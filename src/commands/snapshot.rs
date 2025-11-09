@@ -32,18 +32,51 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         .context("loading VM state")?;
 
     // Connect to running VM
-    let socket_path = PathBuf::from(format!("/tmp/fcvm/{}/firecracker.sock", vm_state.id));
-    let vm_manager = VmManager::new(vm_state.id.clone(), socket_path, None);
+    let socket_path = PathBuf::from(format!("/tmp/fcvm/{}/firecracker.sock", vm_state.vm_id));
+    let vm_manager = VmManager::new(vm_state.vm_id.clone(), socket_path, None);
     let client = vm_manager.client()?;
 
-    // Create snapshot
+    // Create snapshot paths
+    let snapshot_dir = PathBuf::from(format!("/tmp/fcvm/snapshots/{}", snapshot_name));
+    tokio::fs::create_dir_all(&snapshot_dir).await
+        .context("creating snapshot directory")?;
+
+    let memory_path = snapshot_dir.join("memory.bin");
+    let vmstate_path = snapshot_dir.join("vmstate.bin");
+    let disk_path = snapshot_dir.join("disk.ext4");
+
+    // Create snapshot via Firecracker API
+    use crate::firecracker::api::SnapshotCreate;
+
+    client.create_snapshot(SnapshotCreate {
+        snapshot_type: Some("Full".to_string()),
+        snapshot_path: vmstate_path.display().to_string(),
+        mem_file_path: memory_path.display().to_string(),
+    }).await
+        .context("creating Firecracker snapshot")?;
+
+    // TODO: Copy disk (for now just note the source)
+    info!("Snapshot files created, disk copy not yet implemented");
+
+    // Save snapshot metadata
+    use crate::storage::snapshot::{SnapshotConfig, SnapshotMetadata};
+    let snapshot_config = SnapshotConfig {
+        name: snapshot_name.clone(),
+        vm_id: vm_state.vm_id.clone(),
+        memory_path: memory_path.clone(),
+        disk_path: disk_path.clone(),
+        created_at: chrono::Utc::now(),
+        metadata: SnapshotMetadata {
+            image: vm_state.config.image.clone(),
+            vcpu: vm_state.config.vcpu,
+            memory_mib: vm_state.config.memory_mib,
+            network_config: serde_json::json!({}), // TODO: capture network config
+        },
+    };
+
     let snapshot_manager = SnapshotManager::new(PathBuf::from("/tmp/fcvm/snapshots"));
-    let snapshot_config = snapshot_manager.create_snapshot(
-        &snapshot_name,
-        &vm_state,
-        &client,
-    ).await
-        .context("creating snapshot")?;
+    snapshot_manager.save_snapshot(snapshot_config.clone()).await
+        .context("saving snapshot metadata")?;
 
     info!(
         snapshot = %snapshot_name,
