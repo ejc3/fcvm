@@ -57,16 +57,17 @@ tests/
 
 ### Subcommand Structure
 ```
-fcvm run <image>          # Run container in new VM
-fcvm clone <vm-id>        # Clone from snapshot
-fcvm stop <vm-id>         # Stop running VM
-fcvm ls                   # List VMs
-fcvm inspect <vm-id>      # Show VM details
-fcvm logs <vm-id>         # Stream VM logs
-fcvm top <vm-id>          # Show resource usage
-fcvm setup kernel         # Download/build kernel
-fcvm setup rootfs         # Create base rootfs image
-fcvm setup preflight      # Check system requirements
+fcvm run <image>            # Run container in new VM
+fcvm clone <vm-id>          # Clone from snapshot
+fcvm stop <vm-id>           # Stop running VM
+fcvm ls                     # List VMs
+fcvm inspect <vm-id>        # Show VM details
+fcvm logs <vm-id>           # Stream VM logs
+fcvm top <vm-id>            # Show resource usage
+fcvm setup kernel           # Download/build kernel
+fcvm setup rootfs           # Create base rootfs image
+fcvm setup preflight        # Check system requirements
+fcvm memory-server <name>   # Start memory server for snapshot (enables sharing)
 ```
 
 ## Implementation Status
@@ -102,6 +103,16 @@ fcvm setup preflight      # Check system requirements
    - Reduced main.rs from 302 to 38 lines
    - Added integration test infrastructure (tests/)
    - All tests passing (24 total: 14 unit + 10 integration)
+
+5. **Memory Sharing Architecture** (2025-11-09)
+   - Embedded async UFFD server in main binary (no subprocess)
+   - Two-command design: `fcvm memory-server <snapshot>` + `fcvm clone`
+   - One server per snapshot, serves multiple VMs asynchronously
+   - Uses tokio::select! for concurrent VM connections
+   - Each VM gets async task handling page faults
+   - Shared Arc<Mmap> for memory file across all VMs
+   - Server auto-exits when last VM disconnects
+   - Build successful on EC2: 32 seconds for release build
 
 ### 🚧 In Progress
 1. **Guest Environment Setup**
@@ -157,6 +168,40 @@ fcvm setup preflight      # Check system requirements
 - Each VM gets CoW overlay for writes
 - Snapshots capture memory + disk state
 - Clone creates new VM from snapshot (<1s target)
+
+### Memory Sharing Architecture
+**Two-Command Workflow:**
+1. **Start memory server** (one per snapshot, runs in foreground):
+   ```bash
+   fcvm memory-server nginx-base
+   # Creates Unix socket at /tmp/fcvm/uffd-nginx-base.sock
+   # Mmaps snapshot memory file (e.g., 512MB)
+   # Waits for VM connections
+   ```
+
+2. **Clone VMs** (multiple VMs can clone from same snapshot):
+   ```bash
+   fcvm clone --snapshot nginx-base --name web1  # VM 1
+   fcvm clone --snapshot nginx-base --name web2  # VM 2
+   # Each connects to same memory server socket
+   # Memory pages served on-demand via UFFD
+   # True copy-on-write at 4KB page granularity
+   ```
+
+**How it works:**
+- Memory server opens snapshot memory file and mmaps it (MAP_SHARED)
+- Kernel automatically shares physical pages via page cache
+- Server uses tokio AsyncFd to handle UFFD events non-blocking
+- tokio::select! multiplexes: accept new VMs + monitor VM exits
+- Each VM gets dedicated async task (JoinSet) for page faults
+- All tasks share Arc<Mmap> reference to memory file
+- Server exits gracefully when last VM disconnects
+
+**Memory efficiency:**
+- 50 VMs with 512MB snapshot = ~512MB physical RAM + small overhead
+- NOT 50 × 512MB = 25.6GB!
+- Linux kernel handles sharing via page cache automatically
+- Pages only copied on write (true CoW at page level)
 
 ## Build Instructions
 
