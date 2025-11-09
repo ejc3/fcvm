@@ -1,27 +1,21 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::process::Stdio;
 use tokio::{io::{AsyncBufReadExt, BufReader}, process::Command, time::{sleep, Duration}};
 
 #[derive(Debug, Deserialize)]
 struct Plan {
     image: String,
-    #[allow(dead_code)]
-    env: Option<serde_json::Value>,
-    #[allow(dead_code)]
+    #[serde(default)]
+    env: HashMap<String, String>,
     cmd: Option<Vec<String>>,
-    #[allow(dead_code)]
-    logs: Option<serde_json::Value>,
-    #[allow(dead_code)]
-    readiness: Option<serde_json::Value>,
-    #[allow(dead_code)]
-    podman: Option<serde_json::Value>,
-    #[allow(dead_code)]
-    volumes: Option<serde_json::Value>,
+    #[serde(default)]
+    volumes: Vec<String>,
 }
 
 async fn fetch_plan() -> Result<Plan> {
-    let url = std::env::var("FC_MMDs_URI").unwrap_or_else(|_| "http://169.254.169.254/".to_string());
+    let url = std::env::var("FC_MMDS_URI").unwrap_or_else(|_| "http://169.254.169.254/".to_string());
     let plan: Plan = reqwest::Client::new()
         .get(url)
         .send()
@@ -34,38 +28,85 @@ async fn fetch_plan() -> Result<Plan> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    eprintln!("[agent] starting");
+    eprintln!("[fc-agent] starting");
+
+    // Wait for MMDS to be ready
     let plan = loop {
         match fetch_plan().await {
-            Ok(p) => break p,
-            Err(e) => { eprintln!("[agent] MMDS not ready: {e}"); sleep(Duration::from_millis(500)).await; }
+            Ok(p) => {
+                eprintln!("[fc-agent] received container plan");
+                break p;
+            }
+            Err(e) => {
+                eprintln!("[fc-agent] MMDS not ready: {}", e);
+                sleep(Duration::from_millis(500)).await;
+            }
         }
     };
 
+    eprintln!("[fc-agent] launching container: {}", plan.image);
+
+    // Build Podman command
     let mut cmd = Command::new("podman");
-    cmd.arg("run").arg("--rm").arg("--network=host");
+    cmd.arg("run")
+        .arg("--rm")
+        .arg("--network=host");
+
+    // Add environment variables
+    for (key, val) in &plan.env {
+        cmd.arg("-e").arg(format!("{}={}", key, val));
+    }
+
+    // Add volume mounts
+    for vol in &plan.volumes {
+        cmd.arg("-v").arg(vol);
+    }
+
+    // Image
     cmd.arg(&plan.image);
-    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
 
-    // Stream logs to serial
-    if let Some(out) = child.stdout.take() {
-        let mut r = BufReader::new(out).lines();
+    // Command override
+    if let Some(cmd_args) = &plan.cmd {
+        cmd.args(cmd_args);
+    }
+
+    // Spawn container
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn()
+        .context("spawning Podman container")?;
+
+    // Stream stdout to serial console
+    if let Some(stdout) = child.stdout.take() {
         tokio::spawn(async move {
-            while let Ok(Some(line)) = r.next_line().await {
-                println!("[ctr] {line}");
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                println!("[ctr:out] {}", line);
             }
         });
     }
-    if let Some(err) = child.stderr.take() {
-        let mut r = BufReader::new(err).lines();
+
+    // Stream stderr to serial console
+    if let Some(stderr) = child.stderr.take() {
         tokio::spawn(async move {
-            while let Ok(Some(line)) = r.next_line().await {
-                eprintln!("[ctr] {line}");
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                eprintln!("[ctr:err] {}", line);
             }
         });
     }
 
+    // Wait for container to exit
     let status = child.wait().await?;
-    eprintln!("[agent] container exited with {status}");
-    Ok(())
+
+    if status.success() {
+        eprintln!("[fc-agent] container exited successfully");
+        Ok(())
+    } else {
+        eprintln!("[fc-agent] container exited with error: {}", status);
+        std::process::exit(status.code().unwrap_or(1))
+    }
 }

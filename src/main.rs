@@ -1,10 +1,9 @@
 mod lib;
 mod cli;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Commands, RunArgs, CloneArgs, NameArgs};
-use lib::{Mode};
+use cli::{Cli, Commands, RunArgs, CloneArgs};
 
 #[tokio::main]
 async fn main() -> Result<()> {
