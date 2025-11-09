@@ -115,10 +115,13 @@ fcvm memory-server <name>   # Start memory server for snapshot (enables sharing)
    - Build successful on EC2: 32 seconds for release build
 
 ### 🚧 In Progress
-1. **Guest Environment Setup**
-   - Need to add `fcvm setup` subcommands
-   - Kernel: Download pre-built or extract from host
-   - Rootfs: Create Debian-based image with Podman + fc-agent
+1. **Hardware Requirements for Testing**
+   - ❌ c5.large doesn't support KVM (no /dev/kvm)
+   - ✅ Auto-setup working (kernel extraction + Alpine rootfs creation)
+   - Options for testing:
+     - Metal instances (c5.metal $4.08/hr, c6g.metal $2.18/hr) - requires vCPU limit increase
+     - PVM (Pagetable Virtual Machine) - requires custom kernel build
+   - Current blocker: AWS vCPU limit (16 vCPUs, need 64 for metal instances)
 
 ### 📋 TODO
 1. **Setup Subcommands**
@@ -243,6 +246,34 @@ cargo build --release 2>&1 | tee /tmp/fc-agent-build.log
 - **ALWAYS** run in background: `run_in_background=True`
 - **ALWAYS** check every 10 seconds (not 5, not 30!)
 - **Reason**: Filtering loses context, wastes money, can't debug
+
+### KVM and Nested Virtualization (2025-11-09)
+- **Problem**: c5.large instance doesn't have `/dev/kvm` - nested virtualization not supported
+- **Root cause**: Standard EC2 instances don't expose KVM to guest OS
+- **Attempts failed**:
+  - `modprobe kvm_intel` → "Operation not supported"
+  - `modprobe kvm_amd` → "Operation not supported"
+  - No CPU virtualization flags (vmx/svm) exposed in /proc/cpuinfo
+- **Solution Options**:
+
+  **Option 1: Metal Instances** (bare metal hardware)
+  - c5.metal ($4.08/hr, 96 vCPUs, x86_64)
+  - c6g.metal ($2.18/hr, 64 vCPUs, ARM64) ← cheaper!
+  - **Blocker**: AWS vCPU limit is 16, metal instances need 64+
+  - **Fix**: Request limit increase (takes 1-2 business days)
+
+  **Option 2: PVM (Pagetable Virtual Machine)**
+  - Enables Firecracker on regular instances WITHOUT nested virt
+  - Proposed by Ant Group/Alibaba in Feb 2024
+  - **Requirements**:
+    - Build custom host kernel from virt-pvm/linux (Linux 6.7+)
+    - Build custom guest kernel with PVM config
+    - Use Firecracker fork with PVM patches (e.g., Loophole Labs)
+  - **Pros**: Works on c5.large, no extra cost
+  - **Cons**: Experimental, unmaintained upstream, complex setup
+  - **Performance**: ~2x slower than bare metal for I/O workloads
+
+- **Lesson**: Firecracker REQUIRES /dev/kvm or PVM - verify hardware support before testing
 
 ### Sync from Local
 ```bash
