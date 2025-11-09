@@ -8,7 +8,6 @@ use crate::firecracker::{VmManager, api::{SnapshotLoad, MemBackend, NetworkOverr
 use crate::network::{NetworkManager, PortMapping, RootlessNetwork, PrivilegedNetwork};
 use crate::storage::{DiskManager, SnapshotManager};
 use crate::state::{StateManager, VmState, VmStatus, generate_vm_id};
-use crate::uffd::UffdHandler;
 use crate::Mode;
 
 pub async fn cmd_clone(args: CloneArgs) -> Result<()> {
@@ -52,21 +51,22 @@ pub async fn cmd_clone(args: CloneArgs) -> Result<()> {
 
     let socket_path = data_dir.join("firecracker.sock");
     let log_path = data_dir.join("firecracker.log");
-    let uffd_socket = data_dir.join("uffd.sock");
 
-    // Start UFFD handler for memory page serving!
-    // This is THE KEY to memory sharing across clones
-    info!("starting UFFD page fault handler");
-    let uffd_handler = UffdHandler::start(
-        uffd_socket.clone(),
-        &snapshot_config.memory_path,
-    ).await
-        .context("starting UFFD handler for memory sharing")?;
+    // Check for running memory server
+    let uffd_socket = PathBuf::from(format!("/tmp/fcvm/uffd-{}.sock", args.snapshot));
+
+    if !uffd_socket.exists() {
+        anyhow::bail!(
+            "Memory server not running for snapshot '{}'.\n\n\
+             Start it first in another terminal:\n\
+             fcvm memory-server {}",
+            args.snapshot, args.snapshot
+        );
+    }
 
     info!(
-        uffd_socket = %uffd_handler.socket_path().display(),
-        mem_file = %snapshot_config.memory_path.display(),
-        "UFFD handler ready - memory pages will be shared across clones!"
+        uffd_socket = %uffd_socket.display(),
+        "connecting to memory server"
     );
 
     // Create VM state
@@ -139,15 +139,13 @@ pub async fn cmd_clone(args: CloneArgs) -> Result<()> {
     let client = vm_manager.client()?;
 
     // Load snapshot with UFFD backend for TRUE MEMORY SHARING!
-    // This is where the magic happens - backend_path points to the Unix socket
-    // where our uffd_handler is listening, NOT the memory file!
-    info!("loading snapshot with uffd backend via Unix socket");
+    // backend_path points to the Unix socket where memory-server is listening
+    info!("loading snapshot with uffd backend via memory server");
     client.load_snapshot(SnapshotLoad {
         snapshot_path: snapshot_config.memory_path.display().to_string(),
         mem_backend: MemBackend {
             backend_type: "Uffd".to_string(),
-            // CRITICAL FIX: Use Unix socket path, not memory file path!
-            backend_path: uffd_handler.socket_path().display().to_string(),
+            backend_path: uffd_socket.display().to_string(),
         },
         enable_diff_snapshots: Some(false),
         resume_vm: Some(true), // Resume immediately with network override
@@ -193,7 +191,6 @@ pub async fn cmd_clone(args: CloneArgs) -> Result<()> {
     let _ = vm_manager.kill().await;
     let _ = network.cleanup().await;
     let _ = state_manager.delete_state(&vm_id).await;
-    // uffd_handler automatically cleaned up when dropped
 
     Ok(())
 }

@@ -17,6 +17,8 @@ pub enum Commands {
     Logs(NameArgs),
     Top,
     Setup(SetupArgs),
+    /// Start memory server for a snapshot (enables memory sharing across clones)
+    MemoryServer(MemoryServerArgs),
 }
 
 #[derive(Args, Debug)]
@@ -139,6 +141,16 @@ pub struct CloneArgs {
 
     #[arg(long, default_value="stream")]
     pub logs: String,
+}
+
+#[derive(Args, Debug)]
+pub struct MemoryServerArgs {
+    /// Snapshot name to serve memory for
+    pub snapshot_name: String,
+
+    /// Optional: Auto-shutdown after N minutes of inactivity
+    #[arg(long)]
+    pub timeout: Option<u64>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]

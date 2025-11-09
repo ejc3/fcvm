@@ -6,6 +6,7 @@ pub mod inspect;
 pub mod logs;
 pub mod top;
 pub mod setup;
+pub mod memory_server;
 
 // Re-export all command functions for convenience
 pub use run::cmd_run;
@@ -16,3 +17,4 @@ pub use inspect::cmd_inspect;
 pub use logs::cmd_logs;
 pub use top::cmd_top;
 pub use setup::cmd_setup;
+pub use memory_server::cmd_memory_server;
