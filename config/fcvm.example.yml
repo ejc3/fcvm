@@ -1,0 +1,8 @@
+# ~/.config/fcvm/config.yml (example)
+data_dir: ~/.local/share/fcvm
+default_mode: auto        # auto | privileged | rootless
+default_map_mode: block   # block | sshfs | nfs
+default_logs: stream      # stream | file | both
+default_mem_mb: 2048
+default_cpus: 2
+# network_subnet: 172.30.0.0/16   # used in privileged mode

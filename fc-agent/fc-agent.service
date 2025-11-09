@@ -1,0 +1,12 @@
+[Unit]
+Description=Firecracker Guest Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fc-agent
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

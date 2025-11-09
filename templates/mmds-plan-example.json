@@ -1,0 +1,12 @@
+{
+  "image": "ghcr.io/acme/web:latest",
+  "env": {"PORT":"8080"},
+  "cmd": ["./server"],
+  "volumes": [
+    {"guest":"/srv/site","mode":"rw","source":"block","id":"site0"}
+  ],
+  "net": {"ip":"172.30.0.12/24","gw":"172.30.0.1","dns":["1.1.1.1"]},
+  "podman": {"rootless": true, "network": "host", "user":"podman"},
+  "readiness": {"mode":"vsock"},
+  "logs": {"mode":"both"}
+}
