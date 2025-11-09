@@ -199,12 +199,20 @@ pub struct SnapshotLoad {
     pub enable_diff_snapshots: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_vm: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_overrides: Option<Vec<NetworkOverride>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NetworkOverride {
+    pub iface_id: String,
+    pub host_dev_name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MemBackend {
     pub backend_path: String,
-    pub backend_type: String, // "File"
+    pub backend_type: String, // "File" or "Uffd"
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -4,10 +4,11 @@ use tokio::signal::unix::{signal, SignalKind};
 use tracing::info;
 
 use crate::cli::CloneArgs;
-use crate::firecracker::{VmManager, api::{SnapshotLoad, MemBackend, InstanceAction, NetworkInterface}};
+use crate::firecracker::{VmManager, api::{SnapshotLoad, MemBackend, NetworkOverride}};
 use crate::network::{NetworkManager, PortMapping, RootlessNetwork, PrivilegedNetwork};
 use crate::storage::{DiskManager, SnapshotManager};
 use crate::state::{StateManager, VmState, VmStatus, generate_vm_id};
+use crate::uffd::UffdHandler;
 use crate::Mode;
 
 pub async fn cmd_clone(args: CloneArgs) -> Result<()> {
@@ -46,8 +47,27 @@ pub async fn cmd_clone(args: CloneArgs) -> Result<()> {
 
     // Setup paths
     let data_dir = PathBuf::from(format!("/tmp/fcvm/{}", vm_id));
+    tokio::fs::create_dir_all(&data_dir).await
+        .context("creating VM data directory")?;
+
     let socket_path = data_dir.join("firecracker.sock");
     let log_path = data_dir.join("firecracker.log");
+    let uffd_socket = data_dir.join("uffd.sock");
+
+    // Start UFFD handler for memory page serving!
+    // This is THE KEY to memory sharing across clones
+    info!("starting UFFD page fault handler");
+    let uffd_handler = UffdHandler::start(
+        uffd_socket.clone(),
+        &snapshot_config.memory_path,
+    ).await
+        .context("starting UFFD handler for memory sharing")?;
+
+    info!(
+        uffd_socket = %uffd_handler.socket_path().display(),
+        mem_file = %snapshot_config.memory_path.display(),
+        "UFFD handler ready - memory pages will be shared across clones!"
+    );
 
     // Create VM state
     let mut vm_state = VmState::new(
@@ -118,39 +138,26 @@ pub async fn cmd_clone(args: CloneArgs) -> Result<()> {
 
     let client = vm_manager.client()?;
 
-    // Load snapshot with uffd backend for memory sharing!
-    info!("loading snapshot with uffd backend (memory will be shared across clones)");
+    // Load snapshot with UFFD backend for TRUE MEMORY SHARING!
+    // This is where the magic happens - backend_path points to the Unix socket
+    // where our uffd_handler is listening, NOT the memory file!
+    info!("loading snapshot with uffd backend via Unix socket");
     client.load_snapshot(SnapshotLoad {
         snapshot_path: snapshot_config.memory_path.display().to_string(),
         mem_backend: MemBackend {
-            backend_type: "Uffd".to_string(), // KEY: uffd enables page-level CoW sharing!
-            backend_path: snapshot_config.memory_path.display().to_string(),
+            backend_type: "Uffd".to_string(),
+            // CRITICAL FIX: Use Unix socket path, not memory file path!
+            backend_path: uffd_handler.socket_path().display().to_string(),
         },
         enable_diff_snapshots: Some(false),
-        resume_vm: Some(false), // Don't auto-resume, we need to configure network first
-    }).await
-        .context("loading snapshot with uffd backend")?;
-
-    info!("snapshot loaded with uffd - memory pages will be shared until modified");
-
-    // Update network interface with new tap device
-    // Note: After snapshot load, we need to patch the network interface
-    client.add_network_interface(
-        "eth0",
-        NetworkInterface {
+        resume_vm: Some(true), // Resume immediately with network override
+        // Use network_overrides to set TAP device on load (modern Firecracker API)
+        network_overrides: Some(vec![NetworkOverride {
             iface_id: "eth0".to_string(),
             host_dev_name: network_config.tap_device.clone(),
-            guest_mac: Some(network_config.guest_mac.clone()),
-            rx_rate_limiter: None,
-            tx_rate_limiter: None,
-        },
-    ).await
-        .context("configuring network interface")?;
-
-    // Resume VM from snapshot
-    info!("resuming VM from snapshot");
-    client.put_action(InstanceAction::InstanceStart).await
-        .context("resuming VM from snapshot")?;
+        }]),
+    }).await
+        .context("loading snapshot with uffd backend")?;
 
     vm_state.status = VmStatus::Running;
     state_manager.save_state(&vm_state).await?;
@@ -158,9 +165,11 @@ pub async fn cmd_clone(args: CloneArgs) -> Result<()> {
     info!(
         vm_id = %vm_id,
         vm_name = %vm_name,
-        "VM cloned successfully with shared memory pages"
+        "VM cloned successfully with UFFD memory sharing!"
     );
-    println!("VM '{}' cloned from snapshot '{}' (uffd-based memory sharing enabled)", vm_name, args.snapshot);
+    println!("✓ VM '{}' cloned from snapshot '{}'", vm_name, args.snapshot);
+    println!("  Memory pages shared via UFFD - true copy-on-write at page level!");
+    println!("  Disk uses CoW overlay - writes isolated per VM");
 
     // Setup signal handlers
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -184,6 +193,7 @@ pub async fn cmd_clone(args: CloneArgs) -> Result<()> {
     let _ = vm_manager.kill().await;
     let _ = network.cleanup().await;
     let _ = state_manager.delete_state(&vm_id).await;
+    // uffd_handler automatically cleaned up when dropped
 
     Ok(())
 }
