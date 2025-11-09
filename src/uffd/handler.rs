@@ -28,25 +28,20 @@ impl UffdHandler {
             "starting UFFD handler for page-level memory sharing"
         );
 
-        // Try to find uffd_handler binary (from Firecracker examples or custom build)
-        let handler_bin = which::which("uffd_handler")
-            .or_else(|_| which::which("/usr/local/bin/uffd_handler"))
-            .or_else(|_| which::which("./target/release/uffd_handler"))
-            .or_else(|_| {
-                // Try Firecracker examples path
-                std::env::current_dir()
-                    .ok()
-                    .and_then(|d| {
-                        let fc_path = d.join("firecracker/build/cargo_target/release/uffd_handler");
-                        if fc_path.exists() {
-                            Some(fc_path)
-                        } else {
-                            None
-                        }
-                    })
-                    .ok_or_else(|| anyhow::anyhow!("uffd_handler not found in PATH"))
+        // Find uffd_handler binary (should be in same directory as fcvm)
+        let handler_bin = std::env::current_exe()
+            .ok()
+            .and_then(|exe_path| {
+                let exe_dir = exe_path.parent()?;
+                let handler = exe_dir.join("uffd_handler");
+                if handler.exists() {
+                    Some(handler)
+                } else {
+                    None
+                }
             })
-            .context("uffd_handler binary not found - build from Firecracker examples or install to PATH")?;
+            .or_else(|| which::which("uffd_handler").ok())
+            .context("uffd_handler binary not found - should be installed alongside fcvm")?;
 
         info!(handler_bin = %handler_bin.display(), "found uffd_handler binary");
 

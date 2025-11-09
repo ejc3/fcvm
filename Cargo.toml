@@ -3,6 +3,14 @@ name = "fcvm"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "fcvm"
+path = "src/main.rs"
+
+[[bin]]
+name = "uffd_handler"
+path = "src/bin/uffd_handler.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
@@ -26,3 +34,6 @@ async-trait = "0.1"
 hyper = { version = "0.14", features = ["client", "http1"] }
 hyperlocal = "0.8"
 shellexpand = "3"
+userfaultfd = "0.8"
+memmap2 = "0.9"
+vmm-sys-util = "0.12"
