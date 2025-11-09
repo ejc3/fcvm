@@ -74,33 +74,43 @@ fn find_host_kernel() -> Result<PathBuf> {
 async fn extract_kernel(src: &Path, dst: &Path) -> Result<()> {
     // Most modern kernels are self-extracting ELF with embedded compressed payload
     // We need the uncompressed ELF
-    
-    // Try using extract-vmlinux script if available
-    if let Ok(output) = Command::new("which")
-        .arg("extract-vmlinux")
-        .output()
-    {
-        if output.status.success() {
-            info!("using extract-vmlinux script");
-            let output = Command::new("extract-vmlinux")
-                .arg(src)
-                .output()
-                .context("running extract-vmlinux")?;
-            
-            if output.status.success() {
-                tokio::fs::write(dst, &output.stdout).await
-                    .context("writing extracted kernel")?;
-                return Ok(());
+
+    // Try finding extract-vmlinux in common locations
+    let extract_vmlinux_paths = vec![
+        "/usr/src/linux-headers-*/scripts/extract-vmlinux",
+        "/usr/src/*/scripts/extract-vmlinux",
+    ];
+
+    for pattern in &extract_vmlinux_paths {
+        if let Ok(output) = Command::new("sh")
+            .arg("-c")
+            .arg(format!("ls {} 2>/dev/null | head -1", pattern))
+            .output()
+        {
+            if let Ok(script_path) = String::from_utf8(output.stdout) {
+                let script_path = script_path.trim();
+                if !script_path.is_empty() {
+                    info!(script = %script_path, "using extract-vmlinux script");
+                    let output = Command::new(script_path)
+                        .arg(src)
+                        .output()
+                        .context("running extract-vmlinux")?;
+
+                    if output.status.success() && !output.stdout.is_empty() {
+                        tokio::fs::write(dst, &output.stdout).await
+                            .context("writing extracted kernel")?;
+                        return Ok(());
+                    }
+                }
             }
         }
     }
-    
-    warn!("extract-vmlinux not available, trying direct copy");
-    
-    // Fallback: Just copy the kernel as-is
-    // Modern vmlinuz files often work directly with Firecracker
+
+    warn!("extract-vmlinux not found, trying direct copy");
+
+    // Fallback: Just copy the kernel as-is (will likely fail with Firecracker)
     tokio::fs::copy(src, dst).await
         .context("copying kernel file")?;
-    
+
     Ok(())
 }

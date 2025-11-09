@@ -54,6 +54,9 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     // Setup paths
     let data_dir = PathBuf::from(format!("/tmp/fcvm/{}", vm_id));
+    tokio::fs::create_dir_all(&data_dir).await
+        .context("creating VM data directory")?;
+
     let socket_path = data_dir.join("firecracker.sock");
     let log_path = data_dir.join("firecracker.log");
 
@@ -100,8 +103,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     info!(rootfs = %rootfs_path.display(), "disk prepared");
 
-    // Start Firecracker VM
-    let mut vm_manager = VmManager::new(vm_id.clone(), socket_path.clone(), Some(log_path));
+    // Start Firecracker VM (disable file logging for now to avoid permission issues)
+    let mut vm_manager = VmManager::new(vm_id.clone(), socket_path.clone(), None);
     let firecracker_bin = PathBuf::from("/usr/local/bin/firecracker");
 
     vm_manager.start(&firecracker_bin, None).await
