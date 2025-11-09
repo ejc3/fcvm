@@ -18,15 +18,11 @@ async fn main() -> Result<()> {
 
     // Dispatch to appropriate command handler
     let result = match cli.cmd {
-        Commands::Run(args) => commands::cmd_run(args).await,
-        Commands::Clone(args) => commands::cmd_clone(args).await,
-        Commands::Stop(args) => commands::cmd_stop(args).await,
-        Commands::Ls => commands::cmd_ls().await,
-        Commands::Inspect(args) => commands::cmd_inspect(args).await,
+        Commands::Podman(args) => commands::cmd_podman(args).await,
+        Commands::Snapshot(args) => commands::cmd_snapshot(args).await,
+        Commands::Snapshots => commands::cmd_snapshots().await,
         Commands::Logs(args) => commands::cmd_logs(args).await,
-        Commands::Top => commands::cmd_top().await,
-        Commands::Setup(args) => commands::cmd_setup(args).await,
-        Commands::MemoryServer(args) => commands::cmd_memory_server(args).await,
+        Commands::Inspect(args) => commands::cmd_inspect(args).await,
     };
 
     // Handle errors
