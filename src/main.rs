@@ -26,6 +26,7 @@ async fn main() -> Result<()> {
         Commands::Logs(args) => commands::cmd_logs(args).await,
         Commands::Top => commands::cmd_top().await,
         Commands::Setup(args) => commands::cmd_setup(args).await,
+        Commands::MemoryServer(args) => commands::cmd_memory_server(args).await,
     };
 
     // Handle errors
