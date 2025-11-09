@@ -6,12 +6,12 @@
 // Based on Firecracker's examples/uffd/on_demand_handler.rs
 
 use std::fs::File;
-use std::io::{self, Read};
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::io;
+use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::os::unix::net::UnixListener;
 
 use memmap2::MmapOptions;
-use userfaultfd::{Event, Uffd, UffdBuilder};
+use userfaultfd::{Event, Uffd};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 const PAGE_SIZE: usize = 4096;
@@ -78,10 +78,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // Find which memory region this address belongs to
-                let fault_page = addr & !(PAGE_SIZE as u64 - 1);
+                let fault_page = (addr as usize) & !(PAGE_SIZE - 1);
 
                 let mapping = mappings.iter()
-                    .find(|m| m.contains(fault_page))
+                    .find(|m| m.contains(fault_page as u64))
                     .ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidInput,
@@ -90,18 +90,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     })?;
 
                 // Calculate offset in the snapshot file
-                let offset_in_region = (fault_page - mapping.base_host_virt_addr) as usize;
+                let offset_in_region = fault_page - (mapping.base_host_virt_addr as usize);
                 let offset_in_file = mapping.offset as usize + offset_in_region;
 
                 // Get page data from mmap
                 let page_data = &mmap[offset_in_file..offset_in_file + PAGE_SIZE];
 
                 // Copy page to guest memory via UFFD
-                uffd.copy(page_data, fault_page as *mut u8, PAGE_SIZE, true)?;
+                unsafe {
+                    uffd.copy(
+                        page_data.as_ptr() as *const std::ffi::c_void,
+                        fault_page as *mut std::ffi::c_void,
+                        PAGE_SIZE,
+                        true
+                    )?;
+                }
             }
             Ok(Some(Event::Remove { start, end })) => {
                 // Balloon device removed pages - acknowledge removal
-                uffd.remove(start, end - start)?;
+                let len = (end as usize) - (start as usize);
+                unsafe {
+                    uffd.zeropage(start, len, true)?;
+                }
             }
             Ok(None) => {
                 // No more events (shouldn't happen in blocking mode)
@@ -137,7 +147,9 @@ fn receive_uffd_and_mappings(
 ) -> Result<(Uffd, Vec<GuestRegionUffdMapping>), Box<dyn std::error::Error>> {
     // Receive message with UFFD file descriptor from Firecracker
     let mut message_buf = vec![0u8; 4096];
-    let (bytes_read, uffd_fd) = stream.recv_with_fd(&mut message_buf)?
+    let (bytes_read, uffd_fd_opt) = stream.recv_with_fd(&mut message_buf)?;
+
+    let uffd_file = uffd_fd_opt
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "No UFFD received"))?;
 
     message_buf.resize(bytes_read, 0);
@@ -146,8 +158,8 @@ fn receive_uffd_and_mappings(
     let message = String::from_utf8(message_buf)?;
     let mappings: Vec<GuestRegionUffdMapping> = serde_json::from_str(&message)?;
 
-    // Convert raw FD to Uffd
-    let uffd = unsafe { Uffd::from_raw_fd(uffd_fd) };
+    // Convert File to Uffd
+    let uffd = unsafe { Uffd::from_raw_fd(uffd_file.into_raw_fd()) };
 
     Ok((uffd, mappings))
 }
