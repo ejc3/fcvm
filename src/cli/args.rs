@@ -9,71 +9,42 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    Run(RunArgs),
-    Clone(CloneArgs),
-    Stop(NameArgs),
-    Ls,
-    Inspect(NameArgs),
+    /// Podman-compatible container operations
+    Podman(PodmanArgs),
+    /// Snapshot operations (create, serve, run)
+    Snapshot(SnapshotArgs),
+    /// List available snapshots
+    Snapshots,
+    /// View VM logs
     Logs(NameArgs),
-    Top,
-    Setup(SetupArgs),
-    /// Start memory server for a snapshot (enables memory sharing across clones)
-    MemoryServer(MemoryServerArgs),
+    /// Inspect VM details
+    Inspect(NameArgs),
 }
 
+// ============================================================================
+// Podman Commands
+// ============================================================================
+
 #[derive(Args, Debug)]
-pub struct SetupArgs {
+pub struct PodmanArgs {
     #[command(subcommand)]
-    pub cmd: SetupCommands,
+    pub cmd: PodmanCommands,
 }
 
 #[derive(Subcommand, Debug)]
-pub enum SetupCommands {
-    /// Download or extract kernel for Firecracker
-    Kernel {
-        /// Output path for kernel
-        #[arg(long, default_value = "~/.local/share/fcvm/images/vmlinux")]
-        output: String,
-
-        /// Download pre-built kernel instead of extracting from host
-        #[arg(long)]
-        download: bool,
-    },
-
-    /// Create base rootfs image with Podman and fc-agent
-    Rootfs {
-        /// Output directory for rootfs
-        #[arg(long, default_value = "~/.local/share/fcvm/images/rootfs")]
-        output: String,
-
-        /// Debian suite to use
-        #[arg(long, default_value = "bookworm")]
-        suite: String,
-
-        /// Size in MB
-        #[arg(long, default_value_t = 4096)]
-        size_mb: u32,
-    },
-
-    /// Check system requirements and show status
-    Preflight,
-}
-
-#[derive(Args, Debug)]
-pub struct NameArgs {
-    /// VM name or id
-    #[arg(long, short)]
-    pub name: String,
+pub enum PodmanCommands {
+    /// Run a container in a Firecracker VM
+    Run(RunArgs),
 }
 
 #[derive(Args, Debug)]
 pub struct RunArgs {
-    /// Container image (e.g., ghcr.io/org/app:tag)
+    /// Container image (e.g., nginx:latest) or directory to build
     pub image: String,
 
-    /// VM name
+    /// VM name (required)
     #[arg(long)]
-    pub name: Option<String>,
+    pub name: String,
 
     /// vCPUs
     #[arg(long, default_value_t = 2)]
@@ -103,18 +74,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub cmd: Option<String>,
 
-    /// Publish host ports to guest (rootless hostfwd or privileged DNAT)
+    /// Publish host ports to guest
     /// Grammar: [HOSTIP:]HOSTPORT:GUESTPORT[/PROTO], comma-separated
     #[arg(long, num_args=0.., value_delimiter=',')]
     pub publish: Vec<String>,
-
-    /// Save a warm snapshot with this name when readiness gate passes
-    #[arg(long)]
-    pub save_snapshot: Option<String>,
-
-    /// Readiness gate (e.g., 'mode=vsock' or 'mode=http url=http://127.0.0.1:10080/health')
-    #[arg(long)]
-    pub wait_ready: Option<String>,
 
     /// Logs: stream | file | both
     #[arg(long, default_value="stream")]
@@ -125,13 +88,50 @@ pub struct RunArgs {
     pub balloon: Option<u32>,
 }
 
+// ============================================================================
+// Snapshot Commands
+// ============================================================================
+
 #[derive(Args, Debug)]
-pub struct CloneArgs {
-    #[arg(long)]
+pub struct SnapshotArgs {
+    #[command(subcommand)]
+    pub cmd: SnapshotCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SnapshotCommands {
+    /// Create snapshot from a running VM
+    Create(SnapshotCreateArgs),
+    /// Serve snapshot memory for cloning
+    Serve(SnapshotServeArgs),
+    /// Run a clone from a snapshot
+    Run(SnapshotRunArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SnapshotCreateArgs {
+    /// VM name to snapshot
     pub name: String,
 
+    /// Optional: custom snapshot name (defaults to VM name)
     #[arg(long)]
-    pub snapshot: String,
+    pub tag: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct SnapshotServeArgs {
+    /// Snapshot name to serve
+    pub snapshot_name: String,
+}
+
+#[derive(Args, Debug)]
+pub struct SnapshotRunArgs {
+    /// Snapshot name to clone from
+    pub snapshot_name: String,
+
+    /// Optional: custom name for cloned VM (auto-generated if not provided)
+    #[arg(long)]
+    pub name: Option<String>,
 
     #[arg(long, value_enum, default_value_t = ModeOpt::Auto)]
     pub mode: ModeOpt,
@@ -143,15 +143,20 @@ pub struct CloneArgs {
     pub logs: String,
 }
 
-#[derive(Args, Debug)]
-pub struct MemoryServerArgs {
-    /// Snapshot name to serve memory for
-    pub snapshot_name: String,
+// ============================================================================
+// Shared Args
+// ============================================================================
 
-    /// Optional: Auto-shutdown after N minutes of inactivity
-    #[arg(long)]
-    pub timeout: Option<u64>,
+#[derive(Args, Debug)]
+pub struct NameArgs {
+    /// VM name or id
+    #[arg(long, short)]
+    pub name: String,
 }
+
+// ============================================================================
+// Enums
+// ============================================================================
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
 pub enum ModeOpt { Auto, Privileged, Rootless }
