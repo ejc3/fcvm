@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::process::Stdio;
 use tokio::process::{Child, Command};
 use tracing::info;
@@ -9,6 +9,7 @@ use super::{NetworkConfig, NetworkManager, PortMapping, types::generate_mac};
 pub struct RootlessNetwork {
     vm_id: String,
     tap_device: String,
+    #[allow(dead_code)]
     port_mappings: Vec<PortMapping>,
     slirp_process: Option<Child>,
 }

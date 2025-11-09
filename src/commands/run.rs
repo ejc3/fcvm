@@ -1,43 +1,16 @@
-mod cli;
-
 use anyhow::{Context, Result};
-use clap::Parser;
-use cli::{Cli, Commands, RunArgs, CloneArgs, NameArgs};
-mod lib;
-use lib::{Mode, network::*, storage::*, firecracker::*, readiness::*, state::*};
 use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{info, error};
-use tracing_subscriber::EnvFilter;
+use tracing::info;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
-        .with_target(false)
-        .init();
+use crate::cli::RunArgs;
+use crate::firecracker::VmManager;
+use crate::network::{NetworkManager, PortMapping, RootlessNetwork, PrivilegedNetwork};
+use crate::storage::DiskManager;
+use crate::state::{StateManager, VmState, VmStatus, generate_vm_id};
+use crate::Mode;
 
-    let cli = Cli::parse();
-    let result = match cli.cmd {
-        Commands::Run(args) => cmd_run(args).await,
-        Commands::Clone(args) => cmd_clone(args).await,
-        Commands::Stop(args) => cmd_stop(args).await,
-        Commands::Ls => cmd_ls().await,
-        Commands::Inspect(args) => cmd_inspect(args).await,
-        Commands::Logs(args) => cmd_logs(args).await,
-        Commands::Top => cmd_top().await,
-    };
-
-    if let Err(e) = &result {
-        error!("Error: {:#}", e);
-        std::process::exit(1);
-    }
-
-    result
-}
-
-async fn cmd_run(args: RunArgs) -> Result<()> {
+pub async fn cmd_run(args: RunArgs) -> Result<()> {
     info!("Starting fcvm run");
 
     // Generate VM ID
@@ -128,14 +101,14 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     info!("configuring VM via Firecracker API");
 
     // Boot source
-    client.set_boot_source(firecracker::api::BootSource {
+    client.set_boot_source(crate::firecracker::api::BootSource {
         kernel_image_path: "/var/lib/fcvm/kernels/vmlinux.bin".to_string(),
         initrd_path: None,
         boot_args: Some("console=ttyS0 reboot=k panic=1 pci=off".to_string()),
     }).await?;
 
     // Machine config
-    client.set_machine_config(firecracker::api::MachineConfig {
+    client.set_machine_config(crate::firecracker::api::MachineConfig {
         vcpu_count: args.cpu,
         mem_size_mib: args.mem,
         smt: Some(false),
@@ -146,7 +119,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     // Root drive
     client.add_drive(
         "rootfs",
-        firecracker::api::Drive {
+        crate::firecracker::api::Drive {
             drive_id: "rootfs".to_string(),
             path_on_host: rootfs_path.display().to_string(),
             is_root_device: true,
@@ -159,7 +132,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     // Network interface
     client.add_network_interface(
         "eth0",
-        firecracker::api::NetworkInterface {
+        crate::firecracker::api::NetworkInterface {
             iface_id: "eth0".to_string(),
             host_dev_name: network_config.tap_device.clone(),
             guest_mac: Some(network_config.guest_mac.clone()),
@@ -169,7 +142,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     ).await?;
 
     // MMDS configuration
-    client.set_mmds_config(firecracker::api::MmdsConfig {
+    client.set_mmds_config(crate::firecracker::api::MmdsConfig {
         version: "V2".to_string(),
         network_interfaces: Some(vec!["eth0".to_string()]),
         ipv4_address: Some("169.254.169.254".to_string()),
@@ -190,7 +163,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
 
     // Balloon (if specified)
     if let Some(balloon_mib) = args.balloon {
-        client.set_balloon(firecracker::api::Balloon {
+        client.set_balloon(crate::firecracker::api::Balloon {
             amount_mib: balloon_mib,
             deflate_on_oom: true,
             stats_polling_interval_s: Some(1),
@@ -198,7 +171,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     }
 
     // Start VM
-    client.put_action(firecracker::api::InstanceAction::InstanceStart).await?;
+    client.put_action(crate::firecracker::api::InstanceAction::InstanceStart).await?;
 
     vm_state.status = VmStatus::Running;
     state_manager.save_state(&vm_state).await?;
@@ -228,57 +201,5 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     let _ = network.cleanup().await;
     let _ = state_manager.delete_state(&vm_id).await;
 
-    Ok(())
-}
-
-async fn cmd_clone(args: CloneArgs) -> Result<()> {
-    info!("fcvm clone - not yet implemented");
-    println!("Clone from snapshot: {} (snapshot: {})", args.name, args.snapshot);
-    Ok(())
-}
-
-async fn cmd_stop(args: NameArgs) -> Result<()> {
-    info!("fcvm stop - not yet implemented");
-    println!("Stop VM: {}", args.name);
-    Ok(())
-}
-
-async fn cmd_ls() -> Result<()> {
-    info!("fcvm ls");
-    let state_manager = StateManager::new(PathBuf::from("/tmp/fcvm/state"));
-    let vms = state_manager.list_vms().await?;
-
-    println!("{:<20} {:<10} {:<6} {:<8} {:<20}", "NAME", "STATUS", "CPU", "MEM(MB)", "CREATED");
-    println!("{}", "-".repeat(80));
-
-    for vm in vms {
-        println!(
-            "{:<20} {:<10} {:<6} {:<8} {:<20}",
-            vm.name.unwrap_or(vm.vm_id),
-            format!("{:?}", vm.status),
-            vm.config.vcpu,
-            vm.config.memory_mib,
-            vm.created_at.format("%Y-%m-%d %H:%M:%S")
-        );
-    }
-
-    Ok(())
-}
-
-async fn cmd_inspect(args: NameArgs) -> Result<()> {
-    info!("fcvm inspect - not yet implemented");
-    println!("Inspect VM: {}", args.name);
-    Ok(())
-}
-
-async fn cmd_logs(args: NameArgs) -> Result<()> {
-    info!("fcvm logs - not yet implemented");
-    println!("Logs for VM: {}", args.name);
-    Ok(())
-}
-
-async fn cmd_top() -> Result<()> {
-    info!("fcvm top - not yet implemented");
-    println!("VM resource usage - not yet implemented");
     Ok(())
 }

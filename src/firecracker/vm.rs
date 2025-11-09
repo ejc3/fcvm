@@ -70,7 +70,7 @@ impl VmManager {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    info!(vm_id = %vm_id, target: "firecracker", "{}", line);
+                    info!(vm_id = %vm_id, target = "firecracker", "{}", line);
                 }
             });
         }
@@ -81,7 +81,7 @@ impl VmManager {
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    warn!(vm_id = %vm_id, target: "firecracker", "{}", line);
+                    warn!(vm_id = %vm_id, target = "firecracker", "{}", line);
                 }
             });
         }

@@ -10,12 +10,12 @@ pub async fn wait_http(url: &str, timeout_secs: u64) -> Result<()> {
     let start = std::time::Instant::now();
     let timeout_duration = Duration::from_secs(timeout_secs);
 
-    let result = timeout(timeout_duration, async {
+    timeout(timeout_duration, async {
         loop {
             match client.get(url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     info!(url = url, "HTTP endpoint ready");
-                    return Ok(());
+                    break;
                 }
                 Ok(resp) => {
                     debug!(url = url, status = %resp.status(), "HTTP endpoint not ready");
@@ -29,10 +29,10 @@ pub async fn wait_http(url: &str, timeout_secs: u64) -> Result<()> {
         }
     })
     .await
-    .context("HTTP readiness timeout")??;
+    .context("HTTP readiness timeout")?;
 
     let elapsed = start.elapsed();
     info!(url = url, elapsed_secs = elapsed.as_secs(), "HTTP endpoint became ready");
 
-    result
+    Ok(())
 }
