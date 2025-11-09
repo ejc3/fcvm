@@ -1,5 +1,4 @@
 use clap::{Parser, Subcommand, Args, ValueEnum};
-use crate::lib::{Mode, MapMode};
 
 #[derive(Parser, Debug)]
 #[command(name="fcvm", version, about="Firecracker VM runner for Podman containers")]
@@ -17,6 +16,45 @@ pub enum Commands {
     Inspect(NameArgs),
     Logs(NameArgs),
     Top,
+    Setup(SetupArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SetupArgs {
+    #[command(subcommand)]
+    pub cmd: SetupCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SetupCommands {
+    /// Download or extract kernel for Firecracker
+    Kernel {
+        /// Output path for kernel
+        #[arg(long, default_value = "~/.local/share/fcvm/images/vmlinux")]
+        output: String,
+
+        /// Download pre-built kernel instead of extracting from host
+        #[arg(long)]
+        download: bool,
+    },
+
+    /// Create base rootfs image with Podman and fc-agent
+    Rootfs {
+        /// Output directory for rootfs
+        #[arg(long, default_value = "~/.local/share/fcvm/images/rootfs")]
+        output: String,
+
+        /// Debian suite to use
+        #[arg(long, default_value = "bookworm")]
+        suite: String,
+
+        /// Size in MB
+        #[arg(long, default_value_t = 4096)]
+        size_mb: u32,
+    },
+
+    /// Check system requirements and show status
+    Preflight,
 }
 
 #[derive(Args, Debug)]
@@ -108,10 +146,3 @@ pub enum ModeOpt { Auto, Privileged, Rootless }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
 pub enum MapModeOpt { Block, Sshfs, Nfs }
-
-impl From<ModeOpt> for Mode {
-    fn from(m: ModeOpt) -> Self { match m { ModeOpt::Auto => Mode::Auto, ModeOpt::Privileged => Mode::Privileged, ModeOpt::Rootless => Mode::Rootless } }
-}
-impl From<MapModeOpt> for MapMode {
-    fn from(m: MapModeOpt) -> Self { match m { MapModeOpt::Block => MapMode::Block, MapModeOpt::Sshfs => MapMode::Sshfs, MapModeOpt::Nfs => MapMode::Nfs } }
-}
