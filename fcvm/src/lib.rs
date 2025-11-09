@@ -1,3 +1,9 @@
+pub mod firecracker;
+pub mod network;
+pub mod storage;
+pub mod readiness;
+pub mod state;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
