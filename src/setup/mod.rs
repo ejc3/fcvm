@@ -1,3 +1,5 @@
 pub mod kernel;
 pub mod rootfs;
-pub mod preflight;
+
+pub use kernel::ensure_kernel;
+pub use rootfs::ensure_rootfs;

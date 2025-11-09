@@ -20,6 +20,12 @@ pub async fn cmd_podman(args: PodmanArgs) -> Result<()> {
 async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     info!("Starting fcvm podman run");
 
+    // Ensure kernel and rootfs exist (auto-setup on first run)
+    let kernel_path = crate::setup::ensure_kernel().await
+        .context("setting up kernel")?;
+    let base_rootfs = crate::setup::ensure_rootfs().await
+        .context("setting up rootfs")?;
+
     // Generate VM ID
     let vm_id = generate_vm_id();
     let vm_name = args.name.clone();
@@ -86,9 +92,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     info!(tap = %network_config.tap_device, mac = %network_config.guest_mac, "network configured");
 
     // Setup storage
-    let base_rootfs = PathBuf::from("/var/lib/fcvm/rootfs/base.ext4");
     let vm_dir = data_dir.join("disks");
-    let disk_manager = DiskManager::new(vm_id.clone(), base_rootfs, vm_dir);
+    let disk_manager = DiskManager::new(vm_id.clone(), base_rootfs.clone(), vm_dir);
 
     let rootfs_path = disk_manager.create_cow_disk().await
         .context("creating CoW disk")?;
@@ -109,7 +114,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     // Boot source
     client.set_boot_source(crate::firecracker::api::BootSource {
-        kernel_image_path: "/var/lib/fcvm/kernels/vmlinux.bin".to_string(),
+        kernel_image_path: kernel_path.display().to_string(),
         initrd_path: None,
         boot_args: Some("console=ttyS0 reboot=k panic=1 pci=off".to_string()),
     }).await?;
