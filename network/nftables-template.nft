@@ -1,0 +1,11 @@
+# nftables template for fcvm (privileged mode)
+table inet fcvm {
+  chain prerouting { type nat hook prerouting priority -100; }
+  chain output     { type nat hook output priority -100; }
+  chain postrouting { type nat hook postrouting priority 100; }
+  # Example MASQ (adjust uplink)
+  # add rule inet fcvm postrouting oifname "eth0" masquerade
+  # Example DNAT for publish
+  # add rule inet fcvm output ip daddr 127.0.0.1 tcp dport 10080 dnat to 172.30.0.12:80
+  # add rule inet fcvm prerouting ip daddr 127.0.0.1 tcp dport 10080 dnat to 172.30.0.12:80
+}
