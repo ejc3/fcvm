@@ -139,16 +139,25 @@ async fn download_and_extract_alpine(mount_point: &Path) -> Result<()> {
         .context("writing resolv.conf")?;
     
     // Install Podman via chroot + apk
+    // Note: Alpine uses OpenRC, not systemd
     let output = Command::new("chroot")
         .arg(mount_point.to_str().unwrap())
-        .args(&["/bin/sh", "-c", "apk update && apk add podman crun fuse-overlayfs systemd"])
+        .args(&["/bin/sh", "-c", "apk update && apk add podman crun fuse-overlayfs openrc"])
         .output()
         .context("installing packages via apk")?;
-    
+
     if !output.status.success() {
         warn!("apk install had issues: {}", String::from_utf8_lossy(&output.stderr));
         // Continue anyway - Podman might have partially installed
     }
+
+    info!("setting up OpenRC");
+
+    // Enable services for OpenRC
+    let _ = Command::new("chroot")
+        .arg(mount_point.to_str().unwrap())
+        .args(&["/bin/sh", "-c", "rc-update add devfs boot && rc-update add procfs boot && rc-update add sysfs boot"])
+        .output();
     
     // TODO: Copy fc-agent binary into /usr/local/bin/fc-agent
     // TODO: Create systemd service for fc-agent
