@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use std::fs::File;
-use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -210,8 +209,7 @@ async fn handle_vm_page_faults(
             let event = match guard.get_inner().read_event() {
                 Ok(Some(event)) => event,
                 Ok(None) => break, // No more events ready
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => {
+                Err(_) => {
                     // UFFD closed = VM exited
                     info!(
                         vm_id = %vm_id,
