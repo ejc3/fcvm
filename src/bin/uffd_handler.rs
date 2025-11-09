@@ -113,6 +113,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     uffd.zeropage(start, len, true)?;
                 }
             }
+            Ok(Some(Event::Fork { .. })) => {
+                // Fork event - not relevant for our use case
+                eprintln!("  Received Fork event (ignoring)");
+            }
+            Ok(Some(Event::Remap { .. })) => {
+                // Remap event - not relevant for our use case
+                eprintln!("  Received Remap event (ignoring)");
+            }
+            Ok(Some(Event::Unmap { .. })) => {
+                // Unmap event - not relevant for our use case
+                eprintln!("  Received Unmap event (ignoring)");
+            }
             Ok(None) => {
                 // No more events (shouldn't happen in blocking mode)
                 break;
