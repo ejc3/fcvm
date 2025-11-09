@@ -1,14 +1,14 @@
-mod lib;
 mod cli;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Commands, RunArgs, CloneArgs, NameArgs};
+mod lib;
 use lib::{Mode, network::*, storage::*, firecracker::*, readiness::*, state::*};
 use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, error};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {

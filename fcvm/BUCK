@@ -1,0 +1,21 @@
+# BUCK file for fcvm CLI binary
+
+# Main fcvm binary
+rust_binary(
+    name = "fcvm",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/main.rs",
+    edition = "2021",
+    deps = [
+        # External dependencies (these would be defined in a prelude or BUCK config)
+        # In practice, you'd use a package manager integration or vendored crates
+    ],
+)
+
+# Test target
+rust_test(
+    name = "test",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/lib.rs",
+    edition = "2021",
+)
