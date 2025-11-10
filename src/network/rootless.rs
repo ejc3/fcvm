@@ -1,17 +1,19 @@
 use anyhow::{Context, Result};
-use std::process::Stdio;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tracing::info;
 
 use super::{NetworkConfig, NetworkManager, PortMapping, types::generate_mac};
 
-/// Rootless networking using slirp4netns
+/// Rootless networking using TAP device with static IP and NAT
+/// This follows the standard Firecracker networking pattern:
+/// - TAP device with static IP (requires sudo)
+/// - iptables NAT for outbound routing
+/// - Static IP configuration in guest
 pub struct RootlessNetwork {
     vm_id: String,
     tap_device: String,
     #[allow(dead_code)]
     port_mappings: Vec<PortMapping>,
-    slirp_process: Option<Child>,
 }
 
 impl RootlessNetwork {
@@ -20,7 +22,6 @@ impl RootlessNetwork {
             vm_id,
             tap_device,
             port_mappings,
-            slirp_process: None,
         }
     }
 }
@@ -28,31 +29,37 @@ impl RootlessNetwork {
 #[async_trait::async_trait]
 impl NetworkManager for RootlessNetwork {
     async fn setup(&mut self) -> Result<NetworkConfig> {
-        info!(vm_id = %self.vm_id, "setting up rootless network with slirp4netns");
+        info!(vm_id = %self.vm_id, "setting up rootless network with static IP and NAT");
 
-        // For rootless mode, we'll use slirp4netns to provide userspace networking
-        // The TAP device will be created by Firecracker itself
-        // We'll configure port forwarding via slirp4netns after the VM starts
+        // Use unique third octet per VM to avoid routing conflicts
+        // Extract 2 hex chars from tap name (e.g., "tap-vm-4e115" → "4e")
+        let tap_suffix = self.tap_device.strip_prefix("tap-vm-").unwrap_or("00");
+        let octet_3 = u8::from_str_radix(&tap_suffix[0..2.min(tap_suffix.len())], 16).unwrap_or(0);
+
+        // Fixed IPs: 172.16.X.1 (host) and 172.16.X.2 (guest) where X is unique per VM
+        // Use /24 to give each VM its own subnet
+        let host_ip = format!("172.16.{}.1", octet_3);
+        let guest_ip = format!("172.16.{}.2", octet_3);
+        let subnet = format!("172.16.{}.0/24", octet_3);
+
+        // Create TAP device and configure with unique static IP
+        setup_tap_with_nat(&self.tap_device, &host_ip, &subnet, &guest_ip).await?;
 
         // Generate MAC address
         let guest_mac = generate_mac();
 
-        // Note: slirp4netns setup happens after Firecracker starts
-        // For now, just return the config
+        // Return network config with unique static IPs
         Ok(NetworkConfig {
             tap_device: self.tap_device.clone(),
             guest_mac,
-            guest_ip: Some("10.0.2.15".to_string()), // Default slirp4netns IP
-            host_ip: Some("10.0.2.2".to_string()),
+            guest_ip: Some(guest_ip),
+            host_ip: Some(host_ip),
         })
     }
 
     async fn cleanup(&mut self) -> Result<()> {
-        if let Some(mut process) = self.slirp_process.take() {
-            info!(vm_id = %self.vm_id, "killing slirp4netns process");
-            let _ = process.kill().await;
-            let _ = process.wait().await;
-        }
+        // Clean up TAP device and iptables rules
+        cleanup_tap_with_nat(&self.tap_device).await?;
         Ok(())
     }
 
@@ -61,36 +68,136 @@ impl NetworkManager for RootlessNetwork {
     }
 }
 
-/// Setup slirp4netns for a running VM
-pub async fn setup_slirp4netns(
-    pid: u32,
-    tap_device: &str,
-    port_mappings: &[PortMapping],
-) -> Result<Child> {
-    let mut cmd = Command::new("slirp4netns");
-    cmd.arg("--configure");
-    cmd.arg("--mtu=65520");
+/// Setup TAP device with static IP and NAT routing
+/// Follows the official Firecracker networking pattern
+async fn setup_tap_with_nat(tap_name: &str, host_ip: &str, subnet: &str, guest_ip: &str) -> Result<()> {
+    info!(tap = tap_name, host_ip = host_ip, guest_ip = guest_ip, "setting up TAP device with static IP and NAT");
 
-    // Add port forwarding
-    for mapping in port_mappings {
-        let hostfwd = format!(
-            "{}:{}:{}",
-            mapping.proto,
-            mapping.host_port,
-            mapping.guest_port
-        );
-        cmd.arg("--port").arg(hostfwd);
+    // 1. Create TAP device
+    let output = Command::new("sudo")
+        .args(&["ip", "tuntap", "add", tap_name, "mode", "tap"])
+        .output()
+        .await
+        .context("creating TAP device")?;
+
+    if !output.status.success() {
+        anyhow::bail!("failed to create TAP device: {}", String::from_utf8_lossy(&output.stderr));
     }
 
-    cmd.arg(pid.to_string());
-    cmd.arg(tap_device);
+    // 2. Assign static IP to TAP device (host IP with /24 netmask)
+    let host_ip_with_cidr = format!("{}/24", host_ip);
+    let output = Command::new("sudo")
+        .args(&["ip", "addr", "add", &host_ip_with_cidr, "dev", tap_name])
+        .output()
+        .await
+        .context("assigning IP to TAP device")?;
 
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::null());
+    if !output.status.success() {
+        anyhow::bail!("failed to assign IP to TAP: {}", String::from_utf8_lossy(&output.stderr));
+    }
 
-    let child = cmd.spawn()
-        .context("spawning slirp4netns")?;
+    // 3. Bring TAP device up
+    let output = Command::new("sudo")
+        .args(&["ip", "link", "set", tap_name, "up"])
+        .output()
+        .await
+        .context("bringing up TAP device")?;
 
-    info!(pid = pid, "slirp4netns started");
-    Ok(child)
+    if !output.status.success() {
+        anyhow::bail!("failed to bring up TAP device: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    // 4. Enable IPv4 forwarding (required for routing)
+    let output = Command::new("sudo")
+        .args(&["sysctl", "-w", "net.ipv4.ip_forward=1"])
+        .output()
+        .await
+        .context("enabling IP forwarding")?;
+
+    if !output.status.success() {
+        anyhow::bail!("failed to enable IP forwarding: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    // 5. Get default network interface for NAT
+    let output = Command::new("ip")
+        .args(&["route", "show", "default"])
+        .output()
+        .await
+        .context("getting default route")?;
+
+    let default_route = String::from_utf8_lossy(&output.stdout);
+    let default_iface = default_route
+        .split_whitespace()
+        .skip_while(|&s| s != "dev")
+        .nth(1)
+        .unwrap_or("eth0");
+
+    info!(interface = default_iface, "using default interface for NAT");
+
+    // 6. Setup iptables NAT rules (use iptables-nft if available, fallback to iptables)
+    let iptables_cmd = if Command::new("iptables-nft").arg("--version").output().await.is_ok() {
+        "iptables-nft"
+    } else {
+        "iptables"
+    };
+
+    // MASQUERADE rule for outbound traffic from this VM's entire subnet
+    // Use the subnet (172.16.X.0/24) instead of just the guest IP to catch all traffic
+    let _ = Command::new("sudo")
+        .args(&[iptables_cmd, "-t", "nat", "-A", "POSTROUTING", "-o", default_iface, "-s", &subnet, "-j", "MASQUERADE"])
+        .output()
+        .await;
+
+    // Allow forwarding from TAP to external interface
+    let _ = Command::new("sudo")
+        .args(&[iptables_cmd, "-A", "FORWARD", "-i", tap_name, "-o", default_iface, "-j", "ACCEPT"])
+        .output()
+        .await;
+
+    // Allow return traffic from external interface to TAP
+    let _ = Command::new("sudo")
+        .args(&[iptables_cmd, "-A", "FORWARD", "-i", default_iface, "-o", tap_name, "-j", "ACCEPT"])
+        .output()
+        .await;
+
+    // Allow established/related connections back
+    let _ = Command::new("sudo")
+        .args(&[iptables_cmd, "-A", "FORWARD", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"])
+        .output()
+        .await;
+
+    info!(tap = tap_name, host_ip = host_ip, guest_ip = guest_ip, "TAP device configured with NAT");
+    Ok(())
+}
+
+/// Cleanup TAP device and iptables rules
+async fn cleanup_tap_with_nat(tap_name: &str) -> Result<()> {
+    info!(tap = tap_name, "cleaning up TAP device and NAT rules");
+
+    // Delete iptables rules (best effort - don't fail if they don't exist)
+    let iptables_cmd = if Command::new("iptables-nft").arg("--version").output().await.is_ok() {
+        "iptables-nft"
+    } else {
+        "iptables"
+    };
+
+    let _ = Command::new("sudo")
+        .args(&[iptables_cmd, "-t", "nat", "-D", "POSTROUTING", "-s", "172.16.0.2", "-j", "MASQUERADE"])
+        .output()
+        .await;
+
+    // Delete TAP device
+    let output = Command::new("sudo")
+        .args(&["ip", "link", "delete", tap_name])
+        .output()
+        .await
+        .context("deleting TAP device")?;
+
+    if !output.status.success() {
+        // Don't fail if device doesn't exist
+        return Ok(());
+    }
+
+    info!(tap = tap_name, "TAP device cleaned up");
+    Ok(())
 }
