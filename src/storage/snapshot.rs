@@ -10,6 +10,7 @@ pub struct SnapshotConfig {
     pub name: String,
     pub vm_id: String,
     pub memory_path: PathBuf,
+    pub vmstate_path: PathBuf,
     pub disk_path: PathBuf,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub metadata: SnapshotMetadata,

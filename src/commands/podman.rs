@@ -134,7 +134,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         mem_size_mib: args.mem,
         smt: Some(false),
         cpu_template: None,
-        track_dirty_pages: Some(false), // Snapshots are taken explicitly with fcvm snapshot create
+        track_dirty_pages: Some(true), // Enable snapshot support
     }).await?;
 
     // Root drive

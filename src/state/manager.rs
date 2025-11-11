@@ -50,6 +50,14 @@ impl StateManager {
         Ok(())
     }
 
+    /// Load VM state by name
+    pub async fn load_state_by_name(&self, name: &str) -> Result<VmState> {
+        let vms = self.list_vms().await?;
+        vms.into_iter()
+            .find(|vm| vm.name.as_deref() == Some(name))
+            .ok_or_else(|| anyhow::anyhow!("VM not found: {}", name))
+    }
+
     /// List all VMs
     pub async fn list_vms(&self) -> Result<Vec<VmState>> {
         let mut vms = Vec::new();

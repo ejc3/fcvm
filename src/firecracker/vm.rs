@@ -116,6 +116,15 @@ impl VmManager {
         self.client.as_ref().context("VM not started")
     }
 
+    /// Get the VM process PID
+    pub fn pid(&self) -> Result<u32> {
+        if let Some(process) = &self.process {
+            process.id().context("getting process ID")
+        } else {
+            bail!("VM process not running")
+        }
+    }
+
     /// Wait for the VM process to exit
     pub async fn wait(&mut self) -> Result<std::process::ExitStatus> {
         if let Some(mut process) = self.process.take() {
