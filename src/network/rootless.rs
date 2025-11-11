@@ -31,16 +31,13 @@ impl NetworkManager for RootlessNetwork {
     async fn setup(&mut self) -> Result<NetworkConfig> {
         info!(vm_id = %self.vm_id, "setting up rootless network with static IP and NAT");
 
-        // Use unique third octet per VM to avoid routing conflicts
-        // Extract 2 hex chars from tap name (e.g., "tap-vm-4e115" → "4e")
-        let tap_suffix = self.tap_device.strip_prefix("tap-vm-").unwrap_or("00");
-        let octet_3 = u8::from_str_radix(&tap_suffix[0..2.min(tap_suffix.len())], 16).unwrap_or(0);
-
-        // Fixed IPs: 172.16.X.1 (host) and 172.16.X.2 (guest) where X is unique per VM
-        // Use /24 to give each VM its own subnet
-        let host_ip = format!("172.16.{}.1", octet_3);
-        let guest_ip = format!("172.16.{}.2", octet_3);
-        let subnet = format!("172.16.{}.0/24", octet_3);
+        // Use fixed subnet 172.16.0.0/24 for all rootless VMs
+        // This matches the static IP configuration in the base rootfs
+        // Host (TAP device): 172.16.0.1/24
+        // Guest: 172.16.0.2/24
+        let host_ip = "172.16.0.1".to_string();
+        let guest_ip = "172.16.0.2".to_string();
+        let subnet = "172.16.0.0/24".to_string();
 
         // Create TAP device and configure with unique static IP
         setup_tap_with_nat(&self.tap_device, &host_ip, &subnet, &guest_ip).await?;

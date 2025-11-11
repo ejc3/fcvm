@@ -101,11 +101,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     let rootfs_path = disk_manager.create_cow_disk().await
         .context("creating CoW disk")?;
 
-    // Update network configuration in the overlay to match the assigned IPs
-    if let (Some(guest_ip), Some(host_ip)) = (&network_config.guest_ip, &network_config.host_ip) {
-        update_rootfs_network(&rootfs_path, guest_ip, host_ip).await
-            .context("updating rootfs network configuration")?;
-    }
+    // Note: Network configuration is static in base rootfs (172.16.0.2)
+    // No need to update per-VM since we use fixed subnet 172.16.0.0/30
 
     info!(rootfs = %rootfs_path.display(), "disk prepared");
 

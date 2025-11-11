@@ -168,7 +168,7 @@ async fn download_and_extract_alpine(mount_point: &Path) -> Result<()> {
         .output();
 
     // Configure networking for Alpine Linux with static IP
-    // This matches the TAP device configuration (172.16.0.1/30)
+    // This matches the TAP device configuration (172.16.0.1/24)
     info!("configuring network interfaces with static IP");
     let interfaces_config = r#"auto lo
 iface lo inet loopback
@@ -176,7 +176,7 @@ iface lo inet loopback
 auto eth0
 iface eth0 inet static
     address 172.16.0.2
-    netmask 255.255.255.252
+    netmask 255.255.255.0
     gateway 172.16.0.1
 "#;
     let interfaces_path = mount_point.join("etc/network/interfaces");

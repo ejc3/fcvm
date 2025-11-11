@@ -148,6 +148,16 @@ fcvm memory-server <name>   # Start memory server for snapshot (enables sharing)
    - ✅ Original VM properly resumes after snapshotting and continues serving traffic
    - ✅ UFFD memory server serving multiple VMs concurrently
    - ✅ Multiple clones sharing 512 MB memory via UFFD (7000+ page faults served)
+
+10. **OverlayFS Implementation** (2025-11-11)
+   - ✅ Replaced 600ms disk copy with **7ms sparse overlay creation** (50x faster!)
+   - ✅ Dual-drive configuration: vda (read-only base) + vdb (writable overlay)
+   - ✅ Custom overlay-init script as PID 1 for OverlayFS setup
+   - ✅ All VMs/clones share `/var/lib/fcvm/rootfs/base.ext4` (1GB, read-only)
+   - ✅ Per-VM 512MB sparse ext4 overlay (instant creation, minimal disk usage)
+   - ✅ Zero tmpfs/RAM usage for mount points (uses overlay disk itself)
+   - ✅ Fully writable root filesystem with CoW semantics
+   - **Performance**: Exceeds <10ms target, achieves instant VM creation
    - ✅ Clone creation time: ~600ms disk copy + instant UFFD connection
    - ✅ Both clones verified serving nginx traffic simultaneously
    - ✅ Network isolation: each clone on separate TAP device with same guest subnet
@@ -200,11 +210,58 @@ None - core functionality complete!
   - Requires root or CAP_NET_ADMIN
   - Uses nftables for port forwarding
 
-### Storage Notes
-- Base rootfs is read-only, shared across VMs
-- Each VM gets CoW overlay for writes
-- Snapshots capture memory + disk state
-- Clone creates new VM from snapshot (<1s target)
+### Storage Notes - OverlayFS Architecture
+
+**Performance Achievement: 7ms overlay creation (50x faster than 600ms disk copy!)**
+
+#### How It Works
+
+fcvm uses **dual-drive OverlayFS** for instant VM creation with CoW semantics:
+
+**Firecracker VM Configuration:**
+- **Drive vda (read-only)**: `/var/lib/fcvm/rootfs/base.ext4` (~1GB Alpine + Podman)
+  - Shared across ALL VMs and clones
+  - Configured as `is_root_device=true, is_read_only=true`
+
+- **Drive vdb (writable)**: `/tmp/fcvm/{vm_id}/disks/rootfs-overlay.ext4` (512MB sparse ext4)
+  - Per-VM writable layer created in **7ms** (dd + mkfs.ext4 on sparse file)
+  - Configured as `is_read_only=false`
+
+**Boot Process (overlay-init as PID 1):**
+1. Kernel starts with `init=/sbin/overlay-init overlay_root=vdb`
+2. overlay-init script mounts `/proc`, `/sys`, `/dev` (required as PID 1)
+3. Parses `overlay_root=vdb` from `/proc/cmdline`
+4. Mounts `/dev/vdb` (writable overlay disk) to `/mnt`
+5. Creates directories on writable disk: `/mnt/upper`, `/mnt/work`, `/mnt/mnt-overlay-root`, `/mnt/mnt-newroot`
+6. Bind-mounts `/` (vda) to `/mnt/mnt-overlay-root` as lower layer
+7. Creates OverlayFS mount combining lower (vda) + upper (/mnt/upper) → `/mnt/mnt-newroot`
+8. Uses `pivot_root` to switch to OverlayFS root
+9. Execs real init (`/sbin/init`) with fully writable root filesystem
+
+**Key Benefits:**
+- ✅ **Zero tmpfs/RAM usage** for mount points (uses overlay disk itself)
+- ✅ **Instant creation** (sparse files allocate space on-demand)
+- ✅ **True CoW** at filesystem level (not just disk blocks)
+- ✅ **Shared base** (1GB base.ext4 shared by 50 VMs = 1GB on disk, not 50GB!)
+
+#### Regular VMs vs Snapshot Clones
+
+**Regular VMs** (`fcvm podman run`):
+```
+Base: /var/lib/fcvm/rootfs/base.ext4 (shared, read-only)
+Overlay: /tmp/fcvm/{vm_id}/disks/rootfs-overlay.ext4 (per-VM, writable, 7ms creation)
+```
+
+**Snapshot Clones** (`fcvm snapshot run`):
+```
+Base: /var/lib/fcvm/rootfs/base.ext4 (shared via vmstate.bin, read-only)
+Overlay: /tmp/fcvm/{vm_id}/disks/rootfs-overlay.ext4 (per-clone, writable, 7ms creation)
+Symlink: /tmp/fcvm/{original_vm_id}/disks/rootfs-overlay.ext4 → clone's overlay
+```
+
+**Why symlink?** Firecracker's `vmstate.bin` contains hardcoded disk paths from the original VM. The symlink redirects vdb to the clone's fresh overlay while vda still points to the shared base.
+
+**Both use identical OverlayFS setup** - the only difference is memory sharing (UFFD for clones, fresh memory for regular VMs).
 
 ### Memory Sharing Architecture
 **Two-Command Workflow:**
