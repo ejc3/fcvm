@@ -102,6 +102,11 @@ impl FirecrackerClient {
         self.put("/actions", &action).await
     }
 
+    /// Change VM state (Pause/Resume)
+    pub async fn patch_vm_state(&self, state: VmState) -> Result<()> {
+        self.patch("/vm", &state).await
+    }
+
     /// Configure balloon device
     pub async fn set_balloon(&self, config: Balloon) -> Result<()> {
         self.put("/balloon", &config).await
@@ -110,6 +115,11 @@ impl FirecrackerClient {
     /// Update balloon statistics polling interval
     pub async fn update_balloon_stats(&self, config: BalloonStats) -> Result<()> {
         self.patch("/balloon/statistics", &config).await
+    }
+
+    /// Configure entropy device (virtio-rng)
+    pub async fn set_entropy_device(&self, config: EntropyDevice) -> Result<()> {
+        self.put("/entropy", &config).await
     }
 }
 
@@ -224,6 +234,11 @@ pub enum InstanceAction {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct VmState {
+    pub state: String, // "Paused" or "Resumed"
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Balloon {
     pub amount_mib: u32,
     pub deflate_on_oom: bool,
@@ -234,4 +249,10 @@ pub struct Balloon {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BalloonStats {
     pub stats_polling_interval_s: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EntropyDevice {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limiter: Option<RateLimiter>,
 }

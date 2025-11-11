@@ -8,4 +8,4 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "signal"] }
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.11", default-features = false, features = ["json"] }
