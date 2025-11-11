@@ -172,6 +172,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     }).await?;
 
     // MMDS data (container plan) - nested under "latest" for V2 compatibility
+    // Include host timestamp so guest can set clock immediately (avoiding slow NTP sync)
+    // Format without subsecond precision for Alpine `date` compatibility
     let mmds_data = serde_json::json!({
         "latest": {
             "container-plan": {
@@ -182,7 +184,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 }).collect::<std::collections::HashMap<_, _>>(),
                 "cmd": args.cmd,
                 "volumes": args.map,
-            }
+            },
+            "host-time": chrono::Utc::now().timestamp().to_string(),
         }
     });
 
