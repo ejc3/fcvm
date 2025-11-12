@@ -72,6 +72,11 @@ impl FirecrackerClient {
         self.put(&format!("/drives/{}", drive_id), &config).await
     }
 
+    /// Update an existing drive configuration (e.g., host path) after snapshot load
+    pub async fn patch_drive(&self, drive_id: &str, patch: DrivePatch) -> Result<()> {
+        self.patch(&format!("/drives/{}", drive_id), &patch).await
+    }
+
     /// Add a network interface
     pub async fn add_network_interface(
         &self,
@@ -159,6 +164,14 @@ pub struct Drive {
     pub is_read_only: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partuuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limiter: Option<RateLimiter>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct DrivePatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_on_host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limiter: Option<RateLimiter>,
 }
