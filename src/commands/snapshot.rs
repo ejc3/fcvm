@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::cli::{
     SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs, SnapshotServeArgs,
@@ -9,7 +9,7 @@ use crate::cli::{
 use crate::firecracker::VmManager;
 use crate::network::{NetworkManager, PortMapping, PrivilegedNetwork, RootlessNetwork};
 use crate::paths;
-use crate::state::{generate_vm_id, StateManager};
+use crate::state::{generate_vm_id, StateManager, VmState, VmStatus};
 use crate::storage::{DiskManager, SnapshotManager};
 use crate::uffd::UffdServer;
 use crate::Mode;
@@ -74,90 +74,105 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
 
     info!("VM paused successfully");
 
-    // Create snapshot via Firecracker API
-    info!("Creating Firecracker snapshot");
-    use crate::firecracker::api::SnapshotCreate;
+    let snapshot_result = async {
+        // Create snapshot via Firecracker API
+        info!("Creating Firecracker snapshot");
+        use crate::firecracker::api::SnapshotCreate;
 
-    client
-        .create_snapshot(SnapshotCreate {
-            snapshot_type: Some("Full".to_string()),
-            snapshot_path: vmstate_path.display().to_string(),
-            mem_file_path: memory_path.display().to_string(),
-        })
-        .await
-        .context("creating Firecracker snapshot")?;
-
-    // Copy the VM's disk to snapshot directory
-    info!("Copying VM disk to snapshot directory");
-    let vm_disk_path = paths::vm_runtime_dir(&vm_state.vm_id).join("disks/rootfs.ext4");
-
-    if vm_disk_path.exists() {
-        tokio::fs::copy(&vm_disk_path, &disk_path)
+        client
+            .create_snapshot(SnapshotCreate {
+                snapshot_type: Some("Full".to_string()),
+                snapshot_path: vmstate_path.display().to_string(),
+                mem_file_path: memory_path.display().to_string(),
+            })
             .await
-            .context("copying VM disk to snapshot")?;
+            .context("creating Firecracker snapshot")?;
+
+        // Copy the VM's disk to snapshot directory
+        info!("Copying VM disk to snapshot directory");
+        let vm_disk_path = paths::vm_runtime_dir(&vm_state.vm_id).join("disks/rootfs.ext4");
+
+        if vm_disk_path.exists() {
+            tokio::fs::copy(&vm_disk_path, &disk_path)
+                .await
+                .context("copying VM disk to snapshot")?;
+            info!(
+                source = %vm_disk_path.display(),
+                dest = %disk_path.display(),
+                "VM disk copied to snapshot"
+            );
+        } else {
+            anyhow::bail!("VM disk not found at {}", vm_disk_path.display());
+        }
+
+        // Save snapshot metadata
+        use crate::storage::snapshot::{SnapshotConfig, SnapshotMetadata};
+        let snapshot_config = SnapshotConfig {
+            name: snapshot_name.clone(),
+            vm_id: vm_state.vm_id.clone(),
+            memory_path: memory_path.clone(),
+            vmstate_path: vmstate_path.clone(),
+            disk_path: disk_path.clone(),
+            created_at: chrono::Utc::now(),
+            metadata: SnapshotMetadata {
+                image: vm_state.config.image.clone(),
+                vcpu: vm_state.config.vcpu,
+                memory_mib: vm_state.config.memory_mib,
+                network_config: serde_json::json!({}), // TODO: capture network config
+            },
+        };
+
+        let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
+        snapshot_manager
+            .save_snapshot(snapshot_config.clone())
+            .await
+            .context("saving snapshot metadata")?;
+
         info!(
-            source = %vm_disk_path.display(),
-            dest = %disk_path.display(),
-            "VM disk copied to snapshot"
+            snapshot = %snapshot_name,
+            mem_size = snapshot_config.metadata.memory_mib,
+            "snapshot created successfully"
         );
-    } else {
-        anyhow::bail!("VM disk not found at {}", vm_disk_path.display());
+
+        println!(
+            "✓ Snapshot '{}' created from VM '{}'",
+            snapshot_name, args.name
+        );
+        println!("  Memory: {} MB", snapshot_config.metadata.memory_mib);
+        println!("  Files:");
+        println!("    {}", snapshot_config.memory_path.display());
+        println!("    {}", snapshot_config.disk_path.display());
+        println!(
+            "\nOriginal VM '{}' has been resumed and is still running.",
+            args.name
+        );
+
+        Ok::<_, anyhow::Error>(())
     }
+    .await;
 
-    // Save snapshot metadata
-    use crate::storage::snapshot::{SnapshotConfig, SnapshotMetadata};
-    let snapshot_config = SnapshotConfig {
-        name: snapshot_name.clone(),
-        vm_id: vm_state.vm_id.clone(),
-        memory_path: memory_path.clone(),
-        vmstate_path: vmstate_path.clone(),
-        disk_path: disk_path.clone(),
-        created_at: chrono::Utc::now(),
-        metadata: SnapshotMetadata {
-            image: vm_state.config.image.clone(),
-            vcpu: vm_state.config.vcpu,
-            memory_mib: vm_state.config.memory_mib,
-            network_config: serde_json::json!({}), // TODO: capture network config
-        },
-    };
-
-    let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
-    snapshot_manager
-        .save_snapshot(snapshot_config.clone())
-        .await
-        .context("saving snapshot metadata")?;
-
-    info!(
-        snapshot = %snapshot_name,
-        mem_size = snapshot_config.metadata.memory_mib,
-        "snapshot created successfully"
-    );
-
-    // Resume the original VM after snapshotting
+    // Resume the original VM after snapshotting regardless of snapshot result
     info!("Resuming original VM");
-    client
+    let resume_result = client
         .patch_vm_state(ApiVmState {
             state: "Resumed".to_string(),
         })
-        .await
-        .context("resuming VM after snapshot")?;
+        .await;
 
-    info!("Original VM resumed successfully");
+    if let Err(e) = resume_result {
+        warn!(
+            error = %e,
+            vm = %args.name,
+            "failed to resume VM after snapshot"
+        );
+        if snapshot_result.is_ok() {
+            return Err(e);
+        }
+    } else {
+        info!("Original VM resumed successfully");
+    }
 
-    println!(
-        "✓ Snapshot '{}' created from VM '{}'",
-        snapshot_name, args.name
-    );
-    println!("  Memory: {} MB", snapshot_config.metadata.memory_mib);
-    println!("  Files:");
-    println!("    {}", snapshot_config.memory_path.display());
-    println!("    {}", snapshot_config.disk_path.display());
-    println!(
-        "\nOriginal VM '{}' has been resumed and is still running.",
-        args.name
-    );
-
-    Ok(())
+    snapshot_result
 }
 
 /// Serve snapshot memory (foreground)
@@ -229,6 +244,17 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         format!("{}-{}", args.snapshot_name, &vm_id[..6])
     });
 
+    let state_manager = StateManager::new(paths::state_dir());
+    state_manager.init().await?;
+
+    let mut vm_state = VmState::new(
+        vm_id.clone(),
+        snapshot_config.metadata.image.clone(),
+        snapshot_config.metadata.vcpu,
+        snapshot_config.metadata.memory_mib,
+    );
+    vm_state.name = Some(vm_name.clone());
+
     // Detect execution mode
     let mode = match args.mode.into() {
         Mode::Auto => {
@@ -269,7 +295,7 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         "connecting to memory server"
     );
 
-    // Setup networking
+    // Setup networking - use saved network config from snapshot
     let tap_device = format!("tap-{}", &vm_id[..8]);
     let port_mappings: Vec<PortMapping> = args
         .publish
@@ -278,12 +304,29 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         .collect::<Result<Vec<_>>>()
         .context("parsing port mappings")?;
 
+    // Extract guest_ip from snapshot metadata for network config reuse
+    use crate::network::NetworkConfig as SavedNetworkConfig;
+    let saved_network: Option<SavedNetworkConfig> = serde_json::from_value(snapshot_config.metadata.network_config.clone()).ok();
+
     let mut network: Box<dyn NetworkManager> = match mode {
-        Mode::Rootless => Box::new(RootlessNetwork::new(
-            vm_id.clone(),
-            tap_device.clone(),
-            port_mappings.clone(),
-        )),
+        Mode::Rootless => {
+            let mut net = RootlessNetwork::new(
+                vm_id.clone(),
+                tap_device.clone(),
+                port_mappings.clone(),
+            );
+            // If snapshot has saved network config with guest_ip, use it
+            if let Some(ref saved_net) = saved_network {
+                if let Some(ref guest_ip) = saved_net.guest_ip {
+                    net = net.with_guest_ip(guest_ip.clone());
+                    info!(
+                        guest_ip = %guest_ip,
+                        "clone will use same network config as snapshot"
+                    );
+                }
+            }
+            Box::new(net)
+        },
         Mode::Privileged => Box::new(PrivilegedNetwork::new(
             vm_id.clone(),
             tap_device.clone(),
@@ -318,35 +361,6 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         "CoW disk prepared from snapshot"
     );
 
-    // Create symlink so Firecracker can find the disk at the original path
-    // The vmstate.bin contains hardcoded disk paths from the original VM
-    let original_disk_dir = paths::vm_runtime_dir(&snapshot_config.vm_id).join("disks");
-    let original_disk_path = original_disk_dir.join("rootfs.ext4");
-
-    tokio::fs::create_dir_all(&original_disk_dir)
-        .await
-        .context("creating original disk directory for symlink")?;
-
-    if original_disk_path.exists()
-        || tokio::fs::symlink_metadata(&original_disk_path)
-            .await
-            .is_ok()
-    {
-        tokio::fs::remove_file(&original_disk_path)
-            .await
-            .context("removing existing disk symlink")?;
-    }
-
-    tokio::fs::symlink(&rootfs_path, &original_disk_path)
-        .await
-        .context("creating disk symlink")?;
-
-    info!(
-        symlink = %original_disk_path.display(),
-        target = %rootfs_path.display(),
-        "created disk symlink for snapshot compatibility"
-    );
-
     // Start Firecracker VM (disable logging for now to avoid permission issues)
     let mut vm_manager = VmManager::new(vm_id.clone(), socket_path.clone(), None);
     let firecracker_bin = PathBuf::from("/usr/local/bin/firecracker");
@@ -357,9 +371,14 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         .context("starting Firecracker")?;
 
     let client = vm_manager.client()?;
+    if let Ok(pid) = vm_manager.pid() {
+        vm_state.pid = Some(pid);
+    }
 
     // Load snapshot with UFFD backend and network override
-    use crate::firecracker::api::{MemBackend, NetworkOverride, SnapshotLoad};
+    use crate::firecracker::api::{
+        DrivePatch, MemBackend, NetworkOverride, SnapshotLoad, VmState as ApiVmState,
+    };
 
     info!(
         tap_device = %network_config.tap_device,
@@ -374,7 +393,7 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 backend_path: uffd_socket.display().to_string(),
             },
             enable_diff_snapshots: Some(false),
-            resume_vm: Some(true), // Resume VM after loading
+            resume_vm: Some(false), // Update devices before resume
             network_overrides: Some(vec![NetworkOverride {
                 iface_id: "eth0".to_string(),
                 host_dev_name: network_config.tap_device.clone(),
@@ -382,6 +401,31 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         })
         .await
         .context("loading snapshot with uffd backend")?;
+
+    // Point rootfs drive at the clone-specific CoW disk before resuming
+    client
+        .patch_drive(
+            "rootfs",
+            DrivePatch {
+                path_on_host: Some(rootfs_path.display().to_string()),
+                rate_limiter: None,
+            },
+        )
+        .await
+        .context("retargeting rootfs drive for clone")?;
+
+    client
+        .patch_vm_state(ApiVmState {
+            state: "Resumed".to_string(),
+        })
+        .await
+        .context("resuming VM after snapshot load")?;
+
+    vm_state.status = VmStatus::Running;
+    state_manager
+        .save_state(&vm_state)
+        .await
+        .context("persisting snapshot clone state")?;
 
     info!(
         vm_id = %vm_id,
@@ -416,6 +460,7 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     info!("cleaning up resources");
     let _ = vm_manager.kill().await;
     let _ = network.cleanup().await;
+    let _ = state_manager.delete_state(&vm_id).await;
 
     Ok(())
 }

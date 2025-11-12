@@ -163,5 +163,6 @@ fcvm/
 - **Mapping modes**:
   - **block** (default; snapshot-friendly), **sshfs** (rootless OK), **nfs** (privileged only).
 - For **VM-in-VM**, ensure nested virtualization is enabled so `/dev/kvm` exists inside your outer VM.
+- **Storage expectations**: On btrfs/xfs hosts we take advantage of `cp --reflink=always` for instant CoW disks. On ext4 (or any FS without reflink support) we automatically fall back to a normal `cp`, which works everywhere but takes longer because it copies the image fully.
 
 Happy hacking!

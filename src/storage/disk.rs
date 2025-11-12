@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use tokio::fs;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Configuration for a VM disk
 #[derive(Debug, Clone)]
@@ -27,7 +27,7 @@ impl DiskManager {
         }
     }
 
-    /// Create a CoW disk from base rootfs using btrfs reflinks
+    /// Create a CoW disk from base rootfs, preferring reflinks but falling back to copies
     pub async fn create_cow_disk(&self) -> Result<PathBuf> {
         info!(vm_id = %self.vm_id, "creating CoW disk");
 
@@ -55,7 +55,24 @@ impl DiskManager {
                 .context("executing cp --reflink=always")?;
 
             if !status.success() {
-                anyhow::bail!("cp --reflink=always failed - is filesystem btrfs/xfs?");
+                warn!(
+                    vm_id = %self.vm_id,
+                    base = %self.base_rootfs.display(),
+                    "cp --reflink=always failed, falling back to full copy"
+                );
+
+                let fallback_status = tokio::process::Command::new("cp")
+                    .arg(&self.base_rootfs)
+                    .arg(&disk_path)
+                    .status()
+                    .await
+                    .context("executing cp fallback copy")?;
+
+                if !fallback_status.success() {
+                    anyhow::bail!(
+                        "cp failed when falling back to full copy - ensure filesystem has space"
+                    );
+                }
             }
         }
 
@@ -84,4 +101,3 @@ impl DiskManager {
         Ok(())
     }
 }
-

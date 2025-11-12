@@ -14,6 +14,11 @@ pub struct RootlessNetwork {
     tap_device: String,
     #[allow(dead_code)]
     port_mappings: Vec<PortMapping>,
+    guest_ip_override: Option<String>,
+    host_ip: Option<String>,
+    subnet_cidr: Option<String>,
+    default_iface: Option<String>,
+    iptables_cmd: Option<String>,
 }
 
 impl RootlessNetwork {
@@ -22,7 +27,18 @@ impl RootlessNetwork {
             vm_id,
             tap_device,
             port_mappings,
+            guest_ip_override: None,
+            host_ip: None,
+            subnet_cidr: None,
+            default_iface: None,
+            iptables_cmd: None,
         }
+    }
+
+    /// Set guest IP to use (for clones - use same IP as original VM)
+    pub fn with_guest_ip(mut self, guest_ip: String) -> Self {
+        self.guest_ip_override = Some(guest_ip);
+        self
     }
 }
 
@@ -31,26 +47,56 @@ impl NetworkManager for RootlessNetwork {
     async fn setup(&mut self) -> Result<NetworkConfig> {
         info!(vm_id = %self.vm_id, "setting up rootless network with static IP and NAT");
 
-        // Use unique /30 subnet per VM to avoid routing conflicts
-        // Each VM gets a 4-IP subnet: network, host, guest, broadcast
-        // Example: 172.16.X.0/30 where X is derived from vm_id hash
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        // Determine guest IP: use override if set (for clones), otherwise generate new
+        let (host_ip, guest_ip, subnet) = if let Some(ref override_ip) = self.guest_ip_override {
+            // Clone case: use same IP as original VM
+            // Extract subnet from guest IP (e.g., "172.16.0.62" -> 60)
+            let parts: Vec<&str> = override_ip.split('.').collect();
+            if parts.len() != 4 {
+                anyhow::bail!("invalid guest IP format: {}", override_ip);
+            }
+            let last_octet: u8 = parts[3].parse()
+                .with_context(|| format!("parsing guest IP: {}", override_ip))?;
 
-        let mut hasher = DefaultHasher::new();
-        self.vm_id.hash(&mut hasher);
-        let subnet_id = (hasher.finish() % 64) as u8; // Use 64 subnets: 172.16.0-63.0/30
+            // Guest IP should be subnet_base + 2, so subnet_base = guest_ip - 2
+            let subnet_base = last_octet.saturating_sub(2);
+            let host_ip = format!("172.16.0.{}", subnet_base + 1);
+            let subnet = format!("172.16.0.{}/30", subnet_base);
 
-        let subnet_base = subnet_id * 4;
-        let host_ip = format!("172.16.0.{}", subnet_base + 1);
-        let guest_ip = format!("172.16.0.{}", subnet_base + 2);
-        let subnet = format!("172.16.0.{}/30", subnet_base);
+            info!(
+                guest_ip = %override_ip,
+                host_ip = %host_ip,
+                "using saved network config from snapshot"
+            );
+
+            (host_ip, override_ip.clone(), subnet)
+        } else {
+            // New VM case: generate unique subnet from vm_id hash
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+
+            let mut hasher = DefaultHasher::new();
+            self.vm_id.hash(&mut hasher);
+            let subnet_id = (hasher.finish() % 64) as u8; // Use 64 subnets: 172.16.0-63.0/30
+
+            let subnet_base = subnet_id * 4;
+            let host_ip = format!("172.16.0.{}", subnet_base + 1);
+            let guest_ip = format!("172.16.0.{}", subnet_base + 2);
+            let subnet = format!("172.16.0.{}/30", subnet_base);
+
+            (host_ip, guest_ip, subnet)
+        };
 
         // Create TAP device and configure with unique static IP
-        setup_tap_with_nat(&self.tap_device, &host_ip, &subnet, &guest_ip).await?;
+        let nat_setup = setup_tap_with_nat(&self.tap_device, &host_ip, &subnet, &guest_ip).await?;
 
         // Generate MAC address
         let guest_mac = generate_mac();
+
+        self.host_ip = Some(host_ip.clone());
+        self.subnet_cidr = Some(subnet.clone());
+        self.default_iface = Some(nat_setup.default_iface);
+        self.iptables_cmd = Some(nat_setup.iptables_cmd);
 
         // Return network config with unique static IPs
         Ok(NetworkConfig {
@@ -63,13 +109,24 @@ impl NetworkManager for RootlessNetwork {
 
     async fn cleanup(&mut self) -> Result<()> {
         // Clean up TAP device and iptables rules
-        cleanup_tap_with_nat(&self.tap_device).await?;
+        cleanup_tap_with_nat(
+            &self.tap_device,
+            self.subnet_cidr.as_deref(),
+            self.default_iface.as_deref(),
+            self.iptables_cmd.as_deref(),
+        )
+        .await?;
         Ok(())
     }
 
     fn tap_device(&self) -> &str {
         &self.tap_device
     }
+}
+
+struct NatSetup {
+    default_iface: String,
+    iptables_cmd: String,
 }
 
 /// Setup TAP device with static IP and NAT routing
@@ -79,7 +136,7 @@ async fn setup_tap_with_nat(
     host_ip: &str,
     subnet: &str,
     guest_ip: &str,
-) -> Result<()> {
+) -> Result<NatSetup> {
     info!(
         tap = tap_name,
         host_ip = host_ip,
@@ -156,7 +213,8 @@ async fn setup_tap_with_nat(
         .split_whitespace()
         .skip_while(|&s| s != "dev")
         .nth(1)
-        .unwrap_or("eth0");
+        .unwrap_or("eth0")
+        .to_string();
 
     info!(interface = default_iface, "using default interface for NAT");
 
@@ -170,7 +228,8 @@ async fn setup_tap_with_nat(
         "iptables-nft"
     } else {
         "iptables"
-    };
+    }
+    .to_string();
 
     // MASQUERADE rule for outbound traffic from this VM's entire subnet
     // Use the subnet (172.16.X.0/24) instead of just the guest IP to catch all traffic
@@ -182,7 +241,7 @@ async fn setup_tap_with_nat(
             "-A",
             "POSTROUTING",
             "-o",
-            default_iface,
+            default_iface.as_str(),
             "-s",
             &subnet,
             "-j",
@@ -194,29 +253,13 @@ async fn setup_tap_with_nat(
     // Allow forwarding from TAP to external interface
     let _ = Command::new("sudo")
         .args(&[
-            iptables_cmd,
+            iptables_cmd.as_str(),
             "-A",
             "FORWARD",
             "-i",
             tap_name,
             "-o",
-            default_iface,
-            "-j",
-            "ACCEPT",
-        ])
-        .output()
-        .await;
-
-    // Allow return traffic from external interface to TAP
-    let _ = Command::new("sudo")
-        .args(&[
-            iptables_cmd,
-            "-A",
-            "FORWARD",
-            "-i",
-            default_iface,
-            "-o",
-            tap_name,
+            default_iface.as_str(),
             "-j",
             "ACCEPT",
         ])
@@ -226,9 +269,13 @@ async fn setup_tap_with_nat(
     // Allow established/related connections back
     let _ = Command::new("sudo")
         .args(&[
-            iptables_cmd,
+            iptables_cmd.as_str(),
             "-A",
             "FORWARD",
+            "-i",
+            default_iface.as_str(),
+            "-o",
+            tap_name,
             "-m",
             "conntrack",
             "--ctstate",
@@ -245,39 +292,76 @@ async fn setup_tap_with_nat(
         guest_ip = guest_ip,
         "TAP device configured with NAT"
     );
-    Ok(())
+    Ok(NatSetup {
+        default_iface,
+        iptables_cmd,
+    })
 }
 
 /// Cleanup TAP device and iptables rules
-async fn cleanup_tap_with_nat(tap_name: &str) -> Result<()> {
+async fn cleanup_tap_with_nat(
+    tap_name: &str,
+    subnet: Option<&str>,
+    default_iface: Option<&str>,
+    iptables_cmd: Option<&str>,
+) -> Result<()> {
     info!(tap = tap_name, "cleaning up TAP device and NAT rules");
 
     // Delete iptables rules (best effort - don't fail if they don't exist)
-    let iptables_cmd = if Command::new("iptables-nft")
-        .arg("--version")
-        .output()
-        .await
-        .is_ok()
+    if let (Some(subnet), Some(default_iface), Some(iptables_cmd)) =
+        (subnet, default_iface, iptables_cmd)
     {
-        "iptables-nft"
-    } else {
-        "iptables"
-    };
+        let _ = Command::new("sudo")
+            .args(&[
+                iptables_cmd,
+                "-t",
+                "nat",
+                "-D",
+                "POSTROUTING",
+                "-o",
+                default_iface,
+                "-s",
+                subnet,
+                "-j",
+                "MASQUERADE",
+            ])
+            .output()
+            .await;
 
-    let _ = Command::new("sudo")
-        .args(&[
-            iptables_cmd,
-            "-t",
-            "nat",
-            "-D",
-            "POSTROUTING",
-            "-s",
-            "172.16.0.2",
-            "-j",
-            "MASQUERADE",
-        ])
-        .output()
-        .await;
+        let _ = Command::new("sudo")
+            .args(&[
+                iptables_cmd,
+                "-D",
+                "FORWARD",
+                "-i",
+                tap_name,
+                "-o",
+                default_iface,
+                "-j",
+                "ACCEPT",
+            ])
+            .output()
+            .await;
+
+        let _ = Command::new("sudo")
+            .args(&[
+                iptables_cmd,
+                "-D",
+                "FORWARD",
+                "-i",
+                default_iface,
+                "-o",
+                tap_name,
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "RELATED,ESTABLISHED",
+                "-j",
+                "ACCEPT",
+            ])
+            .output()
+            .await;
+    }
 
     // Delete TAP device
     let output = Command::new("sudo")
