@@ -17,12 +17,14 @@ pub async fn build_firecracker_kernel() -> Result<PathBuf> {
     println!("   This will take ~10 minutes on first run...");
 
     // Create kernel directory
-    tokio::fs::create_dir_all(&kernel_dir).await
+    tokio::fs::create_dir_all(&kernel_dir)
+        .await
         .context("creating kernel directory")?;
 
     // Create temporary build directory
     let build_dir = PathBuf::from("/tmp/fcvm-kernel-build");
-    tokio::fs::create_dir_all(&build_dir).await
+    tokio::fs::create_dir_all(&build_dir)
+        .await
         .context("creating build directory")?;
 
     let linux_version = "6.6.58";
@@ -44,7 +46,10 @@ pub async fn build_firecracker_kernel() -> Result<PathBuf> {
             .context("downloading kernel")?;
 
         if !output.status.success() {
-            anyhow::bail!("failed to download kernel: {}", String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "failed to download kernel: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         // Extract
@@ -59,7 +64,10 @@ pub async fn build_firecracker_kernel() -> Result<PathBuf> {
             .context("extracting kernel")?;
 
         if !output.status.success() {
-            anyhow::bail!("failed to extract kernel: {}", String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "failed to extract kernel: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 
@@ -75,7 +83,10 @@ pub async fn build_firecracker_kernel() -> Result<PathBuf> {
         .context("running defconfig")?;
 
     if !output.status.success() {
-        anyhow::bail!("defconfig failed: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "defconfig failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // Enable Firecracker-specific features
@@ -126,7 +137,11 @@ pub async fn build_firecracker_kernel() -> Result<PathBuf> {
             .with_context(|| format!("enabling {}", feature))?;
 
         if !output.status.success() {
-            anyhow::bail!("failed to enable {}: {}", feature, String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "failed to enable {}: {}",
+                feature,
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 
@@ -142,7 +157,10 @@ pub async fn build_firecracker_kernel() -> Result<PathBuf> {
         .context("building kernel")?;
 
     if !output.status.success() {
-        anyhow::bail!("kernel build failed: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "kernel build failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // Copy the built kernel to fcvm kernels directory
@@ -154,7 +172,8 @@ pub async fn build_firecracker_kernel() -> Result<PathBuf> {
     }
 
     info!(src = %kernel_image.display(), dst = %kernel_path.display(), "copying kernel");
-    tokio::fs::copy(&kernel_image, &kernel_path).await
+    tokio::fs::copy(&kernel_image, &kernel_path)
+        .await
         .context("copying kernel to fcvm directory")?;
 
     println!("  ✓ Kernel built successfully!");

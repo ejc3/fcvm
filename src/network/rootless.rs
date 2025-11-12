@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use tokio::process::Command;
 use tracing::info;
 
-use super::{NetworkConfig, NetworkManager, PortMapping, types::generate_mac};
+use super::{types::generate_mac, NetworkConfig, NetworkManager, PortMapping};
 
 /// Rootless networking using TAP device with static IP and NAT
 /// This follows the standard Firecracker networking pattern:
@@ -31,13 +31,20 @@ impl NetworkManager for RootlessNetwork {
     async fn setup(&mut self) -> Result<NetworkConfig> {
         info!(vm_id = %self.vm_id, "setting up rootless network with static IP and NAT");
 
-        // Use fixed subnet 172.16.0.0/24 for all rootless VMs
-        // This matches the static IP configuration in the base rootfs
-        // Host (TAP device): 172.16.0.1/24
-        // Guest: 172.16.0.2/24
-        let host_ip = "172.16.0.1".to_string();
-        let guest_ip = "172.16.0.2".to_string();
-        let subnet = "172.16.0.0/24".to_string();
+        // Use unique /30 subnet per VM to avoid routing conflicts
+        // Each VM gets a 4-IP subnet: network, host, guest, broadcast
+        // Example: 172.16.X.0/30 where X is derived from vm_id hash
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        self.vm_id.hash(&mut hasher);
+        let subnet_id = (hasher.finish() % 64) as u8; // Use 64 subnets: 172.16.0-63.0/30
+
+        let subnet_base = subnet_id * 4;
+        let host_ip = format!("172.16.0.{}", subnet_base + 1);
+        let guest_ip = format!("172.16.0.{}", subnet_base + 2);
+        let subnet = format!("172.16.0.{}/30", subnet_base);
 
         // Create TAP device and configure with unique static IP
         setup_tap_with_nat(&self.tap_device, &host_ip, &subnet, &guest_ip).await?;
@@ -67,8 +74,18 @@ impl NetworkManager for RootlessNetwork {
 
 /// Setup TAP device with static IP and NAT routing
 /// Follows the official Firecracker networking pattern
-async fn setup_tap_with_nat(tap_name: &str, host_ip: &str, subnet: &str, guest_ip: &str) -> Result<()> {
-    info!(tap = tap_name, host_ip = host_ip, guest_ip = guest_ip, "setting up TAP device with static IP and NAT");
+async fn setup_tap_with_nat(
+    tap_name: &str,
+    host_ip: &str,
+    subnet: &str,
+    guest_ip: &str,
+) -> Result<()> {
+    info!(
+        tap = tap_name,
+        host_ip = host_ip,
+        guest_ip = guest_ip,
+        "setting up TAP device with static IP and NAT"
+    );
 
     // 1. Create TAP device
     let output = Command::new("sudo")
@@ -78,7 +95,10 @@ async fn setup_tap_with_nat(tap_name: &str, host_ip: &str, subnet: &str, guest_i
         .context("creating TAP device")?;
 
     if !output.status.success() {
-        anyhow::bail!("failed to create TAP device: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "failed to create TAP device: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // 2. Assign static IP to TAP device (host IP with /24 netmask)
@@ -90,7 +110,10 @@ async fn setup_tap_with_nat(tap_name: &str, host_ip: &str, subnet: &str, guest_i
         .context("assigning IP to TAP device")?;
 
     if !output.status.success() {
-        anyhow::bail!("failed to assign IP to TAP: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "failed to assign IP to TAP: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // 3. Bring TAP device up
@@ -101,7 +124,10 @@ async fn setup_tap_with_nat(tap_name: &str, host_ip: &str, subnet: &str, guest_i
         .context("bringing up TAP device")?;
 
     if !output.status.success() {
-        anyhow::bail!("failed to bring up TAP device: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "failed to bring up TAP device: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // 4. Enable IPv4 forwarding (required for routing)
@@ -112,7 +138,10 @@ async fn setup_tap_with_nat(tap_name: &str, host_ip: &str, subnet: &str, guest_i
         .context("enabling IP forwarding")?;
 
     if !output.status.success() {
-        anyhow::bail!("failed to enable IP forwarding: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "failed to enable IP forwarding: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // 5. Get default network interface for NAT
@@ -132,7 +161,12 @@ async fn setup_tap_with_nat(tap_name: &str, host_ip: &str, subnet: &str, guest_i
     info!(interface = default_iface, "using default interface for NAT");
 
     // 6. Setup iptables NAT rules (use iptables-nft if available, fallback to iptables)
-    let iptables_cmd = if Command::new("iptables-nft").arg("--version").output().await.is_ok() {
+    let iptables_cmd = if Command::new("iptables-nft")
+        .arg("--version")
+        .output()
+        .await
+        .is_ok()
+    {
         "iptables-nft"
     } else {
         "iptables"
@@ -141,29 +175,76 @@ async fn setup_tap_with_nat(tap_name: &str, host_ip: &str, subnet: &str, guest_i
     // MASQUERADE rule for outbound traffic from this VM's entire subnet
     // Use the subnet (172.16.X.0/24) instead of just the guest IP to catch all traffic
     let _ = Command::new("sudo")
-        .args(&[iptables_cmd, "-t", "nat", "-A", "POSTROUTING", "-o", default_iface, "-s", &subnet, "-j", "MASQUERADE"])
+        .args(&[
+            iptables_cmd,
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-o",
+            default_iface,
+            "-s",
+            &subnet,
+            "-j",
+            "MASQUERADE",
+        ])
         .output()
         .await;
 
     // Allow forwarding from TAP to external interface
     let _ = Command::new("sudo")
-        .args(&[iptables_cmd, "-A", "FORWARD", "-i", tap_name, "-o", default_iface, "-j", "ACCEPT"])
+        .args(&[
+            iptables_cmd,
+            "-A",
+            "FORWARD",
+            "-i",
+            tap_name,
+            "-o",
+            default_iface,
+            "-j",
+            "ACCEPT",
+        ])
         .output()
         .await;
 
     // Allow return traffic from external interface to TAP
     let _ = Command::new("sudo")
-        .args(&[iptables_cmd, "-A", "FORWARD", "-i", default_iface, "-o", tap_name, "-j", "ACCEPT"])
+        .args(&[
+            iptables_cmd,
+            "-A",
+            "FORWARD",
+            "-i",
+            default_iface,
+            "-o",
+            tap_name,
+            "-j",
+            "ACCEPT",
+        ])
         .output()
         .await;
 
     // Allow established/related connections back
     let _ = Command::new("sudo")
-        .args(&[iptables_cmd, "-A", "FORWARD", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"])
+        .args(&[
+            iptables_cmd,
+            "-A",
+            "FORWARD",
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "RELATED,ESTABLISHED",
+            "-j",
+            "ACCEPT",
+        ])
         .output()
         .await;
 
-    info!(tap = tap_name, host_ip = host_ip, guest_ip = guest_ip, "TAP device configured with NAT");
+    info!(
+        tap = tap_name,
+        host_ip = host_ip,
+        guest_ip = guest_ip,
+        "TAP device configured with NAT"
+    );
     Ok(())
 }
 
@@ -172,14 +253,29 @@ async fn cleanup_tap_with_nat(tap_name: &str) -> Result<()> {
     info!(tap = tap_name, "cleaning up TAP device and NAT rules");
 
     // Delete iptables rules (best effort - don't fail if they don't exist)
-    let iptables_cmd = if Command::new("iptables-nft").arg("--version").output().await.is_ok() {
+    let iptables_cmd = if Command::new("iptables-nft")
+        .arg("--version")
+        .output()
+        .await
+        .is_ok()
+    {
         "iptables-nft"
     } else {
         "iptables"
     };
 
     let _ = Command::new("sudo")
-        .args(&[iptables_cmd, "-t", "nat", "-D", "POSTROUTING", "-s", "172.16.0.2", "-j", "MASQUERADE"])
+        .args(&[
+            iptables_cmd,
+            "-t",
+            "nat",
+            "-D",
+            "POSTROUTING",
+            "-s",
+            "172.16.0.2",
+            "-j",
+            "MASQUERADE",
+        ])
         .output()
         .await;
 

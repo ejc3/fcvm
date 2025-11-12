@@ -1,10 +1,10 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::process::{Child, Command};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use super::FirecrackerClient;
 
@@ -29,13 +29,16 @@ impl VmManager {
     }
 
     /// Start the Firecracker process
-    pub async fn start(&mut self, firecracker_bin: &Path, config_override: Option<&Path>) -> Result<()> {
+    pub async fn start(
+        &mut self,
+        firecracker_bin: &Path,
+        config_override: Option<&Path>,
+    ) -> Result<()> {
         info!(vm_id = %self.vm_id, "starting Firecracker process");
 
         // Ensure socket doesn't exist
         if self.socket_path.exists() {
-            std::fs::remove_file(&self.socket_path)
-                .context("removing existing socket")?;
+            std::fs::remove_file(&self.socket_path).context("removing existing socket")?;
         }
 
         let mut cmd = Command::new(firecracker_bin);
@@ -60,8 +63,7 @@ impl VmManager {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        let mut child = cmd.spawn()
-            .context("spawning Firecracker process")?;
+        let mut child = cmd.spawn().context("spawning Firecracker process")?;
 
         // Stream stdout/stderr to tracing
         if let Some(stdout) = child.stdout.take() {
@@ -101,7 +103,8 @@ impl VmManager {
     async fn wait_for_socket(&self) -> Result<()> {
         use tokio::time::{sleep, Duration};
 
-        for _ in 0..50 {  // 5 second timeout
+        for _ in 0..50 {
+            // 5 second timeout
             if self.socket_path.exists() {
                 return Ok(());
             }
@@ -128,7 +131,9 @@ impl VmManager {
     /// Wait for the VM process to exit
     pub async fn wait(&mut self) -> Result<std::process::ExitStatus> {
         if let Some(mut process) = self.process.take() {
-            let status = process.wait().await
+            let status = process
+                .wait()
+                .await
                 .context("waiting for Firecracker process")?;
             Ok(status)
         } else {
@@ -140,7 +145,10 @@ impl VmManager {
     pub async fn kill(&mut self) -> Result<()> {
         if let Some(mut process) = self.process.take() {
             info!(vm_id = %self.vm_id, "killing Firecracker process");
-            process.kill().await.context("killing Firecracker process")?;
+            process
+                .kill()
+                .await
+                .context("killing Firecracker process")?;
             let _ = process.wait().await; // Wait to clean up zombie
         }
         Ok(())

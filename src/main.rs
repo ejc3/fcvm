@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
-use fcvm::{cli, commands};
 use fcvm::cli::Commands;
+use fcvm::{cli, commands};
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 

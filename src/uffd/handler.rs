@@ -18,10 +18,7 @@ impl UffdHandler {
     /// 2. Memory-map the snapshot file at `mem_file_path`
     /// 3. Serve page faults from Firecracker via userfaultfd protocol
     /// 4. Enable true copy-on-write memory sharing across clones
-    pub async fn start(
-        socket_path: PathBuf,
-        mem_file_path: &Path,
-    ) -> Result<Self> {
+    pub async fn start(socket_path: PathBuf, mem_file_path: &Path) -> Result<Self> {
         info!(
             socket = %socket_path.display(),
             mem_file = %mem_file_path.display(),
@@ -47,8 +44,7 @@ impl UffdHandler {
 
         // Clean up stale socket if exists
         if socket_path.exists() {
-            std::fs::remove_file(&socket_path)
-                .context("removing stale uffd socket")?;
+            std::fs::remove_file(&socket_path).context("removing stale uffd socket")?;
         }
 
         // Spawn uffd handler process
@@ -75,7 +71,10 @@ impl UffdHandler {
                 if let Ok(Some(status)) = process.try_wait() {
                     anyhow::bail!("uffd_handler process exited early with status: {}", status);
                 }
-                anyhow::bail!("uffd_handler did not create socket after {} attempts", MAX_ATTEMPTS);
+                anyhow::bail!(
+                    "uffd_handler did not create socket after {} attempts",
+                    MAX_ATTEMPTS
+                );
             }
 
             sleep(Duration::from_millis(RETRY_DELAY_MS)).await;

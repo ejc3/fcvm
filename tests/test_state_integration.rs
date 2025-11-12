@@ -43,12 +43,7 @@ async fn test_multiple_vms() {
 
     // Create multiple VMs
     for i in 1..=3 {
-        let mut vm = VmState::new(
-            format!("vm-{}", i),
-            format!("nginx:{}", i),
-            2,
-            512
-        );
+        let mut vm = VmState::new(format!("vm-{}", i), format!("nginx:{}", i), 2, 512);
         vm.name = Some(format!("web-{}", i));
         manager.save_state(&vm).await.unwrap();
     }

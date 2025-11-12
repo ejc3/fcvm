@@ -1,7 +1,11 @@
-use clap::{Parser, Subcommand, Args, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
-#[command(name="fcvm", version, about="Firecracker VM runner for Podman containers")]
+#[command(
+    name = "fcvm",
+    version,
+    about = "Firecracker VM runner for Podman containers"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub cmd: Commands,
@@ -80,7 +84,7 @@ pub struct RunArgs {
     pub publish: Vec<String>,
 
     /// Logs: stream | file | both
-    #[arg(long, default_value="stream")]
+    #[arg(long, default_value = "stream")]
     pub logs: String,
 
     /// Balloon target MiB (default equals --mem)
@@ -139,7 +143,7 @@ pub struct SnapshotRunArgs {
     #[arg(long, num_args=0.., value_delimiter=',')]
     pub publish: Vec<String>,
 
-    #[arg(long, default_value="stream")]
+    #[arg(long, default_value = "stream")]
     pub logs: String,
 }
 
@@ -159,7 +163,15 @@ pub struct NameArgs {
 // ============================================================================
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
-pub enum ModeOpt { Auto, Privileged, Rootless }
+pub enum ModeOpt {
+    Auto,
+    Privileged,
+    Rootless,
+}
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
-pub enum MapModeOpt { Block, Sshfs, Nfs }
+pub enum MapModeOpt {
+    Block,
+    Sshfs,
+    Nfs,
+}

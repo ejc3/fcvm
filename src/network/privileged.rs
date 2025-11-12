@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use tracing::info;
 
-use super::{NetworkConfig, NetworkManager, PortMapping, types::generate_mac};
+use super::{types::generate_mac, NetworkConfig, NetworkManager, PortMapping};
 
 /// Privileged networking using bridge + nftables
 pub struct PrivilegedNetwork {
@@ -91,7 +91,10 @@ async fn create_tap_device(tap_name: &str) -> Result<()> {
         .context("creating TAP device")?;
 
     if !output.status.success() {
-        anyhow::bail!("failed to create TAP device: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "failed to create TAP device: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // Bring it up
@@ -101,7 +104,10 @@ async fn create_tap_device(tap_name: &str) -> Result<()> {
         .context("bringing up TAP device")?;
 
     if !output.status.success() {
-        anyhow::bail!("failed to bring up TAP device: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "failed to bring up TAP device: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     info!(tap = tap_name, "created TAP device");
@@ -118,7 +124,10 @@ async fn delete_tap_device(tap_name: &str) -> Result<()> {
         .context("deleting TAP device")?;
 
     if !output.status.success() {
-        anyhow::bail!("failed to delete TAP device: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "failed to delete TAP device: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     info!(tap = tap_name, "deleted TAP device");
@@ -135,7 +144,10 @@ async fn add_to_bridge(tap_name: &str, bridge: &str) -> Result<()> {
         .context("adding TAP to bridge")?;
 
     if !output.status.success() {
-        anyhow::bail!("failed to add TAP to bridge: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "failed to add TAP to bridge: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     info!(tap = tap_name, bridge = bridge, "added TAP to bridge");
@@ -152,7 +164,10 @@ async fn remove_from_bridge(tap_name: &str, _bridge: &str) -> Result<()> {
         .context("removing TAP from bridge")?;
 
     if !output.status.success() {
-        anyhow::bail!("failed to remove TAP from bridge: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "failed to remove TAP from bridge: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     Ok(())
@@ -167,10 +182,7 @@ async fn setup_nat_rule(mapping: &PortMapping, guest_ip: &str) -> Result<()> {
     // Add DNAT rule using nftables
     let rule = format!(
         "add rule ip nat PREROUTING {} dport {} dnat to {}:{}",
-        mapping.proto,
-        mapping.host_port,
-        guest_ip,
-        mapping.guest_port
+        mapping.proto, mapping.host_port, guest_ip, mapping.guest_port
     );
 
     let output = Command::new("nft")
@@ -179,7 +191,10 @@ async fn setup_nat_rule(mapping: &PortMapping, guest_ip: &str) -> Result<()> {
         .context("setting up NAT rule")?;
 
     if !output.status.success() {
-        anyhow::bail!("failed to setup NAT rule: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "failed to setup NAT rule: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     info!(
@@ -201,10 +216,7 @@ async fn remove_nat_rule(mapping: &PortMapping, guest_ip: &str) -> Result<()> {
     // Delete DNAT rule
     let rule = format!(
         "delete rule ip nat PREROUTING {} dport {} dnat to {}:{}",
-        mapping.proto,
-        mapping.host_port,
-        guest_ip,
-        mapping.guest_port
+        mapping.proto, mapping.host_port, guest_ip, mapping.guest_port
     );
 
     let output = Command::new("nft")

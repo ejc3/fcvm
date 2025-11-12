@@ -35,10 +35,7 @@ impl SnapshotManager {
     }
 
     /// Save a snapshot
-    pub async fn save_snapshot(
-        &self,
-        config: SnapshotConfig,
-    ) -> Result<()> {
+    pub async fn save_snapshot(&self, config: SnapshotConfig) -> Result<()> {
         info!(
             snapshot = %config.name,
             vm_id = %config.vm_id,
@@ -47,13 +44,15 @@ impl SnapshotManager {
 
         // Create snapshot directory
         let snapshot_dir = self.snapshots_dir.join(&config.name);
-        fs::create_dir_all(&snapshot_dir).await
+        fs::create_dir_all(&snapshot_dir)
+            .await
             .context("creating snapshot directory")?;
 
         // Save metadata
         let metadata_path = snapshot_dir.join("config.json");
         let metadata_json = serde_json::to_string_pretty(&config)?;
-        fs::write(&metadata_path, metadata_json).await
+        fs::write(&metadata_path, metadata_json)
+            .await
             .context("writing snapshot metadata")?;
 
         info!(
@@ -75,11 +74,12 @@ impl SnapshotManager {
             anyhow::bail!("snapshot '{}' not found", name);
         }
 
-        let metadata_json = fs::read_to_string(&metadata_path).await
+        let metadata_json = fs::read_to_string(&metadata_path)
+            .await
             .context("reading snapshot metadata")?;
 
-        let config: SnapshotConfig = serde_json::from_str(&metadata_json)
-            .context("parsing snapshot metadata")?;
+        let config: SnapshotConfig =
+            serde_json::from_str(&metadata_json).context("parsing snapshot metadata")?;
 
         Ok(config)
     }
@@ -92,7 +92,8 @@ impl SnapshotManager {
             return Ok(snapshots);
         }
 
-        let mut entries = fs::read_dir(&self.snapshots_dir).await
+        let mut entries = fs::read_dir(&self.snapshots_dir)
+            .await
             .context("reading snapshots directory")?;
 
         while let Some(entry) = entries.next_entry().await? {
@@ -111,7 +112,8 @@ impl SnapshotManager {
         let snapshot_dir = self.snapshots_dir.join(name);
 
         if snapshot_dir.exists() {
-            fs::remove_dir_all(&snapshot_dir).await
+            fs::remove_dir_all(&snapshot_dir)
+                .await
                 .context("removing snapshot directory")?;
 
             info!(snapshot = name, "snapshot deleted");

@@ -13,7 +13,8 @@ pub async fn cmd_snapshots() -> Result<()> {
         return Ok(());
     }
 
-    let mut entries = tokio::fs::read_dir(&snapshots_dir).await
+    let mut entries = tokio::fs::read_dir(&snapshots_dir)
+        .await
         .context("reading snapshots directory")?;
 
     let mut snapshots = Vec::new();
