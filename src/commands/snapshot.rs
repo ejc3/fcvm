@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::info;
 
@@ -250,7 +249,6 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         .context("creating VM data directory")?;
 
     let socket_path = data_dir.join("firecracker.sock");
-    let log_path = data_dir.join("firecracker.log");
 
     // Check for running memory server
     let uffd_socket = paths::base_dir().join(format!("uffd-{}.sock", args.snapshot_name));

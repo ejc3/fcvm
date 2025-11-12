@@ -69,7 +69,6 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .context("creating VM data directory")?;
 
     let socket_path = data_dir.join("firecracker.sock");
-    let log_path = data_dir.join("firecracker.log");
 
     // Create VM state
     let mut vm_state = VmState::new(vm_id.clone(), args.image.clone(), args.cpu, args.mem);
@@ -285,64 +284,3 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-/// Update network configuration in the rootfs overlay
-async fn update_rootfs_network(
-    rootfs_path: &std::path::Path,
-    guest_ip: &str,
-    gateway_ip: &str,
-) -> Result<()> {
-    use std::process::Command;
-
-    // Mount the rootfs
-    let mount_point = std::path::PathBuf::from("/tmp/fcvm-rootfs-mount");
-    tokio::fs::create_dir_all(&mount_point).await?;
-
-    let output = Command::new("sudo")
-        .args(&[
-            "mount",
-            "-o",
-            "loop",
-            rootfs_path.to_str().unwrap(),
-            mount_point.to_str().unwrap(),
-        ])
-        .output()?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "failed to mount rootfs: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    // Extract netmask from guest IP (assume /24 for simplicity)
-    let netmask = "255.255.255.0";
-
-    // Write network interfaces config with dynamic IPs
-    // Add MMDS (169.254.169.254) as link-local on eth0
-    // This is required for Fire cracker MMDS V2 - packets go directly to the interface
-    let interfaces_config = format!(
-        r#"auto lo
-iface lo inet loopback
-
-auto eth0
-iface eth0 inet static
-    address {}
-    netmask {}
-    gateway {}
-    up ip route add 169.254.169.254/32 dev eth0
-"#,
-        guest_ip, netmask, gateway_ip
-    );
-
-    let interfaces_path = mount_point.join("etc/network/interfaces");
-    tokio::fs::write(&interfaces_path, interfaces_config)
-        .await
-        .context("writing network interfaces config")?;
-
-    // Unmount
-    let _ = Command::new("sudo")
-        .args(&["umount", mount_point.to_str().unwrap()])
-        .output()?;
-
-    Ok(())
-}
