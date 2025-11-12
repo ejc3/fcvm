@@ -2,13 +2,13 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 /// Base directory for all fcvm data.
-/// Defaults to `~/.local/share/fcvm` but can be overridden with `FCVM_BASE_DIR`.
+/// Defaults to `/mnt/fcvm-btrfs` but can be overridden with `FCVM_BASE_DIR`.
 pub fn base_dir() -> PathBuf {
     static BASE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
     BASE_DIR
         .get_or_init(|| {
-            let default = shellexpand::tilde("~/.local/share/fcvm").into_owned();
+            let default = "/mnt/fcvm-btrfs".to_string();
             let configured = std::env::var("FCVM_BASE_DIR").unwrap_or(default);
             PathBuf::from(shellexpand::tilde(&configured).as_ref())
         })
