@@ -62,46 +62,6 @@ impl DiskManager {
         Ok(disk_path)
     }
 
-    /// Create a snapshot disk (differential from current state)
-    pub async fn create_snapshot_disk(&self, snapshot_name: &str) -> Result<PathBuf> {
-        let snapshot_path = self.vm_dir.join(format!("{}.disk", snapshot_name));
-
-        info!(
-            vm_id = %self.vm_id,
-            snapshot = snapshot_name,
-            "creating snapshot disk"
-        );
-
-        // Copy current disk to snapshot
-        let disk_path = self.vm_dir.join("rootfs.ext4");
-        fs::copy(&disk_path, &snapshot_path)
-            .await
-            .context("creating snapshot disk")?;
-
-        Ok(snapshot_path)
-    }
-
-    /// Clone disk from snapshot with CoW
-    pub async fn clone_from_snapshot(&self, snapshot_disk: &Path) -> Result<PathBuf> {
-        let clone_path = self.vm_dir.join("rootfs.ext4");
-
-        info!(
-            vm_id = %self.vm_id,
-            snapshot = %snapshot_disk.display(),
-            "cloning disk from snapshot"
-        );
-
-        // For fast cloning, we'd use qcow2 backing files:
-        // qemu-img create -f qcow2 -b snapshot.disk clone.qcow2
-        //
-        // For now, copy the snapshot
-        fs::copy(snapshot_disk, &clone_path)
-            .await
-            .context("cloning from snapshot")?;
-
-        Ok(clone_path)
-    }
-
     /// Get disk configuration for Firecracker
     pub fn get_disk_config(&self, disk_path: PathBuf, is_root: bool) -> DiskConfig {
         DiskConfig {
@@ -125,32 +85,3 @@ impl DiskManager {
     }
 }
 
-/// Create a qcow2 CoW disk (requires qemu-img)
-#[allow(dead_code)]
-async fn create_qcow2_cow(base: &Path, overlay: &Path) -> Result<()> {
-    use tokio::process::Command;
-
-    let output = Command::new("qemu-img")
-        .args(&[
-            "create",
-            "-f",
-            "qcow2",
-            "-b",
-            base.to_str().unwrap(),
-            "-F",
-            "raw",
-            overlay.to_str().unwrap(),
-        ])
-        .output()
-        .await
-        .context("running qemu-img")?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "qemu-img failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    Ok(())
-}
