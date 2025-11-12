@@ -41,6 +41,13 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .collect::<Result<Vec<_>>>()
         .context("parsing port mappings")?;
 
+    // Parse optional container command using shell-like semantics
+    let cmd_args = if let Some(cmd) = &args.cmd {
+        Some(shell_words::split(cmd).with_context(|| format!("parsing --cmd argument: {}", cmd))?)
+    } else {
+        None
+    };
+
     // Detect execution mode
     let mode = match args.mode.into() {
         Mode::Auto => {
@@ -71,7 +78,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     vm_state.config.volumes = args.map.clone();
 
     // Initialize state manager
-    let state_manager = StateManager::new(PathBuf::from("/tmp/fcvm/state"));
+    let state_manager = StateManager::new(paths::state_dir());
     state_manager.init().await?;
 
     // Setup networking
@@ -128,7 +135,9 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // Boot source with network configuration via kernel cmdline
     // Format: ip=<client-ip>:<server-ip>:<gw-ip>:<netmask>:<hostname>:<device>:<autoconf>
     // Example: ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off
-    let boot_args = if let (Some(guest_ip), Some(host_ip)) = (&network_config.guest_ip, &network_config.host_ip) {
+    let boot_args = if let (Some(guest_ip), Some(host_ip)) =
+        (&network_config.guest_ip, &network_config.host_ip)
+    {
         // Extract just the IP without CIDR notation if present
         let guest_ip_clean = guest_ip.split('/').next().unwrap_or(guest_ip);
         let host_ip_clean = host_ip.split('/').next().unwrap_or(host_ip);
@@ -211,7 +220,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                     let parts: Vec<&str> = e.splitn(2, '=').collect();
                     (parts[0], parts.get(1).copied().unwrap_or(""))
                 }).collect::<std::collections::HashMap<_, _>>(),
-                "cmd": args.cmd,
+                "cmd": cmd_args,
                 "volumes": args.map,
             },
             "host-time": chrono::Utc::now().timestamp().to_string(),

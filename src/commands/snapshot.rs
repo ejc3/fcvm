@@ -89,10 +89,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
 
     // Copy the VM's disk to snapshot directory
     info!("Copying VM disk to snapshot directory");
-    let vm_disk_path = PathBuf::from(format!(
-        "/tmp/fcvm/{}/disks/rootfs-overlay.ext4",
-        vm_state.vm_id
-    ));
+    let vm_disk_path = paths::vm_runtime_dir(&vm_state.vm_id).join("disks/rootfs-overlay.ext4");
 
     if vm_disk_path.exists() {
         tokio::fs::copy(&vm_disk_path, &disk_path)

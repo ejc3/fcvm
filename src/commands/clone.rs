@@ -34,7 +34,7 @@ pub async fn cmd_clone(args: CloneArgs) -> Result<()> {
     info!("Starting fcvm clone with uffd-based memory sharing");
 
     // Load snapshot configuration
-    let snapshot_manager = SnapshotManager::new(PathBuf::from("/tmp/fcvm/snapshots"));
+    let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
     let snapshot_config = snapshot_manager.load_snapshot(&args.snapshot).await
         .context("loading snapshot configuration")?;
 
@@ -65,7 +65,7 @@ pub async fn cmd_clone(args: CloneArgs) -> Result<()> {
     info!(mode = ?mode, vm_id = %vm_id, vm_name = %vm_name, "detected execution mode");
 
     // Setup paths
-    let data_dir = PathBuf::from(format!("/tmp/fcvm/{}", vm_id));
+    let data_dir = paths::vm_runtime_dir(&vm_id);
     tokio::fs::create_dir_all(&data_dir).await
         .context("creating VM data directory")?;
 
@@ -73,7 +73,7 @@ pub async fn cmd_clone(args: CloneArgs) -> Result<()> {
     let log_path = data_dir.join("firecracker.log");
 
     // Check for running memory server
-    let uffd_socket = PathBuf::from(format!("/tmp/fcvm/uffd-{}.sock", args.snapshot));
+    let uffd_socket = paths::base_dir().join(format!("uffd-{}.sock", args.snapshot));
 
     if !uffd_socket.exists() {
         anyhow::bail!(
@@ -99,7 +99,7 @@ pub async fn cmd_clone(args: CloneArgs) -> Result<()> {
     vm_state.name = Some(vm_name.clone());
 
     // Initialize state manager
-    let state_manager = StateManager::new(PathBuf::from("/tmp/fcvm/state"));
+    let state_manager = StateManager::new(paths::state_dir());
     state_manager.init().await?;
 
     // Setup networking (similar to run)

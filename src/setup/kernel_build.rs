@@ -5,7 +5,6 @@ use tracing::info;
 
 use crate::paths;
 
-
 /// Build a modern Linux LTS kernel optimized for Firecracker
 ///
 /// This builds Linux 6.6 LTS with:
