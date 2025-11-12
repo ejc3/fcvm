@@ -249,6 +249,10 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .put_action(crate::firecracker::api::InstanceAction::InstanceStart)
         .await?;
 
+    // Save network config to VM state for snapshotting
+    vm_state.config.network = serde_json::to_value(&network_config)
+        .context("serializing network config")?;
+
     vm_state.status = VmStatus::Running;
     state_manager.save_state(&vm_state).await?;
 
