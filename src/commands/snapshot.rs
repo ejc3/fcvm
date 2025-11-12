@@ -118,7 +118,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                 image: vm_state.config.image.clone(),
                 vcpu: vm_state.config.vcpu,
                 memory_mib: vm_state.config.memory_mib,
-                network_config: serde_json::json!({}), // TODO: capture network config
+                network_config: vm_state.config.network.clone(),
             },
         };
 
