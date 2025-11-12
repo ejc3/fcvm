@@ -235,7 +235,7 @@ async fn setup_tap_with_nat(
     // Use the subnet (172.16.X.0/24) instead of just the guest IP to catch all traffic
     let _ = Command::new("sudo")
         .args(&[
-            iptables_cmd,
+            iptables_cmd.as_str(),
             "-t",
             "nat",
             "-A",
