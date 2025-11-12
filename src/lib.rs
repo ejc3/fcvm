@@ -2,6 +2,7 @@ pub mod cli;
 pub mod commands;
 pub mod firecracker;
 pub mod network;
+pub mod paths;
 pub mod readiness;
 pub mod setup;
 pub mod state;

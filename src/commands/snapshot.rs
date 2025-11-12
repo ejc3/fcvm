@@ -8,6 +8,7 @@ use crate::cli::{
 };
 use crate::firecracker::VmManager;
 use crate::network::{NetworkManager, PortMapping, PrivilegedNetwork, RootlessNetwork};
+use crate::paths;
 use crate::state::{generate_vm_id, StateManager};
 use crate::storage::{DiskManager, SnapshotManager};
 use crate::uffd::UffdServer;
@@ -29,14 +30,14 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     let snapshot_name = args.tag.unwrap_or_else(|| args.name.clone());
 
     // Load VM state by name
-    let state_manager = StateManager::new(PathBuf::from("/tmp/fcvm/state"));
+    let state_manager = StateManager::new(paths::state_dir());
     let vm_state = state_manager
         .load_state_by_name(&args.name)
         .await
         .context("loading VM state")?;
 
     // Connect to running VM
-    let socket_path = PathBuf::from(format!("/tmp/fcvm/{}/firecracker.sock", vm_state.vm_id));
+    let socket_path = paths::vm_runtime_dir(&vm_state.vm_id).join("firecracker.sock");
 
     // Check if socket exists
     if !socket_path.exists() {
@@ -51,7 +52,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     let client = FirecrackerClient::new(socket_path)?;
 
     // Create snapshot paths
-    let snapshot_dir = PathBuf::from(format!("/tmp/fcvm/snapshots/{}", snapshot_name));
+    let snapshot_dir = paths::snapshot_dir().join(&snapshot_name);
     tokio::fs::create_dir_all(&snapshot_dir)
         .await
         .context("creating snapshot directory")?;
@@ -123,7 +124,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         },
     };
 
-    let snapshot_manager = SnapshotManager::new(PathBuf::from("/tmp/fcvm/snapshots"));
+    let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
     snapshot_manager
         .save_snapshot(snapshot_config.clone())
         .await
@@ -170,7 +171,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     );
 
     // Load snapshot configuration
-    let snapshot_manager = SnapshotManager::new(PathBuf::from("/tmp/fcvm/snapshots"));
+    let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
     let snapshot_config = snapshot_manager
         .load_snapshot(&args.snapshot_name)
         .await
@@ -210,7 +211,7 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     info!("Cloning VM from snapshot: {}", args.snapshot_name);
 
     // Load snapshot configuration
-    let snapshot_manager = SnapshotManager::new(PathBuf::from("/tmp/fcvm/snapshots"));
+    let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
     let snapshot_config = snapshot_manager
         .load_snapshot(&args.snapshot_name)
         .await
@@ -246,7 +247,7 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     info!(mode = ?mode, vm_id = %vm_id, vm_name = %vm_name, "detected execution mode");
 
     // Setup paths
-    let data_dir = PathBuf::from(format!("/tmp/fcvm/{}", vm_id));
+    let data_dir = paths::vm_runtime_dir(&vm_id);
     tokio::fs::create_dir_all(&data_dir)
         .await
         .context("creating VM data directory")?;
@@ -255,7 +256,7 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     let log_path = data_dir.join("firecracker.log");
 
     // Check for running memory server
-    let uffd_socket = PathBuf::from(format!("/tmp/fcvm/uffd-{}.sock", args.snapshot_name));
+    let uffd_socket = paths::base_dir().join(format!("uffd-{}.sock", args.snapshot_name));
 
     if !uffd_socket.exists() {
         anyhow::bail!(
@@ -323,7 +324,7 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Create symlink so Firecracker can find the disk at the original path
     // The vmstate.bin contains hardcoded disk paths from the original VM
-    let original_disk_dir = PathBuf::from(format!("/tmp/fcvm/{}/disks", snapshot_config.vm_id));
+    let original_disk_dir = paths::vm_runtime_dir(&snapshot_config.vm_id).join("disks");
     let original_disk_path = original_disk_dir.join("rootfs-overlay.ext4");
 
     tokio::fs::create_dir_all(&original_disk_dir)
