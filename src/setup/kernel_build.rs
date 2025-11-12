@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokio::process::Command;
 use tracing::info;
+
+use crate::paths;
+
 
 /// Build a modern Linux LTS kernel optimized for Firecracker
 ///

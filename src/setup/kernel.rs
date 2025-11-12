@@ -3,9 +3,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{info, warn};
 
+use crate::paths;
+
 /// Ensure kernel exists, extracting from host if needed
 pub async fn ensure_kernel() -> Result<PathBuf> {
-    let kernel_dir = PathBuf::from("/var/lib/fcvm/kernels");
+    let kernel_dir = paths::kernel_dir();
     let kernel_path = kernel_dir.join("vmlinux.bin");
 
     if kernel_path.exists() {

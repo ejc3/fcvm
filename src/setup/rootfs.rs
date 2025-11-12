@@ -3,10 +3,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{info, warn};
 
+use crate::paths;
+
 /// Ensure rootfs exists, creating minimal Alpine + Podman if needed
 pub async fn ensure_rootfs() -> Result<PathBuf> {
-    let rootfs_dir = PathBuf::from("/var/lib/fcvm/rootfs");
-    let rootfs_path = rootfs_dir.join("base.ext4");
+    let rootfs_dir = paths::rootfs_dir();
+    let rootfs_path = paths::base_rootfs();
 
     // ALWAYS rebuild rootfs for now - ensures code changes take effect
     // TODO: Add version check or --force-rebuild flag for production

@@ -6,6 +6,7 @@ use tracing::info;
 use crate::cli::{PodmanArgs, PodmanCommands, RunArgs};
 use crate::firecracker::VmManager;
 use crate::network::{NetworkManager, PortMapping, PrivilegedNetwork, RootlessNetwork};
+use crate::paths;
 use crate::state::{generate_vm_id, StateManager, VmState, VmStatus};
 use crate::storage::DiskManager;
 use crate::Mode;
@@ -55,7 +56,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     info!(mode = ?mode, vm_id = %vm_id, "detected execution mode");
 
     // Setup paths
-    let data_dir = PathBuf::from(format!("/tmp/fcvm/{}", vm_id));
+    let data_dir = paths::vm_runtime_dir(&vm_id);
     tokio::fs::create_dir_all(&data_dir)
         .await
         .context("creating VM data directory")?;

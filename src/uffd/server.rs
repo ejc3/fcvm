@@ -12,6 +12,8 @@ use memmap2::MmapOptions;
 use userfaultfd::{Event, Uffd};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
+use crate::paths;
+
 const PAGE_SIZE: usize = 4096;
 
 /// Async UFFD server that serves memory pages for multiple VMs from a single snapshot
@@ -48,7 +50,7 @@ impl UffdServer {
         });
 
         // Create socket path
-        let socket_path = PathBuf::from(format!("/tmp/fcvm/uffd-{}.sock", snapshot_id));
+        let socket_path = paths::base_dir().join(format!("uffd-{}.sock", snapshot_id));
 
         // Ensure parent directory exists
         if let Some(parent) = socket_path.parent() {

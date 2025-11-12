@@ -2,11 +2,13 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use tracing::info;
 
+use crate::paths;
+
 /// List available snapshots
 pub async fn cmd_snapshots() -> Result<()> {
     info!("Listing snapshots");
 
-    let snapshots_dir = PathBuf::from("/tmp/fcvm/snapshots");
+    let snapshots_dir = paths::snapshot_dir();
 
     if !snapshots_dir.exists() {
         println!("No snapshots found.");
