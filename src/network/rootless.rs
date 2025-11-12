@@ -158,8 +158,10 @@ async fn setup_tap_with_nat(
         );
     }
 
-    // 2. Assign static IP to TAP device (host IP with /24 netmask)
-    let host_ip_with_cidr = format!("{}/24", host_ip);
+    // 2. Assign static IP to TAP device with subnet mask
+    // Extract the CIDR from subnet (e.g., "172.16.0.0/30" -> "/30")
+    let cidr_mask = subnet.split('/').nth(1).unwrap_or("30");
+    let host_ip_with_cidr = format!("{}/{}", host_ip, cidr_mask);
     let output = Command::new("sudo")
         .args(&["ip", "addr", "add", &host_ip_with_cidr, "dev", tap_name])
         .output()
