@@ -27,27 +27,36 @@ impl DiskManager {
         }
     }
 
-    /// Create a CoW overlay disk from base rootfs
+    /// Create a CoW overlay disk from base rootfs using btrfs reflinks
     pub async fn create_cow_disk(&self) -> Result<PathBuf> {
         info!(vm_id = %self.vm_id, "creating CoW overlay disk");
 
         // Ensure VM directory exists
-        fs::create_dir_all(&self.vm_dir).await
+        fs::create_dir_all(&self.vm_dir)
+            .await
             .context("creating VM directory")?;
 
-        let overlay_path = self.vm_dir.join("rootfs-overlay.ext4");
+        let overlay_path = self.vm_dir.join("rootfs.ext4");
 
-        // For simplicity, we'll copy the base rootfs for now
-        // In production, use qcow2 or overlayfs
         if !overlay_path.exists() {
             info!(
                 base = %self.base_rootfs.display(),
                 overlay = %overlay_path.display(),
-                "copying base rootfs to overlay"
+                "creating instant reflink copy (btrfs CoW)"
             );
 
-            fs::copy(&self.base_rootfs, &overlay_path).await
-                .context("copying base rootfs")?;
+            // Use cp --reflink=always for instant CoW copy on btrfs
+            let status = tokio::process::Command::new("cp")
+                .arg("--reflink=always")
+                .arg(&self.base_rootfs)
+                .arg(&overlay_path)
+                .status()
+                .await
+                .context("executing cp --reflink=always")?;
+
+            if !status.success() {
+                anyhow::bail!("cp --reflink=always failed - is filesystem btrfs/xfs?");
+            }
         }
 
         Ok(overlay_path)
@@ -65,7 +74,8 @@ impl DiskManager {
 
         // Copy current overlay to snapshot
         let overlay_path = self.vm_dir.join("rootfs-overlay.ext4");
-        fs::copy(&overlay_path, &snapshot_path).await
+        fs::copy(&overlay_path, &snapshot_path)
+            .await
             .context("creating snapshot disk")?;
 
         Ok(snapshot_path)
@@ -85,7 +95,8 @@ impl DiskManager {
         // qemu-img create -f qcow2 -b snapshot.disk clone.qcow2
         //
         // For now, copy the snapshot
-        fs::copy(snapshot_disk, &clone_path).await
+        fs::copy(snapshot_disk, &clone_path)
+            .await
             .context("cloning from snapshot")?;
 
         Ok(clone_path)
@@ -105,7 +116,8 @@ impl DiskManager {
         info!(vm_id = %self.vm_id, "cleaning up VM disks");
 
         if self.vm_dir.exists() {
-            fs::remove_dir_all(&self.vm_dir).await
+            fs::remove_dir_all(&self.vm_dir)
+                .await
                 .context("removing VM directory")?;
         }
 
@@ -121,9 +133,12 @@ async fn create_qcow2_cow(base: &Path, overlay: &Path) -> Result<()> {
     let output = Command::new("qemu-img")
         .args(&[
             "create",
-            "-f", "qcow2",
-            "-b", base.to_str().unwrap(),
-            "-F", "raw",
+            "-f",
+            "qcow2",
+            "-b",
+            base.to_str().unwrap(),
+            "-F",
+            "raw",
             overlay.to_str().unwrap(),
         ])
         .output()
@@ -131,7 +146,10 @@ async fn create_qcow2_cow(base: &Path, overlay: &Path) -> Result<()> {
         .context("running qemu-img")?;
 
     if !output.status.success() {
-        anyhow::bail!("qemu-img failed: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "qemu-img failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     Ok(())
