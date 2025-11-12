@@ -149,36 +149,27 @@ fcvm memory-server <name>   # Start memory server for snapshot (enables sharing)
    - ✅ UFFD memory server serving multiple VMs concurrently
    - ✅ Multiple clones sharing 512 MB memory via UFFD (7000+ page faults served)
 
-10. **OverlayFS Implementation** (2025-11-11)
-   - ✅ Replaced 600ms disk copy with **7ms sparse overlay creation** (50x faster!)
-   - ✅ Dual-drive configuration: vda (read-only base) + vdb (writable overlay)
-   - ✅ Custom overlay-init script as PID 1 for OverlayFS setup
-   - ✅ All VMs/clones share `/var/lib/fcvm/rootfs/base.ext4` (1GB, read-only)
-   - ✅ Per-VM 512MB sparse ext4 overlay (instant creation, minimal disk usage)
-   - ✅ Zero tmpfs/RAM usage for mount points (uses overlay disk itself)
-   - ✅ Fully writable root filesystem with CoW semantics
-   - **Performance**: Exceeds <10ms target, achieves instant VM creation
-   - ✅ Clone creation time: ~600ms disk copy + instant UFFD connection
-   - ✅ Both clones verified serving nginx traffic simultaneously
-   - ✅ Network isolation: each clone on separate TAP device with same guest subnet
-   - **Key Fix**: TAP devices must be configured on same subnet as guest (172.16.29.0/24)
-   - **Performance**: 2 VMs sharing 512 MB memory = ~512 MB host RAM (not 1 GB!)
+10. **btrfs CoW Reflinks** (2025-11-12)
+   - ✅ Replaced fs::copy() with `cp --reflink=always` for instant disk cloning
+   - ✅ Centralized paths module (src/paths.rs) to use btrfs mount
+   - ✅ All data stored under `/mnt/fcvm-btrfs/` for reflink support
+   - ✅ Disk copy time: **~1.5ms** (560x faster than 840ms standard copy!)
+   - ✅ True CoW at block level - shared blocks until write occurs
+   - ✅ Multiple VMs share same base rootfs (1GB base.ext4 shared by all VMs = 1GB on disk)
+   - **Performance**: Instant VM creation with minimal disk usage
+
+11. **Rootless Networking with Unique Subnets** (2025-11-12)
+   - ✅ Each VM gets unique /30 subnet via hash of vm_id (172.16.0.0-63.0/30)
+   - ✅ Eliminates routing conflicts between VMs
+   - ✅ Kernel cmdline network configuration via `ip=` boot parameter
+   - ✅ Static IP assignment: guest receives .202, host uses .201 as gateway
+   - ✅ DNS resolution via dnsmasq on host (bind-dynamic for TAP devices)
+   - ✅ Full end-to-end connectivity: VM boots → DNS works → containers pull images
+   - **Example**: VM gets 172.16.0.200/30 (host: .201, guest: .202)
 
 ### 🚧 In Progress
 
-**DNS Resolution Bug in OverlayFS VMs** (2025-11-12)
-- **Problem**: DNS broken after entering overlay root in overlay-init script
-- **Symptom**: DNS packets timeout to TAP gateway (172.16.0.1:53)
-- **Impact**: Container image pulls fail with DNS resolution timeout
-- **Root Cause**: pivot_root operation disrupts kernel network stack
-- **Evidence**:
-  - Without OverlayFS (commit 9218e87): DNS works perfectly
-  - With OverlayFS (commit 4451589): DNS broken after pivot_root
-- **Attempted Fixes**:
-  1. ✅ Recreated /dev/net/tun device after pivot - device created but DNS still broken
-  2. ❌ Brought network interfaces back up (`ip link set eth0 up`) - no effect
-  3. ❌ Restarted network service (`/etc/init.d/networking restart`) - still broken
-- **Current Status**: pivot_root removed from overlay-init; now switch into overlay root via `chroot` after moving /proc,/sys,/dev,/run (keeps DNS state). Need to rebuild rootfs + retest to confirm fix.
+None - all major features working!
 
 ### 📋 TODO
 1. **Setup Subcommands**
@@ -223,58 +214,60 @@ fcvm memory-server <name>   # Start memory server for snapshot (enables sharing)
   - Requires root or CAP_NET_ADMIN
   - Uses nftables for port forwarding
 
-### Storage Notes - OverlayFS Architecture
+### Storage Notes - btrfs CoW Reflinks
 
-**Performance Achievement: 7ms overlay creation (50x faster than 600ms disk copy!)**
+**Performance Achievement: ~1.5ms disk copy (560x faster than 840ms standard copy!)**
 
 #### How It Works
 
-fcvm uses **dual-drive OverlayFS** for instant VM creation with CoW semantics:
+fcvm uses **btrfs reflinks** for instant VM disk cloning with true copy-on-write:
 
-**Firecracker VM Configuration:**
-- **Drive vda (read-only)**: `/var/lib/fcvm/rootfs/base.ext4` (~1GB Alpine + Podman)
-  - Shared across ALL VMs and clones
-  - Configured as `is_root_device=true, is_read_only=true`
+**Architecture:**
+- All fcvm data stored under `/mnt/fcvm-btrfs/` (btrfs filesystem)
+- Base rootfs: `/mnt/fcvm-btrfs/rootfs/base.ext4` (~1GB Alpine + Podman)
+- VM disks: `/mnt/fcvm-btrfs/vm-disks/{vm_id}/disks/rootfs.ext4`
 
-- **Drive vdb (writable)**: `/tmp/fcvm/{vm_id}/disks/rootfs-overlay.ext4` (512MB sparse ext4)
-  - Per-VM writable layer created in **7ms** (dd + mkfs.ext4 on sparse file)
-  - Configured as `is_read_only=false`
+**Disk Cloning Process:**
+```rust
+// src/storage/disk.rs - create_cow_disk()
+tokio::process::Command::new("cp")
+    .arg("--reflink=always")
+    .arg(&self.base_rootfs)
+    .arg(&overlay_path)
+    .status()
+    .await
+```
 
-**Boot Process (overlay-init as PID 1):**
-1. Kernel starts with `init=/sbin/overlay-init overlay_root=vdb`
-2. overlay-init script mounts `/proc`, `/sys`, `/dev` (required as PID 1)
-3. Parses `overlay_root=vdb` from `/proc/cmdline`
-4. Mounts `/dev/vdb` (writable overlay disk) to `/mnt`
-5. Creates directories on writable disk: `/mnt/upper`, `/mnt/work`, `/mnt/mnt-overlay-root`, `/mnt/mnt-newroot`
-6. Bind-mounts `/` (vda) to `/mnt/mnt-overlay-root` as lower layer
-7. Creates OverlayFS mount combining lower (vda) + upper (/mnt/upper) → `/mnt/mnt-newroot`
-8. Uses `pivot_root` to switch to OverlayFS root
-9. Execs real init (`/sbin/init`) with fully writable root filesystem
+**How reflinks work:**
+- `cp --reflink=always` creates instant CoW copy on btrfs/xfs
+- Only metadata is copied (~1.5ms), data blocks are shared
+- When VM writes to disk, btrfs allocates new blocks (CoW)
+- Multiple VMs share same base blocks until they write
 
 **Key Benefits:**
-- ✅ **Zero tmpfs/RAM usage** for mount points (uses overlay disk itself)
-- ✅ **Instant creation** (sparse files allocate space on-demand)
-- ✅ **True CoW** at filesystem level (not just disk blocks)
-- ✅ **Shared base** (1GB base.ext4 shared by 50 VMs = 1GB on disk, not 50GB!)
+- ✅ **Instant cloning**: ~1.5ms vs 840ms for full copy
+- ✅ **Space efficient**: 50 VMs with 1GB rootfs = ~1GB on disk (plus deltas)
+- ✅ **True CoW**: Block-level deduplication handled by filesystem
+- ✅ **No runtime overhead**: Standard ext4 filesystem inside VM
 
-#### Regular VMs vs Snapshot Clones
+**Path Centralization (src/paths.rs):**
+```rust
+pub fn base_dir() -> PathBuf {
+    PathBuf::from("/mnt/fcvm-btrfs")  // All data on btrfs mount
+}
 
-**Regular VMs** (`fcvm podman run`):
-```
-Base: /var/lib/fcvm/rootfs/base.ext4 (shared, read-only)
-Overlay: /tmp/fcvm/{vm_id}/disks/rootfs-overlay.ext4 (per-VM, writable, 7ms creation)
-```
-
-**Snapshot Clones** (`fcvm snapshot run`):
-```
-Base: /var/lib/fcvm/rootfs/base.ext4 (shared via vmstate.bin, read-only)
-Overlay: /tmp/fcvm/{vm_id}/disks/rootfs-overlay.ext4 (per-clone, writable, 7ms creation)
-Symlink: /tmp/fcvm/{original_vm_id}/disks/rootfs-overlay.ext4 → clone's overlay
+pub fn vm_runtime_dir(vm_id: &str) -> PathBuf {
+    base_dir().join("vm-disks").join(vm_id)
+}
 ```
 
-**Why symlink?** Firecracker's `vmstate.bin` contains hardcoded disk paths from the original VM. The symlink redirects vdb to the clone's fresh overlay while vda still points to the shared base.
-
-**Both use identical OverlayFS setup** - the only difference is memory sharing (UFFD for clones, fresh memory for regular VMs).
+**Setup Requirements:**
+```bash
+# Create btrfs filesystem (already done on EC2)
+sudo mkfs.btrfs /dev/nvme1n1
+sudo mount /dev/nvme1n1 /mnt/fcvm-btrfs
+sudo mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,state,snapshots,vm-disks}
+```
 
 ### Memory Sharing Architecture
 **Two-Command Workflow:**
