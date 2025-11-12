@@ -170,6 +170,7 @@ pub struct Drive {
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct DrivePatch {
+    pub drive_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path_on_host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -407,6 +407,7 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         .patch_drive(
             "rootfs",
             DrivePatch {
+                drive_id: "rootfs".to_string(),
                 path_on_host: Some(rootfs_path.display().to_string()),
                 rate_limiter: None,
             },
