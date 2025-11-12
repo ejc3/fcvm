@@ -521,20 +521,15 @@ make build 2>&1 | tee /tmp/build.log
   ```
 - **Result**: fc-agent runs successfully on Alpine Linux, executes container plans
 
-### Disk Filename Migration (2025-11-12)
-- **Issue**: Snapshot code expects `rootfs-overlay.ext4` but podman run creates `rootfs.ext4`
-- **Root cause**: Code at `src/storage/disk.rs:39-48` handles migration from legacy `rootfs.ext4` to new `rootfs-overlay.ext4`
-- **Current binary on EC2**: Uses OLD code that creates `rootfs.ext4` (legacy name)
-- **Workaround**: Created symlink `rootfs-overlay.ext4 → rootfs.ext4` for snapshot compatibility
-- **Solution**: The code is correct - it will auto-migrate legacy files on first use. Binary just needs rebuild.
-- **Migration logic**:
-  ```rust
-  let overlay_path = self.vm_dir.join("rootfs-overlay.ext4");  // New name
-  let legacy_path = self.vm_dir.join("rootfs.ext4");           // Old name
-  if !overlay_path.exists() && legacy_path.exists() {
-      fs::rename(&legacy_path, &overlay_path).await  // Auto-migrate
-  }
-  ```
+### Disk Filename Consistency (2025-11-12)
+- **Issue**: Code had inconsistent naming - some places used `rootfs-overlay.ext4`, others used `rootfs.ext4`
+- **Root cause**: Legacy migration logic attempted to migrate from old to new naming
+- **Solution**: Removed ALL migration logic, standardized on single filename: `rootfs.ext4`
+- **Changes**:
+  - `src/storage/disk.rs`: Removed migration logic, uses only `rootfs.ext4`
+  - `src/commands/snapshot.rs`: Updated to expect `rootfs.ext4`
+  - Variable names: Changed `overlay_path` → `disk_path` for clarity
+- **Result**: Simple, consistent naming throughout - no migrations, no workarounds
 
 ### KVM and Nested Virtualization (2025-11-09)
 - **Problem**: c5.large instance doesn't have `/dev/kvm` - nested virtualization not supported

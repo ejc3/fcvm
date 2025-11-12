@@ -317,7 +317,7 @@ fs or qcow2)
 │   └── base.ext4                # Base rootfs image
 ├── vms/
 │   ├── vm-abc123/
-│   │   ├── rootfs-overlay.ext4  # CoW overlay for this VM
+│   │   ├── rootfs.ext4          # CoW disk for this VM
 │   │   ├── snapshot.vmstate     # VM memory snapshot
 │   │   ├── snapshot.disk        # Disk snapshot
 │   │   └── config.json          # VM configuration
