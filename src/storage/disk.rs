@@ -27,31 +27,21 @@ impl DiskManager {
         }
     }
 
-    /// Create a CoW overlay disk from base rootfs using btrfs reflinks
+    /// Create a CoW disk from base rootfs using btrfs reflinks
     pub async fn create_cow_disk(&self) -> Result<PathBuf> {
-        info!(vm_id = %self.vm_id, "creating CoW overlay disk");
+        info!(vm_id = %self.vm_id, "creating CoW disk");
 
         // Ensure VM directory exists
         fs::create_dir_all(&self.vm_dir)
             .await
             .context("creating VM directory")?;
 
-        let overlay_path = self.vm_dir.join("rootfs-overlay.ext4");
-        let legacy_path = self.vm_dir.join("rootfs.ext4");
+        let disk_path = self.vm_dir.join("rootfs.ext4");
 
-        if !overlay_path.exists() {
-            // Migrate legacy overlays if they used the old filename
-            if legacy_path.exists() {
-                fs::rename(&legacy_path, &overlay_path)
-                    .await
-                    .context("renaming legacy overlay disk")?;
-            }
-        }
-
-        if !overlay_path.exists() {
+        if !disk_path.exists() {
             info!(
                 base = %self.base_rootfs.display(),
-                overlay = %overlay_path.display(),
+                disk = %disk_path.display(),
                 "creating instant reflink copy (btrfs CoW)"
             );
 
@@ -59,7 +49,7 @@ impl DiskManager {
             let status = tokio::process::Command::new("cp")
                 .arg("--reflink=always")
                 .arg(&self.base_rootfs)
-                .arg(&overlay_path)
+                .arg(&disk_path)
                 .status()
                 .await
                 .context("executing cp --reflink=always")?;
@@ -69,7 +59,7 @@ impl DiskManager {
             }
         }
 
-        Ok(overlay_path)
+        Ok(disk_path)
     }
 
     /// Create a snapshot disk (differential from current state)
@@ -82,9 +72,9 @@ impl DiskManager {
             "creating snapshot disk"
         );
 
-        // Copy current overlay to snapshot
-        let overlay_path = self.vm_dir.join("rootfs-overlay.ext4");
-        fs::copy(&overlay_path, &snapshot_path)
+        // Copy current disk to snapshot
+        let disk_path = self.vm_dir.join("rootfs.ext4");
+        fs::copy(&disk_path, &snapshot_path)
             .await
             .context("creating snapshot disk")?;
 
@@ -93,7 +83,7 @@ impl DiskManager {
 
     /// Clone disk from snapshot with CoW
     pub async fn clone_from_snapshot(&self, snapshot_disk: &Path) -> Result<PathBuf> {
-        let clone_path = self.vm_dir.join("rootfs-overlay.ext4");
+        let clone_path = self.vm_dir.join("rootfs.ext4");
 
         info!(
             vm_id = %self.vm_id,

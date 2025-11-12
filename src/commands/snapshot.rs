@@ -89,7 +89,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
 
     // Copy the VM's disk to snapshot directory
     info!("Copying VM disk to snapshot directory");
-    let vm_disk_path = paths::vm_runtime_dir(&vm_state.vm_id).join("disks/rootfs-overlay.ext4");
+    let vm_disk_path = paths::vm_runtime_dir(&vm_state.vm_id).join("disks/rootfs.ext4");
 
     if vm_disk_path.exists() {
         tokio::fs::copy(&vm_disk_path, &disk_path)
@@ -322,7 +322,7 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Create symlink so Firecracker can find the disk at the original path
     // The vmstate.bin contains hardcoded disk paths from the original VM
     let original_disk_dir = paths::vm_runtime_dir(&snapshot_config.vm_id).join("disks");
-    let original_disk_path = original_disk_dir.join("rootfs-overlay.ext4");
+    let original_disk_path = original_disk_dir.join("rootfs.ext4");
 
     tokio::fs::create_dir_all(&original_disk_dir)
         .await
