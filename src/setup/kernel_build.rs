@@ -3,8 +3,6 @@ use std::path::PathBuf;
 use tokio::process::Command;
 use tracing::info;
 
-use crate::paths;
-
 /// Build a modern Linux LTS kernel optimized for Firecracker
 ///
 /// This builds Linux 6.6 LTS with:
