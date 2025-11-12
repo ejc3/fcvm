@@ -60,7 +60,7 @@ pub async fn cmd_run(args: RunArgs) -> Result<()> {
     info!(mode = ?mode, vm_id = %vm_id, "detected execution mode");
 
     // Setup paths
-    let data_dir = PathBuf::from(format!("/tmp/fcvm/{}", vm_id));
+    let data_dir = paths::vm_runtime_dir(&vm_id);
     let socket_path = data_dir.join("firecracker.sock");
     let log_path = data_dir.join("firecracker.log");
 
@@ -71,7 +71,7 @@ pub async fn cmd_run(args: RunArgs) -> Result<()> {
     vm_state.config.volumes = args.map.clone();
 
     // Initialize state manager
-    let state_manager = StateManager::new(PathBuf::from("/tmp/fcvm/state"));
+    let state_manager = StateManager::new(paths::state_dir());
     state_manager.init().await?;
 
     // Setup networking
@@ -99,7 +99,7 @@ pub async fn cmd_run(args: RunArgs) -> Result<()> {
     info!(tap = %network_config.tap_device, mac = %network_config.guest_mac, "network configured");
 
     // Setup storage
-    let base_rootfs = PathBuf::from("/var/lib/fcvm/rootfs/base.ext4");
+    let base_rootfs = paths::base_rootfs();
     let vm_dir = data_dir.join("disks");
     let disk_manager = DiskManager::new(vm_id.clone(), base_rootfs, vm_dir);
 
@@ -122,7 +122,10 @@ pub async fn cmd_run(args: RunArgs) -> Result<()> {
 
     // Boot source
     client.set_boot_source(crate::firecracker::api::BootSource {
-        kernel_image_path: "/var/lib/fcvm/kernels/vmlinux.bin".to_string(),
+        kernel_image_path: paths::kernel_dir()
+            .join("vmlinux.bin")
+            .display()
+            .to_string(),
         initrd_path: None,
         boot_args: Some("console=ttyS0 reboot=k panic=1 pci=off".to_string()),
     }).await?;

@@ -36,7 +36,17 @@ impl DiskManager {
             .await
             .context("creating VM directory")?;
 
-        let overlay_path = self.vm_dir.join("rootfs.ext4");
+        let overlay_path = self.vm_dir.join("rootfs-overlay.ext4");
+        let legacy_path = self.vm_dir.join("rootfs.ext4");
+
+        if !overlay_path.exists() {
+            // Migrate legacy overlays if they used the old filename
+            if legacy_path.exists() {
+                fs::rename(&legacy_path, &overlay_path)
+                    .await
+                    .context("renaming legacy overlay disk")?;
+            }
+        }
 
         if !overlay_path.exists() {
             info!(

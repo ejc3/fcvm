@@ -1,20 +1,13 @@
 use anyhow::Result;
-use crate::paths;
-
-use std::path::PathBuf;
-use crate::paths;
-
 use tracing::info;
+
 use crate::paths;
-
-
 use crate::state::StateManager;
-use crate::paths;
 
 
 pub async fn cmd_ls() -> Result<()> {
     info!("fcvm ls");
-    let state_manager = StateManager::new(PathBuf::from("/tmp/fcvm/state"));
+    let state_manager = StateManager::new(paths::state_dir());
     let vms = state_manager.list_vms().await?;
 
     println!("{:<20} {:<10} {:<6} {:<8} {:<20}", "NAME", "STATUS", "CPU", "MEM(MB)", "CREATED");
