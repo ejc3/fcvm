@@ -1,10 +1,10 @@
-pub mod rootless;
 pub mod privileged;
+pub mod rootless;
 pub mod types;
 
-pub use types::*;
-pub use rootless::RootlessNetwork;
 pub use privileged::PrivilegedNetwork;
+pub use rootless::RootlessNetwork;
+pub use types::*;
 
 use anyhow::Result;
 

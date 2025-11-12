@@ -5,9 +5,9 @@ use tracing::info;
 
 use crate::cli::{PodmanArgs, PodmanCommands, RunArgs};
 use crate::firecracker::VmManager;
-use crate::network::{NetworkManager, PortMapping, RootlessNetwork, PrivilegedNetwork};
+use crate::network::{NetworkManager, PortMapping, PrivilegedNetwork, RootlessNetwork};
+use crate::state::{generate_vm_id, StateManager, VmState, VmStatus};
 use crate::storage::DiskManager;
-use crate::state::{StateManager, VmState, VmStatus, generate_vm_id};
 use crate::Mode;
 
 /// Main dispatcher for podman commands
@@ -21,9 +21,11 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     info!("Starting fcvm podman run");
 
     // Ensure kernel and rootfs exist (auto-setup on first run)
-    let kernel_path = crate::setup::ensure_kernel().await
+    let kernel_path = crate::setup::ensure_kernel()
+        .await
         .context("setting up kernel")?;
-    let base_rootfs = crate::setup::ensure_rootfs().await
+    let base_rootfs = crate::setup::ensure_rootfs()
+        .await
         .context("setting up rootfs")?;
 
     // Generate VM ID
@@ -54,7 +56,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     // Setup paths
     let data_dir = PathBuf::from(format!("/tmp/fcvm/{}", vm_id));
-    tokio::fs::create_dir_all(&data_dir).await
+    tokio::fs::create_dir_all(&data_dir)
+        .await
         .context("creating VM data directory")?;
 
     let socket_path = data_dir.join("firecracker.sock");
@@ -89,8 +92,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         Mode::Auto => unreachable!(),
     };
 
-    let network_config = network.setup().await
-        .context("setting up network")?;
+    let network_config = network.setup().await.context("setting up network")?;
 
     info!(tap = %network_config.tap_device, mac = %network_config.guest_mac, "network configured");
 
@@ -98,7 +100,9 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     let vm_dir = data_dir.join("disks");
     let disk_manager = DiskManager::new(vm_id.clone(), base_rootfs.clone(), vm_dir);
 
-    let rootfs_path = disk_manager.create_cow_disk().await
+    let rootfs_path = disk_manager
+        .create_cow_disk()
+        .await
         .context("creating CoW disk")?;
 
     // Note: Network configuration is static in base rootfs (172.16.0.2)
@@ -110,7 +114,9 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     let mut vm_manager = VmManager::new(vm_id.clone(), socket_path.clone(), None);
     let firecracker_bin = PathBuf::from("/usr/local/bin/firecracker");
 
-    vm_manager.start(&firecracker_bin, None).await
+    vm_manager
+        .start(&firecracker_bin, None)
+        .await
         .context("starting Firecracker")?;
 
     let client = vm_manager.client()?;
@@ -118,55 +124,80 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // Configure VM via API
     info!("configuring VM via Firecracker API");
 
-    // Boot source
-    client.set_boot_source(crate::firecracker::api::BootSource {
-        kernel_image_path: kernel_path.display().to_string(),
-        initrd_path: None,
-        boot_args: Some("console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=1".to_string()),
-    }).await?;
+    // Boot source with network configuration via kernel cmdline
+    // Format: ip=<client-ip>:<server-ip>:<gw-ip>:<netmask>:<hostname>:<device>:<autoconf>
+    // Example: ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off
+    let boot_args = if let (Some(guest_ip), Some(host_ip)) = (&network_config.guest_ip, &network_config.host_ip) {
+        // Extract just the IP without CIDR notation if present
+        let guest_ip_clean = guest_ip.split('/').next().unwrap_or(guest_ip);
+        let host_ip_clean = host_ip.split('/').next().unwrap_or(host_ip);
+
+        format!(
+            "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=1 ip={}::{}:255.255.255.252::eth0:off",
+            guest_ip_clean, host_ip_clean
+        )
+    } else {
+        "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=1".to_string()
+    };
+
+    client
+        .set_boot_source(crate::firecracker::api::BootSource {
+            kernel_image_path: kernel_path.display().to_string(),
+            initrd_path: None,
+            boot_args: Some(boot_args),
+        })
+        .await?;
 
     // Machine config
-    client.set_machine_config(crate::firecracker::api::MachineConfig {
-        vcpu_count: args.cpu,
-        mem_size_mib: args.mem,
-        smt: Some(false),
-        cpu_template: None,
-        track_dirty_pages: Some(true), // Enable snapshot support
-    }).await?;
+    client
+        .set_machine_config(crate::firecracker::api::MachineConfig {
+            vcpu_count: args.cpu,
+            mem_size_mib: args.mem,
+            smt: Some(false),
+            cpu_template: None,
+            track_dirty_pages: Some(true), // Enable snapshot support
+        })
+        .await?;
 
     // Root drive
-    client.add_drive(
-        "rootfs",
-        crate::firecracker::api::Drive {
-            drive_id: "rootfs".to_string(),
-            path_on_host: rootfs_path.display().to_string(),
-            is_root_device: true,
-            is_read_only: false,
-            partuuid: None,
-            rate_limiter: None,
-        },
-    ).await?;
+    client
+        .add_drive(
+            "rootfs",
+            crate::firecracker::api::Drive {
+                drive_id: "rootfs".to_string(),
+                path_on_host: rootfs_path.display().to_string(),
+                is_root_device: true,
+                is_read_only: false,
+                partuuid: None,
+                rate_limiter: None,
+            },
+        )
+        .await?;
 
     // Network interface - required for MMDS V2 in all modes
     // For rootless: create TAP device first, then slirp4netns will use it
     // For privileged: TAP is created and added to bridge
-    client.add_network_interface(
-        "eth0",
-        crate::firecracker::api::NetworkInterface {
-            iface_id: "eth0".to_string(),
-            host_dev_name: network_config.tap_device.clone(),
-            guest_mac: Some(network_config.guest_mac.clone()),
-            rx_rate_limiter: None,
-            tx_rate_limiter: None,
-        },
-    ).await?;
+    client
+        .add_network_interface(
+            "eth0",
+            crate::firecracker::api::NetworkInterface {
+                iface_id: "eth0".to_string(),
+                host_dev_name: network_config.tap_device.clone(),
+                guest_mac: Some(network_config.guest_mac.clone()),
+                rx_rate_limiter: None,
+                tx_rate_limiter: None,
+            },
+        )
+        .await?;
 
     // MMDS configuration - V2 works in rootless mode as long as interface exists
-    client.set_mmds_config(crate::firecracker::api::MmdsConfig {
-        version: "V2".to_string(),
-        network_interfaces: Some(vec!["eth0".to_string()]),
-        ipv4_address: Some("169.254.169.254".to_string()),
-    }).await?;
+    client
+        .set_mmds_config(crate::firecracker::api::MmdsConfig {
+            version: "V2".to_string(),
+            network_interfaces: Some(vec!["eth0".to_string()]),
+            ipv4_address: Some("169.254.169.254".to_string()),
+        })
+        .await?;
 
     // MMDS data (container plan) - nested under "latest" for V2 compatibility
     // Include host timestamp so guest can set clock immediately (avoiding slow NTP sync)
@@ -189,21 +220,25 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     client.put_mmds(mmds_data).await?;
 
     // Configure entropy device (virtio-rng) for better random number generation
-    client.set_entropy_device(crate::firecracker::api::EntropyDevice {
-        rate_limiter: None,
-    }).await?;
+    client
+        .set_entropy_device(crate::firecracker::api::EntropyDevice { rate_limiter: None })
+        .await?;
 
     // Balloon (if specified)
     if let Some(balloon_mib) = args.balloon {
-        client.set_balloon(crate::firecracker::api::Balloon {
-            amount_mib: balloon_mib,
-            deflate_on_oom: true,
-            stats_polling_interval_s: Some(1),
-        }).await?;
+        client
+            .set_balloon(crate::firecracker::api::Balloon {
+                amount_mib: balloon_mib,
+                deflate_on_oom: true,
+                stats_polling_interval_s: Some(1),
+            })
+            .await?;
     }
 
     // Start VM
-    client.put_action(crate::firecracker::api::InstanceAction::InstanceStart).await?;
+    client
+        .put_action(crate::firecracker::api::InstanceAction::InstanceStart)
+        .await?;
 
     vm_state.status = VmStatus::Running;
     state_manager.save_state(&vm_state).await?;
@@ -241,7 +276,11 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 }
 
 /// Update network configuration in the rootfs overlay
-async fn update_rootfs_network(rootfs_path: &std::path::Path, guest_ip: &str, gateway_ip: &str) -> Result<()> {
+async fn update_rootfs_network(
+    rootfs_path: &std::path::Path,
+    guest_ip: &str,
+    gateway_ip: &str,
+) -> Result<()> {
     use std::process::Command;
 
     // Mount the rootfs
@@ -249,11 +288,20 @@ async fn update_rootfs_network(rootfs_path: &std::path::Path, guest_ip: &str, ga
     tokio::fs::create_dir_all(&mount_point).await?;
 
     let output = Command::new("sudo")
-        .args(&["mount", "-o", "loop", rootfs_path.to_str().unwrap(), mount_point.to_str().unwrap()])
+        .args(&[
+            "mount",
+            "-o",
+            "loop",
+            rootfs_path.to_str().unwrap(),
+            mount_point.to_str().unwrap(),
+        ])
         .output()?;
 
     if !output.status.success() {
-        anyhow::bail!("failed to mount rootfs: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "failed to mount rootfs: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // Extract netmask from guest IP (assume /24 for simplicity)
@@ -262,7 +310,8 @@ async fn update_rootfs_network(rootfs_path: &std::path::Path, guest_ip: &str, ga
     // Write network interfaces config with dynamic IPs
     // Add MMDS (169.254.169.254) as link-local on eth0
     // This is required for Fire cracker MMDS V2 - packets go directly to the interface
-    let interfaces_config = format!(r#"auto lo
+    let interfaces_config = format!(
+        r#"auto lo
 iface lo inet loopback
 
 auto eth0
@@ -271,10 +320,13 @@ iface eth0 inet static
     netmask {}
     gateway {}
     up ip route add 169.254.169.254/32 dev eth0
-"#, guest_ip, netmask, gateway_ip);
+"#,
+        guest_ip, netmask, gateway_ip
+    );
 
     let interfaces_path = mount_point.join("etc/network/interfaces");
-    tokio::fs::write(&interfaces_path, interfaces_config).await
+    tokio::fs::write(&interfaces_path, interfaces_config)
+        .await
         .context("writing network interfaces config")?;
 
     // Unmount

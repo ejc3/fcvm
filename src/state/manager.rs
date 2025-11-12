@@ -16,7 +16,8 @@ impl StateManager {
 
     /// Initialize state directory
     pub async fn init(&self) -> Result<()> {
-        fs::create_dir_all(&self.state_dir).await
+        fs::create_dir_all(&self.state_dir)
+            .await
             .context("creating state directory")?;
         Ok(())
     }
@@ -25,7 +26,8 @@ impl StateManager {
     pub async fn save_state(&self, state: &VmState) -> Result<()> {
         let state_file = self.state_dir.join(format!("{}.json", state.vm_id));
         let state_json = serde_json::to_string_pretty(state)?;
-        fs::write(&state_file, state_json).await
+        fs::write(&state_file, state_json)
+            .await
             .context("writing VM state")?;
         Ok(())
     }
@@ -33,10 +35,10 @@ impl StateManager {
     /// Load VM state
     pub async fn load_state(&self, vm_id: &str) -> Result<VmState> {
         let state_file = self.state_dir.join(format!("{}.json", vm_id));
-        let state_json = fs::read_to_string(&state_file).await
+        let state_json = fs::read_to_string(&state_file)
+            .await
             .context("reading VM state")?;
-        let state: VmState = serde_json::from_str(&state_json)
-            .context("parsing VM state")?;
+        let state: VmState = serde_json::from_str(&state_json).context("parsing VM state")?;
         Ok(state)
     }
 
@@ -44,7 +46,8 @@ impl StateManager {
     pub async fn delete_state(&self, vm_id: &str) -> Result<()> {
         let state_file = self.state_dir.join(format!("{}.json", vm_id));
         if state_file.exists() {
-            fs::remove_file(&state_file).await
+            fs::remove_file(&state_file)
+                .await
                 .context("deleting VM state")?;
         }
         Ok(())
@@ -66,7 +69,8 @@ impl StateManager {
             return Ok(vms);
         }
 
-        let mut entries = fs::read_dir(&self.state_dir).await
+        let mut entries = fs::read_dir(&self.state_dir)
+            .await
             .context("reading state directory")?;
 
         while let Some(entry) = entries.next_entry().await? {

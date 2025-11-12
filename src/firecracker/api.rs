@@ -1,8 +1,8 @@
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use hyper::{Body, Client, Method, Request, StatusCode};
 use hyperlocal::{UnixClientExt, Uri as UnixUri};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Firecracker API client for managing VMs via HTTP over Unix socket
 #[derive(Debug, Clone)]
@@ -73,8 +73,13 @@ impl FirecrackerClient {
     }
 
     /// Add a network interface
-    pub async fn add_network_interface(&self, iface_id: &str, config: NetworkInterface) -> Result<()> {
-        self.put(&format!("/network-interfaces/{}", iface_id), &config).await
+    pub async fn add_network_interface(
+        &self,
+        iface_id: &str,
+        config: NetworkInterface,
+    ) -> Result<()> {
+        self.put(&format!("/network-interfaces/{}", iface_id), &config)
+            .await
     }
 
     /// Configure MMDS (metadata service)

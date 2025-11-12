@@ -1,10 +1,14 @@
 use anyhow::{Context, Result};
-use tokio::time::{sleep, Duration, timeout};
-use tracing::{info, debug};
+use tokio::time::{sleep, timeout, Duration};
+use tracing::{debug, info};
 
 /// Wait for HTTP endpoint to return 200 OK
 pub async fn wait_http(url: &str, timeout_secs: u64) -> Result<()> {
-    info!(url = url, timeout_secs = timeout_secs, "waiting for HTTP readiness");
+    info!(
+        url = url,
+        timeout_secs = timeout_secs,
+        "waiting for HTTP readiness"
+    );
 
     let client = reqwest::Client::new();
     let start = std::time::Instant::now();
@@ -32,7 +36,11 @@ pub async fn wait_http(url: &str, timeout_secs: u64) -> Result<()> {
     .context("HTTP readiness timeout")?;
 
     let elapsed = start.elapsed();
-    info!(url = url, elapsed_secs = elapsed.as_secs(), "HTTP endpoint became ready");
+    info!(
+        url = url,
+        elapsed_secs = elapsed.as_secs(),
+        "HTTP endpoint became ready"
+    );
 
     Ok(())
 }

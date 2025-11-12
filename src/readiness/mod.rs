@@ -1,7 +1,7 @@
-pub mod vsock;
+pub mod exec;
 pub mod http;
 pub mod log;
-pub mod exec;
+pub mod vsock;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -75,13 +75,15 @@ impl ReadinessGate {
             "log" => (
                 ReadinessMode::Log,
                 ReadinessConfig::Log {
-                    pattern: pattern.ok_or_else(|| anyhow::anyhow!("pattern required for log mode"))?,
+                    pattern: pattern
+                        .ok_or_else(|| anyhow::anyhow!("pattern required for log mode"))?,
                 },
             ),
             "exec" => (
                 ReadinessMode::Exec,
                 ReadinessConfig::Exec {
-                    command: command.ok_or_else(|| anyhow::anyhow!("command required for exec mode"))?,
+                    command: command
+                        .ok_or_else(|| anyhow::anyhow!("command required for exec mode"))?,
                 },
             ),
             _ => anyhow::bail!("invalid readiness mode: {}", mode),
@@ -99,9 +101,7 @@ impl ReadinessGate {
             (ReadinessMode::Http, ReadinessConfig::Http { url, timeout_secs }) => {
                 http::wait_http(url, *timeout_secs).await
             }
-            (ReadinessMode::Log, ReadinessConfig::Log { pattern }) => {
-                log::wait_log(pattern).await
-            }
+            (ReadinessMode::Log, ReadinessConfig::Log { pattern }) => log::wait_log(pattern).await,
             (ReadinessMode::Exec, ReadinessConfig::Exec { command }) => {
                 exec::wait_exec(command).await
             }

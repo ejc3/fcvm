@@ -165,7 +165,20 @@ fcvm memory-server <name>   # Start memory server for snapshot (enables sharing)
    - **Performance**: 2 VMs sharing 512 MB memory = ~512 MB host RAM (not 1 GB!)
 
 ### 🚧 In Progress
-None - core functionality complete!
+
+**DNS Resolution Bug in OverlayFS VMs** (2025-11-12)
+- **Problem**: DNS broken after entering overlay root in overlay-init script
+- **Symptom**: DNS packets timeout to TAP gateway (172.16.0.1:53)
+- **Impact**: Container image pulls fail with DNS resolution timeout
+- **Root Cause**: pivot_root operation disrupts kernel network stack
+- **Evidence**:
+  - Without OverlayFS (commit 9218e87): DNS works perfectly
+  - With OverlayFS (commit 4451589): DNS broken after pivot_root
+- **Attempted Fixes**:
+  1. ✅ Recreated /dev/net/tun device after pivot - device created but DNS still broken
+  2. ❌ Brought network interfaces back up (`ip link set eth0 up`) - no effect
+  3. ❌ Restarted network service (`/etc/init.d/networking restart`) - still broken
+- **Current Status**: pivot_root removed from overlay-init; now switch into overlay root via `chroot` after moving /proc,/sys,/dev,/run (keeps DNS state). Need to rebuild rootfs + retest to confirm fix.
 
 ### 📋 TODO
 1. **Setup Subcommands**

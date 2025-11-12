@@ -55,9 +55,11 @@ impl PortMapping {
             (guest_port_str, Protocol::Tcp) // default to TCP
         };
 
-        let host_port = host_port_str.parse()
+        let host_port = host_port_str
+            .parse()
             .map_err(|_| anyhow::anyhow!("invalid host port: {}", host_port_str))?;
-        let guest_port = guest_port_str.parse()
+        let guest_port = guest_port_str
+            .parse()
             .map_err(|_| anyhow::anyhow!("invalid guest port: {}", guest_port_str))?;
 
         Ok(Self {

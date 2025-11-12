@@ -56,12 +56,7 @@ mod tests {
 
     #[test]
     fn test_vm_state_new() {
-        let state = VmState::new(
-            "vm-123".to_string(),
-            "nginx:latest".to_string(),
-            2,
-            512,
-        );
+        let state = VmState::new("vm-123".to_string(), "nginx:latest".to_string(), 2, 512);
 
         assert_eq!(state.vm_id, "vm-123");
         assert_eq!(state.config.image, "nginx:latest");
@@ -74,12 +69,7 @@ mod tests {
 
     #[test]
     fn test_vm_state_serialization() {
-        let state = VmState::new(
-            "vm-456".to_string(),
-            "redis:alpine".to_string(),
-            1,
-            256,
-        );
+        let state = VmState::new("vm-456".to_string(), "redis:alpine".to_string(), 1, 256);
 
         let json = serde_json::to_string(&state).unwrap();
         let deserialized: VmState = serde_json::from_str(&json).unwrap();

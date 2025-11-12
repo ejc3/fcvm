@@ -1,5 +1,5 @@
-use crate::{Mode, MapMode};
-use super::args::{ModeOpt, MapModeOpt};
+use super::args::{MapModeOpt, ModeOpt};
+use crate::{MapMode, Mode};
 
 impl From<ModeOpt> for Mode {
     fn from(m: ModeOpt) -> Self {
