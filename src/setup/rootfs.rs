@@ -204,7 +204,10 @@ async fn download_and_extract_alpine(mount_point: &Path) -> Result<()> {
 iface lo inet loopback
 
 # eth0 configured via kernel cmdline (ip= parameter)
-# No explicit configuration needed
+auto eth0
+iface eth0 inet manual
+    # Add route for MMDS server (Firecracker metadata service)
+    post-up ip route add 169.254.169.254/32 dev eth0
 "#;
     let interfaces_path = mount_point.join("etc/network/interfaces");
     tokio::fs::write(&interfaces_path, interfaces_config)

@@ -20,4 +20,7 @@ pub trait NetworkManager: Send + Sync {
 
     /// Get the TAP device name
     fn tap_device(&self) -> &str;
+
+    /// Get a reference to Any for downcasting
+    fn as_any(&self) -> &dyn std::any::Any;
 }

@@ -336,6 +336,15 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Start Firecracker VM (disable logging for now to avoid permission issues)
     let mut vm_manager = VmManager::new(vm_id.clone(), socket_path.clone(), None);
+
+    // Configure namespace isolation if network provides one
+    if let Some(rootless_net) = network.as_any().downcast_ref::<RootlessNetwork>() {
+        if let Some(ns_id) = rootless_net.namespace_id() {
+            info!(namespace = %ns_id, "configuring VM to run in network namespace");
+            vm_manager.set_namespace(ns_id.to_string());
+        }
+    }
+
     let firecracker_bin = PathBuf::from("/usr/local/bin/firecracker");
 
     vm_manager

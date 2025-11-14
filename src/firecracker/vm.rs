@@ -80,9 +80,10 @@ impl VmManager {
                     use nix::fcntl::{open, OFlag};
                     use nix::sched::{setns, CloneFlags};
                     use nix::sys::stat::Mode;
+                    use std::os::unix::io::{FromRawFd, OwnedFd};
 
                     // Open namespace file descriptor
-                    let ns_fd = open(
+                    let ns_fd_raw = open(
                         ns_path.as_str(),
                         OFlag::O_RDONLY,
                         Mode::empty()
@@ -91,8 +92,11 @@ impl VmManager {
                         format!("failed to open namespace {}: {}", ns_path, e)
                     ))?;
 
+                    // Wrap in OwnedFd for AsFd trait
+                    let ns_fd = OwnedFd::from_raw_fd(ns_fd_raw);
+
                     // Enter the network namespace
-                    setns(ns_fd, CloneFlags::CLONE_NEWNET).map_err(|e| {
+                    setns(&ns_fd, CloneFlags::CLONE_NEWNET).map_err(|e| {
                         std::io::Error::new(
                             std::io::ErrorKind::Other,
                             format!("failed to enter namespace: {}", e)

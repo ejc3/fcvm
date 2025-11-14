@@ -22,7 +22,7 @@ pub async fn setup_port_mappings(
         "setting up port mappings"
     );
 
-    let mut created_rules = Vec::new();
+    let mut created_rules: Vec<String> = Vec::new();
 
     for mapping in mappings {
         let proto_str = match mapping.proto {
