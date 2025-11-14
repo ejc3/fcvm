@@ -7,6 +7,12 @@ Measures:
 - Time to first nginx response (health check)
 - Success rate (percentage of VMs that pass health check)
 
+This script manages the full lifecycle:
+- Kills any existing VMs/servers
+- Starts the UFFD memory server
+- Clones VMs and measures performance
+- Cleans up all processes
+
 Usage:
     python3 -u scripts/stress_test_clone.py --snapshot final --num-clones 10 -v
 """
@@ -15,6 +21,7 @@ import asyncio
 import argparse
 import time
 import sys
+import signal
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Optional
@@ -63,6 +70,47 @@ async def run_command(cmd: List[str], timeout: int = 30) -> tuple[str, str, int]
         proc.kill()
         await proc.wait()
         raise
+
+
+async def start_memory_server(snapshot: str, fcvm_path: Path, verbose: bool = False):
+    """Start the UFFD memory server for the snapshot. Returns the server process."""
+    if verbose:
+        print(f"Starting memory server for snapshot '{snapshot}'...", flush=True)
+
+    cmd = [
+        "sudo",
+        str(fcvm_path),
+        "snapshot",
+        "serve",
+        snapshot,
+    ]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+
+    # Wait for server to be ready (look for "UFFD server listening")
+    ready_marker = b"UFFD server listening"
+    try:
+        while True:
+            line = await asyncio.wait_for(proc.stdout.readline(), timeout=10)
+            if not line:
+                raise RuntimeError("Memory server terminated unexpectedly")
+
+            if verbose:
+                print(f"  [server] {line.decode().strip()}", flush=True)
+
+            if ready_marker in line:
+                if verbose:
+                    print(f"✓ Memory server ready", flush=True)
+                return proc
+
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError("Memory server failed to start within 10 seconds")
 
 
 async def clone_vm(snapshot: str, clone_name: str, fcvm_path: Path) -> CloneMetrics:
@@ -279,11 +327,17 @@ def print_summary(metrics: List[CloneMetrics]):
             print(f"  {m.name}: {m.error}")
 
 
-async def cleanup_vms(fcvm_path: Path):
-    """Kill all VMs."""
-    print("\nCleaning up VMs...")
-    await run_command(["sudo", "killall", "-9", "firecracker"], timeout=5)
+async def cleanup_all(verbose: bool = False):
+    """Kill all VMs and memory servers."""
+    if verbose:
+        print("\nCleaning up all processes (VMs and memory servers)...", flush=True)
+
+    # Kill everything: firecracker VMs, fcvm processes, and any lingering bash/python
+    await run_command(["sudo", "killall", "-9", "firecracker", "fcvm"], timeout=5)
     await asyncio.sleep(2)
+
+    if verbose:
+        print("✓ Cleanup complete", flush=True)
 
 
 async def main():
@@ -328,7 +382,23 @@ async def main():
         print(f"Error: fcvm binary not found at {args.fcvm_path}", file=sys.stderr)
         sys.exit(1)
 
+    memory_server = None
+
     try:
+        # Clean up any existing processes first
+        print("Cleaning up any existing VMs and servers...", flush=True)
+        await cleanup_all(verbose=args.verbose)
+
+        # Start memory server
+        memory_server = await start_memory_server(
+            snapshot=args.snapshot,
+            fcvm_path=args.fcvm_path,
+            verbose=args.verbose,
+        )
+
+        # Give server a moment to fully initialize
+        await asyncio.sleep(1)
+
         # Run stress test
         metrics = await stress_test(
             snapshot=args.snapshot,
@@ -343,7 +413,19 @@ async def main():
 
     finally:
         if not args.no_cleanup:
-            await cleanup_vms(args.fcvm_path)
+            # Kill memory server first
+            if memory_server:
+                if args.verbose:
+                    print("\nStopping memory server...", flush=True)
+                memory_server.terminate()
+                try:
+                    await asyncio.wait_for(memory_server.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    memory_server.kill()
+                    await memory_server.wait()
+
+            # Then cleanup all VMs
+            await cleanup_all(verbose=args.verbose)
 
 
 if __name__ == "__main__":
