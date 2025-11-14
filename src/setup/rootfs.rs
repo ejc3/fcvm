@@ -5,12 +5,6 @@ use tracing::{info, warn};
 
 use crate::paths;
 
-/// Helper to convert PathBuf to &str with proper error handling
-fn path_to_str(path: &Path) -> Result<&str> {
-    path.to_str()
-        .ok_or_else(|| anyhow::anyhow!("Path contains invalid UTF-8: {}", path.display()))
-}
-
 /// Ensure rootfs exists, creating minimal Alpine + Podman if needed
 pub async fn ensure_rootfs() -> Result<PathBuf> {
     let rootfs_dir = paths::rootfs_dir();

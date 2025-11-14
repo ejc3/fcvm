@@ -183,10 +183,6 @@ pub struct StressTestArgs {
     #[arg(long, default_value_t = 5)]
     pub batch_size: usize,
 
-    /// Health check path (e.g., / or /health-check)
-    #[arg(long, default_value = "/")]
-    pub health_check_path: String,
-
     /// Timeout for health checks in seconds
     #[arg(long, default_value_t = 120)]
     pub timeout: u64,
