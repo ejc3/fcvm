@@ -1,33 +1,15 @@
 use anyhow::{Context, Result};
-use crate::paths;
-
 use std::path::PathBuf;
-use crate::paths;
-
 use tokio::signal::unix::{signal, SignalKind};
-use crate::paths;
-
 use tracing::info;
-use crate::paths;
-
 
 use crate::cli::CloneArgs;
-use crate::paths;
-
 use crate::firecracker::{VmManager, api::{SnapshotLoad, MemBackend, NetworkOverride}};
-use crate::paths;
-
 use crate::network::{NetworkManager, PortMapping, RootlessNetwork, PrivilegedNetwork};
 use crate::paths;
-
-use crate::storage::{DiskManager, SnapshotManager};
-use crate::paths;
-
 use crate::state::{StateManager, VmState, VmStatus, generate_vm_id};
-use crate::paths;
-
+use crate::storage::{DiskManager, SnapshotManager};
 use crate::Mode;
-use crate::paths;
 
 
 pub async fn cmd_clone(args: CloneArgs) -> Result<()> {
