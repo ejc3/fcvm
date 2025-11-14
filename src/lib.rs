@@ -12,4 +12,4 @@ pub mod types;
 pub mod uffd;
 
 // Re-export core types for convenience
-pub use types::{MapMode, Mode};
+pub use types::MapMode;

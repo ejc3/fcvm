@@ -58,10 +58,6 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 2048)]
     pub mem: u32,
 
-    /// Host mode
-    #[arg(long, value_enum, default_value_t = ModeOpt::Auto)]
-    pub mode: ModeOpt,
-
     /// Volume mapping(s): HOST:GUEST[:ro]
     #[arg(long, num_args=0.., value_delimiter=',')]
     pub map: Vec<String>,
@@ -137,9 +133,6 @@ pub struct SnapshotRunArgs {
     #[arg(long)]
     pub name: Option<String>,
 
-    #[arg(long, value_enum, default_value_t = ModeOpt::Auto)]
-    pub mode: ModeOpt,
-
     #[arg(long, num_args=0.., value_delimiter=',')]
     pub publish: Vec<String>,
 
@@ -152,13 +145,6 @@ pub struct SnapshotRunArgs {
 // ============================================================================
 // Enums
 // ============================================================================
-
-#[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
-pub enum ModeOpt {
-    Auto,
-    Privileged,
-    Rootless,
-}
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
 pub enum MapModeOpt {

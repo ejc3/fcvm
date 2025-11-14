@@ -7,12 +7,11 @@ use crate::cli::{
     SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs, SnapshotServeArgs,
 };
 use crate::firecracker::VmManager;
-use crate::network::{NetworkManager, PortMapping, PrivilegedNetwork, RootlessNetwork};
+use crate::network::{NetworkManager, PortMapping, RootlessNetwork};
 use crate::paths;
 use crate::state::{generate_vm_id, StateManager, VmState, VmStatus};
 use crate::storage::{DiskManager, SnapshotManager};
 use crate::uffd::UffdServer;
-use crate::Mode;
 
 /// Main dispatcher for snapshot commands
 pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
@@ -255,20 +254,6 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     );
     vm_state.name = Some(vm_name.clone());
 
-    // Detect execution mode
-    let mode = match args.mode.into() {
-        Mode::Auto => {
-            if nix::unistd::Uid::effective().is_root() {
-                Mode::Privileged
-            } else {
-                Mode::Rootless
-            }
-        }
-        m => m,
-    };
-
-    info!(mode = ?mode, vm_id = %vm_id, vm_name = %vm_name, "detected execution mode");
-
     // Setup paths
     let data_dir = paths::vm_runtime_dir(&vm_id);
     tokio::fs::create_dir_all(&data_dir)
@@ -308,35 +293,23 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     use crate::network::NetworkConfig as SavedNetworkConfig;
     let saved_network: Option<SavedNetworkConfig> = serde_json::from_value(snapshot_config.metadata.network_config.clone()).ok();
 
-    let mut network: Box<dyn NetworkManager> = match mode {
-        Mode::Rootless => {
-            let mut net = RootlessNetwork::new(
-                vm_id.clone(),
-                tap_device.clone(),
-                port_mappings.clone(),
+    // Setup networking (always rootless) - reuse guest_ip from snapshot if available
+    let mut net = RootlessNetwork::new(
+        vm_id.clone(),
+        tap_device.clone(),
+        port_mappings.clone(),
+    );
+    // If snapshot has saved network config with guest_ip, use it
+    if let Some(ref saved_net) = saved_network {
+        if let Some(ref guest_ip) = saved_net.guest_ip {
+            net = net.with_guest_ip(guest_ip.clone());
+            info!(
+                guest_ip = %guest_ip,
+                "clone will use same network config as snapshot"
             );
-            // If snapshot has saved network config with guest_ip, use it
-            if let Some(ref saved_net) = saved_network {
-                if let Some(ref guest_ip) = saved_net.guest_ip {
-                    net = net.with_guest_ip(guest_ip.clone());
-                    info!(
-                        guest_ip = %guest_ip,
-                        "clone will use same network config as snapshot"
-                    );
-                }
-            }
-            Box::new(net)
-        },
-        Mode::Privileged => Box::new(PrivilegedNetwork::new(
-            vm_id.clone(),
-            tap_device.clone(),
-            "fcvmbr0".to_string(),
-            format!("172.16.0.{}", 10 + (vm_id.len() % 240)),
-            "172.16.0.1".to_string(),
-            port_mappings.clone(),
-        )),
-        Mode::Auto => anyhow::bail!("Mode::Auto should have been resolved before network setup"),
-    };
+        }
+    }
+    let mut network: Box<dyn NetworkManager> = Box::new(net);
 
     let network_config = network.setup().await.context("setting up network")?;
 

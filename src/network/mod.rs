@@ -1,8 +1,6 @@
-pub mod privileged;
 pub mod rootless;
 pub mod types;
 
-pub use privileged::PrivilegedNetwork;
 pub use rootless::RootlessNetwork;
 pub use types::*;
 
