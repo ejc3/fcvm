@@ -1,4 +1,5 @@
 pub mod namespace;
+pub mod portmap;
 pub mod rootless;
 pub mod types;
 pub mod veth;

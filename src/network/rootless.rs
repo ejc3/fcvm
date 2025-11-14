@@ -55,13 +55,15 @@ impl NetworkManager for RootlessNetwork {
             if parts.len() != 4 {
                 anyhow::bail!("invalid guest IP format: {}", override_ip);
             }
-            let last_octet: u8 = parts[3].parse()
-                .with_context(|| format!("parsing guest IP: {}", override_ip))?;
+            let third_octet: u8 = parts[2].parse()
+                .with_context(|| format!("parsing guest IP third octet: {}", override_ip))?;
+            let fourth_octet: u8 = parts[3].parse()
+                .with_context(|| format!("parsing guest IP fourth octet: {}", override_ip))?;
 
             // Guest IP should be subnet_base + 2, so subnet_base = guest_ip - 2
-            let subnet_base = last_octet.saturating_sub(2);
-            let host_ip = format!("172.16.0.{}", subnet_base + 1);
-            let subnet = format!("172.16.0.{}/30", subnet_base);
+            let subnet_base = fourth_octet.saturating_sub(2);
+            let host_ip = format!("172.30.{}.{}", third_octet, subnet_base + 1);
+            let subnet = format!("172.30.{}.{}/30", third_octet, subnet_base);
 
             info!(
                 guest_ip = %override_ip,
@@ -72,17 +74,25 @@ impl NetworkManager for RootlessNetwork {
             (host_ip, override_ip.clone(), subnet)
         } else {
             // New VM case: generate unique subnet from vm_id hash
+            // Use 172.30.x.y/30 subnet scheme with 16,384 possible subnets
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
 
             let mut hasher = DefaultHasher::new();
             self.vm_id.hash(&mut hasher);
-            let subnet_id = (hasher.finish() % 64) as u8; // Use 64 subnets: 172.16.0-63.0/30
+            let subnet_id = (hasher.finish() % 16384) as u16; // 16,384 subnets across 172.30.0-63.x
 
-            let subnet_base = subnet_id * 4;
-            let host_ip = format!("172.16.0.{}", subnet_base + 1);
-            let guest_ip = format!("172.16.0.{}", subnet_base + 2);
-            let subnet = format!("172.16.0.{}/30", subnet_base);
+            // Each /30 subnet needs 4 IPs, so we can fit 64 subnets per /24 block
+            // subnet_id 0-63 -> 172.30.0.0/30 through 172.30.0.252/30
+            // subnet_id 64-127 -> 172.30.1.0/30 through 172.30.1.252/30
+            // ...
+            let third_octet = (subnet_id / 64) as u8;  // Which /24 block (0-255)
+            let subnet_within_block = (subnet_id % 64) as u8;  // Which /30 within that /24
+            let subnet_base = subnet_within_block * 4;
+
+            let host_ip = format!("172.30.{}.{}", third_octet, subnet_base + 1);
+            let guest_ip = format!("172.30.{}.{}", third_octet, subnet_base + 2);
+            let subnet = format!("172.30.{}.{}/30", third_octet, subnet_base);
 
             (host_ip, guest_ip, subnet)
         };
