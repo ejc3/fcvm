@@ -185,6 +185,15 @@ fcvm memory-server <name>   # Start memory server for snapshot (enables sharing)
      ```
    - **Performance**: Original VM + 2 clones = ~512MB RAM total (not 1.5GB!)
 
+13. **Code Quality Cleanup** (2025-11-13)
+   - ✅ Removed unimplemented stub commands (stop, logs, inspect, top)
+   - ✅ Removed unimplemented readiness gates (vsock, log, exec)
+   - ✅ Fixed duplicate imports (10x `use crate::paths;` → 1x clean import)
+   - ✅ Replaced all `unreachable!()` with proper `anyhow::bail!()` errors
+   - ✅ Eliminated all compiler warnings
+   - ✅ Updated stress test script for self-contained lifecycle management
+   - **Performance verification**: 10 VMs @ ~200ms clone time, 100% success rate
+
 ### 🚧 In Progress
 
 None - all major features working!
