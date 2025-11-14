@@ -74,15 +74,25 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) {
 }
 
 /// Check if HTTP service is responding via curl
+///
+/// Note: With namespace isolation, we use --interface with the host veth device:
+/// - TAP devices exist inside the namespace, not visible on host
+/// - Multiple VMs can have the same guest IP (clones from snapshots)
+/// - Using --interface veth0-vm-XXXXX ensures curl routes to the correct VM
+/// - The veth device name is derived from the TAP device name (tap-vm-X → veth0-vm-X)
 async fn check_http_health(guest_ip: &str, tap_device: &str, health_path: &str) -> Result<bool, ()> {
     let url = format!("http://{}{}", guest_ip, health_path);
+
+    // Derive veth device name from TAP device name
+    // TAP: tap-vm-XXXXX → veth: veth0-vm-XXXXX
+    let veth_device = tap_device.replace("tap-", "veth0-");
 
     let output = Command::new("curl")
         .args([
             "-s",           // Silent
             "-f",           // Fail on HTTP errors
             "-m", "1",      // 1 second timeout
-            "--interface", tap_device,
+            "--interface", &veth_device,
             &url,
         ])
         .output()
