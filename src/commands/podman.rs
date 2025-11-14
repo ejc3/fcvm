@@ -5,11 +5,10 @@ use tracing::{info, warn};
 
 use crate::cli::{PodmanArgs, PodmanCommands, RunArgs};
 use crate::firecracker::VmManager;
-use crate::network::{NetworkManager, PortMapping, PrivilegedNetwork, RootlessNetwork};
+use crate::network::{NetworkManager, PortMapping, RootlessNetwork};
 use crate::paths;
 use crate::state::{generate_vm_id, StateManager, VmState, VmStatus};
 use crate::storage::DiskManager;
-use crate::Mode;
 
 /// Main dispatcher for podman commands
 pub async fn cmd_podman(args: PodmanArgs) -> Result<()> {
@@ -48,20 +47,6 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         None
     };
 
-    // Detect execution mode
-    let mode = match args.mode.into() {
-        Mode::Auto => {
-            if nix::unistd::Uid::effective().is_root() {
-                Mode::Privileged
-            } else {
-                Mode::Rootless
-            }
-        }
-        m => m,
-    };
-
-    info!(mode = ?mode, vm_id = %vm_id, "detected execution mode");
-
     // Setup paths
     let data_dir = paths::vm_runtime_dir(&vm_id);
     tokio::fs::create_dir_all(&data_dir)
@@ -80,24 +65,13 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     let state_manager = StateManager::new(paths::state_dir());
     state_manager.init().await?;
 
-    // Setup networking
+    // Setup networking (always rootless with TAP device)
     let tap_device = format!("tap-{}", &vm_id[..8]);
-    let mut network: Box<dyn NetworkManager> = match mode {
-        Mode::Rootless => Box::new(RootlessNetwork::new(
-            vm_id.clone(),
-            tap_device.clone(),
-            port_mappings.clone(),
-        )),
-        Mode::Privileged => Box::new(PrivilegedNetwork::new(
-            vm_id.clone(),
-            tap_device.clone(),
-            "fcvmbr0".to_string(),
-            format!("172.16.0.{}", 10 + (vm_id.len() % 240)),
-            "172.16.0.1".to_string(),
-            port_mappings.clone(),
-        )),
-        Mode::Auto => anyhow::bail!("Mode::Auto should have been resolved before network setup"),
-    };
+    let mut network: Box<dyn NetworkManager> = Box::new(RootlessNetwork::new(
+        vm_id.clone(),
+        tap_device.clone(),
+        port_mappings.clone(),
+    ));
 
     let network_config = network.setup().await.context("setting up network")?;
 

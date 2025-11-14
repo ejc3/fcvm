@@ -1,15 +1,5 @@
-use super::args::{MapModeOpt, ModeOpt};
-use crate::{MapMode, Mode};
-
-impl From<ModeOpt> for Mode {
-    fn from(m: ModeOpt) -> Self {
-        match m {
-            ModeOpt::Auto => Mode::Auto,
-            ModeOpt::Privileged => Mode::Privileged,
-            ModeOpt::Rootless => Mode::Rootless,
-        }
-    }
-}
+use super::args::MapModeOpt;
+use crate::MapMode;
 
 impl From<MapModeOpt> for MapMode {
     fn from(m: MapModeOpt) -> Self {
@@ -24,13 +14,6 @@ impl From<MapModeOpt> for MapMode {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_mode_opt_conversion() {
-        assert_eq!(Mode::from(ModeOpt::Auto), Mode::Auto);
-        assert_eq!(Mode::from(ModeOpt::Privileged), Mode::Privileged);
-        assert_eq!(Mode::from(ModeOpt::Rootless), Mode::Rootless);
-    }
 
     #[test]
     fn test_map_mode_opt_conversion() {
