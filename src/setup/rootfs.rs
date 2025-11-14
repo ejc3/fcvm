@@ -53,7 +53,7 @@ async fn create_alpine_rootfs(output_path: &Path) -> Result<()> {
 
     // Create 1GB sparse file
     let output = Command::new("dd")
-        .args(&[
+        .args([
             "if=/dev/zero",
             &format!("of={}", output_path.display()),
             "bs=1M",
@@ -69,7 +69,7 @@ async fn create_alpine_rootfs(output_path: &Path) -> Result<()> {
 
     // Format as ext4
     let output = Command::new("mkfs.ext4")
-        .args(&["-F", output_path.to_str().unwrap()])
+        .args(["-F", output_path.to_str().unwrap()])
         .output()
         .context("formatting ext4")?;
 
@@ -84,7 +84,7 @@ async fn create_alpine_rootfs(output_path: &Path) -> Result<()> {
 
     // Mount the image (requires root)
     let output = Command::new("mount")
-        .args(&[
+        .args([
             "-o",
             "loop",
             output_path.to_str().unwrap(),
@@ -132,7 +132,7 @@ async fn download_and_extract_alpine(mount_point: &Path) -> Result<()> {
 
     // Download
     let output = Command::new("curl")
-        .args(&["-L", "-o", tarball_path, &url])
+        .args(["-L", "-o", tarball_path, &url])
         .output()
         .context("downloading Alpine")?;
 
@@ -145,7 +145,7 @@ async fn download_and_extract_alpine(mount_point: &Path) -> Result<()> {
 
     // Extract to mount point
     let output = Command::new("tar")
-        .args(&["-xzf", tarball_path, "-C", mount_point.to_str().unwrap()])
+        .args(["-xzf", tarball_path, "-C", mount_point.to_str().unwrap()])
         .output()
         .context("extracting tarball")?;
 
@@ -173,7 +173,7 @@ async fn download_and_extract_alpine(mount_point: &Path) -> Result<()> {
     // openresolv needed for dns-nameservers in /etc/network/interfaces
     let output = Command::new("chroot")
         .arg(mount_point.to_str().unwrap())
-        .args(&["/bin/sh", "-c", "apk update && apk add podman crun fuse-overlayfs openrc haveged ca-certificates chrony openresolv"])
+        .args(["/bin/sh", "-c", "apk update && apk add podman crun fuse-overlayfs openrc haveged ca-certificates chrony openresolv"])
         .output()
         .context("installing packages via apk")?;
 
@@ -192,7 +192,7 @@ async fn download_and_extract_alpine(mount_point: &Path) -> Result<()> {
     // chronyd service is CRITICAL for TLS - syncs system clock via NTP
     let _ = Command::new("chroot")
         .arg(mount_point.to_str().unwrap())
-        .args(&["/bin/sh", "-c", "rc-update add devfs boot && rc-update add procfs boot && rc-update add sysfs boot && rc-update add cgroups boot && rc-update add haveged boot && rc-update add chronyd default"])
+        .args(["/bin/sh", "-c", "rc-update add devfs boot && rc-update add procfs boot && rc-update add sysfs boot && rc-update add cgroups boot && rc-update add haveged boot && rc-update add chronyd default"])
         .output();
 
     // Configure networking for Alpine Linux
@@ -251,10 +251,10 @@ driftfile /var/lib/chrony/drift
         .context("writing /etc/chrony/chrony.conf")?;
 
     // Install fc-agent binary and OpenRC service
-    install_fc_agent(&mount_point).await?;
+    install_fc_agent(mount_point).await?;
 
     // Install overlay-init script for OverlayFS support
-    install_overlay_init(&mount_point).await?;
+    install_overlay_init(mount_point).await?;
 
     // Add network debugging script that runs at boot
     info!("installing network debug script");
@@ -294,7 +294,7 @@ echo "=== Debug Complete ==="
 
     // Make executable
     let _ = Command::new("chmod")
-        .args(&["+x", debug_script_path.to_str().unwrap()])
+        .args(["+x", debug_script_path.to_str().unwrap()])
         .output();
 
     // Add to boot via local service
@@ -310,13 +310,13 @@ echo "=== Debug Complete ==="
         .await
         .context("writing local.d script")?;
     let _ = Command::new("chmod")
-        .args(&["+x", local_path.to_str().unwrap()])
+        .args(["+x", local_path.to_str().unwrap()])
         .output();
 
     // Enable local service
     let _ = Command::new("chroot")
         .arg(mount_point.to_str().unwrap())
-        .args(&["/bin/sh", "-c", "rc-update add local default"])
+        .args(["/bin/sh", "-c", "rc-update add local default"])
         .output();
 
     Ok(())
@@ -365,7 +365,7 @@ async fn install_fc_agent(mount_point: &Path) -> Result<()> {
 
     // Make executable
     let output = Command::new("chmod")
-        .args(&["+x", fc_agent_dest.to_str().unwrap()])
+        .args(["+x", fc_agent_dest.to_str().unwrap()])
         .output()
         .context("making fc-agent executable")?;
 
@@ -397,7 +397,7 @@ depend() {
 
     // Make service executable
     let output = Command::new("chmod")
-        .args(&["+x", service_path.to_str().unwrap()])
+        .args(["+x", service_path.to_str().unwrap()])
         .output()
         .context("making service executable")?;
 
@@ -408,7 +408,7 @@ depend() {
     // Enable fc-agent service (add to default runlevel)
     let output = Command::new("chroot")
         .arg(mount_point.to_str().unwrap())
-        .args(&["/bin/sh", "-c", "rc-update add fc-agent default"])
+        .args(["/bin/sh", "-c", "rc-update add fc-agent default"])
         .output()
         .context("enabling fc-agent service")?;
 
@@ -536,7 +536,7 @@ fi
 
     // Make executable
     let output = Command::new("chmod")
-        .args(&["+x", overlay_init_path.to_str().unwrap()])
+        .args(["+x", overlay_init_path.to_str().unwrap()])
         .output()
         .context("making overlay-init executable")?;
 

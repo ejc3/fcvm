@@ -112,7 +112,7 @@ struct CloneMetrics {
 async fn cleanup_all() -> Result<()> {
     // Only kill firecracker (not fcvm to avoid killing ourselves!)
     let _ = Command::new("sudo")
-        .args(&["killall", "-9", "firecracker"])
+        .args(["killall", "-9", "firecracker"])
         .output()
         .await;
 
@@ -389,7 +389,7 @@ async fn poll_health_check(vm_name: &str, timeout_secs: u64) -> Result<u64> {
     while start.elapsed() < timeout {
         // Use fcvm ls --json to check VM health status
         let mut cmd = Command::new("sudo");
-        cmd.args(&["./target/release/fcvm", "ls", "--json"]);
+        cmd.args(["./target/release/fcvm", "ls", "--json"]);
 
         if let Ok(output) = cmd.output().await {
             if output.status.success() {
