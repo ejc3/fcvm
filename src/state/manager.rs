@@ -22,13 +22,27 @@ impl StateManager {
         Ok(())
     }
 
-    /// Save VM state
+    /// Save VM state atomically (write to temp file, then rename)
     pub async fn save_state(&self, state: &VmState) -> Result<()> {
         let state_file = self.state_dir.join(format!("{}.json", state.vm_id));
-        let state_json = serde_json::to_string_pretty(state)?;
-        fs::write(&state_file, state_json)
+        let temp_file = self.state_dir.join(format!("{}.json.tmp", state.vm_id));
+
+        // Update last_updated timestamp before saving
+        let mut state = state.clone();
+        state.last_updated = chrono::Utc::now();
+
+        let state_json = serde_json::to_string_pretty(&state)?;
+
+        // Write to temp file first
+        fs::write(&temp_file, &state_json)
             .await
-            .context("writing VM state")?;
+            .context("writing temp state file")?;
+
+        // Atomic rename (this is an atomic operation on Unix)
+        fs::rename(&temp_file, &state_file)
+            .await
+            .context("renaming temp state file")?;
+
         Ok(())
     }
 

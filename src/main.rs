@@ -18,6 +18,7 @@ async fn main() -> Result<()> {
 
     // Dispatch to appropriate command handler
     let result = match cli.cmd {
+        Commands::Ls(args) => commands::cmd_ls(args).await,
         Commands::Podman(args) => commands::cmd_podman(args).await,
         Commands::Snapshot(args) => commands::cmd_snapshot(args).await,
         Commands::Snapshots => commands::cmd_snapshots().await,

@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -122,7 +122,9 @@ impl VmManager {
     /// Get the VM process PID
     pub fn pid(&self) -> Result<u32> {
         if let Some(process) = &self.process {
-            process.id().context("getting process ID")
+            let pid_opt = process.id();
+            info!("Firecracker Child.id() returned: {:?}", pid_opt);
+            pid_opt.ok_or_else(|| anyhow!("process ID not available from tokio::process::Child"))
         } else {
             bail!("VM process not running")
         }

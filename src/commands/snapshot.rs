@@ -375,6 +375,12 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         vm_state.pid = Some(pid);
     }
 
+    // Save network configuration to state (for fcvm ls to display)
+    vm_state.config.network = serde_json::json!({
+        "guest_ip": network_config.guest_ip,
+        "tap_device": network_config.tap_device,
+    });
+
     // Load snapshot with UFFD backend and network override
     use crate::firecracker::api::{
         DrivePatch, MemBackend, NetworkOverride, SnapshotLoad, VmState as ApiVmState,
@@ -439,6 +445,9 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     );
     println!("  Memory pages shared via UFFD");
     println!("  Disk uses CoW overlay");
+
+    // Spawn health monitor task
+    crate::health::spawn_health_monitor(vm_id.clone(), vm_state.pid);
 
     // Setup signal handlers
     let mut sigterm = signal(SignalKind::terminate())?;

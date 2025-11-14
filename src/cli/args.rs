@@ -13,6 +13,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// List running VMs
+    Ls(LsArgs),
     /// Podman-compatible container operations
     Podman(PodmanArgs),
     /// Snapshot operations (create, serve, run)
@@ -195,7 +197,34 @@ pub struct StressTestArgs {
     #[arg(long, default_value_t = 5)]
     pub batch_size: usize,
 
+    /// Health check path (e.g., / or /health-check)
+    #[arg(long, default_value = "/")]
+    pub health_check_path: String,
+
+    /// Timeout for health checks in seconds
+    #[arg(long, default_value_t = 120)]
+    pub timeout: u64,
+
+    /// Clean up before starting (kills all firecracker processes)
+    #[arg(long)]
+    pub clean: bool,
+
+    /// Name for baseline VM
+    #[arg(long, default_value = "baseline-vm")]
+    pub baseline_name: String,
+
     /// Verbose output
     #[arg(short, long)]
     pub verbose: bool,
+}
+
+// ============================================================================
+// Ls Command
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct LsArgs {
+    /// Output in JSON format
+    #[arg(long)]
+    pub json: bool,
 }

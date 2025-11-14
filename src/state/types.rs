@@ -6,8 +6,10 @@ pub struct VmState {
     pub vm_id: String,
     pub name: Option<String>,
     pub status: VmStatus,
+    pub health_status: HealthStatus,
     pub pid: Option<u32>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub last_updated: chrono::DateTime<chrono::Utc>,
     pub config: VmConfig,
 }
 
@@ -18,6 +20,16 @@ pub enum VmStatus {
     Running,
     Stopped,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HealthStatus {
+    Unknown,
+    Healthy,
+    Unhealthy,
+    Timeout,
+    Unreachable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,12 +44,15 @@ pub struct VmConfig {
 
 impl VmState {
     pub fn new(vm_id: String, image: String, vcpu: u8, memory_mib: u32) -> Self {
+        let now = chrono::Utc::now();
         Self {
             vm_id,
             name: None,
             status: VmStatus::Starting,
+            health_status: HealthStatus::Unknown,
             pid: None,
-            created_at: chrono::Utc::now(),
+            created_at: now,
+            last_updated: now,
             config: VmConfig {
                 image,
                 vcpu,
