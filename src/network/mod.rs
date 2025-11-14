@@ -1,5 +1,7 @@
+pub mod namespace;
 pub mod rootless;
 pub mod types;
+pub mod veth;
 
 pub use rootless::RootlessNetwork;
 pub use types::*;
