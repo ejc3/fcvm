@@ -72,7 +72,7 @@ pub async fn cmd_run(args: RunArgs) -> Result<()> {
             "172.16.0.1".to_string(),
             port_mappings.clone(),
         )),
-        Mode::Auto => unreachable!(),
+        Mode::Auto => anyhow::bail!("Mode::Auto should have been resolved before network setup"),
     };
 
     let network_config = network.setup().await
