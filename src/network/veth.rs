@@ -95,6 +95,31 @@ pub async fn setup_host_veth(veth_name: &str, ip_with_cidr: &str) -> Result<()> 
         }
     }
 
+    // Add FORWARD rule to allow outbound traffic from this veth
+    let forward_rule = format!("-A FORWARD -i {} -j ACCEPT", veth_name);
+    let output = Command::new("sudo")
+        .args(["iptables", "-t", "filter", "-C"])
+        .args(forward_rule.split_whitespace().skip(2)) // Skip "-A FORWARD"
+        .output()
+        .await
+        .context("checking FORWARD rule")?;
+
+    if !output.status.success() {
+        // Rule doesn't exist, add it
+        let output = Command::new("sudo")
+            .args(["iptables", "-t", "filter"])
+            .args(forward_rule.split_whitespace())
+            .output()
+            .await
+            .context("adding FORWARD rule for veth")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("failed to add FORWARD rule for {}: {}", veth_name, stderr);
+        }
+        info!(veth = %veth_name, "added FORWARD rule for outbound traffic");
+    }
+
     Ok(())
 }
 
@@ -134,20 +159,9 @@ pub async fn setup_guest_veth_in_ns(
         );
     }
 
-    // Assign IP address
-    let output = exec_in_namespace(ns_name, &["ip", "addr", "add", ip_with_cidr, "dev", veth_name])
-        .await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Ignore "File exists" - IP already assigned
-        if !stderr.contains("File exists") {
-            anyhow::bail!(
-                "failed to assign IP to guest veth {} in namespace: {}",
-                veth_name,
-                stderr
-            );
-        }
-    }
+    // NOTE: With bridge setup, veth does NOT get an IP.
+    // The bridge will have the IP assigned in connect_tap_to_veth().
+    // Just bring up the veth - no IP assignment needed.
 
     // Add default route via gateway
     let output = exec_in_namespace(
@@ -210,11 +224,10 @@ pub async fn create_tap_in_ns(ns_name: &str, tap_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Connects TAP device directly to veth interface inside namespace
+/// Connects TAP device to veth interface via bridge inside namespace
 ///
-/// Since we're skipping the bridge (user's choice), we need to route packets
-/// between TAP and veth. We do this by enabling IP forwarding in the namespace
-/// and setting up proper routing.
+/// Creates a Linux bridge to connect the TAP device (used by Firecracker) to the
+/// veth device (connected to host). This allows L2 forwarding between VM and host.
 pub async fn connect_tap_to_veth(
     ns_name: &str,
     tap_name: &str,
@@ -225,14 +238,26 @@ pub async fn connect_tap_to_veth(
         namespace = %ns_name,
         tap = %tap_name,
         veth = %veth_name,
-        tap_ip = %tap_ip_with_cidr,
-        "connecting TAP to veth in namespace"
+        bridge_ip = %tap_ip_with_cidr,
+        "connecting TAP to veth via bridge in namespace"
     );
 
-    // Assign IP to TAP device (this will be the guest's IP)
+    let bridge_name = "br0";
+
+    // Create bridge
+    let output = exec_in_namespace(ns_name, &["ip", "link", "add", bridge_name, "type", "bridge"]).await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Ignore if bridge already exists
+        if !stderr.contains("File exists") {
+            anyhow::bail!("failed to create bridge in namespace: {}", stderr);
+        }
+    }
+
+    // Assign IP to bridge (not TAP or veth)
     let output = exec_in_namespace(
         ns_name,
-        &["ip", "addr", "add", tap_ip_with_cidr, "dev", tap_name],
+        &["ip", "addr", "add", tap_ip_with_cidr, "dev", bridge_name],
     )
     .await?;
 
@@ -241,41 +266,34 @@ pub async fn connect_tap_to_veth(
         // Ignore "File exists" - IP already assigned
         if !stderr.contains("File exists") {
             anyhow::bail!(
-                "failed to assign IP to TAP {} in namespace: {}",
-                tap_name,
+                "failed to assign IP to bridge in namespace: {}",
                 stderr
             );
         }
     }
 
-    // Enable IP forwarding in namespace (allows packets between TAP and veth)
-    let output = exec_in_namespace(
-        ns_name,
-        &["sysctl", "-w", "net.ipv4.ip_forward=1"],
-    )
-    .await?;
-
+    // Attach TAP to bridge
+    let output = exec_in_namespace(ns_name, &["ip", "link", "set", tap_name, "master", bridge_name]).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!("failed to enable IP forwarding in namespace: {}", stderr);
+        anyhow::bail!("failed to attach TAP to bridge: {}", stderr);
     }
 
-    // Add route for TAP subnet via veth (so return packets work)
-    // This is needed because the guest will send to TAP, but return traffic
-    // needs to route back through veth
-    let output = exec_in_namespace(
-        ns_name,
-        &["ip", "route", "add", tap_ip_with_cidr, "dev", tap_name],
-    )
-    .await?;
-
+    // Attach veth to bridge
+    let output = exec_in_namespace(ns_name, &["ip", "link", "set", veth_name, "master", bridge_name]).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Ignore "File exists" - route may already exist
-        if !stderr.contains("File exists") {
-            warn!("failed to add TAP route in namespace: {}", stderr);
-        }
+        anyhow::bail!("failed to attach veth to bridge: {}", stderr);
     }
+
+    // Bring up bridge
+    let output = exec_in_namespace(ns_name, &["ip", "link", "set", bridge_name, "up"]).await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("failed to bring up bridge: {}", stderr);
+    }
+
+    info!(bridge = %bridge_name, "bridge created and configured in namespace");
 
     Ok(())
 }
