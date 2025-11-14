@@ -19,10 +19,6 @@ pub enum Commands {
     Snapshot(SnapshotArgs),
     /// List available snapshots
     Snapshots,
-    /// View VM logs
-    Logs(NameArgs),
-    /// Inspect VM details
-    Inspect(NameArgs),
 }
 
 // ============================================================================
@@ -149,15 +145,6 @@ pub struct SnapshotRunArgs {
 
 // ============================================================================
 // Shared Args
-// ============================================================================
-
-#[derive(Args, Debug)]
-pub struct NameArgs {
-    /// VM name or id
-    #[arg(long, short)]
-    pub name: String,
-}
-
 // ============================================================================
 // Enums
 // ============================================================================
