@@ -19,6 +19,8 @@ pub enum Commands {
     Snapshot(SnapshotArgs),
     /// List available snapshots
     Snapshots,
+    /// Test operations (stress test, benchmarks)
+    Test(TestArgs),
 }
 
 // ============================================================================
@@ -161,4 +163,39 @@ pub enum MapModeOpt {
     Block,
     Sshfs,
     Nfs,
+}
+
+// ============================================================================
+// Test Commands
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct TestArgs {
+    #[command(subcommand)]
+    pub cmd: TestCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TestCommands {
+    /// Stress test snapshot/clone performance
+    Stress(StressTestArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct StressTestArgs {
+    /// Snapshot name to test
+    #[arg(long, default_value = "final")]
+    pub snapshot: String,
+
+    /// Number of VMs to clone
+    #[arg(long, default_value_t = 10)]
+    pub num_clones: usize,
+
+    /// Number of concurrent clones per batch
+    #[arg(long, default_value_t = 5)]
+    pub batch_size: usize,
+
+    /// Verbose output
+    #[arg(short, long)]
+    pub verbose: bool,
 }
