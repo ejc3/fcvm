@@ -156,10 +156,9 @@ async fn start_baseline_vm(
     let guest_ip = extract_guest_ip_from_network_config(&vm_state.config.network)?;
     println!("  VM assigned IP: {}", guest_ip);
 
-    // Poll health check URL using the actual IP
-    let health_url = format!("http://{}{}", guest_ip, health_check_path);
-    println!("  Polling {} (timeout: {}s)...", health_url, timeout);
-    poll_health_check(&health_url, timeout, None).await?;
+    // Poll health check using fcvm ls
+    println!("  Waiting for VM to become healthy (timeout: {}s)...", timeout);
+    poll_health_check(vm_name, timeout).await?;
 
     Ok((proc, guest_ip))
 }
@@ -267,11 +266,10 @@ async fn run_stress_test(
         println!("  Waiting for health checks...");
         let mut health_tasks = Vec::new();
         for m in &batch_metrics {
-            if let Some(tap) = &m.tap_device {
-                let tap = tap.clone();
-                let url = health_check_url.to_string();
+            if m.tap_device.is_some() {
+                let vm_name = m.name.clone();
                 health_tasks.push(tokio::spawn(async move {
-                    poll_health_check(&url, timeout, Some(&tap)).await.ok()
+                    poll_health_check(&vm_name, timeout).await.ok()
                 }));
             } else {
                 health_tasks.push(tokio::spawn(async { None }));
@@ -394,27 +392,37 @@ async fn clone_vm(snapshot: &str, name: &str) -> CloneMetrics {
     }
 }
 
-async fn poll_health_check(url: &str, timeout_secs: u64, interface: Option<&str>) -> Result<u64> {
+async fn poll_health_check(vm_name: &str, timeout_secs: u64) -> Result<u64> {
     let start = Instant::now();
     let timeout = tokio::time::Duration::from_secs(timeout_secs);
 
     while start.elapsed() < timeout {
-        let mut cmd = Command::new("curl");
-        cmd.args(&["-s", "-f", "-m", "1"]);
-
-        if let Some(iface) = interface {
-            cmd.args(&["--interface", iface]);
-        }
-
-        cmd.arg(url);
+        // Use fcvm ls --json to check VM health status
+        let mut cmd = Command::new("sudo");
+        cmd.args(&["./target/release/fcvm", "ls", "--json"]);
 
         if let Ok(output) = cmd.output().await {
             if output.status.success() {
-                return Ok(start.elapsed().as_millis() as u64);
+                if let Ok(stdout) = String::from_utf8(output.stdout) {
+                    if let Ok(vms) = serde_json::from_str::<Vec<serde_json::Value>>(&stdout) {
+                        // Find the specific VM by name and check if it's healthy
+                        for vm in vms {
+                            if let Some(name) = vm.get("name").and_then(|n| n.as_str()) {
+                                if name == vm_name {
+                                    if let Some(health) = vm.get("health").and_then(|h| h.as_str()) {
+                                        if health == "Healthy" {
+                                            return Ok(start.elapsed().as_millis() as u64);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
 
     anyhow::bail!("Health check timeout after {}s", timeout_secs)
