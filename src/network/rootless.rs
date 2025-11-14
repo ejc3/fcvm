@@ -146,7 +146,7 @@ async fn setup_tap_with_nat(
 
     // 1. Create TAP device
     let output = Command::new("sudo")
-        .args(&["ip", "tuntap", "add", tap_name, "mode", "tap"])
+        .args(["ip", "tuntap", "add", tap_name, "mode", "tap"])
         .output()
         .await
         .context("creating TAP device")?;
@@ -163,7 +163,7 @@ async fn setup_tap_with_nat(
     let cidr_mask = subnet.split('/').nth(1).unwrap_or("30");
     let host_ip_with_cidr = format!("{}/{}", host_ip, cidr_mask);
     let output = Command::new("sudo")
-        .args(&["ip", "addr", "add", &host_ip_with_cidr, "dev", tap_name])
+        .args(["ip", "addr", "add", &host_ip_with_cidr, "dev", tap_name])
         .output()
         .await
         .context("assigning IP to TAP device")?;
@@ -177,7 +177,7 @@ async fn setup_tap_with_nat(
 
     // 3. Bring TAP device up
     let output = Command::new("sudo")
-        .args(&["ip", "link", "set", tap_name, "up"])
+        .args(["ip", "link", "set", tap_name, "up"])
         .output()
         .await
         .context("bringing up TAP device")?;
@@ -191,7 +191,7 @@ async fn setup_tap_with_nat(
 
     // 4. Enable IPv4 forwarding (required for routing)
     let output = Command::new("sudo")
-        .args(&["sysctl", "-w", "net.ipv4.ip_forward=1"])
+        .args(["sysctl", "-w", "net.ipv4.ip_forward=1"])
         .output()
         .await
         .context("enabling IP forwarding")?;
@@ -205,7 +205,7 @@ async fn setup_tap_with_nat(
 
     // 5. Get default network interface for NAT
     let output = Command::new("ip")
-        .args(&["route", "show", "default"])
+        .args(["route", "show", "default"])
         .output()
         .await
         .context("getting default route")?;
@@ -236,7 +236,7 @@ async fn setup_tap_with_nat(
     // MASQUERADE rule for outbound traffic from this VM's entire subnet
     // Use the subnet (172.16.X.0/24) instead of just the guest IP to catch all traffic
     let _ = Command::new("sudo")
-        .args(&[
+        .args([
             iptables_cmd.as_str(),
             "-t",
             "nat",
@@ -245,7 +245,7 @@ async fn setup_tap_with_nat(
             "-o",
             default_iface.as_str(),
             "-s",
-            &subnet,
+            subnet,
             "-j",
             "MASQUERADE",
         ])
@@ -254,7 +254,7 @@ async fn setup_tap_with_nat(
 
     // Allow forwarding from TAP to external interface
     let _ = Command::new("sudo")
-        .args(&[
+        .args([
             iptables_cmd.as_str(),
             "-A",
             "FORWARD",
@@ -270,7 +270,7 @@ async fn setup_tap_with_nat(
 
     // Allow established/related connections back
     let _ = Command::new("sudo")
-        .args(&[
+        .args([
             iptables_cmd.as_str(),
             "-A",
             "FORWARD",
@@ -314,7 +314,7 @@ async fn cleanup_tap_with_nat(
         (subnet, default_iface, iptables_cmd)
     {
         let _ = Command::new("sudo")
-            .args(&[
+            .args([
                 iptables_cmd,
                 "-t",
                 "nat",
@@ -331,7 +331,7 @@ async fn cleanup_tap_with_nat(
             .await;
 
         let _ = Command::new("sudo")
-            .args(&[
+            .args([
                 iptables_cmd,
                 "-D",
                 "FORWARD",
@@ -346,7 +346,7 @@ async fn cleanup_tap_with_nat(
             .await;
 
         let _ = Command::new("sudo")
-            .args(&[
+            .args([
                 iptables_cmd,
                 "-D",
                 "FORWARD",
@@ -367,7 +367,7 @@ async fn cleanup_tap_with_nat(
 
     // Delete TAP device
     let output = Command::new("sudo")
-        .args(&["ip", "link", "delete", tap_name])
+        .args(["ip", "link", "delete", tap_name])
         .output()
         .await
         .context("deleting TAP device")?;

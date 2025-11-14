@@ -78,7 +78,7 @@ async fn check_http_health(guest_ip: &str, tap_device: &str, health_path: &str) 
     let url = format!("http://{}{}", guest_ip, health_path);
 
     let output = Command::new("curl")
-        .args(&[
+        .args([
             "-s",           // Silent
             "-f",           // Fail on HTTP errors
             "-m", "1",      // 1 second timeout

@@ -40,7 +40,7 @@ pub async fn build_firecracker_kernel() -> Result<PathBuf> {
         let tar_path = build_dir.join(&linux_tar);
 
         let output = Command::new("wget")
-            .args(&["-q", "-O", tar_path.to_str().unwrap(), &url])
+            .args(["-q", "-O", tar_path.to_str().unwrap(), &url])
             .output()
             .await
             .context("downloading kernel")?;
@@ -57,7 +57,7 @@ pub async fn build_firecracker_kernel() -> Result<PathBuf> {
         println!("  → Extracting...");
 
         let output = Command::new("tar")
-            .args(&["-xf", tar_path.to_str().unwrap()])
+            .args(["-xf", tar_path.to_str().unwrap()])
             .current_dir(&build_dir)
             .output()
             .await
@@ -76,7 +76,7 @@ pub async fn build_firecracker_kernel() -> Result<PathBuf> {
     println!("  → Creating minimal Firecracker config...");
 
     let output = Command::new("make")
-        .args(&["ARCH=arm64", "defconfig"])
+        .args(["ARCH=arm64", "defconfig"])
         .current_dir(&linux_dir)
         .output()
         .await
@@ -129,8 +129,8 @@ pub async fn build_firecracker_kernel() -> Result<PathBuf> {
     ];
 
     for feature in &features {
-        let output = Command::new(&linux_dir.join("scripts/config"))
-            .args(&["--enable", feature])
+        let output = Command::new(linux_dir.join("scripts/config"))
+            .args(["--enable", feature])
             .current_dir(&linux_dir)
             .output()
             .await
@@ -150,7 +150,7 @@ pub async fn build_firecracker_kernel() -> Result<PathBuf> {
     println!("  → Building kernel with {} cores...", num_cpus::get());
 
     let output = Command::new("make")
-        .args(&["ARCH=arm64", &format!("-j{}", num_cpus::get())])
+        .args(["ARCH=arm64", &format!("-j{}", num_cpus::get())])
         .current_dir(&linux_dir)
         .output()
         .await
