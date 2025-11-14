@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use std::process::Stdio;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -6,6 +7,8 @@ use tokio::process::Command;
 use tracing::info;
 
 use crate::cli::TestArgs;
+use crate::paths;
+use crate::state::StateManager;
 
 pub async fn cmd_test(args: TestArgs) -> Result<()> {
     use crate::cli::TestCommands;
@@ -16,6 +19,10 @@ pub async fn cmd_test(args: TestArgs) -> Result<()> {
                 &stress_args.snapshot,
                 stress_args.num_clones,
                 stress_args.batch_size,
+                &stress_args.health_check_path,
+                stress_args.timeout,
+                stress_args.clean,
+                &stress_args.baseline_name,
                 stress_args.verbose,
             )
             .await
@@ -27,7 +34,11 @@ async fn cmd_stress_test(
     snapshot: &str,
     num_clones: usize,
     batch_size: usize,
-    verbose: bool,
+    health_check_path: &str,
+    timeout: u64,
+    clean: bool,
+    baseline_name: &str,
+    _verbose: bool,
 ) -> Result<()> {
     info!("Starting stress test");
 
@@ -36,27 +47,57 @@ async fn cmd_stress_test(
     println!("Snapshot: {}", snapshot);
     println!("Clones: {}", num_clones);
     println!("Batch size: {}", batch_size);
+    println!("Health check path: {}", health_check_path);
+    println!("Timeout: {}s", timeout);
+    println!("Baseline VM: {}", baseline_name);
     println!();
 
-    // Step 1: Cleanup any existing VMs/servers
+    // Step 1: Cleanup existing processes
     println!("Cleaning up existing processes...");
     cleanup_all().await?;
 
-    // Step 2: Start memory server in background
+    // Step 2: Optionally create fresh baseline VM and snapshot
+    let baseline_vm = if clean {
+        println!("Starting fresh baseline VM...");
+
+        let (vm_proc, baseline_ip) = start_baseline_vm(baseline_name, health_check_path, timeout).await
+            .context("Failed to start baseline VM - health check did not pass")?;
+        println!("✓ Baseline VM started and healthy at {}", baseline_ip);
+
+        println!("Creating snapshot '{}'...", snapshot);
+        create_snapshot(baseline_name, snapshot).await?;
+        println!("✓ Snapshot created");
+        println!();
+
+        Some(vm_proc)
+    } else {
+        println!("Using existing snapshot '{}'", snapshot);
+        println!();
+        None
+    };
+
+    // Step 3: Read guest IP from snapshot config
+    let guest_ip = read_snapshot_guest_ip(snapshot).await?;
+    let health_url = format!("http://{}{}", guest_ip, health_check_path);
+    println!("Clone health check URL: {} (from snapshot)", health_url);
+    println!();
+
+    // Step 4: Start memory server in background
     println!("Starting memory server for '{}'...", snapshot);
-    let server_proc = start_memory_server(snapshot, verbose).await?;
+    let server_proc = start_memory_server(snapshot).await?;
     println!("✓ Memory server ready");
     println!();
 
-    // Step 3: Run stress test
-    let metrics = run_stress_test(snapshot, num_clones, batch_size, verbose).await?;
+    // Step 5: Run stress test
+    let metrics = run_stress_test(snapshot, num_clones, batch_size, &health_url, timeout).await?;
 
-    // Step 4: Print summary
+    // Step 6: Print summary
     print_summary(&metrics);
 
-    // Step 5: Cleanup
+    // Step 7: Cleanup
     println!("\nCleaning up...");
     drop(server_proc); // Kill server
+    drop(baseline_vm); // Kill baseline VM
     cleanup_all().await?;
     println!("✓ Cleanup complete");
 
@@ -73,8 +114,9 @@ struct CloneMetrics {
 }
 
 async fn cleanup_all() -> Result<()> {
+    // Only kill firecracker (not fcvm to avoid killing ourselves!)
     let _ = Command::new("sudo")
-        .args(&["killall", "-9", "firecracker", "fcvm"])
+        .args(&["killall", "-9", "firecracker"])
         .output()
         .await;
 
@@ -82,7 +124,76 @@ async fn cleanup_all() -> Result<()> {
     Ok(())
 }
 
-async fn start_memory_server(snapshot: &str, verbose: bool) -> Result<tokio::process::Child> {
+async fn start_baseline_vm(
+    vm_name: &str,
+    health_check_path: &str,
+    timeout: u64,
+) -> Result<(tokio::process::Child, String)> {
+    println!("  Starting VM '{}'...", vm_name);
+
+    let mut cmd = Command::new("sudo");
+    cmd.arg("./target/release/fcvm")
+        .arg("podman")
+        .arg("run")
+        .arg("--name")
+        .arg(vm_name)
+        .arg("--mode")
+        .arg("rootless")
+        .arg("nginx:alpine")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let proc = cmd.spawn().context("spawning baseline VM")?;
+
+    // Wait for VM state file to be created
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    // Read actual guest IP from VM state
+    let state_manager = StateManager::new(paths::state_dir());
+    let vm_state = state_manager.load_state_by_name(vm_name).await?;
+
+    // Extract guest IP from network config
+    let guest_ip = extract_guest_ip_from_network_config(&vm_state.config.network)?;
+    println!("  VM assigned IP: {}", guest_ip);
+
+    // Poll health check URL using the actual IP
+    let health_url = format!("http://{}{}", guest_ip, health_check_path);
+    println!("  Polling {} (timeout: {}s)...", health_url, timeout);
+    poll_health_check(&health_url, timeout, None).await?;
+
+    Ok((proc, guest_ip))
+}
+
+fn extract_guest_ip_from_network_config(network_config: &serde_json::Value) -> Result<String> {
+    network_config
+        .get("guest_ip")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("guest_ip not found in network config"))
+}
+
+async fn create_snapshot(vm_name: &str, snapshot_name: &str) -> Result<()> {
+    let output = Command::new("./target/release/fcvm")
+        .arg("snapshot")
+        .arg("create")
+        .arg(vm_name)
+        .arg("--tag")
+        .arg(snapshot_name)
+        .output()
+        .await
+        .context("running snapshot create")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Snapshot creation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
+}
+
+async fn start_memory_server(snapshot: &str) -> Result<tokio::process::Child> {
     let mut cmd = Command::new("sudo");
     cmd.arg("./target/release/fcvm")
         .arg("snapshot")
@@ -102,11 +213,7 @@ async fn start_memory_server(snapshot: &str, verbose: bool) -> Result<tokio::pro
 
     while start.elapsed() < timeout {
         if let Some(line) = reader.next_line().await? {
-            if verbose {
-                println!("  [server] {}", line);
-            }
             if line.contains("UFFD server listening") {
-                // Put stdout back (won't use it anymore but keep proc alive)
                 return Ok(proc);
             }
         }
@@ -119,7 +226,8 @@ async fn run_stress_test(
     snapshot: &str,
     num_clones: usize,
     batch_size: usize,
-    verbose: bool,
+    health_check_url: &str,
+    timeout: u64,
 ) -> Result<Vec<CloneMetrics>> {
     let mut all_metrics = Vec::new();
 
@@ -156,13 +264,14 @@ async fn run_stress_test(
         }
 
         // Health check
-        println!("  Waiting for nginx health checks...");
+        println!("  Waiting for health checks...");
         let mut health_tasks = Vec::new();
         for m in &batch_metrics {
             if let Some(tap) = &m.tap_device {
                 let tap = tap.clone();
+                let url = health_check_url.to_string();
                 health_tasks.push(tokio::spawn(async move {
-                    wait_for_nginx(&tap).await
+                    poll_health_check(&url, timeout, Some(&tap)).await.ok()
                 }));
             } else {
                 health_tasks.push(tokio::spawn(async { None }));
@@ -179,9 +288,9 @@ async fn run_stress_test(
         for (m, health_ms) in final_metrics.iter_mut().zip(health_times) {
             m.health_time_ms = health_ms;
             if let Some(ms) = health_ms {
-                println!("  ✓ {}: nginx healthy in {}ms", m.name, ms);
+                println!("  ✓ {}: healthy in {}ms", m.name, ms);
             } else {
-                println!("  ✗ {}: nginx health check timeout", m.name);
+                println!("  ✗ {}: health check timeout", m.name);
             }
         }
 
@@ -239,10 +348,12 @@ async fn clone_vm(snapshot: &str, name: &str) -> CloneMetrics {
                 if line.contains("VM cloned successfully") && clone_time_ms.is_none() {
                     clone_time_ms = Some(start.elapsed().as_millis() as u64);
                 }
-                if let Some(idx) = line.find("tap-") {
-                    if let Some(end) = line[idx..].find(|c: char| c.is_whitespace() || c == ')') {
-                        tap_device = Some(line[idx..idx+end].to_string());
-                    }
+                // Extract TAP device name: tap-vm-XXXXX (alphanumeric + hyphen only)
+                if let Some(idx) = line.find("tap-vm-") {
+                    let rest = &line[idx..];
+                    let end = rest.find(|c: char| !c.is_alphanumeric() && c != '-')
+                        .unwrap_or(rest.len());
+                    tap_device = Some(rest[..end].to_string());
                 }
                 if clone_time_ms.is_some() && tap_device.is_some() {
                     break;
@@ -283,34 +394,30 @@ async fn clone_vm(snapshot: &str, name: &str) -> CloneMetrics {
     }
 }
 
-async fn wait_for_nginx(tap_device: &str) -> Option<u64> {
+async fn poll_health_check(url: &str, timeout_secs: u64, interface: Option<&str>) -> Result<u64> {
     let start = Instant::now();
-    let max_attempts = 30;
+    let timeout = tokio::time::Duration::from_secs(timeout_secs);
 
-    for _ in 0..max_attempts {
-        let output = Command::new("curl")
-            .args(&[
-                "-s",
-                "-m", "1",
-                "--interface", tap_device,
-                "http://172.16.0.202",  // Guest IP
-            ])
-            .output()
-            .await;
+    while start.elapsed() < timeout {
+        let mut cmd = Command::new("curl");
+        cmd.args(&["-s", "-f", "-m", "1"]);
 
-        if let Ok(output) = output {
+        if let Some(iface) = interface {
+            cmd.args(&["--interface", iface]);
+        }
+
+        cmd.arg(url);
+
+        if let Ok(output) = cmd.output().await {
             if output.status.success() {
-                let body = String::from_utf8_lossy(&output.stdout);
-                if body.to_lowercase().contains("nginx") {
-                    return Some(start.elapsed().as_millis() as u64);
-                }
+                return Ok(start.elapsed().as_millis() as u64);
             }
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
-    None
+    anyhow::bail!("Health check timeout after {}s", timeout_secs)
 }
 
 fn print_summary(metrics: &[CloneMetrics]) {
@@ -356,4 +463,31 @@ fn print_summary(metrics: &[CloneMetrics]) {
             println!("  {}: {}", m.name, m.error.as_ref().unwrap());
         }
     }
+}
+
+#[derive(Deserialize)]
+struct SnapshotConfig {
+    metadata: SnapshotMetadata,
+}
+
+#[derive(Deserialize)]
+struct SnapshotMetadata {
+    network_config: NetworkConfig,
+}
+
+#[derive(Deserialize)]
+struct NetworkConfig {
+    guest_ip: String,
+}
+
+async fn read_snapshot_guest_ip(snapshot_name: &str) -> Result<String> {
+    let config_path = paths::snapshot_dir().join(snapshot_name).join("config.json");
+    let config_data = tokio::fs::read_to_string(&config_path)
+        .await
+        .with_context(|| format!("reading snapshot config: {}", config_path.display()))?;
+
+    let config: SnapshotConfig = serde_json::from_str(&config_data)
+        .with_context(|| format!("parsing snapshot config: {}", config_path.display()))?;
+
+    Ok(config.metadata.network_config.guest_ip)
 }

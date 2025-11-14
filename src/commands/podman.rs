@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::cli::{PodmanArgs, PodmanCommands, RunArgs};
 use crate::firecracker::VmManager;
@@ -253,10 +253,25 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     vm_state.config.network = serde_json::to_value(&network_config)
         .context("serializing network config")?;
 
+    // Get Firecracker PID
+    match vm_manager.pid() {
+        Ok(pid) => {
+            info!("Successfully captured Firecracker PID: {}", pid);
+            vm_state.pid = Some(pid);
+        }
+        Err(e) => {
+            warn!("Failed to get Firecracker PID: {}", e);
+            vm_state.pid = None;
+        }
+    }
+
     vm_state.status = VmStatus::Running;
     state_manager.save_state(&vm_state).await?;
 
     info!(vm_id = %vm_id, "VM started successfully");
+
+    // Spawn health monitor task
+    crate::health::spawn_health_monitor(vm_id.clone(), vm_state.pid);
 
     // Note: No need for slirp4netns - we use static IP + NAT routing
     // TAP device is already configured with IP and iptables rules in network setup
