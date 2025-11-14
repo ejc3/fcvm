@@ -13,6 +13,7 @@ pub struct VmManager {
     vm_id: String,
     socket_path: PathBuf,
     log_path: Option<PathBuf>,
+    namespace_id: Option<String>,
     process: Option<Child>,
     client: Option<FirecrackerClient>,
 }
@@ -23,9 +24,18 @@ impl VmManager {
             vm_id,
             socket_path,
             log_path,
+            namespace_id: None,
             process: None,
             client: None,
         }
+    }
+
+    /// Set the network namespace for this VM
+    ///
+    /// When set, Firecracker will be launched inside the specified network namespace
+    /// using setns() before exec. This isolates the VM's network stack.
+    pub fn set_namespace(&mut self, namespace_id: String) {
+        self.namespace_id = Some(namespace_id);
     }
 
     /// Start the Firecracker process
@@ -58,6 +68,41 @@ impl VmManager {
 
         // Disable seccomp for now (can enable later for production)
         cmd.arg("--no-seccomp");
+
+        // Setup namespace isolation if specified
+        if let Some(ref ns_id) = self.namespace_id {
+            let ns_path = format!("/var/run/netns/{}", ns_id);
+            info!(vm_id = %self.vm_id, namespace = %ns_id, "entering network namespace");
+
+            // Use pre_exec to enter namespace before Firecracker starts
+            unsafe {
+                cmd.pre_exec(move || {
+                    use nix::fcntl::{open, OFlag};
+                    use nix::sched::{setns, CloneFlags};
+                    use nix::sys::stat::Mode;
+
+                    // Open namespace file descriptor
+                    let ns_fd = open(
+                        ns_path.as_str(),
+                        OFlag::O_RDONLY,
+                        Mode::empty()
+                    ).map_err(|e| std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("failed to open namespace {}: {}", ns_path, e)
+                    ))?;
+
+                    // Enter the network namespace
+                    setns(ns_fd, CloneFlags::CLONE_NEWNET).map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("failed to enter namespace: {}", e)
+                        )
+                    })?;
+
+                    Ok(())
+                });
+            }
+        }
 
         // Spawn process
         cmd.stdout(Stdio::piped());
