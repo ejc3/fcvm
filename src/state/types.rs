@@ -40,6 +40,12 @@ pub struct VmConfig {
     pub network: serde_json::Value,
     pub volumes: Vec<String>,
     pub env: Vec<String>,
+    #[serde(default = "default_health_check_path")]
+    pub health_check_path: String,
+}
+
+fn default_health_check_path() -> String {
+    "/".to_string()
 }
 
 impl VmState {
@@ -60,6 +66,7 @@ impl VmState {
                 network: serde_json::Value::Null,
                 volumes: Vec::new(),
                 env: Vec::new(),
+                health_check_path: default_health_check_path(),
             },
         }
     }
