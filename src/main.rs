@@ -21,6 +21,7 @@ async fn main() -> Result<()> {
         Commands::Podman(args) => commands::cmd_podman(args).await,
         Commands::Snapshot(args) => commands::cmd_snapshot(args).await,
         Commands::Snapshots => commands::cmd_snapshots().await,
+        Commands::Test(args) => commands::cmd_test(args).await,
     };
 
     // Handle errors
