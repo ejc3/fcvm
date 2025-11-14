@@ -23,7 +23,10 @@ struct VmInfo {
 }
 
 pub async fn cmd_ls(args: LsArgs) -> Result<()> {
-    info!("fcvm ls");
+    // Only log in non-JSON mode to avoid mixing logs with JSON output
+    if !args.json {
+        info!("fcvm ls");
+    }
     let state_manager = StateManager::new(paths::state_dir());
     let mut vms = state_manager.list_vms().await?;
 
