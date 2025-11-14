@@ -106,11 +106,11 @@ impl UffdServer {
                             info!(vm_id = %vm_id, "new VM connection");
 
                             // Convert tokio UnixStream to std UnixStream for SCM_RIGHTS
-                            let std_stream = stream.into_std()
+                            let mut std_stream = stream.into_std()
                                 .context("converting to std stream")?;
 
                             // Receive UFFD and mappings for this VM
-                            match receive_uffd_and_mappings(&mut std::os::unix::net::UnixStream::from(std_stream)) {
+                            match receive_uffd_and_mappings(&mut std_stream) {
                                 Ok((uffd, mappings)) => {
                                     info!(
                                         vm_id = %vm_id,
@@ -227,7 +227,7 @@ async fn handle_vm_page_faults(
             match event {
                 Event::Pagefault { addr, .. } => {
                     fault_count += 1;
-                    if fault_count % 1000 == 0 {
+                    if fault_count.is_multiple_of(1000) {
                         info!(vm_id = %vm_id, fault_count, "served page faults");
                     }
 

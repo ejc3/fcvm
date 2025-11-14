@@ -19,7 +19,6 @@ pub async fn cmd_test(args: TestArgs) -> Result<()> {
                 &stress_args.snapshot,
                 stress_args.num_clones,
                 stress_args.batch_size,
-                &stress_args.health_check_path,
                 stress_args.timeout,
                 stress_args.clean,
                 &stress_args.baseline_name,
@@ -34,7 +33,6 @@ async fn cmd_stress_test(
     snapshot: &str,
     num_clones: usize,
     batch_size: usize,
-    health_check_path: &str,
     timeout: u64,
     clean: bool,
     baseline_name: &str,
@@ -47,7 +45,6 @@ async fn cmd_stress_test(
     println!("Snapshot: {}", snapshot);
     println!("Clones: {}", num_clones);
     println!("Batch size: {}", batch_size);
-    println!("Health check path: {}", health_check_path);
     println!("Timeout: {}s", timeout);
     println!("Baseline VM: {}", baseline_name);
     println!();
@@ -60,7 +57,7 @@ async fn cmd_stress_test(
     let baseline_vm = if clean {
         println!("Starting fresh baseline VM...");
 
-        let (vm_proc, baseline_ip) = start_baseline_vm(baseline_name, health_check_path, timeout).await
+        let (vm_proc, baseline_ip) = start_baseline_vm(baseline_name, timeout).await
             .context("Failed to start baseline VM - health check did not pass")?;
         println!("✓ Baseline VM started and healthy at {}", baseline_ip);
 
@@ -78,8 +75,7 @@ async fn cmd_stress_test(
 
     // Step 3: Read guest IP from snapshot config
     let guest_ip = read_snapshot_guest_ip(snapshot).await?;
-    let health_url = format!("http://{}{}", guest_ip, health_check_path);
-    println!("Clone health check URL: {} (from snapshot)", health_url);
+    println!("Clone health check: http://{}/ (from snapshot)", guest_ip);
     println!();
 
     // Step 4: Start memory server in background
@@ -89,7 +85,7 @@ async fn cmd_stress_test(
     println!();
 
     // Step 5: Run stress test
-    let metrics = run_stress_test(snapshot, num_clones, batch_size, &health_url, timeout).await?;
+    let metrics = run_stress_test(snapshot, num_clones, batch_size, timeout).await?;
 
     // Step 6: Print summary
     print_summary(&metrics);
@@ -126,7 +122,6 @@ async fn cleanup_all() -> Result<()> {
 
 async fn start_baseline_vm(
     vm_name: &str,
-    health_check_path: &str,
     timeout: u64,
 ) -> Result<(tokio::process::Child, String)> {
     println!("  Starting VM '{}'...", vm_name);
@@ -137,8 +132,6 @@ async fn start_baseline_vm(
         .arg("run")
         .arg("--name")
         .arg(vm_name)
-        .arg("--mode")
-        .arg("rootless")
         .arg("nginx:alpine")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -225,7 +218,6 @@ async fn run_stress_test(
     snapshot: &str,
     num_clones: usize,
     batch_size: usize,
-    health_check_url: &str,
     timeout: u64,
 ) -> Result<Vec<CloneMetrics>> {
     let mut all_metrics = Vec::new();
@@ -313,8 +305,6 @@ async fn clone_vm(snapshot: &str, name: &str) -> CloneMetrics {
         .arg(snapshot)
         .arg("--name")
         .arg(name)
-        .arg("--mode")
-        .arg("rootless")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
