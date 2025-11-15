@@ -9,6 +9,17 @@ use tracing::info;
 use crate::cli::TestArgs;
 use crate::paths;
 
+/// Helper to create fcvm subprocess command with --sub-process flag
+/// All test harness commands that spawn fcvm should use this helper
+/// to ensure subprocess logging is consistent (no duplicate timestamps)
+fn fcvm_subprocess() -> Command {
+    let current_exe = std::env::current_exe()
+        .expect("failed to get current executable path");
+    let mut cmd = Command::new(current_exe);
+    cmd.arg("--sub-process");  // Disable timestamps/level in subprocess
+    cmd
+}
+
 pub async fn cmd_test(args: TestArgs) -> Result<()> {
     use crate::cli::TestCommands;
 
@@ -141,7 +152,7 @@ async fn start_baseline_vm(
     println!("  Starting VM '{}'...", vm_name);
 
     // Note: Don't use sudo - stress test command itself is run with sudo
-    let mut cmd = Command::new("./target/release/fcvm");
+    let mut cmd = fcvm_subprocess();
     cmd.arg("podman")
         .arg("run")
         .arg("--name")
@@ -187,7 +198,7 @@ async fn start_baseline_vm(
 
 async fn create_snapshot_by_pid(pid: u32, snapshot_name: &str) -> Result<()> {
     // Note: Don't use sudo - test command itself is run with sudo
-    let output = Command::new("./target/release/fcvm")
+    let output = fcvm_subprocess()
         .arg("snapshot")
         .arg("create")
         .arg("--pid")
@@ -210,7 +221,7 @@ async fn create_snapshot_by_pid(pid: u32, snapshot_name: &str) -> Result<()> {
 
 async fn start_memory_server(snapshot: &str) -> Result<(tokio::process::Child, u32)> {
     // Note: Don't use sudo - test command itself is run with sudo
-    let mut cmd = Command::new("./target/release/fcvm");
+    let mut cmd = fcvm_subprocess();
     cmd.arg("snapshot")
         .arg("serve")
         .arg(snapshot)
@@ -381,7 +392,7 @@ async fn clone_vm(serve_pid: u32, name: &str) -> CloneMetrics {
 
     // Spawn fcvm snapshot run using serve PID
     // Note: Don't use sudo - test command itself is run with sudo
-    let result = Command::new("./target/release/fcvm")
+    let result = fcvm_subprocess()
         .args([
             "snapshot",
             "run",
@@ -390,7 +401,6 @@ async fn clone_vm(serve_pid: u32, name: &str) -> CloneMetrics {
             "--name",
             name,
         ])
-        .env("RUST_LOG", "info")
         .spawn();
 
     match result {
@@ -426,7 +436,7 @@ async fn poll_health_check_by_pid(pid: u32, timeout_secs: u64) -> Result<u64> {
     while start.elapsed() < timeout {
         // Call fcvm ls --json --pid to check specific VM's health status
         // Note: Don't use sudo - test command itself is run with sudo
-        let output = Command::new("./target/release/fcvm")
+        let output = fcvm_subprocess()
             .args(["ls", "--json", "--pid", &pid.to_string()])
             .output()
             .await;
@@ -540,9 +550,8 @@ async fn cmd_sanity_test(args: crate::cli::SanityTestArgs) -> Result<()> {
     // Start the VM in background
     // Note: Don't use sudo here - the test command itself is run with sudo
     println!("Starting VM...");
-    let mut child = Command::new("./target/release/fcvm")
+    let mut child = fcvm_subprocess()
         .args([
-            "--sub-process",  // Disable timestamps/level in subprocess (parent will add them)
             "podman",
             "run",
             "--name",
@@ -624,7 +633,7 @@ async fn cmd_sanity_test(args: crate::cli::SanityTestArgs) -> Result<()> {
     };
 
     // Get guest IP from state for display
-    let guest_ip = Command::new("./target/release/fcvm")
+    let guest_ip = fcvm_subprocess()
         .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
         .output()
         .await
