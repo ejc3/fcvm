@@ -82,12 +82,12 @@ async fn cmd_stress_test(
 
     // Step 4: Start memory server in background
     println!("Starting memory server for '{}'...", snapshot);
-    let server_proc = start_memory_server(snapshot).await?;
-    println!("✓ Memory server ready");
+    let (server_proc, serve_pid) = start_memory_server(snapshot).await?;
+    println!("✓ Memory server ready (PID: {})", serve_pid);
     println!();
 
     // Step 5: Run stress test
-    let metrics = run_stress_test(snapshot, num_clones, batch_size, timeout).await?;
+    let metrics = run_stress_test(serve_pid, num_clones, batch_size, timeout).await?;
 
     // Step 6: Print summary
     print_summary(&metrics);
@@ -208,7 +208,7 @@ async fn create_snapshot_by_pid(pid: u32, snapshot_name: &str) -> Result<()> {
     Ok(())
 }
 
-async fn start_memory_server(snapshot: &str) -> Result<tokio::process::Child> {
+async fn start_memory_server(snapshot: &str) -> Result<(tokio::process::Child, u32)> {
     let mut cmd = Command::new("sudo");
     cmd.arg("./target/release/fcvm")
         .arg("snapshot")
@@ -218,6 +218,7 @@ async fn start_memory_server(snapshot: &str) -> Result<tokio::process::Child> {
         .stderr(Stdio::piped());
 
     let mut proc = cmd.spawn().context("spawning memory server")?;
+    let serve_pid = proc.id().context("getting serve process PID")?;
 
     // Wait for "UFFD server listening" message
     let stdout = proc.stdout.take().context("no stdout")?;
@@ -229,7 +230,7 @@ async fn start_memory_server(snapshot: &str) -> Result<tokio::process::Child> {
     while start.elapsed() < timeout {
         if let Some(line) = reader.next_line().await? {
             if line.contains("UFFD server listening") {
-                return Ok(proc);
+                return Ok((proc, serve_pid));
             }
         }
     }
@@ -238,7 +239,7 @@ async fn start_memory_server(snapshot: &str) -> Result<tokio::process::Child> {
 }
 
 async fn run_stress_test(
-    snapshot: &str,
+    serve_pid: u32,
     num_clones: usize,
     batch_size: usize,
     timeout: u64,
@@ -303,10 +304,9 @@ async fn run_stress_test(
         // Clone VMs concurrently
         let mut clone_tasks = Vec::new();
         for i in batch_start..batch_end {
-            let snapshot = snapshot.to_string();
             let name = format!("stress-{}", i);
             clone_tasks.push(tokio::spawn(async move {
-                clone_vm(&snapshot, &name).await
+                clone_vm(serve_pid, &name).await
             }));
         }
 
@@ -375,12 +375,20 @@ async fn run_stress_test(
     Ok(all_metrics)
 }
 
-async fn clone_vm(snapshot: &str, name: &str) -> CloneMetrics {
+async fn clone_vm(serve_pid: u32, name: &str) -> CloneMetrics {
     let start = Instant::now();
 
-    // Spawn fcvm snapshot run
+    // Spawn fcvm snapshot run using serve PID
     let result = Command::new("sudo")
-        .args(["./target/release/fcvm", "snapshot", "run", snapshot, "--name", name])
+        .args([
+            "./target/release/fcvm",
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid.to_string(),
+            "--name",
+            name,
+        ])
         .env("RUST_LOG", "info")
         .spawn();
 
@@ -546,70 +554,51 @@ async fn cmd_sanity_test(args: crate::cli::SanityTestArgs) -> Result<()> {
     let fcvm_pid = child.id().context("getting child PID")?;
     println!("  fcvm process started (PID: {})", fcvm_pid);
 
-    // Wait for VM to appear in fcvm ls
-    println!("  Waiting for VM to appear in state...");
+    // Wait for VM to appear in fcvm ls and become healthy
+    println!("  Waiting for VM to appear in state and become healthy...");
     let start = Instant::now();
     let timeout_duration = Duration::from_secs(args.timeout);
 
-    let firecracker_pid: u32;
-
-    // First, wait for VM to appear
-    loop {
-        if start.elapsed() > timeout_duration {
-            child.kill().await.ok();
-            anyhow::bail!("VM never appeared in fcvm ls within {}s", args.timeout);
-        }
-
-        let output = Command::new("sudo")
-            .args(["./target/release/fcvm", "ls", "--json"])
-            .output()
-            .await
-            .context("running fcvm ls")?;
-
-        if output.status.success() && !output.stdout.is_empty() {
-            if let Ok(vms) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout) {
-                // Get the VM with the highest PID (most recent)
-                if let Some(pid) = vms.iter()
-                    .filter_map(|vm| vm["pid"].as_u64())
-                    .max()
-                    .map(|p| p as u32) {
-                    firecracker_pid = pid;
-                    println!("  Found Firecracker PID: {}", firecracker_pid);
-                    break;
-                }
-            }
-        }
-
-        sleep(Duration::from_millis(500)).await;
-    }
-
-    // Now poll for health using PID filter
-    println!("  Waiting for VM to become healthy...");
     let mut healthy = false;
     let mut guest_ip = String::new();
 
     while start.elapsed() < timeout_duration {
+        // Check if child process is still alive
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                anyhow::bail!("fcvm process exited unexpectedly with status: {}", status);
+            }
+            Ok(None) => {
+                // Still running, continue
+            }
+            Err(e) => {
+                anyhow::bail!("Failed to check process status: {}", e);
+            }
+        }
+
+        // Query fcvm ls --json --pid to check this specific VM
         let output = Command::new("sudo")
-            .args(["./target/release/fcvm", "ls", "--json", "--pid", &firecracker_pid.to_string()])
+            .args(["./target/release/fcvm", "ls", "--json", "--pid", &fcvm_pid.to_string()])
             .output()
             .await
             .context("running fcvm ls --pid")?;
 
-        if !output.status.success() || output.stdout.is_empty() {
-            child.kill().await.ok();
-            anyhow::bail!("VM with PID {} disappeared", firecracker_pid);
-        }
+        if output.status.success() && !output.stdout.is_empty() {
+            if let Ok(vms) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout) {
+                if let Some(vm) = vms.first() {
+                    // Extract health status and guest IP
+                    if let Some(health_str) = vm["health"].as_str() {
+                        if let Some(ip) = vm["guest_ip"].as_str() {
+                            guest_ip = ip.to_string();
 
-        let vms: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
-            .context("parsing fcvm ls output")?;
-
-        let vm = vms.first().unwrap();
-        let health = vm["health"].as_str().unwrap();
-        guest_ip = vm["guest_ip"].as_str().unwrap().to_string();
-
-        if health == "Healthy" {
-            healthy = true;
-            break;
+                            if health_str == "Healthy" {
+                                healthy = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         sleep(Duration::from_millis(500)).await;
@@ -623,12 +612,12 @@ async fn cmd_sanity_test(args: crate::cli::SanityTestArgs) -> Result<()> {
         println!("✅ SANITY TEST PASSED!");
         println!("  VM became healthy in {:.1}s", elapsed.as_secs_f64());
         println!("  Guest IP: {}", guest_ip);
-        println!("  Firecracker PID: {}", firecracker_pid);
+        println!("  fcvm PID: {}", fcvm_pid);
         println!("  Health checks are working correctly!");
     } else {
         println!("❌ SANITY TEST FAILED!");
         println!("  VM did not become healthy within {}s", args.timeout);
-        println!("  Firecracker PID: {}", firecracker_pid);
+        println!("  fcvm PID: {}", fcvm_pid);
         println!("  Guest IP: {}", guest_ip);
     }
 
@@ -636,11 +625,8 @@ async fn cmd_sanity_test(args: crate::cli::SanityTestArgs) -> Result<()> {
     println!("\nStopping fcvm process...");
     child.kill().await.ok();
 
-    // Kill the specific Firecracker process
-    let _ = Command::new("sudo")
-        .args(["kill", "-9", &firecracker_pid.to_string()])
-        .output()
-        .await;
+    // Wait for it to actually exit
+    let _ = child.wait().await;
 
     if healthy {
         Ok(())

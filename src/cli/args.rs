@@ -232,7 +232,7 @@ pub struct LsArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// Filter by Firecracker PID
+    /// Filter by fcvm process PID
     #[arg(long)]
     pub pid: Option<u32>,
 }
