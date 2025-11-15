@@ -44,9 +44,9 @@ impl StateManager {
             .context("opening lock file")?;
 
         // Acquire exclusive lock (blocks if another process has lock)
-        use nix::fcntl::{flock, FlockArg};
-        use std::os::unix::io::AsRawFd;
-        flock(lock_fd.as_raw_fd(), FlockArg::LockExclusive)
+        use nix::fcntl::{Flock, FlockArg};
+        let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
+            .map_err(|(_, err)| err)
             .context("acquiring exclusive lock on state file")?;
 
         // Now we have exclusive access, perform the write
@@ -80,8 +80,9 @@ impl StateManager {
             Ok::<(), anyhow::Error>(())
         }.await;
 
-        // Release lock (happens automatically when lock_fd is dropped, but being explicit)
-        flock(lock_fd.as_raw_fd(), FlockArg::Unlock)
+        // Release lock (happens automatically when flock is dropped, but being explicit)
+        flock.unlock()
+            .map_err(|(_, err)| err)
             .context("releasing lock on state file")?;
 
         // Clean up lock file (optional, but keeps directory clean)

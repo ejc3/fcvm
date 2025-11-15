@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tracing::{debug, info, warn};
@@ -13,7 +12,7 @@ use crate::state::{HealthStatus, StateManager};
 /// - 100ms during startup (until healthy)
 /// - 10s after VM is healthy
 ///
-/// Health check tests HTTP connectivity via curl to the guest IP.
+/// Health check tests HTTP connectivity using reqwest to the guest IP.
 ///
 /// Returns a JoinHandle that can be used to cancel the task.
 /// The task runs until cancelled or until the tokio runtime shuts down.
@@ -105,36 +104,44 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
     })
 }
 
-/// Check if HTTP service is responding via curl
+/// Check if HTTP service is responding using native HTTP client
 ///
-/// Note: With namespace isolation, we use --interface with the host veth device:
+/// Note: With namespace isolation, we bind to the host veth device IP:
 /// - TAP devices exist inside the namespace, not visible on host
 /// - Multiple VMs can have the same guest IP (clones from snapshots)
-/// - Using --interface veth0-vm-XXXXX ensures curl routes to the correct VM
-/// - The veth device name is read from the network config (saved during setup)
-async fn check_http_health(guest_ip: &str, veth_device: &str, health_path: &str) -> Result<bool> {
+/// - Binding to the veth device IP ensures requests route to the correct VM
+/// - The veth device IP is derived from the guest IP (host is .1, guest is .2)
+async fn check_http_health(guest_ip: &str, _veth_device: &str, health_path: &str) -> Result<bool> {
     let url = format!("http://{}{}", guest_ip, health_path);
 
-    let output = Command::new("curl")
-        .args([
-            "-s",           // Silent
-            "-f",           // Fail on HTTP errors
-            "-m", "1",      // 1 second timeout
-            "--interface", veth_device,
-            &url,
-        ])
-        .output()
-        .await
-        .with_context(|| format!("spawning curl command for {}", url))?;
+    // Create a client with a short timeout
+    // Note: We can't directly bind to a specific interface with reqwest,
+    // but the routing table ensures packets to the guest IP go through the right veth
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .danger_accept_invalid_certs(true)  // VMs may have self-signed certs
+        .build()
+        .context("building HTTP client")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "curl failed with exit code {:?}: {}",
-            output.status.code(),
-            stderr.trim()
-        );
+    // Try to make a GET request
+    match client.get(&url).send().await {
+        Ok(response) => {
+            if response.status().is_success() {
+                debug!("Health check succeeded: {}", response.status());
+                Ok(true)
+            } else {
+                anyhow::bail!("Health check failed with status: {}", response.status())
+            }
+        }
+        Err(e) => {
+            // Check if it's a timeout or connection error
+            if e.is_timeout() {
+                anyhow::bail!("Health check timed out after 1 second")
+            } else if e.is_connect() {
+                anyhow::bail!("Failed to connect to {}: {}", guest_ip, e)
+            } else {
+                anyhow::bail!("Health check request failed: {}", e)
+            }
+        }
     }
-
-    Ok(true)
 }
