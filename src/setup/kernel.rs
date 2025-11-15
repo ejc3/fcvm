@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::paths;
 

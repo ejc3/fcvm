@@ -19,6 +19,7 @@ pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
         SnapshotCommands::Create(create_args) => cmd_snapshot_create(create_args).await,
         SnapshotCommands::Serve(serve_args) => cmd_snapshot_serve(serve_args).await,
         SnapshotCommands::Run(run_args) => cmd_snapshot_run(run_args).await,
+        SnapshotCommands::Ls => cmd_snapshot_ls().await,
     }
 }
 
@@ -209,22 +210,112 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
         "loaded snapshot configuration"
     );
 
-    // Create and start UFFD server
-    let server = UffdServer::new(args.snapshot_name.clone(), &snapshot_config.memory_path)
+    // Generate unique socket name with PID to allow multiple serves per snapshot
+    let my_pid = std::process::id();
+    let socket_path = paths::base_dir().join(format!(
+        "uffd-{}-{}.sock",
+        args.snapshot_name, my_pid
+    ));
+
+    // Create UFFD server with custom socket path
+    let server = UffdServer::new_with_path(
+        args.snapshot_name.clone(),
+        &snapshot_config.memory_path,
+        &socket_path,
+    )
+    .await
+    .context("creating UFFD server")?;
+
+    // Save serve state for tracking
+    let serve_id = generate_vm_id();
+    let mut serve_state = VmState::new(serve_id.clone(), "".to_string(), 0, 0);
+    serve_state.pid = Some(my_pid);
+    serve_state.config.snapshot_name = Some(args.snapshot_name.clone());
+    serve_state.config.process_type = Some("serve".to_string());
+    serve_state.status = VmStatus::Running;
+
+    let state_manager = StateManager::new(paths::state_dir());
+    state_manager.init().await?;
+    state_manager
+        .save_state(&serve_state)
         .await
-        .context("creating UFFD server")?;
+        .context("saving serve state")?;
+
+    info!(
+        serve_id = %serve_id,
+        pid = my_pid,
+        "serve state saved"
+    );
 
     println!("Serving snapshot: {}", args.snapshot_name);
-    println!("  Socket: {}", server.socket_path().display());
+    println!("  Serve PID: {}", my_pid);
+    println!("  Socket: {}", socket_path.display());
     println!("  Memory: {} MB", snapshot_config.metadata.memory_mib);
     println!("  Waiting for VMs to connect...");
     println!();
-    println!("Clone VMs with: fcvm snapshot run {}", args.snapshot_name);
+    println!(
+        "Clone VMs with: fcvm snapshot run --pid {}",
+        my_pid
+    );
     println!("Press Ctrl-C to stop");
     println!();
 
-    // Run server (blocks until all VMs disconnect or Ctrl-C)
-    server.run().await.context("running UFFD server")?;
+    // Setup signal handlers
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+
+    // Run server in background task
+    let server_handle = tokio::spawn(async move { server.run().await });
+
+    // Wait for signal or server exit
+    tokio::select! {
+        _ = sigterm.recv() => {
+            info!("received SIGTERM");
+        }
+        _ = sigint.recv() => {
+            info!("received SIGINT");
+        }
+        result = server_handle => {
+            info!("server exited: {:?}", result);
+        }
+    }
+
+    println!("\nShutting down memory server...");
+
+    // Cleanup: Kill all clones that connected to THIS serve
+    info!("cleaning up clones connected to serve PID {}", my_pid);
+    let all_vms = state_manager.list_vms().await?;
+    let my_clones: Vec<_> = all_vms
+        .into_iter()
+        .filter(|vm| vm.config.serve_pid == Some(my_pid))
+        .collect();
+
+    if !my_clones.is_empty() {
+        println!("Killing {} clone(s)...", my_clones.len());
+        for clone in my_clones {
+            if let Some(pid) = clone.pid {
+                info!(
+                    "killing clone {} (PID {})",
+                    &clone.vm_id[..8.min(clone.vm_id.len())],
+                    pid
+                );
+                // Kill clone process
+                use std::process::Command;
+                let _ = Command::new("kill")
+                    .arg("-TERM")
+                    .arg(pid.to_string())
+                    .status();
+            }
+        }
+    }
+
+    // Clean up socket file
+    let _ = std::fs::remove_file(&socket_path);
+    info!("removed socket file: {}", socket_path.display());
+
+    // Delete serve state
+    let _ = state_manager.delete_state(&serve_id).await;
+    info!("deleted serve state");
 
     println!("Memory server stopped");
 
@@ -233,17 +324,33 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
 
 /// Run clone from snapshot
 async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
-    info!("Cloning VM from snapshot: {}", args.snapshot_name);
+    // Load serve state by PID to get snapshot name
+    let state_manager = StateManager::new(paths::state_dir());
+    let serve_state = state_manager
+        .load_state_by_pid(args.pid)
+        .await
+        .context("loading serve process state - is serve running?")?;
+
+    // Get snapshot name from serve state
+    let snapshot_name = serve_state
+        .config
+        .snapshot_name
+        .ok_or_else(|| anyhow::anyhow!("serve process has no snapshot_name"))?;
+
+    info!(
+        "Cloning VM from serve PID {} (snapshot: {})",
+        args.pid, snapshot_name
+    );
 
     // Load snapshot configuration
     let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
     let snapshot_config = snapshot_manager
-        .load_snapshot(&args.snapshot_name)
+        .load_snapshot(&snapshot_name)
         .await
         .context("loading snapshot configuration")?;
 
     info!(
-        snapshot = %args.snapshot_name,
+        snapshot = %snapshot_name,
         image = %snapshot_config.metadata.image,
         vcpu = snapshot_config.metadata.vcpu,
         mem_mib = snapshot_config.metadata.memory_mib,
@@ -254,10 +361,9 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     let vm_id = generate_vm_id();
     let vm_name = args.name.unwrap_or_else(|| {
         // Auto-generate: snapshot-name + random suffix
-        format!("{}-{}", args.snapshot_name, &vm_id[..6])
+        format!("{}-{}", snapshot_name, &vm_id[..6])
     });
 
-    let state_manager = StateManager::new(paths::state_dir());
     state_manager.init().await?;
 
     let mut vm_state = VmState::new(
@@ -268,6 +374,11 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     );
     vm_state.name = Some(vm_name.clone());
 
+    // Save snapshot tracking info in clone state
+    vm_state.config.snapshot_name = Some(snapshot_name.clone());
+    vm_state.config.process_type = Some("clone".to_string());
+    vm_state.config.serve_pid = Some(args.pid); // Track which serve spawned us!
+
     // Setup paths
     let data_dir = paths::vm_runtime_dir(&vm_id);
     tokio::fs::create_dir_all(&data_dir)
@@ -276,16 +387,16 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     let socket_path = data_dir.join("firecracker.sock");
 
-    // Check for running memory server
-    let uffd_socket = paths::base_dir().join(format!("uffd-{}.sock", args.snapshot_name));
+    // Check for running memory server using serve PID
+    let uffd_socket = paths::base_dir().join(format!("uffd-{}-{}.sock", snapshot_name, args.pid));
 
     if !uffd_socket.exists() {
         anyhow::bail!(
-            "Memory server not running for snapshot '{}'.\\n\\n\\\
-             Start it first in another terminal:\\n\\\
-             fcvm snapshot serve {}",
-            args.snapshot_name,
-            args.snapshot_name
+            "Memory server socket not found for serve PID {}.\\n\\n\\\
+             The serve process may have exited or not be ready yet.\\n\\\
+             Expected socket: {}",
+            args.pid,
+            uffd_socket.display()
         );
     }
 
@@ -428,7 +539,7 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     );
     println!(
         "✓ VM '{}' cloned from snapshot '{}'",
-        vm_name, args.snapshot_name
+        vm_name, snapshot_name
     );
     println!("  Memory pages shared via UFFD");
     println!("  Disk uses CoW overlay");
@@ -458,6 +569,55 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     let _ = vm_manager.kill().await;
     let _ = network.cleanup().await;
     let _ = state_manager.delete_state(&vm_id).await;
+
+    Ok(())
+}
+
+/// List running snapshot servers
+async fn cmd_snapshot_ls() -> Result<()> {
+    let state_manager = StateManager::new(paths::state_dir());
+    let all_vms = state_manager.list_vms().await?;
+
+    // Filter to serve processes only
+    let serves: Vec<_> = all_vms
+        .iter()
+        .filter(|vm| vm.config.process_type.as_deref() == Some("serve"))
+        .collect();
+
+    if serves.is_empty() {
+        println!("No snapshot servers running");
+        return Ok(());
+    }
+
+    // Print header
+    println!(
+        "{:<12} {:<10} {:<12} {:<20} {:<8}",
+        "SERVE_ID", "PID", "HEALTH", "SNAPSHOT", "CLONES"
+    );
+
+    // Print each serve with clone count
+    for serve in serves {
+        let serve_pid = serve.pid.unwrap_or(0);
+
+        // Count clones connected to this serve
+        let clone_count = all_vms
+            .iter()
+            .filter(|vm| vm.config.serve_pid == Some(serve_pid))
+            .count();
+
+        println!(
+            "{:<12} {:<10} {:<12} {:<20} {:<8}",
+            &serve.vm_id[..8.min(serve.vm_id.len())],
+            serve_pid,
+            format!("{:?}", serve.health_status),
+            serve
+                .config
+                .snapshot_name
+                .as_deref()
+                .unwrap_or("-"),
+            clone_count,
+        );
+    }
 
     Ok(())
 }

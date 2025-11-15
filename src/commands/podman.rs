@@ -1,13 +1,13 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::cli::{PodmanArgs, PodmanCommands, RunArgs};
 use crate::firecracker::VmManager;
 use crate::network::{NetworkManager, PortMapping, RootlessNetwork};
 use crate::paths;
-use crate::state::{generate_vm_id, StateManager, VmState, VmStatus};
+use crate::state::{generate_vm_id, StateManager, VmState};
 use crate::storage::DiskManager;
 
 /// Main dispatcher for podman commands

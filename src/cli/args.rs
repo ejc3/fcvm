@@ -106,6 +106,8 @@ pub enum SnapshotCommands {
     Serve(SnapshotServeArgs),
     /// Run a clone from a snapshot
     Run(SnapshotRunArgs),
+    /// List running snapshot servers
+    Ls,
 }
 
 #[derive(Args, Debug)]
@@ -131,8 +133,9 @@ pub struct SnapshotServeArgs {
 
 #[derive(Args, Debug)]
 pub struct SnapshotRunArgs {
-    /// Snapshot name to clone from
-    pub snapshot_name: String,
+    /// Serve process PID to clone from
+    #[arg(long)]
+    pub pid: u32,
 
     /// Optional: custom name for cloned VM (auto-generated if not provided)
     #[arg(long)]
