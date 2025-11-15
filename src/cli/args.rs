@@ -110,8 +110,13 @@ pub enum SnapshotCommands {
 
 #[derive(Args, Debug)]
 pub struct SnapshotCreateArgs {
-    /// VM name to snapshot
-    pub name: String,
+    /// VM name to snapshot (mutually exclusive with --pid)
+    #[arg(conflicts_with = "pid")]
+    pub name: Option<String>,
+
+    /// VM PID to snapshot (mutually exclusive with name)
+    #[arg(long, conflicts_with = "name")]
+    pub pid: Option<u32>,
 
     /// Optional: custom snapshot name (defaults to VM name)
     #[arg(long)]
@@ -167,6 +172,9 @@ pub struct TestArgs {
 pub enum TestCommands {
     /// Stress test snapshot/clone performance
     Stress(StressTestArgs),
+
+    /// Sanity test: start a single VM and verify health check passes
+    Sanity(SanityTestArgs),
 }
 
 #[derive(Args, Debug)]
@@ -200,6 +208,17 @@ pub struct StressTestArgs {
     pub verbose: bool,
 }
 
+#[derive(Args, Debug)]
+pub struct SanityTestArgs {
+    /// Image to use for the VM
+    #[arg(long, default_value = "nginx:alpine")]
+    pub image: String,
+
+    /// Timeout for health check in seconds
+    #[arg(long, default_value_t = 60)]
+    pub timeout: u64,
+}
+
 // ============================================================================
 // Ls Command
 // ============================================================================
@@ -209,4 +228,8 @@ pub struct LsArgs {
     /// Output in JSON format
     #[arg(long)]
     pub json: bool,
+
+    /// Filter by Firecracker PID
+    #[arg(long)]
+    pub pid: Option<u32>,
 }

@@ -229,24 +229,12 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .put_action(crate::firecracker::api::InstanceAction::InstanceStart)
         .await?;
 
-    // Save network config to VM state for snapshotting
-    vm_state.config.network = serde_json::to_value(&network_config)
-        .context("serializing network config")?;
-
-    // Get Firecracker PID
-    match vm_manager.pid() {
-        Ok(pid) => {
-            info!("Successfully captured Firecracker PID: {}", pid);
-            vm_state.pid = Some(pid);
-        }
-        Err(e) => {
-            warn!("Failed to get Firecracker PID: {}", e);
-            vm_state.pid = None;
-        }
-    }
-
-    vm_state.status = VmStatus::Running;
-    state_manager.save_state(&vm_state).await?;
+    // Save VM state with complete network configuration
+    super::common::save_vm_state_with_network(
+        &state_manager,
+        &mut vm_state,
+        &network_config,
+    ).await?;
 
     info!(vm_id = %vm_id, "VM started successfully");
 

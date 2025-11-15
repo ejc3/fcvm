@@ -109,12 +109,13 @@ async fn extract_kernel(src: &Path, dst: &Path) -> Result<()> {
         }
     }
 
-    warn!("extract-vmlinux not found, trying direct copy");
+    bail!(
+        "extract-vmlinux script not found. Please install it or download a pre-built kernel from Firecracker releases.
 
-    // Fallback: Just copy the kernel as-is (will likely fail with Firecracker)
-    tokio::fs::copy(src, dst)
-        .await
-        .context("copying kernel file")?;
+        To install extract-vmlinux:
+          sudo apt-get install linux-tools-generic
 
-    Ok(())
+        Or download a pre-built kernel:
+          wget https://github.com/firecracker-microvm/firecracker/releases/download/v1.13.1/vmlinux-5.10.217"
+    )
 }

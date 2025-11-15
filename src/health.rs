@@ -31,15 +31,18 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) {
                     HealthStatus::Unreachable
                 } else {
                     // Process exists, now check if application is responding
-                    // Get guest IP, TAP device, and health check path from state
+                    // Get guest IP, host veth device, and health check path from state
                     if let Ok(state) = state_manager.load_state(&vm_id).await {
-                        if let (Some(guest_ip), Some(tap_device)) = (
-                            state.config.network.get("guest_ip").and_then(|v| v.as_str()),
-                            state.config.network.get("tap_device").and_then(|v| v.as_str()),
-                        ) {
-                            // Try HTTP request via TAP device
+                        let guest_ip = state.config.network.get("guest_ip").and_then(|v| v.as_str());
+
+                        // Get veth device from network config (required for namespace isolation)
+                        let veth_device = state.config.network.get("host_veth")
+                            .and_then(|v| v.as_str());
+
+                        if let (Some(guest_ip), Some(veth)) = (guest_ip, veth_device) {
+                            // Try HTTP request via veth device
                             let health_path = &state.config.health_check_path;
-                            match check_http_health(guest_ip, tap_device, health_path).await {
+                            match check_http_health(guest_ip, veth, health_path).await {
                                 Ok(true) => HealthStatus::Healthy,
                                 Ok(false) => HealthStatus::Unhealthy,
                                 Err(_) => HealthStatus::Timeout,
@@ -79,13 +82,9 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) {
 /// - TAP devices exist inside the namespace, not visible on host
 /// - Multiple VMs can have the same guest IP (clones from snapshots)
 /// - Using --interface veth0-vm-XXXXX ensures curl routes to the correct VM
-/// - The veth device name is derived from the TAP device name (tap-vm-X → veth0-vm-X)
-async fn check_http_health(guest_ip: &str, tap_device: &str, health_path: &str) -> Result<bool, ()> {
+/// - The veth device name is read from the network config (saved during setup)
+async fn check_http_health(guest_ip: &str, veth_device: &str, health_path: &str) -> Result<bool, ()> {
     let url = format!("http://{}{}", guest_ip, health_path);
-
-    // Derive veth device name from TAP device name
-    // TAP: tap-vm-XXXXX → veth: veth0-vm-XXXXX
-    let veth_device = tap_device.replace("tap-", "veth0-");
 
     let output = Command::new("curl")
         .args([

@@ -75,6 +75,14 @@ impl StateManager {
             .ok_or_else(|| anyhow::anyhow!("VM not found: {}", name))
     }
 
+    /// Load VM state by PID
+    pub async fn load_state_by_pid(&self, pid: u32) -> Result<VmState> {
+        let vms = self.list_vms().await?;
+        vms.into_iter()
+            .find(|vm| vm.pid == Some(pid))
+            .ok_or_else(|| anyhow::anyhow!("VM not found with PID: {}", pid))
+    }
+
     /// List all VMs
     pub async fn list_vms(&self) -> Result<Vec<VmState>> {
         let mut vms = Vec::new();

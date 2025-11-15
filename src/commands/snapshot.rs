@@ -24,16 +24,28 @@ pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
 
 /// Create snapshot from running VM
 async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
-    info!("Creating snapshot from VM: {}", args.name);
-
-    let snapshot_name = args.tag.unwrap_or_else(|| args.name.clone());
-
-    // Load VM state by name
+    // Determine which VM to snapshot
     let state_manager = StateManager::new(paths::state_dir());
-    let vm_state = state_manager
-        .load_state_by_name(&args.name)
-        .await
-        .context("loading VM state")?;
+
+    let vm_state = if let Some(name) = &args.name {
+        info!("Creating snapshot from VM: {}", name);
+        state_manager
+            .load_state_by_name(name)
+            .await
+            .context("loading VM state by name")?
+    } else if let Some(pid) = args.pid {
+        info!("Creating snapshot from VM with PID: {}", pid);
+        state_manager
+            .load_state_by_pid(pid)
+            .await
+            .context("loading VM state by PID")?
+    } else {
+        anyhow::bail!("Either --name or --pid must be specified");
+    };
+
+    let snapshot_name = args.tag.unwrap_or_else(|| {
+        vm_state.name.clone().unwrap_or_else(|| vm_state.vm_id[..8].to_string())
+    });
 
     // Connect to running VM
     let socket_path = paths::vm_runtime_dir(&vm_state.vm_id).join("firecracker.sock");
@@ -133,9 +145,10 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             "snapshot created successfully"
         );
 
+        let vm_name = vm_state.name.as_deref().unwrap_or(&vm_state.vm_id[..8]);
         println!(
             "✓ Snapshot '{}' created from VM '{}'",
-            snapshot_name, args.name
+            snapshot_name, vm_name
         );
         println!("  Memory: {} MB", snapshot_config.metadata.memory_mib);
         println!("  Files:");
@@ -143,7 +156,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         println!("    {}", snapshot_config.disk_path.display());
         println!(
             "\nOriginal VM '{}' has been resumed and is still running.",
-            args.name
+            vm_name
         );
 
         Ok::<_, anyhow::Error>(())
@@ -159,9 +172,10 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         .await;
 
     if let Err(e) = resume_result {
+        let vm_name = vm_state.name.as_deref().unwrap_or(&vm_state.vm_id[..8]);
         warn!(
             error = %e,
-            vm = %args.name,
+            vm = %vm_name,
             "failed to resume VM after snapshot"
         );
         if snapshot_result.is_ok() {
@@ -334,7 +348,7 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         "CoW disk prepared from snapshot"
     );
 
-    // Start Firecracker VM (disable logging for now to avoid permission issues)
+    // Start Firecracker VM (disable file logging - not accessible from inside namespace)
     let mut vm_manager = VmManager::new(vm_id.clone(), socket_path.clone(), None);
 
     // Configure namespace isolation if network provides one
@@ -353,16 +367,6 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         .context("starting Firecracker")?;
 
     let client = vm_manager.client()?;
-    if let Ok(pid) = vm_manager.pid() {
-        vm_state.pid = Some(pid);
-    }
-
-    // Save network configuration to state (for fcvm ls to display)
-    vm_state.config.network = serde_json::json!({
-        "guest_ip": network_config.guest_ip,
-        "tap_device": network_config.tap_device,
-    });
-
     // Load snapshot with UFFD backend and network override
     use crate::firecracker::api::{
         DrivePatch, MemBackend, NetworkOverride, SnapshotLoad, VmState as ApiVmState,
@@ -410,11 +414,12 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         .await
         .context("resuming VM after snapshot load")?;
 
-    vm_state.status = VmStatus::Running;
-    state_manager
-        .save_state(&vm_state)
-        .await
-        .context("persisting snapshot clone state")?;
+    // Save VM state with complete network configuration
+    super::common::save_vm_state_with_network(
+        &state_manager,
+        &mut vm_state,
+        &network_config,
+    ).await?;
 
     info!(
         vm_id = %vm_id,
