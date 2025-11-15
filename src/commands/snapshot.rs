@@ -100,18 +100,32 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             .await
             .context("creating Firecracker snapshot")?;
 
-        // Copy the VM's disk to snapshot directory
+        // Copy the VM's disk to snapshot directory using reflink (instant CoW copy)
+        // REQUIRES btrfs filesystem - no fallback to regular copy
         info!("Copying VM disk to snapshot directory");
         let vm_disk_path = paths::vm_runtime_dir(&vm_state.vm_id).join("disks/rootfs.ext4");
 
         if vm_disk_path.exists() {
-            tokio::fs::copy(&vm_disk_path, &disk_path)
+            // Use cp --reflink=always for instant CoW copy on btrfs
+            let output = tokio::process::Command::new("cp")
+                .arg("--reflink=always")
+                .arg(&vm_disk_path)
+                .arg(&disk_path)
+                .output()
                 .await
-                .context("copying VM disk to snapshot")?;
+                .context("executing cp command")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!(
+                    "Failed to create reflink copy. Ensure /mnt/fcvm-btrfs is a btrfs filesystem. Error: {}",
+                    stderr
+                );
+            }
             info!(
                 source = %vm_disk_path.display(),
                 dest = %disk_path.display(),
-                "VM disk copied to snapshot"
+                "VM disk copied to snapshot using reflink"
             );
         } else {
             anyhow::bail!("VM disk not found at {}", vm_disk_path.display());
@@ -544,8 +558,8 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     println!("  Memory pages shared via UFFD");
     println!("  Disk uses CoW overlay");
 
-    // Spawn health monitor task
-    crate::health::spawn_health_monitor(vm_id.clone(), vm_state.pid);
+    // Spawn health monitor task (store handle for cancellation)
+    let health_monitor_handle = crate::health::spawn_health_monitor(vm_id.clone(), vm_state.pid);
 
     // Setup signal handlers
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -566,9 +580,24 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Cleanup
     info!("cleaning up resources");
-    let _ = vm_manager.kill().await;
-    let _ = network.cleanup().await;
-    let _ = state_manager.delete_state(&vm_id).await;
+
+    // Cancel health monitor task first
+    health_monitor_handle.abort();
+
+    // Kill VM process
+    if let Err(e) = vm_manager.kill().await {
+        warn!("failed to kill VM process: {}", e);
+    }
+
+    // Cleanup network
+    if let Err(e) = network.cleanup().await {
+        warn!("failed to cleanup network: {}", e);
+    }
+
+    // Delete state file
+    if let Err(e) = state_manager.delete_state(&vm_id).await {
+        warn!("failed to delete state file: {}", e);
+    }
 
     Ok(())
 }

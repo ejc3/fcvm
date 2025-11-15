@@ -5,6 +5,11 @@ use tokio::fs;
 use super::types::VmState;
 
 /// Manages VM state persistence
+///
+/// PID Tracking Note:
+/// The `pid` field in VmState stores the fcvm process PID (from std::process::id()),
+/// NOT the Firecracker child process PID. This allows external tools and monitors
+/// to track the fcvm management process that controls the VM lifecycle.
 pub struct StateManager {
     state_dir: PathBuf,
 }
@@ -23,27 +28,66 @@ impl StateManager {
     }
 
     /// Save VM state atomically (write to temp file, then rename)
+    /// Uses file locking to prevent concurrent writes
     pub async fn save_state(&self, state: &VmState) -> Result<()> {
         let state_file = self.state_dir.join(format!("{}.json", state.vm_id));
         let temp_file = self.state_dir.join(format!("{}.json.tmp", state.vm_id));
+        let lock_file = self.state_dir.join(format!("{}.json.lock", state.vm_id));
 
-        // Update last_updated timestamp before saving
-        let mut state = state.clone();
-        state.last_updated = chrono::Utc::now();
+        // Create/open lock file for exclusive locking
+        use std::os::unix::fs::OpenOptionsExt;
+        let lock_fd = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .mode(0o600)
+            .open(&lock_file)
+            .context("opening lock file")?;
 
-        let state_json = serde_json::to_string_pretty(&state)?;
+        // Acquire exclusive lock (blocks if another process has lock)
+        use nix::fcntl::{flock, FlockArg};
+        use std::os::unix::io::AsRawFd;
+        flock(lock_fd.as_raw_fd(), FlockArg::LockExclusive)
+            .context("acquiring exclusive lock on state file")?;
 
-        // Write to temp file first
-        fs::write(&temp_file, &state_json)
-            .await
-            .context("writing temp state file")?;
+        // Now we have exclusive access, perform the write
+        let result = async {
+            // Update last_updated timestamp before saving
+            let mut state = state.clone();
+            state.last_updated = chrono::Utc::now();
 
-        // Atomic rename (this is an atomic operation on Unix)
-        fs::rename(&temp_file, &state_file)
-            .await
-            .context("renaming temp state file")?;
+            let state_json = serde_json::to_string_pretty(&state)?;
 
-        Ok(())
+            // Write to temp file first
+            fs::write(&temp_file, &state_json)
+                .await
+                .context("writing temp state file")?;
+
+            // Set file permissions to 0600 (owner read/write only) for security
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let permissions = std::fs::Permissions::from_mode(0o600);
+                tokio::fs::set_permissions(&temp_file, permissions)
+                    .await
+                    .context("setting file permissions on state file")?;
+            }
+
+            // Atomic rename (this is an atomic operation on Unix)
+            fs::rename(&temp_file, &state_file)
+                .await
+                .context("renaming temp state file")?;
+
+            Ok::<(), anyhow::Error>(())
+        }.await;
+
+        // Release lock (happens automatically when lock_fd is dropped, but being explicit)
+        flock(lock_fd.as_raw_fd(), FlockArg::Unlock)
+            .context("releasing lock on state file")?;
+
+        // Clean up lock file (optional, but keeps directory clean)
+        let _ = std::fs::remove_file(&lock_file);
+
+        result
     }
 
     /// Load VM state
