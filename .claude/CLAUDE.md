@@ -326,6 +326,19 @@ fcvm memory-server <name>   # Start memory server for snapshot (enables sharing)
    - ✅ Updated stress test script for self-contained lifecycle management
    - **Performance verification**: 10 VMs @ ~200ms clone time, 100% success rate
 
+14. **Hierarchical Logging Architecture** (2025-11-15)
+   - ✅ Added hierarchical target tags showing process nesting
+   - ✅ Strip Firecracker timestamps and `[anonymous-instance:*]` prefixes
+   - ✅ Clean log output when piped to files (no ANSI escape codes)
+   - ✅ Smart color handling: parent uses colors for TTY only, subprocesses never use colors
+   - ✅ Added `atty` dependency to detect when output is piped
+   - **Logging hierarchy**:
+     - `sanity-baseline-vm:` (test harness)
+     - `sanity-baseline-vm: vm:` (VM manager)
+     - `sanity-baseline-vm: firecracker:` (Firecracker process)
+     - `sanity-baseline-vm: health-monitor:` (health checks)
+   - **Result**: Production-ready logging that works in terminals and log files
+
 ### 🚧 In Progress
 
 None - all major features working!
