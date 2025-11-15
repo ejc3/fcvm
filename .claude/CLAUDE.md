@@ -3,6 +3,138 @@
 ## Overview
 fcvm is a Firecracker VM manager for running Podman containers in lightweight microVMs. This document tracks implementation findings and decisions.
 
+## PID-Based Process Management (2025-11-14)
+
+**Core Principle:** All fcvm processes store their own PID (via `std::process::id()`), not child process PIDs.
+
+### Process Types
+
+fcvm tracks three types of managed processes:
+
+1. **VM processes** (`fcvm podman run`)
+   - `process_type`: "vm"
+   - Runs Firecracker + container
+   - Health check: HTTP to guest
+
+2. **Serve processes** (`fcvm snapshot serve`)
+   - `process_type`: "serve"
+   - Runs UFFD memory server
+   - Health check: process existence
+   - Tracks which clones connected via `serve_pid` field
+
+3. **Clone processes** (`fcvm snapshot run`)
+   - `process_type`: "clone"
+   - Runs Firecracker with UFFD memory
+   - Health check: HTTP to guest
+   - References parent serve via `serve_pid` field
+
+### Command Workflows
+
+#### Run a VM
+```bash
+# Start baseline VM
+fcvm podman run --name my-vm nginx:alpine
+
+# Track via PID (fcvm process PID, not Firecracker PID)
+fcvm ls --pid 12345
+```
+
+#### Create and Serve Snapshot
+```bash
+# Create snapshot from running VM (by PID or name)
+fcvm snapshot create --pid 12345 --tag my-snapshot
+
+# Start serve process (saves state, prints PID)
+fcvm snapshot serve my-snapshot
+# Output: Serve PID: 67890
+# Socket: /mnt/fcvm-btrfs/uffd-my-snapshot-67890.sock
+
+# List all serve processes
+fcvm snapshot ls
+# Shows: SERVE_ID, PID, HEALTH, SNAPSHOT, CLONES
+```
+
+#### Clone from Serve
+```bash
+# Clone using serve PID (not snapshot name!)
+fcvm snapshot run --pid 67890 --name clone1
+fcvm snapshot run --pid 67890 --name clone2
+
+# Clones automatically track parent serve
+# On serve exit, all clones are automatically killed
+```
+
+### State Management
+
+**VmConfig fields:**
+```rust
+pub struct VmConfig {
+    pub snapshot_name: Option<String>,  // Which snapshot
+    pub process_type: Option<String>,   // "vm" | "serve" | "clone"
+    pub serve_pid: Option<u32>,         // For clones: parent serve PID
+    // ... other fields
+}
+```
+
+**VmState fields:**
+```rust
+pub struct VmState {
+    pub pid: Option<u32>,  // fcvm process PID (from std::process::id())
+    // ... other fields
+}
+```
+
+### Cleanup Architecture
+
+**Serve process cleanup (on SIGTERM/SIGINT):**
+1. Query state manager for all VMs where `serve_pid == my_pid`
+2. Kill each clone process: `kill -TERM <clone_pid>`
+3. Remove socket file: `/mnt/fcvm-btrfs/uffd-{snapshot}-{pid}.sock`
+4. Delete serve state from state manager
+
+**Benefits:**
+- No orphaned clones when serve exits
+- Explicit process ownership model
+- Tests track processes via PIDs (no stdout parsing)
+- Multiple serves per snapshot supported
+
+### Test Integration
+
+Tests spawn processes and track PIDs directly:
+
+```rust
+// 1. Start baseline VM
+let baseline_proc = Command::new("sudo")
+    .args(["fcvm", "podman", "run", ...])
+    .spawn()?;
+let baseline_pid = baseline_proc.id();  // fcvm process PID
+
+// 2. Wait for healthy
+poll_health_by_pid(baseline_pid).await?;
+
+// 3. Create snapshot
+Command::new("sudo")
+    .args(["fcvm", "snapshot", "create", "--pid", &baseline_pid.to_string()])
+    .status()?;
+
+// 4. Start serve
+let serve_proc = Command::new("sudo")
+    .args(["fcvm", "snapshot", "serve", "my-snap"])
+    .spawn()?;
+let serve_pid = serve_proc.id();
+
+// 5. Clone
+let clone_proc = Command::new("sudo")
+    .args(["fcvm", "snapshot", "run", "--pid", &serve_pid.to_string()])
+    .spawn()?;
+let clone_pid = clone_proc.id();
+
+// 6. Wait for clone healthy
+poll_health_by_pid(clone_pid).await?;
+```
+
+**No stdout/stderr parsing needed** - PIDs are known from process spawning!
+
 ## Architecture Decisions
 
 ### Project Structure - A+ Rust Pattern
