@@ -114,8 +114,7 @@ impl VmManager {
                         ns_path_cstr.as_c_str(),
                         OFlag::O_RDONLY,
                         Mode::empty()
-                    ).map_err(|e| std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    ).map_err(|e| std::io::Error::other(
                         format!("failed to open namespace: {}", e)
                     ))?;
 
@@ -126,8 +125,7 @@ impl VmManager {
 
                     // Enter the network namespace
                     setns(&ns_fd, CloneFlags::CLONE_NEWNET).map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        std::io::Error::other(
                             format!("failed to enter namespace: {}", e)
                         )
                     })?;

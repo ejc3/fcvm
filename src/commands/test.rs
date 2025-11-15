@@ -344,10 +344,7 @@ async fn run_stress_test(
             if let (None, Some(pid)) = (&m.error, m.pid) {
                 // VM started successfully, check its health
                 health_tasks.push(tokio::spawn(async move {
-                    match poll_health_check_by_pid(pid, timeout).await {
-                        Ok(ms) => Some(ms),
-                        Err(_) => None,  // Health check timeout
-                    }
+                    poll_health_check_by_pid(pid, timeout).await.ok()
                 }));
             } else {
                 // VM failed to start, no health check needed
