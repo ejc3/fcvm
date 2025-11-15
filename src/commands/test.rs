@@ -543,6 +543,8 @@ async fn cmd_sanity_test(args: crate::cli::SanityTestArgs) -> Result<()> {
             "./target/release/fcvm",
             "podman",
             "run",
+            "--name",
+            "sanity-test-vm",
             &args.image,
         ])
         .env("RUST_LOG", "info")
