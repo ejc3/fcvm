@@ -39,6 +39,7 @@ impl StateManager {
         let lock_fd = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(true)
             .mode(0o600)
             .open(&lock_file)
             .context("opening lock file")?;
