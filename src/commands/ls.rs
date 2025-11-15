@@ -5,7 +5,7 @@ use tracing::info;
 
 use crate::cli::LsArgs;
 use crate::paths;
-use crate::state::{StateManager, VmStatus};
+use crate::state::StateManager;
 
 const STALE_THRESHOLD_SECS: i64 = 300; // 5 minutes
 
@@ -18,6 +18,7 @@ struct VmInfo {
     tap_device: String,
     image: String,
     mem_mb: u32,
+    pid: Option<u32>,
     stale: bool,
     last_updated: String,
 }
@@ -33,16 +34,11 @@ pub async fn cmd_ls(args: LsArgs) -> Result<()> {
     let mut vm_infos = Vec::new();
 
     for vm in &mut vms {
-        // Check if process is actually running
-        let process_running = if let Some(pid) = vm.pid {
-            std::fs::metadata(format!("/proc/{}", pid)).is_ok()
-        } else {
-            false
-        };
-
-        // Update status if process is not running
-        if !process_running && !matches!(vm.status, VmStatus::Stopped) {
-            vm.status = VmStatus::Stopped;
+        // Filter by PID if requested
+        if let Some(filter_pid) = args.pid {
+            if vm.pid != Some(filter_pid) {
+                continue;
+            }
         }
 
         // Check if state is stale (no update in 5 minutes)
@@ -84,6 +80,7 @@ pub async fn cmd_ls(args: LsArgs) -> Result<()> {
             tap_device,
             image: image.to_string(),
             mem_mb: vm.config.memory_mib,
+            pid: vm.pid,
             stale,
             last_updated: vm.last_updated.to_rfc3339(),
         });
@@ -96,17 +93,19 @@ pub async fn cmd_ls(args: LsArgs) -> Result<()> {
     } else {
         // Table output
         println!(
-            "{:<20} {:<12} {:<12} {:<15} {:<15} {:<12} {:<8} {:<6}",
-            "NAME", "STATUS", "HEALTH", "GUEST_IP", "TAP_DEVICE", "IMAGE", "MEM(MB)", "STALE"
+            "{:<20} {:<10} {:<12} {:<12} {:<15} {:<15} {:<12} {:<8} {:<6}",
+            "NAME", "PID", "STATUS", "HEALTH", "GUEST_IP", "TAP_DEVICE", "IMAGE", "MEM(MB)", "STALE"
         );
-        println!("{}", "-".repeat(110));
+        println!("{}", "-".repeat(120));
 
         for vm in vm_infos {
             let stale_marker = if vm.stale { "YES" } else { "" };
+            let pid_str = vm.pid.map_or("-".to_string(), |p| p.to_string());
 
             println!(
-                "{:<20} {:<12} {:<12} {:<15} {:<15} {:<12} {:<8} {:<6}",
+                "{:<20} {:<10} {:<12} {:<12} {:<15} {:<15} {:<12} {:<8} {:<6}",
                 vm.name,
+                pid_str,
                 vm.status,
                 vm.health,
                 vm.guest_ip,

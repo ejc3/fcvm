@@ -1,3 +1,4 @@
+pub mod common;
 pub mod ls;
 pub mod podman;
 pub mod snapshot;

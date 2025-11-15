@@ -185,6 +185,7 @@ impl NetworkManager for RootlessNetwork {
             guest_mac,
             guest_ip: Some(guest_ip),
             host_ip: Some(host_ip),
+            host_veth: self.host_veth.clone(),
         })
     }
 

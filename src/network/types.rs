@@ -6,6 +6,7 @@ pub struct NetworkConfig {
     pub guest_mac: String,
     pub guest_ip: Option<String>,
     pub host_ip: Option<String>,
+    pub host_veth: Option<String>,
 }
 
 #[derive(Debug, Clone)]
