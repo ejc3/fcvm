@@ -140,9 +140,9 @@ async fn start_baseline_vm(
 ) -> Result<(tokio::process::Child, u32)> {
     println!("  Starting VM '{}'...", vm_name);
 
-    let mut cmd = Command::new("sudo");
-    cmd.arg("./target/release/fcvm")
-        .arg("podman")
+    // Note: Don't use sudo - stress test command itself is run with sudo
+    let mut cmd = Command::new("./target/release/fcvm");
+    cmd.arg("podman")
         .arg("run")
         .arg("--name")
         .arg(vm_name)
@@ -186,8 +186,8 @@ async fn start_baseline_vm(
 }
 
 async fn create_snapshot_by_pid(pid: u32, snapshot_name: &str) -> Result<()> {
-    let output = Command::new("sudo")
-        .arg("./target/release/fcvm")
+    // Note: Don't use sudo - test command itself is run with sudo
+    let output = Command::new("./target/release/fcvm")
         .arg("snapshot")
         .arg("create")
         .arg("--pid")
@@ -209,9 +209,9 @@ async fn create_snapshot_by_pid(pid: u32, snapshot_name: &str) -> Result<()> {
 }
 
 async fn start_memory_server(snapshot: &str) -> Result<(tokio::process::Child, u32)> {
-    let mut cmd = Command::new("sudo");
-    cmd.arg("./target/release/fcvm")
-        .arg("snapshot")
+    // Note: Don't use sudo - test command itself is run with sudo
+    let mut cmd = Command::new("./target/release/fcvm");
+    cmd.arg("snapshot")
         .arg("serve")
         .arg(snapshot)
         .stdout(Stdio::piped())
@@ -379,9 +379,9 @@ async fn clone_vm(serve_pid: u32, name: &str) -> CloneMetrics {
     let start = Instant::now();
 
     // Spawn fcvm snapshot run using serve PID
-    let result = Command::new("sudo")
+    // Note: Don't use sudo - test command itself is run with sudo
+    let result = Command::new("./target/release/fcvm")
         .args([
-            "./target/release/fcvm",
             "snapshot",
             "run",
             "--pid",
@@ -424,8 +424,9 @@ async fn poll_health_check_by_pid(pid: u32, timeout_secs: u64) -> Result<u64> {
 
     while start.elapsed() < timeout {
         // Call fcvm ls --json --pid to check specific VM's health status
-        let output = Command::new("sudo")
-            .args(["./target/release/fcvm", "ls", "--json", "--pid", &pid.to_string()])
+        // Note: Don't use sudo - test command itself is run with sudo
+        let output = Command::new("./target/release/fcvm")
+            .args(["ls", "--json", "--pid", &pid.to_string()])
             .output()
             .await;
 
@@ -537,10 +538,10 @@ async fn cmd_sanity_test(args: crate::cli::SanityTestArgs) -> Result<()> {
     println!();
 
     // Start the VM in background
+    // Note: Don't use sudo here - the test command itself is run with sudo
     println!("Starting VM...");
-    let mut child = Command::new("sudo")
+    let mut child = Command::new("./target/release/fcvm")
         .args([
-            "./target/release/fcvm",
             "podman",
             "run",
             "--name",
@@ -579,8 +580,9 @@ async fn cmd_sanity_test(args: crate::cli::SanityTestArgs) -> Result<()> {
         }
 
         // Query fcvm ls --json --pid to check this specific VM
-        let output = Command::new("sudo")
-            .args(["./target/release/fcvm", "ls", "--json", "--pid", &fcvm_pid.to_string()])
+        // Note: Don't use sudo - test command itself is run with sudo
+        let output = Command::new("./target/release/fcvm")
+            .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
             .output()
             .await
             .context("running fcvm ls --pid")?;
