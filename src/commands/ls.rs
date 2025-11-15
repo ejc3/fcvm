@@ -46,6 +46,16 @@ pub async fn cmd_ls(args: LsArgs) -> Result<()> {
         let elapsed = now.signed_duration_since(vm.last_updated);
         let stale = elapsed.num_seconds() > STALE_THRESHOLD_SECS;
 
+        // Verify PID is actually running by checking /proc/{pid}
+        if let Some(pid) = vm.pid {
+            let proc_path = format!("/proc/{}", pid);
+            if !std::path::Path::new(&proc_path).exists() {
+                // Process no longer exists, mark as stopped
+                vm.status = crate::state::VmStatus::Stopped;
+                vm.health_status = crate::state::HealthStatus::Unknown;
+            }
+        }
+
         let name = vm.name.clone().unwrap_or_else(|| vm.vm_id[..8].to_string());
 
         // Extract network info from config
