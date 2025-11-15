@@ -325,20 +325,21 @@ async fn run_stress_test(
             }
         }
 
-        // Health check - wait a bit for VMs to initialize then check
+        // Health check - actually check each VM's health status
         println!("  Waiting for health checks...");
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
-        // For now, just mark all successfully spawned VMs as checked
-        // The actual health checking via fcvm ls needs to be fixed to use fcvm PIDs
         let mut health_tasks = Vec::new();
         for m in &batch_metrics {
-            if m.error.is_none() {
-                // Simulate health check time
+            if let (None, Some(pid)) = (&m.error, m.pid) {
+                // VM started successfully, check its health
                 health_tasks.push(tokio::spawn(async move {
-                    Some(5000u64) // Report 5 seconds
+                    match poll_health_check_by_pid(pid, timeout).await {
+                        Ok(ms) => Some(ms),
+                        Err(_) => None,  // Health check timeout
+                    }
                 }));
             } else {
+                // VM failed to start, no health check needed
                 health_tasks.push(tokio::spawn(async { None }));
             }
         }
@@ -354,7 +355,7 @@ async fn run_stress_test(
             m.health_time_ms = health_ms;
             if let Some(ms) = health_ms {
                 println!("  ✓ {}: healthy in {}ms", m.name, ms);
-            } else {
+            } else if m.error.is_none() {
                 println!("  ✗ {}: health check timeout", m.name);
             }
         }
@@ -528,7 +529,6 @@ async fn read_snapshot_guest_ip(snapshot_name: &str) -> Result<String> {
 
 async fn cmd_sanity_test(args: crate::cli::SanityTestArgs) -> Result<()> {
     use std::time::Duration;
-    use tokio::time::sleep;
 
     println!("fcvm sanity test");
     println!("================");
@@ -542,13 +542,13 @@ async fn cmd_sanity_test(args: crate::cli::SanityTestArgs) -> Result<()> {
     println!("Starting VM...");
     let mut child = Command::new("./target/release/fcvm")
         .args([
+            "--sub-process",  // Disable timestamps/level in subprocess (parent will add them)
             "podman",
             "run",
             "--name",
             "sanity-test-vm",
             &args.image,
         ])
-        .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -557,84 +557,109 @@ async fn cmd_sanity_test(args: crate::cli::SanityTestArgs) -> Result<()> {
     let fcvm_pid = child.id().context("getting child PID")?;
     println!("  fcvm process started (PID: {})", fcvm_pid);
 
-    // Wait for VM to appear in fcvm ls and become healthy
-    println!("  Waiting for VM to appear in state and become healthy...");
-    let start = Instant::now();
-    let timeout_duration = Duration::from_secs(args.timeout);
-
-    let mut healthy = false;
-    let mut guest_ip = String::new();
-
-    while start.elapsed() < timeout_duration {
-        // Check if child process is still alive
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                anyhow::bail!("fcvm process exited unexpectedly with status: {}", status);
+    // Stream subprocess stdout/stderr to tracing (like we do for Firecracker)
+    // Use descriptive target that explains WHY fcvm was launched (sanity test baseline VM)
+    if let Some(stdout) = child.stdout.take() {
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                info!(target: "sanity-baseline-vm", "{}", line);
             }
-            Ok(None) => {
-                // Still running, continue
-            }
-            Err(e) => {
-                anyhow::bail!("Failed to check process status: {}", e);
-            }
-        }
-
-        // Query fcvm ls --json --pid to check this specific VM
-        // Note: Don't use sudo - test command itself is run with sudo
-        let output = Command::new("./target/release/fcvm")
-            .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
-            .output()
-            .await
-            .context("running fcvm ls --pid")?;
-
-        if output.status.success() && !output.stdout.is_empty() {
-            if let Ok(vms) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout) {
-                if let Some(vm) = vms.first() {
-                    // Extract health status and guest IP
-                    if let Some(health_str) = vm["health"].as_str() {
-                        if let Some(ip) = vm["guest_ip"].as_str() {
-                            guest_ip = ip.to_string();
-
-                            if health_str == "Healthy" {
-                                healthy = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        sleep(Duration::from_millis(500)).await;
+        });
     }
 
-    let elapsed = start.elapsed();
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                info!(target: "sanity-baseline-vm", "{}", line);
+            }
+        });
+    }
+
+    // Wait for VM to appear in fcvm ls and become healthy
+    println!("  Waiting for VM to appear in state and become healthy...");
+
+    // Spawn task to poll health status
+    let health_task = tokio::spawn(poll_health_check_by_pid(fcvm_pid, args.timeout));
+
+    // Monitor child process for unexpected exits
+    let monitor_task: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return Err(anyhow::anyhow!("fcvm process exited unexpectedly with status: {}", status));
+                }
+                Ok(None) => {
+                    // Still running, continue
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Failed to check process status: {}", e));
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+
+    // Wait for either health check to pass or process to exit
+    let result = tokio::select! {
+        health_result = health_task => {
+            match health_result {
+                Ok(Ok(ms)) => Ok(ms),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(anyhow::anyhow!("Health check task panicked: {}", e)),
+            }
+        }
+        monitor_result = monitor_task => {
+            match monitor_result {
+                Ok(Err(e)) => Err(e),
+                Ok(Ok(_)) => unreachable!("Monitor task should never return Ok"),
+                Err(e) => Err(anyhow::anyhow!("Monitor task panicked: {}", e)),
+            }
+        }
+    };
+
+    // Get guest IP from state for display
+    let guest_ip = Command::new("./target/release/fcvm")
+        .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
+        .output()
+        .await
+        .ok()
+        .and_then(|output| serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout).ok())
+        .and_then(|vms| vms.first().cloned())
+        .and_then(|vm| vm["guest_ip"].as_str().map(String::from))
+        .unwrap_or_else(|| "unknown".to_string());
 
     // Print results
     println!();
-    if healthy {
-        println!("✅ SANITY TEST PASSED!");
-        println!("  VM became healthy in {:.1}s", elapsed.as_secs_f64());
-        println!("  Guest IP: {}", guest_ip);
-        println!("  fcvm PID: {}", fcvm_pid);
-        println!("  Health checks are working correctly!");
-    } else {
-        println!("❌ SANITY TEST FAILED!");
-        println!("  VM did not become healthy within {}s", args.timeout);
-        println!("  fcvm PID: {}", fcvm_pid);
-        println!("  Guest IP: {}", guest_ip);
+    match &result {
+        Ok(ms) => {
+            println!("✅ SANITY TEST PASSED!");
+            println!("  VM became healthy in {:.1}s", *ms as f64 / 1000.0);
+            println!("  Guest IP: {}", guest_ip);
+            println!("  fcvm PID: {}", fcvm_pid);
+            println!("  Health checks are working correctly!");
+        }
+        Err(e) => {
+            println!("❌ SANITY TEST FAILED!");
+            println!("  Error: {}", e);
+            println!("  fcvm PID: {}", fcvm_pid);
+            println!("  Guest IP: {}", guest_ip);
+        }
     }
 
-    // Always kill our child process
+    // Always kill the fcvm process - need to get a handle to it
+    // Since we moved `child` into the monitor task, we need to kill by PID
     println!("\nStopping fcvm process...");
-    child.kill().await.ok();
+    let _ = Command::new("kill")
+        .arg("-9")
+        .arg(fcvm_pid.to_string())
+        .output()
+        .await;
 
-    // Wait for it to actually exit
-    let _ = child.wait().await;
-
-    if healthy {
-        Ok(())
-    } else {
-        anyhow::bail!("Sanity test failed - VM did not become healthy")
-    }
+    result.map(|_| ())
 }

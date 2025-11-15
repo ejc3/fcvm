@@ -7,6 +7,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     about = "Firecracker VM runner for Podman containers"
 )]
 pub struct Cli {
+    /// Running as a subprocess (disables timestamp and level in logs)
+    #[arg(long, global = true)]
+    pub sub_process: bool,
+
     #[command(subcommand)]
     pub cmd: Commands,
 }

@@ -1,6 +1,7 @@
+use anyhow::{Context, Result};
 use tokio::process::Command;
 use tokio::time::Duration;
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use crate::paths;
 use crate::state::{HealthStatus, StateManager};
@@ -15,7 +16,9 @@ use crate::state::{HealthStatus, StateManager};
 ///
 /// The task runs indefinitely until the tokio runtime shuts down.
 pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) {
-    tokio::spawn(async move {
+    let vm_id_clone = vm_id.clone();
+    let handle = tokio::spawn(async move {
+        info!(target: "health-monitor", vm_id = %vm_id, pid = ?pid, "starting health monitor");
         let state_manager = StateManager::new(paths::state_dir());
 
         // Adaptive polling: 100ms during startup, 10s after healthy
@@ -28,6 +31,7 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) {
             let health_status = if let Some(pid) = pid {
                 // First check if Firecracker process is still running
                 if std::fs::metadata(format!("/proc/{}", pid)).is_err() {
+                    debug!(target: "health-monitor", vm_id = %vm_id, pid = pid, "process not found");
                     HealthStatus::Unreachable
                 } else {
                     // Process exists, now check if application is responding
@@ -39,19 +43,38 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) {
                         let veth_device = state.config.network.get("host_veth")
                             .and_then(|v| v.as_str());
 
+                        debug!(target: "health-monitor", vm_id = %vm_id, guest_ip = ?guest_ip, veth = ?veth_device, "network config for health check");
+
                         if let (Some(guest_ip), Some(veth)) = (guest_ip, veth_device) {
                             // Try HTTP request via veth device
                             let health_path = &state.config.health_check_path;
                             match check_http_health(guest_ip, veth, health_path).await {
-                                Ok(true) => HealthStatus::Healthy,
-                                Ok(false) => HealthStatus::Unhealthy,
-                                Err(_) => HealthStatus::Timeout,
+                                Ok(true) => {
+                                    debug!(target: "health-monitor", vm_id = %vm_id, "health check passed");
+                                    HealthStatus::Healthy
+                                }
+                                Ok(false) => {
+                                    // This case is unreachable since check_http_health only returns Ok(true) or Err
+                                    warn!(target: "health-monitor", vm_id = %vm_id, "health check returned false (unexpected)");
+                                    HealthStatus::Unhealthy
+                                }
+                                Err(e) => {
+                                    warn!(target: "health-monitor", vm_id = %vm_id, error = %e, "health check failed");
+                                    HealthStatus::Unhealthy
+                                }
                             }
                         } else {
-                            // No network config yet, just check process
+                            // No network config yet, log what's missing
+                            if guest_ip.is_none() {
+                                warn!(target: "health-monitor", vm_id = %vm_id, "cannot check health: no guest_ip in config");
+                            }
+                            if veth_device.is_none() {
+                                warn!(target: "health-monitor", vm_id = %vm_id, "cannot check health: no host_veth in config");
+                            }
                             HealthStatus::Unknown
                         }
                     } else {
+                        warn!(target: "health-monitor", vm_id = %vm_id, "failed to load VM state for health check");
                         HealthStatus::Unknown
                     }
                 }
@@ -63,14 +86,37 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) {
             if let Ok(mut state) = state_manager.load_state(&vm_id).await {
                 state.health_status = health_status;
                 state.last_updated = chrono::Utc::now();
-                let _ = state_manager.save_state(&state).await;
+                match state_manager.save_state(&state).await {
+                    Ok(_) => debug!(target: "health-monitor", vm_id = %vm_id, health_status = ?health_status, "state saved"),
+                    Err(e) => warn!(target: "health-monitor", vm_id = %vm_id, error = %e, "failed to save state"),
+                }
+            } else {
+                warn!(target: "health-monitor", vm_id = %vm_id, "failed to load state for updating health");
             }
 
             // Switch to slower polling once healthy
             if health_status == HealthStatus::Healthy && !is_healthy {
                 is_healthy = true;
                 poll_interval = Duration::from_secs(10);
-                info!(vm_id = %vm_id, "VM healthy, switching to 10s polling");
+                info!(target: "health-monitor", vm_id = %vm_id, "VM healthy, switching to 10s polling");
+            }
+        }
+    });
+
+    // Monitor task for panics
+    tokio::spawn(async move {
+        match handle.await {
+            Ok(_) => {
+                warn!(target: "health-monitor", vm_id = %vm_id_clone, "health monitor task exited normally (unexpected)");
+            }
+            Err(e) if e.is_panic() => {
+                warn!(target: "health-monitor", vm_id = %vm_id_clone, panic = ?e, "health monitor task panicked");
+            }
+            Err(e) if e.is_cancelled() => {
+                debug!(target: "health-monitor", vm_id = %vm_id_clone, "health monitor task cancelled");
+            }
+            Err(e) => {
+                warn!(target: "health-monitor", vm_id = %vm_id_clone, error = ?e, "health monitor task failed");
             }
         }
     });
@@ -83,7 +129,7 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) {
 /// - Multiple VMs can have the same guest IP (clones from snapshots)
 /// - Using --interface veth0-vm-XXXXX ensures curl routes to the correct VM
 /// - The veth device name is read from the network config (saved during setup)
-async fn check_http_health(guest_ip: &str, veth_device: &str, health_path: &str) -> Result<bool, ()> {
+async fn check_http_health(guest_ip: &str, veth_device: &str, health_path: &str) -> Result<bool> {
     let url = format!("http://{}{}", guest_ip, health_path);
 
     let output = Command::new("curl")
@@ -91,12 +137,21 @@ async fn check_http_health(guest_ip: &str, veth_device: &str, health_path: &str)
             "-s",           // Silent
             "-f",           // Fail on HTTP errors
             "-m", "1",      // 1 second timeout
-            "--interface", &veth_device,
+            "--interface", veth_device,
             &url,
         ])
         .output()
         .await
-        .map_err(|_| ())?;
+        .with_context(|| format!("spawning curl command for {}", url))?;
 
-    Ok(output.status.success())
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "curl failed with exit code {:?}: {}",
+            output.status.code(),
+            stderr.trim()
+        );
+    }
+
+    Ok(true)
 }

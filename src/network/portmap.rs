@@ -217,11 +217,9 @@ pub async fn detect_default_interface() -> Result<String> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Output format: "default via 192.168.1.1 dev eth0 ..."
-    for part in stdout.split_whitespace() {
-        if let Some(prev) = stdout.split_whitespace().position(|p| p == "dev") {
-            if let Some(iface) = stdout.split_whitespace().nth(prev + 1) {
-                return Ok(iface.to_string());
-            }
+    if let Some(prev) = stdout.split_whitespace().position(|p| p == "dev") {
+        if let Some(iface) = stdout.split_whitespace().nth(prev + 1) {
+            return Ok(iface.to_string());
         }
     }
 
