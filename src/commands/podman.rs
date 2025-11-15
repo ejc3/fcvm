@@ -238,8 +238,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     info!(vm_id = %vm_id, "VM started successfully");
 
-    // Spawn health monitor task
-    crate::health::spawn_health_monitor(vm_id.clone(), vm_state.pid);
+    // Spawn health monitor task (store handle for cancellation)
+    let health_monitor_handle = crate::health::spawn_health_monitor(vm_id.clone(), vm_state.pid);
 
     // Note: No need for slirp4netns - we use static IP + NAT routing
     // TAP device is already configured with IP and iptables rules in network setup
@@ -264,9 +264,23 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // Cleanup
     info!("cleaning up resources");
 
-    let _ = vm_manager.kill().await;
-    let _ = network.cleanup().await;
-    let _ = state_manager.delete_state(&vm_id).await;
+    // Cancel health monitor task first
+    health_monitor_handle.abort();
+
+    // Kill VM process
+    if let Err(e) = vm_manager.kill().await {
+        warn!("failed to kill VM process: {}", e);
+    }
+
+    // Cleanup network
+    if let Err(e) = network.cleanup().await {
+        warn!("failed to cleanup network: {}", e);
+    }
+
+    // Delete state file
+    if let Err(e) = state_manager.delete_state(&vm_id).await {
+        warn!("failed to delete state file: {}", e);
+    }
 
     Ok(())
 }

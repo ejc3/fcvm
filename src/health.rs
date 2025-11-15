@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use tokio::process::Command;
+use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -14,10 +15,10 @@ use crate::state::{HealthStatus, StateManager};
 ///
 /// Health check tests HTTP connectivity via curl to the guest IP.
 ///
-/// The task runs indefinitely until the tokio runtime shuts down.
-pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) {
-    let vm_id_clone = vm_id.clone();
-    let handle = tokio::spawn(async move {
+/// Returns a JoinHandle that can be used to cancel the task.
+/// The task runs until cancelled or until the tokio runtime shuts down.
+pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
+    tokio::spawn(async move {
         info!(target: "health-monitor", vm_id = %vm_id, pid = ?pid, "starting health monitor");
         let state_manager = StateManager::new(paths::state_dir());
 
@@ -101,25 +102,7 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) {
                 info!(target: "health-monitor", vm_id = %vm_id, "VM healthy, switching to 10s polling");
             }
         }
-    });
-
-    // Monitor task for panics
-    tokio::spawn(async move {
-        match handle.await {
-            Ok(_) => {
-                warn!(target: "health-monitor", vm_id = %vm_id_clone, "health monitor task exited normally (unexpected)");
-            }
-            Err(e) if e.is_panic() => {
-                warn!(target: "health-monitor", vm_id = %vm_id_clone, panic = ?e, "health monitor task panicked");
-            }
-            Err(e) if e.is_cancelled() => {
-                debug!(target: "health-monitor", vm_id = %vm_id_clone, "health monitor task cancelled");
-            }
-            Err(e) => {
-                warn!(target: "health-monitor", vm_id = %vm_id_clone, error = ?e, "health monitor task failed");
-            }
-        }
-    });
+    })
 }
 
 /// Check if HTTP service is responding via curl

@@ -9,6 +9,21 @@ use tracing::{error, info, warn};
 use super::FirecrackerClient;
 
 /// Manages a Firecracker VM process
+///
+/// IMPORTANT: PID Tracking Architecture
+/// -------------------------------------
+/// fcvm tracks its OWN process ID (via std::process::id()), not the Firecracker child process ID.
+///
+/// When `fcvm podman run` or `fcvm snapshot run` is executed, the fcvm process itself
+/// stays running to manage the VM lifecycle. The PID stored in VmState is the fcvm
+/// process PID, which allows:
+/// - External tools to send signals to the correct process
+/// - Health monitors to verify the manager process is still running
+/// - Tests to track spawned fcvm processes without parsing stdout
+///
+/// The Firecracker process is a child of fcvm and is managed via the Child handle
+/// stored in self.process. When fcvm exits (via signal or normally), it ensures
+/// the Firecracker child process is also terminated.
 pub struct VmManager {
     vm_id: String,
     socket_path: PathBuf,
@@ -71,10 +86,21 @@ impl VmManager {
 
         // Setup namespace isolation if specified
         if let Some(ref ns_id) = self.namespace_id {
-            let ns_path = format!("/var/run/netns/{}", ns_id);
+            use std::ffi::CString;
+
+            // Create CString outside the closure to ensure proper null termination
+            // for C API usage. This avoids String capture issues in pre_exec.
+            let ns_path_cstr = CString::new(format!("/var/run/netns/{}", ns_id))
+                .expect("namespace path should not contain null bytes");
             info!(target: "vm", vm_id = %self.vm_id, namespace = %ns_id, "entering network namespace");
 
-            // Use pre_exec to enter namespace before Firecracker starts
+            // SAFETY: pre_exec runs after fork() but before exec().
+            // We use it to enter the network namespace in the child process.
+            // Safety requirements:
+            // 1. Only async-signal-safe functions are called (open, setns are safe)
+            // 2. No heap allocations after fork (CString created before fork)
+            // 3. File descriptor is properly owned via OwnedFd
+            // 4. The closure doesn't capture complex types, only CString
             unsafe {
                 cmd.pre_exec(move || {
                     use nix::fcntl::{open, OFlag};
@@ -83,16 +109,19 @@ impl VmManager {
                     use std::os::unix::io::{FromRawFd, OwnedFd};
 
                     // Open namespace file descriptor
+                    // Safe: ns_path_cstr is a valid CString with null termination
                     let ns_fd_raw = open(
-                        ns_path.as_str(),
+                        ns_path_cstr.as_c_str(),
                         OFlag::O_RDONLY,
                         Mode::empty()
                     ).map_err(|e| std::io::Error::new(
                         std::io::ErrorKind::Other,
-                        format!("failed to open namespace {}: {}", ns_path, e)
+                        format!("failed to open namespace: {}", e)
                     ))?;
 
-                    // Wrap in OwnedFd for AsFd trait
+                    // SAFETY: from_raw_fd takes ownership of the file descriptor.
+                    // The fd is valid (just opened) and won't be used elsewhere.
+                    // OwnedFd will close it on drop.
                     let ns_fd = OwnedFd::from_raw_fd(ns_fd_raw);
 
                     // Enter the network namespace
@@ -103,6 +132,7 @@ impl VmManager {
                         )
                     })?;
 
+                    // fd is automatically closed when OwnedFd is dropped
                     Ok(())
                 });
             }
