@@ -44,7 +44,7 @@ impl VmManager {
         firecracker_bin: &Path,
         config_override: Option<&Path>,
     ) -> Result<()> {
-        info!(vm_id = %self.vm_id, "starting Firecracker process");
+        info!(target: "vm", vm_id = %self.vm_id, "starting Firecracker process");
 
         // Ensure socket doesn't exist
         if self.socket_path.exists() {
@@ -72,7 +72,7 @@ impl VmManager {
         // Setup namespace isolation if specified
         if let Some(ref ns_id) = self.namespace_id {
             let ns_path = format!("/var/run/netns/{}", ns_id);
-            info!(vm_id = %self.vm_id, namespace = %ns_id, "entering network namespace");
+            info!(target: "vm", vm_id = %self.vm_id, namespace = %ns_id, "entering network namespace");
 
             // Use pre_exec to enter namespace before Firecracker starts
             unsafe {
@@ -114,6 +114,20 @@ impl VmManager {
 
         let mut child = cmd.spawn().context("spawning Firecracker process")?;
 
+        // Helper function to strip Firecracker timestamp prefix
+        // Firecracker format: "2025-11-15T17:18:55.027478889 [anonymous-instance:main] message"
+        // We want to keep only: "[anonymous-instance:main] message"
+        fn strip_firecracker_timestamp(line: &str) -> &str {
+            // Look for the first space after the timestamp
+            if let Some(pos) = line.find(' ') {
+                // Check if this looks like a timestamp (starts with year)
+                if line.starts_with("20") && line.chars().nth(4) == Some('-') {
+                    return &line[pos + 1..]; // Return everything after the first space
+                }
+            }
+            line // Return as-is if no timestamp pattern found
+        }
+
         // Stream stdout/stderr to tracing
         if let Some(stdout) = child.stdout.take() {
             let vm_id = self.vm_id.clone();
@@ -121,7 +135,8 @@ impl VmManager {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    info!(vm_id = %vm_id, target = "firecracker", "{}", line);
+                    let clean_line = strip_firecracker_timestamp(&line);
+                    info!(target: "firecracker", vm_id = %vm_id, "{}", clean_line);
                 }
             });
         }
@@ -132,7 +147,8 @@ impl VmManager {
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    warn!(vm_id = %vm_id, target = "firecracker", "{}", line);
+                    let clean_line = strip_firecracker_timestamp(&line);
+                    warn!(target: "firecracker", vm_id = %vm_id, "{}", clean_line);
                 }
             });
         }

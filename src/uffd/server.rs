@@ -37,6 +37,7 @@ impl UffdServer {
         socket_path: &Path,
     ) -> Result<Self> {
         info!(
+            target: "uffd",
             snapshot = %snapshot_id,
             mem_file = %mem_file_path.display(),
             socket = %socket_path.display(),
@@ -48,6 +49,7 @@ impl UffdServer {
         let mem_size = mem_file.metadata()?.len() as usize;
 
         info!(
+            target: "uffd",
             mem_size_mb = mem_size / (1024 * 1024),
             "mapping memory file"
         );
@@ -89,6 +91,7 @@ impl UffdServer {
     /// Run the UFFD server (blocks until all VMs disconnect)
     pub async fn run(&self) -> Result<()> {
         info!(
+            target: "uffd",
             snapshot = %self.snapshot_id,
             socket = %self.socket_path.display(),
             "starting UFFD server"
@@ -97,7 +100,7 @@ impl UffdServer {
         // Bind Unix socket
         let listener = UnixListener::bind(&self.socket_path).context("binding Unix socket")?;
 
-        info!("UFFD server listening, waiting for VM connections...");
+        info!(target: "uffd", "UFFD server listening, waiting for VM connections...");
 
         let mut vm_tasks: JoinSet<String> = JoinSet::new();
         let mut next_vm_id = 0u64;
@@ -111,7 +114,7 @@ impl UffdServer {
                             let vm_id = format!("vm-{}", next_vm_id);
                             next_vm_id += 1;
 
-                            info!(vm_id = %vm_id, "new VM connection");
+                            info!(target: "uffd", vm_id = %vm_id, "new VM connection");
 
                             // Convert tokio UnixStream to std UnixStream for SCM_RIGHTS
                             let mut std_stream = stream.into_std()
@@ -121,6 +124,7 @@ impl UffdServer {
                             match receive_uffd_and_mappings(&mut std_stream) {
                                 Ok((uffd, mappings)) => {
                                     info!(
+                                        target: "uffd",
                                         vm_id = %vm_id,
                                         regions = mappings.len(),
                                         "received UFFD with {} memory regions",
@@ -132,21 +136,21 @@ impl UffdServer {
                                     let vm_id_clone = vm_id.clone();
                                     vm_tasks.spawn(async move {
                                         match handle_vm_page_faults(vm_id_clone.clone(), uffd, mappings, mmap).await {
-                                            Ok(()) => info!(vm_id = %vm_id_clone, "VM handler exited cleanly"),
-                                            Err(e) => error!(vm_id = %vm_id_clone, error = %e, "VM handler error"),
+                                            Ok(()) => info!(target: "uffd", vm_id = %vm_id_clone, "VM handler exited cleanly"),
+                                            Err(e) => error!(target: "uffd", vm_id = %vm_id_clone, error = %e, "VM handler error"),
                                         }
                                         vm_id_clone
                                     });
 
-                                    info!(active_vms = vm_tasks.len(), "VM connected");
+                                    info!(target: "uffd", active_vms = vm_tasks.len(), "VM connected");
                                 }
                                 Err(e) => {
-                                    error!(vm_id = %vm_id, error = %e, "failed to receive UFFD");
+                                    error!(target: "uffd", vm_id = %vm_id, error = %e, "failed to receive UFFD");
                                 }
                             }
                         }
                         Err(e) => {
-                            error!(error = %e, "failed to accept connection");
+                            error!(target: "uffd", error = %e, "failed to accept connection");
                         }
                     }
                 }
@@ -154,22 +158,22 @@ impl UffdServer {
                 // Handle completed VM tasks
                 Some(result) = vm_tasks.join_next() => {
                     match result {
-                        Ok(vm_id) => info!(vm_id = %vm_id, "VM disconnected"),
-                        Err(e) => error!(error = %e, "VM task panicked"),
+                        Ok(vm_id) => info!(target: "uffd", vm_id = %vm_id, "VM disconnected"),
+                        Err(e) => error!(target: "uffd", error = %e, "VM task panicked"),
                     }
 
-                    info!(active_vms = vm_tasks.len(), "VM exited");
+                    info!(target: "uffd", active_vms = vm_tasks.len(), "VM exited");
 
                     // Exit when last VM disconnects
                     if vm_tasks.is_empty() {
-                        info!("no active VMs remaining, shutting down server");
+                        info!(target: "uffd", "no active VMs remaining, shutting down server");
                         break;
                     }
                 }
             }
         }
 
-        info!("UFFD server stopped");
+        info!(target: "uffd", "UFFD server stopped");
         Ok(())
     }
 }
@@ -179,7 +183,7 @@ impl Drop for UffdServer {
         // Clean up socket file
         if self.socket_path.exists() {
             if let Err(e) = std::fs::remove_file(&self.socket_path) {
-                warn!(error = %e, "failed to remove socket during cleanup");
+                warn!(target: "uffd", error = %e, "failed to remove socket during cleanup");
             }
         }
     }
@@ -192,7 +196,7 @@ async fn handle_vm_page_faults(
     mappings: Vec<GuestRegionUffdMapping>,
     mmap: Arc<memmap2::Mmap>,
 ) -> Result<()> {
-    info!(vm_id = %vm_id, "page fault handler started");
+    info!(target: "uffd", vm_id = %vm_id, "page fault handler started");
 
     // Set UFFD to non-blocking mode for async integration
     let uffd_fd = uffd.as_raw_fd();
@@ -211,7 +215,7 @@ async fn handle_vm_page_faults(
         let mut guard = match async_uffd.readable().await {
             Ok(guard) => guard,
             Err(e) => {
-                error!(vm_id = %vm_id, error = %e, "error waiting for UFFD readability");
+                error!(target: "uffd", vm_id = %vm_id, error = %e, "error waiting for UFFD readability");
                 return Err(e.into());
             }
         };
@@ -224,6 +228,7 @@ async fn handle_vm_page_faults(
                 Err(_) => {
                     // UFFD closed = VM exited
                     info!(
+                        target: "uffd",
                         vm_id = %vm_id,
                         fault_count,
                         "UFFD closed, VM exited"
@@ -236,7 +241,7 @@ async fn handle_vm_page_faults(
                 Event::Pagefault { addr, .. } => {
                     fault_count += 1;
                     if fault_count.is_multiple_of(1000) {
-                        info!(vm_id = %vm_id, fault_count, "served page faults");
+                        info!(target: "uffd", vm_id = %vm_id, fault_count, "served page faults");
                     }
 
                     // Find which memory region this address belongs to
@@ -268,6 +273,7 @@ async fn handle_vm_page_faults(
 
                     if offset_in_file >= mmap_len {
                         warn!(
+                            target: "uffd",
                             vm_id = %vm_id,
                             fault_addr = format!("0x{:x}", fault_page),
                             "page fault past end of snapshot memory, zero-filling page"
