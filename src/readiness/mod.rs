@@ -51,7 +51,10 @@ impl ReadinessGate {
                     timeout_secs: 60,
                 },
             ),
-            _ => anyhow::bail!("invalid readiness mode: {} (only 'http' is supported)", mode),
+            _ => anyhow::bail!(
+                "invalid readiness mode: {} (only 'http' is supported)",
+                mode
+            ),
         };
 
         Ok(Self { mode, config })

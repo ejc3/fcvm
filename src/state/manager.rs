@@ -79,10 +79,12 @@ impl StateManager {
                 .context("renaming temp state file")?;
 
             Ok::<(), anyhow::Error>(())
-        }.await;
+        }
+        .await;
 
         // Release lock (happens automatically when flock is dropped, but being explicit)
-        flock.unlock()
+        flock
+            .unlock()
             .map_err(|(_, err)| err)
             .context("releasing lock on state file")?;
 

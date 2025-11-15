@@ -1,8 +1,8 @@
+use chrono::Utc;
 use fcvm::health::spawn_health_monitor;
-use fcvm::state::{StateManager, VmState, VmStatus, VmConfig, HealthStatus};
+use fcvm::state::{HealthStatus, StateManager, VmConfig, VmState, VmStatus};
 use tempfile::TempDir;
 use tokio::time::{sleep, Duration};
-use chrono::Utc;
 
 #[tokio::test]
 async fn test_health_monitor_lifecycle() {
@@ -61,7 +61,12 @@ async fn test_health_monitor_lifecycle() {
 
         // Timeout after 1 second (health check runs every 100ms)
         // This should be more than enough time
-        if state.last_updated.signed_duration_since(now).num_milliseconds() > 1000 {
+        if state
+            .last_updated
+            .signed_duration_since(now)
+            .num_milliseconds()
+            > 1000
+        {
             panic!("Health monitor did not update status within 1 second");
         }
     };

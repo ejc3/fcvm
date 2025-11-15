@@ -13,10 +13,9 @@ use crate::paths;
 /// All test harness commands that spawn fcvm should use this helper
 /// to ensure subprocess logging is consistent (no duplicate timestamps)
 fn fcvm_subprocess() -> Command {
-    let current_exe = std::env::current_exe()
-        .expect("failed to get current executable path");
+    let current_exe = std::env::current_exe().expect("failed to get current executable path");
     let mut cmd = Command::new(current_exe);
-    cmd.arg("--sub-process");  // Disable timestamps/level in subprocess
+    cmd.arg("--sub-process"); // Disable timestamps/level in subprocess
     cmd
 }
 
@@ -36,9 +35,7 @@ pub async fn cmd_test(args: TestArgs) -> Result<()> {
             )
             .await
         }
-        TestCommands::Sanity(sanity_args) => {
-            cmd_sanity_test(sanity_args).await
-        }
+        TestCommands::Sanity(sanity_args) => cmd_sanity_test(sanity_args).await,
     }
 }
 
@@ -70,7 +67,8 @@ async fn cmd_stress_test(
     let baseline_vm = if clean {
         println!("Starting fresh baseline VM...");
 
-        let (vm_proc, pid) = start_baseline_vm(baseline_name, timeout).await
+        let (vm_proc, pid) = start_baseline_vm(baseline_name, timeout)
+            .await
             .context("Failed to start baseline VM - health check did not pass")?;
         println!("✓ Baseline VM started and healthy (PID: {})", pid);
 
@@ -127,8 +125,8 @@ async fn cmd_stress_test(
 #[derive(Debug)]
 struct CloneMetrics {
     name: String,
-    pid: Option<u32>,  // fcvm process PID
-    fcvm_child: Option<tokio::process::Child>,  // Keep the fcvm process handle
+    pid: Option<u32>,                          // fcvm process PID
+    fcvm_child: Option<tokio::process::Child>, // Keep the fcvm process handle
     clone_time_ms: u64,
     health_time_ms: Option<u64>,
     error: Option<String>,
@@ -145,10 +143,7 @@ async fn cleanup_all_firecracker() -> Result<()> {
     Ok(())
 }
 
-async fn start_baseline_vm(
-    vm_name: &str,
-    timeout: u64,
-) -> Result<(tokio::process::Child, u32)> {
+async fn start_baseline_vm(vm_name: &str, timeout: u64) -> Result<(tokio::process::Child, u32)> {
     println!("  Starting VM '{}'...", vm_name);
 
     // Note: Don't use sudo - stress test command itself is run with sudo
@@ -166,7 +161,10 @@ async fn start_baseline_vm(
     println!("  fcvm process PID: {}", fcvm_pid);
 
     // Wait for VM to be healthy
-    println!("  Waiting for VM to become healthy (timeout: {}s)...", timeout);
+    println!(
+        "  Waiting for VM to become healthy (timeout: {}s)...",
+        timeout
+    );
     let start = Instant::now();
     let timeout_duration = tokio::time::Duration::from_secs(timeout);
 
@@ -278,18 +276,20 @@ async fn run_stress_test(
                 .output()
                 .await
                 .ok();
-            let mem_output = Command::new("free")
-                .arg("-h")
-                .output()
-                .await
-                .ok();
+            let mem_output = Command::new("free").arg("-h").output().await.ok();
 
-            if let (Some(uptime), Some(fc_count), Some(mem)) = (uptime_output, fc_count_output, mem_output) {
+            if let (Some(uptime), Some(fc_count), Some(mem)) =
+                (uptime_output, fc_count_output, mem_output)
+            {
                 let uptime_str = String::from_utf8_lossy(&uptime.stdout);
                 let fc_count_str = String::from_utf8_lossy(&fc_count.stdout).trim().to_string();
                 let mem_str = String::from_utf8_lossy(&mem.stdout);
 
-                let load = uptime_str.split("load average:").nth(1).unwrap_or("").trim();
+                let load = uptime_str
+                    .split("load average:")
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim();
                 let mem_line = mem_str.lines().nth(1).unwrap_or("");
 
                 let log_line = format!(
@@ -310,15 +310,20 @@ async fn run_stress_test(
         let batch_end = (batch_start + batch_size).min(num_clones);
         let batch_num = (batch_start / batch_size) + 1;
 
-        println!("Batch {}: Cloning VMs {}-{}...", batch_num, batch_start + 1, batch_end);
+        println!(
+            "Batch {}: Cloning VMs {}-{}...",
+            batch_num,
+            batch_start + 1,
+            batch_end
+        );
 
         // Clone VMs concurrently
         let mut clone_tasks = Vec::new();
         for i in batch_start..batch_end {
             let name = format!("stress-{}", i);
-            clone_tasks.push(tokio::spawn(async move {
-                clone_vm(serve_pid, &name).await
-            }));
+            clone_tasks.push(tokio::spawn(
+                async move { clone_vm(serve_pid, &name).await },
+            ));
         }
 
         let batch_metrics: Vec<CloneMetrics> = futures::future::join_all(clone_tasks)
@@ -413,16 +418,14 @@ async fn clone_vm(serve_pid: u32, name: &str) -> CloneMetrics {
                 error: None,
             }
         }
-        Err(e) => {
-            CloneMetrics {
-                name: name.to_string(),
-                pid: None,
-                fcvm_child: None,
-                clone_time_ms: start.elapsed().as_millis() as u64,
-                health_time_ms: None,
-                error: Some(format!("spawn failed: {}", e)),
-            }
-        }
+        Err(e) => CloneMetrics {
+            name: name.to_string(),
+            pid: None,
+            fcvm_child: None,
+            clone_time_ms: start.elapsed().as_millis() as u64,
+            health_time_ms: None,
+            error: Some(format!("spawn failed: {}", e)),
+        },
     }
 }
 
@@ -483,16 +486,26 @@ fn print_summary(metrics: &[CloneMetrics]) {
     println!("\nClone Time:");
     println!("  Min: {}ms", clone_times.iter().min().unwrap());
     println!("  Max: {}ms", clone_times.iter().max().unwrap());
-    println!("  Avg: {}ms", clone_times.iter().sum::<u64>() / clone_times.len() as u64);
+    println!(
+        "  Avg: {}ms",
+        clone_times.iter().sum::<u64>() / clone_times.len() as u64
+    );
 
-    let healthy: Vec<_> = successful.iter().filter(|m| m.health_time_ms.is_some()).collect();
+    let healthy: Vec<_> = successful
+        .iter()
+        .filter(|m| m.health_time_ms.is_some())
+        .collect();
     if !healthy.is_empty() {
         let health_times: Vec<u64> = healthy.iter().map(|m| m.health_time_ms.unwrap()).collect();
         println!("\nTime to First Response:");
         println!("  Min: {}ms", health_times.iter().min().unwrap());
         println!("  Max: {}ms", health_times.iter().max().unwrap());
-        println!("  Avg: {}ms", health_times.iter().sum::<u64>() / health_times.len() as u64);
-        println!("  Success rate: {}/{} ({:.1}%)",
+        println!(
+            "  Avg: {}ms",
+            health_times.iter().sum::<u64>() / health_times.len() as u64
+        );
+        println!(
+            "  Success rate: {}/{} ({:.1}%)",
             healthy.len(),
             successful.len(),
             (healthy.len() as f64 / successful.len() as f64) * 100.0
@@ -523,7 +536,9 @@ struct NetworkConfig {
 }
 
 async fn read_snapshot_guest_ip(snapshot_name: &str) -> Result<String> {
-    let config_path = paths::snapshot_dir().join(snapshot_name).join("config.json");
+    let config_path = paths::snapshot_dir()
+        .join(snapshot_name)
+        .join("config.json");
     let config_data = tokio::fs::read_to_string(&config_path)
         .await
         .with_context(|| format!("reading snapshot config: {}", config_path.display()))?;
@@ -548,13 +563,7 @@ async fn cmd_sanity_test(args: crate::cli::SanityTestArgs) -> Result<()> {
     // Note: Don't use sudo here - the test command itself is run with sudo
     println!("Starting VM...");
     let mut child = fcvm_subprocess()
-        .args([
-            "podman",
-            "run",
-            "--name",
-            "sanity-test-vm",
-            &args.image,
-        ])
+        .args(["podman", "run", "--name", "sanity-test-vm", &args.image])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -598,7 +607,10 @@ async fn cmd_sanity_test(args: crate::cli::SanityTestArgs) -> Result<()> {
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    return Err(anyhow::anyhow!("fcvm process exited unexpectedly with status: {}", status));
+                    return Err(anyhow::anyhow!(
+                        "fcvm process exited unexpectedly with status: {}",
+                        status
+                    ));
                 }
                 Ok(None) => {
                     // Still running, continue

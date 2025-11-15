@@ -110,13 +110,10 @@ impl VmManager {
 
                     // Open namespace file descriptor
                     // Safe: ns_path_cstr is a valid CString with null termination
-                    let ns_fd_raw = open(
-                        ns_path_cstr.as_c_str(),
-                        OFlag::O_RDONLY,
-                        Mode::empty()
-                    ).map_err(|e| std::io::Error::other(
-                        format!("failed to open namespace: {}", e)
-                    ))?;
+                    let ns_fd_raw = open(ns_path_cstr.as_c_str(), OFlag::O_RDONLY, Mode::empty())
+                        .map_err(|e| {
+                        std::io::Error::other(format!("failed to open namespace: {}", e))
+                    })?;
 
                     // SAFETY: from_raw_fd takes ownership of the file descriptor.
                     // The fd is valid (just opened) and won't be used elsewhere.
@@ -125,9 +122,7 @@ impl VmManager {
 
                     // Enter the network namespace
                     setns(&ns_fd, CloneFlags::CLONE_NEWNET).map_err(|e| {
-                        std::io::Error::other(
-                            format!("failed to enter namespace: {}", e)
-                        )
+                        std::io::Error::other(format!("failed to enter namespace: {}", e))
                     })?;
 
                     // fd is automatically closed when OwnedFd is dropped

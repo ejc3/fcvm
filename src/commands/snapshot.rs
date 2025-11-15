@@ -45,7 +45,10 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     };
 
     let snapshot_name = args.tag.unwrap_or_else(|| {
-        vm_state.name.clone().unwrap_or_else(|| vm_state.vm_id[..8].to_string())
+        vm_state
+            .name
+            .clone()
+            .unwrap_or_else(|| vm_state.vm_id[..8].to_string())
     });
 
     // Connect to running VM
@@ -226,10 +229,8 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
 
     // Generate unique socket name with PID to allow multiple serves per snapshot
     let my_pid = std::process::id();
-    let socket_path = paths::base_dir().join(format!(
-        "uffd-{}-{}.sock",
-        args.snapshot_name, my_pid
-    ));
+    let socket_path =
+        paths::base_dir().join(format!("uffd-{}-{}.sock", args.snapshot_name, my_pid));
 
     // Create UFFD server with custom socket path
     let server = UffdServer::new_with_path(
@@ -267,10 +268,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     println!("  Memory: {} MB", snapshot_config.metadata.memory_mib);
     println!("  Waiting for VMs to connect...");
     println!();
-    println!(
-        "Clone VMs with: fcvm snapshot run --pid {}",
-        my_pid
-    );
+    println!("Clone VMs with: fcvm snapshot run --pid {}", my_pid);
     println!("Press Ctrl-C to stop");
     println!();
 
@@ -430,14 +428,11 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Extract guest_ip from snapshot metadata for network config reuse
     use crate::network::NetworkConfig as SavedNetworkConfig;
-    let saved_network: Option<SavedNetworkConfig> = serde_json::from_value(snapshot_config.metadata.network_config.clone()).ok();
+    let saved_network: Option<SavedNetworkConfig> =
+        serde_json::from_value(snapshot_config.metadata.network_config.clone()).ok();
 
     // Setup networking (always rootless) - reuse guest_ip from snapshot if available
-    let mut net = RootlessNetwork::new(
-        vm_id.clone(),
-        tap_device.clone(),
-        port_mappings.clone(),
-    );
+    let mut net = RootlessNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
     // If snapshot has saved network config with guest_ip, use it
     if let Some(ref saved_net) = saved_network {
         if let Some(ref guest_ip) = saved_net.guest_ip {
@@ -540,11 +535,8 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         .context("resuming VM after snapshot load")?;
 
     // Save VM state with complete network configuration
-    super::common::save_vm_state_with_network(
-        &state_manager,
-        &mut vm_state,
-        &network_config,
-    ).await?;
+    super::common::save_vm_state_with_network(&state_manager, &mut vm_state, &network_config)
+        .await?;
 
     info!(
         vm_id = %vm_id,
@@ -639,11 +631,7 @@ async fn cmd_snapshot_ls() -> Result<()> {
             &serve.vm_id[..8.min(serve.vm_id.len())],
             serve_pid,
             format!("{:?}", serve.health_status),
-            serve
-                .config
-                .snapshot_name
-                .as_deref()
-                .unwrap_or("-"),
+            serve.config.snapshot_name.as_deref().unwrap_or("-"),
             clone_count,
         );
     }
