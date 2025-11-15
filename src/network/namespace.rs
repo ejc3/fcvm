@@ -104,10 +104,7 @@ pub async fn list_namespaces() -> Result<Vec<String>> {
         .filter(|line| !line.is_empty())
         .map(|line| {
             // Format is "name (id: N)" or just "name"
-            line.split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_string()
+            line.split_whitespace().next().unwrap_or("").to_string()
         })
         .collect();
 

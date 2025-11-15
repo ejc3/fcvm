@@ -37,10 +37,17 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
                     // Process exists, now check if application is responding
                     // Get guest IP, host veth device, and health check path from state
                     if let Ok(state) = state_manager.load_state(&vm_id).await {
-                        let guest_ip = state.config.network.get("guest_ip").and_then(|v| v.as_str());
+                        let guest_ip = state
+                            .config
+                            .network
+                            .get("guest_ip")
+                            .and_then(|v| v.as_str());
 
                         // Get veth device from network config (required for namespace isolation)
-                        let veth_device = state.config.network.get("host_veth")
+                        let veth_device = state
+                            .config
+                            .network
+                            .get("host_veth")
                             .and_then(|v| v.as_str());
 
                         debug!(target: "health-monitor", vm_id = %vm_id, guest_ip = ?guest_ip, veth = ?veth_device, "network config for health check");
@@ -87,8 +94,12 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
                 state.health_status = health_status;
                 state.last_updated = chrono::Utc::now();
                 match state_manager.save_state(&state).await {
-                    Ok(_) => debug!(target: "health-monitor", vm_id = %vm_id, health_status = ?health_status, "state saved"),
-                    Err(e) => warn!(target: "health-monitor", vm_id = %vm_id, error = %e, "failed to save state"),
+                    Ok(_) => {
+                        debug!(target: "health-monitor", vm_id = %vm_id, health_status = ?health_status, "state saved")
+                    }
+                    Err(e) => {
+                        warn!(target: "health-monitor", vm_id = %vm_id, error = %e, "failed to save state")
+                    }
                 }
             } else {
                 warn!(target: "health-monitor", vm_id = %vm_id, "failed to load state for updating health");
@@ -119,7 +130,7 @@ async fn check_http_health(guest_ip: &str, _veth_device: &str, health_path: &str
     // but the routing table ensures packets to the guest IP go through the right veth
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
-        .danger_accept_invalid_certs(true)  // VMs may have self-signed certs
+        .danger_accept_invalid_certs(true) // VMs may have self-signed certs
         .build()
         .context("building HTTP client")?;
 

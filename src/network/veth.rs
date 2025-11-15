@@ -8,11 +8,7 @@ use super::namespace::exec_in_namespace;
 ///
 /// Creates a pair of virtual ethernet devices. The host side remains in the
 /// root namespace, while the guest side is moved into the VM's namespace.
-pub async fn create_veth_pair(
-    host_veth: &str,
-    guest_veth: &str,
-    ns_name: &str,
-) -> Result<()> {
+pub async fn create_veth_pair(host_veth: &str, guest_veth: &str, ns_name: &str) -> Result<()> {
     info!(
         host = %host_veth,
         guest = %guest_veth,
@@ -23,15 +19,7 @@ pub async fn create_veth_pair(
     // Create veth pair in root namespace
     let output = Command::new("sudo")
         .args([
-            "ip",
-            "link",
-            "add",
-            host_veth,
-            "type",
-            "veth",
-            "peer",
-            "name",
-            guest_veth,
+            "ip", "link", "add", host_veth, "type", "veth", "peer", "name", guest_veth,
         ])
         .output()
         .await
@@ -145,7 +133,10 @@ pub async fn setup_guest_veth_in_ns(
     let output = exec_in_namespace(ns_name, &["ip", "link", "set", "lo", "up"]).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!("failed to bring up loopback (may already be up): {}", stderr);
+        warn!(
+            "failed to bring up loopback (may already be up): {}",
+            stderr
+        );
     }
 
     // Bring up veth interface
@@ -195,11 +186,8 @@ pub async fn create_tap_in_ns(ns_name: &str, tap_name: &str) -> Result<()> {
     );
 
     // Create TAP device
-    let output = exec_in_namespace(
-        ns_name,
-        &["ip", "tuntap", "add", tap_name, "mode", "tap"],
-    )
-    .await?;
+    let output =
+        exec_in_namespace(ns_name, &["ip", "tuntap", "add", tap_name, "mode", "tap"]).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -245,7 +233,11 @@ pub async fn connect_tap_to_veth(
     let bridge_name = "br0";
 
     // Create bridge
-    let output = exec_in_namespace(ns_name, &["ip", "link", "add", bridge_name, "type", "bridge"]).await?;
+    let output = exec_in_namespace(
+        ns_name,
+        &["ip", "link", "add", bridge_name, "type", "bridge"],
+    )
+    .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // Ignore if bridge already exists
@@ -265,22 +257,27 @@ pub async fn connect_tap_to_veth(
         let stderr = String::from_utf8_lossy(&output.stderr);
         // Ignore "File exists" - IP already assigned
         if !stderr.contains("File exists") {
-            anyhow::bail!(
-                "failed to assign IP to bridge in namespace: {}",
-                stderr
-            );
+            anyhow::bail!("failed to assign IP to bridge in namespace: {}", stderr);
         }
     }
 
     // Attach TAP to bridge
-    let output = exec_in_namespace(ns_name, &["ip", "link", "set", tap_name, "master", bridge_name]).await?;
+    let output = exec_in_namespace(
+        ns_name,
+        &["ip", "link", "set", tap_name, "master", bridge_name],
+    )
+    .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("failed to attach TAP to bridge: {}", stderr);
     }
 
     // Attach veth to bridge
-    let output = exec_in_namespace(ns_name, &["ip", "link", "set", veth_name, "master", bridge_name]).await?;
+    let output = exec_in_namespace(
+        ns_name,
+        &["ip", "link", "set", veth_name, "master", bridge_name],
+    )
+    .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("failed to attach veth to bridge: {}", stderr);
@@ -348,9 +345,7 @@ mod tests {
             .unwrap();
 
         // Setup host side
-        setup_host_veth(host_veth, "172.30.0.1/30")
-            .await
-            .unwrap();
+        setup_host_veth(host_veth, "172.30.0.1/30").await.unwrap();
 
         // Setup guest side
         setup_guest_veth_in_ns(ns_name, guest_veth, "172.30.0.2/30", "172.30.0.1")

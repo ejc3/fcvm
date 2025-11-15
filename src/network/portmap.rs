@@ -8,10 +8,7 @@ use super::types::{PortMapping, Protocol};
 ///
 /// Creates iptables DNAT rules to forward traffic from host ports to guest ports.
 /// Returns a list of rule specifications that can be used for cleanup.
-pub async fn setup_port_mappings(
-    guest_ip: &str,
-    mappings: &[PortMapping],
-) -> Result<Vec<String>> {
+pub async fn setup_port_mappings(guest_ip: &str, mappings: &[PortMapping]) -> Result<Vec<String>> {
     if mappings.is_empty() {
         return Ok(Vec::new());
     }
@@ -65,9 +62,7 @@ pub async fn setup_port_mappings(
             .args(forward_rule.split_whitespace())
             .output()
             .await
-            .with_context(|| {
-                format!("adding FORWARD rule for port {}", mapping.guest_port)
-            })?;
+            .with_context(|| format!("adding FORWARD rule for port {}", mapping.guest_port))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -165,7 +160,19 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
 
     // Check if MASQUERADE rule already exists
     let output = Command::new("sudo")
-        .args(["iptables", "-t", "nat", "-C", "POSTROUTING", "-s", vm_subnet, "-o", outbound_iface, "-j", "MASQUERADE"])
+        .args([
+            "iptables",
+            "-t",
+            "nat",
+            "-C",
+            "POSTROUTING",
+            "-s",
+            vm_subnet,
+            "-o",
+            outbound_iface,
+            "-j",
+            "MASQUERADE",
+        ])
         .output()
         .await?;
 

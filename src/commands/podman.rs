@@ -230,11 +230,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .await?;
 
     // Save VM state with complete network configuration
-    super::common::save_vm_state_with_network(
-        &state_manager,
-        &mut vm_state,
-        &network_config,
-    ).await?;
+    super::common::save_vm_state_with_network(&state_manager, &mut vm_state, &network_config)
+        .await?;
 
     info!(vm_id = %vm_id, "VM started successfully");
 
@@ -284,4 +281,3 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     Ok(())
 }
-

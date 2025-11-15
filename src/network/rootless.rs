@@ -2,9 +2,7 @@ use anyhow::{Context, Result};
 use tracing::info;
 
 use super::{
-    namespace, portmap, veth,
-    types::generate_mac,
-    NetworkConfig, NetworkManager, PortMapping
+    namespace, portmap, types::generate_mac, veth, NetworkConfig, NetworkManager, PortMapping,
 };
 
 /// Rootless networking using network namespace isolation with veth pairs
@@ -73,9 +71,11 @@ impl NetworkManager for RootlessNetwork {
             if parts.len() != 4 {
                 anyhow::bail!("invalid guest IP format: {}", override_ip);
             }
-            let third_octet: u8 = parts[2].parse()
+            let third_octet: u8 = parts[2]
+                .parse()
                 .with_context(|| format!("parsing guest IP third octet: {}", override_ip))?;
-            let fourth_octet: u8 = parts[3].parse()
+            let fourth_octet: u8 = parts[3]
+                .parse()
                 .with_context(|| format!("parsing guest IP fourth octet: {}", override_ip))?;
 
             let subnet_base = fourth_octet.saturating_sub(2);
@@ -116,7 +116,8 @@ impl NetworkManager for RootlessNetwork {
 
         // Step 2: Create network namespace
         let namespace_id = format!("fcvm-{}", &self.vm_id[..8]);
-        namespace::create_namespace(&namespace_id).await
+        namespace::create_namespace(&namespace_id)
+            .await
             .context("creating network namespace")?;
 
         // Step 3: Create veth pair
@@ -124,37 +125,50 @@ impl NetworkManager for RootlessNetwork {
         let host_veth = format!("veth0-{}", &self.vm_id[..8]);
         let guest_veth = format!("veth1-{}", &self.vm_id[..8]);
 
-        veth::create_veth_pair(&host_veth, &guest_veth, &namespace_id).await
+        veth::create_veth_pair(&host_veth, &guest_veth, &namespace_id)
+            .await
             .context("creating veth pair")?;
 
         // Step 4: Configure host side of veth
-        veth::setup_host_veth(&host_veth, &host_ip_with_cidr).await
+        veth::setup_host_veth(&host_veth, &host_ip_with_cidr)
+            .await
             .context("configuring host veth")?;
 
         // Step 5: Configure guest side of veth inside namespace
-        veth::setup_guest_veth_in_ns(&namespace_id, &guest_veth, &guest_ip_with_cidr, &host_ip).await
+        veth::setup_guest_veth_in_ns(&namespace_id, &guest_veth, &guest_ip_with_cidr, &host_ip)
+            .await
             .context("configuring guest veth")?;
 
         // Step 6: Create TAP device inside namespace
-        veth::create_tap_in_ns(&namespace_id, &self.tap_device).await
+        veth::create_tap_in_ns(&namespace_id, &self.tap_device)
+            .await
             .context("creating TAP device in namespace")?;
 
         // Step 7: Connect TAP to veth inside namespace
         // The guest (Firecracker) will use the TAP, and it routes through veth to host
         let tap_ip_with_cidr = guest_ip_with_cidr.clone();
-        veth::connect_tap_to_veth(&namespace_id, &self.tap_device, &guest_veth, &tap_ip_with_cidr).await
-            .context("connecting TAP to veth")?;
+        veth::connect_tap_to_veth(
+            &namespace_id,
+            &self.tap_device,
+            &guest_veth,
+            &tap_ip_with_cidr,
+        )
+        .await
+        .context("connecting TAP to veth")?;
 
         // Step 8: Ensure global NAT is configured
-        let default_iface = portmap::detect_default_interface().await
+        let default_iface = portmap::detect_default_interface()
+            .await
             .context("detecting default network interface")?;
 
-        portmap::ensure_global_nat("172.30.0.0/16", &default_iface).await
+        portmap::ensure_global_nat("172.30.0.0/16", &default_iface)
+            .await
             .context("ensuring global NAT configuration")?;
 
         // Step 9: Setup port mappings if any
         let port_mapping_rules = if !self.port_mappings.is_empty() {
-            portmap::setup_port_mappings(&guest_ip, &self.port_mappings).await
+            portmap::setup_port_mappings(&guest_ip, &self.port_mappings)
+                .await
                 .context("setting up port mappings")?
         } else {
             Vec::new()

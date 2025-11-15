@@ -1,6 +1,6 @@
-use fcvm::state::{StateManager, VmState, VmStatus, VmConfig, HealthStatus};
-use tempfile::TempDir;
 use chrono::Utc;
+use fcvm::state::{HealthStatus, StateManager, VmConfig, VmState, VmStatus};
+use tempfile::TempDir;
 
 #[tokio::test]
 async fn test_state_persistence() {

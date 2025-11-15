@@ -27,8 +27,8 @@ pub async fn save_vm_state_with_network(
 ) -> Result<()> {
     // Serialize the COMPLETE network config struct (all fields)
     // This includes: tap_device, guest_mac, guest_ip, host_ip, host_veth
-    vm_state.config.network = serde_json::to_value(network_config)
-        .context("serializing network config")?;
+    vm_state.config.network =
+        serde_json::to_value(network_config).context("serializing network config")?;
 
     // Capture fcvm PID (current process, not Firecracker child)
     let fcvm_pid = std::process::id();
@@ -37,7 +37,9 @@ pub async fn save_vm_state_with_network(
 
     // Mark VM as running and persist to disk
     vm_state.status = VmStatus::Running;
-    state_manager.save_state(vm_state).await
+    state_manager
+        .save_state(vm_state)
+        .await
         .context("persisting VM state to disk")?;
 
     Ok(())
