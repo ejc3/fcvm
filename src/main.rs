@@ -7,14 +7,26 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
-        .with_target(false)
-        .init();
-
     // Parse CLI arguments
     let cli = cli::Cli::parse();
+
+    // Initialize logging
+    // If --sub-process flag is set, disable timestamps AND level (subprocess mode)
+    // Parent process already shows timestamp and level, so subprocess just shows the message
+    // Otherwise, show full formatting (outermost process)
+    if cli.sub_process {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+            .with_target(false)
+            .without_time()
+            .with_level(false)  // Disable level prefix too (INFO, DEBUG, etc.)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+            .with_target(false)
+            .init();
+    }
 
     // Dispatch to appropriate command handler
     let result = match cli.cmd {
