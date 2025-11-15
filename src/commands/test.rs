@@ -150,7 +150,7 @@ async fn start_baseline_vm(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    let proc = cmd.spawn().context("spawning baseline VM")?;
+    let mut proc = cmd.spawn().context("spawning baseline VM")?;
     let fcvm_pid = proc.id().expect("process must have PID");
     println!("  fcvm process PID: {}", fcvm_pid);
 

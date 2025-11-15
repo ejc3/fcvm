@@ -26,9 +26,20 @@ pub struct UffdServer {
 impl UffdServer {
     /// Create a new UFFD server for a snapshot
     pub async fn new(snapshot_id: String, mem_file_path: &Path) -> Result<Self> {
+        let socket_path = paths::base_dir().join(format!("uffd-{}.sock", snapshot_id));
+        Self::new_with_path(snapshot_id, mem_file_path, &socket_path).await
+    }
+
+    /// Create a new UFFD server with custom socket path
+    pub async fn new_with_path(
+        snapshot_id: String,
+        mem_file_path: &Path,
+        socket_path: &Path,
+    ) -> Result<Self> {
         info!(
             snapshot = %snapshot_id,
             mem_file = %mem_file_path.display(),
+            socket = %socket_path.display(),
             "creating UFFD server"
         );
 
@@ -49,9 +60,6 @@ impl UffdServer {
                 .context("mmapping memory file")?
         });
 
-        // Create socket path
-        let socket_path = paths::base_dir().join(format!("uffd-{}.sock", snapshot_id));
-
         // Ensure parent directory exists
         if let Some(parent) = socket_path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -68,7 +76,7 @@ impl UffdServer {
 
         Ok(Self {
             snapshot_id,
-            socket_path,
+            socket_path: socket_path.to_path_buf(),
             mmap,
         })
     }

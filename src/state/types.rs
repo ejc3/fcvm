@@ -42,6 +42,15 @@ pub struct VmConfig {
     pub env: Vec<String>,
     #[serde(default = "default_health_check_path")]
     pub health_check_path: String,
+    /// Which snapshot this process is serving or was cloned from
+    #[serde(default)]
+    pub snapshot_name: Option<String>,
+    /// Process type: "vm" (podman run), "serve" (snapshot serve), "clone" (snapshot run)
+    #[serde(default)]
+    pub process_type: Option<String>,
+    /// For clones: which serve process PID spawned this clone
+    #[serde(default)]
+    pub serve_pid: Option<u32>,
 }
 
 fn default_health_check_path() -> String {
@@ -67,6 +76,9 @@ impl VmState {
                 volumes: Vec::new(),
                 env: Vec::new(),
                 health_check_path: default_health_check_path(),
+                snapshot_name: None,
+                process_type: Some("vm".to_string()),
+                serve_pid: None,
             },
         }
     }
