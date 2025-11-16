@@ -135,7 +135,7 @@ impl NetworkManager for RootlessNetwork {
             .context("configuring host veth")?;
 
         // Step 5: Configure guest side of veth inside namespace
-        veth::setup_guest_veth_in_ns(&namespace_id, &guest_veth, &guest_ip_with_cidr, &host_ip)
+        veth::setup_guest_veth_in_ns(&namespace_id, &guest_veth)
             .await
             .context("configuring guest veth")?;
 

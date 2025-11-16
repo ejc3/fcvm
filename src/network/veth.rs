@@ -113,19 +113,16 @@ pub async fn setup_host_veth(veth_name: &str, ip_with_cidr: &str) -> Result<()> 
 
 /// Configures the guest side of a veth pair inside a namespace
 ///
-/// Sets up the guest-side veth with an IP address, default route, and brings it up.
-/// All operations happen inside the VM's network namespace.
+/// Brings up the veth interface and loopback inside the namespace.
+/// Note: The veth does NOT get an IP - the bridge will have the IP assigned
+/// in connect_tap_to_veth(). Routing is handled by the guest VM, not the namespace.
 pub async fn setup_guest_veth_in_ns(
     ns_name: &str,
     veth_name: &str,
-    ip_with_cidr: &str,
-    gateway_ip: &str,
 ) -> Result<()> {
     info!(
         namespace = %ns_name,
         veth = %veth_name,
-        ip = %ip_with_cidr,
-        gateway = %gateway_ip,
         "configuring guest veth in namespace"
     );
 
@@ -152,24 +149,8 @@ pub async fn setup_guest_veth_in_ns(
 
     // NOTE: With bridge setup, veth does NOT get an IP.
     // The bridge will have the IP assigned in connect_tap_to_veth().
-    // Just bring up the veth - no IP assignment needed.
-
-    // Add default route via gateway
-    let output = exec_in_namespace(
-        ns_name,
-        &["ip", "route", "add", "default", "via", gateway_ip],
-    )
-    .await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Ignore "File exists" - route already exists
-        if !stderr.contains("File exists") {
-            warn!(
-                "failed to add default route in namespace (may already exist): {}",
-                stderr
-            );
-        }
-    }
+    // No default route needed in namespace - routing happens in the guest VM.
+    // The namespace only does L2 bridging between TAP and veth.
 
     Ok(())
 }
@@ -383,7 +364,7 @@ mod tests {
         setup_host_veth(host_veth, "172.30.0.1/30").await.unwrap();
 
         // Setup guest side
-        setup_guest_veth_in_ns(ns_name, guest_veth, "172.30.0.2/30", "172.30.0.1")
+        setup_guest_veth_in_ns(ns_name, guest_veth)
             .await
             .unwrap();
 
