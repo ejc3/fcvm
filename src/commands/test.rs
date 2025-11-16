@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::process::Stdio;
 use std::time::Instant;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::info;
 
@@ -17,6 +16,91 @@ fn fcvm_subprocess() -> Command {
     let mut cmd = Command::new(current_exe);
     cmd.arg("--sub-process"); // Disable timestamps/level in subprocess
     cmd
+}
+
+/// Spawn tasks to read stdout/stderr and prefix each line with [vm-name]
+/// Format: [vm-name] [target] message
+/// where target comes from the subprocess output (e.g., "vm:", "firecracker:", "health-monitor:")
+fn spawn_log_prefix_tasks(
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+    vm_name: String,
+) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    if let Some(stdout) = stdout {
+        let vm_name = vm_name.clone();
+        tokio::spawn(async move {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                // Line format from subprocess: "target: message" or just "message"
+                // We want: "[vm-name] [target] message" or "[vm-name] message"
+                if let Some((target, message)) = line.split_once(": ") {
+                    println!("[{}] [{}] {}", vm_name, target, message);
+                } else {
+                    println!("[{}] {}", vm_name, line);
+                }
+            }
+        });
+    }
+
+    if let Some(stderr) = stderr {
+        tokio::spawn(async move {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                // stderr typically for errors
+                if let Some((target, message)) = line.split_once(": ") {
+                    eprintln!("[{}] [{}] {}", vm_name, target, message);
+                } else {
+                    eprintln!("[{}] {}", vm_name, line);
+                }
+            }
+        });
+    }
+}
+
+/// Spawn task to read stdout, prefix lines with [vm-name], and check for ready message
+/// Returns a channel receiver that will send () when ready message is found
+fn spawn_log_prefix_with_ready_check(
+    stdout: Option<tokio::process::ChildStdout>,
+    vm_name: String,
+    ready_message: &str,
+) -> tokio::sync::oneshot::Receiver<()> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let ready_msg = ready_message.to_string();
+
+    if let Some(stdout) = stdout {
+        tokio::spawn(async move {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            let mut ready_tx = Some(ready_tx);
+
+            while let Ok(Some(line)) = lines.next_line().await {
+                // Check for ready message
+                if let Some(tx) = ready_tx.take() {
+                    if line.contains(&ready_msg) {
+                        let _ = tx.send(());
+                    } else {
+                        // Restore tx if not sent yet
+                        ready_tx = Some(tx);
+                    }
+                }
+
+                // Prefix and print
+                if let Some((target, message)) = line.split_once(": ") {
+                    println!("[{}] [{}] {}", vm_name, target, message);
+                } else {
+                    println!("[{}] {}", vm_name, line);
+                }
+            }
+        });
+    }
+
+    ready_rx
 }
 
 pub async fn cmd_test(args: TestArgs) -> Result<()> {
@@ -139,6 +223,26 @@ async fn cleanup_all_firecracker() -> Result<()> {
         .output()
         .await;
 
+    // Clean up all fcvm network namespaces
+    // First, get list of all fcvm-* namespaces
+    let output = Command::new("ip")
+        .args(["netns", "list"])
+        .output()
+        .await?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let ns_name = line.split_whitespace().next().unwrap_or("");
+            if ns_name.starts_with("fcvm-") {
+                let _ = Command::new("sudo")
+                    .args(["ip", "netns", "del", ns_name])
+                    .output()
+                    .await;
+            }
+        }
+    }
+
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     Ok(())
 }
@@ -153,12 +257,15 @@ async fn start_baseline_vm(vm_name: &str, timeout: u64) -> Result<(tokio::proces
         .arg("--name")
         .arg(vm_name)
         .arg("nginx:alpine")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let mut proc = cmd.spawn().context("spawning baseline VM")?;
     let fcvm_pid = proc.id().expect("process must have PID");
     println!("  fcvm process PID: {}", fcvm_pid);
+
+    // Spawn tasks to read and prefix output
+    spawn_log_prefix_tasks(proc.stdout.take(), proc.stderr.take(), vm_name.to_string());
 
     // Wait for VM to be healthy
     println!(
@@ -167,6 +274,8 @@ async fn start_baseline_vm(vm_name: &str, timeout: u64) -> Result<(tokio::proces
     );
     let start = Instant::now();
     let timeout_duration = tokio::time::Duration::from_secs(timeout);
+
+    let state_manager = crate::state::StateManager::new(crate::paths::state_dir());
 
     while start.elapsed() < timeout_duration {
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -177,17 +286,35 @@ async fn start_baseline_vm(vm_name: &str, timeout: u64) -> Result<(tokio::proces
                 anyhow::bail!("fcvm process exited with status: {}", status);
             }
             Ok(None) => {
-                // Still running, assume it's working
+                // Still running, check actual health status
             }
             Err(e) => {
                 anyhow::bail!("Failed to check process status: {}", e);
             }
         }
 
-        // For now, just wait a reasonable amount of time
-        if start.elapsed() > tokio::time::Duration::from_secs(10) {
-            println!("  Assuming VM is healthy after 10 seconds");
-            break;
+        // Check actual health status from state file
+        if let Ok(states) = state_manager.list_vms().await {
+            if let Some(state) = states.iter().find(|s| s.pid == Some(fcvm_pid)) {
+                if state.health_status == crate::state::HealthStatus::Healthy {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    println!("  ✓ VM became healthy in {:.1}s", elapsed);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Final check - did we actually become healthy?
+    if let Ok(states) = state_manager.list_vms().await {
+        if let Some(state) = states.iter().find(|s| s.pid == Some(fcvm_pid)) {
+            if state.health_status != crate::state::HealthStatus::Healthy {
+                anyhow::bail!(
+                    "VM did not become healthy within {}s timeout (status: {:?})",
+                    timeout,
+                    state.health_status
+                );
+            }
         }
     }
 
@@ -229,22 +356,23 @@ async fn start_memory_server(snapshot: &str) -> Result<(tokio::process::Child, u
     let mut proc = cmd.spawn().context("spawning memory server")?;
     let serve_pid = proc.id().context("getting serve process PID")?;
 
-    // Wait for "UFFD server listening" message
-    let stdout = proc.stdout.take().context("no stdout")?;
-    let mut reader = BufReader::new(stdout).lines();
+    // Spawn task to read stdout, prefix lines, and check for ready message
+    let ready_rx = spawn_log_prefix_with_ready_check(
+        proc.stdout.take(),
+        format!("uffd-{}", snapshot),
+        "UFFD server listening",
+    );
 
+    // Also handle stderr
+    spawn_log_prefix_tasks(None, proc.stderr.take(), format!("uffd-{}", snapshot));
+
+    // Wait for ready message with timeout
     let timeout = tokio::time::Duration::from_secs(10);
-    let start = Instant::now();
-
-    while start.elapsed() < timeout {
-        if let Some(line) = reader.next_line().await? {
-            if line.contains("UFFD server listening") {
-                return Ok((proc, serve_pid));
-            }
-        }
+    match tokio::time::timeout(timeout, ready_rx).await {
+        Ok(Ok(())) => Ok((proc, serve_pid)),
+        Ok(Err(_)) => anyhow::bail!("Memory server stdout closed before ready message"),
+        Err(_) => anyhow::bail!("Memory server failed to start within 10 seconds"),
     }
-
-    anyhow::bail!("Memory server failed to start within 10 seconds")
 }
 
 async fn run_stress_test(
@@ -403,11 +531,16 @@ async fn clone_vm(serve_pid: u32, name: &str) -> CloneMetrics {
             "--name",
             name,
         ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn();
 
     match result {
-        Ok(child) => {
+        Ok(mut child) => {
             let pid = child.id().expect("child must have PID");
+
+            // Spawn tasks to read and prefix output
+            spawn_log_prefix_tasks(child.stdout.take(), child.stderr.take(), name.to_string());
 
             CloneMetrics {
                 name: name.to_string(),

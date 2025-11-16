@@ -88,8 +88,11 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     info!(rootfs = %rootfs_path.display(), "disk prepared");
 
-    // Start Firecracker VM (disable file logging for now to avoid permission issues)
+    info!(vm_name = %vm_name, vm_id = %vm_id, "creating VM manager");
     let mut vm_manager = VmManager::new(vm_id.clone(), socket_path.clone(), None);
+
+    // Set VM name for logging
+    vm_manager.set_vm_name(vm_name);
 
     // Configure namespace isolation if network provides one
     if let Some(rootless_net) = network.as_any().downcast_ref::<RootlessNetwork>() {
