@@ -26,6 +26,7 @@ use super::FirecrackerClient;
 /// the Firecracker child process is also terminated.
 pub struct VmManager {
     vm_id: String,
+    vm_name: Option<String>,
     socket_path: PathBuf,
     log_path: Option<PathBuf>,
     namespace_id: Option<String>,
@@ -37,12 +38,18 @@ impl VmManager {
     pub fn new(vm_id: String, socket_path: PathBuf, log_path: Option<PathBuf>) -> Self {
         Self {
             vm_id,
+            vm_name: None,
             socket_path,
             log_path,
             namespace_id: None,
             process: None,
             client: None,
         }
+    }
+
+    /// Set the VM name for logging purposes
+    pub fn set_vm_name(&mut self, vm_name: String) {
+        self.vm_name = Some(vm_name);
     }
 
     /// Set the network namespace for this VM
@@ -59,7 +66,11 @@ impl VmManager {
         firecracker_bin: &Path,
         config_override: Option<&Path>,
     ) -> Result<()> {
-        info!(target: "vm", vm_id = %self.vm_id, "starting Firecracker process");
+        if let Some(ref name) = self.vm_name {
+            info!(target: "vm", vm_name = %name, vm_id = %self.vm_id, "starting Firecracker process");
+        } else {
+            info!(target: "vm", vm_id = %self.vm_id, "starting Firecracker process");
+        }
 
         // Ensure socket doesn't exist
         if self.socket_path.exists() {
@@ -164,24 +175,34 @@ impl VmManager {
         // Stream stdout/stderr to tracing
         if let Some(stdout) = child.stdout.take() {
             let vm_id = self.vm_id.clone();
+            let vm_name = self.vm_name.clone();
             tokio::spawn(async move {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     let clean_line = strip_firecracker_prefix(&line);
-                    info!(target: "firecracker", vm_id = %vm_id, "{}", clean_line);
+                    if let Some(ref name) = vm_name {
+                        info!(target: "firecracker", vm_name = %name, vm_id = %vm_id, "{}", clean_line);
+                    } else {
+                        info!(target: "firecracker", vm_id = %vm_id, "{}", clean_line);
+                    }
                 }
             });
         }
 
         if let Some(stderr) = child.stderr.take() {
             let vm_id = self.vm_id.clone();
+            let vm_name = self.vm_name.clone();
             tokio::spawn(async move {
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     let clean_line = strip_firecracker_prefix(&line);
-                    warn!(target: "firecracker", vm_id = %vm_id, "{}", clean_line);
+                    if let Some(ref name) = vm_name {
+                        warn!(target: "firecracker", vm_name = %name, vm_id = %vm_id, "{}", clean_line);
+                    } else {
+                        warn!(target: "firecracker", vm_id = %vm_id, "{}", clean_line);
+                    }
                 }
             });
         }
