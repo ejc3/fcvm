@@ -86,7 +86,7 @@ pub async fn setup_host_veth(veth_name: &str, ip_with_cidr: &str) -> Result<()> 
     // Add FORWARD rule to allow outbound traffic from this veth
     let forward_rule = format!("-A FORWARD -i {} -j ACCEPT", veth_name);
     let output = Command::new("sudo")
-        .args(["iptables", "-t", "filter", "-C"])
+        .args(["iptables", "-t", "filter", "-C", "FORWARD"]) // Include chain name for -C check
         .args(forward_rule.split_whitespace().skip(2)) // Skip "-A FORWARD"
         .output()
         .await
@@ -316,6 +316,41 @@ pub async fn delete_veth_pair(host_veth: &str) -> Result<()> {
             return Ok(());
         }
         anyhow::bail!("failed to delete veth {}: {}", host_veth, stderr);
+    }
+
+    Ok(())
+}
+
+/// Deletes the FORWARD rule for a veth interface
+///
+/// This removes the iptables FORWARD rule that allows outbound traffic from the veth interface.
+/// Should be called before deleting the veth pair to avoid accumulating orphaned rules.
+pub async fn delete_veth_forward_rule(veth_name: &str) -> Result<()> {
+    info!(veth = %veth_name, "deleting FORWARD rule");
+
+    let forward_rule = format!("-D FORWARD -i {} -j ACCEPT", veth_name);
+    let output = Command::new("sudo")
+        .args(["iptables", "-t", "filter"])
+        .args(forward_rule.split_whitespace())
+        .output()
+        .await
+        .context("deleting FORWARD rule")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Ignore "No chain/target/match" or "does not exist" - rule already gone
+        if stderr.contains("No chain")
+            || stderr.contains("does not exist")
+            || stderr.contains("Bad rule")
+        {
+            warn!(veth = %veth_name, "FORWARD rule already deleted or never existed");
+            return Ok(());
+        }
+        anyhow::bail!(
+            "failed to delete FORWARD rule for {}: {}",
+            veth_name,
+            stderr
+        );
     }
 
     Ok(())
