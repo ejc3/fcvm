@@ -28,10 +28,18 @@ pub async fn setup_port_mappings(guest_ip: &str, mappings: &[PortMapping]) -> Re
         };
 
         // DNAT rule: Rewrite destination for incoming traffic
-        let dnat_rule = format!(
-            "-t nat -A PREROUTING -p {} --dport {} -j DNAT --to-destination {}:{}",
-            proto_str, mapping.host_port, guest_ip, mapping.guest_port
-        );
+        // If host_ip is specified, only match packets destined to that IP (security: prevents exposing on all interfaces)
+        let dnat_rule = if let Some(ref host_ip) = mapping.host_ip {
+            format!(
+                "-t nat -A PREROUTING -d {} -p {} --dport {} -j DNAT --to-destination {}:{}",
+                host_ip, proto_str, mapping.host_port, guest_ip, mapping.guest_port
+            )
+        } else {
+            format!(
+                "-t nat -A PREROUTING -p {} --dport {} -j DNAT --to-destination {}:{}",
+                proto_str, mapping.host_port, guest_ip, mapping.guest_port
+            )
+        };
 
         let output = Command::new("sudo")
             .arg("iptables")

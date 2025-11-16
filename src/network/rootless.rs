@@ -211,8 +211,11 @@ impl NetworkManager for RootlessNetwork {
             portmap::cleanup_port_mappings(&self.port_mapping_rules).await?;
         }
 
-        // Step 2: Delete veth pair (this will also remove the peer in the namespace)
+        // Step 2: Delete FORWARD rule and veth pair
         if let Some(ref host_veth) = self.host_veth {
+            // Delete FORWARD rule first to avoid accumulating orphaned rules
+            veth::delete_veth_forward_rule(host_veth).await?;
+            // Then delete the veth pair (this will also remove the peer in the namespace)
             veth::delete_veth_pair(host_veth).await?;
         }
 
