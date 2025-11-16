@@ -350,10 +350,18 @@ None - all major features working!
    - `fcvm setup preflight` - Validate system requirements
 
 2. **Testing**
-   - Test `fcvm run nginx:latest` end-to-end
-   - Measure clone performance (<1s target)
-   - Test port mapping (rootless + privileged modes)
+   - Test port mapping with 127.0.0.1 (localhost-only binding)
    - Test volume mounting
+
+   **Sanity Test**:
+   ```bash
+   # Run sanity test (single VM, verify health checks work)
+   sudo fcvm test sanity
+   ```
+   - Starts nginx:alpine VM
+   - Verifies VM becomes healthy within 60s timeout
+   - Tests networking, health checks, and cleanup
+   - Exit code 0 = PASS
 
 3. **Documentation**
    - Usage examples
