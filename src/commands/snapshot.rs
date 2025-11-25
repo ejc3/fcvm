@@ -466,8 +466,16 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             Box::new(net)
         }
         NetworkMode::Rootless => {
+            // For rootless mode, allocate loopback IP atomically with state persistence
+            // This prevents race conditions when starting multiple clones concurrently
+            let loopback_ip = state_manager
+                .allocate_loopback_ip(&mut vm_state)
+                .await
+                .context("allocating loopback IP")?;
+
             let mut net =
-                SlirpNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
+                SlirpNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
+                    .with_loopback_ip(loopback_ip);
             // If snapshot has saved network config with guest_ip, use it
             // This is critical: clones restore with the baseline's IP configuration
             if let Some(ref guest_ip) = saved_network.guest_ip {

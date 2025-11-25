@@ -76,11 +76,19 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
             tap_device.clone(),
             port_mappings.clone(),
         )),
-        NetworkMode::Rootless => Box::new(SlirpNetwork::new(
-            vm_id.clone(),
-            tap_device.clone(),
-            port_mappings.clone(),
-        )),
+        NetworkMode::Rootless => {
+            // For rootless mode, allocate loopback IP atomically with state persistence
+            // This prevents race conditions when starting multiple VMs concurrently
+            let loopback_ip = state_manager
+                .allocate_loopback_ip(&mut vm_state)
+                .await
+                .context("allocating loopback IP")?;
+
+            Box::new(
+                SlirpNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
+                    .with_loopback_ip(loopback_ip),
+            )
+        }
     };
 
     let network_config = network.setup().await.context("setting up network")?;

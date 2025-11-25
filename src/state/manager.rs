@@ -156,6 +156,80 @@ impl StateManager {
 
         Ok(vms)
     }
+
+    /// Allocate a unique loopback IP for rootless networking and persist it atomically
+    ///
+    /// Uses a global lock file to ensure atomic allocation across concurrent VM starts.
+    /// The VM state is saved with the allocated IP WHILE HOLDING THE LOCK, ensuring
+    /// no race conditions - no other process can allocate the same IP.
+    ///
+    /// Returns an IP in the 127.0.0.2 - 127.255.255.254 range.
+    ///
+    /// # Arguments
+    /// * `vm_state` - The VM state to update and persist with the allocated IP
+    pub async fn allocate_loopback_ip(&self, vm_state: &mut VmState) -> Result<String> {
+        use std::collections::HashSet;
+
+        let lock_file = self.state_dir.join("loopback-ip.lock");
+
+        // Create/open lock file for exclusive locking
+        use std::os::unix::fs::OpenOptionsExt;
+        let lock_fd = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&lock_file)
+            .context("opening loopback IP lock file")?;
+
+        // Acquire exclusive lock (blocks if another process has lock)
+        use nix::fcntl::{Flock, FlockArg};
+        let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
+            .map_err(|(_, err)| err)
+            .context("acquiring exclusive lock for loopback IP allocation")?;
+
+        // Collect IPs from all VM state files
+        let used_ips: HashSet<String> = self
+            .list_vms()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|vm| vm.config.network.loopback_ip)
+            .collect();
+
+        // Sequential allocation: 127.0.0.2, 127.0.0.3, ... 127.0.0.254
+        // Then 127.0.1.2, 127.0.1.3, ... etc.
+        let ip = (|| {
+            for b2 in 0..=255u8 {
+                for b3 in 2..=254u8 {
+                    // Skip 127.0.0.1 (localhost)
+                    let ip = format!("127.0.{}.{}", b2, b3);
+                    if !used_ips.contains(&ip) {
+                        return ip;
+                    }
+                }
+            }
+            // Fallback if all IPs are used (very unlikely - 65,000+ IPs)
+            tracing::warn!("all loopback IPs in use, reusing 127.0.0.2");
+            "127.0.0.2".to_string()
+        })();
+
+        // Update VM state with the allocated IP and SAVE WHILE HOLDING THE LOCK
+        // This ensures no other process can allocate the same IP
+        vm_state.config.network.loopback_ip = Some(ip.clone());
+        self.save_state(vm_state).await?;
+
+        // Release lock (only after state is persisted)
+        flock
+            .unlock()
+            .map_err(|(_, err)| err)
+            .context("releasing loopback IP lock")?;
+
+        // Clean up lock file
+        let _ = std::fs::remove_file(&lock_file);
+
+        Ok(ip)
+    }
 }
 
 // StateManager tests moved to tests/test_state_integration.rs for better integration testing
