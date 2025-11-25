@@ -14,6 +14,7 @@ async fn test_state_persistence() {
 
     // Create and save a VM state
     let state = VmState {
+        schema_version: 1,
         vm_id: "test-vm-1".to_string(),
         name: Some("test-vm".to_string()),
         status: VmStatus::Running,
@@ -77,6 +78,7 @@ async fn test_list_vms() {
     // Save multiple VMs
     for i in 1..=3 {
         let state = VmState {
+            schema_version: 1,
             vm_id: format!("vm-{}", i),
             name: Some(format!("test-vm-{}", i)),
             status: VmStatus::Running,

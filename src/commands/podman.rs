@@ -7,7 +7,7 @@ use crate::cli::{PodmanArgs, PodmanCommands, RunArgs};
 use crate::firecracker::VmManager;
 use crate::network::{NetworkManager, PortMapping, RootlessNetwork};
 use crate::paths;
-use crate::state::{generate_vm_id, StateManager, VmState};
+use crate::state::{generate_vm_id, truncate_id, StateManager, VmState};
 use crate::storage::DiskManager;
 
 /// Main dispatcher for podman commands
@@ -66,7 +66,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     state_manager.init().await?;
 
     // Setup networking (always rootless with TAP device)
-    let tap_device = format!("tap-{}", &vm_id[..8]);
+    let tap_device = format!("tap-{}", truncate_id(&vm_id, 8));
     let mut network: Box<dyn NetworkManager> = Box::new(RootlessNetwork::new(
         vm_id.clone(),
         tap_device.clone(),

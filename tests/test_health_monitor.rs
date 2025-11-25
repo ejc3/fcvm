@@ -18,6 +18,7 @@ async fn test_health_monitor_lifecycle() {
 
     // Create a VM state without a real process
     let state = VmState {
+        schema_version: 1,
         vm_id: "health-test-vm".to_string(),
         name: Some("health-test".to_string()),
         status: VmStatus::Running,
