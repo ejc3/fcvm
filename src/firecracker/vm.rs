@@ -72,10 +72,8 @@ impl VmManager {
             info!(target: "vm", vm_id = %self.vm_id, "starting Firecracker process");
         }
 
-        // Ensure socket doesn't exist
-        if self.socket_path.exists() {
-            std::fs::remove_file(&self.socket_path).context("removing existing socket")?;
-        }
+        // Remove existing socket (ignore errors if not exists - avoids TOCTOU race)
+        let _ = std::fs::remove_file(&self.socket_path);
 
         let mut cmd = Command::new(firecracker_bin);
         cmd.arg("--api-sock").arg(&self.socket_path);
