@@ -475,7 +475,7 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         &uffd_socket,
         &snapshot_config,
         &network_config,
-        &network,
+        network.as_ref(),
         &state_manager,
         &mut vm_state,
     )
@@ -604,7 +604,7 @@ async fn run_clone_setup(
     uffd_socket: &std::path::Path,
     snapshot_config: &crate::storage::snapshot::SnapshotConfig,
     network_config: &crate::network::NetworkConfig,
-    network: &Box<dyn NetworkManager>,
+    network: &dyn NetworkManager,
     state_manager: &StateManager,
     vm_state: &mut VmState,
 ) -> Result<VmManager> {
