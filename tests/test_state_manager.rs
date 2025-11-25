@@ -1,4 +1,5 @@
 use chrono::Utc;
+use fcvm::network::NetworkConfig;
 use fcvm::state::{HealthStatus, StateManager, VmConfig, VmState, VmStatus};
 use tempfile::TempDir;
 
@@ -26,10 +27,13 @@ async fn test_state_persistence() {
             image: "nginx:alpine".to_string(),
             vcpu: 2,
             memory_mib: 512,
-            network: serde_json::json!({
-                "guest_ip": "172.16.0.2",
-                "host_veth": "veth0"
-            }),
+            network: NetworkConfig {
+                tap_device: "tap0".to_string(),
+                guest_mac: "02:00:00:00:00:01".to_string(),
+                guest_ip: Some("172.16.0.2".to_string()),
+                host_ip: Some("172.16.0.1".to_string()),
+                host_veth: Some("veth0".to_string()),
+            },
             volumes: vec![],
             env: vec![],
             health_check_path: "/".to_string(),
@@ -90,7 +94,7 @@ async fn test_list_vms() {
                 image: "nginx:alpine".to_string(),
                 vcpu: 1,
                 memory_mib: 256,
-                network: serde_json::json!({}),
+                network: NetworkConfig::default(),
                 volumes: vec![],
                 env: vec![],
                 health_check_path: "/".to_string(),

@@ -444,21 +444,17 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         .context("parsing port mappings")?;
 
     // Extract guest_ip from snapshot metadata for network config reuse
-    use crate::network::NetworkConfig as SavedNetworkConfig;
-    let saved_network: Option<SavedNetworkConfig> =
-        serde_json::from_value(snapshot_config.metadata.network_config.clone()).ok();
+    let saved_network = &snapshot_config.metadata.network_config;
 
     // Setup networking (always rootless) - reuse guest_ip from snapshot if available
     let mut net = RootlessNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
     // If snapshot has saved network config with guest_ip, use it
-    if let Some(ref saved_net) = saved_network {
-        if let Some(ref guest_ip) = saved_net.guest_ip {
-            net = net.with_guest_ip(guest_ip.clone());
-            info!(
-                guest_ip = %guest_ip,
-                "clone will use same network config as snapshot"
-            );
-        }
+    if let Some(ref guest_ip) = saved_network.guest_ip {
+        net = net.with_guest_ip(guest_ip.clone());
+        info!(
+            guest_ip = %guest_ip,
+            "clone will use same network config as snapshot"
+        );
     }
     let mut network: Box<dyn NetworkManager> = Box::new(net);
 

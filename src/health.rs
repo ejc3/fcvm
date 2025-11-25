@@ -51,18 +51,11 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
                     // Process exists, now check if application is responding
                     // Get guest IP, host veth device, and health check path from state
                     if let Ok(state) = state_manager.load_state(&vm_id).await {
-                        let guest_ip = state
-                            .config
-                            .network
-                            .get("guest_ip")
-                            .and_then(|v| v.as_str());
+                        // Direct field access (typed NetworkConfig struct)
+                        let guest_ip = state.config.network.guest_ip.as_deref();
 
                         // Get veth device from network config (required for namespace isolation)
-                        let veth_device = state
-                            .config
-                            .network
-                            .get("host_veth")
-                            .and_then(|v| v.as_str());
+                        let veth_device = state.config.network.host_veth.as_deref();
 
                         debug!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, guest_ip = ?guest_ip, veth = ?veth_device, "network config for health check");
 

@@ -1,11 +1,16 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NetworkConfig {
+    #[serde(default)]
     pub tap_device: String,
+    #[serde(default)]
     pub guest_mac: String,
+    #[serde(default)]
     pub guest_ip: Option<String>,
+    #[serde(default)]
     pub host_ip: Option<String>,
+    #[serde(default)]
     pub host_veth: Option<String>,
 }
 

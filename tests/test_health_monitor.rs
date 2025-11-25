@@ -1,5 +1,6 @@
 use chrono::Utc;
 use fcvm::health::spawn_health_monitor;
+use fcvm::network::NetworkConfig;
 use fcvm::state::{HealthStatus, StateManager, VmConfig, VmState, VmStatus};
 use tempfile::TempDir;
 use tokio::time::{sleep, Duration};
@@ -30,10 +31,13 @@ async fn test_health_monitor_lifecycle() {
             image: "test:latest".to_string(),
             vcpu: 1,
             memory_mib: 256,
-            network: serde_json::json!({
-                "guest_ip": "192.168.1.100",
-                "host_veth": "veth-test"
-            }),
+            network: NetworkConfig {
+                tap_device: "tap-test".to_string(),
+                guest_mac: "02:00:00:00:00:01".to_string(),
+                guest_ip: Some("192.168.1.100".to_string()),
+                host_ip: Some("192.168.1.1".to_string()),
+                host_veth: Some("veth-test".to_string()),
+            },
             volumes: vec![],
             env: vec![],
             health_check_path: "/health".to_string(),

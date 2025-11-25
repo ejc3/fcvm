@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::network::NetworkConfig;
+
 /// Safely truncate a string to at most `max_len` characters.
 /// Returns a string slice without panicking for short inputs.
 pub fn truncate_id(s: &str, max_len: usize) -> &str {
@@ -50,7 +52,7 @@ pub struct VmConfig {
     pub image: String,
     pub vcpu: u8,
     pub memory_mib: u32,
-    pub network: serde_json::Value,
+    pub network: NetworkConfig,
     pub volumes: Vec<String>,
     pub env: Vec<String>,
     #[serde(default = "default_health_check_path")]
@@ -86,7 +88,7 @@ impl VmState {
                 image,
                 vcpu,
                 memory_mib,
-                network: serde_json::Value::Null,
+                network: NetworkConfig::default(),
                 volumes: Vec::new(),
                 env: Vec::new(),
                 health_check_path: default_health_check_path(),
