@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use fcvm::cli::Commands;
-use fcvm::{cli, commands};
+use fcvm::{cli, commands, paths};
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
@@ -9,6 +9,9 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> Result<()> {
     // Parse CLI arguments
     let cli = cli::Cli::parse();
+
+    // Initialize base directory from CLI argument (must be done before any path access)
+    paths::init_base_dir(cli.base_dir.as_deref());
 
     // Initialize logging
     // If --sub-process flag is set, disable timestamps AND level (subprocess mode)
