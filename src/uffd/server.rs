@@ -69,12 +69,8 @@ impl UffdServer {
                 .context("creating socket directory")?;
         }
 
-        // Clean up stale socket
-        if socket_path.exists() {
-            tokio::fs::remove_file(&socket_path)
-                .await
-                .context("removing stale socket")?;
-        }
+        // Remove stale socket (ignore errors if not exists - avoids TOCTOU race)
+        let _ = tokio::fs::remove_file(&socket_path).await;
 
         Ok(Self {
             snapshot_id,
@@ -180,12 +176,8 @@ impl UffdServer {
 
 impl Drop for UffdServer {
     fn drop(&mut self) {
-        // Clean up socket file
-        if self.socket_path.exists() {
-            if let Err(e) = std::fs::remove_file(&self.socket_path) {
-                warn!(target: "uffd", error = %e, "failed to remove socket during cleanup");
-            }
-        }
+        // Clean up socket file (ignore errors - avoids TOCTOU race and handles concurrent cleanup)
+        let _ = std::fs::remove_file(&self.socket_path);
     }
 }
 

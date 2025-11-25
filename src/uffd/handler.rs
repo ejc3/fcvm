@@ -42,10 +42,8 @@ impl UffdHandler {
 
         info!(handler_bin = %handler_bin.display(), "found uffd_handler binary");
 
-        // Clean up stale socket if exists
-        if socket_path.exists() {
-            std::fs::remove_file(&socket_path).context("removing stale uffd socket")?;
-        }
+        // Remove stale socket (ignore errors if not exists - avoids TOCTOU race)
+        let _ = std::fs::remove_file(&socket_path);
 
         // Spawn uffd handler process
         // Args: <socket_path> <mem_file_path>

@@ -107,12 +107,12 @@ impl StateManager {
     /// Delete VM state
     pub async fn delete_state(&self, vm_id: &str) -> Result<()> {
         let state_file = self.state_dir.join(format!("{}.json", vm_id));
-        if state_file.exists() {
-            fs::remove_file(&state_file)
-                .await
-                .context("deleting VM state")?;
+        // Ignore NotFound errors - avoids TOCTOU race and handles concurrent cleanup
+        match fs::remove_file(&state_file).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).context("deleting VM state"),
         }
-        Ok(())
     }
 
     /// Load VM state by name
