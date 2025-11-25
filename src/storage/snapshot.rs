@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use tokio::fs;
 use tracing::info;
 
+use crate::network::NetworkConfig;
+
 /// Snapshot configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotConfig {
@@ -21,7 +23,7 @@ pub struct SnapshotMetadata {
     pub image: String,
     pub vcpu: u8,
     pub memory_mib: u32,
-    pub network_config: serde_json::Value,
+    pub network_config: NetworkConfig,
 }
 
 /// Manages VM snapshots

@@ -25,10 +25,8 @@ pub async fn save_vm_state_with_network(
     vm_state: &mut VmState,
     network_config: &NetworkConfig,
 ) -> Result<()> {
-    // Serialize the COMPLETE network config struct (all fields)
-    // This includes: tap_device, guest_mac, guest_ip, host_ip, host_veth
-    vm_state.config.network =
-        serde_json::to_value(network_config).context("serializing network config")?;
+    // Assign network config directly (typed struct, no serialization needed)
+    vm_state.config.network = network_config.clone();
 
     // Capture fcvm PID (current process, not Firecracker child)
     let fcvm_pid = std::process::id();

@@ -58,19 +58,18 @@ pub async fn cmd_ls(args: LsArgs) -> Result<()> {
 
         let name = vm.name.clone().unwrap_or_else(|| truncate_id(&vm.vm_id, 8).to_string());
 
-        // Extract network info from config
-        let (guest_ip, tap_device) = if let Some(network) = vm.config.network.as_object() {
-            let ip = network
-                .get("guest_ip")
-                .and_then(|v| v.as_str())
-                .unwrap_or("-");
-            let tap = network
-                .get("tap_device")
-                .and_then(|v| v.as_str())
-                .unwrap_or("-");
-            (ip.to_string(), tap.to_string())
+        // Extract network info from typed NetworkConfig struct
+        let guest_ip = vm
+            .config
+            .network
+            .guest_ip
+            .as_deref()
+            .unwrap_or("-")
+            .to_string();
+        let tap_device = if vm.config.network.tap_device.is_empty() {
+            "-".to_string()
         } else {
-            ("-".to_string(), "-".to_string())
+            vm.config.network.tap_device.clone()
         };
 
         let status = format!("{:?}", vm.status);
