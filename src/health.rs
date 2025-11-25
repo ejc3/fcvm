@@ -1,7 +1,5 @@
 use anyhow::{Context, Result};
-use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tracing::{debug, info, warn};
@@ -36,8 +34,8 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
         let mut poll_interval = Duration::from_millis(100);
         let mut is_healthy = false;
 
-        // Throttle health check failure logs to once per second
-        let last_failure_log: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        // Throttle health check failure logs to once per second (simple local variable)
+        let mut last_failure_log: Option<Instant> = None;
 
         loop {
             tokio::time::sleep(poll_interval).await;
@@ -66,7 +64,7 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
                                 Ok(true) => {
                                     debug!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, "health check passed");
                                     // Reset throttle on success
-                                    *last_failure_log.lock().await = None;
+                                    last_failure_log = None;
                                     HealthStatus::Healthy
                                 }
                                 Ok(false) => {
@@ -76,15 +74,14 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
                                 }
                                 Err(e) => {
                                     // Throttle failure logs to once per second
-                                    let mut last_log = last_failure_log.lock().await;
-                                    let should_log = match *last_log {
+                                    let should_log = match last_failure_log {
                                         None => true,
                                         Some(last_time) => last_time.elapsed() >= Duration::from_secs(1),
                                     };
 
                                     if should_log {
                                         warn!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, error = %e, "health check failed");
-                                        *last_log = Some(Instant::now());
+                                        last_failure_log = Some(Instant::now());
                                     }
                                     HealthStatus::Unhealthy
                                 }
