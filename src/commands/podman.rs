@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, warn};
 
-use crate::cli::{PodmanArgs, PodmanCommands, RunArgs};
+use crate::cli::{NetworkMode, PodmanArgs, PodmanCommands, RunArgs};
 use crate::firecracker::VmManager;
-use crate::network::{NetworkManager, PortMapping, RootlessNetwork};
+use crate::network::{BridgedNetwork, NetworkManager, PortMapping, SlirpNetwork};
 use crate::paths;
 use crate::state::{generate_vm_id, truncate_id, StateManager, VmState};
 use crate::storage::DiskManager;
@@ -65,13 +65,20 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     let state_manager = StateManager::new(paths::state_dir());
     state_manager.init().await?;
 
-    // Setup networking (always rootless with TAP device)
+    // Setup networking based on mode
     let tap_device = format!("tap-{}", truncate_id(&vm_id, 8));
-    let mut network: Box<dyn NetworkManager> = Box::new(RootlessNetwork::new(
-        vm_id.clone(),
-        tap_device.clone(),
-        port_mappings.clone(),
-    ));
+    let mut network: Box<dyn NetworkManager> = match args.network {
+        NetworkMode::Bridged => Box::new(BridgedNetwork::new(
+            vm_id.clone(),
+            tap_device.clone(),
+            port_mappings.clone(),
+        )),
+        NetworkMode::Rootless => Box::new(SlirpNetwork::new(
+            vm_id.clone(),
+            tap_device.clone(),
+            port_mappings.clone(),
+        )),
+    };
 
     let network_config = network.setup().await.context("setting up network")?;
 
@@ -86,7 +93,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         &socket_path,
         &kernel_path,
         &network_config,
-        network.as_ref(),
+        network.as_mut(),
         cmd_args,
         &state_manager,
         &mut vm_state,
@@ -109,8 +116,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // Spawn health monitor task (store handle for cancellation)
     let health_monitor_handle = crate::health::spawn_health_monitor(vm_id.clone(), vm_state.pid);
 
-    // Note: No need for slirp4netns - we use static IP + NAT routing
-    // TAP device is already configured with IP and iptables rules in network setup
+    // Note: For rootless mode, pasta wraps Firecracker and configures TAP automatically
+    // For bridged mode, TAP is configured via NAT routing during network setup
 
     // Setup signal handlers
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -164,7 +171,7 @@ async fn run_vm_setup(
     socket_path: &std::path::Path,
     kernel_path: &std::path::Path,
     network_config: &crate::network::NetworkConfig,
-    network: &dyn NetworkManager,
+    network: &mut dyn NetworkManager,
     cmd_args: Option<Vec<String>>,
     state_manager: &StateManager,
     vm_state: &mut VmState,
@@ -187,12 +194,20 @@ async fn run_vm_setup(
     // Set VM name for logging
     vm_manager.set_vm_name(vm_name);
 
-    // Configure namespace isolation if network provides one
-    if let Some(rootless_net) = network.as_any().downcast_ref::<RootlessNetwork>() {
-        if let Some(ns_id) = rootless_net.namespace_id() {
+    // Configure namespace isolation based on network type
+    if let Some(bridged_net) = network.as_any().downcast_ref::<BridgedNetwork>() {
+        // Bridged mode: use pre-created network namespace
+        if let Some(ns_id) = bridged_net.namespace_id() {
             info!(namespace = %ns_id, "configuring VM to run in network namespace");
             vm_manager.set_namespace(ns_id.to_string());
         }
+    } else if let Some(slirp_net) = network.as_any().downcast_ref::<SlirpNetwork>() {
+        // Rootless mode: use slirp4netns with dual-TAP architecture
+        // Creates user+net namespace with two TAPs: slirp0 (for slirp4netns) and tap0 (for Firecracker)
+        // IP forwarding connects them for outbound connectivity
+        let wrapper_cmd = slirp_net.build_wrapper_command();
+        info!(wrapper = %slirp_net.wrapper_command_string(), "configuring VM for rootless operation with slirp4netns");
+        vm_manager.set_pasta_wrapper(wrapper_cmd);
     }
 
     let firecracker_bin = PathBuf::from("/usr/local/bin/firecracker");
@@ -202,6 +217,7 @@ async fn run_vm_setup(
         .await
         .context("starting Firecracker")?;
 
+    let vm_pid = vm_manager.pid()?;
     let client = vm_manager.client()?;
 
     // Configure VM via API
@@ -259,9 +275,16 @@ async fn run_vm_setup(
         )
         .await?;
 
+    // For rootless mode with pasta: post_start is a no-op (TAP already created by pasta wrapper)
+    // For bridged mode: post_start is a no-op (TAP already created by BridgedNetwork)
+    network
+        .post_start(vm_pid)
+        .await
+        .context("post-start network setup")?;
+
     // Network interface - required for MMDS V2 in all modes
-    // For rootless: create TAP device first, then slirp4netns will use it
-    // For privileged: TAP is created and added to bridge
+    // For rootless: pasta already created TAP, Firecracker attaches to it
+    // For bridged: TAP is created by BridgedNetwork and added to bridge
     client
         .add_network_interface(
             "eth0",

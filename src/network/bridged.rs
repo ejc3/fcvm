@@ -6,16 +6,19 @@ use super::{
 };
 use crate::state::truncate_id;
 
-/// Rootless networking using network namespace isolation with veth pairs
+/// Bridged networking using network namespace isolation with veth pairs
 ///
-/// New architecture (post namespace migration):
+/// This mode requires sudo/root for network namespace and iptables setup.
+/// For true rootless operation (no sudo), use SlirpNetwork instead.
+///
+/// Architecture:
 /// - Each VM runs in dedicated network namespace (fcvm-{vm_id})
 /// - veth pair connects host namespace to VM namespace
 /// - TAP device created inside VM namespace
 /// - TAP connected directly to veth (no bridge)
 /// - Port mappings via iptables DNAT/FORWARD rules
 /// - Firecracker process runs inside the namespace
-pub struct RootlessNetwork {
+pub struct BridgedNetwork {
     vm_id: String,
     tap_device: String,
     port_mappings: Vec<PortMapping>,
@@ -31,7 +34,7 @@ pub struct RootlessNetwork {
     port_mapping_rules: Vec<String>,
 }
 
-impl RootlessNetwork {
+impl BridgedNetwork {
     pub fn new(vm_id: String, tap_device: String, port_mappings: Vec<PortMapping>) -> Self {
         Self {
             vm_id,
@@ -61,7 +64,7 @@ impl RootlessNetwork {
 }
 
 #[async_trait::async_trait]
-impl NetworkManager for RootlessNetwork {
+impl NetworkManager for BridgedNetwork {
     async fn setup(&mut self) -> Result<NetworkConfig> {
         info!(vm_id = %self.vm_id, "setting up network namespace with veth pair isolation");
 
@@ -211,6 +214,8 @@ impl NetworkManager for RootlessNetwork {
             guest_ip: Some(guest_ip),
             host_ip: Some(host_ip),
             host_veth: self.host_veth.clone(),
+            loopback_ip: None,       // Not used in bridged mode
+            health_check_port: None, // Not used in bridged mode
         })
     }
 
