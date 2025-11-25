@@ -466,143 +466,31 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         "network configured for clone"
     );
 
-    // Setup storage - Create CoW disk from snapshot disk
-    let vm_dir = data_dir.join("disks");
-    let disk_manager = DiskManager::new(vm_id.clone(), snapshot_config.disk_path.clone(), vm_dir);
+    // Run clone setup in a helper to ensure cleanup on error
+    let setup_result = run_clone_setup(
+        &vm_id,
+        &vm_name,
+        &data_dir,
+        &socket_path,
+        &uffd_socket,
+        &snapshot_config,
+        &network_config,
+        &network,
+        &state_manager,
+        &mut vm_state,
+    )
+    .await;
 
-    let rootfs_path = disk_manager
-        .create_cow_disk()
-        .await
-        .context("creating CoW disk from snapshot")?;
-
-    info!(
-        rootfs = %rootfs_path.display(),
-        snapshot_disk = %snapshot_config.disk_path.display(),
-        "CoW disk prepared from snapshot"
-    );
-
-    info!(vm_name = %vm_name, vm_id = %vm_id, "creating VM manager");
-    let mut vm_manager = VmManager::new(vm_id.clone(), socket_path.clone(), None);
-
-    // Set VM name for logging
-    vm_manager.set_vm_name(vm_name.clone());
-
-    // Configure namespace isolation if network provides one
-    if let Some(rootless_net) = network.as_any().downcast_ref::<RootlessNetwork>() {
-        if let Some(ns_id) = rootless_net.namespace_id() {
-            info!(namespace = %ns_id, "configuring VM to run in network namespace");
-            vm_manager.set_namespace(ns_id.to_string());
+    // If setup failed, cleanup network before propagating error
+    if let Err(e) = setup_result {
+        warn!("Clone setup failed, cleaning up network resources");
+        if let Err(cleanup_err) = network.cleanup().await {
+            warn!("failed to cleanup network after setup error: {}", cleanup_err);
         }
+        return Err(e);
     }
 
-    let firecracker_bin = PathBuf::from("/usr/local/bin/firecracker");
-
-    vm_manager
-        .start(&firecracker_bin, None)
-        .await
-        .context("starting Firecracker")?;
-
-    let client = vm_manager.client()?;
-    // Load snapshot with UFFD backend and network override
-    use crate::firecracker::api::{
-        DrivePatch, MemBackend, NetworkOverride, SnapshotLoad, VmState as ApiVmState,
-    };
-
-    info!(
-        tap_device = %network_config.tap_device,
-        disk = %rootfs_path.display(),
-        "loading snapshot with uffd backend and network override"
-    );
-
-    // Timing instrumentation: measure snapshot load operation
-    let load_start = std::time::Instant::now();
-    client
-        .load_snapshot(SnapshotLoad {
-            snapshot_path: snapshot_config.vmstate_path.display().to_string(),
-            mem_backend: MemBackend {
-                backend_type: "Uffd".to_string(),
-                backend_path: uffd_socket.display().to_string(),
-            },
-            enable_diff_snapshots: Some(false),
-            resume_vm: Some(false), // Update devices before resume
-            network_overrides: Some(vec![NetworkOverride {
-                iface_id: "eth0".to_string(),
-                host_dev_name: network_config.tap_device.clone(),
-            }]),
-        })
-        .await
-        .context("loading snapshot with uffd backend")?;
-    let load_duration = load_start.elapsed();
-    info!(
-        duration_ms = load_duration.as_millis(),
-        "snapshot load completed"
-    );
-
-    // Timing instrumentation: measure disk patch operation
-    let patch_start = std::time::Instant::now();
-    client
-        .patch_drive(
-            "rootfs",
-            DrivePatch {
-                drive_id: "rootfs".to_string(),
-                path_on_host: Some(rootfs_path.display().to_string()),
-                rate_limiter: None,
-            },
-        )
-        .await
-        .context("retargeting rootfs drive for clone")?;
-    let patch_duration = patch_start.elapsed();
-    info!(
-        duration_ms = patch_duration.as_millis(),
-        "disk patch completed"
-    );
-
-    // Signal fc-agent to flush ARP cache via MMDS restore-epoch update
-    // fc-agent watches for this field change and immediately flushes stale ARP entries
-    //
-    // IMPORTANT: After snapshot load:
-    // - MMDS CONFIG is preserved from the snapshot (version, network interfaces, IP)
-    // - MMDS DATA is NOT persisted (empty data store) - we need to populate it
-    // - /mmds/config endpoint is PRE-BOOT ONLY - cannot be called after snapshot load
-    // - /mmds endpoint (PUT/PATCH) is allowed both pre-boot and post-boot
-    //
-    // So we just call put_mmds() - the config is already there from the snapshot.
-    let restore_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    // Put the restore-epoch data directly (MMDS config is preserved from snapshot)
-    // fc-agent doesn't need container-plan after restore since container is already running
-    client
-        .put_mmds(serde_json::json!({
-            "latest": {
-                "host-time": chrono::Utc::now().timestamp().to_string(),
-                "restore-epoch": restore_epoch.to_string()
-            }
-        }))
-        .await
-        .context("updating MMDS with restore-epoch")?;
-    info!(restore_epoch = restore_epoch, "signaled fc-agent to flush ARP via MMDS");
-
-    // Timing instrumentation: measure VM resume operation
-    let resume_start = std::time::Instant::now();
-    client
-        .patch_vm_state(ApiVmState {
-            state: "Resumed".to_string(),
-        })
-        .await
-        .context("resuming VM after snapshot load")?;
-    let resume_duration = resume_start.elapsed();
-    info!(
-        duration_ms = resume_duration.as_millis(),
-        total_snapshot_ms = (load_duration + patch_duration + resume_duration).as_millis(),
-        "VM resume completed"
-    );
-
-    // Save VM state with complete network configuration
-    super::common::save_vm_state_with_network(&state_manager, &mut vm_state, &network_config)
-        .await?;
+    let mut vm_manager = setup_result.unwrap();
 
     info!(
         vm_id = %vm_id,
@@ -703,4 +591,163 @@ async fn cmd_snapshot_ls() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Helper function that runs clone setup and returns VmManager on success.
+/// This allows the caller to cleanup network resources on error.
+#[allow(clippy::too_many_arguments)]
+async fn run_clone_setup(
+    vm_id: &str,
+    vm_name: &str,
+    data_dir: &std::path::Path,
+    socket_path: &std::path::Path,
+    uffd_socket: &std::path::Path,
+    snapshot_config: &crate::storage::snapshot::SnapshotConfig,
+    network_config: &crate::network::NetworkConfig,
+    network: &Box<dyn NetworkManager>,
+    state_manager: &StateManager,
+    vm_state: &mut VmState,
+) -> Result<VmManager> {
+    // Setup storage - Create CoW disk from snapshot disk
+    let vm_dir = data_dir.join("disks");
+    let disk_manager = DiskManager::new(vm_id.to_string(), snapshot_config.disk_path.clone(), vm_dir);
+
+    let rootfs_path = disk_manager
+        .create_cow_disk()
+        .await
+        .context("creating CoW disk from snapshot")?;
+
+    info!(
+        rootfs = %rootfs_path.display(),
+        snapshot_disk = %snapshot_config.disk_path.display(),
+        "CoW disk prepared from snapshot"
+    );
+
+    info!(vm_name = %vm_name, vm_id = %vm_id, "creating VM manager");
+    let mut vm_manager = VmManager::new(vm_id.to_string(), socket_path.to_path_buf(), None);
+
+    // Set VM name for logging
+    vm_manager.set_vm_name(vm_name.to_string());
+
+    // Configure namespace isolation if network provides one
+    if let Some(rootless_net) = network.as_any().downcast_ref::<RootlessNetwork>() {
+        if let Some(ns_id) = rootless_net.namespace_id() {
+            info!(namespace = %ns_id, "configuring VM to run in network namespace");
+            vm_manager.set_namespace(ns_id.to_string());
+        }
+    }
+
+    let firecracker_bin = PathBuf::from("/usr/local/bin/firecracker");
+
+    vm_manager
+        .start(&firecracker_bin, None)
+        .await
+        .context("starting Firecracker")?;
+
+    let client = vm_manager.client()?;
+
+    // Load snapshot with UFFD backend and network override
+    use crate::firecracker::api::{
+        DrivePatch, MemBackend, NetworkOverride, SnapshotLoad, VmState as ApiVmState,
+    };
+
+    info!(
+        tap_device = %network_config.tap_device,
+        disk = %rootfs_path.display(),
+        "loading snapshot with uffd backend and network override"
+    );
+
+    // Timing instrumentation: measure snapshot load operation
+    let load_start = std::time::Instant::now();
+    client
+        .load_snapshot(SnapshotLoad {
+            snapshot_path: snapshot_config.vmstate_path.display().to_string(),
+            mem_backend: MemBackend {
+                backend_type: "Uffd".to_string(),
+                backend_path: uffd_socket.display().to_string(),
+            },
+            enable_diff_snapshots: Some(false),
+            resume_vm: Some(false), // Update devices before resume
+            network_overrides: Some(vec![NetworkOverride {
+                iface_id: "eth0".to_string(),
+                host_dev_name: network_config.tap_device.clone(),
+            }]),
+        })
+        .await
+        .context("loading snapshot with uffd backend")?;
+    let load_duration = load_start.elapsed();
+    info!(
+        duration_ms = load_duration.as_millis(),
+        "snapshot load completed"
+    );
+
+    // Timing instrumentation: measure disk patch operation
+    let patch_start = std::time::Instant::now();
+    client
+        .patch_drive(
+            "rootfs",
+            DrivePatch {
+                drive_id: "rootfs".to_string(),
+                path_on_host: Some(rootfs_path.display().to_string()),
+                rate_limiter: None,
+            },
+        )
+        .await
+        .context("retargeting rootfs drive for clone")?;
+    let patch_duration = patch_start.elapsed();
+    info!(
+        duration_ms = patch_duration.as_millis(),
+        "disk patch completed"
+    );
+
+    // Signal fc-agent to flush ARP cache via MMDS restore-epoch update
+    // fc-agent watches for this field change and immediately flushes stale ARP entries
+    //
+    // IMPORTANT: After snapshot load:
+    // - MMDS CONFIG is preserved from the snapshot (version, network interfaces, IP)
+    // - MMDS DATA is NOT persisted (empty data store) - we need to populate it
+    // - /mmds/config endpoint is PRE-BOOT ONLY - cannot be called after snapshot load
+    // - /mmds endpoint (PUT/PATCH) is allowed both pre-boot and post-boot
+    //
+    // So we just call put_mmds() - the config is already there from the snapshot.
+    let restore_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Put the restore-epoch data directly (MMDS config is preserved from snapshot)
+    // fc-agent doesn't need container-plan after restore since container is already running
+    client
+        .put_mmds(serde_json::json!({
+            "latest": {
+                "host-time": chrono::Utc::now().timestamp().to_string(),
+                "restore-epoch": restore_epoch.to_string()
+            }
+        }))
+        .await
+        .context("updating MMDS with restore-epoch")?;
+    info!(restore_epoch = restore_epoch, "signaled fc-agent to flush ARP via MMDS");
+
+    // Timing instrumentation: measure VM resume operation
+    let resume_start = std::time::Instant::now();
+    client
+        .patch_vm_state(ApiVmState {
+            state: "Resumed".to_string(),
+        })
+        .await
+        .context("resuming VM after snapshot load")?;
+    let resume_duration = resume_start.elapsed();
+    info!(
+        duration_ms = resume_duration.as_millis(),
+        total_snapshot_ms = (load_duration + patch_duration + resume_duration).as_millis(),
+        "VM resume completed"
+    );
+
+    // Store fcvm process PID (not Firecracker PID)
+    vm_state.pid = Some(std::process::id());
+
+    // Save VM state with complete network configuration
+    super::common::save_vm_state_with_network(state_manager, vm_state, network_config).await?;
+
+    Ok(vm_manager)
 }

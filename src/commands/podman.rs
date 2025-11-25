@@ -77,9 +77,101 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     info!(tap = %network_config.tap_device, mac = %network_config.guest_mac, "network configured");
 
+    // Run the main VM setup in a helper to ensure cleanup on error
+    let setup_result = run_vm_setup(
+        &args,
+        &vm_id,
+        &data_dir,
+        &base_rootfs,
+        &socket_path,
+        &kernel_path,
+        &network_config,
+        &network,
+        cmd_args,
+        &state_manager,
+        &mut vm_state,
+    )
+    .await;
+
+    // If setup failed, cleanup network before propagating error
+    if let Err(e) = setup_result {
+        warn!("VM setup failed, cleaning up network resources");
+        if let Err(cleanup_err) = network.cleanup().await {
+            warn!("failed to cleanup network after setup error: {}", cleanup_err);
+        }
+        return Err(e);
+    }
+
+    let mut vm_manager = setup_result.unwrap();
+
+    info!(vm_id = %vm_id, "VM started successfully");
+
+    // Spawn health monitor task (store handle for cancellation)
+    let health_monitor_handle = crate::health::spawn_health_monitor(vm_id.clone(), vm_state.pid);
+
+    // Note: No need for slirp4netns - we use static IP + NAT routing
+    // TAP device is already configured with IP and iptables rules in network setup
+
+    // Setup signal handlers
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+
+    // Wait for signal or VM exit
+    tokio::select! {
+        _ = sigterm.recv() => {
+            info!("received SIGTERM, shutting down VM");
+        }
+        _ = sigint.recv() => {
+            info!("received SIGINT, shutting down VM");
+        }
+        status = vm_manager.wait() => {
+            info!(status = ?status, "VM exited");
+        }
+    }
+
+    // Cleanup
+    info!("cleaning up resources");
+
+    // Cancel health monitor task first
+    health_monitor_handle.abort();
+
+    // Kill VM process
+    if let Err(e) = vm_manager.kill().await {
+        warn!("failed to kill VM process: {}", e);
+    }
+
+    // Cleanup network
+    if let Err(e) = network.cleanup().await {
+        warn!("failed to cleanup network: {}", e);
+    }
+
+    // Delete state file
+    if let Err(e) = state_manager.delete_state(&vm_id).await {
+        warn!("failed to delete state file: {}", e);
+    }
+
+    Ok(())
+}
+
+/// Helper function that runs VM setup and returns VmManager on success.
+/// This allows the caller to cleanup network resources on error.
+#[allow(clippy::too_many_arguments)]
+async fn run_vm_setup(
+    args: &RunArgs,
+    vm_id: &str,
+    data_dir: &std::path::Path,
+    base_rootfs: &std::path::Path,
+    socket_path: &std::path::Path,
+    kernel_path: &std::path::Path,
+    network_config: &crate::network::NetworkConfig,
+    network: &Box<dyn NetworkManager>,
+    cmd_args: Option<Vec<String>>,
+    state_manager: &StateManager,
+    vm_state: &mut VmState,
+) -> Result<VmManager> {
     // Setup storage
     let vm_dir = data_dir.join("disks");
-    let disk_manager = DiskManager::new(vm_id.clone(), base_rootfs.clone(), vm_dir);
+    let disk_manager = DiskManager::new(vm_id.to_string(), base_rootfs.to_path_buf(), vm_dir);
 
     let rootfs_path = disk_manager
         .create_cow_disk()
@@ -88,8 +180,9 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     info!(rootfs = %rootfs_path.display(), "disk prepared");
 
+    let vm_name = args.name.clone();
     info!(vm_name = %vm_name, vm_id = %vm_id, "creating VM manager");
-    let mut vm_manager = VmManager::new(vm_id.clone(), socket_path.clone(), None);
+    let mut vm_manager = VmManager::new(vm_id.to_string(), socket_path.to_path_buf(), None);
 
     // Set VM name for logging
     vm_manager.set_vm_name(vm_name);
@@ -233,54 +326,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .await?;
 
     // Save VM state with complete network configuration
-    super::common::save_vm_state_with_network(&state_manager, &mut vm_state, &network_config)
-        .await?;
+    super::common::save_vm_state_with_network(state_manager, vm_state, network_config).await?;
 
-    info!(vm_id = %vm_id, "VM started successfully");
-
-    // Spawn health monitor task (store handle for cancellation)
-    let health_monitor_handle = crate::health::spawn_health_monitor(vm_id.clone(), vm_state.pid);
-
-    // Note: No need for slirp4netns - we use static IP + NAT routing
-    // TAP device is already configured with IP and iptables rules in network setup
-
-    // Setup signal handlers
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
-
-    // Wait for signal or VM exit
-    tokio::select! {
-        _ = sigterm.recv() => {
-            info!("received SIGTERM, shutting down VM");
-        }
-        _ = sigint.recv() => {
-            info!("received SIGINT, shutting down VM");
-        }
-        status = vm_manager.wait() => {
-            info!(status = ?status, "VM exited");
-        }
-    }
-
-    // Cleanup
-    info!("cleaning up resources");
-
-    // Cancel health monitor task first
-    health_monitor_handle.abort();
-
-    // Kill VM process
-    if let Err(e) = vm_manager.kill().await {
-        warn!("failed to kill VM process: {}", e);
-    }
-
-    // Cleanup network
-    if let Err(e) = network.cleanup().await {
-        warn!("failed to cleanup network: {}", e);
-    }
-
-    // Delete state file
-    if let Err(e) = state_manager.delete_state(&vm_id).await {
-        warn!("failed to delete state file: {}", e);
-    }
-
-    Ok(())
+    Ok(vm_manager)
 }

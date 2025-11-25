@@ -114,72 +114,88 @@ impl NetworkManager for RootlessNetwork {
         let cidr_bits = subnet.split('/').nth(1).unwrap_or("30");
         let host_ip_with_cidr = format!("{}/{}", host_ip, cidr_bits);
 
+        // Store state progressively as resources are created for cleanup on error
+        self.host_ip = Some(host_ip.clone());
+        self.guest_ip = Some(guest_ip.clone());
+        self.subnet_cidr = Some(subnet);
+
         // Step 2: Create network namespace
+        // Store namespace_id BEFORE creating so cleanup knows about it even if creation fails
         let namespace_id = format!("fcvm-{}", truncate_id(&self.vm_id, 8));
         namespace::create_namespace(&namespace_id)
             .await
             .context("creating network namespace")?;
+        // Store immediately after success so cleanup can delete it on later errors
+        self.namespace_id = Some(namespace_id.clone());
 
         // Step 3: Create veth pair
         // Linux interface names are limited to 15 chars (IFNAMSIZ = 16 including null)
         let host_veth = format!("veth0-{}", truncate_id(&self.vm_id, 8));
         let guest_veth = format!("veth1-{}", truncate_id(&self.vm_id, 8));
 
-        veth::create_veth_pair(&host_veth, &guest_veth, &namespace_id)
-            .await
-            .context("creating veth pair")?;
+        if let Err(e) = veth::create_veth_pair(&host_veth, &guest_veth, &namespace_id).await {
+            // Cleanup namespace before returning error
+            let _ = self.cleanup().await;
+            return Err(e).context("creating veth pair");
+        }
+        // Store after success
+        self.host_veth = Some(host_veth.clone());
+        self.guest_veth = Some(guest_veth.clone());
 
         // Step 4: Configure host side of veth
-        veth::setup_host_veth(&host_veth, &host_ip_with_cidr)
-            .await
-            .context("configuring host veth")?;
+        if let Err(e) = veth::setup_host_veth(&host_veth, &host_ip_with_cidr).await {
+            let _ = self.cleanup().await;
+            return Err(e).context("configuring host veth");
+        }
 
         // Step 5: Configure guest side of veth inside namespace
-        veth::setup_guest_veth_in_ns(&namespace_id, &guest_veth)
-            .await
-            .context("configuring guest veth")?;
+        if let Err(e) = veth::setup_guest_veth_in_ns(&namespace_id, &guest_veth).await {
+            let _ = self.cleanup().await;
+            return Err(e).context("configuring guest veth");
+        }
 
         // Step 6: Create TAP device inside namespace
-        veth::create_tap_in_ns(&namespace_id, &self.tap_device)
-            .await
-            .context("creating TAP device in namespace")?;
+        if let Err(e) = veth::create_tap_in_ns(&namespace_id, &self.tap_device).await {
+            let _ = self.cleanup().await;
+            return Err(e).context("creating TAP device in namespace");
+        }
 
         // Step 7: Connect TAP to veth inside namespace via L2 bridge
         // The guest (Firecracker) will use the TAP, and it routes through veth to host
         // Note: Bridge has no IP - it's a pure L2 forwarding device
-        veth::connect_tap_to_veth(&namespace_id, &self.tap_device, &guest_veth)
-            .await
-            .context("connecting TAP to veth")?;
+        if let Err(e) = veth::connect_tap_to_veth(&namespace_id, &self.tap_device, &guest_veth).await
+        {
+            let _ = self.cleanup().await;
+            return Err(e).context("connecting TAP to veth");
+        }
 
         // Step 8: Ensure global NAT is configured
-        let default_iface = portmap::detect_default_interface()
-            .await
-            .context("detecting default network interface")?;
+        let default_iface = match portmap::detect_default_interface().await {
+            Ok(iface) => iface,
+            Err(e) => {
+                let _ = self.cleanup().await;
+                return Err(e).context("detecting default network interface");
+            }
+        };
 
-        portmap::ensure_global_nat("172.30.0.0/16", &default_iface)
-            .await
-            .context("ensuring global NAT configuration")?;
+        if let Err(e) = portmap::ensure_global_nat("172.30.0.0/16", &default_iface).await {
+            let _ = self.cleanup().await;
+            return Err(e).context("ensuring global NAT configuration");
+        }
 
         // Step 9: Setup port mappings if any
-        let port_mapping_rules = if !self.port_mappings.is_empty() {
-            portmap::setup_port_mappings(&guest_ip, &self.port_mappings)
-                .await
-                .context("setting up port mappings")?
-        } else {
-            Vec::new()
-        };
+        if !self.port_mappings.is_empty() {
+            match portmap::setup_port_mappings(&guest_ip, &self.port_mappings).await {
+                Ok(rules) => self.port_mapping_rules = rules,
+                Err(e) => {
+                    let _ = self.cleanup().await;
+                    return Err(e).context("setting up port mappings");
+                }
+            }
+        }
 
         // Generate MAC address
         let guest_mac = generate_mac();
-
-        // Store state for cleanup
-        self.namespace_id = Some(namespace_id.clone());
-        self.host_veth = Some(host_veth);
-        self.guest_veth = Some(guest_veth);
-        self.host_ip = Some(host_ip.clone());
-        self.guest_ip = Some(guest_ip.clone());
-        self.subnet_cidr = Some(subnet);
-        self.port_mapping_rules = port_mapping_rules;
 
         info!(
             namespace = %namespace_id,
