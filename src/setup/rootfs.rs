@@ -256,6 +256,9 @@ driftfile /var/lib/chrony/drift
     // Install fc-agent binary and OpenRC service
     install_fc_agent(mount_point).await?;
 
+    // Install diagnostic scripts for debugging VM boot sequence
+    install_diagnostic_scripts(mount_point).await?;
+
     // Install overlay-init script for OverlayFS support
     install_overlay_init(mount_point).await?;
 
@@ -316,11 +319,176 @@ echo "=== Debug Complete ==="
         .args(["+x", local_path.to_str().unwrap()])
         .output();
 
+    // Note: ARP cache flushing for snapshot restore is handled by fc-agent
+    // via MMDS restore-epoch signaling - not via boot scripts (which don't run on restore)
+
     // Enable local service
     let _ = Command::new("chroot")
         .arg(mount_point.to_str().unwrap())
         .args(["/bin/sh", "-c", "rc-update add local default"])
         .output();
+
+    Ok(())
+}
+
+/// Install diagnostic scripts for observing VM boot sequence
+async fn install_diagnostic_scripts(mount_point: &Path) -> Result<()> {
+    info!("installing diagnostic scripts");
+
+    // 1. Kernel message logger - outputs dmesg periodically to serial console
+    let dmesg_logger_script = r#"#!/bin/sh
+# dmesg-logger: Continuously output kernel messages to serial console
+# This helps debug kernel-level issues during VM boot and resume
+
+echo "[dmesg-logger] Starting kernel message logger..." > /dev/console
+
+# Initial kernel buffer dump
+echo "=== Initial kernel messages ===" > /dev/console
+dmesg | tail -20 > /dev/console
+
+# Monitor new kernel messages every second for 30 seconds
+# (Most interesting boot activity happens in first 30s)
+for i in $(seq 1 30); do
+    sleep 1
+    NEW_MSGS=$(dmesg | tail -5)
+    if [ -n "$NEW_MSGS" ]; then
+        echo "[dmesg +${i}s]" > /dev/console
+        echo "$NEW_MSGS" > /dev/console
+    fi
+done
+
+echo "[dmesg-logger] Kernel message monitoring complete" > /dev/console
+"#;
+
+    let dmesg_logger_path = mount_point.join("usr/local/bin/dmesg-logger.sh");
+    tokio::fs::write(&dmesg_logger_path, dmesg_logger_script)
+        .await
+        .context("writing dmesg-logger script")?;
+
+    let output = Command::new("chmod")
+        .args(["+x", dmesg_logger_path.to_str().unwrap()])
+        .output()
+        .context("making dmesg-logger executable")?;
+
+    if !output.status.success() {
+        bail!("chmod failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    // 2. Process state monitor - tracks what ALL processes are doing after resume
+    let process_monitor_script = r#"#!/bin/sh
+# process-monitor: Monitor process states to understand what's blocking during clone resume
+# This runs continuously and logs process states to help debug the 6-second delay
+
+echo "[proc-monitor] Starting process state monitor..." > /dev/console
+
+# Monitor process states every 200ms for 10 seconds
+for i in $(seq 1 50); do
+    # Get timestamp in milliseconds (approximate)
+    TIME=$((i * 200))
+
+    # Find all processes and show their state
+    # Format: PID STAT COMMAND
+    # STAT codes: R=running, S=sleeping, D=uninterruptible sleep (IO wait), Z=zombie, T=stopped
+    echo "[proc-monitor T+${TIME}ms] Process states:" > /dev/console
+    ps -eo pid,stat,comm 2>/dev/null | grep -E '(nginx|conmon|podman|sleep)' | while read line; do
+        echo "[proc-monitor T+${TIME}ms]   $line" > /dev/console
+    done
+
+    # Check what's listening on network ports
+    LISTENERS=$(netstat -tuln 2>/dev/null | grep -E ':80|:443' | wc -l)
+    if [ "$LISTENERS" -gt 0 ]; then
+        echo "[proc-monitor T+${TIME}ms] Listening on port 80: YES" > /dev/console
+    else
+        echo "[proc-monitor T+${TIME}ms] Listening on port 80: NO" > /dev/console
+    fi
+
+    # Check for uninterruptible sleep (IO wait) - this is often the culprit
+    IO_WAIT=$(ps -eo stat | grep -c '^D')
+    if [ "$IO_WAIT" -gt 0 ]; then
+        echo "[proc-monitor T+${TIME}ms] ⚠️  $IO_WAIT processes in uninterruptible sleep (IO wait)" > /dev/console
+        ps -eo pid,stat,wchan:20,comm 2>/dev/null | grep '^[0-9]* D' | while read line; do
+            echo "[proc-monitor T+${TIME}ms]     IO-WAIT: $line" > /dev/console
+        done
+    fi
+
+    sleep 0.2
+done
+
+echo "[proc-monitor] Process monitoring complete" > /dev/console
+"#;
+
+    let process_monitor_path = mount_point.join("usr/local/bin/process-monitor.sh");
+    tokio::fs::write(&process_monitor_path, process_monitor_script)
+        .await
+        .context("writing process-monitor script")?;
+
+    let output = Command::new("chmod")
+        .args(["+x", process_monitor_path.to_str().unwrap()])
+        .output()
+        .context("making process-monitor executable")?;
+
+    if !output.status.success() {
+        bail!("chmod failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    // 3. Create local.d startup scripts to run diagnostics at boot
+    let local_d_dir = mount_point.join("etc/local.d");
+    tokio::fs::create_dir_all(&local_d_dir)
+        .await
+        .context("creating local.d directory")?;
+
+    // Script to launch dmesg logger early in boot
+    let dmesg_start = r#"#!/bin/sh
+/usr/local/bin/dmesg-logger.sh &
+"#;
+    let dmesg_start_path = local_d_dir.join("dmesg-logger.start");
+    tokio::fs::write(&dmesg_start_path, dmesg_start)
+        .await
+        .context("writing dmesg-logger.start")?;
+
+    let output = Command::new("chmod")
+        .args(["+x", dmesg_start_path.to_str().unwrap()])
+        .output()
+        .context("making dmesg-logger.start executable")?;
+
+    if !output.status.success() {
+        bail!("chmod failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    // Script to launch process monitor immediately (runs on boot AND resume from snapshot!)
+    let process_start = r#"#!/bin/sh
+/usr/local/bin/process-monitor.sh &
+"#;
+    let process_start_path = local_d_dir.join("process-monitor.start");
+    tokio::fs::write(&process_start_path, process_start)
+        .await
+        .context("writing process-monitor.start")?;
+
+    let output = Command::new("chmod")
+        .args(["+x", process_start_path.to_str().unwrap()])
+        .output()
+        .context("making process-monitor.start executable")?;
+
+    if !output.status.success() {
+        bail!("chmod failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    // Enable local service (runs scripts in /etc/local.d/*.start)
+    let output = Command::new("chroot")
+        .arg(mount_point.to_str().unwrap())
+        .args(["/bin/sh", "-c", "rc-update add local default 2>/dev/null || true"])
+        .output()
+        .context("enabling local service")?;
+
+    if !output.status.success() {
+        warn!(
+            "Failed to enable local service: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    info!("diagnostic scripts installed");
+    println!("  ✓ Diagnostic scripts installed (dmesg-logger, process-monitor)");
 
     Ok(())
 }

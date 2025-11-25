@@ -156,6 +156,12 @@ async fn check_http_health(guest_ip: &str, veth_device: &str, health_path: &str)
     // Use curl with --interface to bind to specific veth device
     // This is the simplest and most reliable way to route to a specific VM
     // when multiple VMs share the same IP
+    //
+    // Add --write-out to capture detailed timing information:
+    // - time_namelookup: DNS resolution time
+    // - time_connect: TCP connection establishment time
+    // - time_starttransfer: Time to first byte
+    // - time_total: Total request time
     let output = tokio::process::Command::new("curl")
         .args([
             "--interface", veth_device,
@@ -163,6 +169,7 @@ async fn check_http_health(guest_ip: &str, veth_device: &str, health_path: &str)
             "--silent",
             "--fail",
             "--show-error",
+            "--write-out", "\\nTIMING: dns=%{time_namelookup}s connect=%{time_connect}s ttfb=%{time_starttransfer}s total=%{time_total}s",
             &url,
         ])
         .output()
@@ -170,7 +177,21 @@ async fn check_http_health(guest_ip: &str, veth_device: &str, health_path: &str)
         .context("executing curl")?;
 
     if output.status.success() {
-        debug!("Health check succeeded via {}", veth_device);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Extract timing information from curl output
+        if let Some(timing_line) = stdout.lines().find(|line| line.starts_with("TIMING:")) {
+            debug!(
+                target: "health-monitor",
+                interface = veth_device,
+                guest_ip = guest_ip,
+                timing = timing_line.strip_prefix("TIMING: ").unwrap_or(""),
+                "health check succeeded with timing"
+            );
+        } else {
+            debug!("Health check succeeded via {}", veth_device);
+        }
+
         Ok(true)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);

@@ -27,6 +27,7 @@ fn spawn_log_prefix_tasks(
     vm_name: String,
 ) {
     use tokio::io::{AsyncBufReadExt, BufReader};
+    use tracing::info;
 
     if let Some(stdout) = stdout {
         let vm_name = vm_name.clone();
@@ -37,9 +38,9 @@ fn spawn_log_prefix_tasks(
                 // Line format from subprocess: "target: message" or just "message"
                 // We want: "[vm-name] [target] message" or "[vm-name] message"
                 if let Some((target, message)) = line.split_once(": ") {
-                    println!("[{}] [{}] {}", vm_name, target, message);
+                    info!(target: "test", "[{}] [{}] {}", vm_name, target, message);
                 } else {
-                    println!("[{}] {}", vm_name, line);
+                    info!(target: "test", "[{}] {}", vm_name, line);
                 }
             }
         });
@@ -52,9 +53,9 @@ fn spawn_log_prefix_tasks(
             while let Ok(Some(line)) = lines.next_line().await {
                 // stderr typically for errors
                 if let Some((target, message)) = line.split_once(": ") {
-                    eprintln!("[{}] [{}] {}", vm_name, target, message);
+                    info!(target: "test", "[{}] [{}] {}", vm_name, target, message);
                 } else {
-                    eprintln!("[{}] {}", vm_name, line);
+                    info!(target: "test", "[{}] {}", vm_name, line);
                 }
             }
         });
@@ -69,6 +70,7 @@ fn spawn_log_prefix_with_ready_check(
     ready_message: &str,
 ) -> tokio::sync::oneshot::Receiver<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
+    use tracing::info;
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let ready_msg = ready_message.to_string();
@@ -92,9 +94,9 @@ fn spawn_log_prefix_with_ready_check(
 
                 // Prefix and print
                 if let Some((target, message)) = line.split_once(": ") {
-                    println!("[{}] [{}] {}", vm_name, target, message);
+                    info!(target: "test", "[{}] [{}] {}", vm_name, target, message);
                 } else {
-                    println!("[{}] {}", vm_name, line);
+                    info!(target: "test", "[{}] {}", vm_name, line);
                 }
             }
         });

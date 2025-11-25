@@ -18,6 +18,8 @@ struct Plan {
 struct LatestMetadata {
     #[serde(rename = "host-time")]
     host_time: String,
+    #[serde(rename = "restore-epoch")]
+    restore_epoch: Option<String>,
 }
 
 async fn fetch_plan() -> Result<Plan> {
@@ -112,6 +114,95 @@ async fn fetch_plan() -> Result<Plan> {
     Ok(plan)
 }
 
+/// Watch for restore-epoch changes in MMDS and flush ARP cache when detected
+/// This runs as a background task to handle snapshot restore scenarios
+async fn watch_restore_epoch() {
+    let mut last_epoch: Option<String> = None;
+
+    // Poll every 100ms - simple and fast enough to detect restores quickly
+    // The CPU overhead is negligible (~0.1% of one core)
+    loop {
+        sleep(Duration::from_millis(100)).await;
+
+        // Create a fresh client each time to handle snapshot restore
+        // (TCP connections are invalidated after snapshot restore)
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
+        // Try to fetch current restore-epoch
+        let epoch = match fetch_restore_epoch(&client).await {
+            Ok(e) => e,
+            Err(_) => continue, // Ignore errors, just keep polling
+        };
+
+        // Check if epoch changed or if this is the first time we see one
+        if let Some(ref current) = epoch {
+            match &last_epoch {
+                None => {
+                    // First time seeing an epoch - THIS IS A CLONE RESTORE!
+                    // On fresh boot, there is no restore-epoch in MMDS yet.
+                    // If we see one, we were restored from a snapshot.
+                    eprintln!("[fc-agent] detected restore-epoch: {} (clone restore detected)", current);
+                    flush_arp_cache().await;
+                    last_epoch = epoch;
+                }
+                Some(prev) if prev != current => {
+                    // Epoch changed! This means we were restored from snapshot again
+                    eprintln!("[fc-agent] restore-epoch changed: {} -> {}", prev, current);
+                    flush_arp_cache().await;
+                    last_epoch = epoch;
+                }
+                _ => {
+                    // No change
+                }
+            }
+        }
+    }
+}
+
+async fn fetch_restore_epoch(client: &reqwest::Client) -> Result<Option<String>> {
+    let token_response = client
+        .put("http://169.254.169.254/latest/api/token")
+        .header("X-metadata-token-ttl-seconds", "21600")
+        .timeout(Duration::from_millis(500))
+        .send()
+        .await?;
+    let token = token_response.text().await?;
+
+    let response = client
+        .get("http://169.254.169.254/latest")
+        .header("X-metadata-token", &token)
+        .header("Accept", "application/json")
+        .timeout(Duration::from_millis(500))
+        .send()
+        .await?;
+
+    let body = response.text().await?;
+    let metadata: LatestMetadata = serde_json::from_str(&body)?;
+    Ok(metadata.restore_epoch)
+}
+
+async fn flush_arp_cache() {
+    let output = Command::new("ip")
+        .args(["neigh", "flush", "all"])
+        .output()
+        .await;
+
+    match output {
+        Ok(o) if o.status.success() => {
+            eprintln!("[fc-agent] ✓ ARP cache flushed successfully");
+        }
+        Ok(o) => {
+            eprintln!("[fc-agent] WARNING: ARP flush failed: {}", String::from_utf8_lossy(&o.stderr));
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: ARP flush error: {}", e);
+        }
+    }
+}
+
 /// Sync VM clock from host time provided via MMDS
 /// This avoids the need to wait for slow NTP synchronization
 async fn sync_clock_from_host() -> Result<()> {
@@ -193,6 +284,13 @@ async fn main() -> Result<()> {
         eprintln!("[fc-agent] WARNING: clock sync failed: {:?}", e);
         eprintln!("[fc-agent] continuing anyway (will rely on chronyd)");
     }
+
+    // Start background task to watch for restore-epoch changes
+    // This handles ARP cache flushing when VM is restored from snapshot
+    tokio::spawn(async {
+        eprintln!("[fc-agent] starting restore-epoch watcher for ARP flush");
+        watch_restore_epoch().await;
+    });
 
     eprintln!("[fc-agent] launching container: {}", plan.image);
 

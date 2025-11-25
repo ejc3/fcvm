@@ -87,7 +87,7 @@ impl VmManager {
         // Setup logging
         if let Some(log_path) = &self.log_path {
             cmd.arg("--log-path").arg(log_path);
-            cmd.arg("--level").arg("Info");
+            cmd.arg("--level").arg("Debug");  // Enable Debug logging for detailed diagnostics
             cmd.arg("--show-level");
             cmd.arg("--show-log-origin");
         }
