@@ -187,7 +187,14 @@ async fn cmd_stress_test(
     // Step 6: Print summary
     print_summary(&metrics);
 
-    // Step 7: Cleanup
+    // Step 7: Check for failures
+    let failed_count = metrics
+        .iter()
+        .filter(|m| m.error.is_some() || m.health_time_ms.is_none())
+        .count();
+    let success_count = metrics.len() - failed_count;
+
+    // Step 8: Cleanup
     println!("\nCleaning up...");
 
     // Kill memory server
@@ -204,6 +211,15 @@ async fn cmd_stress_test(
     }
 
     println!("✓ Cleanup complete");
+
+    // Return error if any VMs failed
+    if failed_count > 0 {
+        anyhow::bail!(
+            "Stress test failed: {}/{} VMs failed to become healthy",
+            failed_count,
+            failed_count + success_count
+        );
+    }
 
     Ok(())
 }
