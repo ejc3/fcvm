@@ -141,66 +141,59 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
     })
 }
 
-/// Check if HTTP service is responding using curl with interface binding
+/// Check if HTTP service is responding using reqwest with interface binding
 ///
 /// IMPORTANT: For clones with the same guest_ip, we MUST bind to the specific
 /// veth interface to reach the correct VM. Without interface binding, Linux routing
 /// will always pick the first veth in the routing table, causing all health checks
 /// to go to the same VM.
 ///
-/// We use curl --interface to ensure each health check reaches its specific VM,
-/// even when multiple VMs share the same IP address (from snapshot clones).
+/// We use reqwest's .interface() method (which uses SO_BINDTODEVICE on Linux)
+/// to ensure each health check reaches its specific VM, even when multiple VMs
+/// share the same IP address (from snapshot clones).
 async fn check_http_health(guest_ip: &str, veth_device: &str, health_path: &str) -> Result<bool> {
     let url = format!("http://{}{}", guest_ip, health_path);
 
-    // Use curl with --interface to bind to specific veth device
-    // This is the simplest and most reliable way to route to a specific VM
-    // when multiple VMs share the same IP
-    //
-    // Add --write-out to capture detailed timing information:
-    // - time_namelookup: DNS resolution time
-    // - time_connect: TCP connection establishment time
-    // - time_starttransfer: Time to first byte
-    // - time_total: Total request time
-    let output = tokio::process::Command::new("curl")
-        .args([
-            "--interface", veth_device,
-            "--max-time", "1",
-            "--silent",
-            "--fail",
-            "--show-error",
-            "--write-out", "\\nTIMING: dns=%{time_namelookup}s connect=%{time_connect}s ttfb=%{time_starttransfer}s total=%{time_total}s",
-            &url,
-        ])
-        .output()
-        .await
-        .context("executing curl")?;
+    // Build a reqwest client bound to the specific veth device
+    // This uses SO_BINDTODEVICE on Linux to ensure traffic goes through this interface
+    let client = reqwest::Client::builder()
+        .interface(veth_device)
+        .timeout(Duration::from_secs(1))
+        .build()
+        .context("building reqwest client")?;
 
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
+    let start = Instant::now();
 
-        // Extract timing information from curl output
-        if let Some(timing_line) = stdout.lines().find(|line| line.starts_with("TIMING:")) {
-            debug!(
-                target: "health-monitor",
-                interface = veth_device,
-                guest_ip = guest_ip,
-                timing = timing_line.strip_prefix("TIMING: ").unwrap_or(""),
-                "health check succeeded with timing"
-            );
-        } else {
-            debug!("Health check succeeded via {}", veth_device);
+    match client.get(&url).send().await {
+        Ok(response) => {
+            let elapsed = start.elapsed();
+            if response.status().is_success() {
+                debug!(
+                    target: "health-monitor",
+                    interface = veth_device,
+                    guest_ip = guest_ip,
+                    status = %response.status(),
+                    elapsed_ms = elapsed.as_millis(),
+                    "health check succeeded"
+                );
+                Ok(true)
+            } else {
+                anyhow::bail!(
+                    "Health check failed with status {} via {} ({}ms)",
+                    response.status(),
+                    veth_device,
+                    elapsed.as_millis()
+                )
+            }
         }
-
-        Ok(true)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("Timeout") || stderr.contains("timeout") {
-            anyhow::bail!("Health check timed out after 1 second via {}", veth_device)
-        } else if stderr.contains("Connection refused") {
-            anyhow::bail!("Connection refused to {} via {}", guest_ip, veth_device)
-        } else {
-            anyhow::bail!("Failed to connect to {} via {}: {}", guest_ip, veth_device, stderr.trim())
+        Err(e) => {
+            if e.is_timeout() {
+                anyhow::bail!("Health check timed out after 1 second via {}", veth_device)
+            } else if e.is_connect() {
+                anyhow::bail!("Connection refused to {} via {}", guest_ip, veth_device)
+            } else {
+                anyhow::bail!("Failed to connect to {} via {}: {}", guest_ip, veth_device, e)
+            }
         }
     }
 }
