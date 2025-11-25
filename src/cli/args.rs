@@ -11,6 +11,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub sub_process: bool,
 
+    /// Base directory for all fcvm data (default: /mnt/fcvm-btrfs or FCVM_BASE_DIR env)
+    #[arg(long, global = true, env = "FCVM_BASE_DIR")]
+    pub base_dir: Option<String>,
+
     #[command(subcommand)]
     pub cmd: Commands,
 }
