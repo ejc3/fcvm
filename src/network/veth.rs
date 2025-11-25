@@ -114,8 +114,8 @@ pub async fn setup_host_veth(veth_name: &str, ip_with_cidr: &str) -> Result<()> 
 /// Configures the guest side of a veth pair inside a namespace
 ///
 /// Brings up the veth interface and loopback inside the namespace.
-/// Note: The veth does NOT get an IP - the bridge will have the IP assigned
-/// in connect_tap_to_veth(). Routing is handled by the guest VM, not the namespace.
+/// Note: Neither veth nor bridge get an IP - they are pure L2 devices.
+/// The guest VM has the IP and routing happens inside the VM.
 pub async fn setup_guest_veth_in_ns(
     ns_name: &str,
     veth_name: &str,
@@ -147,8 +147,7 @@ pub async fn setup_guest_veth_in_ns(
         );
     }
 
-    // NOTE: With bridge setup, veth does NOT get an IP.
-    // The bridge will have the IP assigned in connect_tap_to_veth().
+    // NOTE: Neither veth nor bridge get an IP - they are pure L2 devices.
     // No default route needed in namespace - routing happens in the guest VM.
     // The namespace only does L2 bridging between TAP and veth.
 
@@ -197,17 +196,19 @@ pub async fn create_tap_in_ns(ns_name: &str, tap_name: &str) -> Result<()> {
 ///
 /// Creates a Linux bridge to connect the TAP device (used by Firecracker) to the
 /// veth device (connected to host). This allows L2 forwarding between VM and host.
+///
+/// IMPORTANT: The bridge is a pure L2 device with NO IP address. If we assign
+/// the guest IP to the bridge, it will respond to ARP requests instead of
+/// forwarding them to the VM, breaking connectivity.
 pub async fn connect_tap_to_veth(
     ns_name: &str,
     tap_name: &str,
     veth_name: &str,
-    tap_ip_with_cidr: &str,
 ) -> Result<()> {
     info!(
         namespace = %ns_name,
         tap = %tap_name,
         veth = %veth_name,
-        bridge_ip = %tap_ip_with_cidr,
         "connecting TAP to veth via bridge in namespace"
     );
 
@@ -227,20 +228,8 @@ pub async fn connect_tap_to_veth(
         }
     }
 
-    // Assign IP to bridge (not TAP or veth)
-    let output = exec_in_namespace(
-        ns_name,
-        &["ip", "addr", "add", tap_ip_with_cidr, "dev", bridge_name],
-    )
-    .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Ignore "File exists" - IP already assigned
-        if !stderr.contains("File exists") {
-            anyhow::bail!("failed to assign IP to bridge in namespace: {}", stderr);
-        }
-    }
+    // NOTE: Bridge has NO IP address - it's a pure L2 device.
+    // The guest VM has the IP, and packets are forwarded via the bridge.
 
     // Attach TAP to bridge
     let output = exec_in_namespace(
