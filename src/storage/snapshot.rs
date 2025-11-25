@@ -124,3 +124,234 @@ impl SnapshotManager {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_snapshot_config_json_roundtrip() {
+        let config = SnapshotConfig {
+            name: "test-snapshot".to_string(),
+            vm_id: "abc123".to_string(),
+            memory_path: PathBuf::from("/path/to/memory.bin"),
+            vmstate_path: PathBuf::from("/path/to/vmstate.bin"),
+            disk_path: PathBuf::from("/path/to/disk.ext4"),
+            created_at: chrono::Utc::now(),
+            metadata: SnapshotMetadata {
+                image: "nginx:alpine".to_string(),
+                vcpu: 2,
+                memory_mib: 512,
+                network_config: NetworkConfig {
+                    tap_device: "tap-abc123".to_string(),
+                    guest_mac: "AA:BB:CC:DD:EE:FF".to_string(),
+                    guest_ip: Some("172.30.0.2".to_string()),
+                    host_ip: Some("172.30.0.1".to_string()),
+                    host_veth: Some("veth0-abc123".to_string()),
+                },
+            },
+        };
+
+        // Serialize to JSON
+        let json = serde_json::to_string_pretty(&config).unwrap();
+
+        // Deserialize back
+        let parsed: SnapshotConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.name, "test-snapshot");
+        assert_eq!(parsed.vm_id, "abc123");
+        assert_eq!(parsed.metadata.image, "nginx:alpine");
+        assert_eq!(parsed.metadata.vcpu, 2);
+        assert_eq!(parsed.metadata.memory_mib, 512);
+        assert_eq!(
+            parsed.metadata.network_config.guest_ip,
+            Some("172.30.0.2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_snapshot_config_json_parsing() {
+        // Test parsing a JSON config like what would be saved on disk
+        let json = r#"{
+            "name": "nginx-snap",
+            "vm_id": "def456",
+            "memory_path": "/mnt/fcvm-btrfs/snapshots/nginx-snap/memory.bin",
+            "vmstate_path": "/mnt/fcvm-btrfs/snapshots/nginx-snap/vmstate.bin",
+            "disk_path": "/mnt/fcvm-btrfs/snapshots/nginx-snap/disk.ext4",
+            "created_at": "2024-01-15T10:30:00Z",
+            "metadata": {
+                "image": "nginx:alpine",
+                "vcpu": 4,
+                "memory_mib": 1024,
+                "network_config": {
+                    "tap_device": "tap-def456",
+                    "guest_mac": "11:22:33:44:55:66",
+                    "guest_ip": "172.30.100.2",
+                    "host_ip": "172.30.100.1",
+                    "host_veth": "veth0-def456"
+                }
+            }
+        }"#;
+
+        let config: SnapshotConfig = serde_json::from_str(json).unwrap();
+
+        assert_eq!(config.name, "nginx-snap");
+        assert_eq!(config.metadata.vcpu, 4);
+        assert_eq!(config.metadata.memory_mib, 1024);
+        assert_eq!(
+            config.metadata.network_config.guest_mac,
+            "11:22:33:44:55:66"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_metadata_json_parsing() {
+        let json = r#"{
+            "image": "redis:alpine",
+            "vcpu": 1,
+            "memory_mib": 256,
+            "network_config": {
+                "tap_device": "tap-test",
+                "guest_mac": "AA:BB:CC:DD:EE:FF",
+                "guest_ip": null,
+                "host_ip": null,
+                "host_veth": null
+            }
+        }"#;
+
+        let metadata: SnapshotMetadata = serde_json::from_str(json).unwrap();
+
+        assert_eq!(metadata.image, "redis:alpine");
+        assert_eq!(metadata.vcpu, 1);
+        assert_eq!(metadata.memory_mib, 256);
+        assert!(metadata.network_config.guest_ip.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_manager_save_and_load() {
+        // Create temp directory for test
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = SnapshotManager::new(temp_dir.path().to_path_buf());
+
+        let config = SnapshotConfig {
+            name: "test-snap".to_string(),
+            vm_id: "test123".to_string(),
+            memory_path: PathBuf::from("/memory.bin"),
+            vmstate_path: PathBuf::from("/vmstate.bin"),
+            disk_path: PathBuf::from("/disk.ext4"),
+            created_at: chrono::Utc::now(),
+            metadata: SnapshotMetadata {
+                image: "alpine:latest".to_string(),
+                vcpu: 2,
+                memory_mib: 512,
+                network_config: NetworkConfig {
+                    tap_device: "tap-test".to_string(),
+                    guest_mac: "AA:BB:CC:DD:EE:FF".to_string(),
+                    guest_ip: Some("172.30.0.2".to_string()),
+                    host_ip: Some("172.30.0.1".to_string()),
+                    host_veth: None,
+                },
+            },
+        };
+
+        // Save snapshot
+        manager.save_snapshot(config.clone()).await.unwrap();
+
+        // Verify file was created
+        let config_file = temp_dir.path().join("test-snap").join("config.json");
+        assert!(config_file.exists());
+
+        // Load and verify
+        let loaded = manager.load_snapshot("test-snap").await.unwrap();
+        assert_eq!(loaded.name, "test-snap");
+        assert_eq!(loaded.vm_id, "test123");
+        assert_eq!(loaded.metadata.image, "alpine:latest");
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_manager_list() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = SnapshotManager::new(temp_dir.path().to_path_buf());
+
+        // Initially empty
+        let list = manager.list_snapshots().await.unwrap();
+        assert!(list.is_empty());
+
+        // Create two snapshots
+        for name in ["snap1", "snap2"] {
+            let config = SnapshotConfig {
+                name: name.to_string(),
+                vm_id: format!("vm-{}", name),
+                memory_path: PathBuf::from("/memory.bin"),
+                vmstate_path: PathBuf::from("/vmstate.bin"),
+                disk_path: PathBuf::from("/disk.ext4"),
+                created_at: chrono::Utc::now(),
+                metadata: SnapshotMetadata {
+                    image: "alpine".to_string(),
+                    vcpu: 1,
+                    memory_mib: 256,
+                    network_config: NetworkConfig {
+                        tap_device: "tap".to_string(),
+                        guest_mac: "00:00:00:00:00:00".to_string(),
+                        guest_ip: None,
+                        host_ip: None,
+                        host_veth: None,
+                    },
+                },
+            };
+            manager.save_snapshot(config).await.unwrap();
+        }
+
+        let list = manager.list_snapshots().await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list.contains(&"snap1".to_string()));
+        assert!(list.contains(&"snap2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_manager_delete() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = SnapshotManager::new(temp_dir.path().to_path_buf());
+
+        let config = SnapshotConfig {
+            name: "to-delete".to_string(),
+            vm_id: "vm123".to_string(),
+            memory_path: PathBuf::from("/memory.bin"),
+            vmstate_path: PathBuf::from("/vmstate.bin"),
+            disk_path: PathBuf::from("/disk.ext4"),
+            created_at: chrono::Utc::now(),
+            metadata: SnapshotMetadata {
+                image: "alpine".to_string(),
+                vcpu: 1,
+                memory_mib: 256,
+                network_config: NetworkConfig {
+                    tap_device: "tap".to_string(),
+                    guest_mac: "00:00:00:00:00:00".to_string(),
+                    guest_ip: None,
+                    host_ip: None,
+                    host_veth: None,
+                },
+            },
+        };
+        manager.save_snapshot(config).await.unwrap();
+
+        // Verify exists
+        assert!(manager.load_snapshot("to-delete").await.is_ok());
+
+        // Delete
+        manager.delete_snapshot("to-delete").await.unwrap();
+
+        // Verify gone
+        assert!(manager.load_snapshot("to-delete").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_manager_load_nonexistent() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = SnapshotManager::new(temp_dir.path().to_path_buf());
+
+        let result = manager.load_snapshot("does-not-exist").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+}
