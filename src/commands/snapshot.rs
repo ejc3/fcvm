@@ -10,7 +10,7 @@ use crate::cli::{
 use crate::firecracker::VmManager;
 use crate::network::{BridgedNetwork, NetworkManager, PortMapping, SlirpNetwork};
 use crate::paths;
-use crate::state::{generate_vm_id, truncate_id, StateManager, VmState, VmStatus};
+use crate::state::{generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState, VmStatus};
 use crate::storage::{DiskManager, SnapshotManager};
 use crate::uffd::UffdServer;
 
@@ -394,6 +394,9 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         format!("{}-{}", snapshot_name, &vm_id[..6])
     });
 
+    // Validate VM name (whether user-provided or auto-generated)
+    validate_vm_name(&vm_name).context("invalid VM name")?;
+
     state_manager.init().await?;
 
     let mut vm_state = VmState::new(
@@ -742,7 +745,7 @@ async fn run_clone_setup(
     // So we just call put_mmds() - the config is already there from the snapshot.
     let restore_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .context("system time before Unix epoch")?
         .as_secs();
 
     // Put the restore-epoch data directly (MMDS config is preserved from snapshot)

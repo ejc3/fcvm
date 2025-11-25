@@ -12,17 +12,29 @@ use super::{types::generate_mac, NetworkConfig, NetworkManager, PortMapping};
 use crate::paths;
 use crate::state::{truncate_id, StateManager};
 
+/// slirp4netns network addressing constants
+/// slirp0 device is assigned this IP for routing to slirp4netns
+const SLIRP_CIDR: &str = "10.0.2.100/24";
+
+/// Guest network addressing (isolated per VM namespace)
+const GUEST_SUBNET: &str = "192.168.1.0/24";
+const GUEST_IP: &str = "192.168.1.2";
+const NAMESPACE_IP: &str = "192.168.1.1";
+
+/// Default TAP device name for slirp4netns
+const SLIRP_DEVICE_NAME: &str = "slirp0";
+
 /// Rootless networking using slirp4netns with dual-TAP architecture
 ///
 /// This mode uses user namespaces and slirp4netns for true unprivileged operation.
 /// No sudo/root required - everything runs in user namespace.
 ///
 /// Architecture (Dual-TAP):
-/// ```
+/// ```text
 /// Host                    | User Namespace (unshare --user --map-root-user --net)
 ///                         |
-/// slirp4netns ←───────────┤── slirp0 (10.0.2.100/24) ←─── IP forwarding ←─── tap0
-///   (userspace NAT)       |                                                     │
+/// slirp4netns <-----------+-- slirp0 (10.0.2.100/24) <--- IP forwarding <--- tap0
+///   (userspace NAT)       |                                                     |
 ///                         |                                              Firecracker VM
 ///                         |                                              (guest: 192.168.x.2)
 /// ```
@@ -63,12 +75,12 @@ impl SlirpNetwork {
         Self {
             vm_id,
             tap_device,
-            slirp_device: "slirp0".to_string(),
+            slirp_device: SLIRP_DEVICE_NAME.to_string(),
             port_mappings,
-            slirp_cidr: "10.0.2.100/24".to_string(),
-            guest_subnet: "192.168.1.0/24".to_string(),
-            guest_ip: "192.168.1.2".to_string(),
-            namespace_ip: "192.168.1.1".to_string(),
+            slirp_cidr: SLIRP_CIDR.to_string(),
+            guest_subnet: GUEST_SUBNET.to_string(),
+            guest_ip: GUEST_IP.to_string(),
+            namespace_ip: NAMESPACE_IP.to_string(),
             api_socket_path: None,
             slirp_process: None,
             loopback_ip: None,  // Allocated in setup() - must be unique on host

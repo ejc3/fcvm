@@ -7,6 +7,10 @@ use tracing::{debug, info, warn};
 use crate::paths;
 use crate::state::{truncate_id, HealthStatus, StateManager};
 
+/// Health check polling intervals
+const HEALTH_POLL_STARTUP_INTERVAL: Duration = Duration::from_millis(100);
+const HEALTH_POLL_HEALTHY_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Spawn a background health monitoring task for a VM
 ///
 /// The task polls the VM process health at adaptive intervals:
@@ -30,8 +34,8 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
 
         info!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, pid = ?pid, "starting health monitor");
 
-        // Adaptive polling: 100ms during startup, 10s after healthy
-        let mut poll_interval = Duration::from_millis(100);
+        // Adaptive polling: fast during startup, slow after healthy
+        let mut poll_interval = HEALTH_POLL_STARTUP_INTERVAL;
         let mut is_healthy = false;
 
         // Throttle health check failure logs to once per second (simple local variable)
@@ -148,8 +152,8 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
             // Switch to slower polling once healthy
             if health_status == HealthStatus::Healthy && !is_healthy {
                 is_healthy = true;
-                poll_interval = Duration::from_secs(10);
-                info!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, "VM healthy, switching to 10s polling");
+                poll_interval = HEALTH_POLL_HEALTHY_INTERVAL;
+                info!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, "VM healthy, switching to {:?} polling", HEALTH_POLL_HEALTHY_INTERVAL);
             }
         }
     })

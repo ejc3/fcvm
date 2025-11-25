@@ -1,7 +1,13 @@
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tracing::info;
+
+/// Helper to convert Path to str with proper error handling
+fn path_to_str(path: &Path) -> Result<&str> {
+    path.to_str()
+        .ok_or_else(|| anyhow::anyhow!("path contains invalid UTF-8: {:?}", path))
+}
 
 /// Build a modern Linux LTS kernel optimized for Firecracker
 ///
@@ -40,7 +46,7 @@ pub async fn build_firecracker_kernel() -> Result<PathBuf> {
         let tar_path = build_dir.join(&linux_tar);
 
         let output = Command::new("wget")
-            .args(["-q", "-O", tar_path.to_str().unwrap(), &url])
+            .args(["-q", "-O", path_to_str(&tar_path)?, &url])
             .output()
             .await
             .context("downloading kernel")?;
@@ -57,7 +63,7 @@ pub async fn build_firecracker_kernel() -> Result<PathBuf> {
         println!("  → Extracting...");
 
         let output = Command::new("tar")
-            .args(["-xf", tar_path.to_str().unwrap()])
+            .args(["-xf", path_to_str(&tar_path)?])
             .current_dir(&build_dir)
             .output()
             .await
