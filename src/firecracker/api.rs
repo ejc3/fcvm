@@ -92,9 +92,14 @@ impl FirecrackerClient {
         self.put("/mmds/config", &config).await
     }
 
-    /// Put data into MMDS
+    /// Put data into MMDS (replaces entire MMDS content)
     pub async fn put_mmds(&self, data: serde_json::Value) -> Result<()> {
         self.put("/mmds", &data).await
+    }
+
+    /// Patch data into MMDS (merges with existing MMDS content)
+    pub async fn patch_mmds(&self, data: serde_json::Value) -> Result<()> {
+        self.patch("/mmds", &data).await
     }
 
     /// Create a snapshot

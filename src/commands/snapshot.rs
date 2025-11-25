@@ -500,6 +500,9 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         disk = %rootfs_path.display(),
         "loading snapshot with uffd backend and network override"
     );
+
+    // Timing instrumentation: measure snapshot load operation
+    let load_start = std::time::Instant::now();
     client
         .load_snapshot(SnapshotLoad {
             snapshot_path: snapshot_config.vmstate_path.display().to_string(),
@@ -516,8 +519,14 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         })
         .await
         .context("loading snapshot with uffd backend")?;
+    let load_duration = load_start.elapsed();
+    info!(
+        duration_ms = load_duration.as_millis(),
+        "snapshot load completed"
+    );
 
-    // Point rootfs drive at the clone-specific CoW disk before resuming
+    // Timing instrumentation: measure disk patch operation
+    let patch_start = std::time::Instant::now();
     client
         .patch_drive(
             "rootfs",
@@ -529,13 +538,54 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         )
         .await
         .context("retargeting rootfs drive for clone")?;
+    let patch_duration = patch_start.elapsed();
+    info!(
+        duration_ms = patch_duration.as_millis(),
+        "disk patch completed"
+    );
 
+    // Signal fc-agent to flush ARP cache via MMDS restore-epoch update
+    // fc-agent watches for this field change and immediately flushes stale ARP entries
+    //
+    // IMPORTANT: After snapshot load:
+    // - MMDS CONFIG is preserved from the snapshot (version, network interfaces, IP)
+    // - MMDS DATA is NOT persisted (empty data store) - we need to populate it
+    // - /mmds/config endpoint is PRE-BOOT ONLY - cannot be called after snapshot load
+    // - /mmds endpoint (PUT/PATCH) is allowed both pre-boot and post-boot
+    //
+    // So we just call put_mmds() - the config is already there from the snapshot.
+    let restore_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Put the restore-epoch data directly (MMDS config is preserved from snapshot)
+    // fc-agent doesn't need container-plan after restore since container is already running
+    client
+        .put_mmds(serde_json::json!({
+            "latest": {
+                "host-time": chrono::Utc::now().timestamp().to_string(),
+                "restore-epoch": restore_epoch.to_string()
+            }
+        }))
+        .await
+        .context("updating MMDS with restore-epoch")?;
+    info!(restore_epoch = restore_epoch, "signaled fc-agent to flush ARP via MMDS");
+
+    // Timing instrumentation: measure VM resume operation
+    let resume_start = std::time::Instant::now();
     client
         .patch_vm_state(ApiVmState {
             state: "Resumed".to_string(),
         })
         .await
         .context("resuming VM after snapshot load")?;
+    let resume_duration = resume_start.elapsed();
+    info!(
+        duration_ms = resume_duration.as_millis(),
+        total_snapshot_ms = (load_duration + patch_duration + resume_duration).as_millis(),
+        "VM resume completed"
+    );
 
     // Save VM state with complete network configuration
     super::common::save_vm_state_with_network(&state_manager, &mut vm_state, &network_config)

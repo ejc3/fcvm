@@ -209,6 +209,8 @@ async fn handle_vm_page_faults(
     let async_uffd = AsyncFd::new(uffd).context("creating AsyncFd for UFFD")?;
 
     let mut fault_count = 0u64;
+    let start_time = std::time::Instant::now();
+    let mut last_log_time = std::time::Instant::now();
 
     loop {
         // Wait for UFFD to be readable
@@ -240,8 +242,25 @@ async fn handle_vm_page_faults(
             match event {
                 Event::Pagefault { addr, .. } => {
                     fault_count += 1;
-                    if fault_count.is_multiple_of(1000) {
-                        info!(target: "uffd", vm_id = %vm_id, fault_count, "served page faults");
+
+                    // Log every 100ms instead of every 1000 faults for better granularity
+                    let now = std::time::Instant::now();
+                    if now.duration_since(last_log_time).as_millis() >= 100 {
+                        let elapsed = start_time.elapsed();
+                        let rate = if elapsed.as_secs_f64() > 0.0 {
+                            fault_count as f64 / elapsed.as_secs_f64()
+                        } else {
+                            0.0
+                        };
+                        info!(
+                            target: "uffd",
+                            vm_id = %vm_id,
+                            fault_count,
+                            elapsed_ms = elapsed.as_millis(),
+                            rate_per_sec = format!("{:.0}", rate),
+                            "served page faults"
+                        );
+                        last_log_time = now;
                     }
 
                     // Find which memory region this address belongs to
