@@ -387,6 +387,7 @@ async fn run_stress_test(
 
     // Start system monitoring in background
     let monitor_file = "/tmp/fcvm-stress-system-monitor.log";
+    let uffd_pid = serve_pid;
     let monitoring_task = tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
         let mut log_file = match tokio::fs::File::create(monitor_file).await {
@@ -408,12 +409,23 @@ async fn run_stress_test(
                 .ok();
             let mem_output = Command::new("free").arg("-h").output().await.ok();
 
+            // Get UFFD process CPU usage using ps
+            let uffd_cpu_output = Command::new("ps")
+                .args(["-p", &uffd_pid.to_string(), "-o", "%cpu="])
+                .output()
+                .await
+                .ok();
+
             if let (Some(uptime), Some(fc_count), Some(mem)) =
                 (uptime_output, fc_count_output, mem_output)
             {
                 let uptime_str = String::from_utf8_lossy(&uptime.stdout);
                 let fc_count_str = String::from_utf8_lossy(&fc_count.stdout).trim().to_string();
                 let mem_str = String::from_utf8_lossy(&mem.stdout);
+
+                let uffd_cpu = uffd_cpu_output
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_else(|| "?".to_string());
 
                 let load = uptime_str
                     .split("load average:")
@@ -423,10 +435,11 @@ async fn run_stress_test(
                 let mem_line = mem_str.lines().nth(1).unwrap_or("");
 
                 let log_line = format!(
-                    "{} | Load: {} | VMs: {} | Mem: {}\n",
+                    "{} | Load: {} | VMs: {} | UFFD CPU: {}% | Mem: {}\n",
                     chrono::Local::now().format("%H:%M:%S"),
                     load,
                     fc_count_str,
+                    uffd_cpu,
                     mem_line
                 );
                 let _ = log_file.write_all(log_line.as_bytes()).await;
