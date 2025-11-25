@@ -1,7 +1,7 @@
 use chrono::Utc;
 use fcvm::health::spawn_health_monitor;
 use fcvm::network::NetworkConfig;
-use fcvm::state::{HealthStatus, StateManager, VmConfig, VmState, VmStatus};
+use fcvm::state::{HealthStatus, ProcessType, StateManager, VmConfig, VmState, VmStatus};
 use tempfile::TempDir;
 use tokio::time::{sleep, Duration};
 
@@ -42,7 +42,7 @@ async fn test_health_monitor_lifecycle() {
             env: vec![],
             health_check_path: "/health".to_string(),
             snapshot_name: None,
-            process_type: Some("vm".to_string()),
+            process_type: Some(ProcessType::Vm),
             serve_pid: None,
         },
     };

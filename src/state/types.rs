@@ -47,6 +47,18 @@ pub enum HealthStatus {
     Unreachable,
 }
 
+/// Type of fcvm process
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProcessType {
+    /// Standard VM from `fcvm podman run`
+    Vm,
+    /// Memory server from `fcvm snapshot serve`
+    Serve,
+    /// Clone from `fcvm snapshot run`
+    Clone,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmConfig {
     pub image: String,
@@ -60,9 +72,9 @@ pub struct VmConfig {
     /// Which snapshot this process is serving or was cloned from
     #[serde(default)]
     pub snapshot_name: Option<String>,
-    /// Process type: "vm" (podman run), "serve" (snapshot serve), "clone" (snapshot run)
+    /// Process type: vm (podman run), serve (snapshot serve), clone (snapshot run)
     #[serde(default)]
-    pub process_type: Option<String>,
+    pub process_type: Option<ProcessType>,
     /// For clones: which serve process PID spawned this clone
     #[serde(default)]
     pub serve_pid: Option<u32>,
@@ -93,7 +105,7 @@ impl VmState {
                 env: Vec::new(),
                 health_check_path: default_health_check_path(),
                 snapshot_name: None,
-                process_type: Some("vm".to_string()),
+                process_type: Some(ProcessType::Vm),
                 serve_pid: None,
             },
         }
@@ -126,5 +138,68 @@ mod tests {
 
         assert_eq!(state.vm_id, deserialized.vm_id);
         assert_eq!(state.config.image, deserialized.config.image);
+    }
+
+    #[test]
+    fn test_process_type_serialization() {
+        // Test that ProcessType serializes to lowercase strings for backward compatibility
+        let vm = ProcessType::Vm;
+        let serve = ProcessType::Serve;
+        let clone = ProcessType::Clone;
+
+        assert_eq!(serde_json::to_string(&vm).unwrap(), "\"vm\"");
+        assert_eq!(serde_json::to_string(&serve).unwrap(), "\"serve\"");
+        assert_eq!(serde_json::to_string(&clone).unwrap(), "\"clone\"");
+
+        // Test deserialization from lowercase strings (backward compatibility)
+        let vm_from_str: ProcessType = serde_json::from_str("\"vm\"").unwrap();
+        let serve_from_str: ProcessType = serde_json::from_str("\"serve\"").unwrap();
+        let clone_from_str: ProcessType = serde_json::from_str("\"clone\"").unwrap();
+
+        assert_eq!(vm_from_str, ProcessType::Vm);
+        assert_eq!(serve_from_str, ProcessType::Serve);
+        assert_eq!(clone_from_str, ProcessType::Clone);
+    }
+
+    #[test]
+    fn test_vm_config_process_type() {
+        // Test that VmConfig correctly serializes process_type as enum
+        let state = VmState::new("vm-789".to_string(), "alpine:latest".to_string(), 1, 128);
+
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        assert!(json.contains("\"process_type\": \"vm\""));
+
+        // Test that we can deserialize JSON with string process_type (backward compat)
+        let json_with_string_type = r#"{
+            "schema_version": 1,
+            "vm_id": "test-vm",
+            "name": null,
+            "status": "running",
+            "health_status": "unknown",
+            "pid": 12345,
+            "created_at": "2024-01-01T00:00:00Z",
+            "last_updated": "2024-01-01T00:00:00Z",
+            "config": {
+                "image": "test:latest",
+                "vcpu": 1,
+                "memory_mib": 256,
+                "network": {
+                    "tap_device": "tap0",
+                    "guest_mac": "00:00:00:00:00:00",
+                    "guest_ip": null,
+                    "host_ip": null,
+                    "host_veth": null
+                },
+                "volumes": [],
+                "env": [],
+                "health_check_path": "/",
+                "snapshot_name": null,
+                "process_type": "serve",
+                "serve_pid": null
+            }
+        }"#;
+
+        let state: VmState = serde_json::from_str(json_with_string_type).unwrap();
+        assert_eq!(state.config.process_type, Some(ProcessType::Serve));
     }
 }

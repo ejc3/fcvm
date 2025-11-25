@@ -246,7 +246,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     let mut serve_state = VmState::new(serve_id.clone(), "".to_string(), 0, 0);
     serve_state.pid = Some(my_pid);
     serve_state.config.snapshot_name = Some(args.snapshot_name.clone());
-    serve_state.config.process_type = Some("serve".to_string());
+    serve_state.config.process_type = Some(crate::state::ProcessType::Serve);
     serve_state.status = VmStatus::Running;
 
     let state_manager = StateManager::new(paths::state_dir());
@@ -405,7 +405,7 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Save snapshot tracking info in clone state
     vm_state.config.snapshot_name = Some(snapshot_name.clone());
-    vm_state.config.process_type = Some("clone".to_string());
+    vm_state.config.process_type = Some(crate::state::ProcessType::Clone);
     vm_state.config.serve_pid = Some(args.pid); // Track which serve spawned us!
 
     // Setup paths
@@ -668,7 +668,7 @@ async fn cmd_snapshot_ls() -> Result<()> {
     // Filter to serve processes only
     let serves: Vec<_> = all_vms
         .iter()
-        .filter(|vm| vm.config.process_type.as_deref() == Some("serve"))
+        .filter(|vm| vm.config.process_type == Some(crate::state::ProcessType::Serve))
         .collect();
 
     if serves.is_empty() {

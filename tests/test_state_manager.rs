@@ -1,6 +1,6 @@
 use chrono::Utc;
 use fcvm::network::NetworkConfig;
-use fcvm::state::{HealthStatus, StateManager, VmConfig, VmState, VmStatus};
+use fcvm::state::{HealthStatus, ProcessType, StateManager, VmConfig, VmState, VmStatus};
 use tempfile::TempDir;
 
 #[tokio::test]
@@ -38,7 +38,7 @@ async fn test_state_persistence() {
             env: vec![],
             health_check_path: "/".to_string(),
             snapshot_name: None,
-            process_type: Some("vm".to_string()),
+            process_type: Some(ProcessType::Vm),
             serve_pid: None,
         },
     };
@@ -99,7 +99,7 @@ async fn test_list_vms() {
                 env: vec![],
                 health_check_path: "/".to_string(),
                 snapshot_name: None,
-                process_type: Some("vm".to_string()),
+                process_type: Some(ProcessType::Vm),
                 serve_pid: None,
             },
         };
