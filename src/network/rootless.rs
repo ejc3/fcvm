@@ -109,10 +109,9 @@ impl NetworkManager for RootlessNetwork {
             (host_ip, guest_ip, subnet)
         };
 
-        // Extract CIDR for IP assignment
+        // Extract CIDR for host IP assignment
         let cidr_bits = subnet.split('/').nth(1).unwrap_or("30");
         let host_ip_with_cidr = format!("{}/{}", host_ip, cidr_bits);
-        let guest_ip_with_cidr = format!("{}/{}", guest_ip, cidr_bits);
 
         // Step 2: Create network namespace
         let namespace_id = format!("fcvm-{}", &self.vm_id[..8]);
@@ -144,17 +143,12 @@ impl NetworkManager for RootlessNetwork {
             .await
             .context("creating TAP device in namespace")?;
 
-        // Step 7: Connect TAP to veth inside namespace
+        // Step 7: Connect TAP to veth inside namespace via L2 bridge
         // The guest (Firecracker) will use the TAP, and it routes through veth to host
-        let tap_ip_with_cidr = guest_ip_with_cidr.clone();
-        veth::connect_tap_to_veth(
-            &namespace_id,
-            &self.tap_device,
-            &guest_veth,
-            &tap_ip_with_cidr,
-        )
-        .await
-        .context("connecting TAP to veth")?;
+        // Note: Bridge has no IP - it's a pure L2 forwarding device
+        veth::connect_tap_to_veth(&namespace_id, &self.tap_device, &guest_veth)
+            .await
+            .context("connecting TAP to veth")?;
 
         // Step 8: Ensure global NAT is configured
         let default_iface = portmap::detect_default_interface()
