@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -9,7 +10,7 @@ use tracing::{debug, info, warn};
 
 use super::{types::generate_mac, NetworkConfig, NetworkManager, PortMapping};
 use crate::paths;
-use crate::state::truncate_id;
+use crate::state::{truncate_id, StateManager};
 
 /// Rootless networking using slirp4netns with dual-TAP architecture
 ///
@@ -57,57 +58,75 @@ pub struct SlirpNetwork {
 
 impl SlirpNetwork {
     pub fn new(vm_id: String, tap_device: String, port_mappings: Vec<PortMapping>) -> Self {
-        // Generate unique /24 subnet for this VM to avoid conflicts
-        let subnet_id = Self::generate_subnet_id(&vm_id);
-        let guest_subnet = format!("192.168.{}.0/24", subnet_id);
-        let guest_ip = format!("192.168.{}.2", subnet_id);
-        let namespace_ip = format!("192.168.{}.1", subnet_id);
-
+        // Guest subnet is always 192.168.1.0/24 - no conflicts because each VM
+        // runs in its own isolated user namespace
         Self {
             vm_id,
             tap_device,
             slirp_device: "slirp0".to_string(),
             port_mappings,
             slirp_cidr: "10.0.2.100/24".to_string(),
-            guest_subnet,
-            guest_ip,
-            namespace_ip,
+            guest_subnet: "192.168.1.0/24".to_string(),
+            guest_ip: "192.168.1.2".to_string(),
+            namespace_ip: "192.168.1.1".to_string(),
             api_socket_path: None,
             slirp_process: None,
-            loopback_ip: None,
+            loopback_ip: None,  // Allocated in setup() - must be unique on host
         }
     }
 
-    /// Generate unique subnet ID (1-254) from vm_id hash
-    fn generate_subnet_id(vm_id: &str) -> u8 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+    /// Configure specific guest IP for clone operations
+    ///
+    /// When cloning from a snapshot, the guest already has its IP configured.
+    /// This method sets the network to use that same IP so that DNAT rules
+    /// forward traffic to the correct destination.
+    ///
+    /// The guest_ip should include CIDR notation (e.g., "192.168.155.2/24")
+    /// but the /24 is stripped when parsing since we always use /24 subnets.
+    pub fn with_guest_ip(mut self, guest_ip: String) -> Self {
+        // Parse the IP (strip CIDR notation if present)
+        let ip_only = guest_ip.split('/').next().unwrap_or(&guest_ip);
 
-        let mut hasher = DefaultHasher::new();
-        vm_id.hash(&mut hasher);
-        let hash = hasher.finish();
+        // Extract subnet from IP (e.g., "192.168.155.2" -> subnet 155)
+        let parts: Vec<&str> = ip_only.split('.').collect();
+        if parts.len() == 4 {
+            if let Ok(subnet_id) = parts[2].parse::<u8>() {
+                self.guest_subnet = format!("192.168.{}.0/24", subnet_id);
+                self.guest_ip = format!("192.168.{}.2", subnet_id);
+                self.namespace_ip = format!("192.168.{}.1", subnet_id);
+            }
+        }
 
-        // Range: 1-254 (avoid 0 and 255)
-        ((hash % 254) + 1) as u8
+        self
     }
 
-    /// Generate unique loopback IP from vm_id hash for health checks
-    /// Returns a 127.x.x.x IP that won't conflict with 127.0.0.1
-    fn generate_loopback_ip(vm_id: &str) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+    /// Find the next available loopback IP by reading existing VM states
+    /// Returns a 127.0.0.X IP that's not currently in use
+    async fn find_next_loopback_ip() -> String {
+        let state_manager = StateManager::new(paths::state_dir());
+        let used_ips: HashSet<String> = state_manager
+            .list_vms()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|vm| vm.config.network.loopback_ip)
+            .collect();
 
-        let mut hasher = DefaultHasher::new();
-        vm_id.hash(&mut hasher);
-        let hash = hasher.finish();
+        // Sequential allocation: 127.0.0.2, 127.0.0.3, ... 127.0.0.254
+        // Then 127.0.1.2, 127.0.1.3, ... etc.
+        for b2 in 0..=255u8 {
+            for b3 in 2..=254u8 {
+                // Skip 127.0.0.1 (localhost)
+                let ip = format!("127.0.{}.{}", b2, b3);
+                if !used_ips.contains(&ip) {
+                    return ip;
+                }
+            }
+        }
 
-        // Generate 127.x.y.z where x.y.z != 0.0.1
-        // Use bytes 2, 3, 4 of hash, avoiding 127.0.0.1
-        let b1 = ((hash >> 8) % 256) as u8;
-        let b2 = ((hash >> 16) % 256) as u8;
-        let b3 = ((hash >> 24) % 254) as u8 + 2; // 2-255 to avoid .1
-
-        format!("127.{}.{}.{}", b1, b2, b3)
+        // Fallback if all IPs are used (very unlikely - 65,000+ IPs)
+        warn!("all loopback IPs in use, reusing 127.0.0.2");
+        "127.0.0.2".to_string()
     }
 
     /// Get the loopback IP assigned to this VM
@@ -437,23 +456,21 @@ exec "$@"
 #[async_trait::async_trait]
 impl NetworkManager for SlirpNetwork {
     async fn setup(&mut self) -> Result<NetworkConfig> {
-        info!(vm_id = %self.vm_id, "setting up rootless networking with slirp4netns (dual-TAP mode)");
+        info!(vm_id = %self.vm_id, "setting up rootless networking with slirp4netns");
 
-        let loopback_ip = Self::generate_loopback_ip(&self.vm_id);
+        // Allocate a unique loopback IP on the host for health checks
+        // (guest subnet is always 192.168.1.0/24 - isolated per namespace)
+        let loopback_ip = Self::find_next_loopback_ip().await;
         self.loopback_ip = Some(loopback_ip.clone());
 
         info!(
             loopback_ip = %loopback_ip,
-            guest_subnet = %self.guest_subnet,
             guest_ip = %self.guest_ip,
-            namespace_ip = %self.namespace_ip,
             "network configuration"
         );
 
         let guest_mac = generate_mac();
 
-        // Return config with guest IP for kernel boot args
-        // Guest will get IP via kernel cmdline: ip=192.168.x.2::192.168.x.1:...
         Ok(NetworkConfig {
             tap_device: self.tap_device.clone(),
             guest_mac,
@@ -521,32 +538,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_subnet_generation() {
-        let id1 = SlirpNetwork::generate_subnet_id("vm-aaaa1111");
-        let id2 = SlirpNetwork::generate_subnet_id("vm-bbbb2222");
-
-        assert!(id1 >= 1 && id1 <= 254);
-        assert!(id2 >= 1 && id2 <= 254);
-        assert_ne!(id1, id2);
-
-        // Deterministic
-        let id1_again = SlirpNetwork::generate_subnet_id("vm-aaaa1111");
-        assert_eq!(id1, id1_again);
-    }
-
-    #[test]
-    fn test_loopback_ip_generation() {
-        let ip1 = SlirpNetwork::generate_loopback_ip("vm-aaaa1111");
-        let ip2 = SlirpNetwork::generate_loopback_ip("vm-bbbb2222");
-
-        assert!(ip1.starts_with("127."));
-        assert!(ip2.starts_with("127."));
-        assert_ne!(ip1, ip2);
-        assert_ne!(ip1, "127.0.0.1");
-        assert_ne!(ip2, "127.0.0.1");
-    }
-
-    #[test]
     fn test_network_creation() {
         let net = SlirpNetwork::new(
             "vm-test123".to_string(),
@@ -556,7 +547,25 @@ mod tests {
 
         assert_eq!(net.tap_device, "tap0");
         assert_eq!(net.slirp_device, "slirp0");
-        assert!(net.guest_ip.starts_with("192.168."));
-        assert!(net.namespace_ip.starts_with("192.168."));
+        // Fixed IPs - all VMs use same subnet (isolated per namespace)
+        assert_eq!(net.guest_ip, "192.168.1.2");
+        assert_eq!(net.namespace_ip, "192.168.1.1");
+        assert_eq!(net.guest_subnet, "192.168.1.0/24");
+    }
+
+    #[test]
+    fn test_with_guest_ip() {
+        let net = SlirpNetwork::new(
+            "vm-test123".to_string(),
+            "tap0".to_string(),
+            vec![],
+        );
+
+        // Clones can override guest IP if snapshot used different subnet
+        let net = net.with_guest_ip("192.168.42.2/24".to_string());
+
+        assert_eq!(net.guest_ip, "192.168.42.2");
+        assert_eq!(net.namespace_ip, "192.168.42.1");
+        assert_eq!(net.guest_subnet, "192.168.42.0/24");
     }
 }

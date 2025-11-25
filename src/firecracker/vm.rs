@@ -31,7 +31,7 @@ pub struct VmManager {
     log_path: Option<PathBuf>,
     namespace_id: Option<String>,
     use_user_namespace: bool,      // DEPRECATED: Use unshare for rootless operation
-    pasta_wrapper: Option<Vec<String>>, // pasta wrapper command for rootless with networking
+    namespace_wrapper: Option<Vec<String>>, // wrapper command for rootless networking (slirp4netns)
     process: Option<Child>,
     client: Option<FirecrackerClient>,
 }
@@ -45,7 +45,7 @@ impl VmManager {
             log_path,
             namespace_id: None,
             use_user_namespace: false,
-            pasta_wrapper: None,
+            namespace_wrapper: None,
             process: None,
             client: None,
         }
@@ -68,22 +68,22 @@ impl VmManager {
     ///
     /// When set, Firecracker will be launched via `unshare --user --map-root-user --net`
     /// which creates new user and network namespaces without requiring root.
-    /// Note: This doesn't set up networking - use set_pasta_wrapper for rootless networking.
-    #[deprecated(note = "Use set_pasta_wrapper for rootless networking with pasta")]
+    /// Note: This doesn't set up networking - use set_namespace_wrapper for rootless networking.
+    #[deprecated(note = "Use set_namespace_wrapper for rootless networking with slirp4netns")]
     pub fn set_user_namespace(&mut self, enable: bool) {
         self.use_user_namespace = enable;
     }
 
-    /// Set pasta wrapper command for rootless networking
+    /// Set namespace wrapper command for rootless networking
     ///
-    /// When set, Firecracker will be launched inside a pasta-created namespace.
-    /// pasta creates user + network namespaces and sets up a TAP device with
-    /// userspace networking, all without requiring root privileges.
+    /// When set, Firecracker will be launched inside a namespace created by the wrapper.
+    /// The wrapper creates user + network namespaces and sets up a TAP device with
+    /// userspace networking (via slirp4netns), all without requiring root privileges.
     ///
-    /// The wrapper command should be the output of PastaNetwork::build_wrapper_command(),
-    /// e.g., ["pasta", "-4", "--ns-ifname", "tap0", "--config-net", "-f", "--"]
-    pub fn set_pasta_wrapper(&mut self, wrapper_cmd: Vec<String>) {
-        self.pasta_wrapper = Some(wrapper_cmd);
+    /// The wrapper command should be the output of SlirpNetwork::build_wrapper_command(),
+    /// e.g., ["unshare", "--user", "--map-root-user", "--net", "--", ...]
+    pub fn set_namespace_wrapper(&mut self, wrapper_cmd: Vec<String>) {
+        self.namespace_wrapper = Some(wrapper_cmd);
     }
 
     /// Start the Firecracker process
@@ -102,12 +102,12 @@ impl VmManager {
         let _ = std::fs::remove_file(&self.socket_path);
 
         // Build command based on mode:
-        // 1. pasta wrapper (rootless with networking) - highest priority
+        // 1. namespace wrapper (rootless with slirp4netns networking) - highest priority
         // 2. unshare (deprecated rootless, no networking)
         // 3. direct Firecracker (privileged mode)
-        let mut cmd = if let Some(ref wrapper) = self.pasta_wrapper {
-            // Use pasta to create user + network namespaces with TAP device
-            info!(target: "vm", vm_id = %self.vm_id, "using pasta for rootless networking");
+        let mut cmd = if let Some(ref wrapper) = self.namespace_wrapper {
+            // Use wrapper to create user + network namespaces with TAP device
+            info!(target: "vm", vm_id = %self.vm_id, "using namespace wrapper for rootless networking");
             let mut c = Command::new(&wrapper[0]);
             // Add remaining wrapper args (skip first which is the command)
             for arg in &wrapper[1..] {

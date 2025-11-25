@@ -8,7 +8,7 @@ use crate::cli::{
     SnapshotServeArgs,
 };
 use crate::firecracker::VmManager;
-use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, PortMapping};
+use crate::network::{BridgedNetwork, NetworkManager, PortMapping, SlirpNetwork};
 use crate::paths;
 use crate::state::{generate_vm_id, truncate_id, StateManager, VmState, VmStatus};
 use crate::storage::{DiskManager, SnapshotManager};
@@ -463,11 +463,18 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             Box::new(net)
         }
         NetworkMode::Rootless => {
-            Box::new(PastaNetwork::new(
-                vm_id.clone(),
-                tap_device.clone(),
-                port_mappings.clone(),
-            ))
+            let mut net =
+                SlirpNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
+            // If snapshot has saved network config with guest_ip, use it
+            // This is critical: clones restore with the baseline's IP configuration
+            if let Some(ref guest_ip) = saved_network.guest_ip {
+                net = net.with_guest_ip(guest_ip.clone());
+                info!(
+                    guest_ip = %guest_ip,
+                    "clone will use same network config as snapshot"
+                );
+            }
+            Box::new(net)
         }
     };
 
@@ -648,11 +655,11 @@ async fn run_clone_setup(
             info!(namespace = %ns_id, "configuring VM to run in network namespace");
             vm_manager.set_namespace(ns_id.to_string());
         }
-    } else if let Some(pasta_net) = network.as_any().downcast_ref::<PastaNetwork>() {
-        // Rootless mode: use pasta to create namespaces and wrap Firecracker
-        let wrapper_cmd = pasta_net.build_wrapper_command();
-        info!(wrapper = %pasta_net.wrapper_command_string(), "configuring clone for rootless operation with pasta");
-        vm_manager.set_pasta_wrapper(wrapper_cmd);
+    } else if let Some(slirp_net) = network.as_any().downcast_ref::<SlirpNetwork>() {
+        // Rootless mode: use unshare to create namespaces and wrap Firecracker
+        let wrapper_cmd = slirp_net.build_wrapper_command();
+        info!(wrapper = %slirp_net.wrapper_command_string(), "configuring clone for rootless operation with slirp4netns");
+        vm_manager.set_namespace_wrapper(wrapper_cmd);
     }
 
     let firecracker_bin = PathBuf::from("/usr/local/bin/firecracker");
@@ -662,8 +669,8 @@ async fn run_clone_setup(
         .await
         .context("starting Firecracker")?;
 
-    // For rootless mode with pasta: post_start is a no-op (TAP already created by pasta wrapper)
-    // For bridged mode: post_start is also a no-op (TAP already created)
+    // For rootless mode with slirp4netns: post_start starts slirp4netns in the namespace
+    // For bridged mode: post_start is a no-op (TAP already created)
     let vm_pid = vm_manager.pid()?;
     network.post_start(vm_pid).await.context("post-start network setup")?;
 

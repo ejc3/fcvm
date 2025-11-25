@@ -1,13 +1,11 @@
 pub mod bridged;
 pub mod namespace;
-pub mod pasta;
 pub mod portmap;
 pub mod slirp;
 pub mod types;
 pub mod veth;
 
 pub use bridged::BridgedNetwork;
-pub use pasta::PastaNetwork;
 pub use slirp::SlirpNetwork;
 pub use types::*;
 
