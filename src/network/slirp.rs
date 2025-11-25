@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use std::collections::HashSet;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -10,7 +9,7 @@ use tracing::{debug, info, warn};
 
 use super::{types::generate_mac, NetworkConfig, NetworkManager, PortMapping};
 use crate::paths;
-use crate::state::{truncate_id, StateManager};
+use crate::state::truncate_id;
 
 /// slirp4netns network addressing constants
 /// slirp0 device is assigned this IP for routing to slirp4netns
@@ -87,6 +86,16 @@ impl SlirpNetwork {
         }
     }
 
+    /// Set the pre-allocated loopback IP for health checks
+    ///
+    /// This IP must be allocated atomically via StateManager::allocate_loopback_ip()
+    /// BEFORE calling setup(). This ensures race-free IP allocation when starting
+    /// multiple VMs concurrently.
+    pub fn with_loopback_ip(mut self, loopback_ip: String) -> Self {
+        self.loopback_ip = Some(loopback_ip);
+        self
+    }
+
     /// Configure specific guest IP for clone operations
     ///
     /// When cloning from a snapshot, the guest already has its IP configured.
@@ -110,35 +119,6 @@ impl SlirpNetwork {
         }
 
         self
-    }
-
-    /// Find the next available loopback IP by reading existing VM states
-    /// Returns a 127.0.0.X IP that's not currently in use
-    async fn find_next_loopback_ip() -> String {
-        let state_manager = StateManager::new(paths::state_dir());
-        let used_ips: HashSet<String> = state_manager
-            .list_vms()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|vm| vm.config.network.loopback_ip)
-            .collect();
-
-        // Sequential allocation: 127.0.0.2, 127.0.0.3, ... 127.0.0.254
-        // Then 127.0.1.2, 127.0.1.3, ... etc.
-        for b2 in 0..=255u8 {
-            for b3 in 2..=254u8 {
-                // Skip 127.0.0.1 (localhost)
-                let ip = format!("127.0.{}.{}", b2, b3);
-                if !used_ips.contains(&ip) {
-                    return ip;
-                }
-            }
-        }
-
-        // Fallback if all IPs are used (very unlikely - 65,000+ IPs)
-        warn!("all loopback IPs in use, reusing 127.0.0.2");
-        "127.0.0.2".to_string()
     }
 
     /// Get the loopback IP assigned to this VM
@@ -470,10 +450,10 @@ impl NetworkManager for SlirpNetwork {
     async fn setup(&mut self) -> Result<NetworkConfig> {
         info!(vm_id = %self.vm_id, "setting up rootless networking with slirp4netns");
 
-        // Allocate a unique loopback IP on the host for health checks
-        // (guest subnet is always 192.168.1.0/24 - isolated per namespace)
-        let loopback_ip = Self::find_next_loopback_ip().await;
-        self.loopback_ip = Some(loopback_ip.clone());
+        // Loopback IP must be pre-allocated via with_loopback_ip() before setup()
+        // This ensures atomic allocation with state persistence under lock
+        let loopback_ip = self.loopback_ip.clone()
+            .context("loopback IP not set - must call with_loopback_ip() before setup()")?;
 
         info!(
             loopback_ip = %loopback_ip,
