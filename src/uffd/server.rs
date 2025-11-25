@@ -338,7 +338,23 @@ async fn handle_vm_page_faults(
                 }
                 Event::Remove { start, end } => {
                     // Balloon device removed pages - zero them
-                    let len = (end as usize) - (start as usize);
+                    // Validate bounds: end must be >= start and range must be reasonable
+                    let start_addr = start as usize;
+                    let end_addr = end as usize;
+                    if end_addr < start_addr {
+                        warn!(
+                            target: "uffd",
+                            vm_id = %vm_id,
+                            start = format!("0x{:x}", start_addr),
+                            end = format!("0x{:x}", end_addr),
+                            "Remove event with invalid range (end < start), ignoring"
+                        );
+                        continue;
+                    }
+                    let len = end_addr.saturating_sub(start_addr);
+                    if len == 0 {
+                        continue; // Nothing to zero
+                    }
                     unsafe {
                         guard.get_inner().zeropage(start, len, true)?;
                     }
@@ -363,8 +379,32 @@ struct GuestRegionUffdMapping {
 }
 
 impl GuestRegionUffdMapping {
+    /// Check if address is within this mapping (overflow-safe)
     fn contains(&self, addr: u64) -> bool {
-        addr >= self.base_host_virt_addr && addr < self.base_host_virt_addr + self.size as u64
+        if addr < self.base_host_virt_addr {
+            return false;
+        }
+        // Use checked arithmetic to prevent overflow
+        match self.base_host_virt_addr.checked_add(self.size as u64) {
+            Some(end) => addr < end,
+            None => true, // If overflow, assume addr is within (max range)
+        }
+    }
+
+    /// Validate that this mapping has sensible values
+    fn validate(&self) -> Result<()> {
+        if self.size == 0 {
+            anyhow::bail!("mapping has zero size at base 0x{:x}", self.base_host_virt_addr);
+        }
+        // Check for overflow in base + size
+        if self.base_host_virt_addr.checked_add(self.size as u64).is_none() {
+            anyhow::bail!(
+                "mapping range overflow: base 0x{:x}, size {}",
+                self.base_host_virt_addr,
+                self.size
+            );
+        }
+        Ok(())
     }
 }
 
@@ -387,6 +427,16 @@ fn receive_uffd_and_mappings(
     let message = String::from_utf8(message_buf).context("parsing message as UTF-8")?;
     let mappings: Vec<GuestRegionUffdMapping> =
         serde_json::from_str(&message).context("parsing memory mappings JSON")?;
+
+    // Validate all received mappings
+    if mappings.is_empty() {
+        anyhow::bail!("received empty memory mappings from Firecracker");
+    }
+    for (i, mapping) in mappings.iter().enumerate() {
+        mapping
+            .validate()
+            .with_context(|| format!("invalid mapping at index {}", i))?;
+    }
 
     // Convert File to Uffd
     let uffd = unsafe { Uffd::from_raw_fd(uffd_file.into_raw_fd()) };
