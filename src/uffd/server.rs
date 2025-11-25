@@ -435,3 +435,126 @@ fn receive_uffd_and_mappings(
 
     Ok((uffd, mappings))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mapping_contains_basic() {
+        let mapping = GuestRegionUffdMapping {
+            base_host_virt_addr: 0x1000,
+            size: 0x1000, // 4KB
+            offset: 0,
+        };
+
+        // Before mapping
+        assert!(!mapping.contains(0x0FFF));
+        // Start of mapping
+        assert!(mapping.contains(0x1000));
+        // Middle of mapping
+        assert!(mapping.contains(0x1500));
+        // Last byte of mapping
+        assert!(mapping.contains(0x1FFF));
+        // Just after mapping
+        assert!(!mapping.contains(0x2000));
+        // Way after mapping
+        assert!(!mapping.contains(0x3000));
+    }
+
+    #[test]
+    fn test_mapping_contains_large_address() {
+        // Test with addresses near u64::MAX to verify overflow handling
+        let mapping = GuestRegionUffdMapping {
+            base_host_virt_addr: u64::MAX - 0x1000,
+            size: 0x800,
+            offset: 0,
+        };
+
+        // Should contain addresses within range
+        assert!(mapping.contains(u64::MAX - 0x1000));
+        assert!(mapping.contains(u64::MAX - 0x900));
+
+        // Should not contain addresses before range
+        assert!(!mapping.contains(u64::MAX - 0x1001));
+    }
+
+    #[test]
+    fn test_mapping_contains_overflow() {
+        // Test case where base + size would overflow u64
+        let mapping = GuestRegionUffdMapping {
+            base_host_virt_addr: u64::MAX - 100,
+            size: 200, // This would overflow
+            offset: 0,
+        };
+
+        // With overflow, contains() returns true for addresses >= base
+        assert!(mapping.contains(u64::MAX - 100));
+        assert!(mapping.contains(u64::MAX));
+        // Still false for addresses before base
+        assert!(!mapping.contains(u64::MAX - 101));
+    }
+
+    #[test]
+    fn test_mapping_validate_success() {
+        let mapping = GuestRegionUffdMapping {
+            base_host_virt_addr: 0x1000,
+            size: 0x1000,
+            offset: 0,
+        };
+        assert!(mapping.validate().is_ok());
+    }
+
+    #[test]
+    fn test_mapping_validate_zero_size() {
+        let mapping = GuestRegionUffdMapping {
+            base_host_virt_addr: 0x1000,
+            size: 0, // Invalid
+            offset: 0,
+        };
+        let result = mapping.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("zero size"));
+    }
+
+    #[test]
+    fn test_mapping_validate_overflow() {
+        let mapping = GuestRegionUffdMapping {
+            base_host_virt_addr: u64::MAX - 100,
+            size: 200, // Would overflow
+            offset: 0,
+        };
+        let result = mapping.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("overflow"));
+    }
+
+    #[test]
+    fn test_mapping_json_parsing() {
+        let json = r#"[
+            {"base_host_virt_addr": 140000000, "size": 536870912, "offset": 0}
+        ]"#;
+        let mappings: Vec<GuestRegionUffdMapping> = serde_json::from_str(json).unwrap();
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].base_host_virt_addr, 140000000);
+        assert_eq!(mappings[0].size, 536870912); // 512MB
+        assert_eq!(mappings[0].offset, 0);
+    }
+
+    #[test]
+    fn test_mapping_json_multiple_regions() {
+        let json = r#"[
+            {"base_host_virt_addr": 140000000, "size": 268435456, "offset": 0},
+            {"base_host_virt_addr": 408435456, "size": 268435456, "offset": 268435456}
+        ]"#;
+        let mappings: Vec<GuestRegionUffdMapping> = serde_json::from_str(json).unwrap();
+        assert_eq!(mappings.len(), 2);
+
+        // First region
+        assert_eq!(mappings[0].size, 268435456); // 256MB
+        assert_eq!(mappings[0].offset, 0);
+
+        // Second region
+        assert_eq!(mappings[1].offset, 268435456); // Starts after first
+    }
+}
