@@ -10,13 +10,19 @@ pub async fn ensure_rootfs() -> Result<PathBuf> {
     let rootfs_dir = paths::rootfs_dir();
     let rootfs_path = paths::base_rootfs();
 
-    // ALWAYS rebuild rootfs for now - ensures code changes take effect
-    // TODO: Add version check or --force-rebuild flag for production
+    // If rootfs exists, check if we should rebuild
     if rootfs_path.exists() {
-        info!(path = %rootfs_path.display(), "rootfs exists but rebuilding to ensure latest changes");
-        tokio::fs::remove_file(&rootfs_path)
-            .await
-            .context("removing old rootfs")?;
+        // Only rebuild if running as root (uid 0)
+        // Non-root users use the existing rootfs to enable true rootless operation
+        if unsafe { libc::getuid() } == 0 {
+            info!(path = %rootfs_path.display(), "rootfs exists but rebuilding to ensure latest changes");
+            tokio::fs::remove_file(&rootfs_path)
+                .await
+                .context("removing old rootfs")?;
+        } else {
+            info!(path = %rootfs_path.display(), "rootfs exists, using as-is (non-root mode)");
+            return Ok(rootfs_path);
+        }
     }
 
     println!("⚙️  Creating base rootfs (~60s)...");

@@ -339,6 +339,30 @@ fcvm memory-server <name>   # Start memory server for snapshot (enables sharing)
      - `sanity-baseline-vm: health-monitor:` (health checks)
    - **Result**: Production-ready logging that works in terminals and log files
 
+15. **True Rootless Networking with slirp4netns** (2025-11-25)
+   - ✅ Renamed `rootless.rs` → `bridged.rs` (was misleading, uses network namespaces)
+   - ✅ Added `--network bridged|rootless` CLI flag
+   - ✅ Implemented `SlirpNetwork` struct with slirp4netns integration
+   - ✅ User namespace support via `unshare --user --map-root-user --net`
+   - ✅ Added `post_start()` to `NetworkManager` trait for deferred slirp4netns startup
+   - ✅ Unique loopback IPs (127.x.y.z) per VM for health checks
+   - ✅ Port forwarding via slirp4netns JSON-RPC API socket
+   - ✅ Health check architecture updated for rootless mode
+   - ✅ Clone support for rootless VMs
+   - **Key files**:
+     - `src/network/slirp.rs` - SlirpNetwork implementation
+     - `src/network/bridged.rs` - BridgedNetwork (renamed from rootless.rs)
+     - `src/firecracker/vm.rs` - VmManager with user namespace support
+     - `src/health.rs` - Dual health check modes (loopback vs veth)
+   - **Usage**:
+     ```bash
+     # Rootless VM (no root required)
+     fcvm podman run --network rootless nginx:alpine
+
+     # Rootless clone
+     fcvm snapshot run --pid <serve_pid> --network rootless
+     ```
+
 ### 🚧 In Progress
 
 None - all major features working!
@@ -384,15 +408,65 @@ None - all major features working!
   - fc-agent.service enabled
 
 ### Networking Notes
-- **Rootless mode**: slirp4netns provides userspace networking
-  - Port forwarding via hostfwd
-  - No root privileges required
-  - Slightly lower performance than bridge mode
 
-- **Privileged mode**: Linux bridge + nftables DNAT
-  - Better performance
+#### Network Modes (--network flag)
+
+fcvm supports two networking modes:
+
+- **`--network bridged`** (default): Linux bridge + network namespace + nftables
   - Requires root or CAP_NET_ADMIN
-  - Uses nftables for port forwarding
+  - Better performance
+  - Uses veth pairs and TAP devices
+  - Port forwarding via nftables DNAT
+
+- **`--network rootless`**: True rootless networking with slirp4netns
+  - No root privileges required
+  - Uses user namespace (`unshare --user --map-root-user --net`)
+  - slirp4netns creates TAP device inside namespace
+  - Guest IP: 10.0.2.15, Gateway: 10.0.2.2 (slirp4netns defaults)
+  - Port forwarding via slirp4netns JSON-RPC API socket
+  - Health checks use unique loopback IPs (127.x.y.z)
+
+#### Rootless Networking Architecture
+
+**Key Implementation Files:**
+- `src/network/slirp.rs` - SlirpNetwork implementation
+- `src/network/bridged.rs` - BridgedNetwork implementation
+- `src/firecracker/vm.rs` - VmManager with user namespace support
+
+**How slirp4netns Integration Works:**
+1. Firecracker starts with `unshare --user --map-root-user --net`
+2. This creates a new user namespace with root-mapped UID
+3. slirp4netns connects to the namespace via PID
+4. TAP device is created inside the namespace
+5. Port forwarding via API socket (JSON-RPC)
+
+**Health Check Architecture for Rootless:**
+- Each rootless VM gets a unique loopback IP (127.x.y.z) derived from vm_id hash
+- Port 80 is forwarded from loopback IP to guest 10.0.2.15:80
+- Health monitor checks HTTP on loopback IP instead of guest IP + veth
+- `NetworkConfig.loopback_ip` and `NetworkConfig.health_check_port` fields track this
+
+**Loopback IP Generation:**
+```rust
+// src/network/slirp.rs - generate_loopback_ip()
+// Hash vm_id to generate unique 127.x.y.z (avoiding 127.0.0.1)
+fn generate_loopback_ip(vm_id: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    vm_id.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let second = ((hash >> 0) & 0xFF) as u8;
+    let third = ((hash >> 8) & 0xFF) as u8;
+    let fourth = ((hash >> 16) & 0xFF) as u8;
+
+    // Avoid 127.0.0.0 and 127.0.0.1
+    let second = if second == 0 { 1 } else { second };
+    let fourth = if second == 0 && third == 0 && fourth <= 1 { 2 } else { fourth };
+
+    format!("127.{}.{}.{}", second, third, fourth)
+}
+```
 
 ### Storage Notes - btrfs CoW Reflinks
 
