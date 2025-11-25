@@ -1,12 +1,17 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use super::FirecrackerClient;
+
+/// Socket/device wait timeout (total wait time = RETRY_COUNT * RETRY_DELAY)
+const SOCKET_WAIT_RETRY_COUNT: u32 = 50;
+const SOCKET_WAIT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Manages a Firecracker VM process
 ///
@@ -162,7 +167,7 @@ impl VmManager {
             // Create CString outside the closure to ensure proper null termination
             // for C API usage. This avoids String capture issues in pre_exec.
             let ns_path_cstr = CString::new(format!("/var/run/netns/{}", ns_id))
-                .expect("namespace path should not contain null bytes");
+                .context("namespace ID contains invalid characters (null bytes)")?;
             info!(target: "vm", vm_id = %self.vm_id, namespace = %ns_id, "entering network namespace");
 
             // SAFETY: pre_exec runs after fork() but before exec().
@@ -280,17 +285,17 @@ impl VmManager {
 
     /// Wait for Firecracker socket to be ready
     async fn wait_for_socket(&self) -> Result<()> {
-        use tokio::time::{sleep, Duration};
+        use tokio::time::sleep;
 
-        for _ in 0..50 {
-            // 5 second timeout
+        for _ in 0..SOCKET_WAIT_RETRY_COUNT {
             if self.socket_path.exists() {
                 return Ok(());
             }
-            sleep(Duration::from_millis(100)).await;
+            sleep(SOCKET_WAIT_RETRY_DELAY).await;
         }
 
-        bail!("Firecracker socket not ready after 5 seconds")
+        let timeout_secs = SOCKET_WAIT_RETRY_COUNT as u64 * SOCKET_WAIT_RETRY_DELAY.as_millis() as u64 / 1000;
+        bail!("Firecracker socket not ready after {} seconds", timeout_secs)
     }
 
     /// Get the API client
@@ -342,11 +347,11 @@ impl VmManager {
 
         tokio::spawn(async move {
             // Wait for console device to appear
-            for _ in 0..50 {
+            for _ in 0..SOCKET_WAIT_RETRY_COUNT {
                 if console_path.exists() {
                     break;
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                tokio::time::sleep(SOCKET_WAIT_RETRY_DELAY).await;
             }
 
             if !console_path.exists() {

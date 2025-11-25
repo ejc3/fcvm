@@ -7,7 +7,7 @@ use crate::cli::{NetworkMode, PodmanArgs, PodmanCommands, RunArgs};
 use crate::firecracker::VmManager;
 use crate::network::{BridgedNetwork, NetworkManager, PortMapping, SlirpNetwork};
 use crate::paths;
-use crate::state::{generate_vm_id, truncate_id, StateManager, VmState};
+use crate::state::{generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState};
 use crate::storage::DiskManager;
 
 /// Main dispatcher for podman commands
@@ -19,6 +19,9 @@ pub async fn cmd_podman(args: PodmanArgs) -> Result<()> {
 
 async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     info!("Starting fcvm podman run");
+
+    // Validate VM name before any setup work
+    validate_vm_name(&args.name).context("invalid VM name")?;
 
     // Ensure kernel and rootfs exist (auto-setup on first run)
     let kernel_path = crate::setup::ensure_kernel()

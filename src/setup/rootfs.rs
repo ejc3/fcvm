@@ -5,6 +5,12 @@ use tracing::{info, warn};
 
 use crate::paths;
 
+/// Helper to convert Path to str with proper error handling
+fn path_to_str(path: &Path) -> Result<&str> {
+    path.to_str()
+        .ok_or_else(|| anyhow::anyhow!("path contains invalid UTF-8: {:?}", path))
+}
+
 /// Ensure rootfs exists, creating minimal Alpine + Podman if needed
 pub async fn ensure_rootfs() -> Result<PathBuf> {
     let rootfs_dir = paths::rootfs_dir();
@@ -75,7 +81,7 @@ async fn create_alpine_rootfs(output_path: &Path) -> Result<()> {
 
     // Format as ext4
     let output = Command::new("mkfs.ext4")
-        .args(["-F", output_path.to_str().unwrap()])
+        .args(["-F", path_to_str(output_path)?])
         .output()
         .context("formatting ext4")?;
 
@@ -93,8 +99,8 @@ async fn create_alpine_rootfs(output_path: &Path) -> Result<()> {
         .args([
             "-o",
             "loop",
-            output_path.to_str().unwrap(),
-            mount_point.to_str().unwrap(),
+            path_to_str(output_path)?,
+            path_to_str(&mount_point)?,
         ])
         .output()
         .context("mounting image")?;
@@ -110,9 +116,9 @@ async fn create_alpine_rootfs(output_path: &Path) -> Result<()> {
     let result = download_and_extract_alpine(&mount_point).await;
 
     // Always unmount even if setup failed
-    let _ = Command::new("umount")
-        .arg(mount_point.to_str().unwrap())
-        .output();
+    if let Ok(mount_str) = path_to_str(&mount_point) {
+        let _ = Command::new("umount").arg(mount_str).output();
+    }
 
     // Clean up temp directory
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
@@ -151,7 +157,7 @@ async fn download_and_extract_alpine(mount_point: &Path) -> Result<()> {
 
     // Extract to mount point
     let output = Command::new("tar")
-        .args(["-xzf", tarball_path, "-C", mount_point.to_str().unwrap()])
+        .args(["-xzf", tarball_path, "-C", path_to_str(mount_point)?])
         .output()
         .context("extracting tarball")?;
 
@@ -178,7 +184,7 @@ async fn download_and_extract_alpine(mount_point: &Path) -> Result<()> {
     // chrony provides NTP time synchronization (fixes TLS cert validation)
     // openresolv needed for dns-nameservers in /etc/network/interfaces
     let output = Command::new("chroot")
-        .arg(mount_point.to_str().unwrap())
+        .arg(path_to_str(mount_point)?)
         .args(["/bin/sh", "-c", "apk update && apk add podman crun fuse-overlayfs openrc haveged ca-certificates chrony openresolv"])
         .output()
         .context("installing packages via apk")?;
@@ -196,10 +202,12 @@ async fn download_and_extract_alpine(mount_point: &Path) -> Result<()> {
     // Enable services for OpenRC
     // cgroups service is CRITICAL for Podman - mounts cgroup v1 hierarchy
     // chronyd service is CRITICAL for TLS - syncs system clock via NTP
-    let _ = Command::new("chroot")
-        .arg(mount_point.to_str().unwrap())
-        .args(["/bin/sh", "-c", "rc-update add devfs boot && rc-update add procfs boot && rc-update add sysfs boot && rc-update add cgroups boot && rc-update add haveged boot && rc-update add chronyd default"])
-        .output();
+    if let Ok(mount_str) = path_to_str(mount_point) {
+        let _ = Command::new("chroot")
+            .arg(mount_str)
+            .args(["/bin/sh", "-c", "rc-update add devfs boot && rc-update add procfs boot && rc-update add sysfs boot && rc-update add cgroups boot && rc-update add haveged boot && rc-update add chronyd default"])
+            .output();
+    }
 
     // Configure networking for Alpine Linux
     // Network configuration is passed via kernel cmdline (ip= parameter)
@@ -305,9 +313,9 @@ echo "=== Debug Complete ==="
         .context("writing network debug script")?;
 
     // Make executable
-    let _ = Command::new("chmod")
-        .args(["+x", debug_script_path.to_str().unwrap()])
-        .output();
+    if let Ok(path_str) = path_to_str(&debug_script_path) {
+        let _ = Command::new("chmod").args(["+x", path_str]).output();
+    }
 
     // Add to boot via local service
     let local_start = r#"#!/bin/sh
@@ -321,18 +329,20 @@ echo "=== Debug Complete ==="
     tokio::fs::write(&local_path, local_start)
         .await
         .context("writing local.d script")?;
-    let _ = Command::new("chmod")
-        .args(["+x", local_path.to_str().unwrap()])
-        .output();
+    if let Ok(path_str) = path_to_str(&local_path) {
+        let _ = Command::new("chmod").args(["+x", path_str]).output();
+    }
 
     // Note: ARP cache flushing for snapshot restore is handled by fc-agent
     // via MMDS restore-epoch signaling - not via boot scripts (which don't run on restore)
 
     // Enable local service
-    let _ = Command::new("chroot")
-        .arg(mount_point.to_str().unwrap())
-        .args(["/bin/sh", "-c", "rc-update add local default"])
-        .output();
+    if let Ok(mount_str) = path_to_str(mount_point) {
+        let _ = Command::new("chroot")
+            .arg(mount_str)
+            .args(["/bin/sh", "-c", "rc-update add local default"])
+            .output();
+    }
 
     Ok(())
 }
@@ -372,7 +382,7 @@ echo "[dmesg-logger] Kernel message monitoring complete" > /dev/console
         .context("writing dmesg-logger script")?;
 
     let output = Command::new("chmod")
-        .args(["+x", dmesg_logger_path.to_str().unwrap()])
+        .args(["+x", path_to_str(&dmesg_logger_path)?])
         .output()
         .context("making dmesg-logger executable")?;
 
@@ -429,7 +439,7 @@ echo "[proc-monitor] Process monitoring complete" > /dev/console
         .context("writing process-monitor script")?;
 
     let output = Command::new("chmod")
-        .args(["+x", process_monitor_path.to_str().unwrap()])
+        .args(["+x", path_to_str(&process_monitor_path)?])
         .output()
         .context("making process-monitor executable")?;
 
@@ -453,7 +463,7 @@ echo "[proc-monitor] Process monitoring complete" > /dev/console
         .context("writing dmesg-logger.start")?;
 
     let output = Command::new("chmod")
-        .args(["+x", dmesg_start_path.to_str().unwrap()])
+        .args(["+x", path_to_str(&dmesg_start_path)?])
         .output()
         .context("making dmesg-logger.start executable")?;
 
@@ -471,7 +481,7 @@ echo "[proc-monitor] Process monitoring complete" > /dev/console
         .context("writing process-monitor.start")?;
 
     let output = Command::new("chmod")
-        .args(["+x", process_start_path.to_str().unwrap()])
+        .args(["+x", path_to_str(&process_start_path)?])
         .output()
         .context("making process-monitor.start executable")?;
 
@@ -481,7 +491,7 @@ echo "[proc-monitor] Process monitoring complete" > /dev/console
 
     // Enable local service (runs scripts in /etc/local.d/*.start)
     let output = Command::new("chroot")
-        .arg(mount_point.to_str().unwrap())
+        .arg(path_to_str(mount_point)?)
         .args(["/bin/sh", "-c", "rc-update add local default 2>/dev/null || true"])
         .output()
         .context("enabling local service")?;
@@ -542,7 +552,7 @@ async fn install_fc_agent(mount_point: &Path) -> Result<()> {
 
     // Make executable
     let output = Command::new("chmod")
-        .args(["+x", fc_agent_dest.to_str().unwrap()])
+        .args(["+x", path_to_str(&fc_agent_dest)?])
         .output()
         .context("making fc-agent executable")?;
 
@@ -574,7 +584,7 @@ depend() {
 
     // Make service executable
     let output = Command::new("chmod")
-        .args(["+x", service_path.to_str().unwrap()])
+        .args(["+x", path_to_str(&service_path)?])
         .output()
         .context("making service executable")?;
 
@@ -584,7 +594,7 @@ depend() {
 
     // Enable fc-agent service (add to default runlevel)
     let output = Command::new("chroot")
-        .arg(mount_point.to_str().unwrap())
+        .arg(path_to_str(mount_point)?)
         .args(["/bin/sh", "-c", "rc-update add fc-agent default"])
         .output()
         .context("enabling fc-agent service")?;
@@ -713,7 +723,7 @@ fi
 
     // Make executable
     let output = Command::new("chmod")
-        .args(["+x", overlay_init_path.to_str().unwrap()])
+        .args(["+x", path_to_str(&overlay_init_path)?])
         .output()
         .context("making overlay-init executable")?;
 
