@@ -5,7 +5,7 @@ use tracing::info;
 
 use crate::cli::LsArgs;
 use crate::paths;
-use crate::state::StateManager;
+use crate::state::{truncate_id, StateManager};
 
 const STALE_THRESHOLD_SECS: i64 = 300; // 5 minutes
 
@@ -56,7 +56,7 @@ pub async fn cmd_ls(args: LsArgs) -> Result<()> {
             }
         }
 
-        let name = vm.name.clone().unwrap_or_else(|| vm.vm_id[..8].to_string());
+        let name = vm.name.clone().unwrap_or_else(|| truncate_id(&vm.vm_id, 8).to_string());
 
         // Extract network info from config
         let (guest_ip, tap_device) = if let Some(network) = vm.config.network.as_object() {

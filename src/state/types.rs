@@ -1,8 +1,17 @@
 use serde::{Deserialize, Serialize};
 
+/// Safely truncate a string to at most `max_len` characters.
+/// Returns a string slice without panicking for short inputs.
+pub fn truncate_id(s: &str, max_len: usize) -> &str {
+    &s[..max_len.min(s.len())]
+}
+
 /// VM state information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmState {
+    /// Schema version for future migrations (defaults to 1)
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub vm_id: String,
     pub name: Option<String>,
     pub status: VmStatus,
@@ -11,6 +20,10 @@ pub struct VmState {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub last_updated: chrono::DateTime<chrono::Utc>,
     pub config: VmConfig,
+}
+
+fn default_schema_version() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +74,7 @@ impl VmState {
     pub fn new(vm_id: String, image: String, vcpu: u8, memory_mib: u32) -> Self {
         let now = chrono::Utc::now();
         Self {
+            schema_version: 1,
             vm_id,
             name: None,
             status: VmStatus::Starting,

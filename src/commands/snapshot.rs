@@ -9,7 +9,7 @@ use crate::cli::{
 use crate::firecracker::VmManager;
 use crate::network::{NetworkManager, PortMapping, RootlessNetwork};
 use crate::paths;
-use crate::state::{generate_vm_id, StateManager, VmState, VmStatus};
+use crate::state::{generate_vm_id, truncate_id, StateManager, VmState, VmStatus};
 use crate::storage::{DiskManager, SnapshotManager};
 use crate::uffd::UffdServer;
 
@@ -48,7 +48,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         vm_state
             .name
             .clone()
-            .unwrap_or_else(|| vm_state.vm_id[..8].to_string())
+            .unwrap_or_else(|| truncate_id(&vm_state.vm_id, 8).to_string())
     });
 
     // Connect to running VM
@@ -163,7 +163,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             "snapshot created successfully"
         );
 
-        let vm_name = vm_state.name.as_deref().unwrap_or(&vm_state.vm_id[..8]);
+        let vm_name = vm_state.name.as_deref().unwrap_or(truncate_id(&vm_state.vm_id, 8));
         println!(
             "✓ Snapshot '{}' created from VM '{}'",
             snapshot_name, vm_name
@@ -190,7 +190,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         .await;
 
     if let Err(e) = resume_result {
-        let vm_name = vm_state.name.as_deref().unwrap_or(&vm_state.vm_id[..8]);
+        let vm_name = vm_state.name.as_deref().unwrap_or(truncate_id(&vm_state.vm_id, 8));
         warn!(
             error = %e,
             vm = %vm_name,
@@ -308,26 +308,43 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
             if let Some(pid) = clone.pid {
                 info!(
                     "killing clone {} (PID {})",
-                    &clone.vm_id[..8.min(clone.vm_id.len())],
+                    truncate_id(&clone.vm_id, 8),
                     pid
                 );
                 // Kill clone process
                 use std::process::Command;
-                let _ = Command::new("kill")
+                match Command::new("kill")
                     .arg("-TERM")
                     .arg(pid.to_string())
-                    .status();
+                    .status()
+                {
+                    Ok(status) if status.success() => {
+                        info!("successfully killed clone PID {}", pid);
+                    }
+                    Ok(status) => {
+                        warn!("kill command returned non-zero exit for PID {}: {:?}", pid, status.code());
+                    }
+                    Err(e) => {
+                        warn!("failed to kill clone PID {}: {}", pid, e);
+                    }
+                }
             }
         }
     }
 
     // Clean up socket file
-    let _ = std::fs::remove_file(&socket_path);
-    info!("removed socket file: {}", socket_path.display());
+    if let Err(e) = std::fs::remove_file(&socket_path) {
+        warn!("failed to remove socket file {}: {}", socket_path.display(), e);
+    } else {
+        info!("removed socket file: {}", socket_path.display());
+    }
 
     // Delete serve state
-    let _ = state_manager.delete_state(&serve_id).await;
-    info!("deleted serve state");
+    if let Err(e) = state_manager.delete_state(&serve_id).await {
+        warn!("failed to delete serve state {}: {}", serve_id, e);
+    } else {
+        info!("deleted serve state");
+    }
 
     println!("Memory server stopped");
 
@@ -418,7 +435,7 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     );
 
     // Setup networking - use saved network config from snapshot
-    let tap_device = format!("tap-{}", &vm_id[..8]);
+    let tap_device = format!("tap-{}", truncate_id(&vm_id, 8));
     let port_mappings: Vec<PortMapping> = args
         .publish
         .iter()
@@ -681,7 +698,7 @@ async fn cmd_snapshot_ls() -> Result<()> {
 
         println!(
             "{:<12} {:<10} {:<12} {:<20} {:<8}",
-            &serve.vm_id[..8.min(serve.vm_id.len())],
+            truncate_id(&serve.vm_id, 8),
             serve_pid,
             format!("{:?}", serve.health_status),
             serve.config.snapshot_name.as_deref().unwrap_or("-"),

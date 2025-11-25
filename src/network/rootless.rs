@@ -4,6 +4,7 @@ use tracing::info;
 use super::{
     namespace, portmap, types::generate_mac, veth, NetworkConfig, NetworkManager, PortMapping,
 };
+use crate::state::truncate_id;
 
 /// Rootless networking using network namespace isolation with veth pairs
 ///
@@ -114,15 +115,15 @@ impl NetworkManager for RootlessNetwork {
         let host_ip_with_cidr = format!("{}/{}", host_ip, cidr_bits);
 
         // Step 2: Create network namespace
-        let namespace_id = format!("fcvm-{}", &self.vm_id[..8]);
+        let namespace_id = format!("fcvm-{}", truncate_id(&self.vm_id, 8));
         namespace::create_namespace(&namespace_id)
             .await
             .context("creating network namespace")?;
 
         // Step 3: Create veth pair
         // Linux interface names are limited to 15 chars (IFNAMSIZ = 16 including null)
-        let host_veth = format!("veth0-{}", &self.vm_id[..8]);
-        let guest_veth = format!("veth1-{}", &self.vm_id[..8]);
+        let host_veth = format!("veth0-{}", truncate_id(&self.vm_id, 8));
+        let guest_veth = format!("veth1-{}", truncate_id(&self.vm_id, 8));
 
         veth::create_veth_pair(&host_veth, &guest_veth, &namespace_id)
             .await

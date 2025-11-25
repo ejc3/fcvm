@@ -7,7 +7,7 @@ use tokio::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::paths;
-use crate::state::{HealthStatus, StateManager};
+use crate::state::{truncate_id, HealthStatus, StateManager};
 
 /// Spawn a background health monitoring task for a VM
 ///
@@ -25,9 +25,9 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
 
         // Get VM name from state for logging
         let vm_name = if let Ok(state) = state_manager.load_state(&vm_id).await {
-            state.name.clone().unwrap_or_else(|| vm_id[..8].to_string())
+            state.name.clone().unwrap_or_else(|| truncate_id(&vm_id, 8).to_string())
         } else {
-            vm_id[..8].to_string() // Fallback to short vm_id
+            truncate_id(&vm_id, 8).to_string() // Fallback to short vm_id
         };
 
         info!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, pid = ?pid, "starting health monitor");
