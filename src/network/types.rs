@@ -12,6 +12,13 @@ pub struct NetworkConfig {
     pub host_ip: Option<String>,
     #[serde(default)]
     pub host_veth: Option<String>,
+    /// For rootless mode: unique loopback IP (127.x.y.z) for health checks
+    /// When set, health checks use this IP instead of guest_ip + veth
+    #[serde(default)]
+    pub loopback_ip: Option<String>,
+    /// For rootless mode: port on loopback_ip where guest port 80 is forwarded
+    #[serde(default)]
+    pub health_check_port: Option<u16>,
 }
 
 #[derive(Debug, Clone)]

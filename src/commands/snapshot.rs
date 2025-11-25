@@ -4,10 +4,11 @@ use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, warn};
 
 use crate::cli::{
-    SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs, SnapshotServeArgs,
+    NetworkMode, SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs,
+    SnapshotServeArgs,
 };
 use crate::firecracker::VmManager;
-use crate::network::{NetworkManager, PortMapping, RootlessNetwork};
+use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, PortMapping};
 use crate::paths;
 use crate::state::{generate_vm_id, truncate_id, StateManager, VmState, VmStatus};
 use crate::storage::{DiskManager, SnapshotManager};
@@ -446,17 +447,29 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Extract guest_ip from snapshot metadata for network config reuse
     let saved_network = &snapshot_config.metadata.network_config;
 
-    // Setup networking (always rootless) - reuse guest_ip from snapshot if available
-    let mut net = RootlessNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
-    // If snapshot has saved network config with guest_ip, use it
-    if let Some(ref guest_ip) = saved_network.guest_ip {
-        net = net.with_guest_ip(guest_ip.clone());
-        info!(
-            guest_ip = %guest_ip,
-            "clone will use same network config as snapshot"
-        );
-    }
-    let mut network: Box<dyn NetworkManager> = Box::new(net);
+    // Setup networking based on mode - reuse guest_ip from snapshot if available
+    let mut network: Box<dyn NetworkManager> = match args.network {
+        NetworkMode::Bridged => {
+            let mut net =
+                BridgedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
+            // If snapshot has saved network config with guest_ip, use it
+            if let Some(ref guest_ip) = saved_network.guest_ip {
+                net = net.with_guest_ip(guest_ip.clone());
+                info!(
+                    guest_ip = %guest_ip,
+                    "clone will use same network config as snapshot"
+                );
+            }
+            Box::new(net)
+        }
+        NetworkMode::Rootless => {
+            Box::new(PastaNetwork::new(
+                vm_id.clone(),
+                tap_device.clone(),
+                port_mappings.clone(),
+            ))
+        }
+    };
 
     let network_config = network.setup().await.context("setting up network")?;
 
@@ -475,7 +488,7 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         &uffd_socket,
         &snapshot_config,
         &network_config,
-        network.as_ref(),
+        network.as_mut(),
         &state_manager,
         &mut vm_state,
     )
@@ -604,7 +617,7 @@ async fn run_clone_setup(
     uffd_socket: &std::path::Path,
     snapshot_config: &crate::storage::snapshot::SnapshotConfig,
     network_config: &crate::network::NetworkConfig,
-    network: &dyn NetworkManager,
+    network: &mut dyn NetworkManager,
     state_manager: &StateManager,
     vm_state: &mut VmState,
 ) -> Result<VmManager> {
@@ -630,11 +643,16 @@ async fn run_clone_setup(
     vm_manager.set_vm_name(vm_name.to_string());
 
     // Configure namespace isolation if network provides one
-    if let Some(rootless_net) = network.as_any().downcast_ref::<RootlessNetwork>() {
-        if let Some(ns_id) = rootless_net.namespace_id() {
+    if let Some(bridged_net) = network.as_any().downcast_ref::<BridgedNetwork>() {
+        if let Some(ns_id) = bridged_net.namespace_id() {
             info!(namespace = %ns_id, "configuring VM to run in network namespace");
             vm_manager.set_namespace(ns_id.to_string());
         }
+    } else if let Some(pasta_net) = network.as_any().downcast_ref::<PastaNetwork>() {
+        // Rootless mode: use pasta to create namespaces and wrap Firecracker
+        let wrapper_cmd = pasta_net.build_wrapper_command();
+        info!(wrapper = %pasta_net.wrapper_command_string(), "configuring clone for rootless operation with pasta");
+        vm_manager.set_pasta_wrapper(wrapper_cmd);
     }
 
     let firecracker_bin = PathBuf::from("/usr/local/bin/firecracker");
@@ -643,6 +661,11 @@ async fn run_clone_setup(
         .start(&firecracker_bin, None)
         .await
         .context("starting Firecracker")?;
+
+    // For rootless mode with pasta: post_start is a no-op (TAP already created by pasta wrapper)
+    // For bridged mode: post_start is also a no-op (TAP already created)
+    let vm_pid = vm_manager.pid()?;
+    network.post_start(vm_pid).await.context("post-start network setup")?;
 
     let client = vm_manager.client()?;
 

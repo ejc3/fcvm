@@ -118,6 +118,7 @@ pub async fn cmd_test(args: TestArgs) -> Result<()> {
                 stress_args.clean,
                 &stress_args.baseline_name,
                 stress_args.verbose,
+                stress_args.network,
             )
             .await
         }
@@ -133,8 +134,14 @@ async fn cmd_stress_test(
     clean: bool,
     baseline_name: &str,
     _verbose: bool,
+    network: crate::cli::NetworkMode,
 ) -> Result<()> {
     info!("Starting stress test");
+
+    let network_str = match network {
+        crate::cli::NetworkMode::Bridged => "bridged",
+        crate::cli::NetworkMode::Rootless => "rootless",
+    };
 
     println!("fcvm stress test");
     println!("================");
@@ -143,6 +150,7 @@ async fn cmd_stress_test(
     println!("Batch size: {}", batch_size);
     println!("Timeout: {}s", timeout);
     println!("Baseline VM: {}", baseline_name);
+    println!("Network mode: {}", network_str);
     println!();
 
     // Step 1: Cleanup existing processes
@@ -153,7 +161,7 @@ async fn cmd_stress_test(
     let baseline_vm = if clean {
         println!("Starting fresh baseline VM...");
 
-        let (vm_proc, pid) = start_baseline_vm(baseline_name, timeout)
+        let (vm_proc, pid) = start_baseline_vm(baseline_name, timeout, network_str)
             .await
             .context("Failed to start baseline VM - health check did not pass")?;
         println!("✓ Baseline VM started and healthy (PID: {})", pid);
@@ -182,7 +190,7 @@ async fn cmd_stress_test(
     println!();
 
     // Step 5: Run stress test
-    let metrics = run_stress_test(serve_pid, num_clones, batch_size, timeout).await?;
+    let metrics = run_stress_test(serve_pid, num_clones, batch_size, timeout, network_str).await?;
 
     // Step 6: Print summary
     print_summary(&metrics);
@@ -265,7 +273,7 @@ async fn cleanup_all_firecracker() -> Result<()> {
     Ok(())
 }
 
-async fn start_baseline_vm(vm_name: &str, timeout: u64) -> Result<(tokio::process::Child, u32)> {
+async fn start_baseline_vm(vm_name: &str, timeout: u64, network: &str) -> Result<(tokio::process::Child, u32)> {
     println!("  Starting VM '{}'...", vm_name);
 
     // Note: Don't use sudo - stress test command itself is run with sudo
@@ -274,6 +282,8 @@ async fn start_baseline_vm(vm_name: &str, timeout: u64) -> Result<(tokio::proces
         .arg("run")
         .arg("--name")
         .arg(vm_name)
+        .arg("--network")
+        .arg(network)
         .arg("nginx:alpine")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -398,6 +408,7 @@ async fn run_stress_test(
     num_clones: usize,
     batch_size: usize,
     timeout: u64,
+    network: &str,
 ) -> Result<Vec<CloneMetrics>> {
     let mut all_metrics = Vec::new();
 
@@ -480,8 +491,9 @@ async fn run_stress_test(
         let mut clone_tasks = Vec::new();
         for i in batch_start..batch_end {
             let name = format!("stress-{}", i);
+            let network = network.to_string();
             clone_tasks.push(tokio::spawn(
-                async move { clone_vm(serve_pid, &name).await },
+                async move { clone_vm(serve_pid, &name, &network).await },
             ));
         }
 
@@ -548,7 +560,7 @@ async fn run_stress_test(
     Ok(all_metrics)
 }
 
-async fn clone_vm(serve_pid: u32, name: &str) -> CloneMetrics {
+async fn clone_vm(serve_pid: u32, name: &str, network: &str) -> CloneMetrics {
     let start = Instant::now();
 
     // Spawn fcvm snapshot run using serve PID
@@ -561,6 +573,8 @@ async fn clone_vm(serve_pid: u32, name: &str) -> CloneMetrics {
             &serve_pid.to_string(),
             "--name",
             name,
+            "--network",
+            network,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -691,12 +705,13 @@ struct SnapshotConfig {
 
 #[derive(Deserialize)]
 struct SnapshotMetadata {
-    network_config: NetworkConfig,
+    network_config: TestNetworkConfig,
 }
 
 #[derive(Deserialize)]
-struct NetworkConfig {
-    guest_ip: String,
+struct TestNetworkConfig {
+    guest_ip: Option<String>,
+    loopback_ip: Option<String>,
 }
 
 async fn read_snapshot_guest_ip(snapshot_name: &str) -> Result<String> {
@@ -710,24 +725,36 @@ async fn read_snapshot_guest_ip(snapshot_name: &str) -> Result<String> {
     let config: SnapshotConfig = serde_json::from_str(&config_data)
         .with_context(|| format!("parsing snapshot config: {}", config_path.display()))?;
 
-    Ok(config.metadata.network_config.guest_ip)
+    // For bridged mode, use guest_ip. For rootless mode, use loopback_ip.
+    config
+        .metadata
+        .network_config
+        .guest_ip
+        .or(config.metadata.network_config.loopback_ip)
+        .ok_or_else(|| anyhow::anyhow!("Snapshot has no guest_ip or loopback_ip configured"))
 }
 
 async fn cmd_sanity_test(args: crate::cli::SanityTestArgs) -> Result<()> {
     use std::time::Duration;
+
+    let network_str = match args.network {
+        crate::cli::NetworkMode::Bridged => "bridged",
+        crate::cli::NetworkMode::Rootless => "rootless",
+    };
 
     println!("fcvm sanity test");
     println!("================");
     println!("Starting a single VM to verify health checks work");
     println!("Image: {}", args.image);
     println!("Timeout: {}s", args.timeout);
+    println!("Network mode: {}", network_str);
     println!();
 
     // Start the VM in background
     // Note: Don't use sudo here - the test command itself is run with sudo
     println!("Starting VM...");
     let mut child = fcvm_subprocess()
-        .args(["podman", "run", "--name", "sanity-test-vm", &args.image])
+        .args(["podman", "run", "--name", "sanity-test-vm", "--network", network_str, &args.image])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

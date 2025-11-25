@@ -30,6 +30,8 @@ pub struct VmManager {
     socket_path: PathBuf,
     log_path: Option<PathBuf>,
     namespace_id: Option<String>,
+    use_user_namespace: bool,      // DEPRECATED: Use unshare for rootless operation
+    pasta_wrapper: Option<Vec<String>>, // pasta wrapper command for rootless with networking
     process: Option<Child>,
     client: Option<FirecrackerClient>,
 }
@@ -42,6 +44,8 @@ impl VmManager {
             socket_path,
             log_path,
             namespace_id: None,
+            use_user_namespace: false,
+            pasta_wrapper: None,
             process: None,
             client: None,
         }
@@ -60,6 +64,28 @@ impl VmManager {
         self.namespace_id = Some(namespace_id);
     }
 
+    /// Enable user namespace mode for rootless operation (DEPRECATED)
+    ///
+    /// When set, Firecracker will be launched via `unshare --user --map-root-user --net`
+    /// which creates new user and network namespaces without requiring root.
+    /// Note: This doesn't set up networking - use set_pasta_wrapper for rootless networking.
+    #[deprecated(note = "Use set_pasta_wrapper for rootless networking with pasta")]
+    pub fn set_user_namespace(&mut self, enable: bool) {
+        self.use_user_namespace = enable;
+    }
+
+    /// Set pasta wrapper command for rootless networking
+    ///
+    /// When set, Firecracker will be launched inside a pasta-created namespace.
+    /// pasta creates user + network namespaces and sets up a TAP device with
+    /// userspace networking, all without requiring root privileges.
+    ///
+    /// The wrapper command should be the output of PastaNetwork::build_wrapper_command(),
+    /// e.g., ["pasta", "-4", "--ns-ifname", "tap0", "--config-net", "-f", "--"]
+    pub fn set_pasta_wrapper(&mut self, wrapper_cmd: Vec<String>) {
+        self.pasta_wrapper = Some(wrapper_cmd);
+    }
+
     /// Start the Firecracker process
     pub async fn start(
         &mut self,
@@ -75,8 +101,44 @@ impl VmManager {
         // Remove existing socket (ignore errors if not exists - avoids TOCTOU race)
         let _ = std::fs::remove_file(&self.socket_path);
 
-        let mut cmd = Command::new(firecracker_bin);
-        cmd.arg("--api-sock").arg(&self.socket_path);
+        // Build command based on mode:
+        // 1. pasta wrapper (rootless with networking) - highest priority
+        // 2. unshare (deprecated rootless, no networking)
+        // 3. direct Firecracker (privileged mode)
+        let mut cmd = if let Some(ref wrapper) = self.pasta_wrapper {
+            // Use pasta to create user + network namespaces with TAP device
+            info!(target: "vm", vm_id = %self.vm_id, "using pasta for rootless networking");
+            let mut c = Command::new(&wrapper[0]);
+            // Add remaining wrapper args (skip first which is the command)
+            for arg in &wrapper[1..] {
+                c.arg(arg);
+            }
+            // Add Firecracker command
+            c.arg(firecracker_bin)
+                .arg("--api-sock")
+                .arg(&self.socket_path);
+            c
+        } else if self.use_user_namespace {
+            // Use unshare to create user + network namespaces (deprecated, no networking)
+            #[allow(deprecated)]
+            {
+                info!(target: "vm", vm_id = %self.vm_id, "using user namespace for rootless operation (no network)");
+                let mut c = Command::new("unshare");
+                c.arg("--user")
+                    .arg("--map-root-user")
+                    .arg("--net")
+                    .arg("--")
+                    .arg(firecracker_bin)
+                    .arg("--api-sock")
+                    .arg(&self.socket_path);
+                c
+            }
+        } else {
+            // Direct Firecracker invocation (privileged mode)
+            let mut c = Command::new(firecracker_bin);
+            c.arg("--api-sock").arg(&self.socket_path);
+            c
+        };
 
         if let Some(config) = config_override {
             cmd.arg("--config-file").arg(config);

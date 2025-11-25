@@ -94,6 +94,10 @@ pub struct RunArgs {
     /// Balloon target MiB (default equals --mem)
     #[arg(long)]
     pub balloon: Option<u32>,
+
+    /// Network mode: bridged (requires sudo) or rootless (no sudo)
+    #[arg(long, value_enum, default_value_t = NetworkMode::Bridged)]
+    pub network: NetworkMode,
 }
 
 // ============================================================================
@@ -154,6 +158,10 @@ pub struct SnapshotRunArgs {
 
     #[arg(long, default_value = "stream")]
     pub logs: String,
+
+    /// Network mode: bridged (requires sudo) or rootless (no sudo)
+    #[arg(long, value_enum, default_value_t = NetworkMode::Bridged)]
+    pub network: NetworkMode,
 }
 
 // ============================================================================
@@ -167,6 +175,16 @@ pub enum MapModeOpt {
     Block,
     Sshfs,
     Nfs,
+}
+
+/// Network mode for VM networking
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default, ValueEnum)]
+pub enum NetworkMode {
+    /// Bridged networking using network namespaces (requires sudo)
+    #[default]
+    Bridged,
+    /// True rootless networking using slirp4netns (no sudo required)
+    Rootless,
 }
 
 // ============================================================================
@@ -217,6 +235,10 @@ pub struct StressTestArgs {
     /// Verbose output
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Network mode: bridged (requires sudo) or rootless (no sudo)
+    #[arg(long, value_enum, default_value_t = NetworkMode::Bridged)]
+    pub network: NetworkMode,
 }
 
 #[derive(Args, Debug)]
@@ -228,6 +250,10 @@ pub struct SanityTestArgs {
     /// Timeout for health check in seconds
     #[arg(long, default_value_t = 60)]
     pub timeout: u64,
+
+    /// Network mode: bridged (requires sudo) or rootless (no sudo)
+    #[arg(long, value_enum, default_value_t = NetworkMode::Bridged)]
+    pub network: NetworkMode,
 }
 
 // ============================================================================

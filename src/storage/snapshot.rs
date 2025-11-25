@@ -148,6 +148,8 @@ mod tests {
                     guest_ip: Some("172.30.0.2".to_string()),
                     host_ip: Some("172.30.0.1".to_string()),
                     host_veth: Some("veth0-abc123".to_string()),
+                    loopback_ip: None,
+                    health_check_port: None,
                 },
             },
         };
@@ -250,6 +252,8 @@ mod tests {
                     guest_ip: Some("172.30.0.2".to_string()),
                     host_ip: Some("172.30.0.1".to_string()),
                     host_veth: None,
+                    loopback_ip: None,
+                    health_check_port: None,
                 },
             },
         };
@@ -296,6 +300,8 @@ mod tests {
                         guest_ip: None,
                         host_ip: None,
                         host_veth: None,
+                        loopback_ip: None,
+                        health_check_port: None,
                     },
                 },
             };
@@ -330,6 +336,8 @@ mod tests {
                     guest_ip: None,
                     host_ip: None,
                     host_veth: None,
+                    loopback_ip: None,
+                    health_check_port: None,
                 },
             },
         };

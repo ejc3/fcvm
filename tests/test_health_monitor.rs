@@ -37,6 +37,8 @@ async fn test_health_monitor_lifecycle() {
                 guest_ip: Some("192.168.1.100".to_string()),
                 host_ip: Some("192.168.1.1".to_string()),
                 host_veth: Some("veth-test".to_string()),
+                loopback_ip: None,
+                health_check_port: None,
             },
             volumes: vec![],
             env: vec![],

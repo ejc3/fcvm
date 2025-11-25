@@ -33,6 +33,8 @@ async fn test_state_persistence() {
                 guest_ip: Some("172.16.0.2".to_string()),
                 host_ip: Some("172.16.0.1".to_string()),
                 host_veth: Some("veth0".to_string()),
+                loopback_ip: None,
+                health_check_port: None,
             },
             volumes: vec![],
             env: vec![],
