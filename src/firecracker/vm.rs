@@ -35,7 +35,6 @@ pub struct VmManager {
     socket_path: PathBuf,
     log_path: Option<PathBuf>,
     namespace_id: Option<String>,
-    use_user_namespace: bool,      // DEPRECATED: Use unshare for rootless operation
     namespace_wrapper: Option<Vec<String>>, // wrapper command for rootless networking (slirp4netns)
     process: Option<Child>,
     client: Option<FirecrackerClient>,
@@ -49,7 +48,6 @@ impl VmManager {
             socket_path,
             log_path,
             namespace_id: None,
-            use_user_namespace: false,
             namespace_wrapper: None,
             process: None,
             client: None,
@@ -67,16 +65,6 @@ impl VmManager {
     /// using setns() before exec. This isolates the VM's network stack.
     pub fn set_namespace(&mut self, namespace_id: String) {
         self.namespace_id = Some(namespace_id);
-    }
-
-    /// Enable user namespace mode for rootless operation (DEPRECATED)
-    ///
-    /// When set, Firecracker will be launched via `unshare --user --map-root-user --net`
-    /// which creates new user and network namespaces without requiring root.
-    /// Note: This doesn't set up networking - use set_namespace_wrapper for rootless networking.
-    #[deprecated(note = "Use set_namespace_wrapper for rootless networking with slirp4netns")]
-    pub fn set_user_namespace(&mut self, enable: bool) {
-        self.use_user_namespace = enable;
     }
 
     /// Set namespace wrapper command for rootless networking
@@ -107,9 +95,8 @@ impl VmManager {
         let _ = std::fs::remove_file(&self.socket_path);
 
         // Build command based on mode:
-        // 1. namespace wrapper (rootless with slirp4netns networking) - highest priority
-        // 2. unshare (deprecated rootless, no networking)
-        // 3. direct Firecracker (privileged mode)
+        // 1. namespace wrapper (rootless with slirp4netns networking)
+        // 2. direct Firecracker (privileged mode)
         let mut cmd = if let Some(ref wrapper) = self.namespace_wrapper {
             // Use wrapper to create user + network namespaces with TAP device
             info!(target: "vm", vm_id = %self.vm_id, "using namespace wrapper for rootless networking");
@@ -123,21 +110,6 @@ impl VmManager {
                 .arg("--api-sock")
                 .arg(&self.socket_path);
             c
-        } else if self.use_user_namespace {
-            // Use unshare to create user + network namespaces (deprecated, no networking)
-            #[allow(deprecated)]
-            {
-                info!(target: "vm", vm_id = %self.vm_id, "using user namespace for rootless operation (no network)");
-                let mut c = Command::new("unshare");
-                c.arg("--user")
-                    .arg("--map-root-user")
-                    .arg("--net")
-                    .arg("--")
-                    .arg(firecracker_bin)
-                    .arg("--api-sock")
-                    .arg(&self.socket_path);
-                c
-            }
         } else {
             // Direct Firecracker invocation (privileged mode)
             let mut c = Command::new(firecracker_bin);

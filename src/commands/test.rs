@@ -126,6 +126,7 @@ pub async fn cmd_test(args: TestArgs) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_stress_test(
     snapshot: &str,
     num_clones: usize,
