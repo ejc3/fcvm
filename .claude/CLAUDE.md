@@ -592,51 +592,90 @@ sudo ./target/release/fcvm podman run --name nginx-base --mode rootless nginx:la
 
 ## Build Instructions
 
-### On ARM EC2 Instance (c6g.metal)
+### Using Makefile (Recommended)
+
+The Makefile handles all builds on EC2 remotely. Run these commands from your **local macOS machine**:
+
+```bash
+# Standard development workflow:
+make build        # Sync code to EC2 + build fcvm + build fc-agent (musl)
+make test         # Run sanity test on EC2
+make rebuild      # Full rebuild: sync + build + update rootfs with new fc-agent
+
+# Individual targets:
+make sync         # Just sync code to EC2 (no build)
+make build-remote # Build on EC2 without syncing (use after manual changes)
+make rootfs       # Update fc-agent in rootfs (mounts base.ext4, copies binary)
+make deploy       # Quick deploy: copy fc-agent to rootfs (deprecated, use rootfs)
+
+# Kernel builds (only needed once):
+make kernel-setup # Clone Linux 5.10, upload FUSE-enabled config
+make kernel       # Build kernel on EC2 (~10-20 min)
+
+# Fetch artifacts to local machine:
+make fetch        # Download fcvm and fc-agent binaries
+make kernel-fetch # Download vmlinux
+
+# Local builds (for IDE/linting only - won't run on macOS):
+make build-local
+make clean
+```
+
+**Key Makefile targets:**
+| Target | Description |
+|--------|-------------|
+| `make build` | **Most common** - Sync + build everything on EC2 |
+| `make test` | Run sanity test (starts VM, verifies health) |
+| `make rebuild` | Full rebuild including rootfs update |
+| `make rootfs` | Update fc-agent in existing rootfs |
+
+### Manual Build on EC2
+
+If you need to build directly on the EC2 instance:
+
 ```bash
 # SSH to ARM instance
 ssh -i ~/.ssh/fcvm-ec2 ubuntu@54.67.60.104
 
-# One-time setup: Install prerequisites
-sudo apt-get update
-sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu dnsmasq
-rustup target add aarch64-unknown-linux-musl
-
-# One-time setup: Configure dnsmasq for DNS forwarding
-sudo tee /etc/dnsmasq.d/fcvm.conf > /dev/null <<EOF
-# Listen on all interfaces (including dynamically created TAP devices)
-bind-dynamic
-
-# Forward DNS to Google Public DNS
-server=8.8.8.8
-server=8.8.4.4
-
-# Don't read /etc/resolv.conf
-no-resolv
-
-# Cache size
-cache-size=1000
-EOF
-
-sudo systemctl restart dnsmasq
-
-# Sync code from local
-rsync -avz --delete --exclude 'target' --exclude '.git' \
-  -e "ssh -i ~/.ssh/fcvm-ec2" \
-  . ubuntu@54.67.60.104:~/fcvm/
-
-# Build fcvm and fc-agent (use background + tee!)
+# Build fcvm (host binary)
 cd ~/fcvm
 source ~/.cargo/env
-cargo build --release 2>&1 | tee /tmp/fcvm-build.log
-cd fc-agent && cargo build --release --target aarch64-unknown-linux-musl 2>&1 | tee /tmp/fc-agent-build.log
+cargo build --release
 
-# Or use Makefile (builds both automatically):
-make build 2>&1 | tee /tmp/build.log
+# Build fc-agent (guest binary, statically linked with musl)
+cd fc-agent
+cargo build --release --target aarch64-unknown-linux-musl
+
+# Update fc-agent in rootfs
+sudo mkdir -p /tmp/rootfs-mount
+sudo mount -o loop /mnt/fcvm-btrfs/rootfs/base.ext4 /tmp/rootfs-mount
+sudo cp ~/fcvm/fc-agent/target/aarch64-unknown-linux-musl/release/fc-agent /tmp/rootfs-mount/usr/local/bin/
+sudo umount /tmp/rootfs-mount
 
 # Binaries at:
 # ~/fcvm/target/release/fcvm
 # ~/fcvm/fc-agent/target/aarch64-unknown-linux-musl/release/fc-agent
+```
+
+### One-Time EC2 Setup
+
+Only needed when setting up a fresh EC2 instance:
+
+```bash
+# Install prerequisites
+sudo apt-get update
+sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu dnsmasq
+rustup target add aarch64-unknown-linux-musl
+
+# Configure dnsmasq for DNS forwarding
+sudo tee /etc/dnsmasq.d/fcvm.conf > /dev/null <<EOF
+bind-dynamic
+server=8.8.8.8
+server=8.8.4.4
+no-resolv
+cache-size=1000
+EOF
+sudo systemctl restart dnsmasq
 ```
 
 ## Key Learnings

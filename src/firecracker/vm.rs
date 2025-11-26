@@ -36,6 +36,7 @@ pub struct VmManager {
     log_path: Option<PathBuf>,
     namespace_id: Option<String>,
     namespace_wrapper: Option<Vec<String>>, // wrapper command for rootless networking (slirp4netns)
+    vsock_redirect: Option<(PathBuf, PathBuf)>, // (baseline_dir, clone_dir) for mount namespace isolation
     process: Option<Child>,
     client: Option<FirecrackerClient>,
 }
@@ -49,6 +50,7 @@ impl VmManager {
             log_path,
             namespace_id: None,
             namespace_wrapper: None,
+            vsock_redirect: None,
             process: None,
             client: None,
         }
@@ -77,6 +79,19 @@ impl VmManager {
     /// e.g., ["unshare", "--user", "--map-root-user", "--net", "--", ...]
     pub fn set_namespace_wrapper(&mut self, wrapper_cmd: Vec<String>) {
         self.namespace_wrapper = Some(wrapper_cmd);
+    }
+
+    /// Set vsock redirect for mount namespace isolation
+    ///
+    /// When set, Firecracker will be launched in a new mount namespace with
+    /// clone_dir bind-mounted over baseline_dir. This allows multiple clones
+    /// from the same snapshot to each have their own vsock socket binding,
+    /// even though vmstate.bin stores the baseline's uds_path.
+    ///
+    /// The bind mount makes Firecracker see clone's directory contents when
+    /// accessing baseline's path, so each clone binds to its own socket file.
+    pub fn set_vsock_redirect(&mut self, baseline_dir: PathBuf, clone_dir: PathBuf) {
+        self.vsock_redirect = Some((baseline_dir, clone_dir));
     }
 
     /// Start the Firecracker process
@@ -132,48 +147,109 @@ impl VmManager {
         // Disable seccomp for now (can enable later for production)
         cmd.arg("--no-seccomp");
 
-        // Setup namespace isolation if specified
-        if let Some(ref ns_id) = self.namespace_id {
+        // Setup namespace isolation if specified (network namespace and/or mount namespace)
+        // We need to handle these in a single pre_exec because it can only be called once
+        let ns_id_clone = self.namespace_id.clone();
+        let vsock_redirect_clone = self.vsock_redirect.clone();
+
+        if ns_id_clone.is_some() || vsock_redirect_clone.is_some() {
             use std::ffi::CString;
 
-            // Create CString outside the closure to ensure proper null termination
-            // for C API usage. This avoids String capture issues in pre_exec.
-            let ns_path_cstr = CString::new(format!("/var/run/netns/{}", ns_id))
-                .context("namespace ID contains invalid characters (null bytes)")?;
-            info!(target: "vm", vm_id = %self.vm_id, namespace = %ns_id, "entering network namespace");
+            // Prepare CStrings outside the closure (async-signal-safe requirement)
+            let ns_path_cstr = if let Some(ref ns_id) = ns_id_clone {
+                info!(target: "vm", vm_id = %self.vm_id, namespace = %ns_id, "entering network namespace");
+                Some(
+                    CString::new(format!("/var/run/netns/{}", ns_id))
+                        .context("namespace ID contains invalid characters (null bytes)")?,
+                )
+            } else {
+                None
+            };
+
+            let vsock_paths = if let Some((ref baseline_dir, ref clone_dir)) = vsock_redirect_clone {
+                info!(target: "vm", vm_id = %self.vm_id,
+                    baseline = %baseline_dir.display(),
+                    clone = %clone_dir.display(),
+                    "setting up mount namespace for vsock redirect");
+                Some((
+                    CString::new(baseline_dir.to_string_lossy().as_bytes())
+                        .context("baseline path contains invalid characters")?,
+                    CString::new(clone_dir.to_string_lossy().as_bytes())
+                        .context("clone path contains invalid characters")?,
+                ))
+            } else {
+                None
+            };
 
             // SAFETY: pre_exec runs after fork() but before exec().
-            // We use it to enter the network namespace in the child process.
+            // We use it to set up namespace isolation in the child process.
             // Safety requirements:
-            // 1. Only async-signal-safe functions are called (open, setns are safe)
-            // 2. No heap allocations after fork (CString created before fork)
-            // 3. File descriptor is properly owned via OwnedFd
-            // 4. The closure doesn't capture complex types, only CString
+            // 1. Only async-signal-safe functions are called (open, setns, unshare, mount are safe)
+            // 2. No heap allocations after fork (CStrings created before fork)
+            // 3. File descriptors are properly owned via OwnedFd
+            // 4. The closure captures only CStrings and Option types
             unsafe {
                 cmd.pre_exec(move || {
                     use nix::fcntl::{open, OFlag};
-                    use nix::sched::{setns, CloneFlags};
+                    use nix::mount::{mount, MsFlags};
+                    use nix::sched::{setns, unshare, CloneFlags};
                     use nix::sys::stat::Mode;
                     use std::os::unix::io::{FromRawFd, OwnedFd};
 
-                    // Open namespace file descriptor
-                    // Safe: ns_path_cstr is a valid CString with null termination
-                    let ns_fd_raw = open(ns_path_cstr.as_c_str(), OFlag::O_RDONLY, Mode::empty())
+                    // Step 1: Set up mount namespace for vsock redirect if needed
+                    // This must be done BEFORE entering network namespace
+                    if let Some((ref baseline_cstr, ref clone_cstr)) = vsock_paths {
+                        // Create a new mount namespace so our bind mount is isolated
+                        unshare(CloneFlags::CLONE_NEWNS).map_err(|e| {
+                            std::io::Error::other(format!("failed to unshare mount namespace: {}", e))
+                        })?;
+
+                        // Make our mount namespace private so mounts don't propagate
+                        // This is equivalent to: mount --make-rprivate /
+                        mount::<str, str, str, str>(
+                            None,
+                            "/",
+                            None,
+                            MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+                            None,
+                        )
                         .map_err(|e| {
-                        std::io::Error::other(format!("failed to open namespace: {}", e))
-                    })?;
+                            std::io::Error::other(format!("failed to make mount private: {}", e))
+                        })?;
 
-                    // SAFETY: from_raw_fd takes ownership of the file descriptor.
-                    // The fd is valid (just opened) and won't be used elsewhere.
-                    // OwnedFd will close it on drop.
-                    let ns_fd = OwnedFd::from_raw_fd(ns_fd_raw);
+                        // Bind mount clone_dir over baseline_dir
+                        // This makes Firecracker see clone's files when accessing baseline's path
+                        mount(
+                            Some(clone_cstr.as_c_str()),
+                            baseline_cstr.as_c_str(),
+                            None::<&str>,
+                            MsFlags::MS_BIND,
+                            None::<&str>,
+                        )
+                        .map_err(|e| {
+                            std::io::Error::other(format!(
+                                "failed to bind mount {:?} over {:?}: {}",
+                                clone_cstr, baseline_cstr, e
+                            ))
+                        })?;
+                    }
 
-                    // Enter the network namespace
-                    setns(&ns_fd, CloneFlags::CLONE_NEWNET).map_err(|e| {
-                        std::io::Error::other(format!("failed to enter namespace: {}", e))
-                    })?;
+                    // Step 2: Enter network namespace if specified
+                    if let Some(ref ns_path_cstr) = ns_path_cstr {
+                        let ns_fd_raw =
+                            open(ns_path_cstr.as_c_str(), OFlag::O_RDONLY, Mode::empty()).map_err(
+                                |e| std::io::Error::other(format!("failed to open namespace: {}", e)),
+                            )?;
 
-                    // fd is automatically closed when OwnedFd is dropped
+                        // SAFETY: from_raw_fd takes ownership of the file descriptor.
+                        let ns_fd = OwnedFd::from_raw_fd(ns_fd_raw);
+
+                        setns(&ns_fd, CloneFlags::CLONE_NEWNET).map_err(|e| {
+                            std::io::Error::other(format!("failed to enter namespace: {}", e))
+                        })?;
+                        // fd is automatically closed when OwnedFd is dropped
+                    }
+
                     Ok(())
                 });
             }

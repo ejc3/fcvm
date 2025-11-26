@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::cli::{
     NetworkMode, SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs,
@@ -13,6 +13,7 @@ use crate::paths;
 use crate::state::{generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState, VmStatus};
 use crate::storage::{DiskManager, SnapshotManager};
 use crate::uffd::UffdServer;
+use crate::volume::{VolumeConfig, VolumeServer};
 
 /// Main dispatcher for snapshot commands
 pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
@@ -136,7 +137,38 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         }
 
         // Save snapshot metadata
-        use crate::storage::snapshot::{SnapshotConfig, SnapshotMetadata};
+        use crate::storage::snapshot::{SnapshotConfig, SnapshotMetadata, SnapshotVolumeConfig};
+
+        // Parse volume configs from VM state (format: HOST:GUEST[:ro])
+        // VSOCK_VOLUME_PORT_BASE = 5000 (from podman.rs)
+        const VSOCK_VOLUME_PORT_BASE: u32 = 5000;
+        let volume_configs: Vec<SnapshotVolumeConfig> = vm_state.config.volumes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, spec)| {
+                let parts: Vec<&str> = spec.split(':').collect();
+                if parts.len() >= 2 {
+                    Some(SnapshotVolumeConfig {
+                        host_path: PathBuf::from(parts[0]),
+                        guest_path: parts[1].to_string(),
+                        read_only: parts.get(2).map(|s| *s == "ro").unwrap_or(false),
+                        vsock_port: VSOCK_VOLUME_PORT_BASE + idx as u32,
+                    })
+                } else {
+                    warn!("Invalid volume spec in VM state: {}", spec);
+                    None
+                }
+            })
+            .collect();
+
+        if !volume_configs.is_empty() {
+            info!(
+                num_volumes = volume_configs.len(),
+                "saving {} volume config(s) to snapshot metadata",
+                volume_configs.len()
+            );
+        }
+
         let snapshot_config = SnapshotConfig {
             name: snapshot_name.clone(),
             vm_id: vm_state.vm_id.clone(),
@@ -149,6 +181,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                 vcpu: vm_state.config.vcpu,
                 memory_mib: vm_state.config.memory_mib,
                 network_config: vm_state.config.network.clone(),
+                volumes: volume_configs,
             },
         };
 
@@ -438,6 +471,71 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         "connecting to memory server"
     );
 
+    // Setup VolumeServers for clones if snapshot has volumes
+    //
+    // Mount namespace isolation for vsock:
+    // - Firecracker's vmstate.bin stores the baseline's vsock uds_path
+    // - Multiple clones from the same snapshot would all try to bind() to the same path
+    // - This causes "Address in use" errors for all but the first clone
+    //
+    // Solution: Each clone's Firecracker runs in a mount namespace where the baseline's
+    // runtime directory is bind-mounted over the clone's runtime directory.
+    // - Firecracker thinks it's binding to /baseline_dir/vsock.sock
+    // - But the bind mount redirects this to /clone_dir/vsock.sock
+    // - Each clone has its own mount namespace, so each creates unique socket files
+    // - VolumeServers listen on the clone's actual socket paths
+    let volume_configs = &snapshot_config.metadata.volumes;
+    let mut volume_server_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    if !volume_configs.is_empty() {
+        info!(
+            num_volumes = volume_configs.len(),
+            "setting up {} VolumeServer(s) for clone",
+            volume_configs.len()
+        );
+
+        // Clone's vsock socket base path
+        // With mount namespace isolation, Firecracker will create sockets here
+        // (it thinks it's writing to baseline's path but bind mount redirects to clone's)
+        let clone_vsock_base = data_dir.join("vsock.sock");
+
+        // Start VolumeServers for each volume port
+        for vol_config in volume_configs {
+            let port = vol_config.vsock_port;
+            let clone_socket = PathBuf::from(format!("{}_{}", clone_vsock_base.display(), port));
+
+            let config = VolumeConfig {
+                host_path: vol_config.host_path.clone(),
+                guest_path: vol_config.guest_path.clone().into(),
+                read_only: vol_config.read_only,
+                port,
+            };
+
+            let server = VolumeServer::new(config.clone())
+                .with_context(|| format!("creating VolumeServer for {}", vol_config.host_path.display()))?;
+
+            let vsock_path = clone_vsock_base.clone();
+            let handle = tokio::spawn(async move {
+                if let Err(e) = server.serve_vsock(&vsock_path).await {
+                    error!("VolumeServer error for port {}: {}", port, e);
+                }
+            });
+
+            info!(
+                port = port,
+                host_path = %vol_config.host_path.display(),
+                guest_path = %vol_config.guest_path,
+                socket = %clone_socket.display(),
+                "started VolumeServer for clone"
+            );
+
+            volume_server_handles.push(handle);
+        }
+
+        // Give VolumeServers time to bind to their sockets
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
     // Setup networking - use saved network config from snapshot
     let tap_device = format!("tap-{}", truncate_id(&vm_id, 8));
     let port_mappings: Vec<PortMapping> = args
@@ -561,6 +659,11 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Cancel health monitor task first
     health_monitor_handle.abort();
 
+    // Cancel VolumeServer tasks
+    for handle in volume_server_handles {
+        handle.abort();
+    }
+
     // Kill VM process
     if let Err(e) = vm_manager.kill().await {
         warn!("failed to kill VM process: {}", e);
@@ -574,6 +677,20 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Delete state file
     if let Err(e) = state_manager.delete_state(&vm_id).await {
         warn!("failed to delete state file: {}", e);
+    }
+
+    // Clean up vsock sockets for each volume port
+    // With mount namespace isolation, only clone's sockets need cleanup (no symlinks)
+    if !volume_configs.is_empty() {
+        let clone_vsock_base = data_dir.join("vsock.sock");
+
+        for vol_config in volume_configs {
+            let port = vol_config.vsock_port;
+
+            // Remove clone's socket
+            let clone_socket = PathBuf::from(format!("{}_{}", clone_vsock_base.display(), port));
+            let _ = std::fs::remove_file(&clone_socket);
+        }
     }
 
     Ok(())
@@ -671,6 +788,24 @@ async fn run_clone_setup(
         let wrapper_cmd = slirp_net.build_wrapper_command();
         info!(wrapper = %slirp_net.wrapper_command_string(), "configuring clone for rootless operation with slirp4netns");
         vm_manager.set_namespace_wrapper(wrapper_cmd);
+    }
+
+    // Configure mount namespace isolation for vsock redirect if snapshot has volumes
+    // This is needed because vmstate.bin stores the baseline's vsock uds_path, and
+    // Firecracker cannot override it during snapshot restore. Multiple clones would
+    // all try to bind() to the same baseline socket path, causing conflicts.
+    //
+    // Solution: Run each clone in a mount namespace where baseline_dir is bind-mounted
+    // over clone_dir. When Firecracker does bind("/baseline_dir/vsock.sock_5000"),
+    // it actually binds to "/clone_dir/vsock.sock_5000" due to the bind mount.
+    if !snapshot_config.metadata.volumes.is_empty() {
+        let baseline_dir = paths::vm_runtime_dir(&snapshot_config.vm_id);
+        info!(
+            baseline_dir = %baseline_dir.display(),
+            clone_dir = %data_dir.display(),
+            "enabling mount namespace for vsock socket isolation"
+        );
+        vm_manager.set_vsock_redirect(baseline_dir, data_dir.to_path_buf());
     }
 
     let firecracker_bin = PathBuf::from("/usr/local/bin/firecracker");

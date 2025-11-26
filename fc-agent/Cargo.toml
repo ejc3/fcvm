@@ -9,3 +9,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "signal"] }
 reqwest = { version = "0.11", default-features = false, features = ["json"] }
+fuser = { version = "0.14", default-features = false }
+bincode = "1.3"
+libc = "0.2"
+fs2 = "0.4"

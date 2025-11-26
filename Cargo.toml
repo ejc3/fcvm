@@ -16,7 +16,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 libc = "0.2"
-nix = { version = "0.29", features = ["sched", "net", "fs"] }
+nix = { version = "0.29", features = ["sched", "net", "fs", "user", "mount"] }
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3"
 rand = "0.8"
@@ -30,3 +30,4 @@ vmm-sys-util = "0.12"
 num_cpus = "1"
 shell-words = "1"
 futures = "0.3"
+bincode = "1.3"

@@ -136,6 +136,11 @@ impl FirecrackerClient {
     pub async fn set_entropy_device(&self, config: EntropyDevice) -> Result<()> {
         self.put("/entropy", &config).await
     }
+
+    /// Configure vsock device for host-guest communication
+    pub async fn set_vsock(&self, config: Vsock) -> Result<()> {
+        self.put("/vsock", &config).await
+    }
 }
 
 // API data structures
@@ -279,4 +284,12 @@ pub struct BalloonStats {
 pub struct EntropyDevice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limiter: Option<RateLimiter>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Vsock {
+    /// Guest CID (must be > 2, typically 3)
+    pub guest_cid: u32,
+    /// Path to Unix socket on host
+    pub uds_path: String,
 }
