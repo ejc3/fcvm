@@ -9,10 +9,6 @@ pub use bridged::BridgedNetwork;
 pub use slirp::SlirpNetwork;
 pub use types::*;
 
-// Backwards compatibility alias
-#[deprecated(since = "0.4.0", note = "Renamed to BridgedNetwork for clarity")]
-pub type RootlessNetwork = BridgedNetwork;
-
 use anyhow::Result;
 
 /// Network manager trait
