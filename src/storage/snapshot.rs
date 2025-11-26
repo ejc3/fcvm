@@ -24,6 +24,23 @@ pub struct SnapshotMetadata {
     pub vcpu: u8,
     pub memory_mib: u32,
     pub network_config: NetworkConfig,
+    /// Volume mounts from the baseline VM (for clone volume support)
+    #[serde(default)]
+    pub volumes: Vec<SnapshotVolumeConfig>,
+}
+
+/// Volume configuration saved in snapshot metadata.
+/// Used to start VolumeServers when serving snapshot for clones.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotVolumeConfig {
+    /// Path on host filesystem
+    pub host_path: PathBuf,
+    /// Mount path inside guest
+    pub guest_path: String,
+    /// Read-only flag
+    pub read_only: bool,
+    /// Vsock port number
+    pub vsock_port: u32,
 }
 
 /// Manages VM snapshots

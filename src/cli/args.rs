@@ -204,6 +204,15 @@ pub enum TestCommands {
 
     /// Sanity test: start a single VM and verify health check passes
     Sanity(SanityTestArgs),
+
+    /// Volume test: verify host directory mounting via FUSE over vsock
+    Volume(VolumeTestArgs),
+
+    /// Volume stress test: heavy I/O testing on FUSE volumes
+    VolumeStress(VolumeStressTestArgs),
+
+    /// Clone lock test: verify POSIX file locking across multiple clones
+    CloneLock(CloneLockTestArgs),
 }
 
 #[derive(Args, Debug)]
@@ -249,6 +258,67 @@ pub struct SanityTestArgs {
 
     /// Timeout for health check in seconds
     #[arg(long, default_value_t = 60)]
+    pub timeout: u64,
+
+    /// Network mode: bridged (requires sudo) or rootless (no sudo)
+    #[arg(long, value_enum, default_value_t = NetworkMode::Bridged)]
+    pub network: NetworkMode,
+}
+
+#[derive(Args, Debug)]
+pub struct VolumeTestArgs {
+    /// Number of volumes to test (1-4)
+    #[arg(long, default_value_t = 1)]
+    pub num_volumes: usize,
+
+    /// Timeout for test in seconds
+    #[arg(long, default_value_t = 120)]
+    pub timeout: u64,
+
+    /// Network mode: bridged (requires sudo) or rootless (no sudo)
+    #[arg(long, value_enum, default_value_t = NetworkMode::Bridged)]
+    pub network: NetworkMode,
+}
+
+#[derive(Args, Debug)]
+pub struct VolumeStressTestArgs {
+    /// Number of volumes to test (1-4)
+    #[arg(long, default_value_t = 2)]
+    pub num_volumes: usize,
+
+    /// Size of test files in MB
+    #[arg(long, default_value_t = 10)]
+    pub file_size_mb: usize,
+
+    /// Number of concurrent read/write operations
+    #[arg(long, default_value_t = 4)]
+    pub concurrency: usize,
+
+    /// Number of I/O iterations
+    #[arg(long, default_value_t = 10)]
+    pub iterations: usize,
+
+    /// Timeout for test in seconds
+    #[arg(long, default_value_t = 300)]
+    pub timeout: u64,
+
+    /// Network mode: bridged (requires sudo) or rootless (no sudo)
+    #[arg(long, value_enum, default_value_t = NetworkMode::Bridged)]
+    pub network: NetworkMode,
+}
+
+#[derive(Args, Debug)]
+pub struct CloneLockTestArgs {
+    /// Number of clones to spawn for locking test
+    #[arg(long, default_value_t = 10)]
+    pub num_clones: usize,
+
+    /// Number of lock iterations per clone
+    #[arg(long, default_value_t = 100)]
+    pub iterations: usize,
+
+    /// Timeout for test in seconds
+    #[arg(long, default_value_t = 300)]
     pub timeout: u64,
 
     /// Network mode: bridged (requires sudo) or rootless (no sudo)

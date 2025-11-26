@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, warn};
@@ -9,6 +9,52 @@ use crate::network::{BridgedNetwork, NetworkManager, PortMapping, SlirpNetwork};
 use crate::paths;
 use crate::state::{generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState};
 use crate::storage::DiskManager;
+use crate::volume::{VolumeConfig, VolumeServer};
+
+/// Parsed volume mapping from --map HOST:GUEST[:ro]
+#[derive(Debug, Clone)]
+struct VolumeMapping {
+    host_path: PathBuf,
+    guest_path: String,
+    read_only: bool,
+}
+
+impl VolumeMapping {
+    /// Parse a volume spec string: HOST:GUEST[:ro]
+    fn parse(spec: &str) -> Result<Self> {
+        let parts: Vec<&str> = spec.split(':').collect();
+        if parts.len() < 2 {
+            bail!("Invalid volume spec '{}': expected HOST:GUEST[:ro]", spec);
+        }
+
+        let host_path = PathBuf::from(parts[0]);
+        let guest_path = parts[1].to_string();
+        let read_only = parts.len() > 2 && parts[2] == "ro";
+
+        // Validate host path exists
+        if !host_path.exists() {
+            bail!("Volume host path does not exist: {}", host_path.display());
+        }
+
+        // Validate guest path is absolute
+        if !guest_path.starts_with('/') {
+            bail!(
+                "Volume guest path must be absolute: {} (from spec '{}')",
+                guest_path,
+                spec
+            );
+        }
+
+        Ok(Self {
+            host_path,
+            guest_path,
+            read_only,
+        })
+    }
+}
+
+/// Vsock base port for volume servers
+const VSOCK_VOLUME_PORT_BASE: u32 = 5000;
 
 /// Main dispatcher for podman commands
 pub async fn cmd_podman(args: PodmanArgs) -> Result<()> {
@@ -42,6 +88,25 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .map(|s| PortMapping::parse(s))
         .collect::<Result<Vec<_>>>()
         .context("parsing port mappings")?;
+
+    // Parse volume mappings (HOST:GUEST[:ro])
+    let volume_mappings: Vec<VolumeMapping> = args
+        .map
+        .iter()
+        .map(|s| VolumeMapping::parse(s))
+        .collect::<Result<Vec<_>>>()
+        .context("parsing volume mappings")?;
+
+    if !volume_mappings.is_empty() {
+        info!(
+            "Volumes to mount: {}",
+            volume_mappings
+                .iter()
+                .map(|v| format!("{}:{}{}", v.host_path.display(), v.guest_path, if v.read_only { ":ro" } else { "" }))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     // Parse optional container command using shell-like semantics
     let cmd_args = if let Some(cmd) = &args.cmd {
@@ -95,6 +160,49 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     info!(tap = %network_config.tap_device, mac = %network_config.guest_mac, "network configured");
 
+    // Generate vsock socket base path for volume servers
+    // Firecracker binds to vsock.sock, VolumeServers listen on vsock.sock_{port}
+    let vsock_socket_path = data_dir.join("vsock.sock");
+
+    // Start VolumeServers BEFORE the VM so the sockets are ready when guest boots
+    // Each VolumeServer listens on vsock.sock_{port} (e.g., vsock.sock_5000)
+    // Firecracker binds to vsock.sock and routes guest connections to the per-port sockets
+    let mut volume_server_handles = Vec::new();
+    for (idx, vol) in volume_mappings.iter().enumerate() {
+        let port = VSOCK_VOLUME_PORT_BASE + idx as u32;
+        let config = VolumeConfig {
+            host_path: vol.host_path.clone(),
+            guest_path: vol.guest_path.clone().into(),
+            read_only: vol.read_only,
+            port,
+        };
+
+        let server = VolumeServer::new(config)
+            .with_context(|| format!("creating VolumeServer for {}", vol.host_path.display()))?;
+
+        let vsock_path = vsock_socket_path.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(e) = server.serve_vsock(&vsock_path).await {
+                tracing::error!("VolumeServer error for port {}: {}", port, e);
+            }
+        });
+
+        info!(
+            port = port,
+            host_path = %vol.host_path.display(),
+            guest_path = %vol.guest_path,
+            read_only = vol.read_only,
+            "Started VolumeServer"
+        );
+
+        volume_server_handles.push(handle);
+    }
+
+    // Give VolumeServers time to bind to their sockets
+    if !volume_mappings.is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
     // Run the main VM setup in a helper to ensure cleanup on error
     let setup_result = run_vm_setup(
         &args,
@@ -108,6 +216,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         cmd_args,
         &state_manager,
         &mut vm_state,
+        &volume_mappings,
+        &vsock_socket_path,
     )
     .await;
 
@@ -153,6 +263,11 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // Cancel health monitor task first
     health_monitor_handle.abort();
 
+    // Cancel VolumeServer tasks
+    for handle in volume_server_handles {
+        handle.abort();
+    }
+
     // Kill VM process
     if let Err(e) = vm_manager.kill().await {
         warn!("failed to kill VM process: {}", e);
@@ -167,6 +282,9 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     if let Err(e) = state_manager.delete_state(&vm_id).await {
         warn!("failed to delete state file: {}", e);
     }
+
+    // Cleanup vsock socket
+    let _ = std::fs::remove_file(&vsock_socket_path);
 
     Ok(())
 }
@@ -186,6 +304,8 @@ async fn run_vm_setup(
     cmd_args: Option<Vec<String>>,
     state_manager: &StateManager,
     vm_state: &mut VmState,
+    volume_mappings: &[VolumeMapping],
+    vsock_socket_path: &std::path::Path,
 ) -> Result<VmManager> {
     // Setup storage
     let vm_dir = data_dir.join("disks");
@@ -318,6 +438,35 @@ async fn run_vm_setup(
         })
         .await?;
 
+    // Configure vsock device if we have volumes to mount
+    if !volume_mappings.is_empty() {
+        info!(
+            "Configuring vsock device at {:?} for {} volume(s)",
+            vsock_socket_path,
+            volume_mappings.len()
+        );
+        client
+            .set_vsock(crate::firecracker::api::Vsock {
+                guest_cid: 3, // Guest CID (host is always 2)
+                uds_path: vsock_socket_path.display().to_string(),
+            })
+            .await?;
+    }
+
+    // Build volume mount info for MMDS
+    // Format: { guest_path, vsock_port, read_only }
+    let volume_mounts: Vec<serde_json::Value> = volume_mappings
+        .iter()
+        .enumerate()
+        .map(|(idx, v)| {
+            serde_json::json!({
+                "guest_path": v.guest_path,
+                "vsock_port": VSOCK_VOLUME_PORT_BASE + idx as u32,
+                "read_only": v.read_only,
+            })
+        })
+        .collect();
+
     // MMDS data (container plan) - nested under "latest" for V2 compatibility
     // Include host timestamp so guest can set clock immediately (avoiding slow NTP sync)
     // Format without subsecond precision for Alpine `date` compatibility
@@ -330,7 +479,7 @@ async fn run_vm_setup(
                     (parts[0], parts.get(1).copied().unwrap_or(""))
                 }).collect::<std::collections::HashMap<_, _>>(),
                 "cmd": cmd_args,
-                "volumes": args.map,
+                "volumes": volume_mounts,
             },
             "host-time": chrono::Utc::now().timestamp().to_string(),
         }

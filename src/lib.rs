@@ -9,6 +9,7 @@ pub mod state;
 pub mod storage;
 pub mod types;
 pub mod uffd;
+pub mod volume;
 
 // Re-export core types for convenience
 pub use types::MapMode;

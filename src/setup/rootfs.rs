@@ -183,9 +183,11 @@ async fn download_and_extract_alpine(mount_point: &Path) -> Result<()> {
     // ca-certificates needed for fc-agent's reqwest HTTPS requests
     // chrony provides NTP time synchronization (fixes TLS cert validation)
     // openresolv needed for dns-nameservers in /etc/network/interfaces
+    // gcompat provides glibc compatibility for running glibc-linked binaries (fc-agent with fuser)
+    // fuse3 provides libfuse3 for FUSE filesystem support
     let output = Command::new("chroot")
         .arg(path_to_str(mount_point)?)
-        .args(["/bin/sh", "-c", "apk update && apk add podman crun fuse-overlayfs openrc haveged ca-certificates chrony openresolv"])
+        .args(["/bin/sh", "-c", "apk update && apk add podman crun fuse-overlayfs openrc haveged ca-certificates chrony openresolv gcompat fuse3"])
         .output()
         .context("installing packages via apk")?;
 

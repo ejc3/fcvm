@@ -13,7 +13,7 @@ REMOTE_KERNEL_DIR := ~/linux-firecracker
 # Local output directory for downloaded artifacts
 ARTIFACTS := artifacts
 
-.PHONY: all build sync build-remote build-local clean kernel rootfs deploy test help
+.PHONY: all build sync build-remote build-local clean kernel rootfs deploy test sanity test-volume test-volumes test-volume-stress test-clone-lock help
 
 all: build
 
@@ -35,10 +35,15 @@ help:
 	@echo ""
 	@echo "Images:"
 	@echo "  make rootfs        - Build rootfs image on EC2"
+	@echo "  make rebuild       - Sync + build + rebuild rootfs (full rebuild)"
 	@echo ""
 	@echo "Testing:"
-	@echo "  make test          - Run tests on EC2"
-	@echo "  make sanity        - Run sanity test on EC2"
+	@echo "  make test          - Run sanity test on EC2"
+	@echo "  make sanity        - Alias for test"
+	@echo "  make test-volume   - Run single volume test (sync + build + test)"
+	@echo "  make test-volumes  - Run multi-volume test (sync + build + test)"
+	@echo "  make test-volume-stress - Run volume stress test (heavy I/O)"
+	@echo "  make test-clone-lock - Run POSIX lock test across 10 clones sharing a volume"
 	@echo ""
 	@echo "Local:"
 	@echo "  make build-local   - Build locally (macOS, won't run)"
@@ -123,14 +128,25 @@ kernel-fetch:
 	@ls -la $(ARTIFACTS)/vmlinux
 
 #
-# Rootfs build
+# Rootfs build (updates fc-agent in existing base image)
 #
 rootfs:
-	@echo "==> Building rootfs on EC2..."
-	$(SSH) "cd $(REMOTE_DIR) && sudo ./scripts/create-rootfs.sh"
+	@echo "==> Updating fc-agent in rootfs on EC2..."
+	$(SSH) "sudo mkdir -p /tmp/rootfs-mount && \
+		sudo mount -o loop /mnt/fcvm-btrfs/rootfs/base.ext4 /tmp/rootfs-mount && \
+		sudo cp $(REMOTE_DIR)/fc-agent/target/aarch64-unknown-linux-musl/release/fc-agent /tmp/rootfs-mount/usr/local/bin/fc-agent && \
+		sudo chmod +x /tmp/rootfs-mount/usr/local/bin/fc-agent && \
+		sudo umount /tmp/rootfs-mount"
+	@echo "==> Rootfs updated: /mnt/fcvm-btrfs/rootfs/base.ext4"
 
 #
-# Deploy (install fc-agent into rootfs)
+# Full rebuild: build binaries + rebuild rootfs
+#
+rebuild: build rootfs
+	@echo "==> Full rebuild complete!"
+
+#
+# Deploy (install fc-agent into existing rootfs - for quick updates)
 #
 deploy:
 	@echo "==> Deploying fc-agent to rootfs..."
@@ -141,10 +157,26 @@ deploy:
 # Testing
 #
 test:
-	@echo "==> Running tests on EC2..."
+	@echo "==> Running sanity test on EC2..."
 	$(SSH) "cd $(REMOTE_DIR) && sudo ./target/release/fcvm test sanity 2>&1" | tee /tmp/test.log
 
 sanity: test
+
+test-volume: build
+	@echo "==> Running volume test on EC2 (single volume)..."
+	$(SSH) "cd $(REMOTE_DIR) && sudo ./target/release/fcvm test volume --num-volumes 1 2>&1" | tee /tmp/test-volume.log
+
+test-volumes: build
+	@echo "==> Running volume test on EC2 (multiple volumes)..."
+	$(SSH) "cd $(REMOTE_DIR) && sudo ./target/release/fcvm test volume --num-volumes 3 2>&1" | tee /tmp/test-volumes.log
+
+test-volume-stress: build
+	@echo "==> Running volume stress test on EC2..."
+	$(SSH) "cd $(REMOTE_DIR) && sudo ./target/release/fcvm test volume-stress --num-volumes 2 --file-size-mb 10 --iterations 5 2>&1" | tee /tmp/test-volume-stress.log
+
+test-clone-lock: rebuild
+	@echo "==> Running clone lock test on EC2 (POSIX locking across 10 clones)..."
+	$(SSH) "cd $(REMOTE_DIR) && sudo ./target/release/fcvm test clone-lock --num-clones 10 --iterations 100 2>&1" | tee /tmp/test-clone-lock.log
 
 #
 # Local builds (for IDE/linting only - won't run on macOS)
