@@ -40,6 +40,9 @@ pub fn run_stress_test(
     mount_dir: &PathBuf,
     num_readers: usize,
 ) -> anyhow::Result<()> {
+    // Clean up any stale state from previous runs
+    cleanup_stale_state(mount_dir);
+
     println!("╔═══════════════════════════════════════════════════════════════╗");
     println!("║              FUSE Multi-Reader Stress Test                    ║");
     println!("╠═══════════════════════════════════════════════════════════════╣");
@@ -239,6 +242,22 @@ fn print_results(label: &str, result: &TestResult) {
     println!("│    write:        {:>10}                                    │", result.breakdown.write);
     println!("│    create:       {:>10}                                    │", result.breakdown.create);
     println!("└─────────────────────────────────────────────────────────────────┘");
+}
+
+/// Clean up stale state from previous test runs.
+fn cleanup_stale_state(mount_dir: &PathBuf) {
+    let socket = "/tmp/fuse-stress.sock";
+
+    // Try to unmount if still mounted
+    let _ = Command::new("umount")
+        .args(["-f", mount_dir.to_str().unwrap_or("/tmp/fuse-stress-mount")])
+        .output();
+
+    // Remove stale socket
+    let _ = fs::remove_file(socket);
+
+    // Brief pause to let kernel clean up
+    std::thread::sleep(Duration::from_millis(100));
 }
 
 fn setup_test_files(data_dir: &PathBuf, workers: usize) -> anyhow::Result<()> {

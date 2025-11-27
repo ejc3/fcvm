@@ -113,10 +113,8 @@ impl Filesystem for FuseClient {
         _req: &Request<'_>,
         _config: &mut fuser::KernelConfig,
     ) -> Result<(), libc::c_int> {
-        eprintln!("[client] reader {} INIT complete", self.reader_id);
         // Spawn additional readers now that INIT is done
         if let Some(callback) = self.init_callback.take() {
-            eprintln!("[client] spawning additional readers");
             callback();
         }
         Ok(())

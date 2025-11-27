@@ -107,16 +107,10 @@ pub fn mount_with_readers<P: AsRef<Path>>(
     let mux_for_callback = Arc::clone(&mux);
 
     let init_callback = Box::new(move || {
-        let fds = cloned_fds_for_callback.lock().unwrap();
-        // Need to take ownership - use std::mem::take via drain
-        drop(fds); // Release lock first
-
-        let mut fds = cloned_fds_for_callback.lock().unwrap();
-        let fds_vec: Vec<_> = std::mem::take(&mut *fds);
-        drop(fds);
+        // Take ownership of all cloned fds
+        let fds_vec: Vec<_> = std::mem::take(&mut *cloned_fds_for_callback.lock().unwrap());
 
         for (reader_id, cloned_fd) in fds_vec {
-            eprintln!("[client] reader {} starting", reader_id);
             let fs = FuseClient::new(Arc::clone(&mux_for_callback), reader_id as u32);
             let mut reader_session =
                 fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::All);
@@ -135,25 +129,25 @@ pub fn mount_with_readers<P: AsRef<Path>>(
     eprintln!("[client] mounted at {:?}", mount_point.as_ref());
 
     // Clone fds AFTER session created but BEFORE run()
+    let mut clone_failures = 0;
     for reader_id in 1..num_readers {
-        eprintln!("[client] cloning fd for reader {}...", reader_id);
         match session.channel().clone_fd() {
             Ok(fd) => {
-                eprintln!("[client] cloned fd for reader {}: {:?}", reader_id, fd);
                 cloned_fds.lock().unwrap().push((reader_id, fd));
             }
             Err(e) => {
                 eprintln!("[client] failed to clone fd for reader {}: {}", reader_id, e);
+                clone_failures += 1;
             }
         }
     }
 
+    let actual_readers = num_readers - clone_failures;
     eprintln!(
-        "[client] FUSE session starting with {} readers",
-        num_readers
+        "[client] FUSE session starting with {} readers (cloned {} fds)",
+        actual_readers,
+        actual_readers - 1
     );
-
-    eprintln!("[client] reader 0 starting (will spawn others after INIT)");
     if let Err(e) = session.run() {
         eprintln!("[client] reader 0 error: {}", e);
     }
