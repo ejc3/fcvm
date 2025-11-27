@@ -44,7 +44,7 @@ impl Default for ServerConfig {
         Self {
             response_channel_size: 1024,
             write_batch_size: 16,
-            write_batch_timeout: Duration::from_millis(1),
+            write_batch_timeout: Duration::from_micros(100), // Was 1ms - reduced for lower latency
             write_buffer_size: 64 * 1024,
             max_blocking_threads: 1024,
             thread_keep_alive: Duration::from_secs(60),
@@ -119,7 +119,7 @@ impl ServerConfig {
         Self {
             response_channel_size: 4096,
             write_batch_size: 64,
-            write_batch_timeout: Duration::from_millis(5),
+            write_batch_timeout: Duration::from_micros(100), // Was 5ms - way too long!
             write_buffer_size: 256 * 1024,
             max_blocking_threads: 2048,
             thread_keep_alive: Duration::from_secs(120),
@@ -137,7 +137,7 @@ mod tests {
         let config = ServerConfig::default();
         assert_eq!(config.response_channel_size, 1024);
         assert_eq!(config.write_batch_size, 16);
-        assert_eq!(config.write_batch_timeout, Duration::from_millis(1));
+        assert_eq!(config.write_batch_timeout, Duration::from_micros(100));
     }
 
     #[test]
