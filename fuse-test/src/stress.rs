@@ -39,6 +39,7 @@ pub fn run_stress_test(
     data_dir: &PathBuf,
     mount_dir: &PathBuf,
     num_readers: usize,
+    trace_rate: u64,
 ) -> anyhow::Result<()> {
     // Clean up any stale state from previous runs
     cleanup_stale_state(mount_dir);
@@ -101,6 +102,7 @@ pub fn run_stress_test(
             "--socket", socket,
             "--mount", mount_dir.to_str().unwrap(),
             "--readers", &num_readers.to_string(),
+            "--trace-rate", &trace_rate.to_string(),
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())

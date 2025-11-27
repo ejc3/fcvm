@@ -2,51 +2,46 @@
 
 use std::time::Duration;
 
-/// Configuration for the async pipelined server.
+/// Default batch timeout in microseconds.
 ///
-/// These settings control performance characteristics like batching,
-/// buffer sizes, and thread pool configuration.
+/// This controls how long we wait for more responses before flushing.
+/// Lower = better latency, higher = better throughput under load.
+/// 20µs is a good balance given typical operation latency of ~50µs.
+const DEFAULT_BATCH_TIMEOUT_US: u64 = 20;
+
+/// Configuration for the async pipelined server.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Capacity of the response channel (pending responses).
-    /// Higher values allow more parallelism.
-    /// Default: 1024
     pub response_channel_size: usize,
 
     /// Number of responses to batch before flushing.
-    /// Higher values reduce syscalls but increase latency.
-    /// Default: 16
     pub write_batch_size: usize,
 
     /// Maximum time to wait for batch to fill before flushing.
-    /// Default: 1ms
     pub write_batch_timeout: Duration,
 
     /// Size of the write buffer in bytes.
-    /// Default: 64KB
     pub write_buffer_size: usize,
 
     /// Maximum number of blocking threads for filesystem I/O.
-    /// Default: 1024
     pub max_blocking_threads: usize,
 
     /// How long to keep idle blocking threads alive.
-    /// Default: 60 seconds
     pub thread_keep_alive: Duration,
 
     /// Attribute TTL in seconds (for caching).
-    /// Default: 1 second
     pub attr_ttl_secs: u64,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            response_channel_size: 1024,
-            write_batch_size: 16,
-            write_batch_timeout: Duration::from_micros(100), // Was 1ms - reduced for lower latency
-            write_buffer_size: 64 * 1024,
-            max_blocking_threads: 1024,
+            response_channel_size: 4096,
+            write_batch_size: 64,
+            write_batch_timeout: Duration::from_micros(DEFAULT_BATCH_TIMEOUT_US),
+            write_buffer_size: 256 * 1024,
+            max_blocking_threads: 2048,
             thread_keep_alive: Duration::from_secs(60),
             attr_ttl_secs: 1,
         }
@@ -100,32 +95,6 @@ impl ServerConfig {
         self.attr_ttl_secs = secs;
         self
     }
-
-    /// Configuration optimized for low latency.
-    pub fn low_latency() -> Self {
-        Self {
-            response_channel_size: 256,
-            write_batch_size: 1, // Flush immediately
-            write_batch_timeout: Duration::from_micros(100),
-            write_buffer_size: 16 * 1024,
-            max_blocking_threads: 512,
-            thread_keep_alive: Duration::from_secs(30),
-            attr_ttl_secs: 1,
-        }
-    }
-
-    /// Configuration optimized for high throughput.
-    pub fn high_throughput() -> Self {
-        Self {
-            response_channel_size: 4096,
-            write_batch_size: 64,
-            write_batch_timeout: Duration::from_micros(100), // Was 5ms - way too long!
-            write_buffer_size: 256 * 1024,
-            max_blocking_threads: 2048,
-            thread_keep_alive: Duration::from_secs(120),
-            attr_ttl_secs: 5,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -135,9 +104,9 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = ServerConfig::default();
-        assert_eq!(config.response_channel_size, 1024);
-        assert_eq!(config.write_batch_size, 16);
-        assert_eq!(config.write_batch_timeout, Duration::from_micros(100));
+        assert_eq!(config.response_channel_size, 4096);
+        assert_eq!(config.write_batch_size, 64);
+        assert_eq!(config.write_batch_timeout, Duration::from_micros(DEFAULT_BATCH_TIMEOUT_US));
     }
 
     #[test]
@@ -148,14 +117,5 @@ mod tests {
 
         assert_eq!(config.response_channel_size, 2048);
         assert_eq!(config.write_batch_size, 32);
-    }
-
-    #[test]
-    fn test_presets() {
-        let low_latency = ServerConfig::low_latency();
-        assert_eq!(low_latency.write_batch_size, 1);
-
-        let high_throughput = ServerConfig::high_throughput();
-        assert_eq!(high_throughput.write_batch_size, 64);
     }
 }

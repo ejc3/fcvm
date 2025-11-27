@@ -15,48 +15,35 @@ use std::time::Duration;
 ///
 /// This connects to a server at `socket_path` and mounts a FUSE filesystem
 /// at `mount_point`. The function blocks until the filesystem is unmounted.
-///
-/// # Arguments
-///
-/// * `socket_path` - Path to the Unix socket where the server is listening
-/// * `mount_point` - Directory where the FUSE filesystem will be mounted
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use fuse_pipe::client::mount;
-/// use std::path::PathBuf;
-///
-/// mount("/tmp/fuse.sock", &PathBuf::from("/mnt/fuse"))?;
-/// ```
 pub fn mount<P: AsRef<Path>>(socket_path: &str, mount_point: P) -> anyhow::Result<()> {
-    mount_with_readers(socket_path, mount_point, 1)
+    mount_with_options(socket_path, mount_point, 1, 0)
 }
 
 /// Mount a FUSE filesystem with multiple reader threads.
 ///
 /// This creates multiple FUSE reader threads using FUSE_DEV_IOC_CLONE,
-/// allowing parallel processing of FUSE requests. Each reader thread
-/// shares a single socket connection via the multiplexer.
+/// allowing parallel processing of FUSE requests.
+pub fn mount_with_readers<P: AsRef<Path>>(
+    socket_path: &str,
+    mount_point: P,
+    num_readers: usize,
+) -> anyhow::Result<()> {
+    mount_with_options(socket_path, mount_point, num_readers, 0)
+}
+
+/// Mount a FUSE filesystem with full configuration.
 ///
 /// # Arguments
 ///
 /// * `socket_path` - Path to the Unix socket where the server is listening
 /// * `mount_point` - Directory where the FUSE filesystem will be mounted
 /// * `num_readers` - Number of FUSE reader threads (1-8 recommended)
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use fuse_pipe::client::mount_with_readers;
-/// use std::path::PathBuf;
-///
-/// mount_with_readers("/tmp/fuse.sock", &PathBuf::from("/mnt/fuse"), 4)?;
-/// ```
-pub fn mount_with_readers<P: AsRef<Path>>(
+/// * `trace_rate` - Trace every Nth request (0 = disabled)
+pub fn mount_with_options<P: AsRef<Path>>(
     socket_path: &str,
     mount_point: P,
     num_readers: usize,
+    trace_rate: u64,
 ) -> anyhow::Result<()> {
     eprintln!(
         "[client] connecting to {} (multiplexer slots: {})",
@@ -70,7 +57,7 @@ pub fn mount_with_readers<P: AsRef<Path>>(
     eprintln!("[client] connected to server");
 
     // Create multiplexer for request/response handling
-    let mux = Multiplexer::new(socket, num_readers);
+    let mux = Multiplexer::with_trace_rate(socket, num_readers, trace_rate);
     eprintln!(
         "[client] multiplexer started with {} reader slots",
         num_readers

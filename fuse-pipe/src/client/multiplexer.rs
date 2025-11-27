@@ -3,7 +3,7 @@
 //! Uses crossbeam channels for lock-free request submission and DashMap
 //! for lock-free response routing, eliminating mutex contention.
 
-use crate::protocol::{VolumeRequest, VolumeResponse, WireRequest, WireResponse, MAX_MESSAGE_SIZE};
+use crate::protocol::{Span, VolumeRequest, VolumeResponse, WireRequest, WireResponse, MAX_MESSAGE_SIZE};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use dashmap::DashMap;
 use std::io::{Read, Write};
@@ -11,16 +11,17 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// Response channel payload: (response, optional span for tracing)
+type ResponsePayload = (VolumeResponse, Option<Span>);
+
 /// A pending request with its response channel.
 struct PendingRequest {
     /// Pre-serialized request bytes (length prefix + body)
     data: Vec<u8>,
     /// Channel to send response back to the waiting reader
-    response_tx: Sender<VolumeResponse>,
+    response_tx: Sender<ResponsePayload>,
     /// Unique request ID for response routing
     unique: u64,
-    /// Reader ID for response routing
-    reader_id: u32,
 }
 
 /// Shared multiplexer for all reader threads.
@@ -37,13 +38,23 @@ pub struct Multiplexer {
     next_id: AtomicU64,
     /// Number of readers
     num_readers: usize,
+    /// Trace every Nth request (0 = disabled)
+    trace_rate: u64,
 }
 
 impl Multiplexer {
     /// Create a new multiplexer with the given number of readers.
     ///
     /// Spawns background threads for reading and writing to the socket.
+    /// Tracing is disabled by default.
     pub fn new(socket: UnixStream, num_readers: usize) -> Arc<Self> {
+        Self::with_trace_rate(socket, num_readers, 0)
+    }
+
+    /// Create a new multiplexer with tracing enabled.
+    ///
+    /// `trace_rate`: Trace every Nth request (0 = disabled, 100 = every 100th request)
+    pub fn with_trace_rate(socket: UnixStream, num_readers: usize, trace_rate: u64) -> Arc<Self> {
         let socket_reader = socket.try_clone().expect("failed to clone socket");
         let socket_writer = socket;
 
@@ -56,7 +67,7 @@ impl Multiplexer {
 
         // Lock-free map for routing responses back to waiting readers
         // Key: unique request ID, Value: oneshot sender for response
-        let pending: Arc<DashMap<u64, Sender<VolumeResponse>>> =
+        let pending: Arc<DashMap<u64, Sender<ResponsePayload>>> =
             Arc::new(DashMap::with_capacity(num_readers * 2));
 
         let pending_for_writer = Arc::clone(&pending);
@@ -76,6 +87,7 @@ impl Multiplexer {
             request_tx,
             next_id: AtomicU64::new(1),
             num_readers,
+            trace_rate,
         })
     }
 
@@ -85,13 +97,22 @@ impl Multiplexer {
     /// and per-request oneshot channel for response.
     pub fn send_request(&self, reader_id: u32, request: VolumeRequest) -> VolumeResponse {
         let unique = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let should_trace = self.trace_rate > 0 && unique % self.trace_rate == 0;
 
-        // Serialize request with length prefix
-        let wire = WireRequest::new(unique, reader_id, request);
+        // Build wire request - span goes inside the request so server gets it
+        let wire = if should_trace {
+            WireRequest::with_span(unique, reader_id, request, Span::new())
+        } else {
+            WireRequest::new(unique, reader_id, request)
+        };
+
         let body = match bincode::serialize(&wire) {
             Ok(b) => b,
             Err(_) => return VolumeResponse::error(libc::EIO),
         };
+
+        // Note: client_serialize mark is set by the server as server_recv (time delta = network latency)
+        // We can't mark client-side times since the span is already serialized
 
         // Prepare length-prefixed message
         let mut data = Vec::with_capacity(4 + body.len());
@@ -99,14 +120,13 @@ impl Multiplexer {
         data.extend_from_slice(&body);
 
         // Create oneshot channel for response
-        let (response_tx, response_rx) = bounded::<VolumeResponse>(1);
+        let (response_tx, response_rx) = bounded::<ResponsePayload>(1);
 
         // Submit request (lock-free via crossbeam channel)
         let pending = PendingRequest {
             data,
             response_tx,
             unique,
-            reader_id,
         };
 
         if self.request_tx.send(pending).is_err() {
@@ -114,7 +134,17 @@ impl Multiplexer {
         }
 
         // Wait for response on our oneshot channel
-        response_rx.recv().unwrap_or_else(|_| VolumeResponse::error(libc::EIO))
+        let (response, span) = response_rx
+            .recv()
+            .unwrap_or_else(|_| (VolumeResponse::error(libc::EIO), None));
+
+        // Print trace if we have a complete span
+        if let Some(mut s) = span {
+            s.mark("client_done");
+            s.print(unique);
+        }
+
+        response
     }
 
     /// Get the number of readers this multiplexer supports.
@@ -127,7 +157,7 @@ impl Multiplexer {
 fn writer_loop(
     mut socket: UnixStream,
     request_rx: Receiver<PendingRequest>,
-    pending: Arc<DashMap<u64, Sender<VolumeResponse>>>,
+    pending: Arc<DashMap<u64, Sender<ResponsePayload>>>,
 ) {
     while let Ok(req) = request_rx.recv() {
         // Register the response channel BEFORE writing (to avoid race)
@@ -137,16 +167,18 @@ fn writer_loop(
         if socket.write_all(&req.data).is_err() || socket.flush().is_err() {
             // Remove from pending and signal error
             if let Some((_, tx)) = pending.remove(&req.unique) {
-                let _ = tx.send(VolumeResponse::error(libc::EIO));
+                let _ = tx.send((VolumeResponse::error(libc::EIO), None));
             }
         }
+        // Note: client_socket_write is marked by server_recv on the server side
+        // since we can't update the span after serialization
     }
 }
 
 /// Reader thread: reads responses from socket, routes to waiting readers.
 fn reader_loop(
     mut socket: UnixStream,
-    pending: Arc<DashMap<u64, Sender<VolumeResponse>>>,
+    pending: Arc<DashMap<u64, Sender<ResponsePayload>>>,
 ) {
     let mut len_buf = [0u8; 4];
 
@@ -172,20 +204,26 @@ fn reader_loop(
 
         // Deserialize and route to waiting reader (lock-free lookup + remove)
         if let Ok(wire) = bincode::deserialize::<WireResponse>(&resp_buf) {
+            // Mark client receive time on the span
+            let mut span = wire.span;
+            if let Some(ref mut s) = span {
+                s.mark("client_recv");
+            }
+
             if let Some((_, tx)) = pending.remove(&wire.unique) {
-                let _ = tx.send(wire.response);
+                let _ = tx.send((wire.response, span));
             }
         }
     }
 }
 
 /// Fail all pending requests on disconnect.
-fn fail_all_pending(pending: &DashMap<u64, Sender<VolumeResponse>>) {
+fn fail_all_pending(pending: &DashMap<u64, Sender<ResponsePayload>>) {
     // Collect keys first to avoid holding shard locks during send
     let keys: Vec<u64> = pending.iter().map(|r| *r.key()).collect();
     for key in keys {
         if let Some((_, tx)) = pending.remove(&key) {
-            let _ = tx.send(VolumeResponse::error(libc::EIO));
+            let _ = tx.send((VolumeResponse::error(libc::EIO), None));
         }
     }
 }
