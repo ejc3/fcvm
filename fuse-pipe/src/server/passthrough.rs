@@ -6,6 +6,7 @@
 use super::handler::FilesystemHandler;
 use crate::protocol::{file_type, DirEntry, FileAttr, VolumeResponse};
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -16,73 +17,136 @@ use std::sync::{Mutex, RwLock};
 /// Default attribute TTL in seconds.
 const ATTR_TTL_SECS: u64 = 1;
 
-/// Inode table mapping inode numbers to paths.
+/// Inode table mapping inode numbers to parent/name pairs.
 struct InodeTable {
-    ino_to_path: RwLock<HashMap<u64, PathBuf>>,
-    path_to_ino: RwLock<HashMap<PathBuf, u64>>,
+    ino_to_entry: RwLock<HashMap<u64, InodeEntry>>,
+    name_to_ino: RwLock<HashMap<(u64, OsString), u64>>,
     next_ino: AtomicU64,
     root_path: PathBuf,
 }
 
+struct InodeEntry {
+    parent: u64,
+    name: OsString,
+}
+
 impl InodeTable {
     fn new(root_path: PathBuf) -> Self {
-        let mut ino_to_path = HashMap::new();
-        let mut path_to_ino = HashMap::new();
+        let mut ino_to_entry = HashMap::new();
+        let name_to_ino = HashMap::new();
 
-        // Root inode is always 1
-        ino_to_path.insert(1, root_path.clone());
-        path_to_ino.insert(root_path.clone(), 1);
+        // Root inode is always 1; parent is 0 and name empty.
+        ino_to_entry.insert(
+            1,
+            InodeEntry {
+                parent: 0,
+                name: OsString::new(),
+            },
+        );
 
         Self {
-            ino_to_path: RwLock::new(ino_to_path),
-            path_to_ino: RwLock::new(path_to_ino),
+            ino_to_entry: RwLock::new(ino_to_entry),
+            name_to_ino: RwLock::new(name_to_ino),
             next_ino: AtomicU64::new(2),
             root_path,
         }
     }
 
-    fn get_path(&self, ino: u64) -> Option<PathBuf> {
-        self.ino_to_path.read().unwrap().get(&ino).cloned()
+    fn resolve_path(&self, ino: u64) -> Option<PathBuf> {
+        if ino == 1 {
+            return Some(self.root_path.clone());
+        }
+
+        let entries = self.ino_to_entry.read().unwrap();
+        let mut components = Vec::new();
+        let mut current = ino;
+
+        while current != 1 {
+            let entry = entries.get(&current)?;
+            components.push(entry.name.clone());
+            current = entry.parent;
+        }
+
+        let mut path = self.root_path.clone();
+        for component in components.iter().rev() {
+            path.push(component);
+        }
+        Some(path)
     }
 
-    fn get_or_create_ino(&self, path: &PathBuf) -> u64 {
-        // Try read-only first
-        if let Some(&ino) = self.path_to_ino.read().unwrap().get(path) {
+    fn get_or_create_ino(&self, parent: u64, name: &OsStr) -> u64 {
+        // Try read-only first.
+        if let Some(&ino) = self
+            .name_to_ino
+            .read()
+            .unwrap()
+            .get(&(parent, name.to_os_string()))
+        {
             return ino;
         }
 
-        // Need to create - acquire write locks
-        let mut path_to_ino = self.path_to_ino.write().unwrap();
-        let mut ino_to_path = self.ino_to_path.write().unwrap();
+        // Need to create - acquire write locks.
+        let mut name_to_ino = self.name_to_ino.write().unwrap();
+        let mut entries = self.ino_to_entry.write().unwrap();
 
-        // Double-check after acquiring write lock
-        if let Some(&ino) = path_to_ino.get(path) {
+        if let Some(&ino) = name_to_ino.get(&(parent, name.to_os_string())) {
             return ino;
         }
 
         let ino = self.next_ino.fetch_add(1, Ordering::SeqCst);
-        path_to_ino.insert(path.clone(), ino);
-        ino_to_path.insert(ino, path.clone());
+        name_to_ino.insert((parent, name.to_os_string()), ino);
+        entries.insert(
+            ino,
+            InodeEntry {
+                parent,
+                name: name.to_os_string(),
+            },
+        );
         ino
     }
 
-    fn remove_path(&self, path: &PathBuf) {
-        let mut path_to_ino = self.path_to_ino.write().unwrap();
-        let mut ino_to_path = self.ino_to_path.write().unwrap();
-
-        if let Some(ino) = path_to_ino.remove(path) {
-            ino_to_path.remove(&ino);
+    fn remove_entry(&self, parent: u64, name: &OsStr) {
+        let mut name_to_ino = self.name_to_ino.write().unwrap();
+        if let Some(ino) = name_to_ino.remove(&(parent, name.to_os_string())) {
+            let mut entries = self.ino_to_entry.write().unwrap();
+            entries.remove(&ino);
         }
     }
 
-    fn rename_path(&self, old_path: &PathBuf, new_path: PathBuf) {
-        let mut path_to_ino = self.path_to_ino.write().unwrap();
-        let mut ino_to_path = self.ino_to_path.write().unwrap();
+    fn rename_entry(
+        &self,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+    ) -> Option<u64> {
+        let mut name_to_ino = self.name_to_ino.write().unwrap();
+        let key = (parent, name.to_os_string());
+        let ino = match name_to_ino.remove(&key) {
+            Some(i) => i,
+            None => return None,
+        };
+        name_to_ino.insert((newparent, newname.to_os_string()), ino);
 
-        if let Some(ino) = path_to_ino.remove(old_path) {
-            ino_to_path.insert(ino, new_path.clone());
-            path_to_ino.insert(new_path, ino);
+        let mut entries = self.ino_to_entry.write().unwrap();
+        if let Some(entry) = entries.get_mut(&ino) {
+            entry.parent = newparent;
+            entry.name = newname.to_os_string();
         }
+        Some(ino)
+    }
+
+    fn parent_of(&self, ino: u64) -> Option<u64> {
+        self.ino_to_entry
+            .read()
+            .unwrap()
+            .get(&ino)
+            .map(|e| e.parent)
+    }
+
+    fn add_hard_link(&self, parent: u64, name: &OsStr, ino: u64) {
+        let mut name_to_ino = self.name_to_ino.write().unwrap();
+        name_to_ino.insert((parent, name.to_os_string()), ino);
     }
 }
 
@@ -178,7 +242,7 @@ impl PassthroughFs {
 
 impl FilesystemHandler for PassthroughFs {
     fn lookup(&self, parent: u64, name: &str) -> VolumeResponse {
-        let parent_path = match self.inodes.get_path(parent) {
+        let parent_path = match self.inodes.resolve_path(parent) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
@@ -190,7 +254,7 @@ impl FilesystemHandler for PassthroughFs {
             Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
         };
 
-        let ino = self.inodes.get_or_create_ino(&path);
+        let ino = self.inodes.get_or_create_ino(parent, OsStr::new(name));
         let attr = metadata_to_attr(ino, &metadata);
 
         VolumeResponse::Entry {
@@ -201,7 +265,7 @@ impl FilesystemHandler for PassthroughFs {
     }
 
     fn getattr(&self, ino: u64) -> VolumeResponse {
-        let path = match self.inodes.get_path(ino) {
+        let path = match self.inodes.resolve_path(ino) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
@@ -230,7 +294,7 @@ impl FilesystemHandler for PassthroughFs {
         _mtime_secs: Option<i64>,
         _mtime_nsecs: Option<u32>,
     ) -> VolumeResponse {
-        let path = match self.inodes.get_path(ino) {
+        let path = match self.inodes.resolve_path(ino) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
@@ -263,7 +327,7 @@ impl FilesystemHandler for PassthroughFs {
     }
 
     fn readdir(&self, ino: u64, offset: u64) -> VolumeResponse {
-        let path = match self.inodes.get_path(ino) {
+        let path = match self.inodes.resolve_path(ino) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
@@ -281,10 +345,8 @@ impl FilesystemHandler for PassthroughFs {
 
             let parent_ino = if ino == 1 {
                 1
-            } else if let Some(parent) = path.parent() {
-                self.inodes.get_or_create_ino(&parent.to_path_buf())
             } else {
-                1
+                self.inodes.parent_of(ino).unwrap_or(1)
             };
             result.push(DirEntry::dotdot(parent_ino));
         }
@@ -299,13 +361,14 @@ impl FilesystemHandler for PassthroughFs {
                 Err(_) => continue,
             };
 
-            let entry_path = entry.path();
             let metadata = match entry.metadata() {
                 Ok(m) => m,
                 Err(_) => continue,
             };
 
-            let entry_ino = self.inodes.get_or_create_ino(&entry_path);
+            let entry_ino = self
+                .inodes
+                .get_or_create_ino(ino, entry.file_name().as_os_str());
             let ft = file_type::from_mode(metadata.mode());
 
             result.push(DirEntry::new(
@@ -319,7 +382,7 @@ impl FilesystemHandler for PassthroughFs {
     }
 
     fn mkdir(&self, parent: u64, name: &str, mode: u32) -> VolumeResponse {
-        let parent_path = match self.inodes.get_path(parent) {
+        let parent_path = match self.inodes.resolve_path(parent) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
@@ -337,7 +400,7 @@ impl FilesystemHandler for PassthroughFs {
             Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
         };
 
-        let ino = self.inodes.get_or_create_ino(&path);
+        let ino = self.inodes.get_or_create_ino(parent, OsStr::new(name));
         let attr = metadata_to_attr(ino, &metadata);
 
         VolumeResponse::Entry {
@@ -348,7 +411,7 @@ impl FilesystemHandler for PassthroughFs {
     }
 
     fn rmdir(&self, parent: u64, name: &str) -> VolumeResponse {
-        let parent_path = match self.inodes.get_path(parent) {
+        let parent_path = match self.inodes.resolve_path(parent) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
@@ -359,12 +422,12 @@ impl FilesystemHandler for PassthroughFs {
             return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
         }
 
-        self.inodes.remove_path(&path);
+        self.inodes.remove_entry(parent, OsStr::new(name));
         VolumeResponse::Ok
     }
 
     fn create(&self, parent: u64, name: &str, mode: u32, flags: u32) -> VolumeResponse {
-        let parent_path = match self.inodes.get_path(parent) {
+        let parent_path = match self.inodes.resolve_path(parent) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
@@ -388,7 +451,7 @@ impl FilesystemHandler for PassthroughFs {
             Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
         };
 
-        let ino = self.inodes.get_or_create_ino(&path);
+        let ino = self.inodes.get_or_create_ino(parent, OsStr::new(name));
         let fh = self.handles.insert(file);
         let attr = metadata_to_attr(ino, &metadata);
 
@@ -402,7 +465,7 @@ impl FilesystemHandler for PassthroughFs {
     }
 
     fn open(&self, ino: u64, flags: u32) -> VolumeResponse {
-        let path = match self.inodes.get_path(ino) {
+        let path = match self.inodes.resolve_path(ino) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
@@ -501,7 +564,7 @@ impl FilesystemHandler for PassthroughFs {
     }
 
     fn unlink(&self, parent: u64, name: &str) -> VolumeResponse {
-        let parent_path = match self.inodes.get_path(parent) {
+        let parent_path = match self.inodes.resolve_path(parent) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
@@ -512,17 +575,17 @@ impl FilesystemHandler for PassthroughFs {
             return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
         }
 
-        self.inodes.remove_path(&path);
+        self.inodes.remove_entry(parent, OsStr::new(name));
         VolumeResponse::Ok
     }
 
     fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> VolumeResponse {
-        let parent_path = match self.inodes.get_path(parent) {
+        let parent_path = match self.inodes.resolve_path(parent) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
 
-        let newparent_path = match self.inodes.get_path(newparent) {
+        let newparent_path = match self.inodes.resolve_path(newparent) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
@@ -534,12 +597,13 @@ impl FilesystemHandler for PassthroughFs {
             return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
         }
 
-        self.inodes.rename_path(&old_path, new_path);
+        self.inodes
+            .rename_entry(parent, OsStr::new(name), newparent, OsStr::new(newname));
         VolumeResponse::Ok
     }
 
     fn symlink(&self, parent: u64, name: &str, target: &str) -> VolumeResponse {
-        let parent_path = match self.inodes.get_path(parent) {
+        let parent_path = match self.inodes.resolve_path(parent) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
@@ -555,7 +619,7 @@ impl FilesystemHandler for PassthroughFs {
             Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
         };
 
-        let ino = self.inodes.get_or_create_ino(&link_path);
+        let ino = self.inodes.get_or_create_ino(parent, OsStr::new(name));
         let attr = metadata_to_attr(ino, &metadata);
 
         VolumeResponse::Entry {
@@ -566,7 +630,7 @@ impl FilesystemHandler for PassthroughFs {
     }
 
     fn readlink(&self, ino: u64) -> VolumeResponse {
-        let path = match self.inodes.get_path(ino) {
+        let path = match self.inodes.resolve_path(ino) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
@@ -580,12 +644,12 @@ impl FilesystemHandler for PassthroughFs {
     }
 
     fn link(&self, ino: u64, newparent: u64, newname: &str) -> VolumeResponse {
-        let path = match self.inodes.get_path(ino) {
+        let path = match self.inodes.resolve_path(ino) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
 
-        let newparent_path = match self.inodes.get_path(newparent) {
+        let newparent_path = match self.inodes.resolve_path(newparent) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
@@ -596,11 +660,9 @@ impl FilesystemHandler for PassthroughFs {
             return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
         }
 
-        // Reuse same inode for hard link
-        {
-            let mut path_to_ino = self.inodes.path_to_ino.write().unwrap();
-            path_to_ino.insert(new_path, ino);
-        }
+        // Reuse same inode for hard link (canonical path stays unchanged).
+        self.inodes
+            .add_hard_link(newparent, OsStr::new(newname), ino);
 
         let metadata = match fs::metadata(&path) {
             Ok(m) => m,
@@ -617,7 +679,7 @@ impl FilesystemHandler for PassthroughFs {
     }
 
     fn access(&self, ino: u64, mask: u32) -> VolumeResponse {
-        let path = match self.inodes.get_path(ino) {
+        let path = match self.inodes.resolve_path(ino) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
@@ -642,7 +704,7 @@ impl FilesystemHandler for PassthroughFs {
     }
 
     fn statfs(&self, ino: u64) -> VolumeResponse {
-        let path = match self.inodes.get_path(ino) {
+        let path = match self.inodes.resolve_path(ino) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
@@ -743,6 +805,77 @@ mod tests {
                 assert_eq!(data, b"hello");
             }
             _ => panic!("Expected Data response"),
+        }
+    }
+
+    #[test]
+    fn test_passthrough_setattr_chown_errno() {
+        if nix::unistd::Uid::effective().is_root() {
+            // Root can chown successfully, so skip to avoid false positives.
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PassthroughFs::new(dir.path());
+        std::fs::write(dir.path().join("file.txt"), "data").unwrap();
+
+        let lookup = fs.lookup(1, "file.txt");
+        let ino = match lookup {
+            VolumeResponse::Entry { attr, .. } => attr.ino,
+            _ => panic!("Expected Entry response"),
+        };
+
+        let resp = fs.setattr(
+            ino,
+            None,
+            Some(0), // Force a chown we do not have permission for
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            resp.errno(),
+            Some(libc::EPERM),
+            "chown failure should propagate EPERM"
+        );
+    }
+
+    #[test]
+    fn test_passthrough_rename_updates_child_inodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let subdir = root.join("dir");
+        let file_path = subdir.join("file.txt");
+
+        std::fs::create_dir(&subdir).unwrap();
+        std::fs::write(&file_path, "hello").unwrap();
+
+        let fs = PassthroughFs::new(root);
+
+        let dir_ino = match fs.lookup(1, "dir") {
+            VolumeResponse::Entry { attr, .. } => attr.ino,
+            _ => panic!("Expected Entry for dir"),
+        };
+
+        let file_ino = match fs.lookup(dir_ino, "file.txt") {
+            VolumeResponse::Entry { attr, .. } => attr.ino,
+            _ => panic!("Expected Entry for file"),
+        };
+
+        let rename_resp = fs.rename(1, "dir", 1, "renamed");
+        assert!(rename_resp.is_ok());
+
+        let getattr_resp = fs.getattr(file_ino);
+        match getattr_resp {
+            VolumeResponse::Attr { attr, .. } => assert_eq!(attr.size, 5),
+            VolumeResponse::Error { errno } => {
+                panic!("Expected Attr after rename, got errno {}", errno)
+            }
+            _ => panic!("Unexpected response after rename"),
         }
     }
 }

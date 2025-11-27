@@ -13,7 +13,7 @@ REMOTE_KERNEL_DIR := ~/linux-firecracker
 # Local output directory for downloaded artifacts
 ARTIFACTS := artifacts
 
-.PHONY: all build sync build-remote build-local clean kernel rootfs deploy test sanity test-volume test-volumes test-volume-stress test-clone-lock help
+.PHONY: all build sync build-remote build-local clean kernel rootfs deploy test sanity test-volume test-volumes test-volume-stress test-clone-lock test-pjdfstest fuse-pipe-test help
 
 all: build
 
@@ -44,6 +44,8 @@ help:
 	@echo "  make test-volumes  - Run multi-volume test (sync + build + test)"
 	@echo "  make test-volume-stress - Run volume stress test (heavy I/O)"
 	@echo "  make test-clone-lock - Run POSIX lock test across 10 clones sharing a volume"
+	@echo "  make test-pjdfstest  - Run pjdfstest POSIX filesystem compliance tests"
+	@echo "  make fuse-pipe-test - Sync + run fuse-pipe unit tests on EC2"
 	@echo ""
 	@echo "Local:"
 	@echo "  make build-local   - Build locally (macOS, won't run)"
@@ -177,6 +179,14 @@ test-volume-stress: build
 test-clone-lock: rebuild
 	@echo "==> Running clone lock test on EC2 (POSIX locking across 10 clones)..."
 	$(SSH) "cd $(REMOTE_DIR) && sudo ./target/release/fcvm test clone-lock --num-clones 10 --iterations 100 2>&1" | tee /tmp/test-clone-lock.log
+
+test-pjdfstest: rebuild
+	@echo "==> Running pjdfstest on EC2 (POSIX filesystem compliance)..."
+	$(SSH) "cd $(REMOTE_DIR) && sudo ./target/release/fcvm test pjdfstest --timeout 600 2>&1" | tee /tmp/test-pjdfstest.log
+
+fuse-pipe-test: sync
+	@echo "==> Running fuse-pipe tests on EC2..."
+	$(SSH) "cd $(REMOTE_DIR)/fuse-pipe && source ~/.cargo/env && cargo test 2>&1" | tee /tmp/fuse-pipe-test.log
 
 #
 # Local builds (for IDE/linting only - won't run on macOS)

@@ -123,7 +123,7 @@ async fn request_reader<H: FilesystemHandler + 'static>(
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > MAX_MESSAGE_SIZE {
             eprintln!("[pipelined] message too large: {}", len);
-            continue;
+            return Err(anyhow::anyhow!("message too large: {}", len));
         }
 
         // Read request body
@@ -149,9 +149,10 @@ async fn request_reader<H: FilesystemHandler + 'static>(
 
         tokio::spawn(async move {
             // Run FS operation on blocking thread
-            let response = tokio::task::spawn_blocking(move || handler_clone.handle_request(&request))
-                .await
-                .unwrap_or_else(|_| VolumeResponse::error(libc::EIO));
+            let response =
+                tokio::task::spawn_blocking(move || handler_clone.handle_request(&request))
+                    .await
+                    .unwrap_or_else(|_| VolumeResponse::error(libc::EIO));
 
             // Send response to writer
             let _ = tx_clone.send((unique, reader_id, response)).await;
@@ -230,6 +231,9 @@ async fn response_writer(
 mod tests {
     use super::*;
     use crate::server::handler::FilesystemHandler;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
 
     struct EchoHandler;
 
@@ -254,5 +258,26 @@ mod tests {
         let config = ServerConfig::high_throughput();
         let server = AsyncServer::with_config(handler, config);
         assert_eq!(server.config.write_batch_size, 64);
+    }
+
+    #[tokio::test]
+    async fn test_request_reader_exits_on_oversized_frame() {
+        let (server, mut client) = tokio::net::UnixStream::pair().unwrap();
+        let (read_half, _write_half) = server.into_split();
+
+        let handler = Arc::new(EchoHandler);
+        let (tx, _rx) = mpsc::channel(1);
+
+        let reader_task = tokio::spawn(request_reader(read_half, handler, tx));
+
+        // Write an oversized length and keep the connection open to surface hangs.
+        let oversized_len = ((MAX_MESSAGE_SIZE as u32) + 1).to_be_bytes();
+        client.write_all(&oversized_len).await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_millis(200), reader_task).await;
+        assert!(
+            result.is_ok(),
+            "request_reader did not exit after receiving an oversized frame"
+        );
     }
 }

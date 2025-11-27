@@ -65,6 +65,18 @@ impl ReaderPending {
         }
         self.condvar.notify_all();
     }
+
+    /// Fail all pending requests (e.g., on disconnect).
+    fn fail_all(&self, response: VolumeResponse) {
+        let mut slots = self.slots.lock().unwrap();
+        for slot in slots.values_mut() {
+            if !slot.ready {
+                slot.response = Some(response.clone());
+                slot.ready = true;
+            }
+        }
+        self.condvar.notify_all();
+    }
 }
 
 /// Shared multiplexer for all reader threads.
@@ -116,9 +128,12 @@ impl Multiplexer {
             if let Err(e) = socket.read_exact(&mut len_buf) {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
                     eprintln!("[mux] server disconnected");
-                    break;
+                } else {
+                    eprintln!("[mux] read error: {}", e);
                 }
-                eprintln!("[mux] read error: {}", e);
+                for pending in &self.reader_pending {
+                    pending.fail_all(VolumeResponse::error(libc::EIO));
+                }
                 break;
             }
 
@@ -132,6 +147,9 @@ impl Multiplexer {
             let mut resp_buf = vec![0u8; len];
             if let Err(e) = socket.read_exact(&mut resp_buf) {
                 eprintln!("[mux] read body error: {}", e);
+                for pending in &self.reader_pending {
+                    pending.fail_all(VolumeResponse::error(libc::EIO));
+                }
                 break;
             }
 
@@ -219,5 +237,40 @@ mod tests {
 
         // This would block forever without the complete() call
         // In a real test we'd need proper timeout handling
+    }
+
+    #[test]
+    fn test_disconnect_wakes_pending_request() {
+        use std::io::Read;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mux = Multiplexer::new(client, 1);
+        let mux_clone = Arc::clone(&mux);
+
+        let (done_tx, done_rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let resp = mux_clone.send_request(0, VolumeRequest::Getattr { ino: 1 });
+            let _ = done_tx.send(resp.errno());
+        });
+
+        // Drain the request so it is fully sent before we drop the server side.
+        let mut len_buf = [0u8; 4];
+        server.read_exact(&mut len_buf).unwrap();
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len];
+        server.read_exact(&mut body).unwrap();
+
+        // Drop the server end to simulate a disconnect without a response.
+        drop(server);
+
+        // The client should not hang forever waiting for a response.
+        let result = done_rx.recv_timeout(Duration::from_millis(200));
+        assert!(
+            result.is_ok(),
+            "pending request was not completed after disconnect"
+        );
     }
 }
