@@ -544,31 +544,19 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bincode",
+ "clap",
  "criterion",
  "crossbeam-channel",
  "dashmap",
  "fuser",
  "libc",
  "metrics",
+ "metrics-util",
  "nix 0.29.0",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
-name = "fuse-test"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "fuse-pipe",
- "libc",
- "metrics",
- "metrics-util",
- "serde",
- "serde_json",
  "tokio",
 ]
 
@@ -1400,16 +1388,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "parking_lot"
-version = "0.12.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
-dependencies = [
- "lock_api",
- "parking_lot_core",
-]
-
-[[package]]
 name = "parking_lot_core"
 version = "0.9.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2204,7 +2182,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2 0.6.1",
