@@ -28,6 +28,18 @@ impl FuseClient {
     }
 }
 
+/// Convert i64 seconds + u32 nanoseconds to SystemTime.
+/// Handles negative timestamps (times before Unix epoch).
+fn to_system_time(secs: i64, nsecs: u32) -> std::time::SystemTime {
+    if secs >= 0 {
+        UNIX_EPOCH + Duration::new(secs as u64, nsecs)
+    } else {
+        // For negative timestamps, subtract from epoch
+        // Note: nsecs is always positive, so we need to handle it correctly
+        UNIX_EPOCH - Duration::new((-secs) as u64, 0) + Duration::new(0, nsecs)
+    }
+}
+
 /// Convert FileAttr to fuser::FileAttr.
 fn to_fuser_attr(attr: &FileAttr) -> fuser::FileAttr {
     let kind = match attr.mode & libc::S_IFMT as u32 {
@@ -45,9 +57,9 @@ fn to_fuser_attr(attr: &FileAttr) -> fuser::FileAttr {
         ino: attr.ino,
         size: attr.size,
         blocks: attr.blocks,
-        atime: UNIX_EPOCH + Duration::new(attr.atime_secs as u64, attr.atime_nsecs),
-        mtime: UNIX_EPOCH + Duration::new(attr.mtime_secs as u64, attr.mtime_nsecs),
-        ctime: UNIX_EPOCH + Duration::new(attr.ctime_secs as u64, attr.ctime_nsecs),
+        atime: to_system_time(attr.atime_secs, attr.atime_nsecs),
+        mtime: to_system_time(attr.mtime_secs, attr.mtime_nsecs),
+        ctime: to_system_time(attr.ctime_secs, attr.ctime_nsecs),
         crtime: UNIX_EPOCH,
         kind,
         perm: (attr.mode & 0o7777) as u16,

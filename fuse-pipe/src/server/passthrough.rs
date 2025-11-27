@@ -289,10 +289,10 @@ impl FilesystemHandler for PassthroughFs {
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        _atime_secs: Option<i64>,
-        _atime_nsecs: Option<u32>,
-        _mtime_secs: Option<i64>,
-        _mtime_nsecs: Option<u32>,
+        atime_secs: Option<i64>,
+        atime_nsecs: Option<u32>,
+        mtime_secs: Option<i64>,
+        mtime_nsecs: Option<u32>,
     ) -> VolumeResponse {
         let path = match self.inodes.resolve_path(ino) {
             Some(p) => p,
@@ -320,6 +320,27 @@ impl FilesystemHandler for PassthroughFs {
             };
             if let Err(e) = file.set_len(size) {
                 return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
+            }
+        }
+
+        // Handle atime/mtime updates
+        if atime_secs.is_some() || mtime_secs.is_some() {
+            use nix::sys::stat::{utimensat, UtimensatFlags};
+            use nix::sys::time::TimeSpec;
+
+            let atime = match atime_secs {
+                Some(secs) => TimeSpec::new(secs, atime_nsecs.unwrap_or(0) as i64),
+                None => TimeSpec::UTIME_OMIT,
+            };
+
+            let mtime = match mtime_secs {
+                Some(secs) => TimeSpec::new(secs, mtime_nsecs.unwrap_or(0) as i64),
+                None => TimeSpec::UTIME_OMIT,
+            };
+
+            if let Err(e) = utimensat(None, &path, &atime, &mtime, UtimensatFlags::NoFollowSymlink)
+            {
+                return VolumeResponse::error(e as i32);
             }
         }
 
@@ -876,6 +897,49 @@ mod tests {
                 panic!("Expected Attr after rename, got errno {}", errno)
             }
             _ => panic!("Unexpected response after rename"),
+        }
+    }
+
+    #[test]
+    fn test_passthrough_setattr_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PassthroughFs::new(dir.path());
+        std::fs::write(dir.path().join("file.txt"), "data").unwrap();
+
+        let lookup = fs.lookup(1, "file.txt");
+        let ino = match lookup {
+            VolumeResponse::Entry { attr, .. } => attr.ino,
+            _ => panic!("Expected Entry response"),
+        };
+
+        // Set specific timestamps: 2020-01-01 00:00:00 UTC
+        let timestamp_secs: i64 = 1577836800;
+        let timestamp_nsecs: u32 = 123456789;
+
+        let resp = fs.setattr(
+            ino,
+            None,
+            None,
+            None,
+            None,
+            Some(timestamp_secs),
+            Some(timestamp_nsecs),
+            Some(timestamp_secs),
+            Some(timestamp_nsecs),
+        );
+
+        match resp {
+            VolumeResponse::Attr { attr, .. } => {
+                assert_eq!(attr.atime_secs, timestamp_secs, "atime_secs mismatch");
+                assert_eq!(attr.mtime_secs, timestamp_secs, "mtime_secs mismatch");
+                // nsecs may be rounded by filesystem, just check they're set
+                assert!(attr.atime_nsecs > 0, "atime_nsecs should be set");
+                assert!(attr.mtime_nsecs > 0, "mtime_nsecs should be set");
+            }
+            VolumeResponse::Error { errno } => {
+                panic!("setattr failed with errno {}", errno)
+            }
+            _ => panic!("Unexpected response"),
         }
     }
 }
