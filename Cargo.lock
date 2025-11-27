@@ -534,6 +534,7 @@ dependencies = [
  "fuser",
  "libc",
  "metrics",
+ "nix 0.29.0",
  "serde",
  "tempfile",
  "thiserror 1.0.69",
