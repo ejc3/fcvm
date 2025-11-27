@@ -200,6 +200,10 @@ impl Multiplexer {
                 eprintln!("[reader {}] write body error: {}", reader_id, e);
                 return VolumeResponse::error(libc::EIO);
             }
+            if let Err(e) = socket.flush() {
+                eprintln!("[reader {}] flush error: {}", reader_id, e);
+                return VolumeResponse::error(libc::EIO);
+            }
         }
 
         // Wait for response on this reader's pending queue
