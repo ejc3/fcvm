@@ -1,202 +1,192 @@
-//! Socket multiplexer for sharing a single connection across FUSE readers.
+//! Lock-free socket multiplexer for sharing a single connection across FUSE readers.
 //!
-//! Multiple FUSE reader threads can share one socket connection to the server.
-//! Each reader has its own pending queue, and responses are routed back by
-//! unique request ID.
+//! Uses crossbeam channels for lock-free request submission and DashMap
+//! for lock-free response routing, eliminating mutex contention.
 
 use crate::protocol::{VolumeRequest, VolumeResponse, WireRequest, WireResponse, MAX_MESSAGE_SIZE};
-use std::collections::HashMap;
+use crossbeam_channel::{bounded, Receiver, Sender};
+use dashmap::DashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 
-/// Pending response slot for a single request.
-struct PendingSlot {
-    response: Option<VolumeResponse>,
-    ready: bool,
-}
-
-/// Per-reader pending requests map.
-struct ReaderPending {
-    slots: Mutex<HashMap<u64, PendingSlot>>,
-    condvar: Condvar,
-}
-
-impl ReaderPending {
-    fn new() -> Self {
-        Self {
-            slots: Mutex::new(HashMap::new()),
-            condvar: Condvar::new(),
-        }
-    }
-
-    /// Register a pending request and wait for response.
-    fn wait_for(&self, unique: u64) -> VolumeResponse {
-        let mut slots = self.slots.lock().unwrap();
-
-        // Insert placeholder
-        slots.insert(
-            unique,
-            PendingSlot {
-                response: None,
-                ready: false,
-            },
-        );
-
-        // Wait for response
-        loop {
-            if let Some(slot) = slots.get(&unique) {
-                if slot.ready {
-                    let slot = slots.remove(&unique).unwrap();
-                    return slot.response.unwrap();
-                }
-            }
-            slots = self.condvar.wait(slots).unwrap();
-        }
-    }
-
-    /// Complete a pending request with a response.
-    fn complete(&self, unique: u64, response: VolumeResponse) {
-        let mut slots = self.slots.lock().unwrap();
-        if let Some(slot) = slots.get_mut(&unique) {
-            slot.response = Some(response);
-            slot.ready = true;
-        }
-        self.condvar.notify_all();
-    }
-
-    /// Fail all pending requests (e.g., on disconnect).
-    fn fail_all(&self, response: VolumeResponse) {
-        let mut slots = self.slots.lock().unwrap();
-        for slot in slots.values_mut() {
-            if !slot.ready {
-                slot.response = Some(response.clone());
-                slot.ready = true;
-            }
-        }
-        self.condvar.notify_all();
-    }
+/// A pending request with its response channel.
+struct PendingRequest {
+    /// Pre-serialized request bytes (length prefix + body)
+    data: Vec<u8>,
+    /// Channel to send response back to the waiting reader
+    response_tx: Sender<VolumeResponse>,
+    /// Unique request ID for response routing
+    unique: u64,
+    /// Reader ID for response routing
+    reader_id: u32,
 }
 
 /// Shared multiplexer for all reader threads.
 ///
-/// Manages a single socket connection, with request/response routing
-/// to multiple FUSE reader threads.
+/// Uses lock-free channels:
+/// - Readers submit requests via crossbeam channel (no mutex)
+/// - Dedicated writer thread sends requests to socket
+/// - Dedicated reader thread receives responses
+/// - Per-request oneshot channel delivers response back to reader
 pub struct Multiplexer {
-    /// Socket write half (protected by mutex for concurrent writers)
-    socket_writer: Mutex<UnixStream>,
-    /// Per-reader pending response maps
-    reader_pending: Vec<Arc<ReaderPending>>,
-    /// Global request ID counter
+    /// Channel for submitting requests (lock-free)
+    request_tx: Sender<PendingRequest>,
+    /// Global request ID counter (atomic)
     next_id: AtomicU64,
+    /// Number of readers
+    num_readers: usize,
 }
 
 impl Multiplexer {
     /// Create a new multiplexer with the given number of readers.
     ///
-    /// Spawns a background thread to read responses from the socket.
+    /// Spawns background threads for reading and writing to the socket.
     pub fn new(socket: UnixStream, num_readers: usize) -> Arc<Self> {
-        let socket_clone = socket.try_clone().expect("failed to clone socket");
+        let socket_reader = socket.try_clone().expect("failed to clone socket");
+        let socket_writer = socket;
 
-        // Clear timeouts on the reader socket - it should block indefinitely
-        socket_clone.set_read_timeout(None).ok();
+        // Clear timeouts - threads should block indefinitely
+        socket_reader.set_read_timeout(None).ok();
+        socket_writer.set_write_timeout(None).ok();
 
-        let mut reader_pending = Vec::with_capacity(num_readers);
-        for _ in 0..num_readers {
-            reader_pending.push(Arc::new(ReaderPending::new()));
-        }
+        // Channel for request submission (bounded to provide backpressure)
+        let (request_tx, request_rx) = bounded::<PendingRequest>(num_readers * 4);
 
-        let mux = Arc::new(Self {
-            socket_writer: Mutex::new(socket),
-            reader_pending,
-            next_id: AtomicU64::new(1),
-        });
+        // Lock-free map for routing responses back to waiting readers
+        // Key: unique request ID, Value: oneshot sender for response
+        let pending: Arc<DashMap<u64, Sender<VolumeResponse>>> =
+            Arc::new(DashMap::with_capacity(num_readers * 2));
 
-        // Spawn response reader thread
-        let mux_clone = Arc::clone(&mux);
+        let pending_for_writer = Arc::clone(&pending);
+        let pending_for_reader = Arc::clone(&pending);
+
+        // Spawn writer thread - receives requests from channel, writes to socket
         std::thread::spawn(move || {
-            mux_clone.response_reader_loop(socket_clone);
+            writer_loop(socket_writer, request_rx, pending_for_writer);
         });
 
-        mux
-    }
+        // Spawn reader thread - reads responses from socket, routes to waiting readers
+        std::thread::spawn(move || {
+            reader_loop(socket_reader, pending_for_reader);
+        });
 
-    /// Background thread that reads responses and dispatches to waiting readers.
-    fn response_reader_loop(&self, mut socket: UnixStream) {
-        let mut len_buf = [0u8; 4];
-
-        loop {
-            // Read response length
-            if socket.read_exact(&mut len_buf).is_err() {
-                // Server disconnected or error - fail all pending requests
-                for pending in &self.reader_pending {
-                    pending.fail_all(VolumeResponse::error(libc::EIO));
-                }
-                break;
-            }
-
-            let len = u32::from_be_bytes(len_buf) as usize;
-            if len > MAX_MESSAGE_SIZE {
-                continue;
-            }
-
-            // Read response body
-            let mut resp_buf = vec![0u8; len];
-            if socket.read_exact(&mut resp_buf).is_err() {
-                for pending in &self.reader_pending {
-                    pending.fail_all(VolumeResponse::error(libc::EIO));
-                }
-                break;
-            }
-
-            // Deserialize and dispatch to correct reader's pending queue
-            if let Ok(wire) = bincode::deserialize::<WireResponse>(&resp_buf) {
-                let reader_id = wire.reader_id as usize;
-                if reader_id < self.reader_pending.len() {
-                    self.reader_pending[reader_id].complete(wire.unique, wire.response);
-                }
-            }
-        }
+        Arc::new(Self {
+            request_tx,
+            next_id: AtomicU64::new(1),
+            num_readers,
+        })
     }
 
     /// Send a request and wait for response.
     ///
-    /// This is called by reader threads and blocks until the response arrives.
+    /// This is called by reader threads. Uses lock-free channel for submission
+    /// and per-request oneshot channel for response.
     pub fn send_request(&self, reader_id: u32, request: VolumeRequest) -> VolumeResponse {
         let unique = self.next_id.fetch_add(1, Ordering::Relaxed);
 
-        // Serialize request
+        // Serialize request with length prefix
         let wire = WireRequest::new(unique, reader_id, request);
-        let buf = match bincode::serialize(&wire) {
+        let body = match bincode::serialize(&wire) {
             Ok(b) => b,
             Err(_) => return VolumeResponse::error(libc::EIO),
         };
 
-        // Write to socket (mutex-protected)
-        {
-            let mut socket = self.socket_writer.lock().unwrap();
-            let len_bytes = (buf.len() as u32).to_be_bytes();
-            if socket.write_all(&len_bytes).is_err()
-                || socket.write_all(&buf).is_err()
-                || socket.flush().is_err()
-            {
-                return VolumeResponse::error(libc::EIO);
-            }
+        // Prepare length-prefixed message
+        let mut data = Vec::with_capacity(4 + body.len());
+        data.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        data.extend_from_slice(&body);
+
+        // Create oneshot channel for response
+        let (response_tx, response_rx) = bounded::<VolumeResponse>(1);
+
+        // Submit request (lock-free via crossbeam channel)
+        let pending = PendingRequest {
+            data,
+            response_tx,
+            unique,
+            reader_id,
+        };
+
+        if self.request_tx.send(pending).is_err() {
+            return VolumeResponse::error(libc::EIO);
         }
 
-        // Wait for response on this reader's pending queue
-        let reader_idx = reader_id as usize;
-        if reader_idx < self.reader_pending.len() {
-            self.reader_pending[reader_idx].wait_for(unique)
-        } else {
-            VolumeResponse::error(libc::EIO)
-        }
+        // Wait for response on our oneshot channel
+        response_rx.recv().unwrap_or_else(|_| VolumeResponse::error(libc::EIO))
     }
 
     /// Get the number of readers this multiplexer supports.
     pub fn num_readers(&self) -> usize {
-        self.reader_pending.len()
+        self.num_readers
+    }
+}
+
+/// Writer thread: receives requests from channel, writes to socket.
+fn writer_loop(
+    mut socket: UnixStream,
+    request_rx: Receiver<PendingRequest>,
+    pending: Arc<DashMap<u64, Sender<VolumeResponse>>>,
+) {
+    while let Ok(req) = request_rx.recv() {
+        // Register the response channel BEFORE writing (to avoid race)
+        pending.insert(req.unique, req.response_tx);
+
+        // Write to socket
+        if socket.write_all(&req.data).is_err() || socket.flush().is_err() {
+            // Remove from pending and signal error
+            if let Some((_, tx)) = pending.remove(&req.unique) {
+                let _ = tx.send(VolumeResponse::error(libc::EIO));
+            }
+        }
+    }
+}
+
+/// Reader thread: reads responses from socket, routes to waiting readers.
+fn reader_loop(
+    mut socket: UnixStream,
+    pending: Arc<DashMap<u64, Sender<VolumeResponse>>>,
+) {
+    let mut len_buf = [0u8; 4];
+
+    loop {
+        // Read response length
+        if socket.read_exact(&mut len_buf).is_err() {
+            // Server disconnected - fail all pending requests
+            fail_all_pending(&pending);
+            break;
+        }
+
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_MESSAGE_SIZE {
+            continue;
+        }
+
+        // Read response body
+        let mut resp_buf = vec![0u8; len];
+        if socket.read_exact(&mut resp_buf).is_err() {
+            fail_all_pending(&pending);
+            break;
+        }
+
+        // Deserialize and route to waiting reader (lock-free lookup + remove)
+        if let Ok(wire) = bincode::deserialize::<WireResponse>(&resp_buf) {
+            if let Some((_, tx)) = pending.remove(&wire.unique) {
+                let _ = tx.send(wire.response);
+            }
+        }
+    }
+}
+
+/// Fail all pending requests on disconnect.
+fn fail_all_pending(pending: &DashMap<u64, Sender<VolumeResponse>>) {
+    // Collect keys first to avoid holding shard locks during send
+    let keys: Vec<u64> = pending.iter().map(|r| *r.key()).collect();
+    for key in keys {
+        if let Some((_, tx)) = pending.remove(&key) {
+            let _ = tx.send(VolumeResponse::error(libc::EIO));
+        }
     }
 }
 
@@ -205,25 +195,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_pending_slot() {
-        let pending = ReaderPending::new();
-
-        // Spawn thread to complete the request
-        let pending_clone = Arc::new(pending);
-        let pending_ref = Arc::clone(&pending_clone);
-
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            pending_ref.complete(42, VolumeResponse::Ok);
-        });
-
-        // This would block forever without the complete() call
-        // In a real test we'd need proper timeout handling
-    }
-
-    #[test]
     fn test_disconnect_wakes_pending_request() {
-        use std::io::Read;
         use std::sync::mpsc;
         use std::time::Duration;
 
