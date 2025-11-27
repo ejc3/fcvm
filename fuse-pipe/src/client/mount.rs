@@ -1,9 +1,14 @@
-//! FUSE mount helpers.
+//! Multi-reader FUSE mount helpers.
+//!
+//! Uses FUSE_DEV_IOC_CLONE to create multiple reader threads that share
+//! a single FUSE mount, enabling parallel request processing.
 
 use super::{FuseClient, Multiplexer};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 /// Mount a FUSE filesystem using a Unix socket connection.
@@ -28,23 +33,17 @@ pub fn mount<P: AsRef<Path>>(socket_path: &str, mount_point: P) -> anyhow::Resul
     mount_with_readers(socket_path, mount_point, 1)
 }
 
-/// Mount a FUSE filesystem with socket multiplexing support.
+/// Mount a FUSE filesystem with multiple reader threads.
 ///
-/// This creates a multiplexer for the socket connection, allowing multiple
-/// concurrent requests. Currently uses a single FUSE reader thread since
-/// the standard fuser crate doesn't support multi-reader sessions.
+/// This creates multiple FUSE reader threads using FUSE_DEV_IOC_CLONE,
+/// allowing parallel processing of FUSE requests. Each reader thread
+/// shares a single socket connection via the multiplexer.
 ///
 /// # Arguments
 ///
 /// * `socket_path` - Path to the Unix socket where the server is listening
 /// * `mount_point` - Directory where the FUSE filesystem will be mounted
-/// * `num_readers` - Number of reader slots in the multiplexer (protocol-level)
-///
-/// # Note
-///
-/// The `num_readers` parameter configures the protocol-level multiplexer
-/// but the FUSE session itself uses a single reader thread due to fuser
-/// crate limitations. True multi-reader support requires a modified fuser.
+/// * `num_readers` - Number of FUSE reader threads (1-8 recommended)
 ///
 /// # Example
 ///
@@ -77,25 +76,88 @@ pub fn mount_with_readers<P: AsRef<Path>>(
         num_readers
     );
 
-    // Create FUSE client using reader 0
-    let fs = FuseClient::new(Arc::clone(&mux), 0);
-
     let options = vec![
         fuser::MountOption::FSName("fuse-pipe".to_string()),
         fuser::MountOption::AutoUnmount,
         fuser::MountOption::AllowOther,
     ];
 
-    // Create and run FUSE session
+    // For single reader, just run directly
+    if num_readers == 1 {
+        let fs = FuseClient::new(Arc::clone(&mux), 0);
+        let mut session = fuser::Session::new(fs, mount_point.as_ref(), &options)?;
+        eprintln!("[client] mounted at {:?}", mount_point.as_ref());
+        if let Err(e) = session.run() {
+            eprintln!("[client] reader 0 error: {}", e);
+        }
+        eprintln!("[client] FUSE session exited");
+        return Ok(());
+    }
+
+    // Multi-reader setup:
+    // 1. Create shared storage for cloned fds (filled after Session::new)
+    // 2. Create callback that reads from shared storage
+    // 3. Create FuseClient with callback
+    // 4. Create Session (this mounts)
+    // 5. Clone fds and store them
+    // 6. Run session (init() fires, callback spawns readers)
+
+    let cloned_fds: Arc<Mutex<Vec<(usize, OwnedFd)>>> = Arc::new(Mutex::new(Vec::new()));
+    let cloned_fds_for_callback = Arc::clone(&cloned_fds);
+    let mux_for_callback = Arc::clone(&mux);
+
+    let init_callback = Box::new(move || {
+        let fds = cloned_fds_for_callback.lock().unwrap();
+        // Need to take ownership - use std::mem::take via drain
+        drop(fds); // Release lock first
+
+        let mut fds = cloned_fds_for_callback.lock().unwrap();
+        let fds_vec: Vec<_> = std::mem::take(&mut *fds);
+        drop(fds);
+
+        for (reader_id, cloned_fd) in fds_vec {
+            eprintln!("[client] reader {} starting", reader_id);
+            let fs = FuseClient::new(Arc::clone(&mux_for_callback), reader_id as u32);
+            let mut reader_session =
+                fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::All);
+
+            thread::spawn(move || {
+                if let Err(e) = reader_session.run() {
+                    eprintln!("[client] reader {} error: {}", reader_id, e);
+                }
+            });
+        }
+    });
+
+    // Create primary FuseClient with callback
+    let fs = FuseClient::with_init_callback(Arc::clone(&mux), 0, init_callback);
     let mut session = fuser::Session::new(fs, mount_point.as_ref(), &options)?;
     eprintln!("[client] mounted at {:?}", mount_point.as_ref());
 
-    eprintln!("[client] FUSE session starting");
-    if let Err(e) = session.run() {
-        eprintln!("[client] FUSE session error: {}", e);
-        return Err(e.into());
+    // Clone fds AFTER session created but BEFORE run()
+    for reader_id in 1..num_readers {
+        eprintln!("[client] cloning fd for reader {}...", reader_id);
+        match session.channel().clone_fd() {
+            Ok(fd) => {
+                eprintln!("[client] cloned fd for reader {}: {:?}", reader_id, fd);
+                cloned_fds.lock().unwrap().push((reader_id, fd));
+            }
+            Err(e) => {
+                eprintln!("[client] failed to clone fd for reader {}: {}", reader_id, e);
+            }
+        }
     }
-    eprintln!("[client] FUSE session exited");
 
+    eprintln!(
+        "[client] FUSE session starting with {} readers",
+        num_readers
+    );
+
+    eprintln!("[client] reader 0 starting (will spawn others after INIT)");
+    if let Err(e) = session.run() {
+        eprintln!("[client] reader 0 error: {}", e);
+    }
+
+    eprintln!("[client] FUSE session exited");
     Ok(())
 }

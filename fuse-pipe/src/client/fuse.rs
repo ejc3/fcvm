@@ -10,16 +10,37 @@ use std::ffi::OsStr;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
+/// Callback to spawn additional readers after INIT completes.
+pub type InitCallback = Box<dyn FnOnce() + Send>;
+
 /// FUSE client that uses a shared multiplexer.
 pub struct FuseClient {
     mux: Arc<Multiplexer>,
     reader_id: u32,
+    /// Optional callback to run when init() completes (spawns additional readers)
+    init_callback: Option<InitCallback>,
 }
 
 impl FuseClient {
     /// Create a new client for a specific reader using shared multiplexer.
     pub fn new(mux: Arc<Multiplexer>, reader_id: u32) -> Self {
-        Self { mux, reader_id }
+        Self {
+            mux,
+            reader_id,
+            init_callback: None,
+        }
+    }
+
+    /// Create a new client with a callback to run after INIT completes.
+    ///
+    /// The callback should spawn additional reader threads. This is only
+    /// used for the primary reader (reader 0).
+    pub fn with_init_callback(mux: Arc<Multiplexer>, reader_id: u32, callback: InitCallback) -> Self {
+        Self {
+            mux,
+            reader_id,
+            init_callback: Some(callback),
+        }
     }
 
     /// Send request and wait for response.
@@ -87,6 +108,20 @@ fn protocol_file_type_to_fuser(ft: u8) -> FileType {
 }
 
 impl Filesystem for FuseClient {
+    fn init(
+        &mut self,
+        _req: &Request<'_>,
+        _config: &mut fuser::KernelConfig,
+    ) -> Result<(), libc::c_int> {
+        eprintln!("[client] reader {} INIT complete", self.reader_id);
+        // Spawn additional readers now that INIT is done
+        if let Some(callback) = self.init_callback.take() {
+            eprintln!("[client] spawning additional readers");
+            callback();
+        }
+        Ok(())
+    }
+
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let response = self.send_request_sync(VolumeRequest::Lookup {
             parent,
@@ -110,7 +145,7 @@ impl Filesystem for FuseClient {
         }
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         let response = self.send_request_sync(VolumeRequest::Getattr { ino });
 
         match response {
