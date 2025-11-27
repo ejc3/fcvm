@@ -1,0 +1,56 @@
+[package]
+name = "fuse-pipe"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance FUSE-over-pipe/vsock implementation with async pipelining"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ejc3/fuse-pipe"
+keywords = ["fuse", "filesystem", "vsock", "async", "pipelining"]
+categories = ["filesystem", "asynchronous"]
+
+[features]
+default = ["fuse-client"]
+fuse-client = ["dep:fuser"]
+concurrent = ["dep:dashmap"]
+metrics = ["dep:metrics"]
+
+[dependencies]
+# Core
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+libc = "0.2"
+anyhow = "1"
+thiserror = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-util", "net"] }
+
+# Optional: FUSE client
+fuser = { version = "0.14", optional = true }
+
+# Optional: Concurrent data structures
+dashmap = { version = "5.5", optional = true }
+
+# Optional: Metrics
+metrics = { version = "0.23", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+tempfile = "3"
+criterion = "0.5"
+
+[[bench]]
+name = "protocol"
+harness = false
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[[example]]
+name = "simple_server"
+required-features = []
+
+[[example]]
+name = "simple_client"
+required-features = ["fuse-client"]
