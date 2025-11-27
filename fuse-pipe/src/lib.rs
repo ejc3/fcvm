@@ -30,6 +30,9 @@ pub mod protocol;
 pub mod server;
 pub mod transport;
 
+#[cfg(feature = "fuse-client")]
+pub mod client;
+
 // Re-export protocol types at crate root for convenience
 pub use protocol::{
     file_type, read_message, read_message_async, write_message, write_message_async, DirEntry,
@@ -44,6 +47,10 @@ pub use transport::{
 
 // Re-export server types
 pub use server::{AsyncServer, FilesystemHandler, PassthroughFs, ServerConfig};
+
+// Re-export client types
+#[cfg(feature = "fuse-client")]
+pub use client::{mount, mount_with_readers, FuseClient, Multiplexer};
 
 /// Prelude for common imports.
 pub mod prelude {
