@@ -35,7 +35,11 @@ impl FuseClient {
     ///
     /// The callback should spawn additional reader threads. This is only
     /// used for the primary reader (reader 0).
-    pub fn with_init_callback(mux: Arc<Multiplexer>, reader_id: u32, callback: InitCallback) -> Self {
+    pub fn with_init_callback(
+        mux: Arc<Multiplexer>,
+        reader_id: u32,
+        callback: InitCallback,
+    ) -> Self {
         Self {
             mux,
             reader_id,

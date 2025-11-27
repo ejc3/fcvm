@@ -89,12 +89,16 @@ pub trait FilesystemHandler: Send + Sync {
 
     /// Look up a directory entry by name.
     fn lookup(&self, _parent: u64, _name: &str) -> VolumeResponse {
-        VolumeResponse::Error { errno: libc::ENOSYS }
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
     }
 
     /// Get file attributes.
     fn getattr(&self, _ino: u64) -> VolumeResponse {
-        VolumeResponse::Error { errno: libc::ENOSYS }
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
     }
 
     /// Set file attributes.
@@ -111,42 +115,58 @@ pub trait FilesystemHandler: Send + Sync {
         _mtime_secs: Option<i64>,
         _mtime_nsecs: Option<u32>,
     ) -> VolumeResponse {
-        VolumeResponse::Error { errno: libc::ENOSYS }
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
     }
 
     /// Read directory contents.
     fn readdir(&self, _ino: u64, _offset: u64) -> VolumeResponse {
-        VolumeResponse::Error { errno: libc::ENOSYS }
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
     }
 
     /// Create a directory.
     fn mkdir(&self, _parent: u64, _name: &str, _mode: u32) -> VolumeResponse {
-        VolumeResponse::Error { errno: libc::ENOSYS }
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
     }
 
     /// Remove a directory.
     fn rmdir(&self, _parent: u64, _name: &str) -> VolumeResponse {
-        VolumeResponse::Error { errno: libc::ENOSYS }
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
     }
 
     /// Create and open a file.
     fn create(&self, _parent: u64, _name: &str, _mode: u32, _flags: u32) -> VolumeResponse {
-        VolumeResponse::Error { errno: libc::ENOSYS }
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
     }
 
     /// Open a file.
     fn open(&self, _ino: u64, _flags: u32) -> VolumeResponse {
-        VolumeResponse::Error { errno: libc::ENOSYS }
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
     }
 
     /// Read data from an open file.
     fn read(&self, _ino: u64, _fh: u64, _offset: u64, _size: u32) -> VolumeResponse {
-        VolumeResponse::Error { errno: libc::ENOSYS }
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
     }
 
     /// Write data to an open file.
     fn write(&self, _ino: u64, _fh: u64, _offset: u64, _data: &[u8]) -> VolumeResponse {
-        VolumeResponse::Error { errno: libc::ENOSYS }
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
     }
 
     /// Release an open file.
@@ -166,33 +186,37 @@ pub trait FilesystemHandler: Send + Sync {
 
     /// Remove a file.
     fn unlink(&self, _parent: u64, _name: &str) -> VolumeResponse {
-        VolumeResponse::Error { errno: libc::ENOSYS }
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
     }
 
     /// Rename a file or directory.
-    fn rename(
-        &self,
-        _parent: u64,
-        _name: &str,
-        _newparent: u64,
-        _newname: &str,
-    ) -> VolumeResponse {
-        VolumeResponse::Error { errno: libc::ENOSYS }
+    fn rename(&self, _parent: u64, _name: &str, _newparent: u64, _newname: &str) -> VolumeResponse {
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
     }
 
     /// Create a symbolic link.
     fn symlink(&self, _parent: u64, _name: &str, _target: &str) -> VolumeResponse {
-        VolumeResponse::Error { errno: libc::ENOSYS }
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
     }
 
     /// Read the target of a symbolic link.
     fn readlink(&self, _ino: u64) -> VolumeResponse {
-        VolumeResponse::Error { errno: libc::ENOSYS }
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
     }
 
     /// Create a hard link.
     fn link(&self, _ino: u64, _newparent: u64, _newname: &str) -> VolumeResponse {
-        VolumeResponse::Error { errno: libc::ENOSYS }
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
     }
 
     /// Check file access permissions.
@@ -228,10 +252,7 @@ mod tests {
         let handler = NoopHandler;
 
         // Most operations should return ENOSYS
-        assert_eq!(
-            handler.lookup(1, "test").errno(),
-            Some(libc::ENOSYS)
-        );
+        assert_eq!(handler.lookup(1, "test").errno(), Some(libc::ENOSYS));
         assert_eq!(handler.getattr(1).errno(), Some(libc::ENOSYS));
 
         // Some have permissive defaults

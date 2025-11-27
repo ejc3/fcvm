@@ -58,8 +58,8 @@ impl WireRequest {
 
     /// Serialize to bytes with length prefix.
     pub fn encode(&self) -> io::Result<Vec<u8>> {
-        let payload = bincode::serialize(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let payload =
+            bincode::serialize(self).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         if payload.len() > MAX_MESSAGE_SIZE {
             return Err(io::Error::new(
@@ -111,8 +111,8 @@ pub struct Span {
     pub server_fs_done: u64,   // After fs operation completed
     pub server_resp_chan: u64, // After received from response channel (just before serializing response)
     // Client side (set after response received)
-    pub client_recv: u64,      // When client received from socket
-    pub client_done: u64,      // When response delivered to caller
+    pub client_recv: u64, // When client received from socket
+    pub client_done: u64, // When response delivered to caller
 }
 
 impl Span {
@@ -143,7 +143,11 @@ impl Span {
     /// Print the span as a breakdown (all times in µs)
     pub fn print(&self, unique: u64) {
         let delta = |a: u64, b: u64| -> i64 {
-            if a == 0 || b == 0 { -1 } else { ((b - a) / 1000) as i64 }
+            if a == 0 || b == 0 {
+                -1
+            } else {
+                ((b - a) / 1000) as i64
+            }
         };
         let total = delta(self.t0, self.client_done);
 
@@ -204,8 +208,8 @@ impl WireResponse {
 
     /// Serialize to bytes with length prefix.
     pub fn encode(&self) -> io::Result<Vec<u8>> {
-        let payload = bincode::serialize(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let payload =
+            bincode::serialize(self).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         if payload.len() > MAX_MESSAGE_SIZE {
             return Err(io::Error::new(

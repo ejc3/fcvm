@@ -65,11 +65,7 @@ fn bench_request_response_latency(c: &mut Criterion) {
 
     let mut stream = UnixStream::connect(socket_path).unwrap();
 
-    let req = WireRequest::new(
-        1,
-        0,
-        VolumeRequest::Getattr { ino: 1 },
-    );
+    let req = WireRequest::new(1, 0, VolumeRequest::Getattr { ino: 1 });
 
     c.bench_function("request_response_latency", |b| {
         b.iter(|| {

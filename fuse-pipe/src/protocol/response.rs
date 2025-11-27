@@ -69,12 +69,16 @@ impl VolumeResponse {
 
     /// Create a not-found error.
     pub fn not_found() -> Self {
-        VolumeResponse::Error { errno: libc::ENOENT }
+        VolumeResponse::Error {
+            errno: libc::ENOENT,
+        }
     }
 
     /// Create a permission denied error.
     pub fn permission_denied() -> Self {
-        VolumeResponse::Error { errno: libc::EACCES }
+        VolumeResponse::Error {
+            errno: libc::EACCES,
+        }
     }
 
     /// Create an I/O error.

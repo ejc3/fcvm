@@ -106,7 +106,10 @@ mod tests {
         let config = ServerConfig::default();
         assert_eq!(config.response_channel_size, 4096);
         assert_eq!(config.write_batch_size, 64);
-        assert_eq!(config.write_batch_timeout, Duration::from_micros(DEFAULT_BATCH_TIMEOUT_US));
+        assert_eq!(
+            config.write_batch_timeout,
+            Duration::from_micros(DEFAULT_BATCH_TIMEOUT_US)
+        );
     }
 
     #[test]

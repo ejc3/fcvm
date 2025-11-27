@@ -38,6 +38,10 @@ struct FuseFixture {
 
 impl FuseFixture {
     async fn new() -> Self {
+        Self::new_with_readers(1).await
+    }
+
+    async fn new_with_readers(readers: usize) -> Self {
         let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         let pid = std::process::id();
         let socket = format!("/tmp/fuse-integ-{}-{}.sock", pid, id);
@@ -51,7 +55,13 @@ impl FuseFixture {
         let stress_exe = find_stress_binary();
 
         let server = Command::new(&stress_exe)
-            .args(["server", "--socket", &socket, "--root", data_dir.to_str().unwrap()])
+            .args([
+                "server",
+                "--socket",
+                &socket,
+                "--root",
+                data_dir.to_str().unwrap(),
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -60,7 +70,15 @@ impl FuseFixture {
         sleep(Duration::from_millis(500)).await;
 
         let client = Command::new(&stress_exe)
-            .args(["client", "--socket", &socket, "--mount", mount_dir.to_str().unwrap()])
+            .args([
+                "client",
+                "--socket",
+                &socket,
+                "--mount",
+                mount_dir.to_str().unwrap(),
+                "--readers",
+                &readers.to_string(),
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -68,7 +86,13 @@ impl FuseFixture {
 
         sleep(Duration::from_millis(500)).await;
 
-        Self { server, client, data_dir, mount_dir, socket }
+        Self {
+            server,
+            client,
+            data_dir,
+            mount_dir,
+            socket,
+        }
     }
 
     fn mount(&self) -> &PathBuf {
@@ -166,6 +190,109 @@ async fn test_file_metadata() {
     assert_eq!(meta.len(), content.len() as u64);
 
     std::fs::remove_file(&test_file).expect("remove file");
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_rename_across_directories() {
+    let fixture = FuseFixture::new().await;
+    let mount = fixture.mount();
+
+    let dir1 = mount.join("dir1");
+    let dir2 = mount.join("dir2");
+    std::fs::create_dir(&dir1).expect("create dir1");
+    std::fs::create_dir(&dir2).expect("create dir2");
+
+    let file1 = dir1.join("file.txt");
+    let file2 = dir2.join("renamed.txt");
+    std::fs::write(&file1, "rename me").expect("write file");
+
+    std::fs::rename(&file1, &file2).expect("rename across dirs");
+
+    assert!(!file1.exists(), "old path should not exist");
+    let contents = std::fs::read_to_string(&file2).expect("read renamed");
+    assert_eq!(contents, "rename me");
+
+    std::fs::remove_file(&file2).expect("cleanup file");
+    std::fs::remove_dir(&dir1).expect("cleanup dir1");
+    std::fs::remove_dir(&dir2).expect("cleanup dir2");
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_symlink_and_readlink() {
+    let fixture = FuseFixture::new().await;
+    let mount = fixture.mount();
+
+    let target = mount.join("target.txt");
+    let link = mount.join("link.txt");
+
+    std::fs::write(&target, "hello").expect("write target");
+    std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+    let link_contents = std::fs::read_to_string(&link).expect("read via link");
+    assert_eq!(link_contents, "hello");
+
+    let link_target = std::fs::read_link(&link).expect("readlink");
+    assert_eq!(link_target, target);
+
+    std::fs::remove_file(&link).expect("remove link");
+    std::fs::remove_file(&target).expect("remove target");
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_hardlink_survives_source_removal() {
+    let fixture = FuseFixture::new().await;
+    let mount = fixture.mount();
+
+    let source = mount.join("source.txt");
+    let link = mount.join("link.txt");
+    std::fs::write(&source, "hardlink").expect("write source");
+    std::fs::hard_link(&source, &link).expect("create hardlink");
+
+    std::fs::remove_file(&source).expect("remove source");
+
+    let content = std::fs::read_to_string(&link).expect("read hardlink");
+    assert_eq!(content, "hardlink");
+
+    std::fs::remove_file(&link).expect("cleanup");
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_multi_reader_mount_basic_io() {
+    let fixture = FuseFixture::new_with_readers(3).await;
+    let mount = fixture.mount();
+
+    let files: Vec<_> = (0..6)
+        .map(|i| mount.join(format!("multi-{i}.txt")))
+        .collect();
+
+    let handles: Vec<_> = files
+        .iter()
+        .enumerate()
+        .map(|(i, path)| {
+            let data = format!("payload-{i}");
+            let p = path.clone();
+            tokio::spawn(async move {
+                std::fs::write(&p, data.as_bytes()).expect("write");
+                let read_back = std::fs::read_to_string(&p).expect("read");
+                assert!(read_back.starts_with("payload-"));
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    for path in files {
+        std::fs::remove_file(path).ok();
+    }
 
     fixture.cleanup().await;
 }

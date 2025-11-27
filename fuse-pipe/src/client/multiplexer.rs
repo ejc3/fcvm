@@ -3,7 +3,9 @@
 //! Uses crossbeam channels for lock-free request submission and DashMap
 //! for lock-free response routing, eliminating mutex contention.
 
-use crate::protocol::{Span, VolumeRequest, VolumeResponse, WireRequest, WireResponse, MAX_MESSAGE_SIZE};
+use crate::protocol::{
+    Span, VolumeRequest, VolumeResponse, WireRequest, WireResponse, MAX_MESSAGE_SIZE,
+};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use dashmap::DashMap;
 use std::io::{Read, Write};
@@ -176,10 +178,7 @@ fn writer_loop(
 }
 
 /// Reader thread: reads responses from socket, routes to waiting readers.
-fn reader_loop(
-    mut socket: UnixStream,
-    pending: Arc<DashMap<u64, Sender<ResponsePayload>>>,
-) {
+fn reader_loop(mut socket: UnixStream, pending: Arc<DashMap<u64, Sender<ResponsePayload>>>) {
     let mut len_buf = [0u8; 4];
 
     loop {
@@ -264,5 +263,64 @@ mod tests {
             result.is_ok(),
             "pending request was not completed after disconnect"
         );
+    }
+
+    #[test]
+    fn test_routing_multiple_readers_out_of_order() {
+        use crate::protocol::{VolumeRequest, VolumeResponse, WireRequest, WireResponse};
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let mux = Multiplexer::new(client, 2);
+        let mux0 = Arc::clone(&mux);
+        let mux1 = Arc::clone(&mux);
+
+        let (tx0, rx0) = mpsc::channel();
+        let (tx1, rx1) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let resp = mux0.send_request(0, VolumeRequest::Getattr { ino: 10 });
+            let _ = tx0.send(resp);
+        });
+
+        std::thread::spawn(move || {
+            let resp = mux1.send_request(
+                1,
+                VolumeRequest::Lookup {
+                    parent: 1,
+                    name: "file".into(),
+                },
+            );
+            let _ = tx1.send(resp);
+        });
+
+        // Collect the two requests from the wire
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let mut len_buf = [0u8; 4];
+            server.read_exact(&mut len_buf).unwrap();
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut buf = vec![0u8; len];
+            server.read_exact(&mut buf).unwrap();
+            let wire: WireRequest = bincode::deserialize(&buf).unwrap();
+            requests.push((wire.unique, wire.reader_id));
+        }
+
+        // Respond out of order to ensure correct routing
+        for (unique, reader_id) in requests.iter().rev() {
+            let wire_resp = WireResponse::new(*unique, *reader_id, VolumeResponse::Ok);
+            let body = bincode::serialize(&wire_resp).unwrap();
+            let len = (body.len() as u32).to_be_bytes();
+            server.write_all(&len).unwrap();
+            server.write_all(&body).unwrap();
+        }
+
+        let r0 = rx0.recv_timeout(Duration::from_millis(500)).unwrap();
+        let r1 = rx1.recv_timeout(Duration::from_millis(500)).unwrap();
+
+        assert!(r0.is_ok());
+        assert!(r1.is_ok());
     }
 }

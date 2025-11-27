@@ -10,7 +10,9 @@
 //! - Response batching for reduced syscall overhead
 
 use super::{FilesystemHandler, ServerConfig};
-use crate::protocol::{now_nanos, Span, VolumeResponse, WireRequest, WireResponse, MAX_MESSAGE_SIZE};
+use crate::protocol::{
+    now_nanos, Span, VolumeResponse, WireRequest, WireResponse, MAX_MESSAGE_SIZE,
+};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::UnixListener;
@@ -232,7 +234,12 @@ async fn response_writer(
             }
         };
 
-        let PendingResponse { unique, reader_id, response, mut span } = item;
+        let PendingResponse {
+            unique,
+            reader_id,
+            response,
+            mut span,
+        } = item;
 
         // Mark channel receive time (last mark before we serialize the response)
         if let Some(ref mut s) = span {
