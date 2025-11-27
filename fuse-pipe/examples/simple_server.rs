@@ -1,11 +1,45 @@
-//! Simple server example.
+//! Simple passthrough server example.
 //!
-//! This example will be implemented after the server module.
+//! This example demonstrates how to create a FUSE passthrough server
+//! that serves a local directory over a Unix socket.
+//!
+//! # Usage
+//!
+//! ```bash
+//! # Start the server (serves /tmp as the filesystem)
+//! cargo run --example simple_server -- /tmp /tmp/fuse.sock
+//!
+//! # In another terminal, mount with the client
+//! cargo run --example simple_client -- /tmp/fuse.sock /mnt/fuse
+//! ```
 
-fn main() {
-    println!("Server example - coming soon!");
-    println!("Once implemented, this will:");
-    println!("  1. Create a PassthroughFs for a local directory");
-    println!("  2. Start an AsyncServer on a Unix socket");
-    println!("  3. Handle FUSE requests from connected clients");
+use fuse_pipe::{AsyncServer, PassthroughFs, ServerConfig};
+use std::env;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = env::args().collect();
+
+    if args.len() != 3 {
+        eprintln!("Usage: {} <directory> <socket_path>", args[0]);
+        eprintln!();
+        eprintln!("Example:");
+        eprintln!("  {} /tmp /tmp/fuse.sock", args[0]);
+        std::process::exit(1);
+    }
+
+    let directory = &args[1];
+    let socket_path = &args[2];
+
+    eprintln!("Creating passthrough filesystem for: {}", directory);
+    let fs = PassthroughFs::new(directory);
+
+    eprintln!("Starting server on: {}", socket_path);
+    eprintln!("Press Ctrl+C to stop");
+
+    // Use high-throughput config for better performance
+    let config = ServerConfig::high_throughput();
+    let server = AsyncServer::with_config(fs, config);
+
+    server.serve_unix(socket_path).await
 }
