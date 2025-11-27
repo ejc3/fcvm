@@ -1,0 +1,22 @@
+[package]
+name = "fuse-test"
+version = "0.1.0"
+edition = "2021"
+description = "Stress test harness for fuse-pipe"
+
+[dependencies]
+# Use the fuse-pipe crate we just built
+fuse-pipe = { path = "../fuse-pipe" }
+
+# CLI and utilities
+clap = { version = "4.0", features = ["derive"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Metrics
+metrics = "0.23"
+metrics-util = "0.17"
