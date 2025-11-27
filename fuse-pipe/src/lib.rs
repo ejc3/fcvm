@@ -27,6 +27,7 @@
 //! - `metrics`: Enable metrics collection via the `metrics` crate
 
 pub mod protocol;
+pub mod transport;
 
 // Re-export protocol types at crate root for convenience
 pub use protocol::{
@@ -34,9 +35,16 @@ pub use protocol::{
     FileAttr, VolumeRequest, VolumeResponse, WireRequest, WireResponse, MAX_MESSAGE_SIZE,
 };
 
+// Re-export transport types
+pub use transport::{
+    Transport, TransportError, UnixListener, UnixTransport, VsockListener, VsockTransport,
+    HOST_CID, LOCAL_CID,
+};
+
 /// Prelude for common imports.
 pub mod prelude {
     pub use crate::protocol::{
         DirEntry, FileAttr, VolumeRequest, VolumeResponse, WireRequest, WireResponse,
     };
+    pub use crate::transport::{UnixTransport, VsockTransport, HOST_CID};
 }
