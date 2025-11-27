@@ -11,7 +11,7 @@ mod metrics;
 mod worker;
 
 use clap::{Parser, Subcommand};
-use fuse_pipe::{AsyncServer, PassthroughFs, ServerConfig, mount_with_options};
+use fuse_pipe::{mount_with_options, AsyncServer, PassthroughFs, ServerConfig};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -102,31 +102,54 @@ fn main() -> anyhow::Result<()> {
                 .block_on(server.serve_unix(&socket))?;
         }
 
-        Some(Commands::Client { socket, mount, readers, trace_rate }) => {
+        Some(Commands::Client {
+            socket,
+            mount,
+            readers,
+            trace_rate,
+        }) => {
             std::fs::create_dir_all(&mount)?;
             eprintln!(
                 "[client] mounting at {} via {} (readers: {}, trace_rate: {})",
-                mount.display(), socket, readers, trace_rate
+                mount.display(),
+                socket,
+                readers,
+                trace_rate
             );
 
             mount_with_options(&socket, &mount, readers, trace_rate)?;
             eprintln!("[client] unmounted");
         }
 
-        Some(Commands::StressWorker { id, ops, mount, results }) => {
+        Some(Commands::StressWorker {
+            id,
+            ops,
+            mount,
+            results,
+        }) => {
             worker::run_stress_worker(id, ops, &mount, &results)?;
         }
 
         None => {
             // Run the stress test
-            harness::run_stress_test(
+            if let Err(e) = harness::run_stress_test(
                 cli.workers,
                 cli.ops,
                 &cli.data,
                 &cli.mount,
                 cli.readers,
                 cli.trace_rate,
-            )?;
+            ) {
+                if let Some(ioe) = e.downcast_ref::<std::io::Error>() {
+                    if ioe.kind() == std::io::ErrorKind::PermissionDenied {
+                        println!(
+                            "[stress] skipping due to permission denied (need FUSE mount privileges)"
+                        );
+                        return Ok(());
+                    }
+                }
+                return Err(e);
+            }
         }
     }
 

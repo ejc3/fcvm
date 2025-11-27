@@ -31,7 +31,11 @@ pub enum VolumeRequest {
     Readdir { ino: u64, offset: u64 },
 
     /// Create a directory.
-    Mkdir { parent: u64, name: String, mode: u32 },
+    Mkdir {
+        parent: u64,
+        name: String,
+        mode: u32,
+    },
 
     /// Remove a directory.
     Rmdir { parent: u64, name: String },

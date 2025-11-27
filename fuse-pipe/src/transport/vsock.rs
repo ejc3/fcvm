@@ -240,7 +240,8 @@ impl VsockListener {
             return Err(io::Error::last_os_error());
         }
 
-        let transport = unsafe { VsockTransport::from_raw_fd(client_fd, addr.svm_cid, addr.svm_port) };
+        let transport =
+            unsafe { VsockTransport::from_raw_fd(client_fd, addr.svm_cid, addr.svm_port) };
 
         Ok((transport, addr.svm_cid))
     }

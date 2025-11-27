@@ -98,7 +98,36 @@ impl InodeTable {
 
     fn remove_entry(&self, parent: u64, name: &OsStr) {
         if let Some((_, ino)) = self.name_to_ino.remove(&(parent, name.to_os_string())) {
-            self.ino_to_entry.remove(&ino);
+            // If this was the canonical entry, try to pick another alias for the inode.
+            let remove_canonical = self
+                .ino_to_entry
+                .get(&ino)
+                .map(|e| e.parent == parent && e.name == name)
+                .unwrap_or(false);
+
+            if remove_canonical {
+                // Find any other (parent, name) mapped to this inode.
+                let alt = self.name_to_ino.iter().find_map(|entry| {
+                    if *entry.value() == ino {
+                        let (p, n) = entry.key();
+                        Some((*p, n.clone()))
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some((alt_parent, alt_name)) = alt {
+                    self.ino_to_entry.insert(
+                        ino,
+                        InodeEntry {
+                            parent: alt_parent,
+                            name: alt_name,
+                        },
+                    );
+                } else {
+                    self.ino_to_entry.remove(&ino);
+                }
+            }
         }
     }
 
@@ -111,7 +140,8 @@ impl InodeTable {
     ) -> Option<u64> {
         let key = (parent, name.to_os_string());
         let (_, ino) = self.name_to_ino.remove(&key)?;
-        self.name_to_ino.insert((newparent, newname.to_os_string()), ino);
+        self.name_to_ino
+            .insert((newparent, newname.to_os_string()), ino);
 
         if let Some(mut entry) = self.ino_to_entry.get_mut(&ino) {
             entry.parent = newparent;

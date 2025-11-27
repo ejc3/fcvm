@@ -1,7 +1,7 @@
 //! Stress test orchestration for multi-reader FUSE testing.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -41,23 +41,41 @@ pub fn run_stress_test(
     num_readers: usize,
     trace_rate: u64,
 ) -> anyhow::Result<()> {
-    cleanup_stale_state(mount_dir);
+    let pid = std::process::id();
+
+    let socket = match prepare_socket("/tmp/fuse-stress.sock", pid) {
+        Ok(s) => s,
+        Err(e) => return Err(anyhow::anyhow!("failed to prepare socket path: {}", e)),
+    };
+
+    let data_dir = prepare_dir(data_dir, "fuse-stress-data", pid)?;
+    let mount_dir = prepare_dir(mount_dir, "fuse-stress-mount", pid)?;
+
+    cleanup_stale_state(&mount_dir, &socket)?;
 
     println!("╔═══════════════════════════════════════════════════════════════╗");
     println!("║              FUSE Multi-Reader Stress Test                    ║");
     println!("╠═══════════════════════════════════════════════════════════════╣");
-    println!("║  Workers:      {:>6}                                         ║", workers);
-    println!("║  Ops/worker:   {:>6}                                         ║", ops_per_worker);
-    println!("║  Total ops:    {:>6}                                         ║", workers * ops_per_worker);
-    println!("║  FUSE readers: {:>6}                                         ║", num_readers);
+    println!(
+        "║  Workers:      {:>6}                                         ║",
+        workers
+    );
+    println!(
+        "║  Ops/worker:   {:>6}                                         ║",
+        ops_per_worker
+    );
+    println!(
+        "║  Total ops:    {:>6}                                         ║",
+        workers * ops_per_worker
+    );
+    println!(
+        "║  FUSE readers: {:>6}                                         ║",
+        num_readers
+    );
     println!("╚═══════════════════════════════════════════════════════════════╝");
     println!();
 
-    fs::remove_dir_all(data_dir).ok();
-    fs::create_dir_all(data_dir)?;
-    fs::create_dir_all(mount_dir)?;
-
-    setup_test_files(data_dir, workers)?;
+    setup_test_files(&data_dir, workers)?;
 
     let exe = std::env::current_exe()?;
 
@@ -66,10 +84,10 @@ pub fn run_stress_test(
     println!("  PHASE 1: Bare Filesystem (baseline)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    let bare_result = run_workers(&exe, workers, ops_per_worker, data_dir)?;
+    let bare_result = run_workers(&exe, workers, ops_per_worker, &data_dir)?;
     print_results("BARE FILESYSTEM", &bare_result);
 
-    setup_test_files(data_dir, workers)?;
+    setup_test_files(&data_dir, workers)?;
 
     // Phase 2: FUSE
     println!();
@@ -77,12 +95,15 @@ pub fn run_stress_test(
     println!("  PHASE 2: FUSE over Unix Socket ({} readers)", num_readers);
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    let socket = "/tmp/fuse-stress.sock";
-    let _ = fs::remove_file(socket);
-
     println!("[fuse] Starting server...");
     let mut server = Command::new(&exe)
-        .args(["server", "--socket", socket, "--root", data_dir.to_str().unwrap()])
+        .args([
+            "server",
+            "--socket",
+            socket.to_str().unwrap(),
+            "--root",
+            data_dir.to_str().unwrap(),
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()?;
@@ -93,10 +114,14 @@ pub fn run_stress_test(
     let mut client = Command::new(&exe)
         .args([
             "client",
-            "--socket", socket,
-            "--mount", mount_dir.to_str().unwrap(),
-            "--readers", &num_readers.to_string(),
-            "--trace-rate", &trace_rate.to_string(),
+            "--socket",
+            socket.to_str().unwrap(),
+            "--mount",
+            mount_dir.to_str().unwrap(),
+            "--readers",
+            &num_readers.to_string(),
+            "--trace-rate",
+            &trace_rate.to_string(),
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -104,12 +129,12 @@ pub fn run_stress_test(
 
     std::thread::sleep(Duration::from_millis(1000));
 
-    let fuse_result = run_workers(&exe, workers, ops_per_worker, mount_dir)?;
+    let fuse_result = run_workers(&exe, workers, ops_per_worker, &mount_dir)?;
 
     let _ = client.kill();
     std::thread::sleep(Duration::from_millis(500));
     let _ = server.kill();
-    let _ = fs::remove_file(socket);
+    let _ = fs::remove_file(&socket);
 
     print_results(&format!("FUSE ({} readers)", num_readers), &fuse_result);
 
@@ -131,30 +156,60 @@ pub fn run_stress_test(
         0.0
     };
 
-    println!("║  Bare filesystem:  {:>10.1} ops/sec                        ║", bare_result.ops_per_sec);
-    println!("║  FUSE ({} readers): {:>10.1} ops/sec                        ║", num_readers, fuse_result.ops_per_sec);
-    println!("║  FUSE overhead:    {:>10.1}%                                ║", overhead);
-    println!("║  Slowdown factor:  {:>10.2}x                                ║", ratio);
+    println!(
+        "║  Bare filesystem:  {:>10.1} ops/sec                        ║",
+        bare_result.ops_per_sec
+    );
+    println!(
+        "║  FUSE ({} readers): {:>10.1} ops/sec                        ║",
+        num_readers, fuse_result.ops_per_sec
+    );
+    println!(
+        "║  FUSE overhead:    {:>10.1}%                                ║",
+        overhead
+    );
+    println!(
+        "║  Slowdown factor:  {:>10.2}x                                ║",
+        ratio
+    );
     println!("╚═══════════════════════════════════════════════════════════════╝");
 
     if fuse_result.total_errors > fuse_result.total_ops / 2 {
-        anyhow::bail!("FAIL: Too many errors ({}/{})", fuse_result.total_errors, fuse_result.total_ops);
+        anyhow::bail!(
+            "FAIL: Too many errors ({}/{})",
+            fuse_result.total_errors,
+            fuse_result.total_ops
+        );
     }
 
     println!("\n✅ STRESS TEST COMPLETE");
-    println!("   Bare: {} ops at {:.1} ops/sec", bare_result.total_ops, bare_result.ops_per_sec);
-    println!("   FUSE: {} ops at {:.1} ops/sec ({} readers)",
-             fuse_result.total_ops, fuse_result.ops_per_sec, num_readers);
+    println!(
+        "   Bare: {} ops at {:.1} ops/sec",
+        bare_result.total_ops, bare_result.ops_per_sec
+    );
+    println!(
+        "   FUSE: {} ops at {:.1} ops/sec ({} readers)",
+        fuse_result.total_ops, fuse_result.ops_per_sec, num_readers
+    );
 
     Ok(())
 }
 
-fn run_workers(exe: &PathBuf, workers: usize, ops_per_worker: usize, target_dir: &PathBuf) -> anyhow::Result<TestResult> {
+fn run_workers(
+    exe: &PathBuf,
+    workers: usize,
+    ops_per_worker: usize,
+    target_dir: &PathBuf,
+) -> anyhow::Result<TestResult> {
     let results_dir = PathBuf::from("/tmp/fuse-stress-results");
     fs::remove_dir_all(&results_dir).ok();
     fs::create_dir_all(&results_dir)?;
 
-    println!("[test] Spawning {} workers against {}...", workers, target_dir.display());
+    println!(
+        "[test] Spawning {} workers against {}...",
+        workers,
+        target_dir.display()
+    );
     let start = Instant::now();
 
     let mut worker_handles = Vec::new();
@@ -163,10 +218,14 @@ fn run_workers(exe: &PathBuf, workers: usize, ops_per_worker: usize, target_dir:
         let handle = Command::new(exe)
             .args([
                 "stress-worker",
-                "--id", &i.to_string(),
-                "--ops", &ops_per_worker.to_string(),
-                "--mount", target_dir.to_str().unwrap(),
-                "--results", results_file.to_str().unwrap(),
+                "--id",
+                &i.to_string(),
+                "--ops",
+                &ops_per_worker.to_string(),
+                "--mount",
+                target_dir.to_str().unwrap(),
+                "--results",
+                results_file.to_str().unwrap(),
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -221,33 +280,144 @@ fn print_results(label: &str, result: &TestResult) {
     println!("┌─────────────────────────────────────────────────────────────────┐");
     println!("│  {}  ", label);
     println!("├─────────────────────────────────────────────────────────────────┤");
-    println!("│  Total ops:      {:>10}                                    │", result.total_ops);
-    println!("│  Errors:         {:>10}                                    │", result.total_errors);
-    println!("│  Duration:       {:>10.3}s                                  │", result.duration_secs);
-    println!("│  Throughput:     {:>10.1} ops/sec                           │", result.ops_per_sec);
+    println!(
+        "│  Total ops:      {:>10}                                    │",
+        result.total_ops
+    );
+    println!(
+        "│  Errors:         {:>10}                                    │",
+        result.total_errors
+    );
+    println!(
+        "│  Duration:       {:>10.3}s                                  │",
+        result.duration_secs
+    );
+    println!(
+        "│  Throughput:     {:>10.1} ops/sec                           │",
+        result.ops_per_sec
+    );
     println!("├─────────────────────────────────────────────────────────────────┤");
     println!("│  Op breakdown:                                                  │");
-    println!("│    getattr:      {:>10}                                    │", result.breakdown.getattr);
-    println!("│    lookup:       {:>10}                                    │", result.breakdown.lookup);
-    println!("│    read:         {:>10}                                    │", result.breakdown.read);
-    println!("│    readdir:      {:>10}                                    │", result.breakdown.readdir);
-    println!("│    write:        {:>10}                                    │", result.breakdown.write);
-    println!("│    create:       {:>10}                                    │", result.breakdown.create);
+    println!(
+        "│    getattr:      {:>10}                                    │",
+        result.breakdown.getattr
+    );
+    println!(
+        "│    lookup:       {:>10}                                    │",
+        result.breakdown.lookup
+    );
+    println!(
+        "│    read:         {:>10}                                    │",
+        result.breakdown.read
+    );
+    println!(
+        "│    readdir:      {:>10}                                    │",
+        result.breakdown.readdir
+    );
+    println!(
+        "│    write:        {:>10}                                    │",
+        result.breakdown.write
+    );
+    println!(
+        "│    create:       {:>10}                                    │",
+        result.breakdown.create
+    );
     println!("└─────────────────────────────────────────────────────────────────┘");
 }
 
-fn cleanup_stale_state(mount_dir: &PathBuf) {
-    let socket = "/tmp/fuse-stress.sock";
+fn cleanup_stale_state(mount_dir: &PathBuf, socket: &PathBuf) -> anyhow::Result<()> {
+    if let Some(mount) = mount_dir.to_str() {
+        // Try fusermount3 first (user unmount), then fall back to umount -f
+        let fusermount = Command::new("fusermount3")
+            .args(["-u", mount])
+            .output()
+            .ok();
 
-    let _ = Command::new("umount")
-        .args(["-f", mount_dir.to_str().unwrap_or("/tmp/fuse-stress-mount")])
-        .output();
+        let success = fusermount.as_ref().map_or(false, |o| o.status.success());
+
+        if !success {
+            let output = Command::new("umount").args(["-f", mount]).output()?;
+            if !output.status.success() {
+                eprintln!(
+                    "[stress] warning: failed to unmount {} (code {:?})",
+                    mount,
+                    output.status.code()
+                );
+            }
+        }
+    }
 
     let _ = fs::remove_file(socket);
     std::thread::sleep(Duration::from_millis(100));
+    Ok(())
+}
+
+fn prepare_dir(original: &Path, label: &str, pid: u32) -> anyhow::Result<PathBuf> {
+    // Try to reuse the provided path; on permission errors, fall back to a
+    // per-run temp directory.
+    if let Err(e) = fs::remove_dir_all(original) {
+        if e.kind() != std::io::ErrorKind::NotFound
+            && e.kind() != std::io::ErrorKind::PermissionDenied
+        {
+            return Err(e.into());
+        }
+    }
+
+    if let Err(e) = fs::create_dir_all(original) {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            return fallback_dir(original, label, pid);
+        }
+        return Err(e.into());
+    }
+
+    // Probe writability
+    let probe = original.join(".fuse-stress-probe");
+    match fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            Ok(original.to_path_buf())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            fallback_dir(original, label, pid)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn fallback_dir(original: &Path, label: &str, pid: u32) -> anyhow::Result<PathBuf> {
+    let fallback = PathBuf::from(format!("/tmp/{}-{}", label, pid));
+    fs::remove_dir_all(&fallback).ok();
+    fs::create_dir_all(&fallback)?;
+    eprintln!(
+        "[stress] warning: falling back to {} (permission denied on {})",
+        fallback.display(),
+        original.display()
+    );
+    Ok(fallback)
+}
+
+fn prepare_socket(default: &str, pid: u32) -> anyhow::Result<PathBuf> {
+    let path = PathBuf::from(default);
+    match fs::remove_file(&path) {
+        Ok(_) => Ok(path),
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => Ok(path),
+        Err(ref e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            let fallback = PathBuf::from(format!("{}-{}", default, pid));
+            eprintln!(
+                "[stress] warning: falling back to socket {} (permission denied on {})",
+                fallback.display(),
+                path.display()
+            );
+            Ok(fallback)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn setup_test_files(data_dir: &PathBuf, workers: usize) -> anyhow::Result<()> {
+    // Ensure we can write; if not, bubble up so caller can decide.
+    fs::create_dir_all(data_dir)?;
+
     for i in 0..workers {
         let worker_dir = data_dir.join(format!("worker-{}", i));
         fs::remove_dir_all(&worker_dir).ok();

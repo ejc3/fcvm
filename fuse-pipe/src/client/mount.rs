@@ -63,16 +63,18 @@ pub fn mount_with_options<P: AsRef<Path>>(
         num_readers
     );
 
-    let options = vec![
-        fuser::MountOption::FSName("fuse-pipe".to_string()),
-        fuser::MountOption::AutoUnmount,
-        fuser::MountOption::AllowOther,
-    ];
+    // Mount options kept minimal to avoid requiring user_allow_other
+    let options = vec![fuser::MountOption::FSName("fuse-pipe".to_string())];
+
+    let mount_with_options =
+        |opts: &[fuser::MountOption]| -> Result<fuser::Session<FuseClient>, std::io::Error> {
+            let fs = FuseClient::new(Arc::clone(&mux), 0);
+            fuser::Session::new(fs, mount_point.as_ref(), opts)
+        };
 
     // For single reader, just run directly
     if num_readers == 1 {
-        let fs = FuseClient::new(Arc::clone(&mux), 0);
-        let mut session = fuser::Session::new(fs, mount_point.as_ref(), &options)?;
+        let mut session = mount_with_options(&options)?;
         eprintln!("[client] mounted at {:?}", mount_point.as_ref());
         if let Err(e) = session.run() {
             eprintln!("[client] reader 0 error: {}", e);
@@ -90,28 +92,30 @@ pub fn mount_with_options<P: AsRef<Path>>(
     // 6. Run session (init() fires, callback spawns readers)
 
     let cloned_fds: Arc<Mutex<Vec<(usize, OwnedFd)>>> = Arc::new(Mutex::new(Vec::new()));
-    let cloned_fds_for_callback = Arc::clone(&cloned_fds);
-    let mux_for_callback = Arc::clone(&mux);
 
-    let init_callback = Box::new(move || {
-        // Take ownership of all cloned fds
-        let fds_vec: Vec<_> = std::mem::take(&mut *cloned_fds_for_callback.lock().unwrap());
+    let make_init_callback = || {
+        let cloned_fds_for_callback = Arc::clone(&cloned_fds);
+        let mux_for_callback = Arc::clone(&mux);
+        Box::new(move || {
+            // Take ownership of all cloned fds
+            let fds_vec: Vec<_> = std::mem::take(&mut *cloned_fds_for_callback.lock().unwrap());
 
-        for (reader_id, cloned_fd) in fds_vec {
-            let fs = FuseClient::new(Arc::clone(&mux_for_callback), reader_id as u32);
-            let mut reader_session =
-                fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::All);
+            for (reader_id, cloned_fd) in fds_vec {
+                let fs = FuseClient::new(Arc::clone(&mux_for_callback), reader_id as u32);
+                let mut reader_session =
+                    fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::Owner);
 
-            thread::spawn(move || {
-                if let Err(e) = reader_session.run() {
-                    eprintln!("[client] reader {} error: {}", reader_id, e);
-                }
-            });
-        }
-    });
+                thread::spawn(move || {
+                    if let Err(e) = reader_session.run() {
+                        eprintln!("[client] reader {} error: {}", reader_id, e);
+                    }
+                });
+            }
+        })
+    };
 
     // Create primary FuseClient with callback
-    let fs = FuseClient::with_init_callback(Arc::clone(&mux), 0, init_callback);
+    let fs = FuseClient::with_init_callback(Arc::clone(&mux), 0, make_init_callback());
     let mut session = fuser::Session::new(fs, mount_point.as_ref(), &options)?;
     eprintln!("[client] mounted at {:?}", mount_point.as_ref());
 
@@ -123,7 +127,10 @@ pub fn mount_with_options<P: AsRef<Path>>(
                 cloned_fds.lock().unwrap().push((reader_id, fd));
             }
             Err(e) => {
-                eprintln!("[client] failed to clone fd for reader {}: {}", reader_id, e);
+                eprintln!(
+                    "[client] failed to clone fd for reader {}: {}",
+                    reader_id, e
+                );
                 clone_failures += 1;
             }
         }

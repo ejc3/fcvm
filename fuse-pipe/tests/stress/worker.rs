@@ -85,7 +85,13 @@ pub fn run_stress_worker(
         if let Err(e) = result {
             errors += 1;
             if errors <= 3 {
-                eprintln!("[worker-{}] error on {:?} at {}: {}", worker_id, op, file_path.display(), e);
+                eprintln!(
+                    "[worker-{}] error on {:?} at {}: {}",
+                    worker_id,
+                    op,
+                    file_path.display(),
+                    e
+                );
             }
         }
     }
