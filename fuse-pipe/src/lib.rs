@@ -27,6 +27,7 @@
 //! - `metrics`: Enable metrics collection via the `metrics` crate
 
 pub mod protocol;
+pub mod server;
 pub mod transport;
 
 // Re-export protocol types at crate root for convenience
@@ -40,6 +41,9 @@ pub use transport::{
     Transport, TransportError, UnixListener, UnixTransport, VsockListener, VsockTransport,
     HOST_CID, LOCAL_CID,
 };
+
+// Re-export server types
+pub use server::{AsyncServer, FilesystemHandler, PassthroughFs, ServerConfig};
 
 /// Prelude for common imports.
 pub mod prelude {
