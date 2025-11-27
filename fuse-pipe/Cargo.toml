@@ -27,8 +27,8 @@ nix = { version = "0.29", features = ["fs", "user"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-util", "net"] }
 async-trait = "0.1"
 
-# Optional: FUSE client
-fuser = { version = "0.14", optional = true }
+# Optional: FUSE client (using fork with multi-reader support)
+fuser = { path = "../../fuser-fork", optional = true }
 
 # Optional: Concurrent data structures
 dashmap = { version = "5.5", optional = true }

@@ -99,6 +99,9 @@ impl Multiplexer {
     pub fn new(socket: UnixStream, num_readers: usize) -> Arc<Self> {
         let socket_clone = socket.try_clone().expect("failed to clone socket");
 
+        // Clear timeouts on the reader socket - it should block indefinitely
+        socket_clone.set_read_timeout(None).ok();
+
         let mut reader_pending = Vec::with_capacity(num_readers);
         for _ in 0..num_readers {
             reader_pending.push(Arc::new(ReaderPending::new()));
@@ -113,7 +116,9 @@ impl Multiplexer {
         // Spawn response reader thread
         let mux_clone = Arc::clone(&mux);
         std::thread::spawn(move || {
+            eprintln!("[mux] response reader thread started");
             mux_clone.response_reader_loop(socket_clone);
+            eprintln!("[mux] response reader thread exited");
         });
 
         mux
@@ -122,20 +127,22 @@ impl Multiplexer {
     /// Background thread that reads responses and dispatches to waiting readers.
     fn response_reader_loop(&self, mut socket: UnixStream) {
         let mut len_buf = [0u8; 4];
+        let mut response_count = 0u64;
 
         loop {
             // Read response length
             if let Err(e) = socket.read_exact(&mut len_buf) {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    eprintln!("[mux] server disconnected");
+                    eprintln!("[mux] server disconnected after {} responses", response_count);
                 } else {
-                    eprintln!("[mux] read error: {}", e);
+                    eprintln!("[mux] read error after {} responses: {}", response_count, e);
                 }
                 for pending in &self.reader_pending {
                     pending.fail_all(VolumeResponse::error(libc::EIO));
                 }
                 break;
             }
+            response_count += 1;
 
             let len = u32::from_be_bytes(len_buf) as usize;
             if len > MAX_MESSAGE_SIZE {
@@ -178,6 +185,11 @@ impl Multiplexer {
     pub fn send_request(&self, reader_id: u32, request: VolumeRequest) -> VolumeResponse {
         let unique = self.next_id.fetch_add(1, Ordering::Relaxed);
 
+        // Log first 20 requests
+        if unique <= 20 {
+            eprintln!("[mux] request {} from reader {}: {:?}", unique, reader_id, std::mem::discriminant(&request));
+        }
+
         // Serialize request
         let wire = WireRequest::new(unique, reader_id, request);
         let buf = match bincode::serialize(&wire) {
@@ -209,7 +221,11 @@ impl Multiplexer {
         // Wait for response on this reader's pending queue
         let reader_idx = reader_id as usize;
         if reader_idx < self.reader_pending.len() {
-            self.reader_pending[reader_idx].wait_for(unique)
+            let resp = self.reader_pending[reader_idx].wait_for(unique);
+            if unique <= 20 {
+                eprintln!("[mux] response {} for reader {}: {:?}", unique, reader_id, std::mem::discriminant(&resp));
+            }
+            resp
         } else {
             eprintln!("[reader {}] invalid reader_id", reader_id);
             VolumeResponse::error(libc::EIO)
