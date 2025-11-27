@@ -1,4 +1,4 @@
-//! Stress test controller for multi-reader FUSE testing.
+//! Stress test orchestration for multi-reader FUSE testing.
 
 use std::fs;
 use std::path::PathBuf;
@@ -41,7 +41,6 @@ pub fn run_stress_test(
     num_readers: usize,
     trace_rate: u64,
 ) -> anyhow::Result<()> {
-    // Clean up any stale state from previous runs
     cleanup_stale_state(mount_dir);
 
     println!("╔═══════════════════════════════════════════════════════════════╗");
@@ -54,17 +53,15 @@ pub fn run_stress_test(
     println!("╚═══════════════════════════════════════════════════════════════╝");
     println!();
 
-    // Setup directories
     fs::remove_dir_all(data_dir).ok();
     fs::create_dir_all(data_dir)?;
     fs::create_dir_all(mount_dir)?;
 
-    // Pre-populate with test files for read workload
     setup_test_files(data_dir, workers)?;
 
     let exe = std::env::current_exe()?;
 
-    // ========== PHASE 1: Bare filesystem baseline ==========
+    // Phase 1: Bare filesystem
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  PHASE 1: Bare Filesystem (baseline)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -72,10 +69,9 @@ pub fn run_stress_test(
     let bare_result = run_workers(&exe, workers, ops_per_worker, data_dir)?;
     print_results("BARE FILESYSTEM", &bare_result);
 
-    // Reset test files for FUSE test
     setup_test_files(data_dir, workers)?;
 
-    // ========== PHASE 2: FUSE with multi-reader ==========
+    // Phase 2: FUSE
     println!();
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  PHASE 2: FUSE over Unix Socket ({} readers)", num_readers);
@@ -84,7 +80,6 @@ pub fn run_stress_test(
     let socket = "/tmp/fuse-stress.sock";
     let _ = fs::remove_file(socket);
 
-    // Start server
     println!("[fuse] Starting server...");
     let mut server = Command::new(&exe)
         .args(["server", "--socket", socket, "--root", data_dir.to_str().unwrap()])
@@ -94,7 +89,6 @@ pub fn run_stress_test(
 
     std::thread::sleep(Duration::from_millis(500));
 
-    // Start client with specified number of readers
     println!("[fuse] Starting client with {} readers...", num_readers);
     let mut client = Command::new(&exe)
         .args([
@@ -112,15 +106,14 @@ pub fn run_stress_test(
 
     let fuse_result = run_workers(&exe, workers, ops_per_worker, mount_dir)?;
 
-    // Cleanup FUSE - kill client first, wait for server to output stats
     let _ = client.kill();
-    std::thread::sleep(Duration::from_millis(500)); // Let server process client disconnect
+    std::thread::sleep(Duration::from_millis(500));
     let _ = server.kill();
     let _ = fs::remove_file(socket);
 
     print_results(&format!("FUSE ({} readers)", num_readers), &fuse_result);
 
-    // ========== COMPARISON ==========
+    // Comparison
     println!();
     println!("╔═══════════════════════════════════════════════════════════════╗");
     println!("║                       COMPARISON                              ║");
@@ -144,7 +137,6 @@ pub fn run_stress_test(
     println!("║  Slowdown factor:  {:>10.2}x                                ║", ratio);
     println!("╚═══════════════════════════════════════════════════════════════╝");
 
-    // Success criteria - allow errors for now since some are expected (ENOENT on lookup before create)
     if fuse_result.total_errors > fuse_result.total_ops / 2 {
         anyhow::bail!("FAIL: Too many errors ({}/{})", fuse_result.total_errors, fuse_result.total_ops);
     }
@@ -182,14 +174,12 @@ fn run_workers(exe: &PathBuf, workers: usize, ops_per_worker: usize, target_dir:
         worker_handles.push(handle);
     }
 
-    // Wait for all workers
     for mut handle in worker_handles {
         handle.wait()?;
     }
 
     let total_duration = start.elapsed();
 
-    // Collect results
     let mut total_ops = 0usize;
     let mut total_errors = 0usize;
     let mut breakdown = OpsBreakdown::default();
@@ -246,30 +236,23 @@ fn print_results(label: &str, result: &TestResult) {
     println!("└─────────────────────────────────────────────────────────────────┘");
 }
 
-/// Clean up stale state from previous test runs.
 fn cleanup_stale_state(mount_dir: &PathBuf) {
     let socket = "/tmp/fuse-stress.sock";
 
-    // Try to unmount if still mounted
     let _ = Command::new("umount")
         .args(["-f", mount_dir.to_str().unwrap_or("/tmp/fuse-stress-mount")])
         .output();
 
-    // Remove stale socket
     let _ = fs::remove_file(socket);
-
-    // Brief pause to let kernel clean up
     std::thread::sleep(Duration::from_millis(100));
 }
 
 fn setup_test_files(data_dir: &PathBuf, workers: usize) -> anyhow::Result<()> {
-    // Clean existing worker directories
     for i in 0..workers {
         let worker_dir = data_dir.join(format!("worker-{}", i));
         fs::remove_dir_all(&worker_dir).ok();
         fs::create_dir_all(&worker_dir)?;
 
-        // Create files with content for read tests
         for j in 0..10 {
             let file = worker_dir.join(format!("file-{}.txt", j));
             let content: String = (0..1024)

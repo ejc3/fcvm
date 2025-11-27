@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn test_server_with_config() {
         let handler = EchoHandler;
-        let config = ServerConfig::high_throughput();
+        let config = ServerConfig::default();
         let server = AsyncServer::with_config(handler, config);
         assert_eq!(server.config.write_batch_size, 64);
     }

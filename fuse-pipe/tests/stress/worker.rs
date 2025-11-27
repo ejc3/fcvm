@@ -1,13 +1,12 @@
-//! Stress worker that performs filesystem operations on a FUSE mount.
+//! Stress worker that performs filesystem operations.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::stress::{OpsBreakdown, WorkerResult};
+use crate::harness::{OpsBreakdown, WorkerResult};
 
-/// Operations weighted by realistic FUSE usage
 const WEIGHTS: &[(OpType, u32)] = &[
     (OpType::Getattr, 40),
     (OpType::Lookup, 25),
@@ -37,10 +36,8 @@ pub fn run_stress_worker(
     let mut errors = 0usize;
     let mut breakdown = OpsBreakdown::default();
 
-    // Worker's private directory
     let worker_dir = mount.join(format!("worker-{}", worker_id));
 
-    // Pre-generate weighted ops list
     let mut op_list: Vec<OpType> = Vec::with_capacity(100);
     for &(op, weight) in WEIGHTS {
         for _ in 0..weight {
@@ -48,11 +45,9 @@ pub fn run_stress_worker(
         }
     }
 
-    // Deterministic but varied sequence using worker_id as seed
     let mut rng_state = (worker_id as u64).wrapping_add(1);
 
     for i in 0..ops {
-        // Simple LCG for reproducible "random" selection
         rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
         let idx = (rng_state >> 32) as usize % op_list.len();
         let op = op_list[idx];
@@ -89,16 +84,14 @@ pub fn run_stress_worker(
 
         if let Err(e) = result {
             errors += 1;
-            // Log first few errors for debugging
             if errors <= 3 {
-                eprintln!("[worker-{}] error on op {:?} at {}: {}", worker_id, op, file_path.display(), e);
+                eprintln!("[worker-{}] error on {:?} at {}: {}", worker_id, op, file_path.display(), e);
             }
         }
     }
 
     let duration = start.elapsed();
 
-    // Write results
     let result = WorkerResult {
         worker_id,
         ops_completed: ops,
@@ -146,15 +139,11 @@ fn do_write(path: &PathBuf, worker_id: usize, iteration: usize) -> anyhow::Resul
 
 fn do_create(dir: &PathBuf, worker_id: usize, iteration: usize) -> anyhow::Result<()> {
     let tmp_file = dir.join(format!("tmp-{}-{}.txt", worker_id, iteration));
-    // This is a create-then-delete test, so we don't check if the file exists
-    // fs::write will create if needed
     if let Err(e) = fs::write(&tmp_file, "test") {
-        // Only fail on actual errors, not ENOENT
         if e.kind() != std::io::ErrorKind::NotFound {
             return Err(e.into());
         }
     }
-    // Ignore remove errors (file might already be gone in concurrent tests)
     let _ = fs::remove_file(&tmp_file);
     Ok(())
 }

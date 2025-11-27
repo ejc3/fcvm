@@ -13,7 +13,7 @@
 //! use fuse_pipe::server::{AsyncServer, PassthroughFs, ServerConfig};
 //!
 //! let fs = PassthroughFs::new("/path/to/serve");
-//! let config = ServerConfig::high_throughput();
+//! let config = ServerConfig::default();
 //! let server = AsyncServer::with_config(fs, config);
 //! server.run_blocking("/tmp/fuse.sock")?;
 //! ```
