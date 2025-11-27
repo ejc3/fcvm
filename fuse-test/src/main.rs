@@ -112,6 +112,9 @@ enum Commands {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Raise file descriptor limit for stress tests with many readers/workers
+    raise_fd_limit();
+
     // Initialize metrics collection
     metrics::init();
 
@@ -166,6 +169,26 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Raise file descriptor limit to support many FUSE readers and workers.
+fn raise_fd_limit() {
+    use std::mem::MaybeUninit;
+
+    unsafe {
+        let mut rlim = MaybeUninit::<libc::rlimit>::uninit();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, rlim.as_mut_ptr()) == 0 {
+            let mut rlim = rlim.assume_init();
+            // Try to set soft limit to hard limit (or 1M if hard is unlimited)
+            let target = if rlim.rlim_max == libc::RLIM_INFINITY {
+                1_048_576
+            } else {
+                rlim.rlim_max
+            };
+            rlim.rlim_cur = target;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+        }
+    }
 }
 
 /// Run a quick integration test with server + client.

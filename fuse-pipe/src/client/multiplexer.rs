@@ -116,9 +116,7 @@ impl Multiplexer {
         // Spawn response reader thread
         let mux_clone = Arc::clone(&mux);
         std::thread::spawn(move || {
-            eprintln!("[mux] response reader thread started");
             mux_clone.response_reader_loop(socket_clone);
-            eprintln!("[mux] response reader thread exited");
         });
 
         mux
@@ -127,54 +125,37 @@ impl Multiplexer {
     /// Background thread that reads responses and dispatches to waiting readers.
     fn response_reader_loop(&self, mut socket: UnixStream) {
         let mut len_buf = [0u8; 4];
-        let mut response_count = 0u64;
 
         loop {
             // Read response length
-            if let Err(e) = socket.read_exact(&mut len_buf) {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    eprintln!("[mux] server disconnected after {} responses", response_count);
-                } else {
-                    eprintln!("[mux] read error after {} responses: {}", response_count, e);
-                }
+            if socket.read_exact(&mut len_buf).is_err() {
+                // Server disconnected or error - fail all pending requests
                 for pending in &self.reader_pending {
                     pending.fail_all(VolumeResponse::error(libc::EIO));
                 }
                 break;
             }
-            response_count += 1;
 
             let len = u32::from_be_bytes(len_buf) as usize;
             if len > MAX_MESSAGE_SIZE {
-                eprintln!("[mux] response too large: {}", len);
                 continue;
             }
 
             // Read response body
             let mut resp_buf = vec![0u8; len];
-            if let Err(e) = socket.read_exact(&mut resp_buf) {
-                eprintln!("[mux] read body error: {}", e);
+            if socket.read_exact(&mut resp_buf).is_err() {
                 for pending in &self.reader_pending {
                     pending.fail_all(VolumeResponse::error(libc::EIO));
                 }
                 break;
             }
 
-            // Deserialize
-            let wire: WireResponse = match bincode::deserialize(&resp_buf) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("[mux] deserialize error: {}", e);
-                    continue;
+            // Deserialize and dispatch to correct reader's pending queue
+            if let Ok(wire) = bincode::deserialize::<WireResponse>(&resp_buf) {
+                let reader_id = wire.reader_id as usize;
+                if reader_id < self.reader_pending.len() {
+                    self.reader_pending[reader_id].complete(wire.unique, wire.response);
                 }
-            };
-
-            // Dispatch to correct reader's pending queue
-            let reader_id = wire.reader_id as usize;
-            if reader_id < self.reader_pending.len() {
-                self.reader_pending[reader_id].complete(wire.unique, wire.response);
-            } else {
-                eprintln!("[mux] invalid reader_id: {}", reader_id);
             }
         }
     }
@@ -185,35 +166,21 @@ impl Multiplexer {
     pub fn send_request(&self, reader_id: u32, request: VolumeRequest) -> VolumeResponse {
         let unique = self.next_id.fetch_add(1, Ordering::Relaxed);
 
-        // Log first 20 requests
-        if unique <= 20 {
-            eprintln!("[mux] request {} from reader {}: {:?}", unique, reader_id, std::mem::discriminant(&request));
-        }
-
         // Serialize request
         let wire = WireRequest::new(unique, reader_id, request);
         let buf = match bincode::serialize(&wire) {
             Ok(b) => b,
-            Err(e) => {
-                eprintln!("[reader {}] serialize error: {}", reader_id, e);
-                return VolumeResponse::error(libc::EIO);
-            }
+            Err(_) => return VolumeResponse::error(libc::EIO),
         };
 
         // Write to socket (mutex-protected)
         {
             let mut socket = self.socket_writer.lock().unwrap();
             let len_bytes = (buf.len() as u32).to_be_bytes();
-            if let Err(e) = socket.write_all(&len_bytes) {
-                eprintln!("[reader {}] write len error: {}", reader_id, e);
-                return VolumeResponse::error(libc::EIO);
-            }
-            if let Err(e) = socket.write_all(&buf) {
-                eprintln!("[reader {}] write body error: {}", reader_id, e);
-                return VolumeResponse::error(libc::EIO);
-            }
-            if let Err(e) = socket.flush() {
-                eprintln!("[reader {}] flush error: {}", reader_id, e);
+            if socket.write_all(&len_bytes).is_err()
+                || socket.write_all(&buf).is_err()
+                || socket.flush().is_err()
+            {
                 return VolumeResponse::error(libc::EIO);
             }
         }
@@ -221,13 +188,8 @@ impl Multiplexer {
         // Wait for response on this reader's pending queue
         let reader_idx = reader_id as usize;
         if reader_idx < self.reader_pending.len() {
-            let resp = self.reader_pending[reader_idx].wait_for(unique);
-            if unique <= 20 {
-                eprintln!("[mux] response {} for reader {}: {:?}", unique, reader_id, std::mem::discriminant(&resp));
-            }
-            resp
+            self.reader_pending[reader_idx].wait_for(unique)
         } else {
-            eprintln!("[reader {}] invalid reader_id", reader_id);
             VolumeResponse::error(libc::EIO)
         }
     }
