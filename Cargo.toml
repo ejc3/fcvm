@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "fuse-pipe"]
+
 [package]
 name = "fcvm"
 version = "0.1.0"
