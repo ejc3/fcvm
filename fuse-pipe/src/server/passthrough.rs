@@ -5,26 +5,27 @@
 
 use super::handler::FilesystemHandler;
 use crate::protocol::{file_type, DirEntry, FileAttr, VolumeResponse};
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::Mutex;
 
 /// Default attribute TTL in seconds.
 const ATTR_TTL_SECS: u64 = 1;
 
 /// Inode table mapping inode numbers to parent/name pairs.
 struct InodeTable {
-    ino_to_entry: RwLock<HashMap<u64, InodeEntry>>,
-    name_to_ino: RwLock<HashMap<(u64, OsString), u64>>,
+    ino_to_entry: DashMap<u64, InodeEntry>,
+    name_to_ino: DashMap<(u64, OsString), u64>,
     next_ino: AtomicU64,
     root_path: PathBuf,
 }
 
+#[derive(Clone)]
 struct InodeEntry {
     parent: u64,
     name: OsString,
@@ -32,8 +33,8 @@ struct InodeEntry {
 
 impl InodeTable {
     fn new(root_path: PathBuf) -> Self {
-        let mut ino_to_entry = HashMap::new();
-        let name_to_ino = HashMap::new();
+        let ino_to_entry = DashMap::new();
+        let name_to_ino = DashMap::new();
 
         // Root inode is always 1; parent is 0 and name empty.
         ino_to_entry.insert(
@@ -45,8 +46,8 @@ impl InodeTable {
         );
 
         Self {
-            ino_to_entry: RwLock::new(ino_to_entry),
-            name_to_ino: RwLock::new(name_to_ino),
+            ino_to_entry,
+            name_to_ino,
             next_ino: AtomicU64::new(2),
             root_path,
         }
@@ -57,12 +58,11 @@ impl InodeTable {
             return Some(self.root_path.clone());
         }
 
-        let entries = self.ino_to_entry.read().unwrap();
         let mut components = Vec::new();
         let mut current = ino;
 
         while current != 1 {
-            let entry = entries.get(&current)?;
+            let entry = self.ino_to_entry.get(&current)?;
             components.push(entry.name.clone());
             current = entry.parent;
         }
@@ -75,41 +75,30 @@ impl InodeTable {
     }
 
     fn get_or_create_ino(&self, parent: u64, name: &OsStr) -> u64 {
-        // Try read-only first.
-        if let Some(&ino) = self
-            .name_to_ino
-            .read()
-            .unwrap()
-            .get(&(parent, name.to_os_string()))
-        {
-            return ino;
+        // Try read-only first (lock-free lookup).
+        if let Some(ino) = self.name_to_ino.get(&(parent, name.to_os_string())) {
+            return *ino;
         }
 
-        // Need to create - acquire write locks.
-        let mut name_to_ino = self.name_to_ino.write().unwrap();
-        let mut entries = self.ino_to_entry.write().unwrap();
-
-        if let Some(&ino) = name_to_ino.get(&(parent, name.to_os_string())) {
-            return ino;
-        }
-
-        let ino = self.next_ino.fetch_add(1, Ordering::SeqCst);
-        name_to_ino.insert((parent, name.to_os_string()), ino);
-        entries.insert(
-            ino,
-            InodeEntry {
-                parent,
-                name: name.to_os_string(),
-            },
-        );
+        // Need to create - use entry API for atomic insert.
+        let key = (parent, name.to_os_string());
+        let ino = *self.name_to_ino.entry(key.clone()).or_insert_with(|| {
+            let new_ino = self.next_ino.fetch_add(1, Ordering::SeqCst);
+            self.ino_to_entry.insert(
+                new_ino,
+                InodeEntry {
+                    parent,
+                    name: name.to_os_string(),
+                },
+            );
+            new_ino
+        });
         ino
     }
 
     fn remove_entry(&self, parent: u64, name: &OsStr) {
-        let mut name_to_ino = self.name_to_ino.write().unwrap();
-        if let Some(ino) = name_to_ino.remove(&(parent, name.to_os_string())) {
-            let mut entries = self.ino_to_entry.write().unwrap();
-            entries.remove(&ino);
+        if let Some((_, ino)) = self.name_to_ino.remove(&(parent, name.to_os_string())) {
+            self.ino_to_entry.remove(&ino);
         }
     }
 
@@ -120,16 +109,11 @@ impl InodeTable {
         newparent: u64,
         newname: &OsStr,
     ) -> Option<u64> {
-        let mut name_to_ino = self.name_to_ino.write().unwrap();
         let key = (parent, name.to_os_string());
-        let ino = match name_to_ino.remove(&key) {
-            Some(i) => i,
-            None => return None,
-        };
-        name_to_ino.insert((newparent, newname.to_os_string()), ino);
+        let (_, ino) = self.name_to_ino.remove(&key)?;
+        self.name_to_ino.insert((newparent, newname.to_os_string()), ino);
 
-        let mut entries = self.ino_to_entry.write().unwrap();
-        if let Some(entry) = entries.get_mut(&ino) {
+        if let Some(mut entry) = self.ino_to_entry.get_mut(&ino) {
             entry.parent = newparent;
             entry.name = newname.to_os_string();
         }
@@ -137,36 +121,31 @@ impl InodeTable {
     }
 
     fn parent_of(&self, ino: u64) -> Option<u64> {
-        self.ino_to_entry
-            .read()
-            .unwrap()
-            .get(&ino)
-            .map(|e| e.parent)
+        self.ino_to_entry.get(&ino).map(|e| e.parent)
     }
 
     fn add_hard_link(&self, parent: u64, name: &OsStr, ino: u64) {
-        let mut name_to_ino = self.name_to_ino.write().unwrap();
-        name_to_ino.insert((parent, name.to_os_string()), ino);
+        self.name_to_ino.insert((parent, name.to_os_string()), ino);
     }
 }
 
 /// File handle table.
 struct HandleTable {
-    handles: RwLock<HashMap<u64, Mutex<File>>>,
+    handles: DashMap<u64, Mutex<File>>,
     next_fh: AtomicU64,
 }
 
 impl HandleTable {
     fn new() -> Self {
         Self {
-            handles: RwLock::new(HashMap::new()),
+            handles: DashMap::new(),
             next_fh: AtomicU64::new(1),
         }
     }
 
     fn insert(&self, file: File) -> u64 {
         let fh = self.next_fh.fetch_add(1, Ordering::SeqCst);
-        self.handles.write().unwrap().insert(fh, Mutex::new(file));
+        self.handles.insert(fh, Mutex::new(file));
         fh
     }
 
@@ -174,19 +153,16 @@ impl HandleTable {
     where
         F: FnOnce(&mut File) -> R,
     {
-        let handles = self.handles.read().unwrap();
-        handles.get(&fh).map(|mutex| {
-            let mut file = mutex.lock().unwrap();
+        self.handles.get(&fh).map(|entry| {
+            let mut file = entry.lock().unwrap();
             f(&mut file)
         })
     }
 
     fn remove(&self, fh: u64) -> Option<File> {
         self.handles
-            .write()
-            .unwrap()
             .remove(&fh)
-            .map(|m| m.into_inner().unwrap())
+            .map(|(_, m)| m.into_inner().unwrap())
     }
 }
 
