@@ -29,6 +29,10 @@ pub struct WireRequest {
     pub unique: u64,
     pub reader_id: u32,
     pub request: VolumeRequest,
+    /// Trace span - passed through request/response for e2e latency tracking
+    /// Only populated for traced requests (unique % 100 == 0)
+    #[serde(default)]
+    pub span: Option<Span>,
 }
 
 impl WireRequest {
@@ -38,6 +42,17 @@ impl WireRequest {
             unique,
             reader_id,
             request,
+            span: None,
+        }
+    }
+
+    /// Create a new wire request with trace span
+    pub fn with_span(unique: u64, reader_id: u32, request: VolumeRequest, span: Span) -> Self {
+        Self {
+            unique,
+            reader_id,
+            request,
+            span: Some(span),
         }
     }
 
@@ -65,6 +80,94 @@ impl WireRequest {
     }
 }
 
+/// Get current time as nanos since UNIX epoch
+#[inline]
+pub fn now_nanos() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}
+
+/// Distributed trace span - passed through request/response for e2e latency tracking.
+///
+/// The span follows the request:
+/// 1. Client creates span with t0, embeds in WireRequest
+/// 2. Server receives, marks server_recv/deser/spawn/fs_done/resp_chan
+/// 3. Server serializes span into WireResponse (marks BEFORE this point are visible)
+/// 4. Client receives, marks client_recv/done, prints
+///
+/// Note: Timestamps after server serialization (like "flush time") cannot be in the span
+/// since they occur after the span is serialized into the response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Span {
+    /// Start time (nanos since epoch) - set by client when creating request
+    pub t0: u64,
+    // Server side (set during request processing, BEFORE response serialization)
+    pub server_recv: u64,      // When server received from socket
+    pub server_deser: u64,     // After deserializing request
+    pub server_spawn: u64,     // When spawn_blocking task started running
+    pub server_fs_done: u64,   // After fs operation completed
+    pub server_resp_chan: u64, // After received from response channel (just before serializing response)
+    // Client side (set after response received)
+    pub client_recv: u64,      // When client received from socket
+    pub client_done: u64,      // When response delivered to caller
+}
+
+impl Span {
+    /// Create a new span with current time as t0
+    pub fn new() -> Self {
+        Self {
+            t0: now_nanos(),
+            ..Default::default()
+        }
+    }
+
+    /// Record current time for a field
+    #[inline]
+    pub fn mark(&mut self, field: &str) {
+        let now = now_nanos();
+        match field {
+            "server_recv" => self.server_recv = now,
+            "server_deser" => self.server_deser = now,
+            "server_spawn" => self.server_spawn = now,
+            "server_fs_done" => self.server_fs_done = now,
+            "server_resp_chan" => self.server_resp_chan = now,
+            "client_recv" => self.client_recv = now,
+            "client_done" => self.client_done = now,
+            _ => {}
+        }
+    }
+
+    /// Print the span as a breakdown (all times in µs)
+    pub fn print(&self, unique: u64) {
+        let delta = |a: u64, b: u64| -> i64 {
+            if a == 0 || b == 0 { -1 } else { ((b - a) / 1000) as i64 }
+        };
+        let total = delta(self.t0, self.client_done);
+
+        // to_server: client send → server receive (includes client serialize, socket write, network)
+        // deser: deserialize request
+        // spawn: task scheduling delay
+        // fs: filesystem operation
+        // chan: response channel wait
+        // to_client: server serialize + write + flush + network + client receive
+        eprintln!(
+            "[TRACE {}] total={}µs | to_srv={} deser={} spawn={} fs={} chan={} | to_cli={} done={}",
+            unique,
+            total,
+            delta(self.t0, self.server_recv),
+            delta(self.server_recv, self.server_deser),
+            delta(self.server_deser, self.server_spawn),
+            delta(self.server_spawn, self.server_fs_done),
+            delta(self.server_fs_done, self.server_resp_chan),
+            delta(self.server_resp_chan, self.client_recv), // Includes serialize + write + flush + network
+            delta(self.client_recv, self.client_done),
+        );
+    }
+}
+
 /// Wire message wrapping a response with routing information.
 ///
 /// The `unique` and `reader_id` are echoed from the request for routing.
@@ -73,6 +176,9 @@ pub struct WireResponse {
     pub unique: u64,
     pub reader_id: u32,
     pub response: VolumeResponse,
+    /// Trace span - passed back from server with timing data
+    #[serde(default)]
+    pub span: Option<Span>,
 }
 
 impl WireResponse {
@@ -82,6 +188,17 @@ impl WireResponse {
             unique,
             reader_id,
             response,
+            span: None,
+        }
+    }
+
+    /// Create a new wire response with trace span
+    pub fn with_span(unique: u64, reader_id: u32, response: VolumeResponse, span: Span) -> Self {
+        Self {
+            unique,
+            reader_id,
+            response,
+            span: Some(span),
         }
     }
 

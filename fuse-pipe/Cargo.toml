@@ -48,11 +48,3 @@ harness = false
 [[bench]]
 name = "throughput"
 harness = false
-
-[[example]]
-name = "simple_server"
-required-features = []
-
-[[example]]
-name = "simple_client"
-required-features = ["fuse-client"]

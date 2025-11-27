@@ -50,7 +50,7 @@ pub use server::{AsyncServer, FilesystemHandler, PassthroughFs, ServerConfig};
 
 // Re-export client types
 #[cfg(feature = "fuse-client")]
-pub use client::{mount, mount_with_readers, FuseClient, Multiplexer};
+pub use client::{mount, mount_with_options, mount_with_readers, FuseClient, Multiplexer};
 
 /// Prelude for common imports.
 pub mod prelude {

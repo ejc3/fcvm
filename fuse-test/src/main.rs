@@ -18,7 +18,7 @@ mod stress;
 mod worker;
 
 use clap::{Parser, Subcommand};
-use fuse_pipe::{AsyncServer, PassthroughFs, ServerConfig, mount_with_readers};
+use fuse_pipe::{AsyncServer, PassthroughFs, ServerConfig, mount_with_options};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -55,6 +55,10 @@ enum Commands {
         /// Number of FUSE reader threads (protocol-level multiplexing)
         #[arg(short, long, default_value = "1")]
         readers: usize,
+
+        /// Trace every Nth request (0 = disabled)
+        #[arg(short, long, default_value = "0")]
+        trace_rate: u64,
     },
 
     /// Run both server and client (for quick testing)
@@ -89,6 +93,10 @@ enum Commands {
         /// Number of FUSE reader threads
         #[arg(short, long, default_value = "4")]
         readers: usize,
+
+        /// Trace every Nth request (0 = disabled)
+        #[arg(short, long, default_value = "0")]
+        trace_rate: u64,
     },
 
     /// Internal: stress worker process (spawned by stress command)
@@ -129,7 +137,7 @@ fn main() -> anyhow::Result<()> {
 
             // Use fuse-pipe's async pipelined server
             let fs = PassthroughFs::new(&root);
-            let config = ServerConfig::high_throughput();
+            let config = ServerConfig::default();
             let server = AsyncServer::with_config(fs, config);
 
             // Run the server
@@ -139,19 +147,20 @@ fn main() -> anyhow::Result<()> {
                 .block_on(server.serve_unix(&socket))?;
         }
 
-        Commands::Client { socket, mount, readers } => {
+        Commands::Client { socket, mount, readers, trace_rate } => {
             // Create mount point if it doesn't exist
             std::fs::create_dir_all(&mount)?;
 
             eprintln!(
-                "[client] mounting at {} via {} (readers: {})",
+                "[client] mounting at {} via {} (readers: {}, trace_rate: {})",
                 mount.display(),
                 socket,
-                readers
+                readers,
+                trace_rate
             );
 
             // Use fuse-pipe's client
-            mount_with_readers(&socket, &mount, readers)?;
+            mount_with_options(&socket, &mount, readers, trace_rate)?;
             eprintln!("[client] unmounted");
         }
 
@@ -159,8 +168,8 @@ fn main() -> anyhow::Result<()> {
             run_quick_test(&data, &mount)?;
         }
 
-        Commands::Stress { workers, ops, data, mount, readers } => {
-            stress::run_stress_test(workers, ops, &data, &mount, readers)?;
+        Commands::Stress { workers, ops, data, mount, readers, trace_rate } => {
+            stress::run_stress_test(workers, ops, &data, &mount, readers, trace_rate)?;
         }
 
         Commands::StressWorker { id, ops, mount, results } => {

@@ -10,11 +10,19 @@
 //! - Response batching for reduced syscall overhead
 
 use super::{FilesystemHandler, ServerConfig};
-use crate::protocol::{VolumeResponse, WireRequest, WireResponse, MAX_MESSAGE_SIZE};
+use crate::protocol::{now_nanos, Span, VolumeResponse, WireRequest, WireResponse, MAX_MESSAGE_SIZE};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
+
+/// Response with optional tracing span
+struct PendingResponse {
+    unique: u64,
+    reader_id: u32,
+    response: VolumeResponse,
+    span: Option<Span>,
+}
 
 /// Async pipelined server.
 pub struct AsyncServer<H> {
@@ -88,8 +96,8 @@ async fn handle_client_pipelined<H: FilesystemHandler + 'static>(
 ) -> anyhow::Result<()> {
     let (read_half, write_half) = stream.into_split();
 
-    // Channel for completed responses
-    let (tx, rx) = mpsc::channel::<(u64, u32, VolumeResponse)>(config.response_channel_size);
+    // Channel for completed responses (includes optional span for tracing)
+    let (tx, rx) = mpsc::channel::<PendingResponse>(config.response_channel_size);
 
     // Spawn writer task
     let writer_config = config.clone();
@@ -108,7 +116,7 @@ async fn handle_client_pipelined<H: FilesystemHandler + 'static>(
 async fn request_reader<H: FilesystemHandler + 'static>(
     mut read_half: tokio::net::unix::OwnedReadHalf,
     handler: Arc<H>,
-    tx: mpsc::Sender<(u64, u32, VolumeResponse)>,
+    tx: mpsc::Sender<PendingResponse>,
 ) -> anyhow::Result<()> {
     let mut len_buf = [0u8; 4];
 
@@ -119,6 +127,9 @@ async fn request_reader<H: FilesystemHandler + 'static>(
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),
         }
+
+        // Mark server_recv as soon as we have the length header
+        let t_recv = now_nanos();
 
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > MAX_MESSAGE_SIZE {
@@ -139,23 +150,50 @@ async fn request_reader<H: FilesystemHandler + 'static>(
             }
         };
 
+        // Mark deserialize done on span if present
+        let t_deser = now_nanos();
+
         let unique = wire_req.unique;
         let reader_id = wire_req.reader_id;
         let request = wire_req.request;
+        let mut span = wire_req.span;
+
+        // Update span with server timing
+        if let Some(ref mut s) = span {
+            s.server_recv = t_recv;
+            s.server_deser = t_deser;
+        }
 
         // Spawn handler task
         let handler_clone = Arc::clone(&handler);
         let tx_clone = tx.clone();
 
         tokio::spawn(async move {
+            // Mark when spawn_blocking task actually starts running
+            let mut span = span;
+            if let Some(ref mut s) = span {
+                s.server_spawn = now_nanos();
+            }
+
             // Run FS operation on blocking thread
             let response =
                 tokio::task::spawn_blocking(move || handler_clone.handle_request(&request))
                     .await
                     .unwrap_or_else(|_| VolumeResponse::error(libc::EIO));
 
+            // Mark fs operation done
+            if let Some(ref mut s) = span {
+                s.server_fs_done = now_nanos();
+            }
+
             // Send response to writer
-            let _ = tx_clone.send((unique, reader_id, response)).await;
+            let pending = PendingResponse {
+                unique,
+                reader_id,
+                response,
+                span,
+            };
+            let _ = tx_clone.send(pending).await;
         });
     }
 
@@ -165,7 +203,7 @@ async fn request_reader<H: FilesystemHandler + 'static>(
 /// Write responses with batching.
 async fn response_writer(
     write_half: tokio::net::unix::OwnedWriteHalf,
-    mut rx: mpsc::Receiver<(u64, u32, VolumeResponse)>,
+    mut rx: mpsc::Receiver<PendingResponse>,
     config: ServerConfig,
 ) {
     // Use buffered writer for batching
@@ -194,8 +232,18 @@ async fn response_writer(
             }
         };
 
-        let (unique, reader_id, response) = item;
-        let wire_resp = WireResponse::new(unique, reader_id, response);
+        let PendingResponse { unique, reader_id, response, mut span } = item;
+
+        // Mark channel receive time (last mark before we serialize the response)
+        if let Some(ref mut s) = span {
+            s.server_resp_chan = now_nanos();
+        }
+
+        // Build wire response with span (span is cloned/moved into response here)
+        let wire_resp = match span {
+            Some(s) => WireResponse::with_span(unique, reader_id, response, s),
+            None => WireResponse::new(unique, reader_id, response),
+        };
 
         let resp_buf = match bincode::serialize(&wire_resp) {
             Ok(b) => b,
@@ -214,8 +262,11 @@ async fn response_writer(
 
         batch_count += 1;
 
-        // Flush if batch is full
-        if batch_count >= config.write_batch_size {
+        // Check if channel is empty - if so, flush immediately (adaptive batching)
+        let channel_empty = rx.is_empty();
+
+        // Flush if batch is full OR channel is empty (no point waiting)
+        if batch_count >= config.write_batch_size || channel_empty {
             if writer.flush().await.is_err() {
                 break;
             }
@@ -266,7 +317,7 @@ mod tests {
         let (read_half, _write_half) = server.into_split();
 
         let handler = Arc::new(EchoHandler);
-        let (tx, _rx) = mpsc::channel(1);
+        let (tx, _rx) = mpsc::channel::<PendingResponse>(1);
 
         let reader_task = tokio::spawn(request_reader(read_half, handler, tx));
 

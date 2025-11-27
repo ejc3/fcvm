@@ -41,5 +41,5 @@ mod mount;
 mod multiplexer;
 
 pub use fuse::FuseClient;
-pub use mount::{mount, mount_with_readers};
+pub use mount::{mount, mount_with_options, mount_with_readers};
 pub use multiplexer::Multiplexer;

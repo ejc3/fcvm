@@ -31,8 +31,8 @@ pub use request::VolumeRequest;
 pub use response::VolumeResponse;
 pub use types::{file_type, DirEntry, FileAttr};
 pub use wire::{
-    read_message, read_message_async, write_message, write_message_async, WireRequest,
-    WireResponse, MAX_MESSAGE_SIZE,
+    now_nanos, read_message, read_message_async, write_message, write_message_async, Span,
+    WireRequest, WireResponse, MAX_MESSAGE_SIZE,
 };
 
 #[cfg(test)]
