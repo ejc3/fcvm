@@ -294,11 +294,9 @@ impl VmManager {
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     let clean_line = strip_firecracker_prefix(&line);
-                    if let Some(ref name) = vm_name {
-                        info!(target: "firecracker", vm_name = %name, vm_id = %vm_id, "{}", clean_line);
-                    } else {
-                        info!(target: "firecracker", vm_id = %vm_id, "{}", clean_line);
-                    }
+                    // vm_name and vm_id are already in the hierarchical target, so don't duplicate
+                    let _ = (&vm_name, &vm_id); // suppress unused warning
+                    info!(target: "firecracker", "{}", clean_line);
                 }
             });
         }
@@ -311,11 +309,9 @@ impl VmManager {
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     let clean_line = strip_firecracker_prefix(&line);
-                    if let Some(ref name) = vm_name {
-                        warn!(target: "firecracker", vm_name = %name, vm_id = %vm_id, "{}", clean_line);
-                    } else {
-                        warn!(target: "firecracker", vm_id = %vm_id, "{}", clean_line);
-                    }
+                    // vm_name and vm_id are already in the hierarchical target, so don't duplicate
+                    let _ = (&vm_name, &vm_id); // suppress unused warning
+                    warn!(target: "firecracker", "{}", clean_line);
                 }
             });
         }
