@@ -40,10 +40,9 @@ pub use protocol::{
 };
 
 // Re-export transport types
-pub use transport::{
-    Transport, TransportError, UnixListener, UnixTransport, VsockListener, VsockTransport,
-    HOST_CID, LOCAL_CID,
-};
+pub use transport::{Transport, TransportError, UnixListener, UnixTransport, HOST_CID, LOCAL_CID};
+#[cfg(target_os = "linux")]
+pub use transport::{VsockListener, VsockTransport};
 
 // Re-export server types
 pub use server::{AsyncServer, FilesystemHandler, PassthroughFs, ServerConfig};
@@ -51,11 +50,15 @@ pub use server::{AsyncServer, FilesystemHandler, PassthroughFs, ServerConfig};
 // Re-export client types
 #[cfg(feature = "fuse-client")]
 pub use client::{mount, mount_with_options, mount_with_readers, FuseClient, Multiplexer};
+#[cfg(all(feature = "fuse-client", target_os = "linux"))]
+pub use client::{mount_vsock, mount_vsock_with_options, mount_vsock_with_readers};
 
 /// Prelude for common imports.
 pub mod prelude {
     pub use crate::protocol::{
         DirEntry, FileAttr, VolumeRequest, VolumeResponse, WireRequest, WireResponse,
     };
-    pub use crate::transport::{UnixTransport, VsockTransport, HOST_CID};
+    pub use crate::transport::{UnixTransport, HOST_CID};
+    #[cfg(target_os = "linux")]
+    pub use crate::transport::VsockTransport;
 }

@@ -8,6 +8,7 @@ use std::process::Stdio;
 use std::thread;
 use fs2::FileExt;
 use tokio::{io::{AsyncBufReadExt, BufReader}, process::Command, time::{sleep, Duration}};
+use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Deserialize)]
 struct Plan {
@@ -231,33 +232,13 @@ async fn remount_fuse_volumes(volumes: &[VolumeMount]) {
             continue;
         }
 
-        // Connect to host VolumeServer via vsock and mount
-        let fs = match fuse::VolumeFs::new_vsock(vol.vsock_port) {
-            Ok(fs) => fs,
-            Err(e) => {
-                eprintln!("[fc-agent] ERROR: failed to connect to volume server port {}: {}", vol.vsock_port, e);
-                continue;
-            }
-        };
-
-        // Mount FUSE filesystem in a background thread
+        // Mount FUSE filesystem in a background thread using fuse-pipe
         let mount_path = vol.guest_path.clone();
-        let read_only = vol.read_only;
+        let port = vol.vsock_port;
 
         thread::spawn(move || {
-            let options = vec![
-                fuser::MountOption::FSName("fcvm-volume".to_string()),
-                fuser::MountOption::AllowOther,
-                fuser::MountOption::AutoUnmount,
-            ];
-
-            let mut all_options = options;
-            if read_only {
-                all_options.push(fuser::MountOption::RO);
-            }
-
             eprintln!("[fc-agent] fuse: starting remount at {}", mount_path);
-            if let Err(e) = fuser::mount2(fs, &mount_path, &all_options) {
+            if let Err(e) = fuse::mount_vsock(port, &mount_path) {
                 eprintln!("[fc-agent] FUSE remount error at {}: {}", mount_path, e);
             }
             eprintln!("[fc-agent] fuse: remount at {} exited", mount_path);
@@ -474,34 +455,14 @@ fn mount_fuse_volumes(volumes: &[VolumeMount]) -> Result<Vec<String>> {
         std::fs::create_dir_all(&vol.guest_path)
             .with_context(|| format!("creating mount point: {}", vol.guest_path))?;
 
-        // Connect to host VolumeServer via vsock
-        let fs = match fuse::VolumeFs::new_vsock(vol.vsock_port) {
-            Ok(fs) => fs,
-            Err(e) => {
-                eprintln!("[fc-agent] ERROR: failed to connect to volume server: {}", e);
-                return Err(e);
-            }
-        };
-
-        // Mount FUSE filesystem in a background thread
-        // fuser::mount2 blocks, so we run it in a dedicated thread
+        // Mount FUSE filesystem in a background thread using fuse-pipe
+        // fuse-pipe's mount_vsock blocks, so we run it in a dedicated thread
         let mount_path = vol.guest_path.clone();
-        let read_only = vol.read_only;
+        let port = vol.vsock_port;
 
         thread::spawn(move || {
-            let options = vec![
-                fuser::MountOption::FSName("fcvm-volume".to_string()),
-                fuser::MountOption::AllowOther,
-                fuser::MountOption::AutoUnmount,
-            ];
-
-            let mut all_options = options;
-            if read_only {
-                all_options.push(fuser::MountOption::RO);
-            }
-
             eprintln!("[fc-agent] fuse: starting mount at {}", mount_path);
-            if let Err(e) = fuser::mount2(fs, &mount_path, &all_options) {
+            if let Err(e) = fuse::mount_vsock(port, &mount_path) {
                 eprintln!("[fc-agent] FUSE mount error at {}: {}", mount_path, e);
             }
             eprintln!("[fc-agent] fuse: mount at {} exited", mount_path);
@@ -576,6 +537,16 @@ async fn sync_clock_from_host() -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize tracing (fuse-pipe uses tracing for logging)
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,fuse_pipe=debug"))
+        )
+        .with_target(true)
+        .with_writer(std::io::stderr)
+        .init();
+
     eprintln!("[fc-agent] starting");
 
     // Wait for MMDS to be ready

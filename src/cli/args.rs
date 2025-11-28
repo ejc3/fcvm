@@ -213,6 +213,9 @@ pub enum TestCommands {
 
     /// Clone lock test: verify POSIX file locking across multiple clones
     CloneLock(CloneLockTestArgs),
+
+    /// Run pjdfstest POSIX filesystem compliance tests against a FUSE volume
+    Pjdfstest(PjdfstestArgs),
 }
 
 #[derive(Args, Debug)]
@@ -324,6 +327,25 @@ pub struct CloneLockTestArgs {
     /// Network mode: bridged (requires sudo) or rootless (no sudo)
     #[arg(long, value_enum, default_value_t = NetworkMode::Bridged)]
     pub network: NetworkMode,
+}
+
+#[derive(Args, Debug)]
+pub struct PjdfstestArgs {
+    /// Timeout for test in seconds
+    #[arg(long, default_value_t = 600)]
+    pub timeout: u64,
+
+    /// Network mode: bridged (requires sudo) or rootless (no sudo)
+    #[arg(long, value_enum, default_value_t = NetworkMode::Bridged)]
+    pub network: NetworkMode,
+
+    /// Test pattern filter (e.g., "chmod", "chown", "link")
+    #[arg(long)]
+    pub filter: Option<String>,
+
+    /// Verbose output from pjdfstest
+    #[arg(short, long)]
+    pub verbose: bool,
 }
 
 // ============================================================================

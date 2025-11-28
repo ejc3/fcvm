@@ -17,6 +17,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
 
 /// Response with optional tracing span
 struct PendingResponse {
@@ -54,7 +55,7 @@ impl<H: FilesystemHandler + 'static> AsyncServer<H> {
         let _ = std::fs::remove_file(socket_path);
 
         let listener = UnixListener::bind(socket_path)?;
-        eprintln!("[pipelined] listening on {}", socket_path);
+        info!(target: "fuse-pipe::server", socket_path, "listening");
 
         let mut client_id = 0u32;
 
@@ -65,15 +66,40 @@ impl<H: FilesystemHandler + 'static> AsyncServer<H> {
             let id = client_id;
             client_id += 1;
 
-            eprintln!("[pipelined] client {} connected", id);
+            info!(target: "fuse-pipe::server", client_id = id, "client connected");
 
             tokio::spawn(async move {
                 if let Err(e) = handle_client_pipelined(handler, stream, config, id).await {
-                    eprintln!("[pipelined] client {} error: {}", id, e);
+                    error!(target: "fuse-pipe::server", client_id = id, error = %e, "client error");
                 }
-                eprintln!("[pipelined] client {} disconnected", id);
+                debug!(target: "fuse-pipe::server", client_id = id, "client disconnected");
             });
         }
+    }
+
+    /// Serve on Firecracker's vsock-forwarded Unix socket.
+    ///
+    /// Firecracker implements vsock by forwarding guest connections to Unix sockets
+    /// named `{uds_path}_{port}`. This method binds to that path pattern.
+    ///
+    /// # Arguments
+    ///
+    /// * `uds_base_path` - Base path for vsock sockets (e.g., `/tmp/vm/vsock.sock`)
+    /// * `port` - The vsock port number (e.g., 5000)
+    ///
+    /// The server will listen on `{uds_base_path}_{port}` (e.g., `/tmp/vm/vsock.sock_5000`).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let server = AsyncServer::new(PassthroughFs::new("/data"));
+    /// server.serve_vsock_forwarded("/tmp/vm/vsock.sock", 5000).await?;
+    /// // Listens on /tmp/vm/vsock.sock_5000
+    /// ```
+    pub async fn serve_vsock_forwarded(self, uds_base_path: &str, port: u32) -> anyhow::Result<()> {
+        let socket_path = format!("{}_{}", uds_base_path, port);
+        info!(target: "fuse-pipe::server", uds_base_path, port, socket_path = %socket_path, "serving vsock-forwarded");
+        self.serve_unix(&socket_path).await
     }
 
     /// Run the server with a tuned tokio runtime.
@@ -135,7 +161,7 @@ async fn request_reader<H: FilesystemHandler + 'static>(
 
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > MAX_MESSAGE_SIZE {
-            eprintln!("[pipelined] message too large: {}", len);
+            warn!(target: "fuse-pipe::server", len, max = MAX_MESSAGE_SIZE, "message too large");
             return Err(anyhow::anyhow!("message too large: {}", len));
         }
 
@@ -147,7 +173,7 @@ async fn request_reader<H: FilesystemHandler + 'static>(
         let wire_req: WireRequest = match bincode::deserialize(&req_buf) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[pipelined] deserialize error: {}", e);
+                warn!(target: "fuse-pipe::server", error = %e, "deserialize error");
                 continue;
             }
         };

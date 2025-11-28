@@ -168,6 +168,7 @@ mod tests {
                     loopback_ip: None,
                     health_check_port: None,
                 },
+                volumes: vec![],
             },
         };
 
@@ -272,6 +273,7 @@ mod tests {
                     loopback_ip: None,
                     health_check_port: None,
                 },
+                volumes: vec![],
             },
         };
 
@@ -320,6 +322,7 @@ mod tests {
                         loopback_ip: None,
                         health_check_port: None,
                     },
+                    volumes: vec![],
                 },
             };
             manager.save_snapshot(config).await.unwrap();
@@ -356,6 +359,7 @@ mod tests {
                     loopback_ip: None,
                     health_check_port: None,
                 },
+                volumes: vec![],
             },
         };
         manager.save_snapshot(config).await.unwrap();

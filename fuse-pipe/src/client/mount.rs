@@ -10,6 +10,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use tracing::{debug, error, info, warn};
+
+#[cfg(target_os = "linux")]
+use crate::transport::VsockTransport;
 
 /// Mount a FUSE filesystem using a Unix socket connection.
 ///
@@ -45,23 +49,17 @@ pub fn mount_with_options<P: AsRef<Path>>(
     num_readers: usize,
     trace_rate: u64,
 ) -> anyhow::Result<()> {
-    eprintln!(
-        "[client] connecting to {} (multiplexer slots: {})",
-        socket_path, num_readers
-    );
+    info!(target: "fuse-pipe::client", socket_path, num_readers, "connecting");
 
     // Create socket connection
     let socket = UnixStream::connect(socket_path)?;
     socket.set_read_timeout(Some(Duration::from_secs(30)))?;
     socket.set_write_timeout(Some(Duration::from_secs(30)))?;
-    eprintln!("[client] connected to server");
+    debug!(target: "fuse-pipe::client", "connected to server");
 
     // Create multiplexer for request/response handling
     let mux = Multiplexer::with_trace_rate(socket, num_readers, trace_rate);
-    eprintln!(
-        "[client] multiplexer started with {} reader slots",
-        num_readers
-    );
+    debug!(target: "fuse-pipe::client", num_readers, "multiplexer started");
 
     // Mount options kept minimal to avoid requiring user_allow_other
     let options = vec![fuser::MountOption::FSName("fuse-pipe".to_string())];
@@ -75,11 +73,11 @@ pub fn mount_with_options<P: AsRef<Path>>(
     // For single reader, just run directly
     if num_readers == 1 {
         let mut session = mount_with_options(&options)?;
-        eprintln!("[client] mounted at {:?}", mount_point.as_ref());
+        info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), "mounted");
         if let Err(e) = session.run() {
-            eprintln!("[client] reader 0 error: {}", e);
+            error!(target: "fuse-pipe::client", reader_id = 0, error = %e, "reader error");
         }
-        eprintln!("[client] FUSE session exited");
+        debug!(target: "fuse-pipe::client", "FUSE session exited");
         return Ok(());
     }
 
@@ -107,7 +105,7 @@ pub fn mount_with_options<P: AsRef<Path>>(
 
                 thread::spawn(move || {
                     if let Err(e) = reader_session.run() {
-                        eprintln!("[client] reader {} error: {}", reader_id, e);
+                        error!(target: "fuse-pipe::client", reader_id, error = %e, "reader error");
                     }
                 });
             }
@@ -117,7 +115,7 @@ pub fn mount_with_options<P: AsRef<Path>>(
     // Create primary FuseClient with callback
     let fs = FuseClient::with_init_callback(Arc::clone(&mux), 0, make_init_callback());
     let mut session = fuser::Session::new(fs, mount_point.as_ref(), &options)?;
-    eprintln!("[client] mounted at {:?}", mount_point.as_ref());
+    info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), "mounted");
 
     // Clone fds AFTER session created but BEFORE run()
     let mut clone_failures = 0;
@@ -127,25 +125,158 @@ pub fn mount_with_options<P: AsRef<Path>>(
                 cloned_fds.lock().unwrap().push((reader_id, fd));
             }
             Err(e) => {
-                eprintln!(
-                    "[client] failed to clone fd for reader {}: {}",
-                    reader_id, e
-                );
+                warn!(target: "fuse-pipe::client", reader_id, error = %e, "failed to clone fd");
                 clone_failures += 1;
             }
         }
     }
 
     let actual_readers = num_readers - clone_failures;
-    eprintln!(
-        "[client] FUSE session starting with {} readers (cloned {} fds)",
-        actual_readers,
-        actual_readers - 1
-    );
+    info!(target: "fuse-pipe::client", actual_readers, cloned_fds = actual_readers - 1, "FUSE session starting");
     if let Err(e) = session.run() {
-        eprintln!("[client] reader 0 error: {}", e);
+        error!(target: "fuse-pipe::client", reader_id = 0, error = %e, "reader error");
     }
 
-    eprintln!("[client] FUSE session exited");
+    debug!(target: "fuse-pipe::client", "FUSE session exited");
+    Ok(())
+}
+
+/// Mount a FUSE filesystem using a vsock connection.
+///
+/// This connects to a server via vsock (CID + port) and mounts a FUSE filesystem
+/// at `mount_point`. The function blocks until the filesystem is unmounted.
+///
+/// # Arguments
+///
+/// * `cid` - The context ID (use `HOST_CID` to connect to host from guest)
+/// * `port` - The vsock port number
+/// * `mount_point` - Directory where the FUSE filesystem will be mounted
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use fuse_pipe::client::mount_vsock;
+/// use fuse_pipe::transport::HOST_CID;
+///
+/// // Connect from guest to host on port 5000
+/// mount_vsock(HOST_CID, 5000, "/mnt/volume")?;
+/// ```
+#[cfg(target_os = "linux")]
+pub fn mount_vsock<P: AsRef<Path>>(cid: u32, port: u32, mount_point: P) -> anyhow::Result<()> {
+    mount_vsock_with_options(cid, port, mount_point, 1, 0)
+}
+
+/// Mount a FUSE filesystem via vsock with multiple reader threads.
+#[cfg(target_os = "linux")]
+pub fn mount_vsock_with_readers<P: AsRef<Path>>(
+    cid: u32,
+    port: u32,
+    mount_point: P,
+    num_readers: usize,
+) -> anyhow::Result<()> {
+    mount_vsock_with_options(cid, port, mount_point, num_readers, 0)
+}
+
+/// Mount a FUSE filesystem via vsock with full configuration.
+///
+/// # Arguments
+///
+/// * `cid` - The context ID (use `HOST_CID` to connect to host from guest)
+/// * `port` - The vsock port number
+/// * `mount_point` - Directory where the FUSE filesystem will be mounted
+/// * `num_readers` - Number of FUSE reader threads (1-8 recommended)
+/// * `trace_rate` - Trace every Nth request (0 = disabled)
+#[cfg(target_os = "linux")]
+pub fn mount_vsock_with_options<P: AsRef<Path>>(
+    cid: u32,
+    port: u32,
+    mount_point: P,
+    num_readers: usize,
+    trace_rate: u64,
+) -> anyhow::Result<()> {
+    info!(target: "fuse-pipe::client", cid, port, num_readers, "connecting via vsock");
+
+    // Create vsock connection
+    let transport = VsockTransport::connect(cid, port)?;
+    debug!(target: "fuse-pipe::client", cid, port, "connected to server via vsock");
+
+    // VsockTransport wraps a UnixStream internally, extract it for the multiplexer
+    // This is safe because VsockTransport is just a UnixStream created from a vsock fd
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let socket = unsafe { UnixStream::from_raw_fd(libc::dup(transport.as_raw_fd())) };
+    socket.set_read_timeout(Some(Duration::from_secs(30)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(30)))?;
+
+    // Create multiplexer for request/response handling
+    let mux = Multiplexer::with_trace_rate(socket, num_readers, trace_rate);
+    debug!(target: "fuse-pipe::client", num_readers, "multiplexer started");
+
+    // Mount options kept minimal to avoid requiring user_allow_other
+    let options = vec![fuser::MountOption::FSName("fuse-pipe".to_string())];
+
+    let mount_with_options =
+        |opts: &[fuser::MountOption]| -> Result<fuser::Session<FuseClient>, std::io::Error> {
+            let fs = FuseClient::new(Arc::clone(&mux), 0);
+            fuser::Session::new(fs, mount_point.as_ref(), opts)
+        };
+
+    // For single reader, just run directly
+    if num_readers == 1 {
+        let mut session = mount_with_options(&options)?;
+        info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), "mounted via vsock");
+        if let Err(e) = session.run() {
+            error!(target: "fuse-pipe::client", reader_id = 0, error = %e, "reader error");
+        }
+        debug!(target: "fuse-pipe::client", "FUSE session exited");
+        return Ok(());
+    }
+
+    // Multi-reader setup (same as Unix socket version)
+    let cloned_fds: Arc<Mutex<Vec<(usize, OwnedFd)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let make_init_callback = || {
+        let cloned_fds_for_callback = Arc::clone(&cloned_fds);
+        let mux_for_callback = Arc::clone(&mux);
+        Box::new(move || {
+            let fds_vec: Vec<_> = std::mem::take(&mut *cloned_fds_for_callback.lock().unwrap());
+
+            for (reader_id, cloned_fd) in fds_vec {
+                let fs = FuseClient::new(Arc::clone(&mux_for_callback), reader_id as u32);
+                let mut reader_session =
+                    fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::Owner);
+
+                thread::spawn(move || {
+                    if let Err(e) = reader_session.run() {
+                        error!(target: "fuse-pipe::client", reader_id, error = %e, "reader error");
+                    }
+                });
+            }
+        })
+    };
+
+    let fs = FuseClient::with_init_callback(Arc::clone(&mux), 0, make_init_callback());
+    let mut session = fuser::Session::new(fs, mount_point.as_ref(), &options)?;
+    info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), "mounted via vsock");
+
+    let mut clone_failures = 0;
+    for reader_id in 1..num_readers {
+        match session.channel().clone_fd() {
+            Ok(fd) => {
+                cloned_fds.lock().unwrap().push((reader_id, fd));
+            }
+            Err(e) => {
+                warn!(target: "fuse-pipe::client", reader_id, error = %e, "failed to clone fd");
+                clone_failures += 1;
+            }
+        }
+    }
+
+    let actual_readers = num_readers - clone_failures;
+    info!(target: "fuse-pipe::client", actual_readers, cloned_fds = actual_readers - 1, "FUSE session starting");
+    if let Err(e) = session.run() {
+        error!(target: "fuse-pipe::client", reader_id = 0, error = %e, "reader error");
+    }
+
+    debug!(target: "fuse-pipe::client", "FUSE session exited");
     Ok(())
 }
