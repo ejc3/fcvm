@@ -5,6 +5,37 @@ use tracing::{info, warn};
 
 use crate::paths;
 
+/// Find the fc-agent binary (sibling in same target directory as fcvm)
+///
+/// Both fcvm and fc-agent are workspace members built together with:
+///   cargo build --release --target aarch64-unknown-linux-musl
+///
+/// This puts both binaries in the same directory (target/.../release/).
+fn find_fc_agent_binary() -> Result<PathBuf> {
+    // Primary: fc-agent is built alongside fcvm in the same target directory
+    let exe_path = std::env::current_exe().context("getting current executable path")?;
+    let exe_dir = exe_path.parent().context("getting executable directory")?;
+    let fc_agent = exe_dir.join("fc-agent");
+
+    if fc_agent.exists() {
+        return Ok(fc_agent);
+    }
+
+    // Fallback: environment variable override for special cases
+    if let Ok(path) = std::env::var("FC_AGENT_PATH") {
+        let p = PathBuf::from(&path);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+
+    bail!(
+        "fc-agent binary not found at {} or via FC_AGENT_PATH env var.\n\
+         Build with: cargo build --release --target aarch64-unknown-linux-musl",
+        fc_agent.display()
+    )
+}
+
 /// Helper to convert Path to str with proper error handling
 fn path_to_str(path: &Path) -> Result<&str> {
     path.to_str()
@@ -515,30 +546,9 @@ echo "[proc-monitor] Process monitoring complete" > /dev/console
 async fn install_fc_agent(mount_point: &Path) -> Result<()> {
     info!("installing fc-agent guest agent");
 
-    // Find fc-agent binary - try multiple locations
-    // IMPORTANT: Prefer musl target for Alpine Linux compatibility (statically linked)
-    let possible_paths = vec![
-        PathBuf::from(
-            "/home/ubuntu/fcvm/fc-agent/target/aarch64-unknown-linux-musl/release/fc-agent",
-        ), // musl (static)
-        PathBuf::from("fc-agent/target/aarch64-unknown-linux-musl/release/fc-agent"), // musl relative
-        PathBuf::from("/home/ubuntu/fcvm/fc-agent/target/release/fc-agent"), // gnu (fallback, won't work on Alpine)
-        PathBuf::from("fc-agent/target/release/fc-agent"),                   // gnu relative
-        PathBuf::from("../fc-agent/target/release/fc-agent"), // gnu relative from current dir
-    ];
-
-    let fc_agent_src = possible_paths.iter().find(|p| p.exists()).cloned();
-
-    let fc_agent_src = match fc_agent_src {
-        Some(path) => path,
-        None => {
-            bail!(
-                "fc-agent binary not found in any of: {:?}\n\
-                   Please build it first: cd fc-agent && cargo build --release",
-                possible_paths
-            );
-        }
-    };
+    // Find fc-agent binary - it's built alongside fcvm in the same target directory
+    // Both binaries are workspace members built with: cargo build --release --target aarch64-unknown-linux-musl
+    let fc_agent_src = find_fc_agent_binary()?;
 
     // Create /usr/local/bin directory if it doesn't exist
     let bin_dir = mount_point.join("usr/local/bin");

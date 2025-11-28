@@ -128,6 +128,7 @@ pub async fn cmd_test(args: TestArgs) -> Result<()> {
             cmd_volume_stress_test(volume_stress_args).await
         }
         TestCommands::CloneLock(clone_lock_args) => cmd_clone_lock_test(clone_lock_args).await,
+        TestCommands::Pjdfstest(pjdfstest_args) => cmd_pjdfstest(pjdfstest_args).await,
     }
 }
 
@@ -1722,5 +1723,260 @@ async fn cmd_clone_lock_test(args: crate::cli::CloneLockTestArgs) -> Result<()> 
                      lines.len(), expected_lines, corrupt_lines);
         }
         Err(anyhow::anyhow!("Clone lock test failed"))
+    }
+}
+
+/// pjdfstest: Run POSIX filesystem compliance tests against a FUSE volume
+///
+/// Test flow:
+/// 1. Start a VM with a FUSE volume mounted
+/// 2. Wait for VM to become healthy
+/// 3. Install/run pjdfstest inside the VM against the FUSE mount point
+/// 4. Report results
+async fn cmd_pjdfstest(args: crate::cli::PjdfstestArgs) -> Result<()> {
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let network_str = match args.network {
+        crate::cli::NetworkMode::Bridged => "bridged",
+        crate::cli::NetworkMode::Rootless => "rootless",
+    };
+
+    println!("fcvm pjdfstest");
+    println!("==============");
+    println!("Running POSIX filesystem compliance tests (pjdfstest)");
+    println!("Timeout: {}s", args.timeout);
+    println!("Network mode: {}", network_str);
+    if let Some(ref filter) = args.filter {
+        println!("Test filter: {}", filter);
+    }
+    if args.verbose {
+        println!("Verbose: enabled");
+    }
+    println!();
+
+    // Step 1: Create test volume directory on host
+    println!("Setting up test volume on host...");
+    let test_base = std::path::PathBuf::from("/tmp/fcvm-pjdfstest");
+    let _ = std::fs::remove_dir_all(&test_base);
+    std::fs::create_dir_all(&test_base)?;
+
+    let volume_mapping = format!("{}:/mnt/testfs", test_base.display());
+    println!("  Volume: {}", volume_mapping);
+    println!();
+
+    // Step 2: Start VM with volume
+    println!("Starting VM with FUSE volume...");
+    let vm_name = "pjdfstest-vm";
+
+    let cmd_args = vec![
+        "podman".to_string(),
+        "run".to_string(),
+        "--name".to_string(),
+        vm_name.to_string(),
+        "--network".to_string(),
+        network_str.to_string(),
+        "--map".to_string(),
+        volume_mapping.clone(),
+        "--".to_string(),
+        "nginx:alpine".to_string(),
+    ];
+
+    let mut child = fcvm_subprocess()
+        .args(&cmd_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning VM for pjdfstest")?;
+
+    let fcvm_pid = child.id().context("getting child PID")?;
+    println!("  fcvm process started (PID: {})", fcvm_pid);
+
+    // Stream subprocess output
+    if let Some(stdout) = child.stdout.take() {
+        tokio::spawn(async move {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                info!(target: "pjdfstest-vm", "{}", line);
+            }
+        });
+    }
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                info!(target: "pjdfstest-vm", "{}", line);
+            }
+        });
+    }
+
+    // Wait for VM to become healthy
+    println!("  Waiting for VM to become healthy...");
+    match poll_health_check_by_pid(fcvm_pid, 120).await {
+        Ok(ms) => println!("  ✓ VM healthy in {}ms", ms),
+        Err(e) => {
+            println!("  ✗ VM health check failed: {}", e);
+            kill_process(fcvm_pid).await;
+            let _ = std::fs::remove_dir_all(&test_base);
+            return Err(anyhow::anyhow!("VM did not become healthy"));
+        }
+    }
+
+    // Give volume time to mount
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    println!();
+
+    // Step 3: Run pjdfstest from HOST against the FUSE-mounted directory
+    // Since the volume is mounted on the host via FUSE-over-vsock, we can run
+    // pjdfstest directly on the host against /tmp/fcvm-pjdfstest
+    println!("Running pjdfstest against FUSE volume...");
+    println!("  Test path: {}", test_base.display());
+    println!();
+
+    // Build pjdfstest command
+    // pjdfstest usage: pjdfstest -c config.toml -p /path [filter]
+    // Or without config: pjdfstest -p /path [filter]
+    let mut pjdfstest_args = vec![
+        "-p".to_string(),
+        test_base.to_string_lossy().to_string(),
+    ];
+
+    if args.verbose {
+        pjdfstest_args.push("-v".to_string());
+    }
+
+    if let Some(ref filter) = args.filter {
+        pjdfstest_args.push(filter.clone());
+    }
+
+    let test_start = Instant::now();
+
+    // Run pjdfstest (must be installed on the host)
+    let pjdfstest_result = Command::new("pjdfstest")
+        .args(&pjdfstest_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+
+    let (passed, failed, skipped, output) = match pjdfstest_result {
+        Ok(mut pjdfstest_child) => {
+            // Stream output in real-time
+            let stdout = pjdfstest_child.stdout.take();
+            let stderr = pjdfstest_child.stderr.take();
+
+            let mut all_output = String::new();
+            let mut passed = 0u32;
+            let mut failed = 0u32;
+            let mut skipped = 0u32;
+
+            // Read stdout
+            if let Some(stdout) = stdout {
+                let reader = BufReader::new(stdout);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    all_output.push_str(&line);
+                    all_output.push('\n');
+
+                    // Parse pjdfstest output format
+                    // Typical lines: "chmod/00.t .... ok" or "chmod/00.t .... FAILED"
+                    if line.contains(" ok") || line.contains("PASS") {
+                        passed += 1;
+                        if args.verbose {
+                            println!("  ✓ {}", line);
+                        }
+                    } else if line.contains("FAILED") || line.contains("FAIL") {
+                        failed += 1;
+                        println!("  ✗ {}", line);
+                    } else if line.contains("SKIP") || line.contains("skipped") {
+                        skipped += 1;
+                        if args.verbose {
+                            println!("  ⊘ {}", line);
+                        }
+                    } else if args.verbose || line.contains("error") || line.contains("Error") {
+                        println!("  {}", line);
+                    }
+                }
+            }
+
+            // Read stderr
+            if let Some(stderr) = stderr {
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    all_output.push_str("stderr: ");
+                    all_output.push_str(&line);
+                    all_output.push('\n');
+                    eprintln!("  [stderr] {}", line);
+                }
+            }
+
+            // Wait for pjdfstest to complete
+            let status = pjdfstest_child.wait().await?;
+            if !status.success() && failed == 0 {
+                // If exit code indicates failure but we didn't parse any failures,
+                // mark as a general failure
+                failed = 1;
+            }
+
+            (passed, failed, skipped, all_output)
+        }
+        Err(e) => {
+            println!("  ✗ Failed to run pjdfstest: {}", e);
+            println!();
+            println!("  pjdfstest is not installed or not in PATH.");
+            println!("  Install it with: cargo install pjdfstest");
+            println!("  Or clone from: https://github.com/saidsay-so/pjdfstest");
+            println!();
+
+            // Cleanup and return error
+            kill_process(fcvm_pid).await;
+            let _ = std::fs::remove_dir_all(&test_base);
+            return Err(anyhow::anyhow!("pjdfstest not found: {}", e));
+        }
+    };
+
+    let test_duration = test_start.elapsed();
+
+    // Step 4: Summary
+    println!();
+    println!("================================================================================");
+    println!("PJDFSTEST SUMMARY");
+    println!("================================================================================");
+    println!();
+    println!("Duration: {:.1}s", test_duration.as_secs_f64());
+    println!("Passed:   {}", passed);
+    println!("Failed:   {}", failed);
+    println!("Skipped:  {}", skipped);
+    println!("Total:    {}", passed + failed + skipped);
+    println!();
+
+    // Save detailed output to file
+    let output_file = std::path::PathBuf::from("/tmp/fcvm-pjdfstest-output.log");
+    if let Err(e) = std::fs::write(&output_file, &output) {
+        eprintln!("Warning: Failed to write output log: {}", e);
+    } else {
+        println!("Full output saved to: {}", output_file.display());
+    }
+
+    // Cleanup
+    println!();
+    println!("Stopping VM...");
+    kill_process(fcvm_pid).await;
+
+    // Clean up test directories
+    let _ = std::fs::remove_dir_all(&test_base);
+
+    // Final result
+    println!();
+    if failed == 0 {
+        println!("✅ PJDFSTEST PASSED!");
+        println!("  All {} tests passed ({} skipped)", passed, skipped);
+        Ok(())
+    } else {
+        println!("❌ PJDFSTEST FAILED!");
+        println!("  {} tests failed, {} passed, {} skipped", failed, passed, skipped);
+        Err(anyhow::anyhow!("pjdfstest failed: {} test failures", failed))
     }
 }

@@ -32,7 +32,9 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
             truncate_id(&vm_id, 8).to_string() // Fallback to short vm_id
         };
 
-        info!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, pid = ?pid, "starting health monitor");
+        // vm_name is already in the hierarchical target, so don't duplicate
+        let _ = (&vm_name, &vm_id); // suppress unused warning
+        info!(target: "health-monitor", pid = ?pid, "starting health monitor");
 
         // Adaptive polling: fast during startup, slow after healthy
         let mut poll_interval = HEALTH_POLL_STARTUP_INTERVAL;
@@ -47,7 +49,7 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
             let health_status = if let Some(pid) = pid {
                 // First check if Firecracker process is still running
                 if std::fs::metadata(format!("/proc/{}", pid)).is_err() {
-                    debug!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, pid = pid, "process not found");
+                    debug!(target: "health-monitor", pid = pid, "process not found");
                     HealthStatus::Unreachable
                 } else {
                     // Process exists, now check if application is responding
@@ -59,16 +61,16 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
                         // Check for rootless mode (loopback_ip set)
                         if let Some(loopback_ip) = &net.loopback_ip {
                             let port = net.health_check_port.unwrap_or(80);
-                            debug!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, loopback_ip = %loopback_ip, port = port, "rootless health check via loopback");
+                            debug!(target: "health-monitor", loopback_ip = %loopback_ip, port = port, "rootless health check via loopback");
 
                             match check_http_health_loopback(loopback_ip, port, health_path).await {
                                 Ok(true) => {
-                                    debug!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, "health check passed (rootless)");
+                                    debug!(target: "health-monitor", "health check passed (rootless)");
                                     last_failure_log = None;
                                     HealthStatus::Healthy
                                 }
                                 Ok(false) => {
-                                    warn!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, "health check returned false (unexpected)");
+                                    warn!(target: "health-monitor", "health check returned false (unexpected)");
                                     HealthStatus::Unhealthy
                                 }
                                 Err(e) => {
@@ -77,7 +79,7 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
                                         Some(last_time) => last_time.elapsed() >= Duration::from_secs(1),
                                     };
                                     if should_log {
-                                        warn!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, error = %e, "health check failed (rootless)");
+                                        warn!(target: "health-monitor", error = %e, "health check failed (rootless)");
                                         last_failure_log = Some(Instant::now());
                                     }
                                     HealthStatus::Unhealthy
@@ -88,17 +90,17 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
                             let guest_ip = net.guest_ip.as_deref();
                             let veth_device = net.host_veth.as_deref();
 
-                            debug!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, guest_ip = ?guest_ip, veth = ?veth_device, "bridged health check via veth");
+                            debug!(target: "health-monitor", guest_ip = ?guest_ip, veth = ?veth_device, "bridged health check via veth");
 
                             if let (Some(guest_ip), Some(veth)) = (guest_ip, veth_device) {
                                 match check_http_health_bridged(guest_ip, veth, health_path).await {
                                     Ok(true) => {
-                                        debug!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, "health check passed (bridged)");
+                                        debug!(target: "health-monitor", "health check passed (bridged)");
                                         last_failure_log = None;
                                         HealthStatus::Healthy
                                     }
                                     Ok(false) => {
-                                        warn!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, "health check returned false (unexpected)");
+                                        warn!(target: "health-monitor", "health check returned false (unexpected)");
                                         HealthStatus::Unhealthy
                                     }
                                     Err(e) => {
@@ -107,7 +109,7 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
                                             Some(last_time) => last_time.elapsed() >= Duration::from_secs(1),
                                         };
                                         if should_log {
-                                            warn!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, error = %e, "health check failed (bridged)");
+                                            warn!(target: "health-monitor", error = %e, "health check failed (bridged)");
                                             last_failure_log = Some(Instant::now());
                                         }
                                         HealthStatus::Unhealthy
@@ -116,16 +118,16 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
                             } else {
                                 // No network config yet
                                 if guest_ip.is_none() {
-                                    warn!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, "cannot check health: no guest_ip in config");
+                                    warn!(target: "health-monitor", "cannot check health: no guest_ip in config");
                                 }
                                 if veth_device.is_none() {
-                                    warn!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, "cannot check health: no host_veth in config");
+                                    warn!(target: "health-monitor", "cannot check health: no host_veth in config");
                                 }
                                 HealthStatus::Unknown
                             }
                         }
                     } else {
-                        warn!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, "failed to load VM state for health check");
+                        warn!(target: "health-monitor", "failed to load VM state for health check");
                         HealthStatus::Unknown
                     }
                 }
@@ -139,21 +141,21 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
                 state.last_updated = chrono::Utc::now();
                 match state_manager.save_state(&state).await {
                     Ok(_) => {
-                        debug!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, health_status = ?health_status, "state saved")
+                        debug!(target: "health-monitor", health_status = ?health_status, "state saved")
                     }
                     Err(e) => {
-                        warn!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, error = %e, "failed to save state")
+                        warn!(target: "health-monitor", error = %e, "failed to save state")
                     }
                 }
             } else {
-                warn!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, "failed to load state for updating health");
+                warn!(target: "health-monitor", "failed to load state for updating health");
             }
 
             // Switch to slower polling once healthy
             if health_status == HealthStatus::Healthy && !is_healthy {
                 is_healthy = true;
                 poll_interval = HEALTH_POLL_HEALTHY_INTERVAL;
-                info!(target: "health-monitor", vm_name = %vm_name, vm_id = %vm_id, "VM healthy, switching to {:?} polling", HEALTH_POLL_HEALTHY_INTERVAL);
+                info!(target: "health-monitor", "VM healthy, switching to {:?} polling", HEALTH_POLL_HEALTHY_INTERVAL);
             }
         }
     })

@@ -23,4 +23,6 @@ mod vsock;
 
 pub use traits::{AsyncReadHalf, AsyncTransport, AsyncWriteHalf, Transport, TransportError};
 pub use unix::{UnixListener, UnixTransport};
-pub use vsock::{VsockListener, VsockTransport, HOST_CID, LOCAL_CID};
+pub use vsock::{HOST_CID, LOCAL_CID};
+#[cfg(target_os = "linux")]
+pub use vsock::{VsockListener, VsockTransport};

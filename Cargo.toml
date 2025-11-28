@@ -1,5 +1,7 @@
 [workspace]
-members = [".", "fuse-pipe"]
+members = [".", "fuse-pipe", "fc-agent"]
+# Build all members by default (not just the root package)
+default-members = [".", "fuse-pipe", "fc-agent"]
 
 [package]
 name = "fcvm"
@@ -34,3 +36,4 @@ num_cpus = "1"
 shell-words = "1"
 futures = "0.3"
 bincode = "1.3"
+fuse-pipe = { path = "fuse-pipe", default-features = false }

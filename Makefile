@@ -52,8 +52,8 @@ help:
 	@echo "  make clean         - Clean local build artifacts"
 	@echo ""
 	@echo "Build artifacts:"
-	@echo "  fcvm:     target/release/fcvm (host binary)"
-	@echo "  fc-agent: fc-agent/target/.../fc-agent (guest binary, musl)"
+	@echo "  fcvm:     target/aarch64-unknown-linux-musl/release/fcvm"
+	@echo "  fc-agent: target/aarch64-unknown-linux-musl/release/fc-agent"
 	@echo "  vmlinux:  /mnt/fcvm-btrfs/kernels/vmlinux (FUSE-enabled)"
 
 #
@@ -69,13 +69,11 @@ sync:
 build: sync build-remote
 
 build-remote:
-	@echo "==> Building fcvm on EC2..."
+	@echo "==> Building workspace on EC2 (fcvm + fc-agent)..."
 	$(SSH) "cd $(REMOTE_DIR) && source ~/.cargo/env && cargo build --release 2>&1" | tee /tmp/fcvm-build.log
-	@echo "==> Building fc-agent on EC2..."
-	$(SSH) "cd $(REMOTE_DIR)/fc-agent && source ~/.cargo/env && cargo build --release --target aarch64-unknown-linux-musl 2>&1" | tee /tmp/fc-agent-build.log
 	@echo "==> Build complete!"
-	@echo "    fcvm:     $(REMOTE_DIR)/target/release/fcvm"
-	@echo "    fc-agent: $(REMOTE_DIR)/fc-agent/target/aarch64-unknown-linux-musl/release/fc-agent"
+	@echo "    fcvm:     $(REMOTE_DIR)/target/aarch64-unknown-linux-musl/release/fcvm"
+	@echo "    fc-agent: $(REMOTE_DIR)/target/aarch64-unknown-linux-musl/release/fc-agent"
 
 #
 # Fetch built artifacts
@@ -83,9 +81,9 @@ build-remote:
 fetch:
 	@mkdir -p $(ARTIFACTS)
 	@echo "==> Downloading fcvm..."
-	scp -i $(EC2_KEY) $(EC2_HOST):$(REMOTE_DIR)/target/release/fcvm $(ARTIFACTS)/
+	scp -i $(EC2_KEY) $(EC2_HOST):$(REMOTE_DIR)/target/aarch64-unknown-linux-musl/release/fcvm $(ARTIFACTS)/
 	@echo "==> Downloading fc-agent..."
-	scp -i $(EC2_KEY) $(EC2_HOST):$(REMOTE_DIR)/fc-agent/target/aarch64-unknown-linux-musl/release/fc-agent $(ARTIFACTS)/
+	scp -i $(EC2_KEY) $(EC2_HOST):$(REMOTE_DIR)/target/aarch64-unknown-linux-musl/release/fc-agent $(ARTIFACTS)/
 	@echo "==> Artifacts downloaded to $(ARTIFACTS)/"
 	@ls -la $(ARTIFACTS)/
 
@@ -136,7 +134,7 @@ rootfs:
 	@echo "==> Updating fc-agent in rootfs on EC2..."
 	$(SSH) "sudo mkdir -p /tmp/rootfs-mount && \
 		sudo mount -o loop /mnt/fcvm-btrfs/rootfs/base.ext4 /tmp/rootfs-mount && \
-		sudo cp $(REMOTE_DIR)/fc-agent/target/aarch64-unknown-linux-musl/release/fc-agent /tmp/rootfs-mount/usr/local/bin/fc-agent && \
+		sudo cp $(REMOTE_DIR)/target/aarch64-unknown-linux-musl/release/fc-agent /tmp/rootfs-mount/usr/local/bin/fc-agent && \
 		sudo chmod +x /tmp/rootfs-mount/usr/local/bin/fc-agent && \
 		sudo umount /tmp/rootfs-mount"
 	@echo "==> Rootfs updated: /mnt/fcvm-btrfs/rootfs/base.ext4"
@@ -152,37 +150,39 @@ rebuild: build rootfs
 #
 deploy:
 	@echo "==> Deploying fc-agent to rootfs..."
-	$(SSH) "sudo cp $(REMOTE_DIR)/fc-agent/target/aarch64-unknown-linux-musl/release/fc-agent /mnt/fcvm-btrfs/rootfs/base/usr/local/bin/"
+	$(SSH) "sudo cp $(REMOTE_DIR)/target/aarch64-unknown-linux-musl/release/fc-agent /mnt/fcvm-btrfs/rootfs/base/usr/local/bin/"
 	@echo "==> fc-agent deployed"
 
 #
 # Testing
 #
+FCVM_BIN := ./target/aarch64-unknown-linux-musl/release/fcvm
+
 test:
 	@echo "==> Running sanity test on EC2..."
-	$(SSH) "cd $(REMOTE_DIR) && sudo ./target/release/fcvm test sanity 2>&1" | tee /tmp/test.log
+	$(SSH) "cd $(REMOTE_DIR) && sudo $(FCVM_BIN) test sanity 2>&1" | tee /tmp/test.log
 
 sanity: test
 
 test-volume: build
 	@echo "==> Running volume test on EC2 (single volume)..."
-	$(SSH) "cd $(REMOTE_DIR) && sudo ./target/release/fcvm test volume --num-volumes 1 2>&1" | tee /tmp/test-volume.log
+	$(SSH) "cd $(REMOTE_DIR) && sudo $(FCVM_BIN) test volume --num-volumes 1 2>&1" | tee /tmp/test-volume.log
 
 test-volumes: build
 	@echo "==> Running volume test on EC2 (multiple volumes)..."
-	$(SSH) "cd $(REMOTE_DIR) && sudo ./target/release/fcvm test volume --num-volumes 3 2>&1" | tee /tmp/test-volumes.log
+	$(SSH) "cd $(REMOTE_DIR) && sudo $(FCVM_BIN) test volume --num-volumes 3 2>&1" | tee /tmp/test-volumes.log
 
 test-volume-stress: build
 	@echo "==> Running volume stress test on EC2..."
-	$(SSH) "cd $(REMOTE_DIR) && sudo ./target/release/fcvm test volume-stress --num-volumes 2 --file-size-mb 10 --iterations 5 2>&1" | tee /tmp/test-volume-stress.log
+	$(SSH) "cd $(REMOTE_DIR) && sudo $(FCVM_BIN) test volume-stress --num-volumes 2 --file-size-mb 10 --iterations 5 2>&1" | tee /tmp/test-volume-stress.log
 
 test-clone-lock: rebuild
 	@echo "==> Running clone lock test on EC2 (POSIX locking across 10 clones)..."
-	$(SSH) "cd $(REMOTE_DIR) && sudo ./target/release/fcvm test clone-lock --num-clones 10 --iterations 100 2>&1" | tee /tmp/test-clone-lock.log
+	$(SSH) "cd $(REMOTE_DIR) && sudo $(FCVM_BIN) test clone-lock --num-clones 10 --iterations 100 2>&1" | tee /tmp/test-clone-lock.log
 
 test-pjdfstest: rebuild
 	@echo "==> Running pjdfstest on EC2 (POSIX filesystem compliance)..."
-	$(SSH) "cd $(REMOTE_DIR) && sudo ./target/release/fcvm test pjdfstest --timeout 600 2>&1" | tee /tmp/test-pjdfstest.log
+	$(SSH) "cd $(REMOTE_DIR) && sudo $(FCVM_BIN) test pjdfstest --timeout 600 2>&1" | tee /tmp/test-pjdfstest.log
 
 fuse-pipe-test: sync
 	@echo "==> Running fuse-pipe tests on EC2..."
@@ -193,11 +193,9 @@ fuse-pipe-test: sync
 #
 build-local:
 	cargo build --release
-	cd fc-agent && cargo build --release
 
 clean:
 	cargo clean
-	cd fc-agent && cargo clean
 	rm -rf $(ARTIFACTS)
 
 #
