@@ -5,22 +5,16 @@ use tracing::info;
 
 use crate::cli::LsArgs;
 use crate::paths;
-use crate::state::{truncate_id, StateManager};
+use crate::state::{truncate_id, StateManager, VmState};
 
 const STALE_THRESHOLD_SECS: i64 = 300; // 5 minutes
 
+/// Extended VM info for display with computed fields
 #[derive(Debug, Serialize, Deserialize)]
-struct VmInfo {
-    name: String,
-    status: String,
-    health: String,
-    guest_ip: String,
-    tap_device: String,
-    image: String,
-    mem_mb: u32,
-    pid: Option<u32>,
+struct VmInfoDisplay {
+    #[serde(flatten)]
+    vm: VmState,
     stale: bool,
-    last_updated: String,
 }
 
 pub async fn cmd_ls(args: LsArgs) -> Result<()> {
@@ -31,7 +25,7 @@ pub async fn cmd_ls(args: LsArgs) -> Result<()> {
     let state_manager = StateManager::new(paths::state_dir());
     let mut vms = state_manager.list_vms().await?;
 
-    let mut vm_infos = Vec::new();
+    let mut vm_displays = Vec::new();
 
     for vm in &mut vms {
         // Filter by PID if requested
@@ -56,48 +50,15 @@ pub async fn cmd_ls(args: LsArgs) -> Result<()> {
             }
         }
 
-        let name = vm.name.clone().unwrap_or_else(|| truncate_id(&vm.vm_id, 8).to_string());
-
-        // Extract network info from typed NetworkConfig struct
-        let guest_ip = vm
-            .config
-            .network
-            .guest_ip
-            .as_deref()
-            .unwrap_or("-")
-            .to_string();
-        let tap_device = if vm.config.network.tap_device.is_empty() {
-            "-".to_string()
-        } else {
-            vm.config.network.tap_device.clone()
-        };
-
-        let status = format!("{:?}", vm.status);
-        let health = format!("{:?}", vm.health_status);
-        let image = vm
-            .config
-            .image
-            .split(':')
-            .next()
-            .unwrap_or(&vm.config.image);
-
-        vm_infos.push(VmInfo {
-            name,
-            status,
-            health,
-            guest_ip,
-            tap_device,
-            image: image.to_string(),
-            mem_mb: vm.config.memory_mib,
-            pid: vm.pid,
+        vm_displays.push(VmInfoDisplay {
+            vm: vm.clone(),
             stale,
-            last_updated: vm.last_updated.to_rfc3339(),
         });
     }
 
     if args.json {
-        // JSON output
-        let json = serde_json::to_string_pretty(&vm_infos)?;
+        // JSON output - serializes VmState with all typed fields
+        let json = serde_json::to_string_pretty(&vm_displays)?;
         println!("{}", json);
     } else {
         // Table output
@@ -115,20 +76,31 @@ pub async fn cmd_ls(args: LsArgs) -> Result<()> {
         );
         println!("{}", "-".repeat(120));
 
-        for vm in vm_infos {
-            let stale_marker = if vm.stale { "YES" } else { "" };
+        for display in vm_displays {
+            let vm = &display.vm;
+            let stale_marker = if display.stale { "YES" } else { "" };
             let pid_str = vm.pid.map_or("-".to_string(), |p| p.to_string());
+            let name = vm.name.as_ref().map(|s| s.as_str()).unwrap_or_else(|| truncate_id(&vm.vm_id, 8));
+            let guest_ip = vm.config.network.guest_ip.as_deref().unwrap_or("-");
+            let tap_device = if vm.config.network.tap_device.is_empty() {
+                "-"
+            } else {
+                &vm.config.network.tap_device
+            };
+            let image = vm.config.image.split(':').next().unwrap_or(&vm.config.image);
+            let status = format!("{:?}", vm.status);
+            let health = format!("{:?}", vm.health_status);
 
             println!(
                 "{:<20} {:<10} {:<12} {:<12} {:<15} {:<15} {:<12} {:<8} {:<6}",
-                vm.name,
+                name,
                 pid_str,
-                vm.status,
-                vm.health,
-                vm.guest_ip,
-                vm.tap_device,
-                vm.image,
-                vm.mem_mb,
+                status,
+                health,
+                guest_ip,
+                tap_device,
+                image,
+                vm.config.memory_mib,
                 stale_marker
             );
         }

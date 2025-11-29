@@ -47,34 +47,72 @@ fn path_to_str(path: &Path) -> Result<&str> {
 /// Ensure rootfs exists, creating minimal Ubuntu + Podman if needed
 ///
 /// Caches the rootfs filesystem - only creates it once.
-/// Always updates fc-agent binary to ensure latest version is injected.
+/// The base rootfs is immutable after creation to prevent corruption when VMs start in parallel.
 pub async fn ensure_rootfs() -> Result<PathBuf> {
     let rootfs_dir = paths::rootfs_dir();
     let rootfs_path = paths::base_rootfs();
+    let lock_file = rootfs_dir.join(".rootfs-creation.lock");
 
-    // If rootfs exists, just update fc-agent and return
+    // If rootfs exists, return it immediately (it's immutable after creation)
+    // DO NOT modify the base rootfs on every VM start - this causes:
+    // 1. Filesystem corruption when VMs start in parallel
+    // 2. Unnecessary latency (~100ms per VM start)
+    // 3. Violates the "base rootfs is immutable" principle
+    //
+    // To update fc-agent: delete the rootfs and it will be recreated, OR
+    // explicitly run `fcvm setup rootfs` (TODO: implement setup command)
     if rootfs_path.exists() {
-        info!(path = %rootfs_path.display(), "rootfs exists, updating fc-agent");
-        update_fc_agent_in_rootfs(&rootfs_path)
-            .await
-            .context("updating fc-agent in cached rootfs")?;
+        info!(path = %rootfs_path.display(), "rootfs exists (using cached)");
         return Ok(rootfs_path);
     }
 
-    // Create rootfs from scratch
-    info!("creating base rootfs from Ubuntu cloud image");
-    info!("note: first-time cloud image download may take 5-15 minutes");
-    info!("cached rootfs creation takes ~45 seconds");
-
-    // Create directory
+    // Create directory for lock file
     tokio::fs::create_dir_all(&rootfs_dir)
         .await
         .context("creating rootfs directory")?;
 
-    // Create rootfs from Ubuntu cloud image
-    create_ubuntu_rootfs(&rootfs_path)
+    // Acquire lock to prevent concurrent rootfs creation
+    // If multiple VMs start simultaneously, only one creates the rootfs
+    info!("acquiring rootfs creation lock");
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock_fd = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&lock_file)
+        .context("opening rootfs creation lock file")?;
+
+    use nix::fcntl::{Flock, FlockArg};
+    let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
+        .map_err(|(_, err)| err)
+        .context("acquiring rootfs creation lock")?;
+
+    // Check again after acquiring lock (another process may have created it)
+    if rootfs_path.exists() {
+        info!(path = %rootfs_path.display(), "rootfs exists (created by another process)");
+        flock.unlock().map_err(|(_, err)| err).ok();
+        let _ = std::fs::remove_file(&lock_file);
+        return Ok(rootfs_path);
+    }
+
+    // Now we have exclusive access, create the rootfs
+    info!("creating base rootfs from Ubuntu cloud image");
+    info!("note: first-time cloud image download may take 5-15 minutes");
+    info!("cached rootfs creation takes ~45 seconds");
+
+    let result = create_ubuntu_rootfs(&rootfs_path)
         .await
-        .context("creating Ubuntu rootfs")?;
+        .context("creating Ubuntu rootfs");
+
+    // Release lock
+    flock
+        .unlock()
+        .map_err(|(_, err)| err)
+        .context("releasing rootfs creation lock")?;
+    let _ = std::fs::remove_file(&lock_file);
+
+    result?;
 
     info!("rootfs creation complete");
 

@@ -152,13 +152,15 @@ pub async fn poll_health_by_pid(pid: u32, timeout_secs: u64) -> anyhow::Result<(
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        // Deserialize to match ls.rs VmInfo output format
+        // Deserialize to actual VmState type (with stale field from ls.rs)
         #[derive(serde::Deserialize)]
-        struct VmInfo {
-            health: String,  // Field name is "health" not "health_status"
+        struct VmDisplay {
+            #[serde(flatten)]
+            vm: fcvm::state::VmState,
+            stale: bool,
         }
 
-        let vms: Vec<VmInfo> = match serde_json::from_str(&stdout) {
+        let vms: Vec<VmDisplay> = match serde_json::from_str(&stdout) {
             Ok(v) => v,
             Err(_) => {
                 sleep(Duration::from_secs(1)).await;
@@ -166,9 +168,9 @@ pub async fn poll_health_by_pid(pid: u32, timeout_secs: u64) -> anyhow::Result<(
             }
         };
 
-        // Check if VM is healthy (ls.rs outputs enum as string via Debug formatting)
-        if let Some(vm) = vms.first() {
-            if vm.health == "Healthy" {
+        // Check if VM is healthy using proper enum comparison
+        if let Some(display) = vms.first() {
+            if matches!(display.vm.health_status, fcvm::state::HealthStatus::Healthy) {
                 return Ok(());
             }
         }
