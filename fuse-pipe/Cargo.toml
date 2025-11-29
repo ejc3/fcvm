@@ -60,3 +60,8 @@ harness = false
 name = "stress"
 path = "tests/stress/main.rs"
 harness = false
+
+[[test]]
+name = "pjdfstest"
+path = "tests/pjdfstest.rs"
+harness = false

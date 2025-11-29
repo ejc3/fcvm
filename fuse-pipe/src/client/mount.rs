@@ -61,8 +61,14 @@ pub fn mount_with_options<P: AsRef<Path>>(
     let mux = Multiplexer::with_trace_rate(socket, num_readers, trace_rate);
     debug!(target: "fuse-pipe::client", num_readers, "multiplexer started");
 
-    // Mount options kept minimal to avoid requiring user_allow_other
-    let options = vec![fuser::MountOption::FSName("fuse-pipe".to_string())];
+    // Mount options:
+    // - AllowOther: Allow non-root users to access the mount (requires user_allow_other in /etc/fuse.conf or running as root)
+    // Note: We do NOT use DefaultPermissions because we implement our own permission checks
+    // in the passthrough handler to properly enforce POSIX ownership rules (chmod/chown/utimes)
+    let options = vec![
+        fuser::MountOption::FSName("fuse-pipe".to_string()),
+        fuser::MountOption::AllowOther,
+    ];
 
     let mount_with_options =
         |opts: &[fuser::MountOption]| -> Result<fuser::Session<FuseClient>, std::io::Error> {
@@ -211,8 +217,14 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
     let mux = Multiplexer::with_trace_rate(socket, num_readers, trace_rate);
     debug!(target: "fuse-pipe::client", num_readers, "multiplexer started");
 
-    // Mount options kept minimal to avoid requiring user_allow_other
-    let options = vec![fuser::MountOption::FSName("fuse-pipe".to_string())];
+    // Mount options:
+    // - AllowOther: Allow non-root users to access the mount (requires user_allow_other in /etc/fuse.conf or running as root)
+    // Note: We do NOT use DefaultPermissions because we implement our own permission checks
+    // in the passthrough handler to properly enforce POSIX ownership rules (chmod/chown/utimes)
+    let options = vec![
+        fuser::MountOption::FSName("fuse-pipe".to_string()),
+        fuser::MountOption::AllowOther,
+    ];
 
     let mount_with_options =
         |opts: &[fuser::MountOption]| -> Result<fuser::Session<FuseClient>, std::io::Error> {

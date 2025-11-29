@@ -6,15 +6,26 @@ use serde::{Deserialize, Serialize};
 ///
 /// Each variant represents a FUSE operation that the client wants
 /// the server to perform on the underlying filesystem.
+///
+/// Many operations include `uid` and `gid` fields which represent the
+/// credentials of the calling process. The server should use these to
+/// perform proper permission checking.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum VolumeRequest {
     /// Look up a directory entry by name.
-    Lookup { parent: u64, name: String },
+    Lookup {
+        parent: u64,
+        name: String,
+        uid: u32,
+        gid: u32,
+    },
 
     /// Get file attributes.
     Getattr { ino: u64 },
 
     /// Set file attributes.
+    /// Note: `uid`/`gid` here are the *values to set*, not caller credentials.
+    /// The caller credentials are in `caller_uid`/`caller_gid`.
     Setattr {
         ino: u64,
         mode: Option<u32>,
@@ -25,20 +36,44 @@ pub enum VolumeRequest {
         atime_nsecs: Option<u32>,
         mtime_secs: Option<i64>,
         mtime_nsecs: Option<u32>,
+        caller_uid: u32,
+        caller_gid: u32,
     },
 
     /// Read directory contents.
-    Readdir { ino: u64, offset: u64 },
+    Readdir {
+        ino: u64,
+        offset: u64,
+        uid: u32,
+        gid: u32,
+    },
 
     /// Create a directory.
     Mkdir {
         parent: u64,
         name: String,
         mode: u32,
+        uid: u32,
+        gid: u32,
+    },
+
+    /// Create a special file (device node, FIFO, socket).
+    Mknod {
+        parent: u64,
+        name: String,
+        mode: u32,
+        rdev: u32,
+        uid: u32,
+        gid: u32,
     },
 
     /// Remove a directory.
-    Rmdir { parent: u64, name: String },
+    Rmdir {
+        parent: u64,
+        name: String,
+        uid: u32,
+        gid: u32,
+    },
 
     /// Create and open a file.
     Create {
@@ -46,10 +81,17 @@ pub enum VolumeRequest {
         name: String,
         mode: u32,
         flags: u32,
+        uid: u32,
+        gid: u32,
     },
 
     /// Open a file.
-    Open { ino: u64, flags: u32 },
+    Open {
+        ino: u64,
+        flags: u32,
+        uid: u32,
+        gid: u32,
+    },
 
     /// Read data from an open file.
     Read {
@@ -77,7 +119,12 @@ pub enum VolumeRequest {
     Fsync { ino: u64, fh: u64, datasync: bool },
 
     /// Remove a file.
-    Unlink { parent: u64, name: String },
+    Unlink {
+        parent: u64,
+        name: String,
+        uid: u32,
+        gid: u32,
+    },
 
     /// Rename a file or directory.
     Rename {
@@ -85,6 +132,8 @@ pub enum VolumeRequest {
         name: String,
         newparent: u64,
         newname: String,
+        uid: u32,
+        gid: u32,
     },
 
     /// Create a symbolic link.
@@ -92,6 +141,8 @@ pub enum VolumeRequest {
         parent: u64,
         name: String,
         target: String,
+        uid: u32,
+        gid: u32,
     },
 
     /// Read the target of a symbolic link.
@@ -102,10 +153,17 @@ pub enum VolumeRequest {
         ino: u64,
         newparent: u64,
         newname: String,
+        uid: u32,
+        gid: u32,
     },
 
     /// Check file access permissions.
-    Access { ino: u64, mask: u32 },
+    Access {
+        ino: u64,
+        mask: u32,
+        uid: u32,
+        gid: u32,
+    },
 
     /// Get filesystem statistics.
     Statfs { ino: u64 },
@@ -120,6 +178,7 @@ impl VolumeRequest {
             VolumeRequest::Setattr { .. } => "setattr",
             VolumeRequest::Readdir { .. } => "readdir",
             VolumeRequest::Mkdir { .. } => "mkdir",
+            VolumeRequest::Mknod { .. } => "mknod",
             VolumeRequest::Rmdir { .. } => "rmdir",
             VolumeRequest::Create { .. } => "create",
             VolumeRequest::Open { .. } => "open",
@@ -162,6 +221,8 @@ mod tests {
         let req = VolumeRequest::Lookup {
             parent: 1,
             name: "test".to_string(),
+            uid: 1000,
+            gid: 1000,
         };
         assert_eq!(req.op_name(), "lookup");
     }
@@ -192,6 +253,8 @@ mod tests {
             name: "newfile.txt".to_string(),
             mode: 0o644,
             flags: libc::O_RDWR as u32,
+            uid: 1000,
+            gid: 1000,
         };
 
         let encoded = bincode::serialize(&req).unwrap();

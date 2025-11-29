@@ -316,6 +316,8 @@ mod tests {
             VolumeRequest::Lookup {
                 parent: 1,
                 name: "test.txt".to_string(),
+                uid: 1000,
+                gid: 1000,
             },
         );
 

@@ -291,6 +291,8 @@ mod tests {
                 VolumeRequest::Lookup {
                     parent: 1,
                     name: "file".into(),
+                    uid: 1000,
+                    gid: 1000,
                 },
             );
             let _ = tx1.send(resp);

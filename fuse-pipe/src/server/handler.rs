@@ -16,7 +16,12 @@ pub trait FilesystemHandler: Send + Sync {
     /// dispatches to individual operation methods.
     fn handle_request(&self, request: &VolumeRequest) -> VolumeResponse {
         match request {
-            VolumeRequest::Lookup { parent, name } => self.lookup(*parent, name),
+            VolumeRequest::Lookup {
+                parent,
+                name,
+                uid,
+                gid,
+            } => self.lookup(*parent, name, *uid, *gid),
             VolumeRequest::Getattr { ino } => self.getattr(*ino),
             VolumeRequest::Setattr {
                 ino,
@@ -28,6 +33,8 @@ pub trait FilesystemHandler: Send + Sync {
                 atime_nsecs,
                 mtime_secs,
                 mtime_nsecs,
+                caller_uid,
+                caller_gid,
             } => self.setattr(
                 *ino,
                 *mode,
@@ -38,17 +45,35 @@ pub trait FilesystemHandler: Send + Sync {
                 *atime_nsecs,
                 *mtime_secs,
                 *mtime_nsecs,
+                *caller_uid,
+                *caller_gid,
             ),
-            VolumeRequest::Readdir { ino, offset } => self.readdir(*ino, *offset),
-            VolumeRequest::Mkdir { parent, name, mode } => self.mkdir(*parent, name, *mode),
-            VolumeRequest::Rmdir { parent, name } => self.rmdir(*parent, name),
+            VolumeRequest::Readdir { ino, offset, uid, gid } => self.readdir(*ino, *offset, *uid, *gid),
+            VolumeRequest::Mkdir {
+                parent,
+                name,
+                mode,
+                uid,
+                gid,
+            } => self.mkdir(*parent, name, *mode, *uid, *gid),
+            VolumeRequest::Mknod {
+                parent,
+                name,
+                mode,
+                rdev,
+                uid,
+                gid,
+            } => self.mknod(*parent, name, *mode, *rdev, *uid, *gid),
+            VolumeRequest::Rmdir { parent, name, uid, gid } => self.rmdir(*parent, name, *uid, *gid),
             VolumeRequest::Create {
                 parent,
                 name,
                 mode,
                 flags,
-            } => self.create(*parent, name, *mode, *flags),
-            VolumeRequest::Open { ino, flags } => self.open(*ino, *flags),
+                uid,
+                gid,
+            } => self.create(*parent, name, *mode, *flags, *uid, *gid),
+            VolumeRequest::Open { ino, flags, uid, gid } => self.open(*ino, *flags, *uid, *gid),
             VolumeRequest::Read {
                 ino,
                 fh,
@@ -64,31 +89,37 @@ pub trait FilesystemHandler: Send + Sync {
             VolumeRequest::Release { ino, fh } => self.release(*ino, *fh),
             VolumeRequest::Flush { ino, fh } => self.flush(*ino, *fh),
             VolumeRequest::Fsync { ino, fh, datasync } => self.fsync(*ino, *fh, *datasync),
-            VolumeRequest::Unlink { parent, name } => self.unlink(*parent, name),
+            VolumeRequest::Unlink { parent, name, uid, gid } => self.unlink(*parent, name, *uid, *gid),
             VolumeRequest::Rename {
                 parent,
                 name,
                 newparent,
                 newname,
-            } => self.rename(*parent, name, *newparent, newname),
+                uid,
+                gid,
+            } => self.rename(*parent, name, *newparent, newname, *uid, *gid),
             VolumeRequest::Symlink {
                 parent,
                 name,
                 target,
-            } => self.symlink(*parent, name, target),
+                uid,
+                gid,
+            } => self.symlink(*parent, name, target, *uid, *gid),
             VolumeRequest::Readlink { ino } => self.readlink(*ino),
             VolumeRequest::Link {
                 ino,
                 newparent,
                 newname,
-            } => self.link(*ino, *newparent, newname),
-            VolumeRequest::Access { ino, mask } => self.access(*ino, *mask),
+                uid,
+                gid,
+            } => self.link(*ino, *newparent, newname, *uid, *gid),
+            VolumeRequest::Access { ino, mask, uid, gid } => self.access(*ino, *mask, *uid, *gid),
             VolumeRequest::Statfs { ino } => self.statfs(*ino),
         }
     }
 
     /// Look up a directory entry by name.
-    fn lookup(&self, _parent: u64, _name: &str) -> VolumeResponse {
+    fn lookup(&self, _parent: u64, _name: &str, _uid: u32, _gid: u32) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
         }
@@ -102,6 +133,8 @@ pub trait FilesystemHandler: Send + Sync {
     }
 
     /// Set file attributes.
+    /// Note: `uid`/`gid` are the values to set on the file.
+    /// `caller_uid`/`caller_gid` are the credentials of the requesting process.
     #[allow(clippy::too_many_arguments)]
     fn setattr(
         &self,
@@ -114,6 +147,8 @@ pub trait FilesystemHandler: Send + Sync {
         _atime_nsecs: Option<u32>,
         _mtime_secs: Option<i64>,
         _mtime_nsecs: Option<u32>,
+        _caller_uid: u32,
+        _caller_gid: u32,
     ) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
@@ -121,35 +156,61 @@ pub trait FilesystemHandler: Send + Sync {
     }
 
     /// Read directory contents.
-    fn readdir(&self, _ino: u64, _offset: u64) -> VolumeResponse {
+    fn readdir(&self, _ino: u64, _offset: u64, _uid: u32, _gid: u32) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
         }
     }
 
     /// Create a directory.
-    fn mkdir(&self, _parent: u64, _name: &str, _mode: u32) -> VolumeResponse {
+    #[allow(clippy::too_many_arguments)]
+    fn mkdir(&self, _parent: u64, _name: &str, _mode: u32, _uid: u32, _gid: u32) -> VolumeResponse {
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
+    }
+
+    /// Create a special file (device node, FIFO, socket).
+    #[allow(clippy::too_many_arguments)]
+    fn mknod(
+        &self,
+        _parent: u64,
+        _name: &str,
+        _mode: u32,
+        _rdev: u32,
+        _uid: u32,
+        _gid: u32,
+    ) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
         }
     }
 
     /// Remove a directory.
-    fn rmdir(&self, _parent: u64, _name: &str) -> VolumeResponse {
+    fn rmdir(&self, _parent: u64, _name: &str, _uid: u32, _gid: u32) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
         }
     }
 
     /// Create and open a file.
-    fn create(&self, _parent: u64, _name: &str, _mode: u32, _flags: u32) -> VolumeResponse {
+    #[allow(clippy::too_many_arguments)]
+    fn create(
+        &self,
+        _parent: u64,
+        _name: &str,
+        _mode: u32,
+        _flags: u32,
+        _uid: u32,
+        _gid: u32,
+    ) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
         }
     }
 
     /// Open a file.
-    fn open(&self, _ino: u64, _flags: u32) -> VolumeResponse {
+    fn open(&self, _ino: u64, _flags: u32, _uid: u32, _gid: u32) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
         }
@@ -185,21 +246,30 @@ pub trait FilesystemHandler: Send + Sync {
     }
 
     /// Remove a file.
-    fn unlink(&self, _parent: u64, _name: &str) -> VolumeResponse {
+    fn unlink(&self, _parent: u64, _name: &str, _uid: u32, _gid: u32) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
         }
     }
 
     /// Rename a file or directory.
-    fn rename(&self, _parent: u64, _name: &str, _newparent: u64, _newname: &str) -> VolumeResponse {
+    #[allow(clippy::too_many_arguments)]
+    fn rename(&self, _parent: u64, _name: &str, _newparent: u64, _newname: &str, _uid: u32, _gid: u32) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
         }
     }
 
     /// Create a symbolic link.
-    fn symlink(&self, _parent: u64, _name: &str, _target: &str) -> VolumeResponse {
+    #[allow(clippy::too_many_arguments)]
+    fn symlink(
+        &self,
+        _parent: u64,
+        _name: &str,
+        _target: &str,
+        _uid: u32,
+        _gid: u32,
+    ) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
         }
@@ -213,14 +283,15 @@ pub trait FilesystemHandler: Send + Sync {
     }
 
     /// Create a hard link.
-    fn link(&self, _ino: u64, _newparent: u64, _newname: &str) -> VolumeResponse {
+    #[allow(clippy::too_many_arguments)]
+    fn link(&self, _ino: u64, _newparent: u64, _newname: &str, _uid: u32, _gid: u32) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
         }
     }
 
     /// Check file access permissions.
-    fn access(&self, _ino: u64, _mask: u32) -> VolumeResponse {
+    fn access(&self, _ino: u64, _mask: u32, _uid: u32, _gid: u32) -> VolumeResponse {
         VolumeResponse::Ok // Default: allow all access
     }
 
@@ -252,11 +323,11 @@ mod tests {
         let handler = NoopHandler;
 
         // Most operations should return ENOSYS
-        assert_eq!(handler.lookup(1, "test").errno(), Some(libc::ENOSYS));
+        assert_eq!(handler.lookup(1, "test", 1000, 1000).errno(), Some(libc::ENOSYS));
         assert_eq!(handler.getattr(1).errno(), Some(libc::ENOSYS));
 
         // Some have permissive defaults
-        assert!(handler.access(1, 0).is_ok());
+        assert!(handler.access(1, 0, 1000, 1000).is_ok());
         assert!(handler.release(1, 1).is_ok());
     }
 
@@ -267,6 +338,8 @@ mod tests {
         let req = VolumeRequest::Lookup {
             parent: 1,
             name: "test".to_string(),
+            uid: 1000,
+            gid: 1000,
         };
         let resp = handler.handle_request(&req);
         assert_eq!(resp.errno(), Some(libc::ENOSYS));
