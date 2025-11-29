@@ -124,10 +124,12 @@ impl Filesystem for FuseClient {
         Ok(())
     }
 
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let response = self.send_request_sync(VolumeRequest::Lookup {
             parent,
             name: name.to_string_lossy().to_string(),
+            uid: req.uid(),
+            gid: req.gid(),
         });
 
         match response {
@@ -161,7 +163,7 @@ impl Filesystem for FuseClient {
 
     fn setattr(
         &mut self,
-        _req: &Request,
+        req: &Request,
         ino: u64,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -203,6 +205,8 @@ impl Filesystem for FuseClient {
             atime_nsecs,
             mtime_secs,
             mtime_nsecs,
+            caller_uid: req.uid(),
+            caller_gid: req.gid(),
         });
 
         match response {
@@ -216,7 +220,7 @@ impl Filesystem for FuseClient {
 
     fn mkdir(
         &mut self,
-        _req: &Request,
+        req: &Request,
         parent: u64,
         name: &OsStr,
         mode: u32,
@@ -227,6 +231,8 @@ impl Filesystem for FuseClient {
             parent,
             name: name.to_string_lossy().to_string(),
             mode,
+            uid: req.uid(),
+            gid: req.gid(),
         });
 
         match response {
@@ -246,10 +252,48 @@ impl Filesystem for FuseClient {
         }
     }
 
-    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn mknod(
+        &mut self,
+        req: &Request,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        let response = self.send_request_sync(VolumeRequest::Mknod {
+            parent,
+            name: name.to_string_lossy().to_string(),
+            mode,
+            rdev,
+            uid: req.uid(),
+            gid: req.gid(),
+        });
+
+        match response {
+            VolumeResponse::Entry {
+                attr,
+                generation,
+                ttl_secs,
+            } => {
+                reply.entry(
+                    &Duration::from_secs(ttl_secs),
+                    &to_fuser_attr(&attr),
+                    generation,
+                );
+            }
+            VolumeResponse::Error { errno } => reply.error(errno),
+            _ => reply.error(libc::EIO),
+        }
+    }
+
+    fn rmdir(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let response = self.send_request_sync(VolumeRequest::Rmdir {
             parent,
             name: name.to_string_lossy().to_string(),
+            uid: req.uid(),
+            gid: req.gid(),
         });
 
         match response {
@@ -261,7 +305,7 @@ impl Filesystem for FuseClient {
 
     fn create(
         &mut self,
-        _req: &Request,
+        req: &Request,
         parent: u64,
         name: &OsStr,
         mode: u32,
@@ -274,6 +318,8 @@ impl Filesystem for FuseClient {
             name: name.to_string_lossy().to_string(),
             mode,
             flags: flags as u32,
+            uid: req.uid(),
+            gid: req.gid(),
         });
 
         match response {
@@ -297,10 +343,12 @@ impl Filesystem for FuseClient {
         }
     }
 
-    fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
+    fn open(&mut self, req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
         let response = self.send_request_sync(VolumeRequest::Open {
             ino,
             flags: flags as u32,
+            uid: req.uid(),
+            gid: req.gid(),
         });
 
         match response {
@@ -400,10 +448,12 @@ impl Filesystem for FuseClient {
         }
     }
 
-    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let response = self.send_request_sync(VolumeRequest::Unlink {
             parent,
             name: name.to_string_lossy().to_string(),
+            uid: req.uid(),
+            gid: req.gid(),
         });
 
         match response {
@@ -415,7 +465,7 @@ impl Filesystem for FuseClient {
 
     fn rename(
         &mut self,
-        _req: &Request,
+        req: &Request,
         parent: u64,
         name: &OsStr,
         newparent: u64,
@@ -428,6 +478,8 @@ impl Filesystem for FuseClient {
             name: name.to_string_lossy().to_string(),
             newparent,
             newname: newname.to_string_lossy().to_string(),
+            uid: req.uid(),
+            gid: req.gid(),
         });
 
         match response {
@@ -439,7 +491,7 @@ impl Filesystem for FuseClient {
 
     fn symlink(
         &mut self,
-        _req: &Request,
+        req: &Request,
         parent: u64,
         link_name: &OsStr,
         target: &std::path::Path,
@@ -449,6 +501,8 @@ impl Filesystem for FuseClient {
             parent,
             name: link_name.to_string_lossy().to_string(),
             target: target.to_string_lossy().to_string(),
+            uid: req.uid(),
+            gid: req.gid(),
         });
 
         match response {
@@ -480,7 +534,7 @@ impl Filesystem for FuseClient {
 
     fn link(
         &mut self,
-        _req: &Request,
+        req: &Request,
         ino: u64,
         newparent: u64,
         newname: &OsStr,
@@ -490,6 +544,8 @@ impl Filesystem for FuseClient {
             ino,
             newparent,
             newname: newname.to_string_lossy().to_string(),
+            uid: req.uid(),
+            gid: req.gid(),
         });
 
         match response {
@@ -509,10 +565,12 @@ impl Filesystem for FuseClient {
         }
     }
 
-    fn access(&mut self, _req: &Request, ino: u64, mask: i32, reply: ReplyEmpty) {
+    fn access(&mut self, req: &Request, ino: u64, mask: i32, reply: ReplyEmpty) {
         let response = self.send_request_sync(VolumeRequest::Access {
             ino,
             mask: mask as u32,
+            uid: req.uid(),
+            gid: req.gid(),
         });
 
         match response {
@@ -545,7 +603,7 @@ impl Filesystem for FuseClient {
 
     fn readdir(
         &mut self,
-        _req: &Request,
+        req: &Request,
         ino: u64,
         _fh: u64,
         offset: i64,
@@ -554,6 +612,8 @@ impl Filesystem for FuseClient {
         let response = self.send_request_sync(VolumeRequest::Readdir {
             ino,
             offset: offset as u64,
+            uid: req.uid(),
+            gid: req.gid(),
         });
 
         match response {

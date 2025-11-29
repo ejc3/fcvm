@@ -52,8 +52,8 @@ help:
 	@echo "  make clean         - Clean local build artifacts"
 	@echo ""
 	@echo "Build artifacts:"
-	@echo "  fcvm:     target/aarch64-unknown-linux-musl/release/fcvm"
-	@echo "  fc-agent: target/aarch64-unknown-linux-musl/release/fc-agent"
+	@echo "  fcvm:     target/release/fcvm"
+	@echo "  fc-agent: target/release/fc-agent"
 	@echo "  vmlinux:  /mnt/fcvm-btrfs/kernels/vmlinux (FUSE-enabled)"
 
 #
@@ -72,8 +72,8 @@ build-remote:
 	@echo "==> Building workspace on EC2 (fcvm + fc-agent)..."
 	$(SSH) "cd $(REMOTE_DIR) && source ~/.cargo/env && cargo build --release 2>&1" | tee /tmp/fcvm-build.log
 	@echo "==> Build complete!"
-	@echo "    fcvm:     $(REMOTE_DIR)/target/aarch64-unknown-linux-musl/release/fcvm"
-	@echo "    fc-agent: $(REMOTE_DIR)/target/aarch64-unknown-linux-musl/release/fc-agent"
+	@echo "    fcvm:     $(REMOTE_DIR)/target/release/fcvm"
+	@echo "    fc-agent: $(REMOTE_DIR)/target/release/fc-agent"
 
 #
 # Fetch built artifacts
@@ -81,9 +81,9 @@ build-remote:
 fetch:
 	@mkdir -p $(ARTIFACTS)
 	@echo "==> Downloading fcvm..."
-	scp -i $(EC2_KEY) $(EC2_HOST):$(REMOTE_DIR)/target/aarch64-unknown-linux-musl/release/fcvm $(ARTIFACTS)/
+	scp -i $(EC2_KEY) $(EC2_HOST):$(REMOTE_DIR)/target/release/fcvm $(ARTIFACTS)/
 	@echo "==> Downloading fc-agent..."
-	scp -i $(EC2_KEY) $(EC2_HOST):$(REMOTE_DIR)/target/aarch64-unknown-linux-musl/release/fc-agent $(ARTIFACTS)/
+	scp -i $(EC2_KEY) $(EC2_HOST):$(REMOTE_DIR)/target/release/fc-agent $(ARTIFACTS)/
 	@echo "==> Artifacts downloaded to $(ARTIFACTS)/"
 	@ls -la $(ARTIFACTS)/
 
@@ -134,10 +134,19 @@ rootfs:
 	@echo "==> Updating fc-agent in rootfs on EC2..."
 	$(SSH) "sudo mkdir -p /tmp/rootfs-mount && \
 		sudo mount -o loop /mnt/fcvm-btrfs/rootfs/base.ext4 /tmp/rootfs-mount && \
-		sudo cp $(REMOTE_DIR)/target/aarch64-unknown-linux-musl/release/fc-agent /tmp/rootfs-mount/usr/local/bin/fc-agent && \
+		sudo cp $(REMOTE_DIR)/target/release/fc-agent /tmp/rootfs-mount/usr/local/bin/fc-agent && \
 		sudo chmod +x /tmp/rootfs-mount/usr/local/bin/fc-agent && \
 		sudo umount /tmp/rootfs-mount"
 	@echo "==> Rootfs updated: /mnt/fcvm-btrfs/rootfs/base.ext4"
+
+#
+# Fresh rootfs build (creates new Debian rootfs via fcvm setup)
+#
+rootfs-fresh:
+	@echo "==> Creating fresh Debian rootfs on EC2..."
+	@echo "    This will take ~90 seconds (debootstrap + package installation)"
+	$(SSH) "cd $(REMOTE_DIR) && sudo rm -f /mnt/fcvm-btrfs/rootfs/base.ext4 && sudo $(FCVM_BIN) setup rootfs 2>&1" | tee /tmp/rootfs-fresh.log
+	@echo "==> Fresh rootfs created: /mnt/fcvm-btrfs/rootfs/base.ext4"
 
 #
 # Full rebuild: build binaries + rebuild rootfs
@@ -150,13 +159,13 @@ rebuild: build rootfs
 #
 deploy:
 	@echo "==> Deploying fc-agent to rootfs..."
-	$(SSH) "sudo cp $(REMOTE_DIR)/target/aarch64-unknown-linux-musl/release/fc-agent /mnt/fcvm-btrfs/rootfs/base/usr/local/bin/"
+	$(SSH) "sudo cp $(REMOTE_DIR)/target/release/fc-agent /mnt/fcvm-btrfs/rootfs/base/usr/local/bin/"
 	@echo "==> fc-agent deployed"
 
 #
 # Testing
 #
-FCVM_BIN := ./target/aarch64-unknown-linux-musl/release/fcvm
+FCVM_BIN := ./target/release/fcvm
 
 test:
 	@echo "==> Running sanity test on EC2..."

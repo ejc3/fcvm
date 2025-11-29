@@ -2,7 +2,11 @@
 //!
 //! This maps FUSE operations directly to the local filesystem,
 //! allowing a directory to be served over the network.
+//!
+//! For proper POSIX permission enforcement, operations use CredentialsGuard
+//! to temporarily switch effective uid/gid to the caller's credentials.
 
+use super::credentials::CredentialsGuard;
 use super::handler::FilesystemHandler;
 use crate::protocol::{file_type, DirEntry, FileAttr, VolumeResponse};
 use dashmap::DashMap;
@@ -196,6 +200,55 @@ impl HandleTable {
     }
 }
 
+/// The sticky bit constant (S_ISVTX).
+const S_ISVTX: u32 = 0o1000;
+
+/// Check sticky bit restriction for deletion/rename in a directory.
+///
+/// If parent directory has sticky bit set, only root, directory owner,
+/// or file owner can delete/rename files in that directory.
+///
+/// Returns Ok(()) if operation is allowed, Err(EPERM) if not.
+fn check_sticky_bit(
+    parent_path: &std::path::Path,
+    target_path: &std::path::Path,
+    caller_uid: u32,
+) -> Result<(), i32> {
+    // Root can always delete
+    if caller_uid == 0 {
+        return Ok(());
+    }
+
+    // Get parent directory metadata
+    let parent_meta = match fs::metadata(parent_path) {
+        Ok(m) => m,
+        Err(_) => return Ok(()), // Can't check, allow operation
+    };
+
+    // Check if sticky bit is set on parent directory
+    if parent_meta.mode() & S_ISVTX == 0 {
+        return Ok(()); // No sticky bit, normal permissions apply
+    }
+
+    // Sticky bit is set - check if caller is directory owner
+    if caller_uid == parent_meta.uid() {
+        return Ok(());
+    }
+
+    // Check if caller is file/entry owner
+    let target_meta = match fs::symlink_metadata(target_path) {
+        Ok(m) => m,
+        Err(_) => return Ok(()), // Can't check target, allow operation
+    };
+
+    if caller_uid == target_meta.uid() {
+        return Ok(());
+    }
+
+    // Sticky bit restriction violated
+    Err(libc::EPERM)
+}
+
 /// Convert filesystem metadata to FileAttr.
 fn metadata_to_attr(ino: u64, metadata: &std::fs::Metadata) -> FileAttr {
     FileAttr {
@@ -247,13 +300,19 @@ impl PassthroughFs {
 }
 
 impl FilesystemHandler for PassthroughFs {
-    fn lookup(&self, parent: u64, name: &str) -> VolumeResponse {
+    fn lookup(&self, parent: u64, name: &str, uid: u32, gid: u32) -> VolumeResponse {
         let parent_path = match self.inodes.resolve_path(parent) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
 
         let path = parent_path.join(name);
+
+        // Use caller's credentials for permission check
+        let _guard = match CredentialsGuard::new(uid, gid) {
+            Ok(g) => g,
+            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
+        };
 
         let metadata = match fs::metadata(&path) {
             Ok(m) => m,
@@ -299,27 +358,61 @@ impl FilesystemHandler for PassthroughFs {
         atime_nsecs: Option<u32>,
         mtime_secs: Option<i64>,
         mtime_nsecs: Option<u32>,
+        caller_uid: u32,
+        caller_gid: u32,
     ) -> VolumeResponse {
         let path = match self.inodes.resolve_path(ino) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
 
-        if let Some(mode) = mode {
-            if let Err(e) = fs::set_permissions(&path, fs::Permissions::from_mode(mode)) {
+        // Get current file metadata for permission checks
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
+        };
+        let file_uid = metadata.uid();
+        let _file_gid = metadata.gid();
+
+        // chmod: POSIX requires caller to be owner or root
+        // NOTE: We do NOT use CredentialsGuard here - we perform manual permission checks
+        // and then execute as root (the server process). Using CredentialsGuard would drop
+        // root privileges and cause chmod to fail even for the file owner.
+        if let Some(new_mode) = mode {
+            if caller_uid != 0 && caller_uid != file_uid {
+                return VolumeResponse::error(libc::EPERM);
+            }
+            if let Err(e) = fs::set_permissions(&path, fs::Permissions::from_mode(new_mode)) {
                 return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
             }
         }
 
+        // chown: POSIX permission rules
+        // NOTE: We do NOT use CredentialsGuard here - we perform manual permission checks
+        // and then execute as root. Only root can change uid; owner can change gid.
         if uid.is_some() || gid.is_some() {
-            let uid = uid.map(nix::unistd::Uid::from_raw);
-            let gid = gid.map(nix::unistd::Gid::from_raw);
-            if let Err(e) = nix::unistd::chown(&path, uid, gid) {
+            // Changing uid requires root
+            if uid.is_some() && caller_uid != 0 {
+                return VolumeResponse::error(libc::EPERM);
+            }
+            // Changing gid: non-root must be owner
+            if gid.is_some() && caller_uid != 0 && caller_uid != file_uid {
+                return VolumeResponse::error(libc::EPERM);
+            }
+
+            let new_uid = uid.map(nix::unistd::Uid::from_raw);
+            let new_gid = gid.map(nix::unistd::Gid::from_raw);
+            if let Err(e) = nix::unistd::chown(&path, new_uid, new_gid) {
                 return VolumeResponse::error(e as i32);
             }
         }
 
+        // truncate: requires write permission - use CredentialsGuard for filesystem check
         if let Some(size) = size {
+            let _guard = match CredentialsGuard::new(caller_uid, caller_gid) {
+                Ok(g) => g,
+                Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
+            };
             let file = match File::options().write(true).open(&path) {
                 Ok(f) => f,
                 Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
@@ -329,10 +422,32 @@ impl FilesystemHandler for PassthroughFs {
             }
         }
 
-        // Handle atime/mtime updates
+        // utimensat: owner or root can set explicit times, or write permission holder can set to NOW
         if atime_secs.is_some() || mtime_secs.is_some() {
             use nix::sys::stat::{utimensat, UtimensatFlags};
             use nix::sys::time::TimeSpec;
+
+            // For explicit time values (not NOW), must be owner or root
+            let is_now_atime = atime_secs == Some(0) && atime_nsecs == Some(libc::UTIME_NOW as u32);
+            let is_now_mtime = mtime_secs == Some(0) && mtime_nsecs == Some(libc::UTIME_NOW as u32);
+            let setting_explicit_time = (atime_secs.is_some() && !is_now_atime)
+                || (mtime_secs.is_some() && !is_now_mtime);
+
+            if setting_explicit_time && caller_uid != 0 && caller_uid != file_uid {
+                return VolumeResponse::error(libc::EPERM);
+            }
+
+            // For UTIME_NOW, need write permission - use CredentialsGuard
+            // For explicit times as owner/root, we can use root privileges
+            let needs_write_check = !setting_explicit_time && (is_now_atime || is_now_mtime);
+            let _guard = if needs_write_check {
+                match CredentialsGuard::new(caller_uid, caller_gid) {
+                    Ok(g) => Some(g),
+                    Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
+                }
+            } else {
+                None
+            };
 
             let atime = match atime_secs {
                 Some(secs) => TimeSpec::new(secs, atime_nsecs.unwrap_or(0) as i64),
@@ -353,10 +468,16 @@ impl FilesystemHandler for PassthroughFs {
         self.getattr(ino)
     }
 
-    fn readdir(&self, ino: u64, offset: u64) -> VolumeResponse {
+    fn readdir(&self, ino: u64, offset: u64, uid: u32, gid: u32) -> VolumeResponse {
         let path = match self.inodes.resolve_path(ino) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
+        };
+
+        // Use caller's credentials for permission check
+        let _guard = match CredentialsGuard::new(uid, gid) {
+            Ok(g) => g,
+            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
         };
 
         let entries = match fs::read_dir(&path) {
@@ -408,7 +529,7 @@ impl FilesystemHandler for PassthroughFs {
         VolumeResponse::DirEntries { entries: result }
     }
 
-    fn mkdir(&self, parent: u64, name: &str, mode: u32) -> VolumeResponse {
+    fn mkdir(&self, parent: u64, name: &str, mode: u32, uid: u32, gid: u32) -> VolumeResponse {
         let parent_path = match self.inodes.resolve_path(parent) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
@@ -416,10 +537,17 @@ impl FilesystemHandler for PassthroughFs {
 
         let path = parent_path.join(name);
 
+        // Use caller's credentials so kernel applies umask and sets correct ownership
+        let _guard = match CredentialsGuard::new(uid, gid) {
+            Ok(g) => g,
+            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
+        };
+
         if let Err(e) = fs::create_dir(&path) {
             return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
         }
 
+        // Set permissions (umask already applied by kernel during create)
         let _ = fs::set_permissions(&path, fs::Permissions::from_mode(mode));
 
         let metadata = match fs::metadata(&path) {
@@ -437,13 +565,69 @@ impl FilesystemHandler for PassthroughFs {
         }
     }
 
-    fn rmdir(&self, parent: u64, name: &str) -> VolumeResponse {
+    fn mknod(&self, parent: u64, name: &str, mode: u32, rdev: u32, uid: u32, gid: u32) -> VolumeResponse {
         let parent_path = match self.inodes.resolve_path(parent) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
 
         let path = parent_path.join(name);
+
+        // Use caller's credentials so kernel sets correct ownership
+        let _guard = match CredentialsGuard::new(uid, gid) {
+            Ok(g) => g,
+            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
+        };
+
+        use std::ffi::CString;
+        let c_path = match CString::new(path.to_string_lossy().as_bytes()) {
+            Ok(p) => p,
+            Err(_) => return VolumeResponse::error(libc::EINVAL),
+        };
+
+        let result = unsafe { libc::mknod(c_path.as_ptr(), mode, rdev as libc::dev_t) };
+
+        if result != 0 {
+            return VolumeResponse::error(
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            );
+        }
+
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
+        };
+
+        let ino = self.inodes.get_or_create_ino(parent, OsStr::new(name));
+        let attr = metadata_to_attr(ino, &metadata);
+
+        VolumeResponse::Entry {
+            attr,
+            generation: 0,
+            ttl_secs: self.attr_ttl_secs,
+        }
+    }
+
+    fn rmdir(&self, parent: u64, name: &str, uid: u32, gid: u32) -> VolumeResponse {
+        let parent_path = match self.inodes.resolve_path(parent) {
+            Some(p) => p,
+            None => return VolumeResponse::not_found(),
+        };
+
+        let path = parent_path.join(name);
+
+        // Check sticky bit restriction before delete
+        if let Err(errno) = check_sticky_bit(&parent_path, &path, uid) {
+            return VolumeResponse::error(errno);
+        }
+
+        // Use caller's credentials for permission check
+        let _guard = match CredentialsGuard::new(uid, gid) {
+            Ok(g) => g,
+            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
+        };
 
         if let Err(e) = fs::remove_dir(&path) {
             return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
@@ -453,13 +637,19 @@ impl FilesystemHandler for PassthroughFs {
         VolumeResponse::Ok
     }
 
-    fn create(&self, parent: u64, name: &str, mode: u32, flags: u32) -> VolumeResponse {
+    fn create(&self, parent: u64, name: &str, mode: u32, flags: u32, uid: u32, gid: u32) -> VolumeResponse {
         let parent_path = match self.inodes.resolve_path(parent) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
 
         let path = parent_path.join(name);
+
+        // Use caller's credentials so kernel sets correct ownership
+        let _guard = match CredentialsGuard::new(uid, gid) {
+            Ok(g) => g,
+            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
+        };
 
         let file = match OpenOptions::new()
             .read(true)
@@ -491,10 +681,16 @@ impl FilesystemHandler for PassthroughFs {
         }
     }
 
-    fn open(&self, ino: u64, flags: u32) -> VolumeResponse {
+    fn open(&self, ino: u64, flags: u32, uid: u32, gid: u32) -> VolumeResponse {
         let path = match self.inodes.resolve_path(ino) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
+        };
+
+        // Use caller's credentials for permission check
+        let _guard = match CredentialsGuard::new(uid, gid) {
+            Ok(g) => g,
+            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
         };
 
         let mut opts = OpenOptions::new();
@@ -590,13 +786,24 @@ impl FilesystemHandler for PassthroughFs {
         }
     }
 
-    fn unlink(&self, parent: u64, name: &str) -> VolumeResponse {
+    fn unlink(&self, parent: u64, name: &str, uid: u32, gid: u32) -> VolumeResponse {
         let parent_path = match self.inodes.resolve_path(parent) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
 
         let path = parent_path.join(name);
+
+        // Check sticky bit restriction before delete
+        if let Err(errno) = check_sticky_bit(&parent_path, &path, uid) {
+            return VolumeResponse::error(errno);
+        }
+
+        // Use caller's credentials for permission check
+        let _guard = match CredentialsGuard::new(uid, gid) {
+            Ok(g) => g,
+            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
+        };
 
         if let Err(e) = fs::remove_file(&path) {
             return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
@@ -606,7 +813,7 @@ impl FilesystemHandler for PassthroughFs {
         VolumeResponse::Ok
     }
 
-    fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> VolumeResponse {
+    fn rename(&self, parent: u64, name: &str, newparent: u64, newname: &str, uid: u32, gid: u32) -> VolumeResponse {
         let parent_path = match self.inodes.resolve_path(parent) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
@@ -620,6 +827,24 @@ impl FilesystemHandler for PassthroughFs {
         let old_path = parent_path.join(name);
         let new_path = newparent_path.join(newname);
 
+        // Check sticky bit restriction on source directory (removing old entry)
+        if let Err(errno) = check_sticky_bit(&parent_path, &old_path, uid) {
+            return VolumeResponse::error(errno);
+        }
+
+        // Check sticky bit restriction on destination if overwriting existing entry
+        if new_path.exists() {
+            if let Err(errno) = check_sticky_bit(&newparent_path, &new_path, uid) {
+                return VolumeResponse::error(errno);
+            }
+        }
+
+        // Use caller's credentials for permission check
+        let _guard = match CredentialsGuard::new(uid, gid) {
+            Ok(g) => g,
+            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
+        };
+
         if let Err(e) = fs::rename(&old_path, &new_path) {
             return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
         }
@@ -629,13 +854,19 @@ impl FilesystemHandler for PassthroughFs {
         VolumeResponse::Ok
     }
 
-    fn symlink(&self, parent: u64, name: &str, target: &str) -> VolumeResponse {
+    fn symlink(&self, parent: u64, name: &str, target: &str, uid: u32, gid: u32) -> VolumeResponse {
         let parent_path = match self.inodes.resolve_path(parent) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
         };
 
         let link_path = parent_path.join(name);
+
+        // Use caller's credentials so kernel sets correct ownership
+        let _guard = match CredentialsGuard::new(uid, gid) {
+            Ok(g) => g,
+            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
+        };
 
         if let Err(e) = std::os::unix::fs::symlink(target, &link_path) {
             return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
@@ -670,7 +901,7 @@ impl FilesystemHandler for PassthroughFs {
         }
     }
 
-    fn link(&self, ino: u64, newparent: u64, newname: &str) -> VolumeResponse {
+    fn link(&self, ino: u64, newparent: u64, newname: &str, uid: u32, gid: u32) -> VolumeResponse {
         let path = match self.inodes.resolve_path(ino) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
@@ -682,6 +913,12 @@ impl FilesystemHandler for PassthroughFs {
         };
 
         let new_path = newparent_path.join(newname);
+
+        // Use caller's credentials for permission check
+        let _guard = match CredentialsGuard::new(uid, gid) {
+            Ok(g) => g,
+            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
+        };
 
         if let Err(e) = fs::hard_link(&path, &new_path) {
             return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
@@ -705,10 +942,16 @@ impl FilesystemHandler for PassthroughFs {
         }
     }
 
-    fn access(&self, ino: u64, mask: u32) -> VolumeResponse {
+    fn access(&self, ino: u64, mask: u32, uid: u32, gid: u32) -> VolumeResponse {
         let path = match self.inodes.resolve_path(ino) {
             Some(p) => p,
             None => return VolumeResponse::not_found(),
+        };
+
+        // Use caller's credentials for permission check
+        let _guard = match CredentialsGuard::new(uid, gid) {
+            Ok(g) => g,
+            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
         };
 
         use std::ffi::CString;
@@ -799,7 +1042,9 @@ mod tests {
 
         let fs = PassthroughFs::new(dir.path());
 
-        let resp = fs.lookup(1, "test.txt");
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let resp = fs.lookup(1, "test.txt", uid, gid);
         match resp {
             VolumeResponse::Entry { attr, .. } => {
                 assert!(attr.is_file());
@@ -814,8 +1059,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fs = PassthroughFs::new(dir.path());
 
-        // Create file
-        let resp = fs.create(1, "test.txt", 0o644, 0);
+        // Create file (use current user's uid/gid)
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let resp = fs.create(1, "test.txt", 0o644, 0, uid, gid);
         let fh = match resp {
             VolumeResponse::Created { fh, .. } => fh,
             _ => panic!("Expected Created response"),
@@ -846,7 +1093,9 @@ mod tests {
         let fs = PassthroughFs::new(dir.path());
         std::fs::write(dir.path().join("file.txt"), "data").unwrap();
 
-        let lookup = fs.lookup(1, "file.txt");
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let lookup = fs.lookup(1, "file.txt", uid, gid);
         let ino = match lookup {
             VolumeResponse::Entry { attr, .. } => attr.ino,
             _ => panic!("Expected Entry response"),
@@ -862,6 +1111,8 @@ mod tests {
             None,
             None,
             None,
+            uid,
+            gid,
         );
 
         assert_eq!(
@@ -882,18 +1133,20 @@ mod tests {
         std::fs::write(&file_path, "hello").unwrap();
 
         let fs = PassthroughFs::new(root);
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
 
-        let dir_ino = match fs.lookup(1, "dir") {
+        let dir_ino = match fs.lookup(1, "dir", uid, gid) {
             VolumeResponse::Entry { attr, .. } => attr.ino,
             _ => panic!("Expected Entry for dir"),
         };
 
-        let file_ino = match fs.lookup(dir_ino, "file.txt") {
+        let file_ino = match fs.lookup(dir_ino, "file.txt", uid, gid) {
             VolumeResponse::Entry { attr, .. } => attr.ino,
             _ => panic!("Expected Entry for file"),
         };
 
-        let rename_resp = fs.rename(1, "dir", 1, "renamed");
+        let rename_resp = fs.rename(1, "dir", 1, "renamed", uid, gid);
         assert!(rename_resp.is_ok());
 
         let getattr_resp = fs.getattr(file_ino);
@@ -912,7 +1165,9 @@ mod tests {
         let fs = PassthroughFs::new(dir.path());
         std::fs::write(dir.path().join("file.txt"), "data").unwrap();
 
-        let lookup = fs.lookup(1, "file.txt");
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let lookup = fs.lookup(1, "file.txt", uid, gid);
         let ino = match lookup {
             VolumeResponse::Entry { attr, .. } => attr.ino,
             _ => panic!("Expected Entry response"),
@@ -932,6 +1187,8 @@ mod tests {
             Some(timestamp_nsecs),
             Some(timestamp_secs),
             Some(timestamp_nsecs),
+            uid,
+            gid,
         );
 
         match resp {
