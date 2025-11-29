@@ -13,7 +13,7 @@ REMOTE_KERNEL_DIR := ~/linux-firecracker
 # Local output directory for downloaded artifacts
 ARTIFACTS := artifacts
 
-.PHONY: all build sync build-remote build-local clean kernel rootfs deploy test sanity test-volume test-volumes test-volume-stress test-clone-lock test-pjdfstest fuse-pipe-test help
+.PHONY: all build sync build-remote build-local clean kernel rootfs deploy test test-sanity fuse-pipe-test help
 
 all: build
 
@@ -38,14 +38,9 @@ help:
 	@echo "  make rebuild       - Sync + build + rebuild rootfs (full rebuild)"
 	@echo ""
 	@echo "Testing:"
-	@echo "  make test          - Run sanity test on EC2"
-	@echo "  make sanity        - Alias for test"
-	@echo "  make test-volume   - Run single volume test (sync + build + test)"
-	@echo "  make test-volumes  - Run multi-volume test (sync + build + test)"
-	@echo "  make test-volume-stress - Run volume stress test (heavy I/O)"
-	@echo "  make test-clone-lock - Run POSIX lock test across 10 clones sharing a volume"
-	@echo "  make test-pjdfstest  - Run pjdfstest POSIX filesystem compliance tests"
-	@echo "  make fuse-pipe-test - Sync + run fuse-pipe unit tests on EC2"
+	@echo "  make test          - Run all integration tests on EC2 (cargo test)"
+	@echo "  make test-sanity   - Run sanity test (basic VM startup)"
+	@echo "  make fuse-pipe-test - Run fuse-pipe library tests"
 	@echo ""
 	@echo "Local:"
 	@echo "  make build-local   - Build locally (macOS, won't run)"
@@ -163,36 +158,20 @@ deploy:
 	@echo "==> fc-agent deployed"
 
 #
-# Testing
+# Testing (all tests are now cargo integration tests)
 #
-FCVM_BIN := ./target/release/fcvm
 
-test:
+# Run all integration tests
+test: build
+	@echo "==> Running all integration tests on EC2..."
+	$(SSH) "cd $(REMOTE_DIR) && sudo ~/.cargo/bin/cargo test 2>&1" | tee /tmp/test.log
+
+# Run sanity test (basic VM startup)
+test-sanity: build
 	@echo "==> Running sanity test on EC2..."
-	$(SSH) "cd $(REMOTE_DIR) && sudo $(FCVM_BIN) test sanity 2>&1" | tee /tmp/test.log
+	$(SSH) "cd $(REMOTE_DIR) && sudo ~/.cargo/bin/cargo test --test test_sanity 2>&1" | tee /tmp/test-sanity.log
 
-sanity: test
-
-test-volume: build
-	@echo "==> Running volume test on EC2 (single volume)..."
-	$(SSH) "cd $(REMOTE_DIR) && sudo $(FCVM_BIN) test volume --num-volumes 1 2>&1" | tee /tmp/test-volume.log
-
-test-volumes: build
-	@echo "==> Running volume test on EC2 (multiple volumes)..."
-	$(SSH) "cd $(REMOTE_DIR) && sudo $(FCVM_BIN) test volume --num-volumes 3 2>&1" | tee /tmp/test-volumes.log
-
-test-volume-stress: build
-	@echo "==> Running volume stress test on EC2..."
-	$(SSH) "cd $(REMOTE_DIR) && sudo $(FCVM_BIN) test volume-stress --num-volumes 2 --file-size-mb 10 --iterations 5 2>&1" | tee /tmp/test-volume-stress.log
-
-test-clone-lock: rebuild
-	@echo "==> Running clone lock test on EC2 (POSIX locking across 10 clones)..."
-	$(SSH) "cd $(REMOTE_DIR) && sudo $(FCVM_BIN) test clone-lock --num-clones 10 --iterations 100 2>&1" | tee /tmp/test-clone-lock.log
-
-test-pjdfstest: rebuild
-	@echo "==> Running pjdfstest on EC2 (POSIX filesystem compliance)..."
-	$(SSH) "cd $(REMOTE_DIR) && sudo $(FCVM_BIN) test pjdfstest --timeout 600 2>&1" | tee /tmp/test-pjdfstest.log
-
+# Run fuse-pipe library tests
 fuse-pipe-test: sync
 	@echo "==> Running fuse-pipe tests on EC2..."
 	$(SSH) "cd $(REMOTE_DIR)/fuse-pipe && source ~/.cargo/env && cargo test 2>&1" | tee /tmp/fuse-pipe-test.log
