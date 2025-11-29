@@ -259,8 +259,8 @@ pub struct SanityTestArgs {
     #[arg(long, default_value = "nginx:alpine")]
     pub image: String,
 
-    /// Timeout for health check in seconds
-    #[arg(long, default_value_t = 60)]
+    /// Timeout for health check in seconds (includes rootfs creation time)
+    #[arg(long, default_value_t = 240)]
     pub timeout: u64,
 
     /// Network mode: bridged (requires sudo) or rootless (no sudo)
@@ -362,3 +362,4 @@ pub struct LsArgs {
     #[arg(long)]
     pub pid: Option<u32>,
 }
+
