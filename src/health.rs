@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use chrono::Utc;
+use std::path::PathBuf;
 use std::time::Instant;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
@@ -22,8 +24,18 @@ const HEALTH_POLL_HEALTHY_INTERVAL: Duration = Duration::from_secs(10);
 /// Returns a JoinHandle that can be used to cancel the task.
 /// The task runs until cancelled or until the tokio runtime shuts down.
 pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
+    spawn_health_monitor_with_state_dir(vm_id, pid, paths::state_dir())
+}
+
+/// Same as `spawn_health_monitor` but with an explicit state directory.
+/// Useful for tests to avoid relying on global base directory state.
+pub fn spawn_health_monitor_with_state_dir(
+    vm_id: String,
+    pid: Option<u32>,
+    state_dir: PathBuf,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let state_manager = StateManager::new(paths::state_dir());
+        let state_manager = StateManager::new(state_dir);
 
         // Get VM name from state for logging
         let vm_name = if let Ok(state) = state_manager.load_state(&vm_id).await {
@@ -46,110 +58,20 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
         loop {
             tokio::time::sleep(poll_interval).await;
 
-            let health_status = if let Some(pid) = pid {
-                // First check if Firecracker process is still running
-                if std::fs::metadata(format!("/proc/{}", pid)).is_err() {
-                    debug!(target: "health-monitor", pid = pid, "process not found");
-                    HealthStatus::Unreachable
-                } else {
-                    // Process exists, now check if application is responding
-                    // Get network config and health check path from state
-                    if let Ok(state) = state_manager.load_state(&vm_id).await {
-                        let health_path = &state.config.health_check_path;
-                        let net = &state.config.network;
-
-                        // Check for rootless mode (loopback_ip set)
-                        if let Some(loopback_ip) = &net.loopback_ip {
-                            let port = net.health_check_port.unwrap_or(80);
-                            debug!(target: "health-monitor", loopback_ip = %loopback_ip, port = port, "rootless health check via loopback");
-
-                            match check_http_health_loopback(loopback_ip, port, health_path).await {
-                                Ok(true) => {
-                                    debug!(target: "health-monitor", "health check passed (rootless)");
-                                    last_failure_log = None;
-                                    HealthStatus::Healthy
-                                }
-                                Ok(false) => {
-                                    warn!(target: "health-monitor", "health check returned false (unexpected)");
-                                    HealthStatus::Unhealthy
-                                }
-                                Err(e) => {
-                                    let should_log = match last_failure_log {
-                                        None => true,
-                                        Some(last_time) => last_time.elapsed() >= Duration::from_secs(1),
-                                    };
-                                    if should_log {
-                                        warn!(target: "health-monitor", error = %e, "health check failed (rootless)");
-                                        last_failure_log = Some(Instant::now());
-                                    }
-                                    HealthStatus::Unhealthy
-                                }
-                            }
-                        } else {
-                            // Bridged mode: use guest_ip + veth
-                            let guest_ip = net.guest_ip.as_deref();
-                            let veth_device = net.host_veth.as_deref();
-
-                            debug!(target: "health-monitor", guest_ip = ?guest_ip, veth = ?veth_device, "bridged health check via veth");
-
-                            if let (Some(guest_ip), Some(veth)) = (guest_ip, veth_device) {
-                                match check_http_health_bridged(guest_ip, veth, health_path).await {
-                                    Ok(true) => {
-                                        debug!(target: "health-monitor", "health check passed (bridged)");
-                                        last_failure_log = None;
-                                        HealthStatus::Healthy
-                                    }
-                                    Ok(false) => {
-                                        warn!(target: "health-monitor", "health check returned false (unexpected)");
-                                        HealthStatus::Unhealthy
-                                    }
-                                    Err(e) => {
-                                        let should_log = match last_failure_log {
-                                            None => true,
-                                            Some(last_time) => last_time.elapsed() >= Duration::from_secs(1),
-                                        };
-                                        if should_log {
-                                            warn!(target: "health-monitor", error = %e, "health check failed (bridged)");
-                                            last_failure_log = Some(Instant::now());
-                                        }
-                                        HealthStatus::Unhealthy
-                                    }
-                                }
-                            } else {
-                                // No network config yet
-                                if guest_ip.is_none() {
-                                    warn!(target: "health-monitor", "cannot check health: no guest_ip in config");
-                                }
-                                if veth_device.is_none() {
-                                    warn!(target: "health-monitor", "cannot check health: no host_veth in config");
-                                }
-                                HealthStatus::Unknown
-                            }
-                        }
-                    } else {
-                        warn!(target: "health-monitor", "failed to load VM state for health check");
-                        HealthStatus::Unknown
-                    }
+            let health_status = match update_health_status_once(
+                &state_manager,
+                &vm_id,
+                pid,
+                &mut last_failure_log,
+            )
+            .await
+            {
+                Ok(status) => status,
+                Err(e) => {
+                    warn!(target: "health-monitor", error = %e, "health check iteration failed");
+                    HealthStatus::Unknown
                 }
-            } else {
-                HealthStatus::Unknown
             };
-
-            // Update state file
-            if let Ok(mut state) = state_manager.load_state(&vm_id).await {
-                state.health_status = health_status;
-                state.last_updated = chrono::Utc::now();
-                match state_manager.save_state(&state).await {
-                    Ok(_) => {
-                        debug!(target: "health-monitor", health_status = ?health_status, "state saved")
-                    }
-                    Err(e) => {
-                        warn!(target: "health-monitor", error = %e, "failed to save state")
-                    }
-                }
-            } else {
-                warn!(target: "health-monitor", "failed to load state for updating health");
-            }
 
             // Switch to slower polling once healthy
             if health_status == HealthStatus::Healthy && !is_healthy {
@@ -159,6 +81,127 @@ pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
             }
         }
     })
+}
+
+/// Perform a single health check iteration and persist the result.
+async fn update_health_status_once(
+    state_manager: &StateManager,
+    vm_id: &str,
+    pid: Option<u32>,
+    last_failure_log: &mut Option<Instant>,
+) -> Result<HealthStatus> {
+    let health_status = if let Some(pid) = pid {
+        // First check if Firecracker process is still running
+        if std::fs::metadata(format!("/proc/{}", pid)).is_err() {
+            debug!(target: "health-monitor", pid = pid, "process not found");
+            HealthStatus::Unreachable
+        } else {
+            // Process exists, now check if application is responding
+            // Get network config and health check path from state
+            let state = state_manager
+                .load_state(vm_id)
+                .await
+                .context("loading state for health check")?;
+            let health_path = &state.config.health_check_path;
+            let net = &state.config.network;
+
+            // Check for rootless mode (loopback_ip set)
+            if let Some(loopback_ip) = &net.loopback_ip {
+                let port = net.health_check_port.unwrap_or(80);
+                debug!(target: "health-monitor", loopback_ip = %loopback_ip, port = port, "rootless health check via loopback");
+
+                match check_http_health_loopback(loopback_ip, port, health_path).await {
+                    Ok(true) => {
+                        debug!(target: "health-monitor", "health check passed (rootless)");
+                        *last_failure_log = None;
+                        HealthStatus::Healthy
+                    }
+                    Ok(false) => {
+                        warn!(target: "health-monitor", "health check returned false (unexpected)");
+                        HealthStatus::Unhealthy
+                    }
+                    Err(e) => {
+                        let should_log = match last_failure_log {
+                            None => true,
+                            Some(last_time) => last_time.elapsed() >= Duration::from_secs(1),
+                        };
+                        if should_log {
+                            warn!(target: "health-monitor", error = %e, "health check failed (rootless)");
+                            *last_failure_log = Some(Instant::now());
+                        }
+                        HealthStatus::Unhealthy
+                    }
+                }
+            } else {
+                // Bridged mode: use guest_ip + veth
+                let guest_ip = net.guest_ip.as_deref();
+                let veth_device = net.host_veth.as_deref();
+
+                debug!(target: "health-monitor", guest_ip = ?guest_ip, veth = ?veth_device, "bridged health check via veth");
+
+                if let (Some(guest_ip), Some(veth)) = (guest_ip, veth_device) {
+                    match check_http_health_bridged(guest_ip, veth, health_path).await {
+                        Ok(true) => {
+                            debug!(target: "health-monitor", "health check passed (bridged)");
+                            *last_failure_log = None;
+                            HealthStatus::Healthy
+                        }
+                        Ok(false) => {
+                            warn!(target: "health-monitor", "health check returned false (unexpected)");
+                            HealthStatus::Unhealthy
+                        }
+                        Err(e) => {
+                            let should_log = match last_failure_log {
+                                None => true,
+                                Some(last_time) => last_time.elapsed() >= Duration::from_secs(1),
+                            };
+                            if should_log {
+                                warn!(target: "health-monitor", error = %e, "health check failed (bridged)");
+                                *last_failure_log = Some(Instant::now());
+                            }
+                            HealthStatus::Unhealthy
+                        }
+                    }
+                } else {
+                    // No network config yet
+                    if guest_ip.is_none() {
+                        warn!(target: "health-monitor", "cannot check health: no guest_ip in config");
+                    }
+                    if veth_device.is_none() {
+                        warn!(target: "health-monitor", "cannot check health: no host_veth in config");
+                    }
+                    HealthStatus::Unknown
+                }
+            }
+        }
+    } else {
+        HealthStatus::Unknown
+    };
+
+    // Update state file
+    let mut state = state_manager
+        .load_state(vm_id)
+        .await
+        .context("loading state for health update")?;
+    state.health_status = health_status;
+    state.last_updated = Utc::now();
+    state_manager
+        .save_state(&state)
+        .await
+        .context("saving updated health state")?;
+
+    Ok(health_status)
+}
+
+/// Run a single health check iteration (exposed for tests).
+pub async fn run_health_check_once(
+    vm_id: &str,
+    pid: Option<u32>,
+    state_dir: PathBuf,
+) -> Result<HealthStatus> {
+    let state_manager = StateManager::new(state_dir);
+    let mut last_failure_log = None;
+    update_health_status_once(&state_manager, vm_id, pid, &mut last_failure_log).await
 }
 
 /// Check if HTTP service is responding via loopback IP (rootless mode)

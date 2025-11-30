@@ -1,18 +1,40 @@
 use chrono::Utc;
-use fcvm::health::spawn_health_monitor;
+use fcvm::health::spawn_health_monitor_with_state_dir;
 use fcvm::network::NetworkConfig;
+use fcvm::paths;
 use fcvm::state::{HealthStatus, ProcessType, StateManager, VmConfig, VmState, VmStatus};
-use tempfile::TempDir;
+use serial_test::serial;
+use std::path::PathBuf;
+use std::sync::OnceLock;
 use tokio::time::{sleep, Duration};
 
-#[tokio::test]
-async fn test_health_monitor_lifecycle() {
-    let temp_dir = TempDir::new().unwrap();
+/// Ensure all tests share a stable FCVM_BASE_DIR to avoid races from parallel execution.
+fn init_test_base_dir() -> PathBuf {
+    static BASE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-    // Set FCVM_BASE_DIR so spawn_health_monitor uses same state directory
-    std::env::set_var("FCVM_BASE_DIR", temp_dir.path());
+    BASE_DIR
+        .get_or_init(|| {
+            let temp_dir = tempfile::tempdir().expect("create temp base dir");
+            let path = temp_dir.into_path();
 
-    let manager = StateManager::new(temp_dir.path().join("state"));
+            // Configure paths module and env var before any health monitor tasks start.
+            std::env::set_var("FCVM_BASE_DIR", &path);
+            paths::init_base_dir(path.to_str());
+
+            path
+        })
+        .clone()
+}
+
+#[tokio::test(start_paused = false)]
+#[serial]
+async fn test_health_monitor_behaviors() {
+    // Ensure base dir is set before spawning the monitor (tests run in parallel).
+    let base_dir = init_test_base_dir();
+    assert_eq!(paths::base_dir(), base_dir);
+
+    // Use the shared base dir so the monitor and test agree on where state lives.
+    let manager = StateManager::new(base_dir.join("state"));
     manager.init().await.unwrap();
 
     let now = Utc::now();
@@ -52,49 +74,25 @@ async fn test_health_monitor_lifecycle() {
     // Save initial state
     manager.save_state(&state).await.unwrap();
 
-    // Spawn health monitor
-    let handle = spawn_health_monitor("health-test-vm".to_string(), Some(99999));
-
-    // Poll for health status update (no arbitrary sleeps!)
-    // Health monitor should detect the missing PID and mark as Unreachable
-    let updated_state = loop {
-        sleep(Duration::from_millis(50)).await;
-        let state = manager.load_state("health-test-vm").await.unwrap();
-
-        // Break when health status changes from Unknown
-        if state.health_status != HealthStatus::Unknown {
-            break state;
-        }
-
-        // Timeout after 1 second (health check runs every 100ms)
-        // This should be more than enough time
-        if state
-            .last_updated
-            .signed_duration_since(now)
-            .num_milliseconds()
-            > 1000
-        {
-            panic!("Health monitor did not update status within 1 second");
-        }
-    };
-
-    // Cancel the health monitor
-    handle.abort();
-
-    // Verify task was cancelled
-    let result = handle.await;
-    assert!(result.is_err()); // Should be cancelled
+    // Run a single health check iteration
+    let status = fcvm::health::run_health_check_once(
+        "health-test-vm",
+        Some(99999),
+        base_dir.join("state"),
+    )
+    .await
+    .expect("health check should complete");
 
     // Since PID doesn't exist, health should be Unreachable (not Unknown)
     // The health monitor should have detected the missing PID
+    let updated_state = manager.load_state("health-test-vm").await.unwrap();
     assert_ne!(updated_state.health_status, HealthStatus::Unknown);
     assert_eq!(updated_state.health_status, HealthStatus::Unreachable);
-}
+    assert_eq!(status, HealthStatus::Unreachable);
 
-#[tokio::test]
-async fn test_health_monitor_cancellation() {
     // Test that health monitor can be properly cancelled
-    let handle = spawn_health_monitor("cancel-test".to_string(), None);
+    let handle =
+        spawn_health_monitor_with_state_dir("cancel-test".to_string(), None, base_dir.join("state"));
 
     // Cancel immediately
     handle.abort();
@@ -103,15 +101,12 @@ async fn test_health_monitor_cancellation() {
     let result = handle.await;
     assert!(result.is_err());
     assert!(result.unwrap_err().is_cancelled());
-}
 
-#[tokio::test]
-async fn test_multiple_health_monitors() {
     // Test that multiple health monitors can run independently
     let handles = vec![
-        spawn_health_monitor("vm-1".to_string(), Some(1001)),
-        spawn_health_monitor("vm-2".to_string(), Some(1002)),
-        spawn_health_monitor("vm-3".to_string(), Some(1003)),
+        spawn_health_monitor_with_state_dir("vm-1".to_string(), Some(1001), base_dir.join("state")),
+        spawn_health_monitor_with_state_dir("vm-2".to_string(), Some(1002), base_dir.join("state")),
+        spawn_health_monitor_with_state_dir("vm-3".to_string(), Some(1003), base_dir.join("state")),
     ];
 
     // Let them run briefly
