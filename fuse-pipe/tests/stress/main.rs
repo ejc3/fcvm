@@ -85,7 +85,7 @@ fn main() -> anyhow::Result<()> {
     raise_fd_limit();
     metrics::init();
 
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(filtered_args());
 
     match cli.command {
         Some(Commands::Server { socket, root }) => {
@@ -140,20 +140,34 @@ fn main() -> anyhow::Result<()> {
                 cli.readers,
                 cli.trace_rate,
             ) {
-                if let Some(ioe) = e.downcast_ref::<std::io::Error>() {
-                    if ioe.kind() == std::io::ErrorKind::PermissionDenied {
-                        println!(
-                            "[stress] skipping due to permission denied (need FUSE mount privileges)"
-                        );
-                        return Ok(());
-                    }
-                }
+                eprintln!("[stress] failed: {:#}", e);
                 return Err(e);
             }
         }
     }
 
     Ok(())
+}
+
+/// Drop cargo test harness flags so Clap doesn't choke on them.
+fn filtered_args() -> Vec<String> {
+    let mut args = std::env::args();
+    let mut filtered = Vec::new();
+    if let Some(bin) = args.next() {
+        filtered.push(bin);
+    }
+    for arg in args {
+        if matches!(
+            arg.as_str(),
+            "--nocapture" | "--ignored" | "--quiet" | "--test-threads" | "--exact"
+        ) || arg.starts_with("--color")
+            || arg.starts_with("--format")
+        {
+            continue;
+        }
+        filtered.push(arg);
+    }
+    filtered
 }
 
 fn raise_fd_limit() {

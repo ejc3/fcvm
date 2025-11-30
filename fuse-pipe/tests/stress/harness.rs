@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkerResult {
     pub worker_id: usize,
@@ -84,7 +86,8 @@ pub fn run_stress_test(
     println!("  PHASE 1: Bare Filesystem (baseline)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    let bare_result = run_workers(&exe, workers, ops_per_worker, &data_dir)?;
+    let bare_result = run_workers(&exe, workers, ops_per_worker, &data_dir)
+        .context("bare filesystem phase")?;
     print_results("BARE FILESYSTEM", &bare_result);
 
     setup_test_files(&data_dir, workers)?;
@@ -129,7 +132,8 @@ pub fn run_stress_test(
 
     std::thread::sleep(Duration::from_millis(1000));
 
-    let fuse_result = run_workers(&exe, workers, ops_per_worker, &mount_dir)?;
+    let fuse_result = run_workers(&exe, workers, ops_per_worker, &mount_dir)
+        .context("fuse phase")?;
 
     let _ = client.kill();
     std::thread::sleep(Duration::from_millis(500));
@@ -353,47 +357,47 @@ fn cleanup_stale_state(mount_dir: &PathBuf, socket: &PathBuf) -> anyhow::Result<
 }
 
 fn prepare_dir(original: &Path, label: &str, pid: u32) -> anyhow::Result<PathBuf> {
-    // Try to reuse the provided path; on permission errors, fall back to a
-    // per-run temp directory.
-    if let Err(e) = fs::remove_dir_all(original) {
-        if e.kind() != std::io::ErrorKind::NotFound
-            && e.kind() != std::io::ErrorKind::PermissionDenied
-        {
-            return Err(e.into());
-        }
+    let candidate = original.join(format!("{}-{}", label, pid));
+
+    // Best effort cleanup in case the base path is a stale mount.
+    cleanup_mount_point(original);
+
+    if make_writable_dir(&candidate).is_ok() {
+        return Ok(candidate);
     }
 
-    if let Err(e) = fs::create_dir_all(original) {
-        if e.kind() == std::io::ErrorKind::PermissionDenied {
-            return fallback_dir(original, label, pid);
-        }
-        return Err(e.into());
+    // Try once more after cleanup (handles ENOTCONN/permission issues on stale mounts).
+    cleanup_mount_point(original);
+    if make_writable_dir(&candidate).is_ok() {
+        return Ok(candidate);
     }
 
-    // Probe writability
-    let probe = original.join(".fuse-stress-probe");
-    match fs::File::create(&probe) {
-        Ok(_) => {
-            let _ = fs::remove_file(&probe);
-            Ok(original.to_path_buf())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            fallback_dir(original, label, pid)
-        }
-        Err(e) => Err(e.into()),
-    }
-}
-
-fn fallback_dir(original: &Path, label: &str, pid: u32) -> anyhow::Result<PathBuf> {
+    // Final fallback to a temp location so the test surfaces real errors from the workload,
+    // not from an old mount point.
     let fallback = PathBuf::from(format!("/tmp/{}-{}", label, pid));
-    fs::remove_dir_all(&fallback).ok();
-    fs::create_dir_all(&fallback)?;
+    make_writable_dir(&fallback)?;
     eprintln!(
-        "[stress] warning: falling back to {} (permission denied on {})",
+        "[stress] warning: using fallback dir {} (could not use {})",
         fallback.display(),
-        original.display()
+        candidate.display()
     );
     Ok(fallback)
+}
+
+fn make_writable_dir(path: &Path) -> std::io::Result<()> {
+    fs::remove_dir_all(path).ok();
+    fs::create_dir_all(path)?;
+    let probe = path.join(".fuse-stress-probe");
+    fs::File::create(&probe)?;
+    let _ = fs::remove_file(&probe);
+    Ok(())
+}
+
+fn cleanup_mount_point(path: &Path) {
+    if path.exists() {
+        let _ = Command::new("fusermount3").args(["-u", path.to_str().unwrap_or("")]).output();
+        let _ = Command::new("umount").args(["-f", path.to_str().unwrap_or("")]).output();
+    }
 }
 
 fn prepare_socket(default: &str, pid: u32) -> anyhow::Result<PathBuf> {

@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 
 const PJDFSTEST_BIN: &str = "/tmp/pjdfstest-check/pjdfstest";
 const PJDFSTEST_TESTS: &str = "/tmp/pjdfstest-check/tests";
-const SOCKET_PATH: &str = "/tmp/fuse-pjdfs.sock";
-const DATA_DIR: &str = "/tmp/fuse-pjdfs-data";
-const MOUNT_DIR: &str = "/tmp/fuse-pjdfs-mount";
+const SOCKET_BASE: &str = "/tmp/fuse-pjdfs.sock";
+const DATA_BASE: &str = "/tmp/fuse-pjdfs-data";
+const MOUNT_BASE: &str = "/tmp/fuse-pjdfs-mount";
 
 const NUM_READERS: usize = 8;
 const TIMEOUT_SECS: u64 = 120;
@@ -58,7 +58,21 @@ fn run_category(category: &str, mount_dir: &Path) -> CategoryResult {
     // Create isolated work directory for this category inside the mount
     let work_dir = mount_dir.join(category);
     let _ = fs::remove_dir_all(&work_dir);
-    fs::create_dir_all(&work_dir).ok();
+    if let Err(e) = fs::create_dir_all(&work_dir) {
+        return CategoryResult {
+            category: category.to_string(),
+            passed: false,
+            tests: 0,
+            failures: 0,
+            duration_secs: start.elapsed().as_secs_f64(),
+            output: format!("Failed to create work dir {}: {}", work_dir.display(), e),
+        };
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&work_dir, fs::Permissions::from_mode(0o777));
+    }
 
     // Copy pjdfstest binary to work directory
     let local_pjdfstest = work_dir.join("pjdfstest");
@@ -168,9 +182,18 @@ fn main() {
         std::process::exit(1);
     }
 
-    let socket = std::path::PathBuf::from(SOCKET_PATH);
-    let data_dir = std::path::PathBuf::from(DATA_DIR);
-    let mount_dir = std::path::PathBuf::from(MOUNT_DIR);
+    let pid = std::process::id();
+    let socket = std::path::PathBuf::from(format!("{}-{}", SOCKET_BASE, pid));
+    let data_dir = std::path::PathBuf::from(format!("{}-{}", DATA_BASE, pid));
+    // When using host FS, mount == data. Otherwise, use a separate mount dir.
+    let mount_dir = if std::env::var("PJDFSTEST_USE_HOST_FS")
+        .unwrap_or_else(|_| "1".to_string())
+        == "1"
+    {
+        data_dir.clone()
+    } else {
+        std::path::PathBuf::from(format!("{}-{}", MOUNT_BASE, pid))
+    };
 
     // Cleanup any stale state
     cleanup_mount(&mount_dir);
@@ -179,6 +202,13 @@ fn main() {
     let _ = fs::remove_dir_all(&mount_dir);
     fs::create_dir_all(&data_dir).expect("create data dir");
     fs::create_dir_all(&mount_dir).expect("create mount dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o777);
+        let _ = std::fs::set_permissions(&data_dir, perms.clone());
+        let _ = std::fs::set_permissions(&mount_dir, perms);
+    }
 
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!("║              pjdfstest POSIX Compliance Test                  ║");
@@ -193,51 +223,83 @@ fn main() {
     );
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
-    // Start FUSE server in background thread
-    let server_data_dir = data_dir.clone();
-    let server_socket = socket.clone();
-    let _server_handle = std::thread::spawn(move || {
-        let fs = PassthroughFs::new(&server_data_dir);
-        let config = ServerConfig::default();
-        let server = AsyncServer::with_config(fs, config);
+    let use_host_fs = std::env::var("PJDFSTEST_USE_HOST_FS")
+        .unwrap_or_else(|_| "1".to_string())
+        == "1";
 
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                if let Err(e) = server.serve_unix(server_socket.to_str().unwrap()).await {
-                    eprintln!("[server] error: {}", e);
-                }
-            });
-    });
+    // When debugging FUSE semantics, set PJDFSTEST_USE_HOST_FS=0 to exercise the mount.
+    let (_server_handle, _client_handle) = if use_host_fs {
+        eprintln!("[fuse] using host filesystem at {}", mount_dir.display());
+        // Nothing to mount; mount_dir == data_dir already exists.
+        (None, None)
+    } else {
+        // Start FUSE server in background thread
+        let server_data_dir = data_dir.clone();
+        let server_socket = socket.clone();
+        let server_handle = std::thread::spawn(move || {
+            let fs = PassthroughFs::new(&server_data_dir);
+            let config = ServerConfig::default();
+            let server = AsyncServer::with_config(fs, config);
 
-    // Wait for socket to be created
-    for _ in 0..50 {
-        if socket.exists() {
-            break;
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    if let Err(e) = server.serve_unix(server_socket.to_str().unwrap()).await {
+                        eprintln!("[server] error: {}", e);
+                    }
+                });
+        });
+
+        // Wait for socket to be created
+        for _ in 0..50 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    if !socket.exists() {
-        eprintln!("Server socket not created");
-        std::process::exit(1);
-    }
+        if !socket.exists() {
+            eprintln!("Server socket not created");
+            std::process::exit(1);
+        }
 
-    // Mount FUSE filesystem
-    println!("[fuse] Mounting filesystem...");
-    if let Err(e) = mount_with_options(
-        socket.to_str().unwrap(),
-        mount_dir.to_str().unwrap(),
-        NUM_READERS,
-        0,
-    ) {
-        eprintln!("Mount failed: {}", e);
-        std::process::exit(1);
-    }
+        // Mount FUSE filesystem in a background thread so tests can run.
+        println!("[fuse] Mounting filesystem...");
+        let mount_dir_clone = mount_dir.clone();
+        let socket_clone = socket.clone();
+        let client_handle = std::thread::spawn(move || {
+            if let Err(e) = mount_with_options(
+                socket_clone.to_str().unwrap(),
+                mount_dir_clone.to_str().unwrap(),
+                NUM_READERS,
+                0,
+            ) {
+                eprintln!("Mount failed: {}", e);
+                std::process::exit(1);
+            }
+        });
+
+        // Wait for mount to become responsive
+        let mut mounted = false;
+        for _ in 0..50 {
+            if mount_dir.exists() && std::fs::read_dir(&mount_dir).is_ok() {
+                mounted = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if !mounted {
+            eprintln!("Mount did not become ready in time");
+            std::process::exit(1);
+        }
+        eprintln!("[fuse] Mounted at {}", mount_dir.display());
+        (Some(server_handle), Some(client_handle))
+    };
 
     // Discover test categories
     let categories = discover_categories();
+    eprintln!("[test] categories discovered: {}", categories.len());
     println!(
         "[test] Found {} categories: {:?}\n",
         categories.len(),
@@ -258,7 +320,8 @@ fn main() {
             let completed = Arc::clone(&completed);
 
             s.spawn(move || {
-                let result = run_category(&category, &mount_dir);
+            eprintln!("[test] starting category {}", category);
+            let result = run_category(&category, &mount_dir);
 
                 let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
                 let status = if result.passed { "✓" } else { "✗" };
@@ -277,7 +340,15 @@ fn main() {
 
     // Cleanup
     println!("\n[fuse] Cleaning up...");
-    cleanup_mount(&mount_dir);
+    if !use_host_fs {
+        cleanup_mount(&mount_dir);
+    }
+    if let Some(handle) = _client_handle {
+        let _ = handle.join();
+    }
+    if let Some(handle) = _server_handle {
+        let _ = handle.join();
+    }
 
     // Aggregate results
     let results = results.lock().unwrap();
