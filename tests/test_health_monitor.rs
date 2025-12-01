@@ -75,13 +75,10 @@ async fn test_health_monitor_behaviors() {
     manager.save_state(&state).await.unwrap();
 
     // Run a single health check iteration
-    let status = fcvm::health::run_health_check_once(
-        "health-test-vm",
-        Some(99999),
-        base_dir.join("state"),
-    )
-    .await
-    .expect("health check should complete");
+    let status =
+        fcvm::health::run_health_check_once("health-test-vm", Some(99999), base_dir.join("state"))
+            .await
+            .expect("health check should complete");
 
     // Since PID doesn't exist, health should be Unreachable (not Unknown)
     // The health monitor should have detected the missing PID
@@ -91,8 +88,11 @@ async fn test_health_monitor_behaviors() {
     assert_eq!(status, HealthStatus::Unreachable);
 
     // Test that health monitor can be properly cancelled
-    let handle =
-        spawn_health_monitor_with_state_dir("cancel-test".to_string(), None, base_dir.join("state"));
+    let handle = spawn_health_monitor_with_state_dir(
+        "cancel-test".to_string(),
+        None,
+        base_dir.join("state"),
+    );
 
     // Cancel immediately
     handle.abort();

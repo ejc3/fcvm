@@ -12,6 +12,7 @@ categories = ["filesystem", "asynchronous"]
 default = ["fuse-client"]
 fuse-client = ["dep:fuser"]
 metrics = ["dep:metrics"]
+pjdfstest-full = []
 
 [dependencies]
 # Core
@@ -30,8 +31,12 @@ async-trait = "0.1"
 # Logging
 tracing = "0.1"
 
-# Optional: FUSE client (using fork with multi-reader support)
-fuser = { path = "../../fuser-fork", optional = true }
+# fuse-backend-rs for passthrough filesystem (Cloud Hypervisor's production-grade FUSE backend)
+fuse-backend-rs = { version = "0.12", default-features = false, features = ["fusedev"] }
+vm-memory = "0.14"
+
+# Optional: FUSE client (use GitHub fork with multi-reader support via FUSE_DEV_IOC_CLONE)
+fuser = { git = "https://github.com/ejc3/fuser.git", branch = "master", optional = true }
 
 # Concurrent data structures
 dashmap = "5.5"
@@ -47,6 +52,7 @@ clap = { version = "4.0", features = ["derive"] }
 serde_json = "1.0"
 metrics = "0.23"
 metrics-util = "0.17"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[bench]]
 name = "protocol"
@@ -62,6 +68,11 @@ path = "tests/stress/main.rs"
 harness = false
 
 [[test]]
-name = "pjdfstest"
-path = "tests/pjdfstest.rs"
+name = "pjdfstest_fast"
+path = "tests/pjdfstest_fast.rs"
+harness = false
+
+[[test]]
+name = "pjdfstest_full"
+path = "tests/pjdfstest_full.rs"
 harness = false

@@ -140,7 +140,12 @@ async fn update_fc_agent_in_rootfs(rootfs_path: &Path) -> Result<()> {
 
     // Mount the rootfs
     let output = Command::new("mount")
-        .args(["-o", "loop", path_to_str(rootfs_path)?, path_to_str(&mount_point)?])
+        .args([
+            "-o",
+            "loop",
+            path_to_str(rootfs_path)?,
+            path_to_str(&mount_point)?,
+        ])
         .output()
         .await
         .context("mounting rootfs for fc-agent update")?;
@@ -169,10 +174,7 @@ async fn update_fc_agent_in_rootfs(rootfs_path: &Path) -> Result<()> {
             .context("making fc-agent executable")?;
 
         if !output.status.success() {
-            bail!(
-                "chmod failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            bail!("chmod failed: {}", String::from_utf8_lossy(&output.stderr));
         }
 
         Ok(())
@@ -261,9 +263,7 @@ async fn download_ubuntu_cloud_image() -> Result<PathBuf> {
     let bytes = response.bytes().await.context("reading response body")?;
     let downloaded_mb = bytes.len() as f64 / 1024.0 / 1024.0;
 
-    file.write_all(&bytes)
-        .await
-        .context("writing image file")?;
+    file.write_all(&bytes).await.context("writing image file")?;
     file.flush().await.context("flushing image file")?;
 
     info!(path = %image_path.display(),
@@ -374,7 +374,10 @@ async fn extract_root_partition(qcow2_path: &Path, output_path: &Path) -> Result
             .unwrap_or(false)
     {
         // Exit codes 1-2 are warnings, not errors
-        warn!("e2fsck warnings: {}", String::from_utf8_lossy(&output.stderr));
+        warn!(
+            "e2fsck warnings: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // Resize filesystem to fill the file
@@ -412,42 +415,43 @@ async fn customize_ubuntu_cloud_image(image_path: &Path) -> Result<()> {
 
     // 1. Fix /etc/fstab - remove BOOT and UEFI partitions that don't exist
     cmd.arg("--run-command")
-       .arg("sed -i '/LABEL=BOOT/d;/LABEL=UEFI/d' /etc/fstab");
+        .arg("sed -i '/LABEL=BOOT/d;/LABEL=UEFI/d' /etc/fstab");
 
     // 2. Copy fc-agent binary (packages installed later via chroot)
     // Note: universe repository already enabled in base cloud image
     info!("adding fc-agent binary");
-    cmd.arg("--run-command")
-       .arg("mkdir -p /usr/local/bin");
+    cmd.arg("--run-command").arg("mkdir -p /usr/local/bin");
     cmd.arg("--copy-in")
-       .arg(&format!("{}:/usr/local/bin/", fc_agent_src.display()));
-    cmd.arg("--chmod")
-       .arg("0755:/usr/local/bin/fc-agent");
+        .arg(&format!("{}:/usr/local/bin/", fc_agent_src.display()));
+    cmd.arg("--chmod").arg("0755:/usr/local/bin/fc-agent");
 
     // 4. Write chrony config (create directory first)
     info!("adding chrony config");
-    cmd.arg("--run-command")
-       .arg("mkdir -p /etc/chrony");
+    cmd.arg("--run-command").arg("mkdir -p /etc/chrony");
     let chrony_conf = "# NTP servers from pool.ntp.org\npool pool.ntp.org iburst\n\n\
                        # Allow clock to be stepped (not slewed) for large time differences\n\
                        makestep 1.0 3\n\n\
                        # Directory for drift and other runtime files\n\
                        driftfile /var/lib/chrony/drift\n";
     cmd.arg("--write")
-       .arg(&format!("/etc/chrony/chrony.conf:{}", chrony_conf));
+        .arg(&format!("/etc/chrony/chrony.conf:{}", chrony_conf));
 
     // 5. Write systemd-networkd config
     info!("adding network config");
     cmd.arg("--run-command")
-       .arg("mkdir -p /etc/systemd/network /etc/systemd/network/10-eth0.network.d");
+        .arg("mkdir -p /etc/systemd/network /etc/systemd/network/10-eth0.network.d");
 
     let network_config = "[Match]\nName=eth0\n\n[Network]\n# Keep kernel IP configuration from ip= boot parameter\nKeepConfiguration=yes\n# DNS servers for container registry lookups\nDNS=8.8.8.8\nDNS=8.8.4.4\n";
-    cmd.arg("--write")
-       .arg(&format!("/etc/systemd/network/10-eth0.network:{}", network_config));
+    cmd.arg("--write").arg(&format!(
+        "/etc/systemd/network/10-eth0.network:{}",
+        network_config
+    ));
 
     let mmds_route = "[Route]\nDestination=169.254.169.254/32\nScope=link\n";
-    cmd.arg("--write")
-       .arg(&format!("/etc/systemd/network/10-eth0.network.d/mmds.conf:{}", mmds_route));
+    cmd.arg("--write").arg(&format!(
+        "/etc/systemd/network/10-eth0.network.d/mmds.conf:{}",
+        mmds_route
+    ));
 
     // 6. Write fc-agent systemd service
     info!("adding fc-agent service");
@@ -457,20 +461,19 @@ async fn customize_ubuntu_cloud_image(image_path: &Path) -> Result<()> {
                             Restart=on-failure\nRestartSec=5\n\
                             StandardOutput=journal+console\nStandardError=journal+console\n\n\
                             [Install]\nWantedBy=multi-user.target\n";
-    cmd.arg("--write")
-       .arg(&format!("/etc/systemd/system/fc-agent.service:{}", fc_agent_service));
+    cmd.arg("--write").arg(&format!(
+        "/etc/systemd/system/fc-agent.service:{}",
+        fc_agent_service
+    ));
 
     // 8. Enable services (fc-agent only - other services enabled after package install)
     info!("enabling systemd services");
     cmd.arg("--run-command")
-       .arg("systemctl enable fc-agent systemd-networkd serial-getty@ttyS0");
+        .arg("systemctl enable fc-agent systemd-networkd serial-getty@ttyS0");
 
     info!("executing virt-customize (this should be quick)");
 
-    let output = cmd
-        .output()
-        .await
-        .context("running virt-customize")?;
+    let output = cmd.output().await.context("running virt-customize")?;
 
     if !output.status.success() {
         bail!(
@@ -506,7 +509,12 @@ async fn install_packages_in_rootfs(rootfs_path: &Path) -> Result<()> {
 
     // Mount the rootfs
     let output = Command::new("mount")
-        .args(["-o", "loop", path_to_str(rootfs_path)?, path_to_str(&mount_point)?])
+        .args([
+            "-o",
+            "loop",
+            path_to_str(rootfs_path)?,
+            path_to_str(&mount_point)?,
+        ])
         .output()
         .await
         .context("mounting rootfs for package installation")?;
@@ -536,7 +544,8 @@ async fn install_packages_in_rootfs(rootfs_path: &Path) -> Result<()> {
     let resolv_conf_dest = mount_point.join("etc/resolv.conf");
     // Remove existing resolv.conf (might be a symlink)
     let _ = tokio::fs::remove_file(&resolv_conf_dest).await;
-    tokio::fs::copy("/etc/resolv.conf", &resolv_conf_dest).await
+    tokio::fs::copy("/etc/resolv.conf", &resolv_conf_dest)
+        .await
         .context("copying /etc/resolv.conf into chroot")?;
 
     // Install packages via chroot
@@ -570,7 +579,8 @@ async fn install_packages_in_rootfs(rootfs_path: &Path) -> Result<()> {
                 "apt-get",
                 "install",
                 "-y",
-                "-o", "Dpkg::Options::=--force-confnew",  // Force install new config files
+                "-o",
+                "Dpkg::Options::=--force-confnew", // Force install new config files
                 "podman",
                 "crun",
                 "fuse-overlayfs",
@@ -583,9 +593,15 @@ async fn install_packages_in_rootfs(rootfs_path: &Path) -> Result<()> {
             .context("installing packages in chroot")?;
 
         // Log apt output for debugging
-        info!("apt-get install stdout:\n{}", String::from_utf8_lossy(&output.stdout));
+        info!(
+            "apt-get install stdout:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
         if !output.stderr.is_empty() {
-            info!("apt-get install stderr:\n{}", String::from_utf8_lossy(&output.stderr));
+            info!(
+                "apt-get install stderr:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         if !output.status.success() {

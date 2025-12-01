@@ -17,7 +17,10 @@ use fuse_pipe::transport::HOST_CID;
 /// * `port` - The vsock port where the host VolumeServer is listening
 /// * `mount_point` - The path where the filesystem will be mounted
 pub fn mount_vsock(port: u32, mount_point: &str) -> anyhow::Result<()> {
-    eprintln!("[fc-agent] mounting FUSE volume at {} via vsock port {}", mount_point, port);
+    eprintln!(
+        "[fc-agent] mounting FUSE volume at {} via vsock port {}",
+        mount_point, port
+    );
     fuse_pipe::mount_vsock(HOST_CID, port, mount_point)
 }
 
@@ -26,8 +29,14 @@ pub fn mount_vsock(port: u32, mount_point: &str) -> anyhow::Result<()> {
 /// Same as `mount_vsock` but creates multiple FUSE reader threads for
 /// better parallel performance.
 #[allow(dead_code)]
-pub fn mount_vsock_with_readers(port: u32, mount_point: &str, num_readers: usize) -> anyhow::Result<()> {
-    eprintln!("[fc-agent] mounting FUSE volume at {} via vsock port {} ({} readers)",
-        mount_point, port, num_readers);
+pub fn mount_vsock_with_readers(
+    port: u32,
+    mount_point: &str,
+    num_readers: usize,
+) -> anyhow::Result<()> {
+    eprintln!(
+        "[fc-agent] mounting FUSE volume at {} via vsock port {} ({} readers)",
+        mount_point, port, num_readers
+    );
     fuse_pipe::mount_vsock_with_readers(HOST_CID, port, mount_point, num_readers)
 }

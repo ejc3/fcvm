@@ -318,6 +318,7 @@ mod tests {
                 name: "test.txt".to_string(),
                 uid: 1000,
                 gid: 1000,
+                pid: 0,
             },
         );
 

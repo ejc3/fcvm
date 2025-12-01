@@ -102,7 +102,12 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
             "Volumes to mount: {}",
             volume_mappings
                 .iter()
-                .map(|v| format!("{}:{}{}", v.host_path.display(), v.guest_path, if v.read_only { ":ro" } else { "" }))
+                .map(|v| format!(
+                    "{}:{}{}",
+                    v.host_path.display(),
+                    v.guest_path,
+                    if v.read_only { ":ro" } else { "" }
+                ))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -225,7 +230,10 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     if let Err(e) = setup_result {
         warn!("VM setup failed, cleaning up network resources");
         if let Err(cleanup_err) = network.cleanup().await {
-            warn!("failed to cleanup network after setup error: {}", cleanup_err);
+            warn!(
+                "failed to cleanup network after setup error: {}",
+                cleanup_err
+            );
         }
         return Err(e);
     }

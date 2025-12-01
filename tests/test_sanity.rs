@@ -75,25 +75,26 @@ async fn sanity_test_impl(network: &str) -> Result<()> {
     let health_task = tokio::spawn(common::poll_health_by_pid(fcvm_pid, 120));
 
     // Monitor process for unexpected exits
-    let monitor_task: tokio::task::JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    return Err(anyhow::anyhow!(
-                        "fcvm process exited unexpectedly with status: {}",
-                        status
-                    ));
+    let monitor_task: tokio::task::JoinHandle<Result<(), anyhow::Error>> =
+        tokio::spawn(async move {
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        return Err(anyhow::anyhow!(
+                            "fcvm process exited unexpectedly with status: {}",
+                            status
+                        ));
+                    }
+                    Ok(None) => {
+                        // Still running
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("Failed to check process status: {}", e));
+                    }
                 }
-                Ok(None) => {
-                    // Still running
-                }
-                Err(e) => {
-                    return Err(anyhow::anyhow!("Failed to check process status: {}", e));
-                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    });
+        });
 
     // Wait for either health check or process exit
     let result = tokio::select! {

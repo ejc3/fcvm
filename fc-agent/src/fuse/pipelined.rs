@@ -410,10 +410,13 @@ fn mode_to_file_type(mode: u32) -> FileType {
 // ============================================================================
 
 impl Filesystem for SharedFs {
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let response = self.send_request_sync(VolumeRequest::Lookup {
             parent,
             name: name.to_string_lossy().to_string(),
+            uid: req.uid(),
+            gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {
@@ -439,7 +442,7 @@ impl Filesystem for SharedFs {
 
     fn setattr(
         &mut self,
-        _req: &Request,
+        req: &Request,
         ino: u64,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -468,6 +471,9 @@ impl Filesystem for SharedFs {
             ino, mode, uid, gid, size,
             atime_secs, atime_nsecs: None,
             mtime_secs, mtime_nsecs: None,
+            caller_uid: req.uid(),
+            caller_gid: req.gid(),
+            caller_pid: req.pid(),
         });
 
         match response {
@@ -479,8 +485,14 @@ impl Filesystem for SharedFs {
         }
     }
 
-    fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
-        let response = self.send_request_sync(VolumeRequest::Readdir { ino, offset: offset as u64 });
+    fn readdir(&mut self, req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
+        let response = self.send_request_sync(VolumeRequest::Readdir {
+            ino,
+            offset: offset as u64,
+            uid: req.uid(),
+            gid: req.gid(),
+            pid: req.pid(),
+        });
 
         match response {
             VolumeResponse::DirEntries { entries } => {
@@ -497,11 +509,14 @@ impl Filesystem for SharedFs {
         }
     }
 
-    fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, mode: u32, _umask: u32, reply: ReplyEntry) {
+    fn mkdir(&mut self, req: &Request, parent: u64, name: &OsStr, mode: u32, _umask: u32, reply: ReplyEntry) {
         let response = self.send_request_sync(VolumeRequest::Mkdir {
             parent,
             name: name.to_string_lossy().to_string(),
             mode,
+            uid: req.uid(),
+            gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {
@@ -513,10 +528,13 @@ impl Filesystem for SharedFs {
         }
     }
 
-    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let response = self.send_request_sync(VolumeRequest::Rmdir {
             parent,
             name: name.to_string_lossy().to_string(),
+            uid: req.uid(),
+            gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {
@@ -526,12 +544,15 @@ impl Filesystem for SharedFs {
         }
     }
 
-    fn create(&mut self, _req: &Request, parent: u64, name: &OsStr, mode: u32, _umask: u32, flags: i32, reply: ReplyCreate) {
+    fn create(&mut self, req: &Request, parent: u64, name: &OsStr, mode: u32, _umask: u32, flags: i32, reply: ReplyCreate) {
         let response = self.send_request_sync(VolumeRequest::Create {
             parent,
             name: name.to_string_lossy().to_string(),
             mode,
             flags: flags as u32,
+            uid: req.uid(),
+            gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {
@@ -543,8 +564,14 @@ impl Filesystem for SharedFs {
         }
     }
 
-    fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
-        let response = self.send_request_sync(VolumeRequest::Open { ino, flags: flags as u32 });
+    fn open(&mut self, req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
+        let response = self.send_request_sync(VolumeRequest::Open {
+            ino,
+            flags: flags as u32,
+            uid: req.uid(),
+            gid: req.gid(),
+            pid: req.pid(),
+        });
 
         match response {
             VolumeResponse::Opened { fh, flags } => reply.opened(fh, flags),
@@ -607,10 +634,13 @@ impl Filesystem for SharedFs {
         }
     }
 
-    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let response = self.send_request_sync(VolumeRequest::Unlink {
             parent,
             name: name.to_string_lossy().to_string(),
+            uid: req.uid(),
+            gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {
@@ -620,12 +650,15 @@ impl Filesystem for SharedFs {
         }
     }
 
-    fn rename(&mut self, _req: &Request, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, _flags: u32, reply: ReplyEmpty) {
+    fn rename(&mut self, req: &Request, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, _flags: u32, reply: ReplyEmpty) {
         let response = self.send_request_sync(VolumeRequest::Rename {
             parent,
             name: name.to_string_lossy().to_string(),
             newparent,
             newname: newname.to_string_lossy().to_string(),
+            uid: req.uid(),
+            gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {
@@ -635,11 +668,14 @@ impl Filesystem for SharedFs {
         }
     }
 
-    fn symlink(&mut self, _req: &Request, parent: u64, link_name: &OsStr, target: &std::path::Path, reply: ReplyEntry) {
+    fn symlink(&mut self, req: &Request, parent: u64, link_name: &OsStr, target: &std::path::Path, reply: ReplyEntry) {
         let response = self.send_request_sync(VolumeRequest::Symlink {
             parent,
             name: link_name.to_string_lossy().to_string(),
             target: target.to_string_lossy().to_string(),
+            uid: req.uid(),
+            gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {
@@ -662,11 +698,14 @@ impl Filesystem for SharedFs {
         }
     }
 
-    fn link(&mut self, _req: &Request, ino: u64, newparent: u64, newname: &OsStr, reply: ReplyEntry) {
+    fn link(&mut self, req: &Request, ino: u64, newparent: u64, newname: &OsStr, reply: ReplyEntry) {
         let response = self.send_request_sync(VolumeRequest::Link {
             ino,
             newparent,
             newname: newname.to_string_lossy().to_string(),
+            uid: req.uid(),
+            gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {
@@ -678,8 +717,14 @@ impl Filesystem for SharedFs {
         }
     }
 
-    fn access(&mut self, _req: &Request, ino: u64, mask: i32, reply: ReplyEmpty) {
-        let response = self.send_request_sync(VolumeRequest::Access { ino, mask: mask as u32 });
+    fn access(&mut self, req: &Request, ino: u64, mask: i32, reply: ReplyEmpty) {
+        let response = self.send_request_sync(VolumeRequest::Access {
+            ino,
+            mask: mask as u32,
+            uid: req.uid(),
+            gid: req.gid(),
+            pid: req.pid(),
+        });
 
         match response {
             VolumeResponse::Ok => reply.ok(),

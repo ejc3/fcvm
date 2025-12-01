@@ -58,7 +58,7 @@ pub mod prelude {
     pub use crate::protocol::{
         DirEntry, FileAttr, VolumeRequest, VolumeResponse, WireRequest, WireResponse,
     };
-    pub use crate::transport::{UnixTransport, HOST_CID};
     #[cfg(target_os = "linux")]
     pub use crate::transport::VsockTransport;
+    pub use crate::transport::{UnixTransport, HOST_CID};
 }

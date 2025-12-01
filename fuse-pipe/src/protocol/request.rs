@@ -18,6 +18,7 @@ pub enum VolumeRequest {
         name: String,
         uid: u32,
         gid: u32,
+        pid: u32,
     },
 
     /// Get file attributes.
@@ -38,6 +39,7 @@ pub enum VolumeRequest {
         mtime_nsecs: Option<u32>,
         caller_uid: u32,
         caller_gid: u32,
+        caller_pid: u32,
     },
 
     /// Read directory contents.
@@ -46,6 +48,7 @@ pub enum VolumeRequest {
         offset: u64,
         uid: u32,
         gid: u32,
+        pid: u32,
     },
 
     /// Create a directory.
@@ -55,6 +58,7 @@ pub enum VolumeRequest {
         mode: u32,
         uid: u32,
         gid: u32,
+        pid: u32,
     },
 
     /// Create a special file (device node, FIFO, socket).
@@ -65,6 +69,7 @@ pub enum VolumeRequest {
         rdev: u32,
         uid: u32,
         gid: u32,
+        pid: u32,
     },
 
     /// Remove a directory.
@@ -73,6 +78,7 @@ pub enum VolumeRequest {
         name: String,
         uid: u32,
         gid: u32,
+        pid: u32,
     },
 
     /// Create and open a file.
@@ -83,6 +89,7 @@ pub enum VolumeRequest {
         flags: u32,
         uid: u32,
         gid: u32,
+        pid: u32,
     },
 
     /// Open a file.
@@ -91,6 +98,7 @@ pub enum VolumeRequest {
         flags: u32,
         uid: u32,
         gid: u32,
+        pid: u32,
     },
 
     /// Read data from an open file.
@@ -124,6 +132,7 @@ pub enum VolumeRequest {
         name: String,
         uid: u32,
         gid: u32,
+        pid: u32,
     },
 
     /// Rename a file or directory.
@@ -134,6 +143,7 @@ pub enum VolumeRequest {
         newname: String,
         uid: u32,
         gid: u32,
+        pid: u32,
     },
 
     /// Create a symbolic link.
@@ -143,6 +153,7 @@ pub enum VolumeRequest {
         target: String,
         uid: u32,
         gid: u32,
+        pid: u32,
     },
 
     /// Read the target of a symbolic link.
@@ -155,6 +166,7 @@ pub enum VolumeRequest {
         newname: String,
         uid: u32,
         gid: u32,
+        pid: u32,
     },
 
     /// Check file access permissions.
@@ -163,6 +175,7 @@ pub enum VolumeRequest {
         mask: u32,
         uid: u32,
         gid: u32,
+        pid: u32,
     },
 
     /// Get filesystem statistics.
@@ -223,6 +236,7 @@ mod tests {
             name: "test".to_string(),
             uid: 1000,
             gid: 1000,
+            pid: 1234,
         };
         assert_eq!(req.op_name(), "lookup");
     }
@@ -255,6 +269,7 @@ mod tests {
             flags: libc::O_RDWR as u32,
             uid: 1000,
             gid: 1000,
+            pid: 1234,
         };
 
         let encoded = bincode::serialize(&req).unwrap();

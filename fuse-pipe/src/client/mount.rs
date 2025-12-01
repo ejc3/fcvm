@@ -63,11 +63,11 @@ pub fn mount_with_options<P: AsRef<Path>>(
 
     // Mount options:
     // - AllowOther: Allow non-root users to access the mount (requires user_allow_other in /etc/fuse.conf or running as root)
-    // Note: We do NOT use DefaultPermissions because we implement our own permission checks
-    // in the passthrough handler to properly enforce POSIX ownership rules (chmod/chown/utimes)
+    // - DefaultPermissions: Let the kernel enforce basic permission checks before handing off to userspace
     let options = vec![
         fuser::MountOption::FSName("fuse-pipe".to_string()),
         fuser::MountOption::AllowOther,
+        fuser::MountOption::DefaultPermissions,
     ];
 
     let mount_with_options =
@@ -106,6 +106,7 @@ pub fn mount_with_options<P: AsRef<Path>>(
 
             for (reader_id, cloned_fd) in fds_vec {
                 let fs = FuseClient::new(Arc::clone(&mux_for_callback), reader_id as u32);
+                // Each cloned fd handles its own request/response pairs
                 let mut reader_session =
                     fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::Owner);
 
@@ -224,6 +225,7 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
     let options = vec![
         fuser::MountOption::FSName("fuse-pipe".to_string()),
         fuser::MountOption::AllowOther,
+        fuser::MountOption::DefaultPermissions,
     ];
 
     let mount_with_options =
@@ -254,6 +256,7 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
 
             for (reader_id, cloned_fd) in fds_vec {
                 let fs = FuseClient::new(Arc::clone(&mux_for_callback), reader_id as u32);
+                // Each cloned fd handles its own request/response pairs
                 let mut reader_session =
                     fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::Owner);
 

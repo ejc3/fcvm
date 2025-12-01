@@ -80,14 +80,23 @@ pub async fn cmd_ls(args: LsArgs) -> Result<()> {
             let vm = &display.vm;
             let stale_marker = if display.stale { "YES" } else { "" };
             let pid_str = vm.pid.map_or("-".to_string(), |p| p.to_string());
-            let name = vm.name.as_ref().map(|s| s.as_str()).unwrap_or_else(|| truncate_id(&vm.vm_id, 8));
+            let name = vm
+                .name
+                .as_ref()
+                .map(|s| s.as_str())
+                .unwrap_or_else(|| truncate_id(&vm.vm_id, 8));
             let guest_ip = vm.config.network.guest_ip.as_deref().unwrap_or("-");
             let tap_device = if vm.config.network.tap_device.is_empty() {
                 "-"
             } else {
                 &vm.config.network.tap_device
             };
-            let image = vm.config.image.split(':').next().unwrap_or(&vm.config.image);
+            let image = vm
+                .config
+                .image
+                .split(':')
+                .next()
+                .unwrap_or(&vm.config.image);
             let status = format!("{:?}", vm.status);
             let health = format!("{:?}", vm.health_status);
 

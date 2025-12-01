@@ -386,10 +386,17 @@ impl GuestRegionUffdMapping {
     /// Validate that this mapping has sensible values
     fn validate(&self) -> Result<()> {
         if self.size == 0 {
-            anyhow::bail!("mapping has zero size at base 0x{:x}", self.base_host_virt_addr);
+            anyhow::bail!(
+                "mapping has zero size at base 0x{:x}",
+                self.base_host_virt_addr
+            );
         }
         // Check for overflow in base + size
-        if self.base_host_virt_addr.checked_add(self.size as u64).is_none() {
+        if self
+            .base_host_virt_addr
+            .checked_add(self.size as u64)
+            .is_none()
+        {
             anyhow::bail!(
                 "mapping range overflow: base 0x{:x}, size {}",
                 self.base_host_virt_addr,

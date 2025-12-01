@@ -1,13 +1,17 @@
 mod fuse;
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::process::Stdio;
 use std::thread;
-use fs2::FileExt;
-use tokio::{io::{AsyncBufReadExt, BufReader}, process::Command, time::{sleep, Duration}};
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    process::Command,
+    time::{sleep, Duration},
+};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Deserialize)]
@@ -49,7 +53,9 @@ async fn fetch_plan() -> Result<Plan> {
     let client = reqwest::Client::new();
 
     // Step 1: Get session token
-    eprintln!("[fc-agent] requesting MMDS V2 session token from http://169.254.169.254/latest/api/token");
+    eprintln!(
+        "[fc-agent] requesting MMDS V2 session token from http://169.254.169.254/latest/api/token"
+    );
     let token_response = match client
         .put("http://169.254.169.254/latest/api/token")
         .header("X-metadata-token-ttl-seconds", "21600")
@@ -76,10 +82,21 @@ async fn fetch_plan() -> Result<Plan> {
     };
 
     let token_status = token_response.status();
-    eprintln!("[fc-agent] token response status: {} {}", token_status.as_u16(), token_status.canonical_reason().unwrap_or(""));
+    eprintln!(
+        "[fc-agent] token response status: {} {}",
+        token_status.as_u16(),
+        token_status.canonical_reason().unwrap_or("")
+    );
 
-    let token = token_response.text().await.context("reading session token")?;
-    eprintln!("[fc-agent] got token: {} bytes ({})", token.len(), if token.is_empty() { "EMPTY!" } else { "ok" });
+    let token = token_response
+        .text()
+        .await
+        .context("reading session token")?;
+    eprintln!(
+        "[fc-agent] got token: {} bytes ({})",
+        token.len(),
+        if token.is_empty() { "EMPTY!" } else { "ok" }
+    );
 
     // Step 2: Fetch plan with token from /latest/container-plan
     // IMPORTANT: Must include Accept: application/json to get JSON response instead of IMDS key list
@@ -111,14 +128,25 @@ async fn fetch_plan() -> Result<Plan> {
     };
 
     let plan_status = plan_response.status();
-    eprintln!("[fc-agent] plan response status: {} {}", plan_status.as_u16(), plan_status.canonical_reason().unwrap_or(""));
+    eprintln!(
+        "[fc-agent] plan response status: {} {}",
+        plan_status.as_u16(),
+        plan_status.canonical_reason().unwrap_or("")
+    );
 
     if !plan_status.is_success() {
-        eprintln!("[fc-agent] ERROR: HTTP {} - this is NOT a 2xx success code", plan_status.as_u16());
+        eprintln!(
+            "[fc-agent] ERROR: HTTP {} - this is NOT a 2xx success code",
+            plan_status.as_u16()
+        );
     }
 
     let body = plan_response.text().await.context("reading plan body")?;
-    eprintln!("[fc-agent] plan response body ({} bytes): {}", body.len(), body);
+    eprintln!(
+        "[fc-agent] plan response body ({} bytes): {}",
+        body.len(),
+        body
+    );
 
     let plan: Plan = match serde_json::from_str(&body) {
         Ok(p) => {
@@ -166,7 +194,10 @@ async fn watch_restore_epoch() {
                     // First time seeing an epoch - THIS IS A CLONE RESTORE!
                     // On fresh boot, there is no restore-epoch in MMDS yet.
                     // If we see one, we were restored from a snapshot.
-                    eprintln!("[fc-agent] detected restore-epoch: {} (clone restore detected)", current);
+                    eprintln!(
+                        "[fc-agent] detected restore-epoch: {} (clone restore detected)",
+                        current
+                    );
                     handle_clone_restore(&metadata.volumes).await;
                     last_epoch = metadata.restore_epoch;
                 }
@@ -191,7 +222,10 @@ async fn handle_clone_restore(volumes: &[VolumeMount]) {
 
     // 2. Remount FUSE volumes if any
     if !volumes.is_empty() {
-        eprintln!("[fc-agent] clone has {} volume(s) to remount", volumes.len());
+        eprintln!(
+            "[fc-agent] clone has {} volume(s) to remount",
+            volumes.len()
+        );
         remount_fuse_volumes(volumes).await;
     }
 }
@@ -200,7 +234,10 @@ async fn handle_clone_restore(volumes: &[VolumeMount]) {
 /// The old vsock connections are broken, so we unmount and remount.
 async fn remount_fuse_volumes(volumes: &[VolumeMount]) {
     for vol in volumes {
-        eprintln!("[fc-agent] remounting volume at {} (port {})", vol.guest_path, vol.vsock_port);
+        eprintln!(
+            "[fc-agent] remounting volume at {} (port {})",
+            vol.guest_path, vol.vsock_port
+        );
 
         // First, try to unmount the old (broken) FUSE mount
         // Use lazy unmount (-l) in case there are open files
@@ -215,8 +252,11 @@ async fn remount_fuse_volumes(volumes: &[VolumeMount]) {
             }
             Ok(o) => {
                 // Not mounted or error - that's fine, we'll mount fresh
-                eprintln!("[fc-agent] umount {} (may not be mounted): {}",
-                    vol.guest_path, String::from_utf8_lossy(&o.stderr).trim());
+                eprintln!(
+                    "[fc-agent] umount {} (may not be mounted): {}",
+                    vol.guest_path,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
             }
             Err(e) => {
                 eprintln!("[fc-agent] umount error for {}: {}", vol.guest_path, e);
@@ -228,7 +268,10 @@ async fn remount_fuse_volumes(volumes: &[VolumeMount]) {
 
         // Create mount point directory (in case it doesn't exist)
         if let Err(e) = std::fs::create_dir_all(&vol.guest_path) {
-            eprintln!("[fc-agent] ERROR: cannot create mount point {}: {}", vol.guest_path, e);
+            eprintln!(
+                "[fc-agent] ERROR: cannot create mount point {}: {}",
+                vol.guest_path, e
+            );
             continue;
         }
 
@@ -288,7 +331,10 @@ async fn flush_arp_cache() {
             eprintln!("[fc-agent] ✓ ARP cache flushed successfully");
         }
         Ok(o) => {
-            eprintln!("[fc-agent] WARNING: ARP flush failed: {}", String::from_utf8_lossy(&o.stderr));
+            eprintln!(
+                "[fc-agent] WARNING: ARP flush failed: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
         }
         Err(e) => {
             eprintln!("[fc-agent] WARNING: ARP flush error: {}", e);
@@ -304,7 +350,10 @@ async fn watch_for_lock_test(clone_id: String) {
     let counter_path = "/mnt/shared/counter.txt";
     let append_path = "/mnt/shared/append.log";
 
-    eprintln!("[fc-agent] watching for lock test trigger at {}", trigger_path);
+    eprintln!(
+        "[fc-agent] watching for lock test trigger at {}",
+        trigger_path
+    );
 
     // Poll for trigger file
     loop {
@@ -318,7 +367,10 @@ async fn watch_for_lock_test(clone_id: String) {
                 Err(_) => continue,
             };
 
-            eprintln!("[fc-agent] lock test triggered! clone={} iterations={}", clone_id, iterations);
+            eprintln!(
+                "[fc-agent] lock test triggered! clone={} iterations={}",
+                clone_id, iterations
+            );
 
             // Run lock tests
             run_lock_tests(&clone_id, iterations, counter_path, append_path);
@@ -371,11 +423,13 @@ fn increment_counter_with_lock(path: &str) -> Result<()> {
         .context("opening counter file")?;
 
     // Acquire exclusive lock (blocking)
-    file.lock_exclusive().context("acquiring exclusive lock on counter")?;
+    file.lock_exclusive()
+        .context("acquiring exclusive lock on counter")?;
 
     // Read current value
     let mut content = String::new();
-    file.read_to_string(&mut content).context("reading counter")?;
+    file.read_to_string(&mut content)
+        .context("reading counter")?;
     let current: i64 = content.trim().parse().unwrap_or(0);
 
     // Increment
@@ -401,7 +455,8 @@ fn append_with_lock(path: &str, clone_id: &str, iteration: usize) -> Result<()> 
         .context("opening append file")?;
 
     // Acquire exclusive lock (blocking)
-    file.lock_exclusive().context("acquiring exclusive lock on append file")?;
+    file.lock_exclusive()
+        .context("acquiring exclusive lock on append file")?;
 
     // Write line with clone ID, iteration, and timestamp
     let timestamp = std::time::SystemTime::now()
@@ -413,7 +468,9 @@ fn append_with_lock(path: &str, clone_id: &str, iteration: usize) -> Result<()> 
 
     // Use BufWriter for atomic-ish write
     let mut writer = std::io::BufWriter::new(&file);
-    writer.write_all(line.as_bytes()).context("writing append line")?;
+    writer
+        .write_all(line.as_bytes())
+        .context("writing append line")?;
     writer.flush().context("flushing append file")?;
 
     // Lock is automatically released when file is dropped
@@ -448,8 +505,10 @@ fn mount_fuse_volumes(volumes: &[VolumeMount]) -> Result<Vec<String>> {
     let mut mounted_paths = Vec::new();
 
     for vol in volumes {
-        eprintln!("[fc-agent] mounting FUSE volume at {} via vsock port {}",
-            vol.guest_path, vol.vsock_port);
+        eprintln!(
+            "[fc-agent] mounting FUSE volume at {} via vsock port {}",
+            vol.guest_path, vol.vsock_port
+        );
 
         // Create mount point directory
         std::fs::create_dir_all(&vol.guest_path)
@@ -509,8 +568,8 @@ async fn sync_clock_from_host() -> Result<()> {
         .context("fetching host-time from MMDS")?;
 
     let body = metadata_response.text().await?;
-    let metadata: LatestMetadata = serde_json::from_str(&body)
-        .context("parsing host-time from MMDS")?;
+    let metadata: LatestMetadata =
+        serde_json::from_str(&body).context("parsing host-time from MMDS")?;
 
     eprintln!("[fc-agent] received host time: {}", metadata.host_time);
 
@@ -526,7 +585,10 @@ async fn sync_clock_from_host() -> Result<()> {
         .context("setting system clock")?;
 
     if !output.status.success() {
-        eprintln!("[fc-agent] WARNING: failed to set clock: {}", String::from_utf8_lossy(&output.stderr));
+        eprintln!(
+            "[fc-agent] WARNING: failed to set clock: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         eprintln!("[fc-agent] continuing anyway (will rely on chronyd)");
     } else {
         eprintln!("[fc-agent] ✓ system clock synchronized from host");
@@ -541,7 +603,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,fuse_pipe=debug"))
+                .unwrap_or_else(|_| EnvFilter::new("info,fuse_pipe=debug")),
         )
         .with_target(true)
         .with_writer(std::io::stderr)
@@ -583,7 +645,10 @@ async fn main() -> Result<()> {
     // Note: mounted_volumes tracks which mounts succeeded, but we bind from plan.volumes
     // since they use the same guest_path for both FUSE mount and container bind
     let has_shared_volume = if !plan.volumes.is_empty() {
-        eprintln!("[fc-agent] mounting {} FUSE volume(s) from host", plan.volumes.len());
+        eprintln!(
+            "[fc-agent] mounting {} FUSE volume(s) from host",
+            plan.volumes.len()
+        );
         match mount_fuse_volumes(&plan.volumes) {
             Ok(paths) => {
                 eprintln!("[fc-agent] ✓ FUSE volumes mounted successfully");
@@ -604,7 +669,10 @@ async fn main() -> Result<()> {
     // This allows clones to run POSIX lock tests on demand
     if has_shared_volume {
         let clone_id = get_clone_id().await;
-        eprintln!("[fc-agent] starting lock test watcher (clone_id={})", clone_id);
+        eprintln!(
+            "[fc-agent] starting lock test watcher (clone_id={})",
+            clone_id
+        );
         tokio::spawn(async move {
             watch_for_lock_test(clone_id).await;
         });
@@ -614,9 +682,7 @@ async fn main() -> Result<()> {
 
     // Build Podman command
     let mut cmd = Command::new("podman");
-    cmd.arg("run")
-        .arg("--rm")
-        .arg("--network=host");
+    cmd.arg("run").arg("--rm").arg("--network=host");
 
     // Add environment variables
     for (key, val) in &plan.env {
@@ -646,8 +712,7 @@ async fn main() -> Result<()> {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let mut child = cmd.spawn()
-        .context("spawning Podman container")?;
+    let mut child = cmd.spawn().context("spawning Podman container")?;
 
     // Stream stdout to serial console
     if let Some(stdout) = child.stdout.take() {
