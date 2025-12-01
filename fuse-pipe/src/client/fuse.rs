@@ -130,6 +130,7 @@ impl Filesystem for FuseClient {
             name: name.to_string_lossy().to_string(),
             uid: req.uid(),
             gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {
@@ -207,6 +208,7 @@ impl Filesystem for FuseClient {
             mtime_nsecs,
             caller_uid: req.uid(),
             caller_gid: req.gid(),
+            caller_pid: req.pid(),
         });
 
         match response {
@@ -233,6 +235,7 @@ impl Filesystem for FuseClient {
             mode,
             uid: req.uid(),
             gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {
@@ -269,6 +272,7 @@ impl Filesystem for FuseClient {
             rdev,
             uid: req.uid(),
             gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {
@@ -294,6 +298,7 @@ impl Filesystem for FuseClient {
             name: name.to_string_lossy().to_string(),
             uid: req.uid(),
             gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {
@@ -320,6 +325,7 @@ impl Filesystem for FuseClient {
             flags: flags as u32,
             uid: req.uid(),
             gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {
@@ -349,6 +355,7 @@ impl Filesystem for FuseClient {
             flags: flags as u32,
             uid: req.uid(),
             gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {
@@ -454,6 +461,7 @@ impl Filesystem for FuseClient {
             name: name.to_string_lossy().to_string(),
             uid: req.uid(),
             gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {
@@ -480,6 +488,7 @@ impl Filesystem for FuseClient {
             newname: newname.to_string_lossy().to_string(),
             uid: req.uid(),
             gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {
@@ -503,6 +512,7 @@ impl Filesystem for FuseClient {
             target: target.to_string_lossy().to_string(),
             uid: req.uid(),
             gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {
@@ -546,6 +556,7 @@ impl Filesystem for FuseClient {
             newname: newname.to_string_lossy().to_string(),
             uid: req.uid(),
             gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {
@@ -571,6 +582,7 @@ impl Filesystem for FuseClient {
             mask: mask as u32,
             uid: req.uid(),
             gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {
@@ -614,6 +626,7 @@ impl Filesystem for FuseClient {
             offset: offset as u64,
             uid: req.uid(),
             gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {

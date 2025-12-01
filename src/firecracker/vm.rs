@@ -139,7 +139,7 @@ impl VmManager {
         // Setup logging
         if let Some(log_path) = &self.log_path {
             cmd.arg("--log-path").arg(log_path);
-            cmd.arg("--level").arg("Debug");  // Enable Debug logging for detailed diagnostics
+            cmd.arg("--level").arg("Debug"); // Enable Debug logging for detailed diagnostics
             cmd.arg("--show-level");
             cmd.arg("--show-log-origin");
         }
@@ -166,7 +166,8 @@ impl VmManager {
                 None
             };
 
-            let vsock_paths = if let Some((ref baseline_dir, ref clone_dir)) = vsock_redirect_clone {
+            let vsock_paths = if let Some((ref baseline_dir, ref clone_dir)) = vsock_redirect_clone
+            {
                 info!(target: "vm", vm_id = %self.vm_id,
                     baseline = %baseline_dir.display(),
                     clone = %clone_dir.display(),
@@ -201,7 +202,10 @@ impl VmManager {
                     if let Some((ref baseline_cstr, ref clone_cstr)) = vsock_paths {
                         // Create a new mount namespace so our bind mount is isolated
                         unshare(CloneFlags::CLONE_NEWNS).map_err(|e| {
-                            std::io::Error::other(format!("failed to unshare mount namespace: {}", e))
+                            std::io::Error::other(format!(
+                                "failed to unshare mount namespace: {}",
+                                e
+                            ))
                         })?;
 
                         // Make our mount namespace private so mounts don't propagate
@@ -236,10 +240,14 @@ impl VmManager {
 
                     // Step 2: Enter network namespace if specified
                     if let Some(ref ns_path_cstr) = ns_path_cstr {
-                        let ns_fd_raw =
-                            open(ns_path_cstr.as_c_str(), OFlag::O_RDONLY, Mode::empty()).map_err(
-                                |e| std::io::Error::other(format!("failed to open namespace: {}", e)),
-                            )?;
+                        let ns_fd_raw = open(
+                            ns_path_cstr.as_c_str(),
+                            OFlag::O_RDONLY,
+                            Mode::empty(),
+                        )
+                        .map_err(|e| {
+                            std::io::Error::other(format!("failed to open namespace: {}", e))
+                        })?;
 
                         // SAFETY: from_raw_fd takes ownership of the file descriptor.
                         let ns_fd = OwnedFd::from_raw_fd(ns_fd_raw);
@@ -338,8 +346,12 @@ impl VmManager {
             sleep(SOCKET_WAIT_RETRY_DELAY).await;
         }
 
-        let timeout_secs = SOCKET_WAIT_RETRY_COUNT as u64 * SOCKET_WAIT_RETRY_DELAY.as_millis() as u64 / 1000;
-        bail!("Firecracker socket not ready after {} seconds", timeout_secs)
+        let timeout_secs =
+            SOCKET_WAIT_RETRY_COUNT as u64 * SOCKET_WAIT_RETRY_DELAY.as_millis() as u64 / 1000;
+        bail!(
+            "Firecracker socket not ready after {} seconds",
+            timeout_secs
+        )
     }
 
     /// Get the API client

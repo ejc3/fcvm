@@ -5,6 +5,10 @@
 //! Usage:
 //!   cargo test --test stress --release
 //!   cargo test --test stress --release -- --workers 64 --readers 64
+//!
+//! Enable debug logging with RUST_LOG:
+//!   RUST_LOG=debug cargo test --test stress --release
+//!   RUST_LOG=passthrough=trace cargo test --test stress --release
 
 mod harness;
 mod metrics;
@@ -13,6 +17,7 @@ mod worker;
 use clap::{Parser, Subcommand};
 use fuse_pipe::{mount_with_options, AsyncServer, PassthroughFs, ServerConfig};
 use std::path::PathBuf;
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[derive(Parser)]
 #[command(name = "stress")]
@@ -38,7 +43,7 @@ struct Cli {
     mount: PathBuf,
 
     /// Number of FUSE reader threads
-    #[arg(short, long, default_value = "4")]
+    #[arg(short, long, default_value = "256")]
     readers: usize,
 
     /// Trace every Nth request (0 = disabled)
@@ -82,6 +87,12 @@ enum Commands {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Initialize tracing subscriber with env filter (RUST_LOG)
+    tracing_subscriber::registry()
+        .with(fmt::layer().with_writer(std::io::stderr))
+        .with(EnvFilter::from_default_env())
+        .init();
+
     raise_fd_limit();
     metrics::init();
 

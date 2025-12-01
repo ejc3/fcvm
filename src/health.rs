@@ -39,7 +39,10 @@ pub fn spawn_health_monitor_with_state_dir(
 
         // Get VM name from state for logging
         let vm_name = if let Ok(state) = state_manager.load_state(&vm_id).await {
-            state.name.clone().unwrap_or_else(|| truncate_id(&vm_id, 8).to_string())
+            state
+                .name
+                .clone()
+                .unwrap_or_else(|| truncate_id(&vm_id, 8).to_string())
         } else {
             truncate_id(&vm_id, 8).to_string() // Fallback to short vm_id
         };
@@ -208,7 +211,11 @@ pub async fn run_health_check_once(
 ///
 /// For rootless VMs, we use a unique loopback IP (127.x.y.z) with port forwarding
 /// through slirp4netns to reach the guest.
-async fn check_http_health_loopback(loopback_ip: &str, port: u16, health_path: &str) -> Result<bool> {
+async fn check_http_health_loopback(
+    loopback_ip: &str,
+    port: u16,
+    health_path: &str,
+) -> Result<bool> {
     let url = format!("http://{}:{}{}", loopback_ip, port, health_path);
 
     let client = reqwest::Client::builder()
@@ -243,7 +250,11 @@ async fn check_http_health_loopback(loopback_ip: &str, port: u16, health_path: &
         }
         Err(e) => {
             if e.is_timeout() {
-                anyhow::bail!("Health check timed out after 1 second via {}:{}", loopback_ip, port)
+                anyhow::bail!(
+                    "Health check timed out after 1 second via {}:{}",
+                    loopback_ip,
+                    port
+                )
             } else if e.is_connect() {
                 anyhow::bail!("Connection refused to {}:{}", loopback_ip, port)
             } else {
@@ -263,7 +274,11 @@ async fn check_http_health_loopback(loopback_ip: &str, port: u16, health_path: &
 /// We use reqwest's .interface() method (which uses SO_BINDTODEVICE on Linux)
 /// to ensure each health check reaches its specific VM, even when multiple VMs
 /// share the same IP address (from snapshot clones).
-async fn check_http_health_bridged(guest_ip: &str, veth_device: &str, health_path: &str) -> Result<bool> {
+async fn check_http_health_bridged(
+    guest_ip: &str,
+    veth_device: &str,
+    health_path: &str,
+) -> Result<bool> {
     let url = format!("http://{}{}", guest_ip, health_path);
 
     // Build a reqwest client bound to the specific veth device
@@ -304,7 +319,12 @@ async fn check_http_health_bridged(guest_ip: &str, veth_device: &str, health_pat
             } else if e.is_connect() {
                 anyhow::bail!("Connection refused to {} via {}", guest_ip, veth_device)
             } else {
-                anyhow::bail!("Failed to connect to {} via {}: {}", guest_ip, veth_device, e)
+                anyhow::bail!(
+                    "Failed to connect to {} via {}: {}",
+                    guest_ip,
+                    veth_device,
+                    e
+                )
             }
         }
     }

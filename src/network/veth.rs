@@ -116,10 +116,7 @@ pub async fn setup_host_veth(veth_name: &str, ip_with_cidr: &str) -> Result<()> 
 /// Brings up the veth interface and loopback inside the namespace.
 /// Note: Neither veth nor bridge get an IP - they are pure L2 devices.
 /// The guest VM has the IP and routing happens inside the VM.
-pub async fn setup_guest_veth_in_ns(
-    ns_name: &str,
-    veth_name: &str,
-) -> Result<()> {
+pub async fn setup_guest_veth_in_ns(ns_name: &str, veth_name: &str) -> Result<()> {
     info!(
         namespace = %ns_name,
         veth = %veth_name,
@@ -200,11 +197,7 @@ pub async fn create_tap_in_ns(ns_name: &str, tap_name: &str) -> Result<()> {
 /// IMPORTANT: The bridge is a pure L2 device with NO IP address. If we assign
 /// the guest IP to the bridge, it will respond to ARP requests instead of
 /// forwarding them to the VM, breaking connectivity.
-pub async fn connect_tap_to_veth(
-    ns_name: &str,
-    tap_name: &str,
-    veth_name: &str,
-) -> Result<()> {
+pub async fn connect_tap_to_veth(ns_name: &str, tap_name: &str, veth_name: &str) -> Result<()> {
     info!(
         namespace = %ns_name,
         tap = %tap_name,
@@ -353,9 +346,7 @@ mod tests {
         setup_host_veth(host_veth, "172.30.0.1/30").await.unwrap();
 
         // Setup guest side
-        setup_guest_veth_in_ns(ns_name, guest_veth)
-            .await
-            .unwrap();
+        setup_guest_veth_in_ns(ns_name, guest_veth).await.unwrap();
 
         // Verify host veth exists
         let output = Command::new("ip")

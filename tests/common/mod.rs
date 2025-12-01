@@ -52,7 +52,9 @@ impl VmFixture {
             .stderr(Stdio::piped())
             .spawn()?;
 
-        let pid = child.id().ok_or_else(|| anyhow::anyhow!("failed to get VM PID"))?;
+        let pid = child
+            .id()
+            .ok_or_else(|| anyhow::anyhow!("failed to get VM PID"))?;
 
         // Wait for VM to become healthy
         if let Err(e) = poll_health_by_pid(pid, 120).await {
@@ -208,7 +210,14 @@ pub async fn exec_in_vm(pid: u32, cmd: &[&str]) -> anyhow::Result<String> {
 pub async fn create_snapshot_by_pid(pid: u32, snapshot_name: &str) -> anyhow::Result<()> {
     let fcvm_path = find_fcvm_binary()?;
     let output = tokio::process::Command::new(&fcvm_path)
-        .args(["snapshot", "create", "--pid", &pid.to_string(), "--tag", snapshot_name])
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &pid.to_string(),
+            "--tag",
+            snapshot_name,
+        ])
         .output()
         .await?;
 
@@ -228,7 +237,9 @@ pub async fn create_snapshot_by_pid(pid: u32, snapshot_name: &str) -> anyhow::Re
 ///
 /// # Arguments
 /// * `snapshot_name` - Name of the snapshot to serve
-pub async fn start_memory_server(snapshot_name: &str) -> anyhow::Result<(tokio::process::Child, u32)> {
+pub async fn start_memory_server(
+    snapshot_name: &str,
+) -> anyhow::Result<(tokio::process::Child, u32)> {
     let fcvm_path = find_fcvm_binary()?;
     let child = tokio::process::Command::new(&fcvm_path)
         .args(["snapshot", "serve", snapshot_name])
@@ -236,7 +247,9 @@ pub async fn start_memory_server(snapshot_name: &str) -> anyhow::Result<(tokio::
         .stderr(Stdio::piped())
         .spawn()?;
 
-    let serve_pid = child.id().ok_or_else(|| anyhow::anyhow!("failed to get serve PID"))?;
+    let serve_pid = child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("failed to get serve PID"))?;
 
     // Wait for serve process to register in state manager
     // The serve process will show up in `fcvm ls --pid` once it's running
@@ -275,7 +288,9 @@ pub async fn spawn_clone(
         .stderr(Stdio::piped())
         .spawn()?;
 
-    let clone_pid = child.id().ok_or_else(|| anyhow::anyhow!("failed to get clone PID"))?;
+    let clone_pid = child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("failed to get clone PID"))?;
 
     Ok((child, clone_pid))
 }

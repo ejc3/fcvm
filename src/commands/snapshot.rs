@@ -10,7 +10,9 @@ use crate::cli::{
 use crate::firecracker::VmManager;
 use crate::network::{BridgedNetwork, NetworkManager, PortMapping, SlirpNetwork};
 use crate::paths;
-use crate::state::{generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState, VmStatus};
+use crate::state::{
+    generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState, VmStatus,
+};
 use crate::storage::{DiskManager, SnapshotManager};
 use crate::uffd::UffdServer;
 use crate::volume::{VolumeConfig, VolumeServer};
@@ -224,7 +226,10 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         .await;
 
     if let Err(e) = resume_result {
-        let vm_name = vm_state.name.as_deref().unwrap_or(truncate_id(&vm_state.vm_id, 8));
+        let vm_name = vm_state
+            .name
+            .as_deref()
+            .unwrap_or(truncate_id(&vm_state.vm_id, 8));
         warn!(
             error = %e,
             vm = %vm_name,
@@ -356,7 +361,11 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
                         info!("successfully killed clone PID {}", pid);
                     }
                     Ok(status) => {
-                        warn!("kill command returned non-zero exit for PID {}: {:?}", pid, status.code());
+                        warn!(
+                            "kill command returned non-zero exit for PID {}: {:?}",
+                            pid,
+                            status.code()
+                        );
                     }
                     Err(e) => {
                         warn!("failed to kill clone PID {}: {}", pid, e);
@@ -368,7 +377,11 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
 
     // Clean up socket file
     if let Err(e) = std::fs::remove_file(&socket_path) {
-        warn!("failed to remove socket file {}: {}", socket_path.display(), e);
+        warn!(
+            "failed to remove socket file {}: {}",
+            socket_path.display(),
+            e
+        );
     } else {
         info!("removed socket file: {}", socket_path.display());
     }
@@ -511,8 +524,12 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 port,
             };
 
-            let server = VolumeServer::new(config.clone())
-                .with_context(|| format!("creating VolumeServer for {}", vol_config.host_path.display()))?;
+            let server = VolumeServer::new(config.clone()).with_context(|| {
+                format!(
+                    "creating VolumeServer for {}",
+                    vol_config.host_path.display()
+                )
+            })?;
 
             let vsock_path = clone_vsock_base.clone();
             let handle = tokio::spawn(async move {
@@ -614,7 +631,10 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     if let Err(e) = setup_result {
         warn!("Clone setup failed, cleaning up network resources");
         if let Err(cleanup_err) = network.cleanup().await {
-            warn!("failed to cleanup network after setup error: {}", cleanup_err);
+            warn!(
+                "failed to cleanup network after setup error: {}",
+                cleanup_err
+            );
         }
         return Err(e);
     }
@@ -758,7 +778,8 @@ async fn run_clone_setup(
 ) -> Result<VmManager> {
     // Setup storage - Create CoW disk from snapshot disk
     let vm_dir = data_dir.join("disks");
-    let disk_manager = DiskManager::new(vm_id.to_string(), snapshot_config.disk_path.clone(), vm_dir);
+    let disk_manager =
+        DiskManager::new(vm_id.to_string(), snapshot_config.disk_path.clone(), vm_dir);
 
     let rootfs_path = disk_manager
         .create_cow_disk()
@@ -818,7 +839,10 @@ async fn run_clone_setup(
     // For rootless mode with slirp4netns: post_start starts slirp4netns in the namespace
     // For bridged mode: post_start is a no-op (TAP already created)
     let vm_pid = vm_manager.pid()?;
-    network.post_start(vm_pid).await.context("post-start network setup")?;
+    network
+        .post_start(vm_pid)
+        .await
+        .context("post-start network setup")?;
 
     let client = vm_manager.client()?;
 
@@ -902,7 +926,10 @@ async fn run_clone_setup(
         }))
         .await
         .context("updating MMDS with restore-epoch")?;
-    info!(restore_epoch = restore_epoch, "signaled fc-agent to flush ARP via MMDS");
+    info!(
+        restore_epoch = restore_epoch,
+        "signaled fc-agent to flush ARP via MMDS"
+    );
 
     // Timing instrumentation: measure VM resume operation
     let resume_start = std::time::Instant::now();

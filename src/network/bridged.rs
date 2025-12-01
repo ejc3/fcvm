@@ -166,7 +166,8 @@ impl NetworkManager for BridgedNetwork {
         // Step 7: Connect TAP to veth inside namespace via L2 bridge
         // The guest (Firecracker) will use the TAP, and it routes through veth to host
         // Note: Bridge has no IP - it's a pure L2 forwarding device
-        if let Err(e) = veth::connect_tap_to_veth(&namespace_id, &self.tap_device, &guest_veth).await
+        if let Err(e) =
+            veth::connect_tap_to_veth(&namespace_id, &self.tap_device, &guest_veth).await
         {
             let _ = self.cleanup().await;
             return Err(e).context("connecting TAP to veth");

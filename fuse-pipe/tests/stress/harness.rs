@@ -86,8 +86,8 @@ pub fn run_stress_test(
     println!("  PHASE 1: Bare Filesystem (baseline)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    let bare_result = run_workers(&exe, workers, ops_per_worker, &data_dir)
-        .context("bare filesystem phase")?;
+    let bare_result =
+        run_workers(&exe, workers, ops_per_worker, &data_dir).context("bare filesystem phase")?;
     print_results("BARE FILESYSTEM", &bare_result);
 
     setup_test_files(&data_dir, workers)?;
@@ -132,8 +132,8 @@ pub fn run_stress_test(
 
     std::thread::sleep(Duration::from_millis(1000));
 
-    let fuse_result = run_workers(&exe, workers, ops_per_worker, &mount_dir)
-        .context("fuse phase")?;
+    let fuse_result =
+        run_workers(&exe, workers, ops_per_worker, &mount_dir).context("fuse phase")?;
 
     let _ = client.kill();
     std::thread::sleep(Duration::from_millis(500));
@@ -395,8 +395,12 @@ fn make_writable_dir(path: &Path) -> std::io::Result<()> {
 
 fn cleanup_mount_point(path: &Path) {
     if path.exists() {
-        let _ = Command::new("fusermount3").args(["-u", path.to_str().unwrap_or("")]).output();
-        let _ = Command::new("umount").args(["-f", path.to_str().unwrap_or("")]).output();
+        let _ = Command::new("fusermount3")
+            .args(["-u", path.to_str().unwrap_or("")])
+            .output();
+        let _ = Command::new("umount")
+            .args(["-f", path.to_str().unwrap_or("")])
+            .output();
     }
 }
 

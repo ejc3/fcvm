@@ -176,6 +176,14 @@ fuse-pipe-test: sync
 	@echo "==> Running fuse-pipe tests on EC2..."
 	$(SSH) "cd $(REMOTE_DIR)/fuse-pipe && source ~/.cargo/env && cargo test 2>&1" | tee /tmp/fuse-pipe-test.log
 
+pjdfstest-fast: sync
+	@echo "==> Running pjdfstest fast sanity on EC2 (host + fuse posix_fallocate)..."
+	$(SSH) "cd $(REMOTE_DIR) && RUST_LOG=fuse_pipe=trace,fuser=info sudo ~/.cargo/bin/cargo test -p fuse-pipe --test pjdfstest_fast -- --nocapture 2>&1" | tee /tmp/pjdfstest-fast.log
+
+pjdfstest-full: sync
+	@echo "==> Running pjdfstest full suite on EC2 (host + fuse, jobs=256)..."
+	$(SSH) "cd $(REMOTE_DIR) && RUST_LOG=fuse_pipe=trace,fuser=info sudo ~/.cargo/bin/cargo test -p fuse-pipe --features pjdfstest-full --test pjdfstest_full -- --nocapture 2>&1" | tee /tmp/pjdfstest-full.log
+
 #
 # Local builds (for IDE/linting only - won't run on macOS)
 #

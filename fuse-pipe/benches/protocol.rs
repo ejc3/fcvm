@@ -10,6 +10,9 @@ fn bench_serialize_lookup_request(c: &mut Criterion) {
         VolumeRequest::Lookup {
             parent: 1,
             name: "test.txt".to_string(),
+            uid: 1000,
+            gid: 1000,
+            pid: 42,
         },
     );
 
@@ -25,6 +28,9 @@ fn bench_deserialize_lookup_request(c: &mut Criterion) {
         VolumeRequest::Lookup {
             parent: 1,
             name: "test.txt".to_string(),
+            uid: 1000,
+            gid: 1000,
+            pid: 42,
         },
     );
     let encoded = bincode::serialize(&req).unwrap();

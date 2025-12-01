@@ -51,15 +51,15 @@ const SLIRP_DEVICE_NAME: &str = "slirp0";
 /// 7. Namespace host forwards packets: guest → tap0 → IP forward → slirp0 → slirp4netns
 pub struct SlirpNetwork {
     vm_id: String,
-    tap_device: String,       // TAP device for Firecracker (tap0)
-    slirp_device: String,     // TAP device for slirp4netns (slirp0)
+    tap_device: String,   // TAP device for Firecracker (tap0)
+    slirp_device: String, // TAP device for slirp4netns (slirp0)
     port_mappings: Vec<PortMapping>,
 
     // Network addressing
-    slirp_cidr: String,       // slirp0: 10.0.2.100/24, gateway 10.0.2.2
-    guest_subnet: String,     // tap0: 192.168.x.0/24 (derived from vm_id)
-    guest_ip: String,         // Guest VM IP (192.168.x.2)
-    namespace_ip: String,     // Namespace host IP on tap0 (192.168.x.1)
+    slirp_cidr: String,   // slirp0: 10.0.2.100/24, gateway 10.0.2.2
+    guest_subnet: String, // tap0: 192.168.x.0/24 (derived from vm_id)
+    guest_ip: String,     // Guest VM IP (192.168.x.2)
+    namespace_ip: String, // Namespace host IP on tap0 (192.168.x.1)
 
     // State (populated during setup)
     api_socket_path: Option<PathBuf>,
@@ -82,7 +82,7 @@ impl SlirpNetwork {
             namespace_ip: NAMESPACE_IP.to_string(),
             api_socket_path: None,
             slirp_process: None,
-            loopback_ip: None,  // Allocated in setup() - must be unique on host
+            loopback_ip: None, // Allocated in setup() - must be unique on host
         }
     }
 
@@ -216,8 +216,8 @@ exec "$@"
     /// Start slirp4netns process attached to the namespace
     /// Called after Firecracker has started (so we have the namespace PID)
     pub async fn start_slirp(&mut self, namespace_pid: u32) -> Result<()> {
-        let api_socket = paths::base_dir()
-            .join(format!("slirp-{}.sock", truncate_id(&self.vm_id, 8)));
+        let api_socket =
+            paths::base_dir().join(format!("slirp-{}.sock", truncate_id(&self.vm_id, 8)));
 
         if api_socket.exists() {
             tokio::fs::remove_file(&api_socket).await?;
@@ -254,10 +254,9 @@ exec "$@"
 
         // Wait for ready signal
         let mut ready_buf = [0u8; 1];
-        let read_result = tokio::task::spawn_blocking(move || {
-            nix::unistd::read(ready_read_raw, &mut ready_buf)
-        })
-        .await?;
+        let read_result =
+            tokio::task::spawn_blocking(move || nix::unistd::read(ready_read_raw, &mut ready_buf))
+                .await?;
 
         drop(ready_read_fd);
 
@@ -276,9 +275,13 @@ exec "$@"
 
     /// Setup port forwarding via slirp4netns API socket
     async fn setup_port_forwarding(&self) -> Result<()> {
-        let api_socket = self.api_socket_path.as_ref()
+        let api_socket = self
+            .api_socket_path
+            .as_ref()
             .context("API socket not configured")?;
-        let loopback_ip = self.loopback_ip.as_ref()
+        let loopback_ip = self
+            .loopback_ip
+            .as_ref()
             .context("loopback IP not configured")?;
 
         for mapping in &self.port_mappings {
@@ -383,9 +386,13 @@ exec "$@"
     /// Uses slirp4netns API to forward from loopback IP to 10.0.2.100,
     /// then iptables DNAT in the namespace redirects to the actual guest IP.
     async fn setup_health_check_forward(&self) -> Result<()> {
-        let api_socket = self.api_socket_path.as_ref()
+        let api_socket = self
+            .api_socket_path
+            .as_ref()
             .context("API socket not configured")?;
-        let loopback_ip = self.loopback_ip.as_ref()
+        let loopback_ip = self
+            .loopback_ip
+            .as_ref()
             .context("loopback IP not configured")?;
 
         // First, add the loopback IP to the host's lo interface
@@ -452,7 +459,9 @@ impl NetworkManager for SlirpNetwork {
 
         // Loopback IP must be pre-allocated via with_loopback_ip() before setup()
         // This ensures atomic allocation with state persistence under lock
-        let loopback_ip = self.loopback_ip.clone()
+        let loopback_ip = self
+            .loopback_ip
+            .clone()
             .context("loopback IP not set - must call with_loopback_ip() before setup()")?;
 
         info!(
@@ -475,7 +484,10 @@ impl NetworkManager for SlirpNetwork {
     }
 
     async fn post_start(&mut self, vm_pid: u32) -> Result<()> {
-        info!(vm_pid = vm_pid, "starting slirp4netns for rootless networking");
+        info!(
+            vm_pid = vm_pid,
+            "starting slirp4netns for rootless networking"
+        );
 
         self.start_slirp(vm_pid).await?;
         self.setup_health_check_forward().await?;
@@ -531,11 +543,7 @@ mod tests {
 
     #[test]
     fn test_network_creation() {
-        let net = SlirpNetwork::new(
-            "vm-test123".to_string(),
-            "tap0".to_string(),
-            vec![],
-        );
+        let net = SlirpNetwork::new("vm-test123".to_string(), "tap0".to_string(), vec![]);
 
         assert_eq!(net.tap_device, "tap0");
         assert_eq!(net.slirp_device, "slirp0");
@@ -547,11 +555,7 @@ mod tests {
 
     #[test]
     fn test_with_guest_ip() {
-        let net = SlirpNetwork::new(
-            "vm-test123".to_string(),
-            "tap0".to_string(),
-            vec![],
-        );
+        let net = SlirpNetwork::new("vm-test123".to_string(), "tap0".to_string(), vec![]);
 
         // Clones can override guest IP if snapshot used different subnet
         let net = net.with_guest_ip("192.168.42.2/24".to_string());

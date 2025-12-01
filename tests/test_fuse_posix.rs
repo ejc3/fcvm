@@ -260,10 +260,22 @@ async fn test_posix_all_sequential() {
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!("║                       TEST SUMMARY                            ║");
     println!("╠═══════════════════════════════════════════════════════════════╣");
-    println!("║  Total tests:      {:>10}                                 ║", total_tests);
-    println!("║  Total failures:   {:>10}                                 ║", total_failures);
-    println!("║  Categories:       {:>10}                                 ║", categories.len());
-    println!("║  Failed categories:{:>10}                                 ║", failed_categories.len());
+    println!(
+        "║  Total tests:      {:>10}                                 ║",
+        total_tests
+    );
+    println!(
+        "║  Total failures:   {:>10}                                 ║",
+        total_failures
+    );
+    println!(
+        "║  Categories:       {:>10}                                 ║",
+        categories.len()
+    );
+    println!(
+        "║  Failed categories:{:>10}                                 ║",
+        failed_categories.len()
+    );
     println!("╚═══════════════════════════════════════════════════════════════╝");
 
     if !failed_categories.is_empty() {
