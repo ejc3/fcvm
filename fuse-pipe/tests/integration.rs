@@ -2,38 +2,25 @@
 //!
 //! These tests verify basic FUSE operations work correctly through
 //! the fuse-pipe server/client stack.
+//!
+//! See `fuse-pipe/TESTING.md` for complete testing documentation.
+
+#[path = "stress/fixture.rs"]
+mod fixture;
 
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::process::{Child, Command};
 use tokio::time::{sleep, Duration};
+
+use fixture::FuseMount;
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn find_stress_binary() -> PathBuf {
-    let exe = std::env::current_exe().expect("get current exe");
-    let deps_dir = exe.parent().unwrap();
-
-    for entry in std::fs::read_dir(deps_dir).expect("read deps") {
-        if let Ok(entry) = entry {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("stress-") && !name.contains('.') {
-                return entry.path();
-            }
-        }
-    }
-
-    panic!("Could not find stress binary. Run: cargo test --test stress --test integration");
-}
-
+/// Async wrapper around the synchronous FuseMount fixture.
 struct FuseFixture {
-    server: Child,
-    client: Child,
+    inner: Option<FuseMount>,
     data_dir: PathBuf,
     mount_dir: PathBuf,
-    socket: String,
 }
 
 impl FuseFixture {
@@ -44,54 +31,19 @@ impl FuseFixture {
     async fn new_with_readers(readers: usize) -> Self {
         let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         let pid = std::process::id();
-        let socket = format!("/tmp/fuse-integ-{}-{}.sock", pid, id);
         let data_dir = PathBuf::from(format!("/tmp/fuse-integ-data-{}-{}", pid, id));
         let mount_dir = PathBuf::from(format!("/tmp/fuse-integ-mount-{}-{}", pid, id));
 
-        std::fs::create_dir_all(&data_dir).expect("create data dir");
-        std::fs::create_dir_all(&mount_dir).expect("create mount dir");
-        let _ = std::fs::remove_file(&socket);
+        // FuseMount handles creation and cleanup
+        let inner = FuseMount::new(&data_dir, &mount_dir, readers);
 
-        let stress_exe = find_stress_binary();
-
-        let server = Command::new(&stress_exe)
-            .args([
-                "server",
-                "--socket",
-                &socket,
-                "--root",
-                data_dir.to_str().unwrap(),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("start server");
-
-        sleep(Duration::from_millis(500)).await;
-
-        let client = Command::new(&stress_exe)
-            .args([
-                "client",
-                "--socket",
-                &socket,
-                "--mount",
-                mount_dir.to_str().unwrap(),
-                "--readers",
-                &readers.to_string(),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("start client");
-
-        sleep(Duration::from_millis(500)).await;
+        // Give mount a bit more time to stabilize for async tests
+        sleep(Duration::from_millis(100)).await;
 
         Self {
-            server,
-            client,
+            inner: Some(inner),
             data_dir,
             mount_dir,
-            socket,
         }
     }
 
@@ -100,9 +52,11 @@ impl FuseFixture {
     }
 
     async fn cleanup(mut self) {
-        let _ = self.client.kill().await;
-        let _ = self.server.kill().await;
-        let _ = std::fs::remove_file(&self.socket);
+        // Drop the inner FuseMount to trigger cleanup
+        self.inner.take();
+        sleep(Duration::from_millis(100)).await;
+
+        // Additional cleanup of directories
         let _ = std::fs::remove_dir_all(&self.data_dir);
         let _ = std::fs::remove_dir_all(&self.mount_dir);
     }

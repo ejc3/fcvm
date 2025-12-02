@@ -6,6 +6,7 @@
 use crate::protocol::{
     Span, VolumeRequest, VolumeResponse, WireRequest, WireResponse, MAX_MESSAGE_SIZE,
 };
+use crate::telemetry::SpanCollector;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use dashmap::DashMap;
 use std::io::{Read, Write};
@@ -42,6 +43,8 @@ pub struct Multiplexer {
     num_readers: usize,
     /// Trace every Nth request (0 = disabled)
     trace_rate: u64,
+    /// Optional span collector for telemetry aggregation
+    collector: Option<SpanCollector>,
 }
 
 impl Multiplexer {
@@ -57,6 +60,19 @@ impl Multiplexer {
     ///
     /// `trace_rate`: Trace every Nth request (0 = disabled, 100 = every 100th request)
     pub fn with_trace_rate(socket: UnixStream, num_readers: usize, trace_rate: u64) -> Arc<Self> {
+        Self::with_collector(socket, num_readers, trace_rate, None)
+    }
+
+    /// Create a new multiplexer with a span collector for telemetry aggregation.
+    ///
+    /// `trace_rate`: Trace every Nth request (0 = disabled, 100 = every 100th request)
+    /// `collector`: Optional SpanCollector to aggregate spans (instead of printing each)
+    pub fn with_collector(
+        socket: UnixStream,
+        num_readers: usize,
+        trace_rate: u64,
+        collector: Option<SpanCollector>,
+    ) -> Arc<Self> {
         let socket_reader = socket.try_clone().expect("failed to clone socket");
         let socket_writer = socket;
 
@@ -90,6 +106,7 @@ impl Multiplexer {
             next_id: AtomicU64::new(1),
             num_readers,
             trace_rate,
+            collector,
         })
     }
 
@@ -100,6 +117,13 @@ impl Multiplexer {
     pub fn send_request(&self, reader_id: u32, request: VolumeRequest) -> VolumeResponse {
         let unique = self.next_id.fetch_add(1, Ordering::Relaxed);
         let should_trace = self.trace_rate > 0 && unique % self.trace_rate == 0;
+
+        // Capture op_name before request is moved (needed for per-operation telemetry)
+        let op_name = if should_trace {
+            Some(request.op_name().to_string())
+        } else {
+            None
+        };
 
         // Build wire request - span goes inside the request so server gets it
         let wire = if should_trace {
@@ -140,13 +164,25 @@ impl Multiplexer {
             .recv()
             .unwrap_or_else(|_| (VolumeResponse::error(libc::EIO), None));
 
-        // Print trace if we have a complete span
+        // Handle trace span - either collect or print
         if let Some(mut s) = span {
             s.mark("client_done");
-            s.print(unique);
+            if let Some(ref collector) = self.collector {
+                // Collect span for later aggregation (with op_name for per-operation stats)
+                let op = op_name.as_deref().unwrap_or("unknown");
+                collector.record(unique, op, s);
+            } else {
+                // Print individual trace (legacy behavior)
+                s.print(unique);
+            }
         }
 
         response
+    }
+
+    /// Get the span collector, if one was configured.
+    pub fn collector(&self) -> Option<&SpanCollector> {
+        self.collector.as_ref()
     }
 
     /// Get the number of readers this multiplexer supports.

@@ -1,189 +1,250 @@
-//! End-to-end throughput benchmarks.
+//! End-to-end throughput benchmarks comparing host filesystem vs FUSE passthrough.
 //!
-//! Measures actual request/response throughput over Unix sockets.
+//! Tests actual file I/O performance with varying concurrency levels.
+//!
+//! See `fuse-pipe/TESTING.md` for complete testing documentation.
+//!
+//! Requires the stress test binary to be built first:
+//!   cargo build --release --test stress
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use fuse_pipe::{VolumeRequest, VolumeResponse, WireRequest, WireResponse};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
+use std::time::Duration;
 
-/// Spawn a simple echo server that reads requests and sends responses.
-fn spawn_echo_server(socket_path: &str) -> thread::JoinHandle<()> {
-    let path = socket_path.to_string();
-    thread::spawn(move || {
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        let (mut stream, _) = listener.accept().unwrap();
+// Include the shared fixture module
+#[path = "../tests/stress/fixture.rs"]
+mod fixture;
 
-        let mut len_buf = [0u8; 4];
-        loop {
-            // Read request
-            if stream.read_exact(&mut len_buf).is_err() {
-                break;
-            }
-            let len = u32::from_be_bytes(len_buf) as usize;
-            let mut req_buf = vec![0u8; len];
-            if stream.read_exact(&mut req_buf).is_err() {
-                break;
-            }
+use fixture::{increase_ulimit, setup_test_data, FuseMount};
 
-            // Parse and respond
-            let wire_req: WireRequest = match bincode::deserialize(&req_buf) {
-                Ok(r) => r,
-                Err(_) => break,
-            };
+const FILE_SIZE: usize = 4096; // 4KB files
+const NUM_FILES: usize = 1024; // More files for higher concurrency
 
-            // Create response based on request
-            let response = match &wire_req.request {
-                VolumeRequest::Read { size, .. } => VolumeResponse::Data {
-                    data: vec![0u8; *size as usize],
-                },
-                VolumeRequest::Getattr { .. } => VolumeResponse::Attr {
-                    attr: fuse_pipe::FileAttr::new(1),
-                    ttl_secs: 60,
-                },
-                _ => VolumeResponse::Ok,
-            };
+/// Run parallel write benchmark on a directory
+fn parallel_write_bench(dir: &Path, num_workers: usize, ops_per_worker: usize) -> Duration {
+    let dir = dir.to_path_buf();
 
-            let wire_resp = WireResponse::new(wire_req.unique, wire_req.reader_id, response);
-            let resp_buf = bincode::serialize(&wire_resp).unwrap();
-            let resp_len = (resp_buf.len() as u32).to_be_bytes();
+    let start = std::time::Instant::now();
 
-            if stream.write_all(&resp_len).is_err() || stream.write_all(&resp_buf).is_err() {
-                break;
-            }
-        }
-    })
+    let handles: Vec<_> = (0..num_workers)
+        .map(|worker_id| {
+            let dir = dir.clone();
+            thread::spawn(move || {
+                let data = vec![0x42u8; FILE_SIZE];
+                for i in 0..ops_per_worker {
+                    let file_idx = (worker_id * ops_per_worker + i) % NUM_FILES;
+                    let path = dir.join(format!("file_{}.dat", file_idx));
+                    let mut f = OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .unwrap();
+                    f.write_all(&data).unwrap();
+                    f.sync_all().unwrap(); // Ensure data hits disk
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    start.elapsed()
 }
 
-fn bench_request_response_latency(c: &mut Criterion) {
-    let socket_path = "/tmp/fuse-pipe-bench-latency.sock";
-    let _ = std::fs::remove_file(socket_path);
+/// Run parallel read benchmark on a directory
+fn parallel_read_bench(dir: &Path, num_workers: usize, ops_per_worker: usize) -> Duration {
+    let dir = dir.to_path_buf();
 
-    let handle = spawn_echo_server(socket_path);
-    thread::sleep(std::time::Duration::from_millis(50));
+    let start = std::time::Instant::now();
 
-    let mut stream = UnixStream::connect(socket_path).unwrap();
+    let handles: Vec<_> = (0..num_workers)
+        .map(|worker_id| {
+            let dir = dir.clone();
+            thread::spawn(move || {
+                let mut buf = vec![0u8; FILE_SIZE];
+                for i in 0..ops_per_worker {
+                    let file_idx = (worker_id * ops_per_worker + i) % NUM_FILES;
+                    let path = dir.join(format!("file_{}.dat", file_idx));
+                    let mut f = File::open(&path).unwrap();
+                    f.read_exact(&mut buf).unwrap();
+                }
+            })
+        })
+        .collect();
 
-    let req = WireRequest::new(1, 0, VolumeRequest::Getattr { ino: 1 });
+    for h in handles {
+        h.join().unwrap();
+    }
 
-    c.bench_function("request_response_latency", |b| {
-        b.iter(|| {
-            let req_buf = bincode::serialize(&req).unwrap();
-            let len_bytes = (req_buf.len() as u32).to_be_bytes();
-            stream.write_all(&len_bytes).unwrap();
-            stream.write_all(&req_buf).unwrap();
+    start.elapsed()
+}
 
-            let mut len_buf = [0u8; 4];
-            stream.read_exact(&mut len_buf).unwrap();
-            let len = u32::from_be_bytes(len_buf) as usize;
-            let mut resp_buf = vec![0u8; len];
-            stream.read_exact(&mut resp_buf).unwrap();
+/// Run parallel stat benchmark on a directory
+fn parallel_stat_bench(dir: &Path, num_workers: usize, ops_per_worker: usize) -> Duration {
+    let dir = dir.to_path_buf();
 
-            black_box(bincode::deserialize::<WireResponse>(&resp_buf).unwrap())
+    let start = std::time::Instant::now();
+
+    let handles: Vec<_> = (0..num_workers)
+        .map(|worker_id| {
+            let dir = dir.clone();
+            thread::spawn(move || {
+                for i in 0..ops_per_worker {
+                    let file_idx = (worker_id * ops_per_worker + i) % NUM_FILES;
+                    let path = dir.join(format!("file_{}.dat", file_idx));
+                    let _ = black_box(fs::metadata(&path).unwrap());
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    start.elapsed()
+}
+
+// FuseMount is now imported from fixture module
+
+fn bench_parallel_reads(c: &mut Criterion) {
+    increase_ulimit();
+
+    let data_dir = PathBuf::from("/tmp/fuse-bench-data");
+    let mount_dir = PathBuf::from("/tmp/fuse-bench-mount");
+
+    // Cleanup any previous runs
+    let _ = fs::remove_dir_all(&data_dir);
+    let _ = Command::new("fusermount")
+        .args(["-u", mount_dir.to_str().unwrap()])
+        .status();
+    let _ = fs::remove_dir_all(&mount_dir);
+
+    // Setup test data
+    setup_test_data(&data_dir, NUM_FILES, FILE_SIZE);
+
+    let mut group = c.benchmark_group("parallel_reads");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(5));
+
+    const NUM_WORKERS: usize = 256; // Fixed worker count (saturates at this level)
+
+    // Host filesystem baseline
+    group.bench_function("host_fs", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                total += parallel_read_bench(&data_dir, NUM_WORKERS, 10);
+            }
+            total
         })
     });
 
-    drop(stream);
-    let _ = std::fs::remove_file(socket_path);
-    let _ = handle.join();
-}
+    // Test different FUSE reader counts
+    for num_readers in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024] {
+        // Cleanup previous mount
+        let _ = Command::new("fusermount")
+            .args(["-u", mount_dir.to_str().unwrap()])
+            .status();
+        thread::sleep(Duration::from_millis(100));
 
-fn bench_read_throughput_4kb(c: &mut Criterion) {
-    let socket_path = "/tmp/fuse-pipe-bench-read4k.sock";
-    let _ = std::fs::remove_file(socket_path);
+        let fuse = FuseMount::new(&data_dir, &mount_dir, num_readers);
 
-    let handle = spawn_echo_server(socket_path);
-    thread::sleep(std::time::Duration::from_millis(50));
+        group.bench_with_input(
+            BenchmarkId::new("fuse_readers", num_readers),
+            &num_readers,
+            |b, _| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        total += parallel_read_bench(fuse.mount_path(), NUM_WORKERS, 10);
+                    }
+                    total
+                })
+            },
+        );
 
-    let mut stream = UnixStream::connect(socket_path).unwrap();
+        drop(fuse);
+    }
 
-    let req = WireRequest::new(
-        1,
-        0,
-        VolumeRequest::Read {
-            ino: 2,
-            fh: 3,
-            offset: 0,
-            size: 4096,
-        },
-    );
-
-    let mut group = c.benchmark_group("read_throughput");
-    group.throughput(Throughput::Bytes(4096));
-    group.bench_function("4kb", |b| {
-        b.iter(|| {
-            let req_buf = bincode::serialize(&req).unwrap();
-            let len_bytes = (req_buf.len() as u32).to_be_bytes();
-            stream.write_all(&len_bytes).unwrap();
-            stream.write_all(&req_buf).unwrap();
-
-            let mut len_buf = [0u8; 4];
-            stream.read_exact(&mut len_buf).unwrap();
-            let len = u32::from_be_bytes(len_buf) as usize;
-            let mut resp_buf = vec![0u8; len];
-            stream.read_exact(&mut resp_buf).unwrap();
-
-            black_box(bincode::deserialize::<WireResponse>(&resp_buf).unwrap())
-        })
-    });
     group.finish();
-
-    drop(stream);
-    let _ = std::fs::remove_file(socket_path);
-    let _ = handle.join();
+    let _ = fs::remove_dir_all(&data_dir);
+    let _ = fs::remove_dir_all(&mount_dir);
 }
 
-fn bench_read_throughput_64kb(c: &mut Criterion) {
-    let socket_path = "/tmp/fuse-pipe-bench-read64k.sock";
-    let _ = std::fs::remove_file(socket_path);
+fn bench_parallel_writes(c: &mut Criterion) {
+    increase_ulimit();
 
-    let handle = spawn_echo_server(socket_path);
-    thread::sleep(std::time::Duration::from_millis(50));
+    let data_dir = PathBuf::from("/tmp/fuse-bench-write-data");
+    let mount_dir = PathBuf::from("/tmp/fuse-bench-write-mount");
 
-    let mut stream = UnixStream::connect(socket_path).unwrap();
+    // Cleanup any previous runs
+    let _ = fs::remove_dir_all(&data_dir);
+    let _ = Command::new("fusermount")
+        .args(["-u", mount_dir.to_str().unwrap()])
+        .status();
+    let _ = fs::remove_dir_all(&mount_dir);
 
-    let req = WireRequest::new(
-        1,
-        0,
-        VolumeRequest::Read {
-            ino: 2,
-            fh: 3,
-            offset: 0,
-            size: 65536,
-        },
-    );
+    // Setup test data
+    setup_test_data(&data_dir, NUM_FILES, FILE_SIZE);
 
-    let mut group = c.benchmark_group("read_throughput");
-    group.throughput(Throughput::Bytes(65536));
-    group.bench_function("64kb", |b| {
-        b.iter(|| {
-            let req_buf = bincode::serialize(&req).unwrap();
-            let len_bytes = (req_buf.len() as u32).to_be_bytes();
-            stream.write_all(&len_bytes).unwrap();
-            stream.write_all(&req_buf).unwrap();
+    let mut group = c.benchmark_group("parallel_writes");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(5));
 
-            let mut len_buf = [0u8; 4];
-            stream.read_exact(&mut len_buf).unwrap();
-            let len = u32::from_be_bytes(len_buf) as usize;
-            let mut resp_buf = vec![0u8; len];
-            stream.read_exact(&mut resp_buf).unwrap();
+    const NUM_WORKERS: usize = 256;
 
-            black_box(bincode::deserialize::<WireResponse>(&resp_buf).unwrap())
+    // Host filesystem baseline
+    group.bench_function("host_fs", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                total += parallel_write_bench(&data_dir, NUM_WORKERS, 10);
+            }
+            total
         })
     });
-    group.finish();
 
-    drop(stream);
-    let _ = std::fs::remove_file(socket_path);
-    let _ = handle.join();
+    // Test different FUSE reader counts
+    for num_readers in [1, 4, 16, 64, 256, 1024] {
+        let _ = Command::new("fusermount")
+            .args(["-u", mount_dir.to_str().unwrap()])
+            .status();
+        thread::sleep(Duration::from_millis(100));
+
+        let fuse = FuseMount::new(&data_dir, &mount_dir, num_readers);
+
+        group.bench_with_input(
+            BenchmarkId::new("fuse_readers", num_readers),
+            &num_readers,
+            |b, _| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        total += parallel_write_bench(fuse.mount_path(), NUM_WORKERS, 10);
+                    }
+                    total
+                })
+            },
+        );
+
+        drop(fuse);
+    }
+
+    group.finish();
+    let _ = fs::remove_dir_all(&data_dir);
+    let _ = fs::remove_dir_all(&mount_dir);
 }
 
 criterion_group!(
     benches,
-    bench_request_response_latency,
-    bench_read_throughput_4kb,
-    bench_read_throughput_64kb,
+    bench_parallel_reads,
+    bench_parallel_writes,
 );
 
 criterion_main!(benches);
