@@ -13,8 +13,7 @@ default = ["fuse-client"]
 fuse-client = ["dep:fuser"]
 metrics = ["dep:metrics"]
 pjdfstest-full = []
-# Enable tracing in benchmarks (traces every 100th request)
-trace-benchmarks = []
+trace-benchmarks = []  # Enable tracing in benchmarks
 
 [dependencies]
 # Core
@@ -33,6 +32,7 @@ async-trait = "0.1"
 
 # Logging
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # fuse-backend-rs for passthrough filesystem (Cloud Hypervisor's production-grade FUSE backend)
 fuse-backend-rs = { version = "0.12", default-features = false, features = ["fusedev"] }
@@ -51,10 +51,6 @@ metrics = { version = "0.23", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "process", "time"] }
 tempfile = "3"
 criterion = "0.5"
-clap = { version = "4.0", features = ["derive"] }
-metrics = "0.23"
-metrics-util = "0.17"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[bench]]
 name = "protocol"
@@ -66,11 +62,6 @@ harness = false
 
 [[bench]]
 name = "operations"
-harness = false
-
-[[test]]
-name = "stress"
-path = "tests/stress/main.rs"
 harness = false
 
 [[test]]

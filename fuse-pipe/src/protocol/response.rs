@@ -1,6 +1,6 @@
 //! FUSE response types.
 
-use super::types::{DirEntry, FileAttr};
+use super::types::{DirEntry, DirEntryPlus, FileAttr};
 use serde::{Deserialize, Serialize};
 
 /// Responses from server to FUSE client.
@@ -36,8 +36,14 @@ pub enum VolumeResponse {
     /// File opened response.
     Opened { fh: u64, flags: u32 },
 
+    /// Directory opened response.
+    Openeddir { fh: u64 },
+
     /// Directory entries response.
     DirEntries { entries: Vec<DirEntry> },
+
+    /// Directory entries with full attributes response (readdirplus).
+    DirEntriesPlus { entries: Vec<DirEntryPlus> },
 
     /// Symbolic link target.
     Symlink { target: String },
@@ -52,6 +58,23 @@ pub enum VolumeResponse {
         bsize: u32,
         namelen: u32,
         frsize: u32,
+    },
+
+    /// Extended attribute data.
+    Xattr { data: Vec<u8> },
+
+    /// Extended attribute size (when size=0 in request).
+    XattrSize { size: u32 },
+
+    /// Lseek result offset.
+    Lseek { offset: u64 },
+
+    /// Lock information response.
+    Lock {
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
     },
 
     /// Success (no data).

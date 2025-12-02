@@ -15,6 +15,28 @@ const NUM_READERS: usize = 256;
 const TIMEOUT_SECS: u64 = 600;
 const CATEGORY_TIMEOUT_SECS: u64 = 900;
 
+/// Increase file descriptor limit to avoid "Too many open files" errors.
+/// Required when running with 256 FUSE readers + parallel test jobs.
+fn raise_fd_limit() {
+    #[cfg(unix)]
+    {
+        use std::mem::MaybeUninit;
+        let mut rlim = MaybeUninit::<libc::rlimit>::uninit();
+        unsafe {
+            if libc::getrlimit(libc::RLIMIT_NOFILE, rlim.as_mut_ptr()) == 0 {
+                let mut rlim = rlim.assume_init();
+                let target = 65536u64.min(rlim.rlim_max);
+                if rlim.rlim_cur < target {
+                    rlim.rlim_cur = target;
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) == 0 {
+                        eprintln!("[init] Raised fd limit to {}", target);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct CategoryResult {
     category: String,
@@ -175,8 +197,18 @@ fn verify_mount(mount_dir: &Path) -> bool {
     }
 }
 
+/// Check if pjdfstest is installed. Returns true if installed, false if not.
+/// When not installed, prints instructions and the test should skip (not fail).
+pub fn is_pjdfstest_installed() -> bool {
+    Path::new(PJDFSTEST_BIN).exists()
+}
+
 fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
-    if !Path::new(PJDFSTEST_BIN).exists() {
+    // Raise fd limit early - required for 256 FUSE readers + parallel prove jobs
+    raise_fd_limit();
+
+    if !is_pjdfstest_installed() {
+        // This shouldn't be reached - caller should check is_pjdfstest_installed() first
         eprintln!(
             "pjdfstest not found at {}. Install with:\n\
              git clone https://github.com/pjd/pjdfstest /tmp/pjdfstest-check\n\

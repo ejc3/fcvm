@@ -29,7 +29,7 @@ mod wire;
 
 pub use request::VolumeRequest;
 pub use response::VolumeResponse;
-pub use types::{file_type, DirEntry, FileAttr};
+pub use types::{file_type, DirEntry, DirEntryPlus, FileAttr};
 pub use wire::{
     now_nanos, read_message, read_message_async, write_message, write_message_async, Span,
     WireRequest, WireResponse, MAX_MESSAGE_SIZE,

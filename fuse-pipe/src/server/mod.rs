@@ -23,6 +23,7 @@ pub mod credentials;
 mod handler;
 mod passthrough;
 mod pipelined;
+mod zerocopy;
 
 pub use config::ServerConfig;
 pub use credentials::CredentialsGuard;

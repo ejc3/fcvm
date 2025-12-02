@@ -154,6 +154,86 @@ pub trait FilesystemHandler: Send + Sync {
                 pid,
             } => self.access(*ino, *mask, *uid, *gid, *pid),
             VolumeRequest::Statfs { ino } => self.statfs(*ino),
+            VolumeRequest::Opendir {
+                ino,
+                flags,
+                uid,
+                gid,
+                pid,
+            } => self.opendir(*ino, *flags, *uid, *gid, *pid),
+            VolumeRequest::Releasedir { ino, fh } => self.releasedir(*ino, *fh),
+            VolumeRequest::Fsyncdir { ino, fh, datasync } => self.fsyncdir(*ino, *fh, *datasync),
+            VolumeRequest::Setxattr {
+                ino,
+                name,
+                value,
+                flags,
+                uid,
+                gid,
+                pid,
+            } => self.setxattr(*ino, name, value, *flags, *uid, *gid, *pid),
+            VolumeRequest::Getxattr {
+                ino,
+                name,
+                size,
+                uid,
+                gid,
+                pid,
+            } => self.getxattr(*ino, name, *size, *uid, *gid, *pid),
+            VolumeRequest::Listxattr {
+                ino,
+                size,
+                uid,
+                gid,
+                pid,
+            } => self.listxattr(*ino, *size, *uid, *gid, *pid),
+            VolumeRequest::Removexattr {
+                ino,
+                name,
+                uid,
+                gid,
+                pid,
+            } => self.removexattr(*ino, name, *uid, *gid, *pid),
+            VolumeRequest::Fallocate {
+                ino,
+                fh,
+                offset,
+                length,
+                mode,
+            } => self.fallocate(*ino, *fh, *offset, *length, *mode),
+            VolumeRequest::Lseek {
+                ino,
+                fh,
+                offset,
+                whence,
+            } => self.lseek(*ino, *fh, *offset, *whence),
+            VolumeRequest::Getlk {
+                ino,
+                fh,
+                lock_owner,
+                start,
+                end,
+                typ,
+                pid,
+            } => self.getlk(*ino, *fh, *lock_owner, *start, *end, *typ, *pid),
+            VolumeRequest::Setlk {
+                ino,
+                fh,
+                lock_owner,
+                start,
+                end,
+                typ,
+                pid,
+                sleep,
+            } => self.setlk(*ino, *fh, *lock_owner, *start, *end, *typ, *pid, *sleep),
+            VolumeRequest::Readdirplus {
+                ino,
+                fh,
+                offset,
+                uid,
+                gid,
+                pid,
+            } => self.readdirplus(*ino, *fh, *offset, *uid, *gid, *pid),
         }
     }
 
@@ -375,6 +455,149 @@ pub trait FilesystemHandler: Send + Sync {
             bsize: 4096,
             namelen: 255,
             frsize: 4096,
+        }
+    }
+
+    /// Open a directory.
+    fn opendir(&self, _ino: u64, _flags: u32, _uid: u32, _gid: u32, _pid: u32) -> VolumeResponse {
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
+    }
+
+    /// Release a directory handle.
+    fn releasedir(&self, _ino: u64, _fh: u64) -> VolumeResponse {
+        VolumeResponse::Ok
+    }
+
+    /// Synchronize directory contents.
+    fn fsyncdir(&self, _ino: u64, _fh: u64, _datasync: bool) -> VolumeResponse {
+        VolumeResponse::Ok
+    }
+
+    /// Set an extended attribute.
+    #[allow(clippy::too_many_arguments)]
+    fn setxattr(
+        &self,
+        _ino: u64,
+        _name: &str,
+        _value: &[u8],
+        _flags: u32,
+        _uid: u32,
+        _gid: u32,
+        _pid: u32,
+    ) -> VolumeResponse {
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
+    }
+
+    /// Get an extended attribute.
+    #[allow(clippy::too_many_arguments)]
+    fn getxattr(
+        &self,
+        _ino: u64,
+        _name: &str,
+        _size: u32,
+        _uid: u32,
+        _gid: u32,
+        _pid: u32,
+    ) -> VolumeResponse {
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
+    }
+
+    /// List extended attributes.
+    fn listxattr(&self, _ino: u64, _size: u32, _uid: u32, _gid: u32, _pid: u32) -> VolumeResponse {
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
+    }
+
+    /// Remove an extended attribute.
+    fn removexattr(
+        &self,
+        _ino: u64,
+        _name: &str,
+        _uid: u32,
+        _gid: u32,
+        _pid: u32,
+    ) -> VolumeResponse {
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
+    }
+
+    /// Preallocate file space.
+    fn fallocate(
+        &self,
+        _ino: u64,
+        _fh: u64,
+        _offset: u64,
+        _length: u64,
+        _mode: u32,
+    ) -> VolumeResponse {
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
+    }
+
+    /// Seek with SEEK_HOLE/SEEK_DATA support.
+    fn lseek(&self, _ino: u64, _fh: u64, _offset: i64, _whence: u32) -> VolumeResponse {
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
+    }
+
+    /// Test for a POSIX file lock.
+    #[allow(clippy::too_many_arguments)]
+    fn getlk(
+        &self,
+        _ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        _start: u64,
+        _end: u64,
+        _typ: i32,
+        _pid: u32,
+    ) -> VolumeResponse {
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
+    }
+
+    /// Acquire, modify or release a POSIX file lock.
+    #[allow(clippy::too_many_arguments)]
+    fn setlk(
+        &self,
+        _ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        _start: u64,
+        _end: u64,
+        _typ: i32,
+        _pid: u32,
+        _sleep: bool,
+    ) -> VolumeResponse {
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
+    }
+
+    /// Read directory contents with full attributes (combined readdir + lookup).
+    #[allow(clippy::too_many_arguments)]
+    fn readdirplus(
+        &self,
+        _ino: u64,
+        _fh: u64,
+        _offset: u64,
+        _uid: u32,
+        _gid: u32,
+        _pid: u32,
+    ) -> VolumeResponse {
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
         }
     }
 }

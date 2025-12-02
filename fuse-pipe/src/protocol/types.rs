@@ -68,6 +68,20 @@ pub struct DirEntry {
     pub file_type: u8,
 }
 
+/// Directory entry with full attributes for readdirplus responses.
+///
+/// This combines the directory entry with full file attributes,
+/// avoiding the need for separate lookup calls after readdir.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DirEntryPlus {
+    pub ino: u64,
+    pub name: String,
+    pub attr: FileAttr,
+    pub generation: u64,
+    pub attr_ttl_secs: u64,
+    pub entry_ttl_secs: u64,
+}
+
 impl DirEntry {
     /// Create a new directory entry.
     pub fn new(ino: u64, name: impl Into<String>, file_type: u8) -> Self {

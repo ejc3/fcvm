@@ -180,6 +180,110 @@ pub enum VolumeRequest {
 
     /// Get filesystem statistics.
     Statfs { ino: u64 },
+
+    /// Open a directory.
+    Opendir {
+        ino: u64,
+        flags: u32,
+        uid: u32,
+        gid: u32,
+        pid: u32,
+    },
+
+    /// Release a directory handle.
+    Releasedir { ino: u64, fh: u64 },
+
+    /// Synchronize directory contents.
+    Fsyncdir { ino: u64, fh: u64, datasync: bool },
+
+    /// Set an extended attribute.
+    Setxattr {
+        ino: u64,
+        name: String,
+        value: Vec<u8>,
+        flags: u32,
+        uid: u32,
+        gid: u32,
+        pid: u32,
+    },
+
+    /// Get an extended attribute.
+    Getxattr {
+        ino: u64,
+        name: String,
+        size: u32,
+        uid: u32,
+        gid: u32,
+        pid: u32,
+    },
+
+    /// List extended attributes.
+    Listxattr {
+        ino: u64,
+        size: u32,
+        uid: u32,
+        gid: u32,
+        pid: u32,
+    },
+
+    /// Remove an extended attribute.
+    Removexattr {
+        ino: u64,
+        name: String,
+        uid: u32,
+        gid: u32,
+        pid: u32,
+    },
+
+    /// Preallocate file space.
+    Fallocate {
+        ino: u64,
+        fh: u64,
+        offset: u64,
+        length: u64,
+        mode: u32,
+    },
+
+    /// Seek with SEEK_HOLE/SEEK_DATA support.
+    Lseek {
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        whence: u32,
+    },
+
+    /// Test for a POSIX file lock.
+    Getlk {
+        ino: u64,
+        fh: u64,
+        lock_owner: u64,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+    },
+
+    /// Acquire, modify or release a POSIX file lock.
+    Setlk {
+        ino: u64,
+        fh: u64,
+        lock_owner: u64,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        sleep: bool,
+    },
+
+    /// Read directory contents with full attributes (combined readdir + lookup).
+    Readdirplus {
+        ino: u64,
+        fh: u64,
+        offset: u64,
+        uid: u32,
+        gid: u32,
+        pid: u32,
+    },
 }
 
 impl VolumeRequest {
@@ -207,6 +311,18 @@ impl VolumeRequest {
             VolumeRequest::Link { .. } => "link",
             VolumeRequest::Access { .. } => "access",
             VolumeRequest::Statfs { .. } => "statfs",
+            VolumeRequest::Opendir { .. } => "opendir",
+            VolumeRequest::Releasedir { .. } => "releasedir",
+            VolumeRequest::Fsyncdir { .. } => "fsyncdir",
+            VolumeRequest::Setxattr { .. } => "setxattr",
+            VolumeRequest::Getxattr { .. } => "getxattr",
+            VolumeRequest::Listxattr { .. } => "listxattr",
+            VolumeRequest::Removexattr { .. } => "removexattr",
+            VolumeRequest::Fallocate { .. } => "fallocate",
+            VolumeRequest::Lseek { .. } => "lseek",
+            VolumeRequest::Getlk { .. } => "getlk",
+            VolumeRequest::Setlk { .. } => "setlk",
+            VolumeRequest::Readdirplus { .. } => "readdirplus",
         }
     }
 
@@ -221,6 +337,12 @@ impl VolumeRequest {
                 | VolumeRequest::Readlink { .. }
                 | VolumeRequest::Access { .. }
                 | VolumeRequest::Statfs { .. }
+                | VolumeRequest::Opendir { .. }
+                | VolumeRequest::Getxattr { .. }
+                | VolumeRequest::Listxattr { .. }
+                | VolumeRequest::Lseek { .. }
+                | VolumeRequest::Getlk { .. }
+                | VolumeRequest::Readdirplus { .. }
         )
     }
 }

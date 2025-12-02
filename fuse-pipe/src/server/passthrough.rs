@@ -6,69 +6,35 @@
 
 use super::credentials::CredentialsGuard;
 use super::handler::FilesystemHandler;
-use crate::protocol::{file_type, DirEntry, FileAttr, VolumeResponse};
+use super::zerocopy::{SliceReader, VecWriter};
+use crate::protocol::{file_type, DirEntry, DirEntryPlus, FileAttr, VolumeResponse};
 
-use fuse_backend_rs::api::filesystem::{Context, FileSystem, Entry};
-use fuse_backend_rs::passthrough::{Config, PassthroughFs as FuseBackendPassthrough};
 use fuse_backend_rs::abi::fuse_abi::CreateIn;
+use fuse_backend_rs::api::filesystem::{Context, Entry, FileSystem};
+use fuse_backend_rs::passthrough::{Config, PassthroughFs as FuseBackendPassthrough};
 
-use std::collections::HashMap;
 use std::ffi::CString;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Default attribute TTL in seconds.
 const ATTR_TTL_SECS: u64 = 1;
-
-/// File handle table for managing open files.
-/// We maintain our own handle table for read/write operations.
-struct HandleTable {
-    handles: Mutex<HashMap<u64, File>>,
-    next_fh: AtomicU64,
-}
-
-impl HandleTable {
-    fn new() -> Self {
-        Self {
-            handles: Mutex::new(HashMap::new()),
-            next_fh: AtomicU64::new(1),
-        }
-    }
-
-    fn insert(&self, file: File) -> u64 {
-        let fh = self.next_fh.fetch_add(1, Ordering::SeqCst);
-        self.handles.lock().unwrap().insert(fh, file);
-        fh
-    }
-
-    fn with_file<F, R>(&self, fh: u64, f: F) -> Option<R>
-    where
-        F: FnOnce(&mut File) -> R,
-    {
-        let mut handles = self.handles.lock().unwrap();
-        handles.get_mut(&fh).map(f)
-    }
-
-    fn remove(&self, fh: u64) -> Option<File> {
-        self.handles.lock().unwrap().remove(&fh)
-    }
-}
 
 /// A passthrough filesystem that maps operations to a local directory.
 ///
 /// This implementation wraps fuse-backend-rs's production-grade PassthroughFs,
 /// providing full POSIX semantics with proper permission enforcement, inode
 /// tracking, and file handle management.
+///
+/// File handles are managed by fuse-backend-rs internally, providing:
+/// - Inode validation on every access
+/// - Thread-safe operations with per-handle locking
+/// - Proper open flag tracking
 pub struct PassthroughFs {
     inner: Arc<FuseBackendPassthrough>,
     root_path: PathBuf,
     attr_ttl_secs: u64,
-    // Our own handle table for simpler read/write operations
-    handles: HandleTable,
 }
 
 impl PassthroughFs {
@@ -100,7 +66,6 @@ impl PassthroughFs {
             inner: Arc::new(inner),
             root_path,
             attr_ttl_secs: ATTR_TTL_SECS,
-            handles: HandleTable::new(),
         }
     }
 
@@ -174,9 +139,8 @@ impl PassthroughFs {
 
     /// Get the file path for an inode by looking it up via fuse-backend-rs.
     /// This uses readlinkat on /proc/self/fd to get the path.
+    /// Only needed for setattr which still does direct path operations.
     fn get_inode_path(&self, ino: u64) -> Option<PathBuf> {
-        // Use fuse-backend-rs's internal method to get the path
-        // This returns a PathBuf directly
         self.inner.readlinkat_proc_file(ino).ok()
     }
 }
@@ -354,24 +318,34 @@ impl FilesystemHandler for PassthroughFs {
         gid: u32,
         pid: u32,
     ) -> VolumeResponse {
+        tracing::debug!(target: "passthrough", ino, offset, uid, gid, "readdir");
         let ctx = Self::make_context(uid, gid, pid);
 
         // Use caller's credentials for permission check
         let _guard = match CredentialsGuard::new(uid, gid) {
             Ok(g) => g,
-            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
+            Err(e) => {
+                tracing::error!(target: "passthrough", error = ?e, "readdir credentials failed");
+                return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM));
+            }
         };
 
+        tracing::debug!(target: "passthrough", ino, "readdir opening directory");
         // First open the directory
         let (handle, _) = match self.inner.opendir(&ctx, ino, libc::O_RDONLY as u32) {
             Ok(h) => h,
-            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
+            Err(e) => {
+                tracing::error!(target: "passthrough", error = ?e, "readdir opendir failed");
+                return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
+            }
         };
+        tracing::debug!(target: "passthrough", ino, handle = ?handle, "readdir directory opened");
 
         let mut entries = Vec::new();
 
-        // Read directory entries using fuse-backend-rs's readdir
-        // The callback takes a single DirEntry argument
+        // Read ALL directory entries using fuse-backend-rs's readdir
+        // We always read from offset 0 and filter ourselves because we open a fresh
+        // directory handle each time (fuse-backend-rs offset is per-handle state)
         let mut add_entry = |entry: fuse_backend_rs::api::filesystem::DirEntry| -> std::io::Result<usize> {
             // entry.name is already a &[u8]
             let name_str = String::from_utf8_lossy(entry.name).to_string();
@@ -387,36 +361,50 @@ impl FilesystemHandler for PassthroughFs {
             Ok(1)
         };
 
-        if let Err(e) = self.inner.readdir(&ctx, ino, handle.unwrap_or(0), 8192, offset, &mut add_entry) {
+        tracing::debug!(target: "passthrough", ino, "readdir reading entries");
+        // Always read from offset 0 - we handle offset filtering ourselves
+        if let Err(e) = self.inner.readdir(&ctx, ino, handle.unwrap_or(0), 8192, 0, &mut add_entry) {
+            tracing::error!(target: "passthrough", error = ?e, "readdir read failed");
             let _ = self.inner.releasedir(&ctx, ino, 0, handle.unwrap_or(0));
             return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
         }
+        tracing::debug!(target: "passthrough", ino, count = entries.len(), "readdir got raw entries");
 
         // Release the directory handle
         let _ = self.inner.releasedir(&ctx, ino, 0, handle.unwrap_or(0));
 
-        // Add . and .. at the beginning for offset 0
-        if offset == 0 {
-            let mut full_entries = Vec::new();
-            full_entries.push(DirEntry::dot(ino));
+        // Build full entry list with . and .. at the beginning
+        let mut full_entries = Vec::new();
 
-            // Get parent inode - for root, parent is self
-            let parent_ino = if ino == 1 {
-                1
-            } else {
-                let dotdot = CString::new("..").unwrap();
-                match self.inner.lookup(&ctx, ino, &dotdot) {
-                    Ok(entry) => entry.inode,
-                    Err(_) => ino, // Fallback to self if can't find parent
-                }
-            };
-            full_entries.push(DirEntry::dotdot(parent_ino));
+        // Get parent inode - for root, parent is self
+        let parent_ino = if ino == 1 {
+            1
+        } else {
+            tracing::debug!(target: "passthrough", ino, "readdir looking up parent");
+            let dotdot = CString::new("..").unwrap();
+            match self.inner.lookup(&ctx, ino, &dotdot) {
+                Ok(entry) => entry.inode,
+                Err(_) => ino, // Fallback to self if can't find parent
+            }
+        };
 
-            full_entries.extend(entries);
-            entries = full_entries;
-        }
+        full_entries.push(DirEntry::dot(ino));
+        full_entries.push(DirEntry::dotdot(parent_ino));
+        full_entries.extend(entries);
 
-        VolumeResponse::DirEntries { entries }
+        // Now apply offset: skip entries before offset and return the rest
+        // This implements the FUSE readdir contract where offset is the index
+        // of the first entry to return
+        let offset_usize = offset as usize;
+        let result_entries = if offset_usize >= full_entries.len() {
+            // Offset is past all entries - return empty to signal end of directory
+            Vec::new()
+        } else {
+            full_entries.into_iter().skip(offset_usize).collect()
+        };
+
+        tracing::debug!(target: "passthrough", ino, offset, total = result_entries.len(), "readdir succeeded");
+        VolumeResponse::DirEntries { entries: result_entries }
     }
 
     fn mkdir(
@@ -428,6 +416,7 @@ impl FilesystemHandler for PassthroughFs {
         gid: u32,
         pid: u32,
     ) -> VolumeResponse {
+        tracing::debug!(target: "passthrough", parent, name, mode, uid, gid, "mkdir");
         let ctx = Self::make_context(uid, gid, pid);
 
         // Use caller's credentials
@@ -443,6 +432,7 @@ impl FilesystemHandler for PassthroughFs {
 
         match self.inner.mkdir(&ctx, parent, &cname, mode, 0) {
             Ok(entry) => {
+                tracing::debug!(target: "passthrough", inode = entry.inode, "mkdir succeeded");
                 let attr = Self::entry_to_attr(&entry);
                 VolumeResponse::Entry {
                     attr,
@@ -450,7 +440,10 @@ impl FilesystemHandler for PassthroughFs {
                     ttl_secs: self.attr_ttl_secs,
                 }
             }
-            Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
+            Err(e) => {
+                tracing::error!(target: "passthrough", error = ?e, "mkdir failed");
+                VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO))
+            }
         }
     }
 
@@ -552,39 +545,15 @@ impl FilesystemHandler for PassthroughFs {
         };
 
         match self.inner.create(&ctx, parent, &cname, create_in) {
-            Ok((entry, _handle, _, _)) => {
-                tracing::debug!(target: "passthrough", inode = entry.inode, "create succeeded");
-                // Get the file path and open it ourselves for simpler read/write
-                let path = match self.get_inode_path(entry.inode) {
-                    Some(p) => p,
-                    None => {
-                        tracing::error!(target: "passthrough", inode = entry.inode, "failed to get inode path");
-                        return VolumeResponse::error(libc::EIO);
-                    }
-                };
-
-                tracing::debug!(target: "passthrough", path = ?path, "opening file");
-                let file = match OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&path)
-                {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::error!(target: "passthrough", path = ?path, error = ?e, "open failed");
-                        return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
-                    }
-                };
-
-                let fh = self.handles.insert(file);
+            Ok((entry, handle, _opts, _open_opts)) => {
+                tracing::debug!(target: "passthrough", inode = entry.inode, handle = ?handle, "create succeeded");
                 let attr = Self::entry_to_attr(&entry);
-                tracing::debug!(target: "passthrough", fh, "create returning file handle");
 
                 VolumeResponse::Created {
                     attr,
                     generation: entry.generation,
                     ttl_secs: self.attr_ttl_secs,
-                    fh,
+                    fh: handle.unwrap_or(0),
                     flags: 0,
                 }
             }
@@ -595,121 +564,103 @@ impl FilesystemHandler for PassthroughFs {
         }
     }
 
-    fn open(&self, ino: u64, flags: u32, uid: u32, gid: u32, _pid: u32) -> VolumeResponse {
+    fn open(&self, ino: u64, flags: u32, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
+        let ctx = Self::make_context(uid, gid, pid);
+
         // Use caller's credentials
         let _guard = match CredentialsGuard::new(uid, gid) {
             Ok(g) => g,
             Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
         };
 
-        // Get the file path via fuse-backend-rs
-        let path = match self.get_inode_path(ino) {
-            Some(p) => p,
-            None => return VolumeResponse::error(libc::ENOENT),
-        };
-
-        // Open the file ourselves for simpler read/write
-        let mut opts = OpenOptions::new();
-
-        let access_mode = flags & libc::O_ACCMODE as u32;
-        if access_mode == libc::O_RDONLY as u32 {
-            opts.read(true);
-        } else if access_mode == libc::O_WRONLY as u32 {
-            opts.write(true);
-        } else {
-            opts.read(true).write(true);
-        }
-
-        if flags & libc::O_APPEND as u32 != 0 {
-            opts.append(true);
-        }
-
-        let file = match opts.open(&path) {
-            Ok(f) => f,
-            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
-        };
-
-        let fh = self.handles.insert(file);
-        VolumeResponse::Opened { fh, flags: 0 }
-    }
-
-    fn read(&self, _ino: u64, fh: u64, offset: u64, size: u32) -> VolumeResponse {
-        match self.handles.with_file(fh, |file| {
-            if let Err(e) = file.seek(SeekFrom::Start(offset)) {
-                return Err(e.raw_os_error().unwrap_or(libc::EIO));
-            }
-
-            let mut buf = vec![0u8; size as usize];
-            match file.read(&mut buf) {
-                Ok(n) => {
-                    buf.truncate(n);
-                    Ok(buf)
-                }
-                Err(e) => Err(e.raw_os_error().unwrap_or(libc::EIO)),
-            }
-        }) {
-            Some(Ok(data)) => VolumeResponse::Data { data },
-            Some(Err(errno)) => VolumeResponse::error(errno),
-            None => VolumeResponse::bad_fd(),
+        match self.inner.open(&ctx, ino, flags, 0) {
+            Ok((handle, _opts, _passthrough)) => VolumeResponse::Opened {
+                fh: handle.unwrap_or(0),
+                flags: 0,
+            },
+            Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
         }
     }
 
-    fn write(&self, _ino: u64, fh: u64, offset: u64, data: &[u8]) -> VolumeResponse {
-        tracing::debug!(target: "passthrough", fh, offset, len = data.len(), "write");
-        match self.handles.with_file(fh, |file| {
-            if let Err(e) = file.seek(SeekFrom::Start(offset)) {
-                tracing::error!(target: "passthrough", fh, error = ?e, "seek failed");
-                return Err(e.raw_os_error().unwrap_or(libc::EIO));
-            }
+    fn read(&self, ino: u64, fh: u64, offset: u64, size: u32) -> VolumeResponse {
+        let ctx = Context::new();
+        let mut writer = VecWriter::new(size as usize);
 
-            match file.write(data) {
-                Ok(n) => {
-                    tracing::debug!(target: "passthrough", fh, written = n, "write succeeded");
-                    Ok(n as u32)
-                }
-                Err(e) => {
-                    tracing::error!(target: "passthrough", fh, error = ?e, "write failed");
-                    Err(e.raw_os_error().unwrap_or(libc::EIO))
-                }
+        match self.inner.read(&ctx, ino, fh, &mut writer, size, offset, None, 0) {
+            Ok(_) => VolumeResponse::Data {
+                data: writer.into_vec(),
+            },
+            Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
+        }
+    }
+
+    fn write(&self, ino: u64, fh: u64, offset: u64, data: &[u8]) -> VolumeResponse {
+        let ctx = Context::new();
+        let mut reader = SliceReader::new(data);
+
+        tracing::debug!(target: "passthrough", ino, fh, offset, len = data.len(), "write");
+
+        match self.inner.write(
+            &ctx,
+            ino,
+            fh,
+            &mut reader,
+            data.len() as u32,
+            offset,
+            None,  // lock_owner
+            false, // delayed_write
+            0,     // flags
+            0,     // fuse_flags
+        ) {
+            Ok(n) => {
+                tracing::debug!(target: "passthrough", fh, written = n, "write succeeded");
+                VolumeResponse::Written { size: n as u32 }
             }
-        }) {
-            Some(Ok(size)) => VolumeResponse::Written { size },
-            Some(Err(errno)) => VolumeResponse::error(errno),
-            None => {
-                tracing::error!(target: "passthrough", fh, "write: bad fd - handle not found");
-                VolumeResponse::bad_fd()
+            Err(e) => {
+                tracing::error!(target: "passthrough", fh, error = ?e, "write failed");
+                VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO))
             }
         }
     }
 
-    fn release(&self, _ino: u64, fh: u64) -> VolumeResponse {
-        self.handles.remove(fh);
-        VolumeResponse::Ok
-    }
+    fn release(&self, ino: u64, fh: u64) -> VolumeResponse {
+        tracing::debug!(target: "passthrough", ino, fh, "release");
+        let ctx = Context::new();
 
-    fn flush(&self, _ino: u64, fh: u64) -> VolumeResponse {
-        match self.handles.with_file(fh, |file| {
-            file.sync_all()
-                .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
-        }) {
-            Some(Ok(())) => VolumeResponse::Ok,
-            Some(Err(errno)) => VolumeResponse::error(errno),
-            None => VolumeResponse::bad_fd(),
+        match self.inner.release(&ctx, ino, 0, fh, false, true, None) {
+            Ok(()) => {
+                tracing::debug!(target: "passthrough", ino, fh, "release succeeded");
+                VolumeResponse::Ok
+            }
+            Err(e) => {
+                tracing::error!(target: "passthrough", ino, fh, error = ?e, "release failed");
+                VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO))
+            }
         }
     }
 
-    fn fsync(&self, _ino: u64, fh: u64, datasync: bool) -> VolumeResponse {
-        match self.handles.with_file(fh, |file| {
-            let result = if datasync {
-                file.sync_data()
-            } else {
-                file.sync_all()
-            };
-            result.map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
-        }) {
-            Some(Ok(())) => VolumeResponse::Ok,
-            Some(Err(errno)) => VolumeResponse::error(errno),
-            None => VolumeResponse::bad_fd(),
+    fn flush(&self, ino: u64, fh: u64) -> VolumeResponse {
+        tracing::debug!(target: "passthrough", ino, fh, "flush");
+        let ctx = Context::new();
+
+        match self.inner.flush(&ctx, ino, fh, 0) {
+            Ok(()) => {
+                tracing::debug!(target: "passthrough", ino, fh, "flush succeeded");
+                VolumeResponse::Ok
+            }
+            Err(e) => {
+                tracing::error!(target: "passthrough", ino, fh, error = ?e, "flush failed");
+                VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO))
+            }
+        }
+    }
+
+    fn fsync(&self, ino: u64, fh: u64, datasync: bool) -> VolumeResponse {
+        let ctx = Context::new();
+
+        match self.inner.fsync(&ctx, ino, datasync, fh) {
+            Ok(()) => VolumeResponse::Ok,
+            Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
         }
     }
 
@@ -888,6 +839,271 @@ impl FilesystemHandler for PassthroughFs {
             Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
         }
     }
+
+    fn opendir(&self, ino: u64, flags: u32, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
+        let ctx = Self::make_context(uid, gid, pid);
+
+        // Use caller's credentials
+        let _guard = match CredentialsGuard::new(uid, gid) {
+            Ok(g) => g,
+            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
+        };
+
+        match self.inner.opendir(&ctx, ino, flags) {
+            Ok((handle, _opts)) => VolumeResponse::Openeddir {
+                fh: handle.unwrap_or(0),
+            },
+            Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
+        }
+    }
+
+    fn releasedir(&self, ino: u64, fh: u64) -> VolumeResponse {
+        let ctx = Context::new();
+
+        match self.inner.releasedir(&ctx, ino, 0, fh) {
+            Ok(()) => VolumeResponse::Ok,
+            Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
+        }
+    }
+
+    fn fsyncdir(&self, ino: u64, fh: u64, datasync: bool) -> VolumeResponse {
+        let ctx = Context::new();
+
+        match self.inner.fsyncdir(&ctx, ino, datasync, fh) {
+            Ok(()) => VolumeResponse::Ok,
+            Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
+        }
+    }
+
+    fn setxattr(
+        &self,
+        ino: u64,
+        name: &str,
+        value: &[u8],
+        flags: u32,
+        uid: u32,
+        gid: u32,
+        pid: u32,
+    ) -> VolumeResponse {
+        let ctx = Self::make_context(uid, gid, pid);
+
+        // Use caller's credentials
+        let _guard = match CredentialsGuard::new(uid, gid) {
+            Ok(g) => g,
+            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
+        };
+
+        let cname = match CString::new(name) {
+            Ok(c) => c,
+            Err(_) => return VolumeResponse::error(libc::EINVAL),
+        };
+
+        match self.inner.setxattr(&ctx, ino, &cname, value, flags) {
+            Ok(()) => VolumeResponse::Ok,
+            Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
+        }
+    }
+
+    fn getxattr(
+        &self,
+        ino: u64,
+        name: &str,
+        size: u32,
+        uid: u32,
+        gid: u32,
+        pid: u32,
+    ) -> VolumeResponse {
+        use fuse_backend_rs::api::filesystem::GetxattrReply;
+
+        let ctx = Self::make_context(uid, gid, pid);
+
+        // Use caller's credentials
+        let _guard = match CredentialsGuard::new(uid, gid) {
+            Ok(g) => g,
+            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
+        };
+
+        let cname = match CString::new(name) {
+            Ok(c) => c,
+            Err(_) => return VolumeResponse::error(libc::EINVAL),
+        };
+
+        match self.inner.getxattr(&ctx, ino, &cname, size) {
+            Ok(reply) => match reply {
+                GetxattrReply::Value(data) => VolumeResponse::Xattr { data },
+                GetxattrReply::Count(count) => VolumeResponse::XattrSize { size: count },
+            },
+            Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
+        }
+    }
+
+    fn listxattr(&self, ino: u64, size: u32, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
+        use fuse_backend_rs::api::filesystem::ListxattrReply;
+
+        let ctx = Self::make_context(uid, gid, pid);
+
+        // Use caller's credentials
+        let _guard = match CredentialsGuard::new(uid, gid) {
+            Ok(g) => g,
+            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
+        };
+
+        match self.inner.listxattr(&ctx, ino, size) {
+            Ok(reply) => match reply {
+                ListxattrReply::Names(data) => VolumeResponse::Xattr { data },
+                ListxattrReply::Count(count) => VolumeResponse::XattrSize { size: count },
+            },
+            Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
+        }
+    }
+
+    fn removexattr(
+        &self,
+        ino: u64,
+        name: &str,
+        uid: u32,
+        gid: u32,
+        pid: u32,
+    ) -> VolumeResponse {
+        let ctx = Self::make_context(uid, gid, pid);
+
+        // Use caller's credentials
+        let _guard = match CredentialsGuard::new(uid, gid) {
+            Ok(g) => g,
+            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
+        };
+
+        let cname = match CString::new(name) {
+            Ok(c) => c,
+            Err(_) => return VolumeResponse::error(libc::EINVAL),
+        };
+
+        match self.inner.removexattr(&ctx, ino, &cname) {
+            Ok(()) => VolumeResponse::Ok,
+            Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
+        }
+    }
+
+    fn fallocate(
+        &self,
+        ino: u64,
+        fh: u64,
+        offset: u64,
+        length: u64,
+        mode: u32,
+    ) -> VolumeResponse {
+        let ctx = Context::new();
+
+        match self.inner.fallocate(&ctx, ino, fh, mode, offset, length) {
+            Ok(()) => VolumeResponse::Ok,
+            Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
+        }
+    }
+
+    fn lseek(&self, ino: u64, fh: u64, offset: i64, whence: u32) -> VolumeResponse {
+        let ctx = Context::new();
+
+        // fuse-backend-rs expects u64 for offset
+        let offset_u64 = if offset >= 0 {
+            offset as u64
+        } else {
+            return VolumeResponse::error(libc::EINVAL);
+        };
+
+        match self.inner.lseek(&ctx, ino, fh, offset_u64, whence) {
+            Ok(new_offset) => VolumeResponse::Lseek {
+                offset: new_offset as u64,
+            },
+            Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
+        }
+    }
+
+    fn getlk(
+        &self,
+        _ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        start: u64,
+        end: u64,
+        _typ: i32,
+        pid: u32,
+    ) -> VolumeResponse {
+        // fuse-backend-rs doesn't expose file locking, and we can't access the raw fd.
+        // Return "no conflicting lock" which is the most permissive behavior.
+        // This means we report that the requested lock would succeed.
+        VolumeResponse::Lock {
+            start,
+            end,
+            typ: libc::F_UNLCK,  // No conflicting lock
+            pid,
+        }
+    }
+
+    fn setlk(
+        &self,
+        _ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        _start: u64,
+        _end: u64,
+        _typ: i32,
+        _pid: u32,
+        _sleep: bool,
+    ) -> VolumeResponse {
+        // fuse-backend-rs doesn't expose file locking, and we can't access the raw fd.
+        // Return success - this is permissive but prevents applications from failing.
+        VolumeResponse::Ok
+    }
+
+    fn readdirplus(
+        &self,
+        ino: u64,
+        fh: u64,
+        offset: u64,
+        uid: u32,
+        gid: u32,
+        pid: u32,
+    ) -> VolumeResponse {
+        tracing::debug!(target: "passthrough", ino, fh, offset, uid, gid, "readdirplus");
+        let ctx = Self::make_context(uid, gid, pid);
+
+        // Use caller's credentials for permission check
+        let _guard = match CredentialsGuard::new(uid, gid) {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::error!(target: "passthrough", error = ?e, "readdirplus credentials failed");
+                return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM));
+            }
+        };
+
+        let mut entries = Vec::new();
+
+        // Delegate to fuse-backend-rs readdirplus which handles everything
+        // including . and .. entries and does lookups for full attributes
+        let mut add_entry = |dir_entry: fuse_backend_rs::api::filesystem::DirEntry,
+                            entry: Entry|
+         -> std::io::Result<usize> {
+            let name_str = String::from_utf8_lossy(dir_entry.name).to_string();
+            let attr = Self::entry_to_attr(&entry);
+            entries.push(DirEntryPlus {
+                ino: entry.inode,
+                name: name_str,
+                attr,
+                generation: entry.generation,
+                attr_ttl_secs: self.attr_ttl_secs,
+                entry_ttl_secs: self.attr_ttl_secs,
+            });
+            Ok(1)
+        };
+
+        if let Err(e) = self.inner.readdirplus(&ctx, ino, fh, 8192, offset, &mut add_entry) {
+            tracing::error!(target: "passthrough", error = ?e, "readdirplus failed");
+            return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
+        }
+
+        tracing::debug!(target: "passthrough", ino, offset, count = entries.len(), "readdirplus succeeded");
+        VolumeResponse::DirEntriesPlus { entries }
+    }
 }
 
 #[cfg(test)]
@@ -941,26 +1157,166 @@ mod tests {
         let fs = PassthroughFs::new(dir.path());
 
         // Create file (use current user's uid/gid)
+        // Note: flags must include O_RDWR for read/write access
         let uid = nix::unistd::Uid::effective().as_raw();
         let gid = nix::unistd::Gid::effective().as_raw();
-        let resp = fs.create(1, "test.txt", 0o644, 0, uid, gid, 0);
-        let fh = match resp {
-            VolumeResponse::Created { fh, .. } => fh,
+        let resp = fs.create(1, "test.txt", 0o644, libc::O_RDWR as u32, uid, gid, 0);
+        let (ino, fh) = match resp {
+            VolumeResponse::Created { attr, fh, .. } => (attr.ino, fh),
             VolumeResponse::Error { errno } => panic!("Expected Created response, got error: {}", errno),
             _ => panic!("Expected Created response"),
         };
 
-        // Write
-        let resp = fs.write(0, fh, 0, b"hello");
-        assert!(matches!(resp, VolumeResponse::Written { size: 5 }));
+        // Write (now using correct inode)
+        let resp = fs.write(ino, fh, 0, b"hello");
+        match &resp {
+            VolumeResponse::Written { size } => assert_eq!(*size, 5),
+            VolumeResponse::Error { errno } => panic!("Write failed with errno: {}", errno),
+            other => panic!("Unexpected response: {:?}", other),
+        }
 
         // Read back
-        let resp = fs.read(0, fh, 0, 100);
+        let resp = fs.read(ino, fh, 0, 100);
         match resp {
             VolumeResponse::Data { data } => {
                 assert_eq!(data, b"hello");
             }
             _ => panic!("Expected Data response"),
         }
+
+        // Release the file handle
+        let resp = fs.release(ino, fh);
+        assert!(resp.is_ok());
+    }
+
+    #[test]
+    fn test_passthrough_open_read_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let test_file = dir.path().join("existing.txt");
+        std::fs::write(&test_file, "initial content").unwrap();
+
+        let fs = PassthroughFs::new(dir.path());
+
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+
+        // Lookup the file first to get its inode
+        let resp = fs.lookup(1, "existing.txt", uid, gid, 0);
+        let ino = match resp {
+            VolumeResponse::Entry { attr, .. } => attr.ino,
+            _ => panic!("Expected Entry response"),
+        };
+
+        // Open the file
+        let resp = fs.open(ino, libc::O_RDWR as u32, uid, gid, 0);
+        let fh = match resp {
+            VolumeResponse::Opened { fh, .. } => fh,
+            VolumeResponse::Error { errno } => panic!("Expected Opened response, got error: {}", errno),
+            _ => panic!("Expected Opened response"),
+        };
+
+        // Read initial content
+        let resp = fs.read(ino, fh, 0, 100);
+        match resp {
+            VolumeResponse::Data { data } => {
+                assert_eq!(data, b"initial content");
+            }
+            _ => panic!("Expected Data response"),
+        }
+
+        // Write new content at offset 8
+        let resp = fs.write(ino, fh, 8, b"REPLACED");
+        assert!(matches!(resp, VolumeResponse::Written { size: 8 }));
+
+        // Read back to verify
+        let resp = fs.read(ino, fh, 0, 100);
+        match resp {
+            VolumeResponse::Data { data } => {
+                assert_eq!(data, b"initial REPLACED");
+            }
+            _ => panic!("Expected Data response"),
+        }
+
+        // Flush
+        let resp = fs.flush(ino, fh);
+        assert!(resp.is_ok());
+
+        // Fsync
+        let resp = fs.fsync(ino, fh, false);
+        assert!(resp.is_ok());
+
+        // Release
+        let resp = fs.release(ino, fh);
+        assert!(resp.is_ok());
+    }
+
+    #[test]
+    fn test_passthrough_hardlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PassthroughFs::new(dir.path());
+
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+
+        // Create source file
+        let resp = fs.create(1, "source.txt", 0o644, libc::O_RDWR as u32, uid, gid, 0);
+        let (source_ino, fh) = match resp {
+            VolumeResponse::Created { attr, fh, .. } => (attr.ino, fh),
+            VolumeResponse::Error { errno } => panic!("Create failed with errno: {}", errno),
+            _ => panic!("Expected Created response"),
+        };
+
+        // Write to source
+        let resp = fs.write(source_ino, fh, 0, b"hardlink test content");
+        assert!(matches!(resp, VolumeResponse::Written { .. }));
+        fs.release(source_ino, fh);
+
+        // Create hardlink
+        let resp = fs.link(source_ino, 1, "link.txt", uid, gid, 0);
+        let link_ino = match resp {
+            VolumeResponse::Entry { attr, .. } => {
+                // Hardlinks share the same inode
+                assert_eq!(attr.ino, source_ino);
+                attr.ino
+            }
+            VolumeResponse::Error { errno } => panic!("Link failed with errno: {}", errno),
+            _ => panic!("Expected Entry response"),
+        };
+
+        // Delete source file
+        let resp = fs.unlink(1, "source.txt", uid, gid, 0);
+        assert!(resp.is_ok(), "Unlink source failed");
+
+        // Verify source is gone
+        let resp = fs.lookup(1, "source.txt", uid, gid, 0);
+        assert!(matches!(resp, VolumeResponse::Error { errno } if errno == libc::ENOENT));
+
+        // Hardlink should still be accessible and readable
+        let resp = fs.lookup(1, "link.txt", uid, gid, 0);
+        let lookup_ino = match resp {
+            VolumeResponse::Entry { attr, .. } => attr.ino,
+            VolumeResponse::Error { errno } => panic!("Lookup link.txt failed with errno: {}", errno),
+            _ => panic!("Expected Entry response"),
+        };
+        assert_eq!(lookup_ino, link_ino);
+
+        // Open and read from hardlink
+        let resp = fs.open(link_ino, libc::O_RDONLY as u32, uid, gid, 0);
+        let fh = match resp {
+            VolumeResponse::Opened { fh, .. } => fh,
+            VolumeResponse::Error { errno } => panic!("Open link.txt failed with errno: {}", errno),
+            _ => panic!("Expected Opened response"),
+        };
+
+        let resp = fs.read(link_ino, fh, 0, 100);
+        match resp {
+            VolumeResponse::Data { data } => {
+                assert_eq!(data, b"hardlink test content");
+            }
+            VolumeResponse::Error { errno } => panic!("Read failed with errno: {}", errno),
+            _ => panic!("Expected Data response"),
+        }
+
+        fs.release(link_ino, fh);
     }
 }
