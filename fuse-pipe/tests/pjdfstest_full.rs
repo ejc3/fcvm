@@ -3,6 +3,12 @@
 mod common;
 
 fn main() {
+    // Must run as root for proper permission testing (chown, setuid, etc.)
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("ERROR: pjdfstest must run as root (use: sudo cargo test ...)");
+        std::process::exit(1);
+    }
+
     if !common::is_pjdfstest_installed() {
         eprintln!("SKIPPED: pjdfstest not installed");
         std::process::exit(0);

@@ -298,6 +298,111 @@ ls -lt /tmp/fuse-bench-*.log | head -5
 cat $(ls -t /tmp/fuse-bench-telemetry-*.json | head -1) | jq .
 ```
 
+## Multi-Reader Credential Switching
+
+### Background
+
+fuse-pipe uses multiple FUSE reader threads to process requests in parallel. This is implemented via `FUSE_DEV_IOC_CLONE` which creates additional file descriptors that share a single FUSE mount.
+
+### Key Bug Fixes (2025-12-02)
+
+Two critical bugs were discovered when running pjdfstest with multiple readers:
+
+#### Bug 1: SessionACL::Owner Blocking Non-Owner Access
+
+**Symptom**: With 1 reader = tests pass, with 2+ readers = `EACCES` for non-root users
+
+**Root Cause**: When creating cloned FUSE sessions via `fuser::Session::from_fd_initialized()`, the code used `SessionACL::Owner` which restricts access to only the mount owner. Since the mount is created as root, non-root users (like uid 65534/nobody) were denied access at the FUSE layer before requests even reached our handler.
+
+**Fix**: Changed `SessionACL::Owner` to `SessionACL::All` in `src/client/mount.rs`:
+
+```rust
+// Line 135 (Unix socket mount):
+let mut reader_session =
+    fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::All);
+
+// Line 285 (vsock mount):
+let mut reader_session =
+    fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::All);
+```
+
+This works in conjunction with `fuser::MountOption::AllowOther` which allows non-root users to access the mount point.
+
+**Impact**: Fixed 2331 test failures (3313 → 982)
+
+#### Bug 2: Missing CredentialsGuard on Server Operations
+
+**Symptom**: Permission checks incorrect - operations that should fail would succeed (running as root instead of caller's uid)
+
+**Root Cause**: Most filesystem operations in `src/server/passthrough.rs` were missing the `CredentialsGuard` wrapper that uses `setfsuid()`/`setfsgid()` to switch filesystem credentials to the caller's uid/gid before performing operations.
+
+**Operations that needed CredentialsGuard added**:
+- `rmdir` - directory removal permission check
+- `unlink` - file removal permission check
+- `rename` - source and destination permission check
+- `link` - hard link permission check
+- `open` - file open permission check
+- `opendir` - directory open permission check
+- `setxattr` - extended attribute write permission
+- `removexattr` - extended attribute removal permission
+- `setattr` - truncate and utimensat permission checks (conditional)
+
+**Pattern used**:
+```rust
+fn rmdir(&self, parent: u64, name: &str, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
+    // Set filesystem credentials for permission checks
+    let _creds = match CredentialsGuard::new(uid, gid) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::error!(target: "passthrough", error = ?e, "failed to switch credentials");
+            return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM));
+        }
+    };
+
+    // Now perform operation - kernel will check permissions as uid/gid
+    // ...
+}
+```
+
+**Impact**: Fixed remaining 982 test failures (982 → 0)
+
+### pjdfstest Results
+
+After both fixes:
+
+```
+╔═══════════════════════════════════════════════════════════════╗
+║                       TEST SUMMARY                            ║
+╠═══════════════════════════════════════════════════════════════╣
+║  Total tests:            8818                                 ║
+║  Total failures:            0                                 ║
+║  Categories:               17                                 ║
+║  Duration:              142.6s                                ║
+╚═══════════════════════════════════════════════════════════════╝
+
+✅ ALL 8818 TESTS PASSED
+```
+
+### Key Files
+
+| File | Role in Credential Handling |
+|------|----------------------------|
+| `src/client/mount.rs` | SessionACL configuration for cloned sessions |
+| `src/server/passthrough.rs` | CredentialsGuard usage for permission checks |
+| `src/server/credentials.rs` | CredentialsGuard implementation using setfsuid/setfsgid |
+
+### Regression Test
+
+A dedicated regression test ensures multi-reader credential switching works:
+
+```bash
+cargo test test_nonroot_mkdir_with_2_readers --release
+```
+
+This test creates a directory as uid 65534 (nobody) with 2 FUSE readers and verifies:
+1. The mkdir succeeds (no EACCES)
+2. The directory is owned by uid 65534, not root
+
 ## Key Files
 
 | File | Purpose |

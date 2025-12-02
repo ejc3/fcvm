@@ -32,8 +32,10 @@ pub trait FilesystemHandler: Send + Sync {
                 size,
                 atime_secs,
                 atime_nsecs,
+                atime_now,
                 mtime_secs,
                 mtime_nsecs,
+                mtime_now,
                 caller_uid,
                 caller_gid,
                 caller_pid,
@@ -45,8 +47,10 @@ pub trait FilesystemHandler: Send + Sync {
                 *size,
                 *atime_secs,
                 *atime_nsecs,
+                *atime_now,
                 *mtime_secs,
                 *mtime_nsecs,
+                *mtime_now,
                 *caller_uid,
                 *caller_gid,
                 *caller_pid,
@@ -254,6 +258,11 @@ pub trait FilesystemHandler: Send + Sync {
     /// Set file attributes.
     /// Note: `uid`/`gid` are the values to set on the file.
     /// `caller_uid`/`caller_gid` are the credentials of the requesting process.
+    ///
+    /// Time handling:
+    /// - `atime_now`/`mtime_now` = true: Use UTIME_NOW (set to current time)
+    /// - `atime_secs`/`mtime_secs` = Some: Use specific time value
+    /// - Both false/None: Use UTIME_OMIT (don't change)
     #[allow(clippy::too_many_arguments)]
     fn setattr(
         &self,
@@ -264,8 +273,10 @@ pub trait FilesystemHandler: Send + Sync {
         _size: Option<u64>,
         _atime_secs: Option<i64>,
         _atime_nsecs: Option<u32>,
+        _atime_now: bool,
         _mtime_secs: Option<i64>,
         _mtime_nsecs: Option<u32>,
+        _mtime_now: bool,
         _caller_uid: u32,
         _caller_gid: u32,
         _caller_pid: u32,

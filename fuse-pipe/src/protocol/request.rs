@@ -27,6 +27,11 @@ pub enum VolumeRequest {
     /// Set file attributes.
     /// Note: `uid`/`gid` here are the *values to set*, not caller credentials.
     /// The caller credentials are in `caller_uid`/`caller_gid`.
+    ///
+    /// Time handling:
+    /// - `atime_now`/`mtime_now` = true: Use UTIME_NOW (current time)
+    /// - `atime_secs`/`mtime_secs` = Some: Use specific time
+    /// - Both false/None: Use UTIME_OMIT (don't change)
     Setattr {
         ino: u64,
         mode: Option<u32>,
@@ -35,8 +40,10 @@ pub enum VolumeRequest {
         size: Option<u64>,
         atime_secs: Option<i64>,
         atime_nsecs: Option<u32>,
+        atime_now: bool,
         mtime_secs: Option<i64>,
         mtime_nsecs: Option<u32>,
+        mtime_now: bool,
         caller_uid: u32,
         caller_gid: u32,
         caller_pid: u32,
