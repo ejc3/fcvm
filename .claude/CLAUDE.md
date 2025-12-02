@@ -363,6 +363,36 @@ ip addr add 172.16.29.1/24 dev tap-vm-c93e8   # Guest is 172.16.29.2
 - Root cause: VMs configured to use 8.8.8.8 but NAT wasn't forwarding DNS properly
 - Fix: Install dnsmasq on host with `bind-dynamic` to listen on TAP devices
 
+## fuse-pipe Tracing
+
+### Tracing Targets
+
+fuse-pipe uses multiple tracing targets. **Important**: The crate name uses a hyphen (`fuse-pipe`) but Rust module paths use underscores (`fuse_pipe`).
+
+| Target | Component | Notes |
+|--------|-----------|-------|
+| `fuse_pipe::fixture` | Test fixture | In-process mount setup/teardown |
+| `fuse-pipe::server` | Async server | Request dispatch, worker pool |
+| `fuse-pipe::client` | FUSE client | Mount, multiplexer |
+| `passthrough` | PassthroughFs | Filesystem operations |
+
+### Running Tests with Tracing
+
+```bash
+# All components at info level, passthrough at debug
+RUST_LOG="fuse_pipe=info,fuse-pipe=info,passthrough=debug" cargo test --test integration -- --nocapture
+
+# Just passthrough operations
+RUST_LOG="passthrough=debug" cargo test --test integration test_list_directory -- --nocapture
+```
+
+### Debugging Hangs
+
+If tests hang, enable tracing to see which operation is blocking:
+```bash
+RUST_LOG="passthrough=debug" cargo test ... -- --nocapture
+```
+
 ## References
 - Design doc: `/Users/ejcampbell/src/fcvm/DESIGN.md`
 - Firecracker docs: https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md

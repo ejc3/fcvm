@@ -3,30 +3,25 @@
 //! Tests individual FUSE operations to identify bottlenecks.
 //!
 //! See `fuse-pipe/TESTING.md` for complete testing documentation.
-//!
-//! Requires the stress test binary to be built first:
-//!   cargo build --release --test stress
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
 use std::time::Duration;
 
 // Include the shared fixture module
-#[path = "../tests/stress/fixture.rs"]
-mod fixture;
+#[path = "../tests/common/mod.rs"]
+mod common;
 
-use fixture::FuseMount;
+use common::FuseMount;
 
 const FILE_SIZE: usize = 4096; // 4KB test file
 
 /// Setup test files in the data directory
-fn setup_test_files(dir: &Path) {
+fn setup_test_files(dir: &PathBuf) {
     fs::create_dir_all(dir).unwrap();
 
     // Create test file
@@ -44,16 +39,22 @@ fn setup_test_files(dir: &Path) {
     }
 }
 
+fn cleanup(data_dir: &PathBuf, mount_dir: &PathBuf) {
+    let _ = Command::new("fusermount")
+        .args(["-u", mount_dir.to_str().unwrap()])
+        .status();
+    let _ = Command::new("fusermount3")
+        .args(["-u", mount_dir.to_str().unwrap()])
+        .status();
+    let _ = fs::remove_dir_all(data_dir);
+    let _ = fs::remove_dir_all(mount_dir);
+}
+
 fn bench_getattr(c: &mut Criterion) {
     let data_dir = PathBuf::from("/tmp/fuse-ops-data-getattr");
     let mount_dir = PathBuf::from("/tmp/fuse-ops-mount-getattr");
 
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = Command::new("fusermount")
-        .args(["-u", mount_dir.to_str().unwrap()])
-        .status();
-    let _ = fs::remove_dir_all(&mount_dir);
-
+    cleanup(&data_dir, &mount_dir);
     setup_test_files(&data_dir);
 
     let mut group = c.benchmark_group("single_op/getattr");
@@ -78,21 +79,14 @@ fn bench_getattr(c: &mut Criterion) {
 
     drop(fuse);
     group.finish();
-
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&mount_dir);
+    cleanup(&data_dir, &mount_dir);
 }
 
 fn bench_lookup(c: &mut Criterion) {
     let data_dir = PathBuf::from("/tmp/fuse-ops-data-lookup");
     let mount_dir = PathBuf::from("/tmp/fuse-ops-mount-lookup");
 
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = Command::new("fusermount")
-        .args(["-u", mount_dir.to_str().unwrap()])
-        .status();
-    let _ = fs::remove_dir_all(&mount_dir);
-
+    cleanup(&data_dir, &mount_dir);
     setup_test_files(&data_dir);
 
     let mut group = c.benchmark_group("single_op/lookup");
@@ -117,21 +111,14 @@ fn bench_lookup(c: &mut Criterion) {
 
     drop(fuse);
     group.finish();
-
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&mount_dir);
+    cleanup(&data_dir, &mount_dir);
 }
 
 fn bench_open_close(c: &mut Criterion) {
     let data_dir = PathBuf::from("/tmp/fuse-ops-data-open");
     let mount_dir = PathBuf::from("/tmp/fuse-ops-mount-open");
 
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = Command::new("fusermount")
-        .args(["-u", mount_dir.to_str().unwrap()])
-        .status();
-    let _ = fs::remove_dir_all(&mount_dir);
-
+    cleanup(&data_dir, &mount_dir);
     setup_test_files(&data_dir);
 
     let mut group = c.benchmark_group("single_op/open_close");
@@ -158,21 +145,14 @@ fn bench_open_close(c: &mut Criterion) {
 
     drop(fuse);
     group.finish();
-
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&mount_dir);
+    cleanup(&data_dir, &mount_dir);
 }
 
 fn bench_read_4kb(c: &mut Criterion) {
     let data_dir = PathBuf::from("/tmp/fuse-ops-data-read");
     let mount_dir = PathBuf::from("/tmp/fuse-ops-mount-read");
 
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = Command::new("fusermount")
-        .args(["-u", mount_dir.to_str().unwrap()])
-        .status();
-    let _ = fs::remove_dir_all(&mount_dir);
-
+    cleanup(&data_dir, &mount_dir);
     setup_test_files(&data_dir);
 
     let mut group = c.benchmark_group("single_op/read_4kb");
@@ -203,21 +183,14 @@ fn bench_read_4kb(c: &mut Criterion) {
 
     drop(fuse);
     group.finish();
-
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&mount_dir);
+    cleanup(&data_dir, &mount_dir);
 }
 
 fn bench_write_4kb(c: &mut Criterion) {
     let data_dir = PathBuf::from("/tmp/fuse-ops-data-write");
     let mount_dir = PathBuf::from("/tmp/fuse-ops-mount-write");
 
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = Command::new("fusermount")
-        .args(["-u", mount_dir.to_str().unwrap()])
-        .status();
-    let _ = fs::remove_dir_all(&mount_dir);
-
+    cleanup(&data_dir, &mount_dir);
     setup_test_files(&data_dir);
 
     let mut group = c.benchmark_group("single_op/write_4kb");
@@ -248,21 +221,14 @@ fn bench_write_4kb(c: &mut Criterion) {
 
     drop(fuse);
     group.finish();
-
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&mount_dir);
+    cleanup(&data_dir, &mount_dir);
 }
 
 fn bench_readdir(c: &mut Criterion) {
     let data_dir = PathBuf::from("/tmp/fuse-ops-data-readdir");
     let mount_dir = PathBuf::from("/tmp/fuse-ops-mount-readdir");
 
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = Command::new("fusermount")
-        .args(["-u", mount_dir.to_str().unwrap()])
-        .status();
-    let _ = fs::remove_dir_all(&mount_dir);
-
+    cleanup(&data_dir, &mount_dir);
     setup_test_files(&data_dir);
 
     let mut group = c.benchmark_group("single_op/readdir");
@@ -295,27 +261,20 @@ fn bench_readdir(c: &mut Criterion) {
 
     drop(fuse);
     group.finish();
-
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&mount_dir);
+    cleanup(&data_dir, &mount_dir);
 }
 
 fn bench_create_unlink(c: &mut Criterion) {
     let data_dir = PathBuf::from("/tmp/fuse-ops-data-create");
     let mount_dir = PathBuf::from("/tmp/fuse-ops-mount-create");
 
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = Command::new("fusermount")
-        .args(["-u", mount_dir.to_str().unwrap()])
-        .status();
-    let _ = fs::remove_dir_all(&mount_dir);
-
+    cleanup(&data_dir, &mount_dir);
     fs::create_dir_all(&data_dir).unwrap();
 
     let mut group = c.benchmark_group("single_op/create_unlink");
     group.sample_size(100);
 
-    let mut counter = AtomicU64::new(0);
+    let counter = AtomicU64::new(0);
 
     // Host filesystem baseline
     group.bench_function("host_fs", |b| {
@@ -340,9 +299,7 @@ fn bench_create_unlink(c: &mut Criterion) {
 
     drop(fuse);
     group.finish();
-
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&mount_dir);
+    cleanup(&data_dir, &mount_dir);
 }
 
 criterion_group!(

@@ -3,8 +3,9 @@
 use super::multiplexer::Multiplexer;
 use crate::protocol::{file_type, FileAttr, VolumeRequest, VolumeResponse};
 use fuser::{
-    FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus,
+    ReplyEmpty, ReplyEntry, ReplyLock, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
+    Request, TimeOrNow,
 };
 use std::ffi::OsStr;
 use std::sync::Arc;
@@ -645,11 +646,271 @@ impl Filesystem for FuseClient {
         }
     }
 
-    fn opendir(&mut self, _req: &Request, _ino: u64, _flags: i32, reply: ReplyOpen) {
-        reply.opened(0, 0);
+    fn readdirplus(
+        &mut self,
+        req: &Request,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectoryPlus,
+    ) {
+        let response = self.send_request_sync(VolumeRequest::Readdirplus {
+            ino,
+            fh,
+            offset: offset as u64,
+            uid: req.uid(),
+            gid: req.gid(),
+            pid: req.pid(),
+        });
+
+        match response {
+            VolumeResponse::DirEntriesPlus { entries } => {
+                for (i, entry) in entries.iter().enumerate() {
+                    let offset = (offset as usize + i + 1) as i64;
+                    let attr = to_fuser_attr(&entry.attr);
+                    let ttl = Duration::from_secs(entry.attr_ttl_secs);
+                    if reply.add(entry.ino, offset, &entry.name, &ttl, &attr, entry.generation) {
+                        break;
+                    }
+                }
+                reply.ok();
+            }
+            VolumeResponse::Error { errno } => reply.error(errno),
+            _ => reply.error(libc::EIO),
+        }
     }
 
-    fn releasedir(&mut self, _req: &Request, _ino: u64, _fh: u64, _flags: i32, reply: ReplyEmpty) {
-        reply.ok();
+    fn opendir(&mut self, req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
+        let response = self.send_request_sync(VolumeRequest::Opendir {
+            ino,
+            flags: flags as u32,
+            uid: req.uid(),
+            gid: req.gid(),
+            pid: req.pid(),
+        });
+
+        match response {
+            VolumeResponse::Openeddir { fh } => reply.opened(fh, 0),
+            VolumeResponse::Error { errno } => reply.error(errno),
+            _ => reply.error(libc::EIO),
+        }
+    }
+
+    fn releasedir(&mut self, _req: &Request, ino: u64, fh: u64, _flags: i32, reply: ReplyEmpty) {
+        let response = self.send_request_sync(VolumeRequest::Releasedir { ino, fh });
+
+        match response {
+            VolumeResponse::Ok => reply.ok(),
+            VolumeResponse::Error { errno } => reply.error(errno),
+            _ => reply.error(libc::EIO),
+        }
+    }
+
+    fn fsyncdir(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        fh: u64,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let response = self.send_request_sync(VolumeRequest::Fsyncdir { ino, fh, datasync });
+
+        match response {
+            VolumeResponse::Ok => reply.ok(),
+            VolumeResponse::Error { errno } => reply.error(errno),
+            _ => reply.error(libc::EIO),
+        }
+    }
+
+    fn setxattr(
+        &mut self,
+        req: &Request,
+        ino: u64,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        let response = self.send_request_sync(VolumeRequest::Setxattr {
+            ino,
+            name: name.to_string_lossy().to_string(),
+            value: value.to_vec(),
+            flags: flags as u32,
+            uid: req.uid(),
+            gid: req.gid(),
+            pid: req.pid(),
+        });
+
+        match response {
+            VolumeResponse::Ok => reply.ok(),
+            VolumeResponse::Error { errno } => reply.error(errno),
+            _ => reply.error(libc::EIO),
+        }
+    }
+
+    fn getxattr(&mut self, req: &Request, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let response = self.send_request_sync(VolumeRequest::Getxattr {
+            ino,
+            name: name.to_string_lossy().to_string(),
+            size,
+            uid: req.uid(),
+            gid: req.gid(),
+            pid: req.pid(),
+        });
+
+        match response {
+            VolumeResponse::Xattr { data } => reply.data(&data),
+            VolumeResponse::XattrSize { size } => reply.size(size),
+            VolumeResponse::Error { errno } => reply.error(errno),
+            _ => reply.error(libc::EIO),
+        }
+    }
+
+    fn listxattr(&mut self, req: &Request, ino: u64, size: u32, reply: ReplyXattr) {
+        let response = self.send_request_sync(VolumeRequest::Listxattr {
+            ino,
+            size,
+            uid: req.uid(),
+            gid: req.gid(),
+            pid: req.pid(),
+        });
+
+        match response {
+            VolumeResponse::Xattr { data } => reply.data(&data),
+            VolumeResponse::XattrSize { size } => reply.size(size),
+            VolumeResponse::Error { errno } => reply.error(errno),
+            _ => reply.error(libc::EIO),
+        }
+    }
+
+    fn removexattr(&mut self, req: &Request, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        let response = self.send_request_sync(VolumeRequest::Removexattr {
+            ino,
+            name: name.to_string_lossy().to_string(),
+            uid: req.uid(),
+            gid: req.gid(),
+            pid: req.pid(),
+        });
+
+        match response {
+            VolumeResponse::Ok => reply.ok(),
+            VolumeResponse::Error { errno } => reply.error(errno),
+            _ => reply.error(libc::EIO),
+        }
+    }
+
+    fn fallocate(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        length: i64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        let response = self.send_request_sync(VolumeRequest::Fallocate {
+            ino,
+            fh,
+            offset: offset as u64,
+            length: length as u64,
+            mode: mode as u32,
+        });
+
+        match response {
+            VolumeResponse::Ok => reply.ok(),
+            VolumeResponse::Error { errno } => reply.error(errno),
+            _ => reply.error(libc::EIO),
+        }
+    }
+
+    fn lseek(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        whence: i32,
+        reply: ReplyLseek,
+    ) {
+        let response = self.send_request_sync(VolumeRequest::Lseek {
+            ino,
+            fh,
+            offset,
+            whence: whence as u32,
+        });
+
+        match response {
+            VolumeResponse::Lseek { offset } => reply.offset(offset as i64),
+            VolumeResponse::Error { errno } => reply.error(errno),
+            _ => reply.error(libc::EIO),
+        }
+    }
+
+    fn getlk(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        fh: u64,
+        lock_owner: u64,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        reply: ReplyLock,
+    ) {
+        let response = self.send_request_sync(VolumeRequest::Getlk {
+            ino,
+            fh,
+            lock_owner,
+            start,
+            end,
+            typ,
+            pid,
+        });
+
+        match response {
+            VolumeResponse::Lock {
+                start,
+                end,
+                typ,
+                pid,
+            } => reply.locked(start, end, typ, pid),
+            VolumeResponse::Error { errno } => reply.error(errno),
+            _ => reply.error(libc::EIO),
+        }
+    }
+
+    fn setlk(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        fh: u64,
+        lock_owner: u64,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        sleep: bool,
+        reply: ReplyEmpty,
+    ) {
+        let response = self.send_request_sync(VolumeRequest::Setlk {
+            ino,
+            fh,
+            lock_owner,
+            start,
+            end,
+            typ,
+            pid,
+            sleep,
+        });
+
+        match response {
+            VolumeResponse::Ok => reply.ok(),
+            VolumeResponse::Error { errno } => reply.error(errno),
+            _ => reply.error(libc::EIO),
+        }
     }
 }

@@ -3,11 +3,8 @@
 //! Tests actual file I/O performance with varying concurrency levels.
 //!
 //! See `fuse-pipe/TESTING.md` for complete testing documentation.
-//!
-//! Requires the stress test binary to be built first:
-//!   cargo build --release --test stress
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,10 +13,10 @@ use std::thread;
 use std::time::Duration;
 
 // Include the shared fixture module
-#[path = "../tests/stress/fixture.rs"]
-mod fixture;
+#[path = "../tests/common/mod.rs"]
+mod common;
 
-use fixture::{increase_ulimit, setup_test_data, FuseMount};
+use common::{increase_ulimit, setup_test_data, FuseMount};
 
 const FILE_SIZE: usize = 4096; // 4KB files
 const NUM_FILES: usize = 1024; // More files for higher concurrency
@@ -84,34 +81,6 @@ fn parallel_read_bench(dir: &Path, num_workers: usize, ops_per_worker: usize) ->
     start.elapsed()
 }
 
-/// Run parallel stat benchmark on a directory
-fn parallel_stat_bench(dir: &Path, num_workers: usize, ops_per_worker: usize) -> Duration {
-    let dir = dir.to_path_buf();
-
-    let start = std::time::Instant::now();
-
-    let handles: Vec<_> = (0..num_workers)
-        .map(|worker_id| {
-            let dir = dir.clone();
-            thread::spawn(move || {
-                for i in 0..ops_per_worker {
-                    let file_idx = (worker_id * ops_per_worker + i) % NUM_FILES;
-                    let path = dir.join(format!("file_{}.dat", file_idx));
-                    let _ = black_box(fs::metadata(&path).unwrap());
-                }
-            })
-        })
-        .collect();
-
-    for h in handles {
-        h.join().unwrap();
-    }
-
-    start.elapsed()
-}
-
-// FuseMount is now imported from fixture module
-
 fn bench_parallel_reads(c: &mut Criterion) {
     increase_ulimit();
 
@@ -121,6 +90,9 @@ fn bench_parallel_reads(c: &mut Criterion) {
     // Cleanup any previous runs
     let _ = fs::remove_dir_all(&data_dir);
     let _ = Command::new("fusermount")
+        .args(["-u", mount_dir.to_str().unwrap()])
+        .status();
+    let _ = Command::new("fusermount3")
         .args(["-u", mount_dir.to_str().unwrap()])
         .status();
     let _ = fs::remove_dir_all(&mount_dir);
@@ -146,9 +118,12 @@ fn bench_parallel_reads(c: &mut Criterion) {
     });
 
     // Test different FUSE reader counts
-    for num_readers in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024] {
+    for num_readers in [1, 2, 4, 8, 16, 32, 64, 128, 256] {
         // Cleanup previous mount
         let _ = Command::new("fusermount")
+            .args(["-u", mount_dir.to_str().unwrap()])
+            .status();
+        let _ = Command::new("fusermount3")
             .args(["-u", mount_dir.to_str().unwrap()])
             .status();
         thread::sleep(Duration::from_millis(100));
@@ -188,6 +163,9 @@ fn bench_parallel_writes(c: &mut Criterion) {
     let _ = Command::new("fusermount")
         .args(["-u", mount_dir.to_str().unwrap()])
         .status();
+    let _ = Command::new("fusermount3")
+        .args(["-u", mount_dir.to_str().unwrap()])
+        .status();
     let _ = fs::remove_dir_all(&mount_dir);
 
     // Setup test data
@@ -211,8 +189,11 @@ fn bench_parallel_writes(c: &mut Criterion) {
     });
 
     // Test different FUSE reader counts
-    for num_readers in [1, 4, 16, 64, 256, 1024] {
+    for num_readers in [1, 4, 16, 64, 256] {
         let _ = Command::new("fusermount")
+            .args(["-u", mount_dir.to_str().unwrap()])
+            .status();
+        let _ = Command::new("fusermount3")
             .args(["-u", mount_dir.to_str().unwrap()])
             .status();
         thread::sleep(Duration::from_millis(100));
