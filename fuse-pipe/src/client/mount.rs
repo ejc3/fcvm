@@ -86,11 +86,12 @@ pub fn mount_with_telemetry<P: AsRef<Path>>(
 
     // Mount options:
     // - AllowOther: Allow non-root users to access the mount (requires user_allow_other in /etc/fuse.conf or running as root)
-    // - DefaultPermissions: Let the kernel enforce basic permission checks before handing off to userspace
+    // Note: We do NOT use DefaultPermissions because fuse-backend-rs handles permission enforcement
+    // via set_creds() which switches effective uid/gid before filesystem operations. DefaultPermissions
+    // would cause the kernel to reject operations before they reach our handler.
     let options = vec![
         fuser::MountOption::FSName("fuse-pipe".to_string()),
         fuser::MountOption::AllowOther,
-        fuser::MountOption::DefaultPermissions,
     ];
 
     let mount_with_options =
@@ -130,8 +131,9 @@ pub fn mount_with_telemetry<P: AsRef<Path>>(
             for (reader_id, cloned_fd) in fds_vec {
                 let fs = FuseClient::new(Arc::clone(&mux_for_callback), reader_id as u32);
                 // Each cloned fd handles its own request/response pairs
+                // Use SessionACL::All to allow any user to access the mount (AllowOther is set)
                 let mut reader_session =
-                    fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::Owner);
+                    fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::All);
 
                 thread::spawn(move || {
                     if let Err(e) = reader_session.run() {
@@ -243,12 +245,12 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
 
     // Mount options:
     // - AllowOther: Allow non-root users to access the mount (requires user_allow_other in /etc/fuse.conf or running as root)
-    // Note: We do NOT use DefaultPermissions because we implement our own permission checks
-    // in the passthrough handler to properly enforce POSIX ownership rules (chmod/chown/utimes)
+    // Note: We do NOT use DefaultPermissions because fuse-backend-rs handles permission enforcement
+    // via set_creds() which switches effective uid/gid before filesystem operations. DefaultPermissions
+    // would cause the kernel to reject operations before they reach our handler.
     let options = vec![
         fuser::MountOption::FSName("fuse-pipe".to_string()),
         fuser::MountOption::AllowOther,
-        fuser::MountOption::DefaultPermissions,
     ];
 
     let mount_with_options =
@@ -280,8 +282,9 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
             for (reader_id, cloned_fd) in fds_vec {
                 let fs = FuseClient::new(Arc::clone(&mux_for_callback), reader_id as u32);
                 // Each cloned fd handles its own request/response pairs
+                // Use SessionACL::All to allow any user to access the mount (AllowOther is set)
                 let mut reader_session =
-                    fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::Owner);
+                    fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::All);
 
                 thread::spawn(move || {
                     if let Err(e) = reader_session.run() {

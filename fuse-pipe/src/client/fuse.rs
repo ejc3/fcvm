@@ -181,20 +181,24 @@ impl Filesystem for FuseClient {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        let (atime_secs, atime_nsecs) = match atime {
+        // Handle atime: UTIME_NOW, specific time, or UTIME_OMIT
+        let (atime_secs, atime_nsecs, atime_now) = match atime {
             Some(TimeOrNow::SpecificTime(t)) => {
                 let d = t.duration_since(UNIX_EPOCH).unwrap_or_default();
-                (Some(d.as_secs() as i64), Some(d.subsec_nanos()))
+                (Some(d.as_secs() as i64), Some(d.subsec_nanos()), false)
             }
-            _ => (None, None),
+            Some(TimeOrNow::Now) => (None, None, true),
+            None => (None, None, false),
         };
 
-        let (mtime_secs, mtime_nsecs) = match mtime {
+        // Handle mtime: UTIME_NOW, specific time, or UTIME_OMIT
+        let (mtime_secs, mtime_nsecs, mtime_now) = match mtime {
             Some(TimeOrNow::SpecificTime(t)) => {
                 let d = t.duration_since(UNIX_EPOCH).unwrap_or_default();
-                (Some(d.as_secs() as i64), Some(d.subsec_nanos()))
+                (Some(d.as_secs() as i64), Some(d.subsec_nanos()), false)
             }
-            _ => (None, None),
+            Some(TimeOrNow::Now) => (None, None, true),
+            None => (None, None, false),
         };
 
         let response = self.send_request_sync(VolumeRequest::Setattr {
@@ -205,8 +209,10 @@ impl Filesystem for FuseClient {
             size,
             atime_secs,
             atime_nsecs,
+            atime_now,
             mtime_secs,
             mtime_nsecs,
+            mtime_now,
             caller_uid: req.uid(),
             caller_gid: req.gid(),
             caller_pid: req.pid(),
@@ -230,6 +236,7 @@ impl Filesystem for FuseClient {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        tracing::debug!(target: "fuse-pipe::client", parent, ?name, mode, uid = req.uid(), gid = req.gid(), pid = req.pid(), "mkdir request");
         let response = self.send_request_sync(VolumeRequest::Mkdir {
             parent,
             name: name.to_string_lossy().to_string(),
@@ -245,14 +252,21 @@ impl Filesystem for FuseClient {
                 generation,
                 ttl_secs,
             } => {
+                tracing::debug!(target: "fuse-pipe::client", ino = attr.ino, "mkdir succeeded");
                 reply.entry(
                     &Duration::from_secs(ttl_secs),
                     &to_fuser_attr(&attr),
                     generation,
                 );
             }
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => {
+                tracing::debug!(target: "fuse-pipe::client", errno, "mkdir error");
+                reply.error(errno);
+            }
+            _ => {
+                tracing::debug!(target: "fuse-pipe::client", "mkdir unexpected response");
+                reply.error(libc::EIO);
+            }
         }
     }
 

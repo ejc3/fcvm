@@ -3,6 +3,23 @@
 //! This wraps the production-grade passthrough filesystem from the
 //! Cloud Hypervisor project. It provides full POSIX semantics with
 //! proper permission enforcement.
+//!
+//! # Credential Handling
+//!
+//! fuse-backend-rs handles credentials internally via the `Context` parameter
+//! passed to each operation. It uses the uid/gid from Context for permission
+//! checks when performing filesystem operations.
+//!
+//! IMPORTANT: We must NOT use `setfsuid()`/`setfsgid()` before calling
+//! fuse-backend-rs operations because fuse-backend-rs internally uses
+//! `readlinkat` on `/proc/self/fd/` to resolve inode paths. When fsuid
+//! is changed to a non-root user, these `/proc` operations fail because
+//! `/proc/self/fd/` is owned by root (the process's effective UID).
+//!
+//! We only use `CredentialsGuard` for operations we handle directly
+//! (not through fuse-backend-rs), such as:
+//! - `setattr` with truncate: uses std::fs::File::set_len()
+//! - `setattr` with utimensat: uses libc::utimensat() directly
 
 use super::credentials::CredentialsGuard;
 use super::handler::FilesystemHandler;
@@ -156,12 +173,6 @@ impl FilesystemHandler for PassthroughFs {
     ) -> VolumeResponse {
         let ctx = Self::make_context(uid, gid, pid);
 
-        // Use caller's credentials for permission check
-        let _guard = match CredentialsGuard::new(uid, gid) {
-            Ok(g) => g,
-            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
-        };
-
         let cname = match CString::new(name) {
             Ok(c) => c,
             Err(_) => return VolumeResponse::error(libc::EINVAL),
@@ -204,8 +215,10 @@ impl FilesystemHandler for PassthroughFs {
         size: Option<u64>,
         atime_secs: Option<i64>,
         atime_nsecs: Option<u32>,
+        atime_now: bool,
         mtime_secs: Option<i64>,
         mtime_nsecs: Option<u32>,
+        mtime_now: bool,
         caller_uid: u32,
         caller_gid: u32,
         caller_pid: u32,
@@ -235,16 +248,33 @@ impl FilesystemHandler for PassthroughFs {
             return VolumeResponse::error(libc::EPERM);
         }
 
+        // utimensat with specific times: POSIX requires owner or root
+        // UTIME_NOW permission check is done by kernel via write access
+        if (atime_secs.is_some() || mtime_secs.is_some()) && caller_uid != 0 && caller_uid != file_uid {
+            return VolumeResponse::error(libc::EPERM);
+        }
+
+        // Determine if we need to call utimensat
+        let need_time_update = atime_now || mtime_now || atime_secs.is_some() || mtime_secs.is_some();
+
         // Get the file path to perform operations directly
         let path = match self.get_inode_path(ino) {
             Some(p) => p,
             None => return VolumeResponse::error(libc::EIO),
         };
 
-        // Use credentials guard for permission check
-        let _guard = match CredentialsGuard::new(caller_uid, caller_gid) {
-            Ok(g) => g,
-            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
+        // Set filesystem credentials for truncate and utimensat permission checks
+        // Note: chown must run as root, chmod checks ownership above
+        let _creds = if size.is_some() || need_time_update {
+            match CredentialsGuard::new(caller_uid, caller_gid) {
+                Ok(g) => Some(g),
+                Err(e) => {
+                    tracing::error!(target: "passthrough", error = ?e, "failed to switch credentials");
+                    return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM));
+                }
+            }
+        } else {
+            None
         };
 
         // Handle size truncation
@@ -258,7 +288,7 @@ impl FilesystemHandler for PassthroughFs {
             }
         }
 
-        // Handle mode change
+        // Handle mode change (owner check done above, so this runs as root to bypass fs perms)
         if let Some(new_mode) = mode {
             use std::os::unix::fs::PermissionsExt;
             let permissions = std::fs::Permissions::from_mode(new_mode);
@@ -267,7 +297,7 @@ impl FilesystemHandler for PassthroughFs {
             }
         }
 
-        // Handle uid/gid change using libc::chown
+        // Handle uid/gid change using libc::chown (must run as root)
         if uid.is_some() || gid.is_some() {
             let new_uid = uid.map(|u| u as libc::uid_t).unwrap_or(u32::MAX as libc::uid_t);
             let new_gid = gid.map(|g| g as libc::gid_t).unwrap_or(u32::MAX as libc::gid_t);
@@ -279,19 +309,61 @@ impl FilesystemHandler for PassthroughFs {
         }
 
         // Handle time changes
-        if atime_secs.is_some() || mtime_secs.is_some() {
+        // UTIME_NOW and UTIME_OMIT are special values for tv_nsec in utimensat:
+        // - UTIME_NOW (0x3fffffff): Set to current time, requires write access or ownership
+        // - UTIME_OMIT (0x3ffffffe): Don't change this timestamp
+        if need_time_update {
             let path_cstr = CString::new(path.to_string_lossy().as_bytes()).unwrap();
-            let times = [
+
+            // Build atime timespec
+            let atime_spec = if atime_now {
+                // UTIME_NOW: set to current time (kernel checks write permission)
                 libc::timespec {
-                    tv_sec: atime_secs.unwrap_or(current_attr.st_atime),
-                    tv_nsec: atime_nsecs.map(|n| n as i64).unwrap_or(current_attr.st_atime_nsec),
-                },
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_NOW,
+                }
+            } else if let Some(secs) = atime_secs {
+                // Specific time value
                 libc::timespec {
-                    tv_sec: mtime_secs.unwrap_or(current_attr.st_mtime),
-                    tv_nsec: mtime_nsecs.map(|n| n as i64).unwrap_or(current_attr.st_mtime_nsec),
-                },
-            ];
-            let result = unsafe { libc::utimensat(libc::AT_FDCWD, path_cstr.as_ptr(), times.as_ptr(), 0) };
+                    tv_sec: secs,
+                    tv_nsec: atime_nsecs.map(|n| n as i64).unwrap_or(0),
+                }
+            } else {
+                // UTIME_OMIT: don't change
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_OMIT,
+                }
+            };
+
+            // Build mtime timespec
+            let mtime_spec = if mtime_now {
+                // UTIME_NOW: set to current time (kernel checks write permission)
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_NOW,
+                }
+            } else if let Some(secs) = mtime_secs {
+                // Specific time value
+                libc::timespec {
+                    tv_sec: secs,
+                    tv_nsec: mtime_nsecs.map(|n| n as i64).unwrap_or(0),
+                }
+            } else {
+                // UTIME_OMIT: don't change
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_OMIT,
+                }
+            };
+
+            // Check if this is a symlink - if so, use AT_SYMLINK_NOFOLLOW
+            // to set times on the symlink itself, not its target
+            let is_symlink = (current_attr.st_mode & libc::S_IFMT) == libc::S_IFLNK;
+            let flags = if is_symlink { libc::AT_SYMLINK_NOFOLLOW } else { 0 };
+
+            let times = [atime_spec, mtime_spec];
+            let result = unsafe { libc::utimensat(libc::AT_FDCWD, path_cstr.as_ptr(), times.as_ptr(), flags) };
             if result != 0 {
                 return VolumeResponse::error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
             }
@@ -320,15 +392,6 @@ impl FilesystemHandler for PassthroughFs {
     ) -> VolumeResponse {
         tracing::debug!(target: "passthrough", ino, offset, uid, gid, "readdir");
         let ctx = Self::make_context(uid, gid, pid);
-
-        // Use caller's credentials for permission check
-        let _guard = match CredentialsGuard::new(uid, gid) {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::error!(target: "passthrough", error = ?e, "readdir credentials failed");
-                return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM));
-            }
-        };
 
         tracing::debug!(target: "passthrough", ino, "readdir opening directory");
         // First open the directory
@@ -419,16 +482,14 @@ impl FilesystemHandler for PassthroughFs {
         tracing::debug!(target: "passthrough", parent, name, mode, uid, gid, "mkdir");
         let ctx = Self::make_context(uid, gid, pid);
 
-        // Use caller's credentials
-        let _guard = match CredentialsGuard::new(uid, gid) {
-            Ok(g) => g,
-            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
-        };
-
         let cname = match CString::new(name) {
             Ok(c) => c,
             Err(_) => return VolumeResponse::error(libc::EINVAL),
         };
+
+        // fuse-backend-rs handles credentials via Context internally.
+        // Do NOT use CredentialsGuard here - it breaks fuse-backend-rs's
+        // internal readlinkat on /proc/self/fd/.
 
         match self.inner.mkdir(&ctx, parent, &cname, mode, 0) {
             Ok(entry) => {
@@ -459,16 +520,12 @@ impl FilesystemHandler for PassthroughFs {
     ) -> VolumeResponse {
         let ctx = Self::make_context(uid, gid, pid);
 
-        // Use caller's credentials
-        let _guard = match CredentialsGuard::new(uid, gid) {
-            Ok(g) => g,
-            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
-        };
-
         let cname = match CString::new(name) {
             Ok(c) => c,
             Err(_) => return VolumeResponse::error(libc::EINVAL),
         };
+
+        // fuse-backend-rs handles credentials via Context internally.
 
         match self.inner.mknod(&ctx, parent, &cname, mode, rdev, 0) {
             Ok(entry) => {
@@ -493,11 +550,7 @@ impl FilesystemHandler for PassthroughFs {
     ) -> VolumeResponse {
         let ctx = Self::make_context(uid, gid, pid);
 
-        // Use caller's credentials
-        let _guard = match CredentialsGuard::new(uid, gid) {
-            Ok(g) => g,
-            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
-        };
+        // fuse-backend-rs handles credentials via Context internally.
 
         let cname = match CString::new(name) {
             Ok(c) => c,
@@ -523,15 +576,6 @@ impl FilesystemHandler for PassthroughFs {
         let ctx = Self::make_context(uid, gid, pid);
         tracing::debug!(target: "passthrough", parent, name, mode, flags, uid, gid, "create");
 
-        // Use caller's credentials
-        let _guard = match CredentialsGuard::new(uid, gid) {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::debug!(target: "passthrough", error = ?e, "credentials guard failed");
-                return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM));
-            }
-        };
-
         let cname = match CString::new(name) {
             Ok(c) => c,
             Err(_) => return VolumeResponse::error(libc::EINVAL),
@@ -543,6 +587,8 @@ impl FilesystemHandler for PassthroughFs {
             umask: 0,
             fuse_flags: 0,
         };
+
+        // fuse-backend-rs handles credentials via Context internally.
 
         match self.inner.create(&ctx, parent, &cname, create_in) {
             Ok((entry, handle, _opts, _open_opts)) => {
@@ -567,11 +613,7 @@ impl FilesystemHandler for PassthroughFs {
     fn open(&self, ino: u64, flags: u32, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
         let ctx = Self::make_context(uid, gid, pid);
 
-        // Use caller's credentials
-        let _guard = match CredentialsGuard::new(uid, gid) {
-            Ok(g) => g,
-            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
-        };
+        // fuse-backend-rs handles credentials via Context internally.
 
         match self.inner.open(&ctx, ino, flags, 0) {
             Ok((handle, _opts, _passthrough)) => VolumeResponse::Opened {
@@ -667,11 +709,7 @@ impl FilesystemHandler for PassthroughFs {
     fn unlink(&self, parent: u64, name: &str, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
         let ctx = Self::make_context(uid, gid, pid);
 
-        // Use caller's credentials
-        let _guard = match CredentialsGuard::new(uid, gid) {
-            Ok(g) => g,
-            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
-        };
+        // fuse-backend-rs handles credentials via Context internally.
 
         let cname = match CString::new(name) {
             Ok(c) => c,
@@ -696,11 +734,7 @@ impl FilesystemHandler for PassthroughFs {
     ) -> VolumeResponse {
         let ctx = Self::make_context(uid, gid, pid);
 
-        // Use caller's credentials
-        let _guard = match CredentialsGuard::new(uid, gid) {
-            Ok(g) => g,
-            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
-        };
+        // fuse-backend-rs handles credentials via Context internally.
 
         let cname = match CString::new(name) {
             Ok(c) => c,
@@ -729,12 +763,6 @@ impl FilesystemHandler for PassthroughFs {
     ) -> VolumeResponse {
         let ctx = Self::make_context(uid, gid, pid);
 
-        // Use caller's credentials
-        let _guard = match CredentialsGuard::new(uid, gid) {
-            Ok(g) => g,
-            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
-        };
-
         let cname = match CString::new(name) {
             Ok(c) => c,
             Err(_) => return VolumeResponse::error(libc::EINVAL),
@@ -744,6 +772,8 @@ impl FilesystemHandler for PassthroughFs {
             Ok(c) => c,
             Err(_) => return VolumeResponse::error(libc::EINVAL),
         };
+
+        // fuse-backend-rs handles credentials via Context internally.
 
         match self.inner.symlink(&ctx, &ctarget, parent, &cname) {
             Ok(entry) => {
@@ -781,11 +811,7 @@ impl FilesystemHandler for PassthroughFs {
     ) -> VolumeResponse {
         let ctx = Self::make_context(uid, gid, pid);
 
-        // Use caller's credentials
-        let _guard = match CredentialsGuard::new(uid, gid) {
-            Ok(g) => g,
-            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
-        };
+        // fuse-backend-rs handles credentials via Context internally.
 
         let cnewname = match CString::new(newname) {
             Ok(c) => c,
@@ -807,12 +833,6 @@ impl FilesystemHandler for PassthroughFs {
 
     fn access(&self, ino: u64, mask: u32, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
         let ctx = Self::make_context(uid, gid, pid);
-
-        // Use caller's credentials
-        let _guard = match CredentialsGuard::new(uid, gid) {
-            Ok(g) => g,
-            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
-        };
 
         match self.inner.access(&ctx, ino, mask) {
             Ok(()) => VolumeResponse::Ok,
@@ -843,11 +863,7 @@ impl FilesystemHandler for PassthroughFs {
     fn opendir(&self, ino: u64, flags: u32, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
         let ctx = Self::make_context(uid, gid, pid);
 
-        // Use caller's credentials
-        let _guard = match CredentialsGuard::new(uid, gid) {
-            Ok(g) => g,
-            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
-        };
+        // fuse-backend-rs handles credentials via Context internally.
 
         match self.inner.opendir(&ctx, ino, flags) {
             Ok((handle, _opts)) => VolumeResponse::Openeddir {
@@ -887,11 +903,7 @@ impl FilesystemHandler for PassthroughFs {
     ) -> VolumeResponse {
         let ctx = Self::make_context(uid, gid, pid);
 
-        // Use caller's credentials
-        let _guard = match CredentialsGuard::new(uid, gid) {
-            Ok(g) => g,
-            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
-        };
+        // fuse-backend-rs handles credentials via Context internally.
 
         let cname = match CString::new(name) {
             Ok(c) => c,
@@ -917,12 +929,6 @@ impl FilesystemHandler for PassthroughFs {
 
         let ctx = Self::make_context(uid, gid, pid);
 
-        // Use caller's credentials
-        let _guard = match CredentialsGuard::new(uid, gid) {
-            Ok(g) => g,
-            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
-        };
-
         let cname = match CString::new(name) {
             Ok(c) => c,
             Err(_) => return VolumeResponse::error(libc::EINVAL),
@@ -941,12 +947,6 @@ impl FilesystemHandler for PassthroughFs {
         use fuse_backend_rs::api::filesystem::ListxattrReply;
 
         let ctx = Self::make_context(uid, gid, pid);
-
-        // Use caller's credentials
-        let _guard = match CredentialsGuard::new(uid, gid) {
-            Ok(g) => g,
-            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
-        };
 
         match self.inner.listxattr(&ctx, ino, size) {
             Ok(reply) => match reply {
@@ -967,11 +967,7 @@ impl FilesystemHandler for PassthroughFs {
     ) -> VolumeResponse {
         let ctx = Self::make_context(uid, gid, pid);
 
-        // Use caller's credentials
-        let _guard = match CredentialsGuard::new(uid, gid) {
-            Ok(g) => g,
-            Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM)),
-        };
+        // fuse-backend-rs handles credentials via Context internally.
 
         let cname = match CString::new(name) {
             Ok(c) => c,
@@ -1066,15 +1062,6 @@ impl FilesystemHandler for PassthroughFs {
     ) -> VolumeResponse {
         tracing::debug!(target: "passthrough", ino, fh, offset, uid, gid, "readdirplus");
         let ctx = Self::make_context(uid, gid, pid);
-
-        // Use caller's credentials for permission check
-        let _guard = match CredentialsGuard::new(uid, gid) {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::error!(target: "passthrough", error = ?e, "readdirplus credentials failed");
-                return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM));
-            }
-        };
 
         let mut entries = Vec::new();
 
