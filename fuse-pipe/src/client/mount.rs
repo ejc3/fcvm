@@ -4,6 +4,7 @@
 //! a single FUSE mount, enabling parallel request processing.
 
 use super::{FuseClient, Multiplexer};
+use crate::telemetry::SpanCollector;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -49,6 +50,28 @@ pub fn mount_with_options<P: AsRef<Path>>(
     num_readers: usize,
     trace_rate: u64,
 ) -> anyhow::Result<()> {
+    mount_with_telemetry(socket_path, mount_point, num_readers, trace_rate, None)
+}
+
+/// Mount a FUSE filesystem with telemetry collection.
+///
+/// If a `SpanCollector` is provided, trace spans will be collected for later analysis.
+/// Use `trace_rate > 0` to enable tracing (e.g., 1 = trace every request, 100 = every 100th).
+///
+/// # Arguments
+///
+/// * `socket_path` - Path to the Unix socket where the server is listening
+/// * `mount_point` - Directory where the FUSE filesystem will be mounted
+/// * `num_readers` - Number of FUSE reader threads (1-8 recommended)
+/// * `trace_rate` - Trace every Nth request (0 = disabled)
+/// * `collector` - Optional SpanCollector for telemetry aggregation
+pub fn mount_with_telemetry<P: AsRef<Path>>(
+    socket_path: &str,
+    mount_point: P,
+    num_readers: usize,
+    trace_rate: u64,
+    collector: Option<SpanCollector>,
+) -> anyhow::Result<()> {
     info!(target: "fuse-pipe::client", socket_path, num_readers, "connecting");
 
     // Create socket connection
@@ -58,7 +81,7 @@ pub fn mount_with_options<P: AsRef<Path>>(
     debug!(target: "fuse-pipe::client", "connected to server");
 
     // Create multiplexer for request/response handling
-    let mux = Multiplexer::with_trace_rate(socket, num_readers, trace_rate);
+    let mux = Multiplexer::with_collector(socket, num_readers, trace_rate, collector);
     debug!(target: "fuse-pipe::client", num_readers, "multiplexer started");
 
     // Mount options:

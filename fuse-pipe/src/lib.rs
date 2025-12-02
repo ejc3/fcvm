@@ -6,6 +6,7 @@
 //! - **Transport**: Unix socket and vsock transports
 //! - **Server**: Async pipelined server with response batching
 //! - **Client**: Multi-reader FUSE client with socket multiplexing
+//! - **Telemetry**: Span collection and latency analysis
 //!
 //! # Quick Start
 //!
@@ -28,6 +29,7 @@
 
 pub mod protocol;
 pub mod server;
+pub mod telemetry;
 pub mod transport;
 
 #[cfg(feature = "fuse-client")]
@@ -47,9 +49,14 @@ pub use transport::{VsockListener, VsockTransport};
 // Re-export server types
 pub use server::{AsyncServer, FilesystemHandler, PassthroughFs, ServerConfig};
 
+// Re-export telemetry types
+pub use telemetry::{SpanCollector, SpanSummary};
+
 // Re-export client types
 #[cfg(feature = "fuse-client")]
-pub use client::{mount, mount_with_options, mount_with_readers, FuseClient, Multiplexer};
+pub use client::{
+    mount, mount_with_options, mount_with_readers, mount_with_telemetry, FuseClient, Multiplexer,
+};
 #[cfg(all(feature = "fuse-client", target_os = "linux"))]
 pub use client::{mount_vsock, mount_vsock_with_options, mount_vsock_with_readers};
 

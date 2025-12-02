@@ -15,7 +15,9 @@ mod metrics;
 mod worker;
 
 use clap::{Parser, Subcommand};
-use fuse_pipe::{mount_with_options, AsyncServer, PassthroughFs, ServerConfig};
+use fuse_pipe::{
+    mount_with_telemetry, AsyncServer, PassthroughFs, ServerConfig, SpanCollector,
+};
 use std::path::PathBuf;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -71,6 +73,9 @@ enum Commands {
         readers: usize,
         #[arg(short, long, default_value = "0")]
         trace_rate: u64,
+        /// Output telemetry JSON to this file path when unmounted
+        #[arg(long)]
+        telemetry_output: Option<PathBuf>,
     },
 
     /// Internal: stress worker (used by stress test)
@@ -118,6 +123,7 @@ fn main() -> anyhow::Result<()> {
             mount,
             readers,
             trace_rate,
+            telemetry_output,
         }) => {
             std::fs::create_dir_all(&mount)?;
             eprintln!(
@@ -128,8 +134,25 @@ fn main() -> anyhow::Result<()> {
                 trace_rate
             );
 
-            mount_with_options(&socket, &mount, readers, trace_rate)?;
+            // Create collector if telemetry output is requested
+            let collector = if telemetry_output.is_some() && trace_rate > 0 {
+                Some(SpanCollector::new())
+            } else {
+                None
+            };
+
+            mount_with_telemetry(&socket, &mount, readers, trace_rate, collector.clone())?;
             eprintln!("[client] unmounted");
+
+            // Output telemetry if requested
+            if let (Some(output_path), Some(collector)) = (telemetry_output, collector) {
+                if let Some(json) = collector.summary_json() {
+                    std::fs::write(&output_path, &json)?;
+                    eprintln!("[client] telemetry written to {}", output_path.display());
+                } else {
+                    eprintln!("[client] no telemetry data collected");
+                }
+            }
         }
 
         Some(Commands::StressWorker {
