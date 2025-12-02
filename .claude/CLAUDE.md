@@ -168,7 +168,7 @@ tests/
 
 ### Firecracker Requirements
 - **Kernel**: vmlinux or bzImage, boot args: `console=ttyS0 reboot=k panic=1 pci=off`
-- **Rootfs**: ext4 with OpenRC/systemd, Podman, iproute2, fc-agent at `/usr/local/bin/fc-agent`
+- **Rootfs**: ext4 with Ubuntu 24.04, systemd, Podman, iproute2, fc-agent at `/usr/local/bin/fc-agent`
 
 ### Network Modes
 
@@ -209,7 +209,7 @@ fn generate_loopback_ip(vm_id: &str) -> String {
 
 **Architecture:**
 - All data under `/mnt/fcvm-btrfs/` (btrfs filesystem)
-- Base rootfs: `/mnt/fcvm-btrfs/rootfs/base.ext4` (~1GB Alpine + Podman)
+- Base rootfs: `/mnt/fcvm-btrfs/rootfs/base.ext4` (~1GB Ubuntu 24.04 + Podman)
 - VM disks: `/mnt/fcvm-btrfs/vm-disks/{vm_id}/disks/rootfs.ext4`
 
 ```rust
@@ -288,7 +288,7 @@ fcvm clone --snapshot nginx-base --name web1  # Connects to server
 
 | Target | Description |
 |--------|-------------|
-| `make build` | Sync + build fcvm + fc-agent (musl) |
+| `make build` | Sync + build fcvm + fc-agent on EC2 |
 | `make test` | Run sanity test on EC2 |
 | `make rebuild` | Full rebuild including rootfs update |
 | `make rootfs` | Update fc-agent in rootfs only |
@@ -305,13 +305,13 @@ cd ~/fcvm && source ~/.cargo/env
 # Build fcvm
 cargo build --release
 
-# Build fc-agent (musl for Alpine)
-cd fc-agent && cargo build --release --target aarch64-unknown-linux-musl
+# Build fc-agent
+cd fc-agent && cargo build --release
 
 # Update rootfs
 sudo mkdir -p /tmp/rootfs-mount
 sudo mount -o loop /mnt/fcvm-btrfs/rootfs/base.ext4 /tmp/rootfs-mount
-sudo cp ~/fcvm/fc-agent/target/aarch64-unknown-linux-musl/release/fc-agent /tmp/rootfs-mount/usr/local/bin/
+sudo cp ~/fcvm/fc-agent/target/release/fc-agent /tmp/rootfs-mount/usr/local/bin/
 sudo umount /tmp/rootfs-mount
 ```
 
@@ -319,8 +319,7 @@ sudo umount /tmp/rootfs-mount
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu dnsmasq
-rustup target add aarch64-unknown-linux-musl
+sudo apt-get install -y dnsmasq
 
 # dnsmasq for DNS forwarding to VMs (bind-dynamic listens on dynamically created TAP devices)
 sudo tee /etc/dnsmasq.d/fcvm.conf > /dev/null <<EOF
@@ -335,11 +334,9 @@ sudo systemctl restart dnsmasq
 
 ## Key Learnings
 
-### Alpine Serial Console
-- Problem: VM booted but no output after OpenRC
-- Root cause: `/etc/inittab` has `ttyS0` commented out by default
-- Fix: Enable `ttyS0` in `/etc/inittab` (done automatically in rootfs setup)
-- Manual fix: `sudo sed -i 's/^#ttyS0/ttyS0/' /mnt/rootfs/etc/inittab`
+### Serial Console
+- Problem: VM booted but no output after init
+- Fix: Kernel boot args include `console=ttyS0` (done automatically)
 
 ### Clone Network Configuration
 - Problem: Guest retains original static IP after snapshot restore
@@ -353,17 +350,6 @@ ip addr add 172.16.201.1/24 dev tap-vm-c93e8  # Guest thinks it's 172.16.29.2
 ip addr add 172.16.29.1/24 dev tap-vm-c93e8   # Guest is 172.16.29.2
 ```
 - Reference: https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/network-for-clones.md
-
-### fc-agent musl Build
-- Problem: glibc binary doesn't work on Alpine (musl libc)
-- Error: `start-stop-daemon: failed to exec '/usr/local/bin/fc-agent': No such file or directory`
-- Fix: Build with `--target aarch64-unknown-linux-musl`
-- Config in `fc-agent/.cargo/config.toml`:
-```toml
-[target.aarch64-unknown-linux-musl]
-linker = "aarch64-linux-musl-gcc"
-rustflags = ["-C", "target-feature=+crt-static"]
-```
 
 ### KVM Requirements
 - Firecracker REQUIRES `/dev/kvm` - only available on bare metal instances
