@@ -523,6 +523,51 @@ sudo mount /dev/nvme1n1 /mnt/fcvm-btrfs
 sudo mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,state,snapshots,vm-disks}
 ```
 
+### FUSE Passthrough Performance (fuse-pipe)
+
+**Benchmark Date**: 2025-12-01
+**Machine**: c6g.metal (64 ARM cores, 125GB RAM)
+**Test Setup**: 256 workers doing parallel file I/O, varying FUSE reader thread count
+
+#### Parallel Reads (256 workers, 1024 files × 4KB)
+
+| Readers | Time (ms) | vs Host | Speedup vs 1 Reader |
+|---------|-----------|---------|---------------------|
+| Host FS | 10.7 | 1.0x | - |
+| 1 | 490.6 | 45.8x slower | 1.0x |
+| 2 | 265.0 | 24.8x slower | 1.85x |
+| 4 | 142.6 | 13.3x slower | 3.44x |
+| 8 | 82.7 | 7.7x slower | 5.93x |
+| 16 | 63.7 | 5.9x slower | 7.70x |
+| 32 | 63.5 | 5.9x slower | 7.73x |
+| 64 | 61.6 | 5.7x slower | 7.97x |
+| 128 | 59.4 | 5.5x slower | 8.26x |
+| **256** | **57.0** | **5.3x slower** | **8.61x** |
+| 512 | 58.0 | 5.4x slower | 8.46x |
+| 1024 | 58.0 | 5.4x slower | 8.46x |
+
+**Key Finding**: Performance plateaus at 16 readers (~64ms), best at 256 readers (~57ms).
+
+#### Parallel Writes (256 workers, 1024 files × 4KB, with sync_all)
+
+| Readers | Time (s) | vs Host | Speedup vs 1 Reader |
+|---------|----------|---------|---------------------|
+| Host FS | 0.862 | 1.0x | - |
+| 1 | 3.048 | 3.5x slower | 1.0x |
+| 4 | 2.525 | 2.9x slower | 1.21x |
+| 16 | 2.435 | 2.8x slower | 1.25x |
+| 64 | 2.481 | 2.9x slower | 1.23x |
+| **256** | **2.765** | **3.2x slower** | **1.10x** |
+| 1024 | 2.955 | 3.4x slower | 1.03x |
+
+**Key Finding**: Writes are disk I/O bound (sync_all). Performance peaks at 16 readers but 256 readers is still acceptable.
+
+#### Recommendations
+
+- **Default**: Use **256 readers** - good balance for mixed read/write workloads
+- **FUSE Overhead**: ~5.3x for reads, ~3.2x for writes vs native filesystem
+- **Scaling**: Read performance scales well with readers; write performance is bounded by disk I/O
+
 ### Memory Sharing Architecture
 **Two-Command Workflow:**
 1. **Start memory server** (one per snapshot, runs in foreground):
