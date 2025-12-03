@@ -35,7 +35,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # fuse-backend-rs for passthrough filesystem (Cloud Hypervisor's production-grade FUSE backend)
-fuse-backend-rs = { version = "0.12", default-features = false, features = ["fusedev"] }
+# Using fork with set_creds() fixes for proper POSIX permission checking
+fuse-backend-rs = { git = "https://github.com/ejc3/fuse-backend-rs.git", branch = "creds-for-fuse-pipe", default-features = false, features = ["fusedev"] }
 vm-memory = "0.14"
 
 # Optional: FUSE client (use GitHub fork with multi-reader support via FUSE_DEV_IOC_CLONE)
