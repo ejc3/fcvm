@@ -53,6 +53,9 @@ pub fn mount_with_options<P: AsRef<Path>>(
     mount_with_telemetry(socket_path, mount_point, num_readers, trace_rate, None)
 }
 
+/// Re-export fuser's SessionUnmounter for clean unmount from other threads.
+pub use fuser::SessionUnmounter;
+
 /// Mount a FUSE filesystem with telemetry collection.
 ///
 /// If a `SpanCollector` is provided, trace spans will be collected for later analysis.
@@ -71,6 +74,46 @@ pub fn mount_with_telemetry<P: AsRef<Path>>(
     num_readers: usize,
     trace_rate: u64,
     collector: Option<SpanCollector>,
+) -> anyhow::Result<()> {
+    mount_internal(socket_path, mount_point, num_readers, trace_rate, collector, None)
+}
+
+/// Mount a FUSE filesystem and send back an unmounter handle.
+///
+/// This is the same as `mount_with_readers` but sends a `SessionUnmounter` through
+/// the provided channel before blocking on `session.run()`. The caller can use the
+/// unmounter to cleanly stop the FUSE session from another thread.
+///
+/// # Example
+///
+/// ```ignore
+/// use std::sync::mpsc;
+/// let (tx, rx) = mpsc::channel();
+/// let mount_thread = thread::spawn(move || {
+///     mount_with_unmounter("/tmp/fuse.sock", "/mnt/fuse", 256, tx)
+/// });
+/// let mut unmounter = rx.recv().unwrap();
+/// // ... do work ...
+/// unmounter.unmount().unwrap();  // Clean shutdown
+/// mount_thread.join().unwrap();
+/// ```
+pub fn mount_with_unmounter<P: AsRef<Path>>(
+    socket_path: &str,
+    mount_point: P,
+    num_readers: usize,
+    unmounter_tx: std::sync::mpsc::Sender<SessionUnmounter>,
+) -> anyhow::Result<()> {
+    mount_internal(socket_path, mount_point, num_readers, 0, None, Some(unmounter_tx))
+}
+
+/// Internal mount implementation with optional unmounter channel.
+fn mount_internal<P: AsRef<Path>>(
+    socket_path: &str,
+    mount_point: P,
+    num_readers: usize,
+    trace_rate: u64,
+    collector: Option<SpanCollector>,
+    unmounter_tx: Option<std::sync::mpsc::Sender<SessionUnmounter>>,
 ) -> anyhow::Result<()> {
     info!(target: "fuse-pipe::client", socket_path, num_readers, "connecting");
 
@@ -126,6 +169,12 @@ pub fn mount_with_telemetry<P: AsRef<Path>>(
     if num_readers == 1 {
         let mut session = mount_with_options(&options)?;
         info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), "mounted");
+
+        // Send unmounter before blocking on run()
+        if let Some(tx) = unmounter_tx {
+            let _ = tx.send(session.unmount_callable());
+        }
+
         if let Err(e) = session.run() {
             error!(target: "fuse-pipe::client", reader_id = 0, error = %e, "reader error");
         }
@@ -187,6 +236,12 @@ pub fn mount_with_telemetry<P: AsRef<Path>>(
 
     let actual_readers = num_readers - clone_failures;
     info!(target: "fuse-pipe::client", actual_readers, cloned_fds = actual_readers - 1, "FUSE session starting");
+
+    // Send unmounter before blocking on run()
+    if let Some(tx) = unmounter_tx {
+        let _ = tx.send(session.unmount_callable());
+    }
+
     if let Err(e) = session.run() {
         error!(target: "fuse-pipe::client", reader_id = 0, error = %e, "reader error");
     }
