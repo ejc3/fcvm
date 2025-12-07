@@ -256,13 +256,12 @@ fn test_nonroot_user_mkdir_in_owned_directory() {
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
     let mount = fuse.mount_path();
 
-    // Skip if not running as root (required for chown and credential tests)
-    if unsafe { libc::geteuid() } != 0 {
-        eprintln!("[skip] test_nonroot_user_mkdir_in_owned_directory requires root");
-        drop(fuse);
-        cleanup(&data_dir, &mount_dir);
-        return;
-    }
+    // Require root for chown and credential tests
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "test_nonroot_user_mkdir_in_owned_directory requires root"
+    );
 
     // Create a test directory as root
     let test_dir = mount.join("cred_test");
@@ -316,7 +315,7 @@ fn test_nonroot_user_mkdir_in_owned_directory() {
         // Cleanup
         fs::remove_dir(&subdir).expect("remove subdir");
     } else {
-        eprintln!("[skip] pjdfstest not found at {:?}", pjdfstest_bin);
+        panic!("pjdfstest not found at {:?}", pjdfstest_bin);
     }
 
     fs::remove_dir(&test_dir).expect("remove test_dir");
@@ -359,13 +358,13 @@ fn test_nonroot_mkdir_with_readers(num_readers: usize) {
     let fuse = FuseMount::new(&data_dir, &mount_dir, num_readers);
     let mount = fuse.mount_path();
 
-    // Skip if not running as root
-    if unsafe { libc::geteuid() } != 0 {
-        eprintln!("[skip] test with {} readers requires root", num_readers);
-        drop(fuse);
-        cleanup(&data_dir, &mount_dir);
-        return;
-    }
+    // Require root
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "test with {} readers requires root",
+        num_readers
+    );
 
     // Create work directory as root with mode 0777 (exactly like pjdfstest)
     let work_dir = mount.join("pjdfs_work");
@@ -412,7 +411,7 @@ fn test_nonroot_mkdir_with_readers(num_readers: usize) {
         // Cleanup if it succeeded
         let _ = fs::remove_dir(&subdir);
     } else {
-        eprintln!("[skip] pjdfstest not found at {:?}", pjdfstest_bin);
+        panic!("pjdfstest not found at {:?}", pjdfstest_bin);
     }
 
     let _ = fs::remove_dir(&work_dir);
@@ -424,11 +423,12 @@ fn test_nonroot_mkdir_with_readers(num_readers: usize) {
 /// This directly tests the setresuid/setresgid syscalls used by fuse-backend-rs.
 #[test]
 fn test_credential_switching_in_thread() {
-    // Skip if not running as root
-    if unsafe { libc::geteuid() } != 0 {
-        eprintln!("[skip] test_credential_switching_in_thread requires root");
-        return;
-    }
+    // Require root
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "test_credential_switching_in_thread requires root"
+    );
 
     // Test that we can switch credentials in a spawned thread
     let result = std::thread::spawn(|| {

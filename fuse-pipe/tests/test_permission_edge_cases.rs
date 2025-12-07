@@ -121,13 +121,9 @@ fn pjdfstest_in_dir_impl(dir: &std::path::Path, args: &[&str], strace: bool) -> 
     (code, stdout)
 }
 
-fn require_root() -> bool {
-    if unsafe { libc::geteuid() } != 0 {
-        eprintln!("[skip] Test requires root");
-        return false;
-    }
+fn require_root() {
+    assert_eq!(unsafe { libc::geteuid() }, 0, "Test requires root");
     init_ulimit();
-    true
 }
 
 // =============================================================================
@@ -144,7 +140,7 @@ fn require_root() -> bool {
 /// Expected: EACCES (permission denied due to no search permission in parent)
 #[test]
 fn test_chmod_parent_dir_search_denied() {
-    if !require_root() { return; }
+    require_root();
 
     let (data_dir, mount_dir) = unique_paths();
     let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
@@ -189,7 +185,7 @@ fn test_chmod_parent_dir_search_denied() {
 /// 3. File mode should become 0777 (SUID cleared)
 #[test]
 fn test_write_clears_suid() {
-    if !require_root() { return; }
+    require_root();
 
     let (data_dir, mount_dir) = unique_paths();
     let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
@@ -230,7 +226,7 @@ fn test_write_clears_suid() {
 /// chmod/12.t: Writing to SGID file should clear SGID bit
 #[test]
 fn test_write_clears_sgid() {
-    if !require_root() { return; }
+    require_root();
 
     let (data_dir, mount_dir) = unique_paths();
     let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
@@ -266,7 +262,7 @@ fn test_write_clears_sgid() {
 /// chmod/12.t: Writing to SUID+SGID file should clear both bits
 #[test]
 fn test_write_clears_suid_and_sgid() {
-    if !require_root() { return; }
+    require_root();
 
     let (data_dir, mount_dir) = unique_paths();
     let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
@@ -307,7 +303,7 @@ fn test_write_clears_suid_and_sgid() {
 /// This works because the kernel sees the primary group via setfsgid.
 #[test]
 fn test_chown_owner_changes_group_to_primary() {
-    if !require_root() { return; }
+    require_root();
 
     let (data_dir, mount_dir) = unique_paths();
     let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
@@ -340,7 +336,7 @@ fn test_chown_owner_changes_group_to_primary() {
 /// This test changes to 65532 (primary) which should always work.
 #[test]
 fn test_chown_owner_changes_group_to_member() {
-    if !require_root() { return; }
+    require_root();
 
     let (data_dir, mount_dir) = unique_paths();
     let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
@@ -383,7 +379,7 @@ fn test_chown_owner_changes_group_to_member() {
 /// reads the caller's groups from /proc and adopts them, so chown succeeds.
 #[test]
 fn test_chown_supplementary_group_works() {
-    if !require_root() { return; }
+    require_root();
 
     let (data_dir, mount_dir) = unique_paths();
     let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
@@ -414,7 +410,7 @@ fn test_chown_supplementary_group_works() {
 /// chown/07.t: Non-owner cannot chown
 #[test]
 fn test_chown_non_owner_fails() {
-    if !require_root() { return; }
+    require_root();
 
     let (data_dir, mount_dir) = unique_paths();
     let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
@@ -444,7 +440,7 @@ fn test_chown_non_owner_fails() {
 /// open/06.t: O_RDONLY on file with no read permission should fail
 #[test]
 fn test_open_eacces_read_denied() {
-    if !require_root() { return; }
+    require_root();
 
     let (data_dir, mount_dir) = unique_paths();
     let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
@@ -473,7 +469,7 @@ fn test_open_eacces_read_denied() {
 /// open/08.t: O_CREAT in directory without write permission should fail
 #[test]
 fn test_open_creat_dir_not_writable() {
-    if !require_root() { return; }
+    require_root();
 
     let (data_dir, mount_dir) = unique_paths();
     let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
@@ -507,7 +503,7 @@ fn test_open_creat_dir_not_writable() {
 /// truncate/05.t: Search permission denied in parent directory
 #[test]
 fn test_truncate_parent_dir_search_denied() {
-    if !require_root() { return; }
+    require_root();
 
     let (data_dir, mount_dir) = unique_paths();
     let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
@@ -546,7 +542,7 @@ fn test_truncate_parent_dir_search_denied() {
 /// even if file mode is 0
 #[test]
 fn test_ftruncate_on_rdwr_fd_mode_zero() {
-    if !require_root() { return; }
+    require_root();
 
     let (data_dir, mount_dir) = unique_paths();
     let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
@@ -624,7 +620,7 @@ fn test_ftruncate_on_rdwr_fd_mode_zero() {
 /// not ok 7 - tried '-u 65534 -g 65534 link dir1/file dir2/link', expected 0, got ENOENT
 #[test]
 fn test_link_between_user_owned_dirs() {
-    if !require_root() { return; }
+    require_root();
 
     let (data_dir, mount_dir) = unique_paths();
     let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
@@ -688,7 +684,7 @@ fn test_link_between_user_owned_dirs() {
 /// link/07.t: link into directory without write permission should fail
 #[test]
 fn test_link_dir_not_writable() {
-    if !require_root() { return; }
+    require_root();
 
     let (data_dir, mount_dir) = unique_paths();
     let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
@@ -736,7 +732,7 @@ fn test_link_dir_not_writable() {
 /// This works on the host filesystem but fails on FUSE.
 #[test]
 fn test_deep_directory_removal() {
-    if !require_root() { return; }
+    require_root();
 
     let (data_dir, mount_dir) = unique_paths();
     let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
@@ -806,7 +802,7 @@ fn test_deep_directory_removal() {
 /// - Path is built up to PATH_MAX-1 (4095 chars)
 #[test]
 fn test_path_max_directory_removal() {
-    if !require_root() { return; }
+    require_root();
 
     let (data_dir, mount_dir) = unique_paths();
     let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
@@ -900,7 +896,7 @@ fn test_path_max_directory_removal() {
 /// the operations succeed without interference.
 #[test]
 fn test_concurrent_supplementary_groups_no_race() {
-    if !require_root() { return; }
+    require_root();
 
     use std::sync::{Arc, Barrier};
     use std::thread;

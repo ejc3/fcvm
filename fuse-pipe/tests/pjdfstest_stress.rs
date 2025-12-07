@@ -300,8 +300,7 @@ fn run_stress_suite(use_host_fs: bool) -> bool {
     println!();
 
     if !Path::new(PJDFSTEST_BIN).exists() {
-        eprintln!("pjdfstest not found at {}. Skipping.", PJDFSTEST_BIN);
-        return true; // Don't fail, just skip
+        panic!("pjdfstest not found at {}", PJDFSTEST_BIN);
     }
 
     let pid = std::process::id();
