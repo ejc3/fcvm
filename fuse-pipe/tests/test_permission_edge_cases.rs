@@ -722,6 +722,170 @@ fn test_link_dir_not_writable() {
 }
 
 // =============================================================================
+// PATH_MAX / DEEP DIRECTORY TESTS
+// =============================================================================
+
+/// Test recursive removal of deeply nested directories.
+///
+/// This test reproduces the pjdfstest 03.t cleanup failure where `rm -rf`
+/// on PATH_MAX-length paths fails on FUSE but succeeds on the host filesystem.
+///
+/// The 03.t tests (chmod/03.t, chown/03.t, etc.) create paths up to PATH_MAX (4096 chars)
+/// to test ENAMETOOLONG error handling. At the end of each test, they clean up with:
+///   rm -rf "${nx%%/*}"
+/// This works on the host filesystem but fails on FUSE.
+#[test]
+fn test_deep_directory_removal() {
+    if !require_root() { return; }
+
+    let (data_dir, mount_dir) = unique_paths();
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
+    let mount = fuse.mount_path();
+
+    // Create a deeply nested directory structure (30 levels)
+    // Each component is short (6 chars + separator) to avoid hitting NAME_MAX
+    let mut current = mount.to_path_buf();
+    for i in 1..=30 {
+        current = current.join(format!("dir_{}", i));
+    }
+
+    eprintln!("Creating deep directory: {}", current.display());
+    eprintln!("Path length: {}", current.to_str().unwrap().len());
+
+    fs::create_dir_all(&current).expect("create deep directory structure");
+
+    // Create a file at the bottom
+    let deep_file = current.join("testfile");
+    fs::write(&deep_file, "test content").expect("create deep file");
+    assert!(deep_file.exists(), "deep file should exist");
+
+    // Get the top-level directory we created
+    let top_dir = mount.join("dir_1");
+    assert!(top_dir.exists(), "top directory should exist");
+
+    // Now try to remove the entire structure with rm -rf
+    // This is what pjdfstest cleanup does and what fails on FUSE
+    let output = std::process::Command::new("rm")
+        .args(["-rf", top_dir.to_str().unwrap()])
+        .output()
+        .expect("run rm -rf");
+
+    let success = output.status.success();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !success {
+        eprintln!("rm -rf failed: {}", stderr);
+        eprintln!("Exit code: {:?}", output.status.code());
+    }
+
+    // Verify the directory was removed
+    let dir_still_exists = top_dir.exists();
+    if dir_still_exists {
+        eprintln!("ERROR: Directory still exists after rm -rf!");
+        // Try to list what's left
+        if let Ok(entries) = fs::read_dir(&top_dir) {
+            for entry in entries.take(5) {
+                if let Ok(e) = entry {
+                    eprintln!("  Remaining: {:?}", e.path());
+                }
+            }
+        }
+    }
+
+    assert!(success, "rm -rf should succeed, got exit code {:?}", output.status.code());
+    assert!(!dir_still_exists, "directory should be removed after rm -rf");
+
+    drop(fuse);
+    cleanup(&data_dir, &mount_dir);
+}
+
+/// Test removal of PATH_MAX-length paths (matching pjdfstest dirgen_max).
+///
+/// This matches the exact structure created by pjdfstest's dirgen_max() function:
+/// - Components are NAME_MAX/2 characters long (127 chars typically)
+/// - Path is built up to PATH_MAX-1 (4095 chars)
+#[test]
+fn test_path_max_directory_removal() {
+    if !require_root() { return; }
+
+    let (data_dir, mount_dir) = unique_paths();
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
+    let mount = fuse.mount_path();
+
+    // Match pjdfstest dirgen_max: component length = NAME_MAX/2 = 127 chars
+    // Build path up to PATH_MAX-1 = 4095 chars
+    const NAME_MAX: usize = 255;
+    const PATH_MAX: usize = 4096;
+    let comp_len = NAME_MAX / 2;
+
+    // Generate a component of comp_len 'x' characters
+    let component: String = std::iter::repeat('x').take(comp_len).collect();
+
+    let mut path = mount.to_path_buf();
+    let mut path_len = path.to_str().unwrap().len();
+    let mut depth = 0;
+
+    // Build path up to PATH_MAX
+    while path_len + comp_len + 1 < PATH_MAX {
+        path = path.join(&component);
+        path_len = path.to_str().unwrap().len();
+        depth += 1;
+    }
+
+    eprintln!("Creating PATH_MAX structure:");
+    eprintln!("  Component length: {} chars", comp_len);
+    eprintln!("  Depth: {} levels", depth);
+    eprintln!("  Total path length: {} chars", path_len);
+
+    // Create the directory structure
+    fs::create_dir_all(&path).expect("create PATH_MAX directory structure");
+
+    // Create a file at the bottom
+    let deep_file = path.join("f");
+    fs::write(&deep_file, "x").expect("create file at PATH_MAX depth");
+    assert!(deep_file.exists(), "deep file should exist");
+
+    // Get the top-level component
+    let top_dir = mount.join(&component);
+    assert!(top_dir.exists(), "top directory should exist");
+
+    eprintln!("Attempting rm -rf on: {}", top_dir.display());
+
+    // Try rm -rf (this is what fails in pjdfstest 03.t cleanup)
+    let output = std::process::Command::new("rm")
+        .args(["-rf", top_dir.to_str().unwrap()])
+        .output()
+        .expect("run rm -rf");
+
+    let success = output.status.success();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !success {
+        eprintln!("rm -rf FAILED:");
+        eprintln!("  Exit code: {:?}", output.status.code());
+        eprintln!("  Stderr: {}", stderr);
+
+        // Debug: check what errors FUSE is returning
+        // Try to manually unlink the deep file
+        if deep_file.exists() {
+            let unlink_result = fs::remove_file(&deep_file);
+            eprintln!("  Manual unlink of deep file: {:?}", unlink_result);
+        }
+    }
+
+    let dir_still_exists = top_dir.exists();
+    if dir_still_exists {
+        eprintln!("Directory still exists after rm -rf!");
+    }
+
+    assert!(success, "rm -rf should succeed for PATH_MAX directories");
+    assert!(!dir_still_exists, "PATH_MAX directory should be removed after rm -rf");
+
+    drop(fuse);
+    cleanup(&data_dir, &mount_dir);
+}
+
+// =============================================================================
 // THREAD SAFETY / RACE CONDITION TESTS
 // =============================================================================
 

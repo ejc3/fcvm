@@ -16,7 +16,7 @@
 
 use super::handler::FilesystemHandler;
 use super::zerocopy::{SliceReader, VecWriter};
-use crate::protocol::{file_type, DirEntry, DirEntryPlus, FileAttr, VolumeResponse};
+use crate::protocol::{DirEntry, DirEntryPlus, FileAttr, VolumeResponse};
 
 use fuse_backend_rs::abi::fuse_abi::CreateIn;
 use fuse_backend_rs::api::filesystem::{Context, Entry, FileSystem, SetattrValid};
@@ -310,10 +310,12 @@ impl FilesystemHandler for PassthroughFs {
 
             // Skip . and .. as we add them manually for offset 0
             if name_str != "." && name_str != ".." {
+                // Note: entry.type_ is already a d_type value (like DT_DIR=4),
+                // NOT a mode value (like S_IFDIR=0o40000). Use it directly.
                 entries.push(DirEntry {
                     ino: entry.ino,
                     name: name_str,
-                    file_type: file_type::from_mode(entry.type_),
+                    file_type: entry.type_ as u8,
                 });
             }
             Ok(1)
