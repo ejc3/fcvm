@@ -83,10 +83,29 @@ fn discover_categories() -> Vec<String> {
     categories
 }
 
-fn run_category(category: &str, mount_dir: &Path, jobs: usize) -> CategoryResult {
+fn run_category(category: &str, mount_dir: &Path, jobs: usize, is_fuse: bool) -> CategoryResult {
     let start = std::time::Instant::now();
     let tests_dir = Path::new(PJDFSTEST_TESTS);
     let category_tests = tests_dir.join(category);
+
+    // Safety check: If running FUSE tests, verify we're actually on FUSE filesystem
+    if is_fuse {
+        let marker = mount_dir.join(".fuse-pipe-test-marker");
+        if !marker.exists() {
+            return CategoryResult {
+                category: category.to_string(),
+                passed: false,
+                tests: 0,
+                failures: 0,
+                duration_secs: start.elapsed().as_secs_f64(),
+                output: format!(
+                    "FATAL: Test directory is NOT on FUSE filesystem! Marker {} not found. \
+                     This likely means tests would run on host filesystem instead of FUSE.",
+                    marker.display()
+                ),
+            };
+        }
+    }
 
     let work_dir = mount_dir.join(category);
     let _ = fs::remove_dir_all(&work_dir);
@@ -353,6 +372,14 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
             return false;
         }
         info!(target: TARGET, mount = %mount_dir.display(), "FUSE mounted successfully");
+
+        // Create marker file to verify tests run on FUSE, not accidentally on host
+        let marker = mount_dir.join(".fuse-pipe-test-marker");
+        if let Err(e) = fs::write(&marker, "fuse-pipe") {
+            error!(target: TARGET, error = %e, "Failed to create FUSE marker file");
+            return false;
+        }
+
         std::thread::sleep(Duration::from_millis(300));
 
         // Keep mount alive for test execution; cleaned up after results are gathered.
@@ -375,13 +402,14 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
     let total = categories.len();
     let mut results = Vec::with_capacity(total);
 
+    let is_fuse = !use_host_fs;
     for (idx, category) in categories.iter().enumerate() {
         debug!(target: TARGET, category = %category, "Starting test category");
         let (tx, rx) = mpsc::channel();
         let cat = category.clone();
         let mount_for_thread = mount_dir.clone();
         thread::spawn(move || {
-            let result = run_category(&cat, &mount_for_thread, jobs);
+            let result = run_category(&cat, &mount_for_thread, jobs, is_fuse);
             let _ = tx.send(result);
         });
 
@@ -473,9 +501,19 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
         println!("\nFailed categories: {:?}", failed_categories);
 
         for result in results.iter() {
-            if !result.passed && result.output.len() < 5000 {
-                println!("\n━━━ {} output ━━━", result.category);
-                println!("{}", result.output);
+            if !result.passed {
+                println!("\n━━━ {} output (failures only) ━━━", result.category);
+                // Print only failure-related lines to avoid flooding output
+                // while still showing all failures regardless of output size
+                for line in result.output.lines() {
+                    if line.contains("not ok")
+                        || line.contains("Failed")
+                        || line.contains("expected")
+                        || line.contains("got ")
+                    {
+                        println!("{}", line);
+                    }
+                }
             }
         }
 

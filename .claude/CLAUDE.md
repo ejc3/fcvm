@@ -16,6 +16,7 @@ fcvm is a Firecracker VM manager for running Podman containers in lightweight mi
 ### Common Commands
 ```bash
 # Build and deploy
+make sync         # Sync fcvm + fuse-backend-rs to EC2 (ALWAYS use this, not git)
 make build        # Sync + build fcvm + fc-agent on EC2
 make test         # Run sanity test
 make rebuild      # Full rebuild including rootfs update
@@ -28,6 +29,78 @@ fcvm snapshot create --pid <vm_pid> --tag my-snapshot
 fcvm snapshot serve my-snapshot      # Start UFFD server (prints serve PID)
 fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
 ```
+
+### Code Sync Strategy
+
+**ALWAYS use `make sync` to sync code to EC2.** Never use git pull on EC2.
+
+The Makefile syncs both:
+1. `fcvm` - the main project
+2. `fuse-backend-rs` - the FUSE backend library (local fork at `../fuse-backend-rs`)
+
+The `fuse-pipe/Cargo.toml` uses a local path dependency:
+```toml
+fuse-backend-rs = { path = "../../fuse-backend-rs", ... }
+```
+
+This ensures changes to fuse-backend-rs are immediately available without git commits.
+
+### Monitoring Long-Running Tests
+
+When tailing logs from EC2, check every **20 seconds** (not 5, not 60):
+```bash
+# Good - check every 20 seconds
+sleep 20 && ssh -i ~/.ssh/fcvm-ec2 ubuntu@54.67.60.104 "tail -20 /tmp/test.log"
+
+# Bad - too frequent (wastes API calls)
+sleep 5 && ...
+
+# Bad - too slow (miss important output)
+sleep 60 && ...
+```
+
+### Debugging fuse-pipe Tests
+
+**ALWAYS run tests with debug logging enabled when debugging issues:**
+
+```bash
+# Run single test with debug logging
+sudo RUST_LOG=debug cargo test --release -p fuse-pipe --test test_permission_edge_cases test_write_clears_suid -- --nocapture
+
+# Run all permission tests with debug logging
+sudo RUST_LOG=debug cargo test --release -p fuse-pipe --test test_permission_edge_cases -- --nocapture --test-threads=1
+
+# Filter to specific components
+sudo RUST_LOG="passthrough=debug,fuse_pipe=debug" cargo test ...
+
+# Debug fuse-backend-rs internals
+sudo RUST_LOG="fuse_backend_rs=debug" cargo test ...
+```
+
+**Tracing targets:**
+- `passthrough` - fuse-pipe passthrough operations
+- `fuse_pipe` - fuse-pipe client/server
+- `fuse_backend_rs` - fuse-backend-rs internals (uses `log` crate, bridged via tracing-log)
+
+### Debugging Protocol Issues (ftruncate example)
+
+When a FUSE operation fails unexpectedly, trace the full path from kernel to fuse-backend-rs:
+
+1. **Add debug logging to passthrough handler** to see what parameters arrive:
+   ```rust
+   debug!(target: "passthrough", "setattr inode={} handle={:?} valid={:?}", inode, handle, valid);
+   ```
+
+2. **Run test with logging** to see the actual values:
+   ```bash
+   RUST_LOG='passthrough=debug' sudo -E cargo test ... -- --nocapture
+   ```
+
+3. **Check if kernel sends parameter but protocol drops it** - e.g., `handle=None` when it should be `Some(1)` means the protocol layer isn't passing it through.
+
+4. **Trace the path**: kernel → fuser → fuse-pipe client (`_fh` unused?) → protocol message → handler → passthrough → fuse-backend-rs
+
+This pattern found the ftruncate bug: kernel sends `FATTR_FH` with file handle, but fuse-pipe's `VolumeRequest::Setattr` didn't have an `fh` field.
 
 ## PID-Based Process Management
 

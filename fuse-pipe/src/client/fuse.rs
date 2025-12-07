@@ -174,7 +174,7 @@ impl Filesystem for FuseClient {
         atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
-        _fh: Option<u64>,
+        fh: Option<u64>,
         _crtime: Option<std::time::SystemTime>,
         _chgtime: Option<std::time::SystemTime>,
         _bkuptime: Option<std::time::SystemTime>,
@@ -213,6 +213,7 @@ impl Filesystem for FuseClient {
             mtime_secs,
             mtime_nsecs,
             mtime_now,
+            fh,
             caller_uid: req.uid(),
             caller_gid: req.gid(),
             caller_pid: req.pid(),
@@ -382,7 +383,7 @@ impl Filesystem for FuseClient {
 
     fn read(
         &mut self,
-        _req: &Request,
+        req: &Request,
         ino: u64,
         fh: u64,
         offset: i64,
@@ -396,6 +397,9 @@ impl Filesystem for FuseClient {
             fh,
             offset: offset as u64,
             size,
+            uid: req.uid(),
+            gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {
@@ -407,7 +411,7 @@ impl Filesystem for FuseClient {
 
     fn write(
         &mut self,
-        _req: &Request,
+        req: &Request,
         ino: u64,
         fh: u64,
         offset: i64,
@@ -422,6 +426,9 @@ impl Filesystem for FuseClient {
             fh,
             offset: offset as u64,
             data: data.to_vec(),
+            uid: req.uid(),
+            gid: req.gid(),
+            pid: req.pid(),
         });
 
         match response {
