@@ -46,17 +46,17 @@ impl FileAttr {
 
     /// Check if this is a directory.
     pub fn is_dir(&self) -> bool {
-        (self.mode & libc::S_IFMT as u32) == libc::S_IFDIR as u32
+        (self.mode & libc::S_IFMT) == libc::S_IFDIR
     }
 
     /// Check if this is a regular file.
     pub fn is_file(&self) -> bool {
-        (self.mode & libc::S_IFMT as u32) == libc::S_IFREG as u32
+        (self.mode & libc::S_IFMT) == libc::S_IFREG
     }
 
     /// Check if this is a symbolic link.
     pub fn is_symlink(&self) -> bool {
-        (self.mode & libc::S_IFMT as u32) == libc::S_IFLNK as u32
+        (self.mode & libc::S_IFMT) == libc::S_IFLNK
     }
 }
 
@@ -116,14 +116,14 @@ pub mod file_type {
 
     /// Convert from stat mode to file type.
     pub fn from_mode(mode: u32) -> u8 {
-        match mode & libc::S_IFMT as u32 {
-            x if x == libc::S_IFDIR as u32 => DIR,
-            x if x == libc::S_IFREG as u32 => REG,
-            x if x == libc::S_IFLNK as u32 => LNK,
-            x if x == libc::S_IFCHR as u32 => CHR,
-            x if x == libc::S_IFBLK as u32 => BLK,
-            x if x == libc::S_IFIFO as u32 => FIFO,
-            x if x == libc::S_IFSOCK as u32 => SOCK,
+        match mode & libc::S_IFMT {
+            x if x == libc::S_IFDIR => DIR,
+            x if x == libc::S_IFREG => REG,
+            x if x == libc::S_IFLNK => LNK,
+            x if x == libc::S_IFCHR => CHR,
+            x if x == libc::S_IFBLK => BLK,
+            x if x == libc::S_IFIFO => FIFO,
+            x if x == libc::S_IFSOCK => SOCK,
             _ => UNKNOWN,
         }
     }

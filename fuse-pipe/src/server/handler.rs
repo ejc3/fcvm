@@ -1,5 +1,8 @@
 //! Filesystem handler trait for FUSE operations.
 
+// Allow many arguments - FUSE operations have fixed parameter sets
+#![allow(clippy::too_many_arguments)]
+
 use crate::protocol::{VolumeRequest, VolumeResponse};
 
 /// Handler for FUSE filesystem operations.

@@ -5,6 +5,9 @@
 //!
 //! Run with: `sudo cargo test --test test_permission_edge_cases -- --nocapture`
 
+// Allow unused variables - test code often has unused return values
+#![allow(unused_variables)]
+
 mod common;
 
 use std::fs;
@@ -137,6 +140,7 @@ fn require_root() -> bool {
 /// 1. Create directory, create file owned by user 65534
 /// 2. Remove execute permission from parent dir (chmod 0644)
 /// 3. As user 65534, try to chmod the file
+///
 /// Expected: EACCES (permission denied due to no search permission in parent)
 #[test]
 fn test_chmod_parent_dir_search_denied() {

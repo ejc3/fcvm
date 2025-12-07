@@ -117,7 +117,7 @@ impl PassthroughFs {
             ctime_secs: attr.st_ctime,
             ctime_nsecs: attr.st_ctime_nsec as u32,
             mode: attr.st_mode,
-            nlink: attr.st_nlink as u32,
+            nlink: attr.st_nlink,
             uid: attr.st_uid,
             gid: attr.st_gid,
             rdev: attr.st_rdev as u32,
@@ -138,7 +138,7 @@ impl PassthroughFs {
             ctime_secs: st.st_ctime,
             ctime_nsecs: st.st_ctime_nsec as u32,
             mode: st.st_mode,
-            nlink: st.st_nlink as u32,
+            nlink: st.st_nlink,
             uid: st.st_uid,
             gid: st.st_gid,
             rdev: st.st_rdev as u32,
@@ -262,7 +262,7 @@ impl FilesystemHandler for PassthroughFs {
         // Convert fh to Handle type for fuse-backend-rs
         // When fh is present (ftruncate), the passthrough layer uses the already-opened
         // fd which doesn't re-check permissions - this is correct POSIX behavior.
-        let handle = fh.map(|h| h.into());
+        let handle = fh;
 
         // Delegate to fuse-backend-rs which handles credential switching internally
         match self.inner.setattr(&ctx, ino, attr, handle, valid) {
@@ -313,7 +313,7 @@ impl FilesystemHandler for PassthroughFs {
                 entries.push(DirEntry {
                     ino: entry.ino,
                     name: name_str,
-                    file_type: file_type::from_mode(entry.type_ as u32),
+                    file_type: file_type::from_mode(entry.type_),
                 });
             }
             Ok(1)
@@ -921,7 +921,7 @@ impl FilesystemHandler for PassthroughFs {
 
         match self.inner.lseek(&ctx, ino, fh, offset_u64, whence) {
             Ok(new_offset) => VolumeResponse::Lseek {
-                offset: new_offset as u64,
+                offset: new_offset,
             },
             Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
         }
