@@ -116,12 +116,14 @@ src/
 │   ├── slirp.rs      # SlirpNetwork (rootless)
 │   └── bridged.rs    # BridgedNetwork
 ├── storage/          # Disk/snapshot management
-├── readiness/        # Readiness gates
+├── health.rs         # Health monitoring
+├── uffd/             # UFFD memory sharing
 └── setup/            # Setup subcommands
 
 tests/
 ├── common/mod.rs     # Shared test utilities
-└── test_cli_parsing.rs
+├── test_sanity.rs    # End-to-end sanity tests
+└── test_state_manager.rs
 ```
 
 ### Design Principles
@@ -135,7 +137,7 @@ tests/
 
 1. **Core Implementation** (2025-11-09)
    - Firecracker API client using hyper + hyperlocal (Unix sockets)
-   - Dual networking modes: bridged (nftables) + rootless (slirp4netns)
+   - Dual networking modes: bridged (iptables) + rootless (slirp4netns)
    - Storage layer with btrfs CoW disk management
    - VM state persistence
    - Guest agent (fc-agent) with MMDS integration
@@ -149,7 +151,7 @@ tests/
    - **Performance**: Original VM + 2 clones = ~512MB RAM total (not 1.5GB!)
 
 3. **True Rootless Networking** (2025-11-25)
-   - `--network bridged` (default): Linux bridge + nftables, requires root
+   - `--network bridged` (default): Network namespace + iptables, requires root
    - `--network rootless`: slirp4netns, no root required
    - User namespace via `unshare --user --map-root-user --net`
    - Health checks use unique loopback IPs (127.x.y.z) per VM
@@ -174,34 +176,19 @@ tests/
 
 | Mode | Flag | Requires Root | Performance | Port Forwarding |
 |------|------|---------------|-------------|-----------------|
-| Bridged | `--network bridged` | Yes | Better | nftables DNAT |
+| Bridged | `--network bridged` | Yes | Better | iptables DNAT |
 | Rootless | `--network rootless` | No | Good | slirp4netns API |
 
 **Rootless Architecture:**
 - Firecracker starts with `unshare --user --map-root-user --net`
 - slirp4netns connects to the namespace via PID, creates TAP device
-- Guest IP: 10.0.2.15, Gateway: 10.0.2.2 (slirp4netns defaults)
+- Dual-TAP design: slirp0 (10.0.2.x) for slirp4netns, tap0 (192.168.x.x) for Firecracker
 - Port forwarding via slirp4netns JSON-RPC API socket
 - Health checks use unique loopback IPs (127.x.y.z) per VM
 
-```rust
-// src/network/slirp.rs - generate_loopback_ip()
-fn generate_loopback_ip(vm_id: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    vm_id.hash(&mut hasher);
-    let hash = hasher.finish();
-
-    let second = ((hash >> 0) & 0xFF) as u8;
-    let third = ((hash >> 8) & 0xFF) as u8;
-    let fourth = ((hash >> 16) & 0xFF) as u8;
-
-    // Avoid 127.0.0.0 and 127.0.0.1
-    let second = if second == 0 { 1 } else { second };
-    let fourth = if second == 0 && third == 0 && fourth <= 1 { 2 } else { fourth };
-
-    format!("127.{}.{}.{}", second, third, fourth)
-}
-```
+**Loopback IP Allocation** (`src/state/manager.rs`):
+- Sequential allocation: 127.0.0.2, 127.0.0.3, ..., 127.0.0.254, then 127.0.1.2, etc.
+- Lock-protected with persistence to avoid conflicts
 
 ### btrfs CoW Reflinks
 
