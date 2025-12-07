@@ -162,10 +162,7 @@ fn run_single_instance(
             let combined = format!("{}\n{}", stdout, stderr);
 
             let (tests, failures) = parse_prove_output(&combined);
-            // Only check for actual test failures, not script exit codes.
-            // The 03.t tests (ENAMETOOLONG) exit with code 1 even when all subtests pass
-            // because their cleanup fails on very long paths.
-            let passed = failures == 0;
+            let passed = out.status.success() && failures == 0;
 
             debug!(
                 target: TARGET,
