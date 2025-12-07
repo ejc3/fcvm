@@ -9,6 +9,8 @@ RSYNC := rsync -avz --delete --exclude 'target' --exclude '.git' -e "ssh -i $(EC
 # Remote paths
 REMOTE_DIR := ~/fcvm
 REMOTE_KERNEL_DIR := ~/linux-firecracker
+REMOTE_FUSE_BACKEND_RS := ~/fuse-backend-rs
+LOCAL_FUSE_BACKEND_RS := ../fuse-backend-rs
 
 # Local output directory for downloaded artifacts
 ARTIFACTS := artifacts
@@ -55,8 +57,10 @@ help:
 # Code sync
 #
 sync:
-	@echo "==> Syncing code to EC2..."
+	@echo "==> Syncing fcvm to EC2..."
 	$(RSYNC) . $(EC2_HOST):$(REMOTE_DIR)/
+	@echo "==> Syncing fuse-backend-rs to EC2..."
+	$(RSYNC) $(LOCAL_FUSE_BACKEND_RS)/ $(EC2_HOST):$(REMOTE_FUSE_BACKEND_RS)/
 
 #
 # Remote builds (on EC2)

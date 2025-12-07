@@ -204,6 +204,7 @@ impl FilesystemHandler for PassthroughFs {
         mtime_secs: Option<i64>,
         mtime_nsecs: Option<u32>,
         mtime_now: bool,
+        fh: Option<u64>,
         caller_uid: u32,
         caller_gid: u32,
         caller_pid: u32,
@@ -258,8 +259,13 @@ impl FilesystemHandler for PassthroughFs {
             attr.st_mtime_nsec = mtime_nsecs.map(|n| n as i64).unwrap_or(0);
         }
 
+        // Convert fh to Handle type for fuse-backend-rs
+        // When fh is present (ftruncate), the passthrough layer uses the already-opened
+        // fd which doesn't re-check permissions - this is correct POSIX behavior.
+        let handle = fh.map(|h| h.into());
+
         // Delegate to fuse-backend-rs which handles credential switching internally
-        match self.inner.setattr(&ctx, ino, attr, None, valid) {
+        match self.inner.setattr(&ctx, ino, attr, handle, valid) {
             Ok((new_st, _timeout)) => {
                 let result_attr = Self::stat_to_attr(ino, &new_st);
                 VolumeResponse::Attr {
@@ -513,8 +519,17 @@ impl FilesystemHandler for PassthroughFs {
         }
     }
 
-    fn read(&self, ino: u64, fh: u64, offset: u64, size: u32) -> VolumeResponse {
-        let ctx = Context::new();
+    fn read(
+        &self,
+        ino: u64,
+        fh: u64,
+        offset: u64,
+        size: u32,
+        uid: u32,
+        gid: u32,
+        pid: u32,
+    ) -> VolumeResponse {
+        let ctx = Self::make_context(uid, gid, pid);
         let mut writer = VecWriter::new(size as usize);
 
         match self.inner.read(&ctx, ino, fh, &mut writer, size, offset, None, 0) {
@@ -525,11 +540,20 @@ impl FilesystemHandler for PassthroughFs {
         }
     }
 
-    fn write(&self, ino: u64, fh: u64, offset: u64, data: &[u8]) -> VolumeResponse {
-        let ctx = Context::new();
+    fn write(
+        &self,
+        ino: u64,
+        fh: u64,
+        offset: u64,
+        data: &[u8],
+        uid: u32,
+        gid: u32,
+        pid: u32,
+    ) -> VolumeResponse {
+        let ctx = Self::make_context(uid, gid, pid);
         let mut reader = SliceReader::new(data);
 
-        tracing::debug!(target: "passthrough", ino, fh, offset, len = data.len(), "write");
+        tracing::debug!(target: "passthrough", ino, fh, offset, len = data.len(), uid, gid, pid, "write called");
 
         match self.inner.write(
             &ctx,
@@ -548,7 +572,7 @@ impl FilesystemHandler for PassthroughFs {
                 VolumeResponse::Written { size: n as u32 }
             }
             Err(e) => {
-                tracing::error!(target: "passthrough", fh, error = ?e, "write failed");
+                tracing::debug!(target: "passthrough", fh, error = ?e, "write failed");
                 VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO))
             }
         }
@@ -1044,7 +1068,7 @@ mod tests {
         };
 
         // Write (now using correct inode)
-        let resp = fs.write(ino, fh, 0, b"hello");
+        let resp = fs.write(ino, fh, 0, b"hello", uid, gid, 0);
         match &resp {
             VolumeResponse::Written { size } => assert_eq!(*size, 5),
             VolumeResponse::Error { errno } => panic!("Write failed with errno: {}", errno),
@@ -1052,7 +1076,7 @@ mod tests {
         }
 
         // Read back
-        let resp = fs.read(ino, fh, 0, 100);
+        let resp = fs.read(ino, fh, 0, 100, uid, gid, 0);
         match resp {
             VolumeResponse::Data { data } => {
                 assert_eq!(data, b"hello");
@@ -1092,7 +1116,7 @@ mod tests {
         };
 
         // Read initial content
-        let resp = fs.read(ino, fh, 0, 100);
+        let resp = fs.read(ino, fh, 0, 100, uid, gid, 0);
         match resp {
             VolumeResponse::Data { data } => {
                 assert_eq!(data, b"initial content");
@@ -1101,11 +1125,11 @@ mod tests {
         }
 
         // Write new content at offset 8
-        let resp = fs.write(ino, fh, 8, b"REPLACED");
+        let resp = fs.write(ino, fh, 8, b"REPLACED", uid, gid, 0);
         assert!(matches!(resp, VolumeResponse::Written { size: 8 }));
 
         // Read back to verify
-        let resp = fs.read(ino, fh, 0, 100);
+        let resp = fs.read(ino, fh, 0, 100, uid, gid, 0);
         match resp {
             VolumeResponse::Data { data } => {
                 assert_eq!(data, b"initial REPLACED");
@@ -1143,7 +1167,7 @@ mod tests {
         };
 
         // Write to source
-        let resp = fs.write(source_ino, fh, 0, b"hardlink test content");
+        let resp = fs.write(source_ino, fh, 0, b"hardlink test content", uid, gid, 0);
         assert!(matches!(resp, VolumeResponse::Written { .. }));
         fs.release(source_ino, fh);
 
@@ -1184,7 +1208,7 @@ mod tests {
             _ => panic!("Expected Opened response"),
         };
 
-        let resp = fs.read(link_ino, fh, 0, 100);
+        let resp = fs.read(link_ino, fh, 0, 100, uid, gid, 0);
         match resp {
             VolumeResponse::Data { data } => {
                 assert_eq!(data, b"hardlink test content");

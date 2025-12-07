@@ -44,6 +44,9 @@ pub enum VolumeRequest {
         mtime_secs: Option<i64>,
         mtime_nsecs: Option<u32>,
         mtime_now: bool,
+        /// File handle for ftruncate - when present, use fd-based truncate
+        /// which doesn't re-check file permissions (they were validated at open time).
+        fh: Option<u64>,
         caller_uid: u32,
         caller_gid: u32,
         caller_pid: u32,
@@ -114,6 +117,9 @@ pub enum VolumeRequest {
         fh: u64,
         offset: u64,
         size: u32,
+        uid: u32,
+        gid: u32,
+        pid: u32,
     },
 
     /// Write data to an open file.
@@ -122,6 +128,9 @@ pub enum VolumeRequest {
         fh: u64,
         offset: u64,
         data: Vec<u8>,
+        uid: u32,
+        gid: u32,
+        pid: u32,
     },
 
     /// Release an open file (close).
@@ -377,6 +386,9 @@ mod tests {
             fh: 1,
             offset: 0,
             size: 4096,
+            uid: 0,
+            gid: 0,
+            pid: 0,
         };
         assert!(read.is_read_op());
 
@@ -385,6 +397,9 @@ mod tests {
             fh: 1,
             offset: 0,
             data: vec![0; 100],
+            uid: 0,
+            gid: 0,
+            pid: 0,
         };
         assert!(!write.is_read_op());
     }

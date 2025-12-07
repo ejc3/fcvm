@@ -36,6 +36,7 @@ pub trait FilesystemHandler: Send + Sync {
                 mtime_secs,
                 mtime_nsecs,
                 mtime_now,
+                fh,
                 caller_uid,
                 caller_gid,
                 caller_pid,
@@ -51,6 +52,7 @@ pub trait FilesystemHandler: Send + Sync {
                 *mtime_secs,
                 *mtime_nsecs,
                 *mtime_now,
+                *fh,
                 *caller_uid,
                 *caller_gid,
                 *caller_pid,
@@ -107,13 +109,19 @@ pub trait FilesystemHandler: Send + Sync {
                 fh,
                 offset,
                 size,
-            } => self.read(*ino, *fh, *offset, *size),
+                uid,
+                gid,
+                pid,
+            } => self.read(*ino, *fh, *offset, *size, *uid, *gid, *pid),
             VolumeRequest::Write {
                 ino,
                 fh,
                 offset,
                 data,
-            } => self.write(*ino, *fh, *offset, data),
+                uid,
+                gid,
+                pid,
+            } => self.write(*ino, *fh, *offset, data, *uid, *gid, *pid),
             VolumeRequest::Release { ino, fh } => self.release(*ino, *fh),
             VolumeRequest::Flush { ino, fh } => self.flush(*ino, *fh),
             VolumeRequest::Fsync { ino, fh, datasync } => self.fsync(*ino, *fh, *datasync),
@@ -263,6 +271,11 @@ pub trait FilesystemHandler: Send + Sync {
     /// - `atime_now`/`mtime_now` = true: Use UTIME_NOW (set to current time)
     /// - `atime_secs`/`mtime_secs` = Some: Use specific time value
     /// - Both false/None: Use UTIME_OMIT (don't change)
+    ///
+    /// File handle (fh):
+    /// - When present, indicates this is ftruncate() on an already-open fd
+    /// - Should use fd-based truncate which doesn't re-check permissions
+    /// - When None, this is path-based truncate() which needs permission check
     #[allow(clippy::too_many_arguments)]
     fn setattr(
         &self,
@@ -277,6 +290,7 @@ pub trait FilesystemHandler: Send + Sync {
         _mtime_secs: Option<i64>,
         _mtime_nsecs: Option<u32>,
         _mtime_now: bool,
+        _fh: Option<u64>,
         _caller_uid: u32,
         _caller_gid: u32,
         _caller_pid: u32,
@@ -358,14 +372,32 @@ pub trait FilesystemHandler: Send + Sync {
     }
 
     /// Read data from an open file.
-    fn read(&self, _ino: u64, _fh: u64, _offset: u64, _size: u32) -> VolumeResponse {
+    fn read(
+        &self,
+        _ino: u64,
+        _fh: u64,
+        _offset: u64,
+        _size: u32,
+        _uid: u32,
+        _gid: u32,
+        _pid: u32,
+    ) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
         }
     }
 
     /// Write data to an open file.
-    fn write(&self, _ino: u64, _fh: u64, _offset: u64, _data: &[u8]) -> VolumeResponse {
+    fn write(
+        &self,
+        _ino: u64,
+        _fh: u64,
+        _offset: u64,
+        _data: &[u8],
+        _uid: u32,
+        _gid: u32,
+        _pid: u32,
+    ) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
         }

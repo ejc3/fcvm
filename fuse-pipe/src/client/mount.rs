@@ -86,13 +86,35 @@ pub fn mount_with_telemetry<P: AsRef<Path>>(
 
     // Mount options:
     // - AllowOther: Allow non-root users to access the mount (requires user_allow_other in /etc/fuse.conf or running as root)
-    // Note: We do NOT use DefaultPermissions because fuse-backend-rs handles permission enforcement
-    // via set_creds() which switches effective uid/gid before filesystem operations. DefaultPermissions
-    // would cause the kernel to reject operations before they reach our handler.
+    // - Suid: Allow SUID/SGID bits to take effect (fusermount uses nosuid by default). Requires root.
+    // - Dev: Allow device nodes (fusermount uses nodev by default). Requires root.
+    // - DefaultPermissions: Let the kernel perform standard POSIX permission checks (path traversal,
+    //   owner/mode checks) before sending operations to FUSE. This is required for correct behavior
+    //   like "can't access file if parent dir has no search permission". Without this, a passthrough
+    //   fs using cached inodes would bypass parent directory permission checks.
+    //
+    // Note: We intentionally do NOT use DefaultPermissions because it causes ftruncate on
+    // already-opened file handles to fail with EACCES if the file mode is restrictive. The
+    // kernel with DefaultPermissions checks inode permissions before sending SETATTR to FUSE,
+    // but ftruncate on a valid fd should use the fd's access rights, not the current file mode.
+    //
+    // Instead, we rely on set_creds() in fuse-backend-rs to switch to the caller's uid/gid
+    // before filesystem operations. This ensures:
+    // - Path traversal checks work (lookup calls openat which checks parent dir permissions)
+    // - File operations use caller's credentials
+    // - fd-based operations (ftruncate on open handle) work correctly
+    //
+    // default_permissions: Let the kernel check basic file permissions (rwx) before
+    // calling FUSE. This handles parent directory permission checking correctly and
+    // reduces round-trips to the FUSE server for operations that would fail anyway.
     let options = vec![
         fuser::MountOption::FSName("fuse-pipe".to_string()),
         fuser::MountOption::AllowOther,
+        fuser::MountOption::Suid,
+        fuser::MountOption::Dev,
+        fuser::MountOption::DefaultPermissions,
     ];
+    info!(target: "fuse-pipe::client", ?options, "using mount options");
 
     let mount_with_options =
         |opts: &[fuser::MountOption]| -> Result<fuser::Session<FuseClient>, std::io::Error> {
@@ -243,14 +265,13 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
     let mux = Multiplexer::with_trace_rate(socket, num_readers, trace_rate);
     debug!(target: "fuse-pipe::client", num_readers, "multiplexer started");
 
-    // Mount options:
-    // - AllowOther: Allow non-root users to access the mount (requires user_allow_other in /etc/fuse.conf or running as root)
-    // Note: We do NOT use DefaultPermissions because fuse-backend-rs handles permission enforcement
-    // via set_creds() which switches effective uid/gid before filesystem operations. DefaultPermissions
-    // would cause the kernel to reject operations before they reach our handler.
+    // Mount options (same as Unix socket version - see comments there for details)
     let options = vec![
         fuser::MountOption::FSName("fuse-pipe".to_string()),
         fuser::MountOption::AllowOther,
+        fuser::MountOption::Suid,
+        fuser::MountOption::Dev,
+        fuser::MountOption::DefaultPermissions,
     ];
 
     let mount_with_options =
