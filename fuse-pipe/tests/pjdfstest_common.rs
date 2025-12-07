@@ -254,8 +254,8 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
         println!("║                                                                           ║");
         println!("║   ⚠️  SANITY CHECK: Running against HOST FILESYSTEM (not FUSE!)           ║");
         println!("║                                                                           ║");
-        println!("║   This test does NOT test fuse-pipe. It only verifies that pjdfstest     ║");
-        println!("║   works correctly on this system. Failures here are informational only.  ║");
+        println!("║   This test does NOT test fuse-pipe. It only verifies that pjdfstest      ║");
+        println!("║   works correctly on this system. Failures here are informational only.   ║");
         println!("║                                                                           ║");
         println!("╚═══════════════════════════════════════════════════════════════════════════╝");
         println!();
@@ -265,7 +265,7 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
         println!("║                                                                           ║");
         println!("║   🎯 THE REAL TEST: Running against FUSE FILESYSTEM                       ║");
         println!("║                                                                           ║");
-        println!("║   This is the actual fuse-pipe test! All tests must pass.                ║");
+        println!("║   This is the actual fuse-pipe test! All tests must pass.                 ║");
         println!("║                                                                           ║");
         println!("╚═══════════════════════════════════════════════════════════════════════════╝");
         println!();
