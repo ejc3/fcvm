@@ -6,28 +6,20 @@
 //!
 //! # Credential Handling
 //!
-//! fuse-backend-rs handles credentials internally via the `Context` parameter
-//! passed to each operation. It uses the uid/gid from Context for permission
-//! checks when performing filesystem operations.
+//! fuse-backend-rs handles credentials internally via `set_creds()` which
+//! uses `setfsuid()`/`setfsgid()` to switch filesystem credentials before
+//! operations that need it (mkdir, create, mknod, symlink, setattr truncate/utimes).
 //!
-//! IMPORTANT: We must NOT use `setfsuid()`/`setfsgid()` before calling
-//! fuse-backend-rs operations because fuse-backend-rs internally uses
-//! `readlinkat` on `/proc/self/fd/` to resolve inode paths. When fsuid
-//! is changed to a non-root user, these `/proc` operations fail because
-//! `/proc/self/fd/` is owned by root (the process's effective UID).
-//!
-//! We only use `CredentialsGuard` for operations we handle directly
-//! (not through fuse-backend-rs), such as:
-//! - `setattr` with truncate: uses std::fs::File::set_len()
-//! - `setattr` with utimensat: uses libc::utimensat() directly
+//! Unlike `setresuid()`/`setresgid()`, these syscalls only affect filesystem
+//! access checks and do NOT change the real/effective UID, so the process
+//! retains access to /proc/self/fd/ for inode resolution.
 
-use super::credentials::CredentialsGuard;
 use super::handler::FilesystemHandler;
 use super::zerocopy::{SliceReader, VecWriter};
 use crate::protocol::{file_type, DirEntry, DirEntryPlus, FileAttr, VolumeResponse};
 
 use fuse_backend_rs::abi::fuse_abi::CreateIn;
-use fuse_backend_rs::api::filesystem::{Context, Entry, FileSystem};
+use fuse_backend_rs::api::filesystem::{Context, Entry, FileSystem, SetattrValid};
 use fuse_backend_rs::passthrough::{Config, PassthroughFs as FuseBackendPassthrough};
 
 use std::ffi::CString;
@@ -153,13 +145,6 @@ impl PassthroughFs {
             blksize: st.st_blksize as u32,
         }
     }
-
-    /// Get the file path for an inode by looking it up via fuse-backend-rs.
-    /// This uses readlinkat on /proc/self/fd to get the path.
-    /// Only needed for setattr which still does direct path operations.
-    fn get_inode_path(&self, ino: u64) -> Option<PathBuf> {
-        self.inner.readlinkat_proc_file(ino).ok()
-    }
 }
 
 impl FilesystemHandler for PassthroughFs {
@@ -225,156 +210,60 @@ impl FilesystemHandler for PassthroughFs {
     ) -> VolumeResponse {
         let ctx = Self::make_context(caller_uid, caller_gid, caller_pid);
 
-        // Get current file metadata first
+        // Get current file metadata to build the attr struct
         let current_attr = match self.inner.getattr(&ctx, ino, None) {
             Ok((st, _)) => st,
             Err(e) => return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
         };
-        let file_uid = current_attr.st_uid;
 
-        // Check permissions for operations that require ownership
-        // chmod: POSIX requires caller to be owner or root
-        if mode.is_some() && caller_uid != 0 && caller_uid != file_uid {
-            return VolumeResponse::error(libc::EPERM);
+        // Build the valid flags and attr struct for fuse-backend-rs
+        let mut valid = SetattrValid::empty();
+        let mut attr = current_attr;
+
+        if let Some(m) = mode {
+            valid |= SetattrValid::MODE;
+            attr.st_mode = (attr.st_mode & libc::S_IFMT) | m;
         }
 
-        // chown: Only root can change uid
-        if uid.is_some() && caller_uid != 0 {
-            return VolumeResponse::error(libc::EPERM);
+        if let Some(u) = uid {
+            valid |= SetattrValid::UID;
+            attr.st_uid = u;
         }
 
-        // chown gid: non-root must be owner
-        if gid.is_some() && caller_uid != 0 && caller_uid != file_uid {
-            return VolumeResponse::error(libc::EPERM);
+        if let Some(g) = gid {
+            valid |= SetattrValid::GID;
+            attr.st_gid = g;
         }
 
-        // utimensat with specific times: POSIX requires owner or root
-        // UTIME_NOW permission check is done by kernel via write access
-        if (atime_secs.is_some() || mtime_secs.is_some()) && caller_uid != 0 && caller_uid != file_uid {
-            return VolumeResponse::error(libc::EPERM);
+        if let Some(s) = size {
+            valid |= SetattrValid::SIZE;
+            attr.st_size = s as i64;
         }
 
-        // Determine if we need to call utimensat
-        let need_time_update = atime_now || mtime_now || atime_secs.is_some() || mtime_secs.is_some();
-
-        // Get the file path to perform operations directly
-        let path = match self.get_inode_path(ino) {
-            Some(p) => p,
-            None => return VolumeResponse::error(libc::EIO),
-        };
-
-        // Set filesystem credentials for truncate and utimensat permission checks
-        // Note: chown must run as root, chmod checks ownership above
-        let _creds = if size.is_some() || need_time_update {
-            match CredentialsGuard::new(caller_uid, caller_gid) {
-                Ok(g) => Some(g),
-                Err(e) => {
-                    tracing::error!(target: "passthrough", error = ?e, "failed to switch credentials");
-                    return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM));
-                }
-            }
-        } else {
-            None
-        };
-
-        // Handle size truncation
-        if let Some(new_size) = size {
-            if let Err(e) = std::fs::File::options()
-                .write(true)
-                .open(&path)
-                .and_then(|f| f.set_len(new_size))
-            {
-                return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
-            }
+        // Handle atime
+        if atime_now {
+            valid |= SetattrValid::ATIME | SetattrValid::ATIME_NOW;
+        } else if let Some(secs) = atime_secs {
+            valid |= SetattrValid::ATIME;
+            attr.st_atime = secs;
+            attr.st_atime_nsec = atime_nsecs.map(|n| n as i64).unwrap_or(0);
         }
 
-        // Handle mode change (owner check done above, so this runs as root to bypass fs perms)
-        if let Some(new_mode) = mode {
-            use std::os::unix::fs::PermissionsExt;
-            let permissions = std::fs::Permissions::from_mode(new_mode);
-            if let Err(e) = std::fs::set_permissions(&path, permissions) {
-                return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
-            }
+        // Handle mtime
+        if mtime_now {
+            valid |= SetattrValid::MTIME | SetattrValid::MTIME_NOW;
+        } else if let Some(secs) = mtime_secs {
+            valid |= SetattrValid::MTIME;
+            attr.st_mtime = secs;
+            attr.st_mtime_nsec = mtime_nsecs.map(|n| n as i64).unwrap_or(0);
         }
 
-        // Handle uid/gid change using libc::chown (must run as root)
-        if uid.is_some() || gid.is_some() {
-            let new_uid = uid.map(|u| u as libc::uid_t).unwrap_or(u32::MAX as libc::uid_t);
-            let new_gid = gid.map(|g| g as libc::gid_t).unwrap_or(u32::MAX as libc::gid_t);
-            let path_cstr = CString::new(path.to_string_lossy().as_bytes()).unwrap();
-            let result = unsafe { libc::chown(path_cstr.as_ptr(), new_uid, new_gid) };
-            if result != 0 {
-                return VolumeResponse::error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
-            }
-        }
-
-        // Handle time changes
-        // UTIME_NOW and UTIME_OMIT are special values for tv_nsec in utimensat:
-        // - UTIME_NOW (0x3fffffff): Set to current time, requires write access or ownership
-        // - UTIME_OMIT (0x3ffffffe): Don't change this timestamp
-        if need_time_update {
-            let path_cstr = CString::new(path.to_string_lossy().as_bytes()).unwrap();
-
-            // Build atime timespec
-            let atime_spec = if atime_now {
-                // UTIME_NOW: set to current time (kernel checks write permission)
-                libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: libc::UTIME_NOW,
-                }
-            } else if let Some(secs) = atime_secs {
-                // Specific time value
-                libc::timespec {
-                    tv_sec: secs,
-                    tv_nsec: atime_nsecs.map(|n| n as i64).unwrap_or(0),
-                }
-            } else {
-                // UTIME_OMIT: don't change
-                libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: libc::UTIME_OMIT,
-                }
-            };
-
-            // Build mtime timespec
-            let mtime_spec = if mtime_now {
-                // UTIME_NOW: set to current time (kernel checks write permission)
-                libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: libc::UTIME_NOW,
-                }
-            } else if let Some(secs) = mtime_secs {
-                // Specific time value
-                libc::timespec {
-                    tv_sec: secs,
-                    tv_nsec: mtime_nsecs.map(|n| n as i64).unwrap_or(0),
-                }
-            } else {
-                // UTIME_OMIT: don't change
-                libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: libc::UTIME_OMIT,
-                }
-            };
-
-            // Check if this is a symlink - if so, use AT_SYMLINK_NOFOLLOW
-            // to set times on the symlink itself, not its target
-            let is_symlink = (current_attr.st_mode & libc::S_IFMT) == libc::S_IFLNK;
-            let flags = if is_symlink { libc::AT_SYMLINK_NOFOLLOW } else { 0 };
-
-            let times = [atime_spec, mtime_spec];
-            let result = unsafe { libc::utimensat(libc::AT_FDCWD, path_cstr.as_ptr(), times.as_ptr(), flags) };
-            if result != 0 {
-                return VolumeResponse::error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
-            }
-        }
-
-        // Get updated attributes
-        match self.inner.getattr(&ctx, ino, None) {
+        // Delegate to fuse-backend-rs which handles credential switching internally
+        match self.inner.setattr(&ctx, ino, attr, None, valid) {
             Ok((new_st, _timeout)) => {
-                let attr = Self::stat_to_attr(ino, &new_st);
+                let result_attr = Self::stat_to_attr(ino, &new_st);
                 VolumeResponse::Attr {
-                    attr,
+                    attr: result_attr,
                     ttl_secs: self.attr_ttl_secs,
                 }
             }
