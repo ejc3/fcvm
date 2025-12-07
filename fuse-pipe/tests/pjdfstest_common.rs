@@ -359,24 +359,44 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
             }
         });
 
+        // Wait for FUSE to actually be mounted by checking /proc/mounts
+        // This is more reliable than just checking if the directory exists
+        let mount_path_str = mount_dir.to_str().unwrap();
         let mut mounted = false;
-        for _ in 0..50 {
-            if mount_dir.exists() && std::fs::read_dir(&mount_dir).is_ok() {
-                mounted = true;
-                break;
+        for _ in 0..100 {
+            // Check /proc/mounts for the FUSE mount
+            if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
+                if mounts.lines().any(|line| line.contains(mount_path_str) && line.contains("fuse")) {
+                    mounted = true;
+                    break;
+                }
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(50));
         }
-        if !mounted || !verify_mount(&mount_dir) {
-            error!(target: TARGET, mount = %mount_dir.display(), "Mount did not become ready in time");
+        if !mounted {
+            error!(target: TARGET, mount = %mount_dir.display(), "FUSE mount did not appear in /proc/mounts");
+            return false;
+        }
+        // Additional verification that the mount is usable
+        if !verify_mount(&mount_dir) {
+            error!(target: TARGET, mount = %mount_dir.display(), "Mount verification failed");
             return false;
         }
         info!(target: TARGET, mount = %mount_dir.display(), "FUSE mounted successfully");
 
         // Create marker file to verify tests run on FUSE, not accidentally on host
         let marker = mount_dir.join(".fuse-pipe-test-marker");
-        if let Err(e) = fs::write(&marker, "fuse-pipe") {
-            error!(target: TARGET, error = %e, "Failed to create FUSE marker file");
+        debug!(target: TARGET, marker = %marker.display(), "Creating FUSE marker file");
+        match fs::write(&marker, "fuse-pipe") {
+            Ok(_) => debug!(target: TARGET, marker = %marker.display(), "FUSE marker created successfully"),
+            Err(e) => {
+                error!(target: TARGET, error = %e, marker = %marker.display(), "Failed to create FUSE marker file");
+                return false;
+            }
+        }
+        // Verify marker exists
+        if !marker.exists() {
+            error!(target: TARGET, marker = %marker.display(), "FUSE marker does not exist after creation!");
             return false;
         }
 
@@ -510,6 +530,7 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
                         || line.contains("Failed")
                         || line.contains("expected")
                         || line.contains("got ")
+                        || line.contains("FATAL")
                     {
                         println!("{}", line);
                     }
