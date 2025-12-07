@@ -22,7 +22,7 @@ use std::sync::{Arc, Once};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use fuse_pipe::{AsyncServer, PassthroughFs, ServerConfig};
+use fuse_pipe::{AsyncServer, PassthroughFs, ServerConfig, SessionUnmounter};
 use tracing::{debug, info, error};
 
 /// Target name for fixture logs (consistent with library naming)
@@ -74,6 +74,8 @@ pub struct FuseMount {
     data_dir: PathBuf,
     mount_dir: PathBuf,
     socket: PathBuf,
+    /// Handle for clean unmount - avoids double-unmount and fusermount errors
+    unmounter: Option<SessionUnmounter>,
 }
 
 impl FuseMount {
@@ -130,13 +132,16 @@ impl FuseMount {
             thread::sleep(Duration::from_millis(10));
         }
 
+        // Channel to receive the unmounter handle from the client thread
+        let (unmounter_tx, unmounter_rx) = std::sync::mpsc::channel();
+
         // Start FUSE client in dedicated thread
         let client_socket = socket_path.clone();
         let client_mount = mount_path.to_path_buf();
         let client_shutdown = Arc::clone(&shutdown);
         let client_thread = thread::spawn(move || {
             info!(target: TARGET, socket = %client_socket, mount = ?client_mount, readers = num_readers, "Client thread started");
-            match fuse_pipe::mount_with_readers(&client_socket, &client_mount, num_readers) {
+            match fuse_pipe::mount_with_unmounter(&client_socket, &client_mount, num_readers, unmounter_tx) {
                 Ok(()) => {
                     info!(target: TARGET, "Client mount_with_readers returned Ok");
                 }
@@ -167,6 +172,12 @@ impl FuseMount {
             thread::sleep(Duration::from_millis(50));
         }
 
+        // Receive the unmounter handle (sent by mount_with_unmounter before blocking)
+        let unmounter = unmounter_rx.recv_timeout(Duration::from_secs(5)).ok();
+        if unmounter.is_none() {
+            error!(target: TARGET, "Failed to receive unmounter handle");
+        }
+
         FuseMount {
             server_thread: Some(server_thread),
             client_thread: Some(client_thread),
@@ -174,6 +185,7 @@ impl FuseMount {
             data_dir: data_path.to_path_buf(),
             mount_dir: mount_path.to_path_buf(),
             socket,
+            unmounter,
         }
     }
 
@@ -194,13 +206,12 @@ impl Drop for FuseMount {
         // Signal shutdown
         self.shutdown.store(true, Ordering::SeqCst);
 
-        // Unmount with lazy flag
-        let _ = std::process::Command::new("fusermount3")
-            .args(["-uz", self.mount_dir.to_str().unwrap()])
-            .status();
-        let _ = std::process::Command::new("fusermount")
-            .args(["-uz", self.mount_dir.to_str().unwrap()])
-            .status();
+        // Use the unmounter handle for clean unmount (avoids double-unmount errors)
+        if let Some(mut unmounter) = self.unmounter.take() {
+            if let Err(e) = unmounter.unmount() {
+                debug!(target: TARGET, error = %e, "unmount returned error (may be expected)");
+            }
+        }
 
         // Brief wait for client thread (should exit quickly after unmount)
         if let Some(handle) = self.client_thread.take() {

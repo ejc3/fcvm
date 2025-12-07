@@ -55,7 +55,8 @@ pub use telemetry::{SpanCollector, SpanSummary};
 // Re-export client types
 #[cfg(feature = "fuse-client")]
 pub use client::{
-    mount, mount_with_options, mount_with_readers, mount_with_telemetry, FuseClient, Multiplexer,
+    mount, mount_with_options, mount_with_readers, mount_with_telemetry, mount_with_unmounter,
+    FuseClient, Multiplexer, SessionUnmounter,
 };
 #[cfg(all(feature = "fuse-client", target_os = "linux"))]
 pub use client::{mount_vsock, mount_vsock_with_options, mount_vsock_with_readers};
