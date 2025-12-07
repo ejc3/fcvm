@@ -19,14 +19,12 @@
 //! ```
 
 mod config;
-pub mod credentials;
 mod handler;
 mod passthrough;
 mod pipelined;
 mod zerocopy;
 
 pub use config::ServerConfig;
-pub use credentials::CredentialsGuard;
 pub use handler::FilesystemHandler;
 pub use passthrough::PassthroughFs;
 pub use pipelined::AsyncServer;
