@@ -228,6 +228,30 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
     // Raise fd limit early - required for 256 FUSE readers + parallel prove jobs
     raise_fd_limit();
 
+    // Print big banner to make it SUPER CLEAR which test is running
+    if use_host_fs {
+        println!("\n");
+        println!("╔═══════════════════════════════════════════════════════════════════════════╗");
+        println!("║                                                                           ║");
+        println!("║   ⚠️  SANITY CHECK: Running against HOST FILESYSTEM (not FUSE!)           ║");
+        println!("║                                                                           ║");
+        println!("║   This test does NOT test fuse-pipe. It only verifies that pjdfstest     ║");
+        println!("║   works correctly on this system. Failures here are informational only.  ║");
+        println!("║                                                                           ║");
+        println!("╚═══════════════════════════════════════════════════════════════════════════╝");
+        println!();
+    } else {
+        println!("\n");
+        println!("╔═══════════════════════════════════════════════════════════════════════════╗");
+        println!("║                                                                           ║");
+        println!("║   🎯 THE REAL TEST: Running against FUSE FILESYSTEM                       ║");
+        println!("║                                                                           ║");
+        println!("║   This is the actual fuse-pipe test! All tests must pass.                ║");
+        println!("║                                                                           ║");
+        println!("╚═══════════════════════════════════════════════════════════════════════════╝");
+        println!();
+    }
+
     if !is_pjdfstest_installed() {
         // This shouldn't be reached - caller should check is_pjdfstest_installed() first
         eprintln!(
@@ -391,26 +415,43 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
 
     let total_duration = start_time.elapsed().as_secs_f64();
 
-    println!("\n╔═══════════════════════════════════════════════════════════════╗");
-    println!("║                       TEST SUMMARY                            ║");
-    println!("╠═══════════════════════════════════════════════════════════════╣");
+    // Make it crystal clear which test this summary is for
+    let (header, note) = if use_host_fs {
+        (
+            "HOST FILESYSTEM (Sanity Check - Does NOT Affect Pass/Fail)",
+            "(This is NOT the fuse-pipe test)",
+        )
+    } else {
+        (
+            "🎯 FUSE FILESYSTEM (THE REAL TEST - Must Pass!)",
+            "(This IS the fuse-pipe test)",
+        )
+    };
+
+    println!("\n╔═══════════════════════════════════════════════════════════════════════════╗");
+    println!("║  {}  ║", header);
+    println!("╠═══════════════════════════════════════════════════════════════════════════╣");
     println!(
-        "║  Total tests:      {:>10}                                 ║",
+        "║  Total tests:      {:>10}                                             ║",
         results.iter().map(|r| r.tests).sum::<usize>()
     );
     println!(
-        "║  Total failures:   {:>10}                                 ║",
+        "║  Total failures:   {:>10}                                             ║",
         results.iter().map(|r| r.failures).sum::<usize>()
     );
     println!(
-        "║  Categories:       {:>10}                                 ║",
+        "║  Categories:       {:>10}                                             ║",
         categories.len()
     );
     println!(
-        "║  Duration:         {:>10.1}s                                ║",
+        "║  Duration:         {:>10.1}s                                            ║",
         total_duration
     );
-    println!("╚═══════════════════════════════════════════════════════════════╝");
+    println!(
+        "║  {:^71}  ║",
+        note
+    );
+    println!("╚═══════════════════════════════════════════════════════════════════════════╝");
 
     let mut total_tests = 0usize;
     let mut total_failures = 0usize;
@@ -445,7 +486,11 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
         return false;
     }
 
-    println!("\n✅ ALL {} TESTS PASSED", total_tests);
+    if use_host_fs {
+        println!("\n✅ HOST SANITY CHECK: {} tests passed (informational only)", total_tests);
+    } else {
+        println!("\n🎉 FUSE TEST PASSED: ALL {} TESTS PASSED - fuse-pipe is POSIX compliant!", total_tests);
+    }
     if !use_host_fs {
         cleanup_mount(&mount_dir);
     }
