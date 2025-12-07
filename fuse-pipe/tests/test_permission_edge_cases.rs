@@ -716,3 +716,122 @@ fn test_link_dir_not_writable() {
     drop(fuse);
     cleanup(&data_dir, &mount_dir);
 }
+
+// =============================================================================
+// THREAD SAFETY / RACE CONDITION TESTS
+// =============================================================================
+
+/// Test that supplementary groups are per-thread, not process-wide.
+///
+/// This test verifies there's no race condition in the setgroups implementation.
+/// We spawn multiple threads that each use different supplementary groups to
+/// perform chown operations. If setgroups were process-wide (using glibc wrapper),
+/// threads would interfere with each other and some operations would fail.
+///
+/// With the raw SYS_setgroups syscall, each thread has its own groups and
+/// the operations succeed without interference.
+#[test]
+fn test_concurrent_supplementary_groups_no_race() {
+    if !require_root() { return; }
+
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let (data_dir, mount_dir) = unique_paths();
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
+    let mount = fuse.mount_path();
+
+    // Create multiple files, each owned by a different user
+    // User 65531 can change group to 65531 (needs 65531 as supplementary)
+    // User 65532 can change group to 65532 (needs 65532 as supplementary)
+    // User 65533 can change group to 65533 (needs 65533 as supplementary)
+    // User 65534 can change group to 65534 (needs 65534 as supplementary)
+    let users = [65531u32, 65532, 65533, 65534];
+    let mut files = Vec::new();
+
+    for (i, &uid) in users.iter().enumerate() {
+        let file = mount.join(format!("race_test_{}", i));
+        fs::write(&file, "test").expect("create file");
+        // Own by user, with different initial group
+        chown(&file, Some(uid), Some(65530)).expect("chown");
+        files.push(file);
+    }
+
+    // Synchronize all threads to start at the same time
+    let barrier = Arc::new(Barrier::new(users.len()));
+    let mount_path = mount.to_path_buf();
+    let mut handles = Vec::new();
+
+    // Spawn threads that will all try to chown their files concurrently
+    for (i, &uid) in users.iter().enumerate() {
+        let barrier = Arc::clone(&barrier);
+        let file_name = format!("race_test_{}", i);
+        let mount_clone = mount_path.clone();
+        let target_gid = uid; // Change to group matching uid
+
+        handles.push(thread::spawn(move || {
+            // All threads wait here until everyone is ready
+            barrier.wait();
+
+            // Each thread tries to chown its file to its supplementary group
+            // User uid has primary group 65530 and supplementary group = uid
+            let file_path = mount_clone.join(&file_name);
+
+            // Perform multiple chown operations to increase chance of detecting race
+            for iteration in 0..10 {
+                let (_, result) = pjdfstest(&[
+                    "-u", &uid.to_string(),
+                    "-g", &format!("65530,{}", target_gid), // primary=65530, supplementary=target_gid
+                    "--",
+                    "chown", file_path.to_str().unwrap(), "-1", &target_gid.to_string()
+                ]);
+
+                if result != "0" {
+                    return Err(format!(
+                        "Thread for uid {} failed iteration {}: expected 0, got {}. \
+                         This indicates a race condition - another thread's groups leaked!",
+                        uid, iteration, result
+                    ));
+                }
+
+                // Change back for next iteration
+                let (_, result) = pjdfstest(&[
+                    "-u", &uid.to_string(),
+                    "-g", &format!("{},65530", target_gid), // primary=target_gid, supplementary=65530
+                    "--",
+                    "chown", file_path.to_str().unwrap(), "-1", "65530"
+                ]);
+
+                if result != "0" {
+                    return Err(format!(
+                        "Thread for uid {} failed restore iteration {}: expected 0, got {}",
+                        uid, iteration, result
+                    ));
+                }
+            }
+
+            Ok(format!("Thread for uid {} completed 10 iterations successfully", uid))
+        }));
+    }
+
+    // Collect results
+    let mut all_ok = true;
+    for handle in handles {
+        match handle.join().expect("thread panicked") {
+            Ok(msg) => eprintln!("{}", msg),
+            Err(err) => {
+                eprintln!("ERROR: {}", err);
+                all_ok = false;
+            }
+        }
+    }
+
+    // Cleanup
+    for file in &files {
+        let _ = fs::remove_file(file);
+    }
+    drop(fuse);
+    cleanup(&data_dir, &mount_dir);
+
+    assert!(all_ok, "Some threads failed - this indicates a race condition in setgroups");
+}
