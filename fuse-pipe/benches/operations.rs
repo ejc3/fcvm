@@ -10,7 +10,6 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 // Include the shared fixture module
 #[path = "../tests/common/mod.rs"]

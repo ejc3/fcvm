@@ -1,3 +1,6 @@
+// Allow dead code - this module is used as a shared library by multiple test files
+#![allow(dead_code)]
+
 use fuse_pipe::{mount_with_options, AsyncServer, PassthroughFs, ServerConfig};
 use std::fs;
 use std::path::Path;

@@ -362,7 +362,7 @@ impl SpanSummary {
 }
 
 /// Compute statistics from a vector of latencies (in nanoseconds).
-fn compute_stats(values: &mut Vec<u64>) -> LatencyStats {
+fn compute_stats(values: &mut [u64]) -> LatencyStats {
     if values.is_empty() {
         return LatencyStats {
             count: 0,
@@ -414,15 +414,16 @@ mod tests {
     fn test_collect_spans() {
         let collector = SpanCollector::new();
 
-        let mut span = Span::default();
-        span.t0 = 1000;
-        span.server_recv = 1100;
-        span.server_deser = 1150;
-        span.server_spawn = 1200;
-        span.server_fs_done = 1500;
-        span.server_resp_chan = 1550;
-        span.client_recv = 1650;
-        span.client_done = 1700;
+        let span = Span {
+            t0: 1000,
+            server_recv: 1100,
+            server_deser: 1150,
+            server_spawn: 1200,
+            server_fs_done: 1500,
+            server_resp_chan: 1550,
+            client_recv: 1650,
+            client_done: 1700,
+        };
 
         collector.record(1, "getattr", span.clone());
         collector.record(2, "read", span.clone());

@@ -11,6 +11,9 @@
 //!
 //! See `fuse-pipe/TESTING.md` for complete testing documentation.
 
+// Allow dead code - these utilities are conditionally used by different test files
+#![allow(dead_code)]
+
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -229,6 +232,7 @@ pub fn setup_test_data(base: &Path, num_files: usize, file_size: usize) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
 
     #[test]

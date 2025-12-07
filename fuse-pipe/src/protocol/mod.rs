@@ -50,6 +50,9 @@ mod tests {
                 fh: 3,
                 offset: 0,
                 size: 4096,
+                uid: 0,
+                gid: 0,
+                pid: 0,
             },
         );
 

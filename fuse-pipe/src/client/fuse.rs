@@ -68,14 +68,14 @@ fn to_system_time(secs: i64, nsecs: u32) -> std::time::SystemTime {
 
 /// Convert FileAttr to fuser::FileAttr.
 fn to_fuser_attr(attr: &FileAttr) -> fuser::FileAttr {
-    let kind = match attr.mode & libc::S_IFMT as u32 {
-        x if x == libc::S_IFDIR as u32 => FileType::Directory,
-        x if x == libc::S_IFREG as u32 => FileType::RegularFile,
-        x if x == libc::S_IFLNK as u32 => FileType::Symlink,
-        x if x == libc::S_IFCHR as u32 => FileType::CharDevice,
-        x if x == libc::S_IFBLK as u32 => FileType::BlockDevice,
-        x if x == libc::S_IFIFO as u32 => FileType::NamedPipe,
-        x if x == libc::S_IFSOCK as u32 => FileType::Socket,
+    let kind = match attr.mode & libc::S_IFMT {
+        x if x == libc::S_IFDIR => FileType::Directory,
+        x if x == libc::S_IFREG => FileType::RegularFile,
+        x if x == libc::S_IFLNK => FileType::Symlink,
+        x if x == libc::S_IFCHR => FileType::CharDevice,
+        x if x == libc::S_IFBLK => FileType::BlockDevice,
+        x if x == libc::S_IFIFO => FileType::NamedPipe,
+        x if x == libc::S_IFSOCK => FileType::Socket,
         _ => FileType::RegularFile,
     };
 

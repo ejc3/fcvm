@@ -116,7 +116,7 @@ impl Multiplexer {
     /// and per-request oneshot channel for response.
     pub fn send_request(&self, reader_id: u32, request: VolumeRequest) -> VolumeResponse {
         let unique = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let should_trace = self.trace_rate > 0 && unique % self.trace_rate == 0;
+        let should_trace = self.trace_rate > 0 && unique.is_multiple_of(self.trace_rate);
 
         // Capture op_name before request is moved (needed for per-operation telemetry)
         let op_name = if should_trace {
@@ -238,19 +238,16 @@ fn reader_loop(mut socket: UnixStream, pending: Arc<DashMap<u64, Sender<Response
         }
 
         // Deserialize and route to waiting reader (lock-free lookup + remove)
-        match bincode::deserialize::<WireResponse>(&resp_buf) {
-            Ok(wire) => {
-                // Mark client receive time on the span
-                let mut span = wire.span;
-                if let Some(ref mut s) = span {
-                    s.mark("client_recv");
-                }
-
-                if let Some((_, tx)) = pending.remove(&wire.unique) {
-                    let _ = tx.send((wire.response, span));
-                }
+        if let Ok(wire) = bincode::deserialize::<WireResponse>(&resp_buf) {
+            // Mark client receive time on the span
+            let mut span = wire.span;
+            if let Some(ref mut s) = span {
+                s.mark("client_recv");
             }
-            Err(_) => {}
+
+            if let Some((_, tx)) = pending.remove(&wire.unique) {
+                let _ = tx.send((wire.response, span));
+            }
         }
     }
 }
