@@ -238,10 +238,7 @@ fn extract_failure_lines(output: &str) -> String {
             || line.contains("got ")
             || line.contains("FATAL")
         {
-            // Skip TODO lines - they're expected failures
-            if !line.contains("# TODO") {
-                failures.push(line.to_string());
-            }
+            failures.push(line.to_string());
         }
     }
     if failures.is_empty() {
