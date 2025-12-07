@@ -362,9 +362,11 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
     if !full {
         categories.retain(|c| c == "posix_fallocate");
     }
+    let test_type = if use_host_fs { "HOST" } else { "FUSE" };
     info!(target: TARGET, count = categories.len(), ?categories, "Discovered test categories");
     println!(
-        "[test] Found {} categories: {:?}\n",
+        "[{}] Found {} categories: {:?}\n",
+        test_type,
         categories.len(),
         categories
     );
@@ -399,8 +401,10 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
         };
 
         let status = if result.passed { "✓" } else { "✗" };
+        let prefix = if use_host_fs { "[HOST]" } else { "[FUSE]" };
         println!(
-            "[{}/{}] {} {} ({} tests, {} failures, {:.1}s)",
+            "{} [{}/{}] {} {} ({} tests, {} failures, {:.1}s)",
+            prefix,
             idx + 1,
             total,
             status,
