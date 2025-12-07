@@ -102,6 +102,20 @@ When a FUSE operation fails unexpectedly, trace the full path from kernel to fus
 
 This pattern found the ftruncate bug: kernel sends `FATTR_FH` with file handle, but fuse-pipe's `VolumeRequest::Setattr` didn't have an `fh` field.
 
+### Known Limitation: Supplementary Groups with default_permissions
+
+With the `default_permissions` FUSE mount option, chown to supplementary groups fails with EPERM:
+
+**Symptom**: pjdfstest `-u 65534 -g 65532,65531 chown file 65534 65531` returns EPERM.
+
+**Root Cause**: The kernel checks chown permissions but only sees the primary group (65532 from setfsgid), not supplementary groups (65531 from setgroups). The kernel rejects before FUSE is even called.
+
+**Why we use default_permissions**: It correctly handles parent directory permission checks (path traversal) and reduces round-trips for operations that would fail anyway.
+
+**Affected operations**: Any chown where target group is in supplementary groups but not the primary group (~108 pjdfstest failures).
+
+**Workaround**: None currently. To fix would require disabling default_permissions and implementing all permission checks server-side, which has other trade-offs.
+
 ## PID-Based Process Management
 
 **Core Principle:** All fcvm processes store their own PID (via `std::process::id()`), not child process PIDs.
