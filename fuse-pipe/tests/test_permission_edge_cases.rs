@@ -367,18 +367,18 @@ fn test_chown_owner_changes_group_to_member() {
 /// KNOWN LIMITATION: chown to SUPPLEMENTARY group fails with default_permissions.
 ///
 /// With default_permissions mount option, the kernel checks chown permissions
-/// but only sees the primary group (from setfsgid), not supplementary groups
-/// (from setgroups). This is a kernel-level limitation when using FUSE with
-/// default_permissions.
+/// but only sees the primary group (from setfsgid), not supplementary groups.
 ///
-/// pjdfstest failure example:
-///   -u 65534 -g 65532,65531 chown file 65534 65531 → EPERM
-/// Here 65532 is primary, 65531 is supplementary. The kernel rejects chown
-/// to 65531 because it doesn't see it in the caller's groups.
+/// SOLUTION: We now read the caller's supplementary groups from /proc/<pid>/status
+/// and adopt them using setgroups() before performing the operation.
+/// See: https://github.com/rfjakob/gocryptfs/commit/e74f48b (gocryptfs workaround)
 ///
-/// This test documents the limitation by expecting EPERM (the current behavior).
+/// pjdfstest example:
+///   -u 65534 -g 65532,65531 chown file 65534 65531 → 0 (success)
+/// Here 65532 is primary, 65531 is supplementary. With our fix, the FUSE server
+/// reads the caller's groups from /proc and adopts them, so chown succeeds.
 #[test]
-fn test_chown_supplementary_group_limitation() {
+fn test_chown_supplementary_group_works() {
     if !require_root() { return; }
 
     let (data_dir, mount_dir) = unique_paths();
@@ -391,16 +391,15 @@ fn test_chown_supplementary_group_limitation() {
     chown(&file, Some(65534), Some(65533)).expect("chown");
 
     // As user 65534 with groups 65532,65531, try to change group to 65531 (supplementary)
-    // With default_permissions, this FAILS because the kernel only sees primary group 65532
+    // This should SUCCEED because we now read and adopt supplementary groups from /proc
     let (code, result) = pjdfstest(&[
         "-u", "65534", "-g", "65532,65531", "--",
         "chown", file.to_str().unwrap(), "-1", "65531"
     ]);
 
-    // KNOWN LIMITATION: This returns EPERM instead of 0
-    // The test documents current behavior; ideally this would succeed.
-    assert_eq!(result, "EPERM",
-        "chown to supplementary group fails with default_permissions (KNOWN LIMITATION), got: {}",
+    // Should succeed now that we support supplementary groups
+    assert_eq!(result, "0",
+        "chown to supplementary group should succeed with /proc groups parsing, got: {}",
         result);
 
     let _ = fs::remove_file(&file);
