@@ -66,14 +66,14 @@ async fn fuse_in_vm_test_impl(category: &str, jobs: usize) -> Result<()> {
     println!("Step 1: Ensuring pjdfstest container exists...");
     let step1_start = Instant::now();
 
-    // Check if pjdfstest container exists
+    // Check if pjdfstest container exists (in root's storage)
     let check_output = tokio::process::Command::new("podman")
         .args(["image", "exists", "localhost/pjdfstest"])
         .output()
         .await?;
 
     if !check_output.status.success() {
-        println!("  Building pjdfstest container...");
+        println!("  Building pjdfstest container (sudo podman build)...");
         let build_output = tokio::process::Command::new("podman")
             .args(["build", "-t", "pjdfstest", "-f", "Containerfile.pjdfstest", "."])
             .output()
@@ -107,9 +107,10 @@ async fn fuse_in_vm_test_impl(category: &str, jobs: usize) -> Result<()> {
         format!("prove -v -j {} -r /opt/pjdfstest/tests/{}/", jobs, category)
     };
 
-    let mut vm_child = tokio::process::Command::new("sudo")
-        .args([
-            fcvm_path.to_str().unwrap(),
+    // Preserve SUDO_USER from the outer sudo (if any) so that fcvm can
+    // find containers in the correct user's storage
+    let mut cmd = tokio::process::Command::new(fcvm_path);
+    cmd.args([
             "podman", "run",
             "--name", &vm_name,
             "--network", "rootless",
@@ -118,9 +119,14 @@ async fn fuse_in_vm_test_impl(category: &str, jobs: usize) -> Result<()> {
             "localhost/pjdfstest",
         ])
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning VM")?;
+        .stderr(Stdio::piped());
+
+    // If SUDO_USER is set (we're running under sudo), preserve it
+    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        cmd.env("SUDO_USER", sudo_user);
+    }
+
+    let mut vm_child = cmd.spawn().context("spawning VM")?;
 
     let vm_pid = vm_child.id().ok_or_else(|| anyhow::anyhow!("failed to get VM PID"))?;
 

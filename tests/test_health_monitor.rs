@@ -64,7 +64,7 @@ async fn test_health_monitor_behaviors() {
             },
             volumes: vec![],
             env: vec![],
-            health_check_path: "/health".to_string(),
+            health_check_url: Some("http://localhost/health".to_string()),
             snapshot_name: None,
             process_type: Some(ProcessType::Vm),
             serve_pid: None,

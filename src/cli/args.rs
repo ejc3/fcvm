@@ -88,6 +88,11 @@ pub struct RunArgs {
     /// Network mode: bridged (requires sudo) or rootless (no sudo)
     #[arg(long, value_enum, default_value_t = NetworkMode::Bridged)]
     pub network: NetworkMode,
+
+    /// HTTP health check URL. If not specified, health is based on container running status.
+    /// Example: --health-check http://localhost/health
+    #[arg(long)]
+    pub health_check: Option<String>,
 }
 
 // ============================================================================

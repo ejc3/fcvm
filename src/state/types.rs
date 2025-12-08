@@ -67,21 +67,14 @@ pub struct VmConfig {
     pub network: NetworkConfig,
     pub volumes: Vec<String>,
     pub env: Vec<String>,
-    #[serde(default = "default_health_check_path")]
-    pub health_check_path: String,
+    /// HTTP health check URL. None means check container running status via fc-agent.
+    pub health_check_url: Option<String>,
     /// Which snapshot this process is serving or was cloned from
-    #[serde(default)]
     pub snapshot_name: Option<String>,
     /// Process type: vm (podman run), serve (snapshot serve), clone (snapshot run)
-    #[serde(default)]
     pub process_type: Option<ProcessType>,
     /// For clones: which serve process PID spawned this clone
-    #[serde(default)]
     pub serve_pid: Option<u32>,
-}
-
-fn default_health_check_path() -> String {
-    "/".to_string()
 }
 
 impl VmState {
@@ -103,7 +96,7 @@ impl VmState {
                 network: NetworkConfig::default(),
                 volumes: Vec::new(),
                 env: Vec::new(),
-                health_check_path: default_health_check_path(),
+                health_check_url: None,
                 snapshot_name: None,
                 process_type: Some(ProcessType::Vm),
                 serve_pid: None,
@@ -169,7 +162,7 @@ mod tests {
         let json = serde_json::to_string_pretty(&state).unwrap();
         assert!(json.contains("\"process_type\": \"vm\""));
 
-        // Test that we can deserialize JSON with string process_type (backward compat)
+        // Test that we can deserialize JSON with string process_type
         let json_with_string_type = r#"{
             "schema_version": 1,
             "vm_id": "test-vm",
@@ -192,7 +185,7 @@ mod tests {
                 },
                 "volumes": [],
                 "env": [],
-                "health_check_path": "/",
+                "health_check_url": null,
                 "snapshot_name": null,
                 "process_type": "serve",
                 "serve_pid": null
