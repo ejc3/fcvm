@@ -69,7 +69,7 @@ pub fn spawn_health_monitor_with_state_dir(
             )
             .await
             {
-                Ok(status) => status,
+                Ok((status, _exit_code)) => status,
                 Err(e) => {
                     warn!(target: "health-monitor", error = %e, "health check iteration failed");
                     HealthStatus::Unknown
@@ -82,6 +82,12 @@ pub fn spawn_health_monitor_with_state_dir(
                 poll_interval = HEALTH_POLL_HEALTHY_INTERVAL;
                 info!(target: "health-monitor", "VM healthy, switching to {:?} polling", HEALTH_POLL_HEALTHY_INTERVAL);
             }
+
+            // Stop monitoring if container has stopped
+            if health_status == HealthStatus::Stopped {
+                info!(target: "health-monitor", "container stopped, ending health monitor");
+                break;
+            }
         }
     })
 }
@@ -92,12 +98,23 @@ async fn update_health_status_once(
     vm_id: &str,
     pid: Option<u32>,
     last_failure_log: &mut Option<Instant>,
-) -> Result<HealthStatus> {
-    let health_status = if let Some(pid) = pid {
+) -> Result<(HealthStatus, Option<i32>)> {
+    let (health_status, exit_code) = if let Some(pid) = pid {
         // First check if Firecracker process is still running
         if std::fs::metadata(format!("/proc/{}", pid)).is_err() {
             debug!(target: "health-monitor", pid = pid, "process not found");
-            HealthStatus::Unreachable
+            // Process exited - check for container-exit file to get exit code
+            let exit_file = paths::vm_runtime_dir(vm_id).join("container-exit");
+            if exit_file.exists() {
+                let exit_code = std::fs::read_to_string(&exit_file)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i32>().ok());
+                info!(target: "health-monitor", exit_code = ?exit_code, "container stopped");
+                (HealthStatus::Stopped, exit_code)
+            } else {
+                // Process gone but no exit file - VM crashed or was killed
+                (HealthStatus::Unreachable, None)
+            }
         } else {
             // Process exists, now check application health
             let state = state_manager
@@ -108,7 +125,7 @@ async fn update_health_status_once(
             // Two modes:
             // 1. health_check_url = Some(url) -> HTTP check (container running + HTTP responds)
             // 2. health_check_url = None -> Check container-ready file (written by fc-agent via vsock)
-            match &state.config.health_check_url {
+            let status = match &state.config.health_check_url {
                 None => {
                     // No HTTP check - check if container-ready file exists
                     // fc-agent creates this file via vsock when the container starts
@@ -193,10 +210,11 @@ async fn update_health_status_once(
                         }
                     }
                 }
-            }
+            };
+            (status, None)
         }
     } else {
-        HealthStatus::Unknown
+        (HealthStatus::Unknown, None)
     };
 
     // Update state file
@@ -205,13 +223,14 @@ async fn update_health_status_once(
         .await
         .context("loading state for health update")?;
     state.health_status = health_status;
+    state.exit_code = exit_code;
     state.last_updated = Utc::now();
     state_manager
         .save_state(&state)
         .await
         .context("saving updated health state")?;
 
-    Ok(health_status)
+    Ok((health_status, exit_code))
 }
 
 /// Run a single health check iteration (exposed for tests).
@@ -222,7 +241,9 @@ pub async fn run_health_check_once(
 ) -> Result<HealthStatus> {
     let state_manager = StateManager::new(state_dir);
     let mut last_failure_log = None;
-    update_health_status_once(&state_manager, vm_id, pid, &mut last_failure_log).await
+    let (status, _exit_code) =
+        update_health_status_once(&state_manager, vm_id, pid, &mut last_failure_log).await?;
+    Ok(status)
 }
 
 /// Check if HTTP service is responding via loopback IP (rootless mode)

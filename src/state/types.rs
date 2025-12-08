@@ -18,6 +18,9 @@ pub struct VmState {
     pub name: Option<String>,
     pub status: VmStatus,
     pub health_status: HealthStatus,
+    /// Container exit code (set when health_status is Stopped)
+    #[serde(default)]
+    pub exit_code: Option<i32>,
     pub pid: Option<u32>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub last_updated: chrono::DateTime<chrono::Utc>,
@@ -45,6 +48,8 @@ pub enum HealthStatus {
     Unhealthy,
     Timeout,
     Unreachable,
+    /// Container has stopped (process exited)
+    Stopped,
 }
 
 /// Type of fcvm process
@@ -86,6 +91,7 @@ impl VmState {
             name: None,
             status: VmStatus::Starting,
             health_status: HealthStatus::Unknown,
+            exit_code: None,
             pid: None,
             created_at: now,
             last_updated: now,
