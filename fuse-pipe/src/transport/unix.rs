@@ -83,9 +83,15 @@ impl AsRawFd for UnixTransport {
 }
 
 impl Clone for UnixTransport {
+    /// Clone the transport.
+    ///
+    /// # Panics
+    /// Panics if the underlying `UnixStream` cannot be cloned (e.g., due to
+    /// resource exhaustion). Use [`try_clone()`](Self::try_clone) for a
+    /// fallible version that returns `Result` instead of panicking.
     fn clone(&self) -> Self {
         Self {
-            stream: self.stream.try_clone().expect("failed to clone UnixStream"),
+            stream: self.stream.try_clone().expect("UnixTransport::clone failed - use try_clone() for fallible clone"),
         }
     }
 }

@@ -190,7 +190,7 @@ fn mount_internal<P: AsRef<Path>>(
     debug!(target: "fuse-pipe::client", "connected to server");
 
     // Create multiplexer for request/response handling
-    let mux = Multiplexer::with_collector(socket, num_readers, trace_rate, collector);
+    let mux = Multiplexer::with_collector(socket, num_readers, trace_rate, collector)?;
     debug!(target: "fuse-pipe::client", num_readers, "multiplexer started");
 
     // Mount options:
@@ -277,7 +277,7 @@ fn mount_internal<P: AsRef<Path>>(
         let mux_for_callback = Arc::clone(&mux);
         Box::new(move || {
             // Take ownership of all cloned fds
-            let fds_vec: Vec<_> = std::mem::take(&mut *cloned_fds_for_callback.lock().unwrap());
+            let fds_vec: Vec<_> = std::mem::take(&mut *cloned_fds_for_callback.lock().unwrap_or_else(|e| e.into_inner()));
 
             for (reader_id, cloned_fd) in fds_vec {
                 let fs = FuseClient::with_destroyed_flag(
@@ -310,7 +310,7 @@ fn mount_internal<P: AsRef<Path>>(
                     }
                     debug!(target: "fuse-pipe::client", reader_id, "secondary reader thread exiting");
                 });
-                reader_threads.lock().unwrap().push(handle);
+                reader_threads.lock().unwrap_or_else(|e| e.into_inner()).push(handle);
             }
         })
     };
@@ -325,7 +325,7 @@ fn mount_internal<P: AsRef<Path>>(
     for reader_id in 1..num_readers {
         match session.channel().clone_fd() {
             Ok(fd) => {
-                cloned_fds.lock().unwrap().push((reader_id, fd));
+                cloned_fds.lock().unwrap_or_else(|e| e.into_inner()).push((reader_id, fd));
             }
             Err(e) => {
                 warn!(target: "fuse-pipe::client", reader_id, error = %e, "failed to clone fd");
@@ -360,7 +360,7 @@ fn mount_internal<P: AsRef<Path>>(
     }
 
     // Join all secondary reader threads before returning
-    let threads: Vec<_> = std::mem::take(&mut *reader_threads.lock().unwrap());
+    let threads: Vec<_> = std::mem::take(&mut *reader_threads.lock().unwrap_or_else(|e| e.into_inner()));
     let num_threads = threads.len();
     debug!(target: "fuse-pipe::client", num_threads, "joining secondary reader threads");
     for handle in threads {
@@ -434,12 +434,17 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
     // VsockTransport wraps a UnixStream internally, extract it for the multiplexer
     // This is safe because VsockTransport is just a UnixStream created from a vsock fd
     use std::os::unix::io::{AsRawFd, FromRawFd};
-    let socket = unsafe { UnixStream::from_raw_fd(libc::dup(transport.as_raw_fd())) };
+    let fd = unsafe { libc::dup(transport.as_raw_fd()) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: fd is a valid file descriptor from dup() which succeeded (fd >= 0)
+    let socket = unsafe { UnixStream::from_raw_fd(fd) };
     socket.set_read_timeout(Some(Duration::from_secs(30)))?;
     socket.set_write_timeout(Some(Duration::from_secs(30)))?;
 
     // Create multiplexer for request/response handling
-    let mux = Multiplexer::with_trace_rate(socket, num_readers, trace_rate);
+    let mux = Multiplexer::with_trace_rate(socket, num_readers, trace_rate)?;
     debug!(target: "fuse-pipe::client", num_readers, "multiplexer started");
 
     // Mount options (same as Unix socket version - see comments there for details)
@@ -470,15 +475,16 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
 
     // Multi-reader setup (same as Unix socket version)
     let cloned_fds: Arc<Mutex<Vec<(usize, OwnedFd)>>> = Arc::new(Mutex::new(Vec::new()));
+    let reader_threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
 
     // Shared flag set by FuseClient::destroy() when kernel sends FUSE_DESTROY.
     let destroyed = Arc::new(AtomicBool::new(false));
 
-    let make_init_callback = |destroyed: Arc<AtomicBool>| {
+    let make_init_callback = |destroyed: Arc<AtomicBool>, reader_threads: Arc<Mutex<Vec<JoinHandle<()>>>>| {
         let cloned_fds_for_callback = Arc::clone(&cloned_fds);
         let mux_for_callback = Arc::clone(&mux);
         Box::new(move || {
-            let fds_vec: Vec<_> = std::mem::take(&mut *cloned_fds_for_callback.lock().unwrap());
+            let fds_vec: Vec<_> = std::mem::take(&mut *cloned_fds_for_callback.lock().unwrap_or_else(|e| e.into_inner()));
 
             for (reader_id, cloned_fd) in fds_vec {
                 let fs = FuseClient::with_destroyed_flag(
@@ -492,7 +498,7 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
                     fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::All);
 
                 let destroyed_check = Arc::clone(&destroyed);
-                thread::spawn(move || {
+                let handle = thread::spawn(move || {
                     if let Err(e) = reader_session.run() {
                         if destroyed_check.load(Ordering::SeqCst) {
                             debug!(target: "fuse-pipe::client", reader_id, "reader exited (clean shutdown)");
@@ -501,11 +507,12 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
                         }
                     }
                 });
+                reader_threads.lock().unwrap_or_else(|e| e.into_inner()).push(handle);
             }
         })
     };
 
-    let fs = FuseClient::with_init_callback(Arc::clone(&mux), 0, make_init_callback(Arc::clone(&destroyed)), Arc::clone(&destroyed));
+    let fs = FuseClient::with_init_callback(Arc::clone(&mux), 0, make_init_callback(Arc::clone(&destroyed), Arc::clone(&reader_threads)), Arc::clone(&destroyed));
     let mut session = fuser::Session::new(fs, mount_point.as_ref(), &options)?;
     info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), "mounted via vsock");
 
@@ -513,7 +520,7 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
     for reader_id in 1..num_readers {
         match session.channel().clone_fd() {
             Ok(fd) => {
-                cloned_fds.lock().unwrap().push((reader_id, fd));
+                cloned_fds.lock().unwrap_or_else(|e| e.into_inner()).push((reader_id, fd));
             }
             Err(e) => {
                 warn!(target: "fuse-pipe::client", reader_id, error = %e, "failed to clone fd");
@@ -531,6 +538,15 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
             error!(target: "fuse-pipe::client", reader_id = 0, error = %e, "reader error");
         }
     }
+
+    // Join all secondary reader threads before returning
+    let threads: Vec<_> = std::mem::take(&mut *reader_threads.lock().unwrap_or_else(|e| e.into_inner()));
+    let num_threads = threads.len();
+    debug!(target: "fuse-pipe::client", num_threads, "joining secondary reader threads");
+    for handle in threads {
+        let _ = handle.join();
+    }
+    debug!(target: "fuse-pipe::client", "all secondary reader threads joined");
 
     debug!(target: "fuse-pipe::client", "FUSE session exited");
     Ok(())

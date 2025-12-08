@@ -52,14 +52,20 @@ impl Multiplexer {
     ///
     /// Spawns background threads for reading and writing to the socket.
     /// Tracing is disabled by default.
-    pub fn new(socket: UnixStream, num_readers: usize) -> Arc<Self> {
+    ///
+    /// # Errors
+    /// Returns an error if the socket cannot be cloned.
+    pub fn new(socket: UnixStream, num_readers: usize) -> std::io::Result<Arc<Self>> {
         Self::with_trace_rate(socket, num_readers, 0)
     }
 
     /// Create a new multiplexer with tracing enabled.
     ///
     /// `trace_rate`: Trace every Nth request (0 = disabled, 100 = every 100th request)
-    pub fn with_trace_rate(socket: UnixStream, num_readers: usize, trace_rate: u64) -> Arc<Self> {
+    ///
+    /// # Errors
+    /// Returns an error if the socket cannot be cloned.
+    pub fn with_trace_rate(socket: UnixStream, num_readers: usize, trace_rate: u64) -> std::io::Result<Arc<Self>> {
         Self::with_collector(socket, num_readers, trace_rate, None)
     }
 
@@ -67,13 +73,16 @@ impl Multiplexer {
     ///
     /// `trace_rate`: Trace every Nth request (0 = disabled, 100 = every 100th request)
     /// `collector`: Optional SpanCollector to aggregate spans (instead of printing each)
+    ///
+    /// # Errors
+    /// Returns an error if the socket cannot be cloned.
     pub fn with_collector(
         socket: UnixStream,
         num_readers: usize,
         trace_rate: u64,
         collector: Option<SpanCollector>,
-    ) -> Arc<Self> {
-        let socket_reader = socket.try_clone().expect("failed to clone socket");
+    ) -> std::io::Result<Arc<Self>> {
+        let socket_reader = socket.try_clone()?;
         let socket_writer = socket;
 
         // Clear timeouts - threads should block indefinitely
@@ -101,13 +110,13 @@ impl Multiplexer {
             reader_loop(socket_reader, pending_for_reader);
         });
 
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             request_tx,
             next_id: AtomicU64::new(1),
             num_readers,
             trace_rate,
             collector,
-        })
+        }))
     }
 
     /// Send a request and wait for response.
@@ -285,7 +294,7 @@ mod tests {
         use std::time::Duration;
 
         let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
-        let mux = Multiplexer::new(client, 1);
+        let mux = Multiplexer::new(client, 1).unwrap();
         let mux_clone = Arc::clone(&mux);
 
         let (done_tx, done_rx) = mpsc::channel();
@@ -321,7 +330,7 @@ mod tests {
         use std::time::Duration;
 
         let (client, mut server) = UnixStream::pair().unwrap();
-        let mux = Multiplexer::new(client, 2);
+        let mux = Multiplexer::new(client, 2).unwrap();
         let mux0 = Arc::clone(&mux);
         let mux1 = Arc::clone(&mux);
 

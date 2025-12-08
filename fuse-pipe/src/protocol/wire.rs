@@ -17,7 +17,14 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// Maximum message size (16 MB).
+///
+/// This value is chosen to fit in a u32 length prefix while being large enough
+/// for typical FUSE operations. The length prefix is always checked before
+/// casting to u32 to prevent overflow.
 pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
+// Static assertion: MAX_MESSAGE_SIZE must fit in u32 for wire protocol
+const _: () = assert!(MAX_MESSAGE_SIZE <= u32::MAX as usize);
 
 /// Wire message wrapping a request with routing information.
 ///
@@ -121,14 +128,17 @@ impl WireRequest {
     }
 }
 
-/// Get current time as nanos since UNIX epoch
+/// Get current time as nanos since UNIX epoch.
+///
+/// Returns 0 if the system clock is before the Unix epoch (which should
+/// be rare but can happen with clock corrections or misconfigured systems).
 #[inline]
 pub fn now_nanos() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 /// Distributed trace span - passed through request/response for e2e latency tracking.

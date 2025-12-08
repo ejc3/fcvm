@@ -209,7 +209,10 @@ async fn request_reader<H: FilesystemHandler + 'static>(
                 handler_clone.handle_request_with_groups(&request, &supplementary_groups)
             })
             .await
-            .unwrap_or_else(|_| VolumeResponse::error(libc::EIO));
+            .unwrap_or_else(|e| {
+                error!(target: "fuse-pipe::server", unique, "handler task panicked: {:?}", e);
+                VolumeResponse::error(libc::EIO)
+            });
 
             // Mark fs operation done
             if let Some(ref mut s) = span {
@@ -282,7 +285,10 @@ async fn response_writer(
 
         let resp_buf = match bincode::serialize(&wire_resp) {
             Ok(b) => b,
-            Err(_) => continue,
+            Err(e) => {
+                error!(target: "fuse-pipe::server", unique, "response serialization failed: {}", e);
+                continue;
+            }
         };
 
         let resp_len = (resp_buf.len() as u32).to_be_bytes();
