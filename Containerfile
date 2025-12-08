@@ -26,6 +26,14 @@ RUN apt-get update && apt-get install -y \
     # Build deps for bindgen (userfaultfd-sys)
     libclang-dev \
     clang \
+    # fcvm VM test dependencies
+    iproute2 \
+    iptables \
+    slirp4netns \
+    dnsmasq \
+    qemu-utils \
+    libguestfs-tools \
+    e2fsprogs \
     # Utilities
     git \
     curl \
@@ -33,6 +41,14 @@ RUN apt-get update && apt-get install -y \
     procps \
     # Clean up
     && rm -rf /var/lib/apt/lists/*
+
+# Download and install Firecracker (ARM64)
+RUN curl -L -o /tmp/firecracker.tgz \
+    https://github.com/firecracker-microvm/firecracker/releases/download/v1.10.1/firecracker-v1.10.1-aarch64.tgz \
+    && tar -xzf /tmp/firecracker.tgz -C /tmp \
+    && mv /tmp/release-v1.10.1-aarch64/firecracker-v1.10.1-aarch64 /usr/local/bin/firecracker \
+    && chmod +x /usr/local/bin/firecracker \
+    && rm -rf /tmp/firecracker.tgz /tmp/release-v1.10.1-aarch64
 
 # Build and install pjdfstest (tests expect it at /tmp/pjdfstest-check/)
 RUN git clone --depth 1 https://github.com/pjd/pjdfstest /tmp/pjdfstest-check \

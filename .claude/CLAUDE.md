@@ -246,11 +246,6 @@ tests/
    - Smart color handling: TTY gets colors, pipes don't
    - Strips Firecracker timestamps and `[anonymous-instance:*]` prefixes
 
-### 📋 TODO
-1. `fcvm setup kernel` - Download/prepare vmlinux
-2. `fcvm setup rootfs` - Create base rootfs with Podman
-3. `fcvm setup preflight` - Validate system requirements
-
 ## Technical Reference
 
 ### Firecracker Requirements
@@ -303,12 +298,15 @@ pub fn vm_runtime_dir(vm_id: &str) -> PathBuf {
 }
 ```
 
-**Setup (one-time):**
-```bash
-sudo mkfs.btrfs /dev/nvme1n1
-sudo mount /dev/nvme1n1 /mnt/fcvm-btrfs
-sudo mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,state,snapshots,vm-disks}
-```
+**Setup**: Automatic via `make test-sanity` or `make container-test-fcvm-sanity` (idempotent btrfs loopback + kernel copy).
+
+**⚠️ CRITICAL: Changing VM base image (fc-agent, rootfs)**
+
+ALWAYS use Makefile commands to update the VM base:
+- `make rebuild` - Rebuild fc-agent and update rootfs
+- `make rootfs` - Update fc-agent in existing rootfs only
+
+NEVER manually edit `/mnt/fcvm-btrfs/rootfs/base.ext4` or mount it directly. The Makefile handles mount/unmount correctly and ensures proper cleanup.
 
 ### Memory Sharing (UFFD)
 
@@ -376,13 +374,9 @@ fcvm clone --snapshot nginx-base --name web1  # Connects to server
 |--------|-------------|
 | `make container-build` | Sync code + build test container |
 | `make container-test` | Run all fuse-pipe tests |
-| `make container-test-integration` | Integration tests only (15 tests) |
-| `make container-test-permissions` | Permission edge cases (18 tests) |
 | `make container-test-pjdfstest` | POSIX compliance (8789 tests) |
-| `make container-test-stress` | Parallel stress tests |
-| `make container-test-full` | Build + run ALL tests in parallel |
+| `make container-test-fcvm-sanity` | fcvm sanity test (bridged + rootless) |
 | `make container-shell` | Interactive shell in container |
-| `make container-clean` | Remove container image |
 
 ### Manual Build on EC2
 

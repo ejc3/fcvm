@@ -19,7 +19,8 @@ ARTIFACTS := artifacts
 
 .PHONY: all build sync build-remote build-local clean kernel rootfs deploy test test-sanity fuse-pipe-test help \
         container-build container-test container-test-full container-test-integration container-test-permissions \
-        container-test-pjdfstest container-test-stress container-shell container-clean
+        container-test-pjdfstest container-test-stress container-shell container-clean \
+        container-test-fcvm container-test-fcvm-sanity ensure-btrfs
 
 all: build
 
@@ -34,15 +35,17 @@ help:
 	@echo "  make deploy        - Install fc-agent into rootfs"
 	@echo ""
 	@echo "Container Testing (podman on EC2):"
-	@echo "  make container-build          - Build test container"
-	@echo "  make container-test           - Run all fuse-pipe tests in container"
-	@echo "  make container-test-full      - Build + run ALL tests in parallel"
+	@echo "  make container-build            - Build test container"
+	@echo "  make container-test             - Run all fuse-pipe tests in container"
+	@echo "  make container-test-full        - Build + run ALL fuse-pipe tests in parallel"
 	@echo "  make container-test-integration - Run integration tests only"
 	@echo "  make container-test-permissions - Run permission tests only"
-	@echo "  make container-test-pjdfstest  - Run pjdfstest full only"
-	@echo "  make container-test-stress     - Run stress tests only"
-	@echo "  make container-shell          - Open shell in container"
-	@echo "  make container-clean          - Remove container image"
+	@echo "  make container-test-pjdfstest   - Run pjdfstest full only"
+	@echo "  make container-test-stress      - Run stress tests only"
+	@echo "  make container-test-fcvm        - Run all fcvm tests in container"
+	@echo "  make container-test-fcvm-sanity - Run fcvm sanity test in container"
+	@echo "  make container-shell            - Open shell in container"
+	@echo "  make container-clean            - Remove container image"
 	@echo ""
 	@echo "Native Testing (direct on EC2):"
 	@echo "  make test          - Run all integration tests on EC2 (cargo test)"
@@ -183,12 +186,12 @@ deploy:
 #
 
 # Run all integration tests
-test: build
+test: build ensure-btrfs
 	@echo "==> Running all integration tests on EC2..."
 	$(SSH) "cd $(REMOTE_DIR) && sudo ~/.cargo/bin/cargo test 2>&1" | tee /tmp/test.log
 
 # Run sanity test (basic VM startup)
-test-sanity: build
+test-sanity: build ensure-btrfs
 	@echo "==> Running sanity test on EC2..."
 	$(SSH) "cd $(REMOTE_DIR) && sudo ~/.cargo/bin/cargo test --test test_sanity 2>&1" | tee /tmp/test-sanity.log
 
@@ -290,3 +293,41 @@ container-shell:
 container-clean:
 	@echo "==> Removing test container image..."
 	$(SSH) "sudo podman rmi -f $(CONTAINER_IMAGE) 2>/dev/null || true"
+
+#
+# fcvm container testing (requires KVM, btrfs mount, network namespaces)
+#
+CONTAINER_RUN_FCVM := sudo podman run --rm --privileged \
+	--device /dev/kvm \
+	--device /dev/fuse \
+	-v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
+	-v /var/run/netns:/var/run/netns:rshared \
+	--network host
+
+container-test-fcvm: ensure-btrfs
+	@echo "==> Running all fcvm tests in container..."
+	$(SSH) "$(CONTAINER_RUN_FCVM) $(CONTAINER_IMAGE) cargo test --release -p fcvm -- --nocapture 2>&1" | tee /tmp/container-fcvm.log
+
+container-test-fcvm-sanity: ensure-btrfs
+	@echo "==> Running fcvm sanity test in container..."
+	$(SSH) "$(CONTAINER_RUN_FCVM) $(CONTAINER_IMAGE) cargo test --release -p fcvm --test test_sanity -- --nocapture 2>&1" | tee /tmp/container-fcvm-sanity.log
+
+#
+# Ensure btrfs is mounted (idempotent, runs before fcvm tests)
+#
+ensure-btrfs:
+	@$(SSH) "if ! mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then \
+		echo '==> Setting up btrfs loopback...'; \
+		if [ ! -f /var/fcvm-btrfs.img ]; then \
+			sudo truncate -s 20G /var/fcvm-btrfs.img && \
+			sudo mkfs.btrfs /var/fcvm-btrfs.img; \
+		fi && \
+		sudo mkdir -p /mnt/fcvm-btrfs && \
+		sudo mount -o loop /var/fcvm-btrfs.img /mnt/fcvm-btrfs && \
+		sudo mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,state,snapshots,vm-disks,cache} && \
+		sudo chown -R ubuntu:ubuntu /mnt/fcvm-btrfs; \
+	fi && \
+	if [ ! -f /mnt/fcvm-btrfs/kernels/vmlinux.bin ]; then \
+		echo '==> Copying kernel...'; \
+		cp ~/linux-firecracker/arch/arm64/boot/Image /mnt/fcvm-btrfs/kernels/vmlinux.bin; \
+	fi"
