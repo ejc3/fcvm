@@ -119,80 +119,6 @@ pub async fn ensure_rootfs() -> Result<PathBuf> {
     Ok(rootfs_path)
 }
 
-/// Update fc-agent binary in an existing rootfs
-///
-/// Mounts the rootfs, copies the latest fc-agent binary, and unmounts.
-/// This ensures fresh fc-agent on every VM start.
-async fn update_fc_agent_in_rootfs(rootfs_path: &Path) -> Result<()> {
-    let temp_dir = PathBuf::from("/tmp/fcvm-rootfs-update");
-    let mount_point = temp_dir.join("mnt");
-
-    // Cleanup any previous mounts
-    let _ = Command::new("umount")
-        .arg(path_to_str(&mount_point).unwrap_or("/tmp/fcvm-rootfs-update/mnt"))
-        .output()
-        .await;
-    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-
-    tokio::fs::create_dir_all(&mount_point)
-        .await
-        .context("creating temp mount directory")?;
-
-    // Mount the rootfs
-    let output = Command::new("mount")
-        .args([
-            "-o",
-            "loop",
-            path_to_str(rootfs_path)?,
-            path_to_str(&mount_point)?,
-        ])
-        .output()
-        .await
-        .context("mounting rootfs for fc-agent update")?;
-
-    if !output.status.success() {
-        bail!(
-            "mount failed: {}. Are you running as root?",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    // Copy latest fc-agent binary
-    let fc_agent_src = find_fc_agent_binary().context("finding fc-agent binary")?;
-    let fc_agent_dest = mount_point.join("usr/local/bin/fc-agent");
-
-    let result = async {
-        tokio::fs::copy(&fc_agent_src, &fc_agent_dest)
-            .await
-            .context("copying fc-agent")?;
-
-        // Make executable
-        let output = Command::new("chmod")
-            .args(["+x", path_to_str(&fc_agent_dest)?])
-            .output()
-            .await
-            .context("making fc-agent executable")?;
-
-        if !output.status.success() {
-            bail!("chmod failed: {}", String::from_utf8_lossy(&output.stderr));
-        }
-
-        Ok(())
-    }
-    .await;
-
-    // Always unmount
-    if let Ok(mount_str) = path_to_str(&mount_point) {
-        let _ = Command::new("umount").arg(mount_str).output().await;
-    }
-
-    // Cleanup
-    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-
-    result?;
-
-    Ok(())
-}
 
 /// Create Ubuntu rootfs from official cloud image
 ///
@@ -422,7 +348,7 @@ async fn customize_ubuntu_cloud_image(image_path: &Path) -> Result<()> {
     info!("adding fc-agent binary");
     cmd.arg("--run-command").arg("mkdir -p /usr/local/bin");
     cmd.arg("--copy-in")
-        .arg(&format!("{}:/usr/local/bin/", fc_agent_src.display()));
+        .arg(format!("{}:/usr/local/bin/", fc_agent_src.display()));
     cmd.arg("--chmod").arg("0755:/usr/local/bin/fc-agent");
 
     // 4. Write chrony config (create directory first)
@@ -434,7 +360,7 @@ async fn customize_ubuntu_cloud_image(image_path: &Path) -> Result<()> {
                        # Directory for drift and other runtime files\n\
                        driftfile /var/lib/chrony/drift\n";
     cmd.arg("--write")
-        .arg(&format!("/etc/chrony/chrony.conf:{}", chrony_conf));
+        .arg(format!("/etc/chrony/chrony.conf:{}", chrony_conf));
 
     // 5. Write systemd-networkd config
     info!("adding network config");
@@ -442,13 +368,13 @@ async fn customize_ubuntu_cloud_image(image_path: &Path) -> Result<()> {
         .arg("mkdir -p /etc/systemd/network /etc/systemd/network/10-eth0.network.d");
 
     let network_config = "[Match]\nName=eth0\n\n[Network]\n# Keep kernel IP configuration from ip= boot parameter\nKeepConfiguration=yes\n# DNS servers for container registry lookups\nDNS=8.8.8.8\nDNS=8.8.4.4\n";
-    cmd.arg("--write").arg(&format!(
+    cmd.arg("--write").arg(format!(
         "/etc/systemd/network/10-eth0.network:{}",
         network_config
     ));
 
     let mmds_route = "[Route]\nDestination=169.254.169.254/32\nScope=link\n";
-    cmd.arg("--write").arg(&format!(
+    cmd.arg("--write").arg(format!(
         "/etc/systemd/network/10-eth0.network.d/mmds.conf:{}",
         mmds_route
     ));
@@ -461,7 +387,7 @@ async fn customize_ubuntu_cloud_image(image_path: &Path) -> Result<()> {
                             Restart=on-failure\nRestartSec=5\n\
                             StandardOutput=journal+console\nStandardError=journal+console\n\n\
                             [Install]\nWantedBy=multi-user.target\n";
-    cmd.arg("--write").arg(&format!(
+    cmd.arg("--write").arg(format!(
         "/etc/systemd/system/fc-agent.service:{}",
         fc_agent_service
     ));
