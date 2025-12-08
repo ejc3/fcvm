@@ -1,0 +1,63 @@
+# fcvm test container
+#
+# Build context must include fuse-backend-rs and fuser alongside fcvm:
+#   cd ~/fcvm && podman build -t fcvm-test -f Containerfile \
+#       --build-context fuse-backend-rs=../fuse-backend-rs \
+#       --build-context fuser=../fuser .
+#
+# Test with: podman run --rm --privileged --device /dev/fuse fcvm-test
+
+FROM docker.io/library/rust:1.83-bookworm
+
+# Install nightly toolchain for fuser (requires edition2024)
+RUN rustup toolchain install nightly && rustup default nightly
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    # FUSE support
+    fuse3 \
+    libfuse3-dev \
+    # pjdfstest build deps
+    autoconf \
+    automake \
+    libtool \
+    # pjdfstest runtime deps
+    perl \
+    # Build deps for bindgen (userfaultfd-sys)
+    libclang-dev \
+    clang \
+    # Utilities
+    git \
+    curl \
+    sudo \
+    procps \
+    # Clean up
+    && rm -rf /var/lib/apt/lists/*
+
+# Build and install pjdfstest (tests expect it at /tmp/pjdfstest-check/)
+RUN git clone --depth 1 https://github.com/pjd/pjdfstest /tmp/pjdfstest-check \
+    && cd /tmp/pjdfstest-check \
+    && autoreconf -ifs \
+    && ./configure \
+    && make
+
+# Create workspace structure matching local paths
+# fcvm is at /workspace/fcvm
+# fuse-backend-rs is at /workspace/fuse-backend-rs (../../fuse-backend-rs from fuse-pipe)
+# fuser is at /workspace/fuser (../../fuser from fuse-pipe)
+WORKDIR /workspace
+
+# Copy local dependencies first (for layer caching)
+COPY --from=fuse-backend-rs . /workspace/fuse-backend-rs
+COPY --from=fuser . /workspace/fuser
+
+# Copy fcvm source
+COPY . /workspace/fcvm
+
+WORKDIR /workspace/fcvm
+
+# Build in release mode
+RUN cargo build --release --workspace
+
+# Default command runs all fuse-pipe tests
+CMD ["sh", "-c", "cargo test --release -p fuse-pipe"]
