@@ -8,39 +8,12 @@
 mod common;
 
 use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use common::FuseMount;
-
-static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Create unique paths for each test.
-fn unique_paths() -> (PathBuf, PathBuf) {
-    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let pid = std::process::id();
-    let data_dir = PathBuf::from(format!("/tmp/fuse-integ-data-{}-{}", pid, id));
-    let mount_dir = PathBuf::from(format!("/tmp/fuse-integ-mount-{}-{}", pid, id));
-
-    // Cleanup any stale state
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = std::process::Command::new("fusermount3")
-        .args(["-u", mount_dir.to_str().unwrap()])
-        .status();
-    let _ = fs::remove_dir_all(&mount_dir);
-
-    (data_dir, mount_dir)
-}
-
-/// Cleanup directories after test.
-fn cleanup(data_dir: &PathBuf, mount_dir: &PathBuf) {
-    let _ = fs::remove_dir_all(data_dir);
-    let _ = fs::remove_dir_all(mount_dir);
-}
+use common::{cleanup, unique_paths, FuseMount};
 
 #[test]
 fn test_create_and_read_file() {
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-integ");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
 
     let test_file = fuse.mount_path().join("test.txt");
@@ -55,7 +28,7 @@ fn test_create_and_read_file() {
 
 #[test]
 fn test_create_directory() {
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-integ");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
 
     let test_dir = fuse.mount_path().join("testdir");
@@ -69,7 +42,7 @@ fn test_create_directory() {
 
 #[test]
 fn test_list_directory() {
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-integ");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
     let mount = fuse.mount_path();
 
@@ -97,7 +70,7 @@ fn test_list_directory() {
 
 #[test]
 fn test_nested_file() {
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-integ");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
 
     let subdir = fuse.mount_path().join("nested");
@@ -118,7 +91,7 @@ fn test_nested_file() {
 
 #[test]
 fn test_file_metadata() {
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-integ");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
 
     let test_file = fuse.mount_path().join("meta.txt");
@@ -138,7 +111,7 @@ fn test_file_metadata() {
 
 #[test]
 fn test_rename_across_directories() {
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-integ");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
     let mount = fuse.mount_path();
 
@@ -167,7 +140,7 @@ fn test_rename_across_directories() {
 
 #[test]
 fn test_symlink_and_readlink() {
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-integ");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
     let mount = fuse.mount_path();
 
@@ -192,7 +165,7 @@ fn test_symlink_and_readlink() {
 
 #[test]
 fn test_hardlink_survives_source_removal() {
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-integ");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
     let mount = fuse.mount_path();
 
@@ -214,7 +187,7 @@ fn test_hardlink_survives_source_removal() {
 
 #[test]
 fn test_multi_reader_mount_basic_io() {
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-integ");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path().to_path_buf();
 
@@ -252,7 +225,7 @@ fn test_multi_reader_mount_basic_io() {
 fn test_nonroot_user_mkdir_in_owned_directory() {
     use std::os::unix::fs::{chown, PermissionsExt};
 
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-integ");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
     let mount = fuse.mount_path();
 
@@ -354,7 +327,7 @@ fn test_nonroot_mkdir_with_2_readers() {
 fn test_nonroot_mkdir_with_readers(num_readers: usize) {
     use std::os::unix::fs::PermissionsExt;
 
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-integ");
     let fuse = FuseMount::new(&data_dir, &mount_dir, num_readers);
     let mount = fuse.mount_path();
 

@@ -152,8 +152,8 @@ impl Filesystem for FuseClient {
         // Signal to reader threads that this is a clean shutdown.
         // The kernel calls destroy() before closing cloned fds, so reader
         // threads will see this flag when they get ECONNABORTED.
-        self.destroyed.store(true, Ordering::SeqCst);
-        tracing::debug!(target: "fuse-pipe::client", "destroy() called - signaling clean shutdown");
+        let was = self.destroyed.swap(true, Ordering::SeqCst);
+        tracing::debug!(target: "fuse-pipe::client", reader_id = self.reader_id, was_already_set = was, "destroy() called - signaling clean shutdown");
     }
 
     fn lookup(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {

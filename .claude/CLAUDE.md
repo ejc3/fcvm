@@ -30,6 +30,12 @@ fcvm snapshot serve my-snapshot      # Start UFFD server (prints serve PID)
 fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
 ```
 
+### Code Philosophy
+
+**NO LEGACY/BACKWARD COMPATIBILITY in our own implementation.** When we change an API, we update all callers. No deprecated functions, no compatibility shims, no `_old` suffixes. Clean breaks only.
+
+Exception: For **forked libraries** (like fuse-backend-rs), we maintain compatibility with upstream to enable merging upstream changes.
+
 ### Code Sync Strategy
 
 **ALWAYS use `make sync` to sync code to EC2.** Never use git pull on EC2.
@@ -437,34 +443,37 @@ ip addr add 172.16.29.1/24 dev tap-vm-c93e8   # Guest is 172.16.29.2
 - Root cause: VMs configured to use 8.8.8.8 but NAT wasn't forwarding DNS properly
 - Fix: Install dnsmasq on host with `bind-dynamic` to listen on TAP devices
 
-## fuse-pipe Tracing
+## fuse-pipe Testing
+
+**Full documentation**: See `fuse-pipe/TESTING.md` for complete testing guide.
+
+### Quick Reference
+
+| Command | Description |
+|---------|-------------|
+| `sudo cargo test --release -p fuse-pipe --test integration` | Basic FUSE ops (15 tests) |
+| `sudo cargo test --release -p fuse-pipe --test test_permission_edge_cases` | Permission tests (18 tests) |
+| `sudo cargo test --release -p fuse-pipe --test pjdfstest_full` | POSIX compliance (8789 tests) |
+| `sudo cargo test --release -p fuse-pipe --test pjdfstest_stress` | Parallel stress (85 jobs, ~44k tests) |
+| `sudo cargo bench -p fuse-pipe --bench throughput` | I/O benchmarks at varying concurrency |
 
 ### Tracing Targets
 
-fuse-pipe uses multiple tracing targets. **Important**: The crate name uses a hyphen (`fuse-pipe`) but Rust module paths use underscores (`fuse_pipe`).
-
-| Target | Component | Notes |
-|--------|-----------|-------|
-| `fuse_pipe::fixture` | Test fixture | In-process mount setup/teardown |
-| `fuse-pipe::server` | Async server | Request dispatch, worker pool |
-| `fuse-pipe::client` | FUSE client | Mount, multiplexer |
-| `passthrough` | PassthroughFs | Filesystem operations |
+| Target | Component |
+|--------|-----------|
+| `fuse_pipe::fixture` | Test fixture setup/teardown |
+| `fuse-pipe::server` | Async server |
+| `fuse-pipe::client` | FUSE client, multiplexer |
+| `passthrough` | PassthroughFs operations |
 
 ### Running Tests with Tracing
 
 ```bash
 # All components at info level, passthrough at debug
-RUST_LOG="fuse_pipe=info,fuse-pipe=info,passthrough=debug" cargo test --test integration -- --nocapture
+RUST_LOG="fuse_pipe=info,fuse-pipe=info,passthrough=debug" sudo -E cargo test --release -p fuse-pipe --test integration -- --nocapture
 
 # Just passthrough operations
-RUST_LOG="passthrough=debug" cargo test --test integration test_list_directory -- --nocapture
-```
-
-### Debugging Hangs
-
-If tests hang, enable tracing to see which operation is blocking:
-```bash
-RUST_LOG="passthrough=debug" cargo test ... -- --nocapture
+RUST_LOG="passthrough=debug" sudo -E cargo test --release -p fuse-pipe --test integration test_list_directory -- --nocapture
 ```
 
 ## References

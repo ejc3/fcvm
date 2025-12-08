@@ -41,8 +41,9 @@ test-pjdfs-full:
 	cargo test --test pjdfstest_full --features pjdfstest-full -- --nocapture
 
 # Run all tests in order (simplest to hardest)
-test-all: test test-integration
-	@echo "All tests passed!"
+# Note: Most tests require sudo for FUSE mount permissions
+test-all: test test-integration test-pjdfs-full bench
+	@echo "All tests and benchmarks passed!"
 
 # === Benchmarks (Local) ===
 .PHONY: bench bench-throughput bench-ops bench-trace bench-quick

@@ -11,6 +11,8 @@ REMOTE_DIR := ~/fcvm
 REMOTE_KERNEL_DIR := ~/linux-firecracker
 REMOTE_FUSE_BACKEND_RS := ~/fuse-backend-rs
 LOCAL_FUSE_BACKEND_RS := ../fuse-backend-rs
+REMOTE_FUSER := ~/fuser
+LOCAL_FUSER := ../fuser
 
 # Local output directory for downloaded artifacts
 ARTIFACTS := artifacts
@@ -61,6 +63,8 @@ sync:
 	$(RSYNC) . $(EC2_HOST):$(REMOTE_DIR)/
 	@echo "==> Syncing fuse-backend-rs to EC2..."
 	$(RSYNC) $(LOCAL_FUSE_BACKEND_RS)/ $(EC2_HOST):$(REMOTE_FUSE_BACKEND_RS)/
+	@echo "==> Syncing fuser to EC2..."
+	$(RSYNC) $(LOCAL_FUSER)/ $(EC2_HOST):$(REMOTE_FUSER)/
 
 #
 # Remote builds (on EC2)

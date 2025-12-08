@@ -39,8 +39,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 fuse-backend-rs = { path = "../../fuse-backend-rs", default-features = false, features = ["fusedev"] }
 vm-memory = "0.14"
 
-# Optional: FUSE client (use GitHub fork with multi-reader support via FUSE_DEV_IOC_CLONE)
-fuser = { git = "https://github.com/ejc3/fuser.git", branch = "master", optional = true }
+# Optional: FUSE client (local fork with multi-reader support via FUSE_DEV_IOC_CLONE)
+# Using local path for development - synced to EC2 via `make sync`
+fuser = { path = "../../fuser", optional = true }
 
 # Concurrent data structures
 dashmap = "5.5"

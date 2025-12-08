@@ -1,4 +1,4 @@
-//! Multi-reader FUSE mount helpers.
+//! FUSE mount with multi-reader support.
 //!
 //! Uses FUSE_DEV_IOC_CLONE to create multiple reader threads that share
 //! a single FUSE mount, enabling parallel request processing.
@@ -10,101 +10,166 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 #[cfg(target_os = "linux")]
 use crate::transport::VsockTransport;
 
-/// Mount a FUSE filesystem using a Unix socket connection.
-///
-/// This connects to a server at `socket_path` and mounts a FUSE filesystem
-/// at `mount_point`. The function blocks until the filesystem is unmounted.
-pub fn mount<P: AsRef<Path>>(socket_path: &str, mount_point: P) -> anyhow::Result<()> {
-    mount_with_options(socket_path, mount_point, 1, 0)
+use fuser::SessionUnmounter;
+
+/// Configuration for FUSE mount.
+#[derive(Clone, Default)]
+pub struct MountConfig {
+    /// Number of FUSE reader threads (default: 1).
+    pub num_readers: usize,
+    /// Trace every Nth request for telemetry (0 = disabled).
+    pub trace_rate: u64,
+    /// Optional span collector for telemetry aggregation.
+    pub collector: Option<SpanCollector>,
 }
 
-/// Mount a FUSE filesystem with multiple reader threads.
-///
-/// This creates multiple FUSE reader threads using FUSE_DEV_IOC_CLONE,
-/// allowing parallel processing of FUSE requests.
-pub fn mount_with_readers<P: AsRef<Path>>(
-    socket_path: &str,
-    mount_point: P,
-    num_readers: usize,
-) -> anyhow::Result<()> {
-    mount_with_options(socket_path, mount_point, num_readers, 0)
+impl MountConfig {
+    /// Create a new mount config with defaults (1 reader, no tracing).
+    pub fn new() -> Self {
+        Self {
+            num_readers: 1,
+            trace_rate: 0,
+            collector: None,
+        }
+    }
+
+    /// Set number of reader threads.
+    pub fn readers(mut self, n: usize) -> Self {
+        self.num_readers = n;
+        self
+    }
+
+    /// Set trace rate for telemetry.
+    pub fn trace_rate(mut self, rate: u64) -> Self {
+        self.trace_rate = rate;
+        self
+    }
+
+    /// Set span collector for telemetry.
+    pub fn collector(mut self, collector: SpanCollector) -> Self {
+        self.collector = Some(collector);
+        self
+    }
 }
 
-/// Mount a FUSE filesystem with full configuration.
+/// Handle for a spawned FUSE mount.
 ///
-/// # Arguments
-///
-/// * `socket_path` - Path to the Unix socket where the server is listening
-/// * `mount_point` - Directory where the FUSE filesystem will be mounted
-/// * `num_readers` - Number of FUSE reader threads (1-8 recommended)
-/// * `trace_rate` - Trace every Nth request (0 = disabled)
-pub fn mount_with_options<P: AsRef<Path>>(
-    socket_path: &str,
-    mount_point: P,
-    num_readers: usize,
-    trace_rate: u64,
-) -> anyhow::Result<()> {
-    mount_with_telemetry(socket_path, mount_point, num_readers, trace_rate, None)
+/// Created by [`mount_spawn`]. Automatically unmounts when dropped.
+/// Use [`join`] to wait for external unmount without triggering unmount.
+pub struct MountHandle {
+    thread: Option<JoinHandle<anyhow::Result<()>>>,
+    unmounter: Option<SessionUnmounter>,
 }
 
-/// Re-export fuser's SessionUnmounter for clean unmount from other threads.
-pub use fuser::SessionUnmounter;
-
-/// Mount a FUSE filesystem with telemetry collection.
-///
-/// If a `SpanCollector` is provided, trace spans will be collected for later analysis.
-/// Use `trace_rate > 0` to enable tracing (e.g., 1 = trace every request, 100 = every 100th).
-///
-/// # Arguments
-///
-/// * `socket_path` - Path to the Unix socket where the server is listening
-/// * `mount_point` - Directory where the FUSE filesystem will be mounted
-/// * `num_readers` - Number of FUSE reader threads (1-8 recommended)
-/// * `trace_rate` - Trace every Nth request (0 = disabled)
-/// * `collector` - Optional SpanCollector for telemetry aggregation
-pub fn mount_with_telemetry<P: AsRef<Path>>(
-    socket_path: &str,
-    mount_point: P,
-    num_readers: usize,
-    trace_rate: u64,
-    collector: Option<SpanCollector>,
-) -> anyhow::Result<()> {
-    mount_internal(socket_path, mount_point, num_readers, trace_rate, collector, None)
+impl Drop for MountHandle {
+    fn drop(&mut self) {
+        debug!(target: "fuse-pipe::client", "MountHandle::drop() starting");
+        // Unmount first (triggers FUSE_DESTROY, causes session.run() to return)
+        if let Some(mut unmounter) = self.unmounter.take() {
+            debug!(target: "fuse-pipe::client", "MountHandle::drop() calling unmount()");
+            let _ = unmounter.unmount();
+            debug!(target: "fuse-pipe::client", "MountHandle::drop() unmount() returned");
+        }
+        // Then wait for mount thread to finish
+        if let Some(thread) = self.thread.take() {
+            debug!(target: "fuse-pipe::client", "MountHandle::drop() joining mount thread");
+            let _ = thread.join();
+            debug!(target: "fuse-pipe::client", "MountHandle::drop() mount thread joined");
+        }
+        debug!(target: "fuse-pipe::client", "MountHandle::drop() complete");
+    }
 }
 
-/// Mount a FUSE filesystem and send back an unmounter handle.
+impl MountHandle {
+    /// Wait for external unmount (e.g., user ran `fusermount3 -u`).
+    ///
+    /// This does NOT trigger unmount - it just waits for the mount thread to exit.
+    /// Use this when something else will unmount the filesystem.
+    pub fn join(mut self) -> anyhow::Result<()> {
+        // Don't unmount - just wait for thread
+        self.unmounter.take();
+        self.thread
+            .take()
+            .unwrap()
+            .join()
+            .map_err(|_| anyhow::anyhow!("mount thread panicked"))?
+    }
+}
+
+/// Mount a FUSE filesystem via Unix socket (blocking).
 ///
-/// Sends a `SessionUnmounter` through the provided channel before blocking on
-/// `session.run()`. The caller can use the unmounter to cleanly stop the FUSE
-/// session from another thread.
+/// Connects to a server at `socket_path` and mounts at `mount_point`.
+/// **Blocks** until the filesystem is unmounted (e.g., via fusermount -u).
+///
+/// For programmatic unmount control, use [`mount_spawn`] instead.
 ///
 /// # Example
 ///
 /// ```ignore
-/// use std::sync::mpsc;
-/// let (tx, rx) = mpsc::channel();
-/// let mount_thread = thread::spawn(move || {
-///     mount_with_unmounter("/tmp/fuse.sock", "/mnt/fuse", 256, tx)
-/// });
-/// let mut unmounter = rx.recv().unwrap();
-/// // ... do work ...
-/// unmounter.unmount().unwrap();
-/// mount_thread.join().unwrap();
+/// use fuse_pipe::{mount, MountConfig};
+///
+/// // Mount with 256 readers (blocks until Ctrl+C or fusermount -u)
+/// mount("/tmp/fuse.sock", "/mnt/fuse", MountConfig::new().readers(256))?;
 /// ```
-pub fn mount_with_unmounter<P: AsRef<Path>>(
+pub fn mount<P: AsRef<Path>>(
     socket_path: &str,
     mount_point: P,
-    num_readers: usize,
-    unmounter_tx: std::sync::mpsc::Sender<SessionUnmounter>,
+    config: MountConfig,
 ) -> anyhow::Result<()> {
-    mount_internal(socket_path, mount_point, num_readers, 0, None, Some(unmounter_tx))
+    mount_internal(
+        socket_path,
+        mount_point,
+        config.num_readers.max(1),
+        config.trace_rate,
+        config.collector,
+        None,
+    )
+}
+
+/// Mount a FUSE filesystem via Unix socket (spawned).
+///
+/// Like [`mount`], but spawns the mount in a thread and returns a handle.
+/// The filesystem is automatically unmounted when the handle is dropped.
+///
+/// # Example
+///
+/// ```ignore
+/// use fuse_pipe::{mount_spawn, MountConfig};
+///
+/// let handle = mount_spawn("/tmp/fuse.sock", "/mnt/fuse", MountConfig::new().readers(256))?;
+///
+/// // Do work with the mounted filesystem...
+///
+/// // Unmount happens automatically when handle is dropped
+/// drop(handle);
+/// ```
+pub fn mount_spawn<P: AsRef<Path> + Send + 'static>(
+    socket_path: &str,
+    mount_point: P,
+    config: MountConfig,
+) -> anyhow::Result<MountHandle> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let socket_path = socket_path.to_string();
+    let num_readers = config.num_readers.max(1);
+    let trace_rate = config.trace_rate;
+    let collector = config.collector;
+
+    let thread = thread::spawn(move || {
+        mount_internal(&socket_path, mount_point, num_readers, trace_rate, collector, Some(tx))
+    });
+
+    let unmounter = rx.recv().map_err(|_| anyhow::anyhow!("mount thread failed before sending unmounter"))?;
+    Ok(MountHandle {
+        thread: Some(thread),
+        unmounter: Some(unmounter),
+    })
 }
 
 /// Internal mount implementation with optional unmounter channel.
@@ -172,7 +237,13 @@ fn mount_internal<P: AsRef<Path>>(
             let _ = tx.send(session.unmount_callable());
         }
 
-        if let Err(e) = session.run() {
+        let run_result = session.run();
+        // Drop the session BEFORE checking destroyed flag. The Session's Drop impl
+        // calls destroy() if it wasn't already called during run(). This ensures
+        // we see the flag set even when FUSE_DESTROY wasn't delivered (programmatic unmount).
+        drop(session);
+
+        if let Err(e) = run_result {
             if destroyed.load(Ordering::SeqCst) {
                 debug!(target: "fuse-pipe::client", "primary reader exited (clean shutdown)");
             } else {
@@ -190,6 +261,7 @@ fn mount_internal<P: AsRef<Path>>(
     // 4. Create Session (this mounts)
     // 5. Clone fds and store them
     // 6. Run session (init() fires, callback spawns readers)
+    // 7. After session.run() returns, join all secondary reader threads
 
     let cloned_fds: Arc<Mutex<Vec<(usize, OwnedFd)>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -197,7 +269,10 @@ fn mount_internal<P: AsRef<Path>>(
     // Reader threads check this to distinguish clean shutdown from real errors.
     let destroyed = Arc::new(AtomicBool::new(false));
 
-    let make_init_callback = |destroyed: Arc<AtomicBool>| {
+    // Storage for secondary reader thread handles - populated by init callback, joined after session.run()
+    let reader_threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let make_init_callback = |destroyed: Arc<AtomicBool>, reader_threads: Arc<Mutex<Vec<JoinHandle<()>>>>| {
         let cloned_fds_for_callback = Arc::clone(&cloned_fds);
         let mux_for_callback = Arc::clone(&mux);
         Box::new(move || {
@@ -216,24 +291,32 @@ fn mount_internal<P: AsRef<Path>>(
                     fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::All);
 
                 let destroyed_check = Arc::clone(&destroyed);
-                thread::spawn(move || {
-                    if let Err(e) = reader_session.run() {
-                        // Check if destroy() was called (clean shutdown via FUSE_DESTROY).
-                        // The kernel calls destroy() on the primary session before closing
-                        // cloned fds, so this flag will be set by the time we see the error.
-                        if destroyed_check.load(Ordering::SeqCst) {
-                            debug!(target: "fuse-pipe::client", reader_id, "reader exited (clean shutdown)");
-                        } else {
-                            error!(target: "fuse-pipe::client", reader_id, error = %e, "reader error");
+                let handle = thread::spawn(move || {
+                    debug!(target: "fuse-pipe::client", reader_id, "secondary reader starting session.run()");
+                    let run_result = reader_session.run();
+                    debug!(target: "fuse-pipe::client", reader_id, "secondary reader session.run() returned, dropping session");
+                    // Drop the session BEFORE checking destroyed flag. The Session's Drop impl
+                    // calls destroy() if it wasn't already called. This ensures we see the flag
+                    // set even when FUSE_DESTROY wasn't delivered (programmatic unmount).
+                    drop(reader_session);
+                    debug!(target: "fuse-pipe::client", reader_id, "secondary reader session dropped");
+
+                    if let Err(e) = run_result {
+                        let destroyed = destroyed_check.load(Ordering::SeqCst);
+                        debug!(target: "fuse-pipe::client", reader_id, destroyed, error = %e, raw_os_error = ?e.raw_os_error(), "reader exited with error");
+                        if !destroyed {
+                            error!(target: "fuse-pipe::client", reader_id, error = %e, "reader error (destroy not called)");
                         }
                     }
+                    debug!(target: "fuse-pipe::client", reader_id, "secondary reader thread exiting");
                 });
+                reader_threads.lock().unwrap().push(handle);
             }
         })
     };
 
     // Create primary FuseClient with callback and shared destroyed flag
-    let fs = FuseClient::with_init_callback(Arc::clone(&mux), 0, make_init_callback(Arc::clone(&destroyed)), Arc::clone(&destroyed));
+    let fs = FuseClient::with_init_callback(Arc::clone(&mux), 0, make_init_callback(Arc::clone(&destroyed), Arc::clone(&reader_threads)), Arc::clone(&destroyed));
     let mut session = fuser::Session::new(fs, mount_point.as_ref(), &options)?;
     info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), "mounted");
 
@@ -259,17 +342,33 @@ fn mount_internal<P: AsRef<Path>>(
         let _ = tx.send(session.unmount_callable());
     }
 
-    if let Err(e) = session.run() {
-        // Check if destroy() was called (clean shutdown). The primary session
-        // also gets an error when unmounted, but destroy() sets the flag first.
-        if destroyed.load(Ordering::SeqCst) {
-            debug!(target: "fuse-pipe::client", "primary reader exited (clean shutdown)");
-        } else {
-            error!(target: "fuse-pipe::client", reader_id = 0, error = %e, "reader error");
+    debug!(target: "fuse-pipe::client", "primary reader starting session.run()");
+    let run_result = session.run();
+    debug!(target: "fuse-pipe::client", "primary reader session.run() returned, dropping session");
+    // Drop the session BEFORE checking destroyed flag. The Session's Drop impl
+    // calls destroy() if it wasn't already called. This ensures we see the flag
+    // set even when FUSE_DESTROY wasn't delivered (programmatic unmount).
+    drop(session);
+    debug!(target: "fuse-pipe::client", "primary reader session dropped");
+
+    if let Err(e) = run_result {
+        let destroyed_flag = destroyed.load(Ordering::SeqCst);
+        debug!(target: "fuse-pipe::client", reader_id = 0, destroyed = destroyed_flag, error = %e, raw_os_error = ?e.raw_os_error(), "primary reader exited with error");
+        if !destroyed_flag {
+            error!(target: "fuse-pipe::client", reader_id = 0, error = %e, "reader error (destroy not called)");
         }
     }
 
-    debug!(target: "fuse-pipe::client", "FUSE session exited");
+    // Join all secondary reader threads before returning
+    let threads: Vec<_> = std::mem::take(&mut *reader_threads.lock().unwrap());
+    let num_threads = threads.len();
+    debug!(target: "fuse-pipe::client", num_threads, "joining secondary reader threads");
+    for handle in threads {
+        let _ = handle.join();
+    }
+    debug!(target: "fuse-pipe::client", "all secondary reader threads joined");
+
+    debug!(target: "fuse-pipe::client", "primary reader thread exiting, FUSE session exited");
     Ok(())
 }
 

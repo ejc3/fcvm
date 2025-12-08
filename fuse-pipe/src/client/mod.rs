@@ -25,11 +25,23 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use fuse_pipe::client::mount_with_readers;
-//! use std::path::PathBuf;
+//! use fuse_pipe::{mount, MountConfig};
 //!
-//! // Mount with 4 reader threads for parallel access
-//! mount_with_readers("/tmp/fuse.sock", &PathBuf::from("/mnt/fuse"), 4)?;
+//! // Simple blocking mount
+//! mount("/tmp/fuse.sock", "/mnt/fuse", MountConfig::new())?;
+//!
+//! // Mount with 256 readers for parallelism
+//! mount("/tmp/fuse.sock", "/mnt/fuse", MountConfig::new().readers(256))?;
+//! ```
+//!
+//! For non-blocking mount with automatic cleanup, use [`mount_spawn`]:
+//!
+//! ```rust,ignore
+//! use fuse_pipe::{mount_spawn, MountConfig};
+//!
+//! let handle = mount_spawn("/tmp/fuse.sock", "/mnt/fuse", MountConfig::new().readers(256))?;
+//! // ... do work ...
+//! // Unmount happens automatically when handle is dropped
 //! ```
 //!
 //! # Feature
@@ -41,10 +53,7 @@ mod mount;
 mod multiplexer;
 
 pub use fuse::FuseClient;
-pub use mount::{
-    mount, mount_with_options, mount_with_readers, mount_with_telemetry, mount_with_unmounter,
-    SessionUnmounter,
-};
+pub use mount::{mount, mount_spawn, MountConfig, MountHandle};
 #[cfg(target_os = "linux")]
 pub use mount::{mount_vsock, mount_vsock_with_options, mount_vsock_with_readers};
 pub use multiplexer::Multiplexer;

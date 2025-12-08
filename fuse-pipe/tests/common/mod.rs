@@ -17,13 +17,13 @@
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Once;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use fuse_pipe::{AsyncServer, PassthroughFs, ServerConfig, SessionUnmounter};
-use tracing::{debug, info, error};
+use fuse_pipe::{AsyncServer, MountConfig, MountHandle, PassthroughFs, ServerConfig};
+use tracing::{debug, info};
 
 /// Target name for fixture logs (consistent with library naming)
 const TARGET: &str = "fuse_pipe::fixture";
@@ -43,6 +43,41 @@ fn init_tracing() {
 
 /// Global counter for unique test IDs
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Check if a path is a FUSE mount by looking in /proc/mounts.
+pub fn is_fuse_mount(path: &Path) -> bool {
+    if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
+        let path_str = path.to_str().unwrap_or("");
+        mounts.lines().any(|line| line.contains(path_str) && line.contains("fuse"))
+    } else {
+        false
+    }
+}
+
+/// Create unique paths for each test with the given prefix.
+pub fn unique_paths(prefix: &str) -> (PathBuf, PathBuf) {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    let data_dir = PathBuf::from(format!("/tmp/{}-data-{}-{}", prefix, pid, id));
+    let mount_dir = PathBuf::from(format!("/tmp/{}-mount-{}-{}", prefix, pid, id));
+
+    // Cleanup any stale state - only unmount if actually mounted
+    let _ = fs::remove_dir_all(&data_dir);
+    if is_fuse_mount(&mount_dir) {
+        let _ = std::process::Command::new("fusermount3")
+            .args(["-u", mount_dir.to_str().unwrap()])
+            .status();
+    }
+    let _ = fs::remove_dir_all(&mount_dir);
+
+    (data_dir, mount_dir)
+}
+
+/// Cleanup directories after test.
+pub fn cleanup(data_dir: &Path, mount_dir: &Path) {
+    let _ = fs::remove_dir_all(data_dir);
+    let _ = fs::remove_dir_all(mount_dir);
+}
 
 /// Increase file descriptor limit for high-concurrency tests
 pub fn increase_ulimit() {
@@ -69,13 +104,11 @@ pub fn increase_ulimit() {
 /// Automatically unmounts and cleans up on drop.
 pub struct FuseMount {
     server_thread: Option<JoinHandle<()>>,
-    client_thread: Option<JoinHandle<()>>,
-    shutdown: Arc<AtomicBool>,
     data_dir: PathBuf,
     mount_dir: PathBuf,
     socket: PathBuf,
-    /// Handle for clean unmount - avoids double-unmount and fusermount errors
-    unmounter: Option<SessionUnmounter>,
+    /// Handle for FUSE mount - dropping this unmounts automatically
+    mount_handle: Option<MountHandle>,
 }
 
 impl FuseMount {
@@ -93,13 +126,11 @@ impl FuseMount {
         fs::create_dir_all(data_path).expect("create data dir");
         fs::create_dir_all(mount_path).expect("create mount dir");
 
-        let shutdown = Arc::new(AtomicBool::new(false));
         let socket_path = socket.to_str().unwrap().to_string();
 
         // Start server in dedicated thread with its own runtime
         let server_data_path = data_path.to_path_buf();
         let server_socket = socket_path.clone();
-        let server_shutdown = Arc::clone(&shutdown);
         let server_thread = thread::spawn(move || {
             info!(target: TARGET, socket = %server_socket, data = ?server_data_path, "Server thread starting");
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -113,11 +144,9 @@ impl FuseMount {
                 let server = AsyncServer::with_config(fs, config);
 
                 info!(target: TARGET, "Server calling serve_unix");
-                // Run server until shutdown
                 if let Err(e) = server.serve_unix(&server_socket).await {
-                    if !server_shutdown.load(Ordering::SeqCst) {
-                        error!(target: TARGET, error = %e, "Server error");
-                    }
+                    // Server exits when client disconnects - this is expected
+                    debug!(target: TARGET, error = %e, "Server exited");
                 }
                 info!(target: TARGET, "Server exiting");
             });
@@ -132,29 +161,12 @@ impl FuseMount {
             thread::sleep(Duration::from_millis(10));
         }
 
-        // Channel to receive the unmounter handle from the client thread
-        let (unmounter_tx, unmounter_rx) = std::sync::mpsc::channel();
-
-        // Start FUSE client in dedicated thread
-        let client_socket = socket_path.clone();
-        let client_mount = mount_path.to_path_buf();
-        let client_shutdown = Arc::clone(&shutdown);
-        let client_thread = thread::spawn(move || {
-            info!(target: TARGET, socket = %client_socket, mount = ?client_mount, readers = num_readers, "Client thread started");
-            match fuse_pipe::mount_with_unmounter(&client_socket, &client_mount, num_readers, unmounter_tx) {
-                Ok(()) => {
-                    info!(target: TARGET, "Client mount_with_readers returned Ok");
-                }
-                Err(e) => {
-                    if !client_shutdown.load(Ordering::SeqCst) {
-                        error!(target: TARGET, error = %e, error_debug = ?e, "Client mount_with_readers failed");
-                    } else {
-                        debug!(target: TARGET, error = %e, "Client shutdown (expected)");
-                    }
-                }
-            }
-            info!(target: TARGET, "Client thread exiting");
-        });
+        // Start FUSE client using mount_spawn (returns handle for RAII cleanup)
+        info!(target: TARGET, socket = %socket_path, mount = ?mount_path, readers = num_readers, "Starting FUSE client");
+        let config = MountConfig::new().readers(num_readers);
+        let mount_handle = fuse_pipe::mount_spawn(&socket_path, mount_path.to_path_buf(), config)
+            .expect("mount_spawn failed");
+        info!(target: TARGET, "mount_spawn succeeded");
 
         // Wait for mount to appear in /proc/mounts
         info!(target: TARGET, mount = ?mount_path, "Waiting for mount to appear in /proc/mounts");
@@ -172,20 +184,12 @@ impl FuseMount {
             thread::sleep(Duration::from_millis(50));
         }
 
-        // Receive the unmounter handle (sent by mount_with_unmounter before blocking)
-        let unmounter = unmounter_rx.recv_timeout(Duration::from_secs(5)).ok();
-        if unmounter.is_none() {
-            error!(target: TARGET, "Failed to receive unmounter handle");
-        }
-
         FuseMount {
             server_thread: Some(server_thread),
-            client_thread: Some(client_thread),
-            shutdown,
             data_dir: data_path.to_path_buf(),
             mount_dir: mount_path.to_path_buf(),
             socket,
-            unmounter,
+            mount_handle: Some(mount_handle), // MountHandle::drop() will unmount
         }
     }
 
@@ -203,22 +207,9 @@ impl FuseMount {
 impl Drop for FuseMount {
     fn drop(&mut self) {
         info!(target: TARGET, "Drop starting - unmounting");
-        // Signal shutdown
-        self.shutdown.store(true, Ordering::SeqCst);
 
-        // Use the unmounter handle for clean unmount (avoids double-unmount errors)
-        if let Some(mut unmounter) = self.unmounter.take() {
-            if let Err(e) = unmounter.unmount() {
-                debug!(target: TARGET, error = %e, "unmount returned error (may be expected)");
-            }
-        }
-
-        // Brief wait for client thread (should exit quickly after unmount)
-        if let Some(handle) = self.client_thread.take() {
-            let (tx, rx) = std::sync::mpsc::channel();
-            thread::spawn(move || { let _ = tx.send(handle.join()); });
-            let _ = rx.recv_timeout(Duration::from_millis(500));
-        }
+        // Drop mount handle - MountHandle::drop() calls unmounter and waits for thread
+        drop(self.mount_handle.take());
 
         // Remove socket - don't wait for server thread, let it be orphaned
         // (it'll die when test process exits)
@@ -251,11 +242,13 @@ mod tests {
         let data_dir = PathBuf::from("/tmp/fuse-common-test-data");
         let mount_dir = PathBuf::from("/tmp/fuse-common-test-mount");
 
-        // Cleanup
+        // Cleanup - only unmount if actually mounted
         let _ = fs::remove_dir_all(&data_dir);
-        let _ = std::process::Command::new("fusermount3")
-            .args(["-u", mount_dir.to_str().unwrap()])
-            .status();
+        if is_fuse_mount(&mount_dir) {
+            let _ = std::process::Command::new("fusermount3")
+                .args(["-u", mount_dir.to_str().unwrap()])
+                .status();
+        }
         let _ = fs::remove_dir_all(&mount_dir);
 
         let fuse = FuseMount::new(&data_dir, &mount_dir, 1);

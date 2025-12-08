@@ -8,7 +8,7 @@
 
 mod pjdfstest_common;
 
-use fuse_pipe::{mount_with_options, AsyncServer, PassthroughFs, ServerConfig};
+use fuse_pipe::{mount_spawn, AsyncServer, MountConfig, MountHandle, PassthroughFs, ServerConfig};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -248,13 +248,6 @@ fn extract_failure_lines(output: &str) -> String {
     }
 }
 
-fn cleanup_mount(mount_dir: &Path) {
-    if let Some(mount) = mount_dir.to_str() {
-        let _ = Command::new("fusermount3").args(["-uz", mount]).output();
-        let _ = Command::new("umount").args(["-lf", mount]).output();
-    }
-    thread::sleep(Duration::from_millis(100));
-}
 
 fn verify_mount(mount_dir: &Path) -> bool {
     let probe = mount_dir.join(".stress-probe");
@@ -314,7 +307,9 @@ fn run_stress_suite(use_host_fs: bool) -> bool {
         PathBuf::from(format!("{}-{}", MOUNT_BASE, run_id))
     };
 
-    cleanup_mount(&mount_dir);
+    // Mount handle for RAII cleanup - Option so we can use it for both host and FUSE
+    let mut _mount_handle: Option<MountHandle> = None;
+
     let _ = fs::remove_file(&socket);
     let _ = fs::remove_dir_all(&data_dir);
     let _ = fs::remove_dir_all(&mount_dir);
@@ -363,19 +358,15 @@ fn run_stress_suite(use_host_fs: bool) -> bool {
 
         info!(target: TARGET, mount = %mount_dir.display(), readers = NUM_READERS, "Mounting FUSE filesystem");
 
-        let mount_dir_clone = mount_dir.clone();
-        let socket_clone = socket.clone();
-        let _client_handle = thread::spawn(move || {
-            if let Err(e) = mount_with_options(
-                socket_clone.to_str().unwrap(),
-                mount_dir_clone.to_str().unwrap(),
-                NUM_READERS,
-                0,
-            ) {
+        // Use mount_spawn for RAII cleanup
+        let config = MountConfig::new().readers(NUM_READERS);
+        let mount_handle = match mount_spawn(socket.to_str().unwrap(), mount_dir.clone(), config) {
+            Ok(handle) => handle,
+            Err(e) => {
                 error!(target: TARGET, error = %e, "Mount failed");
-                std::process::exit(1);
+                return false;
             }
-        });
+        };
 
         // Wait for mount
         let mount_path_str = mount_dir.to_str().unwrap();
@@ -401,6 +392,9 @@ fn run_stress_suite(use_host_fs: bool) -> bool {
             return false;
         }
         info!(target: TARGET, "FUSE mounted successfully");
+
+        // Store mount handle for RAII cleanup at end of function
+        _mount_handle = Some(mount_handle);
 
         // Create marker
         let marker = mount_dir.join(".fuse-pipe-test-marker");
@@ -516,9 +510,7 @@ fn run_stress_suite(use_host_fs: bool) -> bool {
 
     if !all_completed {
         eprintln!("\n[timeout] Stress test exceeded {}s", CATEGORY_TIMEOUT_SECS);
-        if !use_host_fs {
-            cleanup_mount(&mount_dir);
-        }
+        // _mount_handle drops automatically on return
         return false;
     }
 
@@ -597,9 +589,7 @@ fn run_stress_suite(use_host_fs: bool) -> bool {
             total_failures,
             failed_categories.len()
         );
-        if !use_host_fs {
-            cleanup_mount(&mount_dir);
-        }
+        // _mount_handle drops automatically on return
         return false;
     }
 
@@ -615,10 +605,7 @@ fn run_stress_suite(use_host_fs: bool) -> bool {
         );
     }
 
-    if !use_host_fs {
-        cleanup_mount(&mount_dir);
-    }
-
+    // _mount_handle drops automatically at end of function
     total_failures == 0
 }
 
