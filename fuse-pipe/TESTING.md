@@ -4,17 +4,30 @@ This document covers all testing and benchmarking for fuse-pipe.
 
 ## Prerequisites
 
-### Required
+### Required (Native Testing)
 - Rust 1.70+ with `cargo`
 - Linux with FUSE support (`/dev/fuse`)
 - `fusermount3` or `fusermount`
 - Root access (most tests require sudo for FUSE mounts)
 
-### For pjdfstest
+### Recommended: Container Testing
+Container testing is the recommended approach as it:
+- Provides a consistent, reproducible environment
+- Includes all dependencies pre-installed (pjdfstest, Rust nightly, libfuse)
+- Handles device permissions correctly for mknod tests
+
 ```bash
-git clone https://github.com/pjd/pjdfstest /tmp/pjdfstest
-cd /tmp/pjdfstest && autoreconf -ifs && ./configure && make
-sudo cp pjdfstest /usr/local/bin/
+# From project root, build and run tests in container
+make container-build    # Build test container
+make container-test     # Run all fuse-pipe tests
+```
+
+See "Container Testing" section below for full details.
+
+### For pjdfstest (native only)
+```bash
+git clone https://github.com/pjd/pjdfstest /tmp/pjdfstest-check
+cd /tmp/pjdfstest-check && autoreconf -ifs && ./configure && make
 ```
 
 ### For EC2 Benchmarks
@@ -192,6 +205,71 @@ fn test_something() {
 }
 ```
 
+## Container Testing (Recommended)
+
+Container testing provides the most reliable environment for running all tests, including device node creation tests that require special cgroup permissions.
+
+### Quick Start
+
+```bash
+# From project root
+make container-build    # Build the test container (~5 min first time)
+make container-test     # Run all fuse-pipe tests
+```
+
+### Available Makefile Targets
+
+| Target | Description |
+|--------|-------------|
+| `make container-build` | Sync code + build test container |
+| `make container-test` | Run all fuse-pipe tests |
+| `make container-test-integration` | Run integration tests only |
+| `make container-test-permissions` | Run permission tests only |
+| `make container-test-pjdfstest` | Run pjdfstest full (8789 tests) |
+| `make container-test-stress` | Run parallel stress tests |
+| `make container-test-full` | Build + run ALL tests in parallel |
+| `make container-shell` | Open interactive shell in container |
+| `make container-clean` | Remove container image |
+
+### Why Container Testing?
+
+1. **Device permissions**: pjdfstest requires mknod for block/char devices. Containers need `--device-cgroup-rule` flags that are automatically set by the Makefile.
+
+2. **Rust nightly**: fuser requires edition2024 (nightly). The container pre-installs the correct toolchain.
+
+3. **Dependencies**: All build dependencies (libfuse, libclang, pjdfstest) are pre-installed.
+
+4. **Reproducibility**: Same environment everywhere, no "works on my machine" issues.
+
+### Container Technical Details
+
+The container runs with these flags (handled by Makefile):
+```bash
+sudo podman run --rm --privileged --device /dev/fuse \
+  --cap-add=MKNOD \
+  --device-cgroup-rule='b *:* rwm' \
+  --device-cgroup-rule='c *:* rwm' \
+  --ulimit nofile=65536:65536 \
+  --ulimit nproc=65536:65536 \
+  --pids-limit=-1
+```
+
+Key flags:
+- `--privileged --device /dev/fuse`: FUSE filesystem support
+- `--cap-add=MKNOD --device-cgroup-rule`: Allow mknod for block/char devices
+- `--ulimit`: Higher limits for parallel test execution
+
+### Running Individual Tests
+
+```bash
+# Open shell in container
+make container-shell
+
+# Inside container:
+cargo test --release -p fuse-pipe --test integration -- --nocapture
+cargo test --release -p fuse-pipe --test pjdfstest_full -- --nocapture
+```
+
 ## Remote Testing (EC2)
 
 From the project root:
@@ -199,10 +277,13 @@ From the project root:
 # Sync code
 make sync
 
-# Run tests on EC2
+# Run tests on EC2 (native, requires root)
 ssh -i ~/.ssh/fcvm-ec2 ubuntu@54.67.60.104 \
   "cd ~/fcvm && source ~/.cargo/env && \
    sudo cargo test --release -p fuse-pipe --test pjdfstest_full -- --nocapture"
+
+# Run tests on EC2 via container (recommended)
+make container-test
 ```
 
 ## Key Files

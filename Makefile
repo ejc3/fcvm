@@ -18,7 +18,8 @@ LOCAL_FUSER := ../fuser
 ARTIFACTS := artifacts
 
 .PHONY: all build sync build-remote build-local clean kernel rootfs deploy test test-sanity fuse-pipe-test help \
-        container-build container-test container-test-full container-shell container-clean
+        container-build container-test container-test-full container-test-integration container-test-permissions \
+        container-test-pjdfstest container-test-stress container-shell container-clean
 
 all: build
 
@@ -229,22 +230,27 @@ watch:
 #
 CONTAINER_IMAGE := fcvm-test
 # Higher limits needed for parallel tests (thread spawning)
-CONTAINER_RUN := podman run --rm --privileged --device /dev/fuse \
+# Must run as sudo for mknod block/char device support (pjdfstest requirement)
+# --device-cgroup-rule allows mknod for block (b) and char (c) devices
+CONTAINER_RUN := sudo podman run --rm --privileged --device /dev/fuse \
+	--cap-add=MKNOD \
+	--device-cgroup-rule='b *:* rwm' \
+	--device-cgroup-rule='c *:* rwm' \
 	--ulimit nofile=65536:65536 \
 	--ulimit nproc=65536:65536 \
 	--pids-limit=-1
 
 container-build: sync
-	@echo "==> Building test container on EC2..."
-	$(SSH) "cd $(REMOTE_DIR) && podman build -t $(CONTAINER_IMAGE) -f Containerfile \
+	@echo "==> Building test container on EC2 (sudo for device access)..."
+	$(SSH) "cd $(REMOTE_DIR) && sudo podman build -t $(CONTAINER_IMAGE) -f Containerfile \
 		--build-context fuse-backend-rs=/home/ubuntu/fuse-backend-rs \
 		--build-context fuser=/home/ubuntu/fuser \
 		. 2>&1" | tee /tmp/container-build.log
 	@echo "==> Container built: $(CONTAINER_IMAGE)"
 
-container-test: sync
+container-test:
 	@echo "==> Running fuse-pipe tests in container..."
-	$(SSH) "cd $(REMOTE_DIR) && $(CONTAINER_RUN) $(CONTAINER_IMAGE) cargo test --release -p fuse-pipe 2>&1" | tee /tmp/container-test.log
+	$(SSH) "$(CONTAINER_RUN) $(CONTAINER_IMAGE) cargo test --release -p fuse-pipe 2>&1" | tee /tmp/container-test.log
 
 container-test-integration:
 	@echo "==> Running integration tests in container..."
@@ -283,4 +289,4 @@ container-shell:
 
 container-clean:
 	@echo "==> Removing test container image..."
-	$(SSH) "podman rmi -f $(CONTAINER_IMAGE) 2>/dev/null || true"
+	$(SSH) "sudo podman rmi -f $(CONTAINER_IMAGE) 2>/dev/null || true"
