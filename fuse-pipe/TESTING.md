@@ -46,7 +46,7 @@ cd /tmp/pjdfstest-check && autoreconf -ifs && ./configure && make
 | `sudo cargo test --test pjdfstest_stress` | Parallel stress test (85 jobs) | Yes |
 | `sudo cargo bench --bench throughput` | I/O throughput at varying concurrency | Yes |
 | `sudo cargo bench --bench operations` | Single-operation latency | Yes |
-| `make test-all` | Run everything (unit + integration + pjdfs + bench) | Yes |
+| `make container-test` | Run all tests in container (recommended) | Yes |
 
 ## Test Files
 
@@ -54,11 +54,12 @@ cd /tmp/pjdfstest-check && autoreconf -ifs && ./configure && make
 |------|---------|-------|
 | `src/**/*.rs` | Unit tests | ~20 |
 | `tests/integration.rs` | Basic FUSE operations (read, write, mkdir, etc.) | 15 |
-| `tests/test_permission_edge_cases.rs` | Permission edge cases, setuid/setgid | 18 |
+| `tests/test_permission_edge_cases.rs` | Permission edge cases, setuid/setgid | 17 |
 | `tests/pjdfstest_fast.rs` | Quick POSIX compliance test (32 readers) | 8789 |
 | `tests/pjdfstest_full.rs` | Full POSIX compliance test (256 readers) | 8789 |
 | `tests/pjdfstest_stress.rs` | Parallel stress test (5 instances × 17 categories) | ~44000 |
 | `tests/pjdfstest_common.rs` | Shared pjdfstest harness code | - |
+| `tests/test_unmount_race.rs` | Unmount race condition test | 3 |
 | `tests/common/mod.rs` | Shared `FuseMount` fixture | - |
 | `benches/throughput.rs` | Parallel read/write at varying reader counts | - |
 | `benches/operations.rs` | Single-operation latency benchmarks | - |
@@ -107,8 +108,10 @@ Tests parallel read/write performance at different reader counts (1, 2, 4, 8, 16
 
 ### Full Verification
 ```bash
-make test-all
-# or manually:
+# Container testing (recommended)
+make container-test
+
+# Or manually:
 cargo test --lib && \
 sudo cargo test --release --test integration && \
 sudo cargo test --release --test pjdfstest_full && \
@@ -222,14 +225,9 @@ make container-test     # Run all fuse-pipe tests
 | Target | Description |
 |--------|-------------|
 | `make container-build` | Sync code + build test container |
-| `make container-test` | Run all fuse-pipe tests |
-| `make container-test-integration` | Run integration tests only |
-| `make container-test-permissions` | Run permission tests only |
-| `make container-test-pjdfstest` | Run pjdfstest full (8789 tests) |
-| `make container-test-stress` | Run parallel stress tests |
-| `make container-test-full` | Build + run ALL tests in parallel |
+| `make container-test` | Run all fuse-pipe tests (38 unit + 15 integration + 8789 pjdfstest + 85 stress + 17 permission + 3 unmount race) |
+| `make container-test-fcvm` | Run fcvm VM sanity tests |
 | `make container-shell` | Open interactive shell in container |
-| `make container-clean` | Remove container image |
 
 ### Why Container Testing?
 

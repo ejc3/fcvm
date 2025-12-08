@@ -246,6 +246,24 @@ tests/
    - Smart color handling: TTY gets colors, pipes don't
    - Strips Firecracker timestamps and `[anonymous-instance:*]` prefixes
 
+5. **Container Lifecycle Management** (2025-12-08)
+   - Container exit code forwarding via vsock status channel (port 4999)
+   - `--privileged` mode for containers requiring device access and mknod
+   - Health monitoring detects stopped containers (`HealthStatus::Stopped`)
+   - `fcvm podman run` returns non-zero exit code when container fails
+   - State tracking includes `exit_code` field in `VmState`
+
+6. **Supplementary Groups Forwarding** (2025-12-08)
+   - fuse-pipe forwards supplementary groups through wire protocol
+   - Enables proper permission checks for remote filesystems
+   - Uses raw `SYS_setgroups` syscall for per-thread credential switching
+   - Critical for vsock-based FUSE where server can't read /proc
+
+7. **Resource Limits** (2025-12-08)
+   - RLIMIT_NOFILE raised to 65536 on startup (both fc-agent and fcvm)
+   - Prevents EMFILE errors during parallel test execution
+   - Required for large-scale POSIX compliance test suites
+
 ## Technical Reference
 
 ### Firecracker Requirements

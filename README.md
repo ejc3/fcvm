@@ -1,168 +1,150 @@
 # fcvm - Firecracker VM Manager
 
-A complete Rust implementation that launches Firecracker microVMs to run Podman containers, with **rootless** and **privileged** host modes, lightning-fast cloning, and full production features.
+A Rust implementation that launches Firecracker microVMs to run Podman containers, with lightning-fast cloning via UFFD memory sharing and btrfs CoW disk snapshots.
 
-> **What you get**
-> - Complete Firecracker VM manager with working `run`, `clone`, `ls`, and other commands
-> - Full networking layer (rootless with slirp4netns, privileged with nftables)
-> - CoW disk management for instant cloning
-> - Snapshot save/restore functionality
-> - VM state management and lifecycle control
-> - Enhanced guest agent with environment variables and volume support
-> - Comprehensive 1500-line design specification
-> - Buck build system support
-> - Production-ready error handling and logging
+> **Features**
+> - Run OCI containers in isolated Firecracker microVMs
+> - Instant VM cloning via UFFD memory server + btrfs reflinks (~3ms)
+> - Multiple VMs share memory via kernel page cache (50 VMs = ~512MB, not 25GB!)
+> - Dual networking: bridged (iptables) or rootless (slirp4netns)
+> - FUSE-based host directory mapping via fuse-pipe
+> - Container exit code forwarding
 
 ---
 
-## 0) Prereqs
+## Prerequisites
 
-**Common**
-- Linux x86_64 with `/dev/kvm` (user in `kvm` group for rootless use).
-- `curl`, `jq`, `uidmap` (for user namespaces).
+**Hardware**
+- Linux with `/dev/kvm` (bare-metal or nested virtualization)
+- For EC2: c6g.metal (ARM64) or c5.metal (x86_64) - NOT regular instances
 
-**Privileged mode**
-- `sudo` access, `nftables`, `iproute2`, `ethtool`.
+**Software**
+- Rust 1.70+ with cargo
+- For bridged networking: sudo access, iptables, iproute2, dnsmasq
+- For rootless networking: slirp4netns
+- For building rootfs: virt-customize (libguestfs-tools)
 
-**Rootless mode**
-- `slirp4netns`, `newuidmap`, `newgidmap`, sysctl `user.max_user_namespaces` sufficiently high.
-
-**Build tools**
-- `rustup` + stable toolchain, `cargo`, `clang`/`llvm` (optional), `make`.
-- For building rootfs: `mmdebstrap` (preferred rootless) **or** `debootstrap` (needs sudo), plus `qemu-user-static` on some distros.
+**Storage**
+- btrfs filesystem at `/mnt/fcvm-btrfs` (for CoW disk snapshots)
 
 ---
 
-## 1) Quick Start
+## Quick Start
 
-### 1.1 Preflight
+### Build
 ```bash
-scripts/preflight.sh
+# Build host CLI and guest agent
+cargo build --release --workspace
 ```
 
-### 1.2 Initialize (downloads Firecracker, builds rootfs & places files under ~/.local/share/fcvm)
-```bash
-scripts/fcvm-init.sh
-```
-
-This will:
-- Download Firecracker (latest by default; configurable in `.env`).
-- Build a minimal Debian rootfs with Podman and install the **fc-agent** into it.
-- Create an ext4 rootfs image (`rootfs.ext4`) and copy the rootfs into it.
-- Place artifacts under `~/.local/share/fcvm/{bin,images}`.
-
-> If you already have a kernel (`vmlinux`), copy it to `~/.local/share/fcvm/images/vmlinux` before running `fcvm`.
-
-### 1.3 Build the host CLI + guest agent
-```bash
-make build
-```
-
-### 1.4 First run
+### Run a Container
 ```bash
 # Run nginx in a Firecracker VM
-./target/release/fcvm run nginx:latest --name web1 --publish 8080:80
+sudo fcvm podman run --name web1 --network bridged nginx:alpine
 
-# With environment variables and volumes
-./target/release/fcvm run postgres:15 \
-  --env POSTGRES_PASSWORD=secret \
-  --map /data/postgres:/var/lib/postgresql/data \
-  --mem 4096 --cpu 4
+# With port forwarding
+sudo fcvm podman run --name web1 --network bridged --publish 8080:80 nginx:alpine
+
+# With host directory mapping (via fuse-pipe)
+sudo fcvm podman run --name web1 --network bridged --map /host/data:/data nginx:alpine
 
 # List running VMs
-./target/release/fcvm ls
+fcvm ls
 ```
 
-### 1.5 Warm snapshot flow
+### Snapshot & Clone Workflow
 ```bash
-# Run and save snapshot when ready
-./target/release/fcvm run nginx:latest \
-  --wait-ready mode=http,url=http://127.0.0.1:80 \
-  --save-snapshot warm-nginx
+# 1. Start baseline VM
+sudo fcvm podman run --name baseline --network bridged nginx:alpine
 
-# Clone from snapshot (fast <1s startup)
-./target/release/fcvm clone --name warm-nginx --snapshot warm-nginx --publish 9090:80
+# 2. Create snapshot (pauses VM briefly)
+sudo fcvm snapshot create --pid <vm_pid> --tag nginx-warm
+
+# 3. Start UFFD memory server (serves pages on-demand)
+sudo fcvm snapshot serve nginx-warm
+
+# 4. Clone from snapshot (~3ms startup)
+sudo fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
+sudo fcvm snapshot run --pid <serve_pid> --name clone2 --network bridged
 ```
 
 ---
 
-## 2) Repo Layout
+## Project Structure
 
 ```
 fcvm/
-  README.md            # This file
-  DESIGN.md            # Complete 1500-line design specification
-  Cargo.toml           # Workspace configuration
-  Makefile             # Build targets
-  BUCK                 # Buck2 build system (root)
-
-  config/
-    fcvm.example.yml   # Configuration template
-
-  templates/
-    mmds-plan-example.json  # MMDS metadata example
-
-  network/
-    nftables-template.nft   # Privileged mode networking
-
-  scripts/
-    preflight.sh            # Prerequisites check
-    fcvm-init.sh            # Download Firecracker, build rootfs
-    create-rootfs-debian.sh # Build Debian rootfs with Podman
-    build-kernel.sh         # Kernel build helper
-    setup-nftables.sh       # Network setup (privileged)
-
-  fcvm/                # Host CLI crate
-    Cargo.toml
-    BUCK               # Buck build file
-    src/
-      main.rs          # Entry point with full run/clone implementation
-      cli.rs           # Command-line argument parsing
-      lib.rs           # Shared types
-      state.rs         # VM state persistence
-
-      firecracker/     # Firecracker integration
-        mod.rs
-        api.rs         # HTTP API client (Unix sockets)
-        vm.rs          # VM process lifecycle manager
-
-      network/         # Networking layer
-        mod.rs
-        types.rs       # Port mapping, config types
-        rootless.rs    # slirp4netns integration
-        privileged.rs  # nftables + bridge setup
-
-      storage/         # Storage & snapshots
-        mod.rs
-        disk.rs        # CoW disk management
-        snapshot.rs    # Snapshot save/restore
-        volume.rs      # Volume mount handling
-
-      readiness/       # Readiness gates
-        mod.rs
-        vsock.rs       # vsock readiness
-        http.rs        # HTTP endpoint polling
-        log.rs         # Serial console log matching
-        exec.rs        # Execute command in guest
-
-  fc-agent/            # Guest agent crate
-    Cargo.toml
-    BUCK               # Buck build file
-    fc-agent.service   # systemd unit
-    src/
-      main.rs          # Enhanced Podman launcher with env/volumes
+├── src/                    # Host CLI
+│   ├── main.rs             # Entry point
+│   ├── cli/                # Command-line parsing
+│   ├── commands/           # Command implementations (podman, snapshot, ls)
+│   ├── firecracker/        # Firecracker API client
+│   ├── network/            # Networking (bridged, slirp)
+│   ├── storage/            # Disk/snapshot management
+│   ├── state/              # VM state persistence
+│   ├── health.rs           # Health monitoring
+│   ├── uffd/               # UFFD memory sharing
+│   └── volume/             # Volume/FUSE mount handling
+│
+├── fc-agent/               # Guest agent
+│   └── src/main.rs         # Container orchestration inside VM
+│
+├── fuse-pipe/              # FUSE passthrough library
+│   └── src/                # Client/server for host directory sharing
+│
+└── tests/                  # Integration tests
+    ├── test_sanity.rs      # Basic VM lifecycle
+    ├── test_snapshot_clone.rs
+    └── test_fuse_in_vm.rs  # POSIX compliance (8789 tests)
 ```
 
 ---
 
-## 3) Notes
+## Network Modes
 
-- **Inbound is off by default**. Publishing is optional:
-  - **Rootless**: `--publish` creates slirp hostfwd rules (defaults to 127.0.0.1).
-  - **Privileged**: `--publish` programs nftables DNAT rules.
-- **Mapping modes**:
-  - **block** (default; snapshot-friendly), **sshfs** (rootless OK), **nfs** (privileged only).
-- For **VM-in-VM**, ensure nested virtualization is enabled so `/dev/kvm` exists inside your outer VM.
-- **Storage expectations**: On btrfs/xfs hosts we take advantage of `cp --reflink=always` for instant CoW disks. On ext4 (or any FS without reflink support) we automatically fall back to a normal `cp`, which works everywhere but takes longer because it copies the image fully.
+| Mode | Flag | Root Required | Performance |
+|------|------|---------------|-------------|
+| Bridged | `--network bridged` | Yes | Better |
+| Rootless | `--network rootless` | No | Good |
 
-Happy hacking!
+**Bridged**: Uses iptables NAT, requires sudo. Port forwarding via DNAT rules.
+
+**Rootless**: Uses slirp4netns in user namespace. Port forwarding via slirp4netns API.
+
+---
+
+## Testing
+
+```bash
+# Quick sanity test
+make test-sanity
+
+# Full fuse-pipe POSIX compliance (8789 tests)
+make container-test
+
+# Run tests in container (recommended)
+make container-shell
+```
+
+See `fuse-pipe/TESTING.md` for comprehensive test documentation.
+
+---
+
+## Data Layout
+
+```
+/mnt/fcvm-btrfs/
+├── kernels/vmlinux.bin     # Firecracker kernel
+├── rootfs/base.ext4        # Base Ubuntu + Podman image
+├── vm-disks/{vm_id}/       # Per-VM disk (CoW reflink)
+├── snapshots/              # Firecracker snapshots
+└── state/                  # VM state JSON files
+```
+
+---
+
+## Documentation
+
+- `.claude/CLAUDE.md` - Detailed development notes and implementation status
+- `fuse-pipe/TESTING.md` - Test infrastructure documentation
+- `DESIGN.md` - Original design specification
