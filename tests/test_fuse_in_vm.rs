@@ -33,11 +33,20 @@ async fn test_fuse_in_vm_full() -> Result<()> {
 }
 
 async fn fuse_in_vm_test_impl(category: &str, jobs: usize) -> Result<()> {
+    // Full test suite needs privileged mode for mknod tests
+    let privileged = category == "all";
+    fuse_in_vm_test_impl_inner(category, jobs, privileged).await
+}
+
+async fn fuse_in_vm_test_impl_inner(category: &str, jobs: usize, privileged: bool) -> Result<()> {
     let test_id = format!("fuse-vm-{}", std::process::id());
     let test_start = Instant::now();
 
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!("║     FUSE-in-VM Test: {} ({} jobs)                    ║", category, jobs);
+    if privileged {
+        println!("║     [PRIVILEGED MODE]                                         ║");
+    }
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
     // Paths
@@ -110,14 +119,19 @@ async fn fuse_in_vm_test_impl(category: &str, jobs: usize) -> Result<()> {
     // Preserve SUDO_USER from the outer sudo (if any) so that fcvm can
     // find containers in the correct user's storage
     let mut cmd = tokio::process::Command::new(fcvm_path);
-    cmd.args([
-            "podman", "run",
-            "--name", &vm_name,
-            "--network", "rootless",
-            "--map", &map_arg,
-            "--cmd", &prove_cmd,
-            "localhost/pjdfstest",
-        ])
+    let mut args = vec![
+        "podman", "run",
+        "--name", &vm_name,
+        "--network", "rootless",
+        "--map", &map_arg,
+        "--cmd", &prove_cmd,
+    ];
+    // Add --privileged for full test suite (needed for mknod tests)
+    if privileged {
+        args.push("--privileged");
+    }
+    args.push("localhost/pjdfstest");
+    cmd.args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 

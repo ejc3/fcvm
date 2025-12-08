@@ -26,6 +26,9 @@ struct Plan {
     /// Directory containing exported OCI image (for localhost/ images)
     #[serde(default)]
     image_dir: Option<String>,
+    /// Run container in privileged mode (allows mknod, device access, etc.)
+    #[serde(default)]
+    privileged: bool,
 }
 
 /// Volume mount configuration from MMDS
@@ -486,6 +489,80 @@ const STATUS_VSOCK_PORT: u32 = 4999;
 /// Host CID for vsock (always 2)
 const HOST_CID: u32 = 2;
 
+/// Raise resource limits for high parallelism workloads.
+/// This prevents EMFILE (too many open files) errors when running
+/// tests with many parallel jobs.
+fn raise_resource_limits() {
+    use libc::{rlimit, setrlimit, RLIMIT_NOFILE};
+
+    // Target 65536 open files (default is often 1024)
+    let new_limit = rlimit {
+        rlim_cur: 65536,
+        rlim_max: 65536,
+    };
+
+    let result = unsafe { setrlimit(RLIMIT_NOFILE, &new_limit) };
+    if result == 0 {
+        eprintln!("[fc-agent] ✓ raised RLIMIT_NOFILE to 65536");
+    } else {
+        eprintln!("[fc-agent] WARNING: failed to raise RLIMIT_NOFILE: {}",
+                  std::io::Error::last_os_error());
+    }
+}
+
+/// Notify host of container exit status via vsock.
+///
+/// Sends "exit:{code}\n" message to the host on the status vsock port.
+/// The host side can use this to determine if the container succeeded or failed.
+fn notify_container_exit(exit_code: i32) {
+    // Create vsock socket
+    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        eprintln!("[fc-agent] WARNING: failed to create vsock socket for exit status: {}",
+                  std::io::Error::last_os_error());
+        return;
+    }
+
+    // Build sockaddr_vm structure
+    let addr = libc::sockaddr_vm {
+        svm_family: libc::AF_VSOCK as u16,
+        svm_reserved1: 0,
+        svm_port: STATUS_VSOCK_PORT,
+        svm_cid: HOST_CID,
+        svm_zero: [0u8; 4],
+    };
+
+    // Connect to host
+    let result = unsafe {
+        libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_vm>() as u32,
+        )
+    };
+
+    if result < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        eprintln!("[fc-agent] WARNING: failed to connect vsock for exit status: {}", err);
+        return;
+    }
+
+    // Send exit status message
+    let msg = format!("exit:{}\n", exit_code);
+    let written = unsafe {
+        libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len())
+    };
+
+    unsafe { libc::close(fd) };
+
+    if written == msg.len() as isize {
+        eprintln!("[fc-agent] ✓ notified host of exit code {} via vsock", exit_code);
+    } else {
+        eprintln!("[fc-agent] WARNING: vsock exit status write incomplete: {} bytes", written);
+    }
+}
+
 /// Notify host that container has started via vsock.
 ///
 /// Sends "ready\n" message to the host on the status vsock port.
@@ -689,6 +766,9 @@ async fn main() -> Result<()> {
 
     eprintln!("[fc-agent] starting");
 
+    // Raise resource limits early to support high parallelism workloads
+    raise_resource_limits();
+
     // Wait for MMDS to be ready
     let plan = loop {
         match fetch_plan().await {
@@ -781,7 +861,20 @@ async fn main() -> Result<()> {
 
     // Build Podman command
     let mut cmd = Command::new("podman");
-    cmd.arg("run").arg("--rm").arg("--network=host");
+    cmd.arg("run")
+        .arg("--rm")
+        .arg("--network=host")
+        // Raise ulimit for containers running parallel tests
+        .arg("--ulimit")
+        .arg("nofile=65536:65536");
+
+    // Privileged mode: allows mknod, device access, etc. for POSIX compliance tests
+    if plan.privileged {
+        eprintln!("[fc-agent] privileged mode enabled");
+        cmd.arg("--device-cgroup-rule=b *:* rwm") // Allow block device nodes
+            .arg("--device-cgroup-rule=c *:* rwm") // Allow char device nodes
+            .arg("--privileged");
+    }
 
     // Add environment variables
     for (key, val) in &plan.env {
@@ -841,12 +934,17 @@ async fn main() -> Result<()> {
 
     // Wait for container to exit
     let status = child.wait().await?;
+    let exit_code = status.code().unwrap_or(1);
 
     if status.success() {
         eprintln!("[fc-agent] container exited successfully");
     } else {
-        eprintln!("[fc-agent] container exited with error: {}", status);
+        eprintln!("[fc-agent] container exited with error: {} (code {})", status, exit_code);
     }
+
+    // Notify host of container exit status via vsock
+    // The host can use this to determine if the container succeeded
+    notify_container_exit(exit_code);
 
     // Shut down the VM when the container exits (success or failure)
     // This is the expected behavior - the VM exists to run one container
@@ -855,5 +953,5 @@ async fn main() -> Result<()> {
 
     // Give poweroff a moment to execute, then exit with container's exit code
     sleep(Duration::from_millis(100)).await;
-    std::process::exit(status.code().unwrap_or(0))
+    std::process::exit(exit_code)
 }

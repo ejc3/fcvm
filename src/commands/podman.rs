@@ -66,13 +66,15 @@ pub async fn cmd_podman(args: PodmanArgs) -> Result<()> {
     }
 }
 
-/// Listen for fc-agent "ready" notification on the status vsock port.
+/// Listen for fc-agent status messages on the status vsock port.
 ///
 /// Firecracker forwards guest vsock connections to Unix sockets with format:
 /// `{uds_path}_{port}` - so we listen on vsock.sock_4999 for port 4999.
 ///
-/// When fc-agent connects and sends "ready\n", we create a ready file.
-async fn run_status_listener(socket_path: &str, ready_file: &std::path::Path, vm_id: &str) -> Result<()> {
+/// Messages:
+/// - "ready\n" - Container started, create ready file for health check
+/// - "exit:{code}\n" - Container exited, write exit code to file
+async fn run_status_listener(socket_path: &str, runtime_dir: &std::path::Path, vm_id: &str) -> Result<()> {
     use tokio::io::AsyncReadExt;
     use tokio::net::UnixListener;
 
@@ -84,21 +86,53 @@ async fn run_status_listener(socket_path: &str, ready_file: &std::path::Path, vm
 
     info!(socket = %socket_path, "Status listener started");
 
-    // Accept one connection (we only need one "ready" notification per VM)
-    let (mut stream, _) = listener.accept().await.context("accepting status connection")?;
+    let ready_file = runtime_dir.join("container-ready");
+    let exit_file = runtime_dir.join("container-exit");
 
-    // Read the "ready" message
-    let mut buf = [0u8; 64];
-    let n = stream.read(&mut buf).await.context("reading status message")?;
+    // Accept connections in a loop (we get "ready" then "exit")
+    loop {
+        let accept_result = tokio::time::timeout(
+            std::time::Duration::from_secs(3600), // 1 hour timeout
+            listener.accept()
+        ).await;
 
-    let msg = String::from_utf8_lossy(&buf[..n]);
-    if msg.trim() == "ready" {
-        // Create ready file to signal container is running
-        std::fs::write(ready_file, "ready\n")
-            .with_context(|| format!("writing ready file: {:?}", ready_file))?;
-        info!(vm_id = %vm_id, "Container ready notification received");
-    } else {
-        warn!(vm_id = %vm_id, msg = %msg.trim(), "Unexpected status message");
+        let (mut stream, _) = match accept_result {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => {
+                warn!(vm_id = %vm_id, error = %e, "Error accepting status connection");
+                continue;
+            }
+            Err(_) => {
+                // Timeout - VM probably shut down without sending exit
+                break;
+            }
+        };
+
+        // Read the message
+        let mut buf = [0u8; 64];
+        let n = match stream.read(&mut buf).await {
+            Ok(n) if n > 0 => n,
+            _ => continue,
+        };
+
+        let msg = String::from_utf8_lossy(&buf[..n]);
+        let msg = msg.trim();
+
+        if msg == "ready" {
+            // Create ready file to signal container is running
+            std::fs::write(&ready_file, "ready\n")
+                .with_context(|| format!("writing ready file: {:?}", ready_file))?;
+            info!(vm_id = %vm_id, "Container ready notification received");
+        } else if let Some(code_str) = msg.strip_prefix("exit:") {
+            // Write exit code to file
+            std::fs::write(&exit_file, format!("{}\n", code_str))
+                .with_context(|| format!("writing exit file: {:?}", exit_file))?;
+            info!(vm_id = %vm_id, exit_code = %code_str, "Container exit notification received");
+            // Exit loop after receiving exit code
+            break;
+        } else {
+            warn!(vm_id = %vm_id, msg = %msg, "Unexpected status message");
+        }
     }
 
     // Clean up socket
@@ -290,16 +324,16 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    // Start status channel listener for fc-agent "ready" notifications
-    // When fc-agent sends "ready" on port 4999, we create a ready file
-    let status_ready_file = data_dir.join("container-ready");
+    // Start status channel listener for fc-agent notifications
+    // - "ready" on port 4999 -> creates container-ready file for health check
+    // - "exit:{code}" on port 4999 -> creates container-exit file with exit code
     let status_socket_path = format!("{}_{}", vsock_socket_path.display(), VSOCK_STATUS_PORT);
     let status_handle = {
-        let ready_file = status_ready_file.clone();
+        let runtime_dir = data_dir.clone();
         let socket_path = status_socket_path.clone();
         let vm_id_clone = vm_id.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_status_listener(&socket_path, &ready_file, &vm_id_clone).await {
+            if let Err(e) = run_status_listener(&socket_path, &runtime_dir, &vm_id_clone).await {
                 tracing::warn!("Status listener error: {}", e);
             }
         })
@@ -350,15 +384,24 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt())?;
 
     // Wait for signal or VM exit
+    let container_exit_code: Option<i32>;
     tokio::select! {
         _ = sigterm.recv() => {
             info!("received SIGTERM, shutting down VM");
+            container_exit_code = None; // Signal-based shutdown, not container exit
         }
         _ = sigint.recv() => {
             info!("received SIGINT, shutting down VM");
+            container_exit_code = None; // Signal-based shutdown, not container exit
         }
         status = vm_manager.wait() => {
             info!(status = ?status, "VM exited");
+            // Read container exit code from file written by status listener
+            let exit_file = data_dir.join("container-exit");
+            container_exit_code = std::fs::read_to_string(&exit_file)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok());
+            info!(container_exit_code = ?container_exit_code, "container exit code");
         }
     }
 
@@ -393,6 +436,13 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     // Cleanup vsock socket
     let _ = std::fs::remove_file(&vsock_socket_path);
+
+    // Return error if container exited with non-zero exit code
+    if let Some(code) = container_exit_code {
+        if code != 0 {
+            bail!("container exited with code {}", code);
+        }
+    }
 
     Ok(())
 }
@@ -587,6 +637,7 @@ async fn run_vm_setup(
                 "cmd": cmd_args,
                 "volumes": volume_mounts,
                 "image_dir": if args.image.starts_with("localhost/") { Some("/tmp/fcvm-image") } else { None },
+                "privileged": args.privileged,
             },
             "host-time": chrono::Utc::now().timestamp().to_string(),
         }

@@ -93,6 +93,11 @@ pub struct RunArgs {
     /// Example: --health-check http://localhost/health
     #[arg(long)]
     pub health_check: Option<String>,
+
+    /// Run container in privileged mode (allows mknod, device access, etc.)
+    /// Use for POSIX compliance tests that need full filesystem capabilities
+    #[arg(long)]
+    pub privileged: bool,
 }
 
 // ============================================================================

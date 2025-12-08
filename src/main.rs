@@ -5,8 +5,30 @@ use fcvm::{cli, commands, paths};
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
+/// Raise file descriptor limit for high-parallelism workloads.
+/// The fuse-pipe server can have many open files when serving parallel tests.
+fn raise_resource_limits() {
+    use libc::{rlimit, setrlimit, RLIMIT_NOFILE};
+
+    let new_limit = rlimit {
+        rlim_cur: 65536,
+        rlim_max: 65536,
+    };
+
+    let result = unsafe { setrlimit(RLIMIT_NOFILE, &new_limit) };
+    if result != 0 {
+        eprintln!(
+            "[fcvm] warning: failed to raise RLIMIT_NOFILE: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Raise resource limits early for fuse-pipe server
+    raise_resource_limits();
+
     // Parse CLI arguments
     let cli = cli::Cli::parse();
 
