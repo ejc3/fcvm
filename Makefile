@@ -17,7 +17,8 @@ LOCAL_FUSER := ../fuser
 # Local output directory for downloaded artifacts
 ARTIFACTS := artifacts
 
-.PHONY: all build sync build-remote build-local clean kernel rootfs deploy test test-sanity fuse-pipe-test help
+.PHONY: all build sync build-remote build-local clean kernel rootfs deploy test test-sanity fuse-pipe-test help \
+        container-build container-test container-test-full container-shell container-clean
 
 all: build
 
@@ -31,6 +32,22 @@ help:
 	@echo "  make fetch         - Download built artifacts from EC2"
 	@echo "  make deploy        - Install fc-agent into rootfs"
 	@echo ""
+	@echo "Container Testing (podman on EC2):"
+	@echo "  make container-build          - Build test container"
+	@echo "  make container-test           - Run all fuse-pipe tests in container"
+	@echo "  make container-test-full      - Build + run ALL tests in parallel"
+	@echo "  make container-test-integration - Run integration tests only"
+	@echo "  make container-test-permissions - Run permission tests only"
+	@echo "  make container-test-pjdfstest  - Run pjdfstest full only"
+	@echo "  make container-test-stress     - Run stress tests only"
+	@echo "  make container-shell          - Open shell in container"
+	@echo "  make container-clean          - Remove container image"
+	@echo ""
+	@echo "Native Testing (direct on EC2):"
+	@echo "  make test          - Run all integration tests on EC2 (cargo test)"
+	@echo "  make test-sanity   - Run sanity test (basic VM startup)"
+	@echo "  make fuse-pipe-test - Run fuse-pipe library tests"
+	@echo ""
 	@echo "Kernel (builds on EC2 with FUSE support):"
 	@echo "  make kernel-setup  - Clone Linux $(KERNEL_VERSION) and upload config"
 	@echo "  make kernel        - Build kernel Image on EC2 (~10-20 min)"
@@ -40,11 +57,6 @@ help:
 	@echo "Images:"
 	@echo "  make rootfs        - Build rootfs image on EC2"
 	@echo "  make rebuild       - Sync + build + rebuild rootfs (full rebuild)"
-	@echo ""
-	@echo "Testing:"
-	@echo "  make test          - Run all integration tests on EC2 (cargo test)"
-	@echo "  make test-sanity   - Run sanity test (basic VM startup)"
-	@echo "  make fuse-pipe-test - Run fuse-pipe library tests"
 	@echo ""
 	@echo "Local:"
 	@echo "  make build-local   - Build locally (macOS, won't run)"
@@ -211,3 +223,64 @@ watch:
 		fswatch -1 src fc-agent/src Cargo.toml fc-agent/Cargo.toml && \
 		make build; \
 	done
+
+#
+# Container-based testing (podman)
+#
+CONTAINER_IMAGE := fcvm-test
+# Higher limits needed for parallel tests (thread spawning)
+CONTAINER_RUN := podman run --rm --privileged --device /dev/fuse \
+	--ulimit nofile=65536:65536 \
+	--ulimit nproc=65536:65536 \
+	--pids-limit=-1
+
+container-build: sync
+	@echo "==> Building test container on EC2..."
+	$(SSH) "cd $(REMOTE_DIR) && podman build -t $(CONTAINER_IMAGE) -f Containerfile \
+		--build-context fuse-backend-rs=/home/ubuntu/fuse-backend-rs \
+		--build-context fuser=/home/ubuntu/fuser \
+		. 2>&1" | tee /tmp/container-build.log
+	@echo "==> Container built: $(CONTAINER_IMAGE)"
+
+container-test: sync
+	@echo "==> Running fuse-pipe tests in container..."
+	$(SSH) "cd $(REMOTE_DIR) && $(CONTAINER_RUN) $(CONTAINER_IMAGE) cargo test --release -p fuse-pipe 2>&1" | tee /tmp/container-test.log
+
+container-test-integration:
+	@echo "==> Running integration tests in container..."
+	$(SSH) "$(CONTAINER_RUN) $(CONTAINER_IMAGE) cargo test --release -p fuse-pipe --test integration -- --nocapture 2>&1" | tee /tmp/container-integration.log
+
+container-test-permissions:
+	@echo "==> Running permission tests in container..."
+	$(SSH) "$(CONTAINER_RUN) $(CONTAINER_IMAGE) cargo test --release -p fuse-pipe --test test_permission_edge_cases -- --nocapture 2>&1" | tee /tmp/container-permissions.log
+
+container-test-pjdfstest:
+	@echo "==> Running pjdfstest full in container..."
+	$(SSH) "$(CONTAINER_RUN) $(CONTAINER_IMAGE) cargo test --release -p fuse-pipe --test pjdfstest_full -- --nocapture 2>&1" | tee /tmp/container-pjdfstest.log
+
+container-test-stress:
+	@echo "==> Running stress tests in container..."
+	$(SSH) "$(CONTAINER_RUN) $(CONTAINER_IMAGE) cargo test --release -p fuse-pipe --test pjdfstest_stress -- --nocapture 2>&1" | tee /tmp/container-stress.log
+
+container-test-full: container-build
+	@echo "==> Running ALL tests in container (parallel)..."
+	$(SSH) "cd $(REMOTE_DIR) && \
+		$(CONTAINER_RUN) $(CONTAINER_IMAGE) sh -c ' \
+			cargo test --release -p fuse-pipe --test integration > /tmp/integration.log 2>&1 & \
+			cargo test --release -p fuse-pipe --test test_permission_edge_cases > /tmp/permissions.log 2>&1 & \
+			cargo test --release -p fuse-pipe --test pjdfstest_full > /tmp/pjdfstest.log 2>&1 & \
+			cargo test --release -p fuse-pipe --test pjdfstest_stress > /tmp/stress.log 2>&1 & \
+			wait && \
+			echo \"=== Integration ===\" && tail -5 /tmp/integration.log && \
+			echo \"=== Permissions ===\" && tail -5 /tmp/permissions.log && \
+			echo \"=== pjdfstest ===\" && tail -10 /tmp/pjdfstest.log && \
+			echo \"=== Stress ===\" && tail -5 /tmp/stress.log \
+		' 2>&1" | tee /tmp/container-test-full.log
+
+container-shell:
+	@echo "==> Opening shell in test container..."
+	$(SSH) -t "cd $(REMOTE_DIR) && $(CONTAINER_RUN) -it $(CONTAINER_IMAGE) bash"
+
+container-clean:
+	@echo "==> Removing test container image..."
+	$(SSH) "podman rmi -f $(CONTAINER_IMAGE) 2>/dev/null || true"
