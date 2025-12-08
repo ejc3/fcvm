@@ -8,9 +8,38 @@ use fuser::{
     Request, TimeOrNow,
 };
 use std::ffi::OsStr;
+use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
+
+/// Parse supplementary groups from /proc/<pid>/status.
+///
+/// FUSE protocol only passes uid and primary gid. For proper permission checks
+/// (like chown to a supplementary group), we need to read the caller's groups.
+fn get_supplementary_groups(pid: u32) -> Vec<u32> {
+    if pid == 0 {
+        return Vec::new();
+    }
+
+    let status_path = format!("/proc/{}/status", pid);
+    let content = match fs::read_to_string(&status_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    // Look for line: "Groups:\t1000 1001 1002"
+    for line in content.lines() {
+        if let Some(groups_str) = line.strip_prefix("Groups:") {
+            return groups_str
+                .split_whitespace()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+        }
+    }
+
+    Vec::new()
+}
 
 /// Callback to spawn additional readers after INIT completes.
 pub type InitCallback = Box<dyn FnOnce() + Send>;
@@ -74,6 +103,16 @@ impl FuseClient {
     /// Send request and wait for response.
     fn send_request_sync(&self, request: VolumeRequest) -> VolumeResponse {
         self.mux.send_request(self.reader_id, request)
+    }
+
+    /// Send request with supplementary groups and wait for response.
+    ///
+    /// Reads the caller's supplementary groups from /proc/<pid>/status
+    /// and forwards them to the server for proper permission checks.
+    fn send_request_with_groups(&self, request: VolumeRequest, pid: u32) -> VolumeResponse {
+        let groups = get_supplementary_groups(pid);
+        self.mux
+            .send_request_with_groups(self.reader_id, request, groups)
     }
 }
 
@@ -232,23 +271,29 @@ impl Filesystem for FuseClient {
             None => (None, None, false),
         };
 
-        let response = self.send_request_sync(VolumeRequest::Setattr {
-            ino,
-            mode,
-            uid,
-            gid,
-            size,
-            atime_secs,
-            atime_nsecs,
-            atime_now,
-            mtime_secs,
-            mtime_nsecs,
-            mtime_now,
-            fh,
-            caller_uid: req.uid(),
-            caller_gid: req.gid(),
-            caller_pid: req.pid(),
-        });
+        // Use send_request_with_groups for setattr (which handles chown).
+        // Supplementary groups are needed for proper permission checks when
+        // a non-root user chowns to one of their supplementary groups.
+        let response = self.send_request_with_groups(
+            VolumeRequest::Setattr {
+                ino,
+                mode,
+                uid,
+                gid,
+                size,
+                atime_secs,
+                atime_nsecs,
+                atime_now,
+                mtime_secs,
+                mtime_nsecs,
+                mtime_now,
+                fh,
+                caller_uid: req.uid(),
+                caller_gid: req.gid(),
+                caller_pid: req.pid(),
+            },
+            req.pid(),
+        );
 
         match response {
             VolumeResponse::Attr { attr, ttl_secs } => {

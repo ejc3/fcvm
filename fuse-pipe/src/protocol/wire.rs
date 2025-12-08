@@ -33,6 +33,12 @@ pub struct WireRequest {
     /// Only populated for traced requests (unique % 100 == 0)
     #[serde(default)]
     pub span: Option<Span>,
+    /// Supplementary groups of the calling process.
+    /// FUSE protocol only passes uid and primary gid. For proper permission checks
+    /// (especially chown to a supplementary group), we forward the caller's groups.
+    /// The client reads these from /proc/<pid>/status and forwards them.
+    #[serde(default)]
+    pub supplementary_groups: Vec<u32>,
 }
 
 impl WireRequest {
@@ -43,6 +49,7 @@ impl WireRequest {
             reader_id,
             request,
             span: None,
+            supplementary_groups: Vec::new(),
         }
     }
 
@@ -53,6 +60,40 @@ impl WireRequest {
             reader_id,
             request,
             span: Some(span),
+            supplementary_groups: Vec::new(),
+        }
+    }
+
+    /// Create a new wire request with supplementary groups
+    pub fn with_groups(
+        unique: u64,
+        reader_id: u32,
+        request: VolumeRequest,
+        supplementary_groups: Vec<u32>,
+    ) -> Self {
+        Self {
+            unique,
+            reader_id,
+            request,
+            span: None,
+            supplementary_groups,
+        }
+    }
+
+    /// Create a new wire request with trace span and supplementary groups
+    pub fn with_span_and_groups(
+        unique: u64,
+        reader_id: u32,
+        request: VolumeRequest,
+        span: Span,
+        supplementary_groups: Vec<u32>,
+    ) -> Self {
+        Self {
+            unique,
+            reader_id,
+            request,
+            span: Some(span),
+            supplementary_groups,
         }
     }
 
