@@ -87,9 +87,15 @@ impl ZeroCopyReader for SliceReader<'_> {
         if to_write == 0 {
             return Ok(0);
         }
-        // SAFETY: data is valid for to_write bytes and lives for this call.
-        // We cast away const because FileVolatileSlice requires *mut, but
-        // write_at_volatile only reads from it.
+        // SAFETY: We cast *const to *mut because FileVolatileSlice::from_raw_ptr requires
+        // a mutable pointer, but the underlying operation (write_at_volatile) only READS
+        // from this slice to write data TO the file. The mutable pointer requirement is
+        // an API limitation, not a mutation requirement.
+        //
+        // Invariants:
+        // - self.data is valid for at least `to_write` bytes (checked above)
+        // - self.data lives for the duration of this call (borrowed from caller)
+        // - No actual mutation occurs through this pointer
         let slice =
             unsafe { FileVolatileSlice::from_raw_ptr(self.data.as_ptr() as *mut u8, to_write) };
         let n = f.write_at_volatile(slice, off)?;

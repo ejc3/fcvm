@@ -21,6 +21,31 @@
 //! server.serve_unix("/tmp/fuse.sock").await?;
 //! ```
 //!
+//! # Thread Safety
+//!
+//! All public types in this crate are thread-safe:
+//!
+//! - [`Multiplexer`] can be shared across threads via `Arc<Multiplexer>`
+//! - [`AsyncServer`] handles concurrent requests safely
+//! - [`PassthroughFs`] uses interior mutability for thread-safe access
+//! - [`SpanCollector`] is `Clone` and can be shared across threads
+//!
+//! # Panics
+//!
+//! The following operations can panic:
+//!
+//! - [`PassthroughFs::new()`] panics if the filesystem cannot be created.
+//!   Use [`PassthroughFs::try_new()`] for a fallible version.
+//! - [`UnixTransport::clone()`] panics if the socket cannot be cloned.
+//!   Use [`UnixTransport::try_clone()`] for a fallible version.
+//! - Internal mutex locks use poison recovery, so they won't panic on poisoning.
+//!
+//! # Limitations
+//!
+//! - **Advisory file locking is not implemented.** `getlk`/`setlk` operations
+//!   return success but locks are not enforced. Applications relying on POSIX
+//!   advisory locking will not work correctly.
+//!
 //! # Features
 //!
 //! - `fuse-client` (default): Enable FUSE client support via `fuser`

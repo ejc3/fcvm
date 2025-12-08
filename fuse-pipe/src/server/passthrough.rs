@@ -56,7 +56,20 @@ pub struct PassthroughFs {
 
 impl PassthroughFs {
     /// Create a new passthrough filesystem rooted at the given path.
+    ///
+    /// # Panics
+    /// Panics if the passthrough filesystem cannot be created or imported.
+    /// Use [`try_new()`](Self::try_new) for a fallible version that returns `Result`.
     pub fn new<P: Into<PathBuf>>(root_path: P) -> Self {
+        Self::try_new(root_path).expect("Failed to create passthrough filesystem")
+    }
+
+    /// Create a new passthrough filesystem rooted at the given path.
+    ///
+    /// # Errors
+    /// Returns an error if the passthrough filesystem cannot be created or
+    /// if the root directory cannot be imported.
+    pub fn try_new<P: Into<PathBuf>>(root_path: P) -> std::io::Result<Self> {
         let root_path = root_path.into();
         let root_dir = root_path.to_string_lossy().to_string();
 
@@ -73,17 +86,16 @@ impl PassthroughFs {
             ..Default::default()
         };
 
-        let inner = FuseBackendPassthrough::new(cfg)
-            .expect("Failed to create passthrough filesystem");
+        let inner = FuseBackendPassthrough::new(cfg)?;
 
         // Initialize the filesystem
-        inner.import().expect("Failed to import filesystem");
+        inner.import()?;
 
-        Self {
+        Ok(Self {
             inner: Arc::new(inner),
             root_path,
             attr_ttl_secs: ATTR_TTL_SECS,
-        }
+        })
     }
 
     /// Set the attribute TTL.
@@ -972,6 +984,13 @@ impl FilesystemHandler for PassthroughFs {
         }
     }
 
+    /// Get information about a file lock.
+    ///
+    /// # Warning: Advisory Locking Not Implemented
+    /// Advisory file locking is **not enforced** by fuse-pipe. This method always
+    /// returns "no conflicting lock" (`F_UNLCK`), which makes all lock queries
+    /// succeed. Applications relying on POSIX advisory locking for inter-process
+    /// coordination will **not** work correctly through this filesystem.
     fn getlk(
         &self,
         _ino: u64,
@@ -984,7 +1003,6 @@ impl FilesystemHandler for PassthroughFs {
     ) -> VolumeResponse {
         // fuse-backend-rs doesn't expose file locking, and we can't access the raw fd.
         // Return "no conflicting lock" which is the most permissive behavior.
-        // This means we report that the requested lock would succeed.
         VolumeResponse::Lock {
             start,
             end,
@@ -993,6 +1011,13 @@ impl FilesystemHandler for PassthroughFs {
         }
     }
 
+    /// Set or release a file lock.
+    ///
+    /// # Warning: Advisory Locking Not Implemented
+    /// Advisory file locking is **not enforced** by fuse-pipe. This method always
+    /// returns success, but locks are **not actually applied**. Applications relying
+    /// on POSIX advisory locking for inter-process coordination will **not** work
+    /// correctly through this filesystem.
     fn setlk(
         &self,
         _ino: u64,
