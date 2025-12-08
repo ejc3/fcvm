@@ -68,10 +68,6 @@ pub struct RunArgs {
     #[arg(long, num_args=0.., value_delimiter=',')]
     pub map: Vec<String>,
 
-    /// Map mode: block | sshfs | nfs
-    #[arg(long, value_enum, default_value_t = MapModeOpt::Block)]
-    pub map_mode: MapModeOpt,
-
     /// Environment vars KEY=VALUE (repeat or comma-separated)
     #[arg(long, num_args=0.., value_delimiter=',')]
     pub env: Vec<String>,
@@ -84,10 +80,6 @@ pub struct RunArgs {
     /// Grammar: [HOSTIP:]HOSTPORT:GUESTPORT[/PROTO], comma-separated
     #[arg(long, num_args=0.., value_delimiter=',')]
     pub publish: Vec<String>,
-
-    /// Logs: stream | file | both
-    #[arg(long, default_value = "stream")]
-    pub logs: String,
 
     /// Balloon target MiB (default equals --mem)
     #[arg(long)]
@@ -154,9 +146,6 @@ pub struct SnapshotRunArgs {
     #[arg(long, num_args=0.., value_delimiter=',')]
     pub publish: Vec<String>,
 
-    #[arg(long, default_value = "stream")]
-    pub logs: String,
-
     /// Network mode: bridged (requires sudo) or rootless (no sudo)
     #[arg(long, value_enum, default_value_t = NetworkMode::Bridged)]
     pub network: NetworkMode,
@@ -167,13 +156,6 @@ pub struct SnapshotRunArgs {
 // ============================================================================
 // Enums
 // ============================================================================
-
-#[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
-pub enum MapModeOpt {
-    Block,
-    Sshfs,
-    Nfs,
-}
 
 /// Network mode for VM networking
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default, ValueEnum)]
