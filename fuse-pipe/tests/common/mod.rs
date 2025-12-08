@@ -239,17 +239,7 @@ mod tests {
 
     #[test]
     fn test_in_process_mount() {
-        let data_dir = PathBuf::from("/tmp/fuse-common-test-data");
-        let mount_dir = PathBuf::from("/tmp/fuse-common-test-mount");
-
-        // Cleanup - only unmount if actually mounted
-        let _ = fs::remove_dir_all(&data_dir);
-        if is_fuse_mount(&mount_dir) {
-            let _ = std::process::Command::new("fusermount3")
-                .args(["-u", mount_dir.to_str().unwrap()])
-                .status();
-        }
-        let _ = fs::remove_dir_all(&mount_dir);
+        let (data_dir, mount_dir) = unique_paths("fuse-common");
 
         let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
 
@@ -261,9 +251,6 @@ mod tests {
         fs::remove_file(&test_file).expect("remove");
 
         drop(fuse);
-
-        // Cleanup
-        let _ = fs::remove_dir_all(&data_dir);
-        let _ = fs::remove_dir_all(&mount_dir);
+        cleanup(&data_dir, &mount_dir);
     }
 }
