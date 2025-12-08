@@ -184,6 +184,7 @@ async fn request_reader<H: FilesystemHandler + 'static>(
         let unique = wire_req.unique;
         let reader_id = wire_req.reader_id;
         let request = wire_req.request;
+        let supplementary_groups = wire_req.supplementary_groups;
         let mut span = wire_req.span;
 
         // Update span with server timing
@@ -203,11 +204,12 @@ async fn request_reader<H: FilesystemHandler + 'static>(
                 s.server_spawn = now_nanos();
             }
 
-            // Run FS operation on blocking thread
-            let response =
-                tokio::task::spawn_blocking(move || handler_clone.handle_request(&request))
-                    .await
-                    .unwrap_or_else(|_| VolumeResponse::error(libc::EIO));
+            // Run FS operation on blocking thread with supplementary groups
+            let response = tokio::task::spawn_blocking(move || {
+                handler_clone.handle_request_with_groups(&request, &supplementary_groups)
+            })
+            .await
+            .unwrap_or_else(|_| VolumeResponse::error(libc::EIO));
 
             // Mark fs operation done
             if let Some(ref mut s) = span {

@@ -13,9 +13,29 @@ use crate::protocol::{VolumeRequest, VolumeResponse};
 ///
 /// The default implementation returns ENOSYS for all operations.
 pub trait FilesystemHandler: Send + Sync {
-    /// Handle a complete FUSE request.
+    /// Handle a complete FUSE request with supplementary groups.
     ///
-    /// This is the main entry point. The default implementation
+    /// This is the main entry point. The supplementary_groups parameter contains
+    /// the caller's supplementary groups, which are needed for proper permission
+    /// checks (especially chown to a supplementary group).
+    ///
+    /// The default implementation ignores supplementary_groups and calls
+    /// handle_request for backward compatibility. Handlers that need supplementary
+    /// groups should override this method.
+    fn handle_request_with_groups(
+        &self,
+        request: &VolumeRequest,
+        supplementary_groups: &[u32],
+    ) -> VolumeResponse {
+        // Default: ignore groups for backward compatibility
+        let _ = supplementary_groups;
+        self.handle_request(request)
+    }
+
+    /// Handle a complete FUSE request (without supplementary groups).
+    ///
+    /// This is kept for backward compatibility. New code should use
+    /// handle_request_with_groups. The default implementation
     /// dispatches to individual operation methods.
     fn handle_request(&self, request: &VolumeRequest) -> VolumeResponse {
         match request {

@@ -16,16 +16,24 @@
 
 use super::handler::FilesystemHandler;
 use super::zerocopy::{SliceReader, VecWriter};
-use crate::protocol::{DirEntry, DirEntryPlus, FileAttr, VolumeResponse};
+use crate::protocol::{DirEntry, DirEntryPlus, FileAttr, VolumeRequest, VolumeResponse};
 
 use fuse_backend_rs::abi::fuse_abi::CreateIn;
 use fuse_backend_rs::api::filesystem::{Context, Entry, FileSystem, SetattrValid};
 use fuse_backend_rs::passthrough::{Config, PassthroughFs as FuseBackendPassthrough};
 
+use std::cell::RefCell;
 use std::ffi::CString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+
+// Thread-local storage for supplementary groups during request handling.
+// This allows the individual operation methods to access groups without
+// changing their signatures.
+thread_local! {
+    static CURRENT_GROUPS: RefCell<Option<Vec<libc::gid_t>>> = const { RefCell::new(None) };
+}
 
 /// Default attribute TTL in seconds.
 const ATTR_TTL_SECS: u64 = 1;
@@ -89,8 +97,8 @@ impl PassthroughFs {
         &self.root_path
     }
 
-    /// Create a Context from uid/gid/pid.
-    fn make_context(uid: u32, gid: u32, pid: u32) -> Context {
+    /// Create a Context from uid/gid/pid with optional supplementary groups.
+    fn make_context(uid: u32, gid: u32, pid: u32, supplementary_groups: Option<Vec<libc::gid_t>>) -> Context {
         let pid = if pid == 0 {
             std::process::id()
         } else {
@@ -100,7 +108,14 @@ impl PassthroughFs {
             uid,
             gid,
             pid: pid as i32,
+            supplementary_groups,
         }
+    }
+
+    /// Create a Context from uid/gid/pid, using thread-local supplementary groups if set.
+    fn make_context_simple(uid: u32, gid: u32, pid: u32) -> Context {
+        let groups = CURRENT_GROUPS.with(|g| g.borrow().clone());
+        Self::make_context(uid, gid, pid, groups)
     }
 
     /// Convert fuse-backend-rs Entry to our FileAttr.
@@ -148,6 +163,34 @@ impl PassthroughFs {
 }
 
 impl FilesystemHandler for PassthroughFs {
+    /// Handle a request with supplementary groups.
+    ///
+    /// Sets the groups in thread-local storage so that make_context_simple
+    /// can include them in the Context passed to fuse-backend-rs.
+    fn handle_request_with_groups(
+        &self,
+        request: &VolumeRequest,
+        supplementary_groups: &[u32],
+    ) -> VolumeResponse {
+        // Store groups in thread-local (converted to gid_t)
+        let groups: Vec<libc::gid_t> = supplementary_groups.iter().map(|&g| g as libc::gid_t).collect();
+        let groups_opt = if groups.is_empty() { None } else { Some(groups) };
+
+        CURRENT_GROUPS.with(|g| {
+            *g.borrow_mut() = groups_opt;
+        });
+
+        // Dispatch to the default handler
+        let result = self.handle_request(request);
+
+        // Clear thread-local
+        CURRENT_GROUPS.with(|g| {
+            *g.borrow_mut() = None;
+        });
+
+        result
+    }
+
     fn lookup(
         &self,
         parent: u64,
@@ -156,7 +199,7 @@ impl FilesystemHandler for PassthroughFs {
         gid: u32,
         pid: u32,
     ) -> VolumeResponse {
-        let ctx = Self::make_context(uid, gid, pid);
+        let ctx = Self::make_context_simple(uid, gid, pid);
 
         let cname = match CString::new(name) {
             Ok(c) => c,
@@ -209,7 +252,7 @@ impl FilesystemHandler for PassthroughFs {
         caller_gid: u32,
         caller_pid: u32,
     ) -> VolumeResponse {
-        let ctx = Self::make_context(caller_uid, caller_gid, caller_pid);
+        let ctx = Self::make_context_simple(caller_uid, caller_gid, caller_pid);
 
         // Get current file metadata to build the attr struct
         let current_attr = match self.inner.getattr(&ctx, ino, None) {
@@ -286,7 +329,7 @@ impl FilesystemHandler for PassthroughFs {
         pid: u32,
     ) -> VolumeResponse {
         tracing::debug!(target: "passthrough", ino, offset, uid, gid, "readdir");
-        let ctx = Self::make_context(uid, gid, pid);
+        let ctx = Self::make_context_simple(uid, gid, pid);
 
         tracing::debug!(target: "passthrough", ino, "readdir opening directory");
         // First open the directory
@@ -377,7 +420,7 @@ impl FilesystemHandler for PassthroughFs {
         pid: u32,
     ) -> VolumeResponse {
         tracing::debug!(target: "passthrough", parent, name, mode, uid, gid, "mkdir");
-        let ctx = Self::make_context(uid, gid, pid);
+        let ctx = Self::make_context_simple(uid, gid, pid);
 
         let cname = match CString::new(name) {
             Ok(c) => c,
@@ -415,7 +458,7 @@ impl FilesystemHandler for PassthroughFs {
         gid: u32,
         pid: u32,
     ) -> VolumeResponse {
-        let ctx = Self::make_context(uid, gid, pid);
+        let ctx = Self::make_context_simple(uid, gid, pid);
 
         let cname = match CString::new(name) {
             Ok(c) => c,
@@ -445,7 +488,7 @@ impl FilesystemHandler for PassthroughFs {
         gid: u32,
         pid: u32,
     ) -> VolumeResponse {
-        let ctx = Self::make_context(uid, gid, pid);
+        let ctx = Self::make_context_simple(uid, gid, pid);
 
         // fuse-backend-rs handles credentials via Context internally.
 
@@ -470,7 +513,7 @@ impl FilesystemHandler for PassthroughFs {
         gid: u32,
         pid: u32,
     ) -> VolumeResponse {
-        let ctx = Self::make_context(uid, gid, pid);
+        let ctx = Self::make_context_simple(uid, gid, pid);
         tracing::debug!(target: "passthrough", parent, name, mode, flags, uid, gid, "create");
 
         let cname = match CString::new(name) {
@@ -508,7 +551,7 @@ impl FilesystemHandler for PassthroughFs {
     }
 
     fn open(&self, ino: u64, flags: u32, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
-        let ctx = Self::make_context(uid, gid, pid);
+        let ctx = Self::make_context_simple(uid, gid, pid);
 
         // fuse-backend-rs handles credentials via Context internally.
 
@@ -531,7 +574,7 @@ impl FilesystemHandler for PassthroughFs {
         gid: u32,
         pid: u32,
     ) -> VolumeResponse {
-        let ctx = Self::make_context(uid, gid, pid);
+        let ctx = Self::make_context_simple(uid, gid, pid);
         let mut writer = VecWriter::new(size as usize);
 
         match self.inner.read(&ctx, ino, fh, &mut writer, size, offset, None, 0) {
@@ -552,7 +595,7 @@ impl FilesystemHandler for PassthroughFs {
         gid: u32,
         pid: u32,
     ) -> VolumeResponse {
-        let ctx = Self::make_context(uid, gid, pid);
+        let ctx = Self::make_context_simple(uid, gid, pid);
         let mut reader = SliceReader::new(data);
 
         tracing::debug!(target: "passthrough", ino, fh, offset, len = data.len(), uid, gid, pid, "write called");
@@ -622,7 +665,7 @@ impl FilesystemHandler for PassthroughFs {
     }
 
     fn unlink(&self, parent: u64, name: &str, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
-        let ctx = Self::make_context(uid, gid, pid);
+        let ctx = Self::make_context_simple(uid, gid, pid);
 
         // fuse-backend-rs handles credentials via Context internally.
 
@@ -647,7 +690,7 @@ impl FilesystemHandler for PassthroughFs {
         gid: u32,
         pid: u32,
     ) -> VolumeResponse {
-        let ctx = Self::make_context(uid, gid, pid);
+        let ctx = Self::make_context_simple(uid, gid, pid);
 
         // fuse-backend-rs handles credentials via Context internally.
 
@@ -676,7 +719,7 @@ impl FilesystemHandler for PassthroughFs {
         gid: u32,
         pid: u32,
     ) -> VolumeResponse {
-        let ctx = Self::make_context(uid, gid, pid);
+        let ctx = Self::make_context_simple(uid, gid, pid);
 
         let cname = match CString::new(name) {
             Ok(c) => c,
@@ -724,7 +767,7 @@ impl FilesystemHandler for PassthroughFs {
         gid: u32,
         pid: u32,
     ) -> VolumeResponse {
-        let ctx = Self::make_context(uid, gid, pid);
+        let ctx = Self::make_context_simple(uid, gid, pid);
 
         // fuse-backend-rs handles credentials via Context internally.
 
@@ -747,7 +790,7 @@ impl FilesystemHandler for PassthroughFs {
     }
 
     fn access(&self, ino: u64, mask: u32, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
-        let ctx = Self::make_context(uid, gid, pid);
+        let ctx = Self::make_context_simple(uid, gid, pid);
 
         match self.inner.access(&ctx, ino, mask) {
             Ok(()) => VolumeResponse::Ok,
@@ -776,7 +819,7 @@ impl FilesystemHandler for PassthroughFs {
     }
 
     fn opendir(&self, ino: u64, flags: u32, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
-        let ctx = Self::make_context(uid, gid, pid);
+        let ctx = Self::make_context_simple(uid, gid, pid);
 
         // fuse-backend-rs handles credentials via Context internally.
 
@@ -816,7 +859,7 @@ impl FilesystemHandler for PassthroughFs {
         gid: u32,
         pid: u32,
     ) -> VolumeResponse {
-        let ctx = Self::make_context(uid, gid, pid);
+        let ctx = Self::make_context_simple(uid, gid, pid);
 
         // fuse-backend-rs handles credentials via Context internally.
 
@@ -842,7 +885,7 @@ impl FilesystemHandler for PassthroughFs {
     ) -> VolumeResponse {
         use fuse_backend_rs::api::filesystem::GetxattrReply;
 
-        let ctx = Self::make_context(uid, gid, pid);
+        let ctx = Self::make_context_simple(uid, gid, pid);
 
         let cname = match CString::new(name) {
             Ok(c) => c,
@@ -861,7 +904,7 @@ impl FilesystemHandler for PassthroughFs {
     fn listxattr(&self, ino: u64, size: u32, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
         use fuse_backend_rs::api::filesystem::ListxattrReply;
 
-        let ctx = Self::make_context(uid, gid, pid);
+        let ctx = Self::make_context_simple(uid, gid, pid);
 
         match self.inner.listxattr(&ctx, ino, size) {
             Ok(reply) => match reply {
@@ -880,7 +923,7 @@ impl FilesystemHandler for PassthroughFs {
         gid: u32,
         pid: u32,
     ) -> VolumeResponse {
-        let ctx = Self::make_context(uid, gid, pid);
+        let ctx = Self::make_context_simple(uid, gid, pid);
 
         // fuse-backend-rs handles credentials via Context internally.
 
@@ -976,7 +1019,7 @@ impl FilesystemHandler for PassthroughFs {
         pid: u32,
     ) -> VolumeResponse {
         tracing::debug!(target: "passthrough", ino, fh, offset, uid, gid, "readdirplus");
-        let ctx = Self::make_context(uid, gid, pid);
+        let ctx = Self::make_context_simple(uid, gid, pid);
 
         let mut entries = Vec::new();
 

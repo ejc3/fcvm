@@ -115,6 +115,18 @@ impl Multiplexer {
     /// This is called by reader threads. Uses lock-free channel for submission
     /// and per-request oneshot channel for response.
     pub fn send_request(&self, reader_id: u32, request: VolumeRequest) -> VolumeResponse {
+        self.send_request_with_groups(reader_id, request, Vec::new())
+    }
+
+    /// Send a request with supplementary groups and wait for response.
+    ///
+    /// The supplementary groups are forwarded to the server for proper permission checks.
+    pub fn send_request_with_groups(
+        &self,
+        reader_id: u32,
+        request: VolumeRequest,
+        supplementary_groups: Vec<u32>,
+    ) -> VolumeResponse {
         let unique = self.next_id.fetch_add(1, Ordering::Relaxed);
         let should_trace = self.trace_rate > 0 && unique.is_multiple_of(self.trace_rate);
 
@@ -127,9 +139,9 @@ impl Multiplexer {
 
         // Build wire request - span goes inside the request so server gets it
         let wire = if should_trace {
-            WireRequest::with_span(unique, reader_id, request, Span::new())
+            WireRequest::with_span_and_groups(unique, reader_id, request, Span::new(), supplementary_groups)
         } else {
-            WireRequest::new(unique, reader_id, request)
+            WireRequest::with_groups(unique, reader_id, request, supplementary_groups)
         };
 
         let body = match bincode::serialize(&wire) {
