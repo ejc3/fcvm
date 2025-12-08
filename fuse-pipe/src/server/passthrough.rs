@@ -324,7 +324,7 @@ impl FilesystemHandler for PassthroughFs {
         tracing::debug!(target: "passthrough", ino, "readdir reading entries");
         // Always read from offset 0 - we handle offset filtering ourselves
         if let Err(e) = self.inner.readdir(&ctx, ino, handle.unwrap_or(0), 8192, 0, &mut add_entry) {
-            tracing::error!(target: "passthrough", error = ?e, "readdir read failed");
+            tracing::error!(target: "passthrough", ino, handle = ?handle, error = ?e, "readdir read failed");
             let _ = self.inner.releasedir(&ctx, ino, 0, handle.unwrap_or(0));
             return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
         }
