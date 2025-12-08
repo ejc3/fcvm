@@ -5,10 +5,9 @@
 //! See `fuse-pipe/TESTING.md` for complete testing documentation.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
@@ -16,15 +15,15 @@ use std::time::Duration;
 #[path = "../tests/common/mod.rs"]
 mod common;
 
-use common::{increase_ulimit, setup_test_data, FuseMount};
+use common::{cleanup, increase_ulimit, setup_test_data, unique_paths, FuseMount};
 
 const FILE_SIZE: usize = 4096; // 4KB files
 const NUM_FILES: usize = 1024; // More files for higher concurrency
+const NUM_WORKERS: usize = 256; // Fixed worker count (saturates at this level)
 
 /// Run parallel write benchmark on a directory
 fn parallel_write_bench(dir: &Path, num_workers: usize, ops_per_worker: usize) -> Duration {
     let dir = dir.to_path_buf();
-
     let start = std::time::Instant::now();
 
     let handles: Vec<_> = (0..num_workers)
@@ -35,12 +34,9 @@ fn parallel_write_bench(dir: &Path, num_workers: usize, ops_per_worker: usize) -
                 for i in 0..ops_per_worker {
                     let file_idx = (worker_id * ops_per_worker + i) % NUM_FILES;
                     let path = dir.join(format!("file_{}.dat", file_idx));
-                    let mut f = OpenOptions::new()
-                        .write(true)
-                        .open(&path)
-                        .unwrap();
+                    let mut f = OpenOptions::new().write(true).open(&path).unwrap();
                     f.write_all(&data).unwrap();
-                    f.sync_all().unwrap(); // Ensure data hits disk
+                    f.sync_all().unwrap();
                 }
             })
         })
@@ -56,7 +52,6 @@ fn parallel_write_bench(dir: &Path, num_workers: usize, ops_per_worker: usize) -
 /// Run parallel read benchmark on a directory
 fn parallel_read_bench(dir: &Path, num_workers: usize, ops_per_worker: usize) -> Duration {
     let dir = dir.to_path_buf();
-
     let start = std::time::Instant::now();
 
     let handles: Vec<_> = (0..num_workers)
@@ -84,27 +79,12 @@ fn parallel_read_bench(dir: &Path, num_workers: usize, ops_per_worker: usize) ->
 fn bench_parallel_reads(c: &mut Criterion) {
     increase_ulimit();
 
-    let data_dir = PathBuf::from("/tmp/fuse-bench-data");
-    let mount_dir = PathBuf::from("/tmp/fuse-bench-mount");
-
-    // Cleanup any previous runs
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = Command::new("fusermount")
-        .args(["-u", mount_dir.to_str().unwrap()])
-        .status();
-    let _ = Command::new("fusermount3")
-        .args(["-u", mount_dir.to_str().unwrap()])
-        .status();
-    let _ = fs::remove_dir_all(&mount_dir);
-
-    // Setup test data
+    let (data_dir, mount_dir) = unique_paths("fuse-bench-read");
     setup_test_data(&data_dir, NUM_FILES, FILE_SIZE);
 
     let mut group = c.benchmark_group("parallel_reads");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(5));
-
-    const NUM_WORKERS: usize = 256; // Fixed worker count (saturates at this level)
 
     // Host filesystem baseline
     group.bench_function("host_fs", |b| {
@@ -119,15 +99,6 @@ fn bench_parallel_reads(c: &mut Criterion) {
 
     // Test different FUSE reader counts
     for num_readers in [1, 2, 4, 8, 16, 32, 64, 128, 256] {
-        // Cleanup previous mount
-        let _ = Command::new("fusermount")
-            .args(["-u", mount_dir.to_str().unwrap()])
-            .status();
-        let _ = Command::new("fusermount3")
-            .args(["-u", mount_dir.to_str().unwrap()])
-            .status();
-        thread::sleep(Duration::from_millis(100));
-
         let fuse = FuseMount::new(&data_dir, &mount_dir, num_readers);
 
         group.bench_with_input(
@@ -148,34 +119,18 @@ fn bench_parallel_reads(c: &mut Criterion) {
     }
 
     group.finish();
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&mount_dir);
+    cleanup(&data_dir, &mount_dir);
 }
 
 fn bench_parallel_writes(c: &mut Criterion) {
     increase_ulimit();
 
-    let data_dir = PathBuf::from("/tmp/fuse-bench-write-data");
-    let mount_dir = PathBuf::from("/tmp/fuse-bench-write-mount");
-
-    // Cleanup any previous runs
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = Command::new("fusermount")
-        .args(["-u", mount_dir.to_str().unwrap()])
-        .status();
-    let _ = Command::new("fusermount3")
-        .args(["-u", mount_dir.to_str().unwrap()])
-        .status();
-    let _ = fs::remove_dir_all(&mount_dir);
-
-    // Setup test data
+    let (data_dir, mount_dir) = unique_paths("fuse-bench-write");
     setup_test_data(&data_dir, NUM_FILES, FILE_SIZE);
 
     let mut group = c.benchmark_group("parallel_writes");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(5));
-
-    const NUM_WORKERS: usize = 256;
 
     // Host filesystem baseline
     group.bench_function("host_fs", |b| {
@@ -190,14 +145,6 @@ fn bench_parallel_writes(c: &mut Criterion) {
 
     // Test different FUSE reader counts
     for num_readers in [1, 4, 16, 64, 256] {
-        let _ = Command::new("fusermount")
-            .args(["-u", mount_dir.to_str().unwrap()])
-            .status();
-        let _ = Command::new("fusermount3")
-            .args(["-u", mount_dir.to_str().unwrap()])
-            .status();
-        thread::sleep(Duration::from_millis(100));
-
         let fuse = FuseMount::new(&data_dir, &mount_dir, num_readers);
 
         group.bench_with_input(
@@ -218,14 +165,9 @@ fn bench_parallel_writes(c: &mut Criterion) {
     }
 
     group.finish();
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&mount_dir);
+    cleanup(&data_dir, &mount_dir);
 }
 
-criterion_group!(
-    benches,
-    bench_parallel_reads,
-    bench_parallel_writes,
-);
+criterion_group!(benches, bench_parallel_reads, bench_parallel_writes);
 
 criterion_main!(benches);

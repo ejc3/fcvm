@@ -1,7 +1,7 @@
 // Allow dead code - this module is used as a shared library by multiple test files
 #![allow(dead_code)]
 
-use fuse_pipe::{mount_with_options, AsyncServer, PassthroughFs, ServerConfig};
+use fuse_pipe::{mount_spawn, AsyncServer, MountConfig, MountHandle, PassthroughFs, ServerConfig};
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -202,13 +202,6 @@ fn parse_prove_output(output: &str) -> (usize, usize) {
     (tests, failures)
 }
 
-fn cleanup_mount(mount_dir: &Path) {
-    if let Some(mount) = mount_dir.to_str() {
-        let _ = Command::new("fusermount3").args(["-u", mount]).output();
-        let _ = Command::new("umount").args(["-f", mount]).output();
-    }
-    std::thread::sleep(Duration::from_millis(100));
-}
 
 fn dump_mount_state() {
     let _ = Command::new("mount")
@@ -300,7 +293,9 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
         std::path::PathBuf::from(format!("{}-{}", MOUNT_BASE, run_id))
     };
 
-    cleanup_mount(&mount_dir);
+    // Mount handle for RAII cleanup - Option so we can use it for both host and FUSE
+    let mut _mount_handle: Option<MountHandle> = None;
+
     let _ = fs::remove_file(&socket);
     let _ = fs::remove_dir_all(&data_dir);
     let _ = fs::remove_dir_all(&mount_dir);
@@ -348,19 +343,16 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
         }
 
         info!(target: TARGET, mount = %mount_dir.display(), readers = NUM_READERS, "Mounting FUSE filesystem");
-        let mount_dir_clone = mount_dir.clone();
-        let socket_clone = socket.clone();
-        let _client_handle = std::thread::spawn(move || {
-            if let Err(e) = mount_with_options(
-                socket_clone.to_str().unwrap(),
-                mount_dir_clone.to_str().unwrap(),
-                NUM_READERS,
-                0,
-            ) {
+
+        // Use mount_spawn for RAII cleanup
+        let config = MountConfig::new().readers(NUM_READERS);
+        let mount_handle = match mount_spawn(socket.to_str().unwrap(), mount_dir.clone(), config) {
+            Ok(handle) => handle,
+            Err(e) => {
                 error!(target: TARGET, error = %e, "Mount failed");
-                std::process::exit(1);
+                return false;
             }
-        });
+        };
 
         // Wait for FUSE to actually be mounted by checking /proc/mounts
         // This is more reliable than just checking if the directory exists
@@ -387,6 +379,9 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
         }
         info!(target: TARGET, mount = %mount_dir.display(), "FUSE mounted successfully");
 
+        // Store mount handle for RAII cleanup at end of function
+        _mount_handle = Some(mount_handle);
+
         // Create marker file to verify tests run on FUSE, not accidentally on host
         let marker = mount_dir.join(".fuse-pipe-test-marker");
         debug!(target: TARGET, marker = %marker.display(), "Creating FUSE marker file");
@@ -404,8 +399,6 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
         }
 
         std::thread::sleep(Duration::from_millis(300));
-
-        // Keep mount alive for test execution; cleaned up after results are gathered.
     }
 
     let mut categories = discover_categories();
@@ -444,9 +437,7 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
                     category, CATEGORY_TIMEOUT_SECS
                 );
                 dump_mount_state();
-                if !use_host_fs {
-                    cleanup_mount(&mount_dir);
-                }
+                // _mount_handle drops automatically on return
                 return false;
             }
         };
@@ -546,9 +537,7 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
             total_failures,
             failed_categories.len()
         );
-        if !use_host_fs {
-            cleanup_mount(&mount_dir);
-        }
+        // RAII cleanup happens automatically when _mount_handle drops
         return false;
     }
 
@@ -557,9 +546,7 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
     } else {
         println!("\n🎉 FUSE TEST PASSED: ALL {} TESTS PASSED - fuse-pipe is POSIX compliant!", total_tests);
     }
-    if !use_host_fs {
-        cleanup_mount(&mount_dir);
-    }
+    // RAII cleanup happens automatically when _mount_handle drops at end of function
     true
 }
 

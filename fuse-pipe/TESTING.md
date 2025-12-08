@@ -1,6 +1,6 @@
 # fuse-pipe Testing & Benchmarking
 
-This document covers all testing and benchmarking for fuse-pipe. Each test/benchmark file references this document.
+This document covers all testing and benchmarking for fuse-pipe.
 
 ## Prerequisites
 
@@ -8,410 +8,209 @@ This document covers all testing and benchmarking for fuse-pipe. Each test/bench
 - Rust 1.70+ with `cargo`
 - Linux with FUSE support (`/dev/fuse`)
 - `fusermount3` or `fusermount`
-
-### For Benchmarks (EC2)
-- ARM64 bare-metal instance (c6g.metal) for optimal performance
-- SSH key at `~/.ssh/fcvm-ec2`
+- Root access (most tests require sudo for FUSE mounts)
 
 ### For pjdfstest
 ```bash
-git clone https://github.com/pjd/pjdfstest /tmp/pjdfstest-check
-cd /tmp/pjdfstest-check && autoreconf -ifs && ./configure && make
+git clone https://github.com/pjd/pjdfstest /tmp/pjdfstest
+cd /tmp/pjdfstest && autoreconf -ifs && ./configure && make
+sudo cp pjdfstest /usr/local/bin/
 ```
+
+### For EC2 Benchmarks
+- ARM64 bare-metal instance (c6g.metal) for optimal performance
+- SSH key at `~/.ssh/fcvm-ec2`
 
 ## Quick Reference
 
-| Command | Description |
-|---------|-------------|
-| `make test` | Run all unit tests |
-| `make test-integration` | Run FUSE integration tests |
-| `make test-stress` | Run stress test (4 workers, 1000 ops) |
-| `make bench` | Run all benchmarks |
-| `make bench-trace` | Run benchmarks with tracing enabled |
-| `make bench-remote` | Run benchmarks on EC2 |
-| `make bench-logs` | View recent benchmark logs |
-| `make bench-clean` | Clean up log/telemetry files |
+| Command | Description | Requires Root |
+|---------|-------------|---------------|
+| `cargo test --lib` | Unit tests | No |
+| `sudo cargo test --test integration` | Basic FUSE operations | Yes |
+| `sudo cargo test --test test_permission_edge_cases` | Permission edge cases | Yes |
+| `sudo cargo test --test pjdfstest_fast` | Quick POSIX compliance (32 readers) | Yes |
+| `sudo cargo test --test pjdfstest_full` | Full POSIX compliance (8789 tests) | Yes |
+| `sudo cargo test --test pjdfstest_stress` | Parallel stress test (85 jobs) | Yes |
+| `sudo cargo bench --bench throughput` | I/O throughput at varying concurrency | Yes |
+| `sudo cargo bench --bench operations` | Single-operation latency | Yes |
+| `make test-all` | Run everything (unit + integration + pjdfs + bench) | Yes |
 
-## Test Types
+## Test Files
 
-| Type | Location | Purpose |
-|------|----------|---------|
-| Unit | `src/**/*.rs` | Module-level tests |
-| Integration | `tests/integration.rs` | Basic FUSE operations |
-| Stress | `tests/stress/` | Multi-worker load testing |
-| Benchmarks | `benches/` | Performance measurement |
-| POSIX | `tests/pjdfstest_*.rs` | Filesystem compliance |
+| File | Purpose | Tests |
+|------|---------|-------|
+| `src/**/*.rs` | Unit tests | ~20 |
+| `tests/integration.rs` | Basic FUSE operations (read, write, mkdir, etc.) | 15 |
+| `tests/test_permission_edge_cases.rs` | Permission edge cases, setuid/setgid | 18 |
+| `tests/pjdfstest_fast.rs` | Quick POSIX compliance test (32 readers) | 8789 |
+| `tests/pjdfstest_full.rs` | Full POSIX compliance test (256 readers) | 8789 |
+| `tests/pjdfstest_stress.rs` | Parallel stress test (5 instances × 17 categories) | ~44000 |
+| `tests/pjdfstest_common.rs` | Shared pjdfstest harness code | - |
+| `tests/common/mod.rs` | Shared `FuseMount` fixture | - |
+| `benches/throughput.rs` | Parallel read/write at varying reader counts | - |
+| `benches/operations.rs` | Single-operation latency benchmarks | - |
+| `benches/protocol.rs` | Protocol serialization benchmarks | - |
 
 ## Step-by-Step Test Execution
 
-Run tests in order from simplest to hardest. Each level should pass before proceeding.
+Run tests in order from simplest to hardest.
 
 ### Level 1: Unit Tests (No FUSE Required)
 ```bash
-make test
-# or: cargo test --lib
+cargo test --lib
 ```
 
 ### Level 2: Integration Tests (Basic FUSE Ops)
 ```bash
-make test-integration
-# or: cargo test --test integration
+sudo cargo test --release --test integration -- --nocapture
 ```
 
-### Level 3: Stress Test (Multi-Worker Load)
+### Level 3: Permission Edge Cases
 ```bash
-make test-stress
-# or: cargo build --release --test stress && sudo ./target/release/deps/stress-* --workers 4 --ops 1000
+sudo cargo test --release --test test_permission_edge_cases -- --nocapture
 ```
 
-### Level 4: Quick Benchmarks
+### Level 4: Quick POSIX Compliance (pjdfstest)
 ```bash
-make bench-quick
-# or: cargo bench --bench throughput -- --quick
+sudo cargo test --release --test pjdfstest_fast -- --nocapture
 ```
 
-### Level 5: Full Benchmark Suite
+### Level 5: Full POSIX Compliance (8789 tests)
 ```bash
-make bench
-# or: cargo bench --bench throughput && cargo bench --bench operations
+sudo cargo test --release --test pjdfstest_full -- --nocapture
 ```
 
-### Level 6: Benchmarks with Tracing
+### Level 6: Parallel Stress Test (race condition detection)
 ```bash
-make bench-trace
-# or: cargo bench --bench throughput --features trace-benchmarks
+sudo cargo test --release --test pjdfstest_stress -- --nocapture
 ```
+Runs 5 parallel instances of each of 17 pjdfstest categories simultaneously (85 total parallel jobs, ~44000 tests).
 
-### Full Verification Command
+### Level 7: Throughput Benchmarks
 ```bash
-make test && make test-integration && make test-stress && make bench-quick
+sudo cargo bench --bench throughput
 ```
+Tests parallel read/write performance at different reader counts (1, 2, 4, 8, 16, 32, 64, 128, 256).
 
-## Tracing & Telemetry
-
-### Enable Tracing
-
+### Full Verification
 ```bash
-# With feature flag (traces every 100th request)
-make bench-trace
-
-# With RUST_LOG for application logs
-RUST_LOG=debug make bench-trace
+make test-all
+# or manually:
+cargo test --lib && \
+sudo cargo test --release --test integration && \
+sudo cargo test --release --test pjdfstest_full && \
+sudo cargo bench --bench throughput
 ```
 
-### Output Locations
+## pjdfstest Categories
 
-| Type | Location |
-|------|----------|
-| Application logs | stderr |
-| Telemetry summary | stderr |
-| Telemetry JSON | `/tmp/fuse-bench-telemetry-{pid}-{id}.json` |
-| Benchmark logs | `/tmp/fuse-bench-{pid}-{id}.log` |
+The POSIX compliance tests cover 17 categories:
 
-### Telemetry JSON Format
+| Category | Tests | Description |
+|----------|-------|-------------|
+| chmod | 327 | Permission mode changes |
+| chown | 1497 | Ownership changes |
+| chflags | 14 | File flags (limited on Linux) |
+| ftruncate | 89 | Truncate via file descriptor |
+| granular | 7 | Granular permission checks |
+| link | 359 | Hard links |
+| mkdir | 118 | Directory creation |
+| mkfifo | 120 | FIFO creation |
+| mknod | 186 | Device node creation |
+| open | 328 | File open modes |
+| posix_fallocate | 1 | Space preallocation |
+| rename | 4886 | File/directory renames |
+| rmdir | 145 | Directory removal |
+| symlink | 95 | Symbolic links |
+| truncate | 84 | Truncate by path |
+| unlink | 440 | File removal |
+| utimensat | 122 | Timestamp modification |
 
-```json
-{
-  "count": 1000,
-  "total": {"min_ns": 50000, "p50_ns": 120000, "p90_ns": 250000, "p99_ns": 500000},
-  "to_server": {...},
-  "server_deser": {...},
-  "server_spawn": {...},
-  "server_fs": {...},
-  "server_chan": {...},
-  "to_client": {...},
-  "client_done": {...},
-  "by_operation": [
-    {"op_name": "getattr", "count": 400, "total": {...}, "server_fs": {...}},
-    {"op_name": "lookup", "count": 250, ...}
-  ]
-}
-```
+## Benchmark Results (c6g.metal, 64 ARM cores)
 
-## Architecture
+### Parallel Reads (256 workers, 1024 files × 4KB)
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                     Test Harness                             │
-├──────────────────────────────────────────────────────────────┤
-│  tests/stress/fixture.rs   ←── Shared FuseMount struct       │
-│       ↓                                                      │
-│  Spawns stress binary as subprocess:                         │
-│    - `stress server --socket ... --root ...`                 │
-│    - `stress client --socket ... --mount ... --trace-rate N` │
-│                                                              │
-│  Captures:                                                   │
-│    - stderr → /tmp/fuse-bench-{pid}.log                      │
-│    - telemetry → /tmp/fuse-bench-telemetry-{pid}.json        │
-└──────────────────────────────────────────────────────────────┘
-```
-
-### Shared Fixture
-
-All tests and benchmarks use the shared `FuseMount` struct from `tests/stress/fixture.rs`:
-
-```rust
-use fixture::{FuseMount, increase_ulimit, setup_test_data};
-
-// Basic mount (no tracing)
-let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
-
-// Mount with tracing
-let fuse = FuseMount::with_tracing(&data_dir, &mount_dir, 256, 100, None);
-
-// Access paths
-let path = fuse.mount_path().join("test.txt");
-```
-
-## Performance Benchmarks
-
-### Benchmark Results (c6g.metal, 64 ARM cores)
-
-#### Parallel Reads (256 workers, 1024 files x 4KB)
-
-| Readers | Time (ms) | vs Host | Speedup vs 1 Reader |
-|---------|-----------|---------|---------------------|
-| Host FS | 10.7 | 1.0x | - |
-| 1 | 490.6 | 45.8x slower | 1.0x |
-| 256 | 57.0 | 5.3x slower | 8.6x |
-
-#### Parallel Writes (256 workers, with sync_all)
-
-| Readers | Time (s) | vs Host |
-|---------|----------|---------|
-| Host FS | 0.862 | 1.0x |
-| 256 | 2.765 | 3.2x slower |
+| Readers | Time | vs Host | Speedup vs 1 Reader |
+|---------|------|---------|---------------------|
+| Host FS | ~29ms | 1.0x | - |
+| 1 | ~1.5s | 52x slower | 1.0x |
+| 16 | ~100ms | 3.4x slower | 15x |
+| 256 | ~60ms | 2.1x slower | 25x |
 
 ### Key Findings
 
-- **Optimal readers**: 256 readers provides best balance
-- **Read overhead**: ~5-6x vs native filesystem
-- **Write overhead**: ~3x vs native (bounded by disk I/O)
-- **Scaling**: Performance plateaus at 16+ readers for reads
+- **Optimal readers**: 256 readers provides best throughput
+- **Read overhead**: ~2-3x vs native filesystem at optimal concurrency
+- **Scaling**: Near-linear improvement from 1→16 readers, diminishing returns after
+- **No race conditions**: Stress test validates thread-safety of credential switching
 
-## Stress Test
+## Debugging
 
-The stress test runs multi-worker load testing against both host filesystem and FUSE:
-
+### Enable Tracing
 ```bash
-# Default: 4 workers, 1000 ops each
-cargo test --test stress --release
+# All components
+RUST_LOG=debug sudo -E cargo test --release --test integration -- --nocapture
 
-# Custom configuration
-cargo test --test stress --release -- --workers 64 --readers 256 --ops 5000
-
-# With tracing
-cargo test --test stress --release -- -t 100
+# Specific targets
+RUST_LOG="passthrough=debug,fuse_pipe=info" sudo -E cargo test ...
 ```
 
-### Stress Test Subcommands
+### Tracing Targets
 
-The stress binary also provides server/client subcommands for the test harness:
+| Target | Component |
+|--------|-----------|
+| `fuse_pipe::fixture` | Test fixture setup/teardown |
+| `fuse-pipe::server` | Async server |
+| `fuse-pipe::client` | FUSE client, multiplexer |
+| `passthrough` | PassthroughFs operations |
 
-```bash
-# Start server (passthrough filesystem)
-./stress server --socket /tmp/fuse.sock --root /tmp/data
-
-# Start client (FUSE mount)
-./stress client --socket /tmp/fuse.sock --mount /tmp/mount --readers 256
-
-# With tracing
-./stress client ... --trace-rate 100 --telemetry-output /tmp/telemetry.json
-```
-
-## pjdfstest (POSIX Compliance)
-
-Run the pjdfstest POSIX filesystem compliance suite:
-
-```bash
-# Fast subset
-make test-pjdfs
-
-# Full suite (requires pjdfstest-full feature)
-cargo test --test pjdfstest_full --features pjdfstest-full -- --nocapture
-```
-
-### pjdfstest Prerequisites
-
-```bash
-# Install pjdfstest
-git clone https://github.com/pjd/pjdfstest /tmp/pjdfstest-check
-cd /tmp/pjdfstest-check
-autoreconf -ifs
-./configure
-make
-```
-
-## Remote Benchmarking (EC2)
-
-### Sync and Run
-
-```bash
-# Sync code to EC2
-make sync
-
-# Run benchmarks on EC2
-make bench-remote
-
-# Run with tracing
-make bench-remote-trace
-
-# View remote logs
-make bench-logs-remote
-```
-
-### EC2 Configuration
-
-| Setting | Value |
-|---------|-------|
-| Instance | c6g.metal (ARM64 bare metal) |
-| Host | ubuntu@54.67.60.104 |
-| SSH Key | ~/.ssh/fcvm-ec2 |
-
-## Troubleshooting
-
-### Mount Errors
-
+### Mount Cleanup
 ```bash
 # Force unmount stale mounts
-fusermount3 -u /tmp/fuse-bench-mount
+sudo fusermount3 -u /tmp/fuse-*-mount*
+sudo fusermount -u /tmp/fuse-*-mount*
 
-# Check for existing mounts
-mount | grep fuse
-```
-
-### Socket Cleanup
-
-```bash
 # Remove stale sockets
-rm -f /tmp/fuse-bench-*.sock
-rm -f /tmp/fuse-stress*.sock
+rm -f /tmp/fuse-*.sock
 ```
 
-### Log Inspection
+## Shared Fixture
 
-```bash
-# View recent logs
-ls -lt /tmp/fuse-bench-*.log | head -5
-
-# View latest telemetry
-cat $(ls -t /tmp/fuse-bench-telemetry-*.json | head -1) | jq .
-```
-
-## Multi-Reader Credential Switching
-
-### Background
-
-fuse-pipe uses multiple FUSE reader threads to process requests in parallel. This is implemented via `FUSE_DEV_IOC_CLONE` which creates additional file descriptors that share a single FUSE mount.
-
-### Key Bug Fixes (2025-12-02)
-
-Two critical bugs were discovered when running pjdfstest with multiple readers:
-
-#### Bug 1: SessionACL::Owner Blocking Non-Owner Access
-
-**Symptom**: With 1 reader = tests pass, with 2+ readers = `EACCES` for non-root users
-
-**Root Cause**: When creating cloned FUSE sessions via `fuser::Session::from_fd_initialized()`, the code used `SessionACL::Owner` which restricts access to only the mount owner. Since the mount is created as root, non-root users (like uid 65534/nobody) were denied access at the FUSE layer before requests even reached our handler.
-
-**Fix**: Changed `SessionACL::Owner` to `SessionACL::All` in `src/client/mount.rs`:
+All tests use the `FuseMount` struct from `tests/common/mod.rs`:
 
 ```rust
-// Line 135 (Unix socket mount):
-let mut reader_session =
-    fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::All);
+#[path = "common/mod.rs"]
+mod common;
 
-// Line 285 (vsock mount):
-let mut reader_session =
-    fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::All);
-```
+use common::{FuseMount, increase_ulimit, setup_test_data};
 
-This works in conjunction with `fuser::MountOption::AllowOther` which allows non-root users to access the mount point.
-
-**Impact**: Fixed 2331 test failures (3313 → 982)
-
-#### Bug 2: Missing CredentialsGuard on Server Operations
-
-**Symptom**: Permission checks incorrect - operations that should fail would succeed (running as root instead of caller's uid)
-
-**Root Cause**: Most filesystem operations in `src/server/passthrough.rs` were missing the `CredentialsGuard` wrapper that uses `setfsuid()`/`setfsgid()` to switch filesystem credentials to the caller's uid/gid before performing operations.
-
-**Operations that needed CredentialsGuard added**:
-- `rmdir` - directory removal permission check
-- `unlink` - file removal permission check
-- `rename` - source and destination permission check
-- `link` - hard link permission check
-- `open` - file open permission check
-- `opendir` - directory open permission check
-- `setxattr` - extended attribute write permission
-- `removexattr` - extended attribute removal permission
-- `setattr` - truncate and utimensat permission checks (conditional)
-
-**Pattern used**:
-```rust
-fn rmdir(&self, parent: u64, name: &str, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
-    // Set filesystem credentials for permission checks
-    let _creds = match CredentialsGuard::new(uid, gid) {
-        Ok(g) => g,
-        Err(e) => {
-            tracing::error!(target: "passthrough", error = ?e, "failed to switch credentials");
-            return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EPERM));
-        }
-    };
-
-    // Now perform operation - kernel will check permissions as uid/gid
-    // ...
+#[test]
+fn test_something() {
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
+    // fuse.mount_path() is the FUSE mount point
+    // data_dir is the backing storage
 }
 ```
 
-**Impact**: Fixed remaining 982 test failures (982 → 0)
+## Remote Testing (EC2)
 
-### pjdfstest Results
-
-After both fixes:
-
-```
-╔═══════════════════════════════════════════════════════════════╗
-║                       TEST SUMMARY                            ║
-╠═══════════════════════════════════════════════════════════════╣
-║  Total tests:            8818                                 ║
-║  Total failures:            0                                 ║
-║  Categories:               17                                 ║
-║  Duration:              142.6s                                ║
-╚═══════════════════════════════════════════════════════════════╝
-
-✅ ALL 8818 TESTS PASSED
-```
-
-### Key Files
-
-| File | Role in Credential Handling |
-|------|----------------------------|
-| `src/client/mount.rs` | SessionACL configuration for cloned sessions |
-| `src/server/passthrough.rs` | CredentialsGuard usage for permission checks |
-| `src/server/credentials.rs` | CredentialsGuard implementation using setfsuid/setfsgid |
-
-### Regression Test
-
-A dedicated regression test ensures multi-reader credential switching works:
-
+From the project root:
 ```bash
-cargo test test_nonroot_mkdir_with_2_readers --release
-```
+# Sync code
+make sync
 
-This test creates a directory as uid 65534 (nobody) with 2 FUSE readers and verifies:
-1. The mkdir succeeds (no EACCES)
-2. The directory is owned by uid 65534, not root
+# Run tests on EC2
+ssh -i ~/.ssh/fcvm-ec2 ubuntu@54.67.60.104 \
+  "cd ~/fcvm && source ~/.cargo/env && \
+   sudo cargo test --release -p fuse-pipe --test pjdfstest_full -- --nocapture"
+```
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `tests/stress/fixture.rs` | Shared FuseMount struct |
-| `tests/stress/main.rs` | Stress test binary |
-| `tests/stress/harness.rs` | Stress test orchestration |
-| `tests/integration.rs` | Basic FUSE operation tests |
+| `tests/common/mod.rs` | Shared FuseMount fixture |
+| `tests/pjdfstest_common.rs` | pjdfstest harness |
 | `benches/throughput.rs` | Parallel I/O benchmarks |
-| `benches/operations.rs` | Single-operation latency benchmarks |
-| `src/telemetry.rs` | Span collection and statistics |
-| `src/protocol/wire.rs` | Span struct with timing fields |
+| `src/server/credentials.rs` | CredentialsGuard for uid/gid switching |
+| `src/server/passthrough.rs` | PassthroughFs implementation |

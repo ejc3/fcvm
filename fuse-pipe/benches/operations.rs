@@ -10,12 +10,22 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Once;
 
 // Include the shared fixture module
 #[path = "../tests/common/mod.rs"]
 mod common;
 
 use common::FuseMount;
+
+/// Ensure ulimit is raised once at benchmark startup
+static INIT: Once = Once::new();
+
+fn ensure_ulimit() {
+    INIT.call_once(|| {
+        common::increase_ulimit();
+    });
+}
 
 const FILE_SIZE: usize = 4096; // 4KB test file
 
@@ -39,17 +49,19 @@ fn setup_test_files(dir: &PathBuf) {
 }
 
 fn cleanup(data_dir: &PathBuf, mount_dir: &PathBuf) {
-    let _ = Command::new("fusermount")
-        .args(["-u", mount_dir.to_str().unwrap()])
-        .status();
-    let _ = Command::new("fusermount3")
-        .args(["-u", mount_dir.to_str().unwrap()])
-        .status();
+    // Only unmount if actually a FUSE mount
+    if common::is_fuse_mount(mount_dir) {
+        let _ = Command::new("fusermount3")
+            .args(["-u", mount_dir.to_str().unwrap()])
+            .status();
+    }
     let _ = fs::remove_dir_all(data_dir);
     let _ = fs::remove_dir_all(mount_dir);
 }
 
 fn bench_getattr(c: &mut Criterion) {
+    ensure_ulimit();
+
     let data_dir = PathBuf::from("/tmp/fuse-ops-data-getattr");
     let mount_dir = PathBuf::from("/tmp/fuse-ops-mount-getattr");
 
