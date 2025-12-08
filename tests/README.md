@@ -6,8 +6,12 @@ This directory contains integration tests for fcvm functionality.
 
 - `common/mod.rs` - Shared test utilities (VmFixture, health checking, etc.)
 - `test_fuse_posix.rs` - POSIX FUSE compliance tests using pjdfstest
+- `test_localhost_image.rs` - Localhost container image tests (skopeo workflow)
+- `test_sanity.rs` - Basic VM startup and health check tests
+- `test_snapshot_clone.rs` - Snapshot and clone tests
 - `test_state_manager.rs` - State management tests
 - `test_health_monitor.rs` - Health monitoring tests
+- `test_fuse_in_vm.rs` - FUSE-in-VM integration tests
 
 ## POSIX FUSE Tests
 

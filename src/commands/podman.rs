@@ -56,11 +56,55 @@ impl VolumeMapping {
 /// Vsock base port for volume servers
 const VSOCK_VOLUME_PORT_BASE: u32 = 5000;
 
+/// Vsock port for status channel (fc-agent notifies when container starts)
+const VSOCK_STATUS_PORT: u32 = 4999;
+
 /// Main dispatcher for podman commands
 pub async fn cmd_podman(args: PodmanArgs) -> Result<()> {
     match args.cmd {
         PodmanCommands::Run(run_args) => cmd_podman_run(run_args).await,
     }
+}
+
+/// Listen for fc-agent "ready" notification on the status vsock port.
+///
+/// Firecracker forwards guest vsock connections to Unix sockets with format:
+/// `{uds_path}_{port}` - so we listen on vsock.sock_4999 for port 4999.
+///
+/// When fc-agent connects and sends "ready\n", we create a ready file.
+async fn run_status_listener(socket_path: &str, ready_file: &std::path::Path, vm_id: &str) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::UnixListener;
+
+    // Remove stale socket if it exists
+    let _ = std::fs::remove_file(socket_path);
+
+    let listener = UnixListener::bind(socket_path)
+        .with_context(|| format!("binding status listener to {}", socket_path))?;
+
+    info!(socket = %socket_path, "Status listener started");
+
+    // Accept one connection (we only need one "ready" notification per VM)
+    let (mut stream, _) = listener.accept().await.context("accepting status connection")?;
+
+    // Read the "ready" message
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf).await.context("reading status message")?;
+
+    let msg = String::from_utf8_lossy(&buf[..n]);
+    if msg.trim() == "ready" {
+        // Create ready file to signal container is running
+        std::fs::write(ready_file, "ready\n")
+            .with_context(|| format!("writing ready file: {:?}", ready_file))?;
+        info!(vm_id = %vm_id, "Container ready notification received");
+    } else {
+        warn!(vm_id = %vm_id, msg = %msg.trim(), "Unexpected status message");
+    }
+
+    // Clean up socket
+    let _ = std::fs::remove_file(socket_path);
+
+    Ok(())
 }
 
 async fn cmd_podman_run(args: RunArgs) -> Result<()> {
@@ -90,12 +134,49 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .context("parsing port mappings")?;
 
     // Parse volume mappings (HOST:GUEST[:ro])
-    let volume_mappings: Vec<VolumeMapping> = args
+    let mut volume_mappings: Vec<VolumeMapping> = args
         .map
         .iter()
         .map(|s| VolumeMapping::parse(s))
         .collect::<Result<Vec<_>>>()
         .context("parsing volume mappings")?;
+
+    // For localhost/ images, use skopeo to copy image to a directory
+    // The guest will use skopeo to import it into local storage
+    let _image_export_dir = if args.image.starts_with("localhost/") {
+        let image_dir = paths::vm_runtime_dir(&vm_id).join("image-export");
+        tokio::fs::create_dir_all(&image_dir)
+            .await
+            .context("creating image export directory")?;
+
+        info!(image = %args.image, "Exporting localhost image with skopeo");
+
+        let output = tokio::process::Command::new("skopeo")
+            .arg("copy")
+            .arg(format!("containers-storage:{}", args.image))
+            .arg(format!("dir:{}", image_dir.display()))
+            .output()
+            .await
+            .context("running skopeo copy")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("Failed to export image '{}' with skopeo: {}", args.image, stderr);
+        }
+
+        info!(dir = %image_dir.display(), "Image exported to OCI directory");
+
+        // Add the image directory as a read-only volume mount
+        volume_mappings.push(VolumeMapping {
+            host_path: image_dir.clone(),
+            guest_path: "/tmp/fcvm-image".to_string(),
+            read_only: true,
+        });
+
+        Some(image_dir)
+    } else {
+        None
+    };
 
     if !volume_mappings.is_empty() {
         info!(
@@ -133,6 +214,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     vm_state.name = Some(vm_name.clone());
     vm_state.config.env = args.env.clone();
     vm_state.config.volumes = args.map.clone();
+    vm_state.config.health_check_url = args.health_check.clone();
 
     // Initialize state manager
     let state_manager = StateManager::new(paths::state_dir());
@@ -208,6 +290,21 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
+    // Start status channel listener for fc-agent "ready" notifications
+    // When fc-agent sends "ready" on port 4999, we create a ready file
+    let status_ready_file = data_dir.join("container-ready");
+    let status_socket_path = format!("{}_{}", vsock_socket_path.display(), VSOCK_STATUS_PORT);
+    let status_handle = {
+        let ready_file = status_ready_file.clone();
+        let socket_path = status_socket_path.clone();
+        let vm_id_clone = vm_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_status_listener(&socket_path, &ready_file, &vm_id_clone).await {
+                tracing::warn!("Status listener error: {}", e);
+            }
+        })
+    };
+
     // Run the main VM setup in a helper to ensure cleanup on error
     let setup_result = run_vm_setup(
         &args,
@@ -270,6 +367,9 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     // Cancel health monitor task first
     health_monitor_handle.abort();
+
+    // Cancel status listener
+    status_handle.abort();
 
     // Cancel VolumeServer tasks
     for handle in volume_server_handles {
@@ -446,20 +546,18 @@ async fn run_vm_setup(
         })
         .await?;
 
-    // Configure vsock device if we have volumes to mount
-    if !volume_mappings.is_empty() {
-        info!(
-            "Configuring vsock device at {:?} for {} volume(s)",
-            vsock_socket_path,
-            volume_mappings.len()
-        );
-        client
-            .set_vsock(crate::firecracker::api::Vsock {
-                guest_cid: 3, // Guest CID (host is always 2)
-                uds_path: vsock_socket_path.display().to_string(),
-            })
-            .await?;
-    }
+    // Always configure vsock device for status channel (and optionally volumes)
+    info!(
+        "Configuring vsock device at {:?} (status + {} volume(s))",
+        vsock_socket_path,
+        volume_mappings.len()
+    );
+    client
+        .set_vsock(crate::firecracker::api::Vsock {
+            guest_cid: 3, // Guest CID (host is always 2)
+            uds_path: vsock_socket_path.display().to_string(),
+        })
+        .await?;
 
     // Build volume mount info for MMDS
     // Format: { guest_path, vsock_port, read_only }
@@ -488,6 +586,7 @@ async fn run_vm_setup(
                 }).collect::<std::collections::HashMap<_, _>>(),
                 "cmd": cmd_args,
                 "volumes": volume_mounts,
+                "image_dir": if args.image.starts_with("localhost/") { Some("/tmp/fcvm-image") } else { None },
             },
             "host-time": chrono::Utc::now().timestamp().to_string(),
         }

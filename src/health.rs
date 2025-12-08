@@ -99,81 +99,99 @@ async fn update_health_status_once(
             debug!(target: "health-monitor", pid = pid, "process not found");
             HealthStatus::Unreachable
         } else {
-            // Process exists, now check if application is responding
-            // Get network config and health check path from state
+            // Process exists, now check application health
             let state = state_manager
                 .load_state(vm_id)
                 .await
                 .context("loading state for health check")?;
-            let health_path = &state.config.health_check_path;
-            let net = &state.config.network;
 
-            // Check for rootless mode (loopback_ip set)
-            if let Some(loopback_ip) = &net.loopback_ip {
-                let port = net.health_check_port.unwrap_or(80);
-                debug!(target: "health-monitor", loopback_ip = %loopback_ip, port = port, "rootless health check via loopback");
-
-                match check_http_health_loopback(loopback_ip, port, health_path).await {
-                    Ok(true) => {
-                        debug!(target: "health-monitor", "health check passed (rootless)");
+            // Two modes:
+            // 1. health_check_url = Some(url) -> HTTP check (container running + HTTP responds)
+            // 2. health_check_url = None -> Check container-ready file (written by fc-agent via vsock)
+            match &state.config.health_check_url {
+                None => {
+                    // No HTTP check - check if container-ready file exists
+                    // fc-agent creates this file via vsock when the container starts
+                    let ready_file = paths::vm_runtime_dir(vm_id).join("container-ready");
+                    if ready_file.exists() {
+                        debug!(target: "health-monitor", "container-ready file exists, healthy");
                         *last_failure_log = None;
                         HealthStatus::Healthy
-                    }
-                    Ok(false) => {
-                        warn!(target: "health-monitor", "health check returned false (unexpected)");
-                        HealthStatus::Unhealthy
-                    }
-                    Err(e) => {
-                        let should_log = match last_failure_log {
-                            None => true,
-                            Some(last_time) => last_time.elapsed() >= Duration::from_secs(1),
-                        };
-                        if should_log {
-                            warn!(target: "health-monitor", error = %e, "health check failed (rootless)");
-                            *last_failure_log = Some(Instant::now());
-                        }
-                        HealthStatus::Unhealthy
+                    } else {
+                        debug!(target: "health-monitor", "waiting for container-ready file");
+                        HealthStatus::Unknown
                     }
                 }
-            } else {
-                // Bridged mode: use guest_ip + veth
-                let guest_ip = net.guest_ip.as_deref();
-                let veth_device = net.host_veth.as_deref();
+                Some(url_str) => {
+                    // HTTP health check
+                    let url = url::Url::parse(url_str)
+                        .with_context(|| format!("parsing health check URL: {}", url_str))?;
+                    let health_path = url.path();
+                    let net = &state.config.network;
 
-                debug!(target: "health-monitor", guest_ip = ?guest_ip, veth = ?veth_device, "bridged health check via veth");
+                    // Check for rootless mode (loopback_ip set)
+                    if let Some(loopback_ip) = &net.loopback_ip {
+                        let port = net.health_check_port.unwrap_or(80);
+                        debug!(target: "health-monitor", loopback_ip = %loopback_ip, port = port, "HTTP health check via loopback");
 
-                if let (Some(guest_ip), Some(veth)) = (guest_ip, veth_device) {
-                    match check_http_health_bridged(guest_ip, veth, health_path).await {
-                        Ok(true) => {
-                            debug!(target: "health-monitor", "health check passed (bridged)");
-                            *last_failure_log = None;
-                            HealthStatus::Healthy
-                        }
-                        Ok(false) => {
-                            warn!(target: "health-monitor", "health check returned false (unexpected)");
-                            HealthStatus::Unhealthy
-                        }
-                        Err(e) => {
-                            let should_log = match last_failure_log {
-                                None => true,
-                                Some(last_time) => last_time.elapsed() >= Duration::from_secs(1),
-                            };
-                            if should_log {
-                                warn!(target: "health-monitor", error = %e, "health check failed (bridged)");
-                                *last_failure_log = Some(Instant::now());
+                        match check_http_health_loopback(loopback_ip, port, health_path).await {
+                            Ok(true) => {
+                                debug!(target: "health-monitor", "health check passed");
+                                *last_failure_log = None;
+                                HealthStatus::Healthy
                             }
-                            HealthStatus::Unhealthy
+                            Ok(false) => {
+                                warn!(target: "health-monitor", "health check returned false");
+                                HealthStatus::Unhealthy
+                            }
+                            Err(e) => {
+                                let should_log = match last_failure_log {
+                                    None => true,
+                                    Some(last_time) => last_time.elapsed() >= Duration::from_secs(1),
+                                };
+                                if should_log {
+                                    warn!(target: "health-monitor", error = %e, "HTTP health check failed");
+                                    *last_failure_log = Some(Instant::now());
+                                }
+                                HealthStatus::Unhealthy
+                            }
+                        }
+                    } else {
+                        // Bridged mode: use guest_ip + veth
+                        let guest_ip = net.guest_ip.as_deref();
+                        let veth_device = net.host_veth.as_deref();
+
+                        debug!(target: "health-monitor", guest_ip = ?guest_ip, veth = ?veth_device, "HTTP health check via veth");
+
+                        if let (Some(guest_ip), Some(veth)) = (guest_ip, veth_device) {
+                            match check_http_health_bridged(guest_ip, veth, health_path).await {
+                                Ok(true) => {
+                                    debug!(target: "health-monitor", "health check passed");
+                                    *last_failure_log = None;
+                                    HealthStatus::Healthy
+                                }
+                                Ok(false) => {
+                                    warn!(target: "health-monitor", "health check returned false");
+                                    HealthStatus::Unhealthy
+                                }
+                                Err(e) => {
+                                    let should_log = match last_failure_log {
+                                        None => true,
+                                        Some(last_time) => last_time.elapsed() >= Duration::from_secs(1),
+                                    };
+                                    if should_log {
+                                        warn!(target: "health-monitor", error = %e, "HTTP health check failed");
+                                        *last_failure_log = Some(Instant::now());
+                                    }
+                                    HealthStatus::Unhealthy
+                                }
+                            }
+                        } else {
+                            // No network config yet
+                            debug!(target: "health-monitor", "waiting for network config");
+                            HealthStatus::Unknown
                         }
                     }
-                } else {
-                    // No network config yet
-                    if guest_ip.is_none() {
-                        warn!(target: "health-monitor", "cannot check health: no guest_ip in config");
-                    }
-                    if veth_device.is_none() {
-                        warn!(target: "health-monitor", "cannot check health: no host_veth in config");
-                    }
-                    HealthStatus::Unknown
                 }
             }
         }

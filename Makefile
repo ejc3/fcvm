@@ -9,9 +9,9 @@ RSYNC := rsync -avz --delete --exclude 'target' --exclude '.git' -e "ssh -i $(EC
 # Remote paths
 REMOTE_DIR := ~/fcvm
 REMOTE_KERNEL_DIR := ~/linux-firecracker
-REMOTE_FUSE_BACKEND_RS := ~/fuse-backend-rs
+REMOTE_FUSE_BACKEND_RS := /home/ubuntu/fuse-backend-rs
 LOCAL_FUSE_BACKEND_RS := ../fuse-backend-rs
-REMOTE_FUSER := ~/fuser
+REMOTE_FUSER := /home/ubuntu/fuser
 LOCAL_FUSER := ../fuser
 
 # Container image name

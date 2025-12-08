@@ -1,13 +1,10 @@
 # Minimal pjdfstest container
 #
-# This container only runs pjdfstest against a pre-mounted filesystem.
-# The FUSE filesystem should be mounted into the container from outside.
-#
 # Build:
 #   podman build -t pjdfstest -f Containerfile.pjdfstest .
 #
-# Run (with FUSE mount at /mnt/fuse):
-#   podman run --rm -v /mnt/fuse:/testdir pjdfstest /testdir
+# Run:
+#   podman run --rm -v /mnt/fuse:/testdir pjdfstest prove -v -j 8 -r /opt/pjdfstest/tests/
 
 FROM docker.io/library/debian:bookworm-slim
 
@@ -31,11 +28,7 @@ RUN git clone --depth 1 https://github.com/pjd/pjdfstest /opt/pjdfstest \
     && ./configure \
     && make
 
-# Create test script inline
-RUN printf '#!/bin/bash\nset -e\nTESTDIR="${1:-/testdir}"\nJOBS="${2:-8}"\nif [ ! -d "$TESTDIR" ]; then\n  echo "ERROR: Test directory $TESTDIR does not exist"\n  exit 1\nfi\ncd "$TESTDIR"\necho "Running pjdfstest in $TESTDIR with $JOBS parallel jobs"\nprove -v -j "$JOBS" -r /opt/pjdfstest/tests/\necho "pjdfstest complete"\n' > /usr/local/bin/run-pjdfstest \
-    && chmod +x /usr/local/bin/run-pjdfstest
-
 WORKDIR /testdir
 
-ENTRYPOINT ["/usr/local/bin/run-pjdfstest"]
-CMD ["/testdir", "8"]
+# No entrypoint - just run whatever command is passed
+CMD ["prove", "-v", "-j", "8", "-r", "/opt/pjdfstest/tests/"]

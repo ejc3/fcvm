@@ -23,6 +23,9 @@ struct Plan {
     /// Volume mounts from host (FUSE-over-vsock)
     #[serde(default)]
     volumes: Vec<VolumeMount>,
+    /// Directory containing exported OCI image (for localhost/ images)
+    #[serde(default)]
+    image_dir: Option<String>,
 }
 
 /// Volume mount configuration from MMDS
@@ -477,6 +480,66 @@ fn append_with_lock(path: &str, clone_id: &str, iteration: usize) -> Result<()> 
     Ok(())
 }
 
+/// Status channel port for notifying host that container is running
+const STATUS_VSOCK_PORT: u32 = 4999;
+
+/// Host CID for vsock (always 2)
+const HOST_CID: u32 = 2;
+
+/// Notify host that container has started via vsock.
+///
+/// Sends "ready\n" message to the host on the status vsock port.
+/// The host side listens on vsock.sock_4999 and uses this to determine
+/// when the container is running for health checks.
+fn notify_container_started() {
+    // Create vsock socket
+    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        eprintln!("[fc-agent] WARNING: failed to create vsock socket for status: {}",
+                  std::io::Error::last_os_error());
+        return;
+    }
+
+    // Build sockaddr_vm structure
+    let addr = libc::sockaddr_vm {
+        svm_family: libc::AF_VSOCK as u16,
+        svm_reserved1: 0,
+        svm_port: STATUS_VSOCK_PORT,
+        svm_cid: HOST_CID,
+        svm_zero: [0u8; 4],
+    };
+
+    // Connect to host
+    let result = unsafe {
+        libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_vm>() as u32,
+        )
+    };
+
+    if result < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        eprintln!("[fc-agent] WARNING: failed to connect vsock for status: {}", err);
+        return;
+    }
+
+    // Send "ready" message
+    let msg = b"ready\n";
+    let written = unsafe {
+        libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len())
+    };
+
+    unsafe { libc::close(fd) };
+
+    if written == msg.len() as isize {
+        eprintln!("[fc-agent] ✓ container started, notified host via vsock");
+    } else {
+        eprintln!("[fc-agent] WARNING: vsock status write incomplete: {} bytes", written);
+    }
+}
+
 /// Extract clone ID from MMDS or hostname
 /// Clones are named "clone-lock-{N}" so we extract the number
 async fn get_clone_id() -> String {
@@ -510,9 +573,24 @@ fn mount_fuse_volumes(volumes: &[VolumeMount]) -> Result<Vec<String>> {
             vol.guest_path, vol.vsock_port
         );
 
-        // Create mount point directory
-        std::fs::create_dir_all(&vol.guest_path)
-            .with_context(|| format!("creating mount point: {}", vol.guest_path))?;
+        // Try to unmount any stale FUSE mount from a previous failed attempt
+        // This handles the case where fc-agent was restarted by systemd after a failure
+        let mount_path = std::path::Path::new(&vol.guest_path);
+        if mount_path.exists() {
+            eprintln!("[fc-agent] mount point exists, attempting to unmount stale mount...");
+            // Use lazy unmount (MNT_DETACH) to handle stale FUSE mounts
+            let _ = std::process::Command::new("umount")
+                .arg("-l")
+                .arg(&vol.guest_path)
+                .output();
+        }
+
+        // Create mount point directory (ok if it already exists)
+        if let Err(e) = std::fs::create_dir_all(&vol.guest_path) {
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(e).with_context(|| format!("creating mount point: {}", vol.guest_path));
+            }
+        }
 
         // Mount FUSE filesystem in a background thread using fuse-pipe
         // fuse-pipe's mount_vsock blocks, so we run it in a dedicated thread
@@ -678,6 +756,27 @@ async fn main() -> Result<()> {
         });
     }
 
+    // If image_dir is set, use skopeo to import the image from the FUSE-mounted directory
+    if let Some(image_dir) = &plan.image_dir {
+        eprintln!("[fc-agent] importing image from {} using skopeo", image_dir);
+
+        let output = Command::new("skopeo")
+            .arg("copy")
+            .arg(format!("dir:{}", image_dir))
+            .arg(format!("containers-storage:{}", plan.image))
+            .output()
+            .await
+            .context("running skopeo copy to import image")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("[fc-agent] ERROR: skopeo copy failed: {}", stderr);
+            anyhow::bail!("Failed to import image with skopeo: {}", stderr);
+        }
+
+        eprintln!("[fc-agent] ✓ image imported successfully");
+    }
+
     eprintln!("[fc-agent] launching container: {}", plan.image);
 
     // Build Podman command
@@ -714,6 +813,10 @@ async fn main() -> Result<()> {
 
     let mut child = cmd.spawn().context("spawning Podman container")?;
 
+    // Notify host that container has started via vsock
+    // The host listens on vsock.sock_4999 for status messages
+    notify_container_started();
+
     // Stream stdout to serial console
     if let Some(stdout) = child.stdout.take() {
         tokio::spawn(async move {
@@ -741,9 +844,16 @@ async fn main() -> Result<()> {
 
     if status.success() {
         eprintln!("[fc-agent] container exited successfully");
-        Ok(())
     } else {
         eprintln!("[fc-agent] container exited with error: {}", status);
-        std::process::exit(status.code().unwrap_or(1))
     }
+
+    // Shut down the VM when the container exits (success or failure)
+    // This is the expected behavior - the VM exists to run one container
+    eprintln!("[fc-agent] shutting down VM");
+    let _ = Command::new("poweroff").spawn();
+
+    // Give poweroff a moment to execute, then exit with container's exit code
+    sleep(Duration::from_millis(100)).await;
+    std::process::exit(status.code().unwrap_or(0))
 }

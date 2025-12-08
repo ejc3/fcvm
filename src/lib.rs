@@ -4,7 +4,6 @@ pub mod firecracker;
 pub mod health;
 pub mod network;
 pub mod paths;
-pub mod podman_proxy;
 pub mod setup;
 pub mod state;
 pub mod storage;
