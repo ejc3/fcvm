@@ -108,19 +108,11 @@ When a FUSE operation fails unexpectedly, trace the full path from kernel to fus
 
 This pattern found the ftruncate bug: kernel sends `FATTR_FH` with file handle, but fuse-pipe's `VolumeRequest::Setattr` didn't have an `fh` field.
 
-### Known Limitation: Supplementary Groups with default_permissions
+### Container Testing for Full POSIX Compliance
 
-With the `default_permissions` FUSE mount option, chown to supplementary groups fails with EPERM:
+All 8789 pjdfstest tests pass when running in a container with proper device cgroup rules. Use `make container-test-pjdfstest` for the full POSIX compliance test.
 
-**Symptom**: pjdfstest `-u 65534 -g 65532,65531 chown file 65534 65531` returns EPERM.
-
-**Root Cause**: The kernel checks chown permissions but only sees the primary group (65532 from setfsgid), not supplementary groups (65531 from setgroups). The kernel rejects before FUSE is even called.
-
-**Why we use default_permissions**: It correctly handles parent directory permission checks (path traversal) and reduces round-trips for operations that would fail anyway.
-
-**Affected operations**: Any chown where target group is in supplementary groups but not the primary group (~108 pjdfstest failures).
-
-**Workaround**: None currently. To fix would require disabling default_permissions and implementing all permission checks server-side, which has other trade-offs.
+**Why containers work better**: The container runs with `sudo podman` and `--device-cgroup-rule` flags that allow mknod for block/char devices. Native EC2 testing may have permission issues with supplementary groups and device node creation.
 
 ## PID-Based Process Management
 
@@ -366,6 +358,8 @@ fcvm clone --snapshot nginx-base --name web1  # Connects to server
 
 ### Makefile Targets (from local macOS)
 
+#### Development
+
 | Target | Description |
 |--------|-------------|
 | `make build` | Sync + build fcvm + fc-agent on EC2 |
@@ -375,6 +369,20 @@ fcvm clone --snapshot nginx-base --name web1  # Connects to server
 | `make sync` | Just sync code (no build) |
 | `make kernel` | Build kernel on EC2 (~10-20 min) |
 | `make fetch` | Download binaries to local |
+
+#### Container Testing (Recommended)
+
+| Target | Description |
+|--------|-------------|
+| `make container-build` | Sync code + build test container |
+| `make container-test` | Run all fuse-pipe tests |
+| `make container-test-integration` | Integration tests only (15 tests) |
+| `make container-test-permissions` | Permission edge cases (18 tests) |
+| `make container-test-pjdfstest` | POSIX compliance (8789 tests) |
+| `make container-test-stress` | Parallel stress tests |
+| `make container-test-full` | Build + run ALL tests in parallel |
+| `make container-shell` | Interactive shell in container |
+| `make container-clean` | Remove container image |
 
 ### Manual Build on EC2
 
@@ -447,15 +455,26 @@ ip addr add 172.16.29.1/24 dev tap-vm-c93e8   # Guest is 172.16.29.2
 
 **Full documentation**: See `fuse-pipe/TESTING.md` for complete testing guide.
 
-### Quick Reference
+### Quick Reference (Container - Recommended)
+
+| Command | Description |
+|---------|-------------|
+| `make container-test` | Run all fuse-pipe tests |
+| `make container-test-integration` | Basic FUSE ops (15 tests) |
+| `make container-test-permissions` | Permission tests (18 tests) |
+| `make container-test-pjdfstest` | POSIX compliance (8789 tests) |
+| `make container-test-stress` | Parallel stress (85 jobs) |
+| `make container-shell` | Interactive shell for debugging |
+
+### Quick Reference (Native EC2)
 
 | Command | Description |
 |---------|-------------|
 | `sudo cargo test --release -p fuse-pipe --test integration` | Basic FUSE ops (15 tests) |
 | `sudo cargo test --release -p fuse-pipe --test test_permission_edge_cases` | Permission tests (18 tests) |
 | `sudo cargo test --release -p fuse-pipe --test pjdfstest_full` | POSIX compliance (8789 tests) |
-| `sudo cargo test --release -p fuse-pipe --test pjdfstest_stress` | Parallel stress (85 jobs, ~44k tests) |
-| `sudo cargo bench -p fuse-pipe --bench throughput` | I/O benchmarks at varying concurrency |
+| `sudo cargo test --release -p fuse-pipe --test pjdfstest_stress` | Parallel stress (85 jobs) |
+| `sudo cargo bench -p fuse-pipe --bench throughput` | I/O benchmarks |
 
 ### Tracing Targets
 
