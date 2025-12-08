@@ -356,48 +356,64 @@ fcvm clone --snapshot nginx-base --name web1  # Connects to server
 
 ### Makefile Targets (from local macOS)
 
-#### Development
+Run `make help` for full list. Key targets:
 
+#### Development
 | Target | Description |
 |--------|-------------|
 | `make build` | Sync + build fcvm + fc-agent on EC2 |
-| `make test` | Run sanity test on EC2 |
-| `make rebuild` | Full rebuild including rootfs update |
-| `make rootfs` | Update fc-agent in rootfs only |
 | `make sync` | Just sync code (no build) |
-| `make kernel` | Build kernel on EC2 (~10-20 min) |
-| `make fetch` | Download binaries to local |
+| `make clean` | Clean build artifacts |
 
-#### Container Testing (Recommended)
-
+#### Testing
 | Target | Description |
 |--------|-------------|
-| `make container-build` | Sync code + build test container |
-| `make container-test` | Run all fuse-pipe tests |
-| `make container-test-pjdfstest` | POSIX compliance (8789 tests) |
-| `make container-test-fcvm-sanity` | fcvm sanity test (bridged + rootless) |
+| `make test` | Run all tests (native on EC2) |
+| `make test-sanity` | Run VM sanity test (native on EC2) |
+| `make container-test` | Run fuse-pipe tests (in container) |
+| `make container-test-fcvm` | Run fcvm VM tests (in container) |
 | `make container-shell` | Interactive shell in container |
 
-### Manual Build on EC2
+#### Setup (idempotent, run automatically by tests)
+| Target | Description |
+|--------|-------------|
+| `make setup-all` | Full setup (btrfs + kernel + rootfs) |
+| `make setup-btrfs` | Create btrfs loopback |
+| `make setup-kernel` | Copy kernel to btrfs |
+| `make setup-rootfs` | Create base rootfs (~90 sec first run) |
 
-```bash
-ssh -i ~/.ssh/fcvm-ec2 ubuntu@54.67.60.104
-cd ~/fcvm && source ~/.cargo/env
+#### Rootfs Updates
+| Target | Description |
+|--------|-------------|
+| `make rootfs` | Update fc-agent in existing rootfs |
+| `make rebuild` | Build + update rootfs |
 
-# Build fcvm
-cargo build --release
+### How Setup Works
 
-# Build fc-agent
-cd fc-agent && cargo build --release
+**What Makefile does (prerequisites):**
+1. `setup-btrfs` - Creates 20GB btrfs loopback at `/mnt/fcvm-btrfs`
+2. `setup-kernel` - Copies pre-built kernel from `~/linux-firecracker/arch/arm64/boot/Image`
 
-# Update rootfs
-sudo mkdir -p /tmp/rootfs-mount
-sudo mount -o loop /mnt/fcvm-btrfs/rootfs/base.ext4 /tmp/rootfs-mount
-sudo cp ~/fcvm/fc-agent/target/release/fc-agent /tmp/rootfs-mount/usr/local/bin/
-sudo umount /tmp/rootfs-mount
+**What fcvm binary does (auto on first VM start):**
+1. `ensure_kernel()` - Checks for `/mnt/fcvm-btrfs/kernels/vmlinux.bin` (already copied by Makefile)
+2. `ensure_rootfs()` - If missing, downloads Ubuntu 24.04 cloud image (~590MB), customizes with virt-customize, installs podman/crun/etc, embeds fc-agent binary (~90 sec)
+
+### Data Layout
+```
+/mnt/fcvm-btrfs/           # btrfs filesystem (CoW reflinks work here)
+├── kernels/
+│   └── vmlinux.bin        # Firecracker kernel
+├── rootfs/
+│   └── base.ext4          # Base Ubuntu + Podman image (~10GB)
+├── vm-disks/
+│   └── vm-{id}/
+│       └── rootfs.ext4    # CoW reflink copy per VM
+├── snapshots/             # Firecracker snapshots
+├── state/                 # VM state JSON files
+└── cache/                 # Downloaded cloud images
 ```
 
-### One-Time EC2 Setup
+### One-Time EC2 Setup (dnsmasq)
 
 ```bash
 sudo apt-get update
@@ -454,10 +470,7 @@ ip addr add 172.16.29.1/24 dev tap-vm-c93e8   # Guest is 172.16.29.2
 | Command | Description |
 |---------|-------------|
 | `make container-test` | Run all fuse-pipe tests |
-| `make container-test-integration` | Basic FUSE ops (15 tests) |
-| `make container-test-permissions` | Permission tests (18 tests) |
-| `make container-test-pjdfstest` | POSIX compliance (8789 tests) |
-| `make container-test-stress` | Parallel stress (85 jobs) |
+| `make container-test-fcvm` | Run fcvm VM sanity tests |
 | `make container-shell` | Interactive shell for debugging |
 
 ### Quick Reference (Native EC2)
