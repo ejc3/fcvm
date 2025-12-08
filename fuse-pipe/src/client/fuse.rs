@@ -8,6 +8,7 @@ use fuser::{
     Request, TimeOrNow,
 };
 use std::ffi::OsStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -20,15 +21,30 @@ pub struct FuseClient {
     reader_id: u32,
     /// Optional callback to run when init() completes (spawns additional readers)
     init_callback: Option<InitCallback>,
+    /// Shared flag set by destroy() to signal clean shutdown to reader threads
+    destroyed: Arc<AtomicBool>,
 }
 
 impl FuseClient {
     /// Create a new client for a specific reader using shared multiplexer.
     pub fn new(mux: Arc<Multiplexer>, reader_id: u32) -> Self {
+        Self::with_destroyed_flag(mux, reader_id, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Create a new client with a shared destroyed flag.
+    ///
+    /// The destroyed flag is set by `destroy()` when the filesystem is unmounted.
+    /// Reader threads can check this flag to distinguish clean shutdown from errors.
+    pub fn with_destroyed_flag(
+        mux: Arc<Multiplexer>,
+        reader_id: u32,
+        destroyed: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             mux,
             reader_id,
             init_callback: None,
+            destroyed,
         }
     }
 
@@ -40,12 +56,19 @@ impl FuseClient {
         mux: Arc<Multiplexer>,
         reader_id: u32,
         callback: InitCallback,
+        destroyed: Arc<AtomicBool>,
     ) -> Self {
         Self {
             mux,
             reader_id,
             init_callback: Some(callback),
+            destroyed,
         }
+    }
+
+    /// Get a clone of the destroyed flag for sharing with reader threads.
+    pub fn destroyed_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.destroyed)
     }
 
     /// Send request and wait for response.
@@ -123,6 +146,14 @@ impl Filesystem for FuseClient {
             callback();
         }
         Ok(())
+    }
+
+    fn destroy(&mut self) {
+        // Signal to reader threads that this is a clean shutdown.
+        // The kernel calls destroy() before closing cloned fds, so reader
+        // threads will see this flag when they get ECONNABORTED.
+        self.destroyed.store(true, Ordering::SeqCst);
+        tracing::debug!(target: "fuse-pipe::client", "destroy() called - signaling clean shutdown");
     }
 
     fn lookup(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {

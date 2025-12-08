@@ -8,6 +8,7 @@ use crate::telemetry::SpanCollector;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -80,9 +81,9 @@ pub fn mount_with_telemetry<P: AsRef<Path>>(
 
 /// Mount a FUSE filesystem and send back an unmounter handle.
 ///
-/// This is the same as `mount_with_readers` but sends a `SessionUnmounter` through
-/// the provided channel before blocking on `session.run()`. The caller can use the
-/// unmounter to cleanly stop the FUSE session from another thread.
+/// Sends a `SessionUnmounter` through the provided channel before blocking on
+/// `session.run()`. The caller can use the unmounter to cleanly stop the FUSE
+/// session from another thread.
 ///
 /// # Example
 ///
@@ -94,7 +95,7 @@ pub fn mount_with_telemetry<P: AsRef<Path>>(
 /// });
 /// let mut unmounter = rx.recv().unwrap();
 /// // ... do work ...
-/// unmounter.unmount().unwrap();  // Clean shutdown
+/// unmounter.unmount().unwrap();
 /// mount_thread.join().unwrap();
 /// ```
 pub fn mount_with_unmounter<P: AsRef<Path>>(
@@ -159,15 +160,11 @@ fn mount_internal<P: AsRef<Path>>(
     ];
     info!(target: "fuse-pipe::client", ?options, "using mount options");
 
-    let mount_with_options =
-        |opts: &[fuser::MountOption]| -> Result<fuser::Session<FuseClient>, std::io::Error> {
-            let fs = FuseClient::new(Arc::clone(&mux), 0);
-            fuser::Session::new(fs, mount_point.as_ref(), opts)
-        };
-
     // For single reader, just run directly
     if num_readers == 1 {
-        let mut session = mount_with_options(&options)?;
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let fs = FuseClient::with_destroyed_flag(Arc::clone(&mux), 0, Arc::clone(&destroyed));
+        let mut session = fuser::Session::new(fs, mount_point.as_ref(), &options)?;
         info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), "mounted");
 
         // Send unmounter before blocking on run()
@@ -176,7 +173,11 @@ fn mount_internal<P: AsRef<Path>>(
         }
 
         if let Err(e) = session.run() {
-            error!(target: "fuse-pipe::client", reader_id = 0, error = %e, "reader error");
+            if destroyed.load(Ordering::SeqCst) {
+                debug!(target: "fuse-pipe::client", "primary reader exited (clean shutdown)");
+            } else {
+                error!(target: "fuse-pipe::client", reader_id = 0, error = %e, "reader error");
+            }
         }
         debug!(target: "fuse-pipe::client", "FUSE session exited");
         return Ok(());
@@ -192,7 +193,11 @@ fn mount_internal<P: AsRef<Path>>(
 
     let cloned_fds: Arc<Mutex<Vec<(usize, OwnedFd)>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let make_init_callback = || {
+    // Shared flag set by FuseClient::destroy() when kernel sends FUSE_DESTROY.
+    // Reader threads check this to distinguish clean shutdown from real errors.
+    let destroyed = Arc::new(AtomicBool::new(false));
+
+    let make_init_callback = |destroyed: Arc<AtomicBool>| {
         let cloned_fds_for_callback = Arc::clone(&cloned_fds);
         let mux_for_callback = Arc::clone(&mux);
         Box::new(move || {
@@ -200,23 +205,35 @@ fn mount_internal<P: AsRef<Path>>(
             let fds_vec: Vec<_> = std::mem::take(&mut *cloned_fds_for_callback.lock().unwrap());
 
             for (reader_id, cloned_fd) in fds_vec {
-                let fs = FuseClient::new(Arc::clone(&mux_for_callback), reader_id as u32);
+                let fs = FuseClient::with_destroyed_flag(
+                    Arc::clone(&mux_for_callback),
+                    reader_id as u32,
+                    Arc::clone(&destroyed),
+                );
                 // Each cloned fd handles its own request/response pairs
                 // Use SessionACL::All to allow any user to access the mount (AllowOther is set)
                 let mut reader_session =
                     fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::All);
 
+                let destroyed_check = Arc::clone(&destroyed);
                 thread::spawn(move || {
                     if let Err(e) = reader_session.run() {
-                        error!(target: "fuse-pipe::client", reader_id, error = %e, "reader error");
+                        // Check if destroy() was called (clean shutdown via FUSE_DESTROY).
+                        // The kernel calls destroy() on the primary session before closing
+                        // cloned fds, so this flag will be set by the time we see the error.
+                        if destroyed_check.load(Ordering::SeqCst) {
+                            debug!(target: "fuse-pipe::client", reader_id, "reader exited (clean shutdown)");
+                        } else {
+                            error!(target: "fuse-pipe::client", reader_id, error = %e, "reader error");
+                        }
                     }
                 });
             }
         })
     };
 
-    // Create primary FuseClient with callback
-    let fs = FuseClient::with_init_callback(Arc::clone(&mux), 0, make_init_callback());
+    // Create primary FuseClient with callback and shared destroyed flag
+    let fs = FuseClient::with_init_callback(Arc::clone(&mux), 0, make_init_callback(Arc::clone(&destroyed)), Arc::clone(&destroyed));
     let mut session = fuser::Session::new(fs, mount_point.as_ref(), &options)?;
     info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), "mounted");
 
@@ -243,7 +260,13 @@ fn mount_internal<P: AsRef<Path>>(
     }
 
     if let Err(e) = session.run() {
-        error!(target: "fuse-pipe::client", reader_id = 0, error = %e, "reader error");
+        // Check if destroy() was called (clean shutdown). The primary session
+        // also gets an error when unmounted, but destroy() sets the flag first.
+        if destroyed.load(Ordering::SeqCst) {
+            debug!(target: "fuse-pipe::client", "primary reader exited (clean shutdown)");
+        } else {
+            error!(target: "fuse-pipe::client", reader_id = 0, error = %e, "reader error");
+        }
     }
 
     debug!(target: "fuse-pipe::client", "FUSE session exited");
@@ -329,18 +352,18 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
         fuser::MountOption::DefaultPermissions,
     ];
 
-    let mount_with_options =
-        |opts: &[fuser::MountOption]| -> Result<fuser::Session<FuseClient>, std::io::Error> {
-            let fs = FuseClient::new(Arc::clone(&mux), 0);
-            fuser::Session::new(fs, mount_point.as_ref(), opts)
-        };
-
     // For single reader, just run directly
     if num_readers == 1 {
-        let mut session = mount_with_options(&options)?;
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let fs = FuseClient::with_destroyed_flag(Arc::clone(&mux), 0, Arc::clone(&destroyed));
+        let mut session = fuser::Session::new(fs, mount_point.as_ref(), &options)?;
         info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), "mounted via vsock");
         if let Err(e) = session.run() {
-            error!(target: "fuse-pipe::client", reader_id = 0, error = %e, "reader error");
+            if destroyed.load(Ordering::SeqCst) {
+                debug!(target: "fuse-pipe::client", "primary reader exited (clean shutdown)");
+            } else {
+                error!(target: "fuse-pipe::client", reader_id = 0, error = %e, "reader error");
+            }
         }
         debug!(target: "fuse-pipe::client", "FUSE session exited");
         return Ok(());
@@ -349,29 +372,41 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
     // Multi-reader setup (same as Unix socket version)
     let cloned_fds: Arc<Mutex<Vec<(usize, OwnedFd)>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let make_init_callback = || {
+    // Shared flag set by FuseClient::destroy() when kernel sends FUSE_DESTROY.
+    let destroyed = Arc::new(AtomicBool::new(false));
+
+    let make_init_callback = |destroyed: Arc<AtomicBool>| {
         let cloned_fds_for_callback = Arc::clone(&cloned_fds);
         let mux_for_callback = Arc::clone(&mux);
         Box::new(move || {
             let fds_vec: Vec<_> = std::mem::take(&mut *cloned_fds_for_callback.lock().unwrap());
 
             for (reader_id, cloned_fd) in fds_vec {
-                let fs = FuseClient::new(Arc::clone(&mux_for_callback), reader_id as u32);
+                let fs = FuseClient::with_destroyed_flag(
+                    Arc::clone(&mux_for_callback),
+                    reader_id as u32,
+                    Arc::clone(&destroyed),
+                );
                 // Each cloned fd handles its own request/response pairs
                 // Use SessionACL::All to allow any user to access the mount (AllowOther is set)
                 let mut reader_session =
                     fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::All);
 
+                let destroyed_check = Arc::clone(&destroyed);
                 thread::spawn(move || {
                     if let Err(e) = reader_session.run() {
-                        error!(target: "fuse-pipe::client", reader_id, error = %e, "reader error");
+                        if destroyed_check.load(Ordering::SeqCst) {
+                            debug!(target: "fuse-pipe::client", reader_id, "reader exited (clean shutdown)");
+                        } else {
+                            error!(target: "fuse-pipe::client", reader_id, error = %e, "reader error");
+                        }
                     }
                 });
             }
         })
     };
 
-    let fs = FuseClient::with_init_callback(Arc::clone(&mux), 0, make_init_callback());
+    let fs = FuseClient::with_init_callback(Arc::clone(&mux), 0, make_init_callback(Arc::clone(&destroyed)), Arc::clone(&destroyed));
     let mut session = fuser::Session::new(fs, mount_point.as_ref(), &options)?;
     info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), "mounted via vsock");
 
@@ -391,7 +426,11 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
     let actual_readers = num_readers - clone_failures;
     info!(target: "fuse-pipe::client", actual_readers, cloned_fds = actual_readers - 1, "FUSE session starting");
     if let Err(e) = session.run() {
-        error!(target: "fuse-pipe::client", reader_id = 0, error = %e, "reader error");
+        if destroyed.load(Ordering::SeqCst) {
+            debug!(target: "fuse-pipe::client", "primary reader exited (clean shutdown)");
+        } else {
+            error!(target: "fuse-pipe::client", reader_id = 0, error = %e, "reader error");
+        }
     }
 
     debug!(target: "fuse-pipe::client", "FUSE session exited");
