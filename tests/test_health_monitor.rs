@@ -26,7 +26,7 @@ fn init_test_base_dir() -> PathBuf {
         .clone()
 }
 
-#[tokio::test(start_paused = false)]
+#[tokio::test]
 #[serial]
 async fn test_health_monitor_behaviors() {
     // Ensure base dir is set before spawning the monitor (tests run in parallel).
