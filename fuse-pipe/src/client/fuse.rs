@@ -102,7 +102,14 @@ impl FuseClient {
 
     /// Send request and wait for response.
     fn send_request_sync(&self, request: VolumeRequest) -> VolumeResponse {
-        self.mux.send_request(self.reader_id, request)
+        let pid = Self::request_pid(&request);
+        if let Some(pid) = pid {
+            let groups = get_supplementary_groups(pid);
+            self.mux
+                .send_request_with_groups(self.reader_id, request, groups)
+        } else {
+            self.mux.send_request(self.reader_id, request)
+        }
     }
 
     /// Send request with supplementary groups and wait for response.
@@ -113,6 +120,36 @@ impl FuseClient {
         let groups = get_supplementary_groups(pid);
         self.mux
             .send_request_with_groups(self.reader_id, request, groups)
+    }
+
+    /// Extract the caller PID from a request (when available).
+    fn request_pid(request: &VolumeRequest) -> Option<u32> {
+        match request {
+            VolumeRequest::Lookup { pid, .. }
+            | VolumeRequest::Readdir { pid, .. }
+            | VolumeRequest::Mkdir { pid, .. }
+            | VolumeRequest::Mknod { pid, .. }
+            | VolumeRequest::Rmdir { pid, .. }
+            | VolumeRequest::Create { pid, .. }
+            | VolumeRequest::Open { pid, .. }
+            | VolumeRequest::Read { pid, .. }
+            | VolumeRequest::Write { pid, .. }
+            | VolumeRequest::Unlink { pid, .. }
+            | VolumeRequest::Rename { pid, .. }
+            | VolumeRequest::Symlink { pid, .. }
+            | VolumeRequest::Link { pid, .. }
+            | VolumeRequest::Access { pid, .. }
+            | VolumeRequest::Opendir { pid, .. }
+            | VolumeRequest::Setxattr { pid, .. }
+            | VolumeRequest::Getxattr { pid, .. }
+            | VolumeRequest::Listxattr { pid, .. }
+            | VolumeRequest::Removexattr { pid, .. }
+            | VolumeRequest::Readdirplus { pid, .. }
+            | VolumeRequest::Getlk { pid, .. }
+            | VolumeRequest::Setlk { pid, .. } => Some(*pid),
+            VolumeRequest::Setattr { caller_pid, .. } => Some(*caller_pid),
+            _ => None,
+        }
     }
 }
 
@@ -766,7 +803,14 @@ impl Filesystem for FuseClient {
                     let offset = (offset as usize + i + 1) as i64;
                     let attr = to_fuser_attr(&entry.attr);
                     let ttl = Duration::from_secs(entry.attr_ttl_secs);
-                    if reply.add(entry.ino, offset, &entry.name, &ttl, &attr, entry.generation) {
+                    if reply.add(
+                        entry.ino,
+                        offset,
+                        &entry.name,
+                        &ttl,
+                        &attr,
+                        entry.generation,
+                    ) {
                         break;
                     }
                 }
@@ -803,14 +847,7 @@ impl Filesystem for FuseClient {
         }
     }
 
-    fn fsyncdir(
-        &mut self,
-        _req: &Request,
-        ino: u64,
-        fh: u64,
-        datasync: bool,
-        reply: ReplyEmpty,
-    ) {
+    fn fsyncdir(&mut self, _req: &Request, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
         let response = self.send_request_sync(VolumeRequest::Fsyncdir { ino, fh, datasync });
 
         match response {

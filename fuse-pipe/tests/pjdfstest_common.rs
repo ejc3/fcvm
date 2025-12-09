@@ -202,7 +202,6 @@ fn parse_prove_output(output: &str) -> (usize, usize) {
     (tests, failures)
 }
 
-
 fn dump_mount_state() {
     let _ = Command::new("mount")
         .arg("-t")
@@ -361,7 +360,10 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
         for _ in 0..100 {
             // Check /proc/mounts for the FUSE mount
             if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
-                if mounts.lines().any(|line| line.contains(mount_path_str) && line.contains("fuse")) {
+                if mounts
+                    .lines()
+                    .any(|line| line.contains(mount_path_str) && line.contains("fuse"))
+                {
                     mounted = true;
                     break;
                 }
@@ -386,7 +388,9 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
         let marker = mount_dir.join(".fuse-pipe-test-marker");
         debug!(target: TARGET, marker = %marker.display(), "Creating FUSE marker file");
         match fs::write(&marker, "fuse-pipe") {
-            Ok(_) => debug!(target: TARGET, marker = %marker.display(), "FUSE marker created successfully"),
+            Ok(_) => {
+                debug!(target: TARGET, marker = %marker.display(), "FUSE marker created successfully")
+            }
             Err(e) => {
                 error!(target: TARGET, error = %e, marker = %marker.display(), "Failed to create FUSE marker file");
                 return false;
@@ -493,10 +497,7 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
         "║  Duration:         {:>10.1}s                                            ║",
         total_duration
     );
-    println!(
-        "║  {:^71}  ║",
-        note
-    );
+    println!("║  {:^71}  ║", note);
     println!("╚═══════════════════════════════════════════════════════════════════════════╝");
 
     let mut total_tests = 0usize;
@@ -542,9 +543,15 @@ fn run_suite(use_host_fs: bool, full: bool, jobs: usize) -> bool {
     }
 
     if use_host_fs {
-        println!("\n✅ HOST SANITY CHECK: {} tests passed (informational only)", total_tests);
+        println!(
+            "\n✅ HOST SANITY CHECK: {} tests passed (informational only)",
+            total_tests
+        );
     } else {
-        println!("\n🎉 FUSE TEST PASSED: ALL {} TESTS PASSED - fuse-pipe is POSIX compliant!", total_tests);
+        println!(
+            "\n🎉 FUSE TEST PASSED: ALL {} TESTS PASSED - fuse-pipe is POSIX compliant!",
+            total_tests
+        );
     }
     // RAII cleanup happens automatically when _mount_handle drops at end of function
     true
