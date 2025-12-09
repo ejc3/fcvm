@@ -48,7 +48,9 @@ static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub fn is_fuse_mount(path: &Path) -> bool {
     if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
         let path_str = path.to_str().unwrap_or("");
-        mounts.lines().any(|line| line.contains(path_str) && line.contains("fuse"))
+        mounts
+            .lines()
+            .any(|line| line.contains(path_str) && line.contains("fuse"))
     } else {
         false
     }
@@ -173,7 +175,10 @@ impl FuseMount {
         let mount_str = mount_path.to_str().unwrap();
         for i in 0..100 {
             if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
-                if mounts.lines().any(|line| line.contains(mount_str) && line.contains("fuse")) {
+                if mounts
+                    .lines()
+                    .any(|line| line.contains(mount_str) && line.contains("fuse"))
+                {
                     info!(target: TARGET, iterations = i, "Mount ready");
                     break;
                 }
@@ -228,7 +233,8 @@ pub fn setup_test_data(base: &Path, num_files: usize, file_size: usize) {
     for i in 0..num_files {
         let path = base.join(format!("file_{}.dat", i));
         let mut f = File::create(&path).expect("create test file");
-        f.write_all(&vec![0x42u8; file_size]).expect("write test data");
+        f.write_all(&vec![0x42u8; file_size])
+            .expect("write test data");
     }
 }
 

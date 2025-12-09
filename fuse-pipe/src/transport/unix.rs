@@ -91,7 +91,10 @@ impl Clone for UnixTransport {
     /// fallible version that returns `Result` instead of panicking.
     fn clone(&self) -> Self {
         Self {
-            stream: self.stream.try_clone().expect("UnixTransport::clone failed - use try_clone() for fallible clone"),
+            stream: self
+                .stream
+                .try_clone()
+                .expect("UnixTransport::clone failed - use try_clone() for fallible clone"),
         }
     }
 }

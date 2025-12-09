@@ -8,8 +8,10 @@
 mod common;
 
 use std::fs;
+use std::os::unix::io::AsRawFd;
 
 use common::{cleanup, unique_paths, FuseMount};
+use nix::unistd::{lseek, Whence};
 
 #[test]
 fn test_create_and_read_file() {
@@ -213,6 +215,31 @@ fn test_multi_reader_mount_basic_io() {
     cleanup(&data_dir, &mount_dir);
 }
 
+#[test]
+fn test_lseek_supports_negative_offsets() {
+    common::increase_ulimit();
+
+    let (data_dir, mount_dir) = unique_paths("fuse-integ");
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
+    let mount = fuse.mount_path();
+
+    let path = mount.join("seek-file");
+    fs::write(&path, b"abcdef").expect("write seek file");
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .expect("open for lseek");
+
+    let pos = lseek(file.as_raw_fd(), -2, Whence::SeekEnd).expect("lseek");
+    assert_eq!(pos, 4, "should allow negative offsets relative to SEEK_END");
+
+    let _ = fs::remove_file(&path);
+
+    drop(fuse);
+    cleanup(&data_dir, &mount_dir);
+}
+
 /// Test that non-root users can create directories in directories they own.
 /// This is a regression test for the pjdfstest uid 65534 EACCES failures.
 ///
@@ -241,8 +268,7 @@ fn test_nonroot_user_mkdir_in_owned_directory() {
     fs::create_dir(&test_dir).expect("create test dir as root");
 
     // Set permissions to 0755 (rwxr-xr-x)
-    fs::set_permissions(&test_dir, fs::Permissions::from_mode(0o755))
-        .expect("set permissions");
+    fs::set_permissions(&test_dir, fs::Permissions::from_mode(0o755)).expect("set permissions");
 
     // Change ownership to uid/gid 65534 (nobody/nogroup)
     chown(&test_dir, Some(65534), Some(65534)).expect("chown to 65534");
@@ -261,7 +287,15 @@ fn test_nonroot_user_mkdir_in_owned_directory() {
     if pjdfstest_bin.exists() {
         // Use pjdfstest to create directory as uid 65534
         let output = std::process::Command::new(pjdfstest_bin)
-            .args(["-u", "65534", "-g", "65534", "mkdir", subdir.to_str().unwrap(), "0755"])
+            .args([
+                "-u",
+                "65534",
+                "-g",
+                "65534",
+                "mkdir",
+                subdir.to_str().unwrap(),
+                "0755",
+            ])
             .output()
             .expect("run pjdfstest");
 
@@ -348,8 +382,13 @@ fn test_nonroot_mkdir_with_readers(num_readers: usize) {
     // Verify permissions
     let meta = fs::metadata(&work_dir).expect("stat work_dir");
     use std::os::unix::fs::MetadataExt;
-    eprintln!("[test] {} readers - work_dir owner: uid={} gid={} mode={:o}",
-        num_readers, meta.uid(), meta.gid(), meta.mode() & 0o7777);
+    eprintln!(
+        "[test] {} readers - work_dir owner: uid={} gid={} mode={:o}",
+        num_readers,
+        meta.uid(),
+        meta.gid(),
+        meta.mode() & 0o7777
+    );
 
     // Now try to create a subdirectory as uid 65534 in the world-writable directory
     // This is the exact scenario that fails in pjdfstest mkdir/00.t test 18
@@ -359,7 +398,15 @@ fn test_nonroot_mkdir_with_readers(num_readers: usize) {
     if pjdfstest_bin.exists() {
         // Run from work_dir, just like pjdfstest does
         let output = std::process::Command::new(pjdfstest_bin)
-            .args(["-u", "65534", "-g", "65534", "mkdir", "test_subdir_by_65534", "0755"])
+            .args([
+                "-u",
+                "65534",
+                "-g",
+                "65534",
+                "mkdir",
+                "test_subdir_by_65534",
+                "0755",
+            ])
             .current_dir(&work_dir)
             .output()
             .expect("run pjdfstest");
@@ -368,7 +415,11 @@ fn test_nonroot_mkdir_with_readers(num_readers: usize) {
         let stderr = String::from_utf8_lossy(&output.stderr);
         eprintln!("[pjdfstest {} readers] stdout: {}", num_readers, stdout);
         eprintln!("[pjdfstest {} readers] stderr: {}", num_readers, stderr);
-        eprintln!("[pjdfstest {} readers] exit code: {:?}", num_readers, output.status.code());
+        eprintln!(
+            "[pjdfstest {} readers] exit code: {:?}",
+            num_readers,
+            output.status.code()
+        );
 
         // This is the critical test - pjdfstest should return 0 (success)
         // but the bug causes it to return EACCES with multiple readers
@@ -436,6 +487,10 @@ fn test_credential_switching_in_thread() {
     .join()
     .expect("thread should not panic");
 
-    assert!(result.is_ok(), "file write as uid 65534 should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "file write as uid 65534 should succeed: {:?}",
+        result
+    );
     eprintln!("[pass] credential switching in thread works correctly");
 }

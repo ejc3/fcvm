@@ -106,7 +106,9 @@ impl SpanCollector {
             total_latencies.push(total);
 
             // Track per-operation stats
-            let op_entry = by_op.entry(cs.op_name.clone()).or_insert_with(|| (Vec::new(), Vec::new()));
+            let op_entry = by_op
+                .entry(cs.op_name.clone())
+                .or_insert_with(|| (Vec::new(), Vec::new()));
             op_entry.0.push(total);
             if s.server_fs_done > s.server_spawn {
                 op_entry.1.push(s.server_fs_done - s.server_spawn);
@@ -286,30 +288,48 @@ impl SpanSummary {
             eprintln!();
             eprintln!("Latency Breakdown (based on p50):");
             let total = self.total.p50_ns as f64;
-            eprintln!("  → to_server:  {:5.1}%  (client serialize + network)",
-                     self.to_server.p50_ns as f64 / total * 100.0);
-            eprintln!("    deser:      {:5.1}%  (server deserialize)",
-                     self.server_deser.p50_ns as f64 / total * 100.0);
-            eprintln!("    spawn:      {:5.1}%  (spawn_blocking scheduling)",
-                     self.server_spawn.p50_ns as f64 / total * 100.0);
-            eprintln!("    fs_op:      {:5.1}%  (filesystem operation)",
-                     self.server_fs.p50_ns as f64 / total * 100.0);
-            eprintln!("    chan:       {:5.1}%  (response channel wait)",
-                     self.server_chan.p50_ns as f64 / total * 100.0);
-            eprintln!("  ← to_client:  {:5.1}%  (server serialize + network)",
-                     self.to_client.p50_ns as f64 / total * 100.0);
-            eprintln!("    done:       {:5.1}%  (client finalize)",
-                     self.client_done.p50_ns as f64 / total * 100.0);
+            eprintln!(
+                "  → to_server:  {:5.1}%  (client serialize + network)",
+                self.to_server.p50_ns as f64 / total * 100.0
+            );
+            eprintln!(
+                "    deser:      {:5.1}%  (server deserialize)",
+                self.server_deser.p50_ns as f64 / total * 100.0
+            );
+            eprintln!(
+                "    spawn:      {:5.1}%  (spawn_blocking scheduling)",
+                self.server_spawn.p50_ns as f64 / total * 100.0
+            );
+            eprintln!(
+                "    fs_op:      {:5.1}%  (filesystem operation)",
+                self.server_fs.p50_ns as f64 / total * 100.0
+            );
+            eprintln!(
+                "    chan:       {:5.1}%  (response channel wait)",
+                self.server_chan.p50_ns as f64 / total * 100.0
+            );
+            eprintln!(
+                "  ← to_client:  {:5.1}%  (server serialize + network)",
+                self.to_client.p50_ns as f64 / total * 100.0
+            );
+            eprintln!(
+                "    done:       {:5.1}%  (client finalize)",
+                self.client_done.p50_ns as f64 / total * 100.0
+            );
         }
 
         // Print per-operation breakdown
         if !self.by_operation.is_empty() {
             eprintln!();
             eprintln!("Per-Operation Latency (sorted by count):");
-            eprintln!("  {:12} {:>8} {:>10} {:>10} {:>10} {:>10}",
-                     "Operation", "Count", "p50 Total", "p99 Total", "p50 fs_op", "p99 fs_op");
-            eprintln!("  {:─<12} {:─>8} {:─>10} {:─>10} {:─>10} {:─>10}",
-                     "", "", "", "", "", "");
+            eprintln!(
+                "  {:12} {:>8} {:>10} {:>10} {:>10} {:>10}",
+                "Operation", "Count", "p50 Total", "p99 Total", "p50 fs_op", "p99 fs_op"
+            );
+            eprintln!(
+                "  {:─<12} {:─>8} {:─>10} {:─>10} {:─>10} {:─>10}",
+                "", "", "", "", "", ""
+            );
 
             let fmt_us = |ns: u64| -> String {
                 let us = ns as f64 / 1000.0;
@@ -321,13 +341,15 @@ impl SpanSummary {
             };
 
             for op in &self.by_operation {
-                eprintln!("  {:12} {:>8} {:>10} {:>10} {:>10} {:>10}",
-                         op.op_name,
-                         op.count,
-                         fmt_us(op.total.p50_ns),
-                         fmt_us(op.total.p99_ns),
-                         fmt_us(op.server_fs.p50_ns),
-                         fmt_us(op.server_fs.p99_ns));
+                eprintln!(
+                    "  {:12} {:>8} {:>10} {:>10} {:>10} {:>10}",
+                    op.op_name,
+                    op.count,
+                    fmt_us(op.total.p50_ns),
+                    fmt_us(op.total.p99_ns),
+                    fmt_us(op.server_fs.p50_ns),
+                    fmt_us(op.server_fs.p99_ns)
+                );
             }
         }
     }
@@ -384,7 +406,9 @@ fn compute_stats(values: &mut [u64]) -> LatencyStats {
     let mean_ns = sum / count as u64;
 
     let percentile = |p: f64| -> u64 {
-        let idx = ((count as f64 * p) as usize).saturating_sub(1).min(count - 1);
+        let idx = ((count as f64 * p) as usize)
+            .saturating_sub(1)
+            .min(count - 1);
         values[idx]
     };
 
@@ -436,7 +460,11 @@ mod tests {
 
         // Check per-operation breakdown
         assert_eq!(summary.by_operation.len(), 2);
-        let getattr_op = summary.by_operation.iter().find(|op| op.op_name == "getattr").unwrap();
+        let getattr_op = summary
+            .by_operation
+            .iter()
+            .find(|op| op.op_name == "getattr")
+            .unwrap();
         assert_eq!(getattr_op.count, 1);
     }
 

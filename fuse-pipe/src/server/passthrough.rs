@@ -37,6 +37,8 @@ thread_local! {
 
 /// Default attribute TTL in seconds.
 const ATTR_TTL_SECS: u64 = 1;
+/// Buffer size used when iterating large directories.
+const READDIR_CHUNK_SIZE: u32 = 64 * 1024;
 
 /// A passthrough filesystem that maps operations to a local directory.
 ///
@@ -110,12 +112,13 @@ impl PassthroughFs {
     }
 
     /// Create a Context from uid/gid/pid with optional supplementary groups.
-    fn make_context(uid: u32, gid: u32, pid: u32, supplementary_groups: Option<Vec<libc::gid_t>>) -> Context {
-        let pid = if pid == 0 {
-            std::process::id()
-        } else {
-            pid
-        };
+    fn make_context(
+        uid: u32,
+        gid: u32,
+        pid: u32,
+        supplementary_groups: Option<Vec<libc::gid_t>>,
+    ) -> Context {
+        let pid = if pid == 0 { std::process::id() } else { pid };
         Context {
             uid,
             gid,
@@ -185,8 +188,15 @@ impl FilesystemHandler for PassthroughFs {
         supplementary_groups: &[u32],
     ) -> VolumeResponse {
         // Store groups in thread-local (converted to gid_t)
-        let groups: Vec<libc::gid_t> = supplementary_groups.iter().map(|&g| g as libc::gid_t).collect();
-        let groups_opt = if groups.is_empty() { None } else { Some(groups) };
+        let groups: Vec<libc::gid_t> = supplementary_groups
+            .iter()
+            .map(|&g| g as libc::gid_t)
+            .collect();
+        let groups_opt = if groups.is_empty() {
+            None
+        } else {
+            Some(groups)
+        };
 
         CURRENT_GROUPS.with(|g| {
             *g.borrow_mut() = groups_opt;
@@ -203,14 +213,7 @@ impl FilesystemHandler for PassthroughFs {
         result
     }
 
-    fn lookup(
-        &self,
-        parent: u64,
-        name: &str,
-        uid: u32,
-        gid: u32,
-        pid: u32,
-    ) -> VolumeResponse {
+    fn lookup(&self, parent: u64, name: &str, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
         let ctx = Self::make_context_simple(uid, gid, pid);
 
         let cname = match CString::new(name) {
@@ -332,14 +335,7 @@ impl FilesystemHandler for PassthroughFs {
         }
     }
 
-    fn readdir(
-        &self,
-        ino: u64,
-        offset: u64,
-        uid: u32,
-        gid: u32,
-        pid: u32,
-    ) -> VolumeResponse {
+    fn readdir(&self, ino: u64, offset: u64, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
         tracing::debug!(target: "passthrough", ino, offset, uid, gid, "readdir");
         let ctx = Self::make_context_simple(uid, gid, pid);
 
@@ -355,38 +351,66 @@ impl FilesystemHandler for PassthroughFs {
         tracing::debug!(target: "passthrough", ino, handle = ?handle, "readdir directory opened");
 
         let mut entries = Vec::new();
+        let handle_id = handle.unwrap_or(0);
 
-        // Read ALL directory entries using fuse-backend-rs's readdir
-        // We always read from offset 0 and filter ourselves because we open a fresh
-        // directory handle each time (fuse-backend-rs offset is per-handle state)
-        let mut add_entry = |entry: fuse_backend_rs::api::filesystem::DirEntry| -> std::io::Result<usize> {
-            // entry.name is already a &[u8]
-            let name_str = String::from_utf8_lossy(entry.name).to_string();
+        // Read directory entries in chunks until no new entries are returned.
+        // We ignore the incoming offset because the client sends index-based offsets,
+        // while fuse-backend-rs expects kernel d_off cookies.
+        let mut next_offset = 0u64;
+        loop {
+            let start_len = entries.len();
+            let mut last_offset = next_offset;
 
-            // Skip . and .. as we add them manually for offset 0
-            if name_str != "." && name_str != ".." {
-                // Note: entry.type_ is already a d_type value (like DT_DIR=4),
-                // NOT a mode value (like S_IFDIR=0o40000). Use it directly.
-                entries.push(DirEntry {
-                    ino: entry.ino,
-                    name: name_str,
-                    file_type: entry.type_ as u8,
-                });
+            let mut add_entry =
+                |entry: fuse_backend_rs::api::filesystem::DirEntry| -> std::io::Result<usize> {
+                    // entry.name is already a &[u8]
+                    let name_str = String::from_utf8_lossy(entry.name).to_string();
+
+                    // Skip . and .. as we add them manually for offset 0
+                    if name_str != "." && name_str != ".." {
+                        // Note: entry.type_ is already a d_type value (like DT_DIR=4),
+                        // NOT a mode value (like S_IFDIR=0o40000). Use it directly.
+                        entries.push(DirEntry {
+                            ino: entry.ino,
+                            name: name_str,
+                            file_type: entry.type_ as u8,
+                        });
+                    }
+
+                    last_offset = entry.offset;
+                    Ok(1)
+                };
+
+            tracing::debug!(target: "passthrough", ino, offset = next_offset, "readdir reading entries chunk");
+            if let Err(e) = self.inner.readdir(
+                &ctx,
+                ino,
+                handle_id,
+                READDIR_CHUNK_SIZE,
+                next_offset,
+                &mut add_entry,
+            ) {
+                tracing::error!(target: "passthrough", ino, handle = ?handle, error = ?e, "readdir read failed");
+                let _ = self.inner.releasedir(&ctx, ino, 0, handle_id);
+                return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
             }
-            Ok(1)
-        };
 
-        tracing::debug!(target: "passthrough", ino, "readdir reading entries");
-        // Always read from offset 0 - we handle offset filtering ourselves
-        if let Err(e) = self.inner.readdir(&ctx, ino, handle.unwrap_or(0), 8192, 0, &mut add_entry) {
-            tracing::error!(target: "passthrough", ino, handle = ?handle, error = ?e, "readdir read failed");
-            let _ = self.inner.releasedir(&ctx, ino, 0, handle.unwrap_or(0));
-            return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
+            // No new entries => end of directory
+            if entries.len() == start_len {
+                break;
+            }
+
+            // Prevent infinite loops if the backend returns a non-advancing offset
+            if last_offset <= next_offset {
+                break;
+            }
+
+            next_offset = last_offset;
         }
-        tracing::debug!(target: "passthrough", ino, count = entries.len(), "readdir got raw entries");
+        tracing::debug!(target: "passthrough", ino, count = entries.len(), "readdir collected entries");
 
         // Release the directory handle
-        let _ = self.inner.releasedir(&ctx, ino, 0, handle.unwrap_or(0));
+        let _ = self.inner.releasedir(&ctx, ino, 0, handle_id);
 
         // Build full entry list with . and .. at the beginning
         let mut full_entries = Vec::new();
@@ -419,7 +443,9 @@ impl FilesystemHandler for PassthroughFs {
         };
 
         tracing::debug!(target: "passthrough", ino, offset, total = result_entries.len(), "readdir succeeded");
-        VolumeResponse::DirEntries { entries: result_entries }
+        VolumeResponse::DirEntries {
+            entries: result_entries,
+        }
     }
 
     fn mkdir(
@@ -492,14 +518,7 @@ impl FilesystemHandler for PassthroughFs {
         }
     }
 
-    fn rmdir(
-        &self,
-        parent: u64,
-        name: &str,
-        uid: u32,
-        gid: u32,
-        pid: u32,
-    ) -> VolumeResponse {
+    fn rmdir(&self, parent: u64, name: &str, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
         let ctx = Self::make_context_simple(uid, gid, pid);
 
         // fuse-backend-rs handles credentials via Context internally.
@@ -589,7 +608,10 @@ impl FilesystemHandler for PassthroughFs {
         let ctx = Self::make_context_simple(uid, gid, pid);
         let mut writer = VecWriter::new(size as usize);
 
-        match self.inner.read(&ctx, ino, fh, &mut writer, size, offset, None, 0) {
+        match self
+            .inner
+            .read(&ctx, ino, fh, &mut writer, size, offset, None, 0)
+        {
             Ok(_) => VolumeResponse::Data {
                 data: writer.into_vec(),
             },
@@ -716,7 +738,10 @@ impl FilesystemHandler for PassthroughFs {
             Err(_) => return VolumeResponse::error(libc::EINVAL),
         };
 
-        match self.inner.rename(&ctx, parent, &cname, newparent, &cnewname, 0) {
+        match self
+            .inner
+            .rename(&ctx, parent, &cname, newparent, &cnewname, 0)
+        {
             Ok(()) => VolumeResponse::Ok,
             Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
         }
@@ -814,18 +839,16 @@ impl FilesystemHandler for PassthroughFs {
         let ctx = Context::new();
 
         match self.inner.statfs(&ctx, ino) {
-            Ok(st) => {
-                VolumeResponse::Statfs {
-                    blocks: st.f_blocks,
-                    bfree: st.f_bfree,
-                    bavail: st.f_bavail,
-                    files: st.f_files,
-                    ffree: st.f_ffree,
-                    bsize: st.f_bsize as u32,
-                    namelen: st.f_namemax as u32,
-                    frsize: st.f_frsize as u32,
-                }
-            }
+            Ok(st) => VolumeResponse::Statfs {
+                blocks: st.f_blocks,
+                bfree: st.f_bfree,
+                bavail: st.f_bavail,
+                files: st.f_files,
+                ffree: st.f_ffree,
+                bsize: st.f_bsize as u32,
+                namelen: st.f_namemax as u32,
+                frsize: st.f_frsize as u32,
+            },
             Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
         }
     }
@@ -927,14 +950,7 @@ impl FilesystemHandler for PassthroughFs {
         }
     }
 
-    fn removexattr(
-        &self,
-        ino: u64,
-        name: &str,
-        uid: u32,
-        gid: u32,
-        pid: u32,
-    ) -> VolumeResponse {
+    fn removexattr(&self, ino: u64, name: &str, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
         let ctx = Self::make_context_simple(uid, gid, pid);
 
         // fuse-backend-rs handles credentials via Context internally.
@@ -950,14 +966,7 @@ impl FilesystemHandler for PassthroughFs {
         }
     }
 
-    fn fallocate(
-        &self,
-        ino: u64,
-        fh: u64,
-        offset: u64,
-        length: u64,
-        mode: u32,
-    ) -> VolumeResponse {
+    fn fallocate(&self, ino: u64, fh: u64, offset: u64, length: u64, mode: u32) -> VolumeResponse {
         let ctx = Context::new();
 
         match self.inner.fallocate(&ctx, ino, fh, mode, offset, length) {
@@ -969,17 +978,16 @@ impl FilesystemHandler for PassthroughFs {
     fn lseek(&self, ino: u64, fh: u64, offset: i64, whence: u32) -> VolumeResponse {
         let ctx = Context::new();
 
-        // fuse-backend-rs expects u64 for offset
-        let offset_u64 = if offset >= 0 {
-            offset as u64
-        } else {
+        // fuse-backend-rs expects u64 for offset but casts to off64_t internally.
+        // Reject negative offsets for SEEK_SET; otherwise preserve the two's complement
+        // bits so the backend can interpret negative offsets for SEEK_CUR/SEEK_END.
+        if offset < 0 && whence == libc::SEEK_SET as u32 {
             return VolumeResponse::error(libc::EINVAL);
-        };
+        }
+        let offset_u64 = offset as u64;
 
         match self.inner.lseek(&ctx, ino, fh, offset_u64, whence) {
-            Ok(new_offset) => VolumeResponse::Lseek {
-                offset: new_offset,
-            },
+            Ok(new_offset) => VolumeResponse::Lseek { offset: new_offset },
             Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
         }
     }
@@ -1006,7 +1014,7 @@ impl FilesystemHandler for PassthroughFs {
         VolumeResponse::Lock {
             start,
             end,
-            typ: libc::F_UNLCK,  // No conflicting lock
+            typ: libc::F_UNLCK, // No conflicting lock
             pid,
         }
     }
@@ -1048,27 +1056,53 @@ impl FilesystemHandler for PassthroughFs {
 
         let mut entries = Vec::new();
 
-        // Delegate to fuse-backend-rs readdirplus which handles everything
-        // including . and .. entries and does lookups for full attributes
-        let mut add_entry = |dir_entry: fuse_backend_rs::api::filesystem::DirEntry,
-                            entry: Entry|
-         -> std::io::Result<usize> {
-            let name_str = String::from_utf8_lossy(dir_entry.name).to_string();
-            let attr = Self::entry_to_attr(&entry);
-            entries.push(DirEntryPlus {
-                ino: entry.inode,
-                name: name_str,
-                attr,
-                generation: entry.generation,
-                attr_ttl_secs: self.attr_ttl_secs,
-                entry_ttl_secs: self.attr_ttl_secs,
-            });
-            Ok(1)
-        };
+        // Iterate until the backend returns no new entries. See the note in
+        // readdir() for why we ignore the incoming offset.
+        let mut next_offset = 0u64;
+        loop {
+            let start_len = entries.len();
+            let mut last_offset = next_offset;
 
-        if let Err(e) = self.inner.readdirplus(&ctx, ino, fh, 8192, offset, &mut add_entry) {
-            tracing::error!(target: "passthrough", error = ?e, "readdirplus failed");
-            return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
+            // Delegate to fuse-backend-rs readdirplus which handles everything
+            // including . and .. entries and does lookups for full attributes
+            let mut add_entry = |dir_entry: fuse_backend_rs::api::filesystem::DirEntry,
+                                 entry: Entry|
+             -> std::io::Result<usize> {
+                let name_str = String::from_utf8_lossy(dir_entry.name).to_string();
+                let attr = Self::entry_to_attr(&entry);
+                entries.push(DirEntryPlus {
+                    ino: entry.inode,
+                    name: name_str,
+                    attr,
+                    generation: entry.generation,
+                    attr_ttl_secs: self.attr_ttl_secs,
+                    entry_ttl_secs: self.attr_ttl_secs,
+                });
+                last_offset = dir_entry.offset;
+                Ok(1)
+            };
+
+            if let Err(e) = self.inner.readdirplus(
+                &ctx,
+                ino,
+                fh,
+                READDIR_CHUNK_SIZE,
+                next_offset,
+                &mut add_entry,
+            ) {
+                tracing::error!(target: "passthrough", error = ?e, "readdirplus failed");
+                return VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO));
+            }
+
+            if entries.len() == start_len {
+                break;
+            }
+
+            if last_offset <= next_offset {
+                break;
+            }
+
+            next_offset = last_offset;
         }
 
         tracing::debug!(target: "passthrough", ino, offset, count = entries.len(), "readdirplus succeeded");
@@ -1133,7 +1167,9 @@ mod tests {
         let resp = fs.create(1, "test.txt", 0o644, libc::O_RDWR as u32, uid, gid, 0);
         let (ino, fh) = match resp {
             VolumeResponse::Created { attr, fh, .. } => (attr.ino, fh),
-            VolumeResponse::Error { errno } => panic!("Expected Created response, got error: {}", errno),
+            VolumeResponse::Error { errno } => {
+                panic!("Expected Created response, got error: {}", errno)
+            }
             _ => panic!("Expected Created response"),
         };
 
@@ -1181,7 +1217,9 @@ mod tests {
         let resp = fs.open(ino, libc::O_RDWR as u32, uid, gid, 0);
         let fh = match resp {
             VolumeResponse::Opened { fh, .. } => fh,
-            VolumeResponse::Error { errno } => panic!("Expected Opened response, got error: {}", errno),
+            VolumeResponse::Error { errno } => {
+                panic!("Expected Opened response, got error: {}", errno)
+            }
             _ => panic!("Expected Opened response"),
         };
 
@@ -1265,7 +1303,9 @@ mod tests {
         let resp = fs.lookup(1, "link.txt", uid, gid, 0);
         let lookup_ino = match resp {
             VolumeResponse::Entry { attr, .. } => attr.ino,
-            VolumeResponse::Error { errno } => panic!("Lookup link.txt failed with errno: {}", errno),
+            VolumeResponse::Error { errno } => {
+                panic!("Lookup link.txt failed with errno: {}", errno)
+            }
             _ => panic!("Expected Entry response"),
         };
         assert_eq!(lookup_ino, link_ino);
@@ -1288,5 +1328,45 @@ mod tests {
         }
 
         fs.release(link_ino, fh);
+    }
+
+    #[test]
+    fn test_readdir_returns_all_entries_across_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PassthroughFs::new(dir.path());
+
+        // Choose enough entries with long names to exceed a single READDIR chunk.
+        let file_count = 200usize;
+        let suffix = "y".repeat(512);
+        for i in 0..file_count {
+            let name = format!("entry-{i}-{suffix}");
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+
+        let resp = fs.readdir(1, 0, uid, gid, 0);
+        let entries = match resp {
+            VolumeResponse::DirEntries { entries } => entries,
+            other => panic!("unexpected response: {:?}", other),
+        };
+
+        // Ignore the leading . and .. entries and ensure we saw every file we created.
+        assert!(
+            entries.len() >= file_count,
+            "expected at least {} entries, got {}",
+            file_count,
+            entries.len()
+        );
+
+        for i in 0..file_count {
+            let expected = format!("entry-{i}-");
+            assert!(
+                entries.iter().any(|e| e.name.starts_with(&expected)),
+                "missing directory entry for {}",
+                expected
+            );
+        }
     }
 }

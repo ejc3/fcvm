@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, Instant};
 use std::thread;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -77,7 +77,6 @@ struct InstanceResult {
     duration_secs: f64,
     error_msg: Option<String>,
 }
-
 
 fn discover_categories() -> Vec<String> {
     let tests_dir = Path::new(PJDFSTEST_TESTS);
@@ -248,7 +247,6 @@ fn extract_failure_lines(output: &str) -> String {
     }
 }
 
-
 fn verify_mount(mount_dir: &Path) -> bool {
     let probe = mount_dir.join(".stress-probe");
     match fs::write(&probe, "probe") {
@@ -274,8 +272,14 @@ fn run_stress_suite(use_host_fs: bool) -> bool {
         println!("║                                                                           ║");
         println!("║   🔥 STRESS TEST: HOST FILESYSTEM (Sanity Check)                          ║");
         println!("║                                                                           ║");
-        println!("║   Running {} instances of each category in PARALLEL                       ║", INSTANCES_PER_CATEGORY);
-        println!("║   All {} categories run simultaneously!                                   ║", discover_categories().len());
+        println!(
+            "║   Running {} instances of each category in PARALLEL                       ║",
+            INSTANCES_PER_CATEGORY
+        );
+        println!(
+            "║   All {} categories run simultaneously!                                   ║",
+            discover_categories().len()
+        );
         println!("║                                                                           ║");
         println!("╚═══════════════════════════════════════════════════════════════════════════╝");
     } else {
@@ -284,8 +288,14 @@ fn run_stress_suite(use_host_fs: bool) -> bool {
         println!("║                                                                           ║");
         println!("║   🔥 STRESS TEST: FUSE FILESYSTEM (The Real Test!)                        ║");
         println!("║                                                                           ║");
-        println!("║   Running {} instances of each category in PARALLEL                       ║", INSTANCES_PER_CATEGORY);
-        println!("║   All {} categories run simultaneously!                                   ║", discover_categories().len());
+        println!(
+            "║   Running {} instances of each category in PARALLEL                       ║",
+            INSTANCES_PER_CATEGORY
+        );
+        println!(
+            "║   All {} categories run simultaneously!                                   ║",
+            discover_categories().len()
+        );
         println!("║   Testing thread-safety of credential switching!                          ║");
         println!("║                                                                           ║");
         println!("╚═══════════════════════════════════════════════════════════════════════════╝");
@@ -509,7 +519,10 @@ fn run_stress_suite(use_host_fs: bool) -> bool {
     let total_duration = start_time.elapsed().as_secs_f64();
 
     if !all_completed {
-        eprintln!("\n[timeout] Stress test exceeded {}s", CATEGORY_TIMEOUT_SECS);
+        eprintln!(
+            "\n[timeout] Stress test exceeded {}s",
+            CATEGORY_TIMEOUT_SECS
+        );
         // _mount_handle drops automatically on return
         return false;
     }
@@ -627,5 +640,8 @@ fn test_pjdfstest_stress() {
 
     // Run FUSE stress test - this is the real test
     let fuse_ok = run_stress_suite(false);
-    assert!(fuse_ok, "FUSE stress test failed - possible race condition!");
+    assert!(
+        fuse_ok,
+        "FUSE stress test failed - possible race condition!"
+    );
 }

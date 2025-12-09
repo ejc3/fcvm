@@ -65,7 +65,11 @@ impl Multiplexer {
     ///
     /// # Errors
     /// Returns an error if the socket cannot be cloned.
-    pub fn with_trace_rate(socket: UnixStream, num_readers: usize, trace_rate: u64) -> std::io::Result<Arc<Self>> {
+    pub fn with_trace_rate(
+        socket: UnixStream,
+        num_readers: usize,
+        trace_rate: u64,
+    ) -> std::io::Result<Arc<Self>> {
         Self::with_collector(socket, num_readers, trace_rate, None)
     }
 
@@ -148,7 +152,13 @@ impl Multiplexer {
 
         // Build wire request - span goes inside the request so server gets it
         let wire = if should_trace {
-            WireRequest::with_span_and_groups(unique, reader_id, request, Span::new(), supplementary_groups)
+            WireRequest::with_span_and_groups(
+                unique,
+                reader_id,
+                request,
+                Span::new(),
+                supplementary_groups,
+            )
         } else {
             WireRequest::with_groups(unique, reader_id, request, supplementary_groups)
         };
@@ -248,7 +258,8 @@ fn reader_loop(mut socket: UnixStream, pending: Arc<DashMap<u64, Sender<Response
 
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > MAX_MESSAGE_SIZE {
-            continue;
+            fail_all_pending(&pending);
+            break;
         }
 
         // Read response body
@@ -382,5 +393,38 @@ mod tests {
 
         assert!(r0.is_ok());
         assert!(r1.is_ok());
+    }
+
+    #[test]
+    fn test_oversized_response_fails_pending_request() {
+        use crate::protocol::MAX_MESSAGE_SIZE;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mux = Multiplexer::new(client, 1).unwrap();
+        let mux_clone = Arc::clone(&mux);
+
+        let (done_tx, done_rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let resp = mux_clone.send_request(0, VolumeRequest::Getattr { ino: 1 });
+            let _ = done_tx.send(resp.errno());
+        });
+
+        // Drain the outgoing request so the mux writer isn't blocked.
+        let mut len_buf = [0u8; 4];
+        server.read_exact(&mut len_buf).unwrap();
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len];
+        server.read_exact(&mut body).unwrap();
+
+        // Send an oversized frame to trigger disconnect/error handling.
+        let bad_len = (MAX_MESSAGE_SIZE as u32 + 1).to_be_bytes();
+        server.write_all(&bad_len).unwrap();
+
+        // Pending request should complete with an error instead of hanging.
+        let result = done_rx.recv_timeout(Duration::from_millis(200)).unwrap();
+        assert_eq!(result, Some(libc::EIO));
     }
 }
