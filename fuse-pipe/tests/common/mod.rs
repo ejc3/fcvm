@@ -81,11 +81,12 @@ pub fn cleanup(data_dir: &Path, mount_dir: &Path) {
     let _ = fs::remove_dir_all(mount_dir);
 }
 
-/// Increase file descriptor limit for high-concurrency tests
+/// Increase file descriptor and thread limits for high-concurrency tests
 pub fn increase_ulimit() {
     use std::mem::MaybeUninit;
 
     unsafe {
+        // Raise file descriptor limit
         let mut rlim = MaybeUninit::<libc::rlimit>::uninit();
         if libc::getrlimit(libc::RLIMIT_NOFILE, rlim.as_mut_ptr()) == 0 {
             let mut rlim = rlim.assume_init();
@@ -93,6 +94,17 @@ pub fn increase_ulimit() {
             rlim.rlim_cur = target;
             rlim.rlim_max = target;
             let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+        }
+
+        // Raise thread/process limit (RLIMIT_NPROC)
+        // This is critical for parallel tests with many reader threads
+        let mut rlim = MaybeUninit::<libc::rlimit>::uninit();
+        if libc::getrlimit(libc::RLIMIT_NPROC, rlim.as_mut_ptr()) == 0 {
+            let mut rlim = rlim.assume_init();
+            let target = rlim.rlim_max.max(65536);
+            rlim.rlim_cur = target;
+            rlim.rlim_max = target;
+            let _ = libc::setrlimit(libc::RLIMIT_NPROC, &rlim);
         }
     }
 }
@@ -106,6 +118,8 @@ pub fn increase_ulimit() {
 /// Automatically unmounts and cleans up on drop.
 pub struct FuseMount {
     server_thread: Option<JoinHandle<()>>,
+    /// Shutdown signal to stop the server cleanly
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     data_dir: PathBuf,
     mount_dir: PathBuf,
     socket: PathBuf,
@@ -130,6 +144,10 @@ impl FuseMount {
 
         let socket_path = socket.to_str().unwrap().to_string();
 
+        // Create shutdown channel for clean server termination
+        // Use tokio::sync::oneshot which is async-native (no spawn_blocking needed)
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
         // Start server in dedicated thread with its own runtime
         let server_data_path = data_path.to_path_buf();
         let server_socket = socket_path.clone();
@@ -146,9 +164,17 @@ impl FuseMount {
                 let server = AsyncServer::with_config(fs, config);
 
                 info!(target: TARGET, "Server calling serve_unix");
-                if let Err(e) = server.serve_unix(&server_socket).await {
-                    // Server exits when client disconnects - this is expected
-                    debug!(target: TARGET, error = %e, "Server exited");
+                // Use select to allow clean shutdown via channel
+                tokio::select! {
+                    result = server.serve_unix(&server_socket) => {
+                        if let Err(e) = result {
+                            // Server exits when client disconnects - this is expected
+                            debug!(target: TARGET, error = %e, "Server exited");
+                        }
+                    }
+                    _ = shutdown_rx => {
+                        debug!(target: TARGET, "Server received shutdown signal");
+                    }
                 }
                 info!(target: TARGET, "Server exiting");
             });
@@ -191,6 +217,7 @@ impl FuseMount {
 
         FuseMount {
             server_thread: Some(server_thread),
+            shutdown_tx: Some(shutdown_tx),
             data_dir: data_path.to_path_buf(),
             mount_dir: mount_path.to_path_buf(),
             socket,
@@ -213,16 +240,25 @@ impl Drop for FuseMount {
     fn drop(&mut self) {
         info!(target: TARGET, "Drop starting - unmounting");
 
+        // Signal server to shutdown first (before unmounting client)
+        if let Some(tx) = self.shutdown_tx.take() {
+            debug!(target: TARGET, "Sending shutdown signal to server");
+            let _ = tx.send(());
+        }
+
         // Drop mount handle - MountHandle::drop() calls unmounter and waits for thread
         drop(self.mount_handle.take());
 
-        // Remove socket - don't wait for server thread, let it be orphaned
-        // (it'll die when test process exits)
+        // Remove socket
         let _ = fs::remove_file(&self.socket);
 
-        // Don't wait for server_thread - it blocks on accept() forever
-        // Just drop the handle and let it be orphaned
-        let _ = self.server_thread.take();
+        // Now join server thread (it should exit cleanly after shutdown signal)
+        if let Some(thread) = self.server_thread.take() {
+            debug!(target: TARGET, "Joining server thread");
+            let _ = thread.join();
+            debug!(target: TARGET, "Server thread joined");
+        }
+
         info!(target: TARGET, "Drop complete");
     }
 }
