@@ -1336,11 +1336,12 @@ mod tests {
         let fs = PassthroughFs::new(dir.path());
 
         // Choose enough entries with long names to exceed a single READDIR chunk.
+        // Linux filename limit is 255 bytes, so use 200-char suffix (entry-NNN- is ~10 chars).
         let file_count = 200usize;
-        let suffix = "y".repeat(512);
+        let suffix = "y".repeat(200);
         for i in 0..file_count {
-            let name = format!("entry-{i}-{suffix}");
-            std::fs::write(dir.path().join(name), "x").unwrap();
+            let name = format!("entry-{i:03}-{suffix}");
+            std::fs::write(dir.path().join(&name), "x").unwrap();
         }
 
         let uid = nix::unistd::Uid::effective().as_raw();
@@ -1361,7 +1362,7 @@ mod tests {
         );
 
         for i in 0..file_count {
-            let expected = format!("entry-{i}-");
+            let expected = format!("entry-{i:03}-");
             assert!(
                 entries.iter().any(|e| e.name.starts_with(&expected)),
                 "missing directory entry for {}",
