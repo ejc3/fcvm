@@ -14,29 +14,10 @@ use std::fs;
 use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Once;
 
 use common::FuseMount;
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-static ULIMIT_INIT: Once = Once::new();
-
-/// Increase file descriptor limit for tests with many readers
-fn init_ulimit() {
-    ULIMIT_INIT.call_once(|| unsafe {
-        let mut rlim = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-        if libc::getrlimit(libc::RLIMIT_NOFILE, rlim.as_mut_ptr()) == 0 {
-            let mut rlim = rlim.assume_init();
-            let target = 65536u64.min(rlim.rlim_max);
-            if rlim.rlim_cur < target {
-                rlim.rlim_cur = target;
-                if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) == 0 {
-                    eprintln!("[init] Raised fd limit to {}", target);
-                }
-            }
-        }
-    });
-}
 
 /// Create unique paths for each test.
 fn unique_paths() -> (PathBuf, PathBuf) {
@@ -124,7 +105,7 @@ fn pjdfstest_in_dir_impl(dir: &std::path::Path, args: &[&str], strace: bool) -> 
 
 fn require_root() {
     assert_eq!(unsafe { libc::geteuid() }, 0, "Test requires root");
-    init_ulimit();
+    common::increase_ulimit();
 }
 
 // =============================================================================
@@ -144,7 +125,7 @@ fn test_chmod_parent_dir_search_denied() {
     require_root();
 
     let (data_dir, mount_dir) = unique_paths();
-    let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
     // Create parent dir with full permissions
@@ -213,7 +194,7 @@ fn test_write_clears_suid() {
     require_root();
 
     let (data_dir, mount_dir) = unique_paths();
-    let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
     // Create file with SUID bit (04777)
@@ -273,7 +254,7 @@ fn test_write_clears_sgid() {
     require_root();
 
     let (data_dir, mount_dir) = unique_paths();
-    let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
     // Create file with SGID bit (02777)
@@ -324,7 +305,7 @@ fn test_write_clears_suid_and_sgid() {
     require_root();
 
     let (data_dir, mount_dir) = unique_paths();
-    let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
     // Create file with SUID+SGID bits (06777)
@@ -380,7 +361,7 @@ fn test_chown_owner_changes_group_to_primary() {
     require_root();
 
     let (data_dir, mount_dir) = unique_paths();
-    let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
     // Create file owned by 65534:65533
@@ -424,7 +405,7 @@ fn test_chown_owner_changes_group_to_member() {
     require_root();
 
     let (data_dir, mount_dir) = unique_paths();
-    let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
     // Create file owned by 65534:65533
@@ -478,7 +459,7 @@ fn test_chown_supplementary_group_works() {
     require_root();
 
     let (data_dir, mount_dir) = unique_paths();
-    let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
     // Create file owned by 65534:65533
@@ -514,11 +495,10 @@ fn test_chown_supplementary_group_works() {
 
 /// Ensure we forward supplementary groups for non-chown operations (e.g. mkdir/create).
 ///
-/// NOTE: This test is ignored because it intermittently hangs after dropping privileges
-/// in a spawned thread while performing FUSE operations. The functionality is covered
-/// by pjdfstest which runs more reliably.
+/// This test uses pjdfstest subprocess (not a thread) because permanently dropping
+/// privileges via setresuid/setresgid affects process-wide state that interferes with
+/// FUSE unmount.
 #[test]
-#[ignore]
 fn test_create_with_supplementary_group_permissions() {
     require_root();
 
@@ -538,41 +518,29 @@ fn test_create_with_supplementary_group_permissions() {
     fs::set_permissions(&work_dir, fs::Permissions::from_mode(0o2770)).unwrap();
 
     let file_path = work_dir.join("created_by_suppl");
-    let file_clone = file_path.clone();
 
-    let handle = std::thread::spawn(move || -> Result<(), String> {
-        // Configure supplementary groups before dropping privileges.
-        let groups = [primary_gid as libc::gid_t, target_gid as libc::gid_t];
-        unsafe {
-            if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
-                return Err(format!(
-                    "setgroups failed: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-            if libc::setresgid(primary_gid, primary_gid, primary_gid) != 0 {
-                return Err(format!(
-                    "setresgid failed: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-            if libc::setresuid(uid, uid, uid) != 0 {
-                return Err(format!(
-                    "setresuid failed: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-        }
-
-        fs::write(&file_clone, "hello from suppl").map_err(|e| format!("write failed: {e}"))?;
-        Ok(())
-    });
-
-    match handle.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => panic!("supplementary group creation failed: {err}"),
-        Err(_) => panic!("supplementary group thread panicked"),
-    }
+    // Use pjdfstest to create the file with the correct credentials.
+    // pjdfstest runs in a subprocess and can switch to numeric UIDs/GIDs
+    // without requiring them to exist in /etc/passwd or /etc/group.
+    // This avoids corrupting the main process's credential state which would
+    // interfere with FUSE unmount.
+    //
+    // pjdfstest syntax: -g gid1,gid2,... where first is primary, rest are supplementary
+    let (code, result) = pjdfstest(&[
+        "-u",
+        &uid.to_string(),
+        "-g",
+        &format!("{},{}", primary_gid, target_gid),
+        "open",
+        file_path.to_str().unwrap(),
+        "O_CREAT,O_WRONLY",
+        "0644",
+    ]);
+    assert_eq!(
+        code, 0,
+        "pjdfstest open should succeed, got result: {}",
+        result
+    );
 
     let meta = fs::metadata(&file_path).expect("stat created file");
     assert_eq!(meta.uid(), uid, "file should be owned by test uid");
@@ -594,7 +562,7 @@ fn test_chown_non_owner_fails() {
     require_root();
 
     let (data_dir, mount_dir) = unique_paths();
-    let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
     // Create file owned by 65534:65534
@@ -634,7 +602,7 @@ fn test_open_eacces_read_denied() {
     require_root();
 
     let (data_dir, mount_dir) = unique_paths();
-    let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
     // Create file with write-only permission (mode 0222)
@@ -672,7 +640,7 @@ fn test_open_creat_dir_not_writable() {
     require_root();
 
     let (data_dir, mount_dir) = unique_paths();
-    let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
     // Create directory with read+execute only (no write)
@@ -716,7 +684,7 @@ fn test_truncate_parent_dir_search_denied() {
     require_root();
 
     let (data_dir, mount_dir) = unique_paths();
-    let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
     // Create parent dir
@@ -764,7 +732,7 @@ fn test_ftruncate_on_rdwr_fd_mode_zero() {
     require_root();
 
     let (data_dir, mount_dir) = unique_paths();
-    let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
     // Create directory with 0777 permissions
@@ -862,7 +830,7 @@ fn test_link_between_user_owned_dirs() {
     require_root();
 
     let (data_dir, mount_dir) = unique_paths();
-    let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
     // Create parent directory
@@ -942,7 +910,7 @@ fn test_link_dir_not_writable() {
     require_root();
 
     let (data_dir, mount_dir) = unique_paths();
-    let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
     // Create source file
@@ -999,7 +967,7 @@ fn test_deep_directory_removal() {
     require_root();
 
     let (data_dir, mount_dir) = unique_paths();
-    let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
     // Create a deeply nested directory structure (30 levels)
@@ -1076,7 +1044,7 @@ fn test_path_max_directory_removal() {
     require_root();
 
     let (data_dir, mount_dir) = unique_paths();
-    let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
     // Match pjdfstest dirgen_max: component length = NAME_MAX/2 = 127 chars
@@ -1176,7 +1144,7 @@ fn test_concurrent_supplementary_groups_no_race() {
     use std::thread;
 
     let (data_dir, mount_dir) = unique_paths();
-    let fuse = FuseMount::new(&data_dir, &mount_dir, 256);
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
     // Create multiple files, each owned by a different user
