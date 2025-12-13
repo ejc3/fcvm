@@ -158,8 +158,8 @@ Run a container in a Firecracker VM.
 | `--cmd <COMMAND>` | | Command to run inside container |
 | `--publish <[IP:]HPORT:GPORT[/PROTO]>` | | Port forwarding, comma-separated |
 | `--network <MODE>` | bridged | Network mode: `bridged` or `rootless` |
-| `--health-check <URL>` | | HTTP health check URL (e.g., `http://localhost/health`) |
-| `--balloon <MiB>` | (equals --mem) | Balloon target MiB |
+| `--health-check <URL>` | | HTTP health check URL. If not specified, uses container ready signal via vsock |
+| `--balloon <MiB>` | (none) | Balloon device target MiB. If not specified, no balloon device is configured |
 | `--privileged` | false | Run container in privileged mode (allows mknod, device access) |
 
 #### `fcvm snapshot create`
