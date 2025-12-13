@@ -15,7 +15,7 @@ fn init_test_base_dir() -> PathBuf {
     BASE_DIR
         .get_or_init(|| {
             let temp_dir = tempfile::tempdir().expect("create temp base dir");
-            let path = temp_dir.into_path();
+            let path = temp_dir.keep();
 
             // Configure paths module and env var before any health monitor tasks start.
             std::env::set_var("FCVM_BASE_DIR", &path);
@@ -46,6 +46,7 @@ async fn test_health_monitor_behaviors() {
         name: Some("health-test".to_string()),
         status: VmStatus::Running,
         health_status: HealthStatus::Unknown,
+        exit_code: None,
         pid: Some(99999), // Non-existent PID
         created_at: now,
         last_updated: now,

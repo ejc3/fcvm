@@ -12,33 +12,8 @@ mod common;
 
 use std::fs;
 use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use common::FuseMount;
-
-static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Create unique paths for each test.
-fn unique_paths() -> (PathBuf, PathBuf) {
-    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let pid = std::process::id();
-    let data_dir = PathBuf::from(format!("/tmp/fuse-perm-data-{}-{}", pid, id));
-    let mount_dir = PathBuf::from(format!("/tmp/fuse-perm-mount-{}-{}", pid, id));
-
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = std::process::Command::new("fusermount3")
-        .args(["-u", mount_dir.to_str().unwrap()])
-        .status();
-    let _ = fs::remove_dir_all(&mount_dir);
-
-    (data_dir, mount_dir)
-}
-
-fn cleanup(data_dir: &PathBuf, mount_dir: &PathBuf) {
-    let _ = fs::remove_dir_all(data_dir);
-    let _ = fs::remove_dir_all(mount_dir);
-}
+use common::{cleanup, unique_paths, FuseMount};
 
 /// Helper to run pjdfstest with specific uid/gid
 fn pjdfstest(args: &[&str]) -> (i32, String) {
@@ -124,7 +99,7 @@ fn require_root() {
 fn test_chmod_parent_dir_search_denied() {
     require_root();
 
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
@@ -193,7 +168,7 @@ fn test_chmod_parent_dir_search_denied() {
 fn test_write_clears_suid() {
     require_root();
 
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
@@ -253,7 +228,7 @@ fn test_write_clears_suid() {
 fn test_write_clears_sgid() {
     require_root();
 
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
@@ -304,7 +279,7 @@ fn test_write_clears_sgid() {
 fn test_write_clears_suid_and_sgid() {
     require_root();
 
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
@@ -360,7 +335,7 @@ fn test_write_clears_suid_and_sgid() {
 fn test_chown_owner_changes_group_to_primary() {
     require_root();
 
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
@@ -404,7 +379,7 @@ fn test_chown_owner_changes_group_to_primary() {
 fn test_chown_owner_changes_group_to_member() {
     require_root();
 
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
@@ -458,7 +433,7 @@ fn test_chown_owner_changes_group_to_member() {
 fn test_chown_supplementary_group_works() {
     require_root();
 
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
@@ -504,7 +479,7 @@ fn test_create_with_supplementary_group_permissions() {
 
     use std::os::unix::fs::{chown, PermissionsExt};
 
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
@@ -561,7 +536,7 @@ fn test_create_with_supplementary_group_permissions() {
 fn test_chown_non_owner_fails() {
     require_root();
 
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
@@ -601,7 +576,7 @@ fn test_chown_non_owner_fails() {
 fn test_open_eacces_read_denied() {
     require_root();
 
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
@@ -639,7 +614,7 @@ fn test_open_eacces_read_denied() {
 fn test_open_creat_dir_not_writable() {
     require_root();
 
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
@@ -683,7 +658,7 @@ fn test_open_creat_dir_not_writable() {
 fn test_truncate_parent_dir_search_denied() {
     require_root();
 
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
@@ -731,7 +706,7 @@ fn test_truncate_parent_dir_search_denied() {
 fn test_ftruncate_on_rdwr_fd_mode_zero() {
     require_root();
 
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
@@ -829,7 +804,7 @@ fn test_ftruncate_on_rdwr_fd_mode_zero() {
 fn test_link_between_user_owned_dirs() {
     require_root();
 
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
@@ -909,7 +884,7 @@ fn test_link_between_user_owned_dirs() {
 fn test_link_dir_not_writable() {
     require_root();
 
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
@@ -966,7 +941,7 @@ fn test_link_dir_not_writable() {
 fn test_deep_directory_removal() {
     require_root();
 
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
@@ -1043,7 +1018,7 @@ fn test_deep_directory_removal() {
 fn test_path_max_directory_removal() {
     require_root();
 
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 
@@ -1143,7 +1118,7 @@ fn test_concurrent_supplementary_groups_no_race() {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    let (data_dir, mount_dir) = unique_paths();
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path();
 

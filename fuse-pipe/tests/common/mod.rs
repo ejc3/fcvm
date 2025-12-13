@@ -129,6 +129,9 @@ pub struct FuseMount {
 
 impl FuseMount {
     /// Create a new FUSE mount with default settings.
+    ///
+    /// # Panics
+    /// Panics if mount setup fails (e.g., insufficient privileges).
     pub fn new(data_path: &Path, mount_path: &Path, num_readers: usize) -> Self {
         // Initialize tracing for debug logging
         init_tracing();
@@ -192,9 +195,39 @@ impl FuseMount {
         // Start FUSE client using mount_spawn (returns handle for RAII cleanup)
         info!(target: TARGET, socket = %socket_path, mount = ?mount_path, readers = num_readers, "Starting FUSE client");
         let config = MountConfig::new().readers(num_readers);
-        let mount_handle = fuse_pipe::mount_spawn(&socket_path, mount_path.to_path_buf(), config)
-            .expect("mount_spawn failed");
-        info!(target: TARGET, "mount_spawn succeeded");
+        let mount_result = fuse_pipe::mount_spawn(&socket_path, mount_path.to_path_buf(), config);
+
+        // If mount_spawn fails, we need to clean up the server thread we started
+        let mount_handle = match mount_result {
+            Ok(handle) => {
+                info!(target: TARGET, "mount_spawn succeeded");
+                handle
+            }
+            Err(e) => {
+                // Cleanup server thread before panicking
+                info!(target: TARGET, error = %e, "mount_spawn failed, cleaning up server");
+                let _ = shutdown_tx.send(());
+
+                // Wait for server thread with timeout
+                let start = std::time::Instant::now();
+                let timeout = Duration::from_secs(5);
+                while !server_thread.is_finished() {
+                    if start.elapsed() > timeout {
+                        tracing::warn!(target: TARGET, "Server thread cleanup timed out");
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                if server_thread.is_finished() {
+                    let _ = server_thread.join();
+                }
+
+                // Remove socket
+                let _ = fs::remove_file(&socket);
+
+                panic!("mount_spawn failed: {}", e);
+            }
+        };
 
         // Wait for mount to appear in /proc/mounts
         info!(target: TARGET, mount = ?mount_path, "Waiting for mount to appear in /proc/mounts");
@@ -252,11 +285,22 @@ impl Drop for FuseMount {
         // Remove socket
         let _ = fs::remove_file(&self.socket);
 
-        // Now join server thread (it should exit cleanly after shutdown signal)
+        // Now join server thread with timeout (it should exit cleanly after shutdown signal)
         if let Some(thread) = self.server_thread.take() {
             debug!(target: TARGET, "Joining server thread");
-            let _ = thread.join();
-            debug!(target: TARGET, "Server thread joined");
+            let start = std::time::Instant::now();
+            let timeout = Duration::from_secs(5);
+            while !thread.is_finished() {
+                if start.elapsed() > timeout {
+                    tracing::warn!(target: TARGET, "Server thread join timed out after {:?}", timeout);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+                debug!(target: TARGET, "Server thread joined");
+            }
         }
 
         info!(target: TARGET, "Drop complete");
