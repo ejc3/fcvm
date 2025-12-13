@@ -49,7 +49,7 @@ pub enum PodmanCommands {
 
 #[derive(Args, Debug)]
 pub struct RunArgs {
-    /// Container image (e.g., nginx:latest) or directory to build
+    /// Container image (e.g., nginx:alpine or localhost/myimage)
     pub image: String,
 
     /// VM name (required)

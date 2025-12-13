@@ -149,7 +149,7 @@ Run a container in a Firecracker VM.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `<IMAGE>` | (required) | Container image (e.g., `nginx:alpine`) or directory to build |
+| `<IMAGE>` | (required) | Container image (e.g., `nginx:alpine` or `localhost/myimage`) |
 | `--name <NAME>` | (required) | VM name |
 | `--cpu <N>` | 2 | Number of vCPUs |
 | `--mem <MiB>` | 2048 | Memory in MiB |
