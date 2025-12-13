@@ -81,7 +81,7 @@ pub struct RunArgs {
     #[arg(long, num_args=0.., value_delimiter=',')]
     pub publish: Vec<String>,
 
-    /// Balloon target MiB (default equals --mem)
+    /// Balloon device target MiB. If not specified, no balloon device is configured
     #[arg(long)]
     pub balloon: Option<u32>,
 
