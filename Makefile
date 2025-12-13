@@ -17,8 +17,21 @@ LOCAL_FUSER := ../fuser
 # Container image name
 CONTAINER_IMAGE := fcvm-test
 
-.PHONY: all help sync build test test-sanity rootfs rebuild clean \
-        container-build container-test container-test-fcvm container-shell \
+# Test commands (same tests, container runs as root so no sudo needed)
+TEST_UNIT := cargo test --release --lib
+TEST_FUSE_INTEGRATION := cargo test --release -p fuse-pipe --test integration
+TEST_FUSE_STRESS := cargo test --release -p fuse-pipe --test test_mount_stress
+TEST_FUSE_PERMISSION := cargo test --release -p fuse-pipe --test test_permission_edge_cases
+TEST_PJDFSTEST := cargo test --release -p fuse-pipe --test pjdfstest_full -- --nocapture
+TEST_VM := cargo test --release --test test_sanity -- --nocapture
+
+# Native needs sudo for FUSE tests (container already runs as root)
+SUDO := sudo
+
+.PHONY: all help sync build clean \
+        test test-unit test-fuse test-vm test-pjdfstest test-all \
+        rootfs rebuild \
+        container-build container-test container-test-fcvm container-test-pjdfstest container-shell \
         setup-btrfs setup-kernel setup-rootfs setup-all
 
 all: build
@@ -32,13 +45,20 @@ help:
 	@echo "  make clean       - Clean build artifacts"
 	@echo ""
 	@echo "Testing:"
-	@echo "  make test              - Run all tests (native on EC2)"
-	@echo "  make test-sanity       - Run VM sanity test (native on EC2)"
-	@echo "  make container-test    - Run fuse-pipe tests (in container)"
-	@echo "  make container-test-fcvm - Run fcvm VM tests (in container)"
-	@echo "  make container-shell   - Interactive shell in container"
+	@echo "  make test            - All fast tests: unit + fuse-pipe (~115 tests, ~30s)"
+	@echo "  make test-unit       - Unit tests only (no root needed)"
+	@echo "  make test-fuse       - fuse-pipe tests (integration + permission + stress)"
+	@echo "  make test-vm         - VM tests (sanity bridged + rootless)"
+	@echo "  make test-pjdfstest  - POSIX compliance (8789 tests, ~5 min)"
+	@echo "  make test-all        - Everything: test + test-vm + test-pjdfstest"
 	@echo ""
-	@echo "Setup (idempotent, run automatically by tests):"
+	@echo "Container (encapsulated environment):"
+	@echo "  make container-test          - fuse-pipe tests"
+	@echo "  make container-test-fcvm     - VM tests"
+	@echo "  make container-test-pjdfstest - POSIX compliance (8789 tests)"
+	@echo "  make container-shell         - Interactive shell"
+	@echo ""
+	@echo "Setup (idempotent):"
 	@echo "  make setup-all    - Full EC2 setup (btrfs + kernel + rootfs)"
 	@echo "  make setup-btrfs  - Create btrfs loopback filesystem"
 	@echo "  make setup-kernel - Copy kernel to btrfs"
@@ -111,16 +131,37 @@ clean:
 	cargo clean
 
 #------------------------------------------------------------------------------
-# Native testing (direct on EC2)
+# Testing (native) - uses same commands as container tests
 #------------------------------------------------------------------------------
 
-test: build setup-kernel
-	@echo "==> Running all tests..."
-	$(SSH) "cd $(REMOTE_DIR) && sudo ~/.cargo/bin/cargo test --release"
+# Fast tests: unit tests + fuse-pipe tests (no VM needed)
+test: build
+	@echo "==> Running tests..."
+	$(SSH) "cd $(REMOTE_DIR) && $(TEST_UNIT)"
+	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(TEST_FUSE_INTEGRATION)"
+	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(TEST_FUSE_STRESS)"
+	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(TEST_FUSE_PERMISSION)"
 
-test-sanity: build setup-kernel
-	@echo "==> Running sanity test..."
-	$(SSH) "cd $(REMOTE_DIR) && sudo ~/.cargo/bin/cargo test --release --test test_sanity -- --nocapture"
+# Unit tests only
+test-unit: build
+	$(SSH) "cd $(REMOTE_DIR) && $(TEST_UNIT)"
+
+# All fuse-pipe tests
+test-fuse: build
+	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(TEST_FUSE_INTEGRATION)"
+	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(TEST_FUSE_STRESS)"
+	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(TEST_FUSE_PERMISSION)"
+
+# VM tests (require KVM + setup)
+test-vm: build setup-kernel
+	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(TEST_VM)"
+
+# Full POSIX compliance tests (8789 tests)
+test-pjdfstest: build
+	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(TEST_PJDFSTEST)"
+
+# Run everything
+test-all: test test-vm test-pjdfstest
 
 #------------------------------------------------------------------------------
 # Rootfs management
@@ -169,16 +210,19 @@ container-build: sync
 		--build-context fuse-backend-rs=$(REMOTE_FUSE_BACKEND_RS) \
 		--build-context fuser=$(REMOTE_FUSER) ."
 
-# Run fuse-pipe tests in container
+# Container tests - uses same commands as native tests
 container-test: container-build
-	@echo "==> Running fuse-pipe tests..."
-	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) cargo test --release -p fuse-pipe"
+	@echo "==> Running tests..."
+	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_UNIT)"
+	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_FUSE_INTEGRATION)"
+	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_FUSE_STRESS)"
+	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_FUSE_PERMISSION)"
 
-# Run fcvm VM tests in container
 container-test-fcvm: container-build setup-kernel
-	@echo "==> Running fcvm tests..."
-	$(SSH) "$(CONTAINER_RUN_FCVM) $(CONTAINER_IMAGE) cargo test --release -p fcvm --test test_sanity -- --nocapture"
+	$(SSH) "$(CONTAINER_RUN_FCVM) $(CONTAINER_IMAGE) $(TEST_VM)"
+
+container-test-pjdfstest: container-build
+	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_PJDFSTEST)"
 
 container-shell: container-build
-	@echo "==> Opening shell..."
 	$(SSH) -t "$(CONTAINER_RUN_FUSE) -it $(CONTAINER_IMAGE) bash"
