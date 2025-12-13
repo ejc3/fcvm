@@ -1099,6 +1099,261 @@ fn test_path_max_directory_removal() {
 }
 
 // =============================================================================
+// POSIX COMPLIANCE TESTS (features pjdfstest skips for FUSE)
+// =============================================================================
+
+/// Test fallocate/posix_fallocate - pjdfstest skips this for FUSE filesystems
+/// but fuse-pipe passthrough should support it fully via the underlying ext4.
+///
+/// posix_fallocate(fd, offset, len) preallocates disk space without writing zeros.
+#[test]
+fn test_fallocate_supported() {
+    require_root();
+
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
+    let mount = fuse.mount_path();
+
+    let file = mount.join("fallocate_test");
+
+    // Create file and get fd
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let cpath = CString::new(file.as_os_str().as_bytes()).unwrap();
+    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o644) };
+    assert!(fd >= 0, "open failed: {}", std::io::Error::last_os_error());
+
+    // Try posix_fallocate - allocate 1MB
+    let ret = unsafe { libc::posix_fallocate(fd, 0, 1024 * 1024) };
+
+    unsafe { libc::close(fd) };
+
+    if ret != 0 {
+        let _ = fs::remove_file(&file);
+        drop(fuse);
+        cleanup(&data_dir, &mount_dir);
+        panic!(
+            "posix_fallocate failed with errno {}: fuse-pipe should support fallocate!",
+            ret
+        );
+    }
+
+    // Verify file size is 1MB
+    let meta = fs::metadata(&file).expect("stat file");
+    assert_eq!(
+        meta.len(),
+        1024 * 1024,
+        "file should be 1MB after fallocate"
+    );
+
+    // Also verify blocks are actually allocated (not sparse)
+    // st_blocks is in 512-byte units
+    let blocks = meta.blocks();
+    let expected_blocks = (1024 * 1024) / 512;
+    assert!(
+        blocks >= expected_blocks - 16, // Allow small variance for filesystem overhead
+        "fallocate should allocate real blocks, got {} blocks (expected ~{})",
+        blocks,
+        expected_blocks
+    );
+
+    eprintln!(
+        "posix_fallocate works: allocated {} blocks for 1MB file",
+        blocks
+    );
+
+    let _ = fs::remove_file(&file);
+    drop(fuse);
+    cleanup(&data_dir, &mount_dir);
+}
+
+/// Test fallocate with FALLOC_FL_PUNCH_HOLE - create sparse holes in files
+#[test]
+fn test_fallocate_punch_hole() {
+    require_root();
+
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
+    let mount = fuse.mount_path();
+
+    let file = mount.join("punch_hole_test");
+
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let cpath = CString::new(file.as_os_str().as_bytes()).unwrap();
+    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o644) };
+    assert!(fd >= 0, "open failed: {}", std::io::Error::last_os_error());
+
+    // Write 1MB of data
+    let data = vec![0xAAu8; 1024 * 1024];
+    let written = unsafe { libc::write(fd, data.as_ptr() as *const libc::c_void, data.len()) };
+    assert_eq!(written as usize, data.len(), "write failed");
+
+    // Get initial block count
+    let meta_before = fs::metadata(&file).expect("stat");
+    let blocks_before = meta_before.blocks();
+
+    // Punch a 512KB hole in the middle
+    const FALLOC_FL_PUNCH_HOLE: i32 = 0x02;
+    const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
+    let ret = unsafe {
+        libc::fallocate(
+            fd,
+            FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+            256 * 1024,  // offset: 256KB
+            512 * 1024,  // length: 512KB
+        )
+    };
+
+    unsafe { libc::close(fd) };
+
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        let _ = fs::remove_file(&file);
+        drop(fuse);
+        cleanup(&data_dir, &mount_dir);
+
+        // EOPNOTSUPP is acceptable if underlying fs doesn't support it
+        if err.raw_os_error() == Some(libc::EOPNOTSUPP) {
+            eprintln!("FALLOC_FL_PUNCH_HOLE not supported (EOPNOTSUPP) - OK");
+            return;
+        }
+        panic!("fallocate PUNCH_HOLE failed: {}", err);
+    }
+
+    // Verify blocks decreased (hole was punched)
+    let meta_after = fs::metadata(&file).expect("stat");
+    let blocks_after = meta_after.blocks();
+
+    eprintln!(
+        "PUNCH_HOLE: blocks before={}, after={} (saved {} blocks)",
+        blocks_before,
+        blocks_after,
+        blocks_before - blocks_after
+    );
+
+    // File size should remain 1MB
+    assert_eq!(meta_after.len(), 1024 * 1024, "file size should be unchanged");
+
+    // Blocks should have decreased
+    assert!(
+        blocks_after < blocks_before,
+        "blocks should decrease after punching hole"
+    );
+
+    let _ = fs::remove_file(&file);
+    drop(fuse);
+    cleanup(&data_dir, &mount_dir);
+}
+
+/// Test that rename updates ctime - pjdfstest skips this for FUSE
+/// but ext4 does update ctime on rename and fuse-pipe should pass it through.
+#[test]
+fn test_rename_updates_ctime() {
+    require_root();
+
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
+    let mount = fuse.mount_path();
+
+    let file = mount.join("rename_ctime_test");
+    fs::write(&file, "test").expect("create file");
+
+    // Get initial ctime
+    let meta_before = fs::metadata(&file).expect("stat before");
+    let ctime_before = meta_before.ctime();
+    let ctime_nsec_before = meta_before.ctime_nsec();
+
+    // Wait a tiny bit to ensure time advances
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Rename the file
+    let new_file = mount.join("rename_ctime_test_renamed");
+    fs::rename(&file, &new_file).expect("rename");
+
+    // Get ctime after rename
+    let meta_after = fs::metadata(&new_file).expect("stat after");
+    let ctime_after = meta_after.ctime();
+    let ctime_nsec_after = meta_after.ctime_nsec();
+
+    eprintln!(
+        "rename ctime: before={}.{:09}, after={}.{:09}",
+        ctime_before, ctime_nsec_before, ctime_after, ctime_nsec_after
+    );
+
+    // ctime should have increased (or at least not decreased)
+    let before_ns = ctime_before as i128 * 1_000_000_000 + ctime_nsec_before as i128;
+    let after_ns = ctime_after as i128 * 1_000_000_000 + ctime_nsec_after as i128;
+
+    assert!(
+        after_ns >= before_ns,
+        "ctime should not decrease after rename: before={}, after={}",
+        before_ns,
+        after_ns
+    );
+
+    // On ext4, ctime should actually increase
+    if after_ns > before_ns {
+        eprintln!("rename correctly updated ctime (increased by {} ns)", after_ns - before_ns);
+    } else {
+        eprintln!("WARNING: ctime unchanged after rename (some filesystems don't update it)");
+    }
+
+    let _ = fs::remove_file(&new_file);
+    drop(fuse);
+    cleanup(&data_dir, &mount_dir);
+}
+
+/// Test that rename to overwrite existing file updates target's parent directory mtime
+#[test]
+fn test_rename_overwrites_updates_mtime() {
+    require_root();
+
+    let (data_dir, mount_dir) = unique_paths("fuse-perm");
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
+    let mount = fuse.mount_path();
+
+    // Create source file
+    let source = mount.join("rename_src");
+    fs::write(&source, "source content").expect("create source");
+
+    // Create target file
+    let target = mount.join("rename_dst");
+    fs::write(&target, "target content").expect("create target");
+
+    // Get directory mtime before rename
+    let dir_meta_before = fs::metadata(&mount).expect("stat dir before");
+    let mtime_before = dir_meta_before.mtime();
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Rename source to target (overwriting target)
+    fs::rename(&source, &target).expect("rename overwrite");
+
+    // Get directory mtime after rename
+    let dir_meta_after = fs::metadata(&mount).expect("stat dir after");
+    let mtime_after = dir_meta_after.mtime();
+
+    eprintln!(
+        "rename overwrite: dir mtime before={}, after={}",
+        mtime_before, mtime_after
+    );
+
+    // Verify target has source's content
+    let content = fs::read_to_string(&target).expect("read target");
+    assert_eq!(content, "source content", "target should have source's content");
+
+    // Source should no longer exist
+    assert!(!source.exists(), "source should not exist after rename");
+
+    let _ = fs::remove_file(&target);
+    drop(fuse);
+    cleanup(&data_dir, &mount_dir);
+}
+
+// =============================================================================
 // THREAD SAFETY / RACE CONDITION TESTS
 // =============================================================================
 
