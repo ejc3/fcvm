@@ -25,13 +25,21 @@ TEST_FUSE_PERMISSION := cargo test --release -p fuse-pipe --test test_permission
 TEST_PJDFSTEST := cargo test --release -p fuse-pipe --test pjdfstest_full -- --nocapture
 TEST_VM := cargo test --release --test test_sanity -- --nocapture
 
+# Benchmark commands
+BENCH_THROUGHPUT := cargo bench -p fuse-pipe --bench throughput
+BENCH_OPERATIONS := cargo bench -p fuse-pipe --bench operations
+BENCH_PROTOCOL := cargo bench -p fuse-pipe --bench protocol
+
 # Native needs sudo for FUSE tests (container already runs as root)
 SUDO := sudo
 
 .PHONY: all help sync build clean \
         test test-unit test-fuse test-vm test-pjdfstest test-all \
+        bench bench-throughput bench-operations bench-protocol \
         rootfs rebuild \
-        container-build container-test container-test-fcvm container-test-pjdfstest container-shell \
+        container-build container-test container-test-fcvm container-test-pjdfstest \
+        container-bench container-bench-throughput container-bench-operations container-bench-protocol \
+        container-shell \
         setup-btrfs setup-kernel setup-rootfs setup-all
 
 all: build
@@ -52,10 +60,17 @@ help:
 	@echo "  make test-pjdfstest  - POSIX compliance (8789 tests, ~5 min)"
 	@echo "  make test-all        - Everything: test + test-vm + test-pjdfstest"
 	@echo ""
+	@echo "Benchmarks:"
+	@echo "  make bench           - All benchmarks (throughput + operations + protocol)"
+	@echo "  make bench-throughput - I/O throughput benchmarks"
+	@echo "  make bench-operations - FUSE operation latency benchmarks"
+	@echo "  make bench-protocol  - Wire protocol benchmarks"
+	@echo ""
 	@echo "Container (encapsulated environment):"
 	@echo "  make container-test          - fuse-pipe tests"
 	@echo "  make container-test-fcvm     - VM tests"
 	@echo "  make container-test-pjdfstest - POSIX compliance (8789 tests)"
+	@echo "  make container-bench         - All benchmarks"
 	@echo "  make container-shell         - Interactive shell"
 	@echo ""
 	@echo "Setup (idempotent):"
@@ -164,6 +179,25 @@ test-pjdfstest: build
 test-all: test test-vm test-pjdfstest
 
 #------------------------------------------------------------------------------
+# Benchmarks (native)
+#------------------------------------------------------------------------------
+
+bench: build
+	@echo "==> Running all benchmarks..."
+	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(BENCH_THROUGHPUT)"
+	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(BENCH_OPERATIONS)"
+	$(SSH) "cd $(REMOTE_DIR) && $(BENCH_PROTOCOL)"
+
+bench-throughput: build
+	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(BENCH_THROUGHPUT)"
+
+bench-operations: build
+	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(BENCH_OPERATIONS)"
+
+bench-protocol: build
+	$(SSH) "cd $(REMOTE_DIR) && $(BENCH_PROTOCOL)"
+
+#------------------------------------------------------------------------------
 # Rootfs management
 #------------------------------------------------------------------------------
 
@@ -223,6 +257,22 @@ container-test-fcvm: container-build setup-kernel
 
 container-test-pjdfstest: container-build
 	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_PJDFSTEST)"
+
+# Container benchmarks - uses same commands as native benchmarks
+container-bench: container-build
+	@echo "==> Running all benchmarks..."
+	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(BENCH_THROUGHPUT)"
+	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(BENCH_OPERATIONS)"
+	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(BENCH_PROTOCOL)"
+
+container-bench-throughput: container-build
+	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(BENCH_THROUGHPUT)"
+
+container-bench-operations: container-build
+	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(BENCH_OPERATIONS)"
+
+container-bench-protocol: container-build
+	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(BENCH_PROTOCOL)"
 
 container-shell: container-build
 	$(SSH) -t "$(CONTAINER_RUN_FUSE) -it $(CONTAINER_IMAGE) bash"
