@@ -44,6 +44,19 @@ fn init_tracing() {
 /// Global counter for unique test IDs
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Join a thread with timeout. Returns true if joined successfully, false if timed out.
+fn join_with_timeout<T>(thread: JoinHandle<T>, timeout: Duration) -> bool {
+    let start = std::time::Instant::now();
+    while !thread.is_finished() {
+        if start.elapsed() > timeout {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _ = thread.join();
+    true
+}
+
 /// Check if a path is a FUSE mount by looking in /proc/mounts.
 pub fn is_fuse_mount(path: &Path) -> bool {
     if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
@@ -109,6 +122,34 @@ pub fn increase_ulimit() {
     }
 }
 
+/// RAII guard for the server thread. Handles cleanup automatically on drop.
+struct ServerGuard {
+    thread: Option<JoinHandle<()>>,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    socket: PathBuf,
+}
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        // Signal server to shutdown
+        if let Some(tx) = self.shutdown_tx.take() {
+            debug!(target: TARGET, "ServerGuard: sending shutdown signal");
+            let _ = tx.send(());
+        }
+
+        // Remove socket file
+        let _ = fs::remove_file(&self.socket);
+
+        // Join server thread with timeout
+        if let Some(thread) = self.thread.take() {
+            debug!(target: TARGET, "ServerGuard: joining server thread");
+            if !join_with_timeout(thread, Duration::from_secs(5)) {
+                tracing::warn!(target: TARGET, "ServerGuard: server thread join timed out");
+            }
+        }
+    }
+}
+
 /// In-process FUSE mount fixture.
 ///
 /// Spawns server and client in-process:
@@ -117,13 +158,11 @@ pub fn increase_ulimit() {
 ///
 /// Automatically unmounts and cleans up on drop.
 pub struct FuseMount {
-    server_thread: Option<JoinHandle<()>>,
-    /// Shutdown signal to stop the server cleanly
-    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Server guard - dropped AFTER mount_handle to ensure correct shutdown order
+    server_guard: Option<ServerGuard>,
     data_dir: PathBuf,
     mount_dir: PathBuf,
-    socket: PathBuf,
-    /// Handle for FUSE mount - dropping this unmounts automatically
+    /// Handle for FUSE mount - dropped FIRST to unmount before server shutdown
     mount_handle: Option<MountHandle>,
 }
 
@@ -136,9 +175,8 @@ impl FuseMount {
         // Initialize tracing for debug logging
         init_tracing();
 
-        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let pid = std::process::id();
-        let socket = PathBuf::from(format!("/tmp/fuse-test-{}-{}.sock", pid, id));
+        // Derive socket path from mount_path for consistent naming
+        let socket = PathBuf::from(format!("{}.sock", mount_path.display()));
 
         // Cleanup any stale state
         let _ = fs::remove_file(&socket);
@@ -148,7 +186,6 @@ impl FuseMount {
         let socket_path = socket.to_str().unwrap().to_string();
 
         // Create shutdown channel for clean server termination
-        // Use tokio::sync::oneshot which is async-native (no spawn_blocking needed)
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         // Start server in dedicated thread with its own runtime
@@ -183,6 +220,13 @@ impl FuseMount {
             });
         });
 
+        // Create server guard for RAII cleanup - if mount_spawn fails, guard drops and cleans up
+        let server_guard = ServerGuard {
+            thread: Some(server_thread),
+            shutdown_tx: Some(shutdown_tx),
+            socket,
+        };
+
         // Wait for server to be ready (socket exists)
         for i in 0..100 {
             if Path::new(&socket_path).exists() {
@@ -195,36 +239,14 @@ impl FuseMount {
         // Start FUSE client using mount_spawn (returns handle for RAII cleanup)
         info!(target: TARGET, socket = %socket_path, mount = ?mount_path, readers = num_readers, "Starting FUSE client");
         let config = MountConfig::new().readers(num_readers);
-        let mount_result = fuse_pipe::mount_spawn(&socket_path, mount_path.to_path_buf(), config);
-
-        // If mount_spawn fails, we need to clean up the server thread we started
-        let mount_handle = match mount_result {
+        let mount_handle = match fuse_pipe::mount_spawn(&socket_path, mount_path.to_path_buf(), config) {
             Ok(handle) => {
                 info!(target: TARGET, "mount_spawn succeeded");
                 handle
             }
             Err(e) => {
-                // Cleanup server thread before panicking
-                info!(target: TARGET, error = %e, "mount_spawn failed, cleaning up server");
-                let _ = shutdown_tx.send(());
-
-                // Wait for server thread with timeout
-                let start = std::time::Instant::now();
-                let timeout = Duration::from_secs(5);
-                while !server_thread.is_finished() {
-                    if start.elapsed() > timeout {
-                        tracing::warn!(target: TARGET, "Server thread cleanup timed out");
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(10));
-                }
-                if server_thread.is_finished() {
-                    let _ = server_thread.join();
-                }
-
-                // Remove socket
-                let _ = fs::remove_file(&socket);
-
+                // server_guard will be dropped here, cleaning up server thread
+                drop(server_guard);
                 panic!("mount_spawn failed: {}", e);
             }
         };
@@ -249,12 +271,10 @@ impl FuseMount {
         }
 
         FuseMount {
-            server_thread: Some(server_thread),
-            shutdown_tx: Some(shutdown_tx),
+            server_guard: Some(server_guard),
             data_dir: data_path.to_path_buf(),
             mount_dir: mount_path.to_path_buf(),
-            socket,
-            mount_handle: Some(mount_handle), // MountHandle::drop() will unmount
+            mount_handle: Some(mount_handle),
         }
     }
 
@@ -271,39 +291,20 @@ impl FuseMount {
 
 impl Drop for FuseMount {
     fn drop(&mut self) {
-        info!(target: TARGET, "Drop starting - unmounting");
+        info!(target: TARGET, "FuseMount::drop starting");
 
-        // Signal server to shutdown first (before unmounting client)
-        if let Some(tx) = self.shutdown_tx.take() {
-            debug!(target: TARGET, "Sending shutdown signal to server");
-            let _ = tx.send(());
-        }
-
-        // Drop mount handle - MountHandle::drop() calls unmounter and waits for thread
+        // CORRECT ORDER:
+        // 1. Drop mount_handle FIRST - unmounts FUSE, client disconnects from server
+        // 2. Then drop server_guard - signals server shutdown, joins thread
+        //
+        // This order ensures FUSE operations complete before server shuts down.
+        debug!(target: TARGET, "Dropping mount_handle (unmounting)");
         drop(self.mount_handle.take());
 
-        // Remove socket
-        let _ = fs::remove_file(&self.socket);
+        debug!(target: TARGET, "Dropping server_guard (shutting down server)");
+        drop(self.server_guard.take());
 
-        // Now join server thread with timeout (it should exit cleanly after shutdown signal)
-        if let Some(thread) = self.server_thread.take() {
-            debug!(target: TARGET, "Joining server thread");
-            let start = std::time::Instant::now();
-            let timeout = Duration::from_secs(5);
-            while !thread.is_finished() {
-                if start.elapsed() > timeout {
-                    tracing::warn!(target: TARGET, "Server thread join timed out after {:?}", timeout);
-                    break;
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-            if thread.is_finished() {
-                let _ = thread.join();
-                debug!(target: TARGET, "Server thread joined");
-            }
-        }
-
-        info!(target: TARGET, "Drop complete");
+        info!(target: TARGET, "FuseMount::drop complete");
     }
 }
 
