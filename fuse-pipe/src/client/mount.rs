@@ -77,11 +77,23 @@ impl Drop for MountHandle {
             let _ = unmounter.unmount();
             debug!(target: "fuse-pipe::client", "MountHandle::drop() unmount() returned");
         }
-        // Then wait for mount thread to finish
+        // Then wait for mount thread to finish with timeout
         if let Some(thread) = self.thread.take() {
             debug!(target: "fuse-pipe::client", "MountHandle::drop() joining mount thread");
-            let _ = thread.join();
-            debug!(target: "fuse-pipe::client", "MountHandle::drop() mount thread joined");
+            // Use a timeout to prevent infinite hangs if unmount doesn't work
+            let start = std::time::Instant::now();
+            let timeout = Duration::from_secs(5);
+            while !thread.is_finished() {
+                if start.elapsed() > timeout {
+                    warn!(target: "fuse-pipe::client", "MountHandle::drop() mount thread join timed out after {:?}", timeout);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+                debug!(target: "fuse-pipe::client", "MountHandle::drop() mount thread joined");
+            }
         }
         debug!(target: "fuse-pipe::client", "MountHandle::drop() complete");
     }
@@ -172,13 +184,45 @@ pub fn mount_spawn<P: AsRef<Path> + Send + 'static>(
         )
     });
 
-    let unmounter = rx
-        .recv()
-        .map_err(|_| anyhow::anyhow!("mount thread failed before sending unmounter"))?;
-    Ok(MountHandle {
-        thread: Some(thread),
-        unmounter: Some(unmounter),
-    })
+    // Wait for unmounter with timeout - mount thread might fail before sending
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(unmounter) => Ok(MountHandle {
+            thread: Some(thread),
+            unmounter: Some(unmounter),
+        }),
+        Err(e) => {
+            // Mount failed or timed out - we need to clean up the thread.
+            // The thread may be stuck in Session::new() or similar blocking call.
+            // We can't forcefully kill it, but we should at least wait for it
+            // to finish (with timeout) and not leave it orphaned.
+            warn!(target: "fuse-pipe::client", "mount_spawn failed, cleaning up thread: {:?}", e);
+
+            // Wait for thread to finish with a short timeout
+            let start = std::time::Instant::now();
+            let cleanup_timeout = Duration::from_secs(2);
+            while !thread.is_finished() {
+                if start.elapsed() > cleanup_timeout {
+                    // Thread is stuck - log warning but don't block forever
+                    warn!(target: "fuse-pipe::client", "mount thread stuck, abandoning (will be cleaned up on process exit)");
+                    // Intentionally don't join - let the thread run to completion eventually
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
+
+            Err(match e {
+                std::sync::mpsc::RecvTimeoutError::Timeout => {
+                    anyhow::anyhow!("mount timed out after 10s - check if running as root for FUSE")
+                }
+                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                    anyhow::anyhow!("mount thread failed before sending unmounter")
+                }
+            })
+        }
+    }
 }
 
 /// Internal mount implementation with optional unmounter channel.
