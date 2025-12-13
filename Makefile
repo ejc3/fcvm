@@ -17,12 +17,20 @@ LOCAL_FUSER := ../fuser
 # Container image name
 CONTAINER_IMAGE := fcvm-test
 
-# Test commands (same tests, container runs as root so no sudo needed)
+# Test commands - organized by root requirement
+# No root required:
 TEST_UNIT := cargo test --release --lib
-TEST_FUSE_INTEGRATION := cargo test --release -p fuse-pipe --test integration
+TEST_FUSE_NOROOT := cargo test --release -p fuse-pipe --test integration
 TEST_FUSE_STRESS := cargo test --release -p fuse-pipe --test test_mount_stress
+TEST_VM_ROOTLESS := cargo test --release --test test_sanity test_sanity_rootless -- --nocapture
+
+# Root required:
+TEST_FUSE_ROOT := cargo test --release -p fuse-pipe --test integration_root
 TEST_FUSE_PERMISSION := cargo test --release -p fuse-pipe --test test_permission_edge_cases
 TEST_PJDFSTEST := cargo test --release -p fuse-pipe --test pjdfstest_full -- --nocapture
+TEST_VM_BRIDGED := cargo test --release --test test_sanity test_sanity_bridged -- --nocapture
+
+# Legacy alias
 TEST_VM := cargo test --release --test test_sanity -- --nocapture
 
 # Benchmark commands
@@ -34,10 +42,10 @@ BENCH_PROTOCOL := cargo bench -p fuse-pipe --bench protocol
 SUDO := sudo
 
 .PHONY: all help sync build clean \
-        test test-unit test-fuse test-vm test-pjdfstest test-all \
+        test test-noroot test-root test-unit test-fuse test-vm test-vm-rootless test-vm-bridged test-pjdfstest test-all \
         bench bench-throughput bench-operations bench-protocol \
         rootfs rebuild \
-        container-build container-test container-test-fcvm container-test-pjdfstest \
+        container-build container-test container-test-noroot container-test-root container-test-fcvm container-test-pjdfstest \
         container-bench container-bench-throughput container-bench-operations container-bench-protocol \
         container-shell \
         setup-btrfs setup-kernel setup-rootfs setup-all
@@ -52,12 +60,16 @@ help:
 	@echo "  make sync        - Sync code only (no build)"
 	@echo "  make clean       - Clean build artifacts"
 	@echo ""
-	@echo "Testing:"
-	@echo "  make test            - All fast tests: unit + fuse-pipe (~115 tests, ~30s)"
-	@echo "  make test-unit       - Unit tests only (no root needed)"
-	@echo "  make test-fuse       - fuse-pipe tests (integration + permission + stress)"
-	@echo "  make test-vm         - VM tests (sanity bridged + rootless)"
-	@echo "  make test-pjdfstest  - POSIX compliance (8789 tests, ~5 min)"
+	@echo "Testing (organized by root requirement):"
+	@echo "  make test            - All fuse-pipe tests: noroot + root"
+	@echo "  make test-noroot     - Tests without root: unit + integration + stress (no sudo)"
+	@echo "  make test-root       - Tests requiring root: integration_root + permission (sudo)"
+	@echo "  make test-unit       - Unit tests only (no root)"
+	@echo "  make test-fuse       - fuse-pipe: integration + permission + stress"
+	@echo "  make test-vm         - VM tests: rootless + bridged"
+	@echo "  make test-vm-rootless - VM test with slirp4netns (no root)"
+	@echo "  make test-vm-bridged  - VM test with bridged networking (sudo)"
+	@echo "  make test-pjdfstest  - POSIX compliance (8789 tests, ~5 min, sudo)"
 	@echo "  make test-all        - Everything: test + test-vm + test-pjdfstest"
 	@echo ""
 	@echo "Benchmarks:"
@@ -67,7 +79,9 @@ help:
 	@echo "  make bench-protocol  - Wire protocol benchmarks"
 	@echo ""
 	@echo "Container (encapsulated environment):"
-	@echo "  make container-test          - fuse-pipe tests"
+	@echo "  make container-test          - fuse-pipe tests (noroot + root)"
+	@echo "  make container-test-noroot   - Tests without root privilege"
+	@echo "  make container-test-root     - Tests requiring root privilege"
 	@echo "  make container-test-fcvm     - VM tests"
 	@echo "  make container-test-pjdfstest - POSIX compliance (8789 tests)"
 	@echo "  make container-bench         - All benchmarks"
@@ -146,30 +160,46 @@ clean:
 	cargo clean
 
 #------------------------------------------------------------------------------
-# Testing (native) - uses same commands as container tests
+# Testing (native) - organized by root requirement
 #------------------------------------------------------------------------------
 
-# Fast tests: unit tests + fuse-pipe tests (no VM needed)
-test: build
-	@echo "==> Running tests..."
+# Tests that don't require root (run first for faster feedback)
+test-noroot: build
+	@echo "==> Running tests (no root required)..."
 	$(SSH) "cd $(REMOTE_DIR) && $(TEST_UNIT)"
-	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(TEST_FUSE_INTEGRATION)"
-	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(TEST_FUSE_STRESS)"
+	$(SSH) "cd $(REMOTE_DIR) && $(TEST_FUSE_NOROOT)"
+	$(SSH) "cd $(REMOTE_DIR) && $(TEST_FUSE_STRESS)"
+
+# Tests that require root
+test-root: build
+	@echo "==> Running tests (root required)..."
+	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(TEST_FUSE_ROOT)"
 	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(TEST_FUSE_PERMISSION)"
+
+# All fuse-pipe tests: noroot first, then root
+test: test-noroot test-root
 
 # Unit tests only
 test-unit: build
 	$(SSH) "cd $(REMOTE_DIR) && $(TEST_UNIT)"
 
-# All fuse-pipe tests
+# All fuse-pipe tests (explicit)
 test-fuse: build
-	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(TEST_FUSE_INTEGRATION)"
-	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(TEST_FUSE_STRESS)"
+	$(SSH) "cd $(REMOTE_DIR) && $(TEST_FUSE_NOROOT)"
+	$(SSH) "cd $(REMOTE_DIR) && $(TEST_FUSE_STRESS)"
+	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(TEST_FUSE_ROOT)"
 	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(TEST_FUSE_PERMISSION)"
 
-# VM tests (require KVM + setup)
-test-vm: build setup-kernel
-	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(TEST_VM)"
+# VM tests - rootless (no root on host)
+test-vm-rootless: build setup-kernel
+	$(SSH) "cd $(REMOTE_DIR) && $(TEST_VM_ROOTLESS)"
+
+# VM tests - bridged (requires root for iptables/netns)
+test-vm-bridged: build setup-kernel
+	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(TEST_VM_BRIDGED)"
+
+# All VM tests: rootless first, then bridged
+test-vm: test-vm-rootless test-vm-bridged
 
 # Full POSIX compliance tests (8789 tests)
 test-pjdfstest: build
@@ -244,13 +274,20 @@ container-build: sync
 		--build-context fuse-backend-rs=$(REMOTE_FUSE_BACKEND_RS) \
 		--build-context fuser=$(REMOTE_FUSER) ."
 
-# Container tests - uses same commands as native tests
-container-test: container-build
-	@echo "==> Running tests..."
+# Container tests - organized by root requirement (container runs as root inside)
+container-test-noroot: container-build
+	@echo "==> Running tests (no root required)..."
 	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_UNIT)"
-	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_FUSE_INTEGRATION)"
+	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_FUSE_NOROOT)"
 	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_FUSE_STRESS)"
+
+container-test-root: container-build
+	@echo "==> Running tests (root required)..."
+	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_FUSE_ROOT)"
 	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_FUSE_PERMISSION)"
+
+# All fuse-pipe tests: noroot first, then root
+container-test: container-test-noroot container-test-root
 
 container-test-fcvm: container-build setup-kernel
 	$(SSH) "$(CONTAINER_RUN_FCVM) $(CONTAINER_IMAGE) $(TEST_VM)"
