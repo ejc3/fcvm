@@ -55,6 +55,11 @@ impl<H: FilesystemHandler + 'static> AsyncServer<H> {
         let _ = std::fs::remove_file(socket_path);
 
         let listener = UnixListener::bind(socket_path)?;
+
+        // Make socket accessible by Firecracker running in user namespace (UID 100000)
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o777))?;
+
         info!(target: "fuse-pipe::server", socket_path, "listening");
 
         let mut client_id = 0u32;

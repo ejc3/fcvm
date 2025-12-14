@@ -35,7 +35,7 @@ pub struct VmManager {
     socket_path: PathBuf,
     log_path: Option<PathBuf>,
     namespace_id: Option<String>,
-    namespace_wrapper: Option<Vec<String>>, // wrapper command for rootless networking (slirp4netns)
+    holder_pid: Option<u32>, // namespace holder PID for rootless mode (use nsenter to run FC)
     vsock_redirect: Option<(PathBuf, PathBuf)>, // (baseline_dir, clone_dir) for mount namespace isolation
     process: Option<Child>,
     client: Option<FirecrackerClient>,
@@ -49,7 +49,7 @@ impl VmManager {
             socket_path,
             log_path,
             namespace_id: None,
-            namespace_wrapper: None,
+            holder_pid: None,
             vsock_redirect: None,
             process: None,
             client: None,
@@ -69,16 +69,15 @@ impl VmManager {
         self.namespace_id = Some(namespace_id);
     }
 
-    /// Set namespace wrapper command for rootless networking
+    /// Set namespace holder PID for rootless networking
     ///
-    /// When set, Firecracker will be launched inside a namespace created by the wrapper.
-    /// The wrapper creates user + network namespaces and sets up a TAP device with
-    /// userspace networking (via slirp4netns), all without requiring root privileges.
+    /// When set, Firecracker will be launched inside an existing user+net namespace
+    /// via nsenter. The holder process (created by `unshare --user --map-auto --net -- cat`)
+    /// keeps the namespace alive while Firecracker runs.
     ///
-    /// The wrapper command should be the output of SlirpNetwork::build_wrapper_command(),
-    /// e.g., ["unshare", "--user", "--map-root-user", "--net", "--", ...]
-    pub fn set_namespace_wrapper(&mut self, wrapper_cmd: Vec<String>) {
-        self.namespace_wrapper = Some(wrapper_cmd);
+    /// This approach is fully rootless - no sudo required!
+    pub fn set_holder_pid(&mut self, pid: u32) {
+        self.holder_pid = Some(pid);
     }
 
     /// Set vsock redirect for mount namespace isolation
@@ -110,17 +109,13 @@ impl VmManager {
         let _ = std::fs::remove_file(&self.socket_path);
 
         // Build command based on mode:
-        // 1. namespace wrapper (rootless with slirp4netns networking)
-        // 2. direct Firecracker (privileged mode)
-        let mut cmd = if let Some(ref wrapper) = self.namespace_wrapper {
-            // Use wrapper to create user + network namespaces with TAP device
-            info!(target: "vm", vm_id = %self.vm_id, "using namespace wrapper for rootless networking");
-            let mut c = Command::new(&wrapper[0]);
-            // Add remaining wrapper args (skip first which is the command)
-            for arg in &wrapper[1..] {
-                c.arg(arg);
-            }
-            // Add Firecracker command
+        // 1. holder_pid set: use nsenter to enter existing namespace (rootless)
+        // 2. direct Firecracker (privileged/bridged mode)
+        let mut cmd = if let Some(holder_pid) = self.holder_pid {
+            // Use nsenter to enter existing user+net namespace
+            info!(target: "vm", vm_id = %self.vm_id, holder_pid = holder_pid, "using nsenter for rootless networking");
+            let mut c = Command::new("nsenter");
+            c.args(["-t", &holder_pid.to_string(), "-U", "-n", "--"]);
             c.arg(firecracker_bin)
                 .arg("--api-sock")
                 .arg(&self.socket_path);
@@ -328,6 +323,24 @@ impl VmManager {
 
         // Wait for socket to be ready
         self.wait_for_socket().await?;
+
+        // In rootless mode, the socket is created by Firecracker (UID 0 inside namespace = UID 100000+ outside)
+        // We need to chmod it so the host process (UID 1000) can connect
+        if let Some(holder_pid) = self.holder_pid {
+            info!(target: "vm", vm_id = %self.vm_id, "making API socket accessible from outside namespace");
+            let chmod_output = tokio::process::Command::new("nsenter")
+                .args(["-t", &holder_pid.to_string(), "-U", "-n", "--"])
+                .arg("chmod")
+                .arg("777")
+                .arg(&self.socket_path)
+                .output()
+                .await
+                .context("running chmod via nsenter")?;
+            if !chmod_output.status.success() {
+                let stderr = String::from_utf8_lossy(&chmod_output.stderr);
+                warn!(target: "vm", vm_id = %self.vm_id, stderr = %stderr, "chmod via nsenter failed (non-fatal)");
+            }
+        }
 
         // Create API client
         self.client = Some(FirecrackerClient::new(self.socket_path.clone())?);

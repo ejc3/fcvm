@@ -22,6 +22,9 @@ pub struct VmState {
     #[serde(default)]
     pub exit_code: Option<i32>,
     pub pid: Option<u32>,
+    /// Namespace holder PID for rootless networking (used for nsenter health checks)
+    #[serde(default)]
+    pub holder_pid: Option<u32>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub last_updated: chrono::DateTime<chrono::Utc>,
     pub config: VmConfig,
@@ -93,6 +96,7 @@ impl VmState {
             health_status: HealthStatus::Unknown,
             exit_code: None,
             pid: None,
+            holder_pid: None,
             created_at: now,
             last_updated: now,
             config: VmConfig {

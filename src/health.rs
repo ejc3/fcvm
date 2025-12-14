@@ -146,7 +146,8 @@ async fn update_health_status_once(
                     let health_path = url.path();
                     let net = &state.config.network;
 
-                    // Check for rootless mode (loopback_ip set)
+                    // Rootless mode with loopback_ip (preferred - simpler, no nsenter needed)
+                    // Linux routes all of 127.0.0.0/8 to loopback without ip addr add!
                     if let Some(loopback_ip) = &net.loopback_ip {
                         let port = net.health_check_port.unwrap_or(80);
                         debug!(target: "health-monitor", loopback_ip = %loopback_ip, port = port, "HTTP health check via loopback");
@@ -250,6 +251,9 @@ pub async fn run_health_check_once(
 ///
 /// For rootless VMs, we use a unique loopback IP (127.x.y.z) with port forwarding
 /// through slirp4netns to reach the guest.
+///
+/// Linux routes all of 127.0.0.0/8 to loopback without needing `ip addr add`,
+/// so this works fully rootless!
 async fn check_http_health_loopback(
     loopback_ip: &str,
     port: u16,
