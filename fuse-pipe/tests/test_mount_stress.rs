@@ -1,11 +1,11 @@
 //! Stress test for parallel FUSE mounts.
 //!
 //! This test verifies that multiple FUSE mounts can be created and destroyed
-//! in parallel without hanging or resource leaks.
+//! in parallel without hanging or resource leaks. These tests do NOT require root.
 
 mod common;
 
-use common::{cleanup, unique_paths, FuseMount};
+use common::{cleanup, require_nonroot, unique_paths, FuseMount};
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 /// This catches resource leaks, cleanup issues, and deadlocks.
 #[test]
 fn test_parallel_mount_stress() {
+    require_nonroot();
     const NUM_THREADS: usize = 8;
     const ITERATIONS_PER_THREAD: usize = 5;
 
@@ -95,6 +96,7 @@ fn test_parallel_mount_stress() {
 /// This catches cleanup issues that only manifest under rapid cycling.
 #[test]
 fn test_rapid_mount_unmount_cycles() {
+    require_nonroot();
     const CYCLES: usize = 20;
 
     let start = Instant::now();
@@ -129,6 +131,7 @@ fn test_rapid_mount_unmount_cycles() {
 /// All mounts are created first, then operations run in parallel.
 #[test]
 fn test_concurrent_operations_on_multiple_mounts() {
+    require_nonroot();
     const NUM_MOUNTS: usize = 4;
     const OPS_PER_MOUNT: usize = 10;
 
