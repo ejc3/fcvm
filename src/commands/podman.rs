@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cli::{NetworkMode, PodmanArgs, PodmanCommands, RunArgs};
 use crate::firecracker::VmManager;
@@ -541,25 +541,88 @@ async fn run_vm_setup(
         let holder_cmd = slirp_net.build_holder_command();
         info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
 
+        // Spawn holder with piped stderr to capture errors if it fails
         let mut child = tokio::process::Command::new(&holder_cmd[0])
             .args(&holder_cmd[1..])
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()
-            .context("spawning namespace holder process")?;
+            .with_context(|| format!("failed to spawn holder: {:?}", holder_cmd))?;
 
         let holder_pid = child.id().context("getting holder process PID")?;
         info!(holder_pid = holder_pid, "namespace holder started");
 
-        // Small delay to ensure namespace setup (newuidmap/newgidmap) completes
+        // Give holder a moment to potentially fail, then check status
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Holder exited - capture stderr to see why
+                let stderr = if let Some(mut stderr_pipe) = child.stderr.take() {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = String::new();
+                    let _ = stderr_pipe.read_to_string(&mut buf).await;
+                    buf
+                } else {
+                    String::new()
+                };
+                bail!(
+                    "holder process exited immediately: status={}, stderr={}, cmd={:?}",
+                    status,
+                    stderr.trim(),
+                    holder_cmd
+                );
+            }
+            Ok(None) => {
+                debug!(holder_pid = holder_pid, "holder still running after 50ms");
+                // Holder is running - drop the stderr pipe so it doesn't block
+                drop(child.stderr.take());
+            }
+            Err(e) => {
+                warn!(holder_pid = holder_pid, error = ?e, "failed to check holder status");
+            }
+        }
+
+        // Additional delay for namespace setup (already waited 50ms above)
         // The --map-auto option invokes setuid helpers asynchronously
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Step 2: Run setup script via nsenter (creates TAPs, iptables, etc.)
         let setup_script = slirp_net.build_setup_script();
         let nsenter_prefix = slirp_net.build_nsenter_prefix(holder_pid);
 
+        // Debug: Check if holder is still alive and namespace files exist
+        let proc_dir = format!("/proc/{}", holder_pid);
+        let ns_user = format!("/proc/{}/ns/user", holder_pid);
+        let ns_net = format!("/proc/{}/ns/net", holder_pid);
+        debug!(
+            holder_pid = holder_pid,
+            proc_exists = std::path::Path::new(&proc_dir).exists(),
+            ns_user_exists = std::path::Path::new(&ns_user).exists(),
+            ns_net_exists = std::path::Path::new(&ns_net).exists(),
+            "checking holder process before nsenter"
+        );
+
+        // Check for required devices before attempting network setup
+        let tun_exists = std::path::Path::new("/dev/net/tun").exists();
+        debug!(
+            holder_pid = holder_pid,
+            tun_exists = tun_exists,
+            "checking /dev/net/tun availability"
+        );
+        if !tun_exists {
+            warn!("/dev/net/tun not available - TAP device creation will fail");
+        }
+
         info!(holder_pid = holder_pid, "running network setup via nsenter");
+
+        // Log the setup script for debugging
+        debug!(
+            holder_pid = holder_pid,
+            script = %setup_script.lines().filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#')).collect::<Vec<_>>().join("; "),
+            "network setup script"
+        );
+
         let setup_output = tokio::process::Command::new(&nsenter_prefix[0])
             .args(&nsenter_prefix[1..])
             .arg("bash")
@@ -571,9 +634,34 @@ async fn run_vm_setup(
 
         if !setup_output.status.success() {
             let stderr = String::from_utf8_lossy(&setup_output.stderr);
+            let stdout = String::from_utf8_lossy(&setup_output.stdout);
             // Kill holder before bailing
             let _ = child.kill().await;
-            bail!("network setup failed: {}", stderr);
+            // Re-check state for diagnostics
+            let holder_alive = std::path::Path::new(&proc_dir).exists();
+            let ns_user_exists = std::path::Path::new(&ns_user).exists();
+            let ns_net_exists = std::path::Path::new(&ns_net).exists();
+
+            // Log comprehensive error info at ERROR level (always visible)
+            warn!(
+                holder_pid = holder_pid,
+                holder_alive = holder_alive,
+                tun_exists = tun_exists,
+                ns_user_exists = ns_user_exists,
+                ns_net_exists = ns_net_exists,
+                stderr = %stderr.trim(),
+                stdout = %stdout.trim(),
+                "network setup failed - diagnostics"
+            );
+
+            bail!(
+                "network setup failed: {} (tun={}, holder_alive={}, ns_user={}, ns_net={})",
+                stderr.trim(),
+                tun_exists,
+                holder_alive,
+                ns_user_exists,
+                ns_net_exists
+            );
         }
 
         info!(holder_pid = holder_pid, "network setup complete");

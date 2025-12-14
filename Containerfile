@@ -62,6 +62,16 @@ RUN groupadd -f fuse \
     && useradd -m -s /bin/bash testuser \
     && usermod -aG fuse testuser
 
+# Configure subordinate UIDs/GIDs for rootless user namespaces
+# testuser (UID 1000) gets subordinate range 100000-165535 (65536 IDs)
+# This enables `unshare --user --map-auto` without root
+RUN echo "testuser:100000:65536" >> /etc/subuid \
+    && echo "testuser:100000:65536" >> /etc/subgid
+
+# Install uidmap package for newuidmap/newgidmap setuid helpers
+# These are required for --map-auto to work
+RUN apt-get update && apt-get install -y uidmap && rm -rf /var/lib/apt/lists/*
+
 # Create workspace structure matching local paths
 # Source code is mounted at runtime, not copied - ensures code is always fresh
 WORKDIR /workspace
