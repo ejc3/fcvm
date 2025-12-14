@@ -115,8 +115,21 @@ pub async fn list_namespaces() -> Result<Vec<String>> {
 mod tests {
     use super::*;
 
+    /// Skip test if not running as root (network namespace ops require root)
+    fn require_root() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping test - requires root");
+            return;
+        }
+    }
+
     #[tokio::test]
     async fn test_namespace_lifecycle() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping test_namespace_lifecycle - requires root");
+            return;
+        }
+
         let ns_name = "fcvm-test-ns";
 
         // Clean up if exists from previous test
@@ -139,6 +152,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_exec_in_namespace() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping test_exec_in_namespace - requires root");
+            return;
+        }
+
         let ns_name = "fcvm-test-exec";
 
         // Clean up if exists

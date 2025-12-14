@@ -1,0 +1,4 @@
+# Extends fcvm-test to add user_allow_other config for testing AllowOther as non-root
+FROM fcvm-test
+
+RUN echo 'user_allow_other' >> /etc/fuse.conf

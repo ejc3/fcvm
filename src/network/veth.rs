@@ -326,6 +326,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_veth_lifecycle() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping test_veth_lifecycle - requires root");
+            return;
+        }
+
         let ns_name = "fcvm-test-veth";
         let host_veth = "veth-host-test";
         let guest_veth = "veth-ns-test";
@@ -369,6 +374,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_tap_creation() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("Skipping test_tap_creation - requires root");
+            return;
+        }
+
         let ns_name = "fcvm-test-tap";
         let tap_name = "tap-test";
 
