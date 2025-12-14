@@ -112,10 +112,12 @@ impl VmManager {
         // 1. holder_pid set: use nsenter to enter existing namespace (rootless)
         // 2. direct Firecracker (privileged/bridged mode)
         let mut cmd = if let Some(holder_pid) = self.holder_pid {
-            // Use nsenter to enter existing user+net namespace
+            // Use nsenter to enter user+network namespace with preserved credentials
+            // --preserve-credentials keeps UID, GID, and supplementary groups (including kvm)
+            // This allows KVM access while being in the isolated network namespace
             info!(target: "vm", vm_id = %self.vm_id, holder_pid = holder_pid, "using nsenter for rootless networking");
             let mut c = Command::new("nsenter");
-            c.args(["-t", &holder_pid.to_string(), "-U", "-n", "--"]);
+            c.args(["-t", &holder_pid.to_string(), "-U", "-n", "--preserve-credentials", "--"]);
             c.arg(firecracker_bin)
                 .arg("--api-sock")
                 .arg(&self.socket_path);
