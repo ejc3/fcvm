@@ -3,11 +3,23 @@ SHELL := /bin/bash
 # EC2 build host configuration
 EC2_HOST := ubuntu@54.67.60.104
 EC2_KEY := ~/.ssh/fcvm-ec2
-SSH := ssh -i $(EC2_KEY) $(EC2_HOST)
-RSYNC := rsync -avz --delete --exclude 'target' --exclude '.git' -e "ssh -i $(EC2_KEY)"
 
-# Remote paths
-REMOTE_DIR := ~/fcvm
+# Detect if running on EC2 (SSH key only exists on local machine)
+ifeq ($(wildcard $(EC2_KEY)),)
+    # On EC2: run commands locally
+    ON_EC2 := 1
+    SSH := sh -c
+    RSYNC := true
+    REMOTE_DIR := ~/fcvm
+else
+    # On local: SSH to EC2
+    ON_EC2 :=
+    SSH := ssh -i $(EC2_KEY) $(EC2_HOST)
+    RSYNC := rsync -avz --delete --exclude 'target' --exclude '.git' -e "ssh -i $(EC2_KEY)"
+    REMOTE_DIR := ~/fcvm
+endif
+
+# Remote paths (same whether local or EC2)
 REMOTE_KERNEL_DIR := ~/linux-firecracker
 REMOTE_FUSE_BACKEND_RS := /home/ubuntu/fuse-backend-rs
 LOCAL_FUSE_BACKEND_RS := ../fuse-backend-rs
@@ -45,10 +57,12 @@ SUDO := sudo
         test test-noroot test-root test-unit test-fuse test-vm test-vm-rootless test-vm-bridged test-pjdfstest test-all \
         bench bench-throughput bench-operations bench-protocol \
         rootfs rebuild \
-        container-build container-test container-test-noroot container-test-root container-test-fcvm container-test-pjdfstest \
+        container-test container-test-noroot container-test-root container-test-fcvm container-test-pjdfstest \
         container-bench container-bench-throughput container-bench-operations container-bench-protocol \
-        container-shell \
+        container-shell container-clean \
         setup-btrfs setup-kernel setup-rootfs setup-all
+
+# Note: container-build is NOT in .PHONY because it depends on $(CONTAINER_MARKER) file
 
 all: build
 
@@ -78,14 +92,15 @@ help:
 	@echo "  make bench-operations - FUSE operation latency benchmarks"
 	@echo "  make bench-protocol  - Wire protocol benchmarks"
 	@echo ""
-	@echo "Container (encapsulated environment):"
+	@echo "Container (source mounted, always fresh code):"
 	@echo "  make container-test          - fuse-pipe tests (noroot + root)"
-	@echo "  make container-test-noroot   - Tests without root privilege"
-	@echo "  make container-test-root     - Tests requiring root privilege"
+	@echo "  make container-test-noroot   - Tests as non-root user"
+	@echo "  make container-test-root     - Tests as root"
 	@echo "  make container-test-fcvm     - VM tests"
 	@echo "  make container-test-pjdfstest - POSIX compliance (8789 tests)"
 	@echo "  make container-bench         - All benchmarks"
 	@echo "  make container-shell         - Interactive shell"
+	@echo "  make container-clean         - Force container rebuild"
 	@echo ""
 	@echo "Setup (idempotent):"
 	@echo "  make setup-all    - Full EC2 setup (btrfs + kernel + rootfs)"
@@ -147,14 +162,18 @@ setup-all: setup-btrfs setup-kernel setup-rootfs
 #------------------------------------------------------------------------------
 
 sync:
+ifdef ON_EC2
+	@echo "==> On EC2, skipping sync"
+else
 	@echo "==> Syncing code to EC2..."
 	@$(RSYNC) . $(EC2_HOST):$(REMOTE_DIR)/
 	@$(RSYNC) $(LOCAL_FUSE_BACKEND_RS)/ $(EC2_HOST):$(REMOTE_FUSE_BACKEND_RS)/
 	@$(RSYNC) $(LOCAL_FUSER)/ $(EC2_HOST):$(REMOTE_FUSER)/
+endif
 
 build: sync
 	@echo "==> Building on EC2..."
-	@$(SSH) "cd $(REMOTE_DIR) && source ~/.cargo/env && cargo build --release"
+	@$(SSH) "cd $(REMOTE_DIR) && . ~/.cargo/env && cargo build --release"
 
 clean:
 	cargo clean
@@ -250,8 +269,25 @@ rebuild: rootfs
 # Container testing
 #------------------------------------------------------------------------------
 
+# Container image - source is mounted at runtime, not copied
+# Rebuilds automatically when Containerfile changes (make dependency tracking)
+CONTAINER_IMAGE := fcvm-test
+
+# Marker file for container build state
+CONTAINER_MARKER := .container-built
+
+# Container run with source mounts (code always fresh, can't run stale)
+# Cargo cache goes to testuser's home so non-root builds work
+CONTAINER_RUN_BASE := sudo podman run --rm --privileged \
+	-v $(REMOTE_DIR):/workspace/fcvm \
+	-v $(REMOTE_FUSE_BACKEND_RS):/workspace/fuse-backend-rs \
+	-v $(REMOTE_FUSER):/workspace/fuser \
+	-v fcvm-cargo-target:/workspace/fcvm/target \
+	-v fcvm-cargo-home:/home/testuser/.cargo \
+	-e CARGO_HOME=/home/testuser/.cargo
+
 # Container run options for fuse-pipe tests
-CONTAINER_RUN_FUSE := sudo podman run --rm --privileged \
+CONTAINER_RUN_FUSE := $(CONTAINER_RUN_BASE) \
 	--device /dev/fuse \
 	--cap-add=MKNOD \
 	--device-cgroup-rule='b *:* rwm' \
@@ -261,30 +297,48 @@ CONTAINER_RUN_FUSE := sudo podman run --rm --privileged \
 	--pids-limit=-1
 
 # Container run options for fcvm tests (adds KVM, btrfs, netns)
-CONTAINER_RUN_FCVM := sudo podman run --rm --privileged \
+CONTAINER_RUN_FCVM := $(CONTAINER_RUN_BASE) \
 	--device /dev/kvm \
 	--device /dev/fuse \
 	-v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	-v /var/run/netns:/var/run/netns:rshared \
 	--network host
 
-container-build: sync
-	@echo "==> Building container..."
-	$(SSH) "cd $(REMOTE_DIR) && sudo podman build -t $(CONTAINER_IMAGE) -f Containerfile \
-		--build-context fuse-backend-rs=$(REMOTE_FUSE_BACKEND_RS) \
-		--build-context fuser=$(REMOTE_FUSER) ."
+# Build container only when Containerfile changes (make tracks dependency)
+$(CONTAINER_MARKER): Containerfile
+	@echo "==> Building container (Containerfile changed)..."
+	$(RSYNC) Containerfile $(EC2_HOST):$(REMOTE_DIR)/
+	$(SSH) "cd $(REMOTE_DIR) && sudo podman build -t $(CONTAINER_IMAGE) -f Containerfile ."
+	@touch $@
 
-# Container tests - organized by root requirement (container runs as root inside)
+container-build: sync $(CONTAINER_MARKER)
+
+# Container tests - organized by root requirement
+# Non-root tests run with --user testuser to verify they don't need root
+# fcvm unit tests with network ops skip themselves when not root
 container-test-noroot: container-build
-	@echo "==> Running tests (no root required)..."
-	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_UNIT)"
-	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_FUSE_NOROOT)"
-	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_FUSE_STRESS)"
+	@echo "==> Running tests as non-root user..."
+	$(SSH) "$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_IMAGE) $(TEST_UNIT)"
+	$(SSH) "$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_IMAGE) $(TEST_FUSE_NOROOT)"
+	$(SSH) "$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_IMAGE) $(TEST_FUSE_STRESS)"
 
+# Root tests run as root inside container
 container-test-root: container-build
-	@echo "==> Running tests (root required)..."
+	@echo "==> Running tests as root..."
 	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_FUSE_ROOT)"
 	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_FUSE_PERMISSION)"
+
+# Test AllowOther with user_allow_other configured (non-root with config)
+# Uses separate image with user_allow_other pre-configured
+CONTAINER_IMAGE_ALLOW_OTHER := fcvm-test-allow-other
+
+container-build-allow-other: container-build
+	@echo "==> Building allow-other container..."
+	$(SSH) "cd $(REMOTE_DIR) && sudo podman build -t $(CONTAINER_IMAGE_ALLOW_OTHER) -f Containerfile.allow-other ."
+
+container-test-allow-other: container-build-allow-other
+	@echo "==> Testing AllowOther with user_allow_other in fuse.conf..."
+	$(SSH) "$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_IMAGE_ALLOW_OTHER) cargo test --release -p fuse-pipe --test test_allow_other -- --nocapture"
 
 # All fuse-pipe tests: noroot first, then root
 container-test: container-test-noroot container-test-root
@@ -313,3 +367,9 @@ container-bench-protocol: container-build
 
 container-shell: container-build
 	$(SSH) -t "$(CONTAINER_RUN_FUSE) -it $(CONTAINER_IMAGE) bash"
+
+# Force container rebuild (removes marker file)
+container-clean:
+	rm -f $(CONTAINER_MARKER)
+	$(SSH) "sudo podman rmi $(CONTAINER_IMAGE) 2>/dev/null || true"
+	$(SSH) "sudo podman volume rm fcvm-cargo-target fcvm-cargo-home 2>/dev/null || true"

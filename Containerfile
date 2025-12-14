@@ -57,23 +57,25 @@ RUN git clone --depth 1 https://github.com/pjd/pjdfstest /tmp/pjdfstest-check \
     && ./configure \
     && make
 
+# Create non-root test user with access to fuse group
+RUN groupadd -f fuse \
+    && useradd -m -s /bin/bash testuser \
+    && usermod -aG fuse testuser
+
 # Create workspace structure matching local paths
-# fcvm is at /workspace/fcvm
-# fuse-backend-rs is at /workspace/fuse-backend-rs (../../fuse-backend-rs from fuse-pipe)
-# fuser is at /workspace/fuser (../../fuser from fuse-pipe)
+# Source code is mounted at runtime, not copied - ensures code is always fresh
 WORKDIR /workspace
 
-# Copy local dependencies first (for layer caching)
-COPY --from=fuse-backend-rs . /workspace/fuse-backend-rs
-COPY --from=fuser . /workspace/fuser
+# Create directories that will be mount points
+RUN mkdir -p /workspace/fcvm /workspace/fuse-backend-rs /workspace/fuser
 
-# Copy fcvm source
-COPY . /workspace/fcvm
+# Make workspace owned by testuser for non-root tests
+RUN chown -R testuser:testuser /workspace
 
 WORKDIR /workspace/fcvm
 
-# Build in release mode
-RUN cargo build --release --workspace
+# No entrypoint needed - non-root tests run with --user testuser,
+# root tests run as root. Volumes get correct ownership automatically.
 
 # Default command runs all fuse-pipe tests
-CMD ["sh", "-c", "cargo test --release -p fuse-pipe"]
+CMD ["cargo", "test", "--release", "-p", "fuse-pipe"]

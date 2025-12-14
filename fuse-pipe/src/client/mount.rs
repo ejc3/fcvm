@@ -258,13 +258,29 @@ fn mount_internal<P: AsRef<Path>>(
     // default_permissions: Let the kernel check basic file permissions (rwx) before
     // calling FUSE. This handles parent directory permission checking correctly and
     // reduces round-trips to the FUSE server for operations that would fail anyway.
-    let options = vec![
+    // Build mount options.
+    let mut options = vec![
         fuser::MountOption::FSName("fuse-pipe".to_string()),
-        fuser::MountOption::AllowOther,
         fuser::MountOption::Suid,
         fuser::MountOption::Dev,
         fuser::MountOption::DefaultPermissions,
     ];
+
+    // AllowOther lets other users access the mount. It's needed when:
+    // - Tests switch to different uids (pjdfstest)
+    // - Multiple users need to access the filesystem
+    // Root can always use it; non-root needs user_allow_other in /etc/fuse.conf
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let fuse_conf_allows = std::fs::read_to_string("/etc/fuse.conf")
+        .map(|s| s.lines().any(|l| l.trim() == "user_allow_other"))
+        .unwrap_or(false);
+
+    if is_root || fuse_conf_allows {
+        options.push(fuser::MountOption::AllowOther);
+        debug!(target: "fuse-pipe::client", is_root, fuse_conf_allows, "adding AllowOther mount option");
+    } else {
+        debug!(target: "fuse-pipe::client", "skipping AllowOther (not root and user_allow_other not in /etc/fuse.conf)");
+    }
     info!(target: "fuse-pipe::client", ?options, "using mount options");
 
     // For single reader, just run directly
@@ -507,13 +523,29 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
     debug!(target: "fuse-pipe::client", num_readers, "multiplexer started");
 
     // Mount options (same as Unix socket version - see comments there for details)
-    let options = vec![
+    // Build mount options.
+    let mut options = vec![
         fuser::MountOption::FSName("fuse-pipe".to_string()),
-        fuser::MountOption::AllowOther,
         fuser::MountOption::Suid,
         fuser::MountOption::Dev,
         fuser::MountOption::DefaultPermissions,
     ];
+
+    // AllowOther lets other users access the mount. It's needed when:
+    // - Tests switch to different uids (pjdfstest)
+    // - Multiple users need to access the filesystem
+    // Root can always use it; non-root needs user_allow_other in /etc/fuse.conf
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let fuse_conf_allows = std::fs::read_to_string("/etc/fuse.conf")
+        .map(|s| s.lines().any(|l| l.trim() == "user_allow_other"))
+        .unwrap_or(false);
+
+    if is_root || fuse_conf_allows {
+        options.push(fuser::MountOption::AllowOther);
+        debug!(target: "fuse-pipe::client", is_root, fuse_conf_allows, "adding AllowOther mount option");
+    } else {
+        debug!(target: "fuse-pipe::client", "skipping AllowOther (not root and user_allow_other not in /etc/fuse.conf)");
+    }
 
     // For single reader, just run directly
     if num_readers == 1 {
