@@ -701,11 +701,11 @@ async fn run_vm_setup(
         let host_ip_clean = host_ip.split('/').next().unwrap_or(host_ip);
 
         format!(
-            "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=1 ip={}::{}:255.255.255.252::eth0:off",
+            "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=1 systemd.log_color=no ip={}::{}:255.255.255.252::eth0:off",
             guest_ip_clean, host_ip_clean
         )
     } else {
-        "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=1".to_string()
+        "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=1 systemd.log_color=no".to_string()
     };
 
     client
