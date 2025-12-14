@@ -74,7 +74,11 @@ pub async fn cmd_podman(args: PodmanArgs) -> Result<()> {
 /// Messages:
 /// - "ready\n" - Container started, create ready file for health check
 /// - "exit:{code}\n" - Container exited, write exit code to file
-async fn run_status_listener(socket_path: &str, runtime_dir: &std::path::Path, vm_id: &str) -> Result<()> {
+async fn run_status_listener(
+    socket_path: &str,
+    runtime_dir: &std::path::Path,
+    vm_id: &str,
+) -> Result<()> {
     use tokio::io::AsyncReadExt;
     use tokio::net::UnixListener;
 
@@ -98,8 +102,9 @@ async fn run_status_listener(socket_path: &str, runtime_dir: &std::path::Path, v
     loop {
         let accept_result = tokio::time::timeout(
             std::time::Duration::from_secs(3600), // 1 hour timeout
-            listener.accept()
-        ).await;
+            listener.accept(),
+        )
+        .await;
 
         let (mut stream, _) = match accept_result {
             Ok(Ok(conn)) => conn,
@@ -200,7 +205,11 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Failed to export image '{}' with skopeo: {}", args.image, stderr);
+            bail!(
+                "Failed to export image '{}' with skopeo: {}",
+                args.image,
+                stderr
+            );
         }
 
         info!(dir = %image_dir.display(), "Image exported to OCI directory");
@@ -497,7 +506,8 @@ async fn run_vm_setup(
 ) -> Result<(VmManager, Option<tokio::process::Child>)> {
     // Setup storage
     let vm_dir = data_dir.join("disks");
-    let disk_manager = DiskManager::new(vm_id.to_string(), base_rootfs.to_path_buf(), vm_dir.clone());
+    let disk_manager =
+        DiskManager::new(vm_id.to_string(), base_rootfs.to_path_buf(), vm_dir.clone());
 
     let rootfs_path = disk_manager
         .create_cow_disk()

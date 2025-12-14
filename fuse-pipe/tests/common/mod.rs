@@ -252,17 +252,18 @@ impl FuseMount {
         // Start FUSE client using mount_spawn (returns handle for RAII cleanup)
         info!(target: TARGET, socket = %socket_path, mount = ?mount_path, readers = num_readers, "Starting FUSE client");
         let config = MountConfig::new().readers(num_readers);
-        let mount_handle = match fuse_pipe::mount_spawn(&socket_path, mount_path.to_path_buf(), config) {
-            Ok(handle) => {
-                info!(target: TARGET, "mount_spawn succeeded");
-                handle
-            }
-            Err(e) => {
-                // server_guard will be dropped here, cleaning up server thread
-                drop(server_guard);
-                panic!("mount_spawn failed: {}", e);
-            }
-        };
+        let mount_handle =
+            match fuse_pipe::mount_spawn(&socket_path, mount_path.to_path_buf(), config) {
+                Ok(handle) => {
+                    info!(target: TARGET, "mount_spawn succeeded");
+                    handle
+                }
+                Err(e) => {
+                    // server_guard will be dropped here, cleaning up server thread
+                    drop(server_guard);
+                    panic!("mount_spawn failed: {}", e);
+                }
+            };
 
         // Wait for mount to appear in /proc/mounts
         info!(target: TARGET, mount = ?mount_path, "Waiting for mount to appear in /proc/mounts");

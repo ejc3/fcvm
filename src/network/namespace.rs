@@ -115,14 +115,6 @@ pub async fn list_namespaces() -> Result<Vec<String>> {
 mod tests {
     use super::*;
 
-    /// Skip test if not running as root (network namespace ops require root)
-    fn require_root() {
-        if unsafe { libc::geteuid() } != 0 {
-            eprintln!("Skipping test - requires root");
-            return;
-        }
-    }
-
     #[tokio::test]
     async fn test_namespace_lifecycle() {
         if unsafe { libc::geteuid() } != 0 {

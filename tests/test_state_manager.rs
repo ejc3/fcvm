@@ -22,6 +22,7 @@ async fn test_state_persistence() {
         health_status: HealthStatus::Healthy,
         exit_code: None,
         pid: Some(12345),
+        holder_pid: None,
         created_at: now,
         last_updated: now,
         config: VmConfig {
@@ -92,6 +93,7 @@ async fn test_list_vms() {
             health_status: HealthStatus::Healthy,
             exit_code: None,
             pid: Some(10000 + i),
+            holder_pid: None,
             created_at: now,
             last_updated: now,
             config: VmConfig {

@@ -987,10 +987,8 @@ fn test_deep_directory_removal() {
         eprintln!("ERROR: Directory still exists after rm -rf!");
         // Try to list what's left
         if let Ok(entries) = fs::read_dir(&top_dir) {
-            for entry in entries.take(5) {
-                if let Ok(e) = entry {
-                    eprintln!("  Remaining: {:?}", e.path());
-                }
+            for e in entries.take(5).flatten() {
+                eprintln!("  Remaining: {:?}", e.path());
             }
         }
     }
@@ -1029,7 +1027,7 @@ fn test_path_max_directory_removal() {
     let comp_len = NAME_MAX / 2;
 
     // Generate a component of comp_len 'x' characters
-    let component: String = std::iter::repeat('x').take(comp_len).collect();
+    let component = "x".repeat(comp_len);
 
     let mut path = mount.to_path_buf();
     let mut path_len = path.to_str().unwrap().len();
@@ -1202,8 +1200,8 @@ fn test_fallocate_punch_hole() {
         libc::fallocate(
             fd,
             FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-            256 * 1024,  // offset: 256KB
-            512 * 1024,  // length: 512KB
+            256 * 1024, // offset: 256KB
+            512 * 1024, // length: 512KB
         )
     };
 
@@ -1235,7 +1233,11 @@ fn test_fallocate_punch_hole() {
     );
 
     // File size should remain 1MB
-    assert_eq!(meta_after.len(), 1024 * 1024, "file size should be unchanged");
+    assert_eq!(
+        meta_after.len(),
+        1024 * 1024,
+        "file size should be unchanged"
+    );
 
     // Blocks should have decreased
     assert!(
@@ -1296,7 +1298,10 @@ fn test_rename_updates_ctime() {
 
     // On ext4, ctime should actually increase
     if after_ns > before_ns {
-        eprintln!("rename correctly updated ctime (increased by {} ns)", after_ns - before_ns);
+        eprintln!(
+            "rename correctly updated ctime (increased by {} ns)",
+            after_ns - before_ns
+        );
     } else {
         eprintln!("WARNING: ctime unchanged after rename (some filesystems don't update it)");
     }
@@ -1324,7 +1329,7 @@ fn test_rename_overwrites_updates_mtime() {
     fs::write(&target, "target content").expect("create target");
 
     // Get directory mtime before rename
-    let dir_meta_before = fs::metadata(&mount).expect("stat dir before");
+    let dir_meta_before = fs::metadata(mount).expect("stat dir before");
     let mtime_before = dir_meta_before.mtime();
 
     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1333,7 +1338,7 @@ fn test_rename_overwrites_updates_mtime() {
     fs::rename(&source, &target).expect("rename overwrite");
 
     // Get directory mtime after rename
-    let dir_meta_after = fs::metadata(&mount).expect("stat dir after");
+    let dir_meta_after = fs::metadata(mount).expect("stat dir after");
     let mtime_after = dir_meta_after.mtime();
 
     eprintln!(
@@ -1343,7 +1348,10 @@ fn test_rename_overwrites_updates_mtime() {
 
     // Verify target has source's content
     let content = fs::read_to_string(&target).expect("read target");
-    assert_eq!(content, "source content", "target should have source's content");
+    assert_eq!(
+        content, "source content",
+        "target should have source's content"
+    );
 
     // Source should no longer exist
     assert!(!source.exists(), "source should not exist after rename");

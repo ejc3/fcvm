@@ -43,7 +43,10 @@ async fn fuse_in_vm_test_impl_inner(category: &str, jobs: usize, privileged: boo
     let test_start = Instant::now();
 
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
-    println!("║     FUSE-in-VM Test: {} ({} jobs)                    ║", category, jobs);
+    println!(
+        "║     FUSE-in-VM Test: {} ({} jobs)                    ║",
+        category, jobs
+    );
     if privileged {
         println!("║     [PRIVILEGED MODE]                                         ║");
     }
@@ -84,7 +87,14 @@ async fn fuse_in_vm_test_impl_inner(category: &str, jobs: usize, privileged: boo
     if !check_output.status.success() {
         println!("  Building pjdfstest container (sudo podman build)...");
         let build_output = tokio::process::Command::new("podman")
-            .args(["build", "-t", "pjdfstest", "-f", "Containerfile.pjdfstest", "."])
+            .args([
+                "build",
+                "-t",
+                "pjdfstest",
+                "-f",
+                "Containerfile.pjdfstest",
+                ".",
+            ])
             .output()
             .await
             .context("building pjdfstest container")?;
@@ -96,7 +106,10 @@ async fn fuse_in_vm_test_impl_inner(category: &str, jobs: usize, privileged: boo
             );
         }
     }
-    println!("  ✓ pjdfstest container ready (took {:.1}s)", step1_start.elapsed().as_secs_f64());
+    println!(
+        "  ✓ pjdfstest container ready (took {:.1}s)",
+        step1_start.elapsed().as_secs_f64()
+    );
 
     // =========================================================================
     // Step 2: Start VM with FUSE mount
@@ -120,11 +133,16 @@ async fn fuse_in_vm_test_impl_inner(category: &str, jobs: usize, privileged: boo
     // find containers in the correct user's storage
     let mut cmd = tokio::process::Command::new(fcvm_path);
     let mut args = vec![
-        "podman", "run",
-        "--name", &vm_name,
-        "--network", "rootless",
-        "--map", &map_arg,
-        "--cmd", &prove_cmd,
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "rootless",
+        "--map",
+        &map_arg,
+        "--cmd",
+        &prove_cmd,
     ];
     // Add --privileged for full test suite (needed for mknod tests)
     if privileged {
@@ -142,13 +160,19 @@ async fn fuse_in_vm_test_impl_inner(category: &str, jobs: usize, privileged: boo
 
     let mut vm_child = cmd.spawn().context("spawning VM")?;
 
-    let vm_pid = vm_child.id().ok_or_else(|| anyhow::anyhow!("failed to get VM PID"))?;
+    let vm_pid = vm_child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("failed to get VM PID"))?;
 
     // Spawn log consumers
     spawn_log_consumer(vm_child.stdout.take(), "vm");
     spawn_log_consumer_stderr(vm_child.stderr.take(), "vm");
 
-    println!("  ✓ VM started (PID: {}, took {:.1}s)", vm_pid, step2_start.elapsed().as_secs_f64());
+    println!(
+        "  ✓ VM started (PID: {}, took {:.1}s)",
+        vm_pid,
+        step2_start.elapsed().as_secs_f64()
+    );
 
     // =========================================================================
     // Step 3: Wait for VM to complete
@@ -175,7 +199,11 @@ async fn fuse_in_vm_test_impl_inner(category: &str, jobs: usize, privileged: boo
     };
 
     let test_time = step3_start.elapsed();
-    println!("  VM exited with status: {} (took {:.1}s)", exit_status, test_time.as_secs_f64());
+    println!(
+        "  VM exited with status: {} (took {:.1}s)",
+        exit_status,
+        test_time.as_secs_f64()
+    );
 
     // =========================================================================
     // Cleanup
@@ -191,15 +219,33 @@ async fn fuse_in_vm_test_impl_inner(category: &str, jobs: usize, privileged: boo
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!("║                         RESULTS                               ║");
     println!("╠═══════════════════════════════════════════════════════════════╣");
-    println!("║  Category:    {:>10}                                      ║", category);
-    println!("║  Jobs:        {:>10}                                      ║", jobs);
-    println!("║  Test time:   {:>10.1}s                                     ║", test_time.as_secs_f64());
-    println!("║  Total time:  {:>10.1}s                                     ║", total_time.as_secs_f64());
-    println!("║  Exit status: {:>10}                                      ║", exit_status.code().unwrap_or(-1));
+    println!(
+        "║  Category:    {:>10}                                      ║",
+        category
+    );
+    println!(
+        "║  Jobs:        {:>10}                                      ║",
+        jobs
+    );
+    println!(
+        "║  Test time:   {:>10.1}s                                     ║",
+        test_time.as_secs_f64()
+    );
+    println!(
+        "║  Total time:  {:>10.1}s                                     ║",
+        total_time.as_secs_f64()
+    );
+    println!(
+        "║  Exit status: {:>10}                                      ║",
+        exit_status.code().unwrap_or(-1)
+    );
     println!("╚═══════════════════════════════════════════════════════════════╝");
 
     if !exit_status.success() {
-        anyhow::bail!("pjdfstest failed with exit code: {}", exit_status.code().unwrap_or(-1));
+        anyhow::bail!(
+            "pjdfstest failed with exit code: {}",
+            exit_status.code().unwrap_or(-1)
+        );
     }
 
     println!("\n✅ FUSE-IN-VM TEST PASSED!");

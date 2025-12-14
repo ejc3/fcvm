@@ -119,7 +119,6 @@ pub async fn ensure_rootfs() -> Result<PathBuf> {
     Ok(rootfs_path)
 }
 
-
 /// Create Ubuntu rootfs from official cloud image
 ///
 /// Downloads Ubuntu 24.04 cloud image (cached), customizes it with virt-customize,

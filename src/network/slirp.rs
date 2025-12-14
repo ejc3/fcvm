@@ -440,7 +440,7 @@ impl NetworkManager for SlirpNetwork {
             host_ip: Some(self.namespace_ip.clone()),
             host_veth: None,
             loopback_ip: self.loopback_ip.clone(), // For port forwarding (no ip addr add needed!)
-            health_check_port: Some(8080), // Unprivileged port, forwards to guest:80
+            health_check_port: Some(8080),         // Unprivileged port, forwards to guest:80
         })
     }
 

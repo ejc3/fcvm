@@ -55,7 +55,8 @@ SUDO := sudo
 
 .PHONY: all help sync build clean \
         test test-noroot test-root test-unit test-fuse test-vm test-vm-rootless test-vm-bridged test-pjdfstest test-all \
-        bench bench-throughput bench-operations bench-protocol \
+        bench bench-throughput bench-operations bench-protocol bench-quick bench-logs bench-clean \
+        lint clippy fmt fmt-check \
         rootfs rebuild \
         container-test container-test-unit container-test-noroot container-test-root container-test-fuse \
         container-test-vm container-test-vm-rootless container-test-vm-bridged container-test-fcvm \
@@ -93,6 +94,15 @@ help:
 	@echo "  make bench-throughput - I/O throughput benchmarks"
 	@echo "  make bench-operations - FUSE operation latency benchmarks"
 	@echo "  make bench-protocol  - Wire protocol benchmarks"
+	@echo "  make bench-quick     - Quick benchmarks (faster iteration)"
+	@echo "  make bench-logs      - View recent benchmark logs/telemetry"
+	@echo "  make bench-clean     - Clean benchmark artifacts"
+	@echo ""
+	@echo "Linting:"
+	@echo "  make lint            - Run clippy + fmt-check"
+	@echo "  make clippy          - Run cargo clippy"
+	@echo "  make fmt             - Format code"
+	@echo "  make fmt-check       - Check formatting"
 	@echo ""
 	@echo "Container (source mounted, always fresh code):"
 	@echo "  make container-test              - fuse-pipe tests (noroot + root)"
@@ -268,6 +278,41 @@ bench-operations: build
 
 bench-protocol: build
 	$(SSH) "cd $(REMOTE_DIR) && $(BENCH_PROTOCOL)"
+
+bench-quick: build
+	@echo "==> Running quick benchmarks..."
+	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) cargo bench -p fuse-pipe --bench throughput -- --quick"
+	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) cargo bench -p fuse-pipe --bench operations -- --quick"
+
+bench-logs:
+	@echo "==> Recent benchmark logs..."
+	$(SSH) "ls -lt /tmp/fuse-bench-*.log 2>/dev/null | head -5 || echo 'No logs found'"
+	@echo ""
+	@echo "==> Latest telemetry..."
+	$(SSH) "cat \$$(ls -t /tmp/fuse-bench-telemetry-*.json 2>/dev/null | head -1) 2>/dev/null | jq . || echo 'No telemetry found'"
+
+bench-clean:
+	@echo "==> Cleaning benchmark artifacts..."
+	$(SSH) "rm -rf $(REMOTE_DIR)/target/criterion"
+	$(SSH) "rm -f /tmp/fuse-bench-*.log /tmp/fuse-bench-telemetry-*.json /tmp/fuse-stress*.sock /tmp/fuse-ops-bench-*.sock"
+
+#------------------------------------------------------------------------------
+# Linting
+#------------------------------------------------------------------------------
+
+lint: clippy fmt-check
+
+clippy: sync
+	@echo "==> Running clippy..."
+	$(SSH) "cd $(REMOTE_DIR) && . ~/.cargo/env && cargo clippy --all-targets --all-features -- -D warnings"
+
+fmt: sync
+	@echo "==> Formatting code..."
+	$(SSH) "cd $(REMOTE_DIR) && . ~/.cargo/env && cargo fmt"
+
+fmt-check: sync
+	@echo "==> Checking format..."
+	$(SSH) "cd $(REMOTE_DIR) && . ~/.cargo/env && cargo fmt -- --check"
 
 #------------------------------------------------------------------------------
 # Rootfs management

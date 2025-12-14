@@ -505,8 +505,10 @@ fn raise_resource_limits() {
     if result == 0 {
         eprintln!("[fc-agent] ✓ raised RLIMIT_NOFILE to 65536");
     } else {
-        eprintln!("[fc-agent] WARNING: failed to raise RLIMIT_NOFILE: {}",
-                  std::io::Error::last_os_error());
+        eprintln!(
+            "[fc-agent] WARNING: failed to raise RLIMIT_NOFILE: {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 
@@ -518,8 +520,10 @@ fn notify_container_exit(exit_code: i32) {
     // Create vsock socket
     let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
     if fd < 0 {
-        eprintln!("[fc-agent] WARNING: failed to create vsock socket for exit status: {}",
-                  std::io::Error::last_os_error());
+        eprintln!(
+            "[fc-agent] WARNING: failed to create vsock socket for exit status: {}",
+            std::io::Error::last_os_error()
+        );
         return;
     }
 
@@ -544,22 +548,29 @@ fn notify_container_exit(exit_code: i32) {
     if result < 0 {
         let err = std::io::Error::last_os_error();
         unsafe { libc::close(fd) };
-        eprintln!("[fc-agent] WARNING: failed to connect vsock for exit status: {}", err);
+        eprintln!(
+            "[fc-agent] WARNING: failed to connect vsock for exit status: {}",
+            err
+        );
         return;
     }
 
     // Send exit status message
     let msg = format!("exit:{}\n", exit_code);
-    let written = unsafe {
-        libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len())
-    };
+    let written = unsafe { libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len()) };
 
     unsafe { libc::close(fd) };
 
     if written == msg.len() as isize {
-        eprintln!("[fc-agent] ✓ notified host of exit code {} via vsock", exit_code);
+        eprintln!(
+            "[fc-agent] ✓ notified host of exit code {} via vsock",
+            exit_code
+        );
     } else {
-        eprintln!("[fc-agent] WARNING: vsock exit status write incomplete: {} bytes", written);
+        eprintln!(
+            "[fc-agent] WARNING: vsock exit status write incomplete: {} bytes",
+            written
+        );
     }
 }
 
@@ -572,8 +583,10 @@ fn notify_container_started() {
     // Create vsock socket
     let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
     if fd < 0 {
-        eprintln!("[fc-agent] WARNING: failed to create vsock socket for status: {}",
-                  std::io::Error::last_os_error());
+        eprintln!(
+            "[fc-agent] WARNING: failed to create vsock socket for status: {}",
+            std::io::Error::last_os_error()
+        );
         return;
     }
 
@@ -598,22 +611,26 @@ fn notify_container_started() {
     if result < 0 {
         let err = std::io::Error::last_os_error();
         unsafe { libc::close(fd) };
-        eprintln!("[fc-agent] WARNING: failed to connect vsock for status: {}", err);
+        eprintln!(
+            "[fc-agent] WARNING: failed to connect vsock for status: {}",
+            err
+        );
         return;
     }
 
     // Send "ready" message
     let msg = b"ready\n";
-    let written = unsafe {
-        libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len())
-    };
+    let written = unsafe { libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len()) };
 
     unsafe { libc::close(fd) };
 
     if written == msg.len() as isize {
         eprintln!("[fc-agent] ✓ container started, notified host via vsock");
     } else {
-        eprintln!("[fc-agent] WARNING: vsock status write incomplete: {} bytes", written);
+        eprintln!(
+            "[fc-agent] WARNING: vsock status write incomplete: {} bytes",
+            written
+        );
     }
 }
 
@@ -939,7 +956,10 @@ async fn main() -> Result<()> {
     if status.success() {
         eprintln!("[fc-agent] container exited successfully");
     } else {
-        eprintln!("[fc-agent] container exited with error: {} (code {})", status, exit_code);
+        eprintln!(
+            "[fc-agent] container exited with error: {} (code {})",
+            status, exit_code
+        );
     }
 
     // Notify host of container exit status via vsock

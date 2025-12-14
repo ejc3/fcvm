@@ -165,7 +165,9 @@ async fn update_health_status_once(
                             Err(e) => {
                                 let should_log = match last_failure_log {
                                     None => true,
-                                    Some(last_time) => last_time.elapsed() >= Duration::from_secs(1),
+                                    Some(last_time) => {
+                                        last_time.elapsed() >= Duration::from_secs(1)
+                                    }
                                 };
                                 if should_log {
                                     warn!(target: "health-monitor", error = %e, "HTTP health check failed");
@@ -195,7 +197,9 @@ async fn update_health_status_once(
                                 Err(e) => {
                                     let should_log = match last_failure_log {
                                         None => true,
-                                        Some(last_time) => last_time.elapsed() >= Duration::from_secs(1),
+                                        Some(last_time) => {
+                                            last_time.elapsed() >= Duration::from_secs(1)
+                                        }
                                     };
                                     if should_log {
                                         warn!(target: "health-monitor", error = %e, "HTTP health check failed");
