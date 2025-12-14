@@ -57,7 +57,9 @@ SUDO := sudo
         test test-noroot test-root test-unit test-fuse test-vm test-vm-rootless test-vm-bridged test-pjdfstest test-all \
         bench bench-throughput bench-operations bench-protocol \
         rootfs rebuild \
-        container-test container-test-noroot container-test-root container-test-fcvm container-test-pjdfstest \
+        container-test container-test-unit container-test-noroot container-test-root container-test-fuse \
+        container-test-vm container-test-vm-rootless container-test-vm-bridged container-test-fcvm \
+        container-test-pjdfstest container-test-all container-test-allow-other container-build-allow-other \
         container-bench container-bench-throughput container-bench-operations container-bench-protocol \
         container-shell container-clean \
         setup-btrfs setup-kernel setup-rootfs setup-all
@@ -93,14 +95,20 @@ help:
 	@echo "  make bench-protocol  - Wire protocol benchmarks"
 	@echo ""
 	@echo "Container (source mounted, always fresh code):"
-	@echo "  make container-test          - fuse-pipe tests (noroot + root)"
-	@echo "  make container-test-noroot   - Tests as non-root user"
-	@echo "  make container-test-root     - Tests as root"
-	@echo "  make container-test-fcvm     - VM tests"
-	@echo "  make container-test-pjdfstest - POSIX compliance (8789 tests)"
-	@echo "  make container-bench         - All benchmarks"
-	@echo "  make container-shell         - Interactive shell"
-	@echo "  make container-clean         - Force container rebuild"
+	@echo "  make container-test              - fuse-pipe tests (noroot + root)"
+	@echo "  make container-test-noroot       - Tests as non-root user"
+	@echo "  make container-test-root         - Tests as root"
+	@echo "  make container-test-unit         - Unit tests only (non-root)"
+	@echo "  make container-test-fuse         - All fuse-pipe tests explicitly"
+	@echo "  make container-test-vm           - VM tests (rootless + bridged)"
+	@echo "  make container-test-vm-rootless  - VM test with slirp4netns"
+	@echo "  make container-test-vm-bridged   - VM test with bridged networking"
+	@echo "  make container-test-pjdfstest    - POSIX compliance (8789 tests)"
+	@echo "  make container-test-all          - Everything: test + vm + pjdfstest"
+	@echo "  make container-test-allow-other  - Test AllowOther with fuse.conf"
+	@echo "  make container-bench             - All benchmarks"
+	@echo "  make container-shell             - Interactive shell"
+	@echo "  make container-clean             - Force container rebuild"
 	@echo ""
 	@echo "Setup (idempotent):"
 	@echo "  make setup-all    - Full EC2 setup (btrfs + kernel + rootfs)"
@@ -166,9 +174,24 @@ ifdef ON_EC2
 	@echo "==> On EC2, skipping sync"
 else
 	@echo "==> Syncing code to EC2..."
+	@# Generate unique token and write to sync-test to verify incremental builds
+	@TOKEN=$$(date +%s%N); \
+	mkdir -p sync-test && \
+	echo 'const BUILD_TOKEN: &str = "'$$TOKEN'";' > sync-test/main.rs && \
+	echo 'fn main() { println!("{}", BUILD_TOKEN); }' >> sync-test/main.rs
 	@$(RSYNC) . $(EC2_HOST):$(REMOTE_DIR)/
 	@$(RSYNC) $(LOCAL_FUSE_BACKEND_RS)/ $(EC2_HOST):$(REMOTE_FUSE_BACKEND_RS)/
 	@$(RSYNC) $(LOCAL_FUSER)/ $(EC2_HOST):$(REMOTE_FUSER)/
+	@# Verify incremental build works by building and running sync-test
+	@TOKEN=$$(grep 'const BUILD_TOKEN' sync-test/main.rs | cut -d'"' -f2); \
+	$(SSH) "cd $(REMOTE_DIR)/sync-test && ~/.cargo/bin/cargo build --release -q 2>/dev/null" && \
+	RESULT=$$($(SSH) "$(REMOTE_DIR)/sync-test/target/release/sync-test") && \
+	if [ "$$RESULT" = "$$TOKEN" ]; then \
+		echo "==> Sync verified (token: $$TOKEN)"; \
+	else \
+		echo "ERROR: Sync verification failed! Expected $$TOKEN, got $$RESULT"; \
+		exit 1; \
+	fi
 endif
 
 build: sync
@@ -316,6 +339,10 @@ container-build: sync $(CONTAINER_MARKER)
 # Container tests - organized by root requirement
 # Non-root tests run with --user testuser to verify they don't need root
 # fcvm unit tests with network ops skip themselves when not root
+container-test-unit: container-build
+	@echo "==> Running unit tests as non-root user..."
+	$(SSH) "$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_IMAGE) $(TEST_UNIT)"
+
 container-test-noroot: container-build
 	@echo "==> Running tests as non-root user..."
 	$(SSH) "$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_IMAGE) $(TEST_UNIT)"
@@ -325,6 +352,14 @@ container-test-noroot: container-build
 # Root tests run as root inside container
 container-test-root: container-build
 	@echo "==> Running tests as root..."
+	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_FUSE_ROOT)"
+	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_FUSE_PERMISSION)"
+
+# All fuse-pipe tests (explicit) - matches native test-fuse
+container-test-fuse: container-build
+	@echo "==> Running all fuse-pipe tests..."
+	$(SSH) "$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_IMAGE) $(TEST_FUSE_NOROOT)"
+	$(SSH) "$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_IMAGE) $(TEST_FUSE_STRESS)"
 	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_FUSE_ROOT)"
 	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_FUSE_PERMISSION)"
 
@@ -343,11 +378,25 @@ container-test-allow-other: container-build-allow-other
 # All fuse-pipe tests: noroot first, then root
 container-test: container-test-noroot container-test-root
 
-container-test-fcvm: container-build setup-kernel
-	$(SSH) "$(CONTAINER_RUN_FCVM) $(CONTAINER_IMAGE) $(TEST_VM)"
+# VM tests - rootless (no root on host, but container runs privileged for KVM)
+container-test-vm-rootless: container-build setup-kernel
+	$(SSH) "$(CONTAINER_RUN_FCVM) $(CONTAINER_IMAGE) $(TEST_VM_ROOTLESS)"
+
+# VM tests - bridged (requires root for iptables/netns)
+container-test-vm-bridged: container-build setup-kernel
+	$(SSH) "$(CONTAINER_RUN_FCVM) $(CONTAINER_IMAGE) $(TEST_VM_BRIDGED)"
+
+# All VM tests: rootless first, then bridged
+container-test-vm: container-test-vm-rootless container-test-vm-bridged
+
+# Legacy alias (runs both VM tests)
+container-test-fcvm: container-test-vm
 
 container-test-pjdfstest: container-build
 	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_PJDFSTEST)"
+
+# Run everything in container
+container-test-all: container-test container-test-vm container-test-pjdfstest
 
 # Container benchmarks - uses same commands as native benchmarks
 container-bench: container-build

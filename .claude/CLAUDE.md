@@ -36,6 +36,27 @@ fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
 
 Exception: For **forked libraries** (like fuse-backend-rs), we maintain compatibility with upstream to enable merging upstream changes.
 
+### Build and Test Rules
+
+**CRITICAL: ONLY use Makefile targets. NEVER run cargo commands directly.**
+
+```bash
+# Correct - always use make
+make build              # Sync and build
+make test               # Run fuse-pipe tests
+make test-vm            # Run VM tests
+make test-vm-rootless   # Run rootless VM test only
+make container-test     # Run tests in container
+make clean              # Clean build artifacts
+
+# WRONG - never do this
+ssh ubuntu@ec2 "cargo build"     # NO!
+ssh ubuntu@ec2 "cargo test"      # NO!
+ssh ubuntu@ec2 "cargo clean"     # NO!
+```
+
+Why: Consistency and reproducibility.
+
 ### Code Sync Strategy
 
 **ALWAYS use `make sync` to sync code to EC2.** Never use git pull on EC2.
