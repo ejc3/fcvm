@@ -30,7 +30,7 @@ const SLIRP_DEVICE_NAME: &str = "slirp0";
 ///
 /// Architecture (Dual-TAP):
 /// ```text
-/// Host                    | User Namespace (unshare --user --map-auto --net)
+/// Host                    | User Namespace (unshare --user --map-root-user --net)
 ///                         |
 /// slirp4netns <-----------+-- slirp0 (10.0.2.100/24) <--- IP forwarding <--- tap0
 ///   (userspace NAT)       |                                                     |
@@ -42,7 +42,7 @@ const SLIRP_DEVICE_NAME: &str = "slirp0";
 /// Solution: Use two TAP devices with IP forwarding between them.
 ///
 /// Setup sequence (3-phase with nsenter):
-/// 1. Spawn holder process: `unshare --user --map-auto --net -- cat`
+/// 1. Spawn holder process: `unshare --user --map-root-user --net -- sleep infinity`
 /// 2. Run setup via nsenter: create TAPs, iptables, IP forwarding
 /// 3. Start slirp4netns attached to holder's namespace
 /// 4. Run Firecracker via nsenter: `nsenter -t HOLDER_PID -U -n -- firecracker ...`
@@ -138,24 +138,16 @@ impl SlirpNetwork {
     /// The holder runs `sleep infinity` which blocks forever until killed.
     /// Note: We use sleep instead of cat because cat requires stdin management.
     ///
-    /// UID detection for container compatibility:
-    /// - UID 0 (root or inside container): use --map-root-user (simple 1:1 mapping)
-    /// - UID != 0 (unprivileged user): use --map-auto (needs subordinate UIDs from /etc/subuid)
+    /// Uses --map-root-user for simple 1:1 UID mapping (current user → UID 0 inside namespace).
+    /// This works for both root and unprivileged users.
     ///
-    /// This allows fcvm to work both natively and inside containers.
+    /// Note: --map-auto was considered but it maps to subordinate UIDs (100000+) which doesn't
+    /// include the current user's UID, causing permission issues with KVM and file access.
     pub fn build_holder_command(&self) -> Vec<String> {
-        // Detect if we're running as root (either real root or inside a container)
-        let uid = unsafe { libc::getuid() };
-        let map_flag = if uid == 0 {
-            "--map-root-user" // Simple 1:1 mapping, works in containers
-        } else {
-            "--map-auto" // Uses /etc/subuid, works for unprivileged users
-        };
-
         vec![
             "unshare".to_string(),
             "--user".to_string(),
-            map_flag.to_string(),
+            "--map-root-user".to_string(),
             "--net".to_string(),
             "--".to_string(),
             "sleep".to_string(),
@@ -208,8 +200,9 @@ iptables -t nat -A PREROUTING -d 10.0.2.100 -j DNAT --to-destination {guest_ip} 
 
     /// Build the nsenter prefix command for running processes in the namespace
     ///
-    /// Returns: ["nsenter", "-t", "PID", "-U", "-n", "--"]
-    /// Append firecracker command and args after this.
+    /// Returns: ["nsenter", "-t", "PID", "-U", "-n", "--preserve-credentials", "--"]
+    /// The --preserve-credentials flag keeps UID/GID/groups (including kvm) for KVM access.
+    /// Append command and args after this.
     pub fn build_nsenter_prefix(&self, holder_pid: u32) -> Vec<String> {
         vec![
             "nsenter".to_string(),
@@ -217,13 +210,14 @@ iptables -t nat -A PREROUTING -d 10.0.2.100 -j DNAT --to-destination {guest_ip} 
             holder_pid.to_string(),
             "-U".to_string(),
             "-n".to_string(),
+            "--preserve-credentials".to_string(),
             "--".to_string(),
         ]
     }
 
     /// Get a human-readable representation of the rootless networking flow
     pub fn rootless_flow_string(&self) -> String {
-        "holder(unshare --map-auto) + nsenter for setup/firecracker".to_string()
+        "holder(unshare --map-root-user) + nsenter for setup/firecracker".to_string()
     }
 
     /// Start slirp4netns process attached to the namespace
