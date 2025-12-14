@@ -59,7 +59,10 @@ fn test_allow_other_with_fuse_conf() {
             );
         }
         Err(e) => {
-            eprintln!("Could not verify cross-user access (sudo not available): {}", e);
+            eprintln!(
+                "Could not verify cross-user access (sudo not available): {}",
+                e
+            );
         }
     }
 

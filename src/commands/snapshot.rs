@@ -797,8 +797,11 @@ async fn run_clone_setup(
 ) -> Result<(VmManager, Option<tokio::process::Child>)> {
     // Setup storage - Create CoW disk from snapshot disk
     let vm_dir = data_dir.join("disks");
-    let disk_manager =
-        DiskManager::new(vm_id.to_string(), snapshot_config.disk_path.clone(), vm_dir.clone());
+    let disk_manager = DiskManager::new(
+        vm_id.to_string(),
+        snapshot_config.disk_path.clone(),
+        vm_dir.clone(),
+    );
 
     let rootfs_path = disk_manager
         .create_cow_disk()

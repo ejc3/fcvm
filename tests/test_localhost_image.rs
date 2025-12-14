@@ -96,7 +96,10 @@ async fn test_localhost_hello_world() -> Result<()> {
             println!("  Error waiting for process: {}", e);
         }
         Err(_) => {
-            println!("  Timeout waiting for VM ({}s), killing...", timeout.as_secs());
+            println!(
+                "  Timeout waiting for VM ({}s), killing...",
+                timeout.as_secs()
+            );
             common::kill_process(fcvm_pid).await;
         }
     }

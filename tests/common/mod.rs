@@ -1,4 +1,5 @@
 // Common test utilities for fcvm integration tests
+#![allow(dead_code)]
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -58,7 +59,7 @@ impl VmFixture {
 
         // Wait for VM to become healthy
         if let Err(e) = poll_health_by_pid(pid, 120).await {
-            let _ = child.kill();
+            let _ = child.kill().await;
             anyhow::bail!("VM failed to become healthy: {}", e);
         }
 
@@ -89,9 +90,10 @@ impl VmFixture {
 
 impl Drop for VmFixture {
     fn drop(&mut self) {
-        // Kill the VM process
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Kill the VM process (start_kill is synchronous)
+        let _ = self.child.start_kill();
+        // try_wait is synchronous - check for exit without blocking
+        let _ = self.child.try_wait();
 
         // Cleanup directories
         if let Some(parent) = self.host_dir.parent() {

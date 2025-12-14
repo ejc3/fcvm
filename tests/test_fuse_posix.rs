@@ -27,7 +27,7 @@ mod common;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const PJDFSTEST_BIN: &str = "/tmp/pjdfstest-check/pjdfstest";
 const PJDFSTEST_TESTS: &str = "/tmp/pjdfstest-check/tests";

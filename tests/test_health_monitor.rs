@@ -48,6 +48,7 @@ async fn test_health_monitor_behaviors() {
         health_status: HealthStatus::Unknown,
         exit_code: None,
         pid: Some(99999), // Non-existent PID
+        holder_pid: None,
         created_at: now,
         last_updated: now,
         config: VmConfig {
