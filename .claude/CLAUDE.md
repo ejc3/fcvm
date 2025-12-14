@@ -12,6 +12,7 @@ fcvm is a Firecracker VM manager for running Podman containers in lightweight mi
 - **SSH**: `ssh -i ~/.ssh/fcvm-ec2 ubuntu@54.67.60.104`
 - **Firecracker**: v1.10.0
 - **WARNING**: Do NOT use c5.large instances - no /dev/kvm support
+- **NOTE**: ICMP (ping) is blocked by security group. To check if instance is up, use SSH with short timeout: `ssh -o ConnectTimeout=5 -i ~/.ssh/fcvm-ec2 ubuntu@54.67.60.104 "echo ok"`
 
 ### Common Commands
 ```bash
@@ -28,6 +29,34 @@ sudo fcvm podman run --name my-vm --network bridged nginx:alpine
 fcvm snapshot create --pid <vm_pid> --tag my-snapshot
 fcvm snapshot serve my-snapshot      # Start UFFD server (prints serve PID)
 fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
+```
+
+### Manual E2E Testing with Claude Code
+
+**CRITICAL: VM commands BLOCK the terminal.** When manually testing VMs via SSH, you MUST use Claude's `run_in_background: true` feature.
+
+```bash
+# WRONG - This blocks forever, wastes context, and times out
+ssh -i ~/.ssh/fcvm-ec2 ubuntu@54.67.60.104 "sudo fcvm podman run --name test nginx:alpine"
+
+# CORRECT - Run VM in background, then use exec to test
+ssh -i ~/.ssh/fcvm-ec2 ubuntu@54.67.60.104 "cd ~/fcvm && sudo ./target/release/fcvm podman run --name test --network bridged nginx:alpine 2>&1 | tee /tmp/vm.log" &
+# Use run_in_background: true in Bash tool call
+# Then sleep and check logs:
+sleep 30
+ssh -i ~/.ssh/fcvm-ec2 ubuntu@54.67.60.104 "grep healthy /tmp/vm.log"
+# Get PID from state and use exec:
+ssh -i ~/.ssh/fcvm-ec2 ubuntu@54.67.60.104 "sudo ls -t /mnt/fcvm-btrfs/state/*.json | head -1 | xargs sudo cat | jq -r '.pid'"
+ssh -i ~/.ssh/fcvm-ec2 ubuntu@54.67.60.104 "sudo ./target/release/fcvm exec --pid <PID> -- curl -s ifconfig.me"
+```
+
+**Testing egress connectivity:**
+```bash
+# VM-level egress (runs in guest OS)
+fcvm exec --pid <PID> -- curl -s --max-time 10 ifconfig.me
+
+# Container-level egress (runs inside the container)
+fcvm exec --pid <PID> -c -- wget -q -O - --timeout=10 http://ifconfig.me
 ```
 
 ### Code Philosophy
@@ -206,30 +235,47 @@ poll_health_by_pid(clone_proc.id()).await?;
 ### Project Structure
 ```
 src/
-├── types.rs          # Core shared types (Mode, MapMode)
 ├── lib.rs            # Module exports (public API)
 ├── main.rs           # CLI dispatcher
+├── paths.rs          # Path utilities for btrfs layout
+├── health.rs         # Health monitoring
 ├── cli/              # Command-line parsing
-│   ├── args.rs       # Clap structures
-│   └── types.rs      # Type conversions
+│   └── args.rs       # Clap structures
 ├── commands/         # Command implementations
 ├── state/            # VM state management
-│   ├── types.rs      # VmState, VmStatus, VmConfig
-│   ├── manager.rs    # StateManager (CRUD)
-│   └── utils.rs      # generate_vm_id()
 ├── firecracker/      # Firecracker API client
-├── network/          # Networking layer
-│   ├── slirp.rs      # SlirpNetwork (rootless)
-│   └── bridged.rs    # BridgedNetwork
+├── network/          # Networking layer (bridged + slirp)
 ├── storage/          # Disk/snapshot management
-├── health.rs         # Health monitoring
 ├── uffd/             # UFFD memory sharing
+├── volume/           # FUSE volume handling
 └── setup/            # Setup subcommands
 
 tests/
-├── common/mod.rs     # Shared test utilities
-├── test_sanity.rs    # End-to-end sanity tests
-└── test_state_manager.rs
+├── common/mod.rs           # Shared test utilities (VmFixture, poll_health_by_pid)
+├── test_sanity.rs          # End-to-end VM sanity tests (rootless + bridged)
+├── test_state_manager.rs   # State manager unit tests
+├── test_health_monitor.rs  # Health monitoring tests
+├── test_fuse_posix.rs      # FUSE POSIX compliance in VM
+├── test_fuse_in_vm.rs      # FUSE integration in VM
+├── test_localhost_image.rs # Local image tests
+└── test_snapshot_clone.rs  # Snapshot/clone workflow tests
+
+fuse-pipe/tests/
+├── integration.rs              # Basic FUSE operations (no root)
+├── integration_root.rs         # FUSE operations requiring root
+├── test_permission_edge_cases.rs # Permission/setattr edge cases
+├── test_mount_stress.rs        # Mount/unmount stress tests
+├── test_allow_other.rs         # AllowOther flag tests
+├── test_unmount_race.rs        # Unmount race condition tests
+├── pjdfstest_full.rs           # Full POSIX compliance (8789 tests)
+├── pjdfstest_fast.rs           # Fast POSIX subset
+├── pjdfstest_stress.rs         # Parallel POSIX stress
+└── pjdfstest_common.rs         # Shared pjdfstest utilities
+
+fuse-pipe/benches/
+├── throughput.rs    # I/O throughput benchmarks
+├── operations.rs    # FUSE operation latency benchmarks
+└── protocol.rs      # Wire protocol benchmarks
 ```
 
 ### Design Principles
@@ -337,7 +383,7 @@ pub fn vm_runtime_dir(vm_id: &str) -> PathBuf {
 }
 ```
 
-**Setup**: Automatic via `make test-sanity` or `make container-test-fcvm-sanity` (idempotent btrfs loopback + kernel copy).
+**Setup**: Automatic via `make test-vm` or `make container-test-vm` (idempotent btrfs loopback + kernel copy).
 
 **⚠️ CRITICAL: Changing VM base image (fc-agent, rootfs)**
 
@@ -349,10 +395,19 @@ NEVER manually edit `/mnt/fcvm-btrfs/rootfs/base.ext4` or mount it directly. The
 
 ### Memory Sharing (UFFD)
 
-**Two-command workflow:**
+**Workflow:**
 ```bash
-fcvm memory-server nginx-base    # Start server, creates /tmp/fcvm/uffd-nginx-base.sock
-fcvm clone --snapshot nginx-base --name web1  # Connects to server
+# 1. Start baseline VM
+fcvm podman run --name baseline --network bridged nginx:alpine
+
+# 2. Create snapshot from running VM
+fcvm snapshot create --pid <baseline_pid> --tag my-snapshot
+
+# 3. Start memory server (serves pages via UFFD)
+fcvm snapshot serve my-snapshot    # Creates /mnt/fcvm-btrfs/uffd-my-snapshot-<pid>.sock
+
+# 4. Spawn clones from the memory server
+fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
 ```
 
 **How it works:**
@@ -407,11 +462,39 @@ Run `make help` for full list. Key targets:
 #### Testing
 | Target | Description |
 |--------|-------------|
-| `make test` | Run all tests (native on EC2) |
-| `make test-sanity` | Run VM sanity test (native on EC2) |
+| `make test` | Run fuse-pipe tests: noroot + root |
+| `make test-noroot` | Tests without root: unit + integration + stress |
+| `make test-root` | Tests requiring root: integration_root + permission |
+| `make test-unit` | Unit tests only |
+| `make test-fuse` | All fuse-pipe tests explicitly |
+| `make test-vm` | Run VM tests: rootless + bridged |
+| `make test-vm-rootless` | VM test with slirp4netns (no root) |
+| `make test-vm-bridged` | VM test with bridged networking |
+| `make test-pjdfstest` | POSIX compliance (8789 tests) |
+| `make test-all` | Everything: test + test-vm + test-pjdfstest |
 | `make container-test` | Run fuse-pipe tests (in container) |
-| `make container-test-fcvm` | Run fcvm VM tests (in container) |
+| `make container-test-vm` | Run VM tests (in container) |
+| `make container-test-pjdfstest` | POSIX compliance in container |
 | `make container-shell` | Interactive shell in container |
+
+#### Linting
+| Target | Description |
+|--------|-------------|
+| `make lint` | Run clippy + fmt-check |
+| `make clippy` | Run cargo clippy |
+| `make fmt` | Format code |
+| `make fmt-check` | Check formatting |
+
+#### Benchmarks
+| Target | Description |
+|--------|-------------|
+| `make bench` | All benchmarks (throughput + operations + protocol) |
+| `make bench-throughput` | I/O throughput benchmarks |
+| `make bench-operations` | FUSE operation latency benchmarks |
+| `make bench-protocol` | Wire protocol benchmarks |
+| `make bench-quick` | Quick benchmarks (faster iteration) |
+| `make bench-logs` | View recent benchmark logs/telemetry |
+| `make bench-clean` | Clean benchmark artifacts |
 
 #### Setup (idempotent, run automatically by tests)
 | Target | Description |
@@ -502,14 +585,15 @@ ip addr add 172.16.29.1/24 dev tap-vm-c93e8   # Guest is 172.16.29.2
 
 ## fuse-pipe Testing
 
-**Full documentation**: See `fuse-pipe/TESTING.md` for complete testing guide.
+**Quick reference**: See `README.md` for testing guide and Makefile targets.
 
 ### Quick Reference (Container - Recommended)
 
 | Command | Description |
 |---------|-------------|
 | `make container-test` | Run all fuse-pipe tests |
-| `make container-test-fcvm` | Run fcvm VM sanity tests |
+| `make container-test-vm` | Run fcvm VM tests (rootless + bridged) |
+| `make container-test-pjdfstest` | POSIX compliance (8789 tests) |
 | `make container-shell` | Interactive shell for debugging |
 
 ### Quick Reference (Native EC2)
@@ -542,5 +626,6 @@ RUST_LOG="passthrough=debug" sudo -E cargo test --release -p fuse-pipe --test in
 ```
 
 ## References
-- Design doc: `/Users/ejcampbell/src/fcvm/DESIGN.md`
+- Main documentation: `README.md`
+- Design specification: `DESIGN.md`
 - Firecracker docs: https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md

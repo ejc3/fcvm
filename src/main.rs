@@ -69,6 +69,7 @@ async fn main() -> Result<()> {
         Commands::Podman(args) => commands::cmd_podman(args).await,
         Commands::Snapshot(args) => commands::cmd_snapshot(args).await,
         Commands::Snapshots => commands::cmd_snapshots().await,
+        Commands::Exec(args) => commands::cmd_exec(args).await,
     };
 
     // Handle errors

@@ -29,6 +29,8 @@ pub enum Commands {
     Snapshot(SnapshotArgs),
     /// List available snapshots
     Snapshots,
+    /// Execute a command in a running VM
+    Exec(ExecArgs),
 }
 
 // ============================================================================
@@ -190,4 +192,35 @@ pub struct LsArgs {
     /// Filter by fcvm process PID
     #[arg(long)]
     pub pid: Option<u32>,
+}
+
+// ============================================================================
+// Exec Command
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct ExecArgs {
+    /// VM name to exec into (mutually exclusive with --pid)
+    #[arg(conflicts_with = "pid")]
+    pub name: Option<String>,
+
+    /// VM PID to exec into (mutually exclusive with name)
+    #[arg(long, conflicts_with = "name")]
+    pub pid: Option<u32>,
+
+    /// Execute in the VM instead of inside the container
+    #[arg(long)]
+    pub vm: bool,
+
+    /// Keep STDIN open even if not attached
+    #[arg(short, long)]
+    pub interactive: bool,
+
+    /// Allocate a pseudo-TTY
+    #[arg(short, long)]
+    pub tty: bool,
+
+    /// Command and arguments to execute
+    #[arg(last = true, required = true)]
+    pub command: Vec<String>,
 }

@@ -183,12 +183,27 @@ pub async fn poll_health_by_pid(pid: u32, timeout_secs: u64) -> anyhow::Result<(
     }
 }
 
-/// Execute a command in the guest VM via SSH/exec
+/// Execute a command in the guest VM via exec (--vm flag for VM-level, default is container)
 pub async fn exec_in_vm(pid: u32, cmd: &[&str]) -> anyhow::Result<String> {
     let fcvm_path = find_fcvm_binary()?;
+    let script = cmd.join(" ");
 
-    // For now, we'll use a simple approach - write a script and execute it
-    // TODO: Implement proper exec via fcvm when available
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args(["exec", "--pid", &pid.to_string(), "--vm", "--", "sh", "-c", &script])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("exec failed: {}", stderr);
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Execute a command in the container via exec (default behavior)
+pub async fn exec_in_container(pid: u32, cmd: &[&str]) -> anyhow::Result<String> {
+    let fcvm_path = find_fcvm_binary()?;
     let script = cmd.join(" ");
 
     let output = tokio::process::Command::new(&fcvm_path)

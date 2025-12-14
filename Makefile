@@ -16,6 +16,7 @@ else
     ON_EC2 :=
     SSH := ssh -i $(EC2_KEY) $(EC2_HOST)
     RSYNC := rsync -avz --delete --exclude 'target' --exclude '.git' -e "ssh -i $(EC2_KEY)"
+    RSYNC_WITH_GIT := rsync -avz --delete --exclude 'target' -e "ssh -i $(EC2_KEY)"
     REMOTE_DIR := ~/fcvm
 endif
 
@@ -53,7 +54,7 @@ BENCH_PROTOCOL := cargo bench -p fuse-pipe --bench protocol
 # Native needs sudo for FUSE tests (container already runs as root)
 SUDO := sudo
 
-.PHONY: all help sync build clean \
+.PHONY: all help sync sync-git build clean \
         test test-noroot test-root test-unit test-fuse test-vm test-vm-rootless test-vm-bridged test-pjdfstest test-all \
         bench bench-throughput bench-operations bench-protocol bench-quick bench-logs bench-clean \
         lint clippy fmt fmt-check \
@@ -202,6 +203,18 @@ else
 		echo "ERROR: Sync verification failed! Expected $$TOKEN, got $$RESULT"; \
 		exit 1; \
 	fi
+endif
+
+# Sync including .git directory (for using git on EC2)
+sync-git:
+ifdef ON_EC2
+	@echo "==> On EC2, skipping sync"
+else
+	@echo "==> Syncing code + .git to EC2..."
+	@$(RSYNC_WITH_GIT) . $(EC2_HOST):$(REMOTE_DIR)/
+	@$(RSYNC_WITH_GIT) $(LOCAL_FUSE_BACKEND_RS)/ $(EC2_HOST):$(REMOTE_FUSE_BACKEND_RS)/
+	@$(RSYNC_WITH_GIT) $(LOCAL_FUSER)/ $(EC2_HOST):$(REMOTE_FUSER)/
+	@echo "==> Git sync complete"
 endif
 
 build: sync

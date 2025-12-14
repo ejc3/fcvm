@@ -32,18 +32,20 @@
 
 ### Functional Requirements
 
-1. **`fcvm run` Command**
+1. **`fcvm podman run` Command**
    - Takes a Docker/Podman container image
    - Spins up a Firecracker VM running the container
-   - Supports volume mounts (host → guest)
+   - Supports volume mounts via FUSE passthrough (host → guest)
    - Supports port forwarding (host → guest)
    - Process blocks until VM exits (hanging/foreground mode)
    - VM dies when process is killed (lifetime binding)
 
-2. **`fcvm clone` Command**
-   - Clones from a saved snapshot
-   - Lightning-fast startup (<1 second)
-   - Shares as much state as possible (kernel, base rootfs, page tables)
+2. **`fcvm snapshot` Commands**
+   - `fcvm snapshot create`: Create snapshot from running VM
+   - `fcvm snapshot serve`: Start UFFD memory server for cloning
+   - `fcvm snapshot run`: Spawn clone from memory server
+   - Lightning-fast clone startup (<1 second)
+   - Shares memory via UFFD page fault handler
    - Creates independent VM with its own networking
 
 3. **Networking Modes**
@@ -210,7 +212,7 @@ impl VmManager {
 
 Two implementations based on execution mode.
 
-#### Rootless Networking (`rootless.rs`)
+#### Rootless Networking (`slirp.rs`)
 
 Uses `slirp4netns` for userspace networking.
 
@@ -236,7 +238,7 @@ async fn setup() -> Result<NetworkConfig> {
 }
 ```
 
-#### Privileged Networking (`privileged.rs`)
+#### Privileged Networking (`bridged.rs`)
 
 Uses Linux bridge + nftables for native performance.
 
@@ -304,30 +306,25 @@ impl PortMapping {
 Each VM has:
 1. **Kernel**: Shared across all VMs (read-only)
 2. **Base rootfs**: Shared base image with Podman + fc-agent
-3. **CoW overlay**: Per-VM writable layer (using overlay
-
-fs or qcow2)
+3. **CoW overlay**: Per-VM writable layer (using btrfs reflinks)
 4. **Volume mounts**: Optional host directory mounts
 
 ```
-/var/lib/fcvm/
+/mnt/fcvm-btrfs/               # btrfs filesystem (CoW reflinks work here)
 ├── kernels/
-│   └── vmlinux.bin              # Shared kernel
+│   └── vmlinux.bin            # Shared kernel
 ├── rootfs/
-│   └── base.ext4                # Base rootfs image
-├── vms/
-│   ├── vm-abc123/
-│   │   ├── rootfs.ext4          # CoW disk for this VM
-│   │   ├── snapshot.vmstate     # VM memory snapshot
-│   │   ├── snapshot.disk        # Disk snapshot
-│   │   └── config.json          # VM configuration
-│   └── vm-def456/
-│       └── ...
-└── snapshots/
-    └── warm-nginx/
-        ├── memory.snap
-        ├── disk.snap
-        └── config.json
+│   └── base.ext4              # Base rootfs image (~1GB Ubuntu + Podman)
+├── vm-disks/
+│   └── vm-{id}/
+│       └── rootfs.ext4        # CoW reflink copy per VM
+├── snapshots/
+│   └── {snapshot-name}/
+│       ├── vmstate.snap       # VM memory snapshot
+│       ├── disk.snap          # Disk snapshot
+│       └── config.json        # VM configuration
+├── state/                     # VM state JSON files
+└── cache/                     # Downloaded cloud images
 ```
 
 ### Copy-on-Write (CoW) Strategy
@@ -473,7 +470,7 @@ nft add rule ip nat POSTROUTING oifname "eth0" masquerade
 
 ## VM Lifecycle
 
-### `fcvm run` Flow
+### `fcvm podman run` Flow
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -562,57 +559,89 @@ nft add rule ip nat POSTROUTING oifname "eth0" masquerade
 └─────────────────────────────────────────────────────────┘
 ```
 
-### `fcvm clone` Flow
+### `fcvm snapshot` Flow (Create → Serve → Run)
 
+**Step 1: Create Snapshot** (`fcvm snapshot create`)
 ```
 ┌─────────────────────────────────────────────────────────┐
-│ 1. Load snapshot metadata                               │
-│    - Read snapshot config                               │
-│    - Locate memory.snap and disk.snap                   │
+│ 1. Pause the running VM                                  │
+│    - Firecracker API: pause                             │
 └────────────────┬────────────────────────────────────────┘
                  ▼
 ┌─────────────────────────────────────────────────────────┐
-│ 2. Create CoW overlay disk                              │
-│    - Clone from snapshot disk state                     │
-│    - Create writable layer                              │
+│ 2. Create Firecracker snapshot                          │
+│    - Snapshot memory to file                            │
+│    - Snapshot disk state                                │
+│    - Save VM configuration                              │
 └────────────────┬────────────────────────────────────────┘
                  ▼
 ┌─────────────────────────────────────────────────────────┐
-│ 3. Setup new networking                                  │
+│ 3. Resume the original VM                               │
+│    - VM continues running                               │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Step 2: Start Memory Server** (`fcvm snapshot serve`)
+```
+┌─────────────────────────────────────────────────────────┐
+│ 1. Load snapshot memory file (mmap, MAP_SHARED)         │
+│    - Kernel shares physical pages via page cache        │
+└────────────────┬────────────────────────────────────────┘
+                 ▼
+┌─────────────────────────────────────────────────────────┐
+│ 2. Create Unix socket for clone connections             │
+│    - /mnt/fcvm-btrfs/uffd-{snapshot}-{pid}.sock         │
+└────────────────┬────────────────────────────────────────┘
+                 ▼
+┌─────────────────────────────────────────────────────────┐
+│ 3. Register state in state manager                      │
+│    - process_type: "serve"                              │
+│    - snapshot_name                                      │
+└────────────────┬────────────────────────────────────────┘
+                 ▼
+┌─────────────────────────────────────────────────────────┐
+│ 4. Wait for clone connections (async)                   │
+│    - Handle UFFD page faults from clones                │
+│    - Serve memory pages on-demand                       │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Step 3: Spawn Clone** (`fcvm snapshot run`)
+```
+┌─────────────────────────────────────────────────────────┐
+│ 1. Create CoW overlay disk (btrfs reflink)              │
+│    - cp --reflink=always (~1.5ms)                       │
+└────────────────┬────────────────────────────────────────┘
+                 ▼
+┌─────────────────────────────────────────────────────────┐
+│ 2. Setup new networking                                  │
 │    - Generate new MAC address                           │
-│    - Create new TAP device                              │
-│    - Setup port forwarding with offset or new ports     │
+│    - Create TAP device (bridged) or slirp (rootless)    │
+│    - Allocate loopback IP for health checks             │
 └────────────────┬────────────────────────────────────────┘
                  ▼
 ┌─────────────────────────────────────────────────────────┐
-│ 4. Start Firecracker                                     │
-│    - Spawn process with new socket                      │
+│ 3. Start Firecracker with UFFD backend                  │
+│    - Connect to memory server's Unix socket             │
+│    - Firecracker fetches pages via UFFD on access       │
 └────────────────┬────────────────────────────────────────┘
                  ▼
 ┌─────────────────────────────────────────────────────────┐
-│ 5. Load snapshot via API                                │
-│    - load_snapshot(memory.snap, disk.snap)              │
+│ 4. Load snapshot via Firecracker API                    │
 │    - enable_diff_snapshots = true                       │
 │    - resume_vm = true                                   │
 └────────────────┬────────────────────────────────────────┘
                  ▼
 ┌─────────────────────────────────────────────────────────┐
-│ 6. Patch identity in guest                              │
-│    - Update MAC address                                 │
-│    - Update hostname                                    │
-│    - Update MMDS with new config                        │
-└────────────────┬────────────────────────────────────────┘
-                 ▼
-┌─────────────────────────────────────────────────────────┐
-│ 7. Resume VM (< 1 second startup)                       │
-│    - VM resumes from saved state                        │
-│    - Shared memory pages with base snapshot             │
+│ 5. VM resumes (< 1 second total startup)                │
+│    - Memory pages loaded on-demand                      │
+│    - Shared pages via kernel page cache                 │
 └─────────────────────────────────────────────────────────┘
 ```
 
 ### Signal Handling (Process Lifetime Binding)
 
-**Goal**: VM dies when `fcvm run` process exits.
+**Goal**: VM dies when `fcvm podman run` process exits.
 
 **Implementation** (using `tokio::signal`):
 ```rust
@@ -814,174 +843,177 @@ The guest is configured to support rootless Podman:
 
 ### Commands
 
-#### `fcvm run`
+#### `fcvm podman run`
 
 **Purpose**: Launch a container in a new Firecracker VM.
 
 **Usage**:
 ```bash
-fcvm run [OPTIONS] <IMAGE>
+fcvm podman run --name <NAME> [OPTIONS] <IMAGE>
 ```
 
 **Arguments**:
-- `IMAGE` - Container image (e.g., `nginx:latest`, `ghcr.io/org/app:v1.0`)
+- `IMAGE` - Container image (e.g., `nginx:alpine`, `ghcr.io/org/app:v1.0`)
 
 **Options**:
 ```
---name <NAME>              VM name (default: random)
+--name <NAME>              VM name (required)
 --cpu <COUNT>              vCPU count (default: 2)
 --mem <MB>                 Memory in MiB (default: 2048)
---mode <MODE>              Execution mode: auto|rootless|privileged (default: auto)
---map <HOST:GUEST[:ro]>    Volume mount (can specify multiple)
---map-mode <MODE>          Mount mode: block|sshfs|nfs (default: block)
+--network <MODE>           Network mode: bridged|rootless (default: bridged)
+--map <HOST:GUEST[:ro]>    Volume mount via FUSE (can specify multiple)
 --env <KEY=VALUE>          Environment variable (can specify multiple)
 --cmd <COMMAND>            Container command override
 --publish <MAPPING>        Port publish (can specify multiple)
---save-snapshot <NAME>     Save snapshot after ready
---wait-ready <SPEC>        Readiness gate (mode=vsock|http|log|exec)
---logs <MODE>              Log mode: stream|file|both (default: stream)
---balloon <MB>             Memory balloon target (default: same as --mem)
+--balloon <MB>             Memory balloon target
+--health-check <URL>       HTTP health check URL
+--privileged               Run container in privileged mode
 ```
 
 **Examples**:
 ```bash
-# Simple nginx
-fcvm run nginx:latest
+# Simple nginx (bridged networking, requires sudo)
+sudo fcvm podman run --name my-nginx nginx:alpine
+
+# Rootless mode (no sudo required)
+fcvm podman run --name my-nginx --network rootless nginx:alpine
 
 # With port forwarding
-fcvm run --publish 8080:80 nginx:latest
+sudo fcvm podman run --name web --publish 8080:80 nginx:alpine
 
 # With volumes and environment
-fcvm run \
+sudo fcvm podman run \
+  --name db \
   --map /host/data:/data \
   --env DB_HOST=localhost \
-  --env DB_PORT=5432 \
   postgres:15
 
-# Save warm snapshot
-fcvm run \
-  --wait-ready mode=http,url=http://127.0.0.1:80/health \
-  --save-snapshot warm-nginx \
-  nginx:latest
+# With health check
+sudo fcvm podman run \
+  --name web \
+  --health-check http://localhost/health \
+  nginx:alpine
 
-# Multiple ports (TCP + UDP)
-fcvm run \
-  --publish 8080:80/tcp \
-  --publish 127.0.0.1:53:53/udp \
-  dnsmasq:latest
-
-# High CPU/memory
-fcvm run \
+# High CPU/memory with balloon
+sudo fcvm podman run \
+  --name ml \
   --cpu 8 \
   --mem 8192 \
   --balloon 4096 \
   ml-training:latest
 ```
 
-#### `fcvm clone`
+#### `fcvm snapshot create`
 
-**Purpose**: Clone from a saved snapshot.
+**Purpose**: Create a snapshot from a running VM.
 
 **Usage**:
 ```bash
-fcvm clone --name <SOURCE> --snapshot <SNAPSHOT> [OPTIONS]
+fcvm snapshot create [--pid <PID> | <VM_NAME>] [--tag <TAG>]
 ```
 
 **Options**:
 ```
---name <NAME>              Source VM or snapshot name
---snapshot <SNAPSHOT>      Snapshot name to restore
---mode <MODE>              Execution mode (default: auto)
---publish <MAPPING>        Port mappings (can differ from source)
---logs <MODE>              Log mode (default: stream)
+--pid <PID>               fcvm process PID to snapshot
+--tag <TAG>               Snapshot name (defaults to VM name)
+<VM_NAME>                 VM name to snapshot (alternative to --pid)
 ```
 
 **Examples**:
 ```bash
-# Clone from warm snapshot
-fcvm clone --name warm-nginx --snapshot warm
+# Create snapshot by PID
+fcvm snapshot create --pid 12345 --tag my-snapshot
 
-# Clone with different ports
-fcvm clone \
-  --name warm-nginx \
-  --snapshot warm \
-  --publish 9090:80
-
-# Multiple clones
-for i in {1..10}; do
-  fcvm clone --name warm-nginx --snapshot warm --publish $((8000+i)):80 &
-done
-wait  # Lightning fast: all start in <10 seconds total
+# Create snapshot by name
+fcvm snapshot create my-vm --tag warm-nginx
 ```
 
-#### `fcvm stop`
+#### `fcvm snapshot serve`
 
-**Purpose**: Stop a running VM.
+**Purpose**: Start a UFFD memory server for cloning.
+
+**Usage**:
+```bash
+fcvm snapshot serve <SNAPSHOT_NAME>
+```
+
+The memory server:
+- Loads the snapshot's memory file
+- Listens for clone connections via Unix socket
+- Serves memory pages on-demand via UFFD (userfaultfd)
+- Enables sharing physical pages across multiple clones
+
+**Example**:
+```bash
+# Start memory server (blocks, keeps running)
+fcvm snapshot serve my-snapshot
+```
+
+#### `fcvm snapshot run`
+
+**Purpose**: Spawn a clone VM from a running memory server.
+
+**Usage**:
+```bash
+fcvm snapshot run --pid <SERVE_PID> [OPTIONS]
+```
+
+**Options**:
+```
+--pid <SERVE_PID>         Memory server PID (required)
+--name <NAME>             Clone VM name (auto-generated if not provided)
+--network <MODE>          Network mode: bridged|rootless
+--publish <MAPPING>       Port mappings (can differ from original)
+```
+
+**Examples**:
+```bash
+# Spawn a clone
+fcvm snapshot run --pid 12345 --name clone1 --network bridged
+
+# Multiple clones in parallel
+for i in {1..10}; do
+  fcvm snapshot run --pid 12345 --name clone$i --publish $((8000+i)):80 &
+done
+wait  # Lightning fast: all start in <1 second each
+```
+
+#### `fcvm snapshot ls`
+
+**Purpose**: List running memory servers.
 
 ```bash
-fcvm stop --name <VM_NAME>
+fcvm snapshot ls
 ```
 
 #### `fcvm ls`
 
 **Purpose**: List running VMs.
 
+**Usage**:
 ```bash
-fcvm ls
-
-# Output:
-# NAME         STATUS    CPU    MEM     UPTIME    PORTS
-# vm-abc123    running   2      2048    5m        8080:80
-# vm-def456    running   4      4096    2h        9090:80
+fcvm ls [--json] [--pid <PID>]
 ```
 
-#### `fcvm inspect`
-
-**Purpose**: Inspect VM details.
-
-```bash
-fcvm inspect --name <VM_NAME>
-
-# Output: JSON with full VM config
-{
-  "name": "vm-abc123",
-  "status": "running",
-  "pid": 12345,
-  "config": {
-    "vcpu": 2,
-    "memory_mib": 2048,
-    "image": "nginx:latest",
-    "network": {...},
-    "volumes": [...]
-  }
-}
+**Options**:
+```
+--json                    Output in JSON format
+--pid <PID>               Filter by fcvm process PID
 ```
 
-#### `fcvm logs`
-
-**Purpose**: Stream or tail VM logs.
-
-```bash
-fcvm logs --name <VM_NAME>
-
-# Tail last 100 lines
-fcvm logs --name vm-abc123 --tail 100
-
-# Follow (stream) logs
-fcvm logs --name vm-abc123 --follow
+**Example output**:
+```
+NAME           PID     STATUS    HEALTH    NETWORK   IMAGE
+my-nginx       12345   running   healthy   bridged   nginx:alpine
+clone-1        12350   running   healthy   rootless  (clone)
 ```
 
-#### `fcvm top`
+#### `fcvm snapshots`
 
-**Purpose**: Show resource usage.
+**Purpose**: List available snapshots.
 
 ```bash
-fcvm top
-
-# Output:
-# NAME         CPU%   MEM%    MEM      NET I/O
-# vm-abc123    15%    30%     614MB    1.2MB/500KB
-# vm-def456    80%    60%     2.4GB    5MB/2MB
+fcvm snapshots
 ```
 
 ---
@@ -995,65 +1027,94 @@ fcvm/
 ├── Cargo.toml              # Workspace manifest
 ├── DESIGN.md               # This document
 ├── README.md               # User-facing documentation
-├── BUCK                    # Buck build configuration
+├── Makefile                # Build and test commands
+├── Containerfile           # Test container definition
 │
-├── fcvm/                   # Host CLI crate
-│   ├── Cargo.toml
-│   ├── BUCK
-│   └── src/
-│       ├── main.rs         # Entry point
-│       ├── cli.rs          # Argument parsing
-│       ├── lib.rs          # Shared types
-│       ├── config.rs       # Configuration loading
-│       ├── state.rs        # VM state persistence
-│       │
-│       ├── firecracker/    # Firecracker integration
-│       │   ├── mod.rs
-│       │   ├── api.rs      # API client
-│       │   └── vm.rs       # VM manager
-│       │
-│       ├── network/        # Networking
-│       │   ├── mod.rs
-│       │   ├── types.rs    # Port mapping, config
-│       │   ├── rootless.rs # slirp4netns
-│       │   └── privileged.rs # nftables + bridge
-│       │
-│       ├── storage/        # Storage & snapshots
-│       │   ├── mod.rs
-│       │   ├── disk.rs     # Disk management
-│       │   ├── snapshot.rs # Snapshot save/restore
-│       │   └── cow.rs      # Copy-on-write
-│       │
-│       ├── readiness/      # Readiness gates
-│       │   ├── mod.rs
-│       │   ├── vsock.rs
-│       │   ├── http.rs
-│       │   ├── log.rs
-│       │   └── exec.rs
-│       │
-│       └── commands/       # CLI command implementations
-│           ├── mod.rs
-│           ├── run.rs
-│           ├── clone.rs
-│           ├── stop.rs
-│           ├── ls.rs
-│           ├── inspect.rs
-│           ├── logs.rs
-│           └── top.rs
+├── src/                    # Host CLI (fcvm binary)
+│   ├── main.rs             # Entry point
+│   ├── lib.rs              # Module exports
+│   ├── paths.rs            # Path utilities for btrfs layout
+│   ├── health.rs           # Health monitoring
+│   │
+│   ├── cli/                # Command-line parsing
+│   │   ├── mod.rs
+│   │   └── args.rs         # Clap structures
+│   │
+│   ├── commands/           # CLI command implementations
+│   │   ├── mod.rs
+│   │   ├── ls.rs           # fcvm ls
+│   │   ├── podman.rs       # fcvm podman run
+│   │   ├── snapshot.rs     # fcvm snapshot {create,serve,run}
+│   │   ├── snapshots.rs    # fcvm snapshots
+│   │   ├── setup.rs        # fcvm setup
+│   │   ├── memory_server.rs # UFFD memory server subprocess
+│   │   └── common.rs       # Shared utilities
+│   │
+│   ├── firecracker/        # Firecracker integration
+│   │   ├── mod.rs
+│   │   ├── api.rs          # API client (hyper + hyperlocal)
+│   │   └── vm.rs           # VM manager
+│   │
+│   ├── network/            # Networking
+│   │   ├── mod.rs
+│   │   ├── bridged.rs      # Bridged networking (iptables)
+│   │   ├── slirp.rs        # Rootless networking (slirp4netns)
+│   │   ├── namespace.rs    # Network namespace management
+│   │   ├── veth.rs         # Veth pair management
+│   │   ├── types.rs        # Network types
+│   │   └── portmap.rs      # Port mapping utilities
+│   │
+│   ├── storage/            # Storage & snapshots
+│   │   ├── mod.rs
+│   │   ├── disk.rs         # btrfs CoW disk management
+│   │   ├── snapshot.rs     # Snapshot management
+│   │   └── volume.rs       # Volume handling
+│   │
+│   ├── state/              # VM state management
+│   │   ├── mod.rs
+│   │   ├── types.rs        # VmState, VmConfig
+│   │   ├── manager.rs      # StateManager (CRUD + loopback IPs)
+│   │   └── utils.rs        # State utilities
+│   │
+│   ├── uffd/               # UFFD memory server
+│   │   ├── mod.rs
+│   │   ├── server.rs       # Userfaultfd page handler
+│   │   └── handler.rs      # UFFD event handler
+│   │
+│   ├── volume/             # FUSE volume handling
+│   │   └── mod.rs          # Host → guest filesystem mapping
+│   │
+│   └── setup/              # Setup utilities
+│       ├── mod.rs
+│       ├── preflight.rs    # Pre-flight checks
+│       ├── kernel.rs       # Kernel setup
+│       ├── kernel_build.rs # Kernel build
+│       └── rootfs.rs       # Rootfs setup
 │
 ├── fc-agent/               # Guest agent crate
 │   ├── Cargo.toml
-│   ├── BUCK
-│   ├── fc-agent.service    # systemd unit
 │   └── src/
-│       └── main.rs         # Agent implementation
+│       └── main.rs         # MMDS + Podman orchestration
 │
-└── scripts/                # Setup & build scripts
-    ├── preflight.sh        # Check prerequisites
-    ├── fcvm-init.sh        # Download Firecracker, build rootfs
-    ├── create-rootfs-debian.sh # Build guest rootfs
-    ├── build-kernel.sh     # Kernel build helper
-    └── setup-nftables.sh   # Network setup (privileged mode)
+├── fuse-pipe/              # FUSE passthrough library
+│   ├── Cargo.toml
+│   ├── src/
+│   │   ├── client/         # FUSE client (mounts in VM)
+│   │   ├── server/         # Async server (runs on host)
+│   │   ├── protocol/       # Wire protocol (request/response)
+│   │   └── transport/      # vsock/Unix socket transport
+│   ├── tests/              # Integration tests
+│   └── benches/            # Performance benchmarks
+│
+└── tests/                  # fcvm integration tests
+    ├── common/mod.rs       # Shared test utilities
+    ├── test_sanity.rs      # VM sanity tests
+    ├── test_state_manager.rs
+    ├── test_health_monitor.rs
+    ├── test_fuse_posix.rs
+    ├── test_fuse_in_vm.rs
+    ├── test_localhost_image.rs
+    └── test_snapshot_clone.rs
 ```
 
 ### Dependencies
@@ -1094,50 +1155,33 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 ```
 
-### Build System (Buck)
+### Build System (Makefile)
 
-**Root BUCK file**:
-```python
-# BUCK
+All builds are done via the root Makefile which syncs code to EC2 and builds there.
 
-rust_library(
-    name = "fcvm-lib",
-    srcs = glob(["fcvm/src/**/*.rs"]),
-    deps = [
-        "//third-party:anyhow",
-        "//third-party:tokio",
-        # ... other deps
-    ],
-)
-
-rust_binary(
-    name = "fcvm",
-    srcs = ["fcvm/src/main.rs"],
-    deps = [":fcvm-lib"],
-)
-
-rust_binary(
-    name = "fc-agent",
-    srcs = glob(["fc-agent/src/**/*.rs"]),
-    deps = [
-        "//third-party:anyhow",
-        "//third-party:tokio",
-        "//third-party:reqwest",
-    ],
-)
-```
-
-**Build commands**:
+**Key targets**:
 ```bash
-# Build everything
-buck2 build //:fcvm //:fc-agent
+# Development
+make build         # Sync + build fcvm + fc-agent on EC2
+make sync          # Just sync code (no build)
+make clean         # Clean build artifacts
 
-# Run fcvm
-buck2 run //:fcvm -- run nginx:latest
+# Testing
+make test          # Run fuse-pipe tests (noroot + root)
+make test-vm       # Run VM tests (rootless + bridged)
+make test-all      # Everything: test + test-vm + test-pjdfstest
 
-# Build release
-buck2 build --mode=release //:fcvm
+# Linting
+make lint          # Run clippy + fmt-check
+make fmt           # Format code
+
+# Container testing
+make container-test    # fuse-pipe tests in container
+make container-test-vm # VM tests in container
+make container-shell   # Interactive shell
 ```
+
+See `make help` for the complete list of targets.
 
 ### Configuration File
 
@@ -1316,30 +1360,42 @@ Test full workflows:
 #!/bin/bash
 # tests/integration/test_run.sh
 
-# Test basic run
-fcvm run --name test-nginx nginx:latest &
+# Test rootless mode (no sudo required)
+fcvm podman run --name test-nginx --network rootless nginx:alpine &
 PID=$!
 sleep 5
 kill $PID
 
-# Test port forwarding
-fcvm run --publish 8080:80 nginx:latest &
+# Test bridged mode with port forwarding (requires sudo for iptables/TAP)
+sudo fcvm podman run --name web --network bridged --publish 8080:80 nginx:alpine &
 PID=$!
 sleep 5
 curl http://localhost:8080  # Should return nginx page
 kill $PID
 
-# Test snapshot & clone
-fcvm run --save-snapshot warm --wait-ready mode=http,url=http://127.0.0.1:80 nginx:latest &
-PID=$!
-wait $PID
+# Test snapshot & clone (rootless)
+fcvm podman run --name baseline --network rootless nginx:alpine &
+BASELINE_PID=$!
+sleep 5  # Wait for VM to be healthy
 
-fcvm clone --name warm --snapshot warm --publish 9090:80 &
-PID=$!
+# Create snapshot
+fcvm snapshot create --pid $BASELINE_PID --tag warm
+
+# Start memory server
+fcvm snapshot serve warm &
+SERVE_PID=$!
+sleep 2
+
+# Spawn clone
+fcvm snapshot run --pid $SERVE_PID --name clone1 --network rootless --publish 9090:80 &
+CLONE_PID=$!
 sleep 2
 curl http://localhost:9090  # Should return nginx page in <2s
-kill $PID
+
+kill $CLONE_PID $SERVE_PID $BASELINE_PID
 ```
+
+**Note**: `--network rootless` uses slirp4netns (no root required). `--network bridged` (default) uses iptables/TAP devices (requires sudo).
 
 ---
 
@@ -1486,6 +1542,6 @@ kill $PID
 
 **End of Design Specification**
 
-*Version: 1.0*
-*Date: 2025-01-09*
+*Version: 2.0*
+*Date: 2025-12-14*
 *Author: fcvm project*

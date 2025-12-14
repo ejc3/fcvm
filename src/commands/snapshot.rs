@@ -615,6 +615,16 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     let network_config = network.setup().await.context("setting up network")?;
 
+    // For bridged mode, auto-generate health check URL using guest IP
+    // This ensures HTTP health checks work (not just container-ready file)
+    if matches!(args.network, NetworkMode::Bridged) && vm_state.config.health_check_url.is_none() {
+        if let Some(ref guest_ip) = network_config.guest_ip {
+            vm_state.config.health_check_url = Some(format!("http://{}:80/", guest_ip));
+            // Store the health_check_port for health monitor to use with interface binding
+            vm_state.config.network.health_check_port = Some(80);
+        }
+    }
+
     info!(
         tap = %network_config.tap_device,
         mac = %network_config.guest_mac,
@@ -894,23 +904,22 @@ async fn run_clone_setup(
         holder_child = Some(child);
     }
 
-    // Configure mount namespace isolation for vsock redirect if snapshot has volumes
-    // This is needed because vmstate.bin stores the baseline's vsock uds_path, and
-    // Firecracker cannot override it during snapshot restore. Multiple clones would
-    // all try to bind() to the same baseline socket path, causing conflicts.
+    // Configure mount namespace isolation for vsock redirect
+    // This is ALWAYS needed for clones because vmstate.bin stores the baseline's vsock uds_path,
+    // and Firecracker cannot override it during snapshot restore. Without this isolation:
+    // - The baseline VM is using /baseline_dir/vsock.sock
+    // - All clones would try to bind() to the same path, causing "Address in use" errors
     //
     // Solution: Run each clone in a mount namespace where baseline_dir is bind-mounted
-    // over clone_dir. When Firecracker does bind("/baseline_dir/vsock.sock_5000"),
-    // it actually binds to "/clone_dir/vsock.sock_5000" due to the bind mount.
-    if !snapshot_config.metadata.volumes.is_empty() {
-        let baseline_dir = paths::vm_runtime_dir(&snapshot_config.vm_id);
-        info!(
-            baseline_dir = %baseline_dir.display(),
-            clone_dir = %data_dir.display(),
-            "enabling mount namespace for vsock socket isolation"
-        );
-        vm_manager.set_vsock_redirect(baseline_dir, data_dir.to_path_buf());
-    }
+    // over clone_dir. When Firecracker does bind("/baseline_dir/vsock.sock"),
+    // it actually binds to "/clone_dir/vsock.sock" due to the bind mount.
+    let baseline_dir = paths::vm_runtime_dir(&snapshot_config.vm_id);
+    info!(
+        baseline_dir = %baseline_dir.display(),
+        clone_dir = %data_dir.display(),
+        "enabling mount namespace for vsock socket isolation"
+    );
+    vm_manager.set_vsock_redirect(baseline_dir, data_dir.to_path_buf());
 
     let firecracker_bin = PathBuf::from("/usr/local/bin/firecracker");
 
