@@ -44,6 +44,19 @@ fn init_tracing() {
 /// Global counter for unique test IDs
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Panic if running as root. Use this in tests that should NOT require root
+/// to catch accidental `sudo cargo test` invocations.
+pub fn require_nonroot() {
+    let euid = unsafe { libc::geteuid() };
+    if euid == 0 {
+        panic!(
+            "This test should NOT be run as root. \
+             Use `cargo test` not `sudo cargo test`. \
+             Root tests are in integration_root.rs and test_permission_edge_cases.rs"
+        );
+    }
+}
+
 /// Join a thread with timeout. Returns true if joined successfully, false if timed out.
 fn join_with_timeout<T>(thread: JoinHandle<T>, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
