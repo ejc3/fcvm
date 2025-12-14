@@ -2,6 +2,8 @@
 members = [".", "fuse-pipe", "fc-agent"]
 # Build all members by default (not just the root package)
 default-members = [".", "fuse-pipe", "fc-agent"]
+# Exclude sync-test (used only for Makefile sync verification)
+exclude = ["sync-test"]
 
 [package]
 name = "fcvm"
