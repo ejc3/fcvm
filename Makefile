@@ -320,11 +320,31 @@ CONTAINER_RUN_FUSE := $(CONTAINER_RUN_BASE) \
 	--pids-limit=-1
 
 # Container run options for fcvm tests (adds KVM, btrfs, netns)
+# Used for bridged mode tests that require root/iptables
 CONTAINER_RUN_FCVM := $(CONTAINER_RUN_BASE) \
 	--device /dev/kvm \
 	--device /dev/fuse \
 	-v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	-v /var/run/netns:/var/run/netns:rshared \
+	--network host
+
+# Truly rootless container run - matches unprivileged host user exactly
+# Runs podman WITHOUT sudo (rootless podman) - this is the true unprivileged test
+# Uses separate storage (--root) to avoid conflicts with root-owned storage
+# --network host so slirp4netns can bind to loopback addresses (127.x.y.z)
+# --security-opt seccomp=unconfined allows unshare syscall (no extra capabilities granted)
+# No --privileged, no CAP_SYS_ADMIN - matches real unprivileged user
+CONTAINER_RUN_ROOTLESS := podman --root=/tmp/podman-rootless run --rm \
+	--security-opt seccomp=unconfined \
+	-v $(REMOTE_DIR):/workspace/fcvm \
+	-v $(REMOTE_FUSE_BACKEND_RS):/workspace/fuse-backend-rs \
+	-v $(REMOTE_FUSER):/workspace/fuser \
+	-v fcvm-cargo-target-rootless:/workspace/fcvm/target \
+	-v fcvm-cargo-home-rootless:/home/testuser/.cargo \
+	-e CARGO_HOME=/home/testuser/.cargo \
+	--device /dev/kvm \
+	--device /dev/net/tun \
+	-v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	--network host
 
 # Build container only when Containerfile changes (make tracks dependency)
@@ -378,9 +398,10 @@ container-test-allow-other: container-build-allow-other
 # All fuse-pipe tests: noroot first, then root
 container-test: container-test-noroot container-test-root
 
-# VM tests - rootless (no root on host, but container runs privileged for KVM)
+# VM tests - rootless (truly unprivileged - no --privileged, runs as testuser)
+# Uses CONTAINER_RUN_ROOTLESS which drops privileges to match a normal host user
 container-test-vm-rootless: container-build setup-kernel
-	$(SSH) "$(CONTAINER_RUN_FCVM) $(CONTAINER_IMAGE) $(TEST_VM_ROOTLESS)"
+	$(SSH) "$(CONTAINER_RUN_ROOTLESS) $(CONTAINER_IMAGE) $(TEST_VM_ROOTLESS)"
 
 # VM tests - bridged (requires root for iptables/netns)
 container-test-vm-bridged: container-build setup-kernel

@@ -137,15 +137,29 @@ impl SlirpNetwork {
     /// Returns command to spawn a holder process that keeps the namespace alive.
     /// The holder runs `sleep infinity` which blocks forever until killed.
     /// Note: We use sleep instead of cat because cat requires stdin management.
+    ///
+    /// UID detection for container compatibility:
+    /// - UID 0 (root or inside container): use --map-root-user (simple 1:1 mapping)
+    /// - UID != 0 (unprivileged user): use --map-auto (needs subordinate UIDs from /etc/subuid)
+    ///
+    /// This allows fcvm to work both natively and inside containers.
     pub fn build_holder_command(&self) -> Vec<String> {
+        // Detect if we're running as root (either real root or inside a container)
+        let uid = unsafe { libc::getuid() };
+        let map_flag = if uid == 0 {
+            "--map-root-user" // Simple 1:1 mapping, works in containers
+        } else {
+            "--map-auto" // Uses /etc/subuid, works for unprivileged users
+        };
+
         vec![
             "unshare".to_string(),
             "--user".to_string(),
-            "--map-auto".to_string(),
+            map_flag.to_string(),
             "--net".to_string(),
             "--".to_string(),
             "sleep".to_string(),
-            "infinity".to_string(), // Blocks forever, keeping namespace alive
+            "infinity".to_string(),
         ]
     }
 
@@ -173,9 +187,6 @@ ip link set lo up
 
 # Set default route via slirp gateway
 ip route add default via 10.0.2.2 dev {slirp_dev}
-
-# Enable IP forwarding (works in user namespaces!)
-echo 1 > /proc/sys/net/ipv4/ip_forward
 
 # Set up iptables MASQUERADE for traffic from guest subnet
 # This NATs guest traffic (192.168.x.x) to slirp0's address (10.0.2.100)
