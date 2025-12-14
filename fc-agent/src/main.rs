@@ -2,7 +2,7 @@ mod fuse;
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::process::Stdio;
@@ -486,8 +486,490 @@ fn append_with_lock(path: &str, clone_id: &str, iteration: usize) -> Result<()> 
 /// Status channel port for notifying host that container is running
 const STATUS_VSOCK_PORT: u32 = 4999;
 
+/// Exec server port for running commands from host
+const EXEC_VSOCK_PORT: u32 = 4998;
+
 /// Host CID for vsock (always 2)
 const HOST_CID: u32 = 2;
+
+/// Request from host to execute a command
+#[derive(Debug, Deserialize)]
+struct ExecRequest {
+    command: Vec<String>,
+    #[serde(default)]
+    in_container: bool,
+    /// Keep STDIN open (-i)
+    #[serde(default)]
+    interactive: bool,
+    /// Allocate a pseudo-TTY (-t)
+    #[serde(default)]
+    tty: bool,
+}
+
+/// Response sent back to host
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", content = "data")]
+enum ExecResponse {
+    #[serde(rename = "stdout")]
+    Stdout(String),
+    #[serde(rename = "stderr")]
+    Stderr(String),
+    #[serde(rename = "exit")]
+    Exit(i32),
+    #[serde(rename = "error")]
+    Error(String),
+}
+
+/// Wrapper for vsock fd to use with tokio's AsyncFd
+struct VsockListener {
+    fd: i32,
+}
+
+impl std::os::unix::io::AsRawFd for VsockListener {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.fd
+    }
+}
+
+/// Run the exec server that listens for commands from host via vsock
+async fn run_exec_server() {
+    eprintln!("[fc-agent] starting exec server on vsock port {}", EXEC_VSOCK_PORT);
+
+    // Create vsock listener socket
+    let listener_fd = unsafe {
+        libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0)
+    };
+
+    if listener_fd < 0 {
+        eprintln!(
+            "[fc-agent] ERROR: failed to create vsock listener: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+
+    // Bind to the exec port
+    let addr = libc::sockaddr_vm {
+        svm_family: libc::AF_VSOCK as u16,
+        svm_reserved1: 0,
+        svm_port: EXEC_VSOCK_PORT,
+        svm_cid: libc::VMADDR_CID_ANY,
+        svm_zero: [0u8; 4],
+    };
+
+    let bind_result = unsafe {
+        libc::bind(
+            listener_fd,
+            &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_vm>() as u32,
+        )
+    };
+
+    if bind_result < 0 {
+        eprintln!(
+            "[fc-agent] ERROR: failed to bind vsock listener: {}",
+            std::io::Error::last_os_error()
+        );
+        unsafe { libc::close(listener_fd) };
+        return;
+    }
+
+    // Start listening
+    let listen_result = unsafe { libc::listen(listener_fd, 5) };
+    if listen_result < 0 {
+        eprintln!(
+            "[fc-agent] ERROR: failed to listen on vsock: {}",
+            std::io::Error::last_os_error()
+        );
+        unsafe { libc::close(listener_fd) };
+        return;
+    }
+
+    eprintln!("[fc-agent] ✓ exec server listening on vsock port {}", EXEC_VSOCK_PORT);
+
+    // Wrap in AsyncFd for async accept
+    let listener = VsockListener { fd: listener_fd };
+    let async_fd = match tokio::io::unix::AsyncFd::new(listener) {
+        Ok(fd) => fd,
+        Err(e) => {
+            eprintln!("[fc-agent] ERROR: failed to create AsyncFd: {}", e);
+            unsafe { libc::close(listener_fd) };
+            return;
+        }
+    };
+
+    // Accept connections in a loop
+    loop {
+        // Wait for the socket to be readable (i.e., a connection is pending)
+        let mut guard = match async_fd.readable().await {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[fc-agent] exec server: readable error: {}", e);
+                continue;
+            }
+        };
+
+        // Try to accept
+        let client_fd = unsafe {
+            libc::accept4(
+                listener_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_CLOEXEC,  // Don't set NONBLOCK for client - we'll use blocking I/O
+            )
+        };
+
+        if client_fd < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                // Spurious wakeup, clear readiness and try again
+                guard.clear_ready();
+                continue;
+            }
+            eprintln!("[fc-agent] exec server accept error: {}", err);
+            continue;
+        }
+
+        // Handle the connection in spawn_blocking since we use blocking I/O
+        tokio::task::spawn_blocking(move || {
+            handle_exec_connection_blocking(client_fd);
+        });
+    }
+}
+
+/// Helper to write a line to the vsock fd
+fn write_line_to_fd(fd: i32, data: &str) {
+    let bytes = format!("{}\n", data);
+    let mut written = 0;
+    while written < bytes.len() {
+        let n = unsafe {
+            libc::write(
+                fd,
+                bytes[written..].as_ptr() as *const libc::c_void,
+                bytes.len() - written,
+            )
+        };
+        if n <= 0 {
+            break;
+        }
+        written += n as usize;
+    }
+}
+
+/// Blocking handler for exec connection
+fn handle_exec_connection_blocking(fd: i32) {
+    // Read request line using raw read syscall (File wrapper doesn't work well with vsock)
+    let mut line = String::new();
+    let mut buf = [0u8; 1];
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
+        if n <= 0 {
+            unsafe { libc::close(fd) };
+            return;
+        }
+        if buf[0] == b'\n' {
+            break;
+        }
+        line.push(buf[0] as char);
+    }
+
+    // Parse the request
+    let request: ExecRequest = match serde_json::from_str(&line) {
+        Ok(r) => r,
+        Err(e) => {
+            let response = ExecResponse::Error(format!("Invalid request: {}", e));
+            write_line_to_fd(fd, &serde_json::to_string(&response).unwrap());
+            unsafe { libc::close(fd) };
+            return;
+        }
+    };
+
+    if request.command.is_empty() {
+        let response = ExecResponse::Error("Empty command".to_string());
+        write_line_to_fd(fd, &serde_json::to_string(&response).unwrap());
+        unsafe { libc::close(fd) };
+        return;
+    }
+
+    if request.tty {
+        handle_exec_tty(fd, &request);
+    } else {
+        handle_exec_pipe(fd, &request);
+    }
+}
+
+/// Handle exec in TTY mode with PTY allocation
+fn handle_exec_tty(fd: i32, request: &ExecRequest) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    // Allocate a PTY
+    let mut master_fd: libc::c_int = 0;
+    let mut slave_fd: libc::c_int = 0;
+
+    let result = unsafe {
+        libc::openpty(
+            &mut master_fd,
+            &mut slave_fd,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+
+    if result != 0 {
+        let response = ExecResponse::Error("Failed to allocate PTY".to_string());
+        write_line_to_fd(fd, &serde_json::to_string(&response).unwrap());
+        unsafe { libc::close(fd) };
+        return;
+    }
+
+    // Fork
+    let pid = unsafe { libc::fork() };
+
+    if pid < 0 {
+        let response = ExecResponse::Error("Failed to fork".to_string());
+        write_line_to_fd(fd, &serde_json::to_string(&response).unwrap());
+        unsafe {
+            libc::close(master_fd);
+            libc::close(slave_fd);
+            libc::close(fd);
+        }
+        return;
+    }
+
+    if pid == 0 {
+        // Child process
+        unsafe {
+            // Create new session and set controlling terminal
+            libc::setsid();
+            libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
+
+            // Redirect stdin/stdout/stderr to slave
+            libc::dup2(slave_fd, 0);
+            libc::dup2(slave_fd, 1);
+            libc::dup2(slave_fd, 2);
+
+            // Close fds we don't need
+            if slave_fd > 2 {
+                libc::close(slave_fd);
+            }
+            libc::close(master_fd);
+            libc::close(fd);
+        }
+
+        // Build and exec command
+        if request.in_container {
+            let mut args: Vec<std::ffi::CString> = vec![
+                std::ffi::CString::new("podman").unwrap(),
+                std::ffi::CString::new("exec").unwrap(),
+            ];
+            // Pass -i and/or -t flags based on request
+            if request.interactive && request.tty {
+                args.push(std::ffi::CString::new("-it").unwrap());
+            } else if request.interactive {
+                args.push(std::ffi::CString::new("-i").unwrap());
+            } else if request.tty {
+                args.push(std::ffi::CString::new("-t").unwrap());
+            }
+            args.push(std::ffi::CString::new("--latest").unwrap());
+            for arg in &request.command {
+                args.push(std::ffi::CString::new(arg.as_str()).unwrap());
+            }
+            let arg_ptrs: Vec<*const libc::c_char> =
+                args.iter().map(|s| s.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
+            unsafe {
+                libc::execvp(args[0].as_ptr(), arg_ptrs.as_ptr());
+            }
+        } else {
+            let prog = std::ffi::CString::new(request.command[0].as_str()).unwrap();
+            let args: Vec<std::ffi::CString> = request
+                .command
+                .iter()
+                .map(|s| std::ffi::CString::new(s.as_str()).unwrap())
+                .collect();
+            let arg_ptrs: Vec<*const libc::c_char> =
+                args.iter().map(|s| s.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
+            unsafe {
+                libc::execvp(prog.as_ptr(), arg_ptrs.as_ptr());
+            }
+        }
+
+        // execvp failed
+        unsafe { libc::_exit(127) };
+    }
+
+    // Parent process
+    unsafe { libc::close(slave_fd) };
+
+    let done = Arc::new(AtomicBool::new(false));
+
+    // Thread: read from vsock (fd), write to PTY master
+    let done_writer = done.clone();
+    let _writer_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        loop {
+            if done_writer.load(Ordering::Relaxed) {
+                break;
+            }
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            let written = unsafe {
+                libc::write(master_fd, buf.as_ptr() as *const libc::c_void, n as usize)
+            };
+            if written <= 0 {
+                break;
+            }
+        }
+    });
+
+    // Thread: read from PTY master, write to vsock (fd)
+    let done_reader = done.clone();
+    let _reader_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            if done_reader.load(Ordering::Relaxed) {
+                break;
+            }
+            let n = unsafe { libc::read(master_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            let written = unsafe {
+                libc::write(fd, buf.as_ptr() as *const libc::c_void, n as usize)
+            };
+            if written <= 0 {
+                break;
+            }
+        }
+    });
+
+    // Wait for child to exit
+    let mut status: libc::c_int = 0;
+    unsafe {
+        libc::waitpid(pid, &mut status, 0);
+    }
+
+    let exit_code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        1
+    };
+
+    // Signal threads to stop
+    done.store(true, Ordering::Relaxed);
+
+    // Give threads time to finish
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Send exit code (in TTY mode, send as raw JSON line)
+    let response = ExecResponse::Exit(exit_code);
+    write_line_to_fd(fd, &serde_json::to_string(&response).unwrap());
+
+    // Cleanup
+    unsafe {
+        libc::close(master_fd);
+        libc::close(fd);
+    }
+}
+
+/// Handle exec in pipe mode (non-TTY)
+fn handle_exec_pipe(fd: i32, request: &ExecRequest) {
+    use std::io::{BufRead, BufReader};
+
+    // Build the command using std::process::Command (blocking)
+    let mut cmd = if request.in_container {
+        // Execute inside the container using podman exec
+        let mut cmd = std::process::Command::new("podman");
+        cmd.arg("exec");
+        // Pass -i flag if interactive mode requested
+        if request.interactive {
+            cmd.arg("-i");
+        }
+        // Use the first running container (there should only be one)
+        cmd.arg("--latest");
+        cmd.args(&request.command);
+        cmd
+    } else {
+        // Execute directly in the VM
+        let mut cmd = std::process::Command::new(&request.command[0]);
+        if request.command.len() > 1 {
+            cmd.args(&request.command[1..]);
+        }
+        cmd
+    };
+
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    // Spawn the command
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let response = ExecResponse::Error(format!("Failed to spawn command: {}", e));
+            write_line_to_fd(fd, &serde_json::to_string(&response).unwrap());
+            unsafe { libc::close(fd) };
+            return;
+        }
+    };
+
+    // Stream stdout and stderr
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    // Use mutex to protect fd writes from multiple threads
+    let fd_mutex = std::sync::Arc::new(std::sync::Mutex::new(fd));
+
+    // Spawn threads to stream stdout and stderr
+    let fd_stdout = fd_mutex.clone();
+    let stdout_thread = std::thread::spawn(move || {
+        if let Some(stdout) = stdout {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    let response = ExecResponse::Stdout(format!("{}\n", line));
+                    if let Ok(fd) = fd_stdout.lock() {
+                        write_line_to_fd(*fd, &serde_json::to_string(&response).unwrap());
+                    }
+                }
+            }
+        }
+    });
+
+    let fd_stderr = fd_mutex.clone();
+    let stderr_thread = std::thread::spawn(move || {
+        if let Some(stderr) = stderr {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    let response = ExecResponse::Stderr(format!("{}\n", line));
+                    if let Ok(fd) = fd_stderr.lock() {
+                        write_line_to_fd(*fd, &serde_json::to_string(&response).unwrap());
+                    }
+                }
+            }
+        }
+    });
+
+    // Wait for the command to complete
+    let status = child.wait();
+    let exit_code = status.map(|s| s.code().unwrap_or(1)).unwrap_or(1);
+
+    // Wait for output threads to complete
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
+
+    // Send exit code
+    let response = ExecResponse::Exit(exit_code);
+    if let Ok(fd) = fd_mutex.lock() {
+        write_line_to_fd(*fd, &serde_json::to_string(&response).unwrap());
+    }
+
+    // Close the fd
+    unsafe { libc::close(fd) };
+}
 
 /// Raise resource limits for high parallelism workloads.
 /// This prevents EMFILE (too many open files) errors when running
@@ -814,6 +1296,11 @@ async fn main() -> Result<()> {
     tokio::spawn(async {
         eprintln!("[fc-agent] starting restore-epoch watcher for ARP flush");
         watch_restore_epoch().await;
+    });
+
+    // Start exec server to allow host to run commands in VM
+    tokio::spawn(async {
+        run_exec_server().await;
     });
 
     // Mount FUSE volumes from host before launching container

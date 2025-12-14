@@ -433,3 +433,435 @@ fn spawn_log_consumer_stderr(stderr: Option<tokio::process::ChildStderr>, name: 
         });
     }
 }
+
+/// Test cloning while baseline VM is still running
+///
+/// This tests for vsock socket path conflicts: when cloning from a running baseline,
+/// both the baseline and clone need separate vsock sockets. Without mount namespace
+/// isolation, Firecracker would try to bind to the same socket path stored in vmstate.bin.
+#[tokio::test]
+async fn test_clone_while_baseline_running() -> Result<()> {
+    let snapshot_name = "test-clone-running";
+    let baseline_name = "baseline-running";
+
+    println!("\n╔═══════════════════════════════════════════════════════════════╗");
+    println!("║     Clone While Baseline Running Test                         ║");
+    println!("╚═══════════════════════════════════════════════════════════════╝\n");
+
+    let fcvm_path = common::find_fcvm_binary()?;
+
+    // Step 1: Start baseline VM (bridged mode for faster startup)
+    println!("Step 1: Starting baseline VM...");
+    let mut baseline_child = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "podman",
+            "run",
+            "--name",
+            baseline_name,
+            "--network",
+            "bridged",
+            "nginx:alpine",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning baseline VM")?;
+
+    let baseline_pid = baseline_child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("failed to get baseline PID"))?;
+
+    spawn_log_consumer(baseline_child.stdout.take(), baseline_name);
+    spawn_log_consumer_stderr(baseline_child.stderr.take(), baseline_name);
+
+    println!("  Waiting for baseline VM to become healthy...");
+    common::poll_health_by_pid(baseline_pid, 120).await?;
+    println!("  ✓ Baseline VM healthy (PID: {})", baseline_pid);
+
+    // Step 2: Create snapshot (baseline VM stays running after this)
+    println!("\nStep 2: Creating snapshot (baseline will continue running)...");
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            snapshot_name,
+        ])
+        .output()
+        .await
+        .context("running snapshot create")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Snapshot creation failed: {}", stderr);
+    }
+    println!("  ✓ Snapshot created");
+
+    // Verify baseline is STILL healthy after snapshot
+    println!("\nStep 3: Verifying baseline is still healthy after snapshot...");
+    common::poll_health_by_pid(baseline_pid, 30).await?;
+    println!("  ✓ Baseline VM still healthy");
+
+    // Step 4: Start memory server
+    println!("\nStep 4: Starting memory server...");
+    let mut serve_child = tokio::process::Command::new(&fcvm_path)
+        .args(["snapshot", "serve", snapshot_name])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning memory server")?;
+
+    let serve_pid = serve_child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("failed to get serve PID"))?;
+
+    spawn_log_consumer(serve_child.stdout.take(), "uffd-server");
+    spawn_log_consumer_stderr(serve_child.stderr.take(), "uffd-server");
+
+    // Wait for serve to be ready
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    println!("  ✓ Memory server ready (PID: {})", serve_pid);
+
+    // Step 5: Clone WHILE baseline is still running (this is the key test!)
+    println!("\nStep 5: Spawning clone while baseline is STILL RUNNING...");
+    println!("  (This tests vsock socket isolation via mount namespace)");
+
+    let clone_name = "clone-running";
+    let mut clone_child = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid.to_string(),
+            "--name",
+            clone_name,
+            "--network",
+            "bridged",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning clone while baseline running")?;
+
+    let clone_pid = clone_child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("failed to get clone PID"))?;
+
+    spawn_log_consumer(clone_child.stdout.take(), clone_name);
+    spawn_log_consumer_stderr(clone_child.stderr.take(), clone_name);
+
+    // Step 6: Wait for clone to become healthy
+    println!("\nStep 6: Waiting for clone to become healthy...");
+    let clone_health_result = tokio::time::timeout(
+        Duration::from_secs(120),
+        common::poll_health_by_pid(clone_pid, 120),
+    )
+    .await;
+
+    let clone_healthy = match clone_health_result {
+        Ok(Ok(_)) => {
+            println!("  ✓ Clone is healthy (PID: {})", clone_pid);
+            true
+        }
+        Ok(Err(e)) => {
+            eprintln!("  ✗ Clone health check failed: {}", e);
+            false
+        }
+        Err(_) => {
+            eprintln!("  ✗ Clone health check timeout");
+            false
+        }
+    };
+
+    // Step 7: Verify baseline is STILL healthy (should not be affected by clone)
+    println!("\nStep 7: Verifying baseline is still healthy after clone spawned...");
+    let baseline_still_healthy = common::poll_health_by_pid(baseline_pid, 30).await.is_ok();
+    if baseline_still_healthy {
+        println!("  ✓ Baseline VM still healthy");
+    } else {
+        eprintln!("  ✗ Baseline VM is no longer healthy!");
+    }
+
+    // Cleanup
+    println!("\nCleaning up...");
+    common::kill_process(clone_pid).await;
+    println!("  Killed clone");
+    common::kill_process(serve_pid).await;
+    println!("  Killed memory server");
+    common::kill_process(baseline_pid).await;
+    println!("  Killed baseline VM");
+
+    // Final result
+    if clone_healthy && baseline_still_healthy {
+        println!("\n✅ CLONE-WHILE-BASELINE-RUNNING TEST PASSED!");
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Test failed: clone_healthy={}, baseline_still_healthy={}",
+            clone_healthy,
+            baseline_still_healthy
+        )
+    }
+}
+
+/// Test that clones can reach the internet in bridged mode
+///
+/// This verifies that DNS resolution and outbound connectivity work after snapshot restore.
+/// The clone should be able to resolve hostnames and make HTTP requests.
+#[tokio::test]
+async fn test_clone_internet_bridged() -> Result<()> {
+    clone_internet_test_impl("bridged").await
+}
+
+/// Test that clones can reach the internet in rootless mode
+#[tokio::test]
+async fn test_clone_internet_rootless() -> Result<()> {
+    clone_internet_test_impl("rootless").await
+}
+
+async fn clone_internet_test_impl(network: &str) -> Result<()> {
+    let snapshot_name = format!("test-internet-{}", network);
+    let baseline_name = format!("baseline-internet-{}", network);
+
+    println!("\n╔═══════════════════════════════════════════════════════════════╗");
+    println!(
+        "║     Clone Internet Connectivity Test ({:8})              ║",
+        network
+    );
+    println!("╚═══════════════════════════════════════════════════════════════╝\n");
+
+    let fcvm_path = common::find_fcvm_binary()?;
+
+    // Step 1: Start baseline VM
+    println!("Step 1: Starting baseline VM...");
+    let mut baseline_child = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            network,
+            "nginx:alpine",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning baseline VM")?;
+
+    let baseline_pid = baseline_child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("failed to get baseline PID"))?;
+
+    spawn_log_consumer(baseline_child.stdout.take(), &baseline_name);
+    spawn_log_consumer_stderr(baseline_child.stderr.take(), &baseline_name);
+
+    println!("  Waiting for baseline VM to become healthy...");
+    common::poll_health_by_pid(baseline_pid, 120).await?;
+    println!("  ✓ Baseline VM healthy (PID: {})", baseline_pid);
+
+    // Step 2: Create snapshot
+    println!("\nStep 2: Creating snapshot...");
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
+        ])
+        .output()
+        .await
+        .context("running snapshot create")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Snapshot creation failed: {}", stderr);
+    }
+    println!("  ✓ Snapshot created");
+
+    // Kill baseline - we only need the snapshot
+    common::kill_process(baseline_pid).await;
+    println!("  Killed baseline VM (only need snapshot)");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Step 3: Start memory server
+    println!("\nStep 3: Starting memory server...");
+    let mut serve_child = tokio::process::Command::new(&fcvm_path)
+        .args(["snapshot", "serve", &snapshot_name])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning memory server")?;
+
+    let serve_pid = serve_child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("failed to get serve PID"))?;
+
+    spawn_log_consumer(serve_child.stdout.take(), "uffd-server");
+    spawn_log_consumer_stderr(serve_child.stderr.take(), "uffd-server");
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    println!("  ✓ Memory server ready (PID: {})", serve_pid);
+
+    // Step 4: Spawn clone
+    println!("\nStep 4: Spawning clone...");
+    let clone_name = format!("clone-internet-{}", network);
+    let mut clone_child = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid.to_string(),
+            "--name",
+            &clone_name,
+            "--network",
+            network,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning clone")?;
+
+    let clone_pid = clone_child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("failed to get clone PID"))?;
+
+    spawn_log_consumer(clone_child.stdout.take(), &clone_name);
+    spawn_log_consumer_stderr(clone_child.stderr.take(), &clone_name);
+
+    // Wait for clone to become healthy
+    println!("  Waiting for clone to become healthy...");
+    common::poll_health_by_pid(clone_pid, 120).await?;
+    println!("  ✓ Clone is healthy (PID: {})", clone_pid);
+
+    // Step 5: Test internet connectivity from inside the clone
+    // We'll use fcvm exec to run commands inside the VM
+    println!("\nStep 5: Testing internet connectivity from clone...");
+
+    // Test 1: DNS resolution using nslookup/host (available in alpine)
+    println!("  Testing DNS resolution...");
+    let dns_result = test_clone_dns(&fcvm_path, clone_pid).await;
+
+    // Test 2: HTTP connectivity using wget (available in alpine)
+    println!("  Testing HTTP connectivity...");
+    let http_result = test_clone_http(&fcvm_path, clone_pid).await;
+
+    // Cleanup
+    println!("\nCleaning up...");
+    common::kill_process(clone_pid).await;
+    println!("  Killed clone");
+    common::kill_process(serve_pid).await;
+    println!("  Killed memory server");
+
+    // Report results
+    println!("\n╔═══════════════════════════════════════════════════════════════╗");
+    println!("║                         RESULTS                               ║");
+    println!("╠═══════════════════════════════════════════════════════════════╣");
+
+    let dns_ok = dns_result.is_ok();
+    let http_ok = http_result.is_ok();
+
+    if dns_ok {
+        println!("║  DNS resolution:    ✓ PASSED                                 ║");
+    } else {
+        println!("║  DNS resolution:    ✗ FAILED                                 ║");
+        if let Err(ref e) = dns_result {
+            eprintln!("    Error: {}", e);
+        }
+    }
+
+    if http_ok {
+        println!("║  HTTP connectivity: ✓ PASSED                                 ║");
+    } else {
+        println!("║  HTTP connectivity: ✗ FAILED                                 ║");
+        if let Err(ref e) = http_result {
+            eprintln!("    Error: {}", e);
+        }
+    }
+
+    println!("╚═══════════════════════════════════════════════════════════════╝");
+
+    if dns_ok && http_ok {
+        println!("\n✅ CLONE INTERNET CONNECTIVITY TEST PASSED! ({})", network);
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Clone internet test failed: dns={}, http={}",
+            dns_ok,
+            http_ok
+        )
+    }
+}
+
+/// Test DNS resolution from inside the clone VM
+async fn test_clone_dns(fcvm_path: &std::path::Path, clone_pid: u32) -> Result<()> {
+    // Use nslookup to test DNS - available in the VM
+    // We'll resolve a well-known domain
+    let output = tokio::process::Command::new(fcvm_path)
+        .args([
+            "exec",
+            "--pid",
+            &clone_pid.to_string(),
+            "--",
+            "nslookup",
+            "google.com",
+        ])
+        .output()
+        .await
+        .context("running nslookup in clone")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if output.status.success() && (stdout.contains("Address") || stdout.contains("Name:")) {
+        println!("    nslookup google.com: OK");
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "DNS resolution failed: exit={}, stdout={}, stderr={}",
+            output.status,
+            stdout.trim(),
+            stderr.trim()
+        )
+    }
+}
+
+/// Test HTTP connectivity from inside the clone VM
+async fn test_clone_http(fcvm_path: &std::path::Path, clone_pid: u32) -> Result<()> {
+    // Use curl to test HTTP - available in the VM
+    // We'll fetch a small file from a reliable source
+    let output = tokio::process::Command::new(fcvm_path)
+        .args([
+            "exec",
+            "--pid",
+            &clone_pid.to_string(),
+            "--",
+            "curl",
+            "-s",
+            "--connect-timeout",
+            "10",
+            "http://httpbin.org/ip",
+        ])
+        .output()
+        .await
+        .context("running curl in clone")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if output.status.success() && stdout.contains("origin") {
+        println!("    curl httpbin.org/ip: OK (got response)");
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "HTTP connectivity failed: exit={}, stdout={}, stderr={}",
+            output.status,
+            stdout.trim(),
+            stderr.trim()
+        )
+    }
+}
