@@ -84,6 +84,11 @@ async fn run_status_listener(socket_path: &str, runtime_dir: &std::path::Path, v
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("binding status listener to {}", socket_path))?;
 
+    // Make socket accessible by Firecracker running in user namespace (UID 100000)
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o777))
+        .with_context(|| format!("chmod status socket {}", socket_path))?;
+
     info!(socket = %socket_path, "Status listener started");
 
     let ready_file = runtime_dir.join("container-ready");
@@ -241,6 +246,15 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .await
         .context("creating VM data directory")?;
 
+    // For rootless mode, make directory world-writable so processes inside the user
+    // namespace can create sockets. User namespace UID 0 maps to subordinate UID
+    // (typically 100000+), which doesn't match the directory owner (UID 1000).
+    if matches!(args.network, NetworkMode::Rootless) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o777))
+            .context("setting directory permissions for rootless mode")?;
+    }
+
     let socket_path = data_dir.join("firecracker.sock");
 
     // Create VM state
@@ -269,6 +283,12 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 .allocate_loopback_ip(&mut vm_state)
                 .await
                 .context("allocating loopback IP")?;
+
+            // Auto-generate health check URL using loopback IP
+            // Port 8080 on host forwards to port 80 in guest (unprivileged, fully rootless)
+            if vm_state.config.health_check_url.is_none() {
+                vm_state.config.health_check_url = Some(format!("http://{}:8080/", loopback_ip));
+            }
 
             Box::new(
                 SlirpNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
@@ -369,7 +389,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         return Err(e);
     }
 
-    let mut vm_manager = setup_result.unwrap();
+    let (mut vm_manager, mut holder_child) = setup_result.unwrap();
 
     info!(vm_id = %vm_id, "VM started successfully");
 
@@ -424,6 +444,15 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         warn!("failed to kill VM process: {}", e);
     }
 
+    // Kill holder process (rootless mode only)
+    if let Some(ref mut holder) = holder_child {
+        info!("killing namespace holder process");
+        if let Err(e) = holder.kill().await {
+            warn!("failed to kill holder process: {}", e);
+        }
+        let _ = holder.wait().await; // Clean up zombie
+    }
+
     // Cleanup network
     if let Err(e) = network.cleanup().await {
         warn!("failed to cleanup network: {}", e);
@@ -449,6 +478,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
 /// Helper function that runs VM setup and returns VmManager on success.
 /// This allows the caller to cleanup network resources on error.
+/// For rootless mode, also returns the holder process that keeps the namespace alive.
 #[allow(clippy::too_many_arguments)]
 async fn run_vm_setup(
     args: &RunArgs,
@@ -464,15 +494,25 @@ async fn run_vm_setup(
     vm_state: &mut VmState,
     volume_mappings: &[VolumeMapping],
     vsock_socket_path: &std::path::Path,
-) -> Result<VmManager> {
+) -> Result<(VmManager, Option<tokio::process::Child>)> {
     // Setup storage
     let vm_dir = data_dir.join("disks");
-    let disk_manager = DiskManager::new(vm_id.to_string(), base_rootfs.to_path_buf(), vm_dir);
+    let disk_manager = DiskManager::new(vm_id.to_string(), base_rootfs.to_path_buf(), vm_dir.clone());
 
     let rootfs_path = disk_manager
         .create_cow_disk()
         .await
         .context("creating CoW disk")?;
+
+    // For rootless mode, make disk directory and file world-accessible
+    // Firecracker runs as UID 100000+ inside namespace, can't access UID 1000 files
+    if network.as_any().downcast_ref::<SlirpNetwork>().is_some() {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&vm_dir, std::fs::Permissions::from_mode(0o777))
+            .context("setting disk directory permissions for rootless mode")?;
+        std::fs::set_permissions(&rootfs_path, std::fs::Permissions::from_mode(0o666))
+            .context("setting disk file permissions for rootless mode")?;
+    }
 
     info!(rootfs = %rootfs_path.display(), "disk prepared");
 
@@ -484,19 +524,69 @@ async fn run_vm_setup(
     vm_manager.set_vm_name(vm_name);
 
     // Configure namespace isolation based on network type
+    let holder_child: Option<tokio::process::Child>;
+
     if let Some(bridged_net) = network.as_any().downcast_ref::<BridgedNetwork>() {
         // Bridged mode: use pre-created network namespace
+        holder_child = None;
         if let Some(ns_id) = bridged_net.namespace_id() {
             info!(namespace = %ns_id, "configuring VM to run in network namespace");
             vm_manager.set_namespace(ns_id.to_string());
         }
     } else if let Some(slirp_net) = network.as_any().downcast_ref::<SlirpNetwork>() {
-        // Rootless mode: use slirp4netns with dual-TAP architecture
-        // Creates user+net namespace with two TAPs: slirp0 (for slirp4netns) and tap0 (for Firecracker)
-        // IP forwarding connects them for outbound connectivity
-        let wrapper_cmd = slirp_net.build_wrapper_command();
-        info!(wrapper = %slirp_net.wrapper_command_string(), "configuring VM for rootless operation with slirp4netns");
-        vm_manager.set_namespace_wrapper(wrapper_cmd);
+        // Rootless mode: spawn holder process and set up namespace via nsenter
+        // This is fully rootless - no sudo required!
+
+        // Step 1: Spawn holder process (keeps namespace alive)
+        let holder_cmd = slirp_net.build_holder_command();
+        info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
+
+        let mut child = tokio::process::Command::new(&holder_cmd[0])
+            .args(&holder_cmd[1..])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("spawning namespace holder process")?;
+
+        let holder_pid = child.id().context("getting holder process PID")?;
+        info!(holder_pid = holder_pid, "namespace holder started");
+
+        // Small delay to ensure namespace setup (newuidmap/newgidmap) completes
+        // The --map-auto option invokes setuid helpers asynchronously
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Step 2: Run setup script via nsenter (creates TAPs, iptables, etc.)
+        let setup_script = slirp_net.build_setup_script();
+        let nsenter_prefix = slirp_net.build_nsenter_prefix(holder_pid);
+
+        info!(holder_pid = holder_pid, "running network setup via nsenter");
+        let setup_output = tokio::process::Command::new(&nsenter_prefix[0])
+            .args(&nsenter_prefix[1..])
+            .arg("bash")
+            .arg("-c")
+            .arg(&setup_script)
+            .output()
+            .await
+            .context("running network setup via nsenter")?;
+
+        if !setup_output.status.success() {
+            let stderr = String::from_utf8_lossy(&setup_output.stderr);
+            // Kill holder before bailing
+            let _ = child.kill().await;
+            bail!("network setup failed: {}", stderr);
+        }
+
+        info!(holder_pid = holder_pid, "network setup complete");
+
+        // Step 3: Set holder_pid so VmManager uses nsenter
+        vm_manager.set_holder_pid(holder_pid);
+
+        // Store holder_pid in state for health checks and cleanup
+        vm_state.holder_pid = Some(holder_pid);
+
+        holder_child = Some(child);
+    } else {
+        holder_child = None;
     }
 
     let firecracker_bin = PathBuf::from("/usr/local/bin/firecracker");
@@ -566,8 +656,10 @@ async fn run_vm_setup(
 
     // For rootless mode with slirp4netns: post_start starts slirp4netns in the namespace
     // For bridged mode: post_start is a no-op (TAP already created by BridgedNetwork)
+    // Use holder_pid for rootless (slirp4netns attaches to holder's namespace)
+    let post_start_pid = vm_state.holder_pid.unwrap_or(vm_pid);
     network
-        .post_start(vm_pid)
+        .post_start(post_start_pid)
         .await
         .context("post-start network setup")?;
 
@@ -669,5 +761,5 @@ async fn run_vm_setup(
     // Save VM state with complete network configuration
     super::common::save_vm_state_with_network(state_manager, vm_state, network_config).await?;
 
-    Ok(vm_manager)
+    Ok((vm_manager, holder_child))
 }
