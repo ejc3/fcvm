@@ -40,7 +40,6 @@ TEST_VM_ROOTLESS := cargo test --release --test test_sanity test_sanity_rootless
 # Root required:
 TEST_FUSE_ROOT := cargo test --release -p fuse-pipe --test integration_root
 TEST_FUSE_PERMISSION := cargo test --release -p fuse-pipe --test test_permission_edge_cases
-TEST_PJDFSTEST := cargo test --release -p fuse-pipe --test pjdfstest_full -- --nocapture
 TEST_VM_BRIDGED := cargo test --release --test test_sanity test_sanity_bridged -- --nocapture
 
 # Legacy alias
@@ -55,7 +54,7 @@ BENCH_PROTOCOL := cargo bench -p fuse-pipe --bench protocol
 SUDO := sudo
 
 .PHONY: all help sync sync-git build clean \
-        test test-noroot test-root test-unit test-fuse test-vm test-vm-rootless test-vm-bridged test-pjdfstest test-all \
+        test test-noroot test-root test-unit test-fuse test-vm test-vm-rootless test-vm-bridged test-all \
         bench bench-throughput bench-operations bench-protocol bench-quick bench-logs bench-clean \
         lint clippy fmt fmt-check \
         rootfs rebuild \
@@ -87,8 +86,7 @@ help:
 	@echo "  make test-vm         - VM tests: rootless + bridged"
 	@echo "  make test-vm-rootless - VM test with slirp4netns (no root)"
 	@echo "  make test-vm-bridged  - VM test with bridged networking (sudo)"
-	@echo "  make test-pjdfstest  - POSIX compliance (8789 tests, ~5 min, sudo)"
-	@echo "  make test-all        - Everything: test + test-vm + test-pjdfstest"
+	@echo "  make test-all        - Everything: test + test-vm"
 	@echo ""
 	@echo "Benchmarks:"
 	@echo "  make bench           - All benchmarks (throughput + operations + protocol)"
@@ -266,12 +264,8 @@ test-vm-bridged: build setup-kernel
 # All VM tests: rootless first, then bridged
 test-vm: test-vm-rootless test-vm-bridged
 
-# Full POSIX compliance tests (8789 tests)
-test-pjdfstest: build
-	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(TEST_PJDFSTEST)"
-
-# Run everything
-test-all: test test-vm test-pjdfstest
+# Run everything (use container-test-pjdfstest for POSIX compliance)
+test-all: test test-vm
 
 #------------------------------------------------------------------------------
 # Benchmarks (native)
