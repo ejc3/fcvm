@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
-use chrono::Utc;
 use std::path::PathBuf;
 use std::time::Instant;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::paths;
@@ -24,15 +24,18 @@ const HEALTH_POLL_HEALTHY_INTERVAL: Duration = Duration::from_secs(10);
 /// Returns a JoinHandle that can be used to cancel the task.
 /// The task runs until cancelled or until the tokio runtime shuts down.
 pub fn spawn_health_monitor(vm_id: String, pid: Option<u32>) -> JoinHandle<()> {
-    spawn_health_monitor_with_state_dir(vm_id, pid, paths::state_dir())
+    spawn_health_monitor_with_cancel(vm_id, pid, paths::state_dir(), None)
 }
 
-/// Same as `spawn_health_monitor` but with an explicit state directory.
-/// Useful for tests to avoid relying on global base directory state.
-pub fn spawn_health_monitor_with_state_dir(
+/// Spawn a health monitor with a cancellation token for graceful shutdown.
+///
+/// When the token is cancelled, the health monitor will stop after completing
+/// its current iteration (no partial state updates).
+pub fn spawn_health_monitor_with_cancel(
     vm_id: String,
     pid: Option<u32>,
     state_dir: PathBuf,
+    cancel_token: Option<CancellationToken>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let state_manager = StateManager::new(state_dir);
@@ -59,7 +62,26 @@ pub fn spawn_health_monitor_with_state_dir(
         let mut last_failure_log: Option<Instant> = None;
 
         loop {
-            tokio::time::sleep(poll_interval).await;
+            // Check for cancellation before sleeping
+            if let Some(ref token) = cancel_token {
+                if token.is_cancelled() {
+                    info!(target: "health-monitor", "cancellation requested, stopping");
+                    break;
+                }
+            }
+
+            // Sleep with cancellation support
+            if let Some(ref token) = cancel_token {
+                tokio::select! {
+                    _ = tokio::time::sleep(poll_interval) => {}
+                    _ = token.cancelled() => {
+                        info!(target: "health-monitor", "cancellation requested during sleep, stopping");
+                        break;
+                    }
+                }
+            } else {
+                tokio::time::sleep(poll_interval).await;
+            }
 
             let health_status = match update_health_status_once(
                 &state_manager,
@@ -90,6 +112,16 @@ pub fn spawn_health_monitor_with_state_dir(
             }
         }
     })
+}
+
+/// Same as `spawn_health_monitor` but with an explicit state directory.
+/// Useful for tests to avoid relying on global base directory state.
+pub fn spawn_health_monitor_with_state_dir(
+    vm_id: String,
+    pid: Option<u32>,
+    state_dir: PathBuf,
+) -> JoinHandle<()> {
+    spawn_health_monitor_with_cancel(vm_id, pid, state_dir, None)
 }
 
 /// Perform a single health check iteration and persist the result.
@@ -215,18 +247,11 @@ async fn update_health_status_once(
         (HealthStatus::Unknown, None)
     };
 
-    // Update state file
-    let mut state = state_manager
-        .load_state(vm_id)
-        .await
-        .context("loading state for health update")?;
-    state.health_status = health_status;
-    state.exit_code = exit_code;
-    state.last_updated = Utc::now();
+    // Update state file atomically (lock held across read-modify-write)
     state_manager
-        .save_state(&state)
+        .update_health_status(vm_id, health_status, exit_code)
         .await
-        .context("saving updated health state")?;
+        .context("updating health state atomically")?;
 
     Ok((health_status, exit_code))
 }

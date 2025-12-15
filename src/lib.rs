@@ -8,4 +8,5 @@ pub mod setup;
 pub mod state;
 pub mod storage;
 pub mod uffd;
+pub mod utils;
 pub mod volume;
