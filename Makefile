@@ -40,6 +40,7 @@ TEST_VM_ROOTLESS := cargo test --release --test test_sanity test_sanity_rootless
 # Root required:
 TEST_FUSE_ROOT := cargo test --release -p fuse-pipe --test integration_root
 TEST_FUSE_PERMISSION := cargo test --release -p fuse-pipe --test test_permission_edge_cases
+TEST_PJDFSTEST := cargo test --release -p fuse-pipe --test pjdfstest_full -- --nocapture
 TEST_VM_BRIDGED := cargo test --release --test test_sanity test_sanity_bridged -- --nocapture
 
 # Legacy alias
@@ -80,7 +81,7 @@ help:
 	@echo "Testing (organized by root requirement):"
 	@echo "  make test            - All fuse-pipe tests: noroot + root"
 	@echo "  make test-noroot     - Tests without root: unit + integration + stress (no sudo)"
-	@echo "  make test-root       - Tests requiring root: integration_root + permission (sudo)"
+	@echo "  make test-root       - Tests requiring root: integration_root (sudo)"
 	@echo "  make test-unit       - Unit tests only (no root)"
 	@echo "  make test-fuse       - fuse-pipe: integration + permission + stress"
 	@echo "  make test-vm         - VM tests: rootless + bridged"
@@ -233,11 +234,10 @@ test-noroot: build
 	$(SSH) "cd $(REMOTE_DIR) && $(TEST_FUSE_NOROOT)"
 	$(SSH) "cd $(REMOTE_DIR) && $(TEST_FUSE_STRESS)"
 
-# Tests that require root
+# Tests that require root (permission edge cases moved to container-only due to pjdfstest version)
 test-root: build
 	@echo "==> Running tests (root required)..."
 	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(TEST_FUSE_ROOT)"
-	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(TEST_FUSE_PERMISSION)"
 
 # All fuse-pipe tests: noroot first, then root
 test: test-noroot test-root

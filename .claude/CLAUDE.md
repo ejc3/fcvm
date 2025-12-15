@@ -65,6 +65,24 @@ fcvm exec --pid <PID> -c -- wget -q -O - --timeout=10 http://ifconfig.me
 
 Exception: For **forked libraries** (like fuse-backend-rs), we maintain compatibility with upstream to enable merging upstream changes.
 
+### Test Failure Philosophy
+
+**This project is designed for extreme scale, speed, and correctness.** Test failures are bugs, not excuses.
+
+**NEVER dismiss failures as:**
+- "Resource contention"
+- "Timing issues"
+- "Flaky tests"
+- "Works on my machine"
+
+**ALWAYS:**
+1. Investigate the actual root cause
+2. Find evidence in logs, traces, or code
+3. Fix the underlying bug
+4. Add regression tests if needed
+
+If a test fails intermittently, that's a **concurrency bug** or **race condition** that must be fixed, not ignored.
+
 ### Build and Test Rules
 
 **CRITICAL: ONLY use Makefile targets. NEVER run cargo commands directly.**
