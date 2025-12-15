@@ -1,8 +1,62 @@
 use anyhow::{Context, Result};
+use std::time::Duration;
 use tokio::process::Command;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::namespace::exec_in_namespace;
+
+/// Wait for dnsmasq to bind to a specific IP address on port 53
+///
+/// dnsmasq with `bind-dynamic` detects new interfaces and binds to them,
+/// but this takes time. We must wait for it to bind before VMs can use DNS.
+async fn wait_for_dnsmasq_bind(ip: &str) -> Result<()> {
+    let check_addr = format!("{}:53", ip);
+
+    for attempt in 0..50 {
+        // Check if anything is listening on this IP:53
+        let output = Command::new("ss")
+            .args(["-uln", "sport", "=", ":53"])
+            .output()
+            .await
+            .context("checking if dnsmasq is listening")?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.contains(ip) {
+            if attempt > 0 {
+                debug!(ip = %ip, attempts = attempt, "dnsmasq now listening");
+            }
+            return Ok(());
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    anyhow::bail!(
+        "dnsmasq did not bind to {} within 1 second - check dnsmasq config",
+        check_addr
+    );
+}
+
+/// In-Namespace NAT configuration for clone egress
+///
+/// When clones are restored from a snapshot, they all have the same guest IP
+/// (e.g., 172.30.90.2). With In-Namespace NAT, each clone's namespace:
+/// 1. Has br0 assigned the guest's expected gateway IP (172.30.90.1)
+/// 2. Has veth1 assigned a unique IP in the 10.x.y.0/30 range
+/// 3. NATs outgoing traffic to the veth1 IP via MASQUERADE
+/// 4. DNATs incoming traffic from veth IP to guest IP (for health checks)
+///
+/// This eliminates the need for CONNMARK/policy routing in the host namespace.
+pub struct InNamespaceNatConfig {
+    /// Gateway IP to assign to br0 (e.g., 172.30.90.1)
+    pub gateway_ip: String,
+    /// Guest IP inside the VM (e.g., 172.30.90.2)
+    pub guest_ip: String,
+    /// Unique veth IP inside namespace (e.g., 10.0.1.2/30)
+    pub veth_ip_cidr: String,
+    /// Corresponding host-side veth IP (e.g., 10.0.1.1/30)
+    pub host_veth_ip_cidr: String,
+}
 
 /// Creates a veth pair and moves guest side into a namespace
 ///
@@ -74,9 +128,9 @@ async fn cleanup_stale_veth_with_ip(ip_with_cidr: &str, exclude_veth: &str) -> R
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // Parse output to find veth interfaces with matching IP
-    // Format: "4: veth0-vm-abc@if3: <...> inet 172.30.90.5/30 ..."
+    // Format: "4: veth0-vm-abc@if3: <...> inet 10.0.1.1/30 ..."
     for line in stdout.lines() {
-        if line.contains(ip) && line.contains("veth0-vm-") {
+        if line.contains(ip) && line.contains("veth0-") {
             // Extract interface name
             if let Some(iface) = line.split_whitespace().nth(1) {
                 // Remove trailing @... and colon
@@ -97,10 +151,6 @@ async fn cleanup_stale_veth_with_ip(ip_with_cidr: &str, exclude_veth: &str) -> R
                     "cleaning up stale veth with conflicting IP"
                 );
 
-                // Clean up CONNMARK routing rules for the stale veth
-                // The stale veth has the same IP, so we can use it to compute the mark
-                let _ = cleanup_connmark_routing(iface_name, ip).await;
-
                 // Delete the FORWARD rule
                 let _ = delete_veth_forward_rule(iface_name).await;
 
@@ -113,432 +163,12 @@ async fn cleanup_stale_veth_with_ip(ip_with_cidr: &str, exclude_veth: &str) -> R
     Ok(())
 }
 
-/// Cleans up orphaned iptables rules for non-existent veth interfaces
-///
-/// When a VM is killed with SIGKILL, its CONNMARK rules remain pointing to
-/// a non-existent veth interface. This function finds and removes such rules.
-pub async fn cleanup_orphaned_veth_rules() -> Result<()> {
-    // Get list of existing veth interfaces
-    let output = Command::new("ip")
-        .args(["-o", "link", "show", "type", "veth"])
-        .output()
-        .await
-        .context("listing veth interfaces")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let existing_veths: std::collections::HashSet<&str> = stdout
-        .lines()
-        .filter_map(|line| {
-            // Format: "4: veth0-vm-abc@if3: <...>"
-            line.split_whitespace()
-                .nth(1)
-                .and_then(|s| s.split('@').next())
-                .map(|s| s.trim_end_matches(':'))
-        })
-        .filter(|s| s.starts_with("veth0-vm-"))
-        .collect();
-
-    // List all rules in mangle PREROUTING
-    let output = Command::new("sudo")
-        .args(["iptables", "-t", "mangle", "-S", "PREROUTING"])
-        .output()
-        .await
-        .context("listing mangle PREROUTING rules")?;
-
-    if !output.status.success() {
-        return Ok(()); // Chain might not exist
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Find rules referencing non-existent veth interfaces
-    for line in stdout.lines() {
-        // Look for rules like: -A PREROUTING -i veth0-vm-xxxxx ...
-        if line.contains("-i veth0-vm-") {
-            // Extract the veth name
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if let Some(idx) = parts.iter().position(|&p| p == "-i") {
-                if let Some(veth_name) = parts.get(idx + 1) {
-                    if !existing_veths.contains(*veth_name) {
-                        // This veth doesn't exist anymore - orphaned rule
-                        warn!(
-                            veth = %veth_name,
-                            rule = %line,
-                            "removing orphaned iptables rule for non-existent veth"
-                        );
-
-                        // Delete the rule (convert -A to -D)
-                        let delete_args: Vec<&str> = line
-                            .split_whitespace()
-                            .skip(1) // Skip "-A"
-                            .collect();
-
-                        let _ = Command::new("sudo")
-                            .arg("iptables")
-                            .arg("-t")
-                            .arg("mangle")
-                            .arg("-D")
-                            .args(&delete_args)
-                            .output()
-                            .await;
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Removes duplicate CONNMARK restore rules from a chain, keeping only one
-///
-/// The `-C` check can fail for various reasons, leading to duplicate rules.
-/// This function ensures we only have one CONNMARK restore rule per chain.
-async fn cleanup_duplicate_connmark_restore(chain: &str) -> Result<()> {
-    // List the chain and count CONNMARK restore rules
-    let output = Command::new("sudo")
-        .args(["iptables", "-t", "mangle", "-S", chain])
-        .output()
-        .await
-        .context("listing mangle chain")?;
-
-    if !output.status.success() {
-        return Ok(()); // Chain might not exist, that's fine
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let restore_rules: Vec<&str> = stdout
-        .lines()
-        .filter(|line| line.contains("CONNMARK") && line.contains("restore"))
-        .collect();
-
-    // If there's more than one, delete the extras (keep the first)
-    if restore_rules.len() > 1 {
-        let to_delete = restore_rules.len() - 1;
-        info!(
-            chain = %chain,
-            total = restore_rules.len(),
-            deleting = to_delete,
-            "cleaning up duplicate CONNMARK restore rules"
-        );
-
-        for _ in 0..to_delete {
-            // Delete one instance (iptables -D deletes the first match)
-            let _ = Command::new("sudo")
-                .args([
-                    "iptables", "-t", "mangle", "-D", chain,
-                    "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
-                    "-j", "CONNMARK", "--restore-mark",
-                ])
-                .output()
-                .await;
-        }
-    }
-
-    Ok(())
-}
-
-/// Ensures global CONNMARK restore rules exist in mangle PREROUTING and OUTPUT
-///
-/// These rules restore the connection mark for reply packets, which is essential
-/// for routing replies back to the correct clone veth. Only needs to be added once.
-/// - PREROUTING: For replies from external hosts (packets entering the system)
-/// - OUTPUT: For replies from local processes (e.g., local HTTP server)
-///
-/// Also cleans up:
-/// - Duplicate restore rules that may have accumulated from concurrent starts
-/// - Orphaned rules for veth interfaces that no longer exist (from SIGKILL'd VMs)
-async fn ensure_connmark_restore_rule() -> Result<()> {
-    // First, clean up any orphaned rules from crashed VMs
-    let _ = cleanup_orphaned_veth_rules().await;
-
-    // Check and add PREROUTING restore rule (for external replies)
-    let output = Command::new("sudo")
-        .args([
-            "iptables", "-t", "mangle", "-C", "PREROUTING",
-            "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
-            "-j", "CONNMARK", "--restore-mark",
-        ])
-        .output()
-        .await
-        .context("checking CONNMARK restore rule in PREROUTING")?;
-
-    if !output.status.success() {
-        let output = Command::new("sudo")
-            .args([
-                "iptables", "-t", "mangle", "-I", "PREROUTING", "1",
-                "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
-                "-j", "CONNMARK", "--restore-mark",
-            ])
-            .output()
-            .await
-            .context("adding CONNMARK restore rule to PREROUTING")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("failed to add CONNMARK restore rule to PREROUTING: {}", stderr);
-        }
-        info!("added global CONNMARK restore rule to PREROUTING for external replies");
-    }
-
-    // Clean up any duplicate PREROUTING rules
-    cleanup_duplicate_connmark_restore("PREROUTING").await?;
-
-    // Check and add OUTPUT restore rule (for local replies)
-    let output = Command::new("sudo")
-        .args([
-            "iptables", "-t", "mangle", "-C", "OUTPUT",
-            "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
-            "-j", "CONNMARK", "--restore-mark",
-        ])
-        .output()
-        .await
-        .context("checking CONNMARK restore rule in OUTPUT")?;
-
-    if !output.status.success() {
-        let output = Command::new("sudo")
-            .args([
-                "iptables", "-t", "mangle", "-I", "OUTPUT", "1",
-                "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
-                "-j", "CONNMARK", "--restore-mark",
-            ])
-            .output()
-            .await
-            .context("adding CONNMARK restore rule to OUTPUT")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("failed to add CONNMARK restore rule to OUTPUT: {}", stderr);
-        }
-        info!("added global CONNMARK restore rule to OUTPUT for local replies");
-    }
-
-    // Clean up any duplicate OUTPUT rules
-    cleanup_duplicate_connmark_restore("OUTPUT").await?;
-
-    Ok(())
-}
-
-/// Sets up CONNMARK-based routing for a clone
-///
-/// This enables multiple clones with the same guest IP to all have working egress.
-/// Each clone gets:
-/// 1. A unique mark (derived from host_ip last two octets)
-/// 2. An iptables rule to mark packets from this veth and save to CONNMARK
-/// 3. A policy routing rule (ip rule) to route marked packets to a dedicated table
-/// 4. A route in the dedicated table for the guest's subnet
-async fn setup_connmark_routing(
-    veth_name: &str,
-    host_ip_with_cidr: &str,
-    guest_subnet: &str,
-) -> Result<()> {
-    // Extract host IP parts to create unique mark
-    // Use last two octets to create a 16-bit mark (avoiding 0)
-    let host_ip = host_ip_with_cidr.split('/').next().unwrap_or(host_ip_with_cidr);
-    let parts: Vec<&str> = host_ip.split('.').collect();
-    if parts.len() != 4 {
-        anyhow::bail!("invalid host IP format: {}", host_ip);
-    }
-
-    let third: u32 = parts[2].parse().unwrap_or(0);
-    let fourth: u32 = parts[3].parse().unwrap_or(0);
-    // Create unique mark from last two octets (1-65535, avoiding 0)
-    let mark = (third << 8) | fourth;
-    if mark == 0 {
-        anyhow::bail!("mark cannot be 0 for host IP: {}", host_ip);
-    }
-
-    // Table number: use mark value (but shifted to avoid system tables 0-255)
-    let table = 100 + (mark % 65000);
-
-    info!(veth = %veth_name, mark = mark, table = table, guest_subnet = %guest_subnet, "setting up CONNMARK routing");
-
-    // Step 1: Ensure global CONNMARK restore rule exists
-    ensure_connmark_restore_rule().await?;
-
-    // Step 2: Add rule to mark packets from this veth and save to CONNMARK
-    // Only mark NEW connections (ESTABLISHED/RELATED are handled by restore rule)
-    let mark_str = mark.to_string();
-    let output = Command::new("sudo")
-        .args([
-            "iptables", "-t", "mangle", "-C", "PREROUTING",
-            "-i", veth_name,
-            "-m", "conntrack", "--ctstate", "NEW",
-            "-j", "MARK", "--set-mark", &mark_str,
-        ])
-        .output()
-        .await
-        .context("checking MARK rule")?;
-
-    if !output.status.success() {
-        // Add the rule
-        let output = Command::new("sudo")
-            .args([
-                "iptables", "-t", "mangle", "-A", "PREROUTING",
-                "-i", veth_name,
-                "-m", "conntrack", "--ctstate", "NEW",
-                "-j", "MARK", "--set-mark", &mark_str,
-            ])
-            .output()
-            .await
-            .context("adding MARK rule")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("failed to add MARK rule for {}: {}", veth_name, stderr);
-        }
-    }
-
-    // Step 3: Add rule to save mark to CONNMARK (after setting it)
-    let output = Command::new("sudo")
-        .args([
-            "iptables", "-t", "mangle", "-C", "PREROUTING",
-            "-i", veth_name,
-            "-m", "mark", "--mark", &mark_str,
-            "-j", "CONNMARK", "--save-mark",
-        ])
-        .output()
-        .await
-        .context("checking CONNMARK save rule")?;
-
-    if !output.status.success() {
-        let output = Command::new("sudo")
-            .args([
-                "iptables", "-t", "mangle", "-A", "PREROUTING",
-                "-i", veth_name,
-                "-m", "mark", "--mark", &mark_str,
-                "-j", "CONNMARK", "--save-mark",
-            ])
-            .output()
-            .await
-            .context("adding CONNMARK save rule")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("failed to add CONNMARK save rule for {}: {}", veth_name, stderr);
-        }
-    }
-
-    // Step 4: Add policy routing rule (ip rule)
-    let table_str = table.to_string();
-    let output = Command::new("sudo")
-        .args(["ip", "rule", "add", "fwmark", &mark_str, "table", &table_str])
-        .output()
-        .await
-        .context("adding ip rule")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Ignore "File exists" - rule already exists
-        if !stderr.contains("File exists") && !stderr.contains("RTNETLINK answers: File exists") {
-            anyhow::bail!("failed to add ip rule for mark {}: {}", mark, stderr);
-        }
-    }
-
-    // Step 5: Add route for guest subnet in the dedicated table
-    let output = Command::new("sudo")
-        .args(["ip", "route", "replace", guest_subnet, "dev", veth_name, "table", &table_str])
-        .output()
-        .await
-        .context("adding route to table")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "failed to add route {} via {} to table {}: {}",
-            guest_subnet,
-            veth_name,
-            table,
-            stderr
-        );
-    }
-
-    Ok(())
-}
-
-/// Cleans up CONNMARK routing rules for a veth
-///
-/// Removes the iptables rules, ip rule, and routing table entries for a clone.
-pub async fn cleanup_connmark_routing(veth_name: &str, host_ip: &str) -> Result<()> {
-    // Extract mark from host IP
-    let parts: Vec<&str> = host_ip.split('.').collect();
-    if parts.len() != 4 {
-        return Ok(()); // Invalid IP, nothing to clean
-    }
-
-    let third: u32 = parts[2].parse().unwrap_or(0);
-    let fourth: u32 = parts[3].parse().unwrap_or(0);
-    let mark = (third << 8) | fourth;
-    if mark == 0 {
-        return Ok(());
-    }
-
-    let mark_str = mark.to_string();
-    let table = 100 + (mark % 65000);
-    let table_str = table.to_string();
-
-    // Remove MARK rule
-    let _ = Command::new("sudo")
-        .args([
-            "iptables", "-t", "mangle", "-D", "PREROUTING",
-            "-i", veth_name,
-            "-m", "conntrack", "--ctstate", "NEW",
-            "-j", "MARK", "--set-mark", &mark_str,
-        ])
-        .output()
-        .await;
-
-    // Remove CONNMARK save rule
-    let _ = Command::new("sudo")
-        .args([
-            "iptables", "-t", "mangle", "-D", "PREROUTING",
-            "-i", veth_name,
-            "-m", "mark", "--mark", &mark_str,
-            "-j", "CONNMARK", "--save-mark",
-        ])
-        .output()
-        .await;
-
-    // Remove ip rule
-    let _ = Command::new("sudo")
-        .args(["ip", "rule", "del", "fwmark", &mark_str, "table", &table_str])
-        .output()
-        .await;
-
-    // Flush the routing table
-    let _ = Command::new("sudo")
-        .args(["ip", "route", "flush", "table", &table_str])
-        .output()
-        .await;
-
-    Ok(())
-}
-
 /// Configures the host side of a veth pair
 ///
 /// Sets up the host-side veth interface with an IP address and brings it up.
 /// Includes proactive cleanup of stale veths with conflicting IPs.
-///
-/// For clones, `secondary_ip` should be the guest's expected gateway IP from the
-/// snapshot. This allows the veth to respond to ARP requests from the guest.
 pub async fn setup_host_veth(veth_name: &str, ip_with_cidr: &str) -> Result<()> {
-    setup_host_veth_with_gateway(veth_name, ip_with_cidr, None).await
-}
-
-/// Configures the host side of a veth pair with an optional secondary IP
-///
-/// The secondary IP is used for clones where the guest expects a different gateway
-/// than the veth's primary IP. The veth will respond to ARP for both IPs.
-///
-/// For clones, also sets up CONNMARK-based routing so multiple clones with the
-/// same guest IP can all have working egress. Each clone gets a unique mark and
-/// routing table based on the last octet of its host_ip.
-pub async fn setup_host_veth_with_gateway(
-    veth_name: &str,
-    ip_with_cidr: &str,
-    guest_gateway_ip: Option<&str>,
-) -> Result<()> {
-    info!(veth = %veth_name, ip = %ip_with_cidr, gateway = ?guest_gateway_ip, "configuring host veth");
+    info!(veth = %veth_name, ip = %ip_with_cidr, "configuring host veth");
 
     // Proactive cleanup: remove any stale veth with the same IP
     // This handles cases where a previous fcvm was killed with SIGKILL
@@ -571,70 +201,10 @@ pub async fn setup_host_veth_with_gateway(
         }
     }
 
-    // For clones: Add the guest's expected gateway IP as secondary address
-    // This allows the veth to respond to ARP requests from the guest OS,
-    // which expects its original gateway IP from the snapshot.
-    if let Some(gateway_ip) = guest_gateway_ip {
-        // Calculate the gateway IP with /32 CIDR (point-to-point)
-        let gateway_with_cidr = format!("{}/32", gateway_ip);
-
-        let output = Command::new("sudo")
-            .args(["ip", "addr", "add", &gateway_with_cidr, "dev", veth_name])
-            .output()
-            .await
-            .context("assigning secondary gateway IP to host veth")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Ignore "File exists" - IP already assigned
-            if !stderr.contains("File exists") {
-                anyhow::bail!(
-                    "failed to assign gateway IP {} to host veth {}: {}",
-                    gateway_ip,
-                    veth_name,
-                    stderr
-                );
-            }
-        }
-
-        // Also add a route for the guest's original /30 subnet through this veth
-        // This ensures return traffic from the host reaches the correct clone.
-        // Use "replace" instead of "add" to override any existing conflicting route
-        // (e.g., if a baseline VM or previous clone had the same guest IP).
-        // Parse gateway IP to calculate the subnet base
-        let parts: Vec<&str> = gateway_ip.split('.').collect();
-        if parts.len() == 4 {
-            let third: u8 = parts[2].parse().unwrap_or(0);
-            let fourth: u8 = parts[3].parse().unwrap_or(0);
-            // In a /30, the gateway is .1 in the subnet, so subnet base is gateway - 1
-            let subnet_base = fourth.saturating_sub(1);
-            let guest_subnet = format!("172.30.{}.{}/30", third, subnet_base);
-
-            // Use "replace" to override any existing route (from baseline or previous clone)
-            let output = Command::new("sudo")
-                .args(["ip", "route", "replace", &guest_subnet, "dev", veth_name])
-                .output()
-                .await
-                .context("replacing route for guest subnet")?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                anyhow::bail!(
-                    "failed to replace route for {} via {}: {}",
-                    guest_subnet,
-                    veth_name,
-                    stderr
-                );
-            }
-            // Set up CONNMARK-based routing for this clone
-            // This allows multiple clones with the same guest IP to all have working egress
-            setup_connmark_routing(veth_name, ip_with_cidr, &guest_subnet).await?;
-
-            info!(veth = %veth_name, gateway = %gateway_ip, subnet = %guest_subnet, "added secondary gateway IP, route, and CONNMARK routing for clone");
-        } else {
-            info!(veth = %veth_name, gateway = %gateway_ip, "added secondary gateway IP for clone");
-        }
-    }
+    // Wait for dnsmasq to bind to this IP (bind-dynamic detection)
+    // VMs use this IP as their DNS server, so dnsmasq must be listening before VM boots
+    let ip = ip_with_cidr.split('/').next().unwrap_or(ip_with_cidr);
+    wait_for_dnsmasq_bind(ip).await?;
 
     // Add FORWARD rule to allow outbound traffic from this veth
     let forward_rule = format!("-A FORWARD -i {} -j ACCEPT", veth_name);
@@ -807,6 +377,186 @@ pub async fn connect_tap_to_veth(ns_name: &str, tap_name: &str, veth_name: &str)
     }
 
     info!(bridge = %bridge_name, "bridge created and configured in namespace");
+
+    Ok(())
+}
+
+/// Sets up In-Namespace NAT for clone egress
+///
+/// This is an alternative to `connect_tap_to_veth` for clones. Instead of bridging
+/// TAP directly to veth (L2), this creates a routed setup with NAT:
+///
+/// Architecture:
+/// ```text
+/// TAP → br0 (gateway_ip, e.g. 172.30.90.1)  ← Guest sends here
+///                    ↓ routing + NAT
+/// veth1 (10.x.y.2) → veth0 (host, 10.x.y.1) ← Unique IP per clone
+/// ```
+///
+/// The guest VM has IP 172.30.90.2 and gateway 172.30.90.1. When it sends traffic:
+/// 1. TAP forwards to br0 (L2 bridge with only TAP attached)
+/// 2. br0 has the gateway IP, so it accepts the packet
+/// 3. Namespace routes the packet out via veth1
+/// 4. MASQUERADE changes source IP from 172.30.90.2 to 10.x.y.2
+/// 5. Packet reaches host with unique source IP (no CONNMARK needed!)
+///
+/// Returns on success, or error if setup fails.
+pub async fn setup_in_namespace_nat(
+    ns_name: &str,
+    tap_name: &str,
+    veth_name: &str,
+    config: &InNamespaceNatConfig,
+) -> Result<()> {
+    info!(
+        namespace = %ns_name,
+        tap = %tap_name,
+        veth = %veth_name,
+        gateway_ip = %config.gateway_ip,
+        veth_ip = %config.veth_ip_cidr,
+        "setting up in-namespace NAT for clone"
+    );
+
+    let bridge_name = "br0";
+
+    // Step 1: Create bridge and attach ONLY the TAP (not veth!)
+    let output = exec_in_namespace(
+        ns_name,
+        &["ip", "link", "add", bridge_name, "type", "bridge"],
+    )
+    .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("File exists") {
+            anyhow::bail!("failed to create bridge in namespace: {}", stderr);
+        }
+    }
+
+    // Attach TAP to bridge
+    let output = exec_in_namespace(
+        ns_name,
+        &["ip", "link", "set", tap_name, "master", bridge_name],
+    )
+    .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("failed to attach TAP to bridge: {}", stderr);
+    }
+
+    // Step 2: Assign gateway IP to bridge (e.g., 172.30.90.1/30)
+    // This makes br0 act as the gateway for the guest VM
+    let gateway_cidr = format!("{}/30", config.gateway_ip);
+    let output = exec_in_namespace(
+        ns_name,
+        &["ip", "addr", "add", &gateway_cidr, "dev", bridge_name],
+    )
+    .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("File exists") {
+            anyhow::bail!("failed to assign gateway IP to bridge: {}", stderr);
+        }
+    }
+
+    // Step 3: Bring up bridge
+    let output = exec_in_namespace(ns_name, &["ip", "link", "set", bridge_name, "up"]).await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("failed to bring up bridge: {}", stderr);
+    }
+
+    // Step 4: Configure veth inside namespace (NOT attached to bridge!)
+    // This is the egress path with unique IP per clone
+    let output = exec_in_namespace(ns_name, &["ip", "link", "set", veth_name, "up"]).await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("failed to bring up veth in namespace: {}", stderr);
+    }
+
+    // Assign unique IP to veth inside namespace (e.g., 10.0.1.2/30)
+    let output = exec_in_namespace(
+        ns_name,
+        &["ip", "addr", "add", &config.veth_ip_cidr, "dev", veth_name],
+    )
+    .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("File exists") {
+            anyhow::bail!("failed to assign IP to veth in namespace: {}", stderr);
+        }
+    }
+
+    // Step 5: Add default route via veth peer (host side)
+    // Extract host IP from host_veth_ip_cidr (e.g., "10.0.1.1/30" -> "10.0.1.1")
+    let host_ip = config
+        .host_veth_ip_cidr
+        .split('/')
+        .next()
+        .unwrap_or(&config.host_veth_ip_cidr);
+    let output = exec_in_namespace(
+        ns_name,
+        &["ip", "route", "add", "default", "via", host_ip, "dev", veth_name],
+    )
+    .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("File exists") {
+            anyhow::bail!("failed to add default route in namespace: {}", stderr);
+        }
+    }
+
+    // Step 6: Enable IP forwarding inside namespace
+    let output = exec_in_namespace(
+        ns_name,
+        &["sysctl", "-w", "net.ipv4.ip_forward=1"],
+    )
+    .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("failed to enable IP forwarding in namespace: {}", stderr);
+    }
+
+    // Step 7: Add MASQUERADE rule for NAT on veth outgoing
+    // This changes source IP from guest IP (172.30.90.2) to veth IP (10.x.y.2)
+    let output = exec_in_namespace(
+        ns_name,
+        &[
+            "iptables", "-t", "nat", "-A", "POSTROUTING",
+            "-o", veth_name, "-j", "MASQUERADE",
+        ],
+    )
+    .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("failed to add MASQUERADE rule in namespace: {}", stderr);
+    }
+
+    // Step 8: Add DNAT rule for incoming traffic to reach the guest
+    // This allows health checks from host to reach the guest via the veth IP
+    // Host connects to veth_ip:80 → DNAT to guest_ip:80
+    let veth_ip = config.veth_ip_cidr.split('/').next().unwrap_or(&config.veth_ip_cidr);
+    let output = exec_in_namespace(
+        ns_name,
+        &[
+            "iptables", "-t", "nat", "-A", "PREROUTING",
+            "-d", veth_ip, "-p", "tcp",
+            "-j", "DNAT", "--to-destination", &config.guest_ip,
+        ],
+    )
+    .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("failed to add DNAT rule in namespace: {}", stderr);
+    }
+
+    info!(
+        namespace = %ns_name,
+        bridge = %bridge_name,
+        gateway = %config.gateway_ip,
+        guest_ip = %config.guest_ip,
+        veth = %veth_name,
+        veth_ip = %config.veth_ip_cidr,
+        "in-namespace NAT configured successfully"
+    );
 
     Ok(())
 }

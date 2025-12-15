@@ -46,6 +46,7 @@ async fn main() -> Result<()> {
             .with_env_filter(
                 EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()),
             )
+            .with_writer(std::io::stderr) // Logs to stderr, keep stdout clean for command output
             .with_target(true) // KEEP targets to show nesting hierarchy
             .without_time()
             .with_level(false) // Disable level prefix too (INFO, DEBUG, etc.)
@@ -53,11 +54,12 @@ async fn main() -> Result<()> {
             .init();
     } else {
         // Parent process: only use colors when outputting to a TTY (not when piped to file)
-        let use_color = atty::is(atty::Stream::Stdout);
+        let use_color = atty::is(atty::Stream::Stderr);
         tracing_subscriber::fmt()
             .with_env_filter(
                 EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()),
             )
+            .with_writer(std::io::stderr) // Logs to stderr, keep stdout clean for command output
             .with_target(true) // Show targets for all processes
             .with_ansi(use_color) // Only use ANSI when outputting to TTY
             .init();

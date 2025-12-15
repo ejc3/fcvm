@@ -177,41 +177,34 @@ async fn update_health_status_once(
                             }
                         }
                     } else {
-                        // Bridged mode: use guest_ip + veth
-                        let guest_ip = net.guest_ip.as_deref();
+                        // Bridged mode: use health_check_url directly (may differ from guest_ip for clones)
                         let veth_device = net.host_veth.as_deref();
 
-                        debug!(target: "health-monitor", guest_ip = ?guest_ip, veth = ?veth_device, "HTTP health check via veth");
+                        debug!(target: "health-monitor", url = %url_str, veth = ?veth_device, "HTTP health check via veth");
 
-                        if let (Some(guest_ip), Some(veth)) = (guest_ip, veth_device) {
-                            match check_http_health_bridged(guest_ip, veth, health_path).await {
-                                Ok(true) => {
-                                    debug!(target: "health-monitor", "health check passed");
-                                    *last_failure_log = None;
-                                    HealthStatus::Healthy
-                                }
-                                Ok(false) => {
-                                    warn!(target: "health-monitor", "health check returned false");
-                                    HealthStatus::Unhealthy
-                                }
-                                Err(e) => {
-                                    let should_log = match last_failure_log {
-                                        None => true,
-                                        Some(last_time) => {
-                                            last_time.elapsed() >= Duration::from_secs(1)
-                                        }
-                                    };
-                                    if should_log {
-                                        warn!(target: "health-monitor", error = %e, "HTTP health check failed");
-                                        *last_failure_log = Some(Instant::now());
-                                    }
-                                    HealthStatus::Unhealthy
-                                }
+                        match check_http_health_bridged(url_str, veth_device).await {
+                            Ok(true) => {
+                                debug!(target: "health-monitor", "health check passed");
+                                *last_failure_log = None;
+                                HealthStatus::Healthy
                             }
-                        } else {
-                            // No network config yet
-                            debug!(target: "health-monitor", "waiting for network config");
-                            HealthStatus::Unknown
+                            Ok(false) => {
+                                warn!(target: "health-monitor", "health check returned false");
+                                HealthStatus::Unhealthy
+                            }
+                            Err(e) => {
+                                let should_log = match last_failure_log {
+                                    None => true,
+                                    Some(last_time) => {
+                                        last_time.elapsed() >= Duration::from_secs(1)
+                                    }
+                                };
+                                if should_log {
+                                    warn!(target: "health-monitor", error = %e, "HTTP health check failed");
+                                    *last_failure_log = Some(Instant::now());
+                                }
+                                HealthStatus::Unhealthy
+                            }
                         }
                     }
                 }
@@ -311,41 +304,38 @@ async fn check_http_health_loopback(
     }
 }
 
-/// Check if HTTP service is responding using reqwest with interface binding (bridged mode)
+/// Check if HTTP service is responding using reqwest with optional interface binding (bridged mode)
 ///
-/// IMPORTANT: For clones with the same guest_ip, we MUST bind to the specific
-/// veth interface to reach the correct VM. Without interface binding, Linux routing
-/// will always pick the first veth in the routing table, causing all health checks
-/// to go to the same VM.
+/// For baseline VMs, we bind to the specific veth interface since the guest IP
+/// is reachable via that interface.
+///
+/// For clones with In-Namespace NAT, the health_check_url uses the veth inner IP
+/// (e.g., 10.x.y.2) which is routed directly by the kernel, so interface binding
+/// is optional (the kernel routes to the correct veth based on IP).
 ///
 /// We use reqwest's .interface() method (which uses SO_BINDTODEVICE on Linux)
-/// to ensure each health check reaches its specific VM, even when multiple VMs
-/// share the same IP address (from snapshot clones).
-async fn check_http_health_bridged(
-    guest_ip: &str,
-    veth_device: &str,
-    health_path: &str,
-) -> Result<bool> {
-    let url = format!("http://{}{}", guest_ip, health_path);
+/// when a veth device is provided, ensuring traffic goes through that interface.
+async fn check_http_health_bridged(url: &str, veth_device: Option<&str>) -> Result<bool> {
+    // Build a reqwest client, optionally bound to the veth device
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(1));
 
-    // Build a reqwest client bound to the specific veth device
-    // This uses SO_BINDTODEVICE on Linux to ensure traffic goes through this interface
-    let client = reqwest::Client::builder()
-        .interface(veth_device)
-        .timeout(Duration::from_secs(1))
-        .build()
-        .context("building reqwest client")?;
+    if let Some(veth) = veth_device {
+        builder = builder.interface(veth);
+    }
+
+    let client = builder.build().context("building reqwest client")?;
 
     let start = Instant::now();
+    let iface_str = veth_device.unwrap_or("default");
 
-    match client.get(&url).send().await {
+    match client.get(url).send().await {
         Ok(response) => {
             let elapsed = start.elapsed();
             if response.status().is_success() {
                 debug!(
                     target: "health-monitor",
-                    interface = veth_device,
-                    guest_ip = guest_ip,
+                    interface = iface_str,
+                    url = url,
                     status = %response.status(),
                     elapsed_ms = elapsed.as_millis(),
                     "health check succeeded"
@@ -355,23 +345,18 @@ async fn check_http_health_bridged(
                 anyhow::bail!(
                     "Health check failed with status {} via {} ({}ms)",
                     response.status(),
-                    veth_device,
+                    iface_str,
                     elapsed.as_millis()
                 )
             }
         }
         Err(e) => {
             if e.is_timeout() {
-                anyhow::bail!("Health check timed out after 1 second via {}", veth_device)
+                anyhow::bail!("Health check timed out after 1 second via {}", iface_str)
             } else if e.is_connect() {
-                anyhow::bail!("Connection refused to {} via {}", guest_ip, veth_device)
+                anyhow::bail!("Connection refused to {} via {}", url, iface_str)
             } else {
-                anyhow::bail!(
-                    "Failed to connect to {} via {}: {}",
-                    guest_ip,
-                    veth_device,
-                    e
-                )
+                anyhow::bail!("Failed to connect to {} via {}: {}", url, iface_str, e)
             }
         }
     }

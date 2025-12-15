@@ -2,6 +2,9 @@
 #![allow(dead_code)]
 
 use std::path::PathBuf;
+
+/// Default test image - use AWS ECR to avoid Docker Hub rate limits
+pub const TEST_IMAGE: &str = "public.ecr.aws/nginx/nginx:alpine";
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -47,7 +50,7 @@ impl VmFixture {
                 "--map",
                 &format!("{}:/mnt/test", host_dir.display()),
                 "--",
-                "nginx:alpine",
+                TEST_IMAGE,
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -58,7 +61,7 @@ impl VmFixture {
             .ok_or_else(|| anyhow::anyhow!("failed to get VM PID"))?;
 
         // Wait for VM to become healthy
-        if let Err(e) = poll_health_by_pid(pid, 120).await {
+        if let Err(e) = poll_health_by_pid(pid, 60).await {
             let _ = child.kill().await;
             anyhow::bail!("VM failed to become healthy: {}", e);
         }
@@ -150,7 +153,7 @@ pub async fn poll_health_by_pid(pid: u32, timeout_secs: u64) -> anyhow::Result<(
             .await?;
 
         if !output.status.success() {
-            sleep(Duration::from_secs(1)).await;
+            sleep(Duration::from_millis(100)).await;
             continue;
         }
 
@@ -167,7 +170,7 @@ pub async fn poll_health_by_pid(pid: u32, timeout_secs: u64) -> anyhow::Result<(
         let vms: Vec<VmDisplay> = match serde_json::from_str(&stdout) {
             Ok(v) => v,
             Err(_) => {
-                sleep(Duration::from_secs(1)).await;
+                sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
@@ -179,7 +182,36 @@ pub async fn poll_health_by_pid(pid: u32, timeout_secs: u64) -> anyhow::Result<(
             }
         }
 
-        sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Poll for serve process state to exist by PID (serve processes don't have health status)
+pub async fn poll_serve_state_by_pid(pid: u32, timeout_secs: u64) -> anyhow::Result<()> {
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(timeout_secs);
+
+    loop {
+        if start.elapsed() > timeout {
+            anyhow::bail!("timeout waiting for serve state to be saved");
+        }
+
+        // Query state - serve processes show up in `fcvm ls` once state is saved
+        let fcvm_path = find_fcvm_binary()?;
+        let output = tokio::process::Command::new(&fcvm_path)
+            .args(["ls", "--json", "--pid", &pid.to_string()])
+            .output()
+            .await?;
+
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Check if we got any results (non-empty array)
+            if stdout.trim() != "[]" && !stdout.trim().is_empty() {
+                return Ok(());
+            }
+        }
+
+        sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -268,9 +300,9 @@ pub async fn start_memory_server(
         .id()
         .ok_or_else(|| anyhow::anyhow!("failed to get serve PID"))?;
 
-    // Wait for serve process to register in state manager
-    // The serve process will show up in `fcvm ls --pid` once it's running
-    poll_health_by_pid(serve_pid, 10).await?;
+    // Wait for serve process to save its state file
+    // Serve processes don't have health status, so we just check state exists
+    poll_serve_state_by_pid(serve_pid, 10).await?;
 
     Ok((child, serve_pid))
 }
@@ -312,8 +344,39 @@ pub async fn spawn_clone(
     Ok((child, clone_pid))
 }
 
-/// Kill a process by PID using kill -9
+/// Kill a process by PID gracefully (SIGTERM first, then SIGKILL after timeout)
+///
+/// This allows fcvm to cleanup network resources (veth, namespaces, iptables rules)
+/// before terminating. Without cleanup, network resources accumulate and cause
+/// routing conflicts when the same IPs are reused.
 pub async fn kill_process(pid: u32) {
+    // First try SIGTERM for graceful shutdown
+    let _ = tokio::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .output()
+        .await;
+
+    // Wait up to 5 seconds for process to exit
+    for _ in 0..50 {
+        sleep(Duration::from_millis(100)).await;
+
+        // Check if process still exists
+        let status = tokio::process::Command::new("kill")
+            .arg("-0") // Check existence without signaling
+            .arg(pid.to_string())
+            .output()
+            .await;
+
+        if let Ok(output) = status {
+            if !output.status.success() {
+                // Process no longer exists
+                return;
+            }
+        }
+    }
+
+    // Force kill if still running
     let _ = tokio::process::Command::new("kill")
         .arg("-9")
         .arg(pid.to_string())

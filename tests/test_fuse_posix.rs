@@ -31,7 +31,7 @@ use std::time::Instant;
 
 const PJDFSTEST_BIN: &str = "/tmp/pjdfstest-check/pjdfstest";
 const PJDFSTEST_TESTS: &str = "/tmp/pjdfstest-check/tests";
-const TIMEOUT_SECS: u64 = 120;
+const TIMEOUT_SECS: u64 = 60;
 
 #[derive(Debug)]
 struct TestResult {

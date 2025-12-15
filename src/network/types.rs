@@ -19,6 +19,16 @@ pub struct NetworkConfig {
     /// For rootless mode: port on loopback_ip where guest port 80 is forwarded
     #[serde(default)]
     pub health_check_port: Option<u16>,
+    /// Auto-generated health check URL based on network type
+    /// Bridged: http://{guest_ip}:80/
+    /// Rootless: http://{loopback_ip}:8080/
+    #[serde(default)]
+    pub health_check_url: Option<String>,
+    /// DNS server for the guest to use
+    /// Bridged: host_ip (dnsmasq on veth)
+    /// Rootless: 10.0.2.3 (slirp4netns built-in DNS)
+    #[serde(default)]
+    pub dns_server: Option<String>,
 }
 
 #[derive(Debug, Clone)]

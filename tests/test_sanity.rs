@@ -35,7 +35,7 @@ async fn sanity_test_impl(network: &str) -> Result<()> {
             &format!("sanity-test-{}", network),
             "--network",
             network,
-            "nginx:alpine",
+            common::TEST_IMAGE,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -72,7 +72,7 @@ async fn sanity_test_impl(network: &str) -> Result<()> {
     println!("  Waiting for VM to become healthy...");
 
     // Spawn health check task
-    let health_task = tokio::spawn(common::poll_health_by_pid(fcvm_pid, 120));
+    let health_task = tokio::spawn(common::poll_health_by_pid(fcvm_pid, 60));
 
     // Monitor process for unexpected exits
     let monitor_task: tokio::task::JoinHandle<Result<(), anyhow::Error>> =

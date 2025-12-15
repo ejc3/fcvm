@@ -615,14 +615,13 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     let network_config = network.setup().await.context("setting up network")?;
 
-    // For bridged mode, auto-generate health check URL using guest IP
-    // This ensures HTTP health checks work (not just container-ready file)
-    if matches!(args.network, NetworkMode::Bridged) && vm_state.config.health_check_url.is_none() {
-        if let Some(ref guest_ip) = network_config.guest_ip {
-            vm_state.config.health_check_url = Some(format!("http://{}:80/", guest_ip));
-            // Store the health_check_port for health monitor to use with interface binding
-            vm_state.config.network.health_check_port = Some(80);
-        }
+    // Use network-provided health check URL if user didn't specify one
+    // Each network type (bridged/rootless) generates its own appropriate URL
+    if vm_state.config.health_check_url.is_none() {
+        vm_state.config.health_check_url = network_config.health_check_url.clone();
+    }
+    if let Some(port) = network_config.health_check_port {
+        vm_state.config.network.health_check_port = Some(port);
     }
 
     info!(

@@ -63,6 +63,8 @@ async fn test_health_monitor_behaviors() {
                 host_veth: Some("veth-test".to_string()),
                 loopback_ip: None,
                 health_check_port: None,
+                health_check_url: Some("http://localhost/health".to_string()),
+                dns_server: None,
             },
             volumes: vec![],
             env: vec![],

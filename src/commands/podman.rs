@@ -293,12 +293,6 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 .await
                 .context("allocating loopback IP")?;
 
-            // Auto-generate health check URL using loopback IP
-            // Port 8080 on host forwards to port 80 in guest (unprivileged, fully rootless)
-            if vm_state.config.health_check_url.is_none() {
-                vm_state.config.health_check_url = Some(format!("http://{}:8080/", loopback_ip));
-            }
-
             Box::new(
                 SlirpNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
                     .with_loopback_ip(loopback_ip),
@@ -308,14 +302,13 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     let network_config = network.setup().await.context("setting up network")?;
 
-    // For bridged mode, auto-generate health check URL using guest IP
-    // This ensures HTTP health checks work (not just container-ready file)
-    if matches!(args.network, NetworkMode::Bridged) && vm_state.config.health_check_url.is_none() {
-        if let Some(ref guest_ip) = network_config.guest_ip {
-            vm_state.config.health_check_url = Some(format!("http://{}:80/", guest_ip));
-            // Store the health_check_port for health monitor to use with interface binding
-            vm_state.config.network.health_check_port = Some(80);
-        }
+    // Use network-provided health check URL if user didn't specify one
+    // Each network type (bridged/rootless) generates its own appropriate URL
+    if vm_state.config.health_check_url.is_none() {
+        vm_state.config.health_check_url = network_config.health_check_url.clone();
+    }
+    if let Some(port) = network_config.health_check_port {
+        vm_state.config.network.health_check_port = Some(port);
     }
 
     info!(tap = %network_config.tap_device, mac = %network_config.guest_mac, "network configured");
@@ -711,8 +704,8 @@ async fn run_vm_setup(
     info!("configuring VM via Firecracker API");
 
     // Boot source with network configuration via kernel cmdline
-    // Format: ip=<client-ip>:<server-ip>:<gw-ip>:<netmask>:<hostname>:<device>:<autoconf>
-    // Example: ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off
+    // Format: ip=<client-ip>:<server-ip>:<gw-ip>:<netmask>:<hostname>:<device>:<autoconf>:<dns0>
+    // Example: ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off:172.16.0.1
     let boot_args = if let (Some(guest_ip), Some(host_ip)) =
         (&network_config.guest_ip, &network_config.host_ip)
     {
@@ -720,9 +713,19 @@ async fn run_vm_setup(
         let guest_ip_clean = guest_ip.split('/').next().unwrap_or(guest_ip);
         let host_ip_clean = host_ip.split('/').next().unwrap_or(host_ip);
 
+        // Only add explicit DNS to boot args for rootless mode (slirp4netns DNS at 10.0.2.3)
+        // Bridged mode uses guest's default DNS config which works through NAT
+        let dns_suffix = network_config
+            .dns_server
+            .as_ref()
+            .filter(|dns| dns.as_str() != host_ip_clean)
+            .map(|dns| format!(":{}", dns))
+            .unwrap_or_default();
+
+        // Format: ip=<client>:<server>:<gw>:<netmask>:<hostname>:<device>:<autoconf>[:<dns0>]
         format!(
-            "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=1 systemd.log_color=no ip={}::{}:255.255.255.252::eth0:off",
-            guest_ip_clean, host_ip_clean
+            "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=1 systemd.log_color=no ip={}::{}:255.255.255.252::eth0:off{}",
+            guest_ip_clean, host_ip_clean, dns_suffix
         )
     } else {
         "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=1 systemd.log_color=no".to_string()
