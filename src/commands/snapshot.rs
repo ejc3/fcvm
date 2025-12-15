@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cli::{
     NetworkMode, SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs,
@@ -15,7 +15,7 @@ use crate::state::{
 };
 use crate::storage::{DiskManager, SnapshotManager};
 use crate::uffd::UffdServer;
-use crate::volume::{VolumeConfig, VolumeServer};
+use crate::volume::{spawn_volume_servers, VolumeConfig};
 
 /// Main dispatcher for snapshot commands
 pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
@@ -400,6 +400,15 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
 
 /// Run clone from snapshot
 async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
+    // First verify the serve process is actually alive before attempting any work
+    // This prevents wasted setup if the serve process died between state file creation and now
+    if !crate::utils::is_process_alive(args.pid) {
+        anyhow::bail!(
+            "serve process (PID {}) is not running - start with 'fcvm snapshot serve'",
+            args.pid
+        );
+    }
+
     // Load serve state by PID to get snapshot name
     let state_manager = StateManager::new(paths::state_dir());
     let serve_state = state_manager
@@ -475,21 +484,15 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     let socket_path = data_dir.join("firecracker.sock");
 
-    // Check for running memory server using serve PID
+    // Build UFFD socket path for memory server
+    // Note: We already verified the serve process is alive above.
+    // We do NOT check socket existence here (TOCTOU race) - let the actual
+    // connection attempt fail with a meaningful error instead.
     let uffd_socket = paths::base_dir().join(format!("uffd-{}-{}.sock", snapshot_name, args.pid));
-
-    if !uffd_socket.exists() {
-        anyhow::bail!(
-            "Memory server socket not found for serve PID {}.\\n\\n\\\
-             The serve process may have exited or not be ready yet.\\n\\\
-             Expected socket: {}",
-            args.pid,
-            uffd_socket.display()
-        );
-    }
 
     info!(
         uffd_socket = %uffd_socket.display(),
+        serve_pid = args.pid,
         "connecting to memory server"
     );
 
@@ -506,61 +509,27 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // - But the bind mount redirects this to /clone_dir/vsock.sock
     // - Each clone has its own mount namespace, so each creates unique socket files
     // - VolumeServers listen on the clone's actual socket paths
-    let volume_configs = &snapshot_config.metadata.volumes;
-    let mut volume_server_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // Clone's vsock socket base path
+    // With mount namespace isolation, Firecracker will create sockets here
+    // (it thinks it's writing to baseline's path but bind mount redirects to clone's)
+    let clone_vsock_base = data_dir.join("vsock.sock");
 
-    if !volume_configs.is_empty() {
-        info!(
-            num_volumes = volume_configs.len(),
-            "setting up {} VolumeServer(s) for clone",
-            volume_configs.len()
-        );
+    // Build VolumeConfigs from snapshot metadata and spawn VolumeServers
+    let volume_configs: Vec<VolumeConfig> = snapshot_config
+        .metadata
+        .volumes
+        .iter()
+        .map(|vol| VolumeConfig {
+            host_path: vol.host_path.clone(),
+            guest_path: vol.guest_path.clone().into(),
+            read_only: vol.read_only,
+            port: vol.vsock_port,
+        })
+        .collect();
 
-        // Clone's vsock socket base path
-        // With mount namespace isolation, Firecracker will create sockets here
-        // (it thinks it's writing to baseline's path but bind mount redirects to clone's)
-        let clone_vsock_base = data_dir.join("vsock.sock");
-
-        // Start VolumeServers for each volume port
-        for vol_config in volume_configs {
-            let port = vol_config.vsock_port;
-            let clone_socket = PathBuf::from(format!("{}_{}", clone_vsock_base.display(), port));
-
-            let config = VolumeConfig {
-                host_path: vol_config.host_path.clone(),
-                guest_path: vol_config.guest_path.clone().into(),
-                read_only: vol_config.read_only,
-                port,
-            };
-
-            let server = VolumeServer::new(config.clone()).with_context(|| {
-                format!(
-                    "creating VolumeServer for {}",
-                    vol_config.host_path.display()
-                )
-            })?;
-
-            let vsock_path = clone_vsock_base.clone();
-            let handle = tokio::spawn(async move {
-                if let Err(e) = server.serve_vsock(&vsock_path).await {
-                    error!("VolumeServer error for port {}: {}", port, e);
-                }
-            });
-
-            info!(
-                port = port,
-                host_path = %vol_config.host_path.display(),
-                guest_path = %vol_config.guest_path,
-                socket = %clone_socket.display(),
-                "started VolumeServer for clone"
-            );
-
-            volume_server_handles.push(handle);
-        }
-
-        // Give VolumeServers time to bind to their sockets
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    let volume_server_handles = spawn_volume_servers(&volume_configs, &clone_vsock_base)
+        .await
+        .context("spawning VolumeServers for clone")?;
 
     // Setup networking - use saved network config from snapshot
     let tap_device = format!("tap-{}", truncate_id(&vm_id, 8));
@@ -645,9 +614,16 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     )
     .await;
 
-    // If setup failed, cleanup network before propagating error
+    // If setup failed, cleanup all resources before propagating error
     if let Err(e) = setup_result {
-        warn!("Clone setup failed, cleaning up network resources");
+        warn!("Clone setup failed, cleaning up resources");
+
+        // Abort VolumeServer tasks
+        for handle in volume_server_handles {
+            handle.abort();
+        }
+
+        // Cleanup network
         if let Err(cleanup_err) = network.cleanup().await {
             warn!(
                 "failed to cleanup network after setup error: {}",
@@ -671,8 +647,16 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     println!("  Memory pages shared via UFFD");
     println!("  Disk uses CoW overlay");
 
-    // Spawn health monitor task (store handle for cancellation)
-    let health_monitor_handle = crate::health::spawn_health_monitor(vm_id.clone(), vm_state.pid);
+    // Create cancellation token for graceful health monitor shutdown
+    let health_cancel_token = tokio_util::sync::CancellationToken::new();
+
+    // Spawn health monitor task with cancellation support
+    let health_monitor_handle = crate::health::spawn_health_monitor_with_cancel(
+        vm_id.clone(),
+        vm_state.pid,
+        paths::state_dir(),
+        Some(health_cancel_token.clone()),
+    );
 
     // Setup signal handlers
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -694,8 +678,16 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Cleanup
     info!("cleaning up resources");
 
-    // Cancel health monitor task first
-    health_monitor_handle.abort();
+    // Signal health monitor to stop gracefully, then wait briefly for it
+    health_cancel_token.cancel();
+    tokio::select! {
+        _ = health_monitor_handle => {
+            debug!("health monitor stopped gracefully");
+        }
+        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+            debug!("health monitor didn't stop in time, continuing cleanup");
+        }
+    }
 
     // Cancel VolumeServer tasks
     for handle in volume_server_handles {
@@ -731,11 +723,9 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     if !volume_configs.is_empty() {
         let clone_vsock_base = data_dir.join("vsock.sock");
 
-        for vol_config in volume_configs {
-            let port = vol_config.vsock_port;
-
+        for vol_config in &volume_configs {
             // Remove clone's socket
-            let clone_socket = PathBuf::from(format!("{}_{}", clone_vsock_base.display(), port));
+            let clone_socket = PathBuf::from(format!("{}_{}", clone_vsock_base.display(), vol_config.port));
             let _ = std::fs::remove_file(&clone_socket);
         }
     }
@@ -874,6 +864,15 @@ async fn run_clone_setup(
         let setup_script = slirp_net.build_setup_script();
         let nsenter_prefix = slirp_net.build_nsenter_prefix(holder_pid);
 
+        // Verify holder is still alive before attempting nsenter
+        if !crate::utils::is_process_alive(holder_pid) {
+            let _ = child.kill().await;
+            bail!(
+                "holder process (PID {}) died before network setup could run",
+                holder_pid
+            );
+        }
+
         info!(holder_pid = holder_pid, "running network setup via nsenter");
         let setup_output = tokio::process::Command::new(&nsenter_prefix[0])
             .args(&nsenter_prefix[1..])
@@ -892,6 +891,27 @@ async fn run_clone_setup(
         }
 
         info!(holder_pid = holder_pid, "network setup complete");
+
+        // Verify TAP device was created successfully
+        let tap_device = &network_config.tap_device;
+        let verify_cmd = format!("ip link show {} >/dev/null 2>&1", tap_device);
+        let verify_output = tokio::process::Command::new(&nsenter_prefix[0])
+            .args(&nsenter_prefix[1..])
+            .arg("bash")
+            .arg("-c")
+            .arg(&verify_cmd)
+            .status()
+            .await
+            .context("verifying TAP device")?;
+
+        if !verify_output.success() {
+            let _ = child.kill().await;
+            bail!(
+                "TAP device '{}' not found after network setup - setup may have failed silently",
+                tap_device
+            );
+        }
+        debug!(tap_device = %tap_device, "TAP device verified");
 
         // Step 3: Set holder_pid so VmManager uses nsenter
         vm_manager.set_holder_pid(holder_pid);

@@ -9,7 +9,7 @@ use crate::network::{BridgedNetwork, NetworkManager, PortMapping, SlirpNetwork};
 use crate::paths;
 use crate::state::{generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState};
 use crate::storage::DiskManager;
-use crate::volume::{VolumeConfig, VolumeServer};
+use crate::volume::{spawn_volume_servers, VolumeConfig};
 
 /// Parsed volume mapping from --map HOST:GUEST[:ro]
 #[derive(Debug, Clone)]
@@ -317,44 +317,23 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // Firecracker binds to vsock.sock, VolumeServers listen on vsock.sock_{port}
     let vsock_socket_path = data_dir.join("vsock.sock");
 
-    // Start VolumeServers BEFORE the VM so the sockets are ready when guest boots
+    // Build VolumeConfigs and spawn VolumeServers BEFORE the VM starts
     // Each VolumeServer listens on vsock.sock_{port} (e.g., vsock.sock_5000)
     // Firecracker binds to vsock.sock and routes guest connections to the per-port sockets
-    let mut volume_server_handles = Vec::new();
-    for (idx, vol) in volume_mappings.iter().enumerate() {
-        let port = VSOCK_VOLUME_PORT_BASE + idx as u32;
-        let config = VolumeConfig {
+    let volume_configs: Vec<VolumeConfig> = volume_mappings
+        .iter()
+        .enumerate()
+        .map(|(idx, vol)| VolumeConfig {
             host_path: vol.host_path.clone(),
             guest_path: vol.guest_path.clone().into(),
             read_only: vol.read_only,
-            port,
-        };
+            port: VSOCK_VOLUME_PORT_BASE + idx as u32,
+        })
+        .collect();
 
-        let server = VolumeServer::new(config)
-            .with_context(|| format!("creating VolumeServer for {}", vol.host_path.display()))?;
-
-        let vsock_path = vsock_socket_path.clone();
-        let handle = tokio::spawn(async move {
-            if let Err(e) = server.serve_vsock(&vsock_path).await {
-                tracing::error!("VolumeServer error for port {}: {}", port, e);
-            }
-        });
-
-        info!(
-            port = port,
-            host_path = %vol.host_path.display(),
-            guest_path = %vol.guest_path,
-            read_only = vol.read_only,
-            "Started VolumeServer"
-        );
-
-        volume_server_handles.push(handle);
-    }
-
-    // Give VolumeServers time to bind to their sockets
-    if !volume_mappings.is_empty() {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    let volume_server_handles = spawn_volume_servers(&volume_configs, &vsock_socket_path)
+        .await
+        .context("spawning VolumeServers")?;
 
     // Start status channel listener for fc-agent notifications
     // - "ready" on port 4999 -> creates container-ready file for health check
@@ -389,9 +368,19 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     )
     .await;
 
-    // If setup failed, cleanup network before propagating error
+    // If setup failed, cleanup all resources before propagating error
     if let Err(e) = setup_result {
-        warn!("VM setup failed, cleaning up network resources");
+        warn!("VM setup failed, cleaning up resources");
+
+        // Abort VolumeServer tasks
+        for handle in volume_server_handles {
+            handle.abort();
+        }
+
+        // Abort status listener
+        status_handle.abort();
+
+        // Cleanup network
         if let Err(cleanup_err) = network.cleanup().await {
             warn!(
                 "failed to cleanup network after setup error: {}",
@@ -405,8 +394,16 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     info!(vm_id = %vm_id, "VM started successfully");
 
-    // Spawn health monitor task (store handle for cancellation)
-    let health_monitor_handle = crate::health::spawn_health_monitor(vm_id.clone(), vm_state.pid);
+    // Create cancellation token for graceful health monitor shutdown
+    let health_cancel_token = tokio_util::sync::CancellationToken::new();
+
+    // Spawn health monitor task with cancellation support
+    let health_monitor_handle = crate::health::spawn_health_monitor_with_cancel(
+        vm_id.clone(),
+        vm_state.pid,
+        paths::state_dir(),
+        Some(health_cancel_token.clone()),
+    );
 
     // Note: For rootless mode, slirp4netns wraps Firecracker and configures TAP automatically
     // For bridged mode, TAP is configured via NAT routing during network setup
@@ -440,8 +437,16 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // Cleanup
     info!("cleaning up resources");
 
-    // Cancel health monitor task first
-    health_monitor_handle.abort();
+    // Signal health monitor to stop gracefully, then wait briefly for it
+    health_cancel_token.cancel();
+    tokio::select! {
+        _ = health_monitor_handle => {
+            debug!("health monitor stopped gracefully");
+        }
+        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+            debug!("health monitor didn't stop in time, continuing cleanup");
+        }
+    }
 
     // Cancel status listener
     status_handle.abort();
@@ -627,6 +632,15 @@ async fn run_vm_setup(
             warn!("/dev/net/tun not available - TAP device creation will fail");
         }
 
+        // Verify holder is still alive before attempting nsenter
+        if !crate::utils::is_process_alive(holder_pid) {
+            let _ = child.kill().await;
+            bail!(
+                "holder process (PID {}) died before network setup could run",
+                holder_pid
+            );
+        }
+
         info!(holder_pid = holder_pid, "running network setup via nsenter");
 
         // Log the setup script for debugging
@@ -678,6 +692,27 @@ async fn run_vm_setup(
         }
 
         info!(holder_pid = holder_pid, "network setup complete");
+
+        // Verify TAP device was created successfully
+        let tap_device = &network_config.tap_device;
+        let verify_cmd = format!("ip link show {} >/dev/null 2>&1", tap_device);
+        let verify_output = tokio::process::Command::new(&nsenter_prefix[0])
+            .args(&nsenter_prefix[1..])
+            .arg("bash")
+            .arg("-c")
+            .arg(&verify_cmd)
+            .status()
+            .await
+            .context("verifying TAP device")?;
+
+        if !verify_output.success() {
+            let _ = child.kill().await;
+            bail!(
+                "TAP device '{}' not found after network setup - setup may have failed silently",
+                tap_device
+            );
+        }
+        debug!(tap_device = %tap_device, "TAP device verified");
 
         // Step 3: Set holder_pid so VmManager uses nsenter
         vm_manager.set_holder_pid(holder_pid);

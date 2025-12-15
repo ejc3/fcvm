@@ -51,6 +51,23 @@ impl<H: FilesystemHandler + 'static> AsyncServer<H> {
     ///
     /// This function blocks forever, accepting and handling connections.
     pub async fn serve_unix(self, socket_path: &str) -> anyhow::Result<()> {
+        self.serve_unix_with_ready_signal(socket_path, None).await
+    }
+
+    /// Serve on a Unix socket with an optional ready signal.
+    ///
+    /// The ready signal (oneshot channel) is sent after the socket is bound and before
+    /// entering the accept loop. This allows callers to synchronize on server readiness
+    /// instead of using arbitrary sleeps.
+    ///
+    /// # Arguments
+    /// * `socket_path` - Path for the Unix socket
+    /// * `ready` - Optional oneshot sender that will be notified when the socket is bound
+    pub async fn serve_unix_with_ready_signal(
+        self,
+        socket_path: &str,
+        ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> anyhow::Result<()> {
         // Remove existing socket
         let _ = std::fs::remove_file(socket_path);
 
@@ -59,6 +76,11 @@ impl<H: FilesystemHandler + 'static> AsyncServer<H> {
         // Make socket accessible by Firecracker running in user namespace (UID 100000)
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o777))?;
+
+        // Signal ready BEFORE entering accept loop
+        if let Some(tx) = ready {
+            let _ = tx.send(());
+        }
 
         info!(target: "fuse-pipe::server", socket_path, "listening");
 
@@ -102,9 +124,22 @@ impl<H: FilesystemHandler + 'static> AsyncServer<H> {
     /// // Listens on /tmp/vm/vsock.sock_5000
     /// ```
     pub async fn serve_vsock_forwarded(self, uds_base_path: &str, port: u32) -> anyhow::Result<()> {
+        self.serve_vsock_forwarded_with_ready_signal(uds_base_path, port, None)
+            .await
+    }
+
+    /// Serve on Firecracker's vsock-forwarded Unix socket with ready signal.
+    ///
+    /// Same as `serve_vsock_forwarded` but signals readiness after binding.
+    pub async fn serve_vsock_forwarded_with_ready_signal(
+        self,
+        uds_base_path: &str,
+        port: u32,
+        ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> anyhow::Result<()> {
         let socket_path = format!("{}_{}", uds_base_path, port);
         info!(target: "fuse-pipe::server", uds_base_path, port, socket_path = %socket_path, "serving vsock-forwarded");
-        self.serve_unix(&socket_path).await
+        self.serve_unix_with_ready_signal(&socket_path, ready).await
     }
 
     /// Run the server with a tuned tokio runtime.
