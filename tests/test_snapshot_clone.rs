@@ -67,7 +67,7 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
             &baseline_name,
             "--network",
             network,
-            "nginx:alpine",
+            common::TEST_IMAGE,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -84,7 +84,7 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
 
     // Wait for healthy
     println!("  Waiting for baseline VM to become healthy...");
-    common::poll_health_by_pid(baseline_pid, 120).await?;
+    common::poll_health_by_pid(baseline_pid, 60).await?;
     let baseline_time = step1_start.elapsed();
     println!(
         "  ✓ Baseline VM healthy (PID: {}, took {:.1}s)",
@@ -214,8 +214,8 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
                     // Now wait for health check
                     let health_start = Instant::now();
                     let health_result = tokio::time::timeout(
-                        Duration::from_secs(120),
-                        common::poll_health_by_pid(clone_pid, 120),
+                        Duration::from_secs(60),
+                        common::poll_health_by_pid(clone_pid, 60),
                     )
                     .await;
 
@@ -460,7 +460,7 @@ async fn test_clone_while_baseline_running() -> Result<()> {
             baseline_name,
             "--network",
             "bridged",
-            "nginx:alpine",
+            common::TEST_IMAGE,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -475,7 +475,7 @@ async fn test_clone_while_baseline_running() -> Result<()> {
     spawn_log_consumer_stderr(baseline_child.stderr.take(), baseline_name);
 
     println!("  Waiting for baseline VM to become healthy...");
-    common::poll_health_by_pid(baseline_pid, 120).await?;
+    common::poll_health_by_pid(baseline_pid, 60).await?;
     println!("  ✓ Baseline VM healthy (PID: {})", baseline_pid);
 
     // Step 2: Create snapshot (baseline VM stays running after this)
@@ -555,8 +555,8 @@ async fn test_clone_while_baseline_running() -> Result<()> {
     // Step 6: Wait for clone to become healthy
     println!("\nStep 6: Waiting for clone to become healthy...");
     let clone_health_result = tokio::time::timeout(
-        Duration::from_secs(120),
-        common::poll_health_by_pid(clone_pid, 120),
+        Duration::from_secs(60),
+        common::poll_health_by_pid(clone_pid, 60),
     )
     .await;
 
@@ -644,7 +644,7 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
             &baseline_name,
             "--network",
             network,
-            "nginx:alpine",
+            common::TEST_IMAGE,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -659,7 +659,7 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
     spawn_log_consumer_stderr(baseline_child.stderr.take(), &baseline_name);
 
     println!("  Waiting for baseline VM to become healthy...");
-    common::poll_health_by_pid(baseline_pid, 120).await?;
+    common::poll_health_by_pid(baseline_pid, 60).await?;
     println!("  ✓ Baseline VM healthy (PID: {})", baseline_pid);
 
     // Step 2: Create snapshot
@@ -735,7 +735,7 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
 
     // Wait for clone to become healthy
     println!("  Waiting for clone to become healthy...");
-    common::poll_health_by_pid(clone_pid, 120).await?;
+    common::poll_health_by_pid(clone_pid, 60).await?;
     println!("  ✓ Clone is healthy (PID: {})", clone_pid);
 
     // Step 5: Test internet connectivity from inside the clone

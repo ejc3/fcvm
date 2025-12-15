@@ -11,13 +11,19 @@ use crate::state::truncate_id;
 /// This mode requires sudo/root for network namespace and iptables setup.
 /// For true rootless operation (no sudo), use SlirpNetwork instead.
 ///
-/// Architecture:
+/// Architecture for baseline VMs:
 /// - Each VM runs in dedicated network namespace (fcvm-{vm_id})
 /// - veth pair connects host namespace to VM namespace
 /// - TAP device created inside VM namespace
-/// - TAP connected directly to veth (no bridge)
+/// - TAP connected to veth via L2 bridge (no IP on bridge)
 /// - Port mappings via iptables DNAT/FORWARD rules
 /// - Firecracker process runs inside the namespace
+///
+/// Architecture for clones (In-Namespace NAT):
+/// - TAP connected to br0 which has the guest's expected gateway IP
+/// - veth pair has unique 10.x.y.0/30 IPs (not connected to bridge)
+/// - NAT inside namespace changes source IP to veth IP
+/// - Host routes 10.x.y.0/30 to the veth (no CONNMARK needed!)
 pub struct BridgedNetwork {
     vm_id: String,
     tap_device: String,
@@ -32,6 +38,7 @@ pub struct BridgedNetwork {
     guest_ip: Option<String>,
     subnet_cidr: Option<String>,
     port_mapping_rules: Vec<String>,
+    is_clone: bool,
 }
 
 impl BridgedNetwork {
@@ -48,12 +55,14 @@ impl BridgedNetwork {
             guest_ip: None,
             subnet_cidr: None,
             port_mapping_rules: Vec::new(),
+            is_clone: false,
         }
     }
 
     /// Set guest IP to use (for clones - use same IP as original VM)
     pub fn with_guest_ip(mut self, guest_ip: String) -> Self {
         self.guest_ip_override = Some(guest_ip);
+        self.is_clone = true;
         self
     }
 
@@ -66,114 +75,152 @@ impl BridgedNetwork {
 #[async_trait::async_trait]
 impl NetworkManager for BridgedNetwork {
     async fn setup(&mut self) -> Result<NetworkConfig> {
-        info!(vm_id = %self.vm_id, "setting up network namespace with veth pair isolation");
+        info!(vm_id = %self.vm_id, is_clone = %self.is_clone, "setting up network namespace");
 
-        // Step 1: Determine IPs (same logic as before)
-        let (host_ip, guest_ip, subnet) = if let Some(ref override_ip) = self.guest_ip_override {
-            // Clone case: parse saved guest IP to determine subnet
-            let parts: Vec<&str> = override_ip.split('.').collect();
-            if parts.len() != 4 {
-                anyhow::bail!("invalid guest IP format: {}", override_ip);
-            }
-            let third_octet: u8 = parts[2]
-                .parse()
-                .with_context(|| format!("parsing guest IP third octet: {}", override_ip))?;
-            let fourth_octet: u8 = parts[3]
-                .parse()
-                .with_context(|| format!("parsing guest IP fourth octet: {}", override_ip))?;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
-            let subnet_base = fourth_octet.saturating_sub(2);
-            let host_ip = format!("172.30.{}.{}", third_octet, subnet_base + 1);
-            let subnet = format!("172.30.{}.{}/30", third_octet, subnet_base);
+        let mut hasher = DefaultHasher::new();
+        self.vm_id.hash(&mut hasher);
+        let subnet_id = (hasher.finish() % 16384) as u16;
+
+        // For clones, use In-Namespace NAT with unique 10.x.y.0/30 for veth
+        // For baseline VMs, use 172.30.x.y/30 with L2 bridge
+        let (host_ip, veth_subnet, guest_ip, guest_gateway_ip) = if self.is_clone {
+            // Clone case: veth gets unique 10.x.y.0/30 IP
+            // Guest keeps its original 172.30.x.y IP from snapshot
+            let third_octet = (subnet_id / 64) as u8;
+            let subnet_within_block = (subnet_id % 64) as u8;
+            let subnet_base = subnet_within_block * 4;
+
+            // Use 10.x.y.0/30 for veth IPs (unique per clone)
+            let host_ip = format!("10.{}.{}.{}", third_octet, subnet_within_block, subnet_base + 1);
+            let veth_subnet = format!("10.{}.{}.{}/30", third_octet, subnet_within_block, subnet_base);
+
+            // Guest IP from snapshot (what the guest OS expects)
+            let guest_ip = self.guest_ip_override.clone().unwrap_or_default();
+
+            // Calculate the original gateway IP that guest expects (guest_ip - 1 in the /30)
+            let parts: Vec<&str> = guest_ip.split('.').collect();
+            let orig_third: u8 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let orig_fourth: u8 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let orig_gateway = format!("172.30.{}.{}", orig_third, orig_fourth.saturating_sub(1));
 
             info!(
-                guest_ip = %override_ip,
-                host_ip = %host_ip,
-                "reusing network config from snapshot"
+                guest_ip = %guest_ip,
+                guest_gateway = %orig_gateway,
+                veth_host_ip = %host_ip,
+                veth_subnet = %veth_subnet,
+                "clone using In-Namespace NAT"
             );
 
-            (host_ip, override_ip.clone(), subnet)
+            (host_ip, veth_subnet, guest_ip, Some(orig_gateway))
         } else {
-            // New VM case: generate unique subnet from vm_id hash
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-
-            let mut hasher = DefaultHasher::new();
-            self.vm_id.hash(&mut hasher);
-            let subnet_id = (hasher.finish() % 16384) as u16;
-
+            // Baseline VM case: use 172.30.x.y/30 for everything
             let third_octet = (subnet_id / 64) as u8;
             let subnet_within_block = (subnet_id % 64) as u8;
             let subnet_base = subnet_within_block * 4;
 
             let host_ip = format!("172.30.{}.{}", third_octet, subnet_base + 1);
+            let veth_subnet = format!("172.30.{}.{}/30", third_octet, subnet_base);
             let guest_ip = format!("172.30.{}.{}", third_octet, subnet_base + 2);
-            let subnet = format!("172.30.{}.{}/30", third_octet, subnet_base);
 
-            (host_ip, guest_ip, subnet)
+            (host_ip, veth_subnet, guest_ip, None)
         };
 
         // Extract CIDR for host IP assignment
-        let cidr_bits = subnet.split('/').nth(1).unwrap_or("30");
+        let cidr_bits = veth_subnet.split('/').nth(1).unwrap_or("30");
         let host_ip_with_cidr = format!("{}/{}", host_ip, cidr_bits);
 
-        // Store state progressively as resources are created for cleanup on error
+        // Store state progressively for cleanup on error
         self.host_ip = Some(host_ip.clone());
         self.guest_ip = Some(guest_ip.clone());
-        self.subnet_cidr = Some(subnet);
+        self.subnet_cidr = Some(veth_subnet.clone());
 
-        // Step 2: Create network namespace
-        // Store namespace_id BEFORE creating so cleanup knows about it even if creation fails
+        // Step 1: Create network namespace
         let namespace_id = format!("fcvm-{}", truncate_id(&self.vm_id, 8));
         namespace::create_namespace(&namespace_id)
             .await
             .context("creating network namespace")?;
-        // Store immediately after success so cleanup can delete it on later errors
         self.namespace_id = Some(namespace_id.clone());
 
-        // Step 3: Create veth pair
-        // Linux interface names are limited to 15 chars (IFNAMSIZ = 16 including null)
+        // Step 2: Create veth pair
         let host_veth = format!("veth0-{}", truncate_id(&self.vm_id, 8));
         let guest_veth = format!("veth1-{}", truncate_id(&self.vm_id, 8));
 
         if let Err(e) = veth::create_veth_pair(&host_veth, &guest_veth, &namespace_id).await {
-            // Cleanup namespace before returning error
             let _ = self.cleanup().await;
             return Err(e).context("creating veth pair");
         }
-        // Store after success
         self.host_veth = Some(host_veth.clone());
         self.guest_veth = Some(guest_veth.clone());
 
-        // Step 4: Configure host side of veth
+        // Step 3: Configure host side of veth
         if let Err(e) = veth::setup_host_veth(&host_veth, &host_ip_with_cidr).await {
             let _ = self.cleanup().await;
             return Err(e).context("configuring host veth");
         }
 
-        // Step 5: Configure guest side of veth inside namespace
-        if let Err(e) = veth::setup_guest_veth_in_ns(&namespace_id, &guest_veth).await {
-            let _ = self.cleanup().await;
-            return Err(e).context("configuring guest veth");
-        }
-
-        // Step 6: Create TAP device inside namespace
+        // Step 4: Create TAP device inside namespace
         if let Err(e) = veth::create_tap_in_ns(&namespace_id, &self.tap_device).await {
             let _ = self.cleanup().await;
             return Err(e).context("creating TAP device in namespace");
         }
 
-        // Step 7: Connect TAP to veth inside namespace via L2 bridge
-        // The guest (Firecracker) will use the TAP, and it routes through veth to host
-        // Note: Bridge has no IP - it's a pure L2 forwarding device
-        if let Err(e) =
-            veth::connect_tap_to_veth(&namespace_id, &self.tap_device, &guest_veth).await
-        {
-            let _ = self.cleanup().await;
-            return Err(e).context("connecting TAP to veth");
+        // Step 5: Connect TAP to network - different for clones vs baseline
+        // For clones, we'll use a different health check IP (the veth inner IP)
+        let mut health_check_ip = guest_ip.clone();
+
+        if self.is_clone {
+            // Clone: Use In-Namespace NAT
+            // br0 gets gateway IP, veth1 gets unique IP, NAT inside namespace
+            let gateway_ip = guest_gateway_ip
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("clone missing gateway IP"))?;
+
+            // Calculate veth IP inside namespace (host_ip + 1)
+            let parts: Vec<&str> = host_ip.split('.').collect();
+            let last_octet: u8 = parts[3].parse().unwrap_or(1);
+            let veth_inner_ip = format!("{}.{}.{}.{}", parts[0], parts[1], parts[2], last_octet + 1);
+            let veth_inner_ip_cidr = format!("{}/30", veth_inner_ip);
+
+            // Health checks for clones go to the veth inner IP, which gets DNATed to guest
+            health_check_ip = veth_inner_ip.clone();
+
+            let nat_config = veth::InNamespaceNatConfig {
+                gateway_ip: gateway_ip.clone(),
+                guest_ip: guest_ip.clone(),
+                veth_ip_cidr: veth_inner_ip_cidr,
+                host_veth_ip_cidr: host_ip_with_cidr.clone(),
+            };
+
+            if let Err(e) = veth::setup_in_namespace_nat(
+                &namespace_id,
+                &self.tap_device,
+                &guest_veth,
+                &nat_config,
+            )
+            .await
+            {
+                let _ = self.cleanup().await;
+                return Err(e).context("setting up in-namespace NAT");
+            }
+        } else {
+            // Baseline VM: Configure guest side of veth and connect via L2 bridge
+            if let Err(e) = veth::setup_guest_veth_in_ns(&namespace_id, &guest_veth).await {
+                let _ = self.cleanup().await;
+                return Err(e).context("configuring guest veth");
+            }
+
+            if let Err(e) =
+                veth::connect_tap_to_veth(&namespace_id, &self.tap_device, &guest_veth).await
+            {
+                let _ = self.cleanup().await;
+                return Err(e).context("connecting TAP to veth");
+            }
         }
 
-        // Step 8: Ensure global NAT is configured
+        // Step 6: Ensure global NAT is configured
         let default_iface = match portmap::detect_default_interface().await {
             Ok(iface) => iface,
             Err(e) => {
@@ -182,12 +229,19 @@ impl NetworkManager for BridgedNetwork {
             }
         };
 
+        // NAT for baseline VMs (172.30.x.x)
         if let Err(e) = portmap::ensure_global_nat("172.30.0.0/16", &default_iface).await {
             let _ = self.cleanup().await;
-            return Err(e).context("ensuring global NAT configuration");
+            return Err(e).context("ensuring global NAT for 172.30.0.0/16");
         }
 
-        // Step 9: Setup port mappings if any
+        // NAT for clone veth traffic (10.x.x.x) - only needed for clones but harmless for baseline
+        if let Err(e) = portmap::ensure_global_nat("10.0.0.0/8", &default_iface).await {
+            let _ = self.cleanup().await;
+            return Err(e).context("ensuring global NAT for 10.0.0.0/8");
+        }
+
+        // Step 7: Setup port mappings if any
         if !self.port_mappings.is_empty() {
             match portmap::setup_port_mappings(&guest_ip, &self.port_mappings).await {
                 Ok(rules) => self.port_mapping_rules = rules,
@@ -205,18 +259,22 @@ impl NetworkManager for BridgedNetwork {
             namespace = %namespace_id,
             host_ip = %host_ip,
             guest_ip = %guest_ip,
+            is_clone = %self.is_clone,
             "network namespace configured successfully"
         );
 
-        // Return network config
+        // Return network config with auto-generated health check URL
+        // For clones, use the veth inner IP (which gets DNATed to guest)
         Ok(NetworkConfig {
             tap_device: self.tap_device.clone(),
             guest_mac,
-            guest_ip: Some(guest_ip),
-            host_ip: Some(host_ip),
+            guest_ip: Some(guest_ip.clone()),
+            host_ip: Some(host_ip.clone()),
             host_veth: self.host_veth.clone(),
-            loopback_ip: None,       // Not used in bridged mode
-            health_check_port: None, // Not used in bridged mode
+            loopback_ip: None,
+            health_check_port: Some(80),
+            health_check_url: Some(format!("http://{}:80/", health_check_ip)),
+            dns_server: Some(host_ip), // dnsmasq with bind-dynamic listens here
         })
     }
 
@@ -229,14 +287,17 @@ impl NetworkManager for BridgedNetwork {
         }
 
         // Step 2: Delete FORWARD rule and veth pair
+        // Note: With In-Namespace NAT, all clone-specific rules are inside the namespace
+        // and get cleaned up automatically when the namespace is deleted.
         if let Some(ref host_veth) = self.host_veth {
-            // Delete FORWARD rule first to avoid accumulating orphaned rules
+            // Delete FORWARD rule to avoid accumulating orphaned rules
             veth::delete_veth_forward_rule(host_veth).await?;
             // Then delete the veth pair (this will also remove the peer in the namespace)
             veth::delete_veth_pair(host_veth).await?;
         }
 
         // Step 3: Delete network namespace (this will cleanup everything inside it)
+        // Including all NAT rules, bridge, and veth peer
         if let Some(ref namespace_id) = self.namespace_id {
             namespace::delete_namespace(namespace_id).await?;
         }

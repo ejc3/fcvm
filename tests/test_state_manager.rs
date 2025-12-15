@@ -37,6 +37,8 @@ async fn test_state_persistence() {
                 host_veth: Some("veth0".to_string()),
                 loopback_ip: None,
                 health_check_port: None,
+                health_check_url: None,
+                dns_server: None,
             },
             volumes: vec![],
             env: vec![],

@@ -86,7 +86,7 @@ async fn egress_stress_impl(network: &str, num_clones: usize, requests_per_clone
             &baseline_name,
             "--network",
             network,
-            "nginx:alpine",
+            common::TEST_IMAGE,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -100,7 +100,7 @@ async fn egress_stress_impl(network: &str, num_clones: usize, requests_per_clone
     spawn_log_consumer(baseline_child.stdout.take(), &baseline_name);
     spawn_log_consumer_stderr(baseline_child.stderr.take(), &baseline_name);
 
-    common::poll_health_by_pid(baseline_pid, 120).await?;
+    common::poll_health_by_pid(baseline_pid, 60).await?;
     println!("  ✓ Baseline healthy");
 
     // For rootless, the URL is already correct. For bridged, we use external server.

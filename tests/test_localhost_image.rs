@@ -85,7 +85,7 @@ async fn test_localhost_hello_world() -> Result<()> {
     });
 
     // Wait for the process to exit (with timeout)
-    let timeout = Duration::from_secs(120);
+    let timeout = Duration::from_secs(60);
     let result = tokio::time::timeout(timeout, child.wait()).await;
 
     match result {
