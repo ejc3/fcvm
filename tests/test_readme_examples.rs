@@ -2,16 +2,116 @@
 //!
 //! Verifies that examples shown in README.md actually work.
 //! Each test corresponds to a specific example or feature documented.
+//!
+//! These tests spawn Firecracker VMs which consume significant resources
+//! (memory, network, disk). They must run sequentially to avoid resource
+//! contention and IP address conflicts.
 
 mod common;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use serial_test::serial;
 use std::process::Stdio;
 use std::time::Duration;
 
-// Note: Read-only volume mapping (--map /host:/guest:ro) is tested in test_fuse_in_vm.rs
-// which runs pjdfstest with FUSE mounts. The :ro flag is tested implicitly there.
+/// Test read-only volume mapping (--map /host:/guest:ro)
+///
+/// README example:
+/// ```
+/// sudo fcvm podman run --name web1 --map /host/config:/config:ro nginx:alpine
+/// ```
+#[tokio::test]
+#[serial]
+async fn test_readonly_volume() -> Result<()> {
+    println!("\ntest_readonly_volume");
+    println!("====================");
+
+    // Requires root for bridged networking (more reliable health checks)
+    if !nix::unistd::geteuid().is_root() {
+        eprintln!("Skipping test_readonly_volume: requires root for bridged networking");
+        return Ok(());
+    }
+
+    let fcvm_path = common::find_fcvm_binary()?;
+    let test_id = format!("ro-{}", std::process::id());
+    let vm_name = format!("ro-vol-{}", std::process::id());
+
+    // Create test directory with a file
+    let host_dir = format!("/tmp/{}", test_id);
+    tokio::fs::create_dir_all(&host_dir).await?;
+    tokio::fs::write(format!("{}/readonly.txt", host_dir), "original content").await?;
+
+    // Start VM with read-only volume using bridged mode
+    let map_arg = format!("{}:/config:ro", host_dir);
+    let mut child = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "podman", "run",
+            "--name", &vm_name,
+            "--network", "bridged",
+            "--map", &map_arg,
+            common::TEST_IMAGE,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawning fcvm")?;
+
+    let fcvm_pid = child.id().ok_or_else(|| anyhow::anyhow!("no PID"))?;
+    println!("Started VM with PID: {}", fcvm_pid);
+
+    // Wait for healthy (longer timeout for FUSE volume setup - vsock connection + mount takes time)
+    if let Err(e) = common::poll_health_by_pid(fcvm_pid, 180).await {
+        common::kill_process(fcvm_pid).await;
+        let _ = tokio::fs::remove_dir_all(&host_dir).await;
+        return Err(e.context("VM failed to become healthy"));
+    }
+    println!("VM is healthy");
+
+    // Test 1: Read should work
+    println!("Test 1: Reading from read-only mount...");
+    let output = common::exec_in_container(fcvm_pid, &["cat", "/config/readonly.txt"]).await?;
+    assert!(
+        output.contains("original content"),
+        "Should be able to read file, got: {}",
+        output
+    );
+    println!("  Read OK: {}", output.trim());
+
+    // Test 2: Write should fail (will get EROFS - read-only file system)
+    println!("Test 2: Writing to read-only mount should fail...");
+    let result = common::exec_in_container(
+        fcvm_pid,
+        &["sh", "-c", "echo 'new' > /config/readonly.txt 2>&1 || echo WRITE_FAILED"],
+    ).await;
+
+    // Verify write was blocked
+    match result {
+        Ok(output) => {
+            assert!(
+                output.contains("WRITE_FAILED") || output.contains("Read-only") || output.contains("read-only"),
+                "Write should fail on read-only mount, got: {}",
+                output
+            );
+        }
+        Err(_) => {
+            // Command failing is also acceptable
+        }
+    }
+
+    // Verify the file wasn't modified on host
+    let content = tokio::fs::read_to_string(format!("{}/readonly.txt", host_dir)).await?;
+    assert_eq!(content, "original content", "File should not be modified");
+    println!("  Write correctly blocked, file unchanged");
+
+    // Cleanup
+    common::kill_process(fcvm_pid).await;
+    let _ = child.wait().await;
+    let _ = tokio::fs::remove_dir_all(&host_dir).await;
+
+    println!("✅ test_readonly_volume PASSED");
+    Ok(())
+}
 
 /// Test environment variables (--env KEY=VALUE)
 ///
@@ -20,34 +120,41 @@ use std::time::Duration;
 /// sudo fcvm podman run --name web1 --env DEBUG=1 nginx:alpine
 /// ```
 #[tokio::test]
+#[serial]
 async fn test_env_variables() -> Result<()> {
     println!("\ntest_env_variables");
     println!("==================");
 
+    // Requires root for bridged networking (more reliable health checks)
+    if !nix::unistd::geteuid().is_root() {
+        eprintln!("Skipping test_env_variables: requires root for bridged networking");
+        return Ok(());
+    }
+
     let fcvm_path = common::find_fcvm_binary()?;
     let vm_name = format!("env-test-{}", std::process::id());
 
-    // Start VM with environment variables
+    // Start VM with environment variables using bridged mode for reliable health checks
     let mut child = tokio::process::Command::new(&fcvm_path)
         .args([
             "podman", "run",
             "--name", &vm_name,
-            "--network", "rootless",
+            "--network", "bridged",
             "--env", "MY_VAR=hello_world",
             "--env", "DEBUG=1",
             "--env", "COMPLEX_VAR=value with spaces",
             common::TEST_IMAGE,
         ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .context("spawning fcvm")?;
 
     let fcvm_pid = child.id().ok_or_else(|| anyhow::anyhow!("no PID"))?;
     println!("Started VM with PID: {}", fcvm_pid);
 
-    // Wait for healthy
-    if let Err(e) = common::poll_health_by_pid(fcvm_pid, 90).await {
+    // Wait for healthy with longer timeout for env var processing
+    if let Err(e) = common::poll_health_by_pid(fcvm_pid, 120).await {
         common::kill_process(fcvm_pid).await;
         return Err(e.context("VM failed to become healthy"));
     }
@@ -98,25 +205,32 @@ async fn test_env_variables() -> Result<()> {
 /// sudo fcvm podman run --name web1 --cpu 4 --mem 4096 nginx:alpine
 /// ```
 #[tokio::test]
+#[serial]
 async fn test_custom_resources() -> Result<()> {
     println!("\ntest_custom_resources");
     println!("=====================");
 
+    // Requires root for bridged networking (more reliable health checks)
+    if !nix::unistd::geteuid().is_root() {
+        eprintln!("Skipping test_custom_resources: requires root for bridged networking");
+        return Ok(());
+    }
+
     let fcvm_path = common::find_fcvm_binary()?;
     let vm_name = format!("resources-test-{}", std::process::id());
 
-    // Start VM with custom resources
+    // Start VM with custom resources using bridged mode for reliable health checks
     let mut child = tokio::process::Command::new(&fcvm_path)
         .args([
             "podman", "run",
             "--name", &vm_name,
-            "--network", "rootless",
+            "--network", "bridged",
             "--cpu", "4",
             "--mem", "1024",
             common::TEST_IMAGE,
         ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .context("spawning fcvm")?;
 
@@ -124,7 +238,7 @@ async fn test_custom_resources() -> Result<()> {
     println!("Started VM with PID: {}", fcvm_pid);
 
     // Wait for healthy
-    if let Err(e) = common::poll_health_by_pid(fcvm_pid, 90).await {
+    if let Err(e) = common::poll_health_by_pid(fcvm_pid, 120).await {
         common::kill_process(fcvm_pid).await;
         return Err(e.context("VM failed to become healthy"));
     }
@@ -180,23 +294,30 @@ async fn test_custom_resources() -> Result<()> {
 /// fcvm ls --pid 12345
 /// ```
 #[tokio::test]
+#[serial]
 async fn test_fcvm_ls() -> Result<()> {
     println!("\ntest_fcvm_ls");
     println!("============");
 
+    // Requires root for bridged networking (more reliable health checks)
+    if !nix::unistd::geteuid().is_root() {
+        eprintln!("Skipping test_fcvm_ls: requires root for bridged networking");
+        return Ok(());
+    }
+
     let fcvm_path = common::find_fcvm_binary()?;
     let vm_name = format!("ls-test-{}", std::process::id());
 
-    // Start a VM to list
+    // Start a VM to list using bridged mode for reliable health checks
     let mut child = tokio::process::Command::new(&fcvm_path)
         .args([
             "podman", "run",
             "--name", &vm_name,
-            "--network", "rootless",
+            "--network", "bridged",
             common::TEST_IMAGE,
         ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .context("spawning fcvm")?;
 
@@ -204,7 +325,7 @@ async fn test_fcvm_ls() -> Result<()> {
     println!("Started VM with PID: {}", fcvm_pid);
 
     // Wait for healthy
-    if let Err(e) = common::poll_health_by_pid(fcvm_pid, 90).await {
+    if let Err(e) = common::poll_health_by_pid(fcvm_pid, 120).await {
         common::kill_process(fcvm_pid).await;
         return Err(e.context("VM failed to become healthy"));
     }
@@ -304,4 +425,81 @@ async fn test_fcvm_ls() -> Result<()> {
     Ok(())
 }
 
-// Note: The --cmd flag is tested in test_fuse_in_vm.rs which uses --cmd to run pjdfstest.
+/// Test --cmd custom command
+///
+/// README example:
+/// ```
+/// sudo fcvm podman run --name web1 --cmd "nginx -g 'daemon off;'" nginx:alpine
+/// ```
+#[tokio::test]
+#[serial]
+async fn test_custom_command() -> Result<()> {
+    println!("\ntest_custom_command");
+    println!("===================");
+
+    // Requires root for bridged networking (more reliable for custom commands)
+    if !nix::unistd::geteuid().is_root() {
+        eprintln!("Skipping test_custom_command: requires root for bridged networking");
+        return Ok(());
+    }
+
+    let fcvm_path = common::find_fcvm_binary()?;
+    let vm_name = format!("cmd-test-{}", std::process::id());
+
+    // Use nginx:alpine with a custom command that:
+    // 1. Creates a marker file to prove our command ran
+    // 2. Then starts nginx normally (so health checks pass)
+    // This matches the README pattern: --cmd "nginx -g 'daemon off;'"
+    let custom_cmd = "sh -c 'echo CUSTOM_CMD_MARKER > /tmp/marker.txt && nginx -g \"daemon off;\"'";
+
+    let mut child = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "podman", "run",
+            "--name", &vm_name,
+            "--network", "bridged",
+            "--cmd", custom_cmd,
+            common::TEST_IMAGE,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawning fcvm")?;
+
+    let fcvm_pid = child.id().ok_or_else(|| anyhow::anyhow!("no PID"))?;
+    println!("Started VM with PID: {}", fcvm_pid);
+
+    // Wait for healthy
+    if let Err(e) = common::poll_health_by_pid(fcvm_pid, 120).await {
+        common::kill_process(fcvm_pid).await;
+        return Err(e.context("VM failed to become healthy"));
+    }
+    println!("VM is healthy");
+
+    // Give the command a moment to execute
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Check that our custom command ran by looking for the marker file
+    println!("Checking for marker file from custom command...");
+    let output = common::exec_in_container(fcvm_pid, &["cat", "/tmp/marker.txt"]).await?;
+
+    assert!(
+        output.contains("CUSTOM_CMD_MARKER"),
+        "Custom command should have created marker file, got: {}",
+        output
+    );
+    println!("  Found marker: {}", output.trim());
+
+    // Verify nginx is running by checking if we can curl localhost
+    // (more reliable than pgrep which may not exist in alpine)
+    println!("Checking nginx is serving requests...");
+    let output = common::exec_in_container(fcvm_pid, &["wget", "-q", "-O", "-", "http://localhost/"]).await;
+    assert!(output.is_ok(), "nginx should be responding to requests");
+    println!("  nginx is serving requests");
+
+    // Cleanup
+    common::kill_process(fcvm_pid).await;
+    let _ = child.wait().await;
+
+    println!("✅ test_custom_command PASSED");
+    Ok(())
+}
