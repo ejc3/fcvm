@@ -37,28 +37,22 @@ impl VmFixture {
         std::fs::create_dir_all(&host_dir)?;
         std::fs::create_dir_all(&mount_dir)?;
 
-        // Start VM with FUSE volume
-        let fcvm_path = find_fcvm_binary()?;
-        let mut child = tokio::process::Command::new(&fcvm_path)
-            .args([
-                "podman",
-                "run",
-                "--name",
-                &vm_name,
-                "--network",
-                "rootless",
-                "--map",
-                &format!("{}:/mnt/test", host_dir.display()),
-                "--",
-                TEST_IMAGE,
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-
-        let pid = child
-            .id()
-            .ok_or_else(|| anyhow::anyhow!("failed to get VM PID"))?;
+        // Start VM with FUSE volume using spawn_fcvm helper
+        // (uses Stdio::null() to prevent pipe buffer deadlock)
+        let map_arg = format!("{}:/mnt/test", host_dir.display());
+        let (mut child, pid) = spawn_fcvm(&[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "bridged",  // Use bridged for more reliable health checks
+            "--map",
+            &map_arg,
+            "--",
+            TEST_IMAGE,
+        ])
+        .await?;
 
         // Wait for VM to become healthy
         if let Err(e) = poll_health_by_pid(pid, 60).await {
@@ -103,6 +97,50 @@ impl Drop for VmFixture {
             std::fs::remove_dir_all(parent).ok();
         }
     }
+}
+
+/// Spawn fcvm with safe stdio settings to prevent pipe buffer deadlock.
+///
+/// CRITICAL: This helper uses `Stdio::null()` instead of `Stdio::piped()`.
+/// Using `Stdio::piped()` without consuming the output causes deadlock:
+/// - Linux pipe buffer is 64KB
+/// - fcvm outputs 100+ lines of serial console logs
+/// - When buffer fills, child blocks on write(), freezing ALL async tasks
+/// - Health monitor never runs, VM never becomes "healthy"
+///
+/// # Arguments
+/// * `args` - Arguments to pass to fcvm (e.g., ["podman", "run", "--name", "test", ...])
+///
+/// # Returns
+/// Tuple of (Child process, PID)
+///
+/// # Example
+/// ```ignore
+/// let (mut child, pid) = spawn_fcvm(&[
+///     "podman", "run",
+///     "--name", &vm_name,
+///     "--network", "bridged",
+///     TEST_IMAGE,
+/// ]).await?;
+/// ```
+pub async fn spawn_fcvm(args: &[&str]) -> anyhow::Result<(tokio::process::Child, u32)> {
+    let fcvm_path = find_fcvm_binary()?;
+    let child = tokio::process::Command::new(&fcvm_path)
+        .args(args)
+        // CRITICAL: Use inherit() not piped() to prevent deadlock
+        // inherit() passes output to parent's stdout/stderr - visible with --nocapture
+        // piped() without consuming causes 64KB buffer to fill, blocking child process
+        // See CLAUDE.md "Pipe Buffer Deadlock in Tests" for details
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn fcvm: {}", e))?;
+
+    let pid = child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("failed to get fcvm PID"))?;
+
+    Ok((child, pid))
 }
 
 /// Find the fcvm binary
@@ -289,16 +327,8 @@ pub async fn create_snapshot_by_pid(pid: u32, snapshot_name: &str) -> anyhow::Re
 pub async fn start_memory_server(
     snapshot_name: &str,
 ) -> anyhow::Result<(tokio::process::Child, u32)> {
-    let fcvm_path = find_fcvm_binary()?;
-    let child = tokio::process::Command::new(&fcvm_path)
-        .args(["snapshot", "serve", snapshot_name])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    let serve_pid = child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("failed to get serve PID"))?;
+    // Use spawn_fcvm helper to avoid pipe buffer deadlock
+    let (child, serve_pid) = spawn_fcvm(&["snapshot", "serve", snapshot_name]).await?;
 
     // Wait for serve process to save its state file
     // Serve processes don't have health status, so we just check state exists
@@ -321,27 +351,19 @@ pub async fn spawn_clone(
     clone_name: &str,
     network: &str,
 ) -> anyhow::Result<(tokio::process::Child, u32)> {
-    let fcvm_path = find_fcvm_binary()?;
-    let child = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "snapshot",
-            "run",
-            "--pid",
-            &serve_pid.to_string(),
-            "--name",
-            clone_name,
-            "--network",
-            network,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    let clone_pid = child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("failed to get clone PID"))?;
-
-    Ok((child, clone_pid))
+    let serve_pid_str = serve_pid.to_string();
+    // Use spawn_fcvm helper to avoid pipe buffer deadlock
+    spawn_fcvm(&[
+        "snapshot",
+        "run",
+        "--pid",
+        &serve_pid_str,
+        "--name",
+        clone_name,
+        "--network",
+        network,
+    ])
+    .await
 }
 
 /// Kill a process by PID gracefully (SIGTERM first, then SIGKILL after timeout)

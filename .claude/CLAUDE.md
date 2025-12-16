@@ -632,6 +632,42 @@ ip addr add 172.16.29.1/24 dev tap-vm-c93e8   # Guest is 172.16.29.2
 - Root cause: VMs configured to use 8.8.8.8 but NAT wasn't forwarding DNS properly
 - Fix: Install dnsmasq on host with `bind-dynamic` to listen on TAP devices
 
+### Pipe Buffer Deadlock in Tests (CRITICAL)
+
+**Problem:** Tests hang indefinitely when spawning fcvm with `Stdio::piped()` but not reading the pipes.
+
+**Root cause:**
+- Linux pipe buffer is 64KB
+- fcvm outputs 100+ lines of Firecracker serial console logs
+- When buffer fills, child process blocks on `write()` syscall
+- This prevents ALL async tasks in the child (including health monitor) from running
+- Result: VM never becomes "healthy", test times out
+
+**Symptoms:**
+- Test works manually with `| tee /tmp/log` (because tee consumes output)
+- Test hangs when run via `cargo test`
+- State file timestamp never updates (health monitor blocked)
+- VM is actually running fine, just not being monitored
+
+**Fix:** NEVER use `Stdio::piped()` unless you actively consume the output. Use the `spawn_fcvm()` helper which uses `Stdio::inherit()`:
+
+```rust
+// WRONG - will deadlock!
+let child = tokio::process::Command::new(&fcvm_path)
+    .args([...])
+    .stdout(Stdio::piped())  // Never read = deadlock
+    .stderr(Stdio::piped())  // Never read = deadlock
+    .spawn()?;
+
+// CORRECT - use the helper
+let (mut child, pid) = common::spawn_fcvm(&["podman", "run", "--name", &vm_name, ...]).await?;
+```
+
+**The helper enforces:**
+- `Stdio::inherit()` for stdout/stderr - output goes to parent (visible with `--nocapture`)
+- No deadlock because parent's stdout/stderr handle the data
+- Consistent error handling and PID extraction
+
 ## fuse-pipe Testing
 
 **Quick reference**: See `README.md` for testing guide and Makefile targets.
