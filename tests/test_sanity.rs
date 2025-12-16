@@ -1,4 +1,7 @@
 //! Sanity integration test - verifies basic VM startup and health checks
+//!
+//! Uses common::spawn_fcvm() to prevent pipe buffer deadlock.
+//! See CLAUDE.md "Pipe Buffer Deadlock in Tests" for details.
 
 mod common;
 
@@ -15,59 +18,27 @@ async fn test_sanity_rootless() -> Result<()> {
 }
 
 async fn sanity_test_impl(network: &str) -> Result<()> {
-    use std::process::Stdio;
     use std::time::Duration;
 
     println!("\nfcvm sanity test (network: {})", network);
     println!("================");
     println!("Starting a single VM to verify health checks work");
 
-    // Find fcvm binary
-    let fcvm_path = common::find_fcvm_binary()?;
-
-    // Start the VM
+    // Start the VM using spawn_fcvm helper (uses Stdio::inherit to prevent deadlock)
     println!("Starting VM...");
-    let mut child = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "podman",
-            "run",
-            "--name",
-            &format!("sanity-test-{}", network),
-            "--network",
-            network,
-            common::TEST_IMAGE,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning fcvm podman run")?;
-
-    let fcvm_pid = child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("failed to get child PID"))?;
+    let vm_name = format!("sanity-test-{}", network);
+    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        network,
+        common::TEST_IMAGE,
+    ])
+    .await
+    .context("spawning fcvm podman run")?;
     println!("  fcvm process started (PID: {})", fcvm_pid);
-
-    // Spawn tasks to consume stdout/stderr (prevent blocking)
-    if let Some(stdout) = child.stdout.take() {
-        tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("[VM stdout] {}", line);
-            }
-        });
-    }
-    if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("[VM stderr] {}", line);
-            }
-        });
-    }
 
     println!("  Waiting for VM to become healthy...");
 
