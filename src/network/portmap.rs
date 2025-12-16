@@ -59,6 +59,62 @@ pub async fn setup_port_mappings(guest_ip: &str, mappings: &[PortMapping]) -> Re
 
         created_rules.push(dnat_rule);
 
+        // OUTPUT DNAT rule: Rewrite destination for locally-generated traffic (localhost access)
+        let output_dnat_rule = if let Some(ref host_ip) = mapping.host_ip {
+            format!(
+                "-t nat -A OUTPUT -d {} -p {} --dport {} -j DNAT --to-destination {}:{}",
+                host_ip, proto_str, mapping.host_port, guest_ip, mapping.guest_port
+            )
+        } else {
+            format!(
+                "-t nat -A OUTPUT -p {} --dport {} -j DNAT --to-destination {}:{}",
+                proto_str, mapping.host_port, guest_ip, mapping.guest_port
+            )
+        };
+
+        let output = Command::new("sudo")
+            .arg("iptables")
+            .args(output_dnat_rule.split_whitespace())
+            .output()
+            .await
+            .with_context(|| format!("adding OUTPUT DNAT rule for port {}", mapping.host_port))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Cleanup previously created rules
+            for rule in &created_rules {
+                let _ = delete_rule(rule).await;
+            }
+            anyhow::bail!("failed to add OUTPUT DNAT rule: {}", stderr);
+        }
+
+        created_rules.push(output_dnat_rule);
+
+        // MASQUERADE rule: SNAT locally-generated traffic to guest so return path works
+        // Without this, localhost -> guest traffic would have source 127.0.0.1 which
+        // the guest can't respond to
+        let masq_rule = format!(
+            "-t nat -A POSTROUTING -d {} -p {} --dport {} -j MASQUERADE",
+            guest_ip, proto_str, mapping.guest_port
+        );
+
+        let output = Command::new("sudo")
+            .arg("iptables")
+            .args(masq_rule.split_whitespace())
+            .output()
+            .await
+            .with_context(|| format!("adding MASQUERADE rule for port {}", mapping.guest_port))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            for rule in &created_rules {
+                let _ = delete_rule(rule).await;
+            }
+            anyhow::bail!("failed to add MASQUERADE rule: {}", stderr);
+        }
+
+        created_rules.push(masq_rule);
+
         // FORWARD rule: Allow forwarded traffic to guest
         let forward_rule = format!(
             "-A FORWARD -p {} -d {} --dport {} -j ACCEPT",
@@ -92,6 +148,34 @@ pub async fn setup_port_mappings(guest_ip: &str, mappings: &[PortMapping]) -> Re
     }
 
     Ok(created_rules)
+}
+
+/// Enables route_localnet on a network interface
+///
+/// This is required for localhost port forwarding to work. By default, Linux
+/// doesn't route packets with 127.0.0.0/8 source to external interfaces.
+/// Enabling route_localnet allows DNAT'd packets from localhost to be routed
+/// to the guest VM.
+pub async fn enable_route_localnet(interface: &str) -> Result<()> {
+    let sysctl_path = format!("net.ipv4.conf.{}.route_localnet", interface);
+
+    let output = Command::new("sudo")
+        .args(["sysctl", "-w", &format!("{}=1", sysctl_path)])
+        .output()
+        .await
+        .with_context(|| format!("enabling route_localnet on {}", interface))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!("failed to enable route_localnet on {}: {}", interface, stderr);
+    } else {
+        info!(
+            interface = %interface,
+            "enabled route_localnet for localhost port forwarding"
+        );
+    }
+
+    Ok(())
 }
 
 /// Deletes a single iptables rule
@@ -282,7 +366,7 @@ mod tests {
         let rules = setup_port_mappings(guest_ip, &mappings).await;
 
         if let Ok(rules) = rules {
-            assert_eq!(rules.len(), 2); // DNAT + FORWARD
+            assert_eq!(rules.len(), 4); // DNAT (PREROUTING) + DNAT (OUTPUT) + MASQUERADE + FORWARD
 
             // Cleanup
             cleanup_port_mappings(&rules).await.unwrap();
