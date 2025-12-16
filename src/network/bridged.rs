@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{
     namespace, portmap, types::generate_mac, veth, NetworkConfig, NetworkManager, PortMapping,
@@ -248,6 +248,14 @@ impl NetworkManager for BridgedNetwork {
                 Err(e) => {
                     let _ = self.cleanup().await;
                     return Err(e).context("setting up port mappings");
+                }
+            }
+
+            // Enable route_localnet on host veth for localhost port forwarding
+            // This allows DNAT'd packets from 127.0.0.1 to be routed to the guest
+            if let Some(ref host_veth) = self.host_veth {
+                if let Err(e) = portmap::enable_route_localnet(host_veth).await {
+                    warn!(error = %e, "failed to enable route_localnet (localhost port forwarding may not work)");
                 }
             }
         }

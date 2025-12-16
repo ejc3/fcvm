@@ -386,12 +386,17 @@ impl VmManager {
     }
 
     /// Wait for the VM process to exit
+    ///
+    /// NOTE: This does NOT take ownership of the process handle.
+    /// Use `kill()` to terminate and cleanup the process.
     pub async fn wait(&mut self) -> Result<std::process::ExitStatus> {
-        if let Some(mut process) = self.process.take() {
+        if let Some(ref mut process) = self.process {
             let status = process
                 .wait()
                 .await
                 .context("waiting for Firecracker process")?;
+            // Process exited naturally, clear the handle
+            self.process = None;
             Ok(status)
         } else {
             bail!("VM process not running")

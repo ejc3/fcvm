@@ -66,12 +66,12 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 2048)]
     pub mem: u32,
 
-    /// Volume mapping(s): HOST:GUEST[:ro]
-    #[arg(long, num_args=0.., value_delimiter=',')]
+    /// Volume mapping(s): HOST:GUEST[:ro] (repeat or comma-separated)
+    #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
     pub map: Vec<String>,
 
     /// Environment vars KEY=VALUE (repeat or comma-separated)
-    #[arg(long, num_args=0.., value_delimiter=',')]
+    #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
     pub env: Vec<String>,
 
     /// Command to run inside container
@@ -79,8 +79,8 @@ pub struct RunArgs {
     pub cmd: Option<String>,
 
     /// Publish host ports to guest
-    /// Grammar: [HOSTIP:]HOSTPORT:GUESTPORT[/PROTO], comma-separated
-    #[arg(long, num_args=0.., value_delimiter=',')]
+    /// Grammar: [HOSTIP:]HOSTPORT:GUESTPORT[/PROTO], comma-separated or repeated
+    #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
     pub publish: Vec<String>,
 
     /// Balloon device target MiB. If not specified, no balloon device is configured
@@ -155,7 +155,7 @@ pub struct SnapshotRunArgs {
     #[arg(long)]
     pub name: Option<String>,
 
-    #[arg(long, num_args=0.., value_delimiter=',')]
+    #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
     pub publish: Vec<String>,
 
     /// Network mode: bridged (requires sudo) or rootless (no sudo)

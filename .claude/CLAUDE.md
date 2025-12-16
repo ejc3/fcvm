@@ -83,6 +83,37 @@ Exception: For **forked libraries** (like fuse-backend-rs), we maintain compatib
 
 If a test fails intermittently, that's a **concurrency bug** or **race condition** that must be fixed, not ignored.
 
+### NO TEST HEDGES
+
+**Test assertions must be DEFINITIVE.** A test either PASSES or FAILS - no middle ground.
+
+**NEVER write hedges like:**
+- "NOTE: this may not work (known limitation)"
+- "We log the result but don't fail the test for now"
+- "skip this assertion for now"
+- "this is expected to fail sometimes"
+
+**If a feature should work:**
+- Write an assertion that FAILS if it doesn't work
+- Fix the bug so the assertion passes
+- If you can't fix it, file an issue and mark the test `#[ignore]` with a link
+
+**Example of UNACCEPTABLE test code:**
+```rust
+// BAD - This hides bugs!
+if !localhost_works {
+    println!("NOTE: localhost port forwarding not working (known limitation)");
+}
+// BAD - Test "passes" even when feature is broken
+```
+
+**Example of CORRECT test code:**
+```rust
+// GOOD - This catches bugs!
+assert!(localhost_works, "Localhost port forwarding should work (requires route_localnet)");
+// GOOD - Test fails if feature is broken
+```
+
 ### Build and Test Rules
 
 **CRITICAL: ONLY use Makefile targets. NEVER run cargo commands directly.**
