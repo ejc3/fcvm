@@ -6,13 +6,16 @@
 //! These tests spawn Firecracker VMs which consume significant resources
 //! (memory, network, disk). They must run sequentially to avoid resource
 //! contention and IP address conflicts.
+//!
+//! IMPORTANT: All tests use `common::spawn_fcvm()` helper which uses
+//! `Stdio::inherit()` to prevent pipe buffer deadlock. See CLAUDE.md
+//! "Pipe Buffer Deadlock in Tests" for details.
 
 mod common;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serial_test::serial;
-use std::process::Stdio;
 use std::time::Duration;
 
 /// Test read-only volume mapping (--map /host:/guest:ro)
@@ -33,7 +36,6 @@ async fn test_readonly_volume() -> Result<()> {
         return Ok(());
     }
 
-    let fcvm_path = common::find_fcvm_binary()?;
     let test_id = format!("ro-{}", std::process::id());
     let vm_name = format!("ro-vol-{}", std::process::id());
 
@@ -44,20 +46,13 @@ async fn test_readonly_volume() -> Result<()> {
 
     // Start VM with read-only volume using bridged mode
     let map_arg = format!("{}:/config:ro", host_dir);
-    let mut child = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "podman", "run",
-            "--name", &vm_name,
-            "--network", "bridged",
-            "--map", &map_arg,
-            common::TEST_IMAGE,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("spawning fcvm")?;
-
-    let fcvm_pid = child.id().ok_or_else(|| anyhow::anyhow!("no PID"))?;
+    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
+        "podman", "run",
+        "--name", &vm_name,
+        "--network", "bridged",
+        "--map", &map_arg,
+        common::TEST_IMAGE,
+    ]).await.context("spawning fcvm")?;
     println!("Started VM with PID: {}", fcvm_pid);
 
     // Wait for healthy (longer timeout for FUSE volume setup - vsock connection + mount takes time)
@@ -131,26 +126,18 @@ async fn test_env_variables() -> Result<()> {
         return Ok(());
     }
 
-    let fcvm_path = common::find_fcvm_binary()?;
     let vm_name = format!("env-test-{}", std::process::id());
 
     // Start VM with environment variables using bridged mode for reliable health checks
-    let mut child = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "podman", "run",
-            "--name", &vm_name,
-            "--network", "bridged",
-            "--env", "MY_VAR=hello_world",
-            "--env", "DEBUG=1",
-            "--env", "COMPLEX_VAR=value with spaces",
-            common::TEST_IMAGE,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("spawning fcvm")?;
-
-    let fcvm_pid = child.id().ok_or_else(|| anyhow::anyhow!("no PID"))?;
+    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
+        "podman", "run",
+        "--name", &vm_name,
+        "--network", "bridged",
+        "--env", "MY_VAR=hello_world",
+        "--env", "DEBUG=1",
+        "--env", "COMPLEX_VAR=value with spaces",
+        common::TEST_IMAGE,
+    ]).await.context("spawning fcvm")?;
     println!("Started VM with PID: {}", fcvm_pid);
 
     // Wait for healthy with longer timeout for env var processing
@@ -216,25 +203,17 @@ async fn test_custom_resources() -> Result<()> {
         return Ok(());
     }
 
-    let fcvm_path = common::find_fcvm_binary()?;
     let vm_name = format!("resources-test-{}", std::process::id());
 
     // Start VM with custom resources using bridged mode for reliable health checks
-    let mut child = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "podman", "run",
-            "--name", &vm_name,
-            "--network", "bridged",
-            "--cpu", "4",
-            "--mem", "1024",
-            common::TEST_IMAGE,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("spawning fcvm")?;
-
-    let fcvm_pid = child.id().ok_or_else(|| anyhow::anyhow!("no PID"))?;
+    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
+        "podman", "run",
+        "--name", &vm_name,
+        "--network", "bridged",
+        "--cpu", "4",
+        "--mem", "1024",
+        common::TEST_IMAGE,
+    ]).await.context("spawning fcvm")?;
     println!("Started VM with PID: {}", fcvm_pid);
 
     // Wait for healthy
@@ -309,19 +288,12 @@ async fn test_fcvm_ls() -> Result<()> {
     let vm_name = format!("ls-test-{}", std::process::id());
 
     // Start a VM to list using bridged mode for reliable health checks
-    let mut child = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "podman", "run",
-            "--name", &vm_name,
-            "--network", "bridged",
-            common::TEST_IMAGE,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("spawning fcvm")?;
-
-    let fcvm_pid = child.id().ok_or_else(|| anyhow::anyhow!("no PID"))?;
+    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
+        "podman", "run",
+        "--name", &vm_name,
+        "--network", "bridged",
+        common::TEST_IMAGE,
+    ]).await.context("spawning fcvm")?;
     println!("Started VM with PID: {}", fcvm_pid);
 
     // Wait for healthy
@@ -443,7 +415,6 @@ async fn test_custom_command() -> Result<()> {
         return Ok(());
     }
 
-    let fcvm_path = common::find_fcvm_binary()?;
     let vm_name = format!("cmd-test-{}", std::process::id());
 
     // Use nginx:alpine with a custom command that:
@@ -452,20 +423,13 @@ async fn test_custom_command() -> Result<()> {
     // This matches the README pattern: --cmd "nginx -g 'daemon off;'"
     let custom_cmd = "sh -c 'echo CUSTOM_CMD_MARKER > /tmp/marker.txt && nginx -g \"daemon off;\"'";
 
-    let mut child = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "podman", "run",
-            "--name", &vm_name,
-            "--network", "bridged",
-            "--cmd", custom_cmd,
-            common::TEST_IMAGE,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("spawning fcvm")?;
-
-    let fcvm_pid = child.id().ok_or_else(|| anyhow::anyhow!("no PID"))?;
+    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
+        "podman", "run",
+        "--name", &vm_name,
+        "--network", "bridged",
+        "--cmd", custom_cmd,
+        common::TEST_IMAGE,
+    ]).await.context("spawning fcvm")?;
     println!("Started VM with PID: {}", fcvm_pid);
 
     // Wait for healthy
