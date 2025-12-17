@@ -1,0 +1,501 @@
+//! Exec command latency benchmarks comparing bridged vs rootless networking.
+//!
+//! Measures the time to execute simple commands in VMs via vsock.
+//! VMs are started once per benchmark group to amortize startup cost.
+//!
+//! Run with: cargo bench --bench exec
+//! Or: make bench-exec
+
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use serde::Deserialize;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+const TEST_IMAGE: &str = "public.ecr.aws/nginx/nginx:alpine";
+
+/// VM state from fcvm ls --json
+#[derive(Deserialize)]
+struct VmLsEntry {
+    health_status: String,
+}
+
+/// Find the fcvm binary
+fn find_fcvm_binary() -> PathBuf {
+    let candidates = [
+        "./target/release/fcvm",
+        "./target/debug/fcvm",
+        "/usr/local/bin/fcvm",
+    ];
+    for path in candidates {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return p;
+        }
+    }
+    panic!("fcvm binary not found - run: cargo build --release");
+}
+
+/// A running VM fixture for benchmarking
+struct VmFixture {
+    pid: u32,
+    _name: String,
+    _network: String,
+}
+
+impl VmFixture {
+    /// Start a VM and wait for it to become healthy
+    fn start(name: &str, network: &str) -> Self {
+        let fcvm = find_fcvm_binary();
+
+        // Spawn VM process
+        let child = Command::new(&fcvm)
+            .args([
+                "podman",
+                "run",
+                "--name",
+                name,
+                "--network",
+                network,
+                TEST_IMAGE,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn fcvm");
+
+        let pid = child.id();
+        eprintln!("  Started {} VM (PID: {})", network, pid);
+
+        // Poll for healthy (VMs can take 2+ minutes on first start)
+        let start = Instant::now();
+        let timeout = Duration::from_secs(180);
+        loop {
+            if start.elapsed() > timeout {
+                panic!("VM {} failed to become healthy within {:?}", name, timeout);
+            }
+
+            let output = Command::new(&fcvm)
+                .args(["ls", "--json", "--pid", &pid.to_string()])
+                .output()
+                .expect("failed to run fcvm ls");
+
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Ok(vms) = serde_json::from_str::<Vec<VmLsEntry>>(&stdout) {
+                    if vms.first().map(|v| v.health_status == "healthy").unwrap_or(false) {
+                        eprintln!("  VM healthy after {:.1}s", start.elapsed().as_secs_f64());
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        Self {
+            pid,
+            _name: name.to_string(),
+            _network: network.to_string(),
+        }
+    }
+
+    /// Execute a command in the VM (in container by default)
+    fn exec(&self, cmd: &[&str]) -> Duration {
+        let fcvm = find_fcvm_binary();
+        let start = Instant::now();
+
+        let pid_str = self.pid.to_string();
+        let mut args = vec!["exec", "--pid", &pid_str, "--"];
+        args.extend(cmd);
+
+        let output = Command::new(&fcvm)
+            .args(&args)
+            .output()
+            .expect("failed to run fcvm exec");
+
+        let elapsed = start.elapsed();
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("exec failed: {}", stderr);
+        }
+
+        elapsed
+    }
+
+    /// Execute a command in the VM itself (not container)
+    fn exec_vm(&self, cmd: &[&str]) -> Duration {
+        let fcvm = find_fcvm_binary();
+        let start = Instant::now();
+
+        let pid_str = self.pid.to_string();
+        let mut args = vec!["exec", "--pid", &pid_str, "--vm", "--"];
+        args.extend(cmd);
+
+        let output = Command::new(&fcvm)
+            .args(&args)
+            .output()
+            .expect("failed to run fcvm exec");
+
+        let elapsed = start.elapsed();
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("exec --vm failed: {}", stderr);
+        }
+
+        elapsed
+    }
+
+    /// Kill the VM
+    fn kill(&self) {
+        // SIGTERM for graceful cleanup
+        let _ = Command::new("kill")
+            .args(["-TERM", &self.pid.to_string()])
+            .output();
+
+        // Wait for exit
+        for _ in 0..50 {
+            let status = Command::new("kill")
+                .args(["-0", &self.pid.to_string()])
+                .output();
+            if let Ok(out) = status {
+                if !out.status.success() {
+                    return; // Process exited
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        // Force kill
+        let _ = Command::new("kill")
+            .args(["-9", &self.pid.to_string()])
+            .output();
+    }
+}
+
+impl Drop for VmFixture {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Benchmark exec latency: single command execution time
+fn bench_exec_latency(c: &mut Criterion) {
+    eprintln!("\n=== Setting up VMs for latency benchmarks ===");
+
+    // Start VMs for both network modes
+    let bridged_vm = VmFixture::start("bench-exec-bridged", "bridged");
+    let rootless_vm = VmFixture::start("bench-exec-rootless", "rootless");
+
+    let mut group = c.benchmark_group("exec_latency");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(10));
+
+    // Simple echo command - measures vsock + exec overhead
+    group.bench_function("bridged/echo", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                total += bridged_vm.exec(&["echo", "hello"]);
+            }
+            total
+        })
+    });
+
+    group.bench_function("rootless/echo", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                total += rootless_vm.exec(&["echo", "hello"]);
+            }
+            total
+        })
+    });
+
+    // Exec in VM (not container) - slightly faster path
+    group.bench_function("bridged/echo_vm", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                total += bridged_vm.exec_vm(&["echo", "hello"]);
+            }
+            total
+        })
+    });
+
+    group.bench_function("rootless/echo_vm", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                total += rootless_vm.exec_vm(&["echo", "hello"]);
+            }
+            total
+        })
+    });
+
+    group.finish();
+
+    // VMs cleaned up by Drop
+    eprintln!("\n=== Cleaning up VMs ===");
+}
+
+/// Benchmark exec with data output - measures response size impact
+fn bench_exec_data(c: &mut Criterion) {
+    eprintln!("\n=== Setting up VMs for data benchmarks ===");
+
+    let bridged_vm = VmFixture::start("bench-data-bridged", "bridged");
+    let rootless_vm = VmFixture::start("bench-data-rootless", "rootless");
+
+    let mut group = c.benchmark_group("exec_data");
+    group.sample_size(15);
+    group.measurement_time(Duration::from_secs(10));
+
+    // Output ~1KB of data
+    for (name, size) in [("1kb", 1024), ("4kb", 4096), ("16kb", 16384)] {
+        let cmd_str = format!("head -c {} /dev/zero | base64", size);
+
+        group.throughput(Throughput::Bytes(size as u64));
+
+        group.bench_with_input(BenchmarkId::new("bridged", name), &cmd_str, |b, cmd| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    total += bridged_vm.exec_vm(&["sh", "-c", cmd]);
+                }
+                total
+            })
+        });
+
+        group.bench_with_input(BenchmarkId::new("rootless", name), &cmd_str, |b, cmd| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    total += rootless_vm.exec_vm(&["sh", "-c", cmd]);
+                }
+                total
+            })
+        });
+    }
+
+    group.finish();
+    eprintln!("\n=== Cleaning up VMs ===");
+}
+
+/// Benchmark sequential exec throughput - commands per second
+fn bench_exec_throughput(c: &mut Criterion) {
+    eprintln!("\n=== Setting up VMs for throughput benchmarks ===");
+
+    let bridged_vm = VmFixture::start("bench-tput-bridged", "bridged");
+    let rootless_vm = VmFixture::start("bench-tput-rootless", "rootless");
+
+    let mut group = c.benchmark_group("exec_throughput");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(15));
+    group.throughput(Throughput::Elements(10)); // 10 commands per iteration
+
+    // Run 10 sequential commands per iteration
+    group.bench_function("bridged/10_commands", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                for _ in 0..10 {
+                    total += bridged_vm.exec(&["true"]);
+                }
+            }
+            total
+        })
+    });
+
+    group.bench_function("rootless/10_commands", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                for _ in 0..10 {
+                    total += rootless_vm.exec(&["true"]);
+                }
+            }
+            total
+        })
+    });
+
+    group.finish();
+    eprintln!("\n=== Cleaning up VMs ===");
+}
+
+/// Snapshot/clone fixture - baseline VM + serve process
+struct CloneFixture {
+    baseline_pid: u32,
+    serve_pid: u32,
+    snapshot_name: String,
+}
+
+impl CloneFixture {
+    /// Create a baseline VM, snapshot it, and start serve process
+    fn setup(name: &str, network: &str) -> Self {
+        let fcvm = find_fcvm_binary();
+        let snapshot_name = format!("bench-snap-{}", name);
+        let baseline_name = format!("bench-baseline-{}", name);
+
+        // Start baseline VM
+        eprintln!("  Starting baseline VM...");
+        let child = Command::new(&fcvm)
+            .args([
+                "podman", "run", "--name", &baseline_name,
+                "--network", network, TEST_IMAGE,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn baseline VM");
+
+        let baseline_pid = child.id();
+
+        // Wait for healthy
+        let start = Instant::now();
+        let timeout = Duration::from_secs(180);
+        loop {
+            if start.elapsed() > timeout {
+                panic!("Baseline VM failed to become healthy");
+            }
+            let output = Command::new(&fcvm)
+                .args(["ls", "--json", "--pid", &baseline_pid.to_string()])
+                .output()
+                .expect("failed to run fcvm ls");
+
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Ok(vms) = serde_json::from_str::<Vec<VmLsEntry>>(&stdout) {
+                    if vms.first().map(|v| v.health_status == "healthy").unwrap_or(false) {
+                        eprintln!("  Baseline healthy after {:.1}s", start.elapsed().as_secs_f64());
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        // Create snapshot
+        eprintln!("  Creating snapshot...");
+        let output = Command::new(&fcvm)
+            .args([
+                "snapshot", "create",
+                "--pid", &baseline_pid.to_string(),
+                "--tag", &snapshot_name,
+            ])
+            .output()
+            .expect("failed to create snapshot");
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("Snapshot creation failed: {}", stderr);
+        }
+
+        // Start serve process
+        eprintln!("  Starting serve process...");
+        let serve_child = Command::new(&fcvm)
+            .args(["snapshot", "serve", &snapshot_name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn serve process");
+
+        let serve_pid = serve_child.id();
+
+        // Wait for serve socket
+        let socket_path = format!("/mnt/fcvm-btrfs/uffd-{}-{}.sock", snapshot_name, serve_pid);
+        let start = Instant::now();
+        loop {
+            if start.elapsed() > Duration::from_secs(30) {
+                panic!("Serve socket never appeared: {}", socket_path);
+            }
+            if std::path::Path::new(&socket_path).exists() {
+                eprintln!("  Serve ready (PID: {})", serve_pid);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        Self {
+            baseline_pid,
+            serve_pid,
+            snapshot_name,
+        }
+    }
+
+    /// Run a clone with --exec and measure total time (clone startup + exec + cleanup)
+    fn clone_exec(&self, cmd: &str, network: &str) -> Duration {
+        let fcvm = find_fcvm_binary();
+        let start = Instant::now();
+
+        let output = Command::new(&fcvm)
+            .args([
+                "snapshot", "run",
+                "--pid", &self.serve_pid.to_string(),
+                "--network", network,
+                "--exec", cmd,
+            ])
+            .output()
+            .expect("failed to run snapshot run --exec");
+
+        let elapsed = start.elapsed();
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("clone exec failed: {}", stderr);
+        }
+
+        elapsed
+    }
+
+    fn kill(&self) {
+        let _ = Command::new("kill").args(["-TERM", &self.serve_pid.to_string()]).output();
+        let _ = Command::new("kill").args(["-TERM", &self.baseline_pid.to_string()]).output();
+        std::thread::sleep(Duration::from_secs(2));
+        let _ = Command::new("kill").args(["-9", &self.serve_pid.to_string()]).output();
+        let _ = Command::new("kill").args(["-9", &self.baseline_pid.to_string()]).output();
+    }
+}
+
+impl Drop for CloneFixture {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Benchmark clone exec latency: spawn clone + exec + cleanup
+/// Uses rootless networking only (bridged has dnsmasq timing issues under load)
+fn bench_clone_exec(c: &mut Criterion) {
+    eprintln!("\n=== Setting up snapshot for clone benchmarks ===");
+
+    // Only test rootless - bridged clones have dnsmasq binding issues under rapid iteration
+    let fixture = CloneFixture::setup("clone", "rootless");
+
+    let mut group = c.benchmark_group("clone_exec");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(30));
+
+    // Clone + exec + cleanup (total round-trip)
+    group.bench_function("rootless/echo", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                total += fixture.clone_exec("echo hello", "rootless");
+            }
+            total
+        })
+    });
+
+    group.finish();
+    eprintln!("\n=== Cleaning up snapshot fixtures ===");
+}
+
+criterion_group!(
+    benches,
+    bench_exec_latency,
+    bench_exec_data,
+    bench_exec_throughput,
+    bench_clone_exec,
+);
+
+criterion_main!(benches);

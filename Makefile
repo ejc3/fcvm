@@ -46,23 +46,26 @@ TEST_VM_BRIDGED := cargo test --release --test test_sanity test_sanity_bridged -
 # Legacy alias
 TEST_VM := cargo test --release --test test_sanity -- --nocapture
 
-# Benchmark commands
+# Benchmark commands (fuse-pipe)
 BENCH_THROUGHPUT := cargo bench -p fuse-pipe --bench throughput
 BENCH_OPERATIONS := cargo bench -p fuse-pipe --bench operations
 BENCH_PROTOCOL := cargo bench -p fuse-pipe --bench protocol
+
+# Benchmark commands (fcvm - requires VMs)
+BENCH_EXEC := cargo bench --bench exec
 
 # Native needs sudo for FUSE tests (container already runs as root)
 SUDO := sudo
 
 .PHONY: all help sync sync-git build clean \
         test test-noroot test-root test-unit test-fuse test-vm test-vm-rootless test-vm-bridged test-all \
-        bench bench-throughput bench-operations bench-protocol bench-quick bench-logs bench-clean \
+        bench bench-throughput bench-operations bench-protocol bench-exec bench-quick bench-logs bench-clean \
         lint clippy fmt fmt-check \
         rootfs rebuild \
         container-test container-test-unit container-test-noroot container-test-root container-test-fuse \
         container-test-vm container-test-vm-rootless container-test-vm-bridged container-test-fcvm \
         container-test-pjdfstest container-test-all container-test-allow-other container-build-allow-other \
-        container-bench container-bench-throughput container-bench-operations container-bench-protocol \
+        container-bench container-bench-throughput container-bench-operations container-bench-protocol container-bench-exec \
         container-shell container-clean \
         setup-btrfs setup-kernel setup-rootfs setup-all
 
@@ -90,10 +93,11 @@ help:
 	@echo "  make test-all        - Everything: test + test-vm"
 	@echo ""
 	@echo "Benchmarks:"
-	@echo "  make bench           - All benchmarks (throughput + operations + protocol)"
-	@echo "  make bench-throughput - I/O throughput benchmarks"
+	@echo "  make bench           - All fuse-pipe benchmarks"
+	@echo "  make bench-throughput - FUSE I/O throughput benchmarks"
 	@echo "  make bench-operations - FUSE operation latency benchmarks"
 	@echo "  make bench-protocol  - Wire protocol benchmarks"
+	@echo "  make bench-exec      - fcvm exec latency (bridged vs rootless)"
 	@echo "  make bench-quick     - Quick benchmarks (faster iteration)"
 	@echo "  make bench-logs      - View recent benchmark logs/telemetry"
 	@echo "  make bench-clean     - Clean benchmark artifacts"
@@ -116,7 +120,8 @@ help:
 	@echo "  make container-test-pjdfstest    - POSIX compliance (8789 tests)"
 	@echo "  make container-test-all          - Everything: test + vm + pjdfstest"
 	@echo "  make container-test-allow-other  - Test AllowOther with fuse.conf"
-	@echo "  make container-bench             - All benchmarks"
+	@echo "  make container-bench             - All fuse-pipe benchmarks"
+	@echo "  make container-bench-exec        - fcvm exec latency (bridged vs rootless)"
 	@echo "  make container-shell             - Interactive shell"
 	@echo "  make container-clean             - Force container rebuild"
 	@echo ""
@@ -285,6 +290,10 @@ bench-operations: build
 
 bench-protocol: build
 	$(SSH) "cd $(REMOTE_DIR) && $(BENCH_PROTOCOL)"
+
+bench-exec: build setup-kernel
+	@echo "==> Running exec benchmarks (bridged vs rootless)..."
+	$(SSH) "cd $(REMOTE_DIR) && $(SUDO) $(BENCH_EXEC)"
 
 bench-quick: build
 	@echo "==> Running quick benchmarks..."
@@ -473,7 +482,7 @@ container-test-all: container-test container-test-vm container-test-pjdfstest
 
 # Container benchmarks - uses same commands as native benchmarks
 container-bench: container-build
-	@echo "==> Running all benchmarks..."
+	@echo "==> Running all fuse-pipe benchmarks..."
 	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(BENCH_THROUGHPUT)"
 	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(BENCH_OPERATIONS)"
 	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(BENCH_PROTOCOL)"
@@ -486,6 +495,11 @@ container-bench-operations: container-build
 
 container-bench-protocol: container-build
 	$(SSH) "$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(BENCH_PROTOCOL)"
+
+# fcvm exec benchmarks - requires VMs (uses CONTAINER_RUN_FCVM)
+container-bench-exec: container-build setup-kernel
+	@echo "==> Running exec benchmarks (bridged vs rootless)..."
+	$(SSH) "$(CONTAINER_RUN_FCVM) $(CONTAINER_IMAGE) $(BENCH_EXEC)"
 
 container-shell: container-build
 	$(SSH) -t "$(CONTAINER_RUN_FUSE) -it $(CONTAINER_IMAGE) bash"

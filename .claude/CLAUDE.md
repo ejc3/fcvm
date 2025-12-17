@@ -65,6 +65,24 @@ fcvm exec --pid <PID> -c -- wget -q -O - --timeout=10 http://ifconfig.me
 
 Exception: For **forked libraries** (like fuse-backend-rs), we maintain compatibility with upstream to enable merging upstream changes.
 
+### JSON Parsing
+
+**NEVER parse JSON with string matching.** Always use proper deserialization.
+
+```rust
+// BAD - Fragile, breaks with formatting changes
+if stdout.contains("\"health_status\":\"healthy\"") { ... }
+
+// GOOD - Use serde
+#[derive(Deserialize)]
+struct VmState { health_status: String }
+
+let vms: Vec<VmState> = serde_json::from_str(&stdout)?;
+if vms.first().map(|v| v.health_status == "healthy").unwrap_or(false) { ... }
+```
+
+Why: String matching breaks when JSON formatting changes (spaces, newlines, field order). Proper deserialization is robust and self-documenting.
+
 ### Test Failure Philosophy
 
 **This project is designed for extreme scale, speed, and correctness.** Test failures are bugs, not excuses.
