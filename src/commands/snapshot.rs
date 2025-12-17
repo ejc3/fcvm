@@ -876,53 +876,43 @@ async fn run_clone_setup(
     state_manager: &StateManager,
     vm_state: &mut VmState,
 ) -> Result<(VmManager, Option<tokio::process::Child>)> {
-    // Setup storage - Create CoW disk from snapshot disk
     let vm_dir = data_dir.join("disks");
-    let disk_manager = DiskManager::new(
-        vm_id.to_string(),
-        snapshot_config.disk_path.clone(),
-        vm_dir.clone(),
-    );
-
-    let rootfs_path = disk_manager
-        .create_cow_disk()
-        .await
-        .context("creating CoW disk from snapshot")?;
-
-    // For rootless mode, make disk directory and file world-accessible
-    // Firecracker runs as UID 100000+ inside namespace, can't access UID 1000 files
-    if network.as_any().downcast_ref::<SlirpNetwork>().is_some() {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&vm_dir, std::fs::Permissions::from_mode(0o777))
-            .context("setting disk directory permissions for rootless mode")?;
-        std::fs::set_permissions(&rootfs_path, std::fs::Permissions::from_mode(0o666))
-            .context("setting disk file permissions for rootless mode")?;
-    }
-
-    info!(
-        rootfs = %rootfs_path.display(),
-        snapshot_disk = %snapshot_config.disk_path.display(),
-        "CoW disk prepared from snapshot"
-    );
-
-    info!(vm_name = %vm_name, vm_id = %vm_id, "creating VM manager");
-    let mut vm_manager = VmManager::new(vm_id.to_string(), socket_path.to_path_buf(), None);
-
-    // Set VM name for logging
-    vm_manager.set_vm_name(vm_name.to_string());
 
     // Configure namespace isolation if network provides one
     let mut holder_child: Option<tokio::process::Child> = None;
     let mut holder_pid_for_post_start: Option<u32> = None;
+    let mut vm_manager = VmManager::new(vm_id.to_string(), socket_path.to_path_buf(), None);
+    vm_manager.set_vm_name(vm_name.to_string());
+
+    // rootfs_path is set by either the bridged or rootless branch
+    let rootfs_path: std::path::PathBuf;
 
     if let Some(bridged_net) = network.as_any().downcast_ref::<BridgedNetwork>() {
         if let Some(ns_id) = bridged_net.namespace_id() {
             info!(namespace = %ns_id, "configuring VM to run in network namespace");
             vm_manager.set_namespace(ns_id.to_string());
         }
+
+        // For bridged mode, create disk sequentially (no parallelization benefit)
+        let disk_manager = DiskManager::new(
+            vm_id.to_string(),
+            snapshot_config.disk_path.clone(),
+            vm_dir.clone(),
+        );
+
+        rootfs_path = disk_manager
+            .create_cow_disk()
+            .await
+            .context("creating CoW disk from snapshot")?;
+
+        info!(
+            rootfs = %rootfs_path.display(),
+            snapshot_disk = %snapshot_config.disk_path.display(),
+            "CoW disk prepared from snapshot"
+        );
     } else if let Some(slirp_net) = network.as_any().downcast_ref::<SlirpNetwork>() {
         // Rootless mode: spawn holder process and set up namespace via nsenter
-        // This is fully rootless - no sudo required!
+        // OPTIMIZATION: Parallelize disk creation with network setup
 
         // Step 1: Spawn holder process (keeps namespace alive)
         let holder_cmd = slirp_net.build_holder_command();
@@ -938,81 +928,127 @@ async fn run_clone_setup(
         let holder_pid = child.id().context("getting holder process PID")?;
         info!(holder_pid = holder_pid, "namespace holder started");
 
-        // Step 2: Run setup script via nsenter (creates TAPs, iptables, etc.)
-        // Retry until namespace is ready for nsenter (polling approach)
+        // Step 2: Run disk creation and network setup IN PARALLEL
+        // This saves ~16ms by overlapping these independent operations
         let setup_script = slirp_net.build_setup_script();
         let nsenter_prefix = slirp_net.build_nsenter_prefix(holder_pid);
+        let tap_device = network_config.tap_device.clone();
 
-        const MAX_NS_WAIT: Duration = Duration::from_millis(1000);
-        const NS_POLL_INTERVAL: Duration = Duration::from_millis(5);
-        let ns_poll_start = std::time::Instant::now();
+        // Disk creation task
+        let disk_task = async {
+            let disk_manager = DiskManager::new(
+                vm_id.to_string(),
+                snapshot_config.disk_path.clone(),
+                vm_dir.clone(),
+            );
 
-        info!(holder_pid = holder_pid, "running network setup via nsenter");
-        loop {
-            // Verify holder is still alive before attempting nsenter
-            if !crate::utils::is_process_alive(holder_pid) {
-                let _ = child.kill().await;
-                bail!(
-                    "holder process (PID {}) died before network setup could run",
-                    holder_pid
-                );
+            let rootfs_path = disk_manager
+                .create_cow_disk()
+                .await
+                .context("creating CoW disk from snapshot")?;
+
+            // For rootless mode, make disk directory and file world-accessible
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&vm_dir, std::fs::Permissions::from_mode(0o777))
+                .context("setting disk directory permissions for rootless mode")?;
+            std::fs::set_permissions(&rootfs_path, std::fs::Permissions::from_mode(0o666))
+                .context("setting disk file permissions for rootless mode")?;
+
+            info!(
+                rootfs = %rootfs_path.display(),
+                snapshot_disk = %snapshot_config.disk_path.display(),
+                "CoW disk prepared from snapshot"
+            );
+
+            Ok::<_, anyhow::Error>(rootfs_path)
+        };
+
+        // Network setup task
+        let network_task = async {
+            const MAX_NS_WAIT: Duration = Duration::from_millis(1000);
+            const NS_POLL_INTERVAL: Duration = Duration::from_millis(5);
+            let ns_poll_start = std::time::Instant::now();
+
+            info!(holder_pid = holder_pid, "running network setup via nsenter");
+            loop {
+                // Verify holder is still alive before attempting nsenter
+                if !crate::utils::is_process_alive(holder_pid) {
+                    bail!(
+                        "holder process (PID {}) died before network setup could run",
+                        holder_pid
+                    );
+                }
+
+                let output = tokio::process::Command::new(&nsenter_prefix[0])
+                    .args(&nsenter_prefix[1..])
+                    .arg("bash")
+                    .arg("-c")
+                    .arg(&setup_script)
+                    .output()
+                    .await
+                    .context("running network setup via nsenter")?;
+
+                if output.status.success() {
+                    debug!(
+                        "namespace ready after {:?}",
+                        ns_poll_start.elapsed()
+                    );
+                    break;
+                }
+
+                // Check if it's a namespace-not-ready error (retry) vs permanent error (fail)
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stderr.contains("Invalid argument") || stderr.contains("No such process") {
+                    if ns_poll_start.elapsed() > MAX_NS_WAIT {
+                        bail!("namespace not ready after {:?}: {}", ns_poll_start.elapsed(), stderr);
+                    }
+                    tokio::time::sleep(NS_POLL_INTERVAL).await;
+                    continue;
+                }
+
+                // Permanent error
+                bail!("network setup failed: {}", stderr);
             }
 
-            let output = tokio::process::Command::new(&nsenter_prefix[0])
+            // Verify TAP device was created successfully
+            let verify_cmd = format!("ip link show {} >/dev/null 2>&1", tap_device);
+            let verify_output = tokio::process::Command::new(&nsenter_prefix[0])
                 .args(&nsenter_prefix[1..])
                 .arg("bash")
                 .arg("-c")
-                .arg(&setup_script)
-                .output()
+                .arg(&verify_cmd)
+                .status()
                 .await
-                .context("running network setup via nsenter")?;
+                .context("verifying TAP device")?;
 
-            if output.status.success() {
-                debug!(
-                    "namespace ready after {:?}",
-                    ns_poll_start.elapsed()
+            if !verify_output.success() {
+                bail!(
+                    "TAP device '{}' not found after network setup - setup may have failed silently",
+                    tap_device
                 );
-                break;
             }
+            debug!(tap_device = %tap_device, "TAP device verified");
 
-            // Check if it's a namespace-not-ready error (retry) vs permanent error (fail)
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("Invalid argument") || stderr.contains("No such process") {
-                if ns_poll_start.elapsed() > MAX_NS_WAIT {
-                    let _ = child.kill().await;
-                    bail!("namespace not ready after {:?}: {}", ns_poll_start.elapsed(), stderr);
-                }
-                tokio::time::sleep(NS_POLL_INTERVAL).await;
-                continue;
-            }
-
-            // Permanent error
-            let _ = child.kill().await;
-            bail!("network setup failed: {}", stderr);
+            Ok::<_, anyhow::Error>(())
         };
 
-        info!(holder_pid = holder_pid, "network setup complete");
+        // Run both tasks in parallel
+        let (disk_result, network_result) = tokio::join!(disk_task, network_task);
 
-        // Verify TAP device was created successfully
-        let tap_device = &network_config.tap_device;
-        let verify_cmd = format!("ip link show {} >/dev/null 2>&1", tap_device);
-        let verify_output = tokio::process::Command::new(&nsenter_prefix[0])
-            .args(&nsenter_prefix[1..])
-            .arg("bash")
-            .arg("-c")
-            .arg(&verify_cmd)
-            .status()
-            .await
-            .context("verifying TAP device")?;
-
-        if !verify_output.success() {
+        // Handle errors - kill holder child if either fails
+        if let Err(e) = &disk_result {
             let _ = child.kill().await;
-            bail!(
-                "TAP device '{}' not found after network setup - setup may have failed silently",
-                tap_device
-            );
+            return Err(anyhow::anyhow!("disk creation failed: {}", e));
         }
-        debug!(tap_device = %tap_device, "TAP device verified");
+        if let Err(e) = &network_result {
+            let _ = child.kill().await;
+            return Err(anyhow::anyhow!("network setup failed: {}", e));
+        }
+
+        rootfs_path = disk_result?;
+        network_result?;
+
+        info!(holder_pid = holder_pid, "parallel disk + network setup complete");
 
         // Step 3: Set holder_pid so VmManager uses nsenter
         vm_manager.set_holder_pid(holder_pid);
@@ -1022,6 +1058,9 @@ async fn run_clone_setup(
         holder_pid_for_post_start = Some(holder_pid);
 
         holder_child = Some(child);
+    } else {
+        // Unknown network type - should not happen
+        bail!("Unknown network type - must be either BridgedNetwork or SlirpNetwork");
     }
 
     // Configure mount namespace isolation for vsock redirect
