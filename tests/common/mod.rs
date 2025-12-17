@@ -101,36 +101,20 @@ impl Drop for VmFixture {
 
 /// Spawn fcvm with safe stdio settings to prevent pipe buffer deadlock.
 ///
-/// CRITICAL: This helper uses `Stdio::null()` instead of `Stdio::piped()`.
-/// Using `Stdio::piped()` without consuming the output causes deadlock:
-/// - Linux pipe buffer is 64KB
-/// - fcvm outputs 100+ lines of serial console logs
-/// - When buffer fills, child blocks on write(), freezing ALL async tasks
-/// - Health monitor never runs, VM never becomes "healthy"
+/// Uses `Stdio::inherit()` - output goes directly to parent's stdout/stderr.
+/// Simple and safe, but output is not prefixed with process name.
+///
+/// For prefixed output like `[vm-name] ...`, use `spawn_fcvm_with_logs()` instead.
 ///
 /// # Arguments
 /// * `args` - Arguments to pass to fcvm (e.g., ["podman", "run", "--name", "test", ...])
 ///
 /// # Returns
 /// Tuple of (Child process, PID)
-///
-/// # Example
-/// ```ignore
-/// let (mut child, pid) = spawn_fcvm(&[
-///     "podman", "run",
-///     "--name", &vm_name,
-///     "--network", "bridged",
-///     TEST_IMAGE,
-/// ]).await?;
-/// ```
 pub async fn spawn_fcvm(args: &[&str]) -> anyhow::Result<(tokio::process::Child, u32)> {
     let fcvm_path = find_fcvm_binary()?;
     let child = tokio::process::Command::new(&fcvm_path)
         .args(args)
-        // CRITICAL: Use inherit() not piped() to prevent deadlock
-        // inherit() passes output to parent's stdout/stderr - visible with --nocapture
-        // piped() without consuming causes 64KB buffer to fill, blocking child process
-        // See CLAUDE.md "Pipe Buffer Deadlock in Tests" for details
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -141,6 +125,83 @@ pub async fn spawn_fcvm(args: &[&str]) -> anyhow::Result<(tokio::process::Child,
         .ok_or_else(|| anyhow::anyhow!("failed to get fcvm PID"))?;
 
     Ok((child, pid))
+}
+
+/// Spawn fcvm with piped IO and automatic log consumers.
+///
+/// Output is prefixed with `[name]` for stdout and `[name ERR]` for stderr,
+/// useful when running multiple VMs in parallel.
+///
+/// This is safe from pipe buffer deadlock because log consumer tasks are
+/// spawned immediately to drain the pipes.
+///
+/// # Arguments
+/// * `args` - Arguments to pass to fcvm
+/// * `name` - Prefix for log output (e.g., "baseline", "clone-1")
+///
+/// # Returns
+/// Tuple of (Child process, PID)
+///
+/// # Example
+/// ```ignore
+/// let (mut child, pid) = spawn_fcvm_with_logs(&[
+///     "podman", "run", "--name", "test", "--network", "bridged", TEST_IMAGE,
+/// ], "test-vm").await?;
+/// // Output will appear as:
+/// // [test-vm] Starting container...
+/// // [test-vm ERR] Warning: ...
+/// ```
+pub async fn spawn_fcvm_with_logs(
+    args: &[&str],
+    name: &str,
+) -> anyhow::Result<(tokio::process::Child, u32)> {
+    let fcvm_path = find_fcvm_binary()?;
+    let mut child = tokio::process::Command::new(&fcvm_path)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn fcvm: {}", e))?;
+
+    let pid = child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("failed to get fcvm PID"))?;
+
+    // Spawn log consumers immediately to prevent pipe buffer deadlock
+    spawn_log_consumer(child.stdout.take(), name);
+    spawn_log_consumer_stderr(child.stderr.take(), name);
+
+    Ok((child, pid))
+}
+
+/// Spawn a task to consume stdout and print with `[name]` prefix
+pub fn spawn_log_consumer(stdout: Option<tokio::process::ChildStdout>, name: &str) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    if let Some(stdout) = stdout {
+        let name = name.to_string();
+        tokio::spawn(async move {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                eprintln!("[{}] {}", name, line);
+            }
+        });
+    }
+}
+
+/// Spawn a task to consume stderr and print with `[name ERR]` prefix
+pub fn spawn_log_consumer_stderr(stderr: Option<tokio::process::ChildStderr>, name: &str) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    if let Some(stderr) = stderr {
+        let name = name.to_string();
+        tokio::spawn(async move {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                eprintln!("[{} ERR] {}", name, line);
+            }
+        });
+    }
 }
 
 /// Find the fcvm binary
