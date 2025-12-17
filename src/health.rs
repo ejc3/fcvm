@@ -60,6 +60,7 @@ pub fn spawn_health_monitor_with_cancel(
 
         // Throttle health check failure logs to once per second (simple local variable)
         let mut last_failure_log: Option<Instant> = None;
+        let mut first_check = true;
 
         loop {
             // Check for cancellation before sleeping
@@ -70,17 +71,23 @@ pub fn spawn_health_monitor_with_cancel(
                 }
             }
 
-            // Sleep with cancellation support
-            if let Some(ref token) = cancel_token {
-                tokio::select! {
-                    _ = tokio::time::sleep(poll_interval) => {}
-                    _ = token.cancelled() => {
-                        info!(target: "health-monitor", "cancellation requested during sleep, stopping");
-                        break;
-                    }
-                }
+            // Skip initial sleep - check immediately on first iteration
+            // This saves ~100ms on clone startup
+            if first_check {
+                first_check = false;
             } else {
-                tokio::time::sleep(poll_interval).await;
+                // Sleep with cancellation support
+                if let Some(ref token) = cancel_token {
+                    tokio::select! {
+                        _ = tokio::time::sleep(poll_interval) => {}
+                        _ = token.cancelled() => {
+                            info!(target: "health-monitor", "cancellation requested during sleep, stopping");
+                            break;
+                        }
+                    }
+                } else {
+                    tokio::time::sleep(poll_interval).await;
+                }
             }
 
             let health_status = match update_health_status_once(
