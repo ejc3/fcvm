@@ -39,43 +39,43 @@ cargo build --release --workspace
 
 ### Run a Container
 ```bash
-# Run nginx in a Firecracker VM
-sudo fcvm podman run --name web1 nginx:alpine
+# Run nginx in a Firecracker VM (using AWS ECR public registry to avoid Docker Hub rate limits)
+sudo fcvm podman run --name web1 public.ecr.aws/nginx/nginx:alpine
 
 # With port forwarding (8080 on host -> 80 in guest)
-sudo fcvm podman run --name web1 --publish 8080:80 nginx:alpine
+sudo fcvm podman run --name web1 --publish 8080:80 public.ecr.aws/nginx/nginx:alpine
 
 # With host directory mapping (via fuse-pipe)
-sudo fcvm podman run --name web1 --map /host/data:/data nginx:alpine
+sudo fcvm podman run --name web1 --map /host/data:/data public.ecr.aws/nginx/nginx:alpine
 
 # Read-only volume mapping
-sudo fcvm podman run --name web1 --map /host/config:/config:ro nginx:alpine
+sudo fcvm podman run --name web1 --map /host/config:/config:ro public.ecr.aws/nginx/nginx:alpine
 
 # Custom resources
-sudo fcvm podman run --name web1 --cpu 4 --mem 4096 nginx:alpine
+sudo fcvm podman run --name web1 --cpu 4 --mem 4096 public.ecr.aws/nginx/nginx:alpine
 
 # With environment variables and custom command
-sudo fcvm podman run --name web1 --env DEBUG=1 --cmd "nginx -g 'daemon off;'" nginx:alpine
+sudo fcvm podman run --name web1 --env DEBUG=1 --cmd "nginx -g 'daemon off;'" public.ecr.aws/nginx/nginx:alpine
 
 # Rootless mode (no sudo required)
-fcvm podman run --name web1 --network rootless nginx:alpine
+fcvm podman run --name web1 --network rootless public.ecr.aws/nginx/nginx:alpine
 
-# List running VMs
-fcvm ls
-fcvm ls --json          # JSON output
-fcvm ls --pid 12345     # Filter by PID
+# List running VMs (sudo needed to read VM state files)
+sudo fcvm ls
+sudo fcvm ls --json          # JSON output
+sudo fcvm ls --pid 12345     # Filter by PID
 
-# Execute commands (mirrors podman exec)
-fcvm exec web1 -- cat /etc/os-release         # Run in container (default)
-fcvm exec web1 --vm -- hostname               # Run in VM
-fcvm exec web1 -- bash                        # Interactive shell (auto -it)
-fcvm exec web1 -it -- sh                      # Explicit interactive TTY
+# Execute commands (mirrors podman exec, sudo needed)
+sudo fcvm exec web1 -- cat /etc/os-release         # Run in container (default)
+sudo fcvm exec web1 --vm -- hostname               # Run in VM
+sudo fcvm exec web1 -- bash                        # Interactive shell (auto -it)
+sudo fcvm exec web1 -it -- sh                      # Explicit interactive TTY
 ```
 
 ### Snapshot & Clone Workflow
 ```bash
 # 1. Start baseline VM
-sudo fcvm podman run --name baseline nginx:alpine
+sudo fcvm podman run --name baseline public.ecr.aws/nginx/nginx:alpine
 
 # 2. Create snapshot (pauses VM briefly)
 sudo fcvm snapshot create baseline --tag nginx-warm
@@ -83,13 +83,13 @@ sudo fcvm snapshot create baseline --tag nginx-warm
 sudo fcvm snapshot create --pid <vm_pid> --tag nginx-warm
 
 # 3. List available snapshots
-fcvm snapshots
+sudo fcvm snapshots
 
 # 4. Start UFFD memory server (serves pages on-demand)
 sudo fcvm snapshot serve nginx-warm
 
-# 5. List running snapshot servers
-fcvm snapshot ls
+# 5. List running snapshot servers (sudo needed to read state files)
+sudo fcvm snapshot ls
 
 # 6. Clone from snapshot (~3ms startup)
 sudo fcvm snapshot run --pid <serve_pid> --name clone1
@@ -216,21 +216,21 @@ Execute a command in a running VM or container. Mirrors `podman exec` behavior.
 
 **Examples:**
 ```bash
-# Execute inside container (default)
-fcvm exec my-vm -- cat /etc/os-release
-fcvm exec --pid 12345 -- wget -q -O - ifconfig.me
+# Execute inside container (default, sudo needed to read VM state)
+sudo fcvm exec my-vm -- cat /etc/os-release
+sudo fcvm exec --pid 12345 -- wget -q -O - ifconfig.me
 
 # Execute in VM (guest OS)
-fcvm exec my-vm --vm -- hostname
-fcvm exec --pid 12345 --vm -- curl -s ifconfig.me
+sudo fcvm exec my-vm --vm -- hostname
+sudo fcvm exec --pid 12345 --vm -- curl -s ifconfig.me
 
 # Interactive shell (auto-detects -it when stdin is a TTY)
-fcvm exec my-vm -- bash
-fcvm exec my-vm --vm -- bash
+sudo fcvm exec my-vm -- bash
+sudo fcvm exec my-vm --vm -- bash
 
 # Explicit TTY flags (like podman exec -it)
-fcvm exec my-vm -it -- sh
-fcvm exec my-vm --vm -it -- bash
+sudo fcvm exec my-vm -it -- sh
+sudo fcvm exec my-vm --vm -it -- bash
 ```
 
 ---
