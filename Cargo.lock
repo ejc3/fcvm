@@ -549,6 +549,7 @@ dependencies = [
  "bincode",
  "chrono",
  "clap",
+ "criterion",
  "fuse-pipe",
  "futures",
  "hyper 0.14.32",
