@@ -120,8 +120,8 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
     .await
     .context("spawning memory server")?;
 
-    // Wait for serve process to be ready
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait for serve process to be ready (poll for socket)
+    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
     let serve_time = step3_start.elapsed();
     println!(
         "  ✓ Memory server ready (PID: {}, took {:.1}s)",
@@ -422,8 +422,8 @@ async fn test_clone_while_baseline_running() -> Result<()> {
     .await
     .context("spawning memory server")?;
 
-    // Wait for serve to be ready
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait for serve to be ready (poll for socket)
+    common::poll_serve_ready(snapshot_name, serve_pid, 30).await?;
     println!("  ✓ Memory server ready (PID: {})", serve_pid);
 
     // Step 5: Clone WHILE baseline is still running (this is the key test!)
@@ -558,7 +558,6 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
     // Kill baseline - we only need the snapshot
     common::kill_process(baseline_pid).await;
     println!("  Killed baseline VM (only need snapshot)");
-    tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Step 3: Start memory server
     println!("\nStep 3: Starting memory server...");
@@ -569,7 +568,8 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
     .await
     .context("spawning memory server")?;
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait for serve to be ready (poll for socket)
+    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
     println!("  ✓ Memory server ready (PID: {})", serve_pid);
 
     // Step 4: Spawn clone
@@ -710,6 +710,128 @@ async fn test_clone_http(fcvm_path: &std::path::Path, clone_pid: u32) -> Result<
         anyhow::bail!(
             "HTTP connectivity failed: exit={}, stdout={}, stderr={}",
             output.status,
+            stdout.trim(),
+            stderr.trim()
+        )
+    }
+}
+
+/// Test snapshot run --exec with bridged networking
+#[tokio::test]
+async fn test_snapshot_run_exec_bridged() -> Result<()> {
+    snapshot_run_exec_test_impl("bridged").await
+}
+
+/// Test snapshot run --exec with rootless networking
+#[tokio::test]
+async fn test_snapshot_run_exec_rootless() -> Result<()> {
+    snapshot_run_exec_test_impl("rootless").await
+}
+
+/// Implementation of snapshot run --exec test
+async fn snapshot_run_exec_test_impl(network: &str) -> Result<()> {
+    let snapshot_name = format!("test-exec-{}", network);
+    let baseline_name = format!("baseline-exec-{}", network);
+
+    println!("\n╔═══════════════════════════════════════════════════════════════╗");
+    println!(
+        "║     Snapshot Run --exec Test ({:8})                      ║",
+        network
+    );
+    println!("╚═══════════════════════════════════════════════════════════════╝\n");
+
+    let fcvm_path = common::find_fcvm_binary()?;
+
+    // Step 1: Start baseline VM
+    println!("Step 1: Starting baseline VM...");
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &["podman", "run", "--name", &baseline_name, "--network", network, common::TEST_IMAGE],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
+
+    println!("  Waiting for baseline VM to become healthy...");
+    common::poll_health_by_pid(baseline_pid, 60).await?;
+    println!("  ✓ Baseline VM healthy (PID: {})", baseline_pid);
+
+    // Step 2: Create snapshot
+    println!("\nStep 2: Creating snapshot...");
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
+        ])
+        .output()
+        .await
+        .context("running snapshot create")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Snapshot creation failed: {}", stderr);
+    }
+    println!("  ✓ Snapshot created");
+
+    // Step 3: Start memory server
+    println!("\nStep 3: Starting memory server...");
+    let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
+        &["snapshot", "serve", &snapshot_name],
+        "uffd-server",
+    )
+    .await
+    .context("spawning memory server")?;
+
+    // Wait for serve to be ready (poll for socket)
+    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+    println!("  ✓ Memory server ready (PID: {})", serve_pid);
+
+    // Step 4: Run clone with --exec (command that outputs something)
+    println!("\nStep 4: Running clone with --exec 'echo EXEC_TEST_SUCCESS'...");
+    let serve_pid_str = serve_pid.to_string();
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid_str,
+            "--network",
+            network,
+            "--exec",
+            "echo EXEC_TEST_SUCCESS",
+        ])
+        .output()
+        .await
+        .context("running snapshot run --exec")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!("  stdout: {}", stdout.trim());
+    println!("  stderr: {}", stderr.trim().lines().take(5).collect::<Vec<_>>().join("\n          "));
+
+    // Verify the output contains our test string
+    let exec_success = stdout.contains("EXEC_TEST_SUCCESS") || stderr.contains("EXEC_TEST_SUCCESS");
+    let exit_success = output.status.success();
+
+    // Cleanup
+    println!("\nCleaning up...");
+    common::kill_process(serve_pid).await;
+    println!("  Killed memory server");
+    common::kill_process(baseline_pid).await;
+    println!("  Killed baseline VM");
+
+    // Final result
+    if exec_success && exit_success {
+        println!("\n✅ SNAPSHOT RUN --EXEC TEST PASSED!");
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Test failed: exec_output_found={}, exit_success={}, stdout='{}', stderr='{}'",
+            exec_success,
+            exit_success,
             stdout.trim(),
             stderr.trim()
         )

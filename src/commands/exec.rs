@@ -10,11 +10,81 @@ use crate::state::StateManager;
 use anyhow::{bail, Context, Result};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::time::Duration;
-use tracing::info;
+use tracing::{debug, info};
 
 /// Vsock port for exec commands (fc-agent listens on this)
 pub const EXEC_VSOCK_PORT: u32 = 4998;
+
+/// Execute a command in a VM or its container (programmatic API)
+///
+/// This is a simpler API for programmatic use (e.g., from snapshot run --exec).
+/// For CLI use, see `cmd_exec`.
+///
+/// Returns the command's exit code.
+pub async fn run_exec_in_vm(
+    vsock_socket: &Path,
+    command: &[String],
+    in_container: bool,
+) -> Result<i32> {
+    debug!(
+        socket = %vsock_socket.display(),
+        command = ?command,
+        in_container,
+        "executing command in VM"
+    );
+
+    // Connect to the vsock Unix socket
+    let mut stream = UnixStream::connect(vsock_socket).with_context(|| {
+        format!(
+            "Failed to connect to vsock socket at {}.\n\
+             Make sure the VM is running.",
+            vsock_socket.display()
+        )
+    })?;
+
+    // Set timeouts for non-interactive mode
+    stream.set_read_timeout(Some(Duration::from_secs(300)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+
+    // Send CONNECT command to Firecracker's vsock proxy
+    let connect_cmd = format!("CONNECT {}\n", EXEC_VSOCK_PORT);
+    stream
+        .write_all(connect_cmd.as_bytes())
+        .context("sending CONNECT command to vsock")?;
+
+    // Read the response - should be "OK <port>\n" on success
+    let mut response = [0u8; 32];
+    let n = stream.read(&mut response).context("reading CONNECT response")?;
+    let response_str = String::from_utf8_lossy(&response[..n]);
+
+    if !response_str.starts_with("OK ") {
+        bail!(
+            "Failed to connect to guest exec server: {}. \
+             Make sure fc-agent is running with exec server enabled.",
+            response_str.trim()
+        );
+    }
+
+    debug!("connected to guest exec server");
+
+    // Build the exec request (non-interactive, no TTY)
+    let request = ExecRequest {
+        command: command.to_vec(),
+        in_container,
+        interactive: false,
+        tty: false,
+    };
+
+    // Send request as JSON followed by newline
+    let request_json = serde_json::to_string(&request)?;
+    writeln!(stream, "{}", request_json)?;
+    stream.flush()?;
+
+    // Run in line mode and capture exit code
+    run_line_mode_with_exit_code(stream)
+}
 
 pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
     // Find the VM by name or PID
@@ -143,8 +213,8 @@ pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
     }
 }
 
-/// Run in line-buffered mode (non-TTY)
-fn run_line_mode(stream: UnixStream) -> Result<()> {
+/// Run in line-buffered mode (non-TTY), returns exit code
+fn run_line_mode_with_exit_code(stream: UnixStream) -> Result<i32> {
     let reader = BufReader::new(stream);
     let mut exit_code = 0i32;
 
@@ -172,6 +242,13 @@ fn run_line_mode(stream: UnixStream) -> Result<()> {
             }
         }
     }
+
+    Ok(exit_code)
+}
+
+/// Run in line-buffered mode (non-TTY)
+fn run_line_mode(stream: UnixStream) -> Result<()> {
+    let exit_code = run_line_mode_with_exit_code(stream)?;
 
     // Exit with the command's exit code
     if exit_code != 0 {

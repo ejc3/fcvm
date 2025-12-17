@@ -94,6 +94,10 @@ sudo fcvm snapshot ls
 # 6. Clone from snapshot (~3ms startup)
 sudo fcvm snapshot run --pid <serve_pid> --name clone1
 sudo fcvm snapshot run --pid <serve_pid> --name clone2
+
+# 7. Clone and execute command (auto-cleans up after)
+sudo fcvm snapshot run --pid <serve_pid> --exec "curl localhost"
+# Clone starts → execs command in container → returns result → cleans up
 ```
 
 ---
@@ -196,6 +200,7 @@ Run a clone from a snapshot.
 | `--name <NAME>` | (auto) | Custom name for cloned VM |
 | `--publish <[IP:]HPORT:GPORT[/PROTO]>` | | Port forwarding |
 | `--network <MODE>` | bridged | Network mode: `bridged` or `rootless` |
+| `--exec <CMD>` | | Execute command in container after clone starts, then cleanup |
 
 #### `fcvm snapshot ls`
 List running snapshot servers.
