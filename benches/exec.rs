@@ -8,8 +8,10 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde::Deserialize;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const TEST_IMAGE: &str = "public.ecr.aws/nginx/nginx:alpine";
@@ -17,7 +19,20 @@ const TEST_IMAGE: &str = "public.ecr.aws/nginx/nginx:alpine";
 /// VM state from fcvm ls --json
 #[derive(Deserialize)]
 struct VmLsEntry {
+    pid: Option<u32>,
     health_status: String,
+    config: VmConfigEntry,
+}
+
+#[derive(Deserialize)]
+struct VmConfigEntry {
+    network: NetworkConfigEntry,
+}
+
+#[derive(Deserialize)]
+struct NetworkConfigEntry {
+    loopback_ip: Option<String>,
+    health_check_port: Option<u16>,
 }
 
 /// Find the fcvm binary
@@ -448,6 +463,95 @@ impl CloneFixture {
         elapsed
     }
 
+    /// Spawn a clone, wait for healthy, hit nginx via HTTP, kill clone
+    /// Returns total time from spawn to cleanup complete
+    fn clone_http(&self, network: &str) -> Duration {
+        let fcvm = find_fcvm_binary();
+        let start = Instant::now();
+
+        // Spawn clone (without --exec so it stays running)
+        let mut child = Command::new(&fcvm)
+            .args([
+                "snapshot", "run",
+                "--pid", &self.serve_pid.to_string(),
+                "--network", network,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn clone");
+
+        let clone_pid = child.id();
+
+        // Poll for healthy and get loopback IP
+        let (loopback_ip, health_port) = loop {
+            if start.elapsed() > Duration::from_secs(30) {
+                let _ = Command::new("kill").args(["-9", &clone_pid.to_string()]).output();
+                panic!("clone failed to become healthy within 30s");
+            }
+
+            let output = Command::new(&fcvm)
+                .args(["ls", "--json", "--pid", &clone_pid.to_string()])
+                .output()
+                .expect("failed to run fcvm ls");
+
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Ok(vms) = serde_json::from_str::<Vec<VmLsEntry>>(&stdout) {
+                    if let Some(vm) = vms.first() {
+                        if vm.health_status == "healthy" {
+                            let ip = vm.config.network.loopback_ip.clone()
+                                .expect("no loopback_ip for healthy clone");
+                            let port = vm.config.network.health_check_port.unwrap_or(8080);
+                            break (ip, port);
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        // Make HTTP request to nginx
+        let addr = format!("{}:{}", loopback_ip, health_port);
+        let mut stream = TcpStream::connect(&addr).expect("failed to connect to nginx");
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+
+        let request = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        stream.write_all(request.as_bytes()).expect("failed to send HTTP request");
+
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+
+        // Verify we got a valid response
+        let response_str = String::from_utf8_lossy(&response);
+        if !response_str.contains("200 OK") {
+            panic!("unexpected HTTP response: {}", &response_str[..std::cmp::min(200, response_str.len())]);
+        }
+
+        // Kill the clone
+        let _ = Command::new("kill").args(["-TERM", &clone_pid.to_string()]).output();
+
+        // Wait for child to exit (with timeout)
+        let kill_start = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if kill_start.elapsed() > Duration::from_secs(5) {
+                        let _ = Command::new("kill").args(["-9", &clone_pid.to_string()]).output();
+                        let _ = child.wait();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => break,
+            }
+        }
+
+        start.elapsed()
+    }
+
     fn kill(&self) {
         let _ = Command::new("kill").args(["-TERM", &self.serve_pid.to_string()]).output();
         let _ = Command::new("kill").args(["-TERM", &self.baseline_pid.to_string()]).output();
@@ -466,10 +570,10 @@ impl Drop for CloneFixture {
 /// Benchmark clone exec latency: spawn clone + exec + cleanup
 /// Uses rootless networking only (bridged has dnsmasq timing issues under load)
 fn bench_clone_exec(c: &mut Criterion) {
-    eprintln!("\n=== Setting up snapshot for clone benchmarks ===");
+    eprintln!("\n=== Setting up snapshot for clone exec benchmarks ===");
 
     // Only test rootless - bridged clones have dnsmasq binding issues under rapid iteration
-    let fixture = CloneFixture::setup("clone", "rootless");
+    let fixture = CloneFixture::setup("clone-exec", "rootless");
 
     let mut group = c.benchmark_group("clone_exec");
     group.sample_size(10);
@@ -487,7 +591,33 @@ fn bench_clone_exec(c: &mut Criterion) {
     });
 
     group.finish();
-    eprintln!("\n=== Cleaning up snapshot fixtures ===");
+    eprintln!("\n=== Cleaning up clone exec fixtures ===");
+}
+
+/// Benchmark clone HTTP latency: spawn clone + wait healthy + HTTP request + cleanup
+/// Measures raw network latency without podman exec overhead
+fn bench_clone_http(c: &mut Criterion) {
+    eprintln!("\n=== Setting up snapshot for clone HTTP benchmarks ===");
+
+    let fixture = CloneFixture::setup("clone-http", "rootless");
+
+    let mut group = c.benchmark_group("clone_http");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(30));
+
+    // Clone + wait healthy + HTTP GET + cleanup
+    group.bench_function("rootless/nginx", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                total += fixture.clone_http("rootless");
+            }
+            total
+        })
+    });
+
+    group.finish();
+    eprintln!("\n=== Cleaning up clone HTTP fixtures ===");
 }
 
 criterion_group!(
@@ -496,6 +626,7 @@ criterion_group!(
     bench_exec_data,
     bench_exec_throughput,
     bench_clone_exec,
+    bench_clone_http,
 );
 
 criterion_main!(benches);
