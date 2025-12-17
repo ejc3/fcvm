@@ -248,6 +248,77 @@ sudo fcvm exec my-vm --vm -it -- bash
 
 ---
 
+## Container Behavior
+
+### Exit Code Forwarding
+
+When a container exits, fcvm forwards its exit code:
+
+```bash
+# Container exits with code 0 → fcvm returns 0
+sudo fcvm podman run --name test --cmd "exit 0" public.ecr.aws/nginx/nginx:alpine
+echo $?  # 0
+
+# Container exits with code 42 → fcvm returns error
+sudo fcvm podman run --name test --cmd "exit 42" public.ecr.aws/nginx/nginx:alpine
+# ERROR fcvm: Error: container exited with code 42
+echo $?  # 1
+```
+
+Exit codes are communicated from fc-agent (inside VM) to fcvm (host) via vsock status channel (port 4999).
+
+### Container Logs
+
+Container stdout/stderr flows through the serial console:
+1. Container writes to stdout/stderr
+2. fc-agent prefixes with `[ctr:out]` or `[ctr:err]` and writes to serial console
+3. Firecracker sends serial output to fcvm
+4. fcvm logs via tracing (visible on stderr)
+
+Example output:
+```
+INFO firecracker: fc-agent[292]: [ctr:out] hello world
+INFO firecracker: fc-agent[292]: [ctr:err] error message
+```
+
+### Health Checks
+
+**Default behavior**: fcvm waits for fc-agent to signal container readiness via vsock. No HTTP polling needed.
+
+**Custom HTTP health check**: Use `--health-check` for HTTP-based health monitoring:
+```bash
+sudo fcvm podman run --name web --health-check http://localhost:80/health nginx:alpine
+```
+
+With custom health checks, fcvm polls the URL until it returns 2xx status.
+
+---
+
+## Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `FCVM_BASE_DIR` | Base directory for all fcvm data | `/mnt/fcvm-btrfs` |
+| `RUST_LOG` | Logging level and filters | `info` |
+
+### Examples
+
+```bash
+# Use different base directory
+FCVM_BASE_DIR=/data/fcvm sudo fcvm podman run ...
+
+# Increase logging verbosity
+RUST_LOG=debug sudo fcvm podman run ...
+
+# Debug specific component
+RUST_LOG=firecracker=debug,health-monitor=debug sudo fcvm podman run ...
+
+# Silence all logs
+RUST_LOG=off sudo fcvm podman run ... 2>/dev/null
+```
+
+---
+
 ## Testing
 
 ### Makefile Targets
@@ -440,3 +511,10 @@ sudo chown -R $USER:$USER /mnt/fcvm-btrfs
 
 - `DESIGN.md` - Comprehensive design specification and architecture
 - `.claude/CLAUDE.md` - Development notes, debugging tips, implementation details
+- `LICENSE` - MIT License
+
+---
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.
