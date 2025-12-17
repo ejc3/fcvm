@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::FirecrackerClient;
 
@@ -291,6 +291,7 @@ impl VmManager {
         }
 
         // Stream stdout/stderr to tracing
+        // Only fc-agent and container output shown at INFO level; kernel/systemd at DEBUG
         if let Some(stdout) = child.stdout.take() {
             let vm_id = self.vm_id.clone();
             let vm_name = self.vm_name.clone();
@@ -301,7 +302,13 @@ impl VmManager {
                     let clean_line = strip_firecracker_prefix(&line);
                     // vm_name and vm_id are already in the hierarchical target, so don't duplicate
                     let _ = (&vm_name, &vm_id); // suppress unused warning
-                    info!(target: "firecracker", "{}", clean_line);
+
+                    // Show fc-agent and container output at INFO, everything else at DEBUG
+                    if clean_line.contains("fc-agent") || clean_line.contains("[ctr:") {
+                        info!(target: "firecracker", "{}", clean_line);
+                    } else {
+                        debug!(target: "firecracker", "{}", clean_line);
+                    }
                 }
             });
         }
@@ -316,7 +323,13 @@ impl VmManager {
                     let clean_line = strip_firecracker_prefix(&line);
                     // vm_name and vm_id are already in the hierarchical target, so don't duplicate
                     let _ = (&vm_name, &vm_id); // suppress unused warning
-                    warn!(target: "firecracker", "{}", clean_line);
+
+                    // Show fc-agent and container output at WARN, everything else at DEBUG
+                    if clean_line.contains("fc-agent") || clean_line.contains("[ctr:") {
+                        warn!(target: "firecracker", "{}", clean_line);
+                    } else {
+                        debug!(target: "firecracker", "{}", clean_line);
+                    }
                 }
             });
         }

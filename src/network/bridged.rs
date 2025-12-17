@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::{
     namespace, portmap, types::generate_mac, veth, NetworkConfig, NetworkManager, PortMapping,
@@ -106,7 +106,7 @@ impl NetworkManager for BridgedNetwork {
             let orig_fourth: u8 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
             let orig_gateway = format!("172.30.{}.{}", orig_third, orig_fourth.saturating_sub(1));
 
-            info!(
+            debug!(
                 guest_ip = %guest_ip,
                 guest_gateway = %orig_gateway,
                 veth_host_ip = %host_ip,
@@ -310,7 +310,7 @@ impl NetworkManager for BridgedNetwork {
             namespace::delete_namespace(namespace_id).await?;
         }
 
-        info!(vm_id = %self.vm_id, "network cleanup complete");
+        debug!(vm_id = %self.vm_id, "network cleanup complete");
         Ok(())
     }
 

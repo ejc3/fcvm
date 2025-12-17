@@ -63,7 +63,7 @@ pub struct InNamespaceNatConfig {
 /// Creates a pair of virtual ethernet devices. The host side remains in the
 /// root namespace, while the guest side is moved into the VM's namespace.
 pub async fn create_veth_pair(host_veth: &str, guest_veth: &str, ns_name: &str) -> Result<()> {
-    info!(
+    debug!(
         host = %host_veth,
         guest = %guest_veth,
         namespace = %ns_name,
@@ -168,7 +168,7 @@ async fn cleanup_stale_veth_with_ip(ip_with_cidr: &str, exclude_veth: &str) -> R
 /// Sets up the host-side veth interface with an IP address and brings it up.
 /// Includes proactive cleanup of stale veths with conflicting IPs.
 pub async fn setup_host_veth(veth_name: &str, ip_with_cidr: &str) -> Result<()> {
-    info!(veth = %veth_name, ip = %ip_with_cidr, "configuring host veth");
+    debug!(veth = %veth_name, ip = %ip_with_cidr, "configuring host veth");
 
     // Proactive cleanup: remove any stale veth with the same IP
     // This handles cases where a previous fcvm was killed with SIGKILL
@@ -228,7 +228,7 @@ pub async fn setup_host_veth(veth_name: &str, ip_with_cidr: &str) -> Result<()> 
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("failed to add FORWARD rule for {}: {}", veth_name, stderr);
         }
-        info!(veth = %veth_name, "added FORWARD rule for outbound traffic");
+        debug!(veth = %veth_name, "added FORWARD rule for outbound traffic");
     }
 
     Ok(())
@@ -240,7 +240,7 @@ pub async fn setup_host_veth(veth_name: &str, ip_with_cidr: &str) -> Result<()> 
 /// Note: Neither veth nor bridge get an IP - they are pure L2 devices.
 /// The guest VM has the IP and routing happens inside the VM.
 pub async fn setup_guest_veth_in_ns(ns_name: &str, veth_name: &str) -> Result<()> {
-    info!(
+    debug!(
         namespace = %ns_name,
         veth = %veth_name,
         "configuring guest veth in namespace"
@@ -279,7 +279,7 @@ pub async fn setup_guest_veth_in_ns(ns_name: &str, veth_name: &str) -> Result<()
 /// Creates a TAP device that Firecracker will use. The TAP is created inside
 /// the VM's namespace so it's isolated from other VMs.
 pub async fn create_tap_in_ns(ns_name: &str, tap_name: &str) -> Result<()> {
-    info!(
+    debug!(
         namespace = %ns_name,
         tap = %tap_name,
         "creating TAP device in namespace"
@@ -321,7 +321,7 @@ pub async fn create_tap_in_ns(ns_name: &str, tap_name: &str) -> Result<()> {
 /// the guest IP to the bridge, it will respond to ARP requests instead of
 /// forwarding them to the VM, breaking connectivity.
 pub async fn connect_tap_to_veth(ns_name: &str, tap_name: &str, veth_name: &str) -> Result<()> {
-    info!(
+    debug!(
         namespace = %ns_name,
         tap = %tap_name,
         veth = %veth_name,
@@ -376,7 +376,7 @@ pub async fn connect_tap_to_veth(ns_name: &str, tap_name: &str, veth_name: &str)
         anyhow::bail!("failed to bring up bridge: {}", stderr);
     }
 
-    info!(bridge = %bridge_name, "bridge created and configured in namespace");
+    debug!(bridge = %bridge_name, "bridge created and configured in namespace");
 
     Ok(())
 }
@@ -566,7 +566,7 @@ pub async fn setup_in_namespace_nat(
 /// Deleting the host side automatically removes the peer (if it still exists).
 /// If the peer was moved to a namespace that was deleted, this still works.
 pub async fn delete_veth_pair(host_veth: &str) -> Result<()> {
-    info!(veth = %host_veth, "deleting veth pair");
+    debug!(veth = %host_veth, "deleting veth pair");
 
     let output = Command::new("sudo")
         .args(["ip", "link", "del", host_veth])
@@ -592,7 +592,7 @@ pub async fn delete_veth_pair(host_veth: &str) -> Result<()> {
 /// This removes the iptables FORWARD rule that allows outbound traffic from the veth interface.
 /// Should be called before deleting the veth pair to avoid accumulating orphaned rules.
 pub async fn delete_veth_forward_rule(veth_name: &str) -> Result<()> {
-    info!(veth = %veth_name, "deleting FORWARD rule");
+    debug!(veth = %veth_name, "deleting FORWARD rule");
 
     let forward_rule = format!("-D FORWARD -i {} -j ACCEPT", veth_name);
     let output = Command::new("sudo")

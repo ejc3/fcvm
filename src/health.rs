@@ -202,7 +202,7 @@ async fn update_health_status_once(
                                     }
                                 };
                                 if should_log {
-                                    warn!(target: "health-monitor", error = %e, "HTTP health check failed");
+                                    debug!(target: "health-monitor", error = %e, "HTTP health check failed");
                                     *last_failure_log = Some(Instant::now());
                                 }
                                 HealthStatus::Unhealthy
@@ -221,7 +221,7 @@ async fn update_health_status_once(
                                 HealthStatus::Healthy
                             }
                             Ok(false) => {
-                                warn!(target: "health-monitor", "health check returned false");
+                                debug!(target: "health-monitor", "health check returned false");
                                 HealthStatus::Unhealthy
                             }
                             Err(e) => {
@@ -232,7 +232,7 @@ async fn update_health_status_once(
                                     }
                                 };
                                 if should_log {
-                                    warn!(target: "health-monitor", error = %e, "HTTP health check failed");
+                                    debug!(target: "health-monitor", error = %e, "HTTP health check failed");
                                     *last_failure_log = Some(Instant::now());
                                 }
                                 HealthStatus::Unhealthy

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use tokio::process::Command;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::types::{PortMapping, Protocol};
 
@@ -13,7 +13,7 @@ pub async fn setup_port_mappings(guest_ip: &str, mappings: &[PortMapping]) -> Re
         return Ok(Vec::new());
     }
 
-    info!(
+    debug!(
         guest_ip = %guest_ip,
         mappings = mappings.len(),
         "setting up port mappings"
@@ -212,7 +212,7 @@ pub async fn cleanup_port_mappings(rules: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    info!(rules = rules.len(), "cleaning up port mapping rules");
+    debug!(rules = rules.len(), "cleaning up port mapping rules");
 
     // Delete in reverse order
     for rule in rules.iter().rev() {
@@ -232,7 +232,7 @@ pub async fn cleanup_port_mappings(rules: &[String]) -> Result<()> {
 ///
 /// This should be called once during fcvm initialization, not per-VM.
 pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<()> {
-    info!(
+    debug!(
         subnet = %vm_subnet,
         interface = %outbound_iface,
         "ensuring global NAT configuration"
@@ -270,7 +270,7 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
 
     if output.status.success() {
         // Rule already exists
-        info!("global MASQUERADE rule already exists");
+        debug!("global MASQUERADE rule already exists");
         return Ok(());
     }
 
@@ -298,7 +298,7 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
         anyhow::bail!("failed to add MASQUERADE rule: {}", stderr);
     }
 
-    info!("global NAT configuration complete");
+    debug!("global NAT configuration complete");
     Ok(())
 }
 

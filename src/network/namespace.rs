@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use tokio::process::Command;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 /// Creates a named network namespace
 ///
 /// This uses `ip netns add` to create a persistent namespace in /var/run/netns/.
 /// The namespace will survive even if no processes are in it.
 pub async fn create_namespace(ns_name: &str) -> Result<()> {
-    info!(namespace = %ns_name, "creating network namespace");
+    debug!(namespace = %ns_name, "creating network namespace");
 
     let output = Command::new("sudo")
         .args(["ip", "netns", "add", ns_name])
@@ -34,7 +34,7 @@ pub async fn create_namespace(ns_name: &str) -> Result<()> {
 /// Removes the namespace via `ip netns del`. This will fail if processes
 /// are still running in the namespace.
 pub async fn delete_namespace(ns_name: &str) -> Result<()> {
-    info!(namespace = %ns_name, "deleting network namespace");
+    debug!(namespace = %ns_name, "deleting network namespace");
 
     let output = Command::new("sudo")
         .args(["ip", "netns", "del", ns_name])
