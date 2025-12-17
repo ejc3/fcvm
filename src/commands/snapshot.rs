@@ -647,6 +647,65 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     println!("  Memory pages shared via UFFD");
     println!("  Disk uses CoW overlay");
 
+    // Handle --exec: run command in container then cleanup and exit
+    if let Some(exec_cmd) = &args.exec {
+        info!("executing command in clone: {}", exec_cmd);
+
+        // Parse command using shell_words (same as --cmd in podman run)
+        let cmd_args: Vec<String> = shell_words::split(exec_cmd)
+            .with_context(|| format!("parsing --exec argument: {}", exec_cmd))?;
+
+        // Give the clone a moment to fully stabilize after restore
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Execute command in container
+        let vsock_socket = data_dir.join("vsock.sock");
+        let exit_code = crate::commands::exec::run_exec_in_vm(
+            &vsock_socket,
+            &cmd_args,
+            true, // in_container
+        )
+        .await?;
+
+        // Cleanup resources
+        info!("exec completed with exit code {}, cleaning up", exit_code);
+
+        // Cancel VolumeServer tasks
+        for handle in volume_server_handles {
+            handle.abort();
+        }
+
+        // Kill VM process
+        if let Err(e) = vm_manager.kill().await {
+            warn!("failed to kill VM process: {}", e);
+        }
+
+        // Kill holder process (rootless mode only)
+        if let Some(ref mut holder) = holder_child {
+            if let Err(e) = holder.kill().await {
+                warn!("failed to kill holder process: {}", e);
+            }
+            let _ = holder.wait().await;
+        }
+
+        // Cleanup network
+        if let Err(e) = network.cleanup().await {
+            warn!("failed to cleanup network: {}", e);
+        }
+
+        // Delete state file
+        if let Err(e) = state_manager.delete_state(&vm_id).await {
+            warn!("failed to delete state file: {}", e);
+        }
+
+        // Return error if exec failed
+        if exit_code != 0 {
+            bail!("exec command exited with code {}", exit_code);
+        }
+
+        return Ok(());
+    }
+
     // Create cancellation token for graceful health monitor shutdown
     let health_cancel_token = tokio_util::sync::CancellationToken::new();
 

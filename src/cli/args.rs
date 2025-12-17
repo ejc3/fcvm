@@ -161,6 +161,10 @@ pub struct SnapshotRunArgs {
     /// Network mode: bridged (requires sudo) or rootless (no sudo)
     #[arg(long, value_enum, default_value_t = NetworkMode::Bridged)]
     pub network: NetworkMode,
+
+    /// Execute command in container after clone is healthy (like fcvm exec -c)
+    #[arg(long)]
+    pub exec: Option<String>,
 }
 
 // ============================================================================

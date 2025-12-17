@@ -466,3 +466,41 @@ pub async fn kill_process(pid: u32) {
         .output()
         .await;
 }
+
+/// Wait for a snapshot serve process to be ready by polling for its socket file.
+///
+/// The serve process creates a socket at `/mnt/fcvm-btrfs/uffd-{snapshot}-{pid}.sock`
+/// when it's ready to accept clone connections.
+///
+/// # Arguments
+/// * `snapshot_name` - Name of the snapshot being served
+/// * `serve_pid` - PID of the serve process
+/// * `timeout_secs` - Maximum seconds to wait
+pub async fn poll_serve_ready(
+    snapshot_name: &str,
+    serve_pid: u32,
+    timeout_secs: u64,
+) -> anyhow::Result<()> {
+    let socket_path = PathBuf::from(format!(
+        "/mnt/fcvm-btrfs/uffd-{}-{}.sock",
+        snapshot_name, serve_pid
+    ));
+
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(timeout_secs);
+
+    loop {
+        if start.elapsed() > timeout {
+            anyhow::bail!(
+                "timeout waiting for serve socket: {}",
+                socket_path.display()
+            );
+        }
+
+        if socket_path.exists() {
+            return Ok(());
+        }
+
+        sleep(Duration::from_millis(50)).await;
+    }
+}
