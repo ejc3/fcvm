@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{debug, info, warn};
 
@@ -655,11 +656,33 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         let cmd_args: Vec<String> = shell_words::split(exec_cmd)
             .with_context(|| format!("parsing --exec argument: {}", exec_cmd))?;
 
-        // Give the clone a moment to fully stabilize after restore
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // Execute command in container
+        // Wait for vsock socket to be ready (poll instead of blind sleep)
         let vsock_socket = data_dir.join("vsock.sock");
+        let poll_start = std::time::Instant::now();
+        const MAX_VSOCK_WAIT: Duration = Duration::from_millis(5000);
+        const VSOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+        loop {
+            if poll_start.elapsed() > MAX_VSOCK_WAIT {
+                bail!(
+                    "vsock socket not ready after {:?}",
+                    poll_start.elapsed()
+                );
+            }
+
+            // Check if socket exists and is connectable
+            if vsock_socket.exists() {
+                if let Ok(_stream) = std::os::unix::net::UnixStream::connect(&vsock_socket) {
+                    debug!(
+                        "vsock socket ready after {:?}",
+                        poll_start.elapsed()
+                    );
+                    break;
+                }
+            }
+
+            tokio::time::sleep(VSOCK_POLL_INTERVAL).await;
+        }
         let exit_code = crate::commands::exec::run_exec_in_vm(
             &vsock_socket,
             &cmd_args,
@@ -915,39 +938,58 @@ async fn run_clone_setup(
         let holder_pid = child.id().context("getting holder process PID")?;
         info!(holder_pid = holder_pid, "namespace holder started");
 
-        // Small delay to ensure namespace setup (newuidmap/newgidmap) completes
-        // The --map-auto option invokes setuid helpers asynchronously
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
         // Step 2: Run setup script via nsenter (creates TAPs, iptables, etc.)
+        // Retry until namespace is ready for nsenter (polling approach)
         let setup_script = slirp_net.build_setup_script();
         let nsenter_prefix = slirp_net.build_nsenter_prefix(holder_pid);
 
-        // Verify holder is still alive before attempting nsenter
-        if !crate::utils::is_process_alive(holder_pid) {
-            let _ = child.kill().await;
-            bail!(
-                "holder process (PID {}) died before network setup could run",
-                holder_pid
-            );
-        }
+        const MAX_NS_WAIT: Duration = Duration::from_millis(1000);
+        const NS_POLL_INTERVAL: Duration = Duration::from_millis(5);
+        let ns_poll_start = std::time::Instant::now();
 
         info!(holder_pid = holder_pid, "running network setup via nsenter");
-        let setup_output = tokio::process::Command::new(&nsenter_prefix[0])
-            .args(&nsenter_prefix[1..])
-            .arg("bash")
-            .arg("-c")
-            .arg(&setup_script)
-            .output()
-            .await
-            .context("running network setup via nsenter")?;
+        loop {
+            // Verify holder is still alive before attempting nsenter
+            if !crate::utils::is_process_alive(holder_pid) {
+                let _ = child.kill().await;
+                bail!(
+                    "holder process (PID {}) died before network setup could run",
+                    holder_pid
+                );
+            }
 
-        if !setup_output.status.success() {
-            let stderr = String::from_utf8_lossy(&setup_output.stderr);
-            // Kill holder before bailing
+            let output = tokio::process::Command::new(&nsenter_prefix[0])
+                .args(&nsenter_prefix[1..])
+                .arg("bash")
+                .arg("-c")
+                .arg(&setup_script)
+                .output()
+                .await
+                .context("running network setup via nsenter")?;
+
+            if output.status.success() {
+                debug!(
+                    "namespace ready after {:?}",
+                    ns_poll_start.elapsed()
+                );
+                break;
+            }
+
+            // Check if it's a namespace-not-ready error (retry) vs permanent error (fail)
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("Invalid argument") || stderr.contains("No such process") {
+                if ns_poll_start.elapsed() > MAX_NS_WAIT {
+                    let _ = child.kill().await;
+                    bail!("namespace not ready after {:?}: {}", ns_poll_start.elapsed(), stderr);
+                }
+                tokio::time::sleep(NS_POLL_INTERVAL).await;
+                continue;
+            }
+
+            // Permanent error
             let _ = child.kill().await;
             bail!("network setup failed: {}", stderr);
-        }
+        };
 
         info!(holder_pid = holder_pid, "network setup complete");
 
