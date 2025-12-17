@@ -10,8 +10,8 @@ use tracing::{debug, error, info, warn};
 use super::FirecrackerClient;
 
 /// Socket/device wait timeout (total wait time = RETRY_COUNT * RETRY_DELAY)
-const SOCKET_WAIT_RETRY_COUNT: u32 = 50;
-const SOCKET_WAIT_RETRY_DELAY: Duration = Duration::from_millis(100);
+const SOCKET_WAIT_RETRY_COUNT: u32 = 500;
+const SOCKET_WAIT_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 /// Manages a Firecracker VM process
 ///
