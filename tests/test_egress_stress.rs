@@ -14,7 +14,6 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Semaphore;
 
 /// Number of clones to spawn
@@ -78,27 +77,12 @@ async fn egress_stress_impl(network: &str, num_clones: usize, requests_per_clone
     let baseline_name = format!("{}-baseline", test_name);
     println!("\nStep 1: Starting baseline VM '{}'...", baseline_name);
 
-    let mut baseline_child = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "podman",
-            "run",
-            "--name",
-            &baseline_name,
-            "--network",
-            network,
-            common::TEST_IMAGE,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning baseline VM")?;
-
-    let baseline_pid = baseline_child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("failed to get baseline PID"))?;
-
-    spawn_log_consumer(baseline_child.stdout.take(), &baseline_name);
-    spawn_log_consumer_stderr(baseline_child.stderr.take(), &baseline_name);
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &["podman", "run", "--name", &baseline_name, "--network", network, common::TEST_IMAGE],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
 
     common::poll_health_by_pid(baseline_pid, 60).await?;
     println!("  ✓ Baseline healthy");
@@ -171,19 +155,12 @@ async fn egress_stress_impl(network: &str, num_clones: usize, requests_per_clone
 
     // Step 3: Start memory server
     println!("\nStep 3: Starting memory server...");
-    let mut serve_child = tokio::process::Command::new(&fcvm_path)
-        .args(["snapshot", "serve", &snapshot_name])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning memory server")?;
-
-    let serve_pid = serve_child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("failed to get serve PID"))?;
-
-    spawn_log_consumer(serve_child.stdout.take(), "uffd-server");
-    spawn_log_consumer_stderr(serve_child.stderr.take(), "uffd-server");
+    let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
+        &["snapshot", "serve", &snapshot_name],
+        "uffd-server",
+    )
+    .await
+    .context("spawning memory server")?;
 
     // Wait for server to be ready
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -195,33 +172,16 @@ async fn egress_stress_impl(network: &str, num_clones: usize, requests_per_clone
 
     let mut clone_handles = Vec::new();
     for i in 0..num_clones {
-        let fcvm = fcvm_path.clone();
         let name = format!("{}-clone-{}", test_name, i);
         let net = network.to_string();
-        let spid = serve_pid;
+        let spid_str = serve_pid.to_string();
 
         let handle = tokio::spawn(async move {
-            let mut child = tokio::process::Command::new(&fcvm)
-                .args([
-                    "snapshot",
-                    "run",
-                    "--pid",
-                    &spid.to_string(),
-                    "--name",
-                    &name,
-                    "--network",
-                    &net,
-                ])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()?;
-
-            let pid = child
-                .id()
-                .ok_or_else(|| anyhow::anyhow!("no PID for clone"))?;
-
-            spawn_log_consumer(child.stdout.take(), &name);
-            spawn_log_consumer_stderr(child.stderr.take(), &name);
+            let (_child, pid) = common::spawn_fcvm_with_logs(
+                &["snapshot", "run", "--pid", &spid_str, "--name", &name, "--network", &net],
+                &name,
+            )
+            .await?;
 
             Ok::<_, anyhow::Error>((name, pid))
         });
@@ -501,30 +461,4 @@ async fn get_host_ip_from_state(pid: u32) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("host_ip not found in state"))?;
 
     Ok(host_ip.to_string())
-}
-
-fn spawn_log_consumer(stdout: Option<tokio::process::ChildStdout>, name: &str) {
-    if let Some(stdout) = stdout {
-        let name = name.to_string();
-        tokio::spawn(async move {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                println!("[{}] {}", name, line);
-            }
-        });
-    }
-}
-
-fn spawn_log_consumer_stderr(stderr: Option<tokio::process::ChildStderr>, name: &str) {
-    if let Some(stderr) = stderr {
-        let name = name.to_string();
-        tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("[{} ERR] {}", name, line);
-            }
-        });
-    }
 }

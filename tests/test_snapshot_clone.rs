@@ -10,7 +10,6 @@
 mod common;
 
 use anyhow::{Context, Result};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -59,28 +58,12 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
     println!("Step 1: Starting baseline VM '{}'...", baseline_name);
     let step1_start = Instant::now();
 
-    let mut baseline_child = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "podman",
-            "run",
-            "--name",
-            &baseline_name,
-            "--network",
-            network,
-            common::TEST_IMAGE,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning baseline VM")?;
-
-    let baseline_pid = baseline_child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("failed to get baseline PID"))?;
-
-    // Spawn log consumers
-    spawn_log_consumer(baseline_child.stdout.take(), &baseline_name);
-    spawn_log_consumer_stderr(baseline_child.stderr.take(), &baseline_name);
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &["podman", "run", "--name", &baseline_name, "--network", network, common::TEST_IMAGE],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
 
     // Wait for healthy
     println!("  Waiting for baseline VM to become healthy...");
@@ -130,34 +113,15 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
     );
     let step3_start = Instant::now();
 
-    let mut serve_child = tokio::process::Command::new(&fcvm_path)
-        .args(["snapshot", "serve", &snapshot_name])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning memory server")?;
-
-    let serve_pid = serve_child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("failed to get serve PID"))?;
-
-    // Spawn log consumers
-    spawn_log_consumer(serve_child.stdout.take(), "uffd-server");
-    spawn_log_consumer_stderr(serve_child.stderr.take(), "uffd-server");
+    let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
+        &["snapshot", "serve", &snapshot_name],
+        "uffd-server",
+    )
+    .await
+    .context("spawning memory server")?;
 
     // Wait for serve process to be ready
     tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Verify serve process is still running
-    match serve_child.try_wait() {
-        Ok(Some(status)) => {
-            anyhow::bail!("Memory server exited unexpectedly with status: {}", status);
-        }
-        Ok(None) => {}
-        Err(e) => {
-            anyhow::bail!("Failed to check serve process status: {}", e);
-        }
-    }
     let serve_time = step3_start.elapsed();
     println!(
         "  ✓ Memory server ready (PID: {}, took {:.1}s)",
@@ -178,34 +142,22 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
 
     for i in 0..num_clones {
         let clone_name = format!("clone-{}-{}", network, i);
-        let fcvm_path = fcvm_path.clone();
         let network = network.to_string();
         let results = Arc::clone(&results);
         let clone_pids = Arc::clone(&clone_pids);
+        let serve_pid_str = serve_pid.to_string();
 
         let handle = tokio::spawn(async move {
             let spawn_start = Instant::now();
 
-            let result = tokio::process::Command::new(&fcvm_path)
-                .args([
-                    "snapshot",
-                    "run",
-                    "--pid",
-                    &serve_pid.to_string(),
-                    "--name",
-                    &clone_name,
-                    "--network",
-                    &network,
-                ])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn();
+            let result = common::spawn_fcvm_with_logs(
+                &["snapshot", "run", "--pid", &serve_pid_str, "--name", &clone_name, "--network", &network],
+                &clone_name,
+            )
+            .await;
 
             match result {
-                Ok(mut child) => {
-                    let clone_pid = child.id().unwrap_or(0);
-                    spawn_log_consumer(child.stdout.take(), &clone_name);
-                    spawn_log_consumer_stderr(child.stderr.take(), &clone_name);
+                Ok((_child, clone_pid)) => {
                     let spawn_ms = spawn_start.elapsed().as_secs_f64() * 1000.0;
 
                     // Store PID for cleanup
@@ -406,34 +358,6 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
     Ok(())
 }
 
-fn spawn_log_consumer(stdout: Option<tokio::process::ChildStdout>, name: &str) {
-    if let Some(stdout) = stdout {
-        let name = name.to_string();
-        tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("[{}] {}", name, line);
-            }
-        });
-    }
-}
-
-fn spawn_log_consumer_stderr(stderr: Option<tokio::process::ChildStderr>, name: &str) {
-    if let Some(stderr) = stderr {
-        let name = name.to_string();
-        tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("[{} ERR] {}", name, line);
-            }
-        });
-    }
-}
-
 /// Test cloning while baseline VM is still running
 ///
 /// This tests for vsock socket path conflicts: when cloning from a running baseline,
@@ -452,27 +376,12 @@ async fn test_clone_while_baseline_running() -> Result<()> {
 
     // Step 1: Start baseline VM (bridged mode for faster startup)
     println!("Step 1: Starting baseline VM...");
-    let mut baseline_child = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "podman",
-            "run",
-            "--name",
-            baseline_name,
-            "--network",
-            "bridged",
-            common::TEST_IMAGE,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning baseline VM")?;
-
-    let baseline_pid = baseline_child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("failed to get baseline PID"))?;
-
-    spawn_log_consumer(baseline_child.stdout.take(), baseline_name);
-    spawn_log_consumer_stderr(baseline_child.stderr.take(), baseline_name);
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &["podman", "run", "--name", baseline_name, "--network", "bridged", common::TEST_IMAGE],
+        baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
 
     println!("  Waiting for baseline VM to become healthy...");
     common::poll_health_by_pid(baseline_pid, 60).await?;
@@ -506,19 +415,12 @@ async fn test_clone_while_baseline_running() -> Result<()> {
 
     // Step 4: Start memory server
     println!("\nStep 4: Starting memory server...");
-    let mut serve_child = tokio::process::Command::new(&fcvm_path)
-        .args(["snapshot", "serve", snapshot_name])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning memory server")?;
-
-    let serve_pid = serve_child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("failed to get serve PID"))?;
-
-    spawn_log_consumer(serve_child.stdout.take(), "uffd-server");
-    spawn_log_consumer_stderr(serve_child.stderr.take(), "uffd-server");
+    let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
+        &["snapshot", "serve", snapshot_name],
+        "uffd-server",
+    )
+    .await
+    .context("spawning memory server")?;
 
     // Wait for serve to be ready
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -529,28 +431,13 @@ async fn test_clone_while_baseline_running() -> Result<()> {
     println!("  (This tests vsock socket isolation via mount namespace)");
 
     let clone_name = "clone-running";
-    let mut clone_child = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "snapshot",
-            "run",
-            "--pid",
-            &serve_pid.to_string(),
-            "--name",
-            clone_name,
-            "--network",
-            "bridged",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning clone while baseline running")?;
-
-    let clone_pid = clone_child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("failed to get clone PID"))?;
-
-    spawn_log_consumer(clone_child.stdout.take(), clone_name);
-    spawn_log_consumer_stderr(clone_child.stderr.take(), clone_name);
+    let serve_pid_str = serve_pid.to_string();
+    let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+        &["snapshot", "run", "--pid", &serve_pid_str, "--name", clone_name, "--network", "bridged"],
+        clone_name,
+    )
+    .await
+    .context("spawning clone while baseline running")?;
 
     // Step 6: Wait for clone to become healthy
     println!("\nStep 6: Waiting for clone to become healthy...");
@@ -636,27 +523,12 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
 
     // Step 1: Start baseline VM
     println!("Step 1: Starting baseline VM...");
-    let mut baseline_child = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "podman",
-            "run",
-            "--name",
-            &baseline_name,
-            "--network",
-            network,
-            common::TEST_IMAGE,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning baseline VM")?;
-
-    let baseline_pid = baseline_child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("failed to get baseline PID"))?;
-
-    spawn_log_consumer(baseline_child.stdout.take(), &baseline_name);
-    spawn_log_consumer_stderr(baseline_child.stderr.take(), &baseline_name);
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &["podman", "run", "--name", &baseline_name, "--network", network, common::TEST_IMAGE],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
 
     println!("  Waiting for baseline VM to become healthy...");
     common::poll_health_by_pid(baseline_pid, 60).await?;
@@ -690,19 +562,12 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
 
     // Step 3: Start memory server
     println!("\nStep 3: Starting memory server...");
-    let mut serve_child = tokio::process::Command::new(&fcvm_path)
-        .args(["snapshot", "serve", &snapshot_name])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning memory server")?;
-
-    let serve_pid = serve_child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("failed to get serve PID"))?;
-
-    spawn_log_consumer(serve_child.stdout.take(), "uffd-server");
-    spawn_log_consumer_stderr(serve_child.stderr.take(), "uffd-server");
+    let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
+        &["snapshot", "serve", &snapshot_name],
+        "uffd-server",
+    )
+    .await
+    .context("spawning memory server")?;
 
     tokio::time::sleep(Duration::from_secs(2)).await;
     println!("  ✓ Memory server ready (PID: {})", serve_pid);
@@ -710,28 +575,13 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
     // Step 4: Spawn clone
     println!("\nStep 4: Spawning clone...");
     let clone_name = format!("clone-internet-{}", network);
-    let mut clone_child = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "snapshot",
-            "run",
-            "--pid",
-            &serve_pid.to_string(),
-            "--name",
-            &clone_name,
-            "--network",
-            network,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning clone")?;
-
-    let clone_pid = clone_child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("failed to get clone PID"))?;
-
-    spawn_log_consumer(clone_child.stdout.take(), &clone_name);
-    spawn_log_consumer_stderr(clone_child.stderr.take(), &clone_name);
+    let serve_pid_str = serve_pid.to_string();
+    let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+        &["snapshot", "run", "--pid", &serve_pid_str, "--name", &clone_name, "--network", network],
+        &clone_name,
+    )
+    .await
+    .context("spawning clone")?;
 
     // Wait for clone to become healthy
     println!("  Waiting for clone to become healthy...");

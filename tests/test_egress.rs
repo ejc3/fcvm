@@ -12,9 +12,7 @@
 mod common;
 
 use anyhow::{Context, Result};
-use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// External URL to test egress connectivity - Docker Hub auth endpoint (returns 200)
 const EGRESS_TEST_URL: &str = "https://auth.docker.io/token?service=registry.docker.io";
@@ -58,28 +56,12 @@ async fn egress_fresh_test_impl(network: &str) -> Result<()> {
 
     // Step 1: Start VM
     println!("Step 1: Starting fresh VM '{}'...", vm_name);
-    let mut child = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "podman",
-            "run",
-            "--name",
-            &vm_name,
-            "--network",
-            network,
-            common::TEST_IMAGE,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning VM")?;
-
-    let vm_pid = child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("failed to get VM PID"))?;
-
-    // Consume stdout/stderr to prevent blocking
-    spawn_log_consumer(child.stdout.take(), &vm_name);
-    spawn_log_consumer_stderr(child.stderr.take(), &vm_name);
+    let (_child, vm_pid) = common::spawn_fcvm_with_logs(
+        &["podman", "run", "--name", &vm_name, "--network", network, common::TEST_IMAGE],
+        &vm_name,
+    )
+    .await
+    .context("spawning VM")?;
 
     println!("  Waiting for VM to become healthy (PID: {})...", vm_pid);
     common::poll_health_by_pid(vm_pid, 60).await?;
@@ -125,27 +107,12 @@ async fn egress_clone_test_impl(network: &str) -> Result<()> {
 
     // Step 1: Start baseline VM
     println!("Step 1: Starting baseline VM '{}'...", baseline_name);
-    let mut baseline_child = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "podman",
-            "run",
-            "--name",
-            &baseline_name,
-            "--network",
-            network,
-            common::TEST_IMAGE,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning baseline VM")?;
-
-    let baseline_pid = baseline_child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("failed to get baseline PID"))?;
-
-    spawn_log_consumer(baseline_child.stdout.take(), &baseline_name);
-    spawn_log_consumer_stderr(baseline_child.stderr.take(), &baseline_name);
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &["podman", "run", "--name", &baseline_name, "--network", network, common::TEST_IMAGE],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
 
     println!(
         "  Waiting for baseline VM to become healthy (PID: {})...",
@@ -191,19 +158,12 @@ async fn egress_clone_test_impl(network: &str) -> Result<()> {
 
     // Step 3: Start memory server
     println!("\nStep 3: Starting memory server...");
-    let mut serve_child = tokio::process::Command::new(&fcvm_path)
-        .args(["snapshot", "serve", &snapshot_name])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning memory server")?;
-
-    let serve_pid = serve_child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("failed to get serve PID"))?;
-
-    spawn_log_consumer(serve_child.stdout.take(), "uffd-server");
-    spawn_log_consumer_stderr(serve_child.stderr.take(), "uffd-server");
+    let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
+        &["snapshot", "serve", &snapshot_name],
+        "uffd-server",
+    )
+    .await
+    .context("spawning memory server")?;
 
     // Wait for serve process to save its state file
     common::poll_serve_state_by_pid(serve_pid, 10).await?;
@@ -211,28 +171,13 @@ async fn egress_clone_test_impl(network: &str) -> Result<()> {
 
     // Step 4: Spawn clone
     println!("\nStep 4: Spawning clone '{}'...", clone_name);
-    let mut clone_child = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "snapshot",
-            "run",
-            "--pid",
-            &serve_pid.to_string(),
-            "--name",
-            &clone_name,
-            "--network",
-            network,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning clone")?;
-
-    let clone_pid = clone_child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("failed to get clone PID"))?;
-
-    spawn_log_consumer(clone_child.stdout.take(), &clone_name);
-    spawn_log_consumer_stderr(clone_child.stderr.take(), &clone_name);
+    let serve_pid_str = serve_pid.to_string();
+    let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+        &["snapshot", "run", "--pid", &serve_pid_str, "--name", &clone_name, "--network", network],
+        &clone_name,
+    )
+    .await
+    .context("spawning clone")?;
 
     println!(
         "  Waiting for clone to become healthy (PID: {})...",
@@ -338,30 +283,4 @@ async fn test_egress(fcvm_path: &std::path::Path, pid: u32) -> Result<()> {
     println!("    ✓ Container egress succeeded");
 
     Ok(())
-}
-
-fn spawn_log_consumer(stdout: Option<tokio::process::ChildStdout>, name: &str) {
-    if let Some(stdout) = stdout {
-        let name = name.to_string();
-        tokio::spawn(async move {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("[{}] {}", name, line);
-            }
-        });
-    }
-}
-
-fn spawn_log_consumer_stderr(stderr: Option<tokio::process::ChildStderr>, name: &str) {
-    if let Some(stderr) = stderr {
-        let name = name.to_string();
-        tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("[{} ERR] {}", name, line);
-            }
-        });
-    }
 }

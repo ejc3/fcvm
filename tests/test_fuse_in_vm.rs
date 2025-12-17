@@ -165,8 +165,8 @@ async fn fuse_in_vm_test_impl_inner(category: &str, jobs: usize, privileged: boo
         .ok_or_else(|| anyhow::anyhow!("failed to get VM PID"))?;
 
     // Spawn log consumers
-    spawn_log_consumer(vm_child.stdout.take(), "vm");
-    spawn_log_consumer_stderr(vm_child.stderr.take(), "vm");
+    common::spawn_log_consumer(vm_child.stdout.take(), "vm");
+    common::spawn_log_consumer_stderr(vm_child.stderr.take(), "vm");
 
     println!(
         "  ✓ VM started (PID: {}, took {:.1}s)",
@@ -250,32 +250,4 @@ async fn fuse_in_vm_test_impl_inner(category: &str, jobs: usize, privileged: boo
 
     println!("\n✅ FUSE-IN-VM TEST PASSED!");
     Ok(())
-}
-
-fn spawn_log_consumer(stdout: Option<tokio::process::ChildStdout>, name: &str) {
-    if let Some(stdout) = stdout {
-        let name = name.to_string();
-        tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("[{}] {}", name, line);
-            }
-        });
-    }
-}
-
-fn spawn_log_consumer_stderr(stderr: Option<tokio::process::ChildStderr>, name: &str) {
-    if let Some(stderr) = stderr {
-        let name = name.to_string();
-        tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("[{} ERR] {}", name, line);
-            }
-        });
-    }
 }
