@@ -11,9 +11,26 @@ mod common;
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Global counter for unique test IDs to avoid conflicts when running tests in parallel
+static TEST_ID: AtomicUsize = AtomicUsize::new(0);
+
+/// Generate unique names for this test run
+fn unique_names(prefix: &str) -> (String, String, String, String) {
+    let id = TEST_ID.fetch_add(1, Ordering::SeqCst);
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() % 100000;
+    let baseline = format!("{}-base-{}-{}", prefix, ts, id);
+    let clone = format!("{}-clone-{}-{}", prefix, ts, id);
+    let snapshot = format!("{}-snap-{}-{}", prefix, ts, id);
+    let serve = format!("{}-serve-{}-{}", prefix, ts, id);
+    (baseline, clone, snapshot, serve)
+}
 
 /// A connected client with its connection ID
 struct Client {
@@ -110,6 +127,7 @@ async fn test_clone_connection_reset() -> Result<()> {
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
     let fcvm_path = common::find_fcvm_binary()?;
+    let (baseline_name, clone_name, snapshot_name, _serve_name) = unique_names("connrst");
 
     // =========================================================================
     // Step 1: Start TCP broadcast server on host
@@ -128,16 +146,16 @@ async fn test_clone_connection_reset() -> Result<()> {
     // Step 2: Start baseline VM (nginx stays alive, we exec client later)
     // =========================================================================
     println!("\nStep 2: Starting baseline VM...");
-    let baseline_name = "conn-reset-baseline";
+    println!("  Using unique names: baseline={}, clone={}, snapshot={}", baseline_name, clone_name, snapshot_name);
 
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
         &[
             "podman", "run",
-            "--name", baseline_name,
+            "--name", &baseline_name,
             "--network", "rootless",
             common::TEST_IMAGE,
         ],
-        baseline_name,
+        &baseline_name,
     )
     .await
     .context("spawning baseline VM")?;
@@ -178,13 +196,12 @@ async fn test_clone_connection_reset() -> Result<()> {
     // Step 4: Create snapshot
     // =========================================================================
     println!("\nStep 4: Creating snapshot...");
-    let snapshot_name = "conn-reset-snap";
 
     let output = tokio::process::Command::new(&fcvm_path)
         .args([
             "snapshot", "create",
             "--pid", &baseline_pid.to_string(),
-            "--tag", snapshot_name,
+            "--tag", &snapshot_name,
         ])
         .output()
         .await
@@ -201,13 +218,13 @@ async fn test_clone_connection_reset() -> Result<()> {
     // =========================================================================
     println!("\nStep 5: Starting memory server...");
     let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "serve", snapshot_name],
+        &["snapshot", "serve", &snapshot_name],
         "uffd-server",
     )
     .await
     .context("spawning serve")?;
 
-    common::poll_serve_ready(snapshot_name, serve_pid, 30).await?;
+    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
     println!("  Memory server ready (PID: {})", serve_pid);
 
     // =========================================================================
@@ -216,15 +233,14 @@ async fn test_clone_connection_reset() -> Result<()> {
     println!("\nStep 6: Cloning VM...");
     let clone_start = Instant::now();
 
-    let clone_name = "conn-reset-clone";
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
         &[
             "snapshot", "run",
             "--pid", &serve_pid.to_string(),
-            "--name", clone_name,
+            "--name", &clone_name,
             "--network", "rootless",
         ],
-        clone_name,
+        &clone_name,
     )
     .await
     .context("spawning clone")?;
@@ -309,6 +325,7 @@ async fn test_clone_reconnect_latency() -> Result<()> {
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
     let fcvm_path = common::find_fcvm_binary()?;
+    let (baseline_name, clone_name, snapshot_name, _serve_name) = unique_names("reconn");
 
     // Start server
     println!("Step 1: Starting broadcast server...");
@@ -323,17 +340,17 @@ async fn test_clone_reconnect_latency() -> Result<()> {
 
     // Start VM (nginx stays alive, we'll exec our client into it)
     println!("\nStep 2: Starting VM...");
-    let baseline_name = "reconnect-test-baseline";
+    println!("  Using unique names: baseline={}, clone={}, snapshot={}", baseline_name, clone_name, snapshot_name);
 
     // Use nginx image - it stays alive
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
         &[
             "podman", "run",
-            "--name", baseline_name,
+            "--name", &baseline_name,
             "--network", "rootless",
             common::TEST_IMAGE,
         ],
-        baseline_name,
+        &baseline_name,
     )
     .await?;
 
@@ -378,11 +395,10 @@ async fn test_clone_reconnect_latency() -> Result<()> {
 
     // Snapshot
     println!("\nStep 4: Creating snapshot...");
-    let snapshot_name = "reconnect-test-snap";
     let snapshot_start = Instant::now();
 
     let output = tokio::process::Command::new(&fcvm_path)
-        .args(["snapshot", "create", "--pid", &baseline_pid.to_string(), "--tag", snapshot_name])
+        .args(["snapshot", "create", "--pid", &baseline_pid.to_string(), "--tag", &snapshot_name])
         .output()
         .await?;
 
@@ -397,10 +413,10 @@ async fn test_clone_reconnect_latency() -> Result<()> {
     // Serve
     println!("\nStep 5: Starting serve...");
     let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "serve", snapshot_name],
+        &["snapshot", "serve", &snapshot_name],
         "uffd-server",
     ).await?;
-    common::poll_serve_ready(snapshot_name, serve_pid, 30).await?;
+    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
 
     // Record sequence before clone
     let seq_before_clone = server_seq.load(Ordering::Relaxed);
@@ -409,10 +425,9 @@ async fn test_clone_reconnect_latency() -> Result<()> {
     println!("\nStep 6: Spawning clone (client should reconnect)...");
     let clone_start = Instant::now();
 
-    let clone_name = "reconnect-test-clone";
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "run", "--pid", &serve_pid.to_string(), "--name", clone_name, "--network", "rootless"],
-        clone_name,
+        &["snapshot", "run", "--pid", &serve_pid.to_string(), "--name", &clone_name, "--network", "rootless"],
+        &clone_name,
     ).await?;
 
     // Wait and observe
@@ -473,6 +488,7 @@ async fn test_clone_connection_timing() -> Result<()> {
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
     let fcvm_path = common::find_fcvm_binary()?;
+    let (baseline_name, clone_name, snapshot_name, _serve_name) = unique_names("timing");
 
     // Start server
     println!("Step 1: Starting broadcast server...");
@@ -487,15 +503,15 @@ async fn test_clone_connection_timing() -> Result<()> {
 
     // Start VM with nginx (stays alive)
     println!("\nStep 2: Starting VM...");
-    let baseline_name = "timing-test-baseline";
+    println!("  Using unique names: baseline={}, clone={}, snapshot={}", baseline_name, clone_name, snapshot_name);
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
         &[
             "podman", "run",
-            "--name", baseline_name,
+            "--name", &baseline_name,
             "--network", "rootless",
             common::TEST_IMAGE,
         ],
-        baseline_name,
+        &baseline_name,
     )
     .await?;
 
@@ -550,7 +566,7 @@ async fn test_clone_connection_timing() -> Result<()> {
 
     let snapshot_start = Instant::now();
     let output = tokio::process::Command::new(&fcvm_path)
-        .args(["snapshot", "create", "--pid", &baseline_pid.to_string(), "--tag", "timing-test-snap"])
+        .args(["snapshot", "create", "--pid", &baseline_pid.to_string(), "--tag", &snapshot_name])
         .output()
         .await?;
     let snapshot_time = snapshot_start.elapsed();
@@ -580,17 +596,16 @@ async fn test_clone_connection_timing() -> Result<()> {
     // Serve
     println!("\nStep 6: Starting serve...");
     let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "serve", "timing-test-snap"],
+        &["snapshot", "serve", &snapshot_name],
         "uffd-server",
     ).await?;
-    common::poll_serve_ready("timing-test-snap", serve_pid, 30).await?;
+    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
 
     // Clone - the clone inherits the snapshot state INCLUDING the nc process mid-connection
     println!("\nStep 7: Spawning clone (has nc process from snapshot state!)...");
-    let clone_name = "timing-test-clone";
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "run", "--pid", &serve_pid.to_string(), "--name", clone_name, "--network", "rootless"],
-        clone_name,
+        &["snapshot", "run", "--pid", &serve_pid.to_string(), "--name", &clone_name, "--network", "rootless"],
+        &clone_name,
     ).await?;
 
     common::poll_health_by_pid(clone_pid, 60).await?;
@@ -670,6 +685,7 @@ async fn test_clone_resilient_client() -> Result<()> {
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
     let fcvm_path = common::find_fcvm_binary()?;
+    let (baseline_name, clone_name, snapshot_name, _serve_name) = unique_names("resil");
 
     // Start server
     println!("Step 1: Starting broadcast server...");
@@ -685,15 +701,15 @@ async fn test_clone_resilient_client() -> Result<()> {
 
     // Start VM
     println!("\nStep 2: Starting VM...");
-    let baseline_name = "resilient-test-baseline";
+    println!("  Using unique names: baseline={}, clone={}, snapshot={}", baseline_name, clone_name, snapshot_name);
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
         &[
             "podman", "run",
-            "--name", baseline_name,
+            "--name", &baseline_name,
             "--network", "rootless",
             common::TEST_IMAGE,
         ],
-        baseline_name,
+        &baseline_name,
     )
     .await?;
 
@@ -815,7 +831,7 @@ done
 
     let snapshot_start = Instant::now();
     let output = tokio::process::Command::new(&fcvm_path)
-        .args(["snapshot", "create", "--pid", &baseline_pid.to_string(), "--tag", "resilient-test-snap"])
+        .args(["snapshot", "create", "--pid", &baseline_pid.to_string(), "--tag", &snapshot_name])
         .output()
         .await?;
     let snapshot_time = snapshot_start.elapsed();
@@ -846,20 +862,19 @@ done
     // Serve
     println!("\nStep 7: Starting serve...");
     let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "serve", "resilient-test-snap"],
+        &["snapshot", "serve", &snapshot_name],
         "uffd-server",
     ).await?;
-    common::poll_serve_ready("resilient-test-snap", serve_pid, 30).await?;
+    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
 
     // Clone
     println!("\nStep 8: Spawning clone (resilient client should detect error and reconnect!)...");
     let clone_start = Instant::now();
     let conns_before_clone = conn_counter.load(Ordering::Relaxed);
 
-    let clone_name = "resilient-test-clone";
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "run", "--pid", &serve_pid.to_string(), "--name", clone_name, "--network", "rootless"],
-        clone_name,
+        &["snapshot", "run", "--pid", &serve_pid.to_string(), "--name", &clone_name, "--network", "rootless"],
+        &clone_name,
     ).await?;
 
     common::poll_health_by_pid(clone_pid, 60).await?;
