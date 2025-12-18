@@ -1,11 +1,11 @@
 //! Test that AllowOther works for non-root users when user_allow_other is configured.
 //!
 //! This test requires /etc/fuse.conf to have user_allow_other enabled.
-//! Run with: cargo test --test test_allow_other
+//! Run WITHOUT sudo: `cargo test --release -p fuse-pipe --test test_allow_other`
 
 mod common;
 
-use common::{cleanup, unique_paths, FuseMount};
+use common::{cleanup, require_nonroot, unique_paths, FuseMount};
 use std::fs;
 use std::process::Command;
 
@@ -13,11 +13,7 @@ use std::process::Command;
 /// This test creates a file as the mounting user, then verifies another user can access it.
 #[test]
 fn test_allow_other_with_fuse_conf() {
-    // Skip if running as root (test is specifically for non-root with config)
-    if unsafe { libc::geteuid() } == 0 {
-        eprintln!("Skipping test_allow_other_with_fuse_conf - test is for non-root users");
-        return;
-    }
+    require_nonroot();
 
     // Skip if user_allow_other is not configured
     let fuse_conf = fs::read_to_string("/etc/fuse.conf").unwrap_or_default();
