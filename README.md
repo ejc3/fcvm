@@ -16,7 +16,7 @@ A Rust implementation that launches Firecracker microVMs to run Podman container
 
 **Hardware**
 - Linux with `/dev/kvm` (bare-metal or nested virtualization)
-- For EC2: c6g.metal (ARM64) or c5.metal (x86_64) - NOT regular instances
+- For AWS: c6g.metal (ARM64) or c5.metal (x86_64) - NOT regular instances
 
 **Software**
 - Rust 1.70+ with cargo
@@ -439,8 +439,7 @@ Run `make help` for the full list. Key targets:
 #### Development
 | Target | Description |
 |--------|-------------|
-| `make build` | Sync + build fcvm + fc-agent on EC2 |
-| `make sync` | Just sync code (no build) |
+| `make build` | Build fcvm and fc-agent |
 | `make clean` | Clean build artifacts |
 
 #### Testing
@@ -568,7 +567,7 @@ sudo fusermount3 -u /tmp/fuse-*-mount*
 
 ## Setup
 
-### EC2 Setup
+### dnsmasq Setup
 
 ```bash
 # One-time: Install dnsmasq for DNS forwarding to VMs
@@ -613,8 +612,9 @@ sudo chown -R $USER:$USER /mnt/fcvm-btrfs
 - Manual cleanup: `ps aux | grep fcvm | grep test | awk '{print $2}' | xargs sudo kill`
 
 ### KVM not available
-- Firecracker requires `/dev/kvm` - only available on bare metal instances
-- c6g.metal works, c5.large does NOT work
+- Firecracker requires `/dev/kvm`
+- On AWS: use c6g.metal or c5.metal (NOT c5.large or other regular instances)
+- On other clouds: use bare-metal instances or hosts with nested virtualization
 
 ---
 

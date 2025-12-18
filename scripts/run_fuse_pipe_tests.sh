@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Sequential fuse-pipe test runner with per-step logging and timeouts.
-# Intended to run on the EC2 host where libfuse, pjdfstest, etc. are available.
+# Requires libfuse and pjdfstest to be installed.
 #
 # Usage:
 #   cd /home/ubuntu/fcvm
