@@ -221,12 +221,21 @@ async fn watch_restore_epoch() {
     }
 }
 
-/// Handle clone restore: flush ARP and remount volumes
+/// Handle clone restore: kill stale sockets, flush ARP, and remount volumes
 async fn handle_clone_restore(volumes: &[VolumeMount]) {
-    // 1. Flush ARP cache (network connections are broken after restore)
+    // 1. KILL all established TCP connections immediately
+    // After snapshot restore, existing TCP connections are DEAD (different network namespace).
+    // Processes blocked on read() will hang FOREVER because no packets arrive.
+    // ss -K destroys sockets directly, waking any blocked read()/write() calls.
+    kill_stale_tcp_connections().await;
+
+    // 2. Flush ARP cache (stale MAC entries from previous network)
     flush_arp_cache().await;
 
-    // 2. Remount FUSE volumes if any
+    // Note: Interface bounce (ip link down/up) is NOT needed - ss -K handles socket cleanup
+    // more effectively by directly destroying sockets rather than hoping they notice ENETDOWN.
+
+    // 3. Remount FUSE volumes if any
     if !volumes.is_empty() {
         eprintln!(
             "[fc-agent] clone has {} volume(s) to remount",
@@ -344,6 +353,96 @@ async fn flush_arp_cache() {
         }
         Err(e) => {
             eprintln!("[fc-agent] WARNING: ARP flush error: {}", e);
+        }
+    }
+}
+
+/// Kill all established TCP connections in the VM.
+/// After snapshot restore, these connections point to a dead network namespace.
+/// Processes blocked on read() will hang FOREVER because no packets arrive.
+/// Interface bounce does NOT deliver errors to blocked sockets - we must explicitly
+/// destroy them so the kernel sends RST and wakes blocked threads.
+///
+/// This is comprehensive: we kill ALL TCP connections, not just some.
+/// Applications should reconnect when their sockets die.
+async fn kill_stale_tcp_connections() {
+    // First, list current connections for logging
+    let list_output = Command::new("ss")
+        .args(["-tn", "state", "established"])
+        .output()
+        .await;
+
+    if let Ok(o) = &list_output {
+        let connections = String::from_utf8_lossy(&o.stdout);
+        let count = connections.lines().count().saturating_sub(1); // Subtract header line
+        if count > 0 {
+            eprintln!("[fc-agent] found {} established TCP connection(s) to kill", count);
+            for line in connections.lines().skip(1) {
+                eprintln!("[fc-agent]   {}", line);
+            }
+        } else {
+            eprintln!("[fc-agent] no established TCP connections to kill");
+            return;
+        }
+    }
+
+    // Kill ALL established TCP connections using ss -K
+    // The -K flag uses the kernel's TCP socket destroy mechanism
+    // This sends RST to remote and wakes up any blocked read()/write() calls
+    let kill_output = Command::new("ss")
+        .args(["-K", "state", "established"])
+        .output()
+        .await;
+
+    match kill_output {
+        Ok(o) if o.status.success() => {
+            eprintln!("[fc-agent] ✓ killed all established TCP connections");
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            // ss -K may fail if iproute2 was built without INET_DIAG_DESTROY support
+            // In that case, fall back to a different approach
+            if stderr.contains("INET_DIAG_DESTROY") || stderr.contains("Operation not supported") {
+                eprintln!("[fc-agent] ss -K not supported, trying conntrack");
+                kill_connections_via_conntrack().await;
+            } else {
+                eprintln!(
+                    "[fc-agent] WARNING: ss -K failed: {}",
+                    stderr
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: ss -K error: {}", e);
+        }
+    }
+
+    // Give the kernel a moment to process socket destruction
+    sleep(Duration::from_millis(10)).await;
+}
+
+/// Fallback: try to kill connections using conntrack (if available)
+/// This works for NAT'd connections tracked by nf_conntrack
+async fn kill_connections_via_conntrack() {
+    // conntrack -F flushes the connection tracking table
+    let output = Command::new("conntrack")
+        .args(["-F"])
+        .output()
+        .await;
+
+    match output {
+        Ok(o) if o.status.success() => {
+            eprintln!("[fc-agent] ✓ flushed conntrack table");
+        }
+        Ok(o) => {
+            // conntrack may not be available or no tracked connections
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            if !stderr.contains("No such file") {
+                eprintln!("[fc-agent] conntrack flush: {}", stderr.trim());
+            }
+        }
+        Err(_) => {
+            // conntrack not available, that's fine
         }
     }
 }
