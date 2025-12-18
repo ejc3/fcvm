@@ -21,9 +21,7 @@ async fn test_snapshot_clone_rootless_10() -> Result<()> {
 }
 
 /// Stress test with 100 clones using rootless networking
-/// Run this test in isolation: cargo test --test test_snapshot_clone test_snapshot_clone_stress_100 -- --ignored
 #[tokio::test]
-#[ignore]
 async fn test_snapshot_clone_stress_100() -> Result<()> {
     snapshot_clone_test_impl("rootless", 100).await
 }
