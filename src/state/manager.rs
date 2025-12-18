@@ -97,13 +97,11 @@ impl StateManager {
         .await;
 
         // Release lock (happens automatically when flock is dropped, but being explicit)
+        // NOTE: We intentionally do NOT delete lock files - see allocate_loopback_ip comment
         flock
             .unlock()
             .map_err(|(_, err)| err)
             .context("releasing lock on state file")?;
-
-        // Clean up lock file (optional, but keeps directory clean)
-        let _ = std::fs::remove_file(&lock_file);
 
         result
     }
@@ -254,13 +252,11 @@ impl StateManager {
         .await;
 
         // Release lock (held until this point)
+        // NOTE: We intentionally do NOT delete lock files - see allocate_loopback_ip comment
         flock
             .unlock()
             .map_err(|(_, err)| err)
             .context("releasing lock after health update")?;
-
-        // Clean up lock file
-        let _ = std::fs::remove_file(&lock_file);
 
         result
     }
@@ -335,13 +331,13 @@ impl StateManager {
         self.save_state(vm_state).await?;
 
         // Release lock (only after state is persisted)
+        // NOTE: We intentionally do NOT delete the lock file - deleting it creates a race
+        // condition where another process could create a new file (different inode) and
+        // acquire a lock on it while we still hold the original lock.
         flock
             .unlock()
             .map_err(|(_, err)| err)
             .context("releasing loopback IP lock")?;
-
-        // Clean up lock file
-        let _ = std::fs::remove_file(&lock_file);
 
         Ok(ip)
     }
