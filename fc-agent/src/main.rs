@@ -1458,6 +1458,36 @@ async fn main() -> Result<()> {
         }
 
         eprintln!("[fc-agent] ✓ image imported successfully");
+    } else {
+        // Pull image with retries to handle transient DNS/network errors
+        const MAX_RETRIES: u32 = 3;
+        const RETRY_DELAY_SECS: u64 = 2;
+
+        for attempt in 1..=MAX_RETRIES {
+            eprintln!("[fc-agent] pulling image: {} (attempt {}/{})", plan.image, attempt, MAX_RETRIES);
+
+            let output = Command::new("podman")
+                .arg("pull")
+                .arg(&plan.image)
+                .output()
+                .await
+                .context("running podman pull")?;
+
+            if output.status.success() {
+                eprintln!("[fc-agent] ✓ image pulled successfully");
+                break;
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("[fc-agent] image pull failed: {}", stderr.trim());
+
+            if attempt < MAX_RETRIES {
+                eprintln!("[fc-agent] retrying in {} seconds...", RETRY_DELAY_SECS);
+                tokio::time::sleep(std::time::Duration::from_secs(RETRY_DELAY_SECS)).await;
+            } else {
+                anyhow::bail!("Failed to pull image after {} attempts: {}", MAX_RETRIES, stderr.trim());
+            }
+        }
     }
 
     eprintln!("[fc-agent] launching container: {}", plan.image);
