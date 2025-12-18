@@ -1,8 +1,22 @@
 use anyhow::{Context, Result};
+use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use tokio::fs;
 
 use super::types::VmState;
+
+/// Check if a port is available on a given IP address.
+/// This is used during loopback IP allocation to skip IPs that have
+/// stale processes (e.g., orphaned slirp4netns) still holding ports.
+fn is_port_available(ip: &str, port: u16) -> bool {
+    let addr: SocketAddr = match format!("{}:{}", ip, port).parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    // Try to bind - if it succeeds, port is available
+    // The TcpListener is dropped immediately, releasing the port
+    TcpListener::bind(addr).is_ok()
+}
 
 /// Manages VM state persistence
 ///
@@ -299,12 +313,13 @@ impl StateManager {
 
         // Sequential allocation: 127.0.0.2, 127.0.0.3, ... 127.0.0.254
         // Then 127.0.1.2, 127.0.1.3, ... etc.
+        // Also check that port 8080 is not already bound (handles stale slirp4netns processes)
         let ip = (|| {
             for b2 in 0..=255u8 {
                 for b3 in 2..=254u8 {
                     // Skip 127.0.0.1 (localhost)
                     let ip = format!("127.0.{}.{}", b2, b3);
-                    if !used_ips.contains(&ip) {
+                    if !used_ips.contains(&ip) && is_port_available(&ip, 8080) {
                         return ip;
                     }
                 }
