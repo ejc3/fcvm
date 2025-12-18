@@ -1157,13 +1157,12 @@ reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 
 ### Build System (Makefile)
 
-All builds are done via the root Makefile which syncs code to EC2 and builds there.
+All builds are done via the root Makefile.
 
 **Key targets**:
 ```bash
 # Development
-make build         # Sync + build fcvm + fc-agent on EC2
-make sync          # Just sync code (no build)
+make build         # Build fcvm + fc-agent
 make clean         # Clean build artifacts
 
 # Testing

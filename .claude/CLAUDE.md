@@ -5,21 +5,11 @@ fcvm is a Firecracker VM manager for running Podman containers in lightweight mi
 
 ## Quick Reference
 
-### EC2 Test Instance
-- **Instance**: c6g.metal (ARM64 bare metal with KVM)
-- **Instance ID**: i-05fafabbe2e064949
-- **IP**: 54.67.60.104
-- **SSH**: `ssh -i ~/.ssh/fcvm-ec2 ubuntu@54.67.60.104`
-- **Firecracker**: v1.10.0
-- **WARNING**: Do NOT use c5.large instances - no /dev/kvm support
-- **NOTE**: ICMP (ping) is blocked by security group. To check if instance is up, use SSH with short timeout: `ssh -o ConnectTimeout=5 -i ~/.ssh/fcvm-ec2 ubuntu@54.67.60.104 "echo ok"`
-
 ### Common Commands
 ```bash
-# Build and deploy
-make sync         # Sync fcvm + fuse-backend-rs to EC2 (ALWAYS use this, not git)
-make build        # Sync + build fcvm + fc-agent on EC2
-make test         # Run sanity test
+# Build
+make build        # Build fcvm + fc-agent
+make test         # Run fuse-pipe tests
 make rebuild      # Full rebuild including rootfs update
 
 # Run a VM
@@ -33,21 +23,21 @@ fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
 
 ### Manual E2E Testing with Claude Code
 
-**CRITICAL: VM commands BLOCK the terminal.** When manually testing VMs via SSH, you MUST use Claude's `run_in_background: true` feature.
+**CRITICAL: VM commands BLOCK the terminal.** You MUST use Claude's `run_in_background: true` feature.
 
 ```bash
 # WRONG - This blocks forever, wastes context, and times out
-ssh -i ~/.ssh/fcvm-ec2 ubuntu@54.67.60.104 "sudo fcvm podman run --name test nginx:alpine"
+sudo fcvm podman run --name test nginx:alpine
 
 # CORRECT - Run VM in background, then use exec to test
-ssh -i ~/.ssh/fcvm-ec2 ubuntu@54.67.60.104 "cd ~/fcvm && sudo ./target/release/fcvm podman run --name test --network bridged nginx:alpine 2>&1 | tee /tmp/vm.log" &
+sudo ./target/release/fcvm podman run --name test --network bridged nginx:alpine 2>&1 | tee /tmp/vm.log
 # Use run_in_background: true in Bash tool call
 # Then sleep and check logs:
 sleep 30
-ssh -i ~/.ssh/fcvm-ec2 ubuntu@54.67.60.104 "grep healthy /tmp/vm.log"
+grep healthy /tmp/vm.log
 # Get PID from state and use exec:
-ssh -i ~/.ssh/fcvm-ec2 ubuntu@54.67.60.104 "sudo ls -t /mnt/fcvm-btrfs/state/*.json | head -1 | xargs sudo cat | jq -r '.pid'"
-ssh -i ~/.ssh/fcvm-ec2 ubuntu@54.67.60.104 "sudo ./target/release/fcvm exec --pid <PID> -- curl -s ifconfig.me"
+sudo ls -t /mnt/fcvm-btrfs/state/*.json | head -1 | xargs sudo cat | jq -r '.pid'
+sudo ./target/release/fcvm exec --pid <PID> -- curl -s ifconfig.me
 ```
 
 **Testing egress connectivity:**
@@ -162,32 +152,17 @@ assert!(localhost_works, "Localhost port forwarding should work (requires route_
 
 ### Build and Test Rules
 
-**CRITICAL: ONLY use Makefile targets. NEVER run cargo commands directly.**
+**Use Makefile targets for common operations:**
 
 ```bash
 # Correct - always use make
-make build              # Sync and build
+make build              # Build fcvm + fc-agent
 make test               # Run fuse-pipe tests
 make test-vm            # Run VM tests
 make test-vm-rootless   # Run rootless VM test only
 make container-test     # Run tests in container
 make clean              # Clean build artifacts
-
-# WRONG - never do this
-ssh ubuntu@ec2 "cargo build"     # NO!
-ssh ubuntu@ec2 "cargo test"      # NO!
-ssh ubuntu@ec2 "cargo clean"     # NO!
 ```
-
-Why: Consistency and reproducibility.
-
-### Code Sync Strategy
-
-**ALWAYS use `make sync` to sync code to EC2.** Never use git pull on EC2.
-
-The Makefile syncs both:
-1. `fcvm` - the main project
-2. `fuse-backend-rs` - the FUSE backend library (local fork at `../fuse-backend-rs`)
 
 The `fuse-pipe/Cargo.toml` uses a local path dependency:
 ```toml
@@ -198,10 +173,10 @@ This ensures changes to fuse-backend-rs are immediately available without git co
 
 ### Monitoring Long-Running Tests
 
-When tailing logs from EC2, check every **20 seconds** (not 5, not 60):
+When tailing logs, check every **20 seconds** (not 5, not 60):
 ```bash
 # Good - check every 20 seconds
-sleep 20 && ssh -i ~/.ssh/fcvm-ec2 ubuntu@54.67.60.104 "tail -20 /tmp/test.log"
+sleep 20 && tail -20 /tmp/test.log
 
 # Bad - too frequent (wastes API calls)
 sleep 5 && ...
@@ -257,7 +232,7 @@ This pattern found the ftruncate bug: kernel sends `FATTR_FH` with file handle, 
 
 All 8789 pjdfstest tests pass when running in a container with proper device cgroup rules. Use `make container-test-pjdfstest` for the full POSIX compliance test.
 
-**Why containers work better**: The container runs with `sudo podman` and `--device-cgroup-rule` flags that allow mknod for block/char devices. Native EC2 testing may have permission issues with supplementary groups and device node creation.
+**Why containers work better**: The container runs with `sudo podman` and `--device-cgroup-rule` flags that allow mknod for block/char devices.
 
 ## PID-Based Process Management
 
@@ -520,7 +495,7 @@ fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
 
 ### FUSE Passthrough Performance (fuse-pipe)
 
-**Benchmark**: c6g.metal, 256 workers, 1024 files × 4KB
+**Benchmark**: 256 workers, 1024 files × 4KB
 
 #### Parallel Reads
 
@@ -543,15 +518,14 @@ fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
 
 ## Build Instructions
 
-### Makefile Targets (from local macOS)
+### Makefile Targets
 
 Run `make help` for full list. Key targets:
 
 #### Development
 | Target | Description |
 |--------|-------------|
-| `make build` | Sync + build fcvm + fc-agent on EC2 |
-| `make sync` | Just sync code (no build) |
+| `make build` | Build fcvm + fc-agent |
 | `make clean` | Clean build artifacts |
 
 #### Testing
@@ -594,7 +568,7 @@ Run `make help` for full list. Key targets:
 #### Setup (idempotent, run automatically by tests)
 | Target | Description |
 |--------|-------------|
-| `make setup-all` | Full setup (btrfs + kernel + rootfs) |
+| `make setup-all` | Full setup: btrfs + kernel + rootfs |
 | `make setup-btrfs` | Create btrfs loopback |
 | `make setup-kernel` | Copy kernel to btrfs |
 | `make setup-rootfs` | Create base rootfs (~90 sec first run) |
@@ -630,7 +604,7 @@ Run `make help` for full list. Key targets:
 └── cache/                 # Downloaded cloud images
 ```
 
-### One-Time EC2 Setup (dnsmasq)
+### One-Time Setup (dnsmasq)
 
 ```bash
 sudo apt-get update
@@ -667,11 +641,9 @@ ip addr add 172.16.29.1/24 dev tap-vm-c93e8   # Guest is 172.16.29.2
 - Reference: https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/network-for-clones.md
 
 ### KVM Requirements
-- Firecracker REQUIRES `/dev/kvm` - only available on bare metal instances
-- c6g.metal works ($2.18/hr, 64 vCPUs ARM64)
-- c5.metal works ($4.08/hr, 96 vCPUs x86_64)
-- c5.large does NOT work (no nested virtualization)
-- AWS vCPU limit increase needed for metal instances (64+ vCPUs)
+- Firecracker REQUIRES `/dev/kvm`
+- On AWS: c6g.metal (ARM64) or c5.metal (x86_64) work; c5.large does NOT
+- On other clouds: use bare-metal or hosts with nested virtualization
 
 ### DNS Resolution in VMs
 - Problem: Container image pulls failing with DNS timeout
@@ -727,7 +699,7 @@ let (mut child, pid) = common::spawn_fcvm(&["podman", "run", "--name", &vm_name,
 | `make container-test-pjdfstest` | POSIX compliance (8789 tests) |
 | `make container-shell` | Interactive shell for debugging |
 
-### Quick Reference (Native EC2)
+### Quick Reference (Native)
 
 | Command | Description |
 |---------|-------------|
