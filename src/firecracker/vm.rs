@@ -149,6 +149,16 @@ impl VmManager {
         let ns_id_clone = self.namespace_id.clone();
         let vsock_redirect_clone = self.vsock_redirect.clone();
 
+        // Ensure baseline directory exists for bind mount target
+        // The baseline VM may have been cleaned up, but we need the directory for mount
+        if let Some((ref baseline_dir, _)) = vsock_redirect_clone {
+            if !baseline_dir.exists() {
+                std::fs::create_dir_all(baseline_dir).context(
+                    "creating baseline directory for vsock mount redirect",
+                )?;
+            }
+        }
+
         if ns_id_clone.is_some() || vsock_redirect_clone.is_some() {
             use std::ffi::CString;
 
