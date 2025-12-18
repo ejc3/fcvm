@@ -18,14 +18,57 @@ A Rust implementation that launches Firecracker microVMs to run Podman container
 - Linux with `/dev/kvm` (bare-metal or nested virtualization)
 - For AWS: c6g.metal (ARM64) or c5.metal (x86_64) - NOT regular instances
 
-**Software**
-- Rust 1.70+ with cargo
-- For bridged networking: sudo access, iptables, iproute2, dnsmasq
+**Runtime Dependencies**
+- Rust 1.83+ with cargo (nightly for fuser crate)
+- Firecracker binary in PATH
+- For bridged networking: sudo, iptables, iproute2, dnsmasq
 - For rootless networking: slirp4netns
-- For building rootfs: virt-customize (libguestfs-tools)
+- For building rootfs: virt-customize (libguestfs-tools), qemu-utils, e2fsprogs
 
 **Storage**
 - btrfs filesystem at `/mnt/fcvm-btrfs` (for CoW disk snapshots)
+- Pre-built Firecracker kernel at `/mnt/fcvm-btrfs/kernels/vmlinux.bin`
+
+---
+
+## Test Requirements
+
+**Container Testing (Recommended)** - All dependencies bundled:
+```bash
+# Just needs podman and /dev/kvm
+make container-test          # fuse-pipe tests
+make container-test-vm       # VM tests
+make container-test-pjdfstest # POSIX compliance (8789 tests)
+```
+
+**Native Testing** - Additional dependencies required:
+
+| Category | Packages |
+|----------|----------|
+| FUSE | fuse3, libfuse3-dev |
+| pjdfstest build | autoconf, automake, libtool |
+| pjdfstest runtime | perl |
+| bindgen (userfaultfd-sys) | libclang-dev, clang |
+| VM tests | iproute2, iptables, slirp4netns, dnsmasq |
+| Rootfs build | qemu-utils, libguestfs-tools, e2fsprogs |
+| User namespaces | uidmap (for newuidmap/newgidmap) |
+
+**pjdfstest Setup** (for POSIX compliance tests):
+```bash
+git clone --depth 1 https://github.com/pjd/pjdfstest /tmp/pjdfstest-check
+cd /tmp/pjdfstest-check && autoreconf -ifs && ./configure && make
+```
+
+**Ubuntu/Debian Install**:
+```bash
+sudo apt-get update && sudo apt-get install -y \
+    fuse3 libfuse3-dev \
+    autoconf automake libtool perl \
+    libclang-dev clang \
+    iproute2 iptables slirp4netns dnsmasq \
+    qemu-utils libguestfs-tools e2fsprogs \
+    uidmap
+```
 
 ---
 
