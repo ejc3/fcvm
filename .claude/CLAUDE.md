@@ -132,6 +132,34 @@ assert!(localhost_works, "Localhost port forwarding should work (requires route_
 // GOOD - Test fails if feature is broken
 ```
 
+### Parallel Test Isolation
+
+**Tests MUST work when run in parallel.** Resource conflicts are bugs, not excuses.
+
+**Common parallel test pitfalls and fixes:**
+
+1. **Unique resource names**: Use `unique_names()` helper to generate timestamp+counter-based names
+   ```rust
+   let (baseline, clone, snapshot, serve) = unique_names("mytest");
+   // Returns: mytest-base-12345-0, mytest-clone-12345-0, etc.
+   ```
+
+2. **Port conflicts**: Loopback IP allocation checks port availability before assigning
+   - If orphaned processes hold ports, allocation skips those IPs
+   - Implemented in `state/manager.rs::is_port_available()`
+
+3. **Disk cleanup**: VM data directories are cleaned up on exit
+   - `podman.rs` and `snapshot.rs` both delete `data_dir` on VM exit
+   - Prevents disk from filling up with leftover VM directories
+
+4. **State file cleanup**: State files are deleted when VMs exit
+   - Prevents stale state from affecting IP allocation
+
+**If tests fail in parallel but pass alone:**
+- It's a resource isolation bug - FIX IT
+- Check for shared state (files, ports, IPs, network namespaces)
+- Add unique naming or proper cleanup
+
 ### Build and Test Rules
 
 **CRITICAL: ONLY use Makefile targets. NEVER run cargo commands directly.**
