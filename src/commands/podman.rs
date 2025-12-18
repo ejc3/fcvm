@@ -483,6 +483,13 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // Cleanup vsock socket
     let _ = std::fs::remove_file(&vsock_socket_path);
 
+    // Cleanup VM data directory (includes disks, sockets, etc.)
+    if let Err(e) = tokio::fs::remove_dir_all(&data_dir).await {
+        warn!(vm_id = %vm_id, error = %e, "failed to cleanup VM data directory");
+    } else {
+        info!(vm_id = %vm_id, "cleaned up VM data directory");
+    }
+
     // Return error if container exited with non-zero exit code
     if let Some(code) = container_exit_code {
         if code != 0 {

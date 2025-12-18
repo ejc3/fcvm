@@ -812,6 +812,13 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         }
     }
 
+    // Cleanup VM data directory (includes disks, sockets, etc.)
+    if let Err(e) = tokio::fs::remove_dir_all(&data_dir).await {
+        warn!(vm_id = %vm_id, error = %e, "failed to cleanup clone data directory");
+    } else {
+        info!(vm_id = %vm_id, "cleaned up clone data directory");
+    }
+
     Ok(())
 }
 
