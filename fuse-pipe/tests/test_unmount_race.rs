@@ -2,6 +2,8 @@
 //!
 //! This test does heavy parallel I/O and then immediately unmounts to trigger
 //! the race where reader threads get ECONNABORTED before destroy() is called.
+//!
+//! Run WITHOUT sudo: `cargo test --release -p fuse-pipe --test test_unmount_race`
 
 mod common;
 
@@ -9,7 +11,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::thread;
 
-use common::{cleanup, unique_paths, FuseMount};
+use common::{cleanup, require_nonroot, unique_paths, FuseMount};
 
 /// Reproduce the unmount race with heavy I/O.
 ///
@@ -18,6 +20,7 @@ use common::{cleanup, unique_paths, FuseMount};
 /// is called, causing ERROR logs.
 #[test]
 fn test_unmount_after_heavy_io() {
+    require_nonroot();
     // Use many readers to increase chance of race
     const NUM_READERS: usize = 16;
     const NUM_FILES: usize = 100;
@@ -76,6 +79,7 @@ fn test_unmount_after_heavy_io() {
 /// Run the test multiple times to increase chance of hitting the race.
 #[test]
 fn test_unmount_race_repeated() {
+    require_nonroot();
     for i in 0..5 {
         eprintln!("\n=== Iteration {} ===", i);
         test_unmount_after_heavy_io_inner(i);
