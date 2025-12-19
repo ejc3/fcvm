@@ -397,10 +397,8 @@ fn try_parse_exit(data: &[u8]) -> Option<i32> {
     // Look for JSON exit message at end of data
     let s = String::from_utf8_lossy(data);
     for line in s.lines() {
-        if let Ok(response) = serde_json::from_str::<ExecResponse>(line) {
-            if let ExecResponse::Exit(code) = response {
-                return Some(code);
-            }
+        if let Ok(ExecResponse::Exit(code)) = serde_json::from_str::<ExecResponse>(line) {
+            return Some(code);
         }
     }
     None

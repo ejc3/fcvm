@@ -434,9 +434,7 @@ async fn test_clone_reconnect_latency() -> Result<()> {
     // Start client in background via exec - it will reconnect automatically
     let _client_handle = {
         let fcvm_path = fcvm_path.clone();
-        let baseline_pid = baseline_pid;
         let host_ip = host_ip.to_string();
-        let server_port = server_port;
         tokio::spawn(async move {
             let _ = tokio::process::Command::new(&fcvm_path)
                 .args([

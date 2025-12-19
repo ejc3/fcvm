@@ -184,20 +184,11 @@ async fn exec_test_impl(network: &str) -> Result<()> {
 }
 
 /// Exec flags for tests
+#[derive(Default)]
 struct ExecFlags {
     in_vm: bool,
     interactive: bool,
     tty: bool,
-}
-
-impl Default for ExecFlags {
-    fn default() -> Self {
-        Self {
-            in_vm: false,
-            interactive: false,
-            tty: false,
-        }
-    }
 }
 
 impl ExecFlags {

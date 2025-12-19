@@ -134,6 +134,7 @@ impl PassthroughFs {
     }
 
     /// Convert fuse-backend-rs Entry to our FileAttr.
+    #[allow(clippy::unnecessary_cast)] // st_nlink is u64 on x86_64, u32 on ARM64
     fn entry_to_attr(entry: &Entry) -> FileAttr {
         let attr = &entry.attr;
         FileAttr {
@@ -156,6 +157,7 @@ impl PassthroughFs {
     }
 
     /// Convert libc::stat64 to our FileAttr.
+    #[allow(clippy::unnecessary_cast)] // st_nlink is u64 on x86_64, u32 on ARM64
     fn stat_to_attr(ino: u64, st: &libc::stat64) -> FileAttr {
         FileAttr {
             ino,
