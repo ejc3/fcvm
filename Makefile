@@ -128,11 +128,26 @@ setup-btrfs:
 	fi
 
 # Copy kernel to btrfs (requires setup-btrfs)
+# For local dev: copies from KERNEL_DIR
+# For CI (x86_64): downloads pre-built kernel from Firecracker releases
+KERNEL_VERSION ?= 5.10.225
 setup-kernel: setup-btrfs
 	@if [ ! -f /mnt/fcvm-btrfs/kernels/vmlinux.bin ]; then \
-		echo '==> Copying kernel...'; \
-		cp $(KERNEL_DIR)/arch/arm64/boot/Image /mnt/fcvm-btrfs/kernels/vmlinux.bin && \
-		echo '==> Kernel ready'; \
+		ARCH=$$(uname -m); \
+		if [ "$$ARCH" = "x86_64" ] && [ ! -d "$(KERNEL_DIR)" ]; then \
+			echo "==> Downloading x86_64 kernel for CI..."; \
+			curl -sL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.11/x86_64/vmlinux-$(KERNEL_VERSION)" \
+				-o /mnt/fcvm-btrfs/kernels/vmlinux.bin && \
+			echo "==> Kernel ready (downloaded)"; \
+		else \
+			echo '==> Copying kernel...'; \
+			if [ "$$ARCH" = "aarch64" ]; then \
+				cp $(KERNEL_DIR)/arch/arm64/boot/Image /mnt/fcvm-btrfs/kernels/vmlinux.bin; \
+			else \
+				cp $(KERNEL_DIR)/arch/x86/boot/bzImage /mnt/fcvm-btrfs/kernels/vmlinux.bin; \
+			fi && \
+			echo '==> Kernel ready'; \
+		fi \
 	fi
 
 # Create base rootfs if missing (requires build + setup-kernel)
