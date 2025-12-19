@@ -219,10 +219,10 @@ jobs:
           lsmod | grep kvm || echo "No KVM modules"
       - name: Setup KVM permissions
         run: sudo chmod 666 /dev/kvm
-      - name: Run VM sanity test (container)
+      - name: Run VM sanity tests (container)
         working-directory: fcvm
         run: |
           export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
           export FUSER=${{ github.workspace }}/fuser
           export CONTAINER_ARCH=x86_64
-          make container-test-vm-bridged
+          make container-test-vm

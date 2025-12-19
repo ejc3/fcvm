@@ -364,6 +364,16 @@ $(CONTAINER_MARKER): Containerfile
 
 container-build: $(CONTAINER_MARKER)
 
+# Export container image for rootless podman (needed for container-test-vm-rootless)
+# Rootless podman has separate image storage, so we export from root and import
+CONTAINER_ROOTLESS_MARKER := .container-rootless-imported
+$(CONTAINER_ROOTLESS_MARKER): $(CONTAINER_MARKER)
+	@echo "==> Exporting container for rootless podman..."
+	sudo podman save $(CONTAINER_IMAGE) | podman --root=/tmp/podman-rootless load
+	@touch $@
+
+container-build-rootless: $(CONTAINER_ROOTLESS_MARKER)
+
 # Container tests - organized by root requirement
 # Non-root tests run with --user testuser to verify they don't need root
 # fcvm unit tests with network ops skip themselves when not root
@@ -408,7 +418,8 @@ container-test: container-test-noroot container-test-root
 
 # VM tests - rootless (truly unprivileged - no --privileged, runs as testuser)
 # Uses CONTAINER_RUN_ROOTLESS which drops privileges to match a normal host user
-container-test-vm-rootless: container-build setup-kernel
+# Depends on container-build-rootless to export image to rootless podman storage
+container-test-vm-rootless: container-build-rootless setup-kernel
 	$(CONTAINER_RUN_ROOTLESS) $(CONTAINER_IMAGE) $(TEST_VM_ROOTLESS)
 
 # VM tests - bridged (requires root for iptables/netns)
@@ -453,6 +464,7 @@ container-shell: container-build
 
 # Force container rebuild (removes marker file)
 container-clean:
-	rm -f $(CONTAINER_MARKER)
+	rm -f $(CONTAINER_MARKER) $(CONTAINER_ROOTLESS_MARKER)
 	sudo podman rmi $(CONTAINER_IMAGE) 2>/dev/null || true
 	sudo podman volume rm fcvm-cargo-target fcvm-cargo-home 2>/dev/null || true
+	podman --root=/tmp/podman-rootless rmi $(CONTAINER_IMAGE) 2>/dev/null || true
