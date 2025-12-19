@@ -277,19 +277,76 @@ async fn extract_root_partition(qcow2_path: &Path, output_path: &Path) -> Result
         retries -= 1;
     }
 
+    // If partition still doesn't exist, try to create the device node manually.
+    // This is needed when running in a container where the host kernel creates
+    // the partition device on the host's devtmpfs, but the container has its own.
+    // NBD major is 43, partition 1 is minor 1.
+    if !std::path::Path::new(&partition).exists() {
+        info!("partition not auto-created, trying mknod");
+
+        // Get partition info from sysfs
+        let sysfs_path = "/sys/block/nbd0/nbd0p1/dev";
+        let dev_info = tokio::fs::read_to_string(sysfs_path).await;
+
+        if let Ok(dev_str) = dev_info {
+            // dev_str is "major:minor" e.g., "43:1"
+            let dev_str = dev_str.trim();
+            info!(dev = %dev_str, "found partition info in sysfs");
+
+            // Create device node with mknod
+            let mknod_result = Command::new("mknod")
+                .args([&partition, "b", "43", "1"])
+                .output()
+                .await;
+
+            if let Ok(output) = mknod_result {
+                if output.status.success() {
+                    info!(partition = %partition, "created partition device node");
+                } else {
+                    warn!(
+                        "mknod failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+        } else {
+            // Try mknod with assumed minor number (1 for first partition)
+            info!("sysfs info not available, trying mknod with assumed minor 1");
+            let _ = Command::new("mknod")
+                .args([&partition, "b", "43", "1"])
+                .output()
+                .await;
+        }
+    }
+
+    // Final check
     if !std::path::Path::new(&partition).exists() {
         // List what devices exist for debugging
-        let ls_output = Command::new("ls")
-            .args(["-la", "/dev/nbd0*"])
+        let ls_output = Command::new("sh")
+            .args(["-c", "ls -la /dev/nbd0* 2>/dev/null || echo 'no nbd devices'"])
             .output()
             .await;
         let devices = ls_output
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_else(|_| "failed to list".to_string());
+
+        // Also check sysfs for partition info
+        let sysfs_output = Command::new("sh")
+            .args([
+                "-c",
+                "cat /sys/block/nbd0/nbd0p1/dev 2>/dev/null || echo 'no sysfs info'",
+            ])
+            .output()
+            .await;
+        let sysfs_info = sysfs_output
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_else(|_| "no sysfs".to_string());
+
         bail!(
-            "partition {} not found after waiting. Available: {}",
+            "partition {} not found after waiting. Devices: {}, Sysfs: {}",
             partition,
-            devices
+            devices.trim(),
+            sysfs_info.trim()
         );
     }
 
