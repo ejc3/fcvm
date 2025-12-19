@@ -238,48 +238,12 @@ jobs:
           EOF
           sudo systemctl restart dnsmasq
           sudo systemctl status dnsmasq
-      - name: Clear cached rootfs (force rebuild with symlink fix)
-        run: |
-          sudo rm -f /mnt/fcvm-btrfs/rootfs/base.ext4
-          sudo rm -f /mnt/fcvm-btrfs/cache/*.img
-      - name: Debug network setup
-        run: |
-          echo "=== Host network interfaces ==="
-          ip addr show
-          echo ""
-          echo "=== Default route ==="
-          ip route show default
-          echo ""
-          echo "=== IP forwarding status ==="
-          cat /proc/sys/net/ipv4/ip_forward
-          echo ""
-          echo "=== iptables FORWARD chain (filter table) ==="
-          sudo iptables -L FORWARD -v -n
-          echo ""
-          echo "=== iptables POSTROUTING chain (nat table) ==="
-          sudo iptables -t nat -L POSTROUTING -v -n
-          echo ""
-          echo "=== dnsmasq status ==="
-          sudo systemctl status dnsmasq || true
-          echo ""
-          echo "=== dnsmasq listening ports ==="
-          sudo ss -ulnp | grep dnsmasq || echo "no dnsmasq listening"
-          echo ""
-          echo "=== Test DNS resolution from host ==="
-          nslookup public.ecr.aws 8.8.8.8 || echo "DNS lookup failed"
-          echo ""
-          echo "=== Test ping from host to 8.8.8.8 ==="
-          ping -c 2 8.8.8.8 || echo "host ping to 8.8.8.8 failed"
       - name: Setup iptables for VM networking
         run: |
-          echo "=== Setting FORWARD chain to ACCEPT ==="
+          # BuildJet runners have FORWARD chain set to DROP by default
+          # Set to ACCEPT and add MASQUERADE rule for VM NAT
           sudo iptables -P FORWARD ACCEPT
-          echo "=== Adding MASQUERADE rule for VM subnet ==="
           sudo iptables -t nat -A POSTROUTING -s 172.30.0.0/16 -o eth0 -j MASQUERADE || true
-          echo "=== Final FORWARD chain ==="
-          sudo iptables -L FORWARD -v -n
-          echo "=== Final NAT POSTROUTING ==="
-          sudo iptables -t nat -L POSTROUTING -v -n
       - name: Run VM sanity test (bridged)
         working-directory: fcvm
         run: |
