@@ -238,6 +238,10 @@ jobs:
           EOF
           sudo systemctl restart dnsmasq
           sudo systemctl status dnsmasq
+      - name: Clear cached rootfs (force rebuild with latest code)
+        run: |
+          sudo rm -f /mnt/fcvm-btrfs/rootfs/base.ext4
+          sudo rm -f /mnt/fcvm-btrfs/cache/*.img
       - name: Run VM sanity test (bridged)
         working-directory: fcvm
         run: |
