@@ -481,7 +481,7 @@ async fn customize_ubuntu_cloud_image(image_path: &Path) -> Result<()> {
     cmd.arg("--run-command")
         .arg("mkdir -p /etc/systemd/network /etc/systemd/network/10-eth0.network.d");
 
-    let network_config = "[Match]\nName=eth0\n\n[Network]\n# Keep kernel IP configuration from ip= boot parameter\nKeepConfiguration=yes\n# DNS servers for container registry lookups\nDNS=8.8.8.8\nDNS=8.8.4.4\n";
+    let network_config = "[Match]\nName=eth0\n\n[Network]\n# Keep kernel IP configuration from ip= boot parameter\nKeepConfiguration=yes\n# DNS is provided via kernel ip= boot parameter (gateway IP where dnsmasq listens)\n";
     cmd.arg("--write").arg(format!(
         "/etc/systemd/network/10-eth0.network:{}",
         network_config
