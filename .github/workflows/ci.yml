@@ -191,3 +191,38 @@ jobs:
           export FUSER=${{ github.workspace }}/fuser
           export CONTAINER_ARCH=x86_64
           make container-test-pjdfstest
+
+  test-vm-sanity:
+    name: VM Sanity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fcvm
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+      - name: Check KVM availability
+        run: |
+          echo "=== KVM device ==="
+          ls -la /dev/kvm || echo "No /dev/kvm"
+          echo "=== CPU virtualization ==="
+          grep -E "(vmx|svm)" /proc/cpuinfo | head -1 || echo "No VMX/SVM"
+          echo "=== KVM modules ==="
+          lsmod | grep kvm || echo "No KVM modules"
+      - name: Setup KVM permissions
+        run: sudo chmod 666 /dev/kvm
+      - name: Run VM sanity test (container)
+        working-directory: fcvm
+        run: |
+          export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
+          export FUSER=${{ github.workspace }}/fuser
+          export CONTAINER_ARCH=x86_64
+          make container-test-vm-rootless
