@@ -493,7 +493,54 @@ async fn customize_ubuntu_cloud_image(image_path: &Path) -> Result<()> {
         mmds_route
     ));
 
-    // 6. Write fc-agent systemd service
+    // 6. Write DNS setup script and service
+    // This extracts the gateway IP from kernel cmdline and configures it as DNS
+    // The kernel ip= parameter format is: ip=client::gateway:netmask::device:autoconf[:dns]
+    info!("adding DNS setup script");
+    let dns_setup_script = r#"#!/bin/bash
+# Extract gateway from kernel cmdline and configure as DNS
+# Format: ip=<client>::<gateway>:<netmask>::eth0:off[:<dns>]
+CMDLINE=$(cat /proc/cmdline)
+if [[ $CMDLINE =~ ip=([^[:space:]]+) ]]; then
+    IP_PARAM="${BASH_REMATCH[1]}"
+    # Extract gateway (3rd field, after ::)
+    GATEWAY=$(echo "$IP_PARAM" | cut -d: -f3)
+    # Check if explicit DNS was provided (8th field)
+    DNS=$(echo "$IP_PARAM" | cut -d: -f8)
+    if [ -n "$DNS" ]; then
+        # Use explicit DNS from boot args
+        echo "nameserver $DNS" > /etc/resolv.conf
+        echo "[fcvm-dns] Configured DNS from boot args: $DNS"
+    elif [ -n "$GATEWAY" ]; then
+        # Fall back to gateway as DNS (dnsmasq)
+        echo "nameserver $GATEWAY" > /etc/resolv.conf
+        echo "[fcvm-dns] Configured DNS from gateway: $GATEWAY"
+    fi
+fi
+"#;
+    cmd.arg("--write").arg(format!(
+        "/usr/local/bin/fcvm-setup-dns:{}",
+        dns_setup_script
+    ));
+    cmd.arg("--chmod").arg("0755:/usr/local/bin/fcvm-setup-dns");
+
+    let dns_setup_service = "[Unit]\n\
+                             Description=Configure DNS from kernel boot parameters\n\
+                             DefaultDependencies=no\n\
+                             Before=network.target systemd-resolved.service\n\
+                             After=local-fs.target\n\n\
+                             [Service]\n\
+                             Type=oneshot\n\
+                             ExecStart=/usr/local/bin/fcvm-setup-dns\n\
+                             RemainAfterExit=yes\n\n\
+                             [Install]\n\
+                             WantedBy=sysinit.target\n";
+    cmd.arg("--write").arg(format!(
+        "/etc/systemd/system/fcvm-setup-dns.service:{}",
+        dns_setup_service
+    ));
+
+    // 7. Write fc-agent systemd service
     info!("adding fc-agent service");
     let fc_agent_service = "[Unit]\nDescription=fcvm guest agent for container orchestration\n\
                             After=network.target\nWants=network.target\n\n\
@@ -506,10 +553,10 @@ async fn customize_ubuntu_cloud_image(image_path: &Path) -> Result<()> {
         fc_agent_service
     ));
 
-    // 8. Enable services (fc-agent only - other services enabled after package install)
+    // 9. Enable services (fc-agent + dns-setup, other services enabled after package install)
     info!("enabling systemd services");
     cmd.arg("--run-command")
-        .arg("systemctl enable fc-agent systemd-networkd serial-getty@ttyS0");
+        .arg("systemctl enable fc-agent fcvm-setup-dns systemd-networkd serial-getty@ttyS0");
 
     info!("executing virt-customize (this should be quick)");
 
@@ -676,15 +723,13 @@ async fn install_packages_in_rootfs(rootfs_path: &Path) -> Result<()> {
             .await
             .context("writing registries.conf")?;
 
-        // Write resolv.conf pointing to systemd-resolved's stub resolver
-        // We use a static file (not a symlink) because the symlink target
-        // (/run/systemd/resolve/stub-resolv.conf) won't exist at early boot
-        // when Podman tries to pull images before systemd-resolved is ready
-        info!("configuring systemd-resolved DNS");
+        // Write initial resolv.conf - will be overwritten by fcvm-setup-dns.service at boot
+        // The startup script extracts gateway IP from kernel cmdline and configures DNS
+        info!("configuring initial resolv.conf (will be updated at boot)");
         let resolv_conf_path = mount_point.join("etc/resolv.conf");
         tokio::fs::write(
             &resolv_conf_path,
-            "# Managed by fcvm - points to systemd-resolved\nnameserver 127.0.0.53\noptions edns0 trust-ad\n",
+            "# Placeholder - fcvm-setup-dns.service configures DNS at boot from kernel cmdline\nnameserver 127.0.0.53\n",
         )
         .await
         .context("writing resolv.conf")?;
