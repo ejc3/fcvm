@@ -676,6 +676,18 @@ async fn install_packages_in_rootfs(rootfs_path: &Path) -> Result<()> {
             .await
             .context("writing registries.conf")?;
 
+        // Restore /etc/resolv.conf symlink to systemd-resolved
+        // We copied a real file for apt-get, now restore the Ubuntu default
+        // so systemd-resolved manages DNS at runtime
+        info!("restoring systemd-resolved DNS configuration");
+        let resolv_conf_path = mount_point.join("etc/resolv.conf");
+        let _ = tokio::fs::remove_file(&resolv_conf_path).await;
+        std::os::unix::fs::symlink(
+            "/run/systemd/resolve/stub-resolv.conf",
+            &resolv_conf_path,
+        )
+        .context("creating resolv.conf symlink")?;
+
         Ok(())
     }
     .await;
