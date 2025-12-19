@@ -129,10 +129,43 @@ async fn network_debug_impl(network: &str) -> Result<()> {
     println!("│  SECTION 2: DNS CONFIGURATION                               │");
     println!("└──────────────────────────────────────────────────────────────┘");
 
-    dump_command(fcvm_pid, "/etc/resolv.conf contents", &["cat", "/etc/resolv.conf"]).await?;
-    dump_command(fcvm_pid, "/etc/resolv.conf symlink target", &["ls", "-la", "/etc/resolv.conf"]).await?;
-    dump_command(fcvm_pid, "systemd-resolved status", &["systemctl", "status", "systemd-resolved", "||", "echo", "not running"]).await?;
-    dump_command(fcvm_pid, "resolvectl status", &["resolvectl", "status", "||", "echo", "resolvectl not available"]).await?;
+    dump_command(
+        fcvm_pid,
+        "/etc/resolv.conf contents",
+        &["cat", "/etc/resolv.conf"],
+    )
+    .await?;
+    dump_command(
+        fcvm_pid,
+        "/etc/resolv.conf symlink target",
+        &["ls", "-la", "/etc/resolv.conf"],
+    )
+    .await?;
+    dump_command(
+        fcvm_pid,
+        "systemd-resolved status",
+        &[
+            "systemctl",
+            "status",
+            "systemd-resolved",
+            "||",
+            "echo",
+            "not running",
+        ],
+    )
+    .await?;
+    dump_command(
+        fcvm_pid,
+        "resolvectl status",
+        &[
+            "resolvectl",
+            "status",
+            "||",
+            "echo",
+            "resolvectl not available",
+        ],
+    )
+    .await?;
 
     // ============================================================================
     // SECTION 3: Network Interfaces
@@ -154,7 +187,12 @@ async fn network_debug_impl(network: &str) -> Result<()> {
     println!("└──────────────────────────────────────────────────────────────┘");
 
     dump_command(fcvm_pid, "ip route show", &["ip", "route", "show"]).await?;
-    dump_command(fcvm_pid, "ip route get 8.8.8.8", &["ip", "route", "get", "8.8.8.8"]).await?;
+    dump_command(
+        fcvm_pid,
+        "ip route get 8.8.8.8",
+        &["ip", "route", "get", "8.8.8.8"],
+    )
+    .await?;
 
     // ============================================================================
     // SECTION 5: systemd-networkd Status
@@ -164,9 +202,36 @@ async fn network_debug_impl(network: &str) -> Result<()> {
     println!("│  SECTION 5: SYSTEMD-NETWORKD STATUS                         │");
     println!("└──────────────────────────────────────────────────────────────┘");
 
-    dump_command(fcvm_pid, "systemctl status systemd-networkd", &["systemctl", "status", "systemd-networkd"]).await?;
-    dump_command(fcvm_pid, "networkctl status", &["networkctl", "status", "||", "echo", "networkctl not available"]).await?;
-    dump_command(fcvm_pid, "networkctl list", &["networkctl", "list", "||", "echo", "networkctl not available"]).await?;
+    dump_command(
+        fcvm_pid,
+        "systemctl status systemd-networkd",
+        &["systemctl", "status", "systemd-networkd"],
+    )
+    .await?;
+    dump_command(
+        fcvm_pid,
+        "networkctl status",
+        &[
+            "networkctl",
+            "status",
+            "||",
+            "echo",
+            "networkctl not available",
+        ],
+    )
+    .await?;
+    dump_command(
+        fcvm_pid,
+        "networkctl list",
+        &[
+            "networkctl",
+            "list",
+            "||",
+            "echo",
+            "networkctl not available",
+        ],
+    )
+    .await?;
 
     // ============================================================================
     // SECTION 6: DNS Setup Service Status
@@ -176,9 +241,45 @@ async fn network_debug_impl(network: &str) -> Result<()> {
     println!("│  SECTION 6: DNS SETUP SERVICE STATUS                        │");
     println!("└──────────────────────────────────────────────────────────────┘");
 
-    dump_command(fcvm_pid, "fcvm-setup-dns service status", &["systemctl", "status", "fcvm-setup-dns", "||", "echo", "service not found"]).await?;
-    dump_command(fcvm_pid, "fcvm-setup-dns service logs", &["journalctl", "-u", "fcvm-setup-dns", "--no-pager", "||", "echo", "no logs"]).await?;
-    dump_command(fcvm_pid, "DNS setup script contents", &["cat", "/usr/local/bin/fcvm-setup-dns", "||", "echo", "script not found"]).await?;
+    dump_command(
+        fcvm_pid,
+        "fcvm-setup-dns service status",
+        &[
+            "systemctl",
+            "status",
+            "fcvm-setup-dns",
+            "||",
+            "echo",
+            "service not found",
+        ],
+    )
+    .await?;
+    dump_command(
+        fcvm_pid,
+        "fcvm-setup-dns service logs",
+        &[
+            "journalctl",
+            "-u",
+            "fcvm-setup-dns",
+            "--no-pager",
+            "||",
+            "echo",
+            "no logs",
+        ],
+    )
+    .await?;
+    dump_command(
+        fcvm_pid,
+        "DNS setup script contents",
+        &[
+            "cat",
+            "/usr/local/bin/fcvm-setup-dns",
+            "||",
+            "echo",
+            "script not found",
+        ],
+    )
+    .await?;
 
     // ============================================================================
     // SECTION 7: Connectivity Tests
@@ -190,8 +291,18 @@ async fn network_debug_impl(network: &str) -> Result<()> {
 
     // Find gateway from routing table for ping test
     dump_command(fcvm_pid, "Ping gateway (from route)", &["sh", "-c", "GATEWAY=$(ip route | grep default | awk '{print $3}'); echo \"Gateway: $GATEWAY\"; ping -c 3 $GATEWAY 2>&1 || echo 'ping failed'"]).await?;
-    dump_command(fcvm_pid, "Ping 8.8.8.8", &["ping", "-c", "3", "8.8.8.8", "||", "echo", "ping failed"]).await?;
-    dump_command(fcvm_pid, "Ping 1.1.1.1", &["ping", "-c", "3", "1.1.1.1", "||", "echo", "ping failed"]).await?;
+    dump_command(
+        fcvm_pid,
+        "Ping 8.8.8.8",
+        &["ping", "-c", "3", "8.8.8.8", "||", "echo", "ping failed"],
+    )
+    .await?;
+    dump_command(
+        fcvm_pid,
+        "Ping 1.1.1.1",
+        &["ping", "-c", "3", "1.1.1.1", "||", "echo", "ping failed"],
+    )
+    .await?;
 
     // ============================================================================
     // SECTION 8: DNS Resolution Tests
@@ -202,12 +313,41 @@ async fn network_debug_impl(network: &str) -> Result<()> {
     println!("└──────────────────────────────────────────────────────────────┘");
 
     // Test with different DNS servers
-    dump_command(fcvm_pid, "nslookup google.com (default)", &["nslookup", "google.com", "||", "echo", "nslookup failed"]).await?;
+    dump_command(
+        fcvm_pid,
+        "nslookup google.com (default)",
+        &["nslookup", "google.com", "||", "echo", "nslookup failed"],
+    )
+    .await?;
     dump_command(fcvm_pid, "nslookup google.com @ gateway", &["sh", "-c", "GATEWAY=$(ip route | grep default | awk '{print $3}'); nslookup google.com $GATEWAY 2>&1 || echo 'nslookup failed'"]).await?;
-    dump_command(fcvm_pid, "nslookup google.com @ 8.8.8.8", &["nslookup", "google.com", "8.8.8.8", "||", "echo", "nslookup failed"]).await?;
+    dump_command(
+        fcvm_pid,
+        "nslookup google.com @ 8.8.8.8",
+        &[
+            "nslookup",
+            "google.com",
+            "8.8.8.8",
+            "||",
+            "echo",
+            "nslookup failed",
+        ],
+    )
+    .await?;
 
     // Test dig if available
-    dump_command(fcvm_pid, "dig google.com (if available)", &["dig", "google.com", "+short", "||", "echo", "dig not available"]).await?;
+    dump_command(
+        fcvm_pid,
+        "dig google.com (if available)",
+        &[
+            "dig",
+            "google.com",
+            "+short",
+            "||",
+            "echo",
+            "dig not available",
+        ],
+    )
+    .await?;
 
     // ============================================================================
     // SECTION 9: HTTP Connectivity Tests
@@ -218,11 +358,54 @@ async fn network_debug_impl(network: &str) -> Result<()> {
     println!("└──────────────────────────────────────────────────────────────┘");
 
     // Test curl with various endpoints
-    dump_command(fcvm_pid, "curl ifconfig.me", &["curl", "-s", "--max-time", "10", "http://ifconfig.me", "||", "echo", "curl failed"]).await?;
-    dump_command(fcvm_pid, "curl https://ifconfig.me (SSL)", &["curl", "-s", "--max-time", "10", "https://ifconfig.me", "||", "echo", "curl failed"]).await?;
+    dump_command(
+        fcvm_pid,
+        "curl ifconfig.me",
+        &[
+            "curl",
+            "-s",
+            "--max-time",
+            "10",
+            "http://ifconfig.me",
+            "||",
+            "echo",
+            "curl failed",
+        ],
+    )
+    .await?;
+    dump_command(
+        fcvm_pid,
+        "curl https://ifconfig.me (SSL)",
+        &[
+            "curl",
+            "-s",
+            "--max-time",
+            "10",
+            "https://ifconfig.me",
+            "||",
+            "echo",
+            "curl failed",
+        ],
+    )
+    .await?;
 
     // Test container registry access
-    dump_command(fcvm_pid, "curl public.ecr.aws (DNS test)", &["curl", "-s", "--max-time", "10", "-I", "https://public.ecr.aws", "||", "echo", "curl failed"]).await?;
+    dump_command(
+        fcvm_pid,
+        "curl public.ecr.aws (DNS test)",
+        &[
+            "curl",
+            "-s",
+            "--max-time",
+            "10",
+            "-I",
+            "https://public.ecr.aws",
+            "||",
+            "echo",
+            "curl failed",
+        ],
+    )
+    .await?;
 
     // ============================================================================
     // SECTION 10: dmesg/kernel messages
@@ -242,7 +425,12 @@ async fn network_debug_impl(network: &str) -> Result<()> {
     println!("│  SECTION 11: FC-AGENT LOGS                                  │");
     println!("└──────────────────────────────────────────────────────────────┘");
 
-    dump_command(fcvm_pid, "journalctl -u fc-agent", &["journalctl", "-u", "fc-agent", "--no-pager", "-n", "50"]).await?;
+    dump_command(
+        fcvm_pid,
+        "journalctl -u fc-agent",
+        &["journalctl", "-u", "fc-agent", "--no-pager", "-n", "50"],
+    )
+    .await?;
 
     // ============================================================================
     // SECTION 12: Podman container status (if running)
@@ -253,7 +441,16 @@ async fn network_debug_impl(network: &str) -> Result<()> {
     println!("└──────────────────────────────────────────────────────────────┘");
 
     dump_command(fcvm_pid, "podman ps", &["podman", "ps", "-a"]).await?;
-    dump_command(fcvm_pid, "podman logs (first container)", &["sh", "-c", "podman logs $(podman ps -q | head -1) 2>&1 | tail -30 || echo 'no containers'"]).await?;
+    dump_command(
+        fcvm_pid,
+        "podman logs (first container)",
+        &[
+            "sh",
+            "-c",
+            "podman logs $(podman ps -q | head -1) 2>&1 | tail -30 || echo 'no containers'",
+        ],
+    )
+    .await?;
 
     // ============================================================================
     // CLEANUP
