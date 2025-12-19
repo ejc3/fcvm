@@ -219,6 +219,8 @@ jobs:
           lsmod | grep kvm || echo "No KVM modules"
       - name: Setup KVM permissions
         run: sudo chmod 666 /dev/kvm
+      - name: Setup network namespace directory
+        run: sudo mkdir -p /var/run/netns
       - name: Run VM sanity test (bridged)
         working-directory: fcvm
         run: |
