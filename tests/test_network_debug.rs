@@ -43,7 +43,7 @@ async fn network_debug_impl(network: &str) -> Result<()> {
     // Start the VM
     println!("\n>>> Starting VM...");
     let vm_name = format!("netdebug-{}", network);
-    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
+    let (child, fcvm_pid) = common::spawn_fcvm(&[
         "podman",
         "run",
         "--name",
