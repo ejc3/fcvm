@@ -2,3 +2,7 @@ target/
 artifacts/
 .container-built
 sync-test/
+
+# Local settings (machine-specific)
+*.local.*
+*.local
