@@ -247,12 +247,51 @@ async fn extract_root_partition(qcow2_path: &Path, output_path: &Path) -> Result
         );
     }
 
-    // Wait a moment for partitions to appear
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    // Force kernel to re-read partition table - required on some systems (e.g., CI runners)
+    // Try partprobe first (from parted), fall back to partx (from util-linux)
+    info!("scanning partition table");
+    let partprobe_result = Command::new("partprobe").arg(nbd_device).output().await;
+    if partprobe_result.is_err()
+        || !partprobe_result
+            .as_ref()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    {
+        // Fallback to partx
+        let _ = Command::new("partx")
+            .args(["-a", nbd_device])
+            .output()
+            .await;
+    }
 
-    // Copy the first partition (root filesystem) to output file
-    // Cloud images typically have partition 1 as the root filesystem
+    // Wait for partition to appear with retry loop
     let partition = format!("{}p1", nbd_device);
+    let mut retries = 10;
+    while retries > 0 && !std::path::Path::new(&partition).exists() {
+        info!(
+            partition = %partition,
+            retries_left = retries,
+            "waiting for partition to appear"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        retries -= 1;
+    }
+
+    if !std::path::Path::new(&partition).exists() {
+        // List what devices exist for debugging
+        let ls_output = Command::new("ls")
+            .args(["-la", "/dev/nbd0*"])
+            .output()
+            .await;
+        let devices = ls_output
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_else(|_| "failed to list".to_string());
+        bail!(
+            "partition {} not found after waiting. Available: {}",
+            partition,
+            devices
+        );
+    }
 
     info!(partition = %partition, "copying root partition");
     let output = Command::new("dd")
