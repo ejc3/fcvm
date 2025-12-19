@@ -505,23 +505,40 @@ async fn customize_ubuntu_cloud_image(image_path: &Path) -> Result<()> {
     let dns_setup_script = r#"#!/bin/bash
 # Extract gateway from kernel cmdline and configure as DNS
 # Format: ip=<client>::<gateway>:<netmask>::eth0:off[:<dns>]
+set -e
+
+echo "[fcvm-dns] starting DNS configuration"
 CMDLINE=$(cat /proc/cmdline)
+echo "[fcvm-dns] cmdline: $CMDLINE"
+
 if [[ $CMDLINE =~ ip=([^[:space:]]+) ]]; then
     IP_PARAM="${BASH_REMATCH[1]}"
+    echo "[fcvm-dns] ip param: $IP_PARAM"
     # Extract gateway (3rd field, after ::)
     GATEWAY=$(echo "$IP_PARAM" | cut -d: -f3)
     # Check if explicit DNS was provided (8th field)
     DNS=$(echo "$IP_PARAM" | cut -d: -f8)
+    echo "[fcvm-dns] gateway=$GATEWAY dns=$DNS"
     if [ -n "$DNS" ]; then
         # Use explicit DNS from boot args
         echo "nameserver $DNS" > /etc/resolv.conf
-        echo "[fcvm-dns] Configured DNS from boot args: $DNS"
+        echo "[fcvm-dns] configured DNS from boot args: $DNS"
     elif [ -n "$GATEWAY" ]; then
         # Fall back to gateway as DNS (dnsmasq)
         echo "nameserver $GATEWAY" > /etc/resolv.conf
-        echo "[fcvm-dns] Configured DNS from gateway: $GATEWAY"
+        echo "[fcvm-dns] configured DNS from gateway: $GATEWAY"
+    else
+        echo "[fcvm-dns] ERROR: no DNS or gateway found in ip= parameter"
+        exit 1
     fi
+else
+    echo "[fcvm-dns] ERROR: no ip= parameter found in cmdline"
+    exit 1
 fi
+
+echo "[fcvm-dns] /etc/resolv.conf:"
+cat /etc/resolv.conf
+echo "[fcvm-dns] done"
 "#;
     cmd.arg("--write").arg(format!(
         "/usr/local/bin/fcvm-setup-dns:{}",
@@ -537,7 +554,9 @@ fi
                              [Service]\n\
                              Type=oneshot\n\
                              ExecStart=/usr/local/bin/fcvm-setup-dns\n\
-                             RemainAfterExit=yes\n\n\
+                             RemainAfterExit=yes\n\
+                             StandardOutput=journal+console\n\
+                             StandardError=journal+console\n\n\
                              [Install]\n\
                              WantedBy=sysinit.target\n";
     cmd.arg("--write").arg(format!(
