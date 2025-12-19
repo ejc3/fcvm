@@ -194,7 +194,7 @@ jobs:
 
   test-vm-sanity:
     name: VM Sanity
-    runs-on: ubuntu-latest
+    runs-on: buildjet-32vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
         with:
