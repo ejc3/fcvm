@@ -42,13 +42,14 @@ RUN apt-get update && apt-get install -y \
     # Clean up
     && rm -rf /var/lib/apt/lists/*
 
-# Download and install Firecracker (ARM64)
+# Download and install Firecracker (architecture-aware)
+ARG ARCH=aarch64
 RUN curl -L -o /tmp/firecracker.tgz \
-    https://github.com/firecracker-microvm/firecracker/releases/download/v1.10.1/firecracker-v1.10.1-aarch64.tgz \
+    https://github.com/firecracker-microvm/firecracker/releases/download/v1.10.1/firecracker-v1.10.1-${ARCH}.tgz \
     && tar -xzf /tmp/firecracker.tgz -C /tmp \
-    && mv /tmp/release-v1.10.1-aarch64/firecracker-v1.10.1-aarch64 /usr/local/bin/firecracker \
+    && mv /tmp/release-v1.10.1-${ARCH}/firecracker-v1.10.1-${ARCH} /usr/local/bin/firecracker \
     && chmod +x /usr/local/bin/firecracker \
-    && rm -rf /tmp/firecracker.tgz /tmp/release-v1.10.1-aarch64
+    && rm -rf /tmp/firecracker.tgz /tmp/release-v1.10.1-${ARCH}
 
 # Build and install pjdfstest (tests expect it at /tmp/pjdfstest-check/)
 RUN git clone --depth 1 https://github.com/pjd/pjdfstest /tmp/pjdfstest-check \

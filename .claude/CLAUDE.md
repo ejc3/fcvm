@@ -234,6 +234,38 @@ All 8789 pjdfstest tests pass when running in a container with proper device cgr
 
 **Why containers work better**: The container runs with `sudo podman` and `--device-cgroup-rule` flags that allow mknod for block/char devices.
 
+## CI and Testing Philosophy
+
+**Use the Makefile.** All test commands are defined there. Never reimplement `podman run` commands - use the existing targets.
+
+### Key Makefile Targets
+
+| Target | What | Root? |
+|--------|------|-------|
+| `make test` | fuse-pipe noroot + root tests | Mixed |
+| `make test-vm` | VM tests (rootless + bridged) | Mixed |
+| `make container-test` | fuse-pipe in container | No |
+| `make container-test-pjdfstest` | 8789 POSIX tests | No |
+| `make container-test-vm` | VM tests in container | No |
+| `make bench` | All fuse-pipe benchmarks | No |
+
+### Path Overrides for CI
+
+Makefile paths can be overridden via environment:
+```bash
+export FUSE_BACKEND_RS=/path/to/fuse-backend-rs
+export FUSER=/path/to/fuser
+make container-test-pjdfstest
+```
+
+### CI Structure
+
+**PR/Push (7 parallel jobs):**
+- Lint, Build, Unit Tests, FUSE Integration, CLI Tests, FUSE Permissions, POSIX Compliance
+
+**Nightly (scheduled):**
+- Full benchmarks with artifact upload
+
 ## PID-Based Process Management
 
 **Core Principle:** All fcvm processes store their own PID (via `std::process::id()`), not child process PIDs.

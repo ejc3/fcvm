@@ -117,7 +117,67 @@ jobs:
         working-directory: fcvm
         run: sudo -E env "PATH=$PATH" cargo test --release -p fuse-pipe --test integration_root -- --test-threads=1
 
-  # Note: FUSE Permissions and pjdfstest require specific user/group setup
-  # that's not available on GitHub runners. Run these locally with:
-  #   make test-root          # permission tests
-  #   make test-pjdfstest     # POSIX compliance
+  test-cli:
+    name: CLI Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fcvm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fcvm
+      - name: Run CLI tests
+        working-directory: fcvm
+        run: cargo test --release --test test_cli_parsing --test test_state_manager
+
+  test-fuse-permissions:
+    name: FUSE Permissions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fcvm
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+      - name: Run permission tests (container)
+        working-directory: fcvm
+        run: |
+          export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
+          export FUSER=${{ github.workspace }}/fuser
+          export CONTAINER_ARCH=x86_64
+          make container-test-root
+
+  test-pjdfstest:
+    name: POSIX Compliance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fcvm
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+      - name: Run pjdfstest (container)
+        working-directory: fcvm
+        run: |
+          export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
+          export FUSER=${{ github.workspace }}/fuser
+          export CONTAINER_ARCH=x86_64
+          make container-test-pjdfstest

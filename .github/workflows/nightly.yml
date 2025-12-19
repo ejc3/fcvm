@@ -1,0 +1,41 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: '0 4 * * *'  # 4 AM UTC daily
+  workflow_dispatch:  # Manual trigger
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmarks:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fcvm
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+      - name: Run benchmarks (container)
+        working-directory: fcvm
+        run: |
+          export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
+          export FUSER=${{ github.workspace }}/fuser
+          export CONTAINER_ARCH=x86_64
+          make container-bench
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.run_id }}
+          path: fcvm/target/criterion/
+          if-no-files-found: warn
