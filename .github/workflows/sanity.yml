@@ -21,7 +21,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ejc3/fuse-backend-rs
-          ref: creds-for-fuse-pipe
+          ref: master
           path: fuse-backend-rs
 
       - name: Checkout fuser fork
@@ -43,10 +43,10 @@ jobs:
 
       - name: Build
         working-directory: fcvm
-        run: make build
+        run: cargo build --release
 
-      - name: Run sanity tests
+      - name: Run fuse-pipe tests
         working-directory: fcvm
-        run: make test-vm
+        run: sudo -E cargo test --release -p fuse-pipe --test integration -- --test-threads=1
         env:
           RUST_LOG: info

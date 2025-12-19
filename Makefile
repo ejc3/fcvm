@@ -122,7 +122,7 @@ setup-btrfs:
 		sudo mkdir -p /mnt/fcvm-btrfs && \
 		sudo mount -o loop /var/fcvm-btrfs.img /mnt/fcvm-btrfs && \
 		sudo mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,state,snapshots,vm-disks,cache} && \
-		sudo chown -R ubuntu:ubuntu /mnt/fcvm-btrfs && \
+		sudo chown -R $$(id -un):$$(id -gn) /mnt/fcvm-btrfs && \
 		echo '==> btrfs ready at /mnt/fcvm-btrfs'; \
 	fi
 
