@@ -327,11 +327,13 @@ CONTAINER_RUN_FUSE := $(CONTAINER_RUN_BASE) \
 	--ulimit nproc=65536:65536 \
 	--pids-limit=-1
 
-# Container run options for fcvm tests (adds KVM, btrfs, netns)
+# Container run options for fcvm tests (adds KVM, btrfs, netns, nbd)
 # Used for bridged mode tests that require root/iptables
+# /dev/nbd0 needed for qemu-nbd rootfs extraction
 CONTAINER_RUN_FCVM := $(CONTAINER_RUN_BASE) \
 	--device /dev/kvm \
 	--device /dev/fuse \
+	--device /dev/nbd0 \
 	-v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	-v /var/run/netns:/var/run/netns:rshared \
 	--network host

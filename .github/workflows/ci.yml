@@ -219,6 +219,10 @@ jobs:
           lsmod | grep kvm || echo "No KVM modules"
       - name: Setup KVM permissions
         run: sudo chmod 666 /dev/kvm
+      - name: Setup NBD module for rootfs extraction
+        run: |
+          sudo modprobe nbd max_part=8
+          ls -la /dev/nbd* | head -5
       - name: Setup network namespace directory
         run: sudo mkdir -p /var/run/netns
       - name: Run VM sanity test (bridged)
