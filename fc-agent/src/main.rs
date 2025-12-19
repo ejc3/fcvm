@@ -1408,13 +1408,13 @@ fn configure_dns_from_cmdline() {
     let resolv_conf = format!("nameserver {}\n", nameserver);
     match std::fs::write("/etc/resolv.conf", &resolv_conf) {
         Ok(_) => {
-            eprintln!(
-                "[fc-agent] ✓ configured DNS: nameserver {}",
-                nameserver
-            );
+            eprintln!("[fc-agent] ✓ configured DNS: nameserver {}", nameserver);
         }
         Err(e) => {
-            eprintln!("[fc-agent] WARNING: failed to write /etc/resolv.conf: {}", e);
+            eprintln!(
+                "[fc-agent] WARNING: failed to write /etc/resolv.conf: {}",
+                e
+            );
         }
     }
 }
