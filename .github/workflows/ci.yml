@@ -253,6 +253,12 @@ jobs:
           echo "=== IP forwarding status ==="
           cat /proc/sys/net/ipv4/ip_forward
           echo ""
+          echo "=== iptables FORWARD chain (filter table) ==="
+          sudo iptables -L FORWARD -v -n
+          echo ""
+          echo "=== iptables POSTROUTING chain (nat table) ==="
+          sudo iptables -t nat -L POSTROUTING -v -n
+          echo ""
           echo "=== dnsmasq status ==="
           sudo systemctl status dnsmasq || true
           echo ""
@@ -261,6 +267,19 @@ jobs:
           echo ""
           echo "=== Test DNS resolution from host ==="
           nslookup public.ecr.aws 8.8.8.8 || echo "DNS lookup failed"
+          echo ""
+          echo "=== Test ping from host to 8.8.8.8 ==="
+          ping -c 2 8.8.8.8 || echo "host ping to 8.8.8.8 failed"
+      - name: Setup iptables for VM networking
+        run: |
+          echo "=== Setting FORWARD chain to ACCEPT ==="
+          sudo iptables -P FORWARD ACCEPT
+          echo "=== Adding MASQUERADE rule for VM subnet ==="
+          sudo iptables -t nat -A POSTROUTING -s 172.30.0.0/16 -o eth0 -j MASQUERADE || true
+          echo "=== Final FORWARD chain ==="
+          sudo iptables -L FORWARD -v -n
+          echo "=== Final NAT POSTROUTING ==="
+          sudo iptables -t nat -L POSTROUTING -v -n
       - name: Run VM sanity test (bridged)
         working-directory: fcvm
         run: |
