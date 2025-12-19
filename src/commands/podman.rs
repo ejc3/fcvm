@@ -755,12 +755,11 @@ async fn run_vm_setup(
         let guest_ip_clean = guest_ip.split('/').next().unwrap_or(guest_ip);
         let host_ip_clean = host_ip.split('/').next().unwrap_or(host_ip);
 
-        // Only add explicit DNS to boot args for rootless mode (slirp4netns DNS at 10.0.2.3)
-        // Bridged mode uses guest's default DNS config which works through NAT
+        // Always pass DNS in boot args - gateway IP where dnsmasq listens
+        // This avoids relying on NAT to reach external DNS (8.8.8.8)
         let dns_suffix = network_config
             .dns_server
             .as_ref()
-            .filter(|dns| dns.as_str() != host_ip_clean)
             .map(|dns| format!(":{}", dns))
             .unwrap_or_default();
 
