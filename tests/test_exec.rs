@@ -107,7 +107,14 @@ async fn exec_test_impl(network: &str) -> Result<()> {
         &fcvm_path,
         fcvm_pid,
         false,
-        &["wget", "-q", "-O", "-", "--timeout=10", "http://ifconfig.me"],
+        &[
+            "wget",
+            "-q",
+            "-O",
+            "-",
+            "--timeout=10",
+            "http://ifconfig.me",
+        ],
     )
     .await?;
     let container_ip = output.trim();
@@ -141,7 +148,8 @@ async fn exec_test_impl(network: &str) -> Result<()> {
     // Test 9: TTY allocated WITH -t flag (VM exec)
     // Uses `script` to provide a PTY for the test harness
     println!("\nTest 9: TTY with -t flag (VM)");
-    let output = run_exec_with_tty(&fcvm_path, fcvm_pid, ExecFlags::vm().with_tty(), &["tty"]).await?;
+    let output =
+        run_exec_with_tty(&fcvm_path, fcvm_pid, ExecFlags::vm().with_tty(), &["tty"]).await?;
     println!("  tty output: {}", output.trim());
     // With TTY, should return a device path like /dev/pts/0
     assert!(
@@ -152,7 +160,13 @@ async fn exec_test_impl(network: &str) -> Result<()> {
 
     // Test 10: TTY allocated WITH -t flag (container exec)
     println!("\nTest 10: TTY with -t flag (container)");
-    let output = run_exec_with_tty(&fcvm_path, fcvm_pid, ExecFlags::container().with_tty(), &["tty"]).await?;
+    let output = run_exec_with_tty(
+        &fcvm_path,
+        fcvm_pid,
+        ExecFlags::container().with_tty(),
+        &["tty"],
+    )
+    .await?;
     println!("  tty output: {}", output.trim());
     assert!(
         output.contains("/dev/"),

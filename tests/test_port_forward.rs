@@ -35,10 +35,14 @@ fn test_port_forward_bridged() -> Result<()> {
     // Start VM with port forwarding
     let mut fcvm = Command::new(&fcvm_path)
         .args([
-            "podman", "run",
-            "--name", "port-test",
-            "--network", "bridged",
-            "--publish", "18080:80",
+            "podman",
+            "run",
+            "--name",
+            "port-test",
+            "--network",
+            "bridged",
+            "--publish",
+            "18080:80",
             "nginx:alpine",
         ])
         .spawn()
@@ -99,10 +103,19 @@ fn test_port_forward_bridged() -> Result<()> {
         .context("curl to guest")?;
 
     let direct_works = output.status.success() && !output.stdout.is_empty();
-    println!("Direct access: {}", if direct_works { "OK" } else { "FAIL" });
+    println!(
+        "Direct access: {}",
+        if direct_works { "OK" } else { "FAIL" }
+    );
 
     if direct_works {
-        println!("Response: {}", String::from_utf8_lossy(&output.stdout).lines().next().unwrap_or(""));
+        println!(
+            "Response: {}",
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+        );
     }
 
     // Test 2: Access via forwarded port (external interface)
@@ -119,12 +132,20 @@ fn test_port_forward_bridged() -> Result<()> {
 
     println!("Testing access via host IP {}:18080...", host_ip);
     let output = Command::new("curl")
-        .args(["-s", "--max-time", "5", &format!("http://{}:18080", host_ip)])
+        .args([
+            "-s",
+            "--max-time",
+            "5",
+            &format!("http://{}:18080", host_ip),
+        ])
         .output()
         .context("curl to forwarded port")?;
 
     let forward_works = output.status.success() && !output.stdout.is_empty();
-    println!("Forwarded port (host IP): {}", if forward_works { "OK" } else { "FAIL" });
+    println!(
+        "Forwarded port (host IP): {}",
+        if forward_works { "OK" } else { "FAIL" }
+    );
 
     // Test 3: Access via localhost (this is the tricky one)
     println!("Testing access via localhost:18080...");
@@ -134,7 +155,10 @@ fn test_port_forward_bridged() -> Result<()> {
         .context("curl to localhost")?;
 
     let localhost_works = output.status.success() && !output.stdout.is_empty();
-    println!("Localhost access: {}", if localhost_works { "OK" } else { "FAIL" });
+    println!(
+        "Localhost access: {}",
+        if localhost_works { "OK" } else { "FAIL" }
+    );
 
     // Cleanup
     println!("Cleaning up...");
@@ -148,7 +172,10 @@ fn test_port_forward_bridged() -> Result<()> {
     // Assertions - ALL port forwarding methods must work
     assert!(direct_works, "Direct access to guest should work");
     assert!(forward_works, "Port forwarding via host IP should work");
-    assert!(localhost_works, "Localhost port forwarding should work (requires route_localnet)");
+    assert!(
+        localhost_works,
+        "Localhost port forwarding should work (requires route_localnet)"
+    );
 
     println!("test_port_forward_bridged PASSED");
     Ok(())
@@ -168,10 +195,14 @@ fn test_port_forward_rootless() -> Result<()> {
     // Use unprivileged port 8080 since rootless can't bind to 80
     let mut fcvm = Command::new(&fcvm_path)
         .args([
-            "podman", "run",
-            "--name", "port-test-rootless",
-            "--network", "rootless",
-            "--publish", "8080:80",
+            "podman",
+            "run",
+            "--name",
+            "port-test-rootless",
+            "--network",
+            "rootless",
+            "--publish",
+            "8080:80",
             "nginx:alpine",
         ])
         .spawn()
@@ -228,15 +259,29 @@ fn test_port_forward_rootless() -> Result<()> {
     // In rootless mode, each VM gets a unique 127.x.y.z IP
     println!("Testing access via loopback IP {}:8080...", loopback_ip);
     let output = Command::new("curl")
-        .args(["-s", "--max-time", "5", &format!("http://{}:8080", loopback_ip)])
+        .args([
+            "-s",
+            "--max-time",
+            "5",
+            &format!("http://{}:8080", loopback_ip),
+        ])
         .output()
         .context("curl to loopback")?;
 
     let loopback_works = output.status.success() && !output.stdout.is_empty();
-    println!("Loopback access: {}", if loopback_works { "OK" } else { "FAIL" });
+    println!(
+        "Loopback access: {}",
+        if loopback_works { "OK" } else { "FAIL" }
+    );
 
     if loopback_works {
-        println!("Response: {}", String::from_utf8_lossy(&output.stdout).lines().next().unwrap_or(""));
+        println!(
+            "Response: {}",
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+        );
     }
 
     // Cleanup
@@ -249,7 +294,10 @@ fn test_port_forward_rootless() -> Result<()> {
     let _ = fcvm.wait();
 
     // Assertions
-    assert!(loopback_works, "Rootless port forwarding via loopback IP should work");
+    assert!(
+        loopback_works,
+        "Rootless port forwarding via loopback IP should work"
+    );
 
     println!("test_port_forward_rootless PASSED");
     Ok(())

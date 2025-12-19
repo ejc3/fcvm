@@ -376,7 +376,10 @@ async fn kill_stale_tcp_connections() {
         let connections = String::from_utf8_lossy(&o.stdout);
         let count = connections.lines().count().saturating_sub(1); // Subtract header line
         if count > 0 {
-            eprintln!("[fc-agent] found {} established TCP connection(s) to kill", count);
+            eprintln!(
+                "[fc-agent] found {} established TCP connection(s) to kill",
+                count
+            );
             for line in connections.lines().skip(1) {
                 eprintln!("[fc-agent]   {}", line);
             }
@@ -406,10 +409,7 @@ async fn kill_stale_tcp_connections() {
                 eprintln!("[fc-agent] ss -K not supported, trying conntrack");
                 kill_connections_via_conntrack().await;
             } else {
-                eprintln!(
-                    "[fc-agent] WARNING: ss -K failed: {}",
-                    stderr
-                );
+                eprintln!("[fc-agent] WARNING: ss -K failed: {}", stderr);
             }
         }
         Err(e) => {
@@ -425,10 +425,7 @@ async fn kill_stale_tcp_connections() {
 /// This works for NAT'd connections tracked by nf_conntrack
 async fn kill_connections_via_conntrack() {
     // conntrack -F flushes the connection tracking table
-    let output = Command::new("conntrack")
-        .args(["-F"])
-        .output()
-        .await;
+    let output = Command::new("conntrack").args(["-F"]).output().await;
 
     match output {
         Ok(o) if o.status.success() => {
@@ -632,12 +629,14 @@ impl std::os::unix::io::AsRawFd for VsockListener {
 
 /// Run the exec server that listens for commands from host via vsock
 async fn run_exec_server() {
-    eprintln!("[fc-agent] starting exec server on vsock port {}", EXEC_VSOCK_PORT);
+    eprintln!(
+        "[fc-agent] starting exec server on vsock port {}",
+        EXEC_VSOCK_PORT
+    );
 
     // Create vsock listener socket
-    let listener_fd = unsafe {
-        libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0)
-    };
+    let listener_fd =
+        unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
 
     if listener_fd < 0 {
         eprintln!(
@@ -684,7 +683,10 @@ async fn run_exec_server() {
         return;
     }
 
-    eprintln!("[fc-agent] ✓ exec server listening on vsock port {}", EXEC_VSOCK_PORT);
+    eprintln!(
+        "[fc-agent] ✓ exec server listening on vsock port {}",
+        EXEC_VSOCK_PORT
+    );
 
     // Wrap in AsyncFd for async accept
     let listener = VsockListener { fd: listener_fd };
@@ -714,7 +716,7 @@ async fn run_exec_server() {
                 listener_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                libc::SOCK_CLOEXEC,  // Don't set NONBLOCK for client - we'll use blocking I/O
+                libc::SOCK_CLOEXEC, // Don't set NONBLOCK for client - we'll use blocking I/O
             )
         };
 
@@ -875,8 +877,11 @@ fn handle_exec_tty(fd: i32, request: &ExecRequest) {
             for arg in &request.command {
                 args.push(std::ffi::CString::new(arg.as_str()).unwrap());
             }
-            let arg_ptrs: Vec<*const libc::c_char> =
-                args.iter().map(|s| s.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
+            let arg_ptrs: Vec<*const libc::c_char> = args
+                .iter()
+                .map(|s| s.as_ptr())
+                .chain(std::iter::once(std::ptr::null()))
+                .collect();
             unsafe {
                 libc::execvp(args[0].as_ptr(), arg_ptrs.as_ptr());
             }
@@ -887,8 +892,11 @@ fn handle_exec_tty(fd: i32, request: &ExecRequest) {
                 .iter()
                 .map(|s| std::ffi::CString::new(s.as_str()).unwrap())
                 .collect();
-            let arg_ptrs: Vec<*const libc::c_char> =
-                args.iter().map(|s| s.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
+            let arg_ptrs: Vec<*const libc::c_char> = args
+                .iter()
+                .map(|s| s.as_ptr())
+                .chain(std::iter::once(std::ptr::null()))
+                .collect();
             unsafe {
                 libc::execvp(prog.as_ptr(), arg_ptrs.as_ptr());
             }
@@ -915,9 +923,8 @@ fn handle_exec_tty(fd: i32, request: &ExecRequest) {
             if n <= 0 {
                 break;
             }
-            let written = unsafe {
-                libc::write(master_fd, buf.as_ptr() as *const libc::c_void, n as usize)
-            };
+            let written =
+                unsafe { libc::write(master_fd, buf.as_ptr() as *const libc::c_void, n as usize) };
             if written <= 0 {
                 break;
             }
@@ -932,13 +939,13 @@ fn handle_exec_tty(fd: i32, request: &ExecRequest) {
             if done_reader.load(Ordering::Relaxed) {
                 break;
             }
-            let n = unsafe { libc::read(master_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            let n =
+                unsafe { libc::read(master_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n <= 0 {
                 break;
             }
-            let written = unsafe {
-                libc::write(fd, buf.as_ptr() as *const libc::c_void, n as usize)
-            };
+            let written =
+                unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, n as usize) };
             if written <= 0 {
                 break;
             }
@@ -1464,7 +1471,10 @@ async fn main() -> Result<()> {
         const RETRY_DELAY_SECS: u64 = 2;
 
         for attempt in 1..=MAX_RETRIES {
-            eprintln!("[fc-agent] pulling image: {} (attempt {}/{})", plan.image, attempt, MAX_RETRIES);
+            eprintln!(
+                "[fc-agent] pulling image: {} (attempt {}/{})",
+                plan.image, attempt, MAX_RETRIES
+            );
 
             let output = Command::new("podman")
                 .arg("pull")
@@ -1485,7 +1495,11 @@ async fn main() -> Result<()> {
                 eprintln!("[fc-agent] retrying in {} seconds...", RETRY_DELAY_SECS);
                 tokio::time::sleep(std::time::Duration::from_secs(RETRY_DELAY_SECS)).await;
             } else {
-                anyhow::bail!("Failed to pull image after {} attempts: {}", MAX_RETRIES, stderr.trim());
+                anyhow::bail!(
+                    "Failed to pull image after {} attempts: {}",
+                    MAX_RETRIES,
+                    stderr.trim()
+                );
             }
         }
     }

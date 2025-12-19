@@ -494,7 +494,9 @@ pub async fn setup_in_namespace_nat(
         .unwrap_or(&config.host_veth_ip_cidr);
     let output = exec_in_namespace(
         ns_name,
-        &["ip", "route", "add", "default", "via", host_ip, "dev", veth_name],
+        &[
+            "ip", "route", "add", "default", "via", host_ip, "dev", veth_name,
+        ],
     )
     .await?;
     if !output.status.success() {
@@ -505,11 +507,7 @@ pub async fn setup_in_namespace_nat(
     }
 
     // Step 6: Enable IP forwarding inside namespace
-    let output = exec_in_namespace(
-        ns_name,
-        &["sysctl", "-w", "net.ipv4.ip_forward=1"],
-    )
-    .await?;
+    let output = exec_in_namespace(ns_name, &["sysctl", "-w", "net.ipv4.ip_forward=1"]).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("failed to enable IP forwarding in namespace: {}", stderr);
@@ -520,8 +518,15 @@ pub async fn setup_in_namespace_nat(
     let output = exec_in_namespace(
         ns_name,
         &[
-            "iptables", "-t", "nat", "-A", "POSTROUTING",
-            "-o", veth_name, "-j", "MASQUERADE",
+            "iptables",
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-o",
+            veth_name,
+            "-j",
+            "MASQUERADE",
         ],
     )
     .await?;
@@ -533,13 +538,27 @@ pub async fn setup_in_namespace_nat(
     // Step 8: Add DNAT rule for incoming traffic to reach the guest
     // This allows health checks from host to reach the guest via the veth IP
     // Host connects to veth_ip:80 → DNAT to guest_ip:80
-    let veth_ip = config.veth_ip_cidr.split('/').next().unwrap_or(&config.veth_ip_cidr);
+    let veth_ip = config
+        .veth_ip_cidr
+        .split('/')
+        .next()
+        .unwrap_or(&config.veth_ip_cidr);
     let output = exec_in_namespace(
         ns_name,
         &[
-            "iptables", "-t", "nat", "-A", "PREROUTING",
-            "-d", veth_ip, "-p", "tcp",
-            "-j", "DNAT", "--to-destination", &config.guest_ip,
+            "iptables",
+            "-t",
+            "nat",
+            "-A",
+            "PREROUTING",
+            "-d",
+            veth_ip,
+            "-p",
+            "tcp",
+            "-j",
+            "DNAT",
+            "--to-destination",
+            &config.guest_ip,
         ],
     )
     .await?;

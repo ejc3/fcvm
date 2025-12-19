@@ -67,8 +67,13 @@ impl CloneFixture {
         eprintln!("  Starting baseline VM...");
         let child = Command::new(&fcvm)
             .args([
-                "podman", "run", "--name", &baseline_name,
-                "--network", network, TEST_IMAGE,
+                "podman",
+                "run",
+                "--name",
+                &baseline_name,
+                "--network",
+                network,
+                TEST_IMAGE,
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -92,8 +97,15 @@ impl CloneFixture {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 if let Ok(vms) = serde_json::from_str::<Vec<VmLsEntry>>(&stdout) {
-                    if vms.first().map(|v| v.health_status == "healthy").unwrap_or(false) {
-                        eprintln!("  Baseline healthy after {:.1}s", start.elapsed().as_secs_f64());
+                    if vms
+                        .first()
+                        .map(|v| v.health_status == "healthy")
+                        .unwrap_or(false)
+                    {
+                        eprintln!(
+                            "  Baseline healthy after {:.1}s",
+                            start.elapsed().as_secs_f64()
+                        );
                         break;
                     }
                 }
@@ -105,9 +117,12 @@ impl CloneFixture {
         eprintln!("  Creating snapshot...");
         let output = Command::new(&fcvm)
             .args([
-                "snapshot", "create",
-                "--pid", &baseline_pid.to_string(),
-                "--tag", &snapshot_name,
+                "snapshot",
+                "create",
+                "--pid",
+                &baseline_pid.to_string(),
+                "--tag",
+                &snapshot_name,
             ])
             .output()
             .expect("failed to create snapshot");
@@ -155,10 +170,14 @@ impl CloneFixture {
 
         let output = Command::new(&fcvm)
             .args([
-                "snapshot", "run",
-                "--pid", &self.serve_pid.to_string(),
-                "--network", network,
-                "--exec", cmd,
+                "snapshot",
+                "run",
+                "--pid",
+                &self.serve_pid.to_string(),
+                "--network",
+                network,
+                "--exec",
+                cmd,
             ])
             .output()
             .expect("failed to run snapshot run --exec");
@@ -181,9 +200,12 @@ impl CloneFixture {
         // Spawn clone (without --exec so it stays running)
         let mut child = Command::new(&fcvm)
             .args([
-                "snapshot", "run",
-                "--pid", &self.serve_pid.to_string(),
-                "--network", network,
+                "snapshot",
+                "run",
+                "--pid",
+                &self.serve_pid.to_string(),
+                "--network",
+                network,
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -195,7 +217,9 @@ impl CloneFixture {
         // Poll for healthy and get loopback IP
         let (loopback_ip, health_port) = loop {
             if start.elapsed() > Duration::from_secs(30) {
-                let _ = Command::new("kill").args(["-9", &clone_pid.to_string()]).output();
+                let _ = Command::new("kill")
+                    .args(["-9", &clone_pid.to_string()])
+                    .output();
                 panic!("clone failed to become healthy within 30s");
             }
 
@@ -209,7 +233,11 @@ impl CloneFixture {
                 if let Ok(vms) = serde_json::from_str::<Vec<VmLsEntry>>(&stdout) {
                     if let Some(vm) = vms.first() {
                         if vm.health_status == "healthy" {
-                            let ip = vm.config.network.loopback_ip.clone()
+                            let ip = vm
+                                .config
+                                .network
+                                .loopback_ip
+                                .clone()
                                 .expect("no loopback_ip for healthy clone");
                             let port = vm.config.network.health_check_port.unwrap_or(8080);
                             break (ip, port);
@@ -223,11 +251,17 @@ impl CloneFixture {
         // Make HTTP request to nginx
         let addr = format!("{}:{}", loopback_ip, health_port);
         let mut stream = TcpStream::connect(&addr).expect("failed to connect to nginx");
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
 
         let request = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-        stream.write_all(request.as_bytes()).expect("failed to send HTTP request");
+        stream
+            .write_all(request.as_bytes())
+            .expect("failed to send HTTP request");
 
         let mut response = Vec::new();
         let _ = stream.read_to_end(&mut response);
@@ -235,11 +269,16 @@ impl CloneFixture {
         // Verify we got a valid response
         let response_str = String::from_utf8_lossy(&response);
         if !response_str.contains("200 OK") {
-            panic!("unexpected HTTP response: {}", &response_str[..std::cmp::min(200, response_str.len())]);
+            panic!(
+                "unexpected HTTP response: {}",
+                &response_str[..std::cmp::min(200, response_str.len())]
+            );
         }
 
         // Kill the clone
-        let _ = Command::new("kill").args(["-TERM", &clone_pid.to_string()]).output();
+        let _ = Command::new("kill")
+            .args(["-TERM", &clone_pid.to_string()])
+            .output();
 
         // Wait for child to exit
         let kill_start = Instant::now();
@@ -248,7 +287,9 @@ impl CloneFixture {
                 Ok(Some(_)) => break,
                 Ok(None) => {
                     if kill_start.elapsed() > Duration::from_secs(5) {
-                        let _ = Command::new("kill").args(["-9", &clone_pid.to_string()]).output();
+                        let _ = Command::new("kill")
+                            .args(["-9", &clone_pid.to_string()])
+                            .output();
                         let _ = child.wait();
                         break;
                     }
@@ -262,11 +303,19 @@ impl CloneFixture {
     }
 
     fn kill(&self) {
-        let _ = Command::new("kill").args(["-TERM", &self.serve_pid.to_string()]).output();
-        let _ = Command::new("kill").args(["-TERM", &self.baseline_pid.to_string()]).output();
+        let _ = Command::new("kill")
+            .args(["-TERM", &self.serve_pid.to_string()])
+            .output();
+        let _ = Command::new("kill")
+            .args(["-TERM", &self.baseline_pid.to_string()])
+            .output();
         std::thread::sleep(Duration::from_secs(2));
-        let _ = Command::new("kill").args(["-9", &self.serve_pid.to_string()]).output();
-        let _ = Command::new("kill").args(["-9", &self.baseline_pid.to_string()]).output();
+        let _ = Command::new("kill")
+            .args(["-9", &self.serve_pid.to_string()])
+            .output();
+        let _ = Command::new("kill")
+            .args(["-9", &self.baseline_pid.to_string()])
+            .output();
     }
 }
 

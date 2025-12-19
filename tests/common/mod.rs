@@ -46,7 +46,7 @@ impl VmFixture {
             "--name",
             &vm_name,
             "--network",
-            "bridged",  // Use bridged for more reliable health checks
+            "bridged", // Use bridged for more reliable health checks
             "--map",
             &map_arg,
             "--",
@@ -320,7 +320,16 @@ pub async fn exec_in_vm(pid: u32, cmd: &[&str]) -> anyhow::Result<String> {
     let script = cmd.join(" ");
 
     let output = tokio::process::Command::new(&fcvm_path)
-        .args(["exec", "--pid", &pid.to_string(), "--vm", "--", "sh", "-c", &script])
+        .args([
+            "exec",
+            "--pid",
+            &pid.to_string(),
+            "--vm",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
         .output()
         .await?;
 
@@ -504,4 +513,3 @@ pub async fn poll_serve_ready(
         sleep(Duration::from_millis(50)).await;
     }
 }
-

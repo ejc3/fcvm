@@ -135,7 +135,9 @@ pub fn base_rootfs() -> PathBuf {
         return user_path;
     }
     // Fall back to system location
-    let system_path = PathBuf::from(DEFAULT_BASE_DIR).join("rootfs").join("base.ext4");
+    let system_path = PathBuf::from(DEFAULT_BASE_DIR)
+        .join("rootfs")
+        .join("base.ext4");
     if system_path.exists() {
         return system_path;
     }

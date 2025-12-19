@@ -40,7 +40,11 @@ async fn test_egress_stress_rootless() -> Result<()> {
     egress_stress_impl("rootless", NUM_CLONES, REQUESTS_PER_CLONE).await
 }
 
-async fn egress_stress_impl(network: &str, num_clones: usize, requests_per_clone: usize) -> Result<()> {
+async fn egress_stress_impl(
+    network: &str,
+    num_clones: usize,
+    requests_per_clone: usize,
+) -> Result<()> {
     let test_name = format!("egress-stress-{}", network);
 
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
@@ -51,9 +55,15 @@ async fn egress_stress_impl(network: &str, num_clones: usize, requests_per_clone
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
     // Step 0: Start local HTTP server
-    println!("Step 0: Starting local HTTP server on port {}...", HTTP_SERVER_PORT);
+    println!(
+        "Step 0: Starting local HTTP server on port {}...",
+        HTTP_SERVER_PORT
+    );
     let http_server = start_http_server(HTTP_SERVER_PORT).await?;
-    println!("  ✓ HTTP server started (PID: {})", http_server.id().unwrap_or(0));
+    println!(
+        "  ✓ HTTP server started (PID: {})",
+        http_server.id().unwrap_or(0)
+    );
 
     // Determine the URL that VMs will use to test egress
     // For bridged mode, we use the host's primary network interface IP. Traffic to this IP
@@ -78,7 +88,15 @@ async fn egress_stress_impl(network: &str, num_clones: usize, requests_per_clone
     println!("\nStep 1: Starting baseline VM '{}'...", baseline_name);
 
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
-        &["podman", "run", "--name", &baseline_name, "--network", network, common::TEST_IMAGE],
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            network,
+            common::TEST_IMAGE,
+        ],
         &baseline_name,
     )
     .await
@@ -115,8 +133,12 @@ async fn egress_stress_impl(network: &str, num_clones: usize, requests_per_clone
     let http_code = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() || http_code.trim() != "200" {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!("  Baseline egress failed: status={}, code='{}', stderr='{}'",
-            output.status, http_code.trim(), stderr.lines().next().unwrap_or(""));
+        eprintln!(
+            "  Baseline egress failed: status={}, code='{}', stderr='{}'",
+            output.status,
+            http_code.trim(),
+            stderr.lines().next().unwrap_or("")
+        );
         common::kill_process(baseline_pid).await;
         stop_http_server(http_server).await;
         anyhow::bail!("Baseline egress verification failed");
@@ -155,12 +177,10 @@ async fn egress_stress_impl(network: &str, num_clones: usize, requests_per_clone
 
     // Step 3: Start memory server
     println!("\nStep 3: Starting memory server...");
-    let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "serve", &snapshot_name],
-        "uffd-server",
-    )
-    .await
-    .context("spawning memory server")?;
+    let (_serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server")
+            .await
+            .context("spawning memory server")?;
 
     // Wait for server to be ready
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -178,7 +198,16 @@ async fn egress_stress_impl(network: &str, num_clones: usize, requests_per_clone
 
         let handle = tokio::spawn(async move {
             let (_child, pid) = common::spawn_fcvm_with_logs(
-                &["snapshot", "run", "--pid", &spid_str, "--name", &name, "--network", &net],
+                &[
+                    "snapshot",
+                    "run",
+                    "--pid",
+                    &spid_str,
+                    "--name",
+                    &name,
+                    "--network",
+                    &net,
+                ],
                 &name,
             )
             .await?;
@@ -298,8 +327,12 @@ async fn egress_stress_impl(network: &str, num_clones: usize, requests_per_clone
                         if out.status.success() && code.trim() == "200" {
                             success.fetch_add(1, Ordering::Relaxed);
                         } else {
-                            eprintln!("Request failed: status={}, stdout='{}', stderr='{}'",
-                                out.status, code.trim(), stderr.lines().next().unwrap_or(""));
+                            eprintln!(
+                                "Request failed: status={}, stdout='{}', stderr='{}'",
+                                out.status,
+                                code.trim(),
+                                stderr.lines().next().unwrap_or("")
+                            );
                             failure.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -357,10 +390,7 @@ async fn egress_stress_impl(network: &str, num_clones: usize, requests_per_clone
             "\n❌ EGRESS STRESS TEST FAILED! (network: {}, success rate: {:.1}%)",
             network, success_rate
         );
-        anyhow::bail!(
-            "Success rate {:.1}% below threshold 95%",
-            success_rate
-        )
+        anyhow::bail!("Success rate {:.1}% below threshold 95%", success_rate)
     }
 }
 
@@ -379,7 +409,14 @@ async fn start_http_server(port: u16) -> Result<tokio::process::Child> {
 
     // Verify it's running
     let check = tokio::process::Command::new("curl")
-        .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", &format!("http://127.0.0.1:{}/", port)])
+        .args([
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            &format!("http://127.0.0.1:{}/", port),
+        ])
         .output()
         .await?;
 
@@ -425,10 +462,13 @@ async fn get_host_ip_from_state(pid: u32) -> Result<String> {
 
     // Find state file for this PID
     let output = tokio::process::Command::new("bash")
-        .args(["-c", &format!(
-            "grep -l '\"pid\": {}' {}/*.json 2>/dev/null | head -1",
-            pid, state_dir
-        )])
+        .args([
+            "-c",
+            &format!(
+                "grep -l '\"pid\": {}' {}/*.json 2>/dev/null | head -1",
+                pid, state_dir
+            ),
+        ])
         .output()
         .await?;
 
@@ -449,12 +489,12 @@ async fn get_host_ip_from_state(pid: u32) -> Result<String> {
     }
 
     // Read the state file
-    let content = tokio::fs::read_to_string(&state_file).await
+    let content = tokio::fs::read_to_string(&state_file)
+        .await
         .context("reading state file")?;
 
     // Parse JSON and extract host_ip
-    let state: serde_json::Value = serde_json::from_str(&content)
-        .context("parsing state JSON")?;
+    let state: serde_json::Value = serde_json::from_str(&content).context("parsing state JSON")?;
 
     let host_ip = state["config"]["network"]["host_ip"]
         .as_str()

@@ -94,8 +94,16 @@ impl NetworkManager for BridgedNetwork {
             let subnet_base = subnet_within_block * 4;
 
             // Use 10.x.y.0/30 for veth IPs (unique per clone)
-            let host_ip = format!("10.{}.{}.{}", third_octet, subnet_within_block, subnet_base + 1);
-            let veth_subnet = format!("10.{}.{}.{}/30", third_octet, subnet_within_block, subnet_base);
+            let host_ip = format!(
+                "10.{}.{}.{}",
+                third_octet,
+                subnet_within_block,
+                subnet_base + 1
+            );
+            let veth_subnet = format!(
+                "10.{}.{}.{}/30",
+                third_octet, subnet_within_block, subnet_base
+            );
 
             // Guest IP from snapshot (what the guest OS expects)
             let guest_ip = self.guest_ip_override.clone().unwrap_or_default();
@@ -181,7 +189,8 @@ impl NetworkManager for BridgedNetwork {
             // Calculate veth IP inside namespace (host_ip + 1)
             let parts: Vec<&str> = host_ip.split('.').collect();
             let last_octet: u8 = parts[3].parse().unwrap_or(1);
-            let veth_inner_ip = format!("{}.{}.{}.{}", parts[0], parts[1], parts[2], last_octet + 1);
+            let veth_inner_ip =
+                format!("{}.{}.{}.{}", parts[0], parts[1], parts[2], last_octet + 1);
             let veth_inner_ip_cidr = format!("{}/30", veth_inner_ip);
 
             // Health checks for clones go to the veth inner IP, which gets DNATed to guest
