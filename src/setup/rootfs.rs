@@ -161,9 +161,17 @@ async fn download_ubuntu_cloud_image() -> Result<PathBuf> {
         .await
         .context("creating cache directory")?;
 
-    let image_url =
-        "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img";
-    let image_path = cache_dir.join("ubuntu-24.04-arm64.img");
+    // Detect architecture and use appropriate cloud image
+    let (arch_name, cloud_arch) = match std::env::consts::ARCH {
+        "x86_64" => ("amd64", "amd64"),
+        "aarch64" => ("arm64", "arm64"),
+        other => bail!("unsupported architecture: {}", other),
+    };
+
+    let image_url = format!(
+        "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-{cloud_arch}.img"
+    );
+    let image_path = cache_dir.join(format!("ubuntu-24.04-{arch_name}.img"));
 
     // Return cached image if it exists
     if image_path.exists() {
