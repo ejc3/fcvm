@@ -117,73 +117,7 @@ jobs:
         working-directory: fcvm
         run: sudo -E env "PATH=$PATH" cargo test --release -p fuse-pipe --test integration_root -- --test-threads=1
 
-  test-fuse-permissions:
-    name: FUSE Permissions
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: fcvm
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuse-backend-rs
-          ref: master
-          path: fuse-backend-rs
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuser
-          ref: master
-          path: fuser
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: fcvm
-      - name: Build
-        working-directory: fcvm
-        run: cargo build --release -p fuse-pipe
-      - name: Run permission tests
-        working-directory: fcvm
-        run: sudo -E env "PATH=$PATH" cargo test --release -p fuse-pipe --test test_permission_edge_cases -- --test-threads=1
-
-  # Slow jobs only run on push to main (after PR merge)
-
-  test-pjdfstest:
-    name: POSIX Compliance (pjdfstest)
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: fcvm
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuse-backend-rs
-          ref: master
-          path: fuse-backend-rs
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuser
-          ref: master
-          path: fuser
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: fcvm
-      - name: Install pjdfstest dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential autoconf libtap-parser-sourcehandler-pgtap-perl
-      - name: Clone and build pjdfstest
-        run: |
-          git clone https://github.com/pjd/pjdfstest.git
-          cd pjdfstest
-          autoreconf -ifs
-          ./configure
-          make
-      - name: Build fuse-pipe
-        working-directory: fcvm
-        run: cargo build --release -p fuse-pipe
-      - name: Run pjdfstest
-        working-directory: fcvm
-        run: sudo -E env "PATH=$PATH" cargo test --release -p fuse-pipe --test pjdfstest_full -- --test-threads=1 --nocapture
-        timeout-minutes: 30
+  # Note: FUSE Permissions and pjdfstest require specific user/group setup
+  # that's not available on GitHub runners. Run these locally with:
+  #   make test-root          # permission tests
+  #   make test-pjdfstest     # POSIX compliance

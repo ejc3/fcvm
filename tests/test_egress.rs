@@ -57,7 +57,15 @@ async fn egress_fresh_test_impl(network: &str) -> Result<()> {
     // Step 1: Start VM
     println!("Step 1: Starting fresh VM '{}'...", vm_name);
     let (_child, vm_pid) = common::spawn_fcvm_with_logs(
-        &["podman", "run", "--name", &vm_name, "--network", network, common::TEST_IMAGE],
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            network,
+            common::TEST_IMAGE,
+        ],
         &vm_name,
     )
     .await
@@ -68,7 +76,10 @@ async fn egress_fresh_test_impl(network: &str) -> Result<()> {
     println!("  ✓ VM healthy");
 
     // Step 2: Test egress
-    println!("\nStep 2: Testing egress connectivity to {}...", EGRESS_TEST_URL);
+    println!(
+        "\nStep 2: Testing egress connectivity to {}...",
+        EGRESS_TEST_URL
+    );
     let egress_result = test_egress(&fcvm_path, vm_pid).await;
 
     // Cleanup
@@ -108,7 +119,15 @@ async fn egress_clone_test_impl(network: &str) -> Result<()> {
     // Step 1: Start baseline VM
     println!("Step 1: Starting baseline VM '{}'...", baseline_name);
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
-        &["podman", "run", "--name", &baseline_name, "--network", network, common::TEST_IMAGE],
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            network,
+            common::TEST_IMAGE,
+        ],
         &baseline_name,
     )
     .await
@@ -158,12 +177,10 @@ async fn egress_clone_test_impl(network: &str) -> Result<()> {
 
     // Step 3: Start memory server
     println!("\nStep 3: Starting memory server...");
-    let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "serve", &snapshot_name],
-        "uffd-server",
-    )
-    .await
-    .context("spawning memory server")?;
+    let (_serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server")
+            .await
+            .context("spawning memory server")?;
 
     // Wait for serve process to save its state file
     common::poll_serve_state_by_pid(serve_pid, 10).await?;
@@ -173,7 +190,16 @@ async fn egress_clone_test_impl(network: &str) -> Result<()> {
     println!("\nStep 4: Spawning clone '{}'...", clone_name);
     let serve_pid_str = serve_pid.to_string();
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "run", "--pid", &serve_pid_str, "--name", &clone_name, "--network", network],
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid_str,
+            "--name",
+            &clone_name,
+            "--network",
+            network,
+        ],
         &clone_name,
     )
     .await
@@ -187,7 +213,10 @@ async fn egress_clone_test_impl(network: &str) -> Result<()> {
     println!("  ✓ Clone is healthy");
 
     // Step 5: Test egress on clone
-    println!("\nStep 5: Testing clone egress connectivity to {}...", EGRESS_TEST_URL);
+    println!(
+        "\nStep 5: Testing clone egress connectivity to {}...",
+        EGRESS_TEST_URL
+    );
     let clone_egress = test_egress(&fcvm_path, clone_pid).await;
 
     // Cleanup
@@ -254,7 +283,10 @@ async fn test_egress(fcvm_path: &std::path::Path, pid: u32) -> Result<()> {
     println!("    ✓ VM egress succeeded (HTTP 200)");
 
     // Test 2: Container-level egress using wget (available in alpine nginx)
-    println!("  Testing container-level egress (wget to {})...", EGRESS_TEST_URL);
+    println!(
+        "  Testing container-level egress (wget to {})...",
+        EGRESS_TEST_URL
+    );
     let container_output = tokio::process::Command::new(fcvm_path)
         .args([
             "exec",

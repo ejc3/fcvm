@@ -57,7 +57,15 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
     let step1_start = Instant::now();
 
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
-        &["podman", "run", "--name", &baseline_name, "--network", network, common::TEST_IMAGE],
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            network,
+            common::TEST_IMAGE,
+        ],
         &baseline_name,
     )
     .await
@@ -111,12 +119,10 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
     );
     let step3_start = Instant::now();
 
-    let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "serve", &snapshot_name],
-        "uffd-server",
-    )
-    .await
-    .context("spawning memory server")?;
+    let (_serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server")
+            .await
+            .context("spawning memory server")?;
 
     // Wait for serve process to be ready (poll for socket)
     common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
@@ -149,7 +155,16 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
             let spawn_start = Instant::now();
 
             let result = common::spawn_fcvm_with_logs(
-                &["snapshot", "run", "--pid", &serve_pid_str, "--name", &clone_name, "--network", &network],
+                &[
+                    "snapshot",
+                    "run",
+                    "--pid",
+                    &serve_pid_str,
+                    "--name",
+                    &clone_name,
+                    "--network",
+                    &network,
+                ],
                 &clone_name,
             )
             .await;
@@ -375,7 +390,15 @@ async fn test_clone_while_baseline_running() -> Result<()> {
     // Step 1: Start baseline VM (bridged mode for faster startup)
     println!("Step 1: Starting baseline VM...");
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
-        &["podman", "run", "--name", baseline_name, "--network", "bridged", common::TEST_IMAGE],
+        &[
+            "podman",
+            "run",
+            "--name",
+            baseline_name,
+            "--network",
+            "bridged",
+            common::TEST_IMAGE,
+        ],
         baseline_name,
     )
     .await
@@ -413,12 +436,10 @@ async fn test_clone_while_baseline_running() -> Result<()> {
 
     // Step 4: Start memory server
     println!("\nStep 4: Starting memory server...");
-    let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "serve", snapshot_name],
-        "uffd-server",
-    )
-    .await
-    .context("spawning memory server")?;
+    let (_serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", snapshot_name], "uffd-server")
+            .await
+            .context("spawning memory server")?;
 
     // Wait for serve to be ready (poll for socket)
     common::poll_serve_ready(snapshot_name, serve_pid, 30).await?;
@@ -431,7 +452,16 @@ async fn test_clone_while_baseline_running() -> Result<()> {
     let clone_name = "clone-running";
     let serve_pid_str = serve_pid.to_string();
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "run", "--pid", &serve_pid_str, "--name", clone_name, "--network", "bridged"],
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid_str,
+            "--name",
+            clone_name,
+            "--network",
+            "bridged",
+        ],
         clone_name,
     )
     .await
@@ -522,7 +552,15 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
     // Step 1: Start baseline VM
     println!("Step 1: Starting baseline VM...");
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
-        &["podman", "run", "--name", &baseline_name, "--network", network, common::TEST_IMAGE],
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            network,
+            common::TEST_IMAGE,
+        ],
         &baseline_name,
     )
     .await
@@ -559,12 +597,10 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
 
     // Step 3: Start memory server
     println!("\nStep 3: Starting memory server...");
-    let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "serve", &snapshot_name],
-        "uffd-server",
-    )
-    .await
-    .context("spawning memory server")?;
+    let (_serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server")
+            .await
+            .context("spawning memory server")?;
 
     // Wait for serve to be ready (poll for socket)
     common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
@@ -575,7 +611,16 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
     let clone_name = format!("clone-internet-{}", network);
     let serve_pid_str = serve_pid.to_string();
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "run", "--pid", &serve_pid_str, "--name", &clone_name, "--network", network],
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid_str,
+            "--name",
+            &clone_name,
+            "--network",
+            network,
+        ],
         &clone_name,
     )
     .await
@@ -634,7 +679,10 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
     println!("╚═══════════════════════════════════════════════════════════════╝");
 
     if dns_ok && http_ok {
-        println!("\n✅ CLONE INTERNET CONNECTIVITY TEST PASSED! ({})", network);
+        println!(
+            "\n✅ CLONE INTERNET CONNECTIVITY TEST PASSED! ({})",
+            network
+        );
         Ok(())
     } else {
         anyhow::bail!(
@@ -743,7 +791,15 @@ async fn snapshot_run_exec_test_impl(network: &str) -> Result<()> {
     // Step 1: Start baseline VM
     println!("Step 1: Starting baseline VM...");
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
-        &["podman", "run", "--name", &baseline_name, "--network", network, common::TEST_IMAGE],
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            network,
+            common::TEST_IMAGE,
+        ],
         &baseline_name,
     )
     .await
@@ -776,12 +832,10 @@ async fn snapshot_run_exec_test_impl(network: &str) -> Result<()> {
 
     // Step 3: Start memory server
     println!("\nStep 3: Starting memory server...");
-    let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "serve", &snapshot_name],
-        "uffd-server",
-    )
-    .await
-    .context("spawning memory server")?;
+    let (_serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server")
+            .await
+            .context("spawning memory server")?;
 
     // Wait for serve to be ready (poll for socket)
     common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
@@ -808,7 +862,15 @@ async fn snapshot_run_exec_test_impl(network: &str) -> Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     println!("  stdout: {}", stdout.trim());
-    println!("  stderr: {}", stderr.trim().lines().take(5).collect::<Vec<_>>().join("\n          "));
+    println!(
+        "  stderr: {}",
+        stderr
+            .trim()
+            .lines()
+            .take(5)
+            .collect::<Vec<_>>()
+            .join("\n          ")
+    );
 
     // Verify the output contains our test string
     let exec_success = stdout.contains("EXEC_TEST_SUCCESS") || stderr.contains("EXEC_TEST_SUCCESS");

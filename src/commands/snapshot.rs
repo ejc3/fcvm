@@ -664,19 +664,13 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
         loop {
             if poll_start.elapsed() > MAX_VSOCK_WAIT {
-                bail!(
-                    "vsock socket not ready after {:?}",
-                    poll_start.elapsed()
-                );
+                bail!("vsock socket not ready after {:?}", poll_start.elapsed());
             }
 
             // Check if socket exists and is connectable
             if vsock_socket.exists() {
                 if let Ok(_stream) = std::os::unix::net::UnixStream::connect(&vsock_socket) {
-                    debug!(
-                        "vsock socket ready after {:?}",
-                        poll_start.elapsed()
-                    );
+                    debug!("vsock socket ready after {:?}", poll_start.elapsed());
                     break;
                 }
             }
@@ -807,7 +801,11 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
         for vol_config in &volume_configs {
             // Remove clone's socket
-            let clone_socket = PathBuf::from(format!("{}_{}", clone_vsock_base.display(), vol_config.port));
+            let clone_socket = PathBuf::from(format!(
+                "{}_{}",
+                clone_vsock_base.display(),
+                vol_config.port
+            ));
             let _ = std::fs::remove_file(&clone_socket);
         }
     }
@@ -996,10 +994,7 @@ async fn run_clone_setup(
                     .context("running network setup via nsenter")?;
 
                 if output.status.success() {
-                    debug!(
-                        "namespace ready after {:?}",
-                        ns_poll_start.elapsed()
-                    );
+                    debug!("namespace ready after {:?}", ns_poll_start.elapsed());
                     break;
                 }
 
@@ -1007,7 +1002,11 @@ async fn run_clone_setup(
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if stderr.contains("Invalid argument") || stderr.contains("No such process") {
                     if ns_poll_start.elapsed() > MAX_NS_WAIT {
-                        bail!("namespace not ready after {:?}: {}", ns_poll_start.elapsed(), stderr);
+                        bail!(
+                            "namespace not ready after {:?}: {}",
+                            ns_poll_start.elapsed(),
+                            stderr
+                        );
                     }
                     tokio::time::sleep(NS_POLL_INTERVAL).await;
                     continue;
@@ -1055,7 +1054,10 @@ async fn run_clone_setup(
         rootfs_path = disk_result?;
         network_result?;
 
-        info!(holder_pid = holder_pid, "parallel disk + network setup complete");
+        info!(
+            holder_pid = holder_pid,
+            "parallel disk + network setup complete"
+        );
 
         // Step 3: Set holder_pid so VmManager uses nsenter
         vm_manager.set_holder_pid(holder_pid);

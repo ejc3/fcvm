@@ -167,7 +167,10 @@ pub async fn enable_route_localnet(interface: &str) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!("failed to enable route_localnet on {}: {}", interface, stderr);
+        warn!(
+            "failed to enable route_localnet on {}: {}",
+            interface, stderr
+        );
     } else {
         info!(
             interface = %interface,

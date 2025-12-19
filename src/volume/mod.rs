@@ -176,12 +176,8 @@ pub async fn spawn_volume_servers(
     let mut ready_receivers = Vec::with_capacity(configs.len());
 
     for config in configs {
-        let server = VolumeServer::new(config.clone()).with_context(|| {
-            format!(
-                "creating VolumeServer for {}",
-                config.host_path.display()
-            )
-        })?;
+        let server = VolumeServer::new(config.clone())
+            .with_context(|| format!("creating VolumeServer for {}", config.host_path.display()))?;
 
         // Create oneshot channel for ready signal
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();

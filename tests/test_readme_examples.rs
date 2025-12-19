@@ -47,12 +47,18 @@ async fn test_readonly_volume() -> Result<()> {
     // Start VM with read-only volume using bridged mode
     let map_arg = format!("{}:/config:ro", host_dir);
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
-        "podman", "run",
-        "--name", &vm_name,
-        "--network", "bridged",
-        "--map", &map_arg,
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        "--map",
+        &map_arg,
         common::TEST_IMAGE,
-    ]).await.context("spawning fcvm")?;
+    ])
+    .await
+    .context("spawning fcvm")?;
     println!("Started VM with PID: {}", fcvm_pid);
 
     // Wait for healthy (longer timeout for FUSE volume setup - vsock connection + mount takes time)
@@ -77,14 +83,21 @@ async fn test_readonly_volume() -> Result<()> {
     println!("Test 2: Writing to read-only mount should fail...");
     let result = common::exec_in_container(
         fcvm_pid,
-        &["sh", "-c", "echo 'new' > /config/readonly.txt 2>&1 || echo WRITE_FAILED"],
-    ).await;
+        &[
+            "sh",
+            "-c",
+            "echo 'new' > /config/readonly.txt 2>&1 || echo WRITE_FAILED",
+        ],
+    )
+    .await;
 
     // Verify write was blocked
     match result {
         Ok(output) => {
             assert!(
-                output.contains("WRITE_FAILED") || output.contains("Read-only") || output.contains("read-only"),
+                output.contains("WRITE_FAILED")
+                    || output.contains("Read-only")
+                    || output.contains("read-only"),
                 "Write should fail on read-only mount, got: {}",
                 output
             );
@@ -130,14 +143,22 @@ async fn test_env_variables() -> Result<()> {
 
     // Start VM with environment variables using bridged mode for reliable health checks
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
-        "podman", "run",
-        "--name", &vm_name,
-        "--network", "bridged",
-        "--env", "MY_VAR=hello_world",
-        "--env", "DEBUG=1",
-        "--env", "COMPLEX_VAR=value with spaces",
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        "--env",
+        "MY_VAR=hello_world",
+        "--env",
+        "DEBUG=1",
+        "--env",
+        "COMPLEX_VAR=value with spaces",
         common::TEST_IMAGE,
-    ]).await.context("spawning fcvm")?;
+    ])
+    .await
+    .context("spawning fcvm")?;
     println!("Started VM with PID: {}", fcvm_pid);
 
     // Wait for healthy with longer timeout for env var processing
@@ -207,13 +228,20 @@ async fn test_custom_resources() -> Result<()> {
 
     // Start VM with custom resources using bridged mode for reliable health checks
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
-        "podman", "run",
-        "--name", &vm_name,
-        "--network", "bridged",
-        "--cpu", "4",
-        "--mem", "1024",
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        "--cpu",
+        "4",
+        "--mem",
+        "1024",
         common::TEST_IMAGE,
-    ]).await.context("spawning fcvm")?;
+    ])
+    .await
+    .context("spawning fcvm")?;
     println!("Started VM with PID: {}", fcvm_pid);
 
     // Wait for healthy
@@ -225,13 +253,10 @@ async fn test_custom_resources() -> Result<()> {
 
     // Test 1: Check CPU count (via /proc/cpuinfo in VM)
     println!("Test 1: Check CPU count...");
-    let output = common::exec_in_vm(fcvm_pid, &["grep", "-c", "^processor", "/proc/cpuinfo"]).await?;
+    let output =
+        common::exec_in_vm(fcvm_pid, &["grep", "-c", "^processor", "/proc/cpuinfo"]).await?;
     let cpu_count: i32 = output.trim().parse().unwrap_or(0);
-    assert_eq!(
-        cpu_count, 4,
-        "Should have 4 CPUs, got: {}",
-        cpu_count
-    );
+    assert_eq!(cpu_count, 4, "Should have 4 CPUs, got: {}", cpu_count);
     println!("  CPU count = {}", cpu_count);
 
     // Test 2: Check memory (via /proc/meminfo in VM)
@@ -289,11 +314,16 @@ async fn test_fcvm_ls() -> Result<()> {
 
     // Start a VM to list using bridged mode for reliable health checks
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
-        "podman", "run",
-        "--name", &vm_name,
-        "--network", "bridged",
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
         common::TEST_IMAGE,
-    ]).await.context("spawning fcvm")?;
+    ])
+    .await
+    .context("spawning fcvm")?;
     println!("Started VM with PID: {}", fcvm_pid);
 
     // Wait for healthy
@@ -345,8 +375,7 @@ async fn test_fcvm_ls() -> Result<()> {
         stale: bool,
     }
 
-    let vms: Vec<VmDisplay> = serde_json::from_str(&stdout)
-        .context("JSON should be valid")?;
+    let vms: Vec<VmDisplay> = serde_json::from_str(&stdout).context("JSON should be valid")?;
 
     println!("  Found {} VMs in JSON output", vms.len());
     assert!(!vms.is_empty(), "Should have at least one VM");
@@ -362,12 +391,12 @@ async fn test_fcvm_ls() -> Result<()> {
     assert!(output.status.success(), "fcvm ls --pid should succeed");
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    let vms: Vec<VmDisplay> = serde_json::from_str(&stdout)
-        .context("JSON should be valid")?;
+    let vms: Vec<VmDisplay> = serde_json::from_str(&stdout).context("JSON should be valid")?;
 
     assert_eq!(vms.len(), 1, "Should find exactly one VM with --pid filter");
     assert_eq!(
-        vms[0].vm.pid, Some(fcvm_pid),
+        vms[0].vm.pid,
+        Some(fcvm_pid),
         "Filtered VM should match requested PID"
     );
     println!("  Correctly filtered to PID {}", fcvm_pid);
@@ -380,11 +409,13 @@ async fn test_fcvm_ls() -> Result<()> {
         .await
         .context("running fcvm ls --pid")?;
 
-    assert!(output.status.success(), "fcvm ls --pid should succeed even with no matches");
+    assert!(
+        output.status.success(),
+        "fcvm ls --pid should succeed even with no matches"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    let vms: Vec<VmDisplay> = serde_json::from_str(&stdout)
-        .context("JSON should be valid")?;
+    let vms: Vec<VmDisplay> = serde_json::from_str(&stdout).context("JSON should be valid")?;
 
     assert!(vms.is_empty(), "Should find no VMs with non-existent PID");
     println!("  Correctly returned empty list for non-existent PID");
@@ -424,12 +455,18 @@ async fn test_custom_command() -> Result<()> {
     let custom_cmd = "sh -c 'echo CUSTOM_CMD_MARKER > /tmp/marker.txt && nginx -g \"daemon off;\"'";
 
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
-        "podman", "run",
-        "--name", &vm_name,
-        "--network", "bridged",
-        "--cmd", custom_cmd,
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        "--cmd",
+        custom_cmd,
         common::TEST_IMAGE,
-    ]).await.context("spawning fcvm")?;
+    ])
+    .await
+    .context("spawning fcvm")?;
     println!("Started VM with PID: {}", fcvm_pid);
 
     // Wait for healthy
@@ -456,7 +493,8 @@ async fn test_custom_command() -> Result<()> {
     // Verify nginx is running by checking if we can curl localhost
     // (more reliable than pgrep which may not exist in alpine)
     println!("Checking nginx is serving requests...");
-    let output = common::exec_in_container(fcvm_pid, &["wget", "-q", "-O", "-", "http://localhost/"]).await;
+    let output =
+        common::exec_in_container(fcvm_pid, &["wget", "-q", "-O", "-", "http://localhost/"]).await;
     assert!(output.is_ok(), "nginx should be responding to requests");
     println!("  nginx is serving requests");
 

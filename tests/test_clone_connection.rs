@@ -24,7 +24,8 @@ fn unique_names(prefix: &str) -> (String, String, String, String) {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_millis() % 100000;
+        .as_millis()
+        % 100000;
     let baseline = format!("{}-base-{}-{}", prefix, ts, id);
     let clone = format!("{}-clone-{}-{}", prefix, ts, id);
     let snapshot = format!("{}-snap-{}-{}", prefix, ts, id);
@@ -113,7 +114,10 @@ impl BroadcastServer {
                 std::thread::sleep(Duration::from_millis(100));
             }
 
-            eprintln!("[server] Shutting down, {} clients connected", clients.len());
+            eprintln!(
+                "[server] Shutting down, {} clients connected",
+                clients.len()
+            );
         })
     }
 }
@@ -146,13 +150,19 @@ async fn test_clone_connection_reset() -> Result<()> {
     // Step 2: Start baseline VM (nginx stays alive, we exec client later)
     // =========================================================================
     println!("\nStep 2: Starting baseline VM...");
-    println!("  Using unique names: baseline={}, clone={}, snapshot={}", baseline_name, clone_name, snapshot_name);
+    println!(
+        "  Using unique names: baseline={}, clone={}, snapshot={}",
+        baseline_name, clone_name, snapshot_name
+    );
 
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
         &[
-            "podman", "run",
-            "--name", &baseline_name,
-            "--network", "rootless",
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "rootless",
             common::TEST_IMAGE,
         ],
         &baseline_name,
@@ -169,7 +179,16 @@ async fn test_clone_connection_reset() -> Result<()> {
 
     // Install netcat
     let _ = tokio::process::Command::new(&fcvm_path)
-        .args(["exec", "--pid", &baseline_pid.to_string(), "--", "apk", "add", "--no-cache", "netcat-openbsd"])
+        .args([
+            "exec",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--",
+            "apk",
+            "add",
+            "--no-cache",
+            "netcat-openbsd",
+        ])
         .output()
         .await?;
 
@@ -179,8 +198,12 @@ async fn test_clone_connection_reset() -> Result<()> {
     println!("\nStep 3: Testing connection from baseline...");
     let output = tokio::process::Command::new(&fcvm_path)
         .args([
-            "exec", "--pid", &baseline_pid.to_string(),
-            "--", "sh", "-c",
+            "exec",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--",
+            "sh",
+            "-c",
             &format!("nc -w 2 {} {} </dev/null | head -3", host_ip, server_port),
         ])
         .output()
@@ -199,9 +222,12 @@ async fn test_clone_connection_reset() -> Result<()> {
 
     let output = tokio::process::Command::new(&fcvm_path)
         .args([
-            "snapshot", "create",
-            "--pid", &baseline_pid.to_string(),
-            "--tag", &snapshot_name,
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
         ])
         .output()
         .await
@@ -217,12 +243,10 @@ async fn test_clone_connection_reset() -> Result<()> {
     // Step 5: Start memory server
     // =========================================================================
     println!("\nStep 5: Starting memory server...");
-    let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "serve", &snapshot_name],
-        "uffd-server",
-    )
-    .await
-    .context("spawning serve")?;
+    let (_serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server")
+            .await
+            .context("spawning serve")?;
 
     common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
     println!("  Memory server ready (PID: {})", serve_pid);
@@ -235,10 +259,14 @@ async fn test_clone_connection_reset() -> Result<()> {
 
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
         &[
-            "snapshot", "run",
-            "--pid", &serve_pid.to_string(),
-            "--name", &clone_name,
-            "--network", "rootless",
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid.to_string(),
+            "--name",
+            &clone_name,
+            "--network",
+            "rootless",
         ],
         &clone_name,
     )
@@ -258,14 +286,21 @@ async fn test_clone_connection_reset() -> Result<()> {
     println!("\nStep 7: Testing clone is alive...");
     let exec_output = tokio::process::Command::new(&fcvm_path)
         .args([
-            "exec", "--pid", &clone_pid.to_string(),
-            "--", "echo", "CLONE_IS_ALIVE",
+            "exec",
+            "--pid",
+            &clone_pid.to_string(),
+            "--",
+            "echo",
+            "CLONE_IS_ALIVE",
         ])
         .output()
         .await?;
 
     let clone_alive = String::from_utf8_lossy(&exec_output.stdout).contains("CLONE_IS_ALIVE");
-    println!("  Clone exec test: {}", if clone_alive { "PASS" } else { "FAIL" });
+    println!(
+        "  Clone exec test: {}",
+        if clone_alive { "PASS" } else { "FAIL" }
+    );
 
     // =========================================================================
     // Step 8: Test if clone can establish NEW connection (should be CONN#2)
@@ -274,8 +309,12 @@ async fn test_clone_connection_reset() -> Result<()> {
 
     let new_conn_output = tokio::process::Command::new(&fcvm_path)
         .args([
-            "exec", "--pid", &clone_pid.to_string(),
-            "--", "sh", "-c",
+            "exec",
+            "--pid",
+            &clone_pid.to_string(),
+            "--",
+            "sh",
+            "-c",
             &format!("nc -w 3 {} {} </dev/null | head -3", host_ip, server_port),
         ])
         .output()
@@ -304,15 +343,25 @@ async fn test_clone_connection_reset() -> Result<()> {
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!("║                         RESULTS                               ║");
     println!("╠═══════════════════════════════════════════════════════════════╣");
-    println!("║  Clone is alive:        {}                                   ║", if clone_alive { "YES" } else { "NO " });
-    println!("║  Clone can connect:     {}                                   ║", if can_reconnect { "YES" } else { "NO " });
+    println!(
+        "║  Clone is alive:        {}                                   ║",
+        if clone_alive { "YES" } else { "NO " }
+    );
+    println!(
+        "║  Clone can connect:     {}                                   ║",
+        if can_reconnect { "YES" } else { "NO " }
+    );
     println!("╚═══════════════════════════════════════════════════════════════╝");
 
     if clone_alive && can_reconnect {
         println!("\n✅ CLONE CONNECTION TEST PASSED!");
         Ok(())
     } else {
-        anyhow::bail!("Test failed: clone_alive={}, can_reconnect={}", clone_alive, can_reconnect)
+        anyhow::bail!(
+            "Test failed: clone_alive={}, can_reconnect={}",
+            clone_alive,
+            can_reconnect
+        )
     }
 }
 
@@ -340,14 +389,20 @@ async fn test_clone_reconnect_latency() -> Result<()> {
 
     // Start VM (nginx stays alive, we'll exec our client into it)
     println!("\nStep 2: Starting VM...");
-    println!("  Using unique names: baseline={}, clone={}, snapshot={}", baseline_name, clone_name, snapshot_name);
+    println!(
+        "  Using unique names: baseline={}, clone={}, snapshot={}",
+        baseline_name, clone_name, snapshot_name
+    );
 
     // Use nginx image - it stays alive
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
         &[
-            "podman", "run",
-            "--name", &baseline_name,
-            "--network", "rootless",
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "rootless",
             common::TEST_IMAGE,
         ],
         &baseline_name,
@@ -360,7 +415,16 @@ async fn test_clone_reconnect_latency() -> Result<()> {
 
     // Install netcat
     let _ = tokio::process::Command::new(&fcvm_path)
-        .args(["exec", "--pid", &baseline_pid.to_string(), "--", "apk", "add", "--no-cache", "netcat-openbsd"])
+        .args([
+            "exec",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--",
+            "apk",
+            "add",
+            "--no-cache",
+            "netcat-openbsd",
+        ])
         .output()
         .await?;
 
@@ -376,8 +440,12 @@ async fn test_clone_reconnect_latency() -> Result<()> {
         tokio::spawn(async move {
             let _ = tokio::process::Command::new(&fcvm_path)
                 .args([
-                    "exec", "--pid", &baseline_pid.to_string(),
-                    "--", "sh", "-c",
+                    "exec",
+                    "--pid",
+                    &baseline_pid.to_string(),
+                    "--",
+                    "sh",
+                    "-c",
                     &format!(
                         "while true; do nc -w 5 {} {} 2>&1; sleep 0.1; done",
                         host_ip, server_port
@@ -398,7 +466,14 @@ async fn test_clone_reconnect_latency() -> Result<()> {
     let snapshot_start = Instant::now();
 
     let output = tokio::process::Command::new(&fcvm_path)
-        .args(["snapshot", "create", "--pid", &baseline_pid.to_string(), "--tag", &snapshot_name])
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
+        ])
         .output()
         .await?;
 
@@ -412,10 +487,8 @@ async fn test_clone_reconnect_latency() -> Result<()> {
 
     // Serve
     println!("\nStep 5: Starting serve...");
-    let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "serve", &snapshot_name],
-        "uffd-server",
-    ).await?;
+    let (_serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server").await?;
     common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
 
     // Record sequence before clone
@@ -426,9 +499,19 @@ async fn test_clone_reconnect_latency() -> Result<()> {
     let clone_start = Instant::now();
 
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "run", "--pid", &serve_pid.to_string(), "--name", &clone_name, "--network", "rootless"],
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid.to_string(),
+            "--name",
+            &clone_name,
+            "--network",
+            "rootless",
+        ],
         &clone_name,
-    ).await?;
+    )
+    .await?;
 
     // Wait and observe
     println!("  Clone started, waiting for reconnect...");
@@ -445,13 +528,19 @@ async fn test_clone_reconnect_latency() -> Result<()> {
         if current_seq > seq_before_clone + 5 {
             reconnect_time = clone_start.elapsed();
             reconnected = true;
-            println!("  Clone reconnected! Server seq jumped from {} to {}", seq_before_clone, current_seq);
+            println!(
+                "  Clone reconnected! Server seq jumped from {} to {}",
+                seq_before_clone, current_seq
+            );
             break;
         }
     }
 
     if reconnected {
-        println!("\n  ⏱️  Time from clone start to reconnect: {:.0}ms", reconnect_time.as_millis());
+        println!(
+            "\n  ⏱️  Time from clone start to reconnect: {:.0}ms",
+            reconnect_time.as_millis()
+        );
     } else {
         println!("\n  ❌ Clone did not reconnect within 5 seconds");
     }
@@ -466,7 +555,10 @@ async fn test_clone_reconnect_latency() -> Result<()> {
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!("║                         RESULTS                               ║");
     println!("╠═══════════════════════════════════════════════════════════════╣");
-    println!("║  Clone reconnect time: {:>6}ms                               ║", reconnect_time.as_millis());
+    println!(
+        "║  Clone reconnect time: {:>6}ms                               ║",
+        reconnect_time.as_millis()
+    );
     println!("║                                                               ║");
     println!("║  This measures: VM restore + network setup + TCP connect      ║");
     println!("╚═══════════════════════════════════════════════════════════════╝");
@@ -503,12 +595,18 @@ async fn test_clone_connection_timing() -> Result<()> {
 
     // Start VM with nginx (stays alive)
     println!("\nStep 2: Starting VM...");
-    println!("  Using unique names: baseline={}, clone={}, snapshot={}", baseline_name, clone_name, snapshot_name);
+    println!(
+        "  Using unique names: baseline={}, clone={}, snapshot={}",
+        baseline_name, clone_name, snapshot_name
+    );
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
         &[
-            "podman", "run",
-            "--name", &baseline_name,
-            "--network", "rootless",
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "rootless",
             common::TEST_IMAGE,
         ],
         &baseline_name,
@@ -521,7 +619,16 @@ async fn test_clone_connection_timing() -> Result<()> {
     // Install netcat
     println!("\nStep 3: Installing netcat in VM...");
     let _ = tokio::process::Command::new(&fcvm_path)
-        .args(["exec", "--pid", &baseline_pid.to_string(), "--", "apk", "add", "--no-cache", "netcat-openbsd"])
+        .args([
+            "exec",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--",
+            "apk",
+            "add",
+            "--no-cache",
+            "netcat-openbsd",
+        ])
         .output()
         .await?;
 
@@ -531,9 +638,16 @@ async fn test_clone_connection_timing() -> Result<()> {
     println!("\nStep 4: Starting PERSISTENT client in baseline VM...");
     let output = tokio::process::Command::new(&fcvm_path)
         .args([
-            "exec", "--pid", &baseline_pid.to_string(),
-            "--", "sh", "-c",
-            &format!("nohup nc {} {} > /tmp/received.log 2>&1 &", host_ip, server_port),
+            "exec",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--",
+            "sh",
+            "-c",
+            &format!(
+                "nohup nc {} {} > /tmp/received.log 2>&1 &",
+                host_ip, server_port
+            ),
         ])
         .output()
         .await?;
@@ -545,12 +659,23 @@ async fn test_clone_connection_timing() -> Result<()> {
     // Wait for connection
     tokio::time::sleep(Duration::from_secs(2)).await;
     let seq_at_connect = server_seq.load(Ordering::Relaxed);
-    println!("  Persistent client connected! (server seq: {})", seq_at_connect);
+    println!(
+        "  Persistent client connected! (server seq: {})",
+        seq_at_connect
+    );
 
     // Verify client is receiving
     tokio::time::sleep(Duration::from_millis(500)).await;
     let output = tokio::process::Command::new(&fcvm_path)
-        .args(["exec", "--pid", &baseline_pid.to_string(), "--", "tail", "-3", "/tmp/received.log"])
+        .args([
+            "exec",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--",
+            "tail",
+            "-3",
+            "/tmp/received.log",
+        ])
         .output()
         .await?;
     let received = String::from_utf8_lossy(&output.stdout);
@@ -566,7 +691,14 @@ async fn test_clone_connection_timing() -> Result<()> {
 
     let snapshot_start = Instant::now();
     let output = tokio::process::Command::new(&fcvm_path)
-        .args(["snapshot", "create", "--pid", &baseline_pid.to_string(), "--tag", &snapshot_name])
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
+        ])
         .output()
         .await?;
     let snapshot_time = snapshot_start.elapsed();
@@ -575,7 +707,10 @@ async fn test_clone_connection_timing() -> Result<()> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("Snapshot failed: {}", stderr);
     }
-    println!("  Snapshot created in {:.0}ms (VM was paused during this)", snapshot_time.as_millis());
+    println!(
+        "  Snapshot created in {:.0}ms (VM was paused during this)",
+        snapshot_time.as_millis()
+    );
 
     // Check if baseline connection survived the pause
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -584,7 +719,15 @@ async fn test_clone_connection_timing() -> Result<()> {
 
     // Check what baseline received after snapshot
     let output = tokio::process::Command::new(&fcvm_path)
-        .args(["exec", "--pid", &baseline_pid.to_string(), "--", "tail", "-3", "/tmp/received.log"])
+        .args([
+            "exec",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--",
+            "tail",
+            "-3",
+            "/tmp/received.log",
+        ])
         .output()
         .await?;
     let received_after = String::from_utf8_lossy(&output.stdout);
@@ -595,18 +738,26 @@ async fn test_clone_connection_timing() -> Result<()> {
 
     // Serve
     println!("\nStep 6: Starting serve...");
-    let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "serve", &snapshot_name],
-        "uffd-server",
-    ).await?;
+    let (_serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server").await?;
     common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
 
     // Clone - the clone inherits the snapshot state INCLUDING the nc process mid-connection
     println!("\nStep 7: Spawning clone (has nc process from snapshot state!)...");
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "run", "--pid", &serve_pid.to_string(), "--name", &clone_name, "--network", "rootless"],
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid.to_string(),
+            "--name",
+            &clone_name,
+            "--network",
+            "rootless",
+        ],
         &clone_name,
-    ).await?;
+    )
+    .await?;
 
     common::poll_health_by_pid(clone_pid, 60).await?;
     println!("  Clone healthy (PID: {})", clone_pid);
@@ -617,7 +768,14 @@ async fn test_clone_connection_timing() -> Result<()> {
 
     println!("\nStep 8: Checking clone's inherited nc process...");
     let output = tokio::process::Command::new(&fcvm_path)
-        .args(["exec", "--pid", &clone_pid.to_string(), "--", "cat", "/tmp/received.log"])
+        .args([
+            "exec",
+            "--pid",
+            &clone_pid.to_string(),
+            "--",
+            "cat",
+            "/tmp/received.log",
+        ])
         .output()
         .await?;
     let clone_received = String::from_utf8_lossy(&output.stdout);
@@ -632,9 +790,16 @@ async fn test_clone_connection_timing() -> Result<()> {
     println!("\nStep 9: Testing NEW connection from clone...");
     let output = tokio::process::Command::new(&fcvm_path)
         .args([
-            "exec", "--pid", &clone_pid.to_string(),
-            "--", "sh", "-c",
-            &format!("nc -v -w 5 {} {} </dev/null 2>&1 | head -5", host_ip, server_port),
+            "exec",
+            "--pid",
+            &clone_pid.to_string(),
+            "--",
+            "sh",
+            "-c",
+            &format!(
+                "nc -v -w 5 {} {} </dev/null 2>&1 | head -5",
+                host_ip, server_port
+            ),
         ])
         .output()
         .await?;
@@ -665,14 +830,31 @@ async fn test_clone_connection_timing() -> Result<()> {
     println!("╠═══════════════════════════════════════════════════════════════╣");
     let baseline_survived = received_after.contains("CONN#1");
     let clone_has_new_conn = new_conn.contains("CONN#");
-    println!("║  Baseline connection survived pause: {}                      ║", if baseline_survived { "YES" } else { "NO " });
-    println!("║  Clone can establish new connection: {}                      ║", if clone_has_new_conn { "YES" } else { "NO " });
+    println!(
+        "║  Baseline connection survived pause: {}                      ║",
+        if baseline_survived { "YES" } else { "NO " }
+    );
+    println!(
+        "║  Clone can establish new connection: {}                      ║",
+        if clone_has_new_conn { "YES" } else { "NO " }
+    );
     println!("╚═══════════════════════════════════════════════════════════════╝");
 
     let success = clone_has_new_conn;
-    println!("\n{}", if success { "✅ PERSISTENT CONNECTION TEST PASSED!" } else { "❌ TEST FAILED" });
+    println!(
+        "\n{}",
+        if success {
+            "✅ PERSISTENT CONNECTION TEST PASSED!"
+        } else {
+            "❌ TEST FAILED"
+        }
+    );
 
-    if success { Ok(()) } else { anyhow::bail!("Test failed") }
+    if success {
+        Ok(())
+    } else {
+        anyhow::bail!("Test failed")
+    }
 }
 
 /// Test a RESILIENT client that auto-reconnects on network errors
@@ -701,12 +883,18 @@ async fn test_clone_resilient_client() -> Result<()> {
 
     // Start VM
     println!("\nStep 2: Starting VM...");
-    println!("  Using unique names: baseline={}, clone={}, snapshot={}", baseline_name, clone_name, snapshot_name);
+    println!(
+        "  Using unique names: baseline={}, clone={}, snapshot={}",
+        baseline_name, clone_name, snapshot_name
+    );
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
         &[
-            "podman", "run",
-            "--name", &baseline_name,
-            "--network", "rootless",
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "rootless",
             common::TEST_IMAGE,
         ],
         &baseline_name,
@@ -719,7 +907,16 @@ async fn test_clone_resilient_client() -> Result<()> {
     // Install netcat
     println!("\nStep 3: Installing netcat...");
     let _ = tokio::process::Command::new(&fcvm_path)
-        .args(["exec", "--pid", &baseline_pid.to_string(), "--", "apk", "add", "--no-cache", "netcat-openbsd"])
+        .args([
+            "exec",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--",
+            "apk",
+            "add",
+            "--no-cache",
+            "netcat-openbsd",
+        ])
         .output()
         .await?;
 
@@ -731,7 +928,8 @@ async fn test_clone_resilient_client() -> Result<()> {
     println!("\nStep 4: Creating resilient client script in VM...");
     // Note: nc -w sets a timeout, so we can detect stale sockets
     // The key insight: a stale socket won't receive data, so -w timeout will fire
-    let client_script = format!(r#"#!/bin/sh
+    let client_script = format!(
+        r#"#!/bin/sh
 LOG=/tmp/client.log
 HOST={}
 PORT={}
@@ -758,16 +956,26 @@ while true; do
     log "    Reconnecting in 100ms..."
     sleep 0.1
 done
-"#, host_ip, server_port);
+"#,
+        host_ip, server_port
+    );
 
     // Write script to VM using --vm flag (run in guest OS, not container)
     // Use printf to avoid heredoc issues
     let escaped_script = client_script.replace("'", "'\\''");
     let output = tokio::process::Command::new(&fcvm_path)
         .args([
-            "exec", "--pid", &baseline_pid.to_string(), "--vm",
-            "--", "sh", "-c",
-            &format!("printf '%s' '{}' > /tmp/resilient_client.sh && chmod +x /tmp/resilient_client.sh", escaped_script),
+            "exec",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--vm",
+            "--",
+            "sh",
+            "-c",
+            &format!(
+                "printf '%s' '{}' > /tmp/resilient_client.sh && chmod +x /tmp/resilient_client.sh",
+                escaped_script
+            ),
         ])
         .output()
         .await?;
@@ -779,7 +987,15 @@ done
 
     // Verify script was created
     let output = tokio::process::Command::new(&fcvm_path)
-        .args(["exec", "--pid", &baseline_pid.to_string(), "--vm", "--", "cat", "/tmp/resilient_client.sh"])
+        .args([
+            "exec",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--vm",
+            "--",
+            "cat",
+            "/tmp/resilient_client.sh",
+        ])
         .output()
         .await?;
     println!("  Script created ({} bytes)", output.stdout.len());
@@ -788,8 +1004,13 @@ done
     println!("\nStep 5: Starting resilient client (will auto-reconnect on errors)...");
     let _ = tokio::process::Command::new(&fcvm_path)
         .args([
-            "exec", "--pid", &baseline_pid.to_string(), "--vm",
-            "--", "sh", "-c",
+            "exec",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--vm",
+            "--",
+            "sh",
+            "-c",
             "nohup /tmp/resilient_client.sh > /tmp/client_stdout.log 2>&1 &",
         ])
         .output()
@@ -798,11 +1019,23 @@ done
     // Wait for initial connection
     tokio::time::sleep(Duration::from_secs(2)).await;
     let initial_conns = conn_counter.load(Ordering::Relaxed);
-    println!("  Client connected! (server has {} connections)", initial_conns);
+    println!(
+        "  Client connected! (server has {} connections)",
+        initial_conns
+    );
 
     // Show initial client log
     let output = tokio::process::Command::new(&fcvm_path)
-        .args(["exec", "--pid", &baseline_pid.to_string(), "--vm", "--", "tail", "-10", "/tmp/client.log"])
+        .args([
+            "exec",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--vm",
+            "--",
+            "tail",
+            "-10",
+            "/tmp/client.log",
+        ])
         .output()
         .await?;
     println!("  Initial client log:");
@@ -812,7 +1045,15 @@ done
     if output.stdout.is_empty() {
         // Check if script is running
         let ps_output = tokio::process::Command::new(&fcvm_path)
-            .args(["exec", "--pid", &baseline_pid.to_string(), "--vm", "--", "ps", "aux"])
+            .args([
+                "exec",
+                "--pid",
+                &baseline_pid.to_string(),
+                "--vm",
+                "--",
+                "ps",
+                "aux",
+            ])
             .output()
             .await?;
         eprintln!("  DEBUG: ps aux output:");
@@ -827,29 +1068,57 @@ done
     println!("\nStep 6: Creating snapshot (client is connected!)...");
     let seq_before = server_seq.load(Ordering::Relaxed);
     let conns_before = conn_counter.load(Ordering::Relaxed);
-    println!("  Before snapshot: seq={}, connections={}", seq_before, conns_before);
+    println!(
+        "  Before snapshot: seq={}, connections={}",
+        seq_before, conns_before
+    );
 
     let snapshot_start = Instant::now();
     let output = tokio::process::Command::new(&fcvm_path)
-        .args(["snapshot", "create", "--pid", &baseline_pid.to_string(), "--tag", &snapshot_name])
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
+        ])
         .output()
         .await?;
     let snapshot_time = snapshot_start.elapsed();
 
     if !output.status.success() {
-        anyhow::bail!("Snapshot failed: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "Snapshot failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
-    println!("  Snapshot created in {:.0}ms (baseline paused then unpaused)", snapshot_time.as_millis());
+    println!(
+        "  Snapshot created in {:.0}ms (baseline paused then unpaused)",
+        snapshot_time.as_millis()
+    );
 
     // Verify baseline continues receiving after unpause
     println!("\n  Verifying baseline continues receiving after unpause...");
     tokio::time::sleep(Duration::from_millis(500)).await;
     let seq_after_snapshot = server_seq.load(Ordering::Relaxed);
-    println!("  Server seq after snapshot: {} (was {})", seq_after_snapshot, seq_before);
+    println!(
+        "  Server seq after snapshot: {} (was {})",
+        seq_after_snapshot, seq_before
+    );
 
     // Check baseline's client log - should show continued reception
     let output = tokio::process::Command::new(&fcvm_path)
-        .args(["exec", "--pid", &baseline_pid.to_string(), "--vm", "--", "tail", "-5", "/tmp/client.log"])
+        .args([
+            "exec",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--vm",
+            "--",
+            "tail",
+            "-5",
+            "/tmp/client.log",
+        ])
         .output()
         .await?;
     println!("  Baseline still receiving after unpause:");
@@ -861,10 +1130,8 @@ done
 
     // Serve
     println!("\nStep 7: Starting serve...");
-    let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "serve", &snapshot_name],
-        "uffd-server",
-    ).await?;
+    let (_serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server").await?;
     common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
 
     // Clone
@@ -873,9 +1140,19 @@ done
     let conns_before_clone = conn_counter.load(Ordering::Relaxed);
 
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "run", "--pid", &serve_pid.to_string(), "--name", &clone_name, "--network", "rootless"],
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid.to_string(),
+            "--name",
+            &clone_name,
+            "--network",
+            "rootless",
+        ],
         &clone_name,
-    ).await?;
+    )
+    .await?;
 
     common::poll_health_by_pid(clone_pid, 60).await?;
     println!("  Clone healthy (PID: {})", clone_pid);
@@ -894,7 +1171,10 @@ done
         if current_conns > conns_before_clone {
             reconnect_time = clone_start.elapsed();
             reconnected = true;
-            println!("  ✓ Reconnected! Connection count: {} -> {}", conns_before_clone, current_conns);
+            println!(
+                "  ✓ Reconnected! Connection count: {} -> {}",
+                conns_before_clone, current_conns
+            );
             break;
         }
 
@@ -907,7 +1187,15 @@ done
     println!("\nStep 9: Clone's client log (shows disconnect/reconnect cycle):");
     tokio::time::sleep(Duration::from_millis(500)).await;
     let output = tokio::process::Command::new(&fcvm_path)
-        .args(["exec", "--pid", &clone_pid.to_string(), "--vm", "--", "cat", "/tmp/client.log"])
+        .args([
+            "exec",
+            "--pid",
+            &clone_pid.to_string(),
+            "--vm",
+            "--",
+            "cat",
+            "/tmp/client.log",
+        ])
         .output()
         .await?;
 
@@ -917,7 +1205,8 @@ done
     // Show key events
     println!("  --- Client Timeline ---");
     for line in &log_lines {
-        if line.contains("CONNECTING") || line.contains("DISCONNECTED") || line.contains("STARTING") {
+        if line.contains("CONNECTING") || line.contains("DISCONNECTED") || line.contains("STARTING")
+        {
             println!("  {}", line);
         }
     }
@@ -942,11 +1231,23 @@ done
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!("║                         RESULTS                               ║");
     println!("╠═══════════════════════════════════════════════════════════════╣");
-    println!("║  Initial connections:     {:>3}                                ║", initial_conns);
-    println!("║  Connections after clone: {:>3}                                ║", final_conns);
-    println!("║  Clone reconnected:       {}                               ║", if reconnected { "YES" } else { "NO " });
+    println!(
+        "║  Initial connections:     {:>3}                                ║",
+        initial_conns
+    );
+    println!(
+        "║  Connections after clone: {:>3}                                ║",
+        final_conns
+    );
+    println!(
+        "║  Clone reconnected:       {}                               ║",
+        if reconnected { "YES" } else { "NO " }
+    );
     if reconnected {
-        println!("║  Reconnect latency:       {:>3}ms                              ║", reconnect_time.as_millis());
+        println!(
+            "║  Reconnect latency:       {:>3}ms                              ║",
+            reconnect_time.as_millis()
+        );
     }
     println!("╠═══════════════════════════════════════════════════════════════╣");
     println!("║                                                               ║");

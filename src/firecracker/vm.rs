@@ -117,7 +117,14 @@ impl VmManager {
             // This allows KVM access while being in the isolated network namespace
             info!(target: "vm", vm_id = %self.vm_id, holder_pid = holder_pid, "using nsenter for rootless networking");
             let mut c = Command::new("nsenter");
-            c.args(["-t", &holder_pid.to_string(), "-U", "-n", "--preserve-credentials", "--"]);
+            c.args([
+                "-t",
+                &holder_pid.to_string(),
+                "-U",
+                "-n",
+                "--preserve-credentials",
+                "--",
+            ]);
             c.arg(firecracker_bin)
                 .arg("--api-sock")
                 .arg(&self.socket_path);
@@ -153,9 +160,8 @@ impl VmManager {
         // The baseline VM may have been cleaned up, but we need the directory for mount
         if let Some((ref baseline_dir, _)) = vsock_redirect_clone {
             if !baseline_dir.exists() {
-                std::fs::create_dir_all(baseline_dir).context(
-                    "creating baseline directory for vsock mount redirect",
-                )?;
+                std::fs::create_dir_all(baseline_dir)
+                    .context("creating baseline directory for vsock mount redirect")?;
             }
         }
 

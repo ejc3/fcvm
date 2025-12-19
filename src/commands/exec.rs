@@ -56,7 +56,9 @@ pub async fn run_exec_in_vm(
 
     // Read the response - should be "OK <port>\n" on success
     let mut response = [0u8; 32];
-    let n = stream.read(&mut response).context("reading CONNECT response")?;
+    let n = stream
+        .read(&mut response)
+        .context("reading CONNECT response")?;
     let response_str = String::from_utf8_lossy(&response[..n]);
 
     if !response_str.starts_with("OK ") {
@@ -141,7 +143,9 @@ pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
 
     // Read the response - should be "OK <port>\n" on success
     let mut response = [0u8; 32];
-    let n = stream.read(&mut response).context("reading CONNECT response")?;
+    let n = stream
+        .read(&mut response)
+        .context("reading CONNECT response")?;
     let response_str = String::from_utf8_lossy(&response[..n]);
 
     if !response_str.starts_with("OK ") {
@@ -166,7 +170,10 @@ pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or(cmd);
-            matches!(basename, "bash" | "sh" | "zsh" | "fish" | "ash" | "dash" | "ksh" | "csh" | "tcsh")
+            matches!(
+                basename,
+                "bash" | "sh" | "zsh" | "fish" | "ash" | "dash" | "ksh" | "csh" | "tcsh"
+            )
         })
         .unwrap_or(false);
 
@@ -294,10 +301,8 @@ fn run_tty_mode(stream: UnixStream) -> Result<()> {
 
     // Restore terminal on panic
     let orig_termios_copy = orig_termios;
-    let restore_terminal = move || {
-        unsafe {
-            libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig_termios_copy);
-        }
+    let restore_terminal = move || unsafe {
+        libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig_termios_copy);
     };
 
     // Clone stream for reader/writer

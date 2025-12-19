@@ -48,7 +48,16 @@ fn test_publish_does_not_consume_image() {
 
     // Check that --publish with a value followed by image parses the image correctly
     let output = Command::new(&fcvm_path)
-        .args(["podman", "run", "--name", "test", "--publish", "8080:80", "nginx:alpine", "--help"])
+        .args([
+            "podman",
+            "run",
+            "--name",
+            "test",
+            "--publish",
+            "8080:80",
+            "nginx:alpine",
+            "--help",
+        ])
         .output()
         .expect("failed to run fcvm");
 
@@ -66,7 +75,16 @@ fn test_map_does_not_consume_image() {
     let fcvm_path = common::find_fcvm_binary().expect("fcvm binary not found");
 
     let output = Command::new(&fcvm_path)
-        .args(["podman", "run", "--name", "test", "--map", "/host:/guest", "nginx:alpine", "--help"])
+        .args([
+            "podman",
+            "run",
+            "--name",
+            "test",
+            "--map",
+            "/host:/guest",
+            "nginx:alpine",
+            "--help",
+        ])
         .output()
         .expect("failed to run fcvm");
 
@@ -83,7 +101,16 @@ fn test_env_does_not_consume_image() {
     let fcvm_path = common::find_fcvm_binary().expect("fcvm binary not found");
 
     let output = Command::new(&fcvm_path)
-        .args(["podman", "run", "--name", "test", "--env", "FOO=bar", "nginx:alpine", "--help"])
+        .args([
+            "podman",
+            "run",
+            "--name",
+            "test",
+            "--env",
+            "FOO=bar",
+            "nginx:alpine",
+            "--help",
+        ])
         .output()
         .expect("failed to run fcvm");
 
@@ -102,13 +129,18 @@ fn test_multiple_options_do_not_consume_image() {
     // Test all options together
     let output = Command::new(&fcvm_path)
         .args([
-            "podman", "run",
-            "--name", "test",
-            "--publish", "8080:80",
-            "--map", "/host:/guest",
-            "--env", "FOO=bar",
+            "podman",
+            "run",
+            "--name",
+            "test",
+            "--publish",
+            "8080:80",
+            "--map",
+            "/host:/guest",
+            "--env",
+            "FOO=bar",
             "nginx:alpine",
-            "--help"
+            "--help",
         ])
         .output()
         .expect("failed to run fcvm");
@@ -128,11 +160,14 @@ fn test_comma_separated_publish_works() {
     // Multiple ports comma-separated
     let output = Command::new(&fcvm_path)
         .args([
-            "podman", "run",
-            "--name", "test",
-            "--publish", "8080:80,8443:443",
+            "podman",
+            "run",
+            "--name",
+            "test",
+            "--publish",
+            "8080:80,8443:443",
             "nginx:alpine",
-            "--help"
+            "--help",
         ])
         .output()
         .expect("failed to run fcvm");
@@ -152,12 +187,16 @@ fn test_repeated_publish_works() {
     // Multiple --publish flags
     let output = Command::new(&fcvm_path)
         .args([
-            "podman", "run",
-            "--name", "test",
-            "--publish", "8080:80",
-            "--publish", "8443:443",
+            "podman",
+            "run",
+            "--name",
+            "test",
+            "--publish",
+            "8080:80",
+            "--publish",
+            "8443:443",
             "nginx:alpine",
-            "--help"
+            "--help",
         ])
         .output()
         .expect("failed to run fcvm");
@@ -177,11 +216,15 @@ fn test_snapshot_run_publish_does_not_consume_name() {
     // snapshot run --pid X --publish Y --name Z should work
     let output = Command::new(&fcvm_path)
         .args([
-            "snapshot", "run",
-            "--pid", "12345",
-            "--publish", "8080:80",
-            "--name", "clone1",
-            "--help"
+            "snapshot",
+            "run",
+            "--pid",
+            "12345",
+            "--publish",
+            "8080:80",
+            "--name",
+            "clone1",
+            "--help",
         ])
         .output()
         .expect("failed to run fcvm");
