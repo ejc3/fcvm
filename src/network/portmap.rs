@@ -281,7 +281,10 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
     }
 
     // Add MASQUERADE rule for outbound traffic
-    info!("adding MASQUERADE rule: -s {} -o {} -j MASQUERADE", vm_subnet, outbound_iface);
+    info!(
+        "adding MASQUERADE rule: -s {} -o {} -j MASQUERADE",
+        vm_subnet, outbound_iface
+    );
     let output = Command::new("sudo")
         .args([
             "iptables",
