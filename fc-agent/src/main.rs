@@ -1353,6 +1353,72 @@ async fn sync_clock_from_host() -> Result<()> {
     Ok(())
 }
 
+/// Configure DNS from kernel boot parameters
+/// Parses ip= parameter to extract DNS server and writes to /etc/resolv.conf
+fn configure_dns_from_cmdline() {
+    eprintln!("[fc-agent] configuring DNS from kernel cmdline");
+
+    // Read kernel command line
+    let cmdline = match std::fs::read_to_string("/proc/cmdline") {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: failed to read /proc/cmdline: {}", e);
+            return;
+        }
+    };
+    eprintln!("[fc-agent] cmdline: {}", cmdline.trim());
+
+    // Find ip= parameter by searching for "ip=" and extracting until whitespace
+    // Format: ip=<client>::<gateway>:<netmask>::eth0:off[:<dns>]
+    let ip_param = cmdline
+        .split_whitespace()
+        .find(|s| s.starts_with("ip="))
+        .map(|s| s.trim_start_matches("ip="));
+
+    let ip_param = match ip_param {
+        Some(p) => p,
+        None => {
+            eprintln!("[fc-agent] WARNING: no ip= parameter in cmdline, skipping DNS config");
+            return;
+        }
+    };
+    eprintln!("[fc-agent] ip param: {}", ip_param);
+
+    // Split by colons
+    let fields: Vec<&str> = ip_param.split(':').collect();
+    eprintln!("[fc-agent] ip fields: {:?}", fields);
+
+    // Field 3 is gateway (0-indexed field 2)
+    // Field 8 is DNS (0-indexed field 7)
+    let gateway = fields.get(2).copied().unwrap_or("");
+    let dns = fields.get(7).copied().unwrap_or("");
+
+    eprintln!("[fc-agent] gateway={}, dns={}", gateway, dns);
+
+    let nameserver = if !dns.is_empty() {
+        dns
+    } else if !gateway.is_empty() {
+        gateway
+    } else {
+        eprintln!("[fc-agent] WARNING: no DNS or gateway found, skipping DNS config");
+        return;
+    };
+
+    // Write to /etc/resolv.conf
+    let resolv_conf = format!("nameserver {}\n", nameserver);
+    match std::fs::write("/etc/resolv.conf", &resolv_conf) {
+        Ok(_) => {
+            eprintln!(
+                "[fc-agent] ✓ configured DNS: nameserver {}",
+                nameserver
+            );
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: failed to write /etc/resolv.conf: {}", e);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing (fuse-pipe uses tracing for logging)
@@ -1369,6 +1435,9 @@ async fn main() -> Result<()> {
 
     // Raise resource limits early to support high parallelism workloads
     raise_resource_limits();
+
+    // Configure DNS from kernel boot parameters before any network operations
+    configure_dns_from_cmdline();
 
     // Wait for MMDS to be ready
     let plan = loop {
