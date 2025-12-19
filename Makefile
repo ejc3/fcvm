@@ -1,12 +1,13 @@
 SHELL := /bin/bash
 
-# Paths
-FUSE_BACKEND_RS := /home/ubuntu/fuse-backend-rs
-FUSER := /home/ubuntu/fuser
-KERNEL_DIR := ~/linux-firecracker
+# Paths (can be overridden via environment for CI)
+FUSE_BACKEND_RS ?= /home/ubuntu/fuse-backend-rs
+FUSER ?= /home/ubuntu/fuser
+KERNEL_DIR ?= ~/linux-firecracker
 
-# Container image name
+# Container image name and architecture
 CONTAINER_IMAGE := fcvm-test
+CONTAINER_ARCH ?= aarch64
 
 # Test commands - organized by root requirement
 # No root required:
@@ -340,9 +341,10 @@ CONTAINER_RUN_ROOTLESS := podman --root=/tmp/podman-rootless run --rm \
 	--network host
 
 # Build container only when Containerfile changes (make tracks dependency)
+# CONTAINER_ARCH can be overridden: export CONTAINER_ARCH=x86_64 for CI
 $(CONTAINER_MARKER): Containerfile
-	@echo "==> Building container (Containerfile changed)..."
-	sudo podman build -t $(CONTAINER_IMAGE) -f Containerfile .
+	@echo "==> Building container (Containerfile changed, ARCH=$(CONTAINER_ARCH))..."
+	sudo podman build -t $(CONTAINER_IMAGE) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) .
 	@touch $@
 
 container-build: $(CONTAINER_MARKER)
