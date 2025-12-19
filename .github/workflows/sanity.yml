@@ -47,6 +47,6 @@ jobs:
 
       - name: Run fuse-pipe tests
         working-directory: fcvm
-        run: sudo -E cargo test --release -p fuse-pipe --test integration -- --test-threads=1
+        run: sudo -E env "PATH=$PATH" cargo test --release -p fuse-pipe --test integration -- --test-threads=1
         env:
           RUST_LOG: info
