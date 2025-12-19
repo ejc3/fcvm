@@ -676,14 +676,18 @@ async fn install_packages_in_rootfs(rootfs_path: &Path) -> Result<()> {
             .await
             .context("writing registries.conf")?;
 
-        // Restore /etc/resolv.conf symlink to systemd-resolved
-        // We copied a real file for apt-get, now restore the Ubuntu default
-        // so systemd-resolved manages DNS at runtime
-        info!("restoring systemd-resolved DNS configuration");
+        // Write resolv.conf pointing to systemd-resolved's stub resolver
+        // We use a static file (not a symlink) because the symlink target
+        // (/run/systemd/resolve/stub-resolv.conf) won't exist at early boot
+        // when Podman tries to pull images before systemd-resolved is ready
+        info!("configuring systemd-resolved DNS");
         let resolv_conf_path = mount_point.join("etc/resolv.conf");
-        let _ = tokio::fs::remove_file(&resolv_conf_path).await;
-        std::os::unix::fs::symlink("/run/systemd/resolve/stub-resolv.conf", &resolv_conf_path)
-            .context("creating resolv.conf symlink")?;
+        tokio::fs::write(
+            &resolv_conf_path,
+            "# Managed by fcvm - points to systemd-resolved\nnameserver 127.0.0.53\noptions edns0 trust-ad\n",
+        )
+        .await
+        .context("writing resolv.conf")?;
 
         Ok(())
     }

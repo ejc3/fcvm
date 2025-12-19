@@ -242,18 +242,6 @@ jobs:
         run: |
           sudo rm -f /mnt/fcvm-btrfs/rootfs/base.ext4
           sudo rm -f /mnt/fcvm-btrfs/cache/*.img
-      - name: Debug network setup
-        run: |
-          echo "=== Host iptables NAT rules ==="
-          sudo iptables -t nat -L -n -v || true
-          echo "=== Host interfaces ==="
-          ip addr
-          echo "=== dnsmasq config ==="
-          cat /etc/dnsmasq.d/fcvm.conf || true
-          echo "=== dnsmasq processes ==="
-          ps aux | grep dnsmasq || true
-          echo "=== Test DNS from host ==="
-          host public.ecr.aws 8.8.8.8 || dig public.ecr.aws @8.8.8.8 || nslookup public.ecr.aws 8.8.8.8 || echo "DNS lookup tools not available"
       - name: Run VM sanity test (bridged)
         working-directory: fcvm
         run: |
