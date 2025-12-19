@@ -498,71 +498,9 @@ async fn customize_ubuntu_cloud_image(image_path: &Path) -> Result<()> {
         mmds_route
     ));
 
-    // 6. Write DNS setup script and service
-    // This extracts the gateway IP from kernel cmdline and configures it as DNS
-    // The kernel ip= parameter format is: ip=client::gateway:netmask::device:autoconf[:dns]
-    info!("adding DNS setup script");
-    let dns_setup_script = r#"#!/bin/bash
-# Extract gateway from kernel cmdline and configure as DNS
-# Format: ip=<client>::<gateway>:<netmask>::eth0:off[:<dns>]
-set -e
-
-echo "[fcvm-dns] starting DNS configuration"
-CMDLINE=$(cat /proc/cmdline)
-echo "[fcvm-dns] cmdline: $CMDLINE"
-
-if [[ $CMDLINE =~ ip=([^[:space:]]+) ]]; then
-    IP_PARAM="${BASH_REMATCH[1]}"
-    echo "[fcvm-dns] ip param: $IP_PARAM"
-    # Extract gateway (3rd field, after ::)
-    GATEWAY=$(echo "$IP_PARAM" | cut -d: -f3)
-    # Check if explicit DNS was provided (8th field)
-    DNS=$(echo "$IP_PARAM" | cut -d: -f8)
-    echo "[fcvm-dns] gateway=$GATEWAY dns=$DNS"
-    if [ -n "$DNS" ]; then
-        # Use explicit DNS from boot args
-        echo "nameserver $DNS" > /etc/resolv.conf
-        echo "[fcvm-dns] configured DNS from boot args: $DNS"
-    elif [ -n "$GATEWAY" ]; then
-        # Fall back to gateway as DNS (dnsmasq)
-        echo "nameserver $GATEWAY" > /etc/resolv.conf
-        echo "[fcvm-dns] configured DNS from gateway: $GATEWAY"
-    else
-        echo "[fcvm-dns] ERROR: no DNS or gateway found in ip= parameter"
-        exit 1
-    fi
-else
-    echo "[fcvm-dns] ERROR: no ip= parameter found in cmdline"
-    exit 1
-fi
-
-echo "[fcvm-dns] /etc/resolv.conf:"
-cat /etc/resolv.conf
-echo "[fcvm-dns] done"
-"#;
-    cmd.arg("--write").arg(format!(
-        "/usr/local/bin/fcvm-setup-dns:{}",
-        dns_setup_script
-    ));
-    cmd.arg("--chmod").arg("0755:/usr/local/bin/fcvm-setup-dns");
-
-    let dns_setup_service = "[Unit]\n\
-                             Description=Configure DNS from kernel boot parameters\n\
-                             DefaultDependencies=no\n\
-                             Before=network.target systemd-resolved.service\n\
-                             After=local-fs.target\n\n\
-                             [Service]\n\
-                             Type=oneshot\n\
-                             ExecStart=/usr/local/bin/fcvm-setup-dns\n\
-                             RemainAfterExit=yes\n\
-                             StandardOutput=journal+console\n\
-                             StandardError=journal+console\n\n\
-                             [Install]\n\
-                             WantedBy=sysinit.target\n";
-    cmd.arg("--write").arg(format!(
-        "/etc/systemd/system/fcvm-setup-dns.service:{}",
-        dns_setup_service
-    ));
+    // 6. DNS configuration note
+    // DNS is now handled by fc-agent at startup (parses kernel cmdline, writes /etc/resolv.conf)
+    // This avoids relying on systemd service ordering which was unreliable on some CI runners
 
     // 7. Write fc-agent systemd service
     info!("adding fc-agent service");
@@ -577,10 +515,10 @@ echo "[fcvm-dns] done"
         fc_agent_service
     ));
 
-    // 9. Enable services (fc-agent + dns-setup, other services enabled after package install)
+    // 9. Enable services (fc-agent, other services enabled after package install)
     info!("enabling systemd services");
     cmd.arg("--run-command")
-        .arg("systemctl enable fc-agent fcvm-setup-dns systemd-networkd serial-getty@ttyS0");
+        .arg("systemctl enable fc-agent systemd-networkd serial-getty@ttyS0");
 
     info!("executing virt-customize (this should be quick)");
 
