@@ -225,6 +225,19 @@ jobs:
           ls -la /dev/nbd* | head -5
       - name: Setup network namespace directory
         run: sudo mkdir -p /var/run/netns
+      - name: Setup dnsmasq for VM DNS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dnsmasq
+          sudo tee /etc/dnsmasq.d/fcvm.conf > /dev/null <<EOF
+          bind-dynamic
+          server=8.8.8.8
+          server=8.8.4.4
+          no-resolv
+          cache-size=1000
+          EOF
+          sudo systemctl restart dnsmasq
+          sudo systemctl status dnsmasq
       - name: Run VM sanity test (bridged)
         working-directory: fcvm
         run: |
