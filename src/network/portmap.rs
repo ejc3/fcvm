@@ -235,7 +235,7 @@ pub async fn cleanup_port_mappings(rules: &[String]) -> Result<()> {
 ///
 /// This should be called once during fcvm initialization, not per-VM.
 pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<()> {
-    debug!(
+    info!(
         subnet = %vm_subnet,
         interface = %outbound_iface,
         "ensuring global NAT configuration"
@@ -248,8 +248,11 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
         .await
         .context("enabling IP forwarding")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() {
+        info!("IP forwarding enabled: {}", stdout.trim());
+    } else {
         warn!("failed to enable IP forwarding: {}", stderr);
     }
 
@@ -273,11 +276,12 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
 
     if output.status.success() {
         // Rule already exists
-        debug!("global MASQUERADE rule already exists");
+        info!("global MASQUERADE rule already exists");
         return Ok(());
     }
 
     // Add MASQUERADE rule for outbound traffic
+    info!("adding MASQUERADE rule: -s {} -o {} -j MASQUERADE", vm_subnet, outbound_iface);
     let output = Command::new("sudo")
         .args([
             "iptables",
@@ -301,7 +305,16 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
         anyhow::bail!("failed to add MASQUERADE rule: {}", stderr);
     }
 
-    debug!("global NAT configuration complete");
+    info!("global NAT configuration complete");
+
+    // Verify the rule was added
+    let verify = Command::new("sudo")
+        .args(["iptables", "-t", "nat", "-L", "POSTROUTING", "-n", "-v"])
+        .output()
+        .await?;
+    let verify_out = String::from_utf8_lossy(&verify.stdout);
+    info!("current NAT POSTROUTING rules:\n{}", verify_out);
+
     Ok(())
 }
 
