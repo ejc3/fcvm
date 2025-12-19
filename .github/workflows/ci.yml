@@ -242,6 +242,28 @@ jobs:
         run: |
           sudo rm -f /mnt/fcvm-btrfs/rootfs/base.ext4
           sudo rm -f /mnt/fcvm-btrfs/cache/*.img
+      - name: Debug network setup
+        run: |
+          echo "=== Host network interfaces ==="
+          ip addr show
+          echo ""
+          echo "=== Default route ==="
+          ip route show default
+          echo ""
+          echo "=== IP forwarding status ==="
+          cat /proc/sys/net/ipv4/ip_forward
+          echo ""
+          echo "=== iptables NAT table ==="
+          sudo iptables -t nat -L -n -v
+          echo ""
+          echo "=== dnsmasq status ==="
+          sudo systemctl status dnsmasq || true
+          echo ""
+          echo "=== dnsmasq listening ports ==="
+          sudo ss -ulnp | grep dnsmasq || echo "no dnsmasq listening"
+          echo ""
+          echo "=== Test DNS resolution from host ==="
+          nslookup public.ecr.aws 8.8.8.8 || echo "DNS lookup failed"
       - name: Run VM sanity test (bridged)
         working-directory: fcvm
         run: |
