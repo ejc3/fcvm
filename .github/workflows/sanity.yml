@@ -1,0 +1,50 @@
+name: Sanity Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  sanity:
+    name: VM Sanity Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fcvm
+        uses: actions/checkout@v4
+        with:
+          path: fcvm
+
+      - name: Checkout fuse-backend-rs fork
+        uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          path: fuse-backend-rs
+
+      - name: Checkout fuser fork
+        uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          path: fuser
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -la /dev/kvm
+
+      - name: Build
+        working-directory: fcvm
+        run: make build
+
+      - name: Run sanity tests
+        working-directory: fcvm
+        run: make test-vm
+        env:
+          RUST_LOG: info
