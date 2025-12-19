@@ -55,7 +55,8 @@ impl VmFixture {
         .await?;
 
         // Wait for VM to become healthy
-        if let Err(e) = poll_health_by_pid(pid, 60).await {
+        // Use 180 second timeout to account for rootfs creation on first run (~60 sec)
+        if let Err(e) = poll_health_by_pid(pid, 180).await {
             let _ = child.kill().await;
             anyhow::bail!("VM failed to become healthy: {}", e);
         }
