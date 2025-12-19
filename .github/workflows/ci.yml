@@ -238,7 +238,7 @@ jobs:
           EOF
           sudo systemctl restart dnsmasq
           sudo systemctl status dnsmasq
-      - name: Clear cached rootfs (force rebuild with latest code)
+      - name: Clear cached rootfs (force rebuild with symlink fix)
         run: |
           sudo rm -f /mnt/fcvm-btrfs/rootfs/base.ext4
           sudo rm -f /mnt/fcvm-btrfs/cache/*.img
