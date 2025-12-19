@@ -231,10 +231,7 @@ impl NetworkManager for BridgedNetwork {
 
         // Step 6: Ensure global NAT is configured
         let default_iface = match portmap::detect_default_interface().await {
-            Ok(iface) => {
-                info!(interface = %iface, "detected default outbound interface for NAT");
-                iface
-            }
+            Ok(iface) => iface,
             Err(e) => {
                 let _ = self.cleanup().await;
                 return Err(e).context("detecting default network interface");
@@ -242,7 +239,6 @@ impl NetworkManager for BridgedNetwork {
         };
 
         // NAT for baseline VMs (172.30.x.x)
-        info!(subnet = "172.30.0.0/16", interface = %default_iface, "configuring MASQUERADE rule");
         if let Err(e) = portmap::ensure_global_nat("172.30.0.0/16", &default_iface).await {
             let _ = self.cleanup().await;
             return Err(e).context("ensuring global NAT for 172.30.0.0/16");
