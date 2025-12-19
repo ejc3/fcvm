@@ -266,6 +266,11 @@ async fn extract_root_partition(qcow2_path: &Path, output_path: &Path) -> Result
 
     // Wait for partition to appear with retry loop
     let partition = format!("{}p1", nbd_device);
+
+    // Small delay to allow kernel to create partition device nodes
+    // This is needed because partprobe/partx returns before udev creates the nodes
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
     let mut retries = 10;
     while retries > 0 && !std::path::Path::new(&partition).exists() {
         info!(
