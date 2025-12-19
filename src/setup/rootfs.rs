@@ -303,10 +303,7 @@ async fn extract_root_partition(qcow2_path: &Path, output_path: &Path) -> Result
                 if output.status.success() {
                     info!(partition = %partition, "created partition device node");
                 } else {
-                    warn!(
-                        "mknod failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
+                    warn!("mknod failed: {}", String::from_utf8_lossy(&output.stderr));
                 }
             }
         } else {
@@ -323,7 +320,10 @@ async fn extract_root_partition(qcow2_path: &Path, output_path: &Path) -> Result
     if !std::path::Path::new(&partition).exists() {
         // List what devices exist for debugging
         let ls_output = Command::new("sh")
-            .args(["-c", "ls -la /dev/nbd0* 2>/dev/null || echo 'no nbd devices'"])
+            .args([
+                "-c",
+                "ls -la /dev/nbd0* 2>/dev/null || echo 'no nbd devices'",
+            ])
             .output()
             .await;
         let devices = ls_output
