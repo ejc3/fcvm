@@ -1033,12 +1033,10 @@ fn handle_exec_pipe(fd: i32, request: &ExecRequest) {
     let stdout_thread = std::thread::spawn(move || {
         if let Some(stdout) = stdout {
             let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    let response = ExecResponse::Stdout(format!("{}\n", line));
-                    if let Ok(fd) = fd_stdout.lock() {
-                        write_line_to_fd(*fd, &serde_json::to_string(&response).unwrap());
-                    }
+            for line in reader.lines().map_while(Result::ok) {
+                let response = ExecResponse::Stdout(format!("{}\n", line));
+                if let Ok(fd) = fd_stdout.lock() {
+                    write_line_to_fd(*fd, &serde_json::to_string(&response).unwrap());
                 }
             }
         }
@@ -1048,12 +1046,10 @@ fn handle_exec_pipe(fd: i32, request: &ExecRequest) {
     let stderr_thread = std::thread::spawn(move || {
         if let Some(stderr) = stderr {
             let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    let response = ExecResponse::Stderr(format!("{}\n", line));
-                    if let Ok(fd) = fd_stderr.lock() {
-                        write_line_to_fd(*fd, &serde_json::to_string(&response).unwrap());
-                    }
+            for line in reader.lines().map_while(Result::ok) {
+                let response = ExecResponse::Stderr(format!("{}\n", line));
+                if let Ok(fd) = fd_stderr.lock() {
+                    write_line_to_fd(*fd, &serde_json::to_string(&response).unwrap());
                 }
             }
         }

@@ -18,6 +18,7 @@ const TEST_IMAGE: &str = "public.ecr.aws/nginx/nginx:alpine";
 
 /// VM state from fcvm ls --json
 #[derive(Deserialize)]
+#[allow(dead_code)] // fields are deserialized from JSON but not all are used directly
 struct VmLsEntry {
     pid: Option<u32>,
     health_status: String,
@@ -54,6 +55,7 @@ fn find_fcvm_binary() -> PathBuf {
 /// A running VM fixture for benchmarking
 struct VmFixture {
     pid: u32,
+    child: Child,
     _name: String,
     _network: String,
 }
@@ -113,6 +115,7 @@ impl VmFixture {
 
         Self {
             pid,
+            child,
             _name: name.to_string(),
             _network: network.to_string(),
         }
@@ -166,30 +169,12 @@ impl VmFixture {
         elapsed
     }
 
-    /// Kill the VM
-    fn kill(&self) {
-        // SIGTERM for graceful cleanup
-        let _ = Command::new("kill")
-            .args(["-TERM", &self.pid.to_string()])
-            .output();
-
-        // Wait for exit
-        for _ in 0..50 {
-            let status = Command::new("kill")
-                .args(["-0", &self.pid.to_string()])
-                .output();
-            if let Ok(out) = status {
-                if !out.status.success() {
-                    return; // Process exited
-                }
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-
-        // Force kill
-        let _ = Command::new("kill")
-            .args(["-9", &self.pid.to_string()])
-            .output();
+    /// Kill the VM and wait for it to exit
+    fn kill(&mut self) {
+        // Kill the child process
+        let _ = self.child.kill();
+        // Wait to reap the process and avoid zombies
+        let _ = self.child.wait();
     }
 }
 
@@ -343,8 +328,10 @@ fn bench_exec_throughput(c: &mut Criterion) {
 }
 
 /// Snapshot/clone fixture - baseline VM + serve process
+#[allow(dead_code)] // snapshot_name is used in setup but not directly accessed after
 struct CloneFixture {
-    baseline_pid: u32,
+    baseline_child: Child,
+    serve_child: Child,
     serve_pid: u32,
     snapshot_name: String,
 }
@@ -358,7 +345,7 @@ impl CloneFixture {
 
         // Start baseline VM
         eprintln!("  Starting baseline VM...");
-        let child = Command::new(&fcvm)
+        let baseline_child = Command::new(&fcvm)
             .args([
                 "podman",
                 "run",
@@ -373,7 +360,7 @@ impl CloneFixture {
             .spawn()
             .expect("failed to spawn baseline VM");
 
-        let baseline_pid = child.id();
+        let baseline_pid = baseline_child.id();
 
         // Wait for healthy
         let start = Instant::now();
@@ -451,7 +438,8 @@ impl CloneFixture {
         }
 
         Self {
-            baseline_pid,
+            baseline_child,
+            serve_child,
             serve_pid,
             snapshot_name,
         }
@@ -597,20 +585,12 @@ impl CloneFixture {
         start.elapsed()
     }
 
-    fn kill(&self) {
-        let _ = Command::new("kill")
-            .args(["-TERM", &self.serve_pid.to_string()])
-            .output();
-        let _ = Command::new("kill")
-            .args(["-TERM", &self.baseline_pid.to_string()])
-            .output();
-        std::thread::sleep(Duration::from_secs(2));
-        let _ = Command::new("kill")
-            .args(["-9", &self.serve_pid.to_string()])
-            .output();
-        let _ = Command::new("kill")
-            .args(["-9", &self.baseline_pid.to_string()])
-            .output();
+    fn kill(&mut self) {
+        // Kill both processes and wait to reap them
+        let _ = self.serve_child.kill();
+        let _ = self.baseline_child.kill();
+        let _ = self.serve_child.wait();
+        let _ = self.baseline_child.wait();
     }
 }
 

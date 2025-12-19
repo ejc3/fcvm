@@ -6,38 +6,6 @@ use std::process::Command;
 
 mod common;
 
-/// Helper to run fcvm with args and check if parsing succeeds
-fn parse_args_succeeds(args: &[&str]) -> bool {
-    let fcvm_path = common::find_fcvm_binary().expect("fcvm binary not found");
-
-    // Use --help after the subcommand to avoid actually running the VM
-    // We just want to verify the args parse correctly
-    let output = Command::new(&fcvm_path)
-        .args(args)
-        .arg("--help")
-        .output()
-        .expect("failed to run fcvm");
-
-    // If args are valid, --help should succeed
-    output.status.success()
-}
-
-/// Helper to check that parsing fails with specific error
-fn parse_fails_with_missing_image(args: &[&str]) -> bool {
-    let fcvm_path = common::find_fcvm_binary().expect("fcvm binary not found");
-
-    let output = Command::new(&fcvm_path)
-        .args(args)
-        .output()
-        .expect("failed to run fcvm");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let combined = format!("{}{}", stderr, stdout);
-
-    !output.status.success() && combined.contains("<IMAGE>")
-}
-
 #[test]
 fn test_publish_does_not_consume_image() {
     // This was a bug: --publish 8080:80 nginx:alpine would fail because

@@ -275,7 +275,7 @@ async fn test_custom_resources() -> Result<()> {
 
     // Allow 5% tolerance for kernel overhead
     assert!(
-        mem_mb >= 950 && mem_mb <= 1100,
+        (950..=1100).contains(&mem_mb),
         "Memory should be ~1024 MB, got: {} MB",
         mem_mb
     );

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tracing::info;
 
@@ -21,7 +21,7 @@ fn user_data_dir() -> PathBuf {
 }
 
 /// Check if directory exists and is writable by current user
-fn is_writable(path: &PathBuf) -> bool {
+fn is_writable(path: &Path) -> bool {
     if !path.exists() {
         return false;
     }
