@@ -14,13 +14,13 @@ CONTAINER_ARCH ?= aarch64
 TEST_UNIT := cargo test --release --lib
 TEST_FUSE_NOROOT := cargo test --release -p fuse-pipe --test integration
 TEST_FUSE_STRESS := cargo test --release -p fuse-pipe --test test_mount_stress
-TEST_VM_ROOTLESS := cargo test --release --test test_sanity test_sanity_rootless -- --nocapture
+TEST_VM_ROOTLESS := cargo build --release && cargo test --release --test test_sanity test_sanity_rootless -- --nocapture
 
 # Root required:
 TEST_FUSE_ROOT := cargo test --release -p fuse-pipe --test integration_root
 TEST_FUSE_PERMISSION := cargo test --release -p fuse-pipe --test test_permission_edge_cases
 TEST_PJDFSTEST := cargo test --release -p fuse-pipe --test pjdfstest_full -- --nocapture
-TEST_VM_BRIDGED := cargo test --release --test test_sanity test_sanity_bridged -- --nocapture
+TEST_VM_BRIDGED := cargo build --release && cargo test --release --test test_sanity test_sanity_bridged -- --nocapture
 
 # Legacy alias
 TEST_VM := cargo test --release --test test_sanity -- --nocapture
