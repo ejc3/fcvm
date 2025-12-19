@@ -676,6 +676,17 @@ async fn install_packages_in_rootfs(rootfs_path: &Path) -> Result<()> {
             .await
             .context("writing registries.conf")?;
 
+        // Write static /etc/resolv.conf for DNS resolution
+        // This ensures Podman containers inside the VM can resolve DNS
+        info!("configuring static DNS resolvers");
+        let resolv_conf_path = mount_point.join("etc/resolv.conf");
+        let resolv_content = "# Static DNS for VM - used by Podman's aardvark-dns\n\
+                              nameserver 8.8.8.8\n\
+                              nameserver 8.8.4.4\n";
+        tokio::fs::write(&resolv_conf_path, resolv_content)
+            .await
+            .context("writing resolv.conf")?;
+
         Ok(())
     }
     .await;
