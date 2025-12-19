@@ -7,20 +7,31 @@ use tracing::{info, warn};
 
 use crate::paths;
 
-/// Find the fc-agent binary (sibling in same target directory as fcvm)
+/// Find the fc-agent binary
 ///
 /// Both fcvm and fc-agent are workspace members built together with:
 ///   cargo build --release
 ///
-/// This puts both binaries in the same directory (target/release/).
+/// Search order:
+/// 1. Same directory as current exe (for cargo install)
+/// 2. Parent directory (for tests running from target/release/deps/)
+/// 3. FC_AGENT_PATH environment variable
 fn find_fc_agent_binary() -> Result<PathBuf> {
-    // Primary: fc-agent is built alongside fcvm in the same target directory
     let exe_path = std::env::current_exe().context("getting current executable path")?;
     let exe_dir = exe_path.parent().context("getting executable directory")?;
-    let fc_agent = exe_dir.join("fc-agent");
 
+    // Check same directory (cargo install case)
+    let fc_agent = exe_dir.join("fc-agent");
     if fc_agent.exists() {
         return Ok(fc_agent);
+    }
+
+    // Check parent directory (test case: exe in target/release/deps/, agent in target/release/)
+    if let Some(parent) = exe_dir.parent() {
+        let fc_agent_parent = parent.join("fc-agent");
+        if fc_agent_parent.exists() {
+            return Ok(fc_agent_parent);
+        }
     }
 
     // Fallback: environment variable override for special cases
