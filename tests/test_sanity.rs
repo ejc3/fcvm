@@ -43,8 +43,9 @@ async fn sanity_test_impl(network: &str) -> Result<()> {
     println!("  Waiting for VM to become healthy...");
 
     // Spawn health check task
-    // Use 180 second timeout to account for rootfs creation on first run (~60 sec)
-    let health_task = tokio::spawn(common::poll_health_by_pid(fcvm_pid, 180));
+    // Use 300 second timeout to account for rootfs creation on first run
+    // (cloud image download ~7s, virt-customize ~10-60s, extraction ~30s, packages ~60s)
+    let health_task = tokio::spawn(common::poll_health_by_pid(fcvm_pid, 300));
 
     // Monitor process for unexpected exits
     let monitor_task: tokio::task::JoinHandle<Result<(), anyhow::Error>> =
