@@ -76,7 +76,7 @@ Exception: For **forked libraries** (like fuse-backend-rs), we maintain compatib
    gh pr list --author @me
    gh pr checks <pr-number>
    # Merge when green
-   gh pr merge <pr-number> --squash --delete-branch
+   gh pr merge <pr-number> --merge --delete-branch
    git pull  # Update local main
    ```
 
