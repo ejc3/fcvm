@@ -55,6 +55,37 @@ fcvm exec --pid <PID> -c -- wget -q -O - --timeout=10 http://ifconfig.me
 
 Exception: For **forked libraries** (like fuse-backend-rs), we maintain compatibility with upstream to enable merging upstream changes.
 
+### Development Workflow (PR-Based)
+
+**Local commits are fast. Branch before push.**
+
+1. **Commit locally to main** as you work - no interruption
+2. **Before pushing**, create a branch and PR:
+   ```bash
+   # Create branch from current main
+   git checkout -b feature/description
+   git push -u origin feature/description
+   gh pr create --fill
+   # Go back to main for next work
+   git checkout main
+   ```
+3. **Continue working** - more local commits to main
+4. **End of session** - check CI on all PRs, merge in order:
+   ```bash
+   # Check all PR statuses
+   gh pr list --author @me
+   gh pr checks <pr-number>
+   # Merge when green
+   gh pr merge <pr-number> --squash --delete-branch
+   git pull  # Update local main
+   ```
+
+**Why this works:**
+- Feels like committing to main (local commits are instant)
+- PRs provide CI validation before merge
+- Can stack multiple PRs without waiting
+- Merge at end when CI is green
+
 ### JSON Parsing
 
 **NEVER parse JSON with string matching.** Always use proper deserialization.
