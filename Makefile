@@ -21,6 +21,8 @@ TEST_FUSE_ROOT := cargo test --release -p fuse-pipe --test integration_root
 TEST_FUSE_PERMISSION := cargo test --release -p fuse-pipe --test test_permission_edge_cases
 TEST_PJDFSTEST := cargo test --release -p fuse-pipe --test pjdfstest_full -- --nocapture
 TEST_VM_BRIDGED := sh -c "cargo build --release && cargo test --release --test test_sanity test_sanity_bridged -- --nocapture"
+TEST_VM_EXEC := sh -c "cargo build --release && cargo test --release --test test_exec -- --nocapture --test-threads=1"
+TEST_VM_EGRESS := sh -c "cargo build --release && cargo test --release --test test_egress -- --nocapture --test-threads=1"
 
 # Legacy alias
 TEST_VM := cargo test --release --test test_sanity -- --nocapture
@@ -39,7 +41,7 @@ BENCH_EXEC := cargo bench --bench exec
         lint clippy fmt fmt-check \
         rootfs rebuild \
         container-test container-test-unit container-test-noroot container-test-root container-test-fuse \
-        container-test-vm container-test-vm-rootless container-test-vm-bridged container-test-fcvm \
+        container-test-vm container-test-vm-rootless container-test-vm-bridged container-test-vm-exec container-test-vm-egress container-test-fcvm \
         container-test-pjdfstest container-test-all container-test-allow-other container-build-allow-other \
         container-bench container-bench-throughput container-bench-operations container-bench-protocol container-bench-exec \
         container-shell container-clean \
@@ -427,6 +429,14 @@ container-test-vm-rootless: container-build-rootless setup-kernel
 # VM tests - bridged (requires root for iptables/netns)
 container-test-vm-bridged: container-build setup-kernel
 	$(CONTAINER_RUN_FCVM) $(CONTAINER_IMAGE) $(TEST_VM_BRIDGED)
+
+# VM exec tests - tests fcvm exec functionality
+container-test-vm-exec: container-build setup-kernel
+	$(CONTAINER_RUN_FCVM) $(CONTAINER_IMAGE) $(TEST_VM_EXEC)
+
+# VM egress tests - tests network egress from VMs
+container-test-vm-egress: container-build setup-kernel
+	$(CONTAINER_RUN_FCVM) $(CONTAINER_IMAGE) $(TEST_VM_EGRESS)
 
 # All VM tests: rootless first, then bridged
 container-test-vm: container-test-vm-rootless container-test-vm-bridged
