@@ -1021,7 +1021,7 @@ async fn run_clone_setup(
     );
     vm_manager.set_vsock_redirect(baseline_dir, data_dir.to_path_buf());
 
-    let firecracker_bin = which::which("firecracker").context("firecracker not found in PATH")?;
+    let firecracker_bin = super::common::find_firecracker()?;
 
     vm_manager
         .start(&firecracker_bin, None)

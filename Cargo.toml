@@ -38,6 +38,7 @@ shell-words = "1"
 fuse-pipe = { path = "fuse-pipe", default-features = false }
 url = "2"
 tokio-util = "0.7"
+regex = "1.12.2"
 
 [dev-dependencies]
 serial_test = "3"

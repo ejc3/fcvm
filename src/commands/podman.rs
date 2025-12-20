@@ -689,7 +689,7 @@ async fn run_vm_setup(
         holder_child = None;
     }
 
-    let firecracker_bin = which::which("firecracker").context("firecracker not found in PATH")?;
+    let firecracker_bin = super::common::find_firecracker()?;
 
     vm_manager
         .start(&firecracker_bin, None)
