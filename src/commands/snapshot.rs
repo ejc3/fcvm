@@ -143,8 +143,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         use crate::storage::snapshot::{SnapshotConfig, SnapshotMetadata, SnapshotVolumeConfig};
 
         // Parse volume configs from VM state (format: HOST:GUEST[:ro])
-        // VSOCK_VOLUME_PORT_BASE = 5000 (from podman.rs)
-        const VSOCK_VOLUME_PORT_BASE: u32 = 5000;
+        use super::common::VSOCK_VOLUME_PORT_BASE;
         let volume_configs: Vec<SnapshotVolumeConfig> = vm_state.config.volumes
             .iter()
             .enumerate()
@@ -684,36 +683,21 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         )
         .await?;
 
-        // Cleanup resources
+        // Cleanup resources (exec path has no health monitor)
         info!("exec completed with exit code {}, cleaning up", exit_code);
 
-        // Cancel VolumeServer tasks
-        for handle in volume_server_handles {
-            handle.abort();
-        }
-
-        // Kill VM process
-        if let Err(e) = vm_manager.kill().await {
-            warn!("failed to kill VM process: {}", e);
-        }
-
-        // Kill holder process (rootless mode only)
-        if let Some(ref mut holder) = holder_child {
-            if let Err(e) = holder.kill().await {
-                warn!("failed to kill holder process: {}", e);
-            }
-            let _ = holder.wait().await;
-        }
-
-        // Cleanup network
-        if let Err(e) = network.cleanup().await {
-            warn!("failed to cleanup network: {}", e);
-        }
-
-        // Delete state file
-        if let Err(e) = state_manager.delete_state(&vm_id).await {
-            warn!("failed to delete state file: {}", e);
-        }
+        super::common::cleanup_vm(
+            &vm_id,
+            &mut vm_manager,
+            &mut holder_child,
+            volume_server_handles,
+            network.as_mut(),
+            &state_manager,
+            &data_dir,
+            None, // no health monitor in exec path
+            None,
+        )
+        .await;
 
         // Return error if exec failed
         if exit_code != 0 {
@@ -751,71 +735,19 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         }
     }
 
-    // Cleanup
-    info!("cleaning up resources");
-
-    // Signal health monitor to stop gracefully, then wait briefly for it
-    health_cancel_token.cancel();
-    tokio::select! {
-        _ = health_monitor_handle => {
-            debug!("health monitor stopped gracefully");
-        }
-        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-            debug!("health monitor didn't stop in time, continuing cleanup");
-        }
-    }
-
-    // Cancel VolumeServer tasks
-    for handle in volume_server_handles {
-        handle.abort();
-    }
-
-    // Kill VM process
-    if let Err(e) = vm_manager.kill().await {
-        warn!("failed to kill VM process: {}", e);
-    }
-
-    // Kill holder process (rootless mode only)
-    if let Some(ref mut holder) = holder_child {
-        info!("killing namespace holder process");
-        if let Err(e) = holder.kill().await {
-            warn!("failed to kill holder process: {}", e);
-        }
-        let _ = holder.wait().await; // Clean up zombie
-    }
-
-    // Cleanup network
-    if let Err(e) = network.cleanup().await {
-        warn!("failed to cleanup network: {}", e);
-    }
-
-    // Delete state file
-    if let Err(e) = state_manager.delete_state(&vm_id).await {
-        warn!("failed to delete state file: {}", e);
-    }
-
-    // Clean up vsock sockets for each volume port
-    // With mount namespace isolation, only clone's sockets need cleanup (no symlinks)
-    if !volume_configs.is_empty() {
-        let clone_vsock_base = data_dir.join("vsock.sock");
-
-        for vol_config in &volume_configs {
-            // Remove clone's socket
-            let clone_socket = PathBuf::from(format!(
-                "{}_{}",
-                clone_vsock_base.display(),
-                vol_config.port
-            ));
-            let _ = std::fs::remove_file(&clone_socket);
-        }
-    }
-
-    // Cleanup VM data directory (includes disks, sockets, etc.)
-    if let Err(e) = tokio::fs::remove_dir_all(&data_dir).await {
-        warn!(vm_id = %vm_id, error = %e, "failed to cleanup clone data directory");
-    } else {
-        info!(vm_id = %vm_id, "cleaned up clone data directory");
-    }
+    // Cleanup common resources
+    super::common::cleanup_vm(
+        &vm_id,
+        &mut vm_manager,
+        &mut holder_child,
+        volume_server_handles,
+        network.as_mut(),
+        &state_manager,
+        &data_dir,
+        Some(health_cancel_token),
+        Some(health_monitor_handle),
+    )
+    .await;
 
     Ok(())
 }
@@ -1089,7 +1021,8 @@ async fn run_clone_setup(
     );
     vm_manager.set_vsock_redirect(baseline_dir, data_dir.to_path_buf());
 
-    let firecracker_bin = PathBuf::from("/usr/local/bin/firecracker");
+    let firecracker_bin = which::which("firecracker")
+        .context("firecracker not found in PATH")?;
 
     vm_manager
         .start(&firecracker_bin, None)

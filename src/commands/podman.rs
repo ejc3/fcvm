@@ -53,11 +53,7 @@ impl VolumeMapping {
     }
 }
 
-/// Vsock base port for volume servers
-const VSOCK_VOLUME_PORT_BASE: u32 = 5000;
-
-/// Vsock port for status channel (fc-agent notifies when container starts)
-const VSOCK_STATUS_PORT: u32 = 4999;
+use super::common::{VSOCK_STATUS_PORT, VSOCK_VOLUME_PORT_BASE};
 
 /// Main dispatcher for podman commands
 pub async fn cmd_podman(args: PodmanArgs) -> Result<()> {
@@ -434,61 +430,22 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         }
     }
 
-    // Cleanup
-    info!("cleaning up resources");
-
-    // Signal health monitor to stop gracefully, then wait briefly for it
-    health_cancel_token.cancel();
-    tokio::select! {
-        _ = health_monitor_handle => {
-            debug!("health monitor stopped gracefully");
-        }
-        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-            debug!("health monitor didn't stop in time, continuing cleanup");
-        }
-    }
-
-    // Cancel status listener
+    // Cancel status listener (podman-specific)
     status_handle.abort();
 
-    // Cancel VolumeServer tasks
-    for handle in volume_server_handles {
-        handle.abort();
-    }
-
-    // Kill VM process
-    if let Err(e) = vm_manager.kill().await {
-        warn!("failed to kill VM process: {}", e);
-    }
-
-    // Kill holder process (rootless mode only)
-    if let Some(ref mut holder) = holder_child {
-        info!("killing namespace holder process");
-        if let Err(e) = holder.kill().await {
-            warn!("failed to kill holder process: {}", e);
-        }
-        let _ = holder.wait().await; // Clean up zombie
-    }
-
-    // Cleanup network
-    if let Err(e) = network.cleanup().await {
-        warn!("failed to cleanup network: {}", e);
-    }
-
-    // Delete state file
-    if let Err(e) = state_manager.delete_state(&vm_id).await {
-        warn!("failed to delete state file: {}", e);
-    }
-
-    // Cleanup vsock socket
-    let _ = std::fs::remove_file(&vsock_socket_path);
-
-    // Cleanup VM data directory (includes disks, sockets, etc.)
-    if let Err(e) = tokio::fs::remove_dir_all(&data_dir).await {
-        warn!(vm_id = %vm_id, error = %e, "failed to cleanup VM data directory");
-    } else {
-        info!(vm_id = %vm_id, "cleaned up VM data directory");
-    }
+    // Cleanup common resources
+    super::common::cleanup_vm(
+        &vm_id,
+        &mut vm_manager,
+        &mut holder_child,
+        volume_server_handles,
+        network.as_mut(),
+        &state_manager,
+        &data_dir,
+        Some(health_cancel_token),
+        Some(health_monitor_handle),
+    )
+    .await;
 
     // Return error if container exited with non-zero exit code
     if let Some(code) = container_exit_code {
@@ -732,7 +689,8 @@ async fn run_vm_setup(
         holder_child = None;
     }
 
-    let firecracker_bin = PathBuf::from("/usr/local/bin/firecracker");
+    let firecracker_bin = which::which("firecracker")
+        .context("firecracker not found in PATH")?;
 
     vm_manager
         .start(&firecracker_bin, None)

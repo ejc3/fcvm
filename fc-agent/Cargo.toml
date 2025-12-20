@@ -12,5 +12,4 @@ reqwest = { version = "0.11", default-features = false, features = ["json"] }
 libc = "0.2"
 fs2 = "0.4"
 fuse-pipe = { path = "../fuse-pipe" }
-tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

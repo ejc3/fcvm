@@ -32,12 +32,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - name: Install cargo-machete
+        run: cargo install cargo-machete
       - name: Check formatting
         working-directory: fcvm
         run: cargo fmt --all -- --check
       - name: Clippy
         working-directory: fcvm
         run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Check unused dependencies
+        working-directory: fcvm
+        run: cargo machete
 
   build:
     name: Build
