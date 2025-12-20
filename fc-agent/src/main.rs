@@ -1137,7 +1137,8 @@ fn send_status_to_host(message: &[u8]) -> bool {
     }
 
     // Send message
-    let written = unsafe { libc::write(fd, message.as_ptr() as *const libc::c_void, message.len()) };
+    let written =
+        unsafe { libc::write(fd, message.as_ptr() as *const libc::c_void, message.len()) };
     unsafe { libc::close(fd) };
 
     written == message.len() as isize
