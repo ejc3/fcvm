@@ -1096,19 +1096,19 @@ fn raise_resource_limits() {
     }
 }
 
-/// Notify host of container exit status via vsock.
+/// Send a message to the host via vsock status channel.
 ///
-/// Sends "exit:{code}\n" message to the host on the status vsock port.
-/// The host side can use this to determine if the container succeeded or failed.
-fn notify_container_exit(exit_code: i32) {
+/// Creates a vsock connection to the host on STATUS_VSOCK_PORT and sends the message.
+/// Returns true if the message was sent successfully.
+fn send_status_to_host(message: &[u8]) -> bool {
     // Create vsock socket
     let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
     if fd < 0 {
         eprintln!(
-            "[fc-agent] WARNING: failed to create vsock socket for exit status: {}",
+            "[fc-agent] WARNING: failed to create vsock socket: {}",
             std::io::Error::last_os_error()
         );
-        return;
+        return false;
     }
 
     // Build sockaddr_vm structure
@@ -1132,29 +1132,30 @@ fn notify_container_exit(exit_code: i32) {
     if result < 0 {
         let err = std::io::Error::last_os_error();
         unsafe { libc::close(fd) };
-        eprintln!(
-            "[fc-agent] WARNING: failed to connect vsock for exit status: {}",
-            err
-        );
-        return;
+        eprintln!("[fc-agent] WARNING: failed to connect vsock: {}", err);
+        return false;
     }
 
-    // Send exit status message
-    let msg = format!("exit:{}\n", exit_code);
-    let written = unsafe { libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len()) };
-
+    // Send message
+    let written = unsafe { libc::write(fd, message.as_ptr() as *const libc::c_void, message.len()) };
     unsafe { libc::close(fd) };
 
-    if written == msg.len() as isize {
+    written == message.len() as isize
+}
+
+/// Notify host of container exit status via vsock.
+///
+/// Sends "exit:{code}\n" message to the host on the status vsock port.
+/// The host side can use this to determine if the container succeeded or failed.
+fn notify_container_exit(exit_code: i32) {
+    let msg = format!("exit:{}\n", exit_code);
+    if send_status_to_host(msg.as_bytes()) {
         eprintln!(
             "[fc-agent] ✓ notified host of exit code {} via vsock",
             exit_code
         );
     } else {
-        eprintln!(
-            "[fc-agent] WARNING: vsock exit status write incomplete: {} bytes",
-            written
-        );
+        eprintln!("[fc-agent] WARNING: failed to send exit status to host");
     }
 }
 
@@ -1164,57 +1165,10 @@ fn notify_container_exit(exit_code: i32) {
 /// The host side listens on vsock.sock_4999 and uses this to determine
 /// when the container is running for health checks.
 fn notify_container_started() {
-    // Create vsock socket
-    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        eprintln!(
-            "[fc-agent] WARNING: failed to create vsock socket for status: {}",
-            std::io::Error::last_os_error()
-        );
-        return;
-    }
-
-    // Build sockaddr_vm structure
-    let addr = libc::sockaddr_vm {
-        svm_family: libc::AF_VSOCK as u16,
-        svm_reserved1: 0,
-        svm_port: STATUS_VSOCK_PORT,
-        svm_cid: HOST_CID,
-        svm_zero: [0u8; 4],
-    };
-
-    // Connect to host
-    let result = unsafe {
-        libc::connect(
-            fd,
-            &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_vm>() as u32,
-        )
-    };
-
-    if result < 0 {
-        let err = std::io::Error::last_os_error();
-        unsafe { libc::close(fd) };
-        eprintln!(
-            "[fc-agent] WARNING: failed to connect vsock for status: {}",
-            err
-        );
-        return;
-    }
-
-    // Send "ready" message
-    let msg = b"ready\n";
-    let written = unsafe { libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len()) };
-
-    unsafe { libc::close(fd) };
-
-    if written == msg.len() as isize {
+    if send_status_to_host(b"ready\n") {
         eprintln!("[fc-agent] ✓ container started, notified host via vsock");
     } else {
-        eprintln!(
-            "[fc-agent] WARNING: vsock status write incomplete: {} bytes",
-            written
-        );
+        eprintln!("[fc-agent] WARNING: failed to send ready status to host");
     }
 }
 
