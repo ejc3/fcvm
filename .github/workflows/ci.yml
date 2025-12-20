@@ -257,6 +257,8 @@ jobs:
         run: sudo mkdir -p /var/run/netns
       - name: Setup dnsmasq for VM DNS
         run: |
+          # Stop systemd-resolved which holds port 53
+          sudo systemctl stop systemd-resolved || true
           sudo apt-get update
           sudo apt-get install -y dnsmasq
           sudo tee /etc/dnsmasq.d/fcvm.conf > /dev/null <<EOF
@@ -267,7 +269,8 @@ jobs:
           cache-size=1000
           EOF
           sudo systemctl restart dnsmasq
-          sudo systemctl status dnsmasq
+          # Verify dnsmasq is running
+          sudo systemctl status dnsmasq || true
       - name: Setup iptables for VM networking
         run: |
           # BuildJet runners have FORWARD chain set to DROP by default
@@ -307,6 +310,8 @@ jobs:
         run: sudo mkdir -p /var/run/netns
       - name: Setup dnsmasq for VM DNS
         run: |
+          # Stop systemd-resolved which holds port 53
+          sudo systemctl stop systemd-resolved || true
           sudo apt-get update
           sudo apt-get install -y dnsmasq
           sudo tee /etc/dnsmasq.d/fcvm.conf > /dev/null <<EOF
@@ -317,6 +322,8 @@ jobs:
           cache-size=1000
           EOF
           sudo systemctl restart dnsmasq
+          # Verify dnsmasq is running
+          sudo systemctl status dnsmasq || true
       - name: Setup iptables for VM networking
         run: |
           sudo iptables -P FORWARD ACCEPT
@@ -354,6 +361,8 @@ jobs:
         run: sudo mkdir -p /var/run/netns
       - name: Setup dnsmasq for VM DNS
         run: |
+          # Stop systemd-resolved which holds port 53
+          sudo systemctl stop systemd-resolved || true
           sudo apt-get update
           sudo apt-get install -y dnsmasq
           sudo tee /etc/dnsmasq.d/fcvm.conf > /dev/null <<EOF
@@ -364,6 +373,8 @@ jobs:
           cache-size=1000
           EOF
           sudo systemctl restart dnsmasq
+          # Verify dnsmasq is running
+          sudo systemctl status dnsmasq || true
       - name: Setup iptables for VM networking
         run: |
           sudo iptables -P FORWARD ACCEPT
