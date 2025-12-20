@@ -394,7 +394,7 @@ fn mount_internal<P: AsRef<Path>>(
     // Clone fds AFTER session created but BEFORE run()
     let mut clone_failures = 0;
     for reader_id in 1..num_readers {
-        match session.channel().clone_fd() {
+        match session.clone_fd() {
             Ok(fd) => {
                 cloned_fds
                     .lock()
@@ -622,7 +622,7 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
 
     let mut clone_failures = 0;
     for reader_id in 1..num_readers {
-        match session.channel().clone_fd() {
+        match session.clone_fd() {
             Ok(fd) => {
                 cloned_fds
                     .lock()
