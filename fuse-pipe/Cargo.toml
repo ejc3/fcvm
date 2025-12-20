@@ -11,7 +11,6 @@ categories = ["filesystem", "asynchronous"]
 [features]
 default = ["fuse-client"]
 fuse-client = ["dep:fuser"]
-metrics = ["dep:metrics"]
 pjdfstest-full = []
 trace-benchmarks = []  # Enable tracing in benchmarks
 
@@ -37,7 +36,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # fuse-backend-rs for passthrough filesystem (Cloud Hypervisor's production-grade FUSE backend)
 # Using local path for development - synced to EC2 via `make sync`
 fuse-backend-rs = { path = "../../fuse-backend-rs", default-features = false, features = ["fusedev"] }
-vm-memory = "0.14"
 
 # Optional: FUSE client (local fork with multi-reader support via FUSE_DEV_IOC_CLONE)
 # Using local path for development - synced to EC2 via `make sync`
@@ -45,9 +43,6 @@ fuser = { path = "../../fuser", optional = true }
 
 # Concurrent data structures
 dashmap = "5.5"
-
-# Optional: Metrics
-metrics = { version = "0.23", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "process", "time"] }
