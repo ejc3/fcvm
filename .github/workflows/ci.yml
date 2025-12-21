@@ -222,8 +222,10 @@ jobs:
           export CONTAINER_ARCH=x86_64
           make container-test-pjdfstest
 
-  test-vm-sanity:
-    name: VM Sanity
+  # All VM tests run sequentially on the same runner to share the rootfs
+  # This avoids each job needing to recreate the rootfs via virt-customize
+  test-vm:
+    name: VM Tests
     runs-on: buildjet-32vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
@@ -261,80 +263,6 @@ jobs:
           # Set to ACCEPT and add MASQUERADE rule for VM NAT
           sudo iptables -P FORWARD ACCEPT
           sudo iptables -t nat -A POSTROUTING -s 172.30.0.0/16 -o eth0 -j MASQUERADE || true
-      - name: Run VM sanity test (bridged)
-        working-directory: fcvm
-        run: |
-          export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
-          export FUSER=${{ github.workspace }}/fuser
-          export CONTAINER_ARCH=x86_64
-          make container-test-vm-bridged
-
-  test-vm-exec:
-    name: VM Exec
-    runs-on: buildjet-32vcpu-ubuntu-2204
-    needs: build  # Can run in parallel - NBD device selection handles conflicts
-    if: always()  # Run even if previous job failed (rootfs will be cached after first success)
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: fcvm
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuse-backend-rs
-          ref: master
-          path: fuse-backend-rs
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuser
-          ref: master
-          path: fuser
-      - name: Setup KVM permissions
-        run: sudo chmod 666 /dev/kvm
-      - name: Setup NBD module
-        run: sudo modprobe nbd max_part=8
-      - name: Setup network namespace directory
-        run: sudo mkdir -p /var/run/netns
-      - name: Setup iptables for VM networking
-        run: |
-          sudo iptables -P FORWARD ACCEPT
-          sudo iptables -t nat -A POSTROUTING -s 172.30.0.0/16 -o eth0 -j MASQUERADE || true
-      - name: Run VM exec tests
-        working-directory: fcvm
-        run: |
-          export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
-          export FUSER=${{ github.workspace }}/fuser
-          export CONTAINER_ARCH=x86_64
-          make container-test-vm-exec
-
-  test-vm-egress:
-    name: VM Egress
-    runs-on: buildjet-32vcpu-ubuntu-2204
-    needs: build  # Can run in parallel - NBD device selection handles conflicts
-    if: always()  # Run even if previous job failed (rootfs will be cached after first success)
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: fcvm
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuse-backend-rs
-          ref: master
-          path: fuse-backend-rs
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuser
-          ref: master
-          path: fuser
-      - name: Setup KVM permissions
-        run: sudo chmod 666 /dev/kvm
-      - name: Setup NBD module
-        run: sudo modprobe nbd max_part=8
-      - name: Setup network namespace directory
-        run: sudo mkdir -p /var/run/netns
-      - name: Setup iptables for VM networking
-        run: |
-          sudo iptables -P FORWARD ACCEPT
-          sudo iptables -t nat -A POSTROUTING -s 172.30.0.0/16 -o eth0 -j MASQUERADE || true
       - name: Setup userfaultfd for snapshot cloning
         run: |
           echo "=== Kernel version ==="
@@ -349,6 +277,21 @@ jobs:
           ls -la /dev/userfaultfd
           echo "=== Enable unprivileged userfaultfd ==="
           sudo sysctl -w vm.unprivileged_userfaultfd=1
+      # Run VM tests sequentially - rootfs is created once and reused
+      - name: Run VM sanity test (bridged)
+        working-directory: fcvm
+        run: |
+          export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
+          export FUSER=${{ github.workspace }}/fuser
+          export CONTAINER_ARCH=x86_64
+          make container-test-vm-bridged
+      - name: Run VM exec tests
+        working-directory: fcvm
+        run: |
+          export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
+          export FUSER=${{ github.workspace }}/fuser
+          export CONTAINER_ARCH=x86_64
+          make container-test-vm-exec
       - name: Run VM egress tests
         working-directory: fcvm
         run: |
