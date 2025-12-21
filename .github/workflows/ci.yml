@@ -12,7 +12,7 @@ env:
 jobs:
   # Build inside container, upload artifacts for parallel test jobs
   build:
-    name: Build
+    name: Build [container/ubuntu-latest]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,7 +50,7 @@ jobs:
 
   # Lint runs in parallel with build (just needs source)
   lint:
-    name: Lint
+    name: Lint (fmt+clippy+machete) [host/ubuntu-latest]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -86,7 +86,7 @@ jobs:
 
   # Native tests use rust-cache (compiles incrementally)
   test-native:
-    name: Native Tests
+    name: Unit+CLI+FUSE-root [host/ubuntu-latest]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -118,7 +118,7 @@ jobs:
 
   # Container FUSE tests - download pre-built artifacts
   fuse-tests:
-    name: FUSE Tests
+    name: FUSE (noroot+root) [container/ubuntu-latest]
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -152,7 +152,7 @@ jobs:
 
   # POSIX compliance - download pre-built artifacts
   posix-compliance:
-    name: POSIX Compliance
+    name: POSIX (pjdfstest 8789) [container/ubuntu-latest]
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -186,7 +186,7 @@ jobs:
 
   # VM tests on BuildJet - builds inside container (separate from ubuntu-latest)
   vm-tests:
-    name: VM Tests
+    name: VM (bridged+rootless) [container/buildjet-32cpu]
     runs-on: buildjet-32vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
