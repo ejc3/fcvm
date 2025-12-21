@@ -370,16 +370,15 @@ CONTAINER_RUN_FCVM := $(CONTAINER_RUN_BASE) \
 	-v /var/run/netns:/var/run/netns:rshared \
 	--network host
 
-# Truly rootless container run - matches unprivileged host user exactly
-# Runs podman WITHOUT sudo (rootless podman) - this is the true unprivileged test
-# Uses separate storage (--root) to avoid conflicts with root-owned storage
-# --user testuser ensures process runs as non-root inside container
-# --network host so slirp4netns can bind to loopback addresses (127.x.y.z)
-# --security-opt seccomp=unconfined allows unshare syscall (no extra capabilities granted)
-# No --privileged, no CAP_SYS_ADMIN - matches real unprivileged user
+# Container run for rootless networking tests
+# Uses rootless podman (no sudo!) with --privileged for user namespace capabilities.
+# --privileged with rootless podman grants capabilities within the user namespace,
+# not actual host root. We're root inside the container but unprivileged on host.
+# --group-add keep-groups preserves host user's groups (kvm) for /dev/kvm access.
+# The container's user namespace is the isolation boundary.
 CONTAINER_RUN_ROOTLESS := podman --root=/tmp/podman-rootless run --rm \
-	--user testuser \
-	--security-opt seccomp=unconfined \
+	--privileged \
+	--group-add keep-groups \
 	-v .:/workspace/fcvm \
 	-v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs \
 	-v $(FUSER):/workspace/fuser \
@@ -452,9 +451,9 @@ container-test-allow-other: container-build-allow-other
 # All fuse-pipe tests: noroot first, then root
 container-test: container-test-noroot container-test-root
 
-# VM tests - rootless (truly unprivileged - no --privileged, runs as testuser)
-# Uses CONTAINER_RUN_ROOTLESS which drops privileges to match a normal host user
-# Depends on container-build-rootless to export image to rootless podman storage
+# VM tests - rootless (tests fcvm's rootless networking mode inside container)
+# Uses CONTAINER_RUN_ROOTLESS with rootless podman --privileged
+# Tests that fcvm can set up slirp4netns + user namespace networking
 container-test-vm-rootless: container-build-rootless setup-kernel
 	$(CONTAINER_RUN_ROOTLESS) $(CONTAINER_IMAGE) $(TEST_VM_ROOTLESS)
 
@@ -466,7 +465,7 @@ container-test-vm-bridged: container-build setup-kernel
 container-test-vm-exec-bridged: container-build setup-kernel
 	$(CONTAINER_RUN_FCVM) $(CONTAINER_IMAGE) $(TEST_VM_EXEC_BRIDGED)
 
-# VM exec tests - rootless (needs non-root)
+# VM exec tests - rootless (tests fcvm's rootless networking mode)
 container-test-vm-exec-rootless: container-build-rootless setup-kernel
 	$(CONTAINER_RUN_ROOTLESS) $(CONTAINER_IMAGE) $(TEST_VM_EXEC_ROOTLESS)
 
@@ -477,7 +476,7 @@ container-test-vm-exec: container-test-vm-exec-bridged container-test-vm-exec-ro
 container-test-vm-egress-bridged: container-build setup-kernel
 	$(CONTAINER_RUN_FCVM) $(CONTAINER_IMAGE) $(TEST_VM_EGRESS_BRIDGED)
 
-# VM egress tests - rootless (needs non-root)
+# VM egress tests - rootless (tests fcvm's rootless networking mode)
 container-test-vm-egress-rootless: container-build-rootless setup-kernel
 	$(CONTAINER_RUN_ROOTLESS) $(CONTAINER_IMAGE) $(TEST_VM_EGRESS_ROOTLESS)
 
