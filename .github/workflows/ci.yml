@@ -10,11 +10,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # TEMPORARY: Debug job - run virt-customize INSIDE container like we do locally
+  # TEMPORARY: Debug job - run the ACTUAL fcvm rootfs creation like the real test does
   # All other jobs disabled until we fix the root cause
 
-  debug-virt-customize-in-container:
-    name: Debug virt-customize in container
+  debug-fcvm-rootfs:
+    name: Debug fcvm rootfs creation
     runs-on: buildjet-32vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
@@ -41,25 +41,17 @@ jobs:
 
       - name: Setup btrfs
         run: |
-          echo "=== Creating btrfs loopback ==="
           sudo truncate -s 20G /var/fcvm-btrfs.img
           sudo mkfs.btrfs /var/fcvm-btrfs.img
           sudo mkdir -p /mnt/fcvm-btrfs
           sudo mount -o loop /var/fcvm-btrfs.img /mnt/fcvm-btrfs
           sudo mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,state,snapshots,vm-disks,cache}
           sudo chown -R $(id -un):$(id -gn) /mnt/fcvm-btrfs
-          ls -la /mnt/fcvm-btrfs/
 
       - name: Download kernel
         run: |
           curl -sL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.11/x86_64/vmlinux-5.10.225" \
             -o /mnt/fcvm-btrfs/kernels/vmlinux.bin
-
-      - name: Download Ubuntu cloud image
-        run: |
-          curl -L "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img" \
-            -o /mnt/fcvm-btrfs/cache/ubuntu-24.04-amd64.img
-          ls -la /mnt/fcvm-btrfs/cache/
 
       - name: Build container image
         working-directory: fcvm
@@ -67,12 +59,14 @@ jobs:
           echo "=== Building test container ==="
           sudo podman build -t fcvm-test -f Containerfile --build-arg ARCH=x86_64 .
 
-      - name: Test virt-customize INSIDE container
+      - name: Run ACTUAL fcvm rootfs creation inside container
         working-directory: fcvm
+        timeout-minutes: 10
         run: |
-          echo "=== Testing virt-customize INSIDE container (matching local setup) ==="
+          echo "=== Running ACTUAL fcvm to trigger rootfs creation ==="
+          echo "This is what the real test does"
 
-          # This matches CONTAINER_RUN_FCVM from Makefile
+          # Run with RUST_LOG to see all the debug output
           sudo podman run --rm --privileged \
             -v .:/workspace/fcvm \
             -v ${{ github.workspace }}/fuse-backend-rs:/workspace/fuse-backend-rs \
@@ -82,65 +76,43 @@ jobs:
             --device /dev/nbd0 \
             -v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
             --network host \
+            -e RUST_LOG=debug \
             fcvm-test \
             bash -c '
               set -x
-              echo "=== Inside container ==="
-              echo "User: $(whoami)"
-              echo "Kernel: $(uname -r)"
+              echo "=== Building fcvm ==="
+              cd /workspace/fcvm
+              cargo build --release 2>&1 | tail -20
 
               echo ""
-              echo "=== Check KVM ==="
-              ls -la /dev/kvm || echo "No /dev/kvm"
+              echo "=== Starting fcvm (this triggers rootfs creation) ==="
+              echo "Start time: $(date)"
 
-              echo ""
-              echo "=== Check virt-customize ==="
-              which virt-customize
-              virt-customize --version
-
-              echo ""
-              echo "=== Check libguestfs backend ==="
-              export LIBGUESTFS_DEBUG=1
-              export LIBGUESTFS_TRACE=1
-
-              echo ""
-              echo "=== Copy cloud image ==="
-              cp /mnt/fcvm-btrfs/cache/ubuntu-24.04-amd64.img /tmp/test-image.img
-              ls -la /tmp/test-image.img
-
-              echo ""
-              echo "=== Run virt-customize (with 120s timeout) ==="
-              echo "Start: $(date)"
-              timeout 120 virt-customize \
-                --add /tmp/test-image.img \
-                --run-command "echo Hello from virt-customize" \
+              # Run fcvm with a timeout - it will fail to become healthy but
+              # we can see if rootfs creation succeeds
+              timeout 300 ./target/release/fcvm podman run \
+                --name debug-test \
+                --network bridged \
+                nginx:alpine \
                 2>&1 || {
                   echo ""
-                  echo "=== FAILED or TIMED OUT ==="
+                  echo "=== fcvm exited (expected - timeout or error) ==="
                   echo "Exit code: $?"
-                  echo "End: $(date)"
-
-                  echo ""
-                  echo "=== Check running processes ==="
-                  ps aux | grep -E "(qemu|kvm|guestfs)" || true
-
-                  echo ""
-                  echo "=== dmesg last 30 lines ==="
-                  dmesg 2>/dev/null | tail -30 || true
-
-                  exit 1
+                  echo "End time: $(date)"
                 }
 
               echo ""
-              echo "=== SUCCESS ==="
-              echo "End: $(date)"
+              echo "=== Check if rootfs was created ==="
+              ls -la /mnt/fcvm-btrfs/rootfs/ || true
+              ls -la /mnt/fcvm-btrfs/cache/ || true
             '
 
-      - name: If failed - check host state
-        if: failure()
+      - name: Check what happened
+        if: always()
         run: |
-          echo "=== Host processes ==="
-          ps aux | grep -E "(qemu|kvm|podman)" | head -20
+          echo "=== Final state ==="
+          ls -la /mnt/fcvm-btrfs/rootfs/ || true
+          ls -la /mnt/fcvm-btrfs/cache/ || true
           echo ""
           echo "=== Host dmesg ==="
-          sudo dmesg | tail -50
+          sudo dmesg | tail -30
