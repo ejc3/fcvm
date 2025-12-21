@@ -291,7 +291,7 @@ impl NetworkManager for BridgedNetwork {
             loopback_ip: None,
             health_check_port: Some(80),
             health_check_url: Some(format!("http://{}:80/", health_check_ip)),
-            dns_server: Some(host_ip), // dnsmasq with bind-dynamic listens here
+            dns_server: super::get_host_dns_servers().first().cloned(),
         })
     }
 

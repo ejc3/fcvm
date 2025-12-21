@@ -185,13 +185,19 @@ async fn update_health_status_once(
                     let health_path = url.path();
                     let net = &state.config.network;
 
-                    // Rootless mode with loopback_ip (preferred - simpler, no nsenter needed)
-                    // Linux routes all of 127.0.0.0/8 to loopback without ip addr add!
-                    if let Some(loopback_ip) = &net.loopback_ip {
-                        let port = net.health_check_port.unwrap_or(80);
-                        debug!(target: "health-monitor", loopback_ip = %loopback_ip, port = port, "HTTP health check via loopback");
+                    // Rootless mode with holder_pid: use nsenter to curl guest directly
+                    // This bypasses the complexity of slirp4netns port forwarding
+                    if let Some(holder_pid) = state.holder_pid {
+                        // Extract guest IP without CIDR suffix
+                        let guest_ip = net
+                            .guest_ip
+                            .as_ref()
+                            .map(|ip| ip.split('/').next().unwrap_or(ip))
+                            .unwrap_or("192.168.1.2");
+                        let port = 80; // Always use port 80 directly to guest
+                        debug!(target: "health-monitor", holder_pid = holder_pid, guest_ip = %guest_ip, port = port, "HTTP health check via nsenter");
 
-                        match check_http_health_loopback(loopback_ip, port, health_path).await {
+                        match check_http_health_nsenter(holder_pid, guest_ip, port, health_path).await {
                             Ok(true) => {
                                 debug!(target: "health-monitor", "health check passed");
                                 *last_failure_log = None;
@@ -209,7 +215,7 @@ async fn update_health_status_once(
                                     }
                                 };
                                 if should_log {
-                                    debug!(target: "health-monitor", error = %e, "HTTP health check failed");
+                                    debug!(target: "health-monitor", error = %e, "HTTP health check failed (nsenter)");
                                     *last_failure_log = Some(Instant::now());
                                 }
                                 HealthStatus::Unhealthy
@@ -276,62 +282,89 @@ pub async fn run_health_check_once(
     Ok(status)
 }
 
-/// Check if HTTP service is responding via loopback IP (rootless mode)
+/// Check if HTTP service is responding via nsenter into the network namespace (rootless mode)
 ///
-/// For rootless VMs, we use a unique loopback IP (127.x.y.z) with port forwarding
-/// through slirp4netns to reach the guest.
+/// For rootless VMs, we use nsenter to enter the network namespace and curl
+/// the guest directly. This bypasses the complexity of slirp4netns port forwarding.
 ///
-/// Linux routes all of 127.0.0.0/8 to loopback without needing `ip addr add`,
-/// so this works fully rootless!
-async fn check_http_health_loopback(
-    loopback_ip: &str,
+/// The holder_pid is the PID of the namespace holder process (sleep infinity).
+async fn check_http_health_nsenter(
+    holder_pid: u32,
+    guest_ip: &str,
     port: u16,
     health_path: &str,
 ) -> Result<bool> {
-    let url = format!("http://{}:{}{}", loopback_ip, port, health_path);
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(1))
-        .build()
-        .context("building reqwest client")?;
+    let url = format!("http://{}:{}{}", guest_ip, port, health_path);
 
     let start = Instant::now();
 
-    match client.get(&url).send().await {
-        Ok(response) => {
-            let elapsed = start.elapsed();
-            if response.status().is_success() {
-                debug!(
-                    target: "health-monitor",
-                    loopback_ip = loopback_ip,
-                    port = port,
-                    status = %response.status(),
-                    elapsed_ms = elapsed.as_millis(),
-                    "health check succeeded (rootless)"
-                );
-                Ok(true)
-            } else {
-                anyhow::bail!(
-                    "Health check failed with status {} via {}:{} ({}ms)",
-                    response.status(),
-                    loopback_ip,
-                    port,
-                    elapsed.as_millis()
-                )
-            }
+    // Use nsenter to enter the namespace and curl the guest directly
+    // --preserve-credentials keeps UID/GID mapping
+    let output = tokio::process::Command::new("nsenter")
+        .args([
+            "-t",
+            &holder_pid.to_string(),
+            "-U",
+            "-n",
+            "--preserve-credentials",
+            "--",
+            "curl",
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            "1",
+            &url,
+        ])
+        .output()
+        .await
+        .context("failed to run nsenter curl")?;
+
+    let elapsed = start.elapsed();
+
+    if output.status.success() {
+        let status_code = String::from_utf8_lossy(&output.stdout);
+        let status_code = status_code.trim();
+
+        if status_code.starts_with('2') || status_code.starts_with('3') {
+            debug!(
+                target: "health-monitor",
+                holder_pid = holder_pid,
+                guest_ip = guest_ip,
+                port = port,
+                status = status_code,
+                elapsed_ms = elapsed.as_millis(),
+                "health check succeeded (nsenter)"
+            );
+            Ok(true)
+        } else {
+            anyhow::bail!(
+                "Health check failed with status {} via nsenter to {}:{} ({}ms)",
+                status_code,
+                guest_ip,
+                port,
+                elapsed.as_millis()
+            )
         }
-        Err(e) => {
-            if e.is_timeout() {
-                anyhow::bail!(
-                    "Health check timed out after 1 second via {}:{}",
-                    loopback_ip,
-                    port
-                )
-            } else if e.is_connect() {
-                anyhow::bail!("Connection refused to {}:{}", loopback_ip, port)
-            } else {
-                anyhow::bail!("Failed to connect to {}:{}: {}", loopback_ip, port, e)
-            }
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("timed out") || stderr.contains("Connection timed out") {
+            anyhow::bail!(
+                "Health check timed out via nsenter to {}:{}",
+                guest_ip,
+                port
+            )
+        } else if stderr.contains("Connection refused") {
+            anyhow::bail!("Connection refused to {}:{} via nsenter", guest_ip, port)
+        } else {
+            anyhow::bail!(
+                "Failed to connect to {}:{} via nsenter: {}",
+                guest_ip,
+                port,
+                stderr.trim()
+            )
         }
     }
 }

@@ -22,7 +22,7 @@ pub const VSOCK_VOLUME_PORT_BASE: u32 = 5000;
 pub const VSOCK_STATUS_PORT: u32 = 4999;
 
 /// Minimum required Firecracker version for network_overrides support
-const MIN_FIRECRACKER_VERSION: (u32, u32, u32) = (1, 14, 0);
+const MIN_FIRECRACKER_VERSION: (u32, u32, u32) = (1, 13, 1);
 
 /// Find and validate Firecracker binary
 ///
