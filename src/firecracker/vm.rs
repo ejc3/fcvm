@@ -36,6 +36,8 @@ pub struct VmManager {
     log_path: Option<PathBuf>,
     namespace_id: Option<String>,
     holder_pid: Option<u32>, // namespace holder PID for rootless mode (use nsenter to run FC)
+    user_namespace_path: Option<PathBuf>, // User namespace path for rootless clones (enter via setns in pre_exec)
+    net_namespace_path: Option<PathBuf>,  // Net namespace path for rootless clones (enter via setns in pre_exec)
     vsock_redirect: Option<(PathBuf, PathBuf)>, // (baseline_dir, clone_dir) for mount namespace isolation
     process: Option<Child>,
     client: Option<FirecrackerClient>,
@@ -50,6 +52,8 @@ impl VmManager {
             log_path,
             namespace_id: None,
             holder_pid: None,
+            user_namespace_path: None,
+            net_namespace_path: None,
             vsock_redirect: None,
             process: None,
             client: None,
@@ -78,6 +82,27 @@ impl VmManager {
     /// This approach is fully rootless - no sudo required!
     pub fn set_holder_pid(&mut self, pid: u32) {
         self.holder_pid = Some(pid);
+    }
+
+    /// Set user namespace path for rootless clones
+    ///
+    /// When set along with vsock_redirect, pre_exec will enter this user namespace
+    /// first (via setns) before doing mount operations. This gives CAP_SYS_ADMIN
+    /// inside the user namespace, allowing unshare(CLONE_NEWNS) to succeed.
+    ///
+    /// Use this instead of set_holder_pid when mount namespace isolation is needed,
+    /// since nsenter wrapper runs AFTER pre_exec.
+    pub fn set_user_namespace_path(&mut self, path: PathBuf) {
+        self.user_namespace_path = Some(path);
+    }
+
+    /// Set network namespace path for rootless clones
+    ///
+    /// When set, pre_exec will enter this network namespace (via setns) after
+    /// completing mount operations. Use with set_user_namespace_path for
+    /// rootless clones that need mount namespace isolation.
+    pub fn set_net_namespace_path(&mut self, path: PathBuf) {
+        self.net_namespace_path = Some(path);
     }
 
     /// Set vsock redirect for mount namespace isolation
@@ -109,12 +134,25 @@ impl VmManager {
         let _ = std::fs::remove_file(&self.socket_path);
 
         // Build command based on mode:
-        // 1. holder_pid set: use nsenter to enter existing namespace (rootless)
-        // 2. direct Firecracker (privileged/bridged mode)
-        let mut cmd = if let Some(holder_pid) = self.holder_pid {
+        // 1. user_namespace_path set: direct Firecracker (namespaces entered via pre_exec setns)
+        // 2. holder_pid set (no user_namespace_path): use nsenter to enter existing namespace (rootless baseline)
+        // 3. neither: direct Firecracker (privileged/bridged mode)
+        //
+        // For rootless clones with vsock_redirect, we MUST use pre_exec setns instead of nsenter,
+        // because pre_exec runs BEFORE nsenter would enter the namespace, and we need CAP_SYS_ADMIN
+        // from the user namespace to do mount operations.
+        let mut cmd = if self.user_namespace_path.is_some() {
+            // Use direct Firecracker - namespaces will be entered via setns in pre_exec
+            // This is required for rootless clones that need mount namespace isolation
+            info!(target: "vm", vm_id = %self.vm_id, "using pre_exec setns for rootless clone");
+            let mut c = Command::new(firecracker_bin);
+            c.arg("--api-sock").arg(&self.socket_path);
+            c
+        } else if let Some(holder_pid) = self.holder_pid {
             // Use nsenter to enter user+network namespace with preserved credentials
             // --preserve-credentials keeps UID, GID, and supplementary groups (including kvm)
             // This allows KVM access while being in the isolated network namespace
+            // NOTE: This path is for baseline VMs that don't need mount namespace isolation
             info!(target: "vm", vm_id = %self.vm_id, holder_pid = holder_pid, "using nsenter for rootless networking");
             let mut c = Command::new("nsenter");
             c.args([
@@ -155,6 +193,8 @@ impl VmManager {
         // We need to handle these in a single pre_exec because it can only be called once
         let ns_id_clone = self.namespace_id.clone();
         let vsock_redirect_clone = self.vsock_redirect.clone();
+        let user_ns_path_clone = self.user_namespace_path.clone();
+        let net_ns_path_clone = self.net_namespace_path.clone();
 
         // Ensure baseline directory exists for bind mount target
         // The baseline VM may have been cleaned up, but we need the directory for mount
@@ -165,7 +205,11 @@ impl VmManager {
             }
         }
 
-        if ns_id_clone.is_some() || vsock_redirect_clone.is_some() {
+        if ns_id_clone.is_some()
+            || vsock_redirect_clone.is_some()
+            || user_ns_path_clone.is_some()
+            || net_ns_path_clone.is_some()
+        {
             use std::ffi::CString;
 
             // Prepare CStrings outside the closure (async-signal-safe requirement)
@@ -174,6 +218,28 @@ impl VmManager {
                 Some(
                     CString::new(format!("/var/run/netns/{}", ns_id))
                         .context("namespace ID contains invalid characters (null bytes)")?,
+                )
+            } else {
+                None
+            };
+
+            // User namespace path (for rootless clones that need CAP_SYS_ADMIN for mount ops)
+            let user_ns_cstr = if let Some(ref path) = user_ns_path_clone {
+                info!(target: "vm", vm_id = %self.vm_id, path = %path.display(), "will enter user namespace in pre_exec");
+                Some(
+                    CString::new(path.to_string_lossy().as_bytes())
+                        .context("user namespace path contains invalid characters")?,
+                )
+            } else {
+                None
+            };
+
+            // Network namespace path (for rootless clones via /proc/PID/ns/net)
+            let net_ns_cstr = if let Some(ref path) = net_ns_path_clone {
+                info!(target: "vm", vm_id = %self.vm_id, path = %path.display(), "will enter net namespace in pre_exec");
+                Some(
+                    CString::new(path.to_string_lossy().as_bytes())
+                        .context("net namespace path contains invalid characters")?,
                 )
             } else {
                 None
@@ -210,8 +276,31 @@ impl VmManager {
                     use nix::sys::stat::Mode;
                     use std::os::unix::io::{FromRawFd, OwnedFd};
 
+                    // Step 0: Enter user namespace if specified (for rootless clones)
+                    // This MUST be done first to get CAP_SYS_ADMIN for mount operations.
+                    // The user namespace was created by the holder process with --map-root-user,
+                    // so entering it gives us UID 0 with full capabilities inside the namespace.
+                    if let Some(ref user_ns_path) = user_ns_cstr {
+                        let ns_fd_raw = open(
+                            user_ns_path.as_c_str(),
+                            OFlag::O_RDONLY,
+                            Mode::empty(),
+                        )
+                        .map_err(|e| {
+                            std::io::Error::other(format!("failed to open user namespace: {}", e))
+                        })?;
+
+                        let ns_fd = OwnedFd::from_raw_fd(ns_fd_raw);
+
+                        setns(&ns_fd, CloneFlags::CLONE_NEWUSER).map_err(|e| {
+                            std::io::Error::other(format!("failed to enter user namespace: {}", e))
+                        })?;
+                        // Now we have CAP_SYS_ADMIN inside the user namespace!
+                    }
+
                     // Step 1: Set up mount namespace for vsock redirect if needed
                     // This must be done BEFORE entering network namespace
+                    // Note: This now succeeds because we entered user namespace first (if needed)
                     if let Some((ref baseline_cstr, ref clone_cstr)) = vsock_paths {
                         // Create a new mount namespace so our bind mount is isolated
                         unshare(CloneFlags::CLONE_NEWNS).map_err(|e| {
@@ -252,21 +341,25 @@ impl VmManager {
                     }
 
                     // Step 2: Enter network namespace if specified
-                    if let Some(ref ns_path_cstr) = ns_path_cstr {
+                    // This can come from either:
+                    // - net_ns_cstr: /proc/PID/ns/net (rootless clones via pre_exec) - preferred
+                    // - ns_path_cstr: /var/run/netns/NAME (bridged mode)
+                    let net_ns_to_enter = net_ns_cstr.as_ref().or(ns_path_cstr.as_ref());
+                    if let Some(ns_path) = net_ns_to_enter {
                         let ns_fd_raw = open(
-                            ns_path_cstr.as_c_str(),
+                            ns_path.as_c_str(),
                             OFlag::O_RDONLY,
                             Mode::empty(),
                         )
                         .map_err(|e| {
-                            std::io::Error::other(format!("failed to open namespace: {}", e))
+                            std::io::Error::other(format!("failed to open net namespace: {}", e))
                         })?;
 
                         // SAFETY: from_raw_fd takes ownership of the file descriptor.
                         let ns_fd = OwnedFd::from_raw_fd(ns_fd_raw);
 
                         setns(&ns_fd, CloneFlags::CLONE_NEWNET).map_err(|e| {
-                            std::io::Error::other(format!("failed to enter namespace: {}", e))
+                            std::io::Error::other(format!("failed to enter net namespace: {}", e))
                         })?;
                         // fd is automatically closed when OwnedFd is dropped
                     }
