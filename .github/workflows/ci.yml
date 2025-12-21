@@ -10,9 +10,47 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Lint + Build + Native Tests - compile once, run all
-  build-and-test:
-    name: Build & Test
+  # Build inside container, upload artifacts for parallel test jobs
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fcvm
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+      - name: Build inside container
+        working-directory: fcvm
+        run: |
+          export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
+          export FUSER=${{ github.workspace }}/fuser
+          export CONTAINER_ARCH=x86_64
+          export CI=1
+          make container-build-only
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-build
+          path: |
+            fcvm/target/release
+            !fcvm/target/release/.fingerprint
+            !fcvm/target/release/build
+            !fcvm/target/release/deps
+            !fcvm/target/release/incremental
+          retention-days: 1
+
+  # Lint runs in parallel with build (just needs source)
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,20 +72,40 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fcvm
-      - name: Install cargo-machete
-        run: cargo install cargo-machete
       - name: Check formatting
         working-directory: fcvm
         run: cargo fmt --all -- --check
       - name: Clippy
         working-directory: fcvm
         run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Install cargo-machete
+        run: cargo install cargo-machete
       - name: Check unused dependencies
         working-directory: fcvm
         run: cargo machete
-      - name: Build
-        working-directory: fcvm
-        run: cargo build --release --all-targets
+
+  # Native tests use rust-cache (compiles incrementally)
+  test-native:
+    name: Native Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fcvm
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fcvm
       - name: Unit tests
         working-directory: fcvm
         run: cargo test --release --lib --all
@@ -58,9 +116,10 @@ jobs:
         working-directory: fcvm
         run: sudo -E env "PATH=$PATH" cargo test --release -p fuse-pipe --test integration_root -- --test-threads=1
 
-  # Container FUSE tests - build container once, run all FUSE tests
+  # Container FUSE tests - download pre-built artifacts
   fuse-tests:
     name: FUSE Tests
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -76,18 +135,25 @@ jobs:
           repository: ejc3/fuser
           ref: master
           path: fuser
-      - name: Run all FUSE tests (container)
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: container-build
+          path: fcvm/target/release
+      - name: Run FUSE tests (container, no rebuild)
         working-directory: fcvm
         run: |
           export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
           export FUSER=${{ github.workspace }}/fuser
           export CONTAINER_ARCH=x86_64
-          # Build container once, run all tests sequentially
+          export CI=1
+          mkdir -p cargo-home
           make container-test
 
-  # POSIX compliance - separate because it's slow (8789 tests)
+  # POSIX compliance - download pre-built artifacts
   posix-compliance:
     name: POSIX Compliance
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -103,15 +169,22 @@ jobs:
           repository: ejc3/fuser
           ref: master
           path: fuser
-      - name: Run pjdfstest (container)
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: container-build
+          path: fcvm/target/release
+      - name: Run pjdfstest (container, no rebuild)
         working-directory: fcvm
         run: |
           export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
           export FUSER=${{ github.workspace }}/fuser
           export CONTAINER_ARCH=x86_64
+          export CI=1
+          mkdir -p cargo-home
           make container-test-pjdfstest
 
-  # VM tests - all on same runner, compile once
+  # VM tests on BuildJet - builds inside container (separate from ubuntu-latest)
   vm-tests:
     name: VM Tests
     runs-on: buildjet-32vcpu-ubuntu-2204
@@ -152,5 +225,4 @@ jobs:
           export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
           export FUSER=${{ github.workspace }}/fuser
           export CONTAINER_ARCH=x86_64
-          # Build once, run all VM tests sequentially
           make container-test-vm
