@@ -7,6 +7,7 @@ A Rust implementation that launches Firecracker microVMs to run Podman container
 > - Instant VM cloning via UFFD memory server + btrfs reflinks (~3ms)
 > - Multiple VMs share memory via kernel page cache (50 VMs = ~512MB, not 25GB!)
 > - Dual networking: bridged (iptables) or rootless (slirp4netns)
+> - Port forwarding for both regular VMs and clones
 > - FUSE-based host directory mapping via fuse-pipe
 > - Container exit code forwarding
 
@@ -138,7 +139,13 @@ sudo fcvm snapshot ls
 sudo fcvm snapshot run --pid <serve_pid> --name clone1
 sudo fcvm snapshot run --pid <serve_pid> --name clone2
 
-# 7. Clone and execute command (auto-cleans up after)
+# 7. Clone with port forwarding (each clone can have unique ports)
+sudo fcvm snapshot run --pid <serve_pid> --name web1 --publish 8081:80
+sudo fcvm snapshot run --pid <serve_pid> --name web2 --publish 8082:80
+curl localhost:8081  # Reaches clone web1
+curl localhost:8082  # Reaches clone web2
+
+# 8. Clone and execute command (auto-cleans up after)
 sudo fcvm snapshot run --pid <serve_pid> --exec "curl localhost"
 # Clone starts → execs command in container → returns result → cleans up
 ```
@@ -537,7 +544,8 @@ Run `make help` for the full list. Key targets:
 | `test_fuse_posix.rs` | POSIX FUSE compliance tests |
 | `test_fuse_in_vm.rs` | FUSE-in-VM integration |
 | `test_localhost_image.rs` | Local image tests |
-| `test_snapshot_clone.rs` | Snapshot/clone workflow |
+| `test_snapshot_clone.rs` | Snapshot/clone workflow, clone port forwarding |
+| `test_port_forward.rs` | Port forwarding for regular VMs |
 
 #### fuse-pipe Tests (`fuse-pipe/tests/`)
 | File | Description |

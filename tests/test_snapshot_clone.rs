@@ -17,12 +17,20 @@ use tokio::sync::Mutex;
 /// Full snapshot/clone workflow test with rootless networking (10 clones)
 #[tokio::test]
 async fn test_snapshot_clone_rootless_10() -> Result<()> {
+    // Rootless tests must NOT run as root - user namespace mapping breaks
+    if nix::unistd::geteuid().is_root() {
+        anyhow::bail!("Rootless tests cannot run as root! Run without sudo: cargo test --release -p fcvm --test test_snapshot_clone");
+    }
     snapshot_clone_test_impl("rootless", 10).await
 }
 
 /// Stress test with 100 clones using rootless networking
 #[tokio::test]
 async fn test_snapshot_clone_stress_100() -> Result<()> {
+    // Rootless tests must NOT run as root - user namespace mapping breaks
+    if nix::unistd::geteuid().is_root() {
+        anyhow::bail!("Rootless tests cannot run as root! Run without sudo: cargo test --release -p fcvm --test test_snapshot_clone");
+    }
     snapshot_clone_test_impl("rootless", 100).await
 }
 
@@ -36,8 +44,7 @@ struct CloneResult {
 }
 
 async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()> {
-    let snapshot_name = format!("test-snapshot-{}", network);
-    let baseline_name = format!("baseline-{}", network);
+    let (baseline_name, _, snapshot_name, _) = common::unique_names(&format!("snap-{}", network));
     let test_start = Instant::now();
 
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
@@ -61,12 +68,12 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
             "podman",
             "run",
             "--name",
-            &baseline_name,
+            &&baseline_name,
             "--network",
             network,
             common::TEST_IMAGE,
         ],
-        &baseline_name,
+        &&baseline_name,
     )
     .await
     .context("spawning baseline VM")?;
@@ -94,7 +101,7 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
             "--pid",
             &baseline_pid.to_string(),
             "--tag",
-            &snapshot_name,
+            &&snapshot_name,
         ])
         .output()
         .await
@@ -145,7 +152,7 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
     let mut spawn_handles = Vec::new();
 
     for i in 0..num_clones {
-        let clone_name = format!("clone-{}-{}", network, i);
+        let clone_name = format!("{}-{}", baseline_name.replace("-base-", "-clone-"), i);
         let network = network.to_string();
         let results = Arc::clone(&results);
         let clone_pids = Arc::clone(&clone_pids);
@@ -161,11 +168,11 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
                     "--pid",
                     &serve_pid_str,
                     "--name",
-                    &clone_name,
+                    &&clone_name,
                     "--network",
                     &network,
                 ],
-                &clone_name,
+                &&clone_name,
             )
             .await;
 
@@ -191,7 +198,7 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
                     };
 
                     results.lock().await.push(CloneResult {
-                        name: clone_name,
+                        name: clone_name.clone(),
                         pid: clone_pid,
                         spawn_time_ms: spawn_ms,
                         health_time_secs: health_time,
@@ -200,7 +207,7 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
                 }
                 Err(e) => {
                     results.lock().await.push(CloneResult {
-                        name: clone_name,
+                        name: clone_name.clone(),
                         pid: 0,
                         spawn_time_ms: spawn_start.elapsed().as_secs_f64() * 1000.0,
                         health_time_secs: None,
@@ -378,8 +385,7 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
 /// isolation, Firecracker would try to bind to the same socket path stored in vmstate.bin.
 #[tokio::test]
 async fn test_clone_while_baseline_running() -> Result<()> {
-    let snapshot_name = "test-clone-running";
-    let baseline_name = "baseline-running";
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("running");
 
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!("║     Clone While Baseline Running Test                         ║");
@@ -394,12 +400,12 @@ async fn test_clone_while_baseline_running() -> Result<()> {
             "podman",
             "run",
             "--name",
-            baseline_name,
+            &baseline_name,
             "--network",
             "bridged",
             common::TEST_IMAGE,
         ],
-        baseline_name,
+        &baseline_name,
     )
     .await
     .context("spawning baseline VM")?;
@@ -417,7 +423,7 @@ async fn test_clone_while_baseline_running() -> Result<()> {
             "--pid",
             &baseline_pid.to_string(),
             "--tag",
-            snapshot_name,
+            &snapshot_name,
         ])
         .output()
         .await
@@ -437,19 +443,18 @@ async fn test_clone_while_baseline_running() -> Result<()> {
     // Step 4: Start memory server
     println!("\nStep 4: Starting memory server...");
     let (_serve_child, serve_pid) =
-        common::spawn_fcvm_with_logs(&["snapshot", "serve", snapshot_name], "uffd-server")
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server")
             .await
             .context("spawning memory server")?;
 
     // Wait for serve to be ready (poll for socket)
-    common::poll_serve_ready(snapshot_name, serve_pid, 30).await?;
+    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
     println!("  ✓ Memory server ready (PID: {})", serve_pid);
 
     // Step 5: Clone WHILE baseline is still running (this is the key test!)
     println!("\nStep 5: Spawning clone while baseline is STILL RUNNING...");
     println!("  (This tests vsock socket isolation via mount namespace)");
 
-    let clone_name = "clone-running";
     let serve_pid_str = serve_pid.to_string();
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
         &[
@@ -458,11 +463,11 @@ async fn test_clone_while_baseline_running() -> Result<()> {
             "--pid",
             &serve_pid_str,
             "--name",
-            clone_name,
+            &clone_name,
             "--network",
             "bridged",
         ],
-        clone_name,
+        &clone_name,
     )
     .await
     .context("spawning clone while baseline running")?;
@@ -533,12 +538,15 @@ async fn test_clone_internet_bridged() -> Result<()> {
 /// Test that clones can reach the internet in rootless mode
 #[tokio::test]
 async fn test_clone_internet_rootless() -> Result<()> {
+    // Rootless tests must NOT run as root - user namespace mapping breaks
+    if nix::unistd::geteuid().is_root() {
+        anyhow::bail!("Rootless tests cannot run as root! Run without sudo: cargo test --release -p fcvm --test test_snapshot_clone");
+    }
     clone_internet_test_impl("rootless").await
 }
 
 async fn clone_internet_test_impl(network: &str) -> Result<()> {
-    let snapshot_name = format!("test-internet-{}", network);
-    let baseline_name = format!("baseline-internet-{}", network);
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names(&format!("inet-{}", network));
 
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!(
@@ -556,12 +564,12 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
             "podman",
             "run",
             "--name",
-            &baseline_name,
+            &&baseline_name,
             "--network",
             network,
             common::TEST_IMAGE,
         ],
-        &baseline_name,
+        &&baseline_name,
     )
     .await
     .context("spawning baseline VM")?;
@@ -579,7 +587,7 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
             "--pid",
             &baseline_pid.to_string(),
             "--tag",
-            &snapshot_name,
+            &&snapshot_name,
         ])
         .output()
         .await
@@ -608,7 +616,6 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
 
     // Step 4: Spawn clone
     println!("\nStep 4: Spawning clone...");
-    let clone_name = format!("clone-internet-{}", network);
     let serve_pid_str = serve_pid.to_string();
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
         &[
@@ -617,11 +624,11 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
             "--pid",
             &serve_pid_str,
             "--name",
-            &clone_name,
+            &&clone_name,
             "--network",
             network,
         ],
-        &clone_name,
+        &&clone_name,
     )
     .await
     .context("spawning clone")?;
@@ -762,34 +769,28 @@ async fn test_clone_http(fcvm_path: &std::path::Path, clone_pid: u32) -> Result<
     }
 }
 
-/// Test snapshot run --exec with bridged networking
+/// Test port forwarding on clones with bridged networking
+///
+/// Verifies that --publish correctly forwards ports to cloned VMs.
+/// This tests the full port forwarding path: host → iptables DNAT → clone VM → nginx.
 #[tokio::test]
-async fn test_snapshot_run_exec_bridged() -> Result<()> {
-    snapshot_run_exec_test_impl("bridged").await
-}
+async fn test_clone_port_forward_bridged() -> Result<()> {
+    // Requires root for bridged networking
+    if !nix::unistd::geteuid().is_root() {
+        eprintln!("Skipping test_clone_port_forward_bridged: requires root");
+        return Ok(());
+    }
 
-/// Test snapshot run --exec with rootless networking
-#[tokio::test]
-async fn test_snapshot_run_exec_rootless() -> Result<()> {
-    snapshot_run_exec_test_impl("rootless").await
-}
-
-/// Implementation of snapshot run --exec test
-async fn snapshot_run_exec_test_impl(network: &str) -> Result<()> {
-    let snapshot_name = format!("test-exec-{}", network);
-    let baseline_name = format!("baseline-exec-{}", network);
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("pf-bridged");
 
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
-    println!(
-        "║     Snapshot Run --exec Test ({:8})                      ║",
-        network
-    );
+    println!("║     Clone Port Forwarding Test (bridged)                      ║");
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
     let fcvm_path = common::find_fcvm_binary()?;
 
-    // Step 1: Start baseline VM
-    println!("Step 1: Starting baseline VM...");
+    // Step 1: Start baseline VM with nginx
+    println!("Step 1: Starting baseline VM with nginx...");
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
         &[
             "podman",
@@ -797,7 +798,7 @@ async fn snapshot_run_exec_test_impl(network: &str) -> Result<()> {
             "--name",
             &baseline_name,
             "--network",
-            network,
+            "bridged",
             common::TEST_IMAGE,
         ],
         &baseline_name,
@@ -819,6 +820,372 @@ async fn snapshot_run_exec_test_impl(network: &str) -> Result<()> {
             &baseline_pid.to_string(),
             "--tag",
             &snapshot_name,
+        ])
+        .output()
+        .await
+        .context("running snapshot create")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Snapshot creation failed: {}", stderr);
+    }
+    println!("  ✓ Snapshot created");
+
+    // Kill baseline - we only need the snapshot for clones
+    common::kill_process(baseline_pid).await;
+    println!("  Killed baseline VM (only need snapshot)");
+
+    // Step 3: Start memory server
+    println!("\nStep 3: Starting memory server...");
+    let (_serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server")
+            .await
+            .context("spawning memory server")?;
+
+    // Wait for serve to be ready (poll for socket)
+    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+    println!("  ✓ Memory server ready (PID: {})", serve_pid);
+
+    // Step 4: Spawn clone WITH port forwarding
+    println!("\nStep 4: Spawning clone with --publish 19080:80...");
+    let serve_pid_str = serve_pid.to_string();
+    let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid_str,
+            "--name",
+            &clone_name,
+            "--network",
+            "bridged",
+            "--publish",
+            "19080:80",
+        ],
+        &clone_name,
+    )
+    .await
+    .context("spawning clone with port forward")?;
+
+    // Wait for clone to become healthy
+    println!("  Waiting for clone to become healthy...");
+    common::poll_health_by_pid(clone_pid, 60).await?;
+    println!("  ✓ Clone is healthy (PID: {})", clone_pid);
+
+    // Step 5: Test port forwarding
+    println!("\nStep 5: Testing port forwarding...");
+
+    // Get clone's guest IP from state
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args(["ls", "--json", "--pid", &clone_pid.to_string()])
+        .output()
+        .await
+        .context("getting clone state")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let guest_ip: String = serde_json::from_str::<Vec<serde_json::Value>>(&stdout)
+        .ok()
+        .and_then(|v| v.first().cloned())
+        .and_then(|v| v.get("config")?.get("network")?.get("guest_ip")?.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+
+    println!("  Clone guest IP: {}", guest_ip);
+
+    // Test 1: Direct access to guest IP
+    println!("  Testing direct access to guest...");
+    let direct_result = tokio::process::Command::new("curl")
+        .args(["-s", "--max-time", "10", &format!("http://{}:80", guest_ip)])
+        .output()
+        .await;
+
+    let direct_works = direct_result.map(|o| o.status.success() && !o.stdout.is_empty()).unwrap_or(false);
+    println!("    Direct access: {}", if direct_works { "✓ OK" } else { "✗ FAIL" });
+
+    // Test 2: Access via host's primary IP and forwarded port
+    let host_ip = tokio::process::Command::new("hostname")
+        .arg("-I")
+        .output()
+        .await
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.split_whitespace().next().map(|ip| ip.to_string()))
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+
+    println!("  Testing access via host IP {}:19080...", host_ip);
+    let forward_result = tokio::process::Command::new("curl")
+        .args(["-s", "--max-time", "10", &format!("http://{}:19080", host_ip)])
+        .output()
+        .await;
+
+    let forward_works = forward_result.map(|o| o.status.success() && !o.stdout.is_empty()).unwrap_or(false);
+    println!("    Port forward (host IP): {}", if forward_works { "✓ OK" } else { "✗ FAIL" });
+
+    // Test 3: Access via localhost
+    println!("  Testing access via localhost:19080...");
+    let localhost_result = tokio::process::Command::new("curl")
+        .args(["-s", "--max-time", "10", "http://127.0.0.1:19080"])
+        .output()
+        .await;
+
+    let localhost_works = localhost_result.map(|o| o.status.success() && !o.stdout.is_empty()).unwrap_or(false);
+    println!("    Localhost access: {}", if localhost_works { "✓ OK" } else { "✗ FAIL" });
+
+    // Cleanup
+    println!("\nCleaning up...");
+    common::kill_process(clone_pid).await;
+    println!("  Killed clone");
+    common::kill_process(serve_pid).await;
+    println!("  Killed memory server");
+
+    // Results
+    println!("\n╔═══════════════════════════════════════════════════════════════╗");
+    println!("║                         RESULTS                               ║");
+    println!("╠═══════════════════════════════════════════════════════════════╣");
+    println!("║  Direct access to guest:    {}                                 ║", if direct_works { "✓ PASSED" } else { "✗ FAILED" });
+    println!("║  Port forward (host IP):    {}                                 ║", if forward_works { "✓ PASSED" } else { "✗ FAILED" });
+    println!("║  Localhost port forward:    {}                                 ║", if localhost_works { "✓ PASSED" } else { "✗ FAILED" });
+    println!("╚═══════════════════════════════════════════════════════════════╝");
+
+    // All port forwarding methods must work
+    if direct_works && forward_works && localhost_works {
+        println!("\n✅ CLONE PORT FORWARDING TEST PASSED!");
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Clone port forwarding test failed: direct={}, forward={}, localhost={}",
+            direct_works,
+            forward_works,
+            localhost_works
+        )
+    }
+}
+
+/// Test port forwarding on clones with rootless networking
+///
+/// This is the key test - rootless clones with port forwarding.
+/// Port forwarding is done via slirp4netns API, accessing via unique loopback IP.
+#[tokio::test]
+async fn test_clone_port_forward_rootless() -> Result<()> {
+    // Rootless tests must NOT run as root - user namespace mapping breaks
+    if nix::unistd::geteuid().is_root() {
+        anyhow::bail!("Rootless tests cannot run as root! Run without sudo: cargo test --release -p fcvm --test test_snapshot_clone");
+    }
+
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("pf-rootless");
+
+    println!("\n╔═══════════════════════════════════════════════════════════════╗");
+    println!("║     Clone Port Forwarding Test (rootless)                     ║");
+    println!("╚═══════════════════════════════════════════════════════════════╝\n");
+
+    let fcvm_path = common::find_fcvm_binary()?;
+
+    // Step 1: Start baseline VM with nginx (rootless)
+    println!("Step 1: Starting baseline VM with nginx (rootless)...");
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "rootless",
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
+
+    println!("  Waiting for baseline VM to become healthy...");
+    common::poll_health_by_pid(baseline_pid, 90).await?;
+    println!("  ✓ Baseline VM healthy (PID: {})", baseline_pid);
+
+    // Step 2: Create snapshot
+    println!("\nStep 2: Creating snapshot...");
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
+        ])
+        .output()
+        .await
+        .context("running snapshot create")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Snapshot creation failed: {}", stderr);
+    }
+    println!("  ✓ Snapshot created");
+
+    // Kill baseline - we only need the snapshot for clones
+    common::kill_process(baseline_pid).await;
+    println!("  Killed baseline VM (only need snapshot)");
+
+    // Step 3: Start memory server
+    println!("\nStep 3: Starting memory server...");
+    let (_serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server")
+            .await
+            .context("spawning memory server")?;
+
+    // Wait for serve to be ready (poll for socket)
+    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+    println!("  ✓ Memory server ready (PID: {})", serve_pid);
+
+    // Step 4: Spawn clone WITH port forwarding (rootless)
+    // Use port 8080 (unprivileged) since rootless can't bind to 80
+    println!("\nStep 4: Spawning clone with --publish 8080:80 (rootless)...");
+    let serve_pid_str = serve_pid.to_string();
+    let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid_str,
+            "--name",
+            &clone_name,
+            "--network",
+            "rootless",
+            "--publish",
+            "8080:80",
+        ],
+        &clone_name,
+    )
+    .await
+    .context("spawning clone with port forward")?;
+
+    // Wait for clone to become healthy
+    println!("  Waiting for clone to become healthy...");
+    common::poll_health_by_pid(clone_pid, 60).await?;
+    println!("  ✓ Clone is healthy (PID: {})", clone_pid);
+
+    // Step 5: Test port forwarding via loopback IP
+    println!("\nStep 5: Testing port forwarding...");
+
+    // Get clone's loopback IP from state (rootless uses 127.x.y.z)
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args(["ls", "--json", "--pid", &clone_pid.to_string()])
+        .output()
+        .await
+        .context("getting clone state")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let loopback_ip: String = serde_json::from_str::<Vec<serde_json::Value>>(&stdout)
+        .ok()
+        .and_then(|v| v.first().cloned())
+        .and_then(|v| v.get("config")?.get("network")?.get("loopback_ip")?.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+
+    println!("  Clone loopback IP: {}", loopback_ip);
+
+    // Test: Access via loopback IP and forwarded port
+    println!("  Testing access via loopback {}:8080...", loopback_ip);
+    let loopback_result = tokio::process::Command::new("curl")
+        .args(["-s", "--max-time", "10", &format!("http://{}:8080", loopback_ip)])
+        .output()
+        .await;
+
+    let loopback_works = loopback_result.as_ref().map(|o| o.status.success() && !o.stdout.is_empty()).unwrap_or(false);
+
+    if let Ok(ref out) = loopback_result {
+        if loopback_works {
+            println!("    Loopback access: ✓ OK");
+            let response = String::from_utf8_lossy(&out.stdout);
+            println!("    Response: {} bytes (nginx welcome page)", response.len());
+        } else {
+            println!("    Loopback access: ✗ FAIL");
+            println!("    stderr: {}", String::from_utf8_lossy(&out.stderr));
+        }
+    } else {
+        println!("    Loopback access: ✗ FAIL (request error)");
+    }
+
+    // Cleanup
+    println!("\nCleaning up...");
+    common::kill_process(clone_pid).await;
+    println!("  Killed clone");
+    common::kill_process(serve_pid).await;
+    println!("  Killed memory server");
+
+    // Results
+    println!("\n╔═══════════════════════════════════════════════════════════════╗");
+    println!("║                         RESULTS                               ║");
+    println!("╠═══════════════════════════════════════════════════════════════╣");
+    println!("║  Loopback port forward: {}                                    ║", if loopback_works { "✓ PASSED" } else { "✗ FAILED" });
+    println!("╚═══════════════════════════════════════════════════════════════╝");
+
+    if loopback_works {
+        println!("\n✅ ROOTLESS CLONE PORT FORWARDING TEST PASSED!");
+        Ok(())
+    } else {
+        anyhow::bail!("Rootless clone port forwarding test failed")
+    }
+}
+
+/// Test snapshot run --exec with bridged networking
+#[tokio::test]
+async fn test_snapshot_run_exec_bridged() -> Result<()> {
+    snapshot_run_exec_test_impl("bridged").await
+}
+
+/// Test snapshot run --exec with rootless networking
+#[tokio::test]
+async fn test_snapshot_run_exec_rootless() -> Result<()> {
+    // Rootless tests must NOT run as root - user namespace mapping breaks
+    if nix::unistd::geteuid().is_root() {
+        anyhow::bail!("Rootless tests cannot run as root! Run without sudo: cargo test --release -p fcvm --test test_snapshot_clone");
+    }
+    snapshot_run_exec_test_impl("rootless").await
+}
+
+/// Implementation of snapshot run --exec test
+async fn snapshot_run_exec_test_impl(network: &str) -> Result<()> {
+    let (baseline_name, _, snapshot_name, _) = common::unique_names(&format!("exec-{}", network));
+
+    println!("\n╔═══════════════════════════════════════════════════════════════╗");
+    println!(
+        "║     Snapshot Run --exec Test ({:8})                      ║",
+        network
+    );
+    println!("╚═══════════════════════════════════════════════════════════════╝\n");
+
+    let fcvm_path = common::find_fcvm_binary()?;
+
+    // Step 1: Start baseline VM
+    println!("Step 1: Starting baseline VM...");
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &&baseline_name,
+            "--network",
+            network,
+            common::TEST_IMAGE,
+        ],
+        &&baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
+
+    println!("  Waiting for baseline VM to become healthy...");
+    common::poll_health_by_pid(baseline_pid, 60).await?;
+    println!("  ✓ Baseline VM healthy (PID: {})", baseline_pid);
+
+    // Step 2: Create snapshot
+    println!("\nStep 2: Creating snapshot...");
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &&snapshot_name,
         ])
         .output()
         .await

@@ -13,6 +13,29 @@ use tokio::time::sleep;
 /// Global counter for unique test IDs
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+/// Generate unique names for snapshot/clone tests.
+///
+/// Returns (baseline_name, clone_name, snapshot_name, serve_name) with unique suffixes.
+/// Uses process ID and atomic counter to ensure uniqueness across parallel tests.
+///
+/// # Arguments
+/// * `prefix` - Base name for the test (e.g., "portfwd", "internet")
+///
+/// # Returns
+/// Tuple of (baseline, clone, snapshot, serve) names
+pub fn unique_names(prefix: &str) -> (String, String, String, String) {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    let suffix = format!("{}-{}", pid, id);
+
+    (
+        format!("{}-base-{}", prefix, suffix),
+        format!("{}-clone-{}", prefix, suffix),
+        format!("{}-snap-{}", prefix, suffix),
+        format!("{}-serve-{}", prefix, suffix),
+    )
+}
+
 /// Fixture for managing a VM with FUSE volume for testing
 pub struct VmFixture {
     pub child: tokio::process::Child,

@@ -18,6 +18,80 @@ use crate::storage::{DiskManager, SnapshotManager};
 use crate::uffd::UffdServer;
 use crate::volume::{spawn_volume_servers, VolumeConfig};
 
+const USERFAULTFD_DEVICE: &str = "/dev/userfaultfd";
+
+/// Check if /dev/userfaultfd is accessible for clone operations.
+/// Clones use UFFD (userfaultfd) to share memory pages on-demand from the serve process.
+/// Returns Ok(()) if accessible, or an error with detailed fix instructions.
+fn check_userfaultfd_access() -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::path::Path;
+
+    let path = Path::new(USERFAULTFD_DEVICE);
+
+    // Check if device exists
+    if !path.exists() {
+        bail!(
+            r#"
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                        USERFAULTFD DEVICE NOT FOUND                          ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  {USERFAULTFD_DEVICE} does not exist on this system.                              ║
+║                                                                              ║
+║  This device is required for snapshot cloning (UFFD memory sharing).        ║
+║  It's available on Linux 5.11+ kernels.                                     ║
+║                                                                              ║
+║  Check your kernel version:                                                  ║
+║    uname -r                                                                  ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"#
+        );
+    }
+
+    // Check if we have read/write access
+    match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            bail!(
+                r#"
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                     USERFAULTFD PERMISSION DENIED                            ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  Cannot access /dev/userfaultfd - permission denied.                         ║
+║                                                                              ║
+║  Snapshot clones require access to userfaultfd for memory sharing.           ║
+║                                                                              ║
+║  FIX (choose one):                                                           ║
+║                                                                              ║
+║  Option 1 - Device permissions (recommended):                                ║
+║    # Persistent udev rule (survives reboots):                                ║
+║    echo 'KERNEL=="userfaultfd", MODE="0666"' | \                             ║
+║      sudo tee /etc/udev/rules.d/99-userfaultfd.rules                         ║
+║    sudo udevadm control --reload-rules                                       ║
+║    sudo chmod 666 /dev/userfaultfd                                           ║
+║                                                                              ║
+║  Option 2 - Sysctl (system-wide, affects syscall fallback):                  ║
+║    sudo sysctl vm.unprivileged_userfaultfd=1                                 ║
+║    # To persist: add 'vm.unprivileged_userfaultfd=1' to /etc/sysctl.conf     ║
+║                                                                              ║
+║  Option 3 - One-time fix (must redo after reboot):                           ║
+║    sudo chmod 666 /dev/userfaultfd                                           ║
+║                                                                              ║
+║  After fixing, retry your clone command.                                     ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"#
+            );
+        }
+        Err(e) => {
+            bail!(
+                "Cannot access {}: {} - ensure the device exists and is readable",
+                USERFAULTFD_DEVICE,
+                e
+            );
+        }
+    }
+}
+
 /// Main dispatcher for snapshot commands
 pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
     match args.cmd {
@@ -400,7 +474,11 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
 
 /// Run clone from snapshot
 async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
-    // First verify the serve process is actually alive before attempting any work
+    // Check userfaultfd access FIRST - this is a system requirement
+    // Give a clear error message if permissions aren't configured
+    check_userfaultfd_access().context("userfaultfd access check failed")?;
+
+    // Now verify the serve process is actually alive before attempting any work
     // This prevents wasted setup if the serve process died between state file creation and now
     if !crate::utils::is_process_alive(args.pid) {
         anyhow::bail!(
@@ -991,8 +1069,19 @@ async fn run_clone_setup(
             "parallel disk + network setup complete"
         );
 
-        // Step 3: Set holder_pid so VmManager uses nsenter
-        vm_manager.set_holder_pid(holder_pid);
+        // Step 3: Set namespace paths for pre_exec setns (NOT nsenter wrapper)
+        // For clones, we need to enter namespaces in pre_exec because:
+        // - pre_exec runs BEFORE nsenter would enter the namespace
+        // - We need CAP_SYS_ADMIN (from user namespace) for mount operations
+        // - Entering user namespace first gives us CAP_SYS_ADMIN for unshare(CLONE_NEWNS)
+        vm_manager.set_user_namespace_path(std::path::PathBuf::from(format!(
+            "/proc/{}/ns/user",
+            holder_pid
+        )));
+        vm_manager.set_net_namespace_path(std::path::PathBuf::from(format!(
+            "/proc/{}/ns/net",
+            holder_pid
+        )));
 
         // Store holder_pid in state for health checks
         vm_state.holder_pid = Some(holder_pid);
