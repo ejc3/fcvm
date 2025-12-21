@@ -621,6 +621,22 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Extract guest_ip from snapshot metadata for network config reuse
     let saved_network = &snapshot_config.metadata.network_config;
 
+    // Bridged mode requires root for iptables and network namespace setup
+    if matches!(args.network, NetworkMode::Bridged) && !nix::unistd::geteuid().is_root() {
+        bail!(
+            "Bridged networking requires root. Either:\n  \
+             - Run with sudo: sudo fcvm snapshot run ...\n  \
+             - Use rootless mode: fcvm snapshot run --network rootless ..."
+        );
+    }
+    // Rootless with sudo is pointless - bridged would be faster
+    if matches!(args.network, NetworkMode::Rootless) && nix::unistd::geteuid().is_root() {
+        warn!(
+            "Running rootless mode as root is unnecessary. \
+             Consider using --network bridged for better performance."
+        );
+    }
+
     // Setup networking based on mode - reuse guest_ip from snapshot if available
     let mut network: Box<dyn NetworkManager> = match args.network {
         NetworkMode::Bridged => {

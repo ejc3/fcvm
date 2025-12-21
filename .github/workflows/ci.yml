@@ -272,7 +272,7 @@ jobs:
   test-vm-exec:
     name: VM Exec
     runs-on: buildjet-32vcpu-ubuntu-2204
-    needs: test-vm-sanity  # Sequential: flock doesn't work across podman containers sharing /dev/nbd0
+    needs: build  # Can run in parallel - NBD device selection handles conflicts
     if: always()  # Run even if previous job failed (rootfs will be cached after first success)
     steps:
       - uses: actions/checkout@v4
@@ -309,7 +309,7 @@ jobs:
   test-vm-egress:
     name: VM Egress
     runs-on: buildjet-32vcpu-ubuntu-2204
-    needs: test-vm-exec  # Sequential: flock doesn't work across podman containers sharing /dev/nbd0
+    needs: build  # Can run in parallel - NBD device selection handles conflicts
     if: always()  # Run even if previous job failed (rootfs will be cached after first success)
     steps:
       - uses: actions/checkout@v4
