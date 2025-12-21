@@ -373,10 +373,12 @@ CONTAINER_RUN_FCVM := $(CONTAINER_RUN_BASE) \
 # Truly rootless container run - matches unprivileged host user exactly
 # Runs podman WITHOUT sudo (rootless podman) - this is the true unprivileged test
 # Uses separate storage (--root) to avoid conflicts with root-owned storage
+# --user testuser ensures process runs as non-root inside container
 # --network host so slirp4netns can bind to loopback addresses (127.x.y.z)
 # --security-opt seccomp=unconfined allows unshare syscall (no extra capabilities granted)
 # No --privileged, no CAP_SYS_ADMIN - matches real unprivileged user
 CONTAINER_RUN_ROOTLESS := podman --root=/tmp/podman-rootless run --rm \
+	--user testuser \
 	--security-opt seccomp=unconfined \
 	-v .:/workspace/fcvm \
 	-v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs \
