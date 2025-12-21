@@ -11,8 +11,6 @@ use super::{types::generate_mac, NetworkConfig, NetworkManager, PortMapping};
 use crate::paths;
 use crate::state::truncate_id;
 
-/// slirp4netns network addressing constants
-
 /// Guest network addressing (isolated per VM namespace)
 const GUEST_SUBNET: &str = "192.168.1.0/24";
 const GUEST_IP: &str = "192.168.1.2";

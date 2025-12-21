@@ -667,23 +667,6 @@ Run `make help` for full list. Key targets:
 └── cache/                 # Downloaded cloud images
 ```
 
-### One-Time Setup (dnsmasq)
-
-```bash
-sudo apt-get update
-sudo apt-get install -y dnsmasq
-
-# dnsmasq for DNS forwarding to VMs (bind-dynamic listens on dynamically created TAP devices)
-sudo tee /etc/dnsmasq.d/fcvm.conf > /dev/null <<EOF
-bind-dynamic
-server=8.8.8.8
-server=8.8.4.4
-no-resolv
-cache-size=1000
-EOF
-sudo systemctl restart dnsmasq
-```
-
 ## Key Learnings
 
 ### Serial Console
@@ -709,9 +692,10 @@ ip addr add 172.16.29.1/24 dev tap-vm-c93e8   # Guest is 172.16.29.2
 - On other clouds: use bare-metal or hosts with nested virtualization
 
 ### DNS Resolution in VMs
-- Problem: Container image pulls failing with DNS timeout
-- Root cause: VMs configured to use 8.8.8.8 but NAT wasn't forwarding DNS properly
-- Fix: Install dnsmasq on host with `bind-dynamic` to listen on TAP devices
+- VMs use host's DNS servers directly (read from `/etc/resolv.conf`)
+- For systemd-resolved hosts, falls back to `/run/systemd/resolve/resolv.conf`
+- Traffic flows: Guest → NAT → Host's DNS servers
+- No dnsmasq required
 
 ### Pipe Buffer Deadlock in Tests (CRITICAL)
 

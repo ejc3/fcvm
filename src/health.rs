@@ -197,7 +197,9 @@ async fn update_health_status_once(
                         let port = 80; // Always use port 80 directly to guest
                         debug!(target: "health-monitor", holder_pid = holder_pid, guest_ip = %guest_ip, port = port, "HTTP health check via nsenter");
 
-                        match check_http_health_nsenter(holder_pid, guest_ip, port, health_path).await {
+                        match check_http_health_nsenter(holder_pid, guest_ip, port, health_path)
+                            .await
+                        {
                             Ok(true) => {
                                 debug!(target: "health-monitor", "health check passed");
                                 *last_failure_log = None;
