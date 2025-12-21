@@ -45,7 +45,7 @@ async fn exec_test_impl(network: &str) -> Result<()> {
 
     // Wait for VM to become healthy
     println!("  Waiting for VM to become healthy...");
-    if let Err(e) = common::poll_health_by_pid(fcvm_pid, 60).await {
+    if let Err(e) = common::poll_health_by_pid(fcvm_pid, 180).await {
         common::kill_process(fcvm_pid).await;
         return Err(e.context("VM failed to become healthy"));
     }

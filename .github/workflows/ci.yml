@@ -255,19 +255,6 @@ jobs:
           ls -la /dev/nbd* | head -5
       - name: Setup network namespace directory
         run: sudo mkdir -p /var/run/netns
-      - name: Setup dnsmasq for VM DNS
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y dnsmasq
-          sudo tee /etc/dnsmasq.d/fcvm.conf > /dev/null <<EOF
-          bind-dynamic
-          server=8.8.8.8
-          server=8.8.4.4
-          no-resolv
-          cache-size=1000
-          EOF
-          sudo systemctl restart dnsmasq
-          sudo systemctl status dnsmasq
       - name: Setup iptables for VM networking
         run: |
           # BuildJet runners have FORWARD chain set to DROP by default
@@ -285,6 +272,8 @@ jobs:
   test-vm-exec:
     name: VM Exec
     runs-on: buildjet-32vcpu-ubuntu-2204
+    needs: test-vm-sanity  # Sequential: flock doesn't work across podman containers sharing /dev/nbd0
+    if: always()  # Run even if previous job failed (rootfs will be cached after first success)
     steps:
       - uses: actions/checkout@v4
         with:
@@ -305,18 +294,6 @@ jobs:
         run: sudo modprobe nbd max_part=8
       - name: Setup network namespace directory
         run: sudo mkdir -p /var/run/netns
-      - name: Setup dnsmasq for VM DNS
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y dnsmasq
-          sudo tee /etc/dnsmasq.d/fcvm.conf > /dev/null <<EOF
-          bind-dynamic
-          server=8.8.8.8
-          server=8.8.4.4
-          no-resolv
-          cache-size=1000
-          EOF
-          sudo systemctl restart dnsmasq
       - name: Setup iptables for VM networking
         run: |
           sudo iptables -P FORWARD ACCEPT
@@ -332,6 +309,8 @@ jobs:
   test-vm-egress:
     name: VM Egress
     runs-on: buildjet-32vcpu-ubuntu-2204
+    needs: test-vm-exec  # Sequential: flock doesn't work across podman containers sharing /dev/nbd0
+    if: always()  # Run even if previous job failed (rootfs will be cached after first success)
     steps:
       - uses: actions/checkout@v4
         with:
@@ -352,18 +331,6 @@ jobs:
         run: sudo modprobe nbd max_part=8
       - name: Setup network namespace directory
         run: sudo mkdir -p /var/run/netns
-      - name: Setup dnsmasq for VM DNS
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y dnsmasq
-          sudo tee /etc/dnsmasq.d/fcvm.conf > /dev/null <<EOF
-          bind-dynamic
-          server=8.8.8.8
-          server=8.8.4.4
-          no-resolv
-          cache-size=1000
-          EOF
-          sudo systemctl restart dnsmasq
       - name: Setup iptables for VM networking
         run: |
           sudo iptables -P FORWARD ACCEPT

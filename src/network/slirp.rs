@@ -11,10 +11,6 @@ use super::{types::generate_mac, NetworkConfig, NetworkManager, PortMapping};
 use crate::paths;
 use crate::state::truncate_id;
 
-/// slirp4netns network addressing constants
-/// slirp0 device is assigned this IP for routing to slirp4netns
-const SLIRP_CIDR: &str = "10.0.2.100/24";
-
 /// Guest network addressing (isolated per VM namespace)
 const GUEST_SUBNET: &str = "192.168.1.0/24";
 const GUEST_IP: &str = "192.168.1.2";
@@ -54,7 +50,6 @@ pub struct SlirpNetwork {
     port_mappings: Vec<PortMapping>,
 
     // Network addressing
-    slirp_cidr: String,   // slirp0: 10.0.2.100/24, gateway 10.0.2.2
     guest_subnet: String, // tap0: 192.168.x.0/24 (derived from vm_id)
     guest_ip: String,     // Guest VM IP (192.168.x.2)
     namespace_ip: String, // Namespace host IP on tap0 (192.168.x.1)
@@ -74,7 +69,6 @@ impl SlirpNetwork {
             tap_device,
             slirp_device: SLIRP_DEVICE_NAME.to_string(),
             port_mappings,
-            slirp_cidr: SLIRP_CIDR.to_string(),
             guest_subnet: GUEST_SUBNET.to_string(),
             guest_ip: GUEST_IP.to_string(),
             namespace_ip: NAMESPACE_IP.to_string(),
@@ -157,16 +151,17 @@ impl SlirpNetwork {
 
     /// Build the setup script to run inside the namespace via nsenter
     ///
-    /// This script creates both TAP devices and configures networking.
+    /// This script creates both TAP devices and sets up iptables rules for egress.
+    /// Health checks use nsenter to curl the guest directly, no port forwarding needed.
     /// Run via: nsenter -t HOLDER_PID -U -n -- bash -c '<this script>'
     pub fn build_setup_script(&self) -> String {
         format!(
             r#"
 set -e
 
-# Create slirp0 TAP for slirp4netns connectivity
+# Create slirp0 TAP for slirp4netns (slirp4netns will attach to this)
 ip tuntap add {slirp_dev} mode tap
-ip addr add {slirp_ip} dev {slirp_dev}
+ip addr add 10.0.2.1/24 dev {slirp_dev}
 ip link set {slirp_dev} up
 
 # Create TAP device for Firecracker (must exist before Firecracker starts)
@@ -177,24 +172,23 @@ ip link set {fc_tap} up
 # Set up loopback
 ip link set lo up
 
-# Set default route via slirp gateway
+# Enable IP forwarding (required for NAT to work)
+sysctl -w net.ipv4.ip_forward=1
+
+# Set default route via slirp gateway (10.0.2.2 is slirp4netns internal gateway)
 ip route add default via 10.0.2.2 dev {slirp_dev}
 
-# Set up iptables MASQUERADE for traffic from guest subnet
-# This NATs guest traffic (192.168.x.x) to slirp0's address (10.0.2.100)
-iptables -t nat -A POSTROUTING -s {guest_subnet} -o {slirp_dev} -j MASQUERADE 2>/dev/null || true
+# Allow forwarding between slirp0 and FC TAP
+iptables -A FORWARD -i {slirp_dev} -o {fc_tap} -j ACCEPT 2>/dev/null || true
+iptables -A FORWARD -i {fc_tap} -o {slirp_dev} -j ACCEPT 2>/dev/null || true
 
-# Set up DNAT for inbound connections from slirp4netns
-# When slirp4netns forwards traffic to 10.0.2.100, redirect it to the actual guest IP
-# This enables port forwarding: host -> slirp4netns -> 10.0.2.100 -> DNAT -> guest (192.168.x.2)
-iptables -t nat -A PREROUTING -d 10.0.2.100 -j DNAT --to-destination {guest_ip} 2>/dev/null || true
+# Set up iptables MASQUERADE for traffic from guest subnet (egress)
+iptables -t nat -A POSTROUTING -s {guest_subnet} -o {slirp_dev} -j MASQUERADE 2>/dev/null || true
 "#,
             slirp_dev = self.slirp_device,
-            slirp_ip = self.slirp_cidr,
             fc_tap = self.tap_device,
             ns_ip = self.namespace_ip,
             guest_subnet = self.guest_subnet,
-            guest_ip = self.guest_ip,
         )
     }
 
@@ -239,11 +233,12 @@ iptables -t nat -A PREROUTING -d 10.0.2.100 -j DNAT --to-destination {guest_ip} 
             namespace_pid = namespace_pid,
             slirp_tap = %self.slirp_device,
             api_socket = %api_socket.display(),
-            "starting slirp4netns (attaching to existing TAP)"
+            "starting slirp4netns (creating TAP, no IP assignment)"
         );
 
-        // Start slirp4netns WITHOUT --configure (TAP already exists and is configured)
-        // slirp4netns will attach to the existing TAP device
+        // Start slirp4netns WITHOUT --configure so it doesn't assign an IP
+        // This avoids the issue where DNAT doesn't work for local addresses
+        // The TAP is created and connected, but we handle routing ourselves
         let mut cmd = Command::new("slirp4netns");
         cmd.arg("--ready-fd")
             .arg(ready_write_raw.to_string())
@@ -347,59 +342,6 @@ iptables -t nat -A PREROUTING -d 10.0.2.100 -j DNAT --to-destination {guest_ip} 
         Ok(())
     }
 
-    /// Setup health check port forward (loopback_ip:8080 → guest:80)
-    ///
-    /// Uses port 8080 on host (unprivileged) forwarding to port 80 in guest.
-    /// This is fully rootless - no capabilities or sudo needed.
-    /// Linux routes all of 127.0.0.0/8 to loopback without needing `ip addr add`.
-    async fn setup_health_check_forward(&self, loopback_ip: &str) -> Result<()> {
-        let api_socket = self
-            .api_socket_path
-            .as_ref()
-            .context("API socket not configured")?;
-
-        // Forward from unprivileged port 8080 on host to port 80 in guest
-        // Port 8080 doesn't require CAP_NET_BIND_SERVICE
-        let request = serde_json::json!({
-            "execute": "add_hostfwd",
-            "arguments": {
-                "proto": "tcp",
-                "host_addr": loopback_ip,
-                "host_port": 8080,
-                "guest_addr": "10.0.2.100",
-                "guest_port": 80
-            }
-        });
-
-        info!(
-            loopback_ip = %loopback_ip,
-            guest_ip = %self.guest_ip,
-            "setting up health check port forward (8080 -> 80) - fully rootless!"
-        );
-
-        let mut stream = UnixStream::connect(api_socket)
-            .await
-            .context("connecting to slirp4netns API socket")?;
-
-        let request_str = serde_json::to_string(&request)? + "\n";
-        stream.write_all(request_str.as_bytes()).await?;
-        stream.shutdown().await?;
-
-        let mut reader = BufReader::new(stream);
-        let mut response_line = String::new();
-        reader.read_line(&mut response_line).await?;
-
-        debug!(response = %response_line.trim(), "slirp4netns health check forward response");
-
-        if response_line.contains("error") {
-            warn!(response = %response_line.trim(), "health check port forwarding may have failed");
-        } else {
-            info!("health check port forwarding configured successfully");
-        }
-
-        Ok(())
-    }
-
     /// Get guest IP address for kernel boot args
     pub fn guest_ip(&self) -> &str {
         &self.guest_ip
@@ -454,12 +396,10 @@ impl NetworkManager for SlirpNetwork {
 
         self.start_slirp(holder_pid).await?;
 
-        // Set up health check port forward (loopback_ip:80 → guest:80)
-        // No ip addr add needed - Linux routes all of 127.0.0.0/8 to loopback!
-        if let Some(loopback_ip) = &self.loopback_ip {
-            self.setup_health_check_forward(loopback_ip).await?;
-        }
+        // Health checks now use nsenter to curl the guest directly
+        // No port forwarding needed for health checks
 
+        // User-specified port mappings still use slirp4netns port forwarding
         if !self.port_mappings.is_empty() {
             self.setup_port_forwarding().await?;
         }

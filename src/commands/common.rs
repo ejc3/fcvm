@@ -21,6 +21,59 @@ pub const VSOCK_VOLUME_PORT_BASE: u32 = 5000;
 /// Vsock port for status channel (fc-agent notifies when container starts)
 pub const VSOCK_STATUS_PORT: u32 = 4999;
 
+/// Minimum required Firecracker version for network_overrides support
+const MIN_FIRECRACKER_VERSION: (u32, u32, u32) = (1, 13, 1);
+
+/// Find and validate Firecracker binary
+///
+/// Returns the path to the Firecracker binary if it exists and meets minimum version requirements.
+/// Fails with a clear error if Firecracker is not found or version is too old.
+pub fn find_firecracker() -> Result<std::path::PathBuf> {
+    let firecracker_bin = which::which("firecracker").context("firecracker not found in PATH")?;
+
+    // Check version
+    let output = std::process::Command::new(&firecracker_bin)
+        .arg("--version")
+        .output()
+        .context("failed to run firecracker --version")?;
+
+    let version_str = String::from_utf8_lossy(&output.stdout);
+    let version = parse_firecracker_version(&version_str)?;
+
+    if version < MIN_FIRECRACKER_VERSION {
+        anyhow::bail!(
+            "Firecracker version {}.{}.{} is too old. Minimum required: {}.{}.{} (for network_overrides support in snapshot cloning)",
+            version.0, version.1, version.2,
+            MIN_FIRECRACKER_VERSION.0, MIN_FIRECRACKER_VERSION.1, MIN_FIRECRACKER_VERSION.2
+        );
+    }
+
+    debug!(
+        "Found Firecracker {}.{}.{} at {:?}",
+        version.0, version.1, version.2, firecracker_bin
+    );
+
+    Ok(firecracker_bin)
+}
+
+/// Parse Firecracker version from --version output
+///
+/// Expected format: "Firecracker v1.14.0" or similar
+fn parse_firecracker_version(output: &str) -> Result<(u32, u32, u32)> {
+    // Find version number pattern vX.Y.Z
+    let version_re = regex::Regex::new(r"v?(\d+)\.(\d+)\.(\d+)").context("invalid regex")?;
+
+    let caps = version_re
+        .captures(output)
+        .context("could not parse Firecracker version from output")?;
+
+    let major: u32 = caps[1].parse().context("invalid major version")?;
+    let minor: u32 = caps[2].parse().context("invalid minor version")?;
+    let patch: u32 = caps[3].parse().context("invalid patch version")?;
+
+    Ok((major, minor, patch))
+}
+
 /// Save VM state with complete network configuration
 ///
 /// This function ensures both baseline and clone VMs save identical network data,

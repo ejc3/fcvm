@@ -36,7 +36,10 @@ impl FirecrackerClient {
 
         let resp = self.client.request(req).await?;
         if resp.status() != StatusCode::NO_CONTENT && resp.status() != StatusCode::OK {
-            anyhow::bail!("Firecracker API error: {}", resp.status());
+            let status = resp.status();
+            let body_bytes = hyper::body::to_bytes(resp.into_body()).await?;
+            let body_str = String::from_utf8_lossy(&body_bytes);
+            anyhow::bail!("Firecracker API error: {} - {}", status, body_str);
         }
         Ok(())
     }
@@ -52,7 +55,10 @@ impl FirecrackerClient {
 
         let resp = self.client.request(req).await?;
         if resp.status() != StatusCode::NO_CONTENT && resp.status() != StatusCode::OK {
-            anyhow::bail!("Firecracker API error: {}", resp.status());
+            let status = resp.status();
+            let body_bytes = hyper::body::to_bytes(resp.into_body()).await?;
+            let body_str = String::from_utf8_lossy(&body_bytes);
+            anyhow::bail!("Firecracker API error: {} - {}", status, body_str);
         }
         Ok(())
     }

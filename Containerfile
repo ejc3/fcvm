@@ -44,13 +44,14 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Download and install Firecracker (architecture-aware)
+# v1.14.0 adds network_overrides support for snapshot cloning
 ARG ARCH=aarch64
 RUN curl -L -o /tmp/firecracker.tgz \
-    https://github.com/firecracker-microvm/firecracker/releases/download/v1.10.1/firecracker-v1.10.1-${ARCH}.tgz \
+    https://github.com/firecracker-microvm/firecracker/releases/download/v1.14.0/firecracker-v1.14.0-${ARCH}.tgz \
     && tar -xzf /tmp/firecracker.tgz -C /tmp \
-    && mv /tmp/release-v1.10.1-${ARCH}/firecracker-v1.10.1-${ARCH} /usr/local/bin/firecracker \
+    && mv /tmp/release-v1.14.0-${ARCH}/firecracker-v1.14.0-${ARCH} /usr/local/bin/firecracker \
     && chmod +x /usr/local/bin/firecracker \
-    && rm -rf /tmp/firecracker.tgz /tmp/release-v1.10.1-${ARCH}
+    && rm -rf /tmp/firecracker.tgz /tmp/release-v1.14.0-${ARCH}
 
 # Build and install pjdfstest (tests expect it at /tmp/pjdfstest-check/)
 RUN git clone --depth 1 https://github.com/pjd/pjdfstest /tmp/pjdfstest-check \

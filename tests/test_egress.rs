@@ -72,7 +72,7 @@ async fn egress_fresh_test_impl(network: &str) -> Result<()> {
     .context("spawning VM")?;
 
     println!("  Waiting for VM to become healthy (PID: {})...", vm_pid);
-    common::poll_health_by_pid(vm_pid, 60).await?;
+    common::poll_health_by_pid(vm_pid, 180).await?;
     println!("  ✓ VM healthy");
 
     // Step 2: Test egress
@@ -137,7 +137,11 @@ async fn egress_clone_test_impl(network: &str) -> Result<()> {
         "  Waiting for baseline VM to become healthy (PID: {})...",
         baseline_pid
     );
-    common::poll_health_by_pid(baseline_pid, 60).await?;
+    // Use 300 second timeout to account for rootfs creation on first run
+    if let Err(e) = common::poll_health_by_pid(baseline_pid, 300).await {
+        common::kill_process(baseline_pid).await;
+        return Err(e.context("baseline VM failed to become healthy"));
+    }
     println!("  ✓ Baseline VM healthy");
 
     // Test egress on baseline first
