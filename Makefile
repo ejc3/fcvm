@@ -375,6 +375,7 @@ CONTAINER_RUN_FCVM := $(CONTAINER_RUN_BASE) \
 # --privileged with rootless podman grants capabilities within the user namespace,
 # not actual host root. We're root inside the container but unprivileged on host.
 # --group-add keep-groups preserves host user's groups (kvm) for /dev/kvm access.
+# --device /dev/userfaultfd needed for snapshot/clone UFFD memory sharing.
 # The container's user namespace is the isolation boundary.
 CONTAINER_RUN_ROOTLESS := podman --root=/tmp/podman-rootless run --rm \
 	--privileged \
@@ -387,6 +388,7 @@ CONTAINER_RUN_ROOTLESS := podman --root=/tmp/podman-rootless run --rm \
 	-e CARGO_HOME=/home/testuser/.cargo \
 	--device /dev/kvm \
 	--device /dev/net/tun \
+	--device /dev/userfaultfd \
 	-v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	--network host
 
