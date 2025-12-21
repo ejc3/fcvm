@@ -255,22 +255,6 @@ jobs:
           ls -la /dev/nbd* | head -5
       - name: Setup network namespace directory
         run: sudo mkdir -p /var/run/netns
-      - name: Setup dnsmasq for VM DNS
-        run: |
-          # Stop systemd-resolved which holds port 53
-          sudo systemctl stop systemd-resolved || true
-          sudo apt-get update
-          sudo apt-get install -y dnsmasq
-          sudo tee /etc/dnsmasq.d/fcvm.conf > /dev/null <<EOF
-          bind-dynamic
-          server=8.8.8.8
-          server=8.8.4.4
-          no-resolv
-          cache-size=1000
-          EOF
-          sudo systemctl restart dnsmasq
-          # Verify dnsmasq is running
-          sudo systemctl status dnsmasq || true
       - name: Setup iptables for VM networking
         run: |
           # BuildJet runners have FORWARD chain set to DROP by default
@@ -308,22 +292,6 @@ jobs:
         run: sudo modprobe nbd max_part=8
       - name: Setup network namespace directory
         run: sudo mkdir -p /var/run/netns
-      - name: Setup dnsmasq for VM DNS
-        run: |
-          # Stop systemd-resolved which holds port 53
-          sudo systemctl stop systemd-resolved || true
-          sudo apt-get update
-          sudo apt-get install -y dnsmasq
-          sudo tee /etc/dnsmasq.d/fcvm.conf > /dev/null <<EOF
-          bind-dynamic
-          server=8.8.8.8
-          server=8.8.4.4
-          no-resolv
-          cache-size=1000
-          EOF
-          sudo systemctl restart dnsmasq
-          # Verify dnsmasq is running
-          sudo systemctl status dnsmasq || true
       - name: Setup iptables for VM networking
         run: |
           sudo iptables -P FORWARD ACCEPT
@@ -359,22 +327,6 @@ jobs:
         run: sudo modprobe nbd max_part=8
       - name: Setup network namespace directory
         run: sudo mkdir -p /var/run/netns
-      - name: Setup dnsmasq for VM DNS
-        run: |
-          # Stop systemd-resolved which holds port 53
-          sudo systemctl stop systemd-resolved || true
-          sudo apt-get update
-          sudo apt-get install -y dnsmasq
-          sudo tee /etc/dnsmasq.d/fcvm.conf > /dev/null <<EOF
-          bind-dynamic
-          server=8.8.8.8
-          server=8.8.4.4
-          no-resolv
-          cache-size=1000
-          EOF
-          sudo systemctl restart dnsmasq
-          # Verify dnsmasq is running
-          sudo systemctl status dnsmasq || true
       - name: Setup iptables for VM networking
         run: |
           sudo iptables -P FORWARD ACCEPT
