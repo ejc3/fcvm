@@ -17,20 +17,14 @@ use tokio::sync::Mutex;
 /// Full snapshot/clone workflow test with rootless networking (10 clones)
 #[tokio::test]
 async fn test_snapshot_clone_rootless_10() -> Result<()> {
-    // Rootless tests must NOT run as root - user namespace mapping breaks
-    if nix::unistd::geteuid().is_root() {
-        anyhow::bail!("Rootless tests cannot run as root! Run without sudo: cargo test --release -p fcvm --test test_snapshot_clone");
-    }
+    common::require_non_root("test_snapshot_clone_rootless_10")?;
     snapshot_clone_test_impl("rootless", 10).await
 }
 
 /// Stress test with 100 clones using rootless networking
 #[tokio::test]
 async fn test_snapshot_clone_stress_100() -> Result<()> {
-    // Rootless tests must NOT run as root - user namespace mapping breaks
-    if nix::unistd::geteuid().is_root() {
-        anyhow::bail!("Rootless tests cannot run as root! Run without sudo: cargo test --release -p fcvm --test test_snapshot_clone");
-    }
+    common::require_non_root("test_snapshot_clone_stress_100")?;
     snapshot_clone_test_impl("rootless", 100).await
 }
 
@@ -68,12 +62,12 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
             "podman",
             "run",
             "--name",
-            &&baseline_name,
+            &baseline_name,
             "--network",
             network,
             common::TEST_IMAGE,
         ],
-        &&baseline_name,
+        &baseline_name,
     )
     .await
     .context("spawning baseline VM")?;
@@ -101,7 +95,7 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
             "--pid",
             &baseline_pid.to_string(),
             "--tag",
-            &&snapshot_name,
+            &snapshot_name,
         ])
         .output()
         .await
@@ -168,11 +162,11 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
                     "--pid",
                     &serve_pid_str,
                     "--name",
-                    &&clone_name,
+                    &clone_name,
                     "--network",
                     &network,
                 ],
-                &&clone_name,
+                &clone_name,
             )
             .await;
 
@@ -538,15 +532,13 @@ async fn test_clone_internet_bridged() -> Result<()> {
 /// Test that clones can reach the internet in rootless mode
 #[tokio::test]
 async fn test_clone_internet_rootless() -> Result<()> {
-    // Rootless tests must NOT run as root - user namespace mapping breaks
-    if nix::unistd::geteuid().is_root() {
-        anyhow::bail!("Rootless tests cannot run as root! Run without sudo: cargo test --release -p fcvm --test test_snapshot_clone");
-    }
+    common::require_non_root("test_clone_internet_rootless")?;
     clone_internet_test_impl("rootless").await
 }
 
 async fn clone_internet_test_impl(network: &str) -> Result<()> {
-    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names(&format!("inet-{}", network));
+    let (baseline_name, clone_name, snapshot_name, _) =
+        common::unique_names(&format!("inet-{}", network));
 
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!(
@@ -564,12 +556,12 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
             "podman",
             "run",
             "--name",
-            &&baseline_name,
+            &baseline_name,
             "--network",
             network,
             common::TEST_IMAGE,
         ],
-        &&baseline_name,
+        &baseline_name,
     )
     .await
     .context("spawning baseline VM")?;
@@ -587,7 +579,7 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
             "--pid",
             &baseline_pid.to_string(),
             "--tag",
-            &&snapshot_name,
+            &snapshot_name,
         ])
         .output()
         .await
@@ -624,11 +616,11 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
             "--pid",
             &serve_pid_str,
             "--name",
-            &&clone_name,
+            &clone_name,
             "--network",
             network,
         ],
-        &&clone_name,
+        &clone_name,
     )
     .await
     .context("spawning clone")?;
@@ -775,12 +767,6 @@ async fn test_clone_http(fcvm_path: &std::path::Path, clone_pid: u32) -> Result<
 /// This tests the full port forwarding path: host → iptables DNAT → clone VM → nginx.
 #[tokio::test]
 async fn test_clone_port_forward_bridged() -> Result<()> {
-    // Requires root for bridged networking
-    if !nix::unistd::geteuid().is_root() {
-        eprintln!("Skipping test_clone_port_forward_bridged: requires root");
-        return Ok(());
-    }
-
     let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("pf-bridged");
 
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
@@ -886,7 +872,13 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
     let guest_ip: String = serde_json::from_str::<Vec<serde_json::Value>>(&stdout)
         .ok()
         .and_then(|v| v.first().cloned())
-        .and_then(|v| v.get("config")?.get("network")?.get("guest_ip")?.as_str().map(|s| s.to_string()))
+        .and_then(|v| {
+            v.get("config")?
+                .get("network")?
+                .get("guest_ip")?
+                .as_str()
+                .map(|s| s.to_string())
+        })
         .unwrap_or_default();
 
     println!("  Clone guest IP: {}", guest_ip);
@@ -898,8 +890,13 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
         .output()
         .await;
 
-    let direct_works = direct_result.map(|o| o.status.success() && !o.stdout.is_empty()).unwrap_or(false);
-    println!("    Direct access: {}", if direct_works { "✓ OK" } else { "✗ FAIL" });
+    let direct_works = direct_result
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false);
+    println!(
+        "    Direct access: {}",
+        if direct_works { "✓ OK" } else { "✗ FAIL" }
+    );
 
     // Test 2: Access via host's primary IP and forwarded port
     let host_ip = tokio::process::Command::new("hostname")
@@ -913,12 +910,22 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
 
     println!("  Testing access via host IP {}:19080...", host_ip);
     let forward_result = tokio::process::Command::new("curl")
-        .args(["-s", "--max-time", "10", &format!("http://{}:19080", host_ip)])
+        .args([
+            "-s",
+            "--max-time",
+            "10",
+            &format!("http://{}:19080", host_ip),
+        ])
         .output()
         .await;
 
-    let forward_works = forward_result.map(|o| o.status.success() && !o.stdout.is_empty()).unwrap_or(false);
-    println!("    Port forward (host IP): {}", if forward_works { "✓ OK" } else { "✗ FAIL" });
+    let forward_works = forward_result
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false);
+    println!(
+        "    Port forward (host IP): {}",
+        if forward_works { "✓ OK" } else { "✗ FAIL" }
+    );
 
     // Test 3: Access via localhost
     println!("  Testing access via localhost:19080...");
@@ -927,8 +934,17 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
         .output()
         .await;
 
-    let localhost_works = localhost_result.map(|o| o.status.success() && !o.stdout.is_empty()).unwrap_or(false);
-    println!("    Localhost access: {}", if localhost_works { "✓ OK" } else { "✗ FAIL" });
+    let localhost_works = localhost_result
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false);
+    println!(
+        "    Localhost access: {}",
+        if localhost_works {
+            "✓ OK"
+        } else {
+            "✗ FAIL"
+        }
+    );
 
     // Cleanup
     println!("\nCleaning up...");
@@ -941,9 +957,30 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!("║                         RESULTS                               ║");
     println!("╠═══════════════════════════════════════════════════════════════╣");
-    println!("║  Direct access to guest:    {}                                 ║", if direct_works { "✓ PASSED" } else { "✗ FAILED" });
-    println!("║  Port forward (host IP):    {}                                 ║", if forward_works { "✓ PASSED" } else { "✗ FAILED" });
-    println!("║  Localhost port forward:    {}                                 ║", if localhost_works { "✓ PASSED" } else { "✗ FAILED" });
+    println!(
+        "║  Direct access to guest:    {}                                 ║",
+        if direct_works {
+            "✓ PASSED"
+        } else {
+            "✗ FAILED"
+        }
+    );
+    println!(
+        "║  Port forward (host IP):    {}                                 ║",
+        if forward_works {
+            "✓ PASSED"
+        } else {
+            "✗ FAILED"
+        }
+    );
+    println!(
+        "║  Localhost port forward:    {}                                 ║",
+        if localhost_works {
+            "✓ PASSED"
+        } else {
+            "✗ FAILED"
+        }
+    );
     println!("╚═══════════════════════════════════════════════════════════════╝");
 
     // All port forwarding methods must work
@@ -966,10 +1003,7 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
 /// Port forwarding is done via slirp4netns API, accessing via unique loopback IP.
 #[tokio::test]
 async fn test_clone_port_forward_rootless() -> Result<()> {
-    // Rootless tests must NOT run as root - user namespace mapping breaks
-    if nix::unistd::geteuid().is_root() {
-        anyhow::bail!("Rootless tests cannot run as root! Run without sudo: cargo test --release -p fcvm --test test_snapshot_clone");
-    }
+    common::require_non_root("test_clone_port_forward_rootless")?;
 
     let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("pf-rootless");
 
@@ -1077,7 +1111,13 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
     let loopback_ip: String = serde_json::from_str::<Vec<serde_json::Value>>(&stdout)
         .ok()
         .and_then(|v| v.first().cloned())
-        .and_then(|v| v.get("config")?.get("network")?.get("loopback_ip")?.as_str().map(|s| s.to_string()))
+        .and_then(|v| {
+            v.get("config")?
+                .get("network")?
+                .get("loopback_ip")?
+                .as_str()
+                .map(|s| s.to_string())
+        })
         .unwrap_or_default();
 
     println!("  Clone loopback IP: {}", loopback_ip);
@@ -1085,17 +1125,28 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
     // Test: Access via loopback IP and forwarded port
     println!("  Testing access via loopback {}:8080...", loopback_ip);
     let loopback_result = tokio::process::Command::new("curl")
-        .args(["-s", "--max-time", "10", &format!("http://{}:8080", loopback_ip)])
+        .args([
+            "-s",
+            "--max-time",
+            "10",
+            &format!("http://{}:8080", loopback_ip),
+        ])
         .output()
         .await;
 
-    let loopback_works = loopback_result.as_ref().map(|o| o.status.success() && !o.stdout.is_empty()).unwrap_or(false);
+    let loopback_works = loopback_result
+        .as_ref()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false);
 
     if let Ok(ref out) = loopback_result {
         if loopback_works {
             println!("    Loopback access: ✓ OK");
             let response = String::from_utf8_lossy(&out.stdout);
-            println!("    Response: {} bytes (nginx welcome page)", response.len());
+            println!(
+                "    Response: {} bytes (nginx welcome page)",
+                response.len()
+            );
         } else {
             println!("    Loopback access: ✗ FAIL");
             println!("    stderr: {}", String::from_utf8_lossy(&out.stderr));
@@ -1115,7 +1166,14 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!("║                         RESULTS                               ║");
     println!("╠═══════════════════════════════════════════════════════════════╣");
-    println!("║  Loopback port forward: {}                                    ║", if loopback_works { "✓ PASSED" } else { "✗ FAILED" });
+    println!(
+        "║  Loopback port forward: {}                                    ║",
+        if loopback_works {
+            "✓ PASSED"
+        } else {
+            "✗ FAILED"
+        }
+    );
     println!("╚═══════════════════════════════════════════════════════════════╝");
 
     if loopback_works {
@@ -1135,10 +1193,7 @@ async fn test_snapshot_run_exec_bridged() -> Result<()> {
 /// Test snapshot run --exec with rootless networking
 #[tokio::test]
 async fn test_snapshot_run_exec_rootless() -> Result<()> {
-    // Rootless tests must NOT run as root - user namespace mapping breaks
-    if nix::unistd::geteuid().is_root() {
-        anyhow::bail!("Rootless tests cannot run as root! Run without sudo: cargo test --release -p fcvm --test test_snapshot_clone");
-    }
+    common::require_non_root("test_snapshot_run_exec_rootless")?;
     snapshot_run_exec_test_impl("rootless").await
 }
 
@@ -1162,12 +1217,12 @@ async fn snapshot_run_exec_test_impl(network: &str) -> Result<()> {
             "podman",
             "run",
             "--name",
-            &&baseline_name,
+            &baseline_name,
             "--network",
             network,
             common::TEST_IMAGE,
         ],
-        &&baseline_name,
+        &baseline_name,
     )
     .await
     .context("spawning baseline VM")?;
@@ -1185,7 +1240,7 @@ async fn snapshot_run_exec_test_impl(network: &str) -> Result<()> {
             "--pid",
             &baseline_pid.to_string(),
             "--tag",
-            &&snapshot_name,
+            &snapshot_name,
         ])
         .output()
         .await

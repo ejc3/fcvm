@@ -26,6 +26,7 @@ async fn test_egress_fresh_bridged() -> Result<()> {
 /// Test egress connectivity for fresh VM with rootless networking
 #[tokio::test]
 async fn test_egress_fresh_rootless() -> Result<()> {
+    common::require_non_root("test_egress_fresh_rootless")?;
     egress_fresh_test_impl("rootless").await
 }
 
@@ -38,12 +39,13 @@ async fn test_egress_clone_bridged() -> Result<()> {
 /// Test egress connectivity for cloned VM with rootless networking
 #[tokio::test]
 async fn test_egress_clone_rootless() -> Result<()> {
+    common::require_non_root("test_egress_clone_rootless")?;
     egress_clone_test_impl("rootless").await
 }
 
 /// Implementation for testing egress on a fresh (non-cloned) VM
 async fn egress_fresh_test_impl(network: &str) -> Result<()> {
-    let vm_name = format!("egress-fresh-{}", network);
+    let (vm_name, _, _, _) = common::unique_names(&format!("egress-fresh-{}", network));
 
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!(
@@ -103,9 +105,8 @@ async fn egress_fresh_test_impl(network: &str) -> Result<()> {
 
 /// Implementation for testing egress on a cloned VM
 async fn egress_clone_test_impl(network: &str) -> Result<()> {
-    let snapshot_name = format!("egress-snapshot-{}", network);
-    let baseline_name = format!("egress-baseline-{}", network);
-    let clone_name = format!("egress-clone-{}", network);
+    let (baseline_name, clone_name, snapshot_name, _) =
+        common::unique_names(&format!("egress-{}", network));
 
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!(

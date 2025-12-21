@@ -37,7 +37,7 @@ pub struct VmManager {
     namespace_id: Option<String>,
     holder_pid: Option<u32>, // namespace holder PID for rootless mode (use nsenter to run FC)
     user_namespace_path: Option<PathBuf>, // User namespace path for rootless clones (enter via setns in pre_exec)
-    net_namespace_path: Option<PathBuf>,  // Net namespace path for rootless clones (enter via setns in pre_exec)
+    net_namespace_path: Option<PathBuf>, // Net namespace path for rootless clones (enter via setns in pre_exec)
     vsock_redirect: Option<(PathBuf, PathBuf)>, // (baseline_dir, clone_dir) for mount namespace isolation
     process: Option<Child>,
     client: Option<FirecrackerClient>,
@@ -346,14 +346,13 @@ impl VmManager {
                     // - ns_path_cstr: /var/run/netns/NAME (bridged mode)
                     let net_ns_to_enter = net_ns_cstr.as_ref().or(ns_path_cstr.as_ref());
                     if let Some(ns_path) = net_ns_to_enter {
-                        let ns_fd_raw = open(
-                            ns_path.as_c_str(),
-                            OFlag::O_RDONLY,
-                            Mode::empty(),
-                        )
-                        .map_err(|e| {
-                            std::io::Error::other(format!("failed to open net namespace: {}", e))
-                        })?;
+                        let ns_fd_raw = open(ns_path.as_c_str(), OFlag::O_RDONLY, Mode::empty())
+                            .map_err(|e| {
+                                std::io::Error::other(format!(
+                                    "failed to open net namespace: {}",
+                                    e
+                                ))
+                            })?;
 
                         // SAFETY: from_raw_fd takes ownership of the file descriptor.
                         let ns_fd = OwnedFd::from_raw_fd(ns_fd_raw);

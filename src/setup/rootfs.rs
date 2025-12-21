@@ -3,9 +3,79 @@ use std::path::{Path, PathBuf};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::paths;
+
+/// Find a free NBD device by checking which ones are not currently connected.
+/// Returns the device path (e.g., "/dev/nbd0") or error if none available.
+///
+/// Note: There's a small race window between checking and connecting. If connection
+/// fails, the caller should retry with a different device.
+async fn find_free_nbd_device() -> Result<String> {
+    // modprobe nbd with max_part=8 creates nbd0-nbd15 by default
+    for i in 0..16 {
+        let device = format!("/dev/nbd{}", i);
+        let pid_file = format!("/sys/block/nbd{}/pid", i);
+
+        // Check if device exists
+        if !std::path::Path::new(&device).exists() {
+            continue;
+        }
+
+        // If pid file doesn't exist or is empty/contains -1, device is free
+        match tokio::fs::read_to_string(&pid_file).await {
+            Ok(content) => {
+                let pid = content.trim();
+                if pid.is_empty() || pid == "-1" {
+                    debug!(device = %device, "found free NBD device");
+                    return Ok(device);
+                }
+                debug!(device = %device, pid = %pid, "NBD device in use");
+            }
+            Err(_) => {
+                // No pid file means not connected
+                debug!(device = %device, "found free NBD device (no pid file)");
+                return Ok(device);
+            }
+        }
+    }
+
+    bail!("No free NBD devices available (checked nbd0-nbd15)")
+}
+
+/// Connect to an NBD device, with retry on failure (handles race conditions)
+async fn connect_nbd_with_retry(qcow2_path: &Path, max_attempts: u32) -> Result<String> {
+    let mut last_error = None;
+
+    for attempt in 1..=max_attempts {
+        let nbd_device = find_free_nbd_device().await?;
+        info!(device = %nbd_device, attempt = attempt, "trying NBD device");
+
+        let output = Command::new("qemu-nbd")
+            .args(["--connect", &nbd_device, "-r", path_to_str(qcow2_path)?])
+            .output()
+            .await
+            .context("running qemu-nbd connect")?;
+
+        if output.status.success() {
+            return Ok(nbd_device);
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(device = %nbd_device, error = %stderr.trim(), "NBD connect failed, retrying");
+        last_error = Some(stderr.to_string());
+
+        // Small delay before retry
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+
+    bail!(
+        "Failed to connect to any NBD device after {} attempts: {}",
+        max_attempts,
+        last_error.unwrap_or_default()
+    )
+}
 
 /// Find the fc-agent binary
 ///
@@ -239,9 +309,6 @@ async fn download_ubuntu_cloud_image() -> Result<PathBuf> {
 async fn extract_root_partition(qcow2_path: &Path, output_path: &Path) -> Result<()> {
     info!("extracting root partition from cloud image");
 
-    // Find a free NBD device
-    let nbd_device = "/dev/nbd0";
-
     // Load nbd kernel module if not already loaded
     let _ = Command::new("modprobe")
         .arg("nbd")
@@ -249,20 +316,9 @@ async fn extract_root_partition(qcow2_path: &Path, output_path: &Path) -> Result
         .output()
         .await;
 
-    // Connect qcow2 to NBD device
-    info!("connecting qcow2 to NBD device");
-    let output = Command::new("qemu-nbd")
-        .args(["--connect", nbd_device, "-r", path_to_str(qcow2_path)?])
-        .output()
-        .await
-        .context("running qemu-nbd connect")?;
-
-    if !output.status.success() {
-        bail!(
-            "qemu-nbd connect failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    // Connect qcow2 to NBD device (with retry for parallel safety)
+    let nbd_device = connect_nbd_with_retry(qcow2_path, 5).await?;
+    let nbd_device = nbd_device.as_str();
 
     // Force kernel to re-read partition table - required on some systems (e.g., CI runners)
     // Try partprobe first (from parted), fall back to partx (from util-linux)
@@ -303,12 +359,16 @@ async fn extract_root_partition(qcow2_path: &Path, output_path: &Path) -> Result
     // This is needed when running in a container where the host kernel creates
     // the partition device on the host's devtmpfs, but the container has its own.
     // NBD major is 43, partition 1 is minor 1.
+    //
+    // Extract device name (e.g., "nbd0" from "/dev/nbd0") for sysfs paths
+    let nbd_name = nbd_device.strip_prefix("/dev/").unwrap_or(nbd_device);
+
     if !std::path::Path::new(&partition).exists() {
         info!("partition not auto-created, trying mknod");
 
         // Get partition info from sysfs
-        let sysfs_path = "/sys/block/nbd0/nbd0p1/dev";
-        let dev_info = tokio::fs::read_to_string(sysfs_path).await;
+        let sysfs_path = format!("/sys/block/{}/{}p1/dev", nbd_name, nbd_name);
+        let dev_info = tokio::fs::read_to_string(&sysfs_path).await;
 
         if let Ok(dev_str) = dev_info {
             // dev_str is "major:minor" e.g., "43:1"
@@ -341,25 +401,21 @@ async fn extract_root_partition(qcow2_path: &Path, output_path: &Path) -> Result
     // Final check
     if !std::path::Path::new(&partition).exists() {
         // List what devices exist for debugging
-        let ls_output = Command::new("sh")
-            .args([
-                "-c",
-                "ls -la /dev/nbd0* 2>/dev/null || echo 'no nbd devices'",
-            ])
-            .output()
-            .await;
+        let ls_cmd = format!(
+            "ls -la {}* 2>/dev/null || echo 'no nbd devices'",
+            nbd_device
+        );
+        let ls_output = Command::new("sh").args(["-c", &ls_cmd]).output().await;
         let devices = ls_output
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_else(|_| "failed to list".to_string());
 
         // Also check sysfs for partition info
-        let sysfs_output = Command::new("sh")
-            .args([
-                "-c",
-                "cat /sys/block/nbd0/nbd0p1/dev 2>/dev/null || echo 'no sysfs info'",
-            ])
-            .output()
-            .await;
+        let sysfs_cmd = format!(
+            "cat /sys/block/{}/{}p1/dev 2>/dev/null || echo 'no sysfs info'",
+            nbd_name, nbd_name
+        );
+        let sysfs_output = Command::new("sh").args(["-c", &sysfs_cmd]).output().await;
         let sysfs_info = sysfs_output
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_else(|_| "no sysfs".to_string());

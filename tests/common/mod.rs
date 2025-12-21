@@ -13,6 +13,20 @@ use tokio::time::sleep;
 /// Global counter for unique test IDs
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+/// Fail loudly if running as root. Rootless tests break when run as root
+/// because user namespace mapping doesn't work correctly.
+///
+/// Call this at the start of any rootless test function.
+pub fn require_non_root(test_name: &str) -> anyhow::Result<()> {
+    if nix::unistd::geteuid().is_root() {
+        anyhow::bail!(
+            "Rootless test '{}' cannot run as root! Run without sudo.",
+            test_name
+        );
+    }
+    Ok(())
+}
+
 /// Generate unique names for snapshot/clone tests.
 ///
 /// Returns (baseline_name, clone_name, snapshot_name, serve_name) with unique suffixes.
