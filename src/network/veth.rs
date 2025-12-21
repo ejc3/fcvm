@@ -1,41 +1,8 @@
 use anyhow::{Context, Result};
-use std::time::Duration;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
 use super::namespace::exec_in_namespace;
-
-/// Wait for dnsmasq to bind to a specific IP address on port 53
-///
-/// dnsmasq with `bind-dynamic` detects new interfaces and binds to them,
-/// but this takes time. We must wait for it to bind before VMs can use DNS.
-async fn wait_for_dnsmasq_bind(ip: &str) -> Result<()> {
-    let check_addr = format!("{}:53", ip);
-
-    for attempt in 0..50 {
-        // Check if anything is listening on this IP:53
-        let output = Command::new("ss")
-            .args(["-uln", "sport", "=", ":53"])
-            .output()
-            .await
-            .context("checking if dnsmasq is listening")?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.contains(ip) {
-            if attempt > 0 {
-                debug!(ip = %ip, attempts = attempt, "dnsmasq now listening");
-            }
-            return Ok(());
-        }
-
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    anyhow::bail!(
-        "dnsmasq did not bind to {} within 1 second - check dnsmasq config",
-        check_addr
-    );
-}
 
 /// In-Namespace NAT configuration for clone egress
 ///
@@ -201,10 +168,8 @@ pub async fn setup_host_veth(veth_name: &str, ip_with_cidr: &str) -> Result<()> 
         }
     }
 
-    // Wait for dnsmasq to bind to this IP (bind-dynamic detection)
-    // VMs use this IP as their DNS server, so dnsmasq must be listening before VM boots
-    let ip = ip_with_cidr.split('/').next().unwrap_or(ip_with_cidr);
-    wait_for_dnsmasq_bind(ip).await?;
+    // DNS: VMs now use host DNS servers directly (read from /etc/resolv.conf)
+    // No dnsmasq needed - the host DNS servers are reachable via the veth bridge
 
     // Add FORWARD rule to allow outbound traffic from this veth
     let forward_rule = format!("-A FORWARD -i {} -j ACCEPT", veth_name);
