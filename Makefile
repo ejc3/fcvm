@@ -470,8 +470,8 @@ container-test-vm-exec-bridged: container-build setup-kernel
 container-test-vm-exec-rootless: container-build-rootless setup-kernel
 	$(CONTAINER_RUN_ROOTLESS) $(CONTAINER_IMAGE) $(TEST_VM_EXEC_ROOTLESS)
 
-# VM exec tests - all
-container-test-vm-exec: container-test-vm-exec-rootless container-test-vm-exec-bridged
+# VM exec tests - all (bridged first to create rootfs, then rootless)
+container-test-vm-exec: container-test-vm-exec-bridged container-test-vm-exec-rootless
 
 # VM egress tests - bridged (needs root)
 container-test-vm-egress-bridged: container-build setup-kernel
@@ -481,11 +481,11 @@ container-test-vm-egress-bridged: container-build setup-kernel
 container-test-vm-egress-rootless: container-build-rootless setup-kernel
 	$(CONTAINER_RUN_ROOTLESS) $(CONTAINER_IMAGE) $(TEST_VM_EGRESS_ROOTLESS)
 
-# VM egress tests - all
-container-test-vm-egress: container-test-vm-egress-rootless container-test-vm-egress-bridged
+# VM egress tests - all (bridged first to create rootfs, then rootless)
+container-test-vm-egress: container-test-vm-egress-bridged container-test-vm-egress-rootless
 
-# All VM tests: rootless first, then bridged
-container-test-vm: container-test-vm-rootless container-test-vm-bridged
+# All VM tests: bridged first (creates rootfs), then rootless
+container-test-vm: container-test-vm-bridged container-test-vm-rootless
 
 # Legacy alias (runs both VM tests)
 container-test-fcvm: container-test-vm
