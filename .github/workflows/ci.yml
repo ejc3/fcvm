@@ -10,11 +10,222 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # TEMPORARY: Debug job - run the ACTUAL fcvm rootfs creation like the real test does
-  # All other jobs disabled until we fix the root cause
+  # Fast jobs run in parallel on every PR and push
 
-  debug-fcvm-rootfs:
-    name: Debug fcvm rootfs creation
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fcvm
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install cargo-machete
+        run: cargo install cargo-machete
+      - name: Check formatting
+        working-directory: fcvm
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        working-directory: fcvm
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Check unused dependencies
+        working-directory: fcvm
+        run: cargo machete
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fcvm
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fcvm
+      - name: Build
+        working-directory: fcvm
+        run: cargo build --release --all-targets
+
+  test-unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fcvm
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fcvm
+      - name: Run unit tests
+        working-directory: fcvm
+        run: cargo test --release --lib --all
+
+  test-fuse-integration:
+    name: FUSE Integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fcvm
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fcvm
+      - name: Build
+        working-directory: fcvm
+        run: cargo build --release -p fuse-pipe
+      - name: Run integration_root tests
+        working-directory: fcvm
+        run: sudo -E env "PATH=$PATH" cargo test --release -p fuse-pipe --test integration_root -- --test-threads=1
+
+  test-fuse-noroot:
+    name: FUSE No-Root
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fcvm
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+      - name: Run no-root FUSE tests (container)
+        working-directory: fcvm
+        run: |
+          export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
+          export FUSER=${{ github.workspace }}/fuser
+          export CONTAINER_ARCH=x86_64
+          make container-test-noroot
+
+  test-cli:
+    name: CLI Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fcvm
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fcvm
+      - name: Run CLI tests
+        working-directory: fcvm
+        run: cargo test --release --test test_cli_parsing --test test_state_manager
+
+  test-fuse-permissions:
+    name: FUSE Permissions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fcvm
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+      - name: Run permission tests (container)
+        working-directory: fcvm
+        run: |
+          export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
+          export FUSER=${{ github.workspace }}/fuser
+          export CONTAINER_ARCH=x86_64
+          make container-test-root
+
+  test-pjdfstest:
+    name: POSIX Compliance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fcvm
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+      - name: Run pjdfstest (container)
+        working-directory: fcvm
+        run: |
+          export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
+          export FUSER=${{ github.workspace }}/fuser
+          export CONTAINER_ARCH=x86_64
+          make container-test-pjdfstest
+
+  # All VM tests run sequentially on the same runner to share the rootfs
+  # This avoids each job needing to recreate the rootfs via virt-customize
+  test-vm:
+    name: VM Tests
     runs-on: buildjet-32vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
@@ -30,89 +241,61 @@ jobs:
           repository: ejc3/fuser
           ref: master
           path: fuser
-
+      - name: Check KVM availability
+        run: |
+          echo "=== KVM device ==="
+          ls -la /dev/kvm || echo "No /dev/kvm"
+          echo "=== CPU virtualization ==="
+          grep -E "(vmx|svm)" /proc/cpuinfo | head -1 || echo "No VMX/SVM"
+          echo "=== KVM modules ==="
+          lsmod | grep kvm || echo "No KVM modules"
       - name: Setup KVM permissions
         run: sudo chmod 666 /dev/kvm
-
-      - name: Setup NBD module
+      - name: Setup NBD module for rootfs extraction
         run: |
           sudo modprobe nbd max_part=8
           ls -la /dev/nbd* | head -5
-
-      - name: Setup btrfs
+      - name: Setup network namespace directory
+        run: sudo mkdir -p /var/run/netns
+      - name: Setup iptables for VM networking
         run: |
-          sudo truncate -s 20G /var/fcvm-btrfs.img
-          sudo mkfs.btrfs /var/fcvm-btrfs.img
-          sudo mkdir -p /mnt/fcvm-btrfs
-          sudo mount -o loop /var/fcvm-btrfs.img /mnt/fcvm-btrfs
-          sudo mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,state,snapshots,vm-disks,cache}
-          sudo chown -R $(id -un):$(id -gn) /mnt/fcvm-btrfs
-
-      - name: Download kernel
+          # BuildJet runners have FORWARD chain set to DROP by default
+          # Set to ACCEPT and add MASQUERADE rule for VM NAT
+          sudo iptables -P FORWARD ACCEPT
+          sudo iptables -t nat -A POSTROUTING -s 172.30.0.0/16 -o eth0 -j MASQUERADE || true
+      - name: Setup userfaultfd for snapshot cloning
         run: |
-          curl -sL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.11/x86_64/vmlinux-5.10.225" \
-            -o /mnt/fcvm-btrfs/kernels/vmlinux.bin
-
-      - name: Build container image
+          echo "=== Kernel version ==="
+          uname -r
+          echo "=== Check /dev/userfaultfd ==="
+          if [ ! -e /dev/userfaultfd ]; then
+            echo "Creating /dev/userfaultfd..."
+            # misc major is 10, userfaultfd minor is 126
+            sudo mknod /dev/userfaultfd c 10 126
+          fi
+          sudo chmod 666 /dev/userfaultfd
+          ls -la /dev/userfaultfd
+          echo "=== Enable unprivileged userfaultfd ==="
+          sudo sysctl -w vm.unprivileged_userfaultfd=1
+      # Run VM tests sequentially - rootfs is created once and reused
+      - name: Run VM sanity test (bridged)
         working-directory: fcvm
         run: |
-          echo "=== Building test container ==="
-          sudo podman build -t fcvm-test -f Containerfile --build-arg ARCH=x86_64 .
-
-      - name: Run ACTUAL fcvm rootfs creation inside container
+          export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
+          export FUSER=${{ github.workspace }}/fuser
+          export CONTAINER_ARCH=x86_64
+          make container-test-vm-bridged
+      - name: Run VM exec tests
         working-directory: fcvm
-        timeout-minutes: 10
         run: |
-          echo "=== Running ACTUAL fcvm to trigger rootfs creation ==="
-          echo "This is what the real test does"
-
-          # Run with RUST_LOG to see all the debug output
-          sudo podman run --rm --privileged \
-            -v .:/workspace/fcvm \
-            -v ${{ github.workspace }}/fuse-backend-rs:/workspace/fuse-backend-rs \
-            -v ${{ github.workspace }}/fuser:/workspace/fuser \
-            --device /dev/kvm \
-            --device /dev/fuse \
-            --device /dev/nbd0 \
-            -v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
-            --network host \
-            -e RUST_LOG=debug \
-            fcvm-test \
-            bash -c '
-              set -x
-              echo "=== Building fcvm ==="
-              cd /workspace/fcvm
-              cargo build --release 2>&1 | tail -20
-
-              echo ""
-              echo "=== Starting fcvm (this triggers rootfs creation) ==="
-              echo "Start time: $(date)"
-
-              # Run fcvm with a timeout - it will fail to become healthy but
-              # we can see if rootfs creation succeeds
-              timeout 300 ./target/release/fcvm podman run \
-                --name debug-test \
-                --network bridged \
-                nginx:alpine \
-                2>&1 || {
-                  echo ""
-                  echo "=== fcvm exited (expected - timeout or error) ==="
-                  echo "Exit code: $?"
-                  echo "End time: $(date)"
-                }
-
-              echo ""
-              echo "=== Check if rootfs was created ==="
-              ls -la /mnt/fcvm-btrfs/rootfs/ || true
-              ls -la /mnt/fcvm-btrfs/cache/ || true
-            '
-
-      - name: Check what happened
-        if: always()
+          export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
+          export FUSER=${{ github.workspace }}/fuser
+          export CONTAINER_ARCH=x86_64
+          make container-test-vm-exec
+      - name: Run VM egress tests
+        working-directory: fcvm
         run: |
-          echo "=== Final state ==="
-          ls -la /mnt/fcvm-btrfs/rootfs/ || true
-          ls -la /mnt/fcvm-btrfs/cache/ || true
-          echo ""
-          echo "=== Host dmesg ==="
-          sudo dmesg | tail -30
+          export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
+          export FUSER=${{ github.workspace }}/fuser
+          export CONTAINER_ARCH=x86_64
+          make container-test-vm-egress
