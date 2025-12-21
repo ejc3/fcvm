@@ -10,11 +10,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # TEMPORARY: Debug job only - find out why virt-customize hangs on BuildJet
+  # TEMPORARY: Debug job - run virt-customize INSIDE container like we do locally
   # All other jobs disabled until we fix the root cause
 
-  debug-virt-customize:
-    name: Debug virt-customize
+  debug-virt-customize-in-container:
+    name: Debug virt-customize in container
     runs-on: buildjet-32vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
@@ -31,53 +31,13 @@ jobs:
           ref: master
           path: fuser
 
-      - name: System info
-        run: |
-          echo "=== System Info ==="
-          uname -a
-          cat /etc/os-release
-          echo ""
-          echo "=== CPU ==="
-          lscpu | head -20
-          echo ""
-          echo "=== Memory ==="
-          free -h
-          echo ""
-          echo "=== Disk ==="
-          df -h
+      - name: Setup KVM permissions
+        run: sudo chmod 666 /dev/kvm
 
-      - name: Check KVM
+      - name: Setup NBD module
         run: |
-          echo "=== KVM device ==="
-          ls -la /dev/kvm || echo "No /dev/kvm"
-          echo ""
-          echo "=== KVM modules ==="
-          lsmod | grep kvm || echo "No KVM modules loaded"
-          echo ""
-          echo "=== CPU virtualization flags ==="
-          grep -E "(vmx|svm)" /proc/cpuinfo | head -1 || echo "No VMX/SVM"
-          echo ""
-          echo "=== Set KVM permissions ==="
-          sudo chmod 666 /dev/kvm
-          ls -la /dev/kvm
-
-      - name: Check libguestfs/virt-customize
-        run: |
-          echo "=== Check if virt-customize is available ==="
-          which virt-customize || echo "virt-customize not in PATH"
-          dpkg -l | grep -E "(libguestfs|guestfs)" || echo "No libguestfs packages"
-          echo ""
-          echo "=== Install libguestfs-tools ==="
-          sudo apt-get update
-          sudo apt-get install -y libguestfs-tools
-          echo ""
-          echo "=== virt-customize version ==="
-          virt-customize --version
-          echo ""
-          echo "=== libguestfs test ==="
-          # This tests if libguestfs can launch its appliance
-          echo "Running libguestfs-test-tool (may take a minute)..."
-          timeout 120 sudo libguestfs-test-tool 2>&1 | tail -50 || echo "libguestfs-test-tool timed out or failed"
+          sudo modprobe nbd max_part=8
+          ls -la /dev/nbd* | head -5
 
       - name: Setup btrfs
         run: |
@@ -92,49 +52,95 @@ jobs:
 
       - name: Download kernel
         run: |
-          echo "=== Downloading Firecracker kernel ==="
           curl -sL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.11/x86_64/vmlinux-5.10.225" \
             -o /mnt/fcvm-btrfs/kernels/vmlinux.bin
-          ls -la /mnt/fcvm-btrfs/kernels/
 
       - name: Download Ubuntu cloud image
         run: |
-          echo "=== Downloading Ubuntu cloud image ==="
           curl -L "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img" \
             -o /mnt/fcvm-btrfs/cache/ubuntu-24.04-amd64.img
           ls -la /mnt/fcvm-btrfs/cache/
 
-      - name: Test virt-customize directly (with timeout)
+      - name: Build container image
+        working-directory: fcvm
         run: |
-          echo "=== Testing virt-customize directly ==="
-          echo "Creating test copy of cloud image..."
-          cp /mnt/fcvm-btrfs/cache/ubuntu-24.04-amd64.img /tmp/test-image.img
+          echo "=== Building test container ==="
+          sudo podman build -t fcvm-test -f Containerfile --build-arg ARCH=x86_64 .
 
-          echo ""
-          echo "=== Running virt-customize with verbose output ==="
-          echo "Start time: $(date)"
+      - name: Test virt-customize INSIDE container
+        working-directory: fcvm
+        run: |
+          echo "=== Testing virt-customize INSIDE container (matching local setup) ==="
 
-          # Run with timeout and capture all output
-          timeout 180 sudo virt-customize \
-            --add /tmp/test-image.img \
-            --run-command "echo 'Hello from virt-customize'" \
-            --verbose \
-            2>&1 || {
+          # This matches CONTAINER_RUN_FCVM from Makefile
+          sudo podman run --rm --privileged \
+            -v .:/workspace/fcvm \
+            -v ${{ github.workspace }}/fuse-backend-rs:/workspace/fuse-backend-rs \
+            -v ${{ github.workspace }}/fuser:/workspace/fuser \
+            --device /dev/kvm \
+            --device /dev/fuse \
+            --device /dev/nbd0 \
+            -v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
+            --network host \
+            fcvm-test \
+            bash -c '
+              set -x
+              echo "=== Inside container ==="
+              echo "User: $(whoami)"
+              echo "Kernel: $(uname -r)"
+
               echo ""
-              echo "=== virt-customize failed or timed out ==="
-              echo "Exit code: $?"
-              echo "End time: $(date)"
-            }
+              echo "=== Check KVM ==="
+              ls -la /dev/kvm || echo "No /dev/kvm"
 
-          echo ""
-          echo "=== virt-customize completed ==="
-          echo "End time: $(date)"
+              echo ""
+              echo "=== Check virt-customize ==="
+              which virt-customize
+              virt-customize --version
 
-      - name: Check what processes are running during virt-customize
+              echo ""
+              echo "=== Check libguestfs backend ==="
+              export LIBGUESTFS_DEBUG=1
+              export LIBGUESTFS_TRACE=1
+
+              echo ""
+              echo "=== Copy cloud image ==="
+              cp /mnt/fcvm-btrfs/cache/ubuntu-24.04-amd64.img /tmp/test-image.img
+              ls -la /tmp/test-image.img
+
+              echo ""
+              echo "=== Run virt-customize (with 120s timeout) ==="
+              echo "Start: $(date)"
+              timeout 120 virt-customize \
+                --add /tmp/test-image.img \
+                --run-command "echo Hello from virt-customize" \
+                2>&1 || {
+                  echo ""
+                  echo "=== FAILED or TIMED OUT ==="
+                  echo "Exit code: $?"
+                  echo "End: $(date)"
+
+                  echo ""
+                  echo "=== Check running processes ==="
+                  ps aux | grep -E "(qemu|kvm|guestfs)" || true
+
+                  echo ""
+                  echo "=== dmesg last 30 lines ==="
+                  dmesg 2>/dev/null | tail -30 || true
+
+                  exit 1
+                }
+
+              echo ""
+              echo "=== SUCCESS ==="
+              echo "End: $(date)"
+            '
+
+      - name: If failed - check host state
         if: failure()
         run: |
-          echo "=== Running processes ==="
-          ps aux | grep -E "(qemu|libvirt|guestfs)" || echo "No relevant processes"
+          echo "=== Host processes ==="
+          ps aux | grep -E "(qemu|kvm|podman)" | head -20
           echo ""
-          echo "=== dmesg (last 50 lines) ==="
+          echo "=== Host dmesg ==="
           sudo dmesg | tail -50
