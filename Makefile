@@ -339,14 +339,25 @@ rebuild: rootfs
 # Marker file for container build state
 CONTAINER_MARKER := .container-built
 
+# CI mode: use host directories instead of named volumes (for artifact sharing)
+# Set CI=1 to enable artifact-compatible mode
+CI ?= 0
+ifeq ($(CI),1)
+VOLUME_TARGET := -v ./target:/workspace/fcvm/target
+VOLUME_CARGO := -v ./cargo-home:/home/testuser/.cargo
+else
+VOLUME_TARGET := -v fcvm-cargo-target:/workspace/fcvm/target
+VOLUME_CARGO := -v fcvm-cargo-home:/home/testuser/.cargo
+endif
+
 # Container run with source mounts (code always fresh, can't run stale)
 # Cargo cache goes to testuser's home so non-root builds work
 CONTAINER_RUN_BASE := sudo podman run --rm --privileged \
 	-v .:/workspace/fcvm \
 	-v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs \
 	-v $(FUSER):/workspace/fuser \
-	-v fcvm-cargo-target:/workspace/fcvm/target \
-	-v fcvm-cargo-home:/home/testuser/.cargo \
+	$(VOLUME_TARGET) \
+	$(VOLUME_CARGO) \
 	-e CARGO_HOME=/home/testuser/.cargo
 
 # Container run options for fuse-pipe tests
@@ -377,14 +388,21 @@ CONTAINER_RUN_FCVM := $(CONTAINER_RUN_BASE) \
 # --group-add keep-groups preserves host user's groups (kvm) for /dev/kvm access.
 # --device /dev/userfaultfd needed for snapshot/clone UFFD memory sharing.
 # The container's user namespace is the isolation boundary.
+ifeq ($(CI),1)
+VOLUME_TARGET_ROOTLESS := -v ./target:/workspace/fcvm/target
+VOLUME_CARGO_ROOTLESS := -v ./cargo-home:/home/testuser/.cargo
+else
+VOLUME_TARGET_ROOTLESS := -v fcvm-cargo-target-rootless:/workspace/fcvm/target
+VOLUME_CARGO_ROOTLESS := -v fcvm-cargo-home-rootless:/home/testuser/.cargo
+endif
 CONTAINER_RUN_ROOTLESS := podman --root=/tmp/podman-rootless run --rm \
 	--privileged \
 	--group-add keep-groups \
 	-v .:/workspace/fcvm \
 	-v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs \
 	-v $(FUSER):/workspace/fuser \
-	-v fcvm-cargo-target-rootless:/workspace/fcvm/target \
-	-v fcvm-cargo-home-rootless:/home/testuser/.cargo \
+	$(VOLUME_TARGET_ROOTLESS) \
+	$(VOLUME_CARGO_ROOTLESS) \
 	-e CARGO_HOME=/home/testuser/.cargo \
 	--device /dev/kvm \
 	--device /dev/net/tun \
@@ -400,6 +418,13 @@ $(CONTAINER_MARKER): Containerfile
 	@touch $@
 
 container-build: $(CONTAINER_MARKER)
+
+# Build inside container only (no tests) - useful for CI artifact caching
+# Creates target/ with compiled binaries that can be uploaded/downloaded
+container-build-only: container-build
+	@echo "==> Building inside container (CI mode)..."
+	@mkdir -p target cargo-home
+	$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) cargo build --release --all-targets -p fuse-pipe
 
 # Export container image for rootless podman (needed for container-test-vm-rootless)
 # Rootless podman has separate image storage, so we export from root and import
