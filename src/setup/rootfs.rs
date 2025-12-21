@@ -112,9 +112,28 @@ pub async fn ensure_rootfs() -> Result<PathBuf> {
     info!("note: first-time cloud image download may take 5-15 minutes");
     info!("cached rootfs creation takes ~45 seconds");
 
-    let result = create_ubuntu_rootfs(&rootfs_path)
+    // Create at temp path first, then rename when complete to avoid race conditions.
+    // Other processes check if rootfs_path exists, so we must not create it until
+    // package installation is complete.
+    let temp_rootfs_path = rootfs_path.with_extension("ext4.tmp");
+
+    // Clean up any leftover temp file from a previous failed attempt
+    let _ = tokio::fs::remove_file(&temp_rootfs_path).await;
+
+    let result = create_ubuntu_rootfs(&temp_rootfs_path)
         .await
         .context("creating Ubuntu rootfs");
+
+    // If successful, rename temp file to final path
+    if result.is_ok() {
+        tokio::fs::rename(&temp_rootfs_path, &rootfs_path)
+            .await
+            .context("renaming temp rootfs to final path")?;
+        info!("rootfs creation complete");
+    } else {
+        // Clean up temp file on failure
+        let _ = tokio::fs::remove_file(&temp_rootfs_path).await;
+    }
 
     // Release lock
     flock
@@ -124,8 +143,6 @@ pub async fn ensure_rootfs() -> Result<PathBuf> {
     let _ = std::fs::remove_file(&lock_file);
 
     result?;
-
-    info!("rootfs creation complete");
 
     Ok(rootfs_path)
 }
