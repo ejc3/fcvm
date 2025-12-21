@@ -50,6 +50,7 @@ RUN curl -L -o /tmp/firecracker.tgz \
     https://github.com/firecracker-microvm/firecracker/releases/download/v1.14.0/firecracker-v1.14.0-${ARCH}.tgz \
     && tar -xzf /tmp/firecracker.tgz -C /tmp \
     && mv /tmp/release-v1.14.0-${ARCH}/firecracker-v1.14.0-${ARCH} /usr/local/bin/firecracker \
+    && chown root:root /usr/local/bin/firecracker \
     && chmod +x /usr/local/bin/firecracker \
     && rm -rf /tmp/firecracker.tgz /tmp/release-v1.14.0-${ARCH}
 
