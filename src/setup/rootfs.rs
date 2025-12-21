@@ -526,6 +526,14 @@ async fn customize_ubuntu_cloud_image(image_path: &Path) -> Result<()> {
     info!("running virt-customize on cloud image");
 
     let mut cmd = Command::new("virt-customize");
+
+    // Enable verbose output for debugging
+    cmd.arg("--verbose");
+
+    // Set libguestfs environment for debugging
+    cmd.env("LIBGUESTFS_DEBUG", "1");
+    cmd.env("LIBGUESTFS_TRACE", "1");
+
     cmd.arg("-a").arg(path_to_str(image_path)?);
 
     // Disable networking to avoid passt errors (packages installed later via chroot)
