@@ -10,10 +10,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Fast jobs run in parallel on every PR and push
-
-  lint:
-    name: Lint
+  # Lint + Build + Native Tests - compile once, run all
+  build-and-test:
+    name: Build & Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,6 +31,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fcvm
       - name: Install cargo-machete
         run: cargo install cargo-machete
       - name: Check formatting
@@ -43,87 +45,22 @@ jobs:
       - name: Check unused dependencies
         working-directory: fcvm
         run: cargo machete
-
-  build:
-    name: Build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: fcvm
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuse-backend-rs
-          ref: master
-          path: fuse-backend-rs
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuser
-          ref: master
-          path: fuser
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: fcvm
       - name: Build
         working-directory: fcvm
         run: cargo build --release --all-targets
-
-  test-unit:
-    name: Unit Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: fcvm
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuse-backend-rs
-          ref: master
-          path: fuse-backend-rs
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuser
-          ref: master
-          path: fuser
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: fcvm
-      - name: Run unit tests
+      - name: Unit tests
         working-directory: fcvm
         run: cargo test --release --lib --all
-
-  test-fuse-integration:
-    name: FUSE Integration
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: fcvm
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuse-backend-rs
-          ref: master
-          path: fuse-backend-rs
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuser
-          ref: master
-          path: fuser
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: fcvm
-      - name: Build
+      - name: CLI tests
         working-directory: fcvm
-        run: cargo build --release -p fuse-pipe
-      - name: Run integration_root tests
+        run: cargo test --release --test test_cli_parsing --test test_state_manager
+      - name: FUSE integration tests (root)
         working-directory: fcvm
         run: sudo -E env "PATH=$PATH" cargo test --release -p fuse-pipe --test integration_root -- --test-threads=1
 
-  test-fuse-noroot:
-    name: FUSE No-Root
+  # Container FUSE tests - build container once, run all FUSE tests
+  fuse-tests:
+    name: FUSE Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -139,65 +76,17 @@ jobs:
           repository: ejc3/fuser
           ref: master
           path: fuser
-      - name: Run no-root FUSE tests (container)
+      - name: Run all FUSE tests (container)
         working-directory: fcvm
         run: |
           export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
           export FUSER=${{ github.workspace }}/fuser
           export CONTAINER_ARCH=x86_64
-          make container-test-noroot
+          # Build container once, run all tests sequentially
+          make container-test
 
-  test-cli:
-    name: CLI Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: fcvm
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuse-backend-rs
-          ref: master
-          path: fuse-backend-rs
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuser
-          ref: master
-          path: fuser
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: fcvm
-      - name: Run CLI tests
-        working-directory: fcvm
-        run: cargo test --release --test test_cli_parsing --test test_state_manager
-
-  test-fuse-permissions:
-    name: FUSE Permissions
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: fcvm
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuse-backend-rs
-          ref: master
-          path: fuse-backend-rs
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuser
-          ref: master
-          path: fuser
-      - name: Run permission tests (container)
-        working-directory: fcvm
-        run: |
-          export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
-          export FUSER=${{ github.workspace }}/fuser
-          export CONTAINER_ARCH=x86_64
-          make container-test-root
-
-  test-pjdfstest:
+  # POSIX compliance - separate because it's slow (8789 tests)
+  posix-compliance:
     name: POSIX Compliance
     runs-on: ubuntu-latest
     steps:
@@ -222,9 +111,8 @@ jobs:
           export CONTAINER_ARCH=x86_64
           make container-test-pjdfstest
 
-  # All VM tests run sequentially on the same runner to share the rootfs
-  # This avoids each job needing to recreate the rootfs via virt-customize
-  test-vm:
+  # VM tests - all on same runner, compile once
+  vm-tests:
     name: VM Tests
     runs-on: buildjet-32vcpu-ubuntu-2204
     steps:
@@ -241,61 +129,28 @@ jobs:
           repository: ejc3/fuser
           ref: master
           path: fuser
-      - name: Check KVM availability
-        run: |
-          echo "=== KVM device ==="
-          ls -la /dev/kvm || echo "No /dev/kvm"
-          echo "=== CPU virtualization ==="
-          grep -E "(vmx|svm)" /proc/cpuinfo | head -1 || echo "No VMX/SVM"
-          echo "=== KVM modules ==="
-          lsmod | grep kvm || echo "No KVM modules"
       - name: Setup KVM permissions
         run: sudo chmod 666 /dev/kvm
-      - name: Setup NBD module for rootfs extraction
-        run: |
-          sudo modprobe nbd max_part=8
-          ls -la /dev/nbd* | head -5
+      - name: Setup NBD module
+        run: sudo modprobe nbd max_part=8
       - name: Setup network namespace directory
         run: sudo mkdir -p /var/run/netns
       - name: Setup iptables for VM networking
         run: |
-          # BuildJet runners have FORWARD chain set to DROP by default
-          # Set to ACCEPT and add MASQUERADE rule for VM NAT
           sudo iptables -P FORWARD ACCEPT
           sudo iptables -t nat -A POSTROUTING -s 172.30.0.0/16 -o eth0 -j MASQUERADE || true
       - name: Setup userfaultfd for snapshot cloning
         run: |
-          echo "=== Kernel version ==="
-          uname -r
-          echo "=== Check /dev/userfaultfd ==="
           if [ ! -e /dev/userfaultfd ]; then
-            echo "Creating /dev/userfaultfd..."
-            # misc major is 10, userfaultfd minor is 126
             sudo mknod /dev/userfaultfd c 10 126
           fi
           sudo chmod 666 /dev/userfaultfd
-          ls -la /dev/userfaultfd
-          echo "=== Enable unprivileged userfaultfd ==="
           sudo sysctl -w vm.unprivileged_userfaultfd=1
-      # Run VM tests sequentially - rootfs is created once and reused
-      - name: Run VM sanity test (bridged)
+      - name: Run all VM tests
         working-directory: fcvm
         run: |
           export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
           export FUSER=${{ github.workspace }}/fuser
           export CONTAINER_ARCH=x86_64
-          make container-test-vm-bridged
-      - name: Run VM exec tests
-        working-directory: fcvm
-        run: |
-          export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
-          export FUSER=${{ github.workspace }}/fuser
-          export CONTAINER_ARCH=x86_64
-          make container-test-vm-exec
-      - name: Run VM egress tests
-        working-directory: fcvm
-        run: |
-          export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
-          export FUSER=${{ github.workspace }}/fuser
-          export CONTAINER_ARCH=x86_64
-          make container-test-vm-egress
+          # Build once, run all VM tests sequentially
+          make container-test-vm
