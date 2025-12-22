@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use tokio::fs;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Configuration for a VM disk
 #[derive(Debug, Clone)]
@@ -12,6 +12,10 @@ pub struct DiskConfig {
 }
 
 /// Manages VM disks with CoW support
+///
+/// The disk is a raw partition image (layer2-{sha}.raw) with partitions.
+/// fc-agent is injected at boot via initrd, not installed to disk.
+/// This allows completely rootless per-VM disk creation.
 pub struct DiskManager {
     vm_id: String,
     base_rootfs: PathBuf,
@@ -28,6 +32,9 @@ impl DiskManager {
     }
 
     /// Create a CoW disk from base rootfs, preferring reflinks but falling back to copies
+    ///
+    /// The base rootfs is a raw disk image with partitions (e.g., /dev/vda1 for root).
+    /// This operation is completely rootless - just a file copy with btrfs reflinks.
     pub async fn create_cow_disk(&self) -> Result<PathBuf> {
         info!(vm_id = %self.vm_id, "creating CoW disk");
 
@@ -36,7 +43,8 @@ impl DiskManager {
             .await
             .context("creating VM directory")?;
 
-        let disk_path = self.vm_dir.join("rootfs.ext4");
+        // Use .raw extension to match the new raw disk format
+        let disk_path = self.vm_dir.join("rootfs.raw");
 
         if !disk_path.exists() {
             info!(
@@ -46,33 +54,22 @@ impl DiskManager {
             );
 
             // Use cp --reflink=always for instant CoW copy on btrfs
-            let status = tokio::process::Command::new("cp")
+            // Requires btrfs filesystem - no fallback to regular copy
+            let output = tokio::process::Command::new("cp")
                 .arg("--reflink=always")
                 .arg(&self.base_rootfs)
                 .arg(&disk_path)
-                .status()
+                .output()
                 .await
                 .context("executing cp --reflink=always")?;
 
-            if !status.success() {
-                warn!(
-                    vm_id = %self.vm_id,
-                    base = %self.base_rootfs.display(),
-                    "cp --reflink=always failed, falling back to full copy"
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!(
+                    "Failed to create reflink copy. Ensure {} is a btrfs filesystem. Error: {}",
+                    disk_path.parent().unwrap_or(&disk_path).display(),
+                    stderr
                 );
-
-                let fallback_status = tokio::process::Command::new("cp")
-                    .arg(&self.base_rootfs)
-                    .arg(&disk_path)
-                    .status()
-                    .await
-                    .context("executing cp fallback copy")?;
-
-                if !fallback_status.success() {
-                    anyhow::bail!(
-                        "cp failed when falling back to full copy - ensure filesystem has space"
-                    );
-                }
             }
         }
 
