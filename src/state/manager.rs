@@ -116,15 +116,26 @@ impl StateManager {
         Ok(state)
     }
 
-    /// Delete VM state
+    /// Delete VM state and associated lock/temp files
     pub async fn delete_state(&self, vm_id: &str) -> Result<()> {
         let state_file = self.state_dir.join(format!("{}.json", vm_id));
-        // Ignore NotFound errors - avoids TOCTOU race and handles concurrent cleanup
+        let lock_file = self.state_dir.join(format!("{}.json.lock", vm_id));
+        let temp_file = self.state_dir.join(format!("{}.json.tmp", vm_id));
+
+        // Delete state file - ignore NotFound (TOCTOU race / concurrent cleanup)
         match fs::remove_file(&state_file).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e).context("deleting VM state"),
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context("deleting VM state"),
         }
+
+        // Clean up lock file (ignore errors - may not exist or be held by another process)
+        let _ = fs::remove_file(&lock_file).await;
+
+        // Clean up temp file (ignore errors - may not exist)
+        let _ = fs::remove_file(&temp_file).await;
+
+        Ok(())
     }
 
     /// Load VM state by name
