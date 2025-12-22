@@ -1,0 +1,101 @@
+# Rootfs Modification Plan
+#
+# This file describes all modifications applied to the base Ubuntu cloud image.
+# The SHA256 of the generated setup script determines the image name: layer2-{sha}.raw
+# If this file changes, Layer 2 is rebuilt automatically.
+#
+# fc-agent is NOT in Layer 2 at all (neither binary nor service).
+# Both are injected per-VM at boot time via initrd.
+# This allows updating fc-agent without rebuilding Layer 2.
+
+[base]
+# Ubuntu 24.04 LTS (Noble Numbat) cloud images
+# Using "current" for latest updates - URL changes trigger plan SHA change
+version = "24.04"
+
+[base.arm64]
+url = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img"
+
+[base.amd64]
+url = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+
+[packages]
+# Container runtime
+runtime = ["podman", "crun", "fuse-overlayfs", "skopeo"]
+
+# FUSE support for overlay filesystem
+fuse = ["fuse3"]
+
+# System services
+system = ["haveged", "chrony"]
+
+[services]
+# Services to enable
+# NOTE: fc-agent is NOT enabled here - it's injected per-VM via initrd
+# NOTE: systemd-resolved is NOT enabled - DNS comes from kernel cmdline via fc-agent
+enable = [
+    "haveged",
+    "chrony",
+    "systemd-networkd",
+]
+
+# Services to disable
+disable = [
+    "multipathd",
+    "snapd",
+    "cloud-init",
+    "cloud-config",
+    "cloud-final",
+]
+
+[files]
+# Files to create/modify in the rootfs
+
+[files."/etc/resolv.conf"]
+content = """
+# Placeholder - fc-agent configures DNS at boot from kernel cmdline
+nameserver 127.0.0.53
+"""
+
+[files."/etc/chrony/chrony.conf"]
+content = """
+# NTP servers from pool.ntp.org
+pool pool.ntp.org iburst
+
+# Allow clock to be stepped (not slewed) for large time differences
+makestep 1.0 3
+
+# Directory for drift and other runtime files
+driftfile /var/lib/chrony/drift
+"""
+
+[files."/etc/systemd/network/10-eth0.network"]
+content = """
+[Match]
+Name=eth0
+
+[Network]
+# Keep kernel IP configuration from ip= boot parameter
+KeepConfiguration=yes
+"""
+
+[files."/etc/systemd/network/10-eth0.network.d/mmds.conf"]
+content = """
+[Route]
+Destination=169.254.169.254/32
+Scope=link
+"""
+
+# NOTE: fc-agent.service is NOT defined here - it's injected per-VM via initrd
+
+[fstab]
+# Lines to remove from /etc/fstab (patterns to filter out)
+remove_patterns = ["LABEL=BOOT", "LABEL=UEFI"]
+
+[cleanup]
+# Patterns to remove for smaller image
+remove_dirs = [
+    "/usr/share/doc/*",
+    "/usr/share/man/*",
+    "/var/cache/apt/archives/*",
+]
