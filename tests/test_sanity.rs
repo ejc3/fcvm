@@ -7,6 +7,7 @@ mod common;
 
 use anyhow::{Context, Result};
 
+#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_sanity_bridged() -> Result<()> {
     sanity_test_impl("bridged").await
