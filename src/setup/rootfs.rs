@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use nix::fcntl::{Flock, FlockArg};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -697,6 +698,9 @@ exec switch_root /newroot /sbin/init
 /// a new initrd is automatically created.
 ///
 /// Returns the path to the initrd file.
+///
+/// Uses file locking to prevent race conditions when multiple VMs start
+/// simultaneously and all try to create the initrd.
 pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
     // Find fc-agent binary
     let fc_agent_path = find_fc_agent_binary()?;
@@ -705,7 +709,7 @@ pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
     let fc_agent_sha = compute_sha256(&fc_agent_bytes);
     let fc_agent_sha_short = &fc_agent_sha[..12];
 
-    // Check if initrd already exists for this fc-agent version
+    // Check if initrd already exists for this fc-agent version (fast path, no lock)
     let initrd_dir = paths::base_dir().join("initrd");
     let initrd_path = initrd_dir.join(format!("fc-agent-{}.initrd", fc_agent_sha_short));
 
@@ -718,10 +722,39 @@ pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
         return Ok(initrd_path);
     }
 
-    // Create initrd directory
+    // Create initrd directory (needed for lock file)
     tokio::fs::create_dir_all(&initrd_dir)
         .await
         .context("creating initrd directory")?;
+
+    // Acquire exclusive lock to prevent race conditions
+    let lock_file = initrd_dir.join(format!("fc-agent-{}.lock", fc_agent_sha_short));
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock_fd = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&lock_file)
+        .context("opening initrd lock file")?;
+
+    let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
+        .map_err(|(_, err)| err)
+        .context("acquiring exclusive lock for initrd creation")?;
+
+    // Double-check after acquiring lock - another process may have created it
+    if initrd_path.exists() {
+        debug!(
+            path = %initrd_path.display(),
+            fc_agent_sha = %fc_agent_sha_short,
+            "using cached fc-agent initrd (created by another process)"
+        );
+        flock
+            .unlock()
+            .map_err(|(_, err)| err)
+            .context("releasing initrd lock")?;
+        return Ok(initrd_path);
+    }
 
     info!(
         fc_agent = %fc_agent_path.display(),
@@ -730,7 +763,12 @@ pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
     );
 
     // Create temporary directory for initrd contents
-    let temp_dir = initrd_dir.join(format!(".initrd-build-{}", fc_agent_sha_short));
+    // Use PID in temp dir name to avoid conflicts even with same sha
+    let temp_dir = initrd_dir.join(format!(
+        ".initrd-build-{}-{}",
+        fc_agent_sha_short,
+        std::process::id()
+    ));
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     tokio::fs::create_dir_all(&temp_dir).await?;
 
@@ -784,13 +822,15 @@ pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
         .context("creating initrd cpio archive")?;
 
     if !output.status.success() {
+        // Release lock before bailing
+        let _ = flock.unlock();
         bail!(
             "Failed to create initrd: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
 
-    // Rename to final path
+    // Rename to final path (atomic)
     tokio::fs::rename(&temp_initrd, &initrd_path).await?;
 
     // Cleanup temp directory
@@ -801,6 +841,12 @@ pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
         fc_agent_sha = %fc_agent_sha_short,
         "fc-agent initrd created"
     );
+
+    // Release lock (file created successfully)
+    flock
+        .unlock()
+        .map_err(|(_, err)| err)
+        .context("releasing initrd lock after creation")?;
 
     Ok(initrd_path)
 }
