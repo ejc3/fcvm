@@ -11,6 +11,7 @@ mod common;
 use anyhow::{Context, Result};
 use std::time::Duration;
 
+#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_exec_bridged() -> Result<()> {
     exec_test_impl("bridged").await

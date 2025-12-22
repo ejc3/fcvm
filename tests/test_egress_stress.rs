@@ -29,6 +29,7 @@ const HTTP_SERVER_PORT: u16 = 18080;
 ///
 /// Uses CONNMARK-based routing to ensure each clone's egress traffic is routed
 /// back to the correct clone, even though they all share the same guest IP.
+#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_egress_stress_bridged() -> Result<()> {
     egress_stress_impl("bridged", NUM_CLONES, REQUESTS_PER_CLONE).await

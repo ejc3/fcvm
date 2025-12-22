@@ -19,6 +19,8 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// Quick smoke test - run just posix_fallocate category (~100 tests)
+/// Requires sudo for reliable podman storage access.
+#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_fuse_in_vm_smoke() -> Result<()> {
     fuse_in_vm_test_impl("posix_fallocate", 8).await
@@ -26,6 +28,8 @@ async fn test_fuse_in_vm_smoke() -> Result<()> {
 
 /// Full pjdfstest suite in VM (8789 tests)
 /// Run with: cargo test --test test_fuse_in_vm test_fuse_in_vm_full -- --ignored
+/// Requires sudo for reliable podman storage access.
+#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 #[ignore]
 async fn test_fuse_in_vm_full() -> Result<()> {

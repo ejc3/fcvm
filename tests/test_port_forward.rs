@@ -20,6 +20,7 @@ struct VmDisplay {
 }
 
 /// Test port forwarding with bridged networking
+#[cfg(feature = "privileged-tests")]
 #[test]
 fn test_port_forward_bridged() -> Result<()> {
     println!("\ntest_port_forward_bridged");

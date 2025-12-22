@@ -206,9 +206,10 @@ fn list_categories() {
 ///
 /// This test creates ONE VM with a FUSE volume and runs all pjdfstest categories
 /// sequentially. Useful for comprehensive testing without parallelism complexity.
+#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 #[ignore = "comprehensive test - runs all categories sequentially"]
-async fn test_posix_all_sequential() {
+async fn test_posix_all_sequential_bridged() {
     check_prerequisites();
 
     // Create VM with FUSE volume
