@@ -50,9 +50,10 @@ fn send_signal(pid: u32, signal: &str) -> Result<()> {
 }
 
 /// Test that SIGINT properly kills the VM and cleans up firecracker
+#[cfg(feature = "privileged-tests")]
 #[test]
-fn test_sigint_kills_firecracker() -> Result<()> {
-    println!("\ntest_sigint_kills_firecracker");
+fn test_sigint_kills_firecracker_bridged() -> Result<()> {
+    println!("\ntest_sigint_kills_firecracker_bridged");
 
     // Get initial firecracker count
     let initial_fc_count = Command::new("pgrep")
@@ -70,7 +71,7 @@ fn test_sigint_kills_firecracker() -> Result<()> {
 
     // Start fcvm in background
     let fcvm_path = common::find_fcvm_binary()?;
-    let vm_name = format!("signal-int-{}", std::process::id());
+    let (vm_name, _, _, _) = common::unique_names("signal-int");
     let mut fcvm = Command::new(&fcvm_path)
         .args([
             "podman",
@@ -198,18 +199,19 @@ fn test_sigint_kills_firecracker() -> Result<()> {
         final_fc_count
     );
 
-    println!("test_sigint_kills_firecracker PASSED");
+    println!("test_sigint_kills_firecracker_bridged PASSED");
     Ok(())
 }
 
 /// Test that SIGTERM properly kills the VM and cleans up firecracker
+#[cfg(feature = "privileged-tests")]
 #[test]
-fn test_sigterm_kills_firecracker() -> Result<()> {
-    println!("\ntest_sigterm_kills_firecracker");
+fn test_sigterm_kills_firecracker_bridged() -> Result<()> {
+    println!("\ntest_sigterm_kills_firecracker_bridged");
 
     // Start fcvm in background
     let fcvm_path = common::find_fcvm_binary()?;
-    let vm_name = format!("signal-term-{}", std::process::id());
+    let (vm_name, _, _, _) = common::unique_names("signal-term");
     let mut fcvm = Command::new(&fcvm_path)
         .args([
             "podman",
@@ -294,6 +296,6 @@ fn test_sigterm_kills_firecracker() -> Result<()> {
         );
     }
 
-    println!("test_sigterm_kills_firecracker PASSED");
+    println!("test_sigterm_kills_firecracker_bridged PASSED");
     Ok(())
 }
