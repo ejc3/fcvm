@@ -38,8 +38,8 @@ A Rust implementation that launches Firecracker microVMs to run Podman container
 ```bash
 # Just needs podman and /dev/kvm
 make container-test          # fuse-pipe tests
-make container-test-vm       # VM tests
-make container-test-pjdfstest # POSIX compliance (8789 tests)
+make container-test-vm       # VM tests (rootless + bridged)
+make container-test-all      # Everything
 ```
 
 **Native Testing** - Additional dependencies required:
@@ -492,27 +492,23 @@ Run `make help` for the full list. Key targets:
 | `make build` | Build fcvm and fc-agent |
 | `make clean` | Clean build artifacts |
 
-#### Testing
-| Target | Description |
-|--------|-------------|
-| `make test` | Run fuse-pipe tests: noroot + root |
-| `make test-noroot` | Tests without root: unit + integration + stress |
-| `make test-root` | Tests requiring root: integration_root + permission |
-| `make test-unit` | Unit tests only (no root) |
-| `make test-fuse` | All fuse-pipe tests explicitly |
-| `make test-vm` | Run VM tests: rootless + bridged |
-| `make test-vm-rootless` | VM test with slirp4netns (no root) |
-| `make test-vm-bridged` | VM test with bridged networking |
-| `make test-pjdfstest` | POSIX compliance (8789 tests) |
-| `make test-all` | Everything: test + test-vm + test-pjdfstest |
+#### Testing (with optional FILTER)
 
-#### Container Testing (Recommended)
+Tests use Cargo feature: `privileged-tests` (needs sudo). Unprivileged tests run by default.
+Use `FILTER=` to further filter tests by name pattern.
+
 | Target | Description |
 |--------|-------------|
-| `make container-test` | Run fuse-pipe tests in container |
-| `make container-test-vm` | Run VM tests in container |
-| `make container-test-pjdfstest` | POSIX compliance in container |
-| `make container-shell` | Interactive shell in container |
+| `make test-vm` | All VM tests (unprivileged + privileged) |
+| `make test-vm-unprivileged` | Unprivileged tests only (no sudo) |
+| `make test-vm-privileged` | All tests including privileged (sudo) |
+| `make test-vm FILTER=sanity` | Only sanity tests |
+| `make test-vm FILTER=exec` | Only exec tests |
+| `make test-vm FILTER=egress` | Only egress tests |
+| `make test-vm-privileged FILTER=clone` | Only privileged clone tests |
+| `make container-test-vm` | VM tests in container |
+| `make container-test-vm FILTER=exec` | Only exec tests |
+| `make test-all` | Everything |
 
 #### Linting
 | Target | Description |

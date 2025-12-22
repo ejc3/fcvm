@@ -75,6 +75,8 @@ pub struct RunArgs {
     pub env: Vec<String>,
 
     /// Command to run inside container
+    ///
+    /// Example: --cmd "nginx -g 'daemon off;'"
     #[arg(long)]
     pub cmd: Option<String>,
 

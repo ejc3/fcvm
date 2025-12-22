@@ -157,11 +157,17 @@ assert!(localhost_works, "Localhost port forwarding should work (requires route_
 
 **Tests MUST work when run in parallel.** Resource conflicts are bugs, not excuses.
 
+**Test feature flags:**
+- `#[cfg(feature = "privileged-tests")]`: Tests requiring sudo (iptables, root podman storage)
+- No feature flag: Unprivileged tests run by default
+- Features are compile-time gates - tests won't exist unless the feature is enabled
+- Use `FILTER=` to further filter by name pattern: `make test-vm FILTER=exec`
+
 **Common parallel test pitfalls and fixes:**
 
-1. **Unique resource names**: Use `unique_names()` helper to generate timestamp+counter-based names
+1. **Unique resource names**: Use `common::unique_names()` helper to generate timestamp+counter-based names
    ```rust
-   let (baseline, clone, snapshot, serve) = unique_names("mytest");
+   let (baseline, clone, snapshot, serve) = common::unique_names("mytest");
    // Returns: mytest-base-12345-0, mytest-clone-12345-0, etc.
    ```
 
@@ -183,17 +189,31 @@ assert!(localhost_works, "Localhost port forwarding should work (requires route_
 
 ### Build and Test Rules
 
-**Use Makefile targets for common operations:**
+**CRITICAL: NEVER run `cargo build` or `cargo test` directly. ALWAYS use Makefile targets.**
+
+The Makefile handles:
+- Correct `CARGO_TARGET_DIR` for sudo vs non-sudo builds (avoids permission conflicts)
+- Proper feature flags (`--features privileged-tests`)
+- btrfs setup prerequisites
+- Container image building for container tests
 
 ```bash
-# Correct - always use make
-make build              # Build fcvm + fc-agent
-make test               # Run fuse-pipe tests
-make test-vm            # Run VM tests
-make test-vm-rootless   # Run rootless VM test only
-make container-test     # Run tests in container
-make clean              # Clean build artifacts
+# CORRECT - always use make
+make build                  # Build fcvm + fc-agent
+make test                   # Run fuse-pipe tests
+make test-vm                # All VM tests (unprivileged + privileged)
+make test-vm-unprivileged   # Unprivileged tests only (no sudo)
+make test-vm-privileged     # Privileged tests only (sudo)
+make test-vm FILTER=exec    # Only exec tests
+make container-test         # Run tests in container
+make clean                  # Clean build artifacts
+
+# WRONG - never do this
+sudo cargo build ...        # Wrong target dir, permission issues
+cargo test -p fcvm ...      # Missing feature flags, setup
 ```
+
+**Test feature flags**: Tests use `#[cfg(feature = "privileged-tests")]` for tests requiring sudo. Unprivileged tests run by default (no feature flag). Use `FILTER=` to further filter by name.
 
 The `fuse-pipe/Cargo.toml` uses a local path dependency:
 ```toml
@@ -271,14 +291,14 @@ All 8789 pjdfstest tests pass when running in a container with proper device cgr
 
 ### Key Makefile Targets
 
-| Target | What | Root? |
-|--------|------|-------|
-| `make test` | fuse-pipe noroot + root tests | Mixed |
-| `make test-vm` | VM tests (rootless + bridged) | Mixed |
-| `make container-test` | fuse-pipe in container | No |
-| `make container-test-pjdfstest` | 8789 POSIX tests | No |
-| `make container-test-vm` | VM tests in container | No |
-| `make bench` | All fuse-pipe benchmarks | No |
+| Target | What |
+|--------|------|
+| `make test` | fuse-pipe tests |
+| `make test-vm` | All VM tests (rootless + bridged) |
+| `make test-vm FILTER=exec` | Only exec tests |
+| `make container-test` | fuse-pipe in container |
+| `make container-test-vm` | VM tests in container |
+| `make test-all` | Everything |
 
 ### Path Overrides for CI
 
@@ -594,20 +614,13 @@ Run `make help` for full list. Key targets:
 #### Testing
 | Target | Description |
 |--------|-------------|
-| `make test` | Run fuse-pipe tests: noroot + root |
-| `make test-noroot` | Tests without root: unit + integration + stress |
-| `make test-root` | Tests requiring root: integration_root + permission |
-| `make test-unit` | Unit tests only |
-| `make test-fuse` | All fuse-pipe tests explicitly |
-| `make test-vm` | Run VM tests: rootless + bridged |
-| `make test-vm-rootless` | VM test with slirp4netns (no root) |
-| `make test-vm-bridged` | VM test with bridged networking |
-| `make test-pjdfstest` | POSIX compliance (8789 tests) |
-| `make test-all` | Everything: test + test-vm + test-pjdfstest |
-| `make container-test` | Run fuse-pipe tests (in container) |
-| `make container-test-vm` | Run VM tests (in container) |
-| `make container-test-pjdfstest` | POSIX compliance in container |
-| `make container-shell` | Interactive shell in container |
+| `make test` | fuse-pipe tests |
+| `make test-vm` | All VM tests (rootless + bridged) |
+| `make test-vm FILTER=exec` | Only exec tests |
+| `make test-all` | Everything |
+| `make container-test` | fuse-pipe in container |
+| `make container-test-vm` | VM tests in container |
+| `make container-shell` | Interactive shell |
 
 #### Linting
 | Target | Description |
@@ -735,26 +748,16 @@ let (mut child, pid) = common::spawn_fcvm(&["podman", "run", "--name", &vm_name,
 
 ## fuse-pipe Testing
 
-**Quick reference**: See `README.md` for testing guide and Makefile targets.
+**Quick reference**: See `make help` for all targets.
 
-### Quick Reference (Container - Recommended)
-
-| Command | Description |
-|---------|-------------|
-| `make container-test` | Run all fuse-pipe tests |
-| `make container-test-vm` | Run fcvm VM tests (rootless + bridged) |
-| `make container-test-pjdfstest` | POSIX compliance (8789 tests) |
-| `make container-shell` | Interactive shell for debugging |
-
-### Quick Reference (Native)
+### Quick Reference
 
 | Command | Description |
 |---------|-------------|
-| `sudo cargo test --release -p fuse-pipe --test integration` | Basic FUSE ops (15 tests) |
-| `sudo cargo test --release -p fuse-pipe --test test_permission_edge_cases` | Permission tests (18 tests) |
-| `sudo cargo test --release -p fuse-pipe --test pjdfstest_full` | POSIX compliance (8789 tests) |
-| `sudo cargo test --release -p fuse-pipe --test pjdfstest_stress` | Parallel stress (85 jobs) |
-| `sudo cargo bench -p fuse-pipe --bench throughput` | I/O benchmarks |
+| `make container-test` | fuse-pipe tests |
+| `make container-test-vm` | VM tests (rootless + bridged) |
+| `make container-test-vm FILTER=exec` | Only exec tests |
+| `make container-shell` | Interactive shell |
 
 ### Tracing Targets
 
