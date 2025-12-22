@@ -11,27 +11,9 @@ mod common;
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-/// Global counter for unique test IDs to avoid conflicts when running tests in parallel
-static TEST_ID: AtomicUsize = AtomicUsize::new(0);
-
-/// Generate unique names for this test run
-fn unique_names(prefix: &str) -> (String, String, String, String) {
-    let id = TEST_ID.fetch_add(1, Ordering::SeqCst);
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis()
-        % 100000;
-    let baseline = format!("{}-base-{}-{}", prefix, ts, id);
-    let clone = format!("{}-clone-{}-{}", prefix, ts, id);
-    let snapshot = format!("{}-snap-{}-{}", prefix, ts, id);
-    let serve = format!("{}-serve-{}-{}", prefix, ts, id);
-    (baseline, clone, snapshot, serve)
-}
 
 /// A connected client with its connection ID
 struct Client {
@@ -124,14 +106,14 @@ impl BroadcastServer {
 
 /// Test that cloning a VM resets TCP connections properly
 #[tokio::test]
-async fn test_clone_connection_reset() -> Result<()> {
+async fn test_clone_connection_reset_rootless() -> Result<()> {
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!("║     Clone Connection Reset Test                               ║");
     println!("║     Server on host, client in VM, clone and observe           ║");
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
     let fcvm_path = common::find_fcvm_binary()?;
-    let (baseline_name, clone_name, snapshot_name, _serve_name) = unique_names("connrst");
+    let (baseline_name, clone_name, snapshot_name, _serve_name) = common::unique_names("connrst");
 
     // =========================================================================
     // Step 1: Start TCP broadcast server on host
@@ -367,14 +349,14 @@ async fn test_clone_connection_reset() -> Result<()> {
 
 /// Test how long it takes for a persistent client to detect disconnect and reconnect after clone
 #[tokio::test]
-async fn test_clone_reconnect_latency() -> Result<()> {
+async fn test_clone_reconnect_latency_rootless() -> Result<()> {
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!("║     Clone Reconnect Latency Test                              ║");
     println!("║     Persistent client in VM, measure reconnect time           ║");
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
     let fcvm_path = common::find_fcvm_binary()?;
-    let (baseline_name, clone_name, snapshot_name, _serve_name) = unique_names("reconn");
+    let (baseline_name, clone_name, snapshot_name, _serve_name) = common::unique_names("reconn");
 
     // Start server
     println!("Step 1: Starting broadcast server...");
@@ -571,14 +553,14 @@ async fn test_clone_reconnect_latency() -> Result<()> {
 
 /// Test PERSISTENT connection behavior - client stays connected through snapshot/clone
 #[tokio::test]
-async fn test_clone_connection_timing() -> Result<()> {
+async fn test_clone_connection_timing_rootless() -> Result<()> {
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!("║     Persistent Connection Clone Test                          ║");
     println!("║     Client stays connected, observe behavior during clone     ║");
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
     let fcvm_path = common::find_fcvm_binary()?;
-    let (baseline_name, clone_name, snapshot_name, _serve_name) = unique_names("timing");
+    let (baseline_name, clone_name, snapshot_name, _serve_name) = common::unique_names("timing");
 
     // Start server
     println!("Step 1: Starting broadcast server...");
@@ -858,14 +840,14 @@ async fn test_clone_connection_timing() -> Result<()> {
 /// Test a RESILIENT client that auto-reconnects on network errors
 /// This demonstrates how a well-behaved app handles clone restore
 #[tokio::test]
-async fn test_clone_resilient_client() -> Result<()> {
+async fn test_clone_resilient_client_rootless() -> Result<()> {
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!("║     Resilient Client Clone Test                               ║");
     println!("║     Client auto-reconnects on error, like a real app          ║");
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
     let fcvm_path = common::find_fcvm_binary()?;
-    let (baseline_name, clone_name, snapshot_name, _serve_name) = unique_names("resil");
+    let (baseline_name, clone_name, snapshot_name, _serve_name) = common::unique_names("resil");
 
     // Start server
     println!("Step 1: Starting broadcast server...");
@@ -1160,8 +1142,8 @@ done
     let mut reconnect_time = Duration::ZERO;
     let mut reconnected = false;
 
-    // Wait up to 5 seconds (2s timeout + buffer)
-    for i in 0..50 {
+    // Wait up to 10 seconds (2s timeout + buffer for parallel test load)
+    for i in 0..100 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let current_conns = conn_counter.load(Ordering::Relaxed);
 

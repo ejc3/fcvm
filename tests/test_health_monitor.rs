@@ -1,37 +1,33 @@
 use chrono::Utc;
 use fcvm::health::spawn_health_monitor_with_state_dir;
 use fcvm::network::NetworkConfig;
-use fcvm::paths;
 use fcvm::state::{HealthStatus, ProcessType, StateManager, VmConfig, VmState, VmStatus};
-use serial_test::serial;
-use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::time::{sleep, Duration};
 
-/// Ensure all tests share a stable FCVM_BASE_DIR to avoid races from parallel execution.
-fn init_test_base_dir() -> PathBuf {
-    static BASE_DIR: OnceLock<PathBuf> = OnceLock::new();
+/// Counter for generating unique test IDs
+static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-    BASE_DIR
-        .get_or_init(|| {
-            let temp_dir = tempfile::tempdir().expect("create temp base dir");
-            let path = temp_dir.keep();
-
-            // Configure paths module and env var before any health monitor tasks start.
-            std::env::set_var("FCVM_BASE_DIR", &path);
-            paths::init_base_dir(path.to_str());
-
-            path
-        })
-        .clone()
+/// Create a unique temp directory for this test instance
+fn create_unique_test_dir() -> std::path::PathBuf {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    let temp_dir = tempfile::tempdir().expect("create temp base dir");
+    let path = temp_dir.into_path();
+    // Rename to include unique suffix for debugging
+    let unique_path = std::path::PathBuf::from(format!("/tmp/fcvm-test-health-{}-{}", pid, id));
+    let _ = std::fs::remove_dir_all(&unique_path);
+    std::fs::rename(&path, &unique_path).unwrap_or_else(|_| {
+        // If rename fails, just use original path
+        std::fs::create_dir_all(&unique_path).ok();
+    });
+    unique_path
 }
 
 #[tokio::test]
-#[serial]
 async fn test_health_monitor_behaviors() {
-    // Ensure base dir is set before spawning the monitor (tests run in parallel).
-    let base_dir = init_test_base_dir();
-    assert_eq!(paths::base_dir(), base_dir);
+    // Create unique temp directory for this test instance
+    let base_dir = create_unique_test_dir();
 
     // Use the shared base dir so the monitor and test agree on where state lives.
     let manager = StateManager::new(base_dir.join("state"));
