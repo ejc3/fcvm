@@ -21,6 +21,7 @@ const LAYER2_SIZE: &str = "10G";
 #[derive(Debug, Deserialize, Clone)]
 pub struct Plan {
     pub base: BaseConfig,
+    pub kernel: KernelConfig,
     pub packages: PackagesConfig,
     pub services: ServicesConfig,
     pub files: HashMap<String, FileConfig>,
@@ -39,6 +40,31 @@ pub struct BaseConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct ArchConfig {
     pub url: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct KernelConfig {
+    pub arm64: KernelArchConfig,
+    pub amd64: KernelArchConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct KernelArchConfig {
+    /// URL to the kernel archive (e.g., Kata release tarball)
+    pub url: String,
+    /// Path within the archive to extract
+    pub path: String,
+}
+
+impl KernelConfig {
+    /// Get the kernel config for the current architecture
+    pub fn current_arch(&self) -> anyhow::Result<&KernelArchConfig> {
+        match std::env::consts::ARCH {
+            "x86_64" => Ok(&self.amd64),
+            "aarch64" => Ok(&self.arm64),
+            other => anyhow::bail!("unsupported architecture: {}", other),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -88,7 +114,7 @@ pub struct CleanupConfig {
 /// Generate a setup script from the plan
 ///
 /// Generate the install script that runs BEFORE the setup script.
-/// This script installs packages from the ISO and removes conflicting packages.
+/// This script installs packages from /mnt/packages and removes conflicting packages.
 pub fn generate_install_script() -> String {
     r#"#!/bin/bash
 set -e
@@ -98,7 +124,7 @@ apt-get remove -y --purge systemd-timesyncd 2>/dev/null || true
 # Remove packages we don't need in microVM (also frees space)
 apt-get remove -y --purge cloud-init snapd ubuntu-server 2>/dev/null || true
 
-echo 'FCVM: Installing packages from local ISO...'
+echo 'FCVM: Installing packages from initrd...'
 dpkg -i /mnt/packages/*.deb || true
 apt-get -f install -y || true
 echo 'FCVM: Packages installed successfully'
@@ -116,11 +142,12 @@ pub fn generate_init_script(install_script: &str, setup_script: &str) -> String 
         r#"#!/bin/busybox sh
 # FCVM Layer 2 setup initrd
 # Runs package installation before systemd
+# Packages are embedded in the initrd at /packages
 
 echo "FCVM Layer 2 Setup: Starting..."
 
 # Install busybox commands
-/bin/busybox mkdir -p /bin /sbin /proc /sys /dev /newroot /mnt/packages
+/bin/busybox mkdir -p /bin /sbin /proc /sys /dev /newroot
 /bin/busybox --install -s /bin
 /bin/busybox --install -s /sbin
 
@@ -144,14 +171,12 @@ if [ $? -ne 0 ]; then
     poweroff -f
 fi
 
-echo "FCVM Layer 2 Setup: Mounting packages ISO..."
+# Copy embedded packages from initrd to rootfs
+# Packages are in /packages directory inside the initrd (loaded in RAM)
+echo "FCVM Layer 2 Setup: Copying packages from initrd to rootfs..."
 mkdir -p /newroot/mnt/packages
-mount -t iso9660 -o ro /dev/vdb /newroot/mnt/packages
-if [ $? -ne 0 ]; then
-    echo "ERROR: Failed to mount packages ISO"
-    sleep 5
-    poweroff -f
-fi
+cp -a /packages/* /newroot/mnt/packages/
+echo "FCVM Layer 2 Setup: Copied $(ls /newroot/mnt/packages/*.deb 2>/dev/null | wc -l) packages"
 
 # Write the install script to rootfs
 cat > /newroot/tmp/install-packages.sh << 'INSTALL_SCRIPT_EOF'
@@ -185,7 +210,6 @@ echo "FCVM Layer 2 Setup: Setup script returned: $SETUP_RESULT"
 
 # Cleanup chroot mounts (use lazy unmount as fallback)
 echo "FCVM Layer 2 Setup: Cleaning up..."
-umount /newroot/mnt/packages 2>/dev/null || umount -l /newroot/mnt/packages 2>/dev/null || true
 umount /newroot/dev 2>/dev/null || umount -l /newroot/dev 2>/dev/null || true
 umount /newroot/sys 2>/dev/null || umount -l /newroot/sys 2>/dev/null || true
 umount /newroot/proc 2>/dev/null || umount -l /newroot/proc 2>/dev/null || true
@@ -197,6 +221,7 @@ rm -f /newroot/tmp/fcvm-setup.sh
 sync
 umount /newroot 2>/dev/null || umount -l /newroot 2>/dev/null || true
 
+echo "FCVM_SETUP_COMPLETE"
 echo "FCVM Layer 2 Setup: Complete! Powering off..."
 umount /proc /sys /dev 2>/dev/null || true
 poweroff -f
@@ -209,21 +234,21 @@ poweroff -f
 /// The SHA256 of this script determines the rootfs image name.
 ///
 /// NOTE: This script does NOT install packages - they are installed from
-/// the packages ISO by install-packages.sh before this script runs.
+/// install-packages.sh before this script runs.
 pub fn generate_setup_script(plan: &Plan) -> String {
     let mut s = String::new();
 
-    // Script header - will be run by cloud-init AFTER packages are installed from ISO
+    // Script header - runs after packages are installed from initrd
     s.push_str("#!/bin/bash\n");
     s.push_str("set -euo pipefail\n\n");
 
     // Note: No partition resize needed - filesystem is already resized on host
     // (we use a raw ext4 filesystem without partition table)\n
 
-    // Note: Packages are already installed from local ISO by install-packages.sh
+    // Note: Packages are already installed by install-packages.sh
     // We just need to include the package list in the script for SHA calculation
     let packages = plan.packages.all_packages();
-    s.push_str("# Packages (installed from ISO): ");
+    s.push_str("# Packages (installed from initrd): ");
     s.push_str(&packages.join(", "));
     s.push_str("\n\n");
 
@@ -388,8 +413,9 @@ pub fn compute_sha256(data: &[u8]) -> String {
 /// 1. Download Ubuntu cloud image (qcow2)
 /// 2. Convert to raw with qemu-img
 /// 3. Expand to 10GB with truncate
-/// 4. Download packages, create ISO
-/// 5. Boot VM with cloud-init to install from local ISO (no network needed)
+/// 4. Download packages
+/// 5. Create initrd with embedded packages
+/// 6. Boot VM with initrd to install packages (no network needed)
 /// 6. Wait for VM to shut down
 /// 7. Rename to layer2-{sha}.raw
 ///
@@ -403,9 +429,19 @@ pub async fn ensure_rootfs() -> Result<PathBuf> {
     let install_script = generate_install_script();
     let init_script = generate_init_script(&install_script, &setup_script);
 
-    // Hash the complete init script - includes mounts, commands, and both embedded scripts
-    // Any change to the init logic, install script, or setup script invalidates the cache
-    let script_sha = compute_sha256(init_script.as_bytes());
+    // Get kernel URL for the current architecture
+    let kernel_config = plan.kernel.current_arch()?;
+    let kernel_url = &kernel_config.url;
+
+    // Hash the complete init script + kernel URL
+    // Any change to:
+    // - init logic, install script, or setup script
+    // - kernel URL (different kernel version/release)
+    // invalidates the cache
+    let mut combined = init_script.clone();
+    combined.push_str("\n# KERNEL_URL: ");
+    combined.push_str(kernel_url);
+    let script_sha = compute_sha256(combined.as_bytes());
     let script_sha_short = &script_sha[..12];
 
     let rootfs_dir = paths::rootfs_dir();
@@ -802,8 +838,8 @@ fn find_busybox() -> Result<PathBuf> {
 /// 2. Convert to raw with qemu-img (no root)
 /// 3. Expand to 10GB (no root)
 /// 4. Download .deb packages on host (has network)
-/// 5. Create ISO with packages
-/// 6. Boot VM with cloud-init to install from local ISO (no network needed)
+/// 5. Create initrd with embedded packages
+/// 6. Boot VM with initrd to install packages (no network needed)
 /// 7. Wait for VM to shut down
 ///
 /// NOTE: fc-agent is NOT included - it will be injected per-VM at boot time.
@@ -922,7 +958,7 @@ async fn create_layer2_rootless(
 
     // Resize the ext4 filesystem to fill the partition
     info!("resizing ext4 filesystem");
-    let output = Command::new("e2fsck")
+    let _output = Command::new("e2fsck")
         .args(["-f", "-y", path_to_str(&partition_path)?])
         .output()
         .await
@@ -945,36 +981,36 @@ async fn create_layer2_rootless(
     fix_fstab_in_image(&partition_path).await?;
 
     // Step 5: Download packages on host (host has network!)
-    let packages_iso = download_packages_and_create_iso(plan, script_sha_short).await?;
+    let packages_dir = download_packages(plan, script_sha_short).await?;
 
-    // Step 6: Create initrd for Layer 2 setup
+    // Step 6: Create initrd for Layer 2 setup with embedded packages
     // The initrd runs before systemd and:
-    // - Mounts rootfs and packages ISO
+    // - Mounts rootfs at /newroot
+    // - Copies packages from initrd to rootfs
     // - Runs dpkg -i to install packages
     // - Runs the setup script
     // - Powers off
+    // Packages are embedded in the initrd (no second disk needed)
     let install_script = generate_install_script();
 
-    let setup_initrd = create_layer2_setup_initrd(&install_script, script).await?;
+    let setup_initrd = create_layer2_setup_initrd(&install_script, script, &packages_dir).await?;
 
     // Step 7: Boot VM with initrd to run setup (no cloud-init needed!)
     // Now we boot a pure ext4 partition (no GPT), so root=/dev/vda works
+    // Only one disk needed - packages are in the initrd
     info!(
         script_sha = %script_sha_short,
-        "booting VM with setup initrd"
+        "booting VM with setup initrd (packages embedded)"
     );
 
-    boot_vm_for_setup(&partition_path, &packages_iso, &setup_initrd).await?;
+    boot_vm_for_setup(&partition_path, &setup_initrd).await?;
 
-    // Step 7: Rename to final path
+    // Step 8: Rename to final path
     tokio::fs::rename(&partition_path, output_path)
         .await
         .context("renaming partition to output path")?;
 
-    // Cleanup packages ISO
-    let _ = tokio::fs::remove_file(&packages_iso).await;
-
-    info!("Layer 2 creation complete (packages installed from local ISO)");
+    info!("Layer 2 creation complete (packages embedded in initrd)");
     Ok(())
 }
 
@@ -1076,28 +1112,29 @@ async fn fix_fstab_in_image(image_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Create a Layer 2 setup initrd
+/// Create a Layer 2 setup initrd with embedded packages
 ///
 /// This creates a busybox-based initrd that:
 /// 1. Mounts /dev/vda (rootfs) at /newroot
-/// 2. Mounts /dev/vdb (packages ISO) at /newroot/mnt/packages
+/// 2. Copies packages from /packages (embedded in initrd) to rootfs
 /// 3. Runs dpkg -i to install packages inside rootfs
 /// 4. Runs the setup script
 /// 5. Powers off the VM
 ///
-/// This is more reliable than rc.local/cloud-init on Ubuntu 24.04.
+/// Packages are embedded directly in the initrd, no second disk needed.
+/// This allows using Kata's kernel which has FUSE but no ISO9660/SquashFS.
 async fn create_layer2_setup_initrd(
     install_script: &str,
     setup_script: &str,
+    packages_dir: &Path,
 ) -> Result<PathBuf> {
-    info!("creating Layer 2 setup initrd");
+    info!("creating Layer 2 setup initrd with embedded packages");
 
     let temp_dir = PathBuf::from("/tmp/fcvm-layer2-initrd");
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     tokio::fs::create_dir_all(&temp_dir).await?;
 
     // Create the init script that runs before systemd
-    // This mounts rootfs, packages ISO, installs packages, runs setup, powers off
     let init_script = generate_init_script(install_script, setup_script);
 
     // Write init script
@@ -1133,6 +1170,23 @@ async fn create_layer2_setup_initrd(
         bail!("Failed to chmod busybox: {}", String::from_utf8_lossy(&output.stderr));
     }
 
+    // Copy packages into initrd
+    let initrd_packages_dir = temp_dir.join("packages");
+    tokio::fs::create_dir_all(&initrd_packages_dir).await?;
+
+    // Copy all .deb files from packages_dir to initrd
+    let mut entries = tokio::fs::read_dir(packages_dir).await?;
+    let mut package_count = 0;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().map(|e| e == "deb").unwrap_or(false) {
+            let dest = initrd_packages_dir.join(entry.file_name());
+            tokio::fs::copy(&path, &dest).await?;
+            package_count += 1;
+        }
+    }
+    info!(count = package_count, "embedded packages in initrd");
+
     // Create the initrd using cpio
     let initrd_path = temp_dir.join("initrd.cpio.gz");
     let cpio_output = Command::new("sh")
@@ -1155,22 +1209,40 @@ async fn create_layer2_setup_initrd(
         );
     }
 
-    info!(path = %initrd_path.display(), "Layer 2 setup initrd created");
+    // Log initrd size
+    if let Ok(meta) = tokio::fs::metadata(&initrd_path).await {
+        let size_mb = meta.len() as f64 / 1024.0 / 1024.0;
+        info!(path = %initrd_path.display(), size_mb = format!("{:.1}", size_mb), "Layer 2 setup initrd created");
+    }
+
     Ok(initrd_path)
 }
 
-/// Download all required .deb packages on the host and create an ISO
+/// Download all required .deb packages on the host
+///
+/// Returns the path to the packages directory (not an ISO).
+/// Packages will be embedded directly in the initrd.
 ///
 /// NOTE: fc-agent is NOT included - it will be injected per-VM at boot time.
-async fn download_packages_and_create_iso(plan: &Plan, script_sha_short: &str) -> Result<PathBuf> {
+async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBuf> {
     let cache_dir = paths::base_dir().join("cache");
     let packages_dir = cache_dir.join(format!("packages-{}", script_sha_short));
-    let packages_iso = cache_dir.join(format!("packages-{}.iso", script_sha_short));
 
-    // If ISO already exists, use it
-    if packages_iso.exists() {
-        info!(path = %packages_iso.display(), "using cached packages ISO");
-        return Ok(packages_iso);
+    // If packages directory already exists with .deb files, use it
+    if packages_dir.exists() {
+        if let Ok(mut entries) = tokio::fs::read_dir(&packages_dir).await {
+            let mut has_debs = false;
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if entry.path().extension().map(|e| e == "deb").unwrap_or(false) {
+                    has_debs = true;
+                    break;
+                }
+            }
+            if has_debs {
+                info!(path = %packages_dir.display(), "using cached packages directory");
+                return Ok(packages_dir);
+            }
+        }
     }
 
     // Create packages directory
@@ -1252,32 +1324,8 @@ async fn download_packages_and_create_iso(plan: &Plan, script_sha_short: &str) -
         bail!("No packages downloaded. Check network and apt configuration.");
     }
 
-    // Create ISO from packages directory
-    info!("creating packages ISO");
-    let output = Command::new("genisoimage")
-        .args([
-            "-o", path_to_str(&packages_iso)?,
-            "-V", "PACKAGES",
-            "-r",
-            "-J",
-            path_to_str(&packages_dir)?,
-        ])
-        .output()
-        .await
-        .context("creating packages ISO")?;
-
-    if !output.status.success() {
-        bail!(
-            "genisoimage failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    // Cleanup packages directory (keep ISO)
-    let _ = tokio::fs::remove_dir_all(&packages_dir).await;
-
-    info!(path = %packages_iso.display(), "packages ISO created");
-    Ok(packages_iso)
+    info!(path = %packages_dir.display(), count = count, "packages downloaded");
+    Ok(packages_dir)
 }
 
 /// Download cloud image (cached by URL hash)
@@ -1353,16 +1401,16 @@ async fn download_cloud_image(plan: &Plan) -> Result<PathBuf> {
 
 /// Boot a Firecracker VM to run the Layer 2 setup initrd
 ///
-/// This boots with an initrd that:
-/// - Mounts rootfs (/dev/vda) and packages ISO (/dev/vdb)
+/// This boots with an initrd that has packages embedded:
+/// - Mounts rootfs (/dev/vda) at /newroot
+/// - Copies packages from /packages (in initrd RAM) to rootfs
 /// - Runs dpkg -i to install packages inside rootfs via chroot
 /// - Runs the setup script
 /// - Powers off when complete
 ///
-/// NOTE: We don't use cloud-init because Firecracker's virtio-blk devices
-/// are not reliably detected by cloud-init's NoCloud datasource scanner.
-/// Instead, we use an initrd that runs setup before systemd.
-async fn boot_vm_for_setup(disk_path: &Path, packages_iso: &Path, initrd_path: &Path) -> Result<()> {
+/// Only one disk is needed - packages are embedded in the initrd.
+/// This allows using Kata's kernel which has FUSE but no ISO9660/SquashFS.
+async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -1374,11 +1422,8 @@ async fn boot_vm_for_setup(disk_path: &Path, packages_iso: &Path, initrd_path: &
     let api_socket = temp_dir.join("firecracker.sock");
     let log_path = temp_dir.join("firecracker.log");
 
-    // Find kernel
-    let kernel_path = paths::kernel_dir().join("vmlinux.bin");
-    if !kernel_path.exists() {
-        bail!("Kernel not found at {:?}. Run setup first.", kernel_path);
-    }
+    // Find kernel - downloaded from Kata release if needed
+    let kernel_path = crate::setup::kernel::ensure_kernel().await?;
 
     // Create serial console output file
     let serial_path = temp_dir.join("serial.log");
@@ -1442,20 +1487,7 @@ async fn boot_vm_for_setup(disk_path: &Path, packages_iso: &Path, initrd_path: &
         )
         .await?;
 
-    // Add packages ISO (/dev/vdb) - contains .deb files for local install
-    client
-        .add_drive(
-            "packages",
-            crate::firecracker::api::Drive {
-                drive_id: "packages".to_string(),
-                path_on_host: packages_iso.display().to_string(),
-                is_root_device: false,
-                is_read_only: true,
-                partuuid: None,
-                rate_limiter: None,
-            },
-        )
-        .await?;
+    // No packages drive needed - packages are embedded in the initrd
 
     // Configure machine (minimal for setup)
     client
