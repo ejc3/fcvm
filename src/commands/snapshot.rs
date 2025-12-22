@@ -153,7 +153,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
 
     let memory_path = snapshot_dir.join("memory.bin");
     let vmstate_path = snapshot_dir.join("vmstate.bin");
-    let disk_path = snapshot_dir.join("disk.ext4");
+    let disk_path = snapshot_dir.join("disk.raw");
 
     // Pause VM before snapshotting (required by Firecracker)
     info!("Pausing VM before snapshot");
@@ -185,7 +185,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         // Copy the VM's disk to snapshot directory using reflink (instant CoW copy)
         // REQUIRES btrfs filesystem - no fallback to regular copy
         info!("Copying VM disk to snapshot directory");
-        let vm_disk_path = paths::vm_runtime_dir(&vm_state.vm_id).join("disks/rootfs.ext4");
+        let vm_disk_path = paths::vm_runtime_dir(&vm_state.vm_id).join("disks/rootfs.raw");
 
         if vm_disk_path.exists() {
             // Use cp --reflink=always for instant CoW copy on btrfs
@@ -362,7 +362,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     serve_state.config.process_type = Some(crate::state::ProcessType::Serve);
     serve_state.status = VmStatus::Running;
 
-    let state_manager = StateManager::new(paths::state_dir());
+    let state_manager = std::sync::Arc::new(StateManager::new(paths::state_dir()));
     state_manager.init().await?;
     state_manager
         .save_state(&serve_state)
@@ -390,18 +390,72 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt())?;
 
     // Run server in background task
-    let server_handle = tokio::spawn(async move { server.run().await });
+    let mut server_handle = tokio::spawn(async move { server.run().await });
+
+    // Clone state_manager for signal handler use
+    let state_manager_for_signal = state_manager.clone();
 
     // Wait for signal or server exit
-    tokio::select! {
-        _ = sigterm.recv() => {
-            info!("received SIGTERM");
-        }
-        _ = sigint.recv() => {
-            info!("received SIGINT");
-        }
-        result = server_handle => {
-            info!("server exited: {:?}", result);
+    // First Ctrl-C warns about clones, second one shuts down
+    let mut shutdown_requested = false;
+    let mut confirm_deadline: Option<tokio::time::Instant> = None;
+    loop {
+        let timeout = if let Some(deadline) = confirm_deadline {
+            tokio::time::sleep_until(deadline)
+        } else {
+            // Far future - effectively disabled
+            tokio::time::sleep(std::time::Duration::from_secs(86400))
+        };
+
+        tokio::select! {
+            biased;
+
+            _ = sigterm.recv() => {
+                info!("received SIGTERM");
+                break;
+            }
+            _ = sigint.recv() => {
+                info!("received SIGINT");
+                if shutdown_requested {
+                    // Second Ctrl-C - force shutdown
+                    info!("received second SIGINT, forcing shutdown");
+                    println!("\nForcing shutdown...");
+                    break;
+                }
+
+                // First Ctrl-C - check for running clones
+                let all_vms: Vec<crate::state::VmState> = state_manager_for_signal.list_vms().await?;
+                let running_clones: Vec<crate::state::VmState> = all_vms
+                    .into_iter()
+                    .filter(|vm| vm.config.serve_pid == Some(my_pid))
+                    .filter(|vm| vm.pid.map(|p| crate::utils::is_process_alive(p)).unwrap_or(false))
+                    .collect();
+
+                if running_clones.is_empty() {
+                    println!("\nNo running clones, shutting down...");
+                    break;
+                } else {
+                    println!("\n⚠️  {} clone(s) still running!", running_clones.len());
+                    for clone in &running_clones {
+                        if let Some(pid) = clone.pid {
+                            let name = clone.name.as_deref().unwrap_or(&clone.vm_id);
+                            println!("   - {} (PID {})", name, pid);
+                        }
+                    }
+                    println!("\nPress Ctrl-C again within 3 seconds to kill clones and shut down...");
+                    shutdown_requested = true;
+                    confirm_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(3));
+                }
+            }
+            _ = timeout, if shutdown_requested => {
+                println!("Timeout expired, continuing to serve...");
+                shutdown_requested = false;
+                confirm_deadline = None;
+            }
+            result = &mut server_handle => {
+                info!("server exited: {:?}", result);
+                break;
+            }
         }
     }
 
@@ -465,6 +519,21 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
         warn!("failed to delete serve state {}: {}", serve_id, e);
     } else {
         info!("deleted serve state");
+    }
+
+    // Delete snapshot directory (memory.bin, disk.raw, vmstate.bin, config.json)
+    let snapshot_dir = paths::snapshot_dir().join(&args.snapshot_name);
+    if snapshot_dir.exists() {
+        println!("Cleaning up snapshot directory...");
+        if let Err(e) = std::fs::remove_dir_all(&snapshot_dir) {
+            warn!(
+                "failed to remove snapshot directory {}: {}",
+                snapshot_dir.display(),
+                e
+            );
+        } else {
+            info!("removed snapshot directory: {}", snapshot_dir.display());
+        }
     }
 
     println!("Memory server stopped");
