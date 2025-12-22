@@ -20,42 +20,47 @@ CONTAINER_ARCH ?= aarch64
 FILTER ?=
 
 # Test commands - organized by root requirement
+# Uses cargo-nextest for better parallelism and output handling
 # Host tests use CARGO_TARGET_DIR for sudo/non-sudo isolation
 # Container tests don't need CARGO_TARGET_DIR - volume mounts provide isolation
+#
+# nextest benefits:
+# - Each test runs in own process (better isolation)
+# - Smart parallelism with test groups (see .config/nextest.toml)
+# - No doctests by default (no --tests flag needed)
+# - Better output: progress, timing, failures highlighted
 
 # No root required (uses TARGET_DIR):
-TEST_UNIT := CARGO_TARGET_DIR=$(TARGET_DIR) cargo test --release --lib
-TEST_FUSE_NOROOT := CARGO_TARGET_DIR=$(TARGET_DIR) cargo test --release -p fuse-pipe --test integration
-TEST_FUSE_STRESS := CARGO_TARGET_DIR=$(TARGET_DIR) cargo test --release -p fuse-pipe --test test_mount_stress
+TEST_UNIT := CARGO_TARGET_DIR=$(TARGET_DIR) cargo nextest run --release --lib
+TEST_FUSE_NOROOT := CARGO_TARGET_DIR=$(TARGET_DIR) cargo nextest run --release -p fuse-pipe --test integration
+TEST_FUSE_STRESS := CARGO_TARGET_DIR=$(TARGET_DIR) cargo nextest run --release -p fuse-pipe --test test_mount_stress
 
 # Root required (uses TARGET_DIR_ROOT):
-TEST_FUSE_ROOT := CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo test --release -p fuse-pipe --test integration_root
+TEST_FUSE_ROOT := CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo nextest run --release -p fuse-pipe --test integration_root
 # Note: test_permission_edge_cases requires C pjdfstest with -u/-g flags, only available in container
-TEST_PJDFSTEST := CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo test --release -p fuse-pipe --test pjdfstest_full -- --nocapture
+TEST_PJDFSTEST := CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo nextest run --release -p fuse-pipe --test pjdfstest_full --no-capture
 
 # VM tests: privileged-tests feature gates tests that require sudo
 # Unprivileged tests run by default (no feature flag)
 # Use -p fcvm to only run fcvm package tests (excludes fuse-pipe)
-# Use --tests to skip doctests (rustdoc has proc-macro linking issues)
-TEST_VM_UNPRIVILEGED := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR) cargo test -p fcvm --release --tests -- $(FILTER) --nocapture"
-TEST_VM_PRIVILEGED := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo test -p fcvm --release --tests --features privileged-tests -- $(FILTER) --nocapture"
+TEST_VM_UNPRIVILEGED := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR) cargo nextest run -p fcvm --release --no-capture $(FILTER)"
+TEST_VM_PRIVILEGED := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo nextest run -p fcvm --release --features privileged-tests --no-capture $(FILTER)"
 
 # Container test commands (no CARGO_TARGET_DIR - volume mounts provide isolation)
-CTEST_UNIT := cargo test --release --lib
-CTEST_FUSE_NOROOT := cargo test --release -p fuse-pipe --test integration
-CTEST_FUSE_STRESS := cargo test --release -p fuse-pipe --test test_mount_stress
-CTEST_FUSE_ROOT := cargo test --release -p fuse-pipe --test integration_root
-CTEST_FUSE_PERMISSION := cargo test --release -p fuse-pipe --test test_permission_edge_cases
-CTEST_PJDFSTEST := cargo test --release -p fuse-pipe --test pjdfstest_full -- --nocapture
+CTEST_UNIT := cargo nextest run --release --lib
+CTEST_FUSE_NOROOT := cargo nextest run --release -p fuse-pipe --test integration
+CTEST_FUSE_STRESS := cargo nextest run --release -p fuse-pipe --test test_mount_stress
+CTEST_FUSE_ROOT := cargo nextest run --release -p fuse-pipe --test integration_root
+CTEST_FUSE_PERMISSION := cargo nextest run --release -p fuse-pipe --test test_permission_edge_cases
+CTEST_PJDFSTEST := cargo nextest run --release -p fuse-pipe --test pjdfstest_full --no-capture
 
 # VM tests: privileged-tests feature gates tests that require sudo
 # Use -p fcvm to only run fcvm package tests (excludes fuse-pipe)
-# Use --tests to skip doctests (rustdoc has proc-macro linking issues)
-CTEST_VM_UNPRIVILEGED := cargo test -p fcvm --release --tests -- $(FILTER) --nocapture
-CTEST_VM_PRIVILEGED := cargo test -p fcvm --release --tests --features privileged-tests -- $(FILTER) --nocapture
+CTEST_VM_UNPRIVILEGED := cargo nextest run -p fcvm --release --no-capture $(FILTER)
+CTEST_VM_PRIVILEGED := cargo nextest run -p fcvm --release --features privileged-tests --no-capture $(FILTER)
 
 # Legacy alias
-TEST_VM := cargo test --release --test test_sanity -- --nocapture
+TEST_VM := cargo nextest run --release --test test_sanity --no-capture
 
 # Benchmark commands (fuse-pipe)
 BENCH_THROUGHPUT := cargo bench -p fuse-pipe --bench throughput
