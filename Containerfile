@@ -12,6 +12,9 @@ FROM docker.io/library/rust:1.83-bookworm
 # Install nightly toolchain for fuser (requires edition2024)
 RUN rustup toolchain install nightly && rustup default nightly
 
+# Install cargo-nextest for better test parallelism and output
+RUN cargo install cargo-nextest --locked
+
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     # FUSE support
@@ -92,4 +95,4 @@ WORKDIR /workspace/fcvm
 # root tests run as root. Volumes get correct ownership automatically.
 
 # Default command runs all fuse-pipe tests
-CMD ["cargo", "test", "--release", "-p", "fuse-pipe"]
+CMD ["cargo", "nextest", "run", "--release", "-p", "fuse-pipe"]
