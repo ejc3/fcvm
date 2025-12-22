@@ -1394,11 +1394,13 @@ RUST_LOG=trace fcvm run nginx:latest
 - Checks `/sys/block/nbdN/pid` to detect in-use devices
 - Includes retry logic for race conditions during parallel execution
 
-**Root/Rootless Test Organization**:
-- Rootless tests: Use `require_non_root()` guard, fail loudly if run as root
-- Bridged tests: Rely on fcvm binary's built-in check
-- Makefile targets: Split by network mode (`test-vm-exec-bridged`/`test-vm-exec-rootless`)
-- Container tests: Use appropriate container run configurations (CONTAINER_RUN_FCVM vs CONTAINER_RUN_ROOTLESS)
+**Privileged/Unprivileged Test Organization**:
+- Tests requiring sudo use `#[cfg(feature = "privileged-tests")]`
+- Unprivileged tests run by default (no feature flag needed)
+- Privileged tests: Need sudo for iptables, root podman storage
+- Unprivileged tests: Run without sudo, use slirp4netns networking
+- Makefile uses `--features` for selection: `make test-vm FILTER=exec` runs all exec tests
+- Container tests: Use appropriate container run configurations (CONTAINER_RUN_FCVM vs CONTAINER_RUN_UNPRIVILEGED)
 
 ### Unit Tests
 

@@ -5,28 +5,52 @@ FUSE_BACKEND_RS ?= /home/ubuntu/fuse-backend-rs
 FUSER ?= /home/ubuntu/fuser
 KERNEL_DIR ?= ~/linux-firecracker
 
+# Separate target directories for sudo vs non-sudo builds
+# This prevents permission conflicts when running tests in parallel
+TARGET_DIR := target
+TARGET_DIR_ROOT := target-root
+
 # Container image name and architecture
 CONTAINER_IMAGE := fcvm-test
 CONTAINER_ARCH ?= aarch64
 
+# Test filter - use to run subset of tests
+# Usage: make test-vm FILTER=sanity    (runs only *sanity* tests)
+#        make test-vm FILTER=exec      (runs only *exec* tests)
+FILTER ?=
+
 # Test commands - organized by root requirement
-# No root required:
-TEST_UNIT := cargo test --release --lib
-TEST_FUSE_NOROOT := cargo test --release -p fuse-pipe --test integration
-TEST_FUSE_STRESS := cargo test --release -p fuse-pipe --test test_mount_stress
-TEST_VM_ROOTLESS := sh -c "cargo build --release && cargo test --release --test test_sanity test_sanity_rootless -- --nocapture"
+# Host tests use CARGO_TARGET_DIR for sudo/non-sudo isolation
+# Container tests don't need CARGO_TARGET_DIR - volume mounts provide isolation
 
-# Root required:
-TEST_FUSE_ROOT := cargo test --release -p fuse-pipe --test integration_root
-TEST_FUSE_PERMISSION := cargo test --release -p fuse-pipe --test test_permission_edge_cases
-TEST_PJDFSTEST := cargo test --release -p fuse-pipe --test pjdfstest_full -- --nocapture
-TEST_VM_BRIDGED := sh -c "cargo build --release && cargo test --release --test test_sanity test_sanity_bridged -- --nocapture"
-TEST_VM_EXEC_BRIDGED := sh -c "cargo build --release && cargo test --release --test test_exec test_exec_bridged -- --nocapture"
-TEST_VM_EGRESS_BRIDGED := sh -c "cargo build --release && cargo test --release --test test_egress bridged -- --nocapture"
+# No root required (uses TARGET_DIR):
+TEST_UNIT := CARGO_TARGET_DIR=$(TARGET_DIR) cargo test --release --lib
+TEST_FUSE_NOROOT := CARGO_TARGET_DIR=$(TARGET_DIR) cargo test --release -p fuse-pipe --test integration
+TEST_FUSE_STRESS := CARGO_TARGET_DIR=$(TARGET_DIR) cargo test --release -p fuse-pipe --test test_mount_stress
 
-# No root required (rootless networking):
-TEST_VM_EXEC_ROOTLESS := sh -c "cargo build --release && cargo test --release --test test_exec test_exec_rootless -- --nocapture"
-TEST_VM_EGRESS_ROOTLESS := sh -c "cargo build --release && cargo test --release --test test_egress rootless -- --nocapture"
+# Root required (uses TARGET_DIR_ROOT):
+TEST_FUSE_ROOT := CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo test --release -p fuse-pipe --test integration_root
+# Note: test_permission_edge_cases requires C pjdfstest with -u/-g flags, only available in container
+TEST_PJDFSTEST := CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo test --release -p fuse-pipe --test pjdfstest_full -- --nocapture
+
+# VM tests: privileged-tests feature gates tests that require sudo
+# Unprivileged tests run by default (no feature flag)
+# Use -p fcvm to only run fcvm package tests (excludes fuse-pipe)
+TEST_VM_UNPRIVILEGED := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR) cargo test -p fcvm --release -- $(FILTER) --nocapture"
+TEST_VM_PRIVILEGED := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo test -p fcvm --release --features privileged-tests -- $(FILTER) --nocapture"
+
+# Container test commands (no CARGO_TARGET_DIR - volume mounts provide isolation)
+CTEST_UNIT := cargo test --release --lib
+CTEST_FUSE_NOROOT := cargo test --release -p fuse-pipe --test integration
+CTEST_FUSE_STRESS := cargo test --release -p fuse-pipe --test test_mount_stress
+CTEST_FUSE_ROOT := cargo test --release -p fuse-pipe --test integration_root
+CTEST_FUSE_PERMISSION := cargo test --release -p fuse-pipe --test test_permission_edge_cases
+CTEST_PJDFSTEST := cargo test --release -p fuse-pipe --test pjdfstest_full -- --nocapture
+
+# VM tests: privileged-tests feature gates tests that require sudo
+# Use -p fcvm to only run fcvm package tests (excludes fuse-pipe)
+CTEST_VM_UNPRIVILEGED := cargo test -p fcvm --release -- $(FILTER) --nocapture
+CTEST_VM_PRIVILEGED := cargo test -p fcvm --release --features privileged-tests -- $(FILTER) --nocapture
 
 # Legacy alias
 TEST_VM := cargo test --release --test test_sanity -- --nocapture
@@ -39,18 +63,16 @@ BENCH_PROTOCOL := cargo bench -p fuse-pipe --bench protocol
 # Benchmark commands (fcvm - requires VMs)
 BENCH_EXEC := cargo bench --bench exec
 
-.PHONY: all help build clean \
-        test test-noroot test-root test-unit test-fuse test-vm test-vm-rootless test-vm-bridged test-all \
-        test-vm-exec test-vm-exec-bridged test-vm-exec-rootless \
-        test-vm-egress test-vm-egress-bridged test-vm-egress-rootless \
+.PHONY: all help build build-root build-all clean \
+        test test-noroot test-root test-unit test-fuse test-vm test-vm-unprivileged test-vm-privileged test-all \
+        test-pjdfstest test-all-host test-all-container ci-local pre-push \
         bench bench-throughput bench-operations bench-protocol bench-exec bench-quick bench-logs bench-clean \
         lint clippy fmt fmt-check \
         rootfs rebuild \
+        container-build container-build-root container-build-rootless container-build-only container-build-allow-other \
         container-test container-test-unit container-test-noroot container-test-root container-test-fuse \
-        container-test-vm container-test-vm-rootless container-test-vm-bridged container-test-fcvm \
-        container-test-vm-exec container-test-vm-exec-bridged container-test-vm-exec-rootless \
-        container-test-vm-egress container-test-vm-egress-bridged container-test-vm-egress-rootless \
-        container-test-pjdfstest container-test-all container-test-allow-other container-build-allow-other \
+        container-test-vm container-test-vm-unprivileged container-test-vm-privileged container-test-fcvm \
+        container-test-pjdfstest container-test-all container-test-allow-other \
         container-bench container-bench-throughput container-bench-operations container-bench-protocol container-bench-exec \
         container-shell container-clean \
         setup-btrfs setup-kernel setup-rootfs setup-all
@@ -64,63 +86,36 @@ help:
 	@echo "  make build       - Build fcvm and fc-agent"
 	@echo "  make clean       - Clean build artifacts"
 	@echo ""
-	@echo "Testing (organized by root requirement):"
-	@echo "  make test            - All fuse-pipe tests: noroot + root"
-	@echo "  make test-noroot     - Tests without root: unit + integration + stress (no sudo)"
-	@echo "  make test-root       - Tests requiring root: integration_root (sudo)"
-	@echo "  make test-unit       - Unit tests only (no root)"
-	@echo "  make test-fuse       - fuse-pipe: integration + permission + stress"
-	@echo "  make test-vm         - VM tests: rootless + bridged sanity"
-	@echo "  make test-vm-rootless - VM sanity test with slirp4netns (no sudo)"
-	@echo "  make test-vm-bridged  - VM sanity test with bridged networking (sudo)"
-	@echo "  make test-vm-exec     - VM exec tests: rootless + bridged"
-	@echo "  make test-vm-egress   - VM egress tests: rootless + bridged"
-	@echo "  make test-all        - Everything: test + test-vm"
+	@echo "Testing (with optional FILTER):"
+	@echo "  Tests use Cargo feature: privileged-tests (needs sudo). Unprivileged tests run by default."
+	@echo "  Use FILTER= to further filter tests matching a pattern."
 	@echo ""
-	@echo "Benchmarks:"
-	@echo "  make bench           - All fuse-pipe benchmarks"
-	@echo "  make bench-throughput - FUSE I/O throughput benchmarks"
-	@echo "  make bench-operations - FUSE operation latency benchmarks"
-	@echo "  make bench-protocol  - Wire protocol benchmarks"
-	@echo "  make bench-exec      - fcvm exec latency (bridged vs rootless)"
-	@echo "  make bench-quick     - Quick benchmarks (faster iteration)"
-	@echo "  make bench-logs      - View recent benchmark logs/telemetry"
-	@echo "  make bench-clean     - Clean benchmark artifacts"
+	@echo "  make test-vm                    - All VM tests (unprivileged + privileged)"
+	@echo "  make test-vm-unprivileged       - Unprivileged tests only (no sudo)"
+	@echo "  make test-vm-privileged         - All tests including privileged (sudo)"
+	@echo "  make test-vm FILTER=exec        - Only *exec* tests"
+	@echo "  make test-vm FILTER=sanity      - Only *sanity* tests"
+	@echo "  make test-vm-privileged FILTER=egress - Only privileged *egress* tests"
+	@echo ""
+	@echo "  make test            - All fuse-pipe tests"
+	@echo "  make test-pjdfstest  - POSIX compliance (8789 tests)"
+	@echo "  make test-all        - Everything"
+	@echo ""
+	@echo "Container Testing:"
+	@echo "  make container-test-vm             - All VM tests"
+	@echo "  make container-test-vm FILTER=exec - Only *exec* tests"
+	@echo "  make container-test                - fuse-pipe tests"
+	@echo "  make container-test-pjdfstest      - POSIX compliance"
+	@echo "  make container-test-all            - Everything"
+	@echo "  make container-shell               - Interactive shell"
 	@echo ""
 	@echo "Linting:"
-	@echo "  make lint            - Run clippy + fmt-check"
-	@echo "  make clippy          - Run cargo clippy"
-	@echo "  make fmt             - Format code"
-	@echo "  make fmt-check       - Check formatting"
+	@echo "  make lint  - Run clippy + fmt-check"
+	@echo "  make fmt   - Format code"
 	@echo ""
-	@echo "Container (source mounted, always fresh code):"
-	@echo "  make container-test              - fuse-pipe tests (noroot + root)"
-	@echo "  make container-test-noroot       - Tests as non-root user"
-	@echo "  make container-test-root         - Tests as root"
-	@echo "  make container-test-unit         - Unit tests only (non-root)"
-	@echo "  make container-test-fuse         - All fuse-pipe tests explicitly"
-	@echo "  make container-test-vm           - VM sanity tests (rootless + bridged)"
-	@echo "  make container-test-vm-rootless  - VM sanity with slirp4netns"
-	@echo "  make container-test-vm-bridged   - VM sanity with bridged networking"
-	@echo "  make container-test-vm-exec      - VM exec tests (rootless + bridged)"
-	@echo "  make container-test-vm-egress    - VM egress tests (rootless + bridged)"
-	@echo "  make container-test-pjdfstest    - POSIX compliance (8789 tests)"
-	@echo "  make container-test-all          - Everything: test + vm + pjdfstest"
-	@echo "  make container-test-allow-other  - Test AllowOther with fuse.conf"
-	@echo "  make container-bench             - All fuse-pipe benchmarks"
-	@echo "  make container-bench-exec        - fcvm exec latency (bridged vs rootless)"
-	@echo "  make container-shell             - Interactive shell"
-	@echo "  make container-clean             - Force container rebuild"
-	@echo ""
-	@echo "Setup (idempotent):"
-	@echo "  make setup-all    - Full setup (btrfs + kernel + rootfs)"
-	@echo "  make setup-btrfs  - Create btrfs loopback filesystem"
-	@echo "  make setup-kernel - Copy kernel to btrfs"
-	@echo "  make setup-rootfs - Create base rootfs (~90 sec on first run)"
-	@echo ""
-	@echo "Rootfs Updates:"
-	@echo "  make rootfs      - Update fc-agent in existing rootfs"
-	@echo "  make rebuild     - Full rebuild (build + update rootfs)"
+	@echo "Setup:"
+	@echo "  make setup-all  - Full setup (btrfs + kernel + rootfs)"
+	@echo "  make rebuild    - Build + update fc-agent in rootfs"
 
 #------------------------------------------------------------------------------
 # Setup targets (idempotent)
@@ -186,12 +181,26 @@ setup-all: setup-btrfs setup-kernel setup-rootfs
 # Build targets
 #------------------------------------------------------------------------------
 
+# Build non-root targets (uses TARGET_DIR)
+# Builds fcvm, fc-agent binaries AND test harnesses
 build:
-	@echo "==> Building..."
-	cargo build --release
+	@echo "==> Building non-root targets..."
+	CARGO_TARGET_DIR=$(TARGET_DIR) cargo build --release
+	CARGO_TARGET_DIR=$(TARGET_DIR) cargo test --release --all-targets --no-run
+
+# Build root targets (uses TARGET_DIR_ROOT, run with sudo)
+# Builds fcvm, fc-agent binaries AND test harnesses
+build-root:
+	@echo "==> Building root targets..."
+	sudo CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo build --release
+	sudo CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo test --release --all-targets --no-run
+
+# Build everything (both target dirs)
+build-all: build build-root
 
 clean:
-	cargo clean
+	# Use sudo to ensure we can remove any root-owned files
+	sudo rm -rf $(TARGET_DIR) $(TARGET_DIR_ROOT)
 
 #------------------------------------------------------------------------------
 # Testing (native) - organized by root requirement
@@ -205,7 +214,7 @@ test-noroot: build
 	$(TEST_FUSE_STRESS)
 
 # Tests that require root
-test-root: build
+test-root: build-root
 	@echo "==> Running tests (root required)..."
 	sudo $(TEST_FUSE_ROOT)
 
@@ -216,44 +225,31 @@ test: test-noroot test-root
 test-unit: build
 	$(TEST_UNIT)
 
-# All fuse-pipe tests (explicit)
-test-fuse: build
+# All fuse-pipe tests (needs both builds)
+test-fuse: build build-root
 	$(TEST_FUSE_NOROOT)
 	$(TEST_FUSE_STRESS)
 	sudo $(TEST_FUSE_ROOT)
-	sudo $(TEST_FUSE_PERMISSION)
 
-# VM tests - rootless (no root on host)
-test-vm-rootless: build setup-kernel
-	$(TEST_VM_ROOTLESS)
+# VM tests - unprivileged (no sudo needed)
+test-vm-unprivileged: build setup-kernel
+	$(TEST_VM_UNPRIVILEGED)
 
-# VM tests - bridged (requires root for iptables/netns)
-test-vm-bridged: build setup-kernel
-	sudo $(TEST_VM_BRIDGED)
+# VM tests - privileged (requires sudo, runs ALL tests including unprivileged)
+test-vm-privileged: build-root setup-kernel
+	sudo $(TEST_VM_PRIVILEGED)
 
-# VM exec tests
-test-vm-exec-bridged: build setup-kernel
-	sudo $(TEST_VM_EXEC_BRIDGED)
+# All VM tests: unprivileged first, then privileged
+# Use FILTER= to run subset, e.g.: make test-vm FILTER=exec
+test-vm: test-vm-unprivileged test-vm-privileged
 
-test-vm-exec-rootless: build setup-kernel
-	$(TEST_VM_EXEC_ROOTLESS)
-
-test-vm-exec: test-vm-exec-rootless test-vm-exec-bridged
-
-# VM egress tests
-test-vm-egress-bridged: build setup-kernel
-	sudo $(TEST_VM_EGRESS_BRIDGED)
-
-test-vm-egress-rootless: build setup-kernel
-	$(TEST_VM_EGRESS_ROOTLESS)
-
-test-vm-egress: test-vm-egress-rootless test-vm-egress-bridged
-
-# All VM tests: rootless first, then bridged
-test-vm: test-vm-rootless test-vm-bridged
+# POSIX compliance tests (host - requires pjdfstest installed)
+test-pjdfstest: build-root
+	@echo "==> Running POSIX compliance tests (8789 tests)..."
+	sudo $(TEST_PJDFSTEST)
 
 # Run everything (use container-test-pjdfstest for POSIX compliance)
-test-all: test test-vm
+test-all: test test-vm test-pjdfstest
 
 #------------------------------------------------------------------------------
 # Benchmarks (native)
@@ -336,22 +332,29 @@ rebuild: rootfs
 # Container testing
 #------------------------------------------------------------------------------
 
-# Marker file for container build state
-CONTAINER_MARKER := .container-built
+# Source hash for container rebuild detection
+# Rebuild container if ANY source file changes (not just Containerfile)
+SOURCE_HASH := $(shell find src fuse-pipe/src fc-agent/src Cargo.toml Cargo.lock Containerfile -type f 2>/dev/null | sort | xargs cat 2>/dev/null | sha256sum | cut -c1-12)
+CONTAINER_TAG := fcvm-test:$(SOURCE_HASH)
+CONTAINER_MARKER := .container-$(SOURCE_HASH)
 
 # CI mode: use host directories instead of named volumes (for artifact sharing)
 # Set CI=1 to enable artifact-compatible mode
+# Note: Container tests use separate volumes for root vs non-root to avoid permission conflicts
 CI ?= 0
 ifeq ($(CI),1)
 VOLUME_TARGET := -v ./target:/workspace/fcvm/target
+VOLUME_TARGET_ROOT := -v ./target-root:/workspace/fcvm/target
 VOLUME_CARGO := -v ./cargo-home:/home/testuser/.cargo
 else
 VOLUME_TARGET := -v fcvm-cargo-target:/workspace/fcvm/target
+VOLUME_TARGET_ROOT := -v fcvm-cargo-target-root:/workspace/fcvm/target
 VOLUME_CARGO := -v fcvm-cargo-home:/home/testuser/.cargo
 endif
 
 # Container run with source mounts (code always fresh, can't run stale)
 # Cargo cache goes to testuser's home so non-root builds work
+# Note: We have separate bases for root vs non-root to use different target volumes
 CONTAINER_RUN_BASE := sudo podman run --rm --privileged \
 	-v .:/workspace/fcvm \
 	-v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs \
@@ -360,8 +363,27 @@ CONTAINER_RUN_BASE := sudo podman run --rm --privileged \
 	$(VOLUME_CARGO) \
 	-e CARGO_HOME=/home/testuser/.cargo
 
-# Container run options for fuse-pipe tests
+# Same as CONTAINER_RUN_BASE but uses separate target volume for root tests
+CONTAINER_RUN_BASE_ROOT := sudo podman run --rm --privileged \
+	-v .:/workspace/fcvm \
+	-v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs \
+	-v $(FUSER):/workspace/fuser \
+	$(VOLUME_TARGET_ROOT) \
+	$(VOLUME_CARGO) \
+	-e CARGO_HOME=/home/testuser/.cargo
+
+# Container run options for fuse-pipe tests (non-root)
 CONTAINER_RUN_FUSE := $(CONTAINER_RUN_BASE) \
+	--device /dev/fuse \
+	--cap-add=MKNOD \
+	--device-cgroup-rule='b *:* rwm' \
+	--device-cgroup-rule='c *:* rwm' \
+	--ulimit nofile=65536:65536 \
+	--ulimit nproc=65536:65536 \
+	--pids-limit=-1
+
+# Container run options for fuse-pipe tests (root)
+CONTAINER_RUN_FUSE_ROOT := $(CONTAINER_RUN_BASE_ROOT) \
 	--device /dev/fuse \
 	--cap-add=MKNOD \
 	--device-cgroup-rule='b *:* rwm' \
@@ -410,58 +432,74 @@ CONTAINER_RUN_ROOTLESS := podman --root=/tmp/podman-rootless run --rm \
 	-v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	--network host
 
-# Build container only when Containerfile changes (make tracks dependency)
+# Build container when source hash changes (any source file modified)
 # CONTAINER_ARCH can be overridden: export CONTAINER_ARCH=x86_64 for CI
-$(CONTAINER_MARKER): Containerfile
-	@echo "==> Building container (Containerfile changed, ARCH=$(CONTAINER_ARCH))..."
-	sudo podman build -t $(CONTAINER_IMAGE) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) .
+# Old markers are removed by finding 12-char hex patterns (our hash format)
+$(CONTAINER_MARKER):
+	@echo "==> Source hash: $(SOURCE_HASH)"
+	@echo "==> Building container (source changed, ARCH=$(CONTAINER_ARCH))..."
+	sudo podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) .
+	@find . -maxdepth 1 -name '.container-????????????' -type f -delete 2>/dev/null || true
 	@touch $@
+	@echo "==> Container ready: $(CONTAINER_TAG)"
 
 container-build: $(CONTAINER_MARKER)
+	@echo "==> Pre-building all test binaries inside container..."
+	$(CONTAINER_RUN_FUSE) $(CONTAINER_TAG) cargo test --release --all-targets --no-run
 
 # Build inside container only (no tests) - useful for CI artifact caching
 # Creates target/ with compiled binaries that can be uploaded/downloaded
 container-build-only: container-build
 	@echo "==> Building inside container (CI mode)..."
 	@mkdir -p target cargo-home
-	$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) cargo build --release --all-targets -p fuse-pipe
+	$(CONTAINER_RUN_FUSE) $(CONTAINER_TAG) cargo build --release --all-targets -p fuse-pipe
 
-# Export container image for rootless podman (needed for container-test-vm-rootless)
+# Export container image for rootless podman (needed for container-test-vm-unprivileged)
 # Rootless podman has separate image storage, so we export from root and import
-CONTAINER_ROOTLESS_MARKER := .container-rootless-imported
+CONTAINER_ROOTLESS_MARKER := .container-rootless-$(SOURCE_HASH)
 $(CONTAINER_ROOTLESS_MARKER): $(CONTAINER_MARKER)
 	@echo "==> Exporting container for rootless podman..."
-	sudo podman save $(CONTAINER_IMAGE) | podman --root=/tmp/podman-rootless load
+	sudo podman save $(CONTAINER_TAG) | podman --root=/tmp/podman-rootless load
+	@find . -maxdepth 1 -name '.container-rootless-????????????' -type f -delete 2>/dev/null || true
 	@touch $@
 
 container-build-rootless: $(CONTAINER_ROOTLESS_MARKER)
+	@echo "==> Pre-building all test binaries inside rootless container..."
+	$(CONTAINER_RUN_ROOTLESS) $(CONTAINER_TAG) cargo test --release --all-targets --no-run
+
+# Build for container root tests (uses separate volume)
+container-build-root: $(CONTAINER_MARKER)
+	@echo "==> Pre-building all test binaries for container root tests..."
+	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) cargo test --release --all-targets --no-run
 
 # Container tests - organized by root requirement
 # Non-root tests run with --user testuser to verify they don't need root
 # fcvm unit tests with network ops skip themselves when not root
+# Uses CTEST_* commands (no CARGO_TARGET_DIR - volume mounts provide isolation)
 container-test-unit: container-build
 	@echo "==> Running unit tests as non-root user..."
-	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_IMAGE) $(TEST_UNIT)
+	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) $(CTEST_UNIT)
 
 container-test-noroot: container-build
 	@echo "==> Running tests as non-root user..."
-	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_IMAGE) $(TEST_UNIT)
-	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_IMAGE) $(TEST_FUSE_NOROOT)
-	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_IMAGE) $(TEST_FUSE_STRESS)
+	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) $(CTEST_UNIT)
+	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) $(CTEST_FUSE_NOROOT)
+	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) $(CTEST_FUSE_STRESS)
 
-# Root tests run as root inside container
-container-test-root: container-build
+# Root tests run as root inside container (uses separate volume)
+container-test-root: container-build-root
 	@echo "==> Running tests as root..."
-	$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_FUSE_ROOT)
-	$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_FUSE_PERMISSION)
+	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) $(CTEST_FUSE_ROOT)
+	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) $(CTEST_FUSE_PERMISSION)
 
 # All fuse-pipe tests (explicit) - matches native test-fuse
-container-test-fuse: container-build
+# Note: Uses both volumes since it mixes root and non-root tests
+container-test-fuse: container-build container-build-root
 	@echo "==> Running all fuse-pipe tests..."
-	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_IMAGE) $(TEST_FUSE_NOROOT)
-	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_IMAGE) $(TEST_FUSE_STRESS)
-	$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_FUSE_ROOT)
-	$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_FUSE_PERMISSION)
+	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) $(CTEST_FUSE_NOROOT)
+	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) $(CTEST_FUSE_STRESS)
+	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) $(CTEST_FUSE_ROOT)
+	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) $(CTEST_FUSE_PERMISSION)
 
 # Test AllowOther with user_allow_other configured (non-root with config)
 # Uses separate image with user_allow_other pre-configured
@@ -478,46 +516,24 @@ container-test-allow-other: container-build-allow-other
 # All fuse-pipe tests: noroot first, then root
 container-test: container-test-noroot container-test-root
 
-# VM tests - rootless (tests fcvm's rootless networking mode inside container)
+# VM tests - unprivileged (tests fcvm without sudo inside container)
 # Uses CONTAINER_RUN_ROOTLESS with rootless podman --privileged
-# Tests that fcvm can set up slirp4netns + user namespace networking
-container-test-vm-rootless: container-build-rootless setup-kernel
-	$(CONTAINER_RUN_ROOTLESS) $(CONTAINER_IMAGE) $(TEST_VM_ROOTLESS)
+container-test-vm-unprivileged: container-build-rootless setup-kernel
+	$(CONTAINER_RUN_ROOTLESS) $(CONTAINER_TAG) $(CTEST_VM_UNPRIVILEGED)
 
-# VM tests - bridged (requires root for iptables/netns)
-container-test-vm-bridged: container-build setup-kernel
-	$(CONTAINER_RUN_FCVM) $(CONTAINER_IMAGE) $(TEST_VM_BRIDGED)
+# VM tests - privileged (runs ALL tests including unprivileged)
+container-test-vm-privileged: container-build setup-kernel
+	$(CONTAINER_RUN_FCVM) $(CONTAINER_TAG) $(CTEST_VM_PRIVILEGED)
 
-# VM exec tests - bridged (needs root)
-container-test-vm-exec-bridged: container-build setup-kernel
-	$(CONTAINER_RUN_FCVM) $(CONTAINER_IMAGE) $(TEST_VM_EXEC_BRIDGED)
-
-# VM exec tests - rootless (tests fcvm's rootless networking mode)
-container-test-vm-exec-rootless: container-build-rootless setup-kernel
-	$(CONTAINER_RUN_ROOTLESS) $(CONTAINER_IMAGE) $(TEST_VM_EXEC_ROOTLESS)
-
-# VM exec tests - all (bridged first to create rootfs, then rootless)
-container-test-vm-exec: container-test-vm-exec-bridged container-test-vm-exec-rootless
-
-# VM egress tests - bridged (needs root)
-container-test-vm-egress-bridged: container-build setup-kernel
-	$(CONTAINER_RUN_FCVM) $(CONTAINER_IMAGE) $(TEST_VM_EGRESS_BRIDGED)
-
-# VM egress tests - rootless (tests fcvm's rootless networking mode)
-container-test-vm-egress-rootless: container-build-rootless setup-kernel
-	$(CONTAINER_RUN_ROOTLESS) $(CONTAINER_IMAGE) $(TEST_VM_EGRESS_ROOTLESS)
-
-# VM egress tests - all (bridged first to create rootfs, then rootless)
-container-test-vm-egress: container-test-vm-egress-bridged container-test-vm-egress-rootless
-
-# All VM tests: bridged first (creates rootfs), then rootless
-container-test-vm: container-test-vm-bridged container-test-vm-rootless
+# All VM tests: privileged first (creates rootfs), then unprivileged
+# Use FILTER= to run subset, e.g.: make container-test-vm FILTER=exec
+container-test-vm: container-test-vm-privileged container-test-vm-unprivileged
 
 # Legacy alias (runs both VM tests)
 container-test-fcvm: container-test-vm
 
-container-test-pjdfstest: container-build
-	$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(TEST_PJDFSTEST)
+container-test-pjdfstest: container-build-root
+	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) $(CTEST_PJDFSTEST)
 
 # Run everything in container
 container-test-all: container-test container-test-vm container-test-pjdfstest
@@ -525,30 +541,70 @@ container-test-all: container-test container-test-vm container-test-pjdfstest
 # Container benchmarks - uses same commands as native benchmarks
 container-bench: container-build
 	@echo "==> Running all fuse-pipe benchmarks..."
-	$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(BENCH_THROUGHPUT)
-	$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(BENCH_OPERATIONS)
-	$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(BENCH_PROTOCOL)
+	$(CONTAINER_RUN_FUSE) $(CONTAINER_TAG) $(BENCH_THROUGHPUT)
+	$(CONTAINER_RUN_FUSE) $(CONTAINER_TAG) $(BENCH_OPERATIONS)
+	$(CONTAINER_RUN_FUSE) $(CONTAINER_TAG) $(BENCH_PROTOCOL)
 
 container-bench-throughput: container-build
-	$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(BENCH_THROUGHPUT)
+	$(CONTAINER_RUN_FUSE) $(CONTAINER_TAG) $(BENCH_THROUGHPUT)
 
 container-bench-operations: container-build
-	$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(BENCH_OPERATIONS)
+	$(CONTAINER_RUN_FUSE) $(CONTAINER_TAG) $(BENCH_OPERATIONS)
 
 container-bench-protocol: container-build
-	$(CONTAINER_RUN_FUSE) $(CONTAINER_IMAGE) $(BENCH_PROTOCOL)
+	$(CONTAINER_RUN_FUSE) $(CONTAINER_TAG) $(BENCH_PROTOCOL)
 
 # fcvm exec benchmarks - requires VMs (uses CONTAINER_RUN_FCVM)
 container-bench-exec: container-build setup-kernel
 	@echo "==> Running exec benchmarks (bridged vs rootless)..."
-	$(CONTAINER_RUN_FCVM) $(CONTAINER_IMAGE) $(BENCH_EXEC)
+	$(CONTAINER_RUN_FCVM) $(CONTAINER_TAG) $(BENCH_EXEC)
 
 container-shell: container-build
-	$(CONTAINER_RUN_FUSE) -it $(CONTAINER_IMAGE) bash
+	$(CONTAINER_RUN_FUSE) -it $(CONTAINER_TAG) bash
 
-# Force container rebuild (removes marker file)
+# Force container rebuild (removes markers and images)
 container-clean:
-	rm -f $(CONTAINER_MARKER) $(CONTAINER_ROOTLESS_MARKER)
-	sudo podman rmi $(CONTAINER_IMAGE) 2>/dev/null || true
-	sudo podman volume rm fcvm-cargo-target fcvm-cargo-home 2>/dev/null || true
-	podman --root=/tmp/podman-rootless rmi $(CONTAINER_IMAGE) 2>/dev/null || true
+	@find . -maxdepth 1 -name '.container-????????????' -type f -delete 2>/dev/null || true
+	@find . -maxdepth 1 -name '.container-rootless-????????????' -type f -delete 2>/dev/null || true
+	sudo podman rmi $(CONTAINER_TAG) 2>/dev/null || true
+	sudo podman volume rm fcvm-cargo-target fcvm-cargo-target-root fcvm-cargo-home 2>/dev/null || true
+	podman --root=/tmp/podman-rootless rmi $(CONTAINER_TAG) 2>/dev/null || true
+
+#------------------------------------------------------------------------------
+# CI Simulation (local)
+#------------------------------------------------------------------------------
+
+# Run full CI locally with max parallelism
+# Phase 1: Build all 5 target directories in parallel (host x2, container x3)
+# Phase 2: Run all tests in parallel (they use pre-built binaries)
+ci-local:
+	@echo "==> Phase 1: Building all targets in parallel..."
+	$(MAKE) -j build build-root container-build container-build-root container-build-rootless
+	@echo "==> Phase 2: Running all tests in parallel..."
+	$(MAKE) -j \
+		lint \
+		test-unit \
+		test-fuse \
+		test-pjdfstest \
+		test-vm \
+		container-test-noroot \
+		container-test-root \
+		container-test-pjdfstest \
+		container-test-vm
+	@echo "==> CI local complete"
+
+# Quick pre-push check (just lint + unit, parallel)
+pre-push: build
+	$(MAKE) -j lint test-unit
+	@echo "==> Ready to push"
+
+# Host-only tests (parallel, builds both target dirs first)
+# test-vm runs all VM tests (privileged + unprivileged)
+test-all-host:
+	$(MAKE) -j build build-root
+	$(MAKE) -j lint test-unit test-fuse test-pjdfstest test-vm
+
+# Container-only tests (parallel, builds all 3 container target dirs first)
+test-all-container:
+	$(MAKE) -j container-build container-build-root container-build-rootless
+	$(MAKE) -j container-test-noroot container-test-root container-test-pjdfstest container-test-vm
