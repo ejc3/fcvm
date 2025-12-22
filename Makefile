@@ -36,8 +36,9 @@ TEST_PJDFSTEST := CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo test --release -p fu
 # VM tests: privileged-tests feature gates tests that require sudo
 # Unprivileged tests run by default (no feature flag)
 # Use -p fcvm to only run fcvm package tests (excludes fuse-pipe)
-TEST_VM_UNPRIVILEGED := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR) cargo test -p fcvm --release -- $(FILTER) --nocapture"
-TEST_VM_PRIVILEGED := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo test -p fcvm --release --features privileged-tests -- $(FILTER) --nocapture"
+# Use --tests to skip doctests (rustdoc has proc-macro linking issues)
+TEST_VM_UNPRIVILEGED := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR) cargo test -p fcvm --release --tests -- $(FILTER) --nocapture"
+TEST_VM_PRIVILEGED := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo test -p fcvm --release --tests --features privileged-tests -- $(FILTER) --nocapture"
 
 # Container test commands (no CARGO_TARGET_DIR - volume mounts provide isolation)
 CTEST_UNIT := cargo test --release --lib
@@ -49,8 +50,9 @@ CTEST_PJDFSTEST := cargo test --release -p fuse-pipe --test pjdfstest_full -- --
 
 # VM tests: privileged-tests feature gates tests that require sudo
 # Use -p fcvm to only run fcvm package tests (excludes fuse-pipe)
-CTEST_VM_UNPRIVILEGED := cargo test -p fcvm --release -- $(FILTER) --nocapture
-CTEST_VM_PRIVILEGED := cargo test -p fcvm --release --features privileged-tests -- $(FILTER) --nocapture
+# Use --tests to skip doctests (rustdoc has proc-macro linking issues)
+CTEST_VM_UNPRIVILEGED := cargo test -p fcvm --release --tests -- $(FILTER) --nocapture
+CTEST_VM_PRIVILEGED := cargo test -p fcvm --release --tests --features privileged-tests -- $(FILTER) --nocapture
 
 # Legacy alias
 TEST_VM := cargo test --release --test test_sanity -- --nocapture
