@@ -1130,7 +1130,9 @@ async fn create_layer2_setup_initrd(
 ) -> Result<PathBuf> {
     info!("creating Layer 2 setup initrd with embedded packages");
 
-    let temp_dir = PathBuf::from("/tmp/fcvm-layer2-initrd");
+    // Use UID in path to avoid permission conflicts between root and non-root
+    let uid = unsafe { libc::getuid() };
+    let temp_dir = PathBuf::from(format!("/tmp/fcvm-layer2-initrd-{}", uid));
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     tokio::fs::create_dir_all(&temp_dir).await?;
 
@@ -1415,7 +1417,9 @@ async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
     use tokio::time::timeout;
 
     // Create a temporary directory for this setup VM
-    let temp_dir = PathBuf::from("/tmp/fcvm-layer2-setup");
+    // Use UID in path to avoid permission conflicts between root and non-root
+    let uid = unsafe { libc::getuid() };
+    let temp_dir = PathBuf::from(format!("/tmp/fcvm-layer2-setup-{}", uid));
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     tokio::fs::create_dir_all(&temp_dir).await?;
 
