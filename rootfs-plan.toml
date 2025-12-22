@@ -19,6 +19,21 @@ url = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64
 [base.amd64]
 url = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
 
+[kernel]
+# Kata Containers kernel with FUSE support built-in
+# Firecracker's official kernel lacks FUSE, but Kata's has it
+# URL hash is included in Layer 2 SHA calculation
+
+[kernel.arm64]
+# Kata 3.24.0 release - kernel 6.12.47 with CONFIG_FUSE_FS=y
+url = "https://github.com/kata-containers/kata-containers/releases/download/3.24.0/kata-static-3.24.0-arm64.tar.zst"
+# Path within the tarball to extract
+path = "opt/kata/share/kata-containers/vmlinux-6.12.47-173"
+
+[kernel.amd64]
+url = "https://github.com/kata-containers/kata-containers/releases/download/3.24.0/kata-static-3.24.0-amd64.tar.zst"
+path = "opt/kata/share/kata-containers/vmlinux-6.12.47-173"
+
 [packages]
 # Container runtime
 runtime = ["podman", "crun", "fuse-overlayfs", "skopeo"]
