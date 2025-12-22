@@ -1,149 +1,424 @@
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
 use crate::paths;
 
-/// Find a free NBD device by checking which ones are not currently connected.
-/// Returns the device path (e.g., "/dev/nbd0") or error if none available.
-///
-/// Note: There's a small race window between checking and connecting. If connection
-/// fails, the caller should retry with a different device.
-async fn find_free_nbd_device() -> Result<String> {
-    // modprobe nbd with max_part=8 creates nbd0-nbd15 by default
-    for i in 0..16 {
-        let device = format!("/dev/nbd{}", i);
-        let pid_file = format!("/sys/block/nbd{}/pid", i);
+/// Plan file location (relative to workspace root)
+const PLAN_FILE: &str = "rootfs-plan.toml";
 
-        // Check if device exists
-        if !std::path::Path::new(&device).exists() {
-            continue;
-        }
+/// Size of the Layer 2 disk image
+const LAYER2_SIZE: &str = "10G";
 
-        // If pid file doesn't exist or is empty/contains -1, device is free
-        match tokio::fs::read_to_string(&pid_file).await {
-            Ok(content) => {
-                let pid = content.trim();
-                if pid.is_empty() || pid == "-1" {
-                    debug!(device = %device, "found free NBD device");
-                    return Ok(device);
-                }
-                debug!(device = %device, pid = %pid, "NBD device in use");
-            }
-            Err(_) => {
-                // No pid file means not connected
-                debug!(device = %device, "found free NBD device (no pid file)");
-                return Ok(device);
-            }
-        }
-    }
+// ============================================================================
+// Plan File Data Structures
+// ============================================================================
 
-    bail!("No free NBD devices available (checked nbd0-nbd15)")
+#[derive(Debug, Deserialize, Clone)]
+pub struct Plan {
+    pub base: BaseConfig,
+    pub packages: PackagesConfig,
+    pub services: ServicesConfig,
+    pub files: HashMap<String, FileConfig>,
+    pub fstab: FstabConfig,
+    #[serde(default)]
+    pub cleanup: CleanupConfig,
 }
 
-/// Connect to an NBD device, with retry on failure (handles race conditions)
-async fn connect_nbd_with_retry(qcow2_path: &Path, max_attempts: u32) -> Result<String> {
-    let mut last_error = None;
+#[derive(Debug, Deserialize, Clone)]
+pub struct BaseConfig {
+    pub version: String,
+    pub arm64: ArchConfig,
+    pub amd64: ArchConfig,
+}
 
-    for attempt in 1..=max_attempts {
-        let nbd_device = find_free_nbd_device().await?;
-        info!(device = %nbd_device, attempt = attempt, "trying NBD device");
+#[derive(Debug, Deserialize, Clone)]
+pub struct ArchConfig {
+    pub url: String,
+}
 
-        let output = Command::new("qemu-nbd")
-            .args(["--connect", &nbd_device, "-r", path_to_str(qcow2_path)?])
-            .output()
-            .await
-            .context("running qemu-nbd connect")?;
+#[derive(Debug, Deserialize, Clone)]
+pub struct PackagesConfig {
+    pub runtime: Vec<String>,
+    pub fuse: Vec<String>,
+    pub system: Vec<String>,
+}
 
-        if output.status.success() {
-            return Ok(nbd_device);
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!(device = %nbd_device, error = %stderr.trim(), "NBD connect failed, retrying");
-        last_error = Some(stderr.to_string());
-
-        // Small delay before retry
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+impl PackagesConfig {
+    pub fn all_packages(&self) -> Vec<&str> {
+        self.runtime
+            .iter()
+            .chain(&self.fuse)
+            .chain(&self.system)
+            .map(|s| s.as_str())
+            .collect()
     }
+}
 
-    bail!(
-        "Failed to connect to any NBD device after {} attempts: {}",
-        max_attempts,
-        last_error.unwrap_or_default()
+#[derive(Debug, Deserialize, Clone)]
+pub struct ServicesConfig {
+    pub enable: Vec<String>,
+    pub disable: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct FileConfig {
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct FstabConfig {
+    pub remove_patterns: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct CleanupConfig {
+    #[serde(default)]
+    pub remove_dirs: Vec<String>,
+}
+
+// ============================================================================
+// Script Generation
+// ============================================================================
+
+/// Generate a setup script from the plan
+///
+/// Generate the install script that runs BEFORE the setup script.
+/// This script installs packages from the ISO and removes conflicting packages.
+pub fn generate_install_script() -> String {
+    r#"#!/bin/bash
+set -e
+echo 'FCVM: Removing conflicting packages before install...'
+# Remove time-daemon provider that conflicts with chrony
+apt-get remove -y --purge systemd-timesyncd 2>/dev/null || true
+# Remove packages we don't need in microVM (also frees space)
+apt-get remove -y --purge cloud-init snapd ubuntu-server 2>/dev/null || true
+
+echo 'FCVM: Installing packages from local ISO...'
+dpkg -i /mnt/packages/*.deb || true
+apt-get -f install -y || true
+echo 'FCVM: Packages installed successfully'
+"#
+    .to_string()
+}
+
+/// Generate the init script that runs in the initrd during Layer 2 setup.
+/// This script mounts filesystems, runs install + setup scripts, then powers off.
+///
+/// The SHA256 of this complete script determines the rootfs name, ensuring
+/// any changes to mounts, commands, or embedded scripts invalidate the cache.
+pub fn generate_init_script(install_script: &str, setup_script: &str) -> String {
+    format!(
+        r#"#!/bin/busybox sh
+# FCVM Layer 2 setup initrd
+# Runs package installation before systemd
+
+echo "FCVM Layer 2 Setup: Starting..."
+
+# Install busybox commands
+/bin/busybox mkdir -p /bin /sbin /proc /sys /dev /newroot /mnt/packages
+/bin/busybox --install -s /bin
+/bin/busybox --install -s /sbin
+
+# Mount essential filesystems
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+
+# Populate /dev with device nodes from sysfs
+mdev -s
+
+# Debug: show available block devices
+echo "FCVM Layer 2 Setup: Available block devices:"
+ls -la /dev/vd* 2>/dev/null || echo "No /dev/vd* devices found"
+
+echo "FCVM Layer 2 Setup: Mounting rootfs..."
+mount -o rw /dev/vda /newroot
+if [ $? -ne 0 ]; then
+    echo "ERROR: Failed to mount rootfs"
+    sleep 5
+    poweroff -f
+fi
+
+echo "FCVM Layer 2 Setup: Mounting packages ISO..."
+mkdir -p /newroot/mnt/packages
+mount -t iso9660 -o ro /dev/vdb /newroot/mnt/packages
+if [ $? -ne 0 ]; then
+    echo "ERROR: Failed to mount packages ISO"
+    sleep 5
+    poweroff -f
+fi
+
+# Write the install script to rootfs
+cat > /newroot/tmp/install-packages.sh << 'INSTALL_SCRIPT_EOF'
+{}
+INSTALL_SCRIPT_EOF
+chmod 755 /newroot/tmp/install-packages.sh
+
+# Write the setup script to rootfs
+cat > /newroot/tmp/fcvm-setup.sh << 'SETUP_SCRIPT_EOF'
+{}
+SETUP_SCRIPT_EOF
+chmod 755 /newroot/tmp/fcvm-setup.sh
+
+# Set up chroot environment (proc, sys, dev)
+echo "FCVM Layer 2 Setup: Setting up chroot environment..."
+mount --bind /proc /newroot/proc
+mount --bind /sys /newroot/sys
+mount --bind /dev /newroot/dev
+
+# Install packages using chroot
+echo "FCVM Layer 2 Setup: Installing packages..."
+chroot /newroot /bin/bash /tmp/install-packages.sh
+INSTALL_RESULT=$?
+echo "FCVM Layer 2 Setup: Package installation returned: $INSTALL_RESULT"
+
+# Run setup script using chroot
+echo "FCVM Layer 2 Setup: Running setup script..."
+chroot /newroot /bin/bash /tmp/fcvm-setup.sh
+SETUP_RESULT=$?
+echo "FCVM Layer 2 Setup: Setup script returned: $SETUP_RESULT"
+
+# Cleanup chroot mounts (use lazy unmount as fallback)
+echo "FCVM Layer 2 Setup: Cleaning up..."
+umount /newroot/mnt/packages 2>/dev/null || umount -l /newroot/mnt/packages 2>/dev/null || true
+umount /newroot/dev 2>/dev/null || umount -l /newroot/dev 2>/dev/null || true
+umount /newroot/sys 2>/dev/null || umount -l /newroot/sys 2>/dev/null || true
+umount /newroot/proc 2>/dev/null || umount -l /newroot/proc 2>/dev/null || true
+rm -rf /newroot/mnt/packages
+rm -f /newroot/tmp/install-packages.sh
+rm -f /newroot/tmp/fcvm-setup.sh
+
+# Sync and unmount rootfs
+sync
+umount /newroot 2>/dev/null || umount -l /newroot 2>/dev/null || true
+
+echo "FCVM Layer 2 Setup: Complete! Powering off..."
+umount /proc /sys /dev 2>/dev/null || true
+poweroff -f
+"#,
+        install_script, setup_script
     )
 }
 
-/// Find the fc-agent binary
+/// The script content is deterministic - same plan always produces same script.
+/// The SHA256 of this script determines the rootfs image name.
 ///
-/// Both fcvm and fc-agent are workspace members built together with:
-///   cargo build --release
-///
-/// Search order:
-/// 1. Same directory as current exe (for cargo install)
-/// 2. Parent directory (for tests running from target/release/deps/)
-/// 3. FC_AGENT_PATH environment variable
-fn find_fc_agent_binary() -> Result<PathBuf> {
+/// NOTE: This script does NOT install packages - they are installed from
+/// the packages ISO by install-packages.sh before this script runs.
+pub fn generate_setup_script(plan: &Plan) -> String {
+    let mut s = String::new();
+
+    // Script header - will be run by cloud-init AFTER packages are installed from ISO
+    s.push_str("#!/bin/bash\n");
+    s.push_str("set -euo pipefail\n\n");
+
+    // Note: No partition resize needed - filesystem is already resized on host
+    // (we use a raw ext4 filesystem without partition table)\n
+
+    // Note: Packages are already installed from local ISO by install-packages.sh
+    // We just need to include the package list in the script for SHA calculation
+    let packages = plan.packages.all_packages();
+    s.push_str("# Packages (installed from ISO): ");
+    s.push_str(&packages.join(", "));
+    s.push_str("\n\n");
+
+    // Write configuration files (sorted for deterministic output)
+    let mut file_paths: Vec<_> = plan.files.keys().collect();
+    file_paths.sort();
+
+    s.push_str("# Write configuration files\n");
+    for path in file_paths {
+        let config = &plan.files[path];
+        // Create parent directory if needed
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if parent != std::path::Path::new("") && parent != std::path::Path::new("/") {
+                s.push_str(&format!("mkdir -p {}\n", parent.display()));
+            }
+        }
+        s.push_str(&format!("cat > {} << 'FCVM_EOF'\n", path));
+        s.push_str(&config.content);
+        if !config.content.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push_str("FCVM_EOF\n\n");
+    }
+
+    // Fix fstab (remove problematic entries)
+    if !plan.fstab.remove_patterns.is_empty() {
+        s.push_str("# Fix /etc/fstab\n");
+        for pattern in &plan.fstab.remove_patterns {
+            // Use sed to remove lines containing the pattern
+            s.push_str(&format!("sed -i '/{}/d' /etc/fstab\n", pattern.replace('/', "\\/")));
+        }
+        s.push('\n');
+    }
+
+    // Configure container registries
+    s.push_str("# Configure Podman registries\n");
+    s.push_str("cat > /etc/containers/registries.conf << 'FCVM_EOF'\n");
+    s.push_str("unqualified-search-registries = [\"docker.io\"]\n\n");
+    s.push_str("[[registry]]\n");
+    s.push_str("location = \"docker.io\"\n");
+    s.push_str("FCVM_EOF\n\n");
+
+    // Enable services
+    if !plan.services.enable.is_empty() {
+        s.push_str("# Enable services\n");
+        s.push_str("systemctl enable");
+        for svc in &plan.services.enable {
+            s.push_str(&format!(" {}", svc));
+        }
+        s.push('\n');
+    }
+
+    // Also enable serial console
+    s.push_str("systemctl enable serial-getty@ttyS0\n\n");
+
+    // Disable services
+    if !plan.services.disable.is_empty() {
+        s.push_str("# Disable services\n");
+        s.push_str("systemctl disable");
+        for svc in &plan.services.disable {
+            s.push_str(&format!(" {}", svc));
+        }
+        s.push_str(" || true\n\n");
+    }
+
+    // Cleanup
+    if !plan.cleanup.remove_dirs.is_empty() {
+        s.push_str("# Cleanup unnecessary files\n");
+        for pattern in &plan.cleanup.remove_dirs {
+            s.push_str(&format!("rm -rf {}\n", pattern));
+        }
+        s.push('\n');
+    }
+
+    // Clean apt cache for smaller image
+    s.push_str("# Clean apt cache\n");
+    s.push_str("apt-get clean\n");
+    s.push_str("rm -rf /var/lib/apt/lists/*\n\n");
+
+    s.push_str("echo 'FCVM_SETUP_COMPLETE'\n");
+    s.push_str("# Shutdown to signal completion\n");
+    s.push_str("shutdown -h now\n");
+    s
+}
+
+
+// ============================================================================
+// Plan Loading and SHA256
+// ============================================================================
+
+/// Find the plan file in the workspace
+fn find_plan_file() -> Result<PathBuf> {
+    // Try relative to current exe (for installed binary)
     let exe_path = std::env::current_exe().context("getting current executable path")?;
     let exe_dir = exe_path.parent().context("getting executable directory")?;
 
-    // Check same directory (cargo install case)
-    let fc_agent = exe_dir.join("fc-agent");
-    if fc_agent.exists() {
-        return Ok(fc_agent);
-    }
+    // Check various locations
+    let candidates = [
+        exe_dir.join(PLAN_FILE),
+        exe_dir.join("..").join(PLAN_FILE),
+        exe_dir.join("../..").join(PLAN_FILE),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(PLAN_FILE),
+    ];
 
-    // Check parent directory (test case: exe in target/release/deps/, agent in target/release/)
-    if let Some(parent) = exe_dir.parent() {
-        let fc_agent_parent = parent.join("fc-agent");
-        if fc_agent_parent.exists() {
-            return Ok(fc_agent_parent);
+    for path in &candidates {
+        if path.exists() {
+            return Ok(path.canonicalize().context("canonicalizing plan file path")?);
         }
     }
 
-    // Fallback: environment variable override for special cases
-    if let Ok(path) = std::env::var("FC_AGENT_PATH") {
-        let p = PathBuf::from(&path);
-        if p.exists() {
-            return Ok(p);
-        }
+    // Fallback to CARGO_MANIFEST_DIR for development
+    let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(PLAN_FILE);
+    if manifest_path.exists() {
+        return Ok(manifest_path);
     }
 
     bail!(
-        "fc-agent binary not found at {} or via FC_AGENT_PATH env var.\n\
-         Build with: cargo build --release",
-        fc_agent.display()
+        "rootfs-plan.toml not found. Checked: {:?}",
+        candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()
     )
 }
 
-/// Helper to convert Path to str with proper error handling
-fn path_to_str(path: &Path) -> Result<&str> {
-    path.to_str()
-        .ok_or_else(|| anyhow::anyhow!("path contains invalid UTF-8: {:?}", path))
+/// Load and parse the plan file
+pub fn load_plan() -> Result<(Plan, String, String)> {
+    let plan_path = find_plan_file()?;
+    let plan_content = std::fs::read_to_string(&plan_path)
+        .with_context(|| format!("reading plan file: {}", plan_path.display()))?;
+
+    // Compute SHA256 of plan content (first 12 chars for image naming)
+    let plan_sha = compute_sha256(plan_content.as_bytes());
+    let plan_sha_short = plan_sha[..12].to_string();
+
+    let plan: Plan = toml::from_str(&plan_content)
+        .with_context(|| format!("parsing plan file: {}", plan_path.display()))?;
+
+    info!(
+        plan_file = %plan_path.display(),
+        plan_sha = %plan_sha_short,
+        "loaded rootfs plan"
+    );
+
+    Ok((plan, plan_sha, plan_sha_short))
 }
 
-/// Ensure rootfs exists, creating minimal Ubuntu + Podman if needed
+/// Compute SHA256 of bytes, return hex string
+pub fn compute_sha256(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+/// Ensure rootfs exists, creating if needed (NO ROOT REQUIRED)
 ///
-/// Caches the rootfs filesystem - only creates it once.
-/// The base rootfs is immutable after creation to prevent corruption when VMs start in parallel.
+/// The rootfs is named after the generated setup script SHA256: layer2-{script_sha}.raw
+/// If the script changes (due to plan changes), a new rootfs is created automatically.
+///
+/// Layer 2 creation flow (all rootless):
+/// 1. Download Ubuntu cloud image (qcow2)
+/// 2. Convert to raw with qemu-img
+/// 3. Expand to 10GB with truncate
+/// 4. Download packages, create ISO
+/// 5. Boot VM with cloud-init to install from local ISO (no network needed)
+/// 6. Wait for VM to shut down
+/// 7. Rename to layer2-{sha}.raw
+///
+/// NOTE: fc-agent is NOT included in Layer 2. It will be injected per-VM at boot time.
+/// Layer 2 only contains packages (podman, crun, etc.).
 pub async fn ensure_rootfs() -> Result<PathBuf> {
+    let (plan, _plan_sha_full, _plan_sha_short) = load_plan()?;
+
+    // Generate all scripts and compute hash of the complete init script
+    let setup_script = generate_setup_script(&plan);
+    let install_script = generate_install_script();
+    let init_script = generate_init_script(&install_script, &setup_script);
+
+    // Hash the complete init script - includes mounts, commands, and both embedded scripts
+    // Any change to the init logic, install script, or setup script invalidates the cache
+    let script_sha = compute_sha256(init_script.as_bytes());
+    let script_sha_short = &script_sha[..12];
+
     let rootfs_dir = paths::rootfs_dir();
-    let rootfs_path = paths::base_rootfs();
+    let rootfs_path = rootfs_dir.join(format!("layer2-{}.raw", script_sha_short));
     let lock_file = rootfs_dir.join(".rootfs-creation.lock");
 
-    // If rootfs exists, return it immediately (it's immutable after creation)
-    // DO NOT modify the base rootfs on every VM start - this causes:
-    // 1. Filesystem corruption when VMs start in parallel
-    // 2. Unnecessary latency (~100ms per VM start)
-    // 3. Violates the "base rootfs is immutable" principle
-    //
-    // To update fc-agent: delete the rootfs and it will be recreated, OR
-    // explicitly run `fcvm setup rootfs` (TODO: implement setup command)
+    // If rootfs exists for this script, return it
     if rootfs_path.exists() {
-        info!(path = %rootfs_path.display(), "rootfs exists (using cached)");
+        info!(
+            path = %rootfs_path.display(),
+            script_sha = %script_sha_short,
+            "rootfs exists for current script (using cached)"
+        );
         return Ok(rootfs_path);
     }
 
@@ -153,7 +428,6 @@ pub async fn ensure_rootfs() -> Result<PathBuf> {
         .context("creating rootfs directory")?;
 
     // Acquire lock to prevent concurrent rootfs creation
-    // If multiple VMs start simultaneously, only one creates the rootfs
     info!("acquiring rootfs creation lock");
     use std::os::unix::fs::OpenOptionsExt;
     let lock_fd = std::fs::OpenOptions::new()
@@ -169,39 +443,41 @@ pub async fn ensure_rootfs() -> Result<PathBuf> {
         .map_err(|(_, err)| err)
         .context("acquiring rootfs creation lock")?;
 
-    // Check again after acquiring lock (another process may have created it)
+    // Check again after acquiring lock
     if rootfs_path.exists() {
-        info!(path = %rootfs_path.display(), "rootfs exists (created by another process)");
+        info!(
+            path = %rootfs_path.display(),
+            "rootfs exists (created by another process)"
+        );
         flock.unlock().map_err(|(_, err)| err).ok();
         let _ = std::fs::remove_file(&lock_file);
         return Ok(rootfs_path);
     }
 
-    // Now we have exclusive access, create the rootfs
-    info!("creating base rootfs from Ubuntu cloud image");
-    info!("note: first-time cloud image download may take 5-15 minutes");
-    info!("cached rootfs creation takes ~45 seconds");
+    // Create the rootfs
+    info!(
+        script_sha = %script_sha_short,
+        "creating Layer 2 rootfs (first-time may take 5-15 minutes)"
+    );
 
-    // Create at temp path first, then rename when complete to avoid race conditions.
-    // Other processes check if rootfs_path exists, so we must not create it until
-    // package installation is complete.
-    let temp_rootfs_path = rootfs_path.with_extension("ext4.tmp");
+    // Log the generated script for debugging
+    debug!("generated setup script:\n{}", setup_script);
 
-    // Clean up any leftover temp file from a previous failed attempt
+    let temp_rootfs_path = rootfs_path.with_extension("raw.tmp");
     let _ = tokio::fs::remove_file(&temp_rootfs_path).await;
 
-    let result = create_ubuntu_rootfs(&temp_rootfs_path)
-        .await
-        .context("creating Ubuntu rootfs");
+    let result = create_layer2_rootless(&plan, script_sha_short, &setup_script, &temp_rootfs_path).await;
 
-    // If successful, rename temp file to final path
     if result.is_ok() {
         tokio::fs::rename(&temp_rootfs_path, &rootfs_path)
             .await
             .context("renaming temp rootfs to final path")?;
-        info!("rootfs creation complete");
+        info!(
+            path = %rootfs_path.display(),
+            script_sha = %script_sha_short,
+            "Layer 2 rootfs creation complete"
+        );
     } else {
-        // Clean up temp file on failure
         let _ = tokio::fs::remove_file(&temp_rootfs_path).await;
     }
 
@@ -213,593 +489,1061 @@ pub async fn ensure_rootfs() -> Result<PathBuf> {
     let _ = std::fs::remove_file(&lock_file);
 
     result?;
-
     Ok(rootfs_path)
 }
 
-/// Create Ubuntu rootfs from official cloud image
+/// Find the fc-agent binary for per-VM injection
 ///
-/// Downloads Ubuntu 24.04 cloud image (cached), customizes it with virt-customize,
-/// extracts to ext4, then installs packages.
-async fn create_ubuntu_rootfs(output_path: &Path) -> Result<()> {
-    // Download Ubuntu cloud image (cached)
-    let cloud_image = download_ubuntu_cloud_image().await?;
+/// fc-agent is NOT included in Layer 2 (the base rootfs). Instead, it is
+/// injected per-VM at boot time via initrd. This function is used to locate
+/// the binary for that injection.
+///
+/// Both fcvm and fc-agent are workspace members built together.
+/// Search order:
+/// 1. Same directory as current exe
+/// 2. Parent directory (for tests in target/release/deps/)
+/// 3. FC_AGENT_PATH environment variable
+pub fn find_fc_agent_binary() -> Result<PathBuf> {
+    let exe_path = std::env::current_exe().context("getting current executable path")?;
+    let exe_dir = exe_path.parent().context("getting executable directory")?;
 
-    info!("customizing Ubuntu cloud image with virt-customize");
-
-    // Customize the qcow2 image BEFORE extracting
-    customize_ubuntu_cloud_image(&cloud_image).await?;
-
-    // Extract root partition from customized cloud image
-    info!("extracting customized root partition");
-    extract_root_partition(&cloud_image, output_path).await?;
-
-    // Install packages after extraction (virt-customize has networking issues)
-    info!("installing packages in extracted rootfs");
-    install_packages_in_rootfs(output_path).await?;
-
-    Ok(())
-}
-
-/// Download Ubuntu cloud image (cached)
-async fn download_ubuntu_cloud_image() -> Result<PathBuf> {
-    let cache_dir = paths::base_dir().join("cache");
-    tokio::fs::create_dir_all(&cache_dir)
-        .await
-        .context("creating cache directory")?;
-
-    // Detect architecture and use appropriate cloud image
-    let (arch_name, cloud_arch) = match std::env::consts::ARCH {
-        "x86_64" => ("amd64", "amd64"),
-        "aarch64" => ("arm64", "arm64"),
-        other => bail!("unsupported architecture: {}", other),
-    };
-
-    let image_url = format!(
-        "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-{cloud_arch}.img"
-    );
-    let image_path = cache_dir.join(format!("ubuntu-24.04-{arch_name}.img"));
-
-    // Return cached image if it exists
-    if image_path.exists() {
-        info!(path = %image_path.display(), "using cached Ubuntu cloud image");
-        return Ok(image_path);
+    // Check same directory
+    let fc_agent = exe_dir.join("fc-agent");
+    if fc_agent.exists() {
+        return Ok(fc_agent);
     }
 
-    info!(url = %image_url, "downloading Ubuntu 24.04 cloud image");
-    info!("download size: ~644MB (one-time, cached for future use)");
-    info!("download may take 5-15 minutes depending on network speed");
-
-    // Download with reqwest
-    let client = reqwest::Client::new();
-    let response = client
-        .get(image_url)
-        .send()
-        .await
-        .context("downloading cloud image")?;
-
-    if !response.status().is_success() {
-        bail!("download failed with status: {}", response.status());
-    }
-
-    // Get content length for progress reporting
-    let total_size = response.content_length().unwrap_or(0);
-    let total_mb = total_size as f64 / 1024.0 / 1024.0;
-
-    // Stream to file with progress
-    let mut file = File::create(&image_path)
-        .await
-        .context("creating image file")?;
-
-    let bytes = response.bytes().await.context("reading response body")?;
-    let downloaded_mb = bytes.len() as f64 / 1024.0 / 1024.0;
-
-    file.write_all(&bytes).await.context("writing image file")?;
-    file.flush().await.context("flushing image file")?;
-
-    info!(path = %image_path.display(),
-          downloaded_mb = downloaded_mb,
-          expected_mb = total_mb,
-          "cloud image download complete");
-
-    Ok(image_path)
-}
-
-/// Extract root partition from qcow2 cloud image to a raw ext4 file
-async fn extract_root_partition(qcow2_path: &Path, output_path: &Path) -> Result<()> {
-    info!("extracting root partition from cloud image");
-
-    // Load nbd kernel module if not already loaded
-    let _ = Command::new("modprobe")
-        .arg("nbd")
-        .arg("max_part=8")
-        .output()
-        .await;
-
-    // Connect qcow2 to NBD device (with retry for parallel safety)
-    let nbd_device = connect_nbd_with_retry(qcow2_path, 5).await?;
-    let nbd_device = nbd_device.as_str();
-
-    // Force kernel to re-read partition table - required on some systems (e.g., CI runners)
-    // Try partprobe first (from parted), fall back to partx (from util-linux)
-    info!("scanning partition table");
-    let partprobe_result = Command::new("partprobe").arg(nbd_device).output().await;
-    if partprobe_result.is_err()
-        || !partprobe_result
-            .as_ref()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    {
-        // Fallback to partx
-        let _ = Command::new("partx")
-            .args(["-a", nbd_device])
-            .output()
-            .await;
-    }
-
-    // Wait for partition to appear with retry loop
-    let partition = format!("{}p1", nbd_device);
-
-    // Small delay to allow kernel to create partition device nodes
-    // This is needed because partprobe/partx returns before udev creates the nodes
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    let mut retries = 10;
-    while retries > 0 && !std::path::Path::new(&partition).exists() {
-        info!(
-            partition = %partition,
-            retries_left = retries,
-            "waiting for partition to appear"
-        );
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        retries -= 1;
-    }
-
-    // If partition still doesn't exist, try to create the device node manually.
-    // This is needed when running in a container where the host kernel creates
-    // the partition device on the host's devtmpfs, but the container has its own.
-    // NBD major is 43, partition 1 is minor 1.
-    //
-    // Extract device name (e.g., "nbd0" from "/dev/nbd0") for sysfs paths
-    let nbd_name = nbd_device.strip_prefix("/dev/").unwrap_or(nbd_device);
-
-    if !std::path::Path::new(&partition).exists() {
-        info!("partition not auto-created, trying mknod");
-
-        // Get partition info from sysfs
-        let sysfs_path = format!("/sys/block/{}/{}p1/dev", nbd_name, nbd_name);
-        let dev_info = tokio::fs::read_to_string(&sysfs_path).await;
-
-        if let Ok(dev_str) = dev_info {
-            // dev_str is "major:minor" e.g., "43:1"
-            let dev_str = dev_str.trim();
-            info!(dev = %dev_str, "found partition info in sysfs");
-
-            // Create device node with mknod
-            let mknod_result = Command::new("mknod")
-                .args([&partition, "b", "43", "1"])
-                .output()
-                .await;
-
-            if let Ok(output) = mknod_result {
-                if output.status.success() {
-                    info!(partition = %partition, "created partition device node");
-                } else {
-                    warn!("mknod failed: {}", String::from_utf8_lossy(&output.stderr));
-                }
-            }
-        } else {
-            // Try mknod with assumed minor number (1 for first partition)
-            info!("sysfs info not available, trying mknod with assumed minor 1");
-            let _ = Command::new("mknod")
-                .args([&partition, "b", "43", "1"])
-                .output()
-                .await;
+    // Check parent directory (test case)
+    if let Some(parent) = exe_dir.parent() {
+        let fc_agent_parent = parent.join("fc-agent");
+        if fc_agent_parent.exists() {
+            return Ok(fc_agent_parent);
         }
     }
 
-    // Final check
-    if !std::path::Path::new(&partition).exists() {
-        // List what devices exist for debugging
-        let ls_cmd = format!(
-            "ls -la {}* 2>/dev/null || echo 'no nbd devices'",
-            nbd_device
-        );
-        let ls_output = Command::new("sh").args(["-c", &ls_cmd]).output().await;
-        let devices = ls_output
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_else(|_| "failed to list".to_string());
+    // Fallback: environment variable
+    if let Ok(path) = std::env::var("FC_AGENT_PATH") {
+        let p = PathBuf::from(&path);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
 
-        // Also check sysfs for partition info
-        let sysfs_cmd = format!(
-            "cat /sys/block/{}/{}p1/dev 2>/dev/null || echo 'no sysfs info'",
-            nbd_name, nbd_name
-        );
-        let sysfs_output = Command::new("sh").args(["-c", &sysfs_cmd]).output().await;
-        let sysfs_info = sysfs_output
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_else(|_| "no sysfs".to_string());
+    bail!(
+        "fc-agent binary not found at {} or via FC_AGENT_PATH env var.\n\
+         Build with: cargo build --release",
+        fc_agent.display()
+    )
+}
 
+// ============================================================================
+// fc-agent Initrd Creation
+// ============================================================================
+
+/// The fc-agent systemd service unit file content
+const FC_AGENT_SERVICE: &str = r#"[Unit]
+Description=fcvm guest agent for container orchestration
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fc-agent
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
+"#;
+
+/// The init script for the initrd
+/// This runs before the real init, copies fc-agent to the rootfs, then switches root
+const INITRD_INIT_SCRIPT: &str = r#"#!/bin/busybox sh
+# fc-agent injection initrd
+# This runs before systemd, copies fc-agent to the rootfs, then switch_root
+
+# Install busybox applets
+/bin/busybox mkdir -p /bin /sbin /proc /sys /dev /newroot
+/bin/busybox --install -s /bin
+/bin/busybox --install -s /sbin
+
+# Mount essential filesystems
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+
+# Parse kernel cmdline to find root device
+ROOT=""
+for param in $(cat /proc/cmdline); do
+    case "$param" in
+        root=*)
+            ROOT="${param#root=}"
+            ;;
+    esac
+done
+
+if [ -z "$ROOT" ]; then
+    echo "ERROR: No root= parameter found in kernel cmdline"
+    exec /bin/sh
+fi
+
+# Handle /dev/vda1 style paths
+case "$ROOT" in
+    /dev/*)
+        # Wait for device to appear
+        for i in 1 2 3 4 5; do
+            if [ -b "$ROOT" ]; then
+                break
+            fi
+            echo "Waiting for $ROOT..."
+            sleep 1
+        done
+        ;;
+esac
+
+# Mount the real root filesystem
+echo "Mounting $ROOT as real root..."
+mount -o rw "$ROOT" /newroot
+
+if [ ! -d /newroot/usr ]; then
+    echo "ERROR: Failed to mount root filesystem"
+    exec /bin/sh
+fi
+
+# Copy fc-agent binary
+echo "Installing fc-agent..."
+cp /fc-agent /newroot/usr/local/bin/fc-agent
+chmod 755 /newroot/usr/local/bin/fc-agent
+
+# Copy service file
+cp /fc-agent.service /newroot/etc/systemd/system/fc-agent.service
+
+# Enable the service (create symlink)
+mkdir -p /newroot/etc/systemd/system/multi-user.target.wants
+ln -sf ../fc-agent.service /newroot/etc/systemd/system/multi-user.target.wants/fc-agent.service
+
+echo "fc-agent installed successfully"
+
+# Also ensure MMDS route config exists (in case setup script failed)
+mkdir -p /newroot/etc/systemd/network/10-eth0.network.d
+if [ ! -f /newroot/etc/systemd/network/10-eth0.network.d/mmds.conf ]; then
+    echo "Adding MMDS route config..."
+    cat > /newroot/etc/systemd/network/10-eth0.network.d/mmds.conf << 'MMDSCONF'
+[Route]
+Destination=169.254.169.254/32
+Scope=link
+MMDSCONF
+fi
+
+# Also create the base network config if missing
+if [ ! -f /newroot/etc/systemd/network/10-eth0.network ]; then
+    echo "Adding base network config..."
+    cat > /newroot/etc/systemd/network/10-eth0.network << 'NETCONF'
+[Match]
+Name=eth0
+
+[Network]
+KeepConfiguration=yes
+NETCONF
+fi
+
+# Cleanup
+umount /proc
+umount /sys
+umount /dev
+
+# Switch to the real root and exec init
+exec switch_root /newroot /sbin/init
+"#;
+
+/// Ensure the fc-agent initrd exists, creating if needed
+///
+/// The initrd is cached by fc-agent binary hash. When fc-agent is rebuilt,
+/// a new initrd is automatically created.
+///
+/// Returns the path to the initrd file.
+pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
+    // Find fc-agent binary
+    let fc_agent_path = find_fc_agent_binary()?;
+    let fc_agent_bytes = std::fs::read(&fc_agent_path)
+        .with_context(|| format!("reading fc-agent binary at {}", fc_agent_path.display()))?;
+    let fc_agent_sha = compute_sha256(&fc_agent_bytes);
+    let fc_agent_sha_short = &fc_agent_sha[..12];
+
+    // Check if initrd already exists for this fc-agent version
+    let initrd_dir = paths::base_dir().join("initrd");
+    let initrd_path = initrd_dir.join(format!("fc-agent-{}.initrd", fc_agent_sha_short));
+
+    if initrd_path.exists() {
+        debug!(
+            path = %initrd_path.display(),
+            fc_agent_sha = %fc_agent_sha_short,
+            "using cached fc-agent initrd"
+        );
+        return Ok(initrd_path);
+    }
+
+    // Create initrd directory
+    tokio::fs::create_dir_all(&initrd_dir)
+        .await
+        .context("creating initrd directory")?;
+
+    info!(
+        fc_agent = %fc_agent_path.display(),
+        fc_agent_sha = %fc_agent_sha_short,
+        "creating fc-agent initrd"
+    );
+
+    // Create temporary directory for initrd contents
+    let temp_dir = initrd_dir.join(format!(".initrd-build-{}", fc_agent_sha_short));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await?;
+
+    // Create directory structure
+    for dir in &["bin", "sbin", "dev", "proc", "sys", "newroot"] {
+        tokio::fs::create_dir_all(temp_dir.join(dir)).await?;
+    }
+
+    // Find busybox (prefer static version)
+    let busybox_path = find_busybox()?;
+
+    // Copy busybox
+    tokio::fs::copy(&busybox_path, temp_dir.join("bin/busybox")).await?;
+
+    // Make busybox executable
+    Command::new("chmod")
+        .args(["755", temp_dir.join("bin/busybox").to_str().unwrap()])
+        .output()
+        .await?;
+
+    // Write init script
+    tokio::fs::write(temp_dir.join("init"), INITRD_INIT_SCRIPT).await?;
+    Command::new("chmod")
+        .args(["755", temp_dir.join("init").to_str().unwrap()])
+        .output()
+        .await?;
+
+    // Copy fc-agent binary
+    tokio::fs::copy(&fc_agent_path, temp_dir.join("fc-agent")).await?;
+    Command::new("chmod")
+        .args(["755", temp_dir.join("fc-agent").to_str().unwrap()])
+        .output()
+        .await?;
+
+    // Write service file
+    tokio::fs::write(temp_dir.join("fc-agent.service"), FC_AGENT_SERVICE).await?;
+
+    // Create cpio archive (initrd format)
+    let temp_initrd = initrd_path.with_extension("initrd.tmp");
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            &format!(
+                "cd {} && find . | cpio -o -H newc 2>/dev/null | gzip > {}",
+                temp_dir.display(),
+                temp_initrd.display()
+            ),
+        ])
+        .output()
+        .await
+        .context("creating initrd cpio archive")?;
+
+    if !output.status.success() {
         bail!(
-            "partition {} not found after waiting. Devices: {}, Sysfs: {}",
-            partition,
-            devices.trim(),
-            sysfs_info.trim()
+            "Failed to create initrd: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
-    info!(partition = %partition, "copying root partition");
-    let output = Command::new("dd")
+    // Rename to final path
+    tokio::fs::rename(&temp_initrd, &initrd_path).await?;
+
+    // Cleanup temp directory
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+
+    info!(
+        path = %initrd_path.display(),
+        fc_agent_sha = %fc_agent_sha_short,
+        "fc-agent initrd created"
+    );
+
+    Ok(initrd_path)
+}
+
+/// Find busybox binary (prefer static version)
+fn find_busybox() -> Result<PathBuf> {
+    // Check for busybox-static first
+    for path in &["/bin/busybox-static", "/usr/bin/busybox-static", "/bin/busybox", "/usr/bin/busybox"] {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+
+    // Try which
+    if let Ok(output) = std::process::Command::new("which").arg("busybox").output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Ok(PathBuf::from(path));
+            }
+        }
+    }
+
+    bail!("busybox not found. Install with: apt-get install busybox-static")
+}
+
+// ============================================================================
+// Layer 2 Creation (Rootless)
+// ============================================================================
+
+/// Create Layer 2 rootfs without requiring root
+///
+/// 1. Download cloud image (qcow2, cached)
+/// 2. Convert to raw with qemu-img (no root)
+/// 3. Expand to 10GB (no root)
+/// 4. Download .deb packages on host (has network)
+/// 5. Create ISO with packages
+/// 6. Boot VM with cloud-init to install from local ISO (no network needed)
+/// 7. Wait for VM to shut down
+///
+/// NOTE: fc-agent is NOT included - it will be injected per-VM at boot time.
+async fn create_layer2_rootless(
+    plan: &Plan,
+    script_sha_short: &str,
+    script: &str,
+    output_path: &Path,
+) -> Result<()> {
+    // Step 1: Download cloud image (cached by URL)
+    let cloud_image = download_cloud_image(plan).await?;
+
+    // Step 2: Convert qcow2 to raw (no root required!)
+    info!("converting qcow2 to raw format (no root required)");
+    let full_disk_path = output_path.with_extension("full");
+    let output = Command::new("qemu-img")
         .args([
-            &format!("if={}", partition),
-            &format!("of={}", path_to_str(output_path)?),
-            "bs=4M",
+            "convert",
+            "-f", "qcow2",
+            "-O", "raw",
+            path_to_str(&cloud_image)?,
+            path_to_str(&full_disk_path)?,
         ])
         .output()
-        .await;
+        .await
+        .context("running qemu-img convert")?;
 
-    // Always disconnect NBD
-    let disconnect_output = Command::new("qemu-nbd")
-        .args(["--disconnect", nbd_device])
+    if !output.status.success() {
+        bail!(
+            "qemu-img convert failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Step 3: Extract partition 1 (root filesystem) using fdisk and dd
+    // This avoids GPT partition table issues with Firecracker
+    info!("extracting root partition from GPT disk (no root required)");
+    let partition_path = output_path.with_extension("converting");
+
+    // Get partition info using sfdisk
+    let output = Command::new("sfdisk")
+        .args(["-J", path_to_str(&full_disk_path)?])
         .output()
-        .await;
+        .await
+        .context("getting partition info")?;
 
-    // Check dd result
-    let output = output.context("running dd")?;
+    if !output.status.success() {
+        bail!("sfdisk failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    // Parse sfdisk JSON output to find partition 1
+    #[derive(serde::Deserialize)]
+    struct SfdiskOutput {
+        partitiontable: PartitionTable,
+    }
+    #[derive(serde::Deserialize)]
+    struct PartitionTable {
+        partitions: Vec<Partition>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Partition {
+        node: String,
+        start: u64,
+        size: u64,
+        #[serde(rename = "type")]
+        ptype: String,
+    }
+
+    let sfdisk_output: SfdiskOutput = serde_json::from_slice(&output.stdout)
+        .context("parsing sfdisk JSON output")?;
+
+    // Find the Linux filesystem partition (type ends with 0FC63DAF-8483-4772-8E79-3D69D8477DE4 or similar)
+    let root_part = sfdisk_output.partitiontable.partitions.iter()
+        .find(|p| p.ptype.contains("0FC63DAF") || p.node.ends_with("1"))
+        .ok_or_else(|| anyhow::anyhow!("Could not find root partition in GPT disk"))?;
+
+    info!(
+        partition = %root_part.node,
+        start_sector = root_part.start,
+        size_sectors = root_part.size,
+        "found root partition"
+    );
+
+    // Extract partition using dd (sector size is 512 bytes)
+    let output = Command::new("dd")
+        .args([
+            &format!("if={}", path_to_str(&full_disk_path)?),
+            &format!("of={}", path_to_str(&partition_path)?),
+            "bs=512",
+            &format!("skip={}", root_part.start),
+            &format!("count={}", root_part.size),
+            "status=progress",
+        ])
+        .output()
+        .await
+        .context("extracting partition with dd")?;
+
     if !output.status.success() {
         bail!("dd failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
-    // Check disconnect result
-    if let Ok(disc_out) = disconnect_output {
-        if !disc_out.status.success() {
-            warn!(
-                "qemu-nbd disconnect warning: {}",
-                String::from_utf8_lossy(&disc_out.stderr)
-            );
-        }
-    }
+    // Remove full disk image (no longer needed)
+    let _ = tokio::fs::remove_file(&full_disk_path).await;
 
-    // Resize the extracted ext4 to 10GB (plenty of space for containers)
-    info!("resizing filesystem to 10GB");
-
-    // First resize the file itself to 10GB
+    // Step 4: Expand the extracted partition to 10GB
+    info!("expanding partition to {}", LAYER2_SIZE);
     let output = Command::new("truncate")
-        .args(["-s", "10G", path_to_str(output_path)?])
+        .args(["-s", LAYER2_SIZE, path_to_str(&partition_path)?])
         .output()
         .await
-        .context("running truncate")?;
+        .context("expanding partition")?;
 
     if !output.status.success() {
-        bail!(
-            "truncate failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        bail!("truncate failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
-    // Check and fix filesystem
+    // Resize the ext4 filesystem to fill the partition
+    info!("resizing ext4 filesystem");
     let output = Command::new("e2fsck")
-        .args(["-f", "-y", path_to_str(output_path)?])
+        .args(["-f", "-y", path_to_str(&partition_path)?])
         .output()
         .await
         .context("running e2fsck")?;
+    // e2fsck may return non-zero even on success (exit code 1 = errors corrected)
 
-    if !output.status.success()
-        && !output
-            .status
-            .code()
-            .map(|c| c == 1 || c == 2)
-            .unwrap_or(false)
-    {
-        // Exit codes 1-2 are warnings, not errors
-        warn!(
-            "e2fsck warnings: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    // Resize filesystem to fill the file
     let output = Command::new("resize2fs")
-        .arg(path_to_str(output_path)?)
+        .args([path_to_str(&partition_path)?])
         .output()
         .await
         .context("running resize2fs")?;
 
     if !output.status.success() {
-        bail!(
-            "resize2fs failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        bail!("resize2fs failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
+    // Step 4b: Fix /etc/fstab to remove BOOT and UEFI entries
+    // This MUST happen before booting - systemd reads fstab before cloud-init runs
+    info!("fixing /etc/fstab to remove non-existent partition entries");
+    fix_fstab_in_image(&partition_path).await?;
+
+    // Step 5: Download packages on host (host has network!)
+    let packages_iso = download_packages_and_create_iso(plan, script_sha_short).await?;
+
+    // Step 6: Create initrd for Layer 2 setup
+    // The initrd runs before systemd and:
+    // - Mounts rootfs and packages ISO
+    // - Runs dpkg -i to install packages
+    // - Runs the setup script
+    // - Powers off
+    let install_script = generate_install_script();
+
+    let setup_initrd = create_layer2_setup_initrd(&install_script, script).await?;
+
+    // Step 7: Boot VM with initrd to run setup (no cloud-init needed!)
+    // Now we boot a pure ext4 partition (no GPT), so root=/dev/vda works
+    info!(
+        script_sha = %script_sha_short,
+        "booting VM with setup initrd"
+    );
+
+    boot_vm_for_setup(&partition_path, &packages_iso, &setup_initrd).await?;
+
+    // Step 7: Rename to final path
+    tokio::fs::rename(&partition_path, output_path)
+        .await
+        .context("renaming partition to output path")?;
+
+    // Cleanup packages ISO
+    let _ = tokio::fs::remove_file(&packages_iso).await;
+
+    info!("Layer 2 creation complete (packages installed from local ISO)");
     Ok(())
 }
 
-/// Customize Ubuntu cloud image using virt-customize
+/// Fix /etc/fstab in an ext4 image to remove BOOT and UEFI partition entries
 ///
-/// This modifies the qcow2 image in-place, adding Podman, fc-agent, and all configs.
-/// Much simpler and more robust than manual mount/chroot/unmount.
-async fn customize_ubuntu_cloud_image(image_path: &Path) -> Result<()> {
-    // Find fc-agent binary
-    let fc_agent_src = find_fc_agent_binary()?;
-
-    info!("running virt-customize on cloud image");
-
-    let mut cmd = Command::new("virt-customize");
-
-    // Enable verbose output for debugging
-    cmd.arg("--verbose");
-
-    // Set libguestfs environment for debugging
-    cmd.env("LIBGUESTFS_DEBUG", "1");
-    cmd.env("LIBGUESTFS_TRACE", "1");
-
-    cmd.arg("-a").arg(path_to_str(image_path)?);
-
-    // Disable networking to avoid passt errors (packages installed later via chroot)
-    cmd.arg("--no-network");
-
-    // 1. Fix /etc/fstab - remove BOOT and UEFI partitions that don't exist
-    cmd.arg("--run-command")
-        .arg("sed -i '/LABEL=BOOT/d;/LABEL=UEFI/d' /etc/fstab");
-
-    // 2. Copy fc-agent binary (packages installed later via chroot)
-    // Note: universe repository already enabled in base cloud image
-    info!("adding fc-agent binary");
-    cmd.arg("--run-command").arg("mkdir -p /usr/local/bin");
-    cmd.arg("--copy-in")
-        .arg(format!("{}:/usr/local/bin/", fc_agent_src.display()));
-    cmd.arg("--chmod").arg("0755:/usr/local/bin/fc-agent");
-
-    // 4. Write chrony config (create directory first)
-    info!("adding chrony config");
-    cmd.arg("--run-command").arg("mkdir -p /etc/chrony");
-    let chrony_conf = "# NTP servers from pool.ntp.org\npool pool.ntp.org iburst\n\n\
-                       # Allow clock to be stepped (not slewed) for large time differences\n\
-                       makestep 1.0 3\n\n\
-                       # Directory for drift and other runtime files\n\
-                       driftfile /var/lib/chrony/drift\n";
-    cmd.arg("--write")
-        .arg(format!("/etc/chrony/chrony.conf:{}", chrony_conf));
-
-    // 5. Write systemd-networkd config
-    info!("adding network config");
-    cmd.arg("--run-command")
-        .arg("mkdir -p /etc/systemd/network /etc/systemd/network/10-eth0.network.d");
-
-    let network_config = "[Match]\nName=eth0\n\n[Network]\n# Keep kernel IP configuration from ip= boot parameter\nKeepConfiguration=yes\n# DNS is provided via kernel ip= boot parameter (gateway IP where dnsmasq listens)\n";
-    cmd.arg("--write").arg(format!(
-        "/etc/systemd/network/10-eth0.network:{}",
-        network_config
-    ));
-
-    let mmds_route = "[Route]\nDestination=169.254.169.254/32\nScope=link\n";
-    cmd.arg("--write").arg(format!(
-        "/etc/systemd/network/10-eth0.network.d/mmds.conf:{}",
-        mmds_route
-    ));
-
-    // 6. DNS configuration note
-    // DNS is now handled by fc-agent at startup (parses kernel cmdline, writes /etc/resolv.conf)
-    // This avoids relying on systemd service ordering which was unreliable on some CI runners
-
-    // 7. Write fc-agent systemd service
-    info!("adding fc-agent service");
-    let fc_agent_service = "[Unit]\nDescription=fcvm guest agent for container orchestration\n\
-                            After=network.target\nWants=network.target\n\n\
-                            [Service]\nType=simple\nExecStart=/usr/local/bin/fc-agent\n\
-                            Restart=on-failure\nRestartSec=5\n\
-                            StandardOutput=journal+console\nStandardError=journal+console\n\n\
-                            [Install]\nWantedBy=multi-user.target\n";
-    cmd.arg("--write").arg(format!(
-        "/etc/systemd/system/fc-agent.service:{}",
-        fc_agent_service
-    ));
-
-    // 9. Enable services (fc-agent, other services enabled after package install)
-    info!("enabling systemd services");
-    cmd.arg("--run-command")
-        .arg("systemctl enable fc-agent systemd-networkd serial-getty@ttyS0");
-
-    info!("executing virt-customize (this should be quick)");
-
-    let output = cmd.output().await.context("running virt-customize")?;
+/// The Ubuntu cloud image has fstab entries for LABEL=BOOT and LABEL=UEFI
+/// which cause systemd to enter emergency mode when these partitions don't exist.
+/// We use debugfs to modify fstab directly in the ext4 image without mounting.
+async fn fix_fstab_in_image(image_path: &Path) -> Result<()> {
+    // Read current fstab using debugfs
+    let output = Command::new("debugfs")
+        .args(["-R", "cat /etc/fstab", path_to_str(image_path)?])
+        .output()
+        .await
+        .context("reading fstab with debugfs")?;
 
     if !output.status.success() {
         bail!(
-            "virt-customize failed:\n{}",
+            "debugfs read failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
 
-    info!("virt-customize completed successfully");
+    let fstab_content = String::from_utf8_lossy(&output.stdout);
 
-    Ok(())
-}
+    // Filter out BOOT and UEFI entries
+    let new_fstab: String = fstab_content
+        .lines()
+        .filter(|line| {
+            !line.contains("LABEL=BOOT") && !line.contains("LABEL=UEFI")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
-/// Install packages in extracted rootfs using mount + chroot
-///
-/// This is done AFTER extraction because virt-customize has networking issues.
-/// Still much simpler than the old approach - single-purpose mount+chroot.
-async fn install_packages_in_rootfs(rootfs_path: &Path) -> Result<()> {
-    let temp_dir = PathBuf::from("/tmp/fcvm-rootfs-install");
-    let mount_point = temp_dir.join("mnt");
+    debug!("new fstab content:\n{}", new_fstab);
 
-    // Cleanup any previous mounts
-    let _ = Command::new("umount")
-        .arg("-R")
-        .arg(path_to_str(&mount_point).unwrap_or("/tmp/fcvm-rootfs-install/mnt"))
-        .output()
-        .await;
-    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-
-    tokio::fs::create_dir_all(&mount_point)
+    // Write new fstab to a temp file
+    let temp_fstab = std::env::temp_dir().join("fstab.new");
+    tokio::fs::write(&temp_fstab, format!("{}\n", new_fstab))
         .await
-        .context("creating temp mount directory")?;
+        .context("writing temp fstab")?;
 
-    // Mount the rootfs
-    let output = Command::new("mount")
+    // Write the new fstab back using debugfs -w
+    // debugfs command: rm /etc/fstab; write /tmp/fstab.new /etc/fstab
+    let output = Command::new("debugfs")
         .args([
-            "-o",
-            "loop",
-            path_to_str(rootfs_path)?,
-            path_to_str(&mount_point)?,
+            "-w",
+            "-R",
+            &format!("rm /etc/fstab"),
+            path_to_str(image_path)?,
         ])
         .output()
         .await
-        .context("mounting rootfs for package installation")?;
+        .context("removing old fstab with debugfs")?;
 
+    // rm might fail if file doesn't exist, that's OK
     if !output.status.success() {
-        bail!(
-            "mount failed: {}. Are you running as root?",
+        debug!(
+            "debugfs rm fstab (might be expected): {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
 
-    // Mount required filesystems for chroot
-    for (fs, target) in [
-        ("proc", "proc"),
-        ("sysfs", "sys"),
-        ("devtmpfs", "dev"),
-        ("devpts", "dev/pts"),
-    ] {
-        let target_path = mount_point.join(target);
-        let _ = Command::new("mount")
-            .args(["-t", fs, fs, path_to_str(&target_path)?])
-            .output()
-            .await;
-    }
-
-    // Copy DNS resolution config into chroot for apt-get update
-    let resolv_conf_dest = mount_point.join("etc/resolv.conf");
-    // Remove existing resolv.conf (might be a symlink)
-    let _ = tokio::fs::remove_file(&resolv_conf_dest).await;
-    tokio::fs::copy("/etc/resolv.conf", &resolv_conf_dest)
+    let output = Command::new("debugfs")
+        .args([
+            "-w",
+            "-R",
+            &format!("write {} /etc/fstab", temp_fstab.display()),
+            path_to_str(image_path)?,
+        ])
+        .output()
         .await
-        .context("copying /etc/resolv.conf into chroot")?;
+        .context("writing new fstab with debugfs")?;
 
-    // Install packages via chroot
-    let result = async {
-        // Update apt cache (universe already enabled in base cloud image)
-        info!("running apt-get update in chroot");
-        let output = Command::new("chroot")
-            .arg(path_to_str(&mount_point)?)
-            .args(["apt-get", "update", "-y"])
-            .output()
-            .await
-            .context("running apt-get update in chroot")?;
-
-        // apt-get update completed successfully - no need to log verbose output
-
-        if !output.status.success() {
-            bail!(
-                "apt-get update failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        // Install packages (with verbose output)
-        info!("installing packages: podman crun fuse-overlayfs fuse3 haveged chrony");
-        info!("package installation typically takes 30-60 seconds");
-
-        let output = Command::new("chroot")
-            .arg(path_to_str(&mount_point)?)
-            .env("DEBIAN_FRONTEND", "noninteractive")
-            .args([
-                "apt-get",
-                "install",
-                "-y",
-                "-o",
-                "Dpkg::Options::=--force-confnew", // Force install new config files
-                "podman",
-                "crun",
-                "fuse-overlayfs",
-                "fuse3",
-                "haveged",
-                "chrony",
-            ])
-            .output()
-            .await
-            .context("installing packages in chroot")?;
-
-        // Log apt output for debugging
-        info!(
-            "apt-get install stdout:\n{}",
-            String::from_utf8_lossy(&output.stdout)
+    if !output.status.success() {
+        bail!(
+            "debugfs write failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
-        if !output.stderr.is_empty() {
-            info!(
-                "apt-get install stderr:\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
+    }
 
-        if !output.status.success() {
-            bail!(
-                "apt-get install failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
+    // Cleanup temp file
+    let _ = tokio::fs::remove_file(&temp_fstab).await;
 
-        // Enable services
-        let output = Command::new("chroot")
-            .arg(path_to_str(&mount_point)?)
-            .args(["systemctl", "enable", "haveged", "chrony"])
-            .output()
-            .await
-            .context("enabling services in chroot")?;
-
-        if !output.status.success() {
-            bail!(
-                "systemctl enable failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        // Configure Podman registries (after packages installed to avoid conffile conflict)
-        info!("configuring Podman container registries");
-        let registries_conf_path = mount_point.join("etc/containers/registries.conf");
-        let registries_content = "unqualified-search-registries = [\"docker.io\"]\n\n\
-                                  [[registry]]\n\
-                                  location = \"docker.io\"\n";
-        tokio::fs::write(&registries_conf_path, registries_content)
-            .await
-            .context("writing registries.conf")?;
-
-        // Write initial resolv.conf - will be overwritten by fcvm-setup-dns.service at boot
-        // The startup script extracts gateway IP from kernel cmdline and configures DNS
-        info!("configuring initial resolv.conf (will be updated at boot)");
-        let resolv_conf_path = mount_point.join("etc/resolv.conf");
-        tokio::fs::write(
-            &resolv_conf_path,
-            "# Placeholder - fcvm-setup-dns.service configures DNS at boot from kernel cmdline\nnameserver 127.0.0.53\n",
-        )
+    // Verify the change
+    let output = Command::new("debugfs")
+        .args(["-R", "cat /etc/fstab", path_to_str(image_path)?])
+        .output()
         .await
-        .context("writing resolv.conf")?;
+        .context("verifying fstab with debugfs")?;
 
-        Ok(())
+    let new_content = String::from_utf8_lossy(&output.stdout);
+    if new_content.contains("LABEL=BOOT") || new_content.contains("LABEL=UEFI") {
+        warn!("fstab still contains BOOT/UEFI entries after fix - VM may enter emergency mode");
+    } else {
+        info!("fstab fixed - removed BOOT and UEFI entries");
     }
-    .await;
-
-    // Always unmount (in reverse order)
-    for target in ["dev/pts", "dev", "sys", "proc", ""] {
-        let target_path = if target.is_empty() {
-            mount_point.clone()
-        } else {
-            mount_point.join(target)
-        };
-        let _ = Command::new("umount")
-            .arg(path_to_str(&target_path).unwrap_or(""))
-            .output()
-            .await;
-    }
-
-    // Cleanup
-    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-
-    result?;
-
-    info!("packages installed successfully");
 
     Ok(())
+}
+
+/// Create a Layer 2 setup initrd
+///
+/// This creates a busybox-based initrd that:
+/// 1. Mounts /dev/vda (rootfs) at /newroot
+/// 2. Mounts /dev/vdb (packages ISO) at /newroot/mnt/packages
+/// 3. Runs dpkg -i to install packages inside rootfs
+/// 4. Runs the setup script
+/// 5. Powers off the VM
+///
+/// This is more reliable than rc.local/cloud-init on Ubuntu 24.04.
+async fn create_layer2_setup_initrd(
+    install_script: &str,
+    setup_script: &str,
+) -> Result<PathBuf> {
+    info!("creating Layer 2 setup initrd");
+
+    let temp_dir = PathBuf::from("/tmp/fcvm-layer2-initrd");
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await?;
+
+    // Create the init script that runs before systemd
+    // This mounts rootfs, packages ISO, installs packages, runs setup, powers off
+    let init_script = generate_init_script(install_script, setup_script);
+
+    // Write init script
+    let init_path = temp_dir.join("init");
+    tokio::fs::write(&init_path, &init_script).await?;
+
+    // Make init executable
+    let output = Command::new("chmod")
+        .args(["755", path_to_str(&init_path)?])
+        .output()
+        .await
+        .context("making init executable")?;
+
+    if !output.status.success() {
+        bail!("Failed to chmod init: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    // Copy busybox static binary
+    let busybox_src = PathBuf::from("/bin/busybox");
+    let busybox_dst = temp_dir.join("bin").join("busybox");
+    tokio::fs::create_dir_all(temp_dir.join("bin")).await?;
+    tokio::fs::copy(&busybox_src, &busybox_dst)
+        .await
+        .context("copying busybox")?;
+
+    let output = Command::new("chmod")
+        .args(["755", path_to_str(&busybox_dst)?])
+        .output()
+        .await
+        .context("making busybox executable")?;
+
+    if !output.status.success() {
+        bail!("Failed to chmod busybox: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    // Create the initrd using cpio
+    let initrd_path = temp_dir.join("initrd.cpio.gz");
+    let cpio_output = Command::new("sh")
+        .args([
+            "-c",
+            &format!(
+                "cd {} && find . | cpio -o -H newc 2>/dev/null | gzip > {}",
+                temp_dir.display(),
+                initrd_path.display()
+            ),
+        ])
+        .output()
+        .await
+        .context("creating initrd cpio archive")?;
+
+    if !cpio_output.status.success() {
+        bail!(
+            "Failed to create initrd: {}",
+            String::from_utf8_lossy(&cpio_output.stderr)
+        );
+    }
+
+    info!(path = %initrd_path.display(), "Layer 2 setup initrd created");
+    Ok(initrd_path)
+}
+
+/// Download all required .deb packages on the host and create an ISO
+///
+/// NOTE: fc-agent is NOT included - it will be injected per-VM at boot time.
+async fn download_packages_and_create_iso(plan: &Plan, script_sha_short: &str) -> Result<PathBuf> {
+    let cache_dir = paths::base_dir().join("cache");
+    let packages_dir = cache_dir.join(format!("packages-{}", script_sha_short));
+    let packages_iso = cache_dir.join(format!("packages-{}.iso", script_sha_short));
+
+    // If ISO already exists, use it
+    if packages_iso.exists() {
+        info!(path = %packages_iso.display(), "using cached packages ISO");
+        return Ok(packages_iso);
+    }
+
+    // Create packages directory
+    let _ = tokio::fs::remove_dir_all(&packages_dir).await;
+    tokio::fs::create_dir_all(&packages_dir).await?;
+
+    // Get list of packages
+    let packages = plan.packages.all_packages();
+    let packages_str = packages.join(" ");
+
+    info!(packages = %packages_str, "downloading .deb packages on host");
+
+    // Download packages with dependencies using apt-get download
+    // We need to run this in a way that downloads packages for the target system
+    // Using apt-get download with proper architecture
+    let output = Command::new("apt-get")
+        .args([
+            "download",
+            "-o", &format!("Dir::Cache::archives={}", packages_dir.display()),
+        ])
+        .args(&packages)
+        .current_dir(&packages_dir)
+        .output()
+        .await
+        .context("downloading packages with apt-get")?;
+
+    if !output.status.success() {
+        // apt-get download might fail, try with apt-cache to get dependencies first
+        warn!("apt-get download failed, trying alternative method");
+
+        // Alternative: use apt-rdepends or manually download
+        for pkg in &packages {
+            let output = Command::new("apt-get")
+                .args(["download", pkg])
+                .current_dir(&packages_dir)
+                .output()
+                .await;
+
+            if let Ok(out) = output {
+                if !out.status.success() {
+                    warn!(package = %pkg, "failed to download package, continuing...");
+                }
+            }
+        }
+    }
+
+    // Also download dependencies
+    info!("downloading package dependencies");
+    let deps_output = Command::new("sh")
+        .args([
+            "-c",
+            &format!(
+                "apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts \
+                 --no-breaks --no-replaces --no-enhances {} | \
+                 grep '^\\w' | sort -u | xargs apt-get download 2>/dev/null || true",
+                packages_str
+            ),
+        ])
+        .current_dir(&packages_dir)
+        .output()
+        .await;
+
+    if let Err(e) = deps_output {
+        warn!(error = %e, "failed to download some dependencies, continuing...");
+    }
+
+    // Count downloaded packages
+    let mut count = 0;
+    if let Ok(mut entries) = tokio::fs::read_dir(&packages_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.path().extension().map(|e| e == "deb").unwrap_or(false) {
+                count += 1;
+            }
+        }
+    }
+    info!(count = count, "downloaded .deb packages");
+
+    if count == 0 {
+        bail!("No packages downloaded. Check network and apt configuration.");
+    }
+
+    // Create ISO from packages directory
+    info!("creating packages ISO");
+    let output = Command::new("genisoimage")
+        .args([
+            "-o", path_to_str(&packages_iso)?,
+            "-V", "PACKAGES",
+            "-r",
+            "-J",
+            path_to_str(&packages_dir)?,
+        ])
+        .output()
+        .await
+        .context("creating packages ISO")?;
+
+    if !output.status.success() {
+        bail!(
+            "genisoimage failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Cleanup packages directory (keep ISO)
+    let _ = tokio::fs::remove_dir_all(&packages_dir).await;
+
+    info!(path = %packages_iso.display(), "packages ISO created");
+    Ok(packages_iso)
+}
+
+/// Download cloud image (cached by URL hash)
+async fn download_cloud_image(plan: &Plan) -> Result<PathBuf> {
+    let cache_dir = paths::base_dir().join("cache");
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .context("creating cache directory")?;
+
+    // Get arch-specific config
+    let arch_config = match std::env::consts::ARCH {
+        "x86_64" => &plan.base.amd64,
+        "aarch64" => &plan.base.arm64,
+        other => bail!("unsupported architecture: {}", other),
+    };
+
+    let arch_name = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+
+    // Cache by URL hash - changing URL triggers re-download
+    let url_hash = &compute_sha256(arch_config.url.as_bytes())[..12];
+    let image_path = cache_dir.join(format!(
+        "ubuntu-{}-{}-{}.img",
+        plan.base.version,
+        arch_name,
+        url_hash
+    ));
+
+    // If cached, use it
+    if image_path.exists() {
+        info!(path = %image_path.display(), "using cached cloud image");
+        return Ok(image_path);
+    }
+
+    // Download
+    info!(
+        url = %arch_config.url,
+        "downloading Ubuntu cloud image (this may take several minutes)"
+    );
+
+    let temp_path = image_path.with_extension("img.download");
+    let output = Command::new("curl")
+        .args([
+            "-L",
+            "-o",
+            path_to_str(&temp_path)?,
+            "--progress-bar",
+            &arch_config.url,
+        ])
+        .status()
+        .await
+        .context("downloading cloud image")?;
+
+    if !output.success() {
+        bail!("curl failed to download cloud image");
+    }
+
+    // Rename to final path
+    tokio::fs::rename(&temp_path, &image_path)
+        .await
+        .context("renaming downloaded image")?;
+
+    info!(
+        path = %image_path.display(),
+        "cloud image downloaded"
+    );
+
+    Ok(image_path)
+}
+
+/// Boot a Firecracker VM to run the Layer 2 setup initrd
+///
+/// This boots with an initrd that:
+/// - Mounts rootfs (/dev/vda) and packages ISO (/dev/vdb)
+/// - Runs dpkg -i to install packages inside rootfs via chroot
+/// - Runs the setup script
+/// - Powers off when complete
+///
+/// NOTE: We don't use cloud-init because Firecracker's virtio-blk devices
+/// are not reliably detected by cloud-init's NoCloud datasource scanner.
+/// Instead, we use an initrd that runs setup before systemd.
+async fn boot_vm_for_setup(disk_path: &Path, packages_iso: &Path, initrd_path: &Path) -> Result<()> {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    // Create a temporary directory for this setup VM
+    let temp_dir = PathBuf::from("/tmp/fcvm-layer2-setup");
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await?;
+
+    let api_socket = temp_dir.join("firecracker.sock");
+    let log_path = temp_dir.join("firecracker.log");
+
+    // Find kernel
+    let kernel_path = paths::kernel_dir().join("vmlinux.bin");
+    if !kernel_path.exists() {
+        bail!("Kernel not found at {:?}. Run setup first.", kernel_path);
+    }
+
+    // Create serial console output file
+    let serial_path = temp_dir.join("serial.log");
+    let serial_file = std::fs::File::create(&serial_path)
+        .context("creating serial console file")?;
+
+    // Start Firecracker with serial console output
+    info!("starting Firecracker for Layer 2 setup (serial output: {})", serial_path.display());
+    let mut fc_process = Command::new("firecracker")
+        .args([
+            "--api-sock", path_to_str(&api_socket)?,
+            "--log-path", path_to_str(&log_path)?,
+            "--level", "Info",
+        ])
+        .stdout(serial_file.try_clone().context("cloning serial file")?)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("starting Firecracker")?;
+
+    // Wait for socket to be ready
+    for _ in 0..50 {
+        if api_socket.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    if !api_socket.exists() {
+        fc_process.kill().await.ok();
+        bail!("Firecracker API socket not created");
+    }
+
+    // Configure VM via API
+    let client = crate::firecracker::api::FirecrackerClient::new(api_socket.clone())?;
+
+    // Set boot source - boot from raw ext4 partition (no GPT)
+    // The disk IS the filesystem, so use root=/dev/vda directly
+    // No cloud-init needed - scripts are injected via debugfs and run by rc.local
+    client
+        .set_boot_source(crate::firecracker::api::BootSource {
+            kernel_image_path: kernel_path.display().to_string(),
+            // Boot with initrd that runs setup before trying to use systemd
+            // The initrd handles everything and powers off, so we don't need to worry about systemd
+            boot_args: Some("console=ttyS0 reboot=k panic=1 pci=off".to_string()),
+            initrd_path: Some(initrd_path.display().to_string()),
+        })
+        .await?;
+
+    // Add root drive (raw ext4 filesystem, no partition table)
+    client
+        .add_drive(
+            "rootfs",
+            crate::firecracker::api::Drive {
+                drive_id: "rootfs".to_string(),
+                path_on_host: disk_path.display().to_string(),
+                is_root_device: true,
+                is_read_only: false,
+                partuuid: None,
+                rate_limiter: None,
+            },
+        )
+        .await?;
+
+    // Add packages ISO (/dev/vdb) - contains .deb files for local install
+    client
+        .add_drive(
+            "packages",
+            crate::firecracker::api::Drive {
+                drive_id: "packages".to_string(),
+                path_on_host: packages_iso.display().to_string(),
+                is_root_device: false,
+                is_read_only: true,
+                partuuid: None,
+                rate_limiter: None,
+            },
+        )
+        .await?;
+
+    // Configure machine (minimal for setup)
+    client
+        .set_machine_config(crate::firecracker::api::MachineConfig {
+            vcpu_count: 2,
+            mem_size_mib: 2048, // 2GB for package installation
+            smt: Some(false),
+            cpu_template: None,
+            track_dirty_pages: None,
+        })
+        .await?;
+
+    // No network needed! Packages are installed from local ISO.
+
+    // Start the VM
+    client.put_action(crate::firecracker::api::InstanceAction::InstanceStart).await?;
+    info!("Layer 2 setup VM started, waiting for completion (this takes several minutes)");
+
+    // Wait for VM to shut down (setup script runs shutdown -h now when done)
+    // Timeout after 15 minutes
+    let start = std::time::Instant::now();
+    let mut last_serial_len = 0usize;
+    let result = timeout(Duration::from_secs(900), async {
+        loop {
+            // Check if Firecracker process has exited
+            match fc_process.try_wait() {
+                Ok(Some(status)) => {
+                    let elapsed = start.elapsed();
+                    info!("Firecracker exited with status: {:?} after {:?}", status, elapsed);
+                    return Ok(elapsed);
+                }
+                Ok(None) => {
+                    // Still running, check for new serial output and log it
+                    if let Ok(serial_content) = tokio::fs::read_to_string(&serial_path).await {
+                        if serial_content.len() > last_serial_len {
+                            // Log new output (trimmed to avoid excessive logging)
+                            let new_output = &serial_content[last_serial_len..];
+                            for line in new_output.lines() {
+                                // Skip empty lines and lines that are just timestamps
+                                if !line.trim().is_empty() {
+                                    debug!(target: "layer2_setup", "{}", line);
+                                }
+                            }
+                            last_serial_len = serial_content.len();
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Error checking Firecracker status: {}", e));
+                }
+            }
+        }
+    })
+    .await;
+
+    // Cleanup
+    fc_process.kill().await.ok();
+
+    match result {
+        Ok(Ok(elapsed)) => {
+            // Check for completion marker in serial output
+            let serial_content = tokio::fs::read_to_string(&serial_path).await.unwrap_or_default();
+            if !serial_content.contains("FCVM_SETUP_COMPLETE") {
+                warn!("Setup failed! Serial console output:\n{}", serial_content);
+                if let Ok(log_content) = tokio::fs::read_to_string(&log_path).await {
+                    warn!("Firecracker log:\n{}", log_content);
+                }
+                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+                bail!("Layer 2 setup failed (no FCVM_SETUP_COMPLETE marker found)");
+            }
+            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+            info!(elapsed_secs = elapsed.as_secs(), "Layer 2 setup VM completed successfully");
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+            Err(e)
+        }
+        Err(_) => {
+            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+            bail!("Layer 2 setup VM timed out after 15 minutes")
+        }
+    }
+}
+
+/// Helper to convert Path to str
+fn path_to_str(path: &Path) -> Result<&str> {
+    path.to_str()
+        .ok_or_else(|| anyhow::anyhow!("path contains invalid UTF-8: {:?}", path))
 }
