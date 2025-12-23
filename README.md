@@ -28,7 +28,7 @@ A Rust implementation that launches Firecracker microVMs to run Podman container
 
 **Storage**
 - btrfs filesystem at `/mnt/fcvm-btrfs` (for CoW disk snapshots)
-- Pre-built Firecracker kernel at `/mnt/fcvm-btrfs/kernels/vmlinux.bin`
+- Kernel auto-downloaded from Kata Containers release on first run
 
 ---
 
@@ -602,12 +602,17 @@ sudo fusermount3 -u /tmp/fuse-*-mount*
 
 ```
 /mnt/fcvm-btrfs/
-├── kernels/vmlinux.bin     # Firecracker kernel
-├── rootfs/base.ext4        # Base Ubuntu + Podman image
-├── vm-disks/{vm_id}/       # Per-VM disk (CoW reflink)
-├── snapshots/              # Firecracker snapshots
-├── state/                  # VM state JSON files
-└── cache/                  # Downloaded cloud images
+├── kernels/
+│   ├── vmlinux.bin            # Symlink to active kernel
+│   └── vmlinux-{sha}.bin      # Kernel (SHA of URL for cache key)
+├── rootfs/
+│   └── layer2-{sha}.raw       # Base Ubuntu + Podman (~10GB, SHA of setup script)
+├── initrd/
+│   └── fc-agent-{sha}.initrd  # fc-agent injection initrd (SHA of binary)
+├── vm-disks/{vm_id}/          # Per-VM disk (CoW reflink)
+├── snapshots/                 # Firecracker snapshots
+├── state/                     # VM state JSON files
+└── cache/                     # Downloaded cloud images
 ```
 
 ---

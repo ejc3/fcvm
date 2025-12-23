@@ -51,7 +51,13 @@ fcvm exec --pid <PID> -c -- wget -q -O - --timeout=10 http://ifconfig.me
 
 ### Code Philosophy
 
-**NO LEGACY/BACKWARD COMPATIBILITY in our own implementation.** When we change an API, we update all callers. No deprecated functions, no compatibility shims, no `_old` suffixes. Clean breaks only.
+**NO LEGACY/BACKWARD COMPATIBILITY.** This applies to everything: code, Makefile, documentation.
+
+- When we change an API, we update all callers
+- No deprecated functions, no compatibility shims, no `_old` suffixes
+- No legacy Makefile targets or aliases
+- No "keep this for backwards compatibility" comments
+- Clean breaks only - delete the old thing entirely
 
 Exception: For **forked libraries** (like fuse-backend-rs), we maintain compatibility with upstream to enable merging upstream changes.
 
@@ -572,8 +578,16 @@ fuse-pipe/benches/
 
 **Architecture:**
 - All data under `/mnt/fcvm-btrfs/` (btrfs filesystem)
-- Base rootfs: `/mnt/fcvm-btrfs/rootfs/base.ext4` (~1GB Ubuntu 24.04 + Podman)
-- VM disks: `/mnt/fcvm-btrfs/vm-disks/{vm_id}/disks/rootfs.ext4`
+- Base rootfs: `/mnt/fcvm-btrfs/rootfs/layer2-{sha}.raw` (~10GB raw disk with Ubuntu 24.04 + Podman)
+- VM disks: `/mnt/fcvm-btrfs/vm-disks/{vm_id}/disks/rootfs.raw`
+- Initrd: `/mnt/fcvm-btrfs/initrd/fc-agent-{sha}.initrd` (injects fc-agent at boot)
+
+**Layer System:**
+The rootfs is named after the SHA of the setup script + kernel URL. This ensures automatic cache invalidation when:
+- The init logic, install script, or setup script changes
+- The kernel URL changes (different kernel version)
+
+The initrd contains a statically-linked busybox and fc-agent binary, injected at boot before systemd.
 
 ```rust
 // src/storage/disk.rs - create_cow_disk()
@@ -599,10 +613,10 @@ pub fn vm_runtime_dir(vm_id: &str) -> PathBuf {
 **⚠️ CRITICAL: Changing VM base image (fc-agent, rootfs)**
 
 ALWAYS use Makefile commands to update the VM base:
-- `make rebuild` - Rebuild fc-agent and update rootfs
-- `make rootfs` - Update fc-agent in existing rootfs only
+- `make rebuild` - Rebuild fc-agent and regenerate rootfs/initrd
+- Rootfs is auto-regenerated when setup script changes (via SHA-based caching)
 
-NEVER manually edit `/mnt/fcvm-btrfs/rootfs/base.ext4` or mount it directly. The Makefile handles mount/unmount correctly and ensures proper cleanup.
+NEVER manually edit rootfs files. The setup script in `rootfs-plan.toml` and `src/setup/rootfs.rs` control what gets installed. Changes trigger automatic regeneration on next VM start.
 
 ### Memory Sharing (UFFD)
 
@@ -702,37 +716,33 @@ Run `make help` for full list. Key targets:
 #### Setup (idempotent, run automatically by tests)
 | Target | Description |
 |--------|-------------|
-| `make setup-all` | Full setup: btrfs + kernel + rootfs |
 | `make setup-btrfs` | Create btrfs loopback |
-| `make setup-kernel` | Copy kernel to btrfs |
-| `make setup-rootfs` | Create base rootfs (~90 sec first run) |
-
-#### Rootfs Updates
-| Target | Description |
-|--------|-------------|
-| `make rootfs` | Update fc-agent in existing rootfs |
-| `make rebuild` | Build + update rootfs |
+| `make setup-rootfs` | Trigger rootfs creation (~90 sec first run) |
 
 ### How Setup Works
 
 **What Makefile does (prerequisites):**
 1. `setup-btrfs` - Creates 20GB btrfs loopback at `/mnt/fcvm-btrfs`
-2. `setup-kernel` - Copies pre-built kernel from `~/linux-firecracker/arch/arm64/boot/Image`
 
 **What fcvm binary does (auto on first VM start):**
-1. `ensure_kernel()` - Checks for `/mnt/fcvm-btrfs/kernels/vmlinux.bin` (already copied by Makefile)
-2. `ensure_rootfs()` - If missing, downloads Ubuntu 24.04 cloud image (~590MB), customizes with virt-customize, installs podman/crun/etc, embeds fc-agent binary (~90 sec)
+1. `ensure_kernel()` - Downloads Kata kernel from URL in `rootfs-plan.toml` if not present (cached by URL hash)
+2. `ensure_rootfs()` - Creates Layer 2 rootfs if SHA doesn't match (downloads Ubuntu cloud image, runs setup in VM, creates initrd with fc-agent)
+
+**Kernel source**: Kata Containers kernel (6.12.47 from Kata 3.24.0 release) with `CONFIG_FUSE_FS=y` built-in. This is specified in `rootfs-plan.toml` and auto-downloaded on first run.
 
 ### Data Layout
 ```
 /mnt/fcvm-btrfs/           # btrfs filesystem (CoW reflinks work here)
 ├── kernels/
-│   └── vmlinux.bin        # Firecracker kernel
+│   ├── vmlinux.bin        # Symlink to active kernel
+│   └── vmlinux-{sha}.bin  # Kernel files (SHA of URL for cache key)
 ├── rootfs/
-│   └── base.ext4          # Base Ubuntu + Podman image (~10GB)
+│   └── layer2-{sha}.raw   # Base Ubuntu + Podman image (~10GB, SHA of setup script)
+├── initrd/
+│   └── fc-agent-{sha}.initrd  # fc-agent injection initrd (SHA of binary)
 ├── vm-disks/
 │   └── vm-{id}/
-│       └── rootfs.ext4    # CoW reflink copy per VM
+│       └── disks/rootfs.raw   # CoW reflink copy per VM
 ├── snapshots/             # Firecracker snapshots
 ├── state/                 # VM state JSON files
 └── cache/                 # Downloaded cloud images
