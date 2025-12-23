@@ -27,7 +27,6 @@ async fn test_egress_fresh_bridged() -> Result<()> {
 /// Test egress connectivity for fresh VM with rootless networking
 #[tokio::test]
 async fn test_egress_fresh_rootless() -> Result<()> {
-    common::require_non_root("test_egress_fresh_rootless")?;
     egress_fresh_test_impl("rootless").await
 }
 
@@ -41,7 +40,6 @@ async fn test_egress_clone_bridged() -> Result<()> {
 /// Test egress connectivity for cloned VM with rootless networking
 #[tokio::test]
 async fn test_egress_clone_rootless() -> Result<()> {
-    common::require_non_root("test_egress_clone_rootless")?;
     egress_clone_test_impl("rootless").await
 }
 

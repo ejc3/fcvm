@@ -15,7 +15,6 @@ async fn test_sanity_bridged() -> Result<()> {
 
 #[tokio::test]
 async fn test_sanity_rootless() -> Result<()> {
-    common::require_non_root("test_sanity_rootless")?;
     sanity_test_impl("rootless").await
 }
 

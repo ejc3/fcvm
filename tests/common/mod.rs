@@ -13,18 +13,6 @@ use tokio::time::sleep;
 /// Global counter for unique test IDs
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// Legacy guard function - now a no-op.
-///
-/// Previously prevented rootless tests from running as root, but testing shows
-/// `unshare --user --map-root-user` works fine when already root. The rootless
-/// networking stack (slirp4netns + user namespaces) works correctly regardless
-/// of whether we're running as root or not.
-///
-/// Kept for API compatibility but does nothing.
-#[allow(unused_variables)]
-pub fn require_non_root(test_name: &str) -> anyhow::Result<()> {
-    Ok(())
-}
 
 /// Check if we're running inside a container.
 ///

@@ -17,14 +17,12 @@ use tokio::sync::Mutex;
 /// Full snapshot/clone workflow test with rootless networking (10 clones)
 #[tokio::test]
 async fn test_snapshot_clone_rootless_10() -> Result<()> {
-    common::require_non_root("test_snapshot_clone_rootless_10")?;
     snapshot_clone_test_impl("rootless", 10).await
 }
 
 /// Stress test with 100 clones using rootless networking
 #[tokio::test]
 async fn test_snapshot_clone_stress_100() -> Result<()> {
-    common::require_non_root("test_snapshot_clone_stress_100")?;
     snapshot_clone_test_impl("rootless", 100).await
 }
 
@@ -534,7 +532,6 @@ async fn test_clone_internet_bridged() -> Result<()> {
 /// Test that clones can reach the internet in rootless mode
 #[tokio::test]
 async fn test_clone_internet_rootless() -> Result<()> {
-    common::require_non_root("test_clone_internet_rootless")?;
     clone_internet_test_impl("rootless").await
 }
 
@@ -1005,8 +1002,6 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
 /// Port forwarding is done via slirp4netns API, accessing via unique loopback IP.
 #[tokio::test]
 async fn test_clone_port_forward_rootless() -> Result<()> {
-    common::require_non_root("test_clone_port_forward_rootless")?;
-
     let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("pf-rootless");
 
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
@@ -1196,7 +1191,6 @@ async fn test_snapshot_run_exec_bridged() -> Result<()> {
 /// Test snapshot run --exec with rootless networking
 #[tokio::test]
 async fn test_snapshot_run_exec_rootless() -> Result<()> {
-    common::require_non_root("test_snapshot_run_exec_rootless")?;
     snapshot_run_exec_test_impl("rootless").await
 }
 
