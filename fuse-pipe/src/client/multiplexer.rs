@@ -203,7 +203,7 @@ impl Multiplexer {
                 let op = op_name.as_deref().unwrap_or("unknown");
                 collector.record(unique, op, s);
             } else {
-                // Print individual trace (legacy behavior)
+                // No collector - print trace directly
                 s.print(unique);
             }
         }
