@@ -3,7 +3,6 @@ SHELL := /bin/bash
 # Paths (can be overridden via environment for CI)
 FUSE_BACKEND_RS ?= /home/ubuntu/fuse-backend-rs
 FUSER ?= /home/ubuntu/fuser
-KERNEL_DIR ?= ~/linux-firecracker
 
 # Separate target directories for sudo vs non-sudo builds
 # This prevents permission conflicts when running tests in parallel
@@ -65,9 +64,6 @@ CTEST_PJDFSTEST := cargo nextest run --release -p fuse-pipe --test pjdfstest_ful
 CTEST_VM_UNPRIVILEGED := cargo nextest run -p fcvm --release $(FILTER)
 CTEST_VM_PRIVILEGED := cargo nextest run -p fcvm --release --features privileged-tests -E '!test(/rootless/)' $(FILTER)
 
-# Legacy alias
-TEST_VM := cargo nextest run --release --test test_sanity
-
 # Benchmark commands (fuse-pipe)
 BENCH_THROUGHPUT := cargo bench -p fuse-pipe --bench throughput
 BENCH_OPERATIONS := cargo bench -p fuse-pipe --bench operations
@@ -81,14 +77,13 @@ BENCH_EXEC := cargo bench --bench exec
         test-pjdfstest test-all-host test-all-container ci-local pre-push \
         bench bench-throughput bench-operations bench-protocol bench-exec bench-quick bench-logs bench-clean \
         lint clippy fmt fmt-check \
-        rootfs rebuild \
         container-build container-build-root container-build-rootless container-build-only container-build-allow-other \
         container-test container-test-unit container-test-noroot container-test-root container-test-fuse \
-        container-test-vm container-test-vm-unprivileged container-test-vm-privileged container-test-fcvm \
+        container-test-vm container-test-vm-unprivileged container-test-vm-privileged \
         container-test-pjdfstest container-test-all container-test-allow-other \
         container-bench container-bench-throughput container-bench-operations container-bench-protocol container-bench-exec \
         container-shell container-clean \
-        setup-btrfs setup-kernel setup-rootfs setup-all
+        setup-btrfs setup-rootfs setup-all
 
 all: build
 
@@ -127,14 +122,14 @@ help:
 	@echo "  make fmt   - Format code"
 	@echo ""
 	@echo "Setup:"
-	@echo "  make setup-all  - Full setup (btrfs + kernel + rootfs)"
-	@echo "  make rebuild    - Build + update fc-agent in rootfs"
+	@echo "  make setup-btrfs  - Create btrfs loopback (kernel/rootfs auto-created by fcvm)"
 
 #------------------------------------------------------------------------------
 # Setup targets (idempotent)
 #------------------------------------------------------------------------------
 
 # Create btrfs loopback filesystem if not mounted
+# Kernel is auto-downloaded by fcvm binary from Kata release (see rootfs-plan.toml)
 setup-btrfs:
 	@if ! mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then \
 		echo '==> Creating btrfs loopback...'; \
@@ -144,50 +139,18 @@ setup-btrfs:
 		fi && \
 		sudo mkdir -p /mnt/fcvm-btrfs && \
 		sudo mount -o loop /var/fcvm-btrfs.img /mnt/fcvm-btrfs && \
-		sudo mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,state,snapshots,vm-disks,cache} && \
+		sudo mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,initrd,state,snapshots,vm-disks,cache} && \
 		sudo chown -R $$(id -un):$$(id -gn) /mnt/fcvm-btrfs && \
 		echo '==> btrfs ready at /mnt/fcvm-btrfs'; \
 	fi
 
-# Copy kernel to btrfs (requires setup-btrfs)
-# For local dev: copies from KERNEL_DIR
-# For CI (x86_64): downloads pre-built kernel from Firecracker releases
-KERNEL_VERSION ?= 5.10.225
-setup-kernel: setup-btrfs
-	@if [ ! -f /mnt/fcvm-btrfs/kernels/vmlinux.bin ]; then \
-		ARCH=$$(uname -m); \
-		if [ "$$ARCH" = "x86_64" ] && [ ! -d "$(KERNEL_DIR)" ]; then \
-			echo "==> Downloading x86_64 kernel for CI..."; \
-			curl -sL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.11/x86_64/vmlinux-$(KERNEL_VERSION)" \
-				-o /mnt/fcvm-btrfs/kernels/vmlinux.bin && \
-			echo "==> Kernel ready (downloaded)"; \
-		else \
-			echo '==> Copying kernel...'; \
-			if [ "$$ARCH" = "aarch64" ]; then \
-				cp $(KERNEL_DIR)/arch/arm64/boot/Image /mnt/fcvm-btrfs/kernels/vmlinux.bin; \
-			else \
-				cp $(KERNEL_DIR)/arch/x86/boot/bzImage /mnt/fcvm-btrfs/kernels/vmlinux.bin; \
-			fi && \
-			echo '==> Kernel ready'; \
-		fi \
-	fi
-
-# Create base rootfs if missing (requires build + setup-kernel)
-# Rootfs is auto-created by fcvm binary on first VM start
-setup-rootfs: build setup-kernel
-	@if [ ! -f /mnt/fcvm-btrfs/rootfs/base.ext4 ]; then \
-		echo '==> Creating rootfs (first run, ~90 sec)...'; \
-		sudo ./target/release/fcvm podman run --name setup-tmp nginx:alpine & \
-		FCVM_PID=$$!; \
-		sleep 120; \
-		sudo kill $$FCVM_PID 2>/dev/null || true; \
-		echo '==> Rootfs created'; \
-	else \
-		echo '==> Rootfs exists'; \
-	fi
+# Create base rootfs if missing (requires build + setup-btrfs)
+# Rootfs and kernel are auto-created by fcvm binary on first VM start
+setup-rootfs: build setup-btrfs
+	@echo '==> Rootfs and kernel will be auto-created on first VM start'
 
 # Full setup
-setup-all: setup-btrfs setup-kernel setup-rootfs
+setup-all: setup-btrfs setup-rootfs
 	@echo "==> Setup complete"
 
 #------------------------------------------------------------------------------
@@ -245,11 +208,11 @@ test-fuse: build build-root
 	sudo $(TEST_FUSE_ROOT)
 
 # VM tests - unprivileged (no sudo needed)
-test-vm-unprivileged: build setup-kernel
+test-vm-unprivileged: build setup-btrfs
 	$(TEST_VM_UNPRIVILEGED)
 
 # VM tests - privileged (requires sudo, runs ALL tests including unprivileged)
-test-vm-privileged: build-root setup-kernel
+test-vm-privileged: build-root setup-btrfs
 	sudo $(TEST_VM_PRIVILEGED)
 
 # All VM tests: unprivileged first, then privileged
@@ -283,7 +246,7 @@ bench-operations: build
 bench-protocol: build
 	$(BENCH_PROTOCOL)
 
-bench-exec: build setup-kernel
+bench-exec: build setup-btrfs
 	@echo "==> Running exec benchmarks (bridged vs rootless)..."
 	sudo $(BENCH_EXEC)
 
@@ -322,24 +285,6 @@ fmt-check:
 	@echo "==> Checking format..."
 	cargo fmt -- --check
 
-#------------------------------------------------------------------------------
-# Rootfs management
-#------------------------------------------------------------------------------
-
-# Update fc-agent in existing rootfs (use after changing fc-agent code)
-rootfs: build
-	@echo "==> Updating fc-agent in rootfs..."
-	@sudo mkdir -p /tmp/rootfs-mount && \
-		sudo mount -o loop /mnt/fcvm-btrfs/rootfs/base.ext4 /tmp/rootfs-mount && \
-		sudo cp ./target/release/fc-agent /tmp/rootfs-mount/usr/local/bin/fc-agent && \
-		sudo chmod +x /tmp/rootfs-mount/usr/local/bin/fc-agent && \
-		sudo umount /tmp/rootfs-mount && \
-		sudo rmdir /tmp/rootfs-mount
-	@echo "==> fc-agent updated in rootfs"
-
-# Full rebuild: build + update rootfs
-rebuild: rootfs
-	@echo "==> Rebuild complete"
 
 #------------------------------------------------------------------------------
 # Container testing
@@ -531,19 +476,16 @@ container-test: container-test-noroot container-test-root
 
 # VM tests - unprivileged (tests fcvm without sudo inside container)
 # Uses CONTAINER_RUN_ROOTLESS with rootless podman --privileged
-container-test-vm-unprivileged: container-build-rootless setup-kernel
+container-test-vm-unprivileged: container-build-rootless setup-btrfs
 	$(CONTAINER_RUN_ROOTLESS) $(CONTAINER_TAG) $(CTEST_VM_UNPRIVILEGED)
 
 # VM tests - privileged (runs ALL tests including unprivileged)
-container-test-vm-privileged: container-build setup-kernel
+container-test-vm-privileged: container-build setup-btrfs
 	$(CONTAINER_RUN_FCVM) $(CONTAINER_TAG) $(CTEST_VM_PRIVILEGED)
 
 # All VM tests: privileged first (creates rootfs), then unprivileged
 # Use FILTER= to run subset, e.g.: make container-test-vm FILTER=exec
 container-test-vm: container-test-vm-privileged container-test-vm-unprivileged
-
-# Legacy alias (runs both VM tests)
-container-test-fcvm: container-test-vm
 
 container-test-pjdfstest: container-build-root
 	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) $(CTEST_PJDFSTEST)
@@ -568,7 +510,7 @@ container-bench-protocol: container-build
 	$(CONTAINER_RUN_FUSE) $(CONTAINER_TAG) $(BENCH_PROTOCOL)
 
 # fcvm exec benchmarks - requires VMs (uses CONTAINER_RUN_FCVM)
-container-bench-exec: container-build setup-kernel
+container-bench-exec: container-build setup-btrfs
 	@echo "==> Running exec benchmarks (bridged vs rootless)..."
 	$(CONTAINER_RUN_FCVM) $(CONTAINER_TAG) $(BENCH_EXEC)
 
