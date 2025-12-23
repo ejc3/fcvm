@@ -61,8 +61,12 @@ CTEST_PJDFSTEST := cargo nextest run --release -p fuse-pipe --test pjdfstest_ful
 # VM tests: privileged-tests feature gates tests that require sudo
 # Use -p fcvm to only run fcvm package tests (excludes fuse-pipe)
 # Filter out rootless tests from privileged run (same reason as host tests above)
-CTEST_VM_UNPRIVILEGED := cargo nextest run -p fcvm --release $(FILTER)
-CTEST_VM_PRIVILEGED := cargo nextest run -p fcvm --release --features privileged-tests -E '!test(/rootless/)' $(FILTER)
+# Build all packages first (fc-agent needed by VM tests), then run tests
+# Wrapped in sh -c to ensure && runs inside container, not on host
+CTEST_VM_UNPRIVILEGED := sh -c 'cargo build --release && cargo nextest run -p fcvm --release $(FILTER)'
+# Build all packages first (fc-agent needed by VM tests), then run tests
+# Wrapped in sh -c to ensure && runs inside container, not on host
+CTEST_VM_PRIVILEGED := sh -c 'cargo build --release && cargo nextest run -p fcvm --release --features privileged-tests -E "!test(/rootless/)" $(FILTER)'
 
 # Benchmark commands (fuse-pipe)
 BENCH_THROUGHPUT := cargo bench -p fuse-pipe --bench throughput
@@ -290,11 +294,8 @@ fmt-check:
 # Container testing
 #------------------------------------------------------------------------------
 
-# Source hash for container rebuild detection
-# Rebuild container if ANY source file changes (not just Containerfile)
-SOURCE_HASH := $(shell find src fuse-pipe/src fc-agent/src Cargo.toml Cargo.lock Containerfile -type f 2>/dev/null | sort | xargs cat 2>/dev/null | sha256sum | cut -c1-12)
-CONTAINER_TAG := fcvm-test:$(SOURCE_HASH)
-CONTAINER_MARKER := .container-$(SOURCE_HASH)
+# Container tag - podman layer caching handles incremental builds
+CONTAINER_TAG := fcvm-test:latest
 
 # CI mode: use host directories instead of named volumes (for artifact sharing)
 # Set CI=1 to enable artifact-compatible mode
@@ -337,26 +338,30 @@ CONTAINER_RUN_BASE_ROOT := podman run --rm --privileged \
 # Container run options for fuse-pipe tests (non-root)
 CONTAINER_RUN_FUSE := $(CONTAINER_RUN_BASE) \
 	--device /dev/fuse \
-	--cap-add=MKNOD \
-	--device-cgroup-rule='b *:* rwm' \
-	--device-cgroup-rule='c *:* rwm' \
 	--ulimit nofile=65536:65536 \
 	--ulimit nproc=65536:65536 \
 	--pids-limit=-1
 
 # Container run options for fuse-pipe tests (root)
+# Note: --device-cgroup-rule not supported in rootless mode
 CONTAINER_RUN_FUSE_ROOT := $(CONTAINER_RUN_BASE_ROOT) \
 	--device /dev/fuse \
-	--cap-add=MKNOD \
-	--device-cgroup-rule='b *:* rwm' \
-	--device-cgroup-rule='c *:* rwm' \
 	--ulimit nofile=65536:65536 \
 	--ulimit nproc=65536:65536 \
 	--pids-limit=-1
 
 # Container run options for fcvm tests (adds KVM, btrfs, netns)
 # Used for bridged mode tests that require root/iptables
-CONTAINER_RUN_FCVM := $(CONTAINER_RUN_BASE) \
+# REQUIRES sudo - network namespace creation needs real root, not user namespace root
+# Uses VOLUME_TARGET_ROOT for isolation from rootless podman builds
+CONTAINER_RUN_FCVM := sudo podman run --rm --privileged \
+	--group-add keep-groups \
+	-v .:/workspace/fcvm \
+	-v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs \
+	-v $(FUSER):/workspace/fuser \
+	$(VOLUME_TARGET_ROOT) \
+	$(VOLUME_CARGO) \
+	-e CARGO_HOME=/home/testuser/.cargo \
 	--device /dev/kvm \
 	--device /dev/fuse \
 	-v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
@@ -392,43 +397,17 @@ CONTAINER_RUN_ROOTLESS := podman --root=/tmp/podman-rootless run --rm \
 	-v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	--network host
 
-# Build container when source hash changes (any source file modified)
+# Build containers - podman layer caching handles incremental builds
 # CONTAINER_ARCH can be overridden: export CONTAINER_ARCH=x86_64 for CI
-# Old markers are removed by finding 12-char hex patterns (our hash format)
-$(CONTAINER_MARKER):
-	@echo "==> Source hash: $(SOURCE_HASH)"
-	@echo "==> Building container (source changed, ARCH=$(CONTAINER_ARCH))..."
+container-build:
+	@echo "==> Building rootless container (ARCH=$(CONTAINER_ARCH))..."
 	podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) .
-	@find . -maxdepth 1 -name '.container-????????????' -type f -delete 2>/dev/null || true
-	@touch $@
-	@echo "==> Container ready: $(CONTAINER_TAG)"
 
-container-build: $(CONTAINER_MARKER)
-	@echo "==> Pre-building all test binaries inside container..."
-	$(CONTAINER_RUN_FUSE) $(CONTAINER_TAG) cargo test --release --all-targets --no-run
+container-build-root:
+	@echo "==> Building root container (ARCH=$(CONTAINER_ARCH))..."
+	sudo podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) .
 
-# Build inside container only (no tests) - useful for CI artifact caching
-# Creates target/ with compiled binaries that can be uploaded/downloaded
-container-build-only: container-build
-	@echo "==> Building inside container (CI mode)..."
-	@mkdir -p target cargo-home
-	$(CONTAINER_RUN_FUSE) $(CONTAINER_TAG) cargo build --release --all-targets -p fuse-pipe
-
-# CONTAINER_ROOTLESS_MARKER is no longer needed since we use rootless podman everywhere
-# Keep for compatibility but it just creates the marker without export/import
-CONTAINER_ROOTLESS_MARKER := .container-rootless-$(SOURCE_HASH)
-$(CONTAINER_ROOTLESS_MARKER): $(CONTAINER_MARKER)
-	@find . -maxdepth 1 -name '.container-rootless-????????????' -type f -delete 2>/dev/null || true
-	@touch $@
-
-container-build-rootless: $(CONTAINER_ROOTLESS_MARKER)
-	@echo "==> Pre-building all test binaries inside rootless container..."
-	$(CONTAINER_RUN_ROOTLESS) $(CONTAINER_TAG) cargo test --release --all-targets --no-run
-
-# Build for container root tests (uses separate volume)
-container-build-root: $(CONTAINER_MARKER)
-	@echo "==> Pre-building all test binaries for container root tests..."
-	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) cargo test --release --all-targets --no-run
+container-build-rootless: container-build
 
 # Container tests - organized by root requirement
 # Non-root tests run with --user testuser to verify they don't need root
@@ -480,7 +459,7 @@ container-test-vm-unprivileged: container-build-rootless setup-btrfs
 	$(CONTAINER_RUN_ROOTLESS) $(CONTAINER_TAG) $(CTEST_VM_UNPRIVILEGED)
 
 # VM tests - privileged (runs ALL tests including unprivileged)
-container-test-vm-privileged: container-build setup-btrfs
+container-test-vm-privileged: container-build-root setup-btrfs
 	$(CONTAINER_RUN_FCVM) $(CONTAINER_TAG) $(CTEST_VM_PRIVILEGED)
 
 # All VM tests: privileged first (creates rootfs), then unprivileged
@@ -517,13 +496,11 @@ container-bench-exec: container-build setup-btrfs
 container-shell: container-build
 	$(CONTAINER_RUN_FUSE) -it $(CONTAINER_TAG) bash
 
-# Force container rebuild (removes markers and images)
+# Force container rebuild (removes images and volumes)
 container-clean:
-	@find . -maxdepth 1 -name '.container-????????????' -type f -delete 2>/dev/null || true
-	@find . -maxdepth 1 -name '.container-rootless-????????????' -type f -delete 2>/dev/null || true
 	podman rmi $(CONTAINER_TAG) 2>/dev/null || true
+	sudo podman rmi $(CONTAINER_TAG) 2>/dev/null || true
 	podman volume rm fcvm-cargo-target fcvm-cargo-target-root fcvm-cargo-home 2>/dev/null || true
-	podman --root=/tmp/podman-rootless rmi $(CONTAINER_TAG) 2>/dev/null || true
 
 #------------------------------------------------------------------------------
 # CI Simulation (local)

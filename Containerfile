@@ -9,9 +9,15 @@
 
 FROM docker.io/library/rust:1.83-bookworm
 
-# Install specific toolchain to match rust-toolchain.toml
+# Copy rust-toolchain.toml to read version from single source of truth
+COPY rust-toolchain.toml /tmp/rust-toolchain.toml
+
+# Install toolchain version from rust-toolchain.toml (avoids version drift)
 # Edition 2024 is stable since Rust 1.85
-RUN rustup toolchain install 1.92.0 --component rustfmt clippy && rustup default 1.92.0
+RUN RUST_VERSION=$(grep 'channel' /tmp/rust-toolchain.toml | cut -d'"' -f2) && \
+    rustup toolchain install $RUST_VERSION && \
+    rustup default $RUST_VERSION && \
+    rustup component add rustfmt clippy
 
 # Install cargo-nextest for better test parallelism and output
 RUN cargo install cargo-nextest --locked
@@ -45,6 +51,7 @@ RUN apt-get update && apt-get install -y \
     procps \
     # Required for initrd creation (must be statically linked for kernel boot)
     busybox-static \
+    cpio \
     # Clean up
     && rm -rf /var/lib/apt/lists/*
 
@@ -53,9 +60,8 @@ RUN apt-get update && apt-get install -y \
 ARG ARCH=aarch64
 RUN curl -L -o /tmp/firecracker.tgz \
     https://github.com/firecracker-microvm/firecracker/releases/download/v1.14.0/firecracker-v1.14.0-${ARCH}.tgz \
-    && tar -xzf /tmp/firecracker.tgz -C /tmp \
+    && tar --no-same-owner -xzf /tmp/firecracker.tgz -C /tmp \
     && mv /tmp/release-v1.14.0-${ARCH}/firecracker-v1.14.0-${ARCH} /usr/local/bin/firecracker \
-    && chown root:root /usr/local/bin/firecracker \
     && chmod +x /usr/local/bin/firecracker \
     && rm -rf /tmp/firecracker.tgz /tmp/release-v1.14.0-${ARCH}
 
@@ -71,13 +77,11 @@ RUN groupadd -f fuse \
     && useradd -m -s /bin/bash testuser \
     && usermod -aG fuse testuser
 
-# Install rust toolchain for testuser (root's toolchain is at /root/.rustup)
-# This prevents re-downloading toolchain when running as --user testuser
-USER testuser
-RUN rustup toolchain install 1.92.0 --component rustfmt clippy && rustup default 1.92.0
-# Install cargo-nextest for testuser
-RUN cargo install cargo-nextest --locked
+# Rust tools are installed system-wide at /usr/local/cargo (owned by root)
+# Both root and testuser can use rustup/cargo since it's in PATH
+# No need for per-user installs - system-wide toolchain is sufficient
 USER root
+WORKDIR /workspace
 
 # Configure subordinate UIDs/GIDs for rootless user namespaces
 # testuser (UID 1000) gets subordinate range 100000-165535 (65536 IDs)
