@@ -43,6 +43,8 @@ RUN apt-get update && apt-get install -y \
     curl \
     sudo \
     procps \
+    # Required for initrd creation (must be statically linked for kernel boot)
+    busybox-static \
     # Clean up
     && rm -rf /var/lib/apt/lists/*
 

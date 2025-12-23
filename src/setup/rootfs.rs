@@ -1200,8 +1200,8 @@ async fn create_layer2_setup_initrd(
         bail!("Failed to chmod init: {}", String::from_utf8_lossy(&output.stderr));
     }
 
-    // Copy busybox static binary
-    let busybox_src = PathBuf::from("/bin/busybox");
+    // Copy busybox static binary (prefer busybox-static if available)
+    let busybox_src = find_busybox()?;
     let busybox_dst = temp_dir.join("bin").join("busybox");
     tokio::fs::create_dir_all(temp_dir.join("bin")).await?;
     tokio::fs::copy(&busybox_src, &busybox_dst)
