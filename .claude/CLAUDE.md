@@ -92,6 +92,41 @@ Exception: For **forked libraries** (like fuse-backend-rs), we maintain compatib
 - Can stack multiple PRs without waiting
 - Merge at end when CI is green
 
+### Commit Messages
+
+**Detailed messages with context and testing.** Commit messages should capture the nuance from the session that created them.
+
+**What to include:**
+- **What changed** - specific files, functions, behaviors modified
+- **Why it changed** - the problem being solved or feature being added
+- **How it was tested** - "show don't tell" with actual commands/output
+
+**Good example:**
+```
+Remove obsolete require_non_root guard function
+
+The function was a no-op kept for "API compatibility" - exactly what
+our NO LEGACY policy prohibits. Rootless tests work fine under sudo.
+
+Removed function and all 12 call sites across test files.
+
+Tested: make test-vm FILTER=sanity (both rootless and bridged pass)
+```
+
+**Bad example:**
+```
+Fix tests
+```
+
+**Testing section format** - show actual commands:
+```
+Tested:
+  make test-vm FILTER=sanity     # 2 passed
+  make container-test-vm FILTER=sanity  # 2 passed
+```
+
+Not vague claims like "tested and works" or "verified manually".
+
 ### JSON Parsing
 
 **NEVER parse JSON with string matching.** Always use proper deserialization.
