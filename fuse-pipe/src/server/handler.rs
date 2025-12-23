@@ -19,24 +19,21 @@ pub trait FilesystemHandler: Send + Sync {
     /// the caller's supplementary groups, which are needed for proper permission
     /// checks (especially chown to a supplementary group).
     ///
-    /// The default implementation ignores supplementary_groups and calls
-    /// handle_request for backward compatibility. Handlers that need supplementary
-    /// groups should override this method.
+    /// Real handlers should override this method. The default ignores groups
+    /// and delegates to handle_request (suitable for simple test handlers).
     fn handle_request_with_groups(
         &self,
         request: &VolumeRequest,
         supplementary_groups: &[u32],
     ) -> VolumeResponse {
-        // Default: ignore groups for backward compatibility
         let _ = supplementary_groups;
         self.handle_request(request)
     }
 
     /// Handle a complete FUSE request (without supplementary groups).
     ///
-    /// This is kept for backward compatibility. New code should use
-    /// handle_request_with_groups. The default implementation
-    /// dispatches to individual operation methods.
+    /// Used by the default handle_request_with_groups. The default implementation
+    /// dispatches to individual operation methods (returning ENOSYS).
     fn handle_request(&self, request: &VolumeRequest) -> VolumeResponse {
         match request {
             VolumeRequest::Lookup {
