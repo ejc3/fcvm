@@ -807,12 +807,13 @@ pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
     tokio::fs::write(temp_dir.join("fc-agent.service"), FC_AGENT_SERVICE).await?;
 
     // Create cpio archive (initrd format)
+    // Use bash with pipefail so cpio errors aren't masked by gzip success (v3)
     let temp_initrd = initrd_path.with_extension("initrd.tmp");
-    let output = Command::new("sh")
+    let output = Command::new("bash")
         .args([
             "-c",
             &format!(
-                "cd {} && find . | cpio -o -H newc 2>/dev/null | gzip > {}",
+                "set -o pipefail && cd {} && find . | cpio -o -H newc | gzip > {}",
                 temp_dir.display(),
                 temp_initrd.display()
             ),
@@ -825,7 +826,8 @@ pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
         // Release lock before bailing
         let _ = flock.unlock();
         bail!(
-            "Failed to create initrd: {}",
+            "Failed to create initrd: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
     }
@@ -1236,12 +1238,13 @@ async fn create_layer2_setup_initrd(
     info!(count = package_count, "embedded packages in initrd");
 
     // Create the initrd using cpio
+    // Use bash with pipefail so cpio errors aren't masked by gzip success
     let initrd_path = temp_dir.join("initrd.cpio.gz");
-    let cpio_output = Command::new("sh")
+    let cpio_output = Command::new("bash")
         .args([
             "-c",
             &format!(
-                "cd {} && find . | cpio -o -H newc 2>/dev/null | gzip > {}",
+                "set -o pipefail && cd {} && find . | cpio -o -H newc | gzip > {}",
                 temp_dir.display(),
                 initrd_path.display()
             ),
@@ -1252,7 +1255,8 @@ async fn create_layer2_setup_initrd(
 
     if !cpio_output.status.success() {
         bail!(
-            "Failed to create initrd: {}",
+            "Failed to create initrd: stdout={}, stderr={}",
+            String::from_utf8_lossy(&cpio_output.stdout),
             String::from_utf8_lossy(&cpio_output.stderr)
         );
     }
