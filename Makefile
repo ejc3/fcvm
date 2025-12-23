@@ -38,13 +38,18 @@ TEST_FUSE_STRESS := CARGO_TARGET_DIR=$(TARGET_DIR) cargo nextest run --release -
 # Root required (uses TARGET_DIR_ROOT):
 TEST_FUSE_ROOT := CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo nextest run --release -p fuse-pipe --test integration_root
 # Note: test_permission_edge_cases requires C pjdfstest with -u/-g flags, only available in container
-TEST_PJDFSTEST := CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo nextest run --release -p fuse-pipe --test pjdfstest_full --no-capture
+TEST_PJDFSTEST := CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo nextest run --release -p fuse-pipe --test pjdfstest_full
 
 # VM tests: privileged-tests feature gates tests that require sudo
 # Unprivileged tests run by default (no feature flag)
 # Use -p fcvm to only run fcvm package tests (excludes fuse-pipe)
-TEST_VM_UNPRIVILEGED := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR) cargo nextest run -p fcvm --release --no-capture $(FILTER)"
-TEST_VM_PRIVILEGED := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo nextest run -p fcvm --release --features privileged-tests --no-capture $(FILTER)"
+#
+# IMPORTANT: Privileged tests filter out 'rootless' tests because:
+# - Rootless tests already run in the unprivileged phase (no sudo needed)
+# - Running rootless tests under sudo causes process group signal issues
+#   that kill namespace holder processes when tests run at full parallelism
+TEST_VM_UNPRIVILEGED := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR) cargo nextest run -p fcvm --release $(FILTER)"
+TEST_VM_PRIVILEGED := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo nextest run -p fcvm --release --features privileged-tests -E '!test(/rootless/)' $(FILTER)"
 
 # Container test commands (no CARGO_TARGET_DIR - volume mounts provide isolation)
 CTEST_UNIT := cargo nextest run --release --lib
@@ -52,15 +57,16 @@ CTEST_FUSE_NOROOT := cargo nextest run --release -p fuse-pipe --test integration
 CTEST_FUSE_STRESS := cargo nextest run --release -p fuse-pipe --test test_mount_stress
 CTEST_FUSE_ROOT := cargo nextest run --release -p fuse-pipe --test integration_root
 CTEST_FUSE_PERMISSION := cargo nextest run --release -p fuse-pipe --test test_permission_edge_cases
-CTEST_PJDFSTEST := cargo nextest run --release -p fuse-pipe --test pjdfstest_full --no-capture
+CTEST_PJDFSTEST := cargo nextest run --release -p fuse-pipe --test pjdfstest_full
 
 # VM tests: privileged-tests feature gates tests that require sudo
 # Use -p fcvm to only run fcvm package tests (excludes fuse-pipe)
-CTEST_VM_UNPRIVILEGED := cargo nextest run -p fcvm --release --no-capture $(FILTER)
-CTEST_VM_PRIVILEGED := cargo nextest run -p fcvm --release --features privileged-tests --no-capture $(FILTER)
+# Filter out rootless tests from privileged run (same reason as host tests above)
+CTEST_VM_UNPRIVILEGED := cargo nextest run -p fcvm --release $(FILTER)
+CTEST_VM_PRIVILEGED := cargo nextest run -p fcvm --release --features privileged-tests -E '!test(/rootless/)' $(FILTER)
 
 # Legacy alias
-TEST_VM := cargo nextest run --release --test test_sanity --no-capture
+TEST_VM := cargo nextest run --release --test test_sanity
 
 # Benchmark commands (fuse-pipe)
 BENCH_THROUGHPUT := cargo bench -p fuse-pipe --bench throughput
