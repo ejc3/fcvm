@@ -1392,11 +1392,6 @@ RUST_LOG=trace fcvm run nginx:latest
 - PID-based naming for additional uniqueness
 - Automatic cleanup on test exit
 
-**Dynamic NBD Device Selection**: When creating rootfs (extracting qcow2 images):
-- Scans `/dev/nbd0` through `/dev/nbd15` to find a free device
-- Checks `/sys/block/nbdN/pid` to detect in-use devices
-- Includes retry logic for race conditions during parallel execution
-
 **Privileged/Unprivileged Test Organization**:
 - Tests requiring sudo use `#[cfg(feature = "privileged-tests")]`
 - Unprivileged tests run by default (no feature flag needed)

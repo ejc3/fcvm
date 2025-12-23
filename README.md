@@ -24,7 +24,7 @@ A Rust implementation that launches Firecracker microVMs to run Podman container
 - Firecracker binary in PATH
 - For bridged networking: sudo, iptables, iproute2, dnsmasq
 - For rootless networking: slirp4netns
-- For building rootfs: virt-customize (libguestfs-tools), qemu-utils, e2fsprogs
+- For building rootfs: qemu-utils, e2fsprogs
 
 **Storage**
 - btrfs filesystem at `/mnt/fcvm-btrfs` (for CoW disk snapshots)
@@ -51,7 +51,7 @@ make container-test-all      # Everything
 | pjdfstest runtime | perl |
 | bindgen (userfaultfd-sys) | libclang-dev, clang |
 | VM tests | iproute2, iptables, slirp4netns, dnsmasq |
-| Rootfs build | qemu-utils, libguestfs-tools, e2fsprogs |
+| Rootfs build | qemu-utils, e2fsprogs |
 | User namespaces | uidmap (for newuidmap/newgidmap) |
 
 **pjdfstest Setup** (for POSIX compliance tests):
@@ -67,7 +67,7 @@ sudo apt-get update && sudo apt-get install -y \
     autoconf automake libtool perl \
     libclang-dev clang \
     iproute2 iptables slirp4netns dnsmasq \
-    qemu-utils libguestfs-tools e2fsprogs \
+    qemu-utils e2fsprogs \
     uidmap
 ```
 

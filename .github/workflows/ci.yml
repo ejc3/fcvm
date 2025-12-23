@@ -204,8 +204,6 @@ jobs:
           path: fuser
       - name: Setup KVM permissions
         run: sudo chmod 666 /dev/kvm
-      - name: Setup NBD module
-        run: sudo modprobe nbd max_part=8
       - name: Setup network namespace directory
         run: sudo mkdir -p /var/run/netns
       - name: Setup iptables for VM networking

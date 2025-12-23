@@ -9,8 +9,9 @@
 
 FROM docker.io/library/rust:1.83-bookworm
 
-# Install nightly toolchain for fuser (requires edition2024)
-RUN rustup toolchain install nightly && rustup default nightly
+# Install specific toolchain to match rust-toolchain.toml
+# Edition 2024 is stable since Rust 1.85
+RUN rustup toolchain install 1.92.0 --component rustfmt clippy && rustup default 1.92.0
 
 # Install cargo-nextest for better test parallelism and output
 RUN cargo install cargo-nextest --locked
@@ -35,7 +36,6 @@ RUN apt-get update && apt-get install -y \
     slirp4netns \
     dnsmasq \
     qemu-utils \
-    libguestfs-tools \
     e2fsprogs \
     parted \
     # Utilities
@@ -70,6 +70,14 @@ RUN git clone --depth 1 https://github.com/pjd/pjdfstest /tmp/pjdfstest-check \
 RUN groupadd -f fuse \
     && useradd -m -s /bin/bash testuser \
     && usermod -aG fuse testuser
+
+# Install rust toolchain for testuser (root's toolchain is at /root/.rustup)
+# This prevents re-downloading toolchain when running as --user testuser
+USER testuser
+RUN rustup toolchain install 1.92.0 --component rustfmt clippy && rustup default 1.92.0
+# Install cargo-nextest for testuser
+RUN cargo install cargo-nextest --locked
+USER root
 
 # Configure subordinate UIDs/GIDs for rootless user namespaces
 # testuser (UID 1000) gets subordinate range 100000-165535 (65536 IDs)

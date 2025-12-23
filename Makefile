@@ -313,7 +313,10 @@ endif
 # Container run with source mounts (code always fresh, can't run stale)
 # Cargo cache goes to testuser's home so non-root builds work
 # Note: We have separate bases for root vs non-root to use different target volumes
-CONTAINER_RUN_BASE := sudo podman run --rm --privileged \
+# Uses rootless podman - no sudo needed. --privileged grants capabilities within
+# user namespace which is sufficient for fuse tests and VM tests.
+CONTAINER_RUN_BASE := podman run --rm --privileged \
+	--group-add keep-groups \
 	-v .:/workspace/fcvm \
 	-v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs \
 	-v $(FUSER):/workspace/fuser \
@@ -322,7 +325,8 @@ CONTAINER_RUN_BASE := sudo podman run --rm --privileged \
 	-e CARGO_HOME=/home/testuser/.cargo
 
 # Same as CONTAINER_RUN_BASE but uses separate target volume for root tests
-CONTAINER_RUN_BASE_ROOT := sudo podman run --rm --privileged \
+CONTAINER_RUN_BASE_ROOT := podman run --rm --privileged \
+	--group-add keep-groups \
 	-v .:/workspace/fcvm \
 	-v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs \
 	-v $(FUSER):/workspace/fuser \
@@ -350,13 +354,11 @@ CONTAINER_RUN_FUSE_ROOT := $(CONTAINER_RUN_BASE_ROOT) \
 	--ulimit nproc=65536:65536 \
 	--pids-limit=-1
 
-# Container run options for fcvm tests (adds KVM, btrfs, netns, nbd)
+# Container run options for fcvm tests (adds KVM, btrfs, netns)
 # Used for bridged mode tests that require root/iptables
-# /dev/nbd0 needed for qemu-nbd rootfs extraction
 CONTAINER_RUN_FCVM := $(CONTAINER_RUN_BASE) \
 	--device /dev/kvm \
 	--device /dev/fuse \
-	--device /dev/nbd0 \
 	-v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	-v /var/run/netns:/var/run/netns:rshared \
 	--network host
@@ -396,7 +398,7 @@ CONTAINER_RUN_ROOTLESS := podman --root=/tmp/podman-rootless run --rm \
 $(CONTAINER_MARKER):
 	@echo "==> Source hash: $(SOURCE_HASH)"
 	@echo "==> Building container (source changed, ARCH=$(CONTAINER_ARCH))..."
-	sudo podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) .
+	podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) .
 	@find . -maxdepth 1 -name '.container-????????????' -type f -delete 2>/dev/null || true
 	@touch $@
 	@echo "==> Container ready: $(CONTAINER_TAG)"
@@ -412,12 +414,10 @@ container-build-only: container-build
 	@mkdir -p target cargo-home
 	$(CONTAINER_RUN_FUSE) $(CONTAINER_TAG) cargo build --release --all-targets -p fuse-pipe
 
-# Export container image for rootless podman (needed for container-test-vm-unprivileged)
-# Rootless podman has separate image storage, so we export from root and import
+# CONTAINER_ROOTLESS_MARKER is no longer needed since we use rootless podman everywhere
+# Keep for compatibility but it just creates the marker without export/import
 CONTAINER_ROOTLESS_MARKER := .container-rootless-$(SOURCE_HASH)
 $(CONTAINER_ROOTLESS_MARKER): $(CONTAINER_MARKER)
-	@echo "==> Exporting container for rootless podman..."
-	sudo podman save $(CONTAINER_TAG) | podman --root=/tmp/podman-rootless load
 	@find . -maxdepth 1 -name '.container-rootless-????????????' -type f -delete 2>/dev/null || true
 	@touch $@
 
@@ -465,7 +465,7 @@ CONTAINER_IMAGE_ALLOW_OTHER := fcvm-test-allow-other
 
 container-build-allow-other: container-build
 	@echo "==> Building allow-other container..."
-	sudo podman build -t $(CONTAINER_IMAGE_ALLOW_OTHER) -f Containerfile.allow-other .
+	podman build -t $(CONTAINER_IMAGE_ALLOW_OTHER) -f Containerfile.allow-other .
 
 container-test-allow-other: container-build-allow-other
 	@echo "==> Testing AllowOther with user_allow_other in fuse.conf..."
@@ -521,8 +521,8 @@ container-shell: container-build
 container-clean:
 	@find . -maxdepth 1 -name '.container-????????????' -type f -delete 2>/dev/null || true
 	@find . -maxdepth 1 -name '.container-rootless-????????????' -type f -delete 2>/dev/null || true
-	sudo podman rmi $(CONTAINER_TAG) 2>/dev/null || true
-	sudo podman volume rm fcvm-cargo-target fcvm-cargo-target-root fcvm-cargo-home 2>/dev/null || true
+	podman rmi $(CONTAINER_TAG) 2>/dev/null || true
+	podman volume rm fcvm-cargo-target fcvm-cargo-target-root fcvm-cargo-home 2>/dev/null || true
 	podman --root=/tmp/podman-rootless rmi $(CONTAINER_TAG) 2>/dev/null || true
 
 #------------------------------------------------------------------------------
