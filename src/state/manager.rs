@@ -138,6 +138,41 @@ impl StateManager {
         Ok(())
     }
 
+    /// Clean up stale state files from processes that no longer exist.
+    ///
+    /// This frees up loopback IPs that were allocated but not properly cleaned up
+    /// (e.g., due to crashes or SIGKILL). Called lazily during IP allocation.
+    async fn cleanup_stale_state(&self) {
+        let entries = match std::fs::read_dir(&self.state_dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            // Only process .json files
+            if path.extension().map(|e| e == "json").unwrap_or(false) {
+                // Read the state file to get the PID
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(state) = serde_json::from_str::<serde_json::Value>(&content) {
+                        if let Some(pid) = state.get("pid").and_then(|p| p.as_u64()) {
+                            // Check if process exists
+                            let proc_path = format!("/proc/{}", pid);
+                            if !std::path::Path::new(&proc_path).exists() {
+                                // Process doesn't exist - remove stale state
+                                let _ = std::fs::remove_file(&path);
+                                // Also remove lock file if exists
+                                let lock_path = path.with_extension("json.lock");
+                                let _ = std::fs::remove_file(&lock_path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Load VM state by name
     pub async fn load_state_by_name(&self, name: &str) -> Result<VmState> {
         let vms = self.list_vms().await?;
@@ -302,6 +337,10 @@ impl StateManager {
         let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
             .map_err(|(_, err)| err)
             .context("acquiring exclusive lock for loopback IP allocation")?;
+
+        // Lazily clean up stale state files from dead processes
+        // This frees up loopback IPs that were allocated but not properly cleaned up
+        self.cleanup_stale_state().await;
 
         // Collect IPs from all VM state files
         let used_ips: HashSet<String> = match self.list_vms().await {

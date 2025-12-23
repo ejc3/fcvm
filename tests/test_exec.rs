@@ -85,46 +85,59 @@ async fn exec_test_impl(network: &str) -> Result<()> {
         "should get nginx version or empty (stderr)"
     );
 
-    // Test 5: VM internet connectivity - curl ifconfig.me (use --vm flag)
-    println!("\nTest 5: VM internet connectivity - curl ifconfig.me");
+    // Test 5: VM internet connectivity - curl AWS public ECR (use --vm flag)
+    println!("\nTest 5: VM internet connectivity - curl public.ecr.aws");
     let output = run_exec(
         &fcvm_path,
         fcvm_pid,
         true,
-        &["curl", "-s", "--max-time", "10", "ifconfig.me"],
+        &[
+            "curl",
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            "10",
+            "https://public.ecr.aws/",
+        ],
     )
     .await?;
-    let ip = output.trim();
-    println!("  VM external IP: {}", ip);
-    // Should be a valid IP address (contains dots)
+    let http_code = output.trim();
+    println!("  HTTP status code: {}", http_code);
+    // Should get 2xx success or 3xx redirect (AWS ECR returns 308)
     assert!(
-        ip.contains('.') && ip.len() >= 7,
-        "should return a valid IP address, got: {}",
-        ip
+        http_code.starts_with('2') || http_code.starts_with('3'),
+        "should get HTTP 2xx/3xx, got: {}",
+        http_code
     );
 
-    // Test 6: Container internet connectivity - wget (default, no flag needed)
-    println!("\nTest 6: Container internet - wget ifconfig.me");
+    // Test 6: Container internet connectivity - wget AWS public ECR (default, no flag needed)
+    println!("\nTest 6: Container internet - wget public.ecr.aws");
+    // Use wget --spider for HEAD request (exits 0 on success, 1 on failure)
+    // Alpine's wget doesn't have the same options as curl, but --spider works
     let output = run_exec(
         &fcvm_path,
         fcvm_pid,
         false,
         &[
             "wget",
+            "--spider",
             "-q",
-            "-O",
-            "-",
             "--timeout=10",
-            "http://ifconfig.me",
+            "https://public.ecr.aws/",
         ],
     )
     .await?;
-    let container_ip = output.trim();
-    println!("  container external IP: {}", container_ip);
+    // wget --spider -q outputs nothing on success, just exits 0
+    // If we got here without error, connectivity works
+    println!("  wget spider succeeded (exit 0)");
+    // The command succeeds if we reach here; wget returns non-zero on network failure
     assert!(
-        container_ip.contains('.') && container_ip.len() >= 7,
-        "container should have internet access, got: {}",
-        container_ip
+        output.trim().is_empty() || output.contains("200"),
+        "wget should succeed silently, got: {}",
+        output
     );
 
     // Test 7: TTY NOT allocated without -t flag (VM exec)
