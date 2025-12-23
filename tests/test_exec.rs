@@ -19,7 +19,6 @@ async fn test_exec_bridged() -> Result<()> {
 
 #[tokio::test]
 async fn test_exec_rootless() -> Result<()> {
-    common::require_non_root("test_exec_rootless")?;
     exec_test_impl("rootless").await
 }
 

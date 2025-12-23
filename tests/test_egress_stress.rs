@@ -36,7 +36,6 @@ async fn test_egress_stress_bridged() -> Result<()> {
 /// Test egress stress with rootless networking using local HTTP server
 #[tokio::test]
 async fn test_egress_stress_rootless() -> Result<()> {
-    common::require_non_root("test_egress_stress_rootless")?;
     egress_stress_impl("rootless", NUM_CLONES, REQUESTS_PER_CLONE).await
 }
 

@@ -183,7 +183,6 @@ fn test_port_forward_bridged() -> Result<()> {
 /// allowing multiple VMs to all forward the same port.
 #[test]
 fn test_port_forward_rootless() -> Result<()> {
-    common::require_non_root("test_port_forward_rootless")?;
     println!("\ntest_port_forward_rootless");
 
     let fcvm_path = common::find_fcvm_binary()?;
