@@ -122,6 +122,38 @@ Why: String matching breaks when JSON formatting changes (spaces, newlines, fiel
 
 If a test fails intermittently, that's a **concurrency bug** or **race condition** that must be fixed, not ignored.
 
+### Race Condition Debugging Protocol
+
+**Workarounds are NOT acceptable.** When a test fails due to a race condition:
+
+1. **NEVER "fix" it with timing changes** like:
+   - Increasing timeouts
+   - Adding sleeps
+   - Separating phases that should work concurrently
+   - Reducing parallelism
+
+2. **ALWAYS examine the actual output:**
+   - Capture FULL logs from failing test runs
+   - Look at what the SPECIFIC failing component did/didn't do
+   - Trace timestamps to understand ordering
+   - Find the EXACT operation that failed
+
+3. **Ask the right questions:**
+   - What's different about the failing component vs. successful ones?
+   - What resource/state is being contended?
+   - What initialization happens on first access?
+   - Are there orphaned processes or stale state?
+
+4. **Find and fix the ROOT CAUSE:**
+   - If it's a lock ordering issue, fix the locking
+   - If it's uninitialized state, fix the initialization
+   - If it's resource exhaustion, fix the resource management
+   - If it's a cleanup issue, fix the cleanup
+
+**Example bad fix:** "Clone-0 times out while clones 1-99 succeed" → "Let's wait for all spawns before health checking"
+
+**Correct approach:** Look at clone-0's logs to see WHY it specifically failed. What did clone-0 do differently? What resource did it touch first?
+
 ### NO TEST HEDGES
 
 **Test assertions must be DEFINITIVE.** A test either PASSES or FAILS - no middle ground.
@@ -233,7 +265,33 @@ sleep 20 && tail -20 /tmp/test.log
 sleep 5 && ...
 
 # Bad - too slow (miss important output)
-sleep 60 && ...
+```
+
+### Preserving Logs from Failed Tests
+
+**When a test fails, IMMEDIATELY save the log to a uniquely-named file for diagnosis:**
+
+```bash
+# Pattern: /tmp/fcvm-failed-{test_name}-{timestamp}.log
+# Example after test_exec_rootless fails:
+cp /tmp/test.log /tmp/fcvm-failed-test_exec_rootless-$(date +%Y%m%d-%H%M%S).log
+
+# Then continue with other tests using a fresh log file
+make test-vm 2>&1 | tee /tmp/test-run2.log
+```
+
+**Why this matters:**
+- Test logs get overwritten when running the suite again
+- Failed test output is essential for root cause analysis
+- Timestamps prevent filename collisions across sessions
+
+**Automated approach:**
+```bash
+# After a test suite run, check for failures and save logs
+if grep -q "FAIL\|TIMEOUT" /tmp/test.log; then
+  cp /tmp/test.log /tmp/fcvm-failed-$(date +%Y%m%d-%H%M%S).log
+  echo "Saved failed test log"
+fi
 ```
 
 ### Debugging fuse-pipe Tests
