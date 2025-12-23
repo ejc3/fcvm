@@ -312,12 +312,15 @@ Each VM has:
 ```
 /mnt/fcvm-btrfs/               # btrfs filesystem (CoW reflinks work here)
 ├── kernels/
-│   └── vmlinux.bin            # Shared kernel
+│   ├── vmlinux.bin            # Symlink to active kernel
+│   └── vmlinux-{sha}.bin      # Kernel (SHA of URL for cache key)
 ├── rootfs/
-│   └── base.ext4              # Base rootfs image (~1GB Ubuntu + Podman)
+│   └── layer2-{sha}.raw       # Base rootfs (~10GB, SHA of setup script)
+├── initrd/
+│   └── fc-agent-{sha}.initrd  # fc-agent injection initrd (SHA of binary)
 ├── vm-disks/
 │   └── vm-{id}/
-│       └── rootfs.ext4        # CoW reflink copy per VM
+│       └── disks/rootfs.raw   # CoW reflink copy per VM
 ├── snapshots/
 │   └── {snapshot-name}/
 │       ├── vmstate.snap       # VM memory snapshot
@@ -340,9 +343,9 @@ Each VM has:
      /vm/merged
    ```
 
-2. **qcow2** (better for snapshots)
+2. **btrfs reflinks** (current implementation)
    ```bash
-   qcow2-img create -f qcow2 -b base.ext4 vm-overlay.qcow2
+   cp --reflink=always /mnt/fcvm-btrfs/rootfs/layer2-{sha}.raw /mnt/fcvm-btrfs/vm-disks/{id}/disks/rootfs.raw
    ```
 
 **Benefits**:
@@ -1249,8 +1252,8 @@ firecracker_bin: /usr/local/bin/firecracker
 # Kernel image
 kernel_path: /var/lib/fcvm/kernels/vmlinux.bin
 
-# Base rootfs image
-rootfs_path: /var/lib/fcvm/rootfs/base.ext4
+# Base rootfs directory (layer2-{sha}.raw files)
+rootfs_dir: /var/lib/fcvm/rootfs
 
 # Default settings
 defaults:
@@ -1298,7 +1301,7 @@ logging:
     },
     "disks": [
       {
-        "path": "/var/lib/fcvm/vms/abc123/rootfs.ext4",
+        "path": "/var/lib/fcvm/vms/abc123/rootfs.raw",
         "is_root": true
       }
     ],
