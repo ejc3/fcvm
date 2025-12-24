@@ -69,7 +69,7 @@ jobs:
           make container-test-pjdfstest
 
   vm:
-    name: VM
+    name: Host (sudo+rootless)
     runs-on: buildjet-32vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
