@@ -65,11 +65,13 @@ TEST_PJDFSTEST := CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo nextest run --releas
 # Use -p fcvm to only run fcvm package tests (excludes fuse-pipe)
 #
 # VM test command - runs all tests with privileged-tests feature
-# Test binaries run via target runner (sudo -E) from .cargo/config.toml
+# Sets target runner to "sudo -E" so test binaries run with privileges
+# (not set globally in .cargo/config.toml to avoid affecting non-root tests)
 # Excludes rootless tests which have signal handling issues under sudo
-TEST_VM := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR) FCVM_STRACE_AGENT=$(FCVM_STRACE_AGENT) cargo nextest run -p fcvm --release $(NEXTEST_CAPTURE) --features privileged-tests -E '!test(/rootless/)' $(FILTER)"
+TEST_VM := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR) FCVM_STRACE_AGENT=$(FCVM_STRACE_AGENT) CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' cargo nextest run -p fcvm --release $(NEXTEST_CAPTURE) --features privileged-tests -E '!test(/rootless/)' $(FILTER)"
 
 # Container test commands (no CARGO_TARGET_DIR - volume mounts provide isolation)
+# No global target runner in .cargo/config.toml, so these run without sudo by default
 CTEST_UNIT := cargo nextest run --release --lib
 CTEST_FUSE_NOROOT := cargo nextest run --release -p fuse-pipe --test integration
 CTEST_FUSE_STRESS := cargo nextest run --release -p fuse-pipe --test test_mount_stress
@@ -109,7 +111,7 @@ help:
 	@echo "  make clean       - Clean build artifacts"
 	@echo ""
 	@echo "Testing (with optional FILTER and STREAM):"
-	@echo "  Test binaries run via target runner (sudo -E) from .cargo/config.toml"
+	@echo "  VM tests run with sudo (via CARGO_TARGET_*_RUNNER env vars)"
 	@echo "  Use FILTER= to filter tests matching a pattern, STREAM=1 for live output."
 	@echo ""
 	@echo "  make test-vm                    - All VM tests"
@@ -239,7 +241,7 @@ test-fuse: build build-root
 	sudo $(TEST_FUSE_ROOT)
 
 # VM tests - runs all tests with privileged-tests feature
-# Test binaries run via target runner (sudo -E) from .cargo/config.toml
+# Test binaries run with sudo via CARGO_TARGET_*_RUNNER env vars
 # Use FILTER= to run subset, e.g.: make test-vm FILTER=exec
 test-vm: build setup-btrfs
 ifeq ($(STREAM),1)
@@ -370,7 +372,9 @@ CONTAINER_RUN_FUSE := $(CONTAINER_RUN_BASE) \
 
 # Container run options for fuse-pipe tests (root)
 # Note: --device-cgroup-rule not supported in rootless mode
+# Uses --user root to override Containerfile's USER testuser
 CONTAINER_RUN_FUSE_ROOT := $(CONTAINER_RUN_BASE_ROOT) \
+	--user root \
 	--device /dev/fuse \
 	--ulimit nofile=65536:65536 \
 	--ulimit nproc=65536:65536 \
@@ -485,7 +489,7 @@ container-test-allow-other: container-build-allow-other
 container-test: container-test-noroot container-test-root
 
 # VM tests in container
-# Uses privileged container since test binaries run via target runner (sudo -E)
+# Uses privileged container, test binaries run with sudo via CARGO_TARGET_*_RUNNER
 # Use FILTER= to run subset, e.g.: make container-test-vm FILTER=exec
 container-test-vm: container-build-root setup-btrfs
 	$(CONTAINER_RUN_FCVM) $(CONTAINER_TAG) make test-vm TARGET_DIR=target FILTER=$(FILTER) STREAM=$(STREAM) STRACE=$(STRACE)

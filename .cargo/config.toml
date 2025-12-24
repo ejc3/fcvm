@@ -1,7 +1,6 @@
-# Target runner for running tests with elevated privileges
-# This allows cargo/rustup to run as normal user while test binaries run as root
-[target.aarch64-unknown-linux-gnu]
-runner = "sudo -E"
-
-[target.x86_64-unknown-linux-gnu]
-runner = "sudo -E"
+# Cargo configuration for fcvm
+#
+# Note: NO global target runner here. Tests that need sudo explicitly
+# set CARGO_TARGET_*_RUNNER in the Makefile. This is more secure
+# (opt-in to privileges) and avoids needing to clear the env var
+# for non-root tests.
