@@ -11,7 +11,7 @@ env:
 
 jobs:
   container-rootless:
-    name: Lint + Tests (rootless)
+    name: Container (rootless)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,7 +40,7 @@ jobs:
           make container-test-noroot
 
   container-sudo:
-    name: FUSE + POSIX (sudo)
+    name: Container (sudo)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -69,7 +69,7 @@ jobs:
           make container-test-pjdfstest
 
   vm:
-    name: VM Tests (KVM)
+    name: VM
     runs-on: buildjet-32vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
