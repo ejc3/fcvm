@@ -31,7 +31,7 @@ pub enum Commands {
     Snapshots,
     /// Execute a command in a running VM
     Exec(ExecArgs),
-    /// Setup kernel and rootfs (downloads ~500MB, takes 5-10 minutes on first run)
+    /// Setup kernel and rootfs (kernel ~15MB download, rootfs ~10GB creation, takes 5-10 minutes)
     Setup,
 }
 
@@ -110,7 +110,7 @@ pub struct RunArgs {
     #[arg(long)]
     pub strace_agent: bool,
 
-    /// Run setup if kernel/rootfs are missing (downloads ~500MB, takes 5-10 minutes)
+    /// Run setup if kernel/rootfs are missing (takes 5-10 minutes on first run)
     /// Without this flag, fcvm will fail if setup hasn't been run
     #[arg(long)]
     pub setup: bool,
