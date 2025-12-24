@@ -73,6 +73,8 @@ pub struct PackagesConfig {
     pub runtime: Vec<String>,
     pub fuse: Vec<String>,
     pub system: Vec<String>,
+    #[serde(default)]
+    pub debug: Vec<String>,
 }
 
 impl PackagesConfig {
@@ -81,6 +83,7 @@ impl PackagesConfig {
             .iter()
             .chain(&self.fuse)
             .chain(&self.system)
+            .chain(&self.debug)
             .map(|s| s.as_str())
             .collect()
     }
@@ -578,6 +581,7 @@ pub fn find_fc_agent_binary() -> Result<PathBuf> {
 // ============================================================================
 
 /// The fc-agent systemd service unit file content
+/// Supports optional strace via kernel cmdline parameter fc_agent_strace=1
 const FC_AGENT_SERVICE: &str = r#"[Unit]
 Description=fcvm guest agent for container orchestration
 After=network.target
@@ -587,6 +591,27 @@ Type=simple
 ExecStart=/usr/local/bin/fc-agent
 Restart=on-failure
 RestartSec=1
+# Send stdout/stderr to serial console so fcvm host can see fc-agent logs
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target
+"#;
+
+/// The fc-agent systemd service unit file with strace enabled
+const FC_AGENT_SERVICE_STRACE: &str = r#"[Unit]
+Description=fcvm guest agent for container orchestration (with strace)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fc-agent-strace-wrapper
+Restart=on-failure
+RestartSec=1
+# Send stdout/stderr to serial console so fcvm host can see fc-agent logs
+StandardOutput=journal+console
+StandardError=journal+console
 
 [Install]
 WantedBy=multi-user.target
@@ -608,12 +633,17 @@ mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 
-# Parse kernel cmdline to find root device
+# Parse kernel cmdline to find root device and debug flags
 ROOT=""
+FC_AGENT_STRACE=""
 for param in $(cat /proc/cmdline); do
     case "$param" in
         root=*)
             ROOT="${param#root=}"
+            ;;
+        fc_agent_strace=1)
+            FC_AGENT_STRACE="1"
+            echo "fc-agent strace debugging ENABLED"
             ;;
     esac
 done
@@ -651,8 +681,21 @@ echo "Installing fc-agent..."
 cp /fc-agent /newroot/usr/local/bin/fc-agent
 chmod 755 /newroot/usr/local/bin/fc-agent
 
-# Copy service file
-cp /fc-agent.service /newroot/etc/systemd/system/fc-agent.service
+# Copy service file (use strace version if debugging enabled)
+if [ -n "$FC_AGENT_STRACE" ]; then
+    echo "Installing fc-agent with strace wrapper..."
+    cp /fc-agent.service.strace /newroot/etc/systemd/system/fc-agent.service
+    # Create wrapper script that tees strace to both file and serial console
+    cat > /newroot/usr/local/bin/fc-agent-strace-wrapper << 'STRACE_WRAPPER'
+#!/bin/bash
+# Write strace output to both file and serial console (/dev/console)
+# This ensures we see crash info in Firecracker serial output
+exec strace -f -o >(tee /tmp/fc-agent.strace > /dev/console 2>&1) /usr/local/bin/fc-agent "$@"
+STRACE_WRAPPER
+    chmod 755 /newroot/usr/local/bin/fc-agent-strace-wrapper
+else
+    cp /fc-agent.service /newroot/etc/systemd/system/fc-agent.service
+fi
 
 # Enable the service (create symlink)
 mkdir -p /newroot/etc/systemd/system/multi-user.target.wants
@@ -694,8 +737,12 @@ exec switch_root /newroot /sbin/init
 
 /// Ensure the fc-agent initrd exists, creating if needed
 ///
-/// The initrd is cached by fc-agent binary hash. When fc-agent is rebuilt,
-/// a new initrd is automatically created.
+/// The initrd is cached by a combined hash of:
+/// - fc-agent binary
+/// - init script content (INITRD_INIT_SCRIPT)
+/// - service file content (FC_AGENT_SERVICE, FC_AGENT_SERVICE_STRACE)
+///
+/// This ensures the initrd is regenerated when any of these change.
 ///
 /// Returns the path to the initrd file.
 ///
@@ -706,17 +753,23 @@ pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
     let fc_agent_path = find_fc_agent_binary()?;
     let fc_agent_bytes = std::fs::read(&fc_agent_path)
         .with_context(|| format!("reading fc-agent binary at {}", fc_agent_path.display()))?;
-    let fc_agent_sha = compute_sha256(&fc_agent_bytes);
-    let fc_agent_sha_short = &fc_agent_sha[..12];
 
-    // Check if initrd already exists for this fc-agent version (fast path, no lock)
+    // Compute combined hash of all initrd contents
+    let mut combined = fc_agent_bytes.clone();
+    combined.extend_from_slice(INITRD_INIT_SCRIPT.as_bytes());
+    combined.extend_from_slice(FC_AGENT_SERVICE.as_bytes());
+    combined.extend_from_slice(FC_AGENT_SERVICE_STRACE.as_bytes());
+    let initrd_sha = compute_sha256(&combined);
+    let initrd_sha_short = &initrd_sha[..12];
+
+    // Check if initrd already exists for this version (fast path, no lock)
     let initrd_dir = paths::base_dir().join("initrd");
-    let initrd_path = initrd_dir.join(format!("fc-agent-{}.initrd", fc_agent_sha_short));
+    let initrd_path = initrd_dir.join(format!("fc-agent-{}.initrd", initrd_sha_short));
 
     if initrd_path.exists() {
         debug!(
             path = %initrd_path.display(),
-            fc_agent_sha = %fc_agent_sha_short,
+            initrd_sha = %initrd_sha_short,
             "using cached fc-agent initrd"
         );
         return Ok(initrd_path);
@@ -728,7 +781,7 @@ pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
         .context("creating initrd directory")?;
 
     // Acquire exclusive lock to prevent race conditions
-    let lock_file = initrd_dir.join(format!("fc-agent-{}.lock", fc_agent_sha_short));
+    let lock_file = initrd_dir.join(format!("fc-agent-{}.lock", initrd_sha_short));
     use std::os::unix::fs::OpenOptionsExt;
     let lock_fd = std::fs::OpenOptions::new()
         .create(true)
@@ -746,7 +799,7 @@ pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
     if initrd_path.exists() {
         debug!(
             path = %initrd_path.display(),
-            fc_agent_sha = %fc_agent_sha_short,
+            initrd_sha = %initrd_sha_short,
             "using cached fc-agent initrd (created by another process)"
         );
         flock
@@ -758,7 +811,7 @@ pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
 
     info!(
         fc_agent = %fc_agent_path.display(),
-        fc_agent_sha = %fc_agent_sha_short,
+        initrd_sha = %initrd_sha_short,
         "creating fc-agent initrd"
     );
 
@@ -766,7 +819,7 @@ pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
     // Use PID in temp dir name to avoid conflicts even with same sha
     let temp_dir = initrd_dir.join(format!(
         ".initrd-build-{}-{}",
-        fc_agent_sha_short,
+        initrd_sha_short,
         std::process::id()
     ));
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
@@ -803,8 +856,9 @@ pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
         .output()
         .await?;
 
-    // Write service file
+    // Write service files (normal and strace version)
     tokio::fs::write(temp_dir.join("fc-agent.service"), FC_AGENT_SERVICE).await?;
+    tokio::fs::write(temp_dir.join("fc-agent.service.strace"), FC_AGENT_SERVICE_STRACE).await?;
 
     // Create cpio archive (initrd format)
     // Use bash with pipefail so cpio errors aren't masked by gzip success (v3)
@@ -840,7 +894,7 @@ pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
 
     info!(
         path = %initrd_path.display(),
-        fc_agent_sha = %fc_agent_sha_short,
+        initrd_sha = %initrd_sha_short,
         "fc-agent initrd created"
     );
 
