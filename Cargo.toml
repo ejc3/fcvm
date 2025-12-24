@@ -4,6 +4,8 @@ members = [".", "fuse-pipe", "fc-agent"]
 default-members = [".", "fuse-pipe", "fc-agent"]
 # Exclude sync-test (used only for Makefile sync verification)
 exclude = ["sync-test"]
+# Resolver v2 makes --no-default-features work across all workspace members
+resolver = "2"
 
 [package]
 name = "fcvm"

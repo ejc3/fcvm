@@ -15,6 +15,7 @@ CONTAINER_ARCH ?= aarch64
 FILTER ?=
 STREAM ?= 0
 STRACE ?= 0
+LIST ?= 0
 
 ifeq ($(STREAM),1)
 NEXTEST_CAPTURE := --no-capture
@@ -26,6 +27,12 @@ ifeq ($(STRACE),1)
 FCVM_STRACE_AGENT := 1
 else
 FCVM_STRACE_AGENT :=
+endif
+
+ifeq ($(LIST),1)
+NEXTEST_CMD := list
+else
+NEXTEST_CMD := run
 endif
 
 #------------------------------------------------------------------------------
@@ -41,14 +48,14 @@ TEST_ENV := CARGO_TARGET_DIR=$(TARGET_DIR) \
 # Unit tests = fast, no VMs, no sudo (< 1s each)
 # --no-default-features disables integration-fast and integration-slow
 # Unit tests (cli parsing, state manager, health monitor, lint) always compile
-TEST_UNIT := CARGO_TARGET_DIR=$(TARGET_DIR) cargo nextest run --release --no-default-features
+TEST_UNIT := CARGO_TARGET_DIR=$(TARGET_DIR) cargo nextest $(NEXTEST_CMD) --release --no-default-features
 
 # Integration-fast = unit + quick VM tests (< 30s each, requires sudo + KVM)
-TEST_INTEGRATION_FAST := $(TEST_ENV) cargo nextest run --release $(NEXTEST_CAPTURE) \
+TEST_INTEGRATION_FAST := $(TEST_ENV) cargo nextest $(NEXTEST_CMD) --release $(NEXTEST_CAPTURE) \
 	--no-default-features --features integration-fast,privileged-tests $(FILTER)
 
 # Root = all tests (default features = all tiers, requires sudo + KVM)
-TEST_ROOT := $(TEST_ENV) cargo nextest run --release $(NEXTEST_CAPTURE) \
+TEST_ROOT := $(TEST_ENV) cargo nextest $(NEXTEST_CMD) --release $(NEXTEST_CAPTURE) \
 	--features privileged-tests $(FILTER)
 
 # Container test commands (call back to Makefile for single source of truth)
@@ -85,7 +92,7 @@ help:
 	@echo "  make test-unit             - Unit tests only (no VMs, <1s each)"
 	@echo "  make test-integration-fast - Quick tests (unit + VM tests <30s each)"
 	@echo "  make test-root             - All tests (requires sudo + KVM)"
-	@echo "  Options: FILTER=pattern STREAM=1"
+	@echo "  Options: FILTER=pattern STREAM=1 LIST=1"
 	@echo ""
 	@echo "Testing (container):"
 	@echo "  make container-test                  - All tests"
@@ -182,7 +189,6 @@ build:
 	CARGO_TARGET_DIR=$(TARGET_DIR) cargo build --release -p fc-agent --target $(MUSL_TARGET)
 	@mkdir -p $(TARGET_DIR)/release
 	cp $(TARGET_DIR)/$(MUSL_TARGET)/release/fc-agent $(TARGET_DIR)/release/fc-agent
-	CARGO_TARGET_DIR=$(TARGET_DIR) cargo test --release --all-targets --no-run
 
 clean:
 	sudo rm -rf $(TARGET_DIR) target-root

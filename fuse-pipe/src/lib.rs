@@ -57,7 +57,6 @@ pub mod server;
 pub mod telemetry;
 pub mod transport;
 
-#[cfg(feature = "fuse-client")]
 pub mod client;
 
 // Re-export protocol types at crate root for convenience
@@ -78,9 +77,8 @@ pub use server::{AsyncServer, FilesystemHandler, PassthroughFs, ServerConfig};
 pub use telemetry::{SpanCollector, SpanSummary};
 
 // Re-export client types
-#[cfg(feature = "fuse-client")]
 pub use client::{mount, mount_spawn, FuseClient, MountConfig, MountHandle, Multiplexer};
-#[cfg(all(feature = "fuse-client", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub use client::{mount_vsock, mount_vsock_with_options, mount_vsock_with_readers};
 
 /// Prelude for common imports.
