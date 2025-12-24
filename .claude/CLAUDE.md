@@ -5,6 +5,16 @@ fcvm is a Firecracker VM manager for running Podman containers in lightweight mi
 
 ## Quick Reference
 
+### Streaming Test Output
+
+**Use `STREAM=1` to see test output in real-time:**
+```bash
+make test-vm FILTER=sanity STREAM=1              # Host tests with streaming
+make container-test-vm-privileged FILTER=sanity STREAM=1  # Container tests with streaming
+```
+
+Without `STREAM=1`, nextest captures output and only shows it after tests complete (better for parallel runs).
+
 ### Common Commands
 ```bash
 # Build
@@ -287,6 +297,17 @@ cargo test -p fcvm ...      # Missing feature flags, setup
 ```
 
 **Test feature flags**: Tests use `#[cfg(feature = "privileged-tests")]` for tests requiring sudo. Unprivileged tests run by default (no feature flag). Use `FILTER=` to further filter by name.
+
+### Container Build Rules
+
+**Container builds work naturally with layer caching.** No workarounds needed.
+
+- Podman caches layers based on Containerfile content
+- When you modify a line, that layer and all subsequent layers rebuild automatically
+- Just run `make container-build-root` and let caching work
+- NEVER use `--no-cache` or add dummy comments to invalidate cache
+
+**Symlinks for sudo access**: The Containerfile creates symlinks in `/usr/local/bin/` so that `sudo cargo` works (sudo uses secure_path which includes `/usr/local/bin`). This matches how the host is configured.
 
 The `fuse-pipe/Cargo.toml` uses a local path dependency:
 ```toml
