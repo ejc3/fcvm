@@ -8,6 +8,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  FUSE_BACKEND_RS: ${{ github.workspace }}/fuse-backend-rs
+  FUSER: ${{ github.workspace }}/fuser
+  CONTAINER_ARCH: x86_64
 
 jobs:
   container-rootless:
@@ -27,15 +30,12 @@ jobs:
           repository: ejc3/fuser
           ref: master
           path: fuser
-      - name: Lint and test (rootless container)
+      - name: make lint
         working-directory: fcvm
-        run: |
-          export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
-          export FUSER=${{ github.workspace }}/fuser
-          export CONTAINER_ARCH=x86_64
-          make container-build
-          make lint
-          make container-test-noroot
+        run: make lint
+      - name: make container-test-noroot
+        working-directory: fcvm
+        run: make container-test-noroot
 
   container-sudo:
     name: Container (sudo)
@@ -54,15 +54,12 @@ jobs:
           repository: ejc3/fuser
           ref: master
           path: fuser
-      - name: FUSE root and POSIX tests (sudo container)
+      - name: make container-test-root
         working-directory: fcvm
-        run: |
-          export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
-          export FUSER=${{ github.workspace }}/fuser
-          export CONTAINER_ARCH=x86_64
-          make container-build-root
-          make container-test-root
-          make container-test-pjdfstest
+        run: make container-test-root
+      - name: make container-test-pjdfstest
+        working-directory: fcvm
+        run: make container-test-pjdfstest
 
   vm:
     name: Host (sudo+rootless)
@@ -92,10 +89,6 @@ jobs:
           fi
           sudo chmod 666 /dev/userfaultfd
           sudo sysctl -w vm.unprivileged_userfaultfd=1
-      - name: Run VM tests
+      - name: make container-test-vm
         working-directory: fcvm
-        run: |
-          export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
-          export FUSER=${{ github.workspace }}/fuser
-          export CONTAINER_ARCH=x86_64
-          make container-test-vm
+        run: make container-test-vm
