@@ -43,7 +43,28 @@ impl StateManager {
 
     /// Save VM state atomically (write to temp file, then rename)
     /// Uses file locking to prevent concurrent writes
+    ///
+    /// If another state file claims our PID, it's stale (that process is dead
+    /// and its PID was reused by the OS). We delete it to prevent collisions
+    /// when querying by PID.
     pub async fn save_state(&self, state: &VmState) -> Result<()> {
+        // Clean up any stale state files that claim our PID
+        // This happens when a VM crashes and its PID is later reused
+        if let Some(pid) = state.pid {
+            if let Ok(existing_vms) = self.list_vms().await {
+                for existing in existing_vms {
+                    if existing.pid == Some(pid) && existing.vm_id != state.vm_id {
+                        tracing::warn!(
+                            stale_vm_id = %existing.vm_id,
+                            pid = pid,
+                            "deleting stale state file with reused PID (previous VM crashed without cleanup)"
+                        );
+                        let _ = self.delete_state(&existing.vm_id).await;
+                    }
+                }
+            }
+        }
+
         let state_file = self.state_dir.join(format!("{}.json", state.vm_id));
         let temp_file = self.state_dir.join(format!("{}.json.tmp", state.vm_id));
         let lock_file = self.state_dir.join(format!("{}.json.lock", state.vm_id));

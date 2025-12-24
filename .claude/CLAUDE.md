@@ -469,6 +469,28 @@ On serve process exit (SIGTERM/SIGINT):
 3. Remove socket file: `/mnt/fcvm-btrfs/uffd-{snapshot}-{pid}.sock`
 4. Delete serve state from state manager
 
+### Stale State File Handling
+
+**Problem**: State files persist when VMs crash (SIGKILL, test abort). When the OS reuses a PID, the old state file causes collisions when querying by PID.
+
+**Solution**: `StateManager::save_state()` automatically cleans up stale state files:
+- Before saving, checks if any OTHER state file claims the same PID
+- If found, that file is stale (the process is dead, PID was reused)
+- Deletes the stale file with a warning log
+- Then saves the new state
+
+**Why it works**: If process A has PID 5000 and we're saving state for process B with PID 5000, process A must be dead (OS wouldn't reuse the PID otherwise). So A's state file is safe to delete.
+
+**State file layout**: Individual files per VM, keyed by `vm_id` (UUID):
+```
+/mnt/fcvm-btrfs/state/
+├── vm-abc123.json    # { vm_id: "vm-abc123", pid: 5000, ... }
+├── vm-def456.json    # { vm_id: "vm-def456", pid: 5001, ... }
+└── loopback-ip.lock  # Global lock for IP allocation
+```
+
+No master state file - `list_vms()` globs all `.json` files.
+
 ### Test Integration
 
 Tests spawn processes and track PIDs directly (no stdout parsing needed):

@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
 use super::{
-    namespace, portmap, types::generate_mac, veth, NetworkConfig, NetworkManager, PortMapping,
+    get_host_dns_servers, namespace, portmap, types::generate_mac, veth, NetworkConfig,
+    NetworkManager, PortMapping,
 };
 use crate::state::truncate_id;
 
@@ -262,7 +263,11 @@ impl NetworkManager for BridgedNetwork {
             return Err(e).context("ensuring global NAT for 10.0.0.0/8");
         }
 
-        // Step 7: Setup port mappings if any
+        // Step 7: Get DNS server for VM
+        let dns_servers = get_host_dns_servers().context("getting DNS servers")?;
+        let dns_server = dns_servers.first().cloned();
+
+        // Step 8: Setup port mappings if any
         if !self.port_mappings.is_empty() {
             // For clones: DNAT to veth_inner_ip (host-reachable), blanket DNAT in namespace
             //             already forwards veth_inner_ip → guest_ip (set up in step 5)
@@ -281,14 +286,6 @@ impl NetworkManager for BridgedNetwork {
                 Err(e) => {
                     let _ = self.cleanup().await;
                     return Err(e).context("setting up port mappings");
-                }
-            }
-
-            // Enable route_localnet on host veth for localhost port forwarding
-            // This allows DNAT'd packets from 127.0.0.1 to be routed to the guest
-            if let Some(ref host_veth) = self.host_veth {
-                if let Err(e) = portmap::enable_route_localnet(host_veth).await {
-                    warn!(error = %e, "failed to enable route_localnet (localhost port forwarding may not work)");
                 }
             }
         }
@@ -315,7 +312,7 @@ impl NetworkManager for BridgedNetwork {
             loopback_ip: None,
             health_check_port: Some(80),
             health_check_url: Some(format!("http://{}:80/", health_check_ip)),
-            dns_server: super::get_host_dns_servers().first().cloned(),
+            dns_server,
         })
     }
 
@@ -337,7 +334,7 @@ impl NetworkManager for BridgedNetwork {
             veth::delete_veth_pair(host_veth).await?;
         }
 
-        // Step 3: Delete network namespace (this will cleanup everything inside it)
+        // Step 3: Delete network namespace (this cleans up everything inside it)
         // Including all NAT rules, bridge, and veth peer
         if let Some(ref namespace_id) = self.namespace_id {
             namespace::delete_namespace(namespace_id).await?;
