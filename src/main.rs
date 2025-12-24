@@ -54,7 +54,8 @@ async fn main() -> Result<()> {
             .init();
     } else {
         // Parent process: only use colors when outputting to a TTY (not when piped to file)
-        let use_color = atty::is(atty::Stream::Stderr);
+        use std::io::IsTerminal;
+        let use_color = std::io::stderr().is_terminal();
         tracing_subscriber::fmt()
             .with_env_filter(
                 EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()),

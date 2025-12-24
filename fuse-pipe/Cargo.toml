@@ -12,6 +12,7 @@ categories = ["filesystem", "asynchronous"]
 default = ["fuse-client"]
 fuse-client = ["dep:fuser"]
 trace-benchmarks = []  # Enable tracing in benchmarks
+privileged-tests = []  # Gate tests requiring root
 
 [dependencies]
 # Core
@@ -61,5 +62,5 @@ name = "operations"
 harness = false
 
 [[test]]
-name = "pjdfstest_matrix"
-path = "tests/pjdfstest_matrix.rs"
+name = "pjdfstest_matrix_root"
+path = "tests/pjdfstest_matrix_root.rs"

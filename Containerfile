@@ -21,7 +21,7 @@ RUN RUST_VERSION=$(grep 'channel' /tmp/rust-toolchain.toml | cut -d'"' -f2) && \
     rustup component add rustfmt clippy && \
     rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
 
-# Install cargo-nextest for better test parallelism and output
+# Install cargo-nextest for test parallelism
 RUN cargo install cargo-nextest --locked
 
 # Install system dependencies
@@ -73,12 +73,7 @@ RUN curl -L -o /tmp/firecracker.tgz \
     && chmod +x /usr/local/bin/firecracker \
     && rm -rf /tmp/firecracker.tgz /tmp/release-v1.14.0-${ARCH}
 
-# Build and install pjdfstest (tests expect it at /tmp/pjdfstest-check/)
-RUN git clone --depth 1 https://github.com/pjd/pjdfstest /tmp/pjdfstest-check \
-    && cd /tmp/pjdfstest-check \
-    && autoreconf -ifs \
-    && ./configure \
-    && make
+# pjdfstest is built via `make setup-pjdfstest` when tests run
 
 # Create non-root test user with access to fuse group
 RUN groupadd -f fuse \

@@ -191,10 +191,10 @@ pub fn run_single_category(category: &str, jobs: usize) -> (bool, usize, usize) 
     init_tracing();
     raise_fd_limit();
 
-    if !is_pjdfstest_installed() {
-        eprintln!("pjdfstest not found - skipping {}", category);
-        return (true, 0, 0); // Skip, don't fail
-    }
+    assert!(
+        is_pjdfstest_installed(),
+        "pjdfstest binary not found - install it or exclude pjdfstest tests from run"
+    );
 
     // Unique paths for this test process
     let pid = std::process::id();

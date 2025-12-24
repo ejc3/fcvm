@@ -1,0 +1,35 @@
+# cargo-deny configuration
+# https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# Fail on security vulnerabilities
+ignore = []
+
+[licenses]
+# Allowed open-source licenses
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+
+# Workspace crates don't need license in manifest
+[licenses.private]
+ignore = true
+
+[bans]
+# Warn on duplicate crate versions
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+# Only allow crates.io
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
