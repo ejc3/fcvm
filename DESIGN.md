@@ -898,6 +898,19 @@ The guest is configured to support rootless Podman:
 
 ### Commands
 
+#### `fcvm setup`
+
+**Purpose**: Download kernel and create rootfs (first-time setup).
+
+**Usage**:
+```bash
+fcvm setup
+```
+
+This downloads the Kata kernel (~15MB) and creates the Layer 2 rootfs (~10GB with Ubuntu + Podman). Takes 5-10 minutes on first run.
+
+**Note**: Must be run before `fcvm podman run` with bridged networking. For rootless mode, you can use `--setup` flag on `fcvm podman run` instead.
+
 #### `fcvm podman run`
 
 **Purpose**: Launch a container in a new Firecracker VM.
@@ -923,6 +936,7 @@ fcvm podman run --name <NAME> [OPTIONS] <IMAGE>
 --balloon <MB>             Memory balloon target
 --health-check <URL>       HTTP health check URL
 --privileged               Run container in privileged mode
+--setup                    Run setup if kernel/rootfs missing (rootless only)
 ```
 
 **Examples**:

@@ -37,10 +37,13 @@ Without `STREAM=1`, nextest captures output and only shows it after tests comple
 # Build
 make build        # Build fcvm + fc-agent
 make test         # Run fuse-pipe tests
-make rebuild      # Full rebuild including rootfs update
+make setup-fcvm   # Download kernel and create rootfs
 
-# Run a VM
+# Run a VM (requires setup first, or use --setup flag)
 sudo fcvm podman run --name my-vm --network bridged nginx:alpine
+
+# Or run with auto-setup (first run takes 5-10 minutes)
+sudo fcvm podman run --name my-vm --network bridged --setup nginx:alpine
 
 # Snapshot workflow
 fcvm snapshot create --pid <vm_pid> --tag my-snapshot
@@ -698,15 +701,17 @@ pub fn vm_runtime_dir(vm_id: &str) -> PathBuf {
 }
 ```
 
-**Setup**: Automatic via `make test-root` or `make container-test-root` (idempotent btrfs loopback + kernel copy).
+**Setup**: Run `make setup-fcvm` before tests (called automatically by `make test-root` or `make container-test-root`).
 
 **⚠️ CRITICAL: Changing VM base image (fc-agent, rootfs)**
 
-ALWAYS use Makefile commands to update the VM base:
-- `make rebuild` - Rebuild fc-agent and regenerate rootfs/initrd
-- Rootfs is auto-regenerated when setup script changes (via SHA-based caching)
+When you change fc-agent or setup scripts, regenerate the rootfs:
+1. Delete existing rootfs: `sudo rm -f /mnt/fcvm-btrfs/rootfs/layer2-*.raw /mnt/fcvm-btrfs/initrd/fc-agent-*.initrd`
+2. Run setup: `make setup-fcvm`
 
-NEVER manually edit rootfs files. The setup script in `rootfs-plan.toml` and `src/setup/rootfs.rs` control what gets installed. Changes trigger automatic regeneration on next VM start.
+The rootfs is cached by SHA of setup script + kernel URL. Changes to these automatically invalidate the cache.
+
+NEVER manually edit rootfs files. The setup script in `rootfs-plan.toml` and `src/setup/rootfs.rs` control what gets installed.
 
 ### Memory Sharing (UFFD)
 
@@ -806,18 +811,34 @@ Run `make help` for full list. Key targets:
 | Target | Description |
 |--------|-------------|
 | `make setup-btrfs` | Create btrfs loopback |
-| `make setup-rootfs` | Trigger rootfs creation (~90 sec first run) |
+| `make setup-fcvm` | Download kernel and create rootfs (runs `fcvm setup`) |
 
 ### How Setup Works
 
-**What Makefile does (prerequisites):**
-1. `setup-btrfs` - Creates 20GB btrfs loopback at `/mnt/fcvm-btrfs`
+**Setup is explicit, not automatic.** VMs require kernel, rootfs, and initrd to exist before running.
 
-**What fcvm binary does (auto on first VM start):**
-1. `ensure_kernel()` - Downloads Kata kernel from URL in `rootfs-plan.toml` if not present (cached by URL hash)
-2. `ensure_rootfs()` - Creates Layer 2 rootfs if SHA doesn't match (downloads Ubuntu cloud image, runs setup in VM, creates initrd with fc-agent)
+**Two ways to set up:**
 
-**Kernel source**: Kata Containers kernel (6.12.47 from Kata 3.24.0 release) with `CONFIG_FUSE_FS=y` built-in. This is specified in `rootfs-plan.toml` and auto-downloaded on first run.
+1. **`fcvm setup`** (explicit, works for all modes):
+   - Downloads kernel and creates rootfs
+   - Required before running VMs with bridged networking (root)
+
+2. **`fcvm podman run --setup`** (rootless only):
+   - Adds `--setup` flag to opt-in to auto-setup
+   - Only works for rootless mode (no root)
+   - Disallowed when running as root - use `fcvm setup` instead
+
+**Without setup**, fcvm fails immediately if assets are missing:
+```
+ERROR fcvm: Error: setting up rootfs: Rootfs not found. Run 'fcvm setup' first, or use --setup flag.
+```
+
+**What `fcvm setup` does:**
+1. Downloads Kata kernel from URL in `rootfs-plan.toml` (~15MB, cached by URL hash)
+2. Creates Layer 2 rootfs (~10GB, downloads Ubuntu cloud image, boots VM to install packages)
+3. Creates fc-agent initrd (embeds statically-linked fc-agent binary)
+
+**Kernel source**: Kata Containers kernel (6.12.47 from Kata 3.24.0 release) with `CONFIG_FUSE_FS=y` built-in.
 
 ### Data Layout
 ```

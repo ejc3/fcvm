@@ -81,6 +81,13 @@ sudo apt-get update && sudo apt-get install -y \
 cargo build --release --workspace
 ```
 
+### Setup (First Time)
+```bash
+# Create btrfs filesystem and download kernel + rootfs (takes 5-10 minutes)
+make setup-btrfs
+fcvm setup
+```
+
 ### Run a Container
 ```bash
 # Run nginx in a Firecracker VM (using AWS ECR public registry to avoid Docker Hub rate limits)
@@ -306,6 +313,11 @@ fcvm/
 
 ### Commands
 
+#### `fcvm setup`
+Download kernel and create rootfs (first-time setup).
+
+This downloads the Kata kernel (~15MB) and creates the Layer 2 rootfs (~10GB with Ubuntu + Podman). Takes 5-10 minutes on first run.
+
 #### `fcvm ls`
 List running VMs.
 
@@ -334,6 +346,7 @@ Run a container in a Firecracker VM.
 | `--health-check <URL>` | | HTTP health check URL. If not specified, uses container ready signal via vsock |
 | `--balloon <MiB>` | (none) | Balloon device target MiB. If not specified, no balloon device is configured |
 | `--privileged` | false | Run container in privileged mode (allows mknod, device access) |
+| `--setup` | false | Run setup if kernel/rootfs missing (rootless only, not allowed with sudo) |
 
 #### `fcvm snapshot create`
 Create a snapshot from a running VM.

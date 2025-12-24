@@ -253,6 +253,12 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // Validate VM name before any setup work
     validate_vm_name(&args.name).context("invalid VM name")?;
 
+    // Disallow --setup when running as root
+    // Root users should run `fcvm setup` explicitly
+    if args.setup && nix::unistd::geteuid().is_root() {
+        bail!("--setup is not allowed when running as root. Run 'fcvm setup' first.");
+    }
+
     // Get kernel, rootfs, and initrd paths
     // With --setup: create if missing; without: fail if missing
     let kernel_path = crate::setup::ensure_kernel(args.setup)

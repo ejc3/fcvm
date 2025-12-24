@@ -116,7 +116,37 @@ setup-btrfs:
 	fi
 
 # Download kernel and create rootfs (runs fcvm setup)
+# Requires ~15GB free space on /mnt/fcvm-btrfs
 setup-fcvm: build setup-btrfs
+	@FREE_GB=$$(df -BG /mnt/fcvm-btrfs 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \
+	if [ -n "$$FREE_GB" ] && [ "$$FREE_GB" -lt 15 ]; then \
+		echo "ERROR: Not enough disk space on /mnt/fcvm-btrfs"; \
+		echo "  Available: $${FREE_GB}GB, Required: 15GB"; \
+		echo ""; \
+		echo "Note: fcvm uses btrfs CoW (copy-on-write) for efficient disk usage."; \
+		echo "      Each VM uses reflinks to share the base rootfs (~10GB)."; \
+		echo ""; \
+		echo "Remediation options:"; \
+		echo "  1. Expand the btrfs image:"; \
+		echo "     sudo truncate -s +10G /var/fcvm-btrfs.img"; \
+		echo "     sudo btrfs filesystem resize max /mnt/fcvm-btrfs"; \
+		echo ""; \
+		echo "  2. Clean up old VM data (CoW reflinks):"; \
+		echo "     sudo rm -rf /mnt/fcvm-btrfs/vm-disks/*"; \
+		echo "     sudo rm -rf /mnt/fcvm-btrfs/cache/*"; \
+		echo "     sudo rm -rf /mnt/fcvm-btrfs/snapshots/*"; \
+		echo ""; \
+		echo "  3. Clean up podman storage (container images inside VMs):"; \
+		echo "     # These are stored in the rootfs, regenerate if needed"; \
+		echo "     sudo rm -f /mnt/fcvm-btrfs/rootfs/layer2-*.raw"; \
+		echo "     sudo rm -f /mnt/fcvm-btrfs/initrd/fc-agent-*.initrd"; \
+		echo ""; \
+		echo "  4. Delete and recreate everything:"; \
+		echo "     sudo umount /mnt/fcvm-btrfs"; \
+		echo "     sudo rm /var/fcvm-btrfs.img"; \
+		echo "     make setup-btrfs"; \
+		exit 1; \
+	fi
 	@echo "==> Running fcvm setup..."
 	./$(TARGET_DIR)/release/fcvm setup
 
