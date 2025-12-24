@@ -408,6 +408,9 @@ CONTAINER_RUN_FCVM := sudo podman run --rm --privileged \
 	-e CARGO_HOME=/home/testuser/.cargo \
 	--device /dev/kvm \
 	--device /dev/fuse \
+	--ulimit nofile=65536:65536 \
+	--ulimit nproc=65536:65536 \
+	--pids-limit=-1 \
 	-v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	-v /var/run/netns:/var/run/netns:rshared \
 	-v /run/systemd/resolve:/run/systemd/resolve:ro \
