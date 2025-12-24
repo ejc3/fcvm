@@ -146,7 +146,6 @@ mod tests {
     #[cfg(feature = "privileged-tests")]
     #[tokio::test]
     async fn test_exec_in_namespace() {
-
         let ns_name = "fcvm-test-exec";
 
         // Clean up if exists

@@ -1550,16 +1550,12 @@ async fn main() -> Result<()> {
         let mut pull_succeeded = false;
 
         for attempt in 1..=MAX_RETRIES {
-            eprintln!(
-                "[fc-agent] =========================================="
-            );
+            eprintln!("[fc-agent] ==========================================");
             eprintln!(
                 "[fc-agent] PULLING IMAGE: {} (attempt {}/{})",
                 plan.image, attempt, MAX_RETRIES
             );
-            eprintln!(
-                "[fc-agent] =========================================="
-            );
+            eprintln!("[fc-agent] ==========================================");
 
             // Spawn podman pull and stream output in real-time
             let mut child = Command::new("podman")
@@ -1571,21 +1567,19 @@ async fn main() -> Result<()> {
                 .context("spawning podman pull")?;
 
             // Stream stdout in real-time
-            let stdout_task = if let Some(stdout) = child.stdout.take() {
-                Some(tokio::spawn(async move {
+            let stdout_task = child.stdout.take().map(|stdout| {
+                tokio::spawn(async move {
                     let reader = BufReader::new(stdout);
                     let mut lines = reader.lines();
                     while let Ok(Some(line)) = lines.next_line().await {
                         eprintln!("[fc-agent] [podman] {}", line);
                     }
-                }))
-            } else {
-                None
-            };
+                })
+            });
 
             // Stream stderr in real-time and capture for error reporting
-            let stderr_task = if let Some(stderr) = child.stderr.take() {
-                Some(tokio::spawn(async move {
+            let stderr_task = child.stderr.take().map(|stderr| {
+                tokio::spawn(async move {
                     let reader = BufReader::new(stderr);
                     let mut lines = reader.lines();
                     let mut captured = Vec::new();
@@ -1594,10 +1588,8 @@ async fn main() -> Result<()> {
                         captured.push(line);
                     }
                     captured
-                }))
-            } else {
-                None
-            };
+                })
+            });
 
             // Wait for podman to finish
             let status = child.wait().await.context("waiting for podman pull")?;
@@ -1620,20 +1612,13 @@ async fn main() -> Result<()> {
 
             // Capture error for final bail message
             last_error = stderr_lines.join("\n");
-            eprintln!(
-                "[fc-agent] =========================================="
-            );
+            eprintln!("[fc-agent] ==========================================");
             eprintln!(
                 "[fc-agent] IMAGE PULL FAILED (attempt {}/{})",
                 attempt, MAX_RETRIES
             );
-            eprintln!(
-                "[fc-agent] exit code: {:?}",
-                status.code()
-            );
-            eprintln!(
-                "[fc-agent] =========================================="
-            );
+            eprintln!("[fc-agent] exit code: {:?}", status.code());
+            eprintln!("[fc-agent] ==========================================");
 
             if attempt < MAX_RETRIES {
                 eprintln!("[fc-agent] retrying in {} seconds...", RETRY_DELAY_SECS);
@@ -1642,16 +1627,12 @@ async fn main() -> Result<()> {
         }
 
         if !pull_succeeded {
-            eprintln!(
-                "[fc-agent] =========================================="
-            );
+            eprintln!("[fc-agent] ==========================================");
             eprintln!(
                 "[fc-agent] FATAL: IMAGE PULL FAILED AFTER {} ATTEMPTS",
                 MAX_RETRIES
             );
-            eprintln!(
-                "[fc-agent] =========================================="
-            );
+            eprintln!("[fc-agent] ==========================================");
             anyhow::bail!(
                 "Failed to pull image after {} attempts:\n{}",
                 MAX_RETRIES,
@@ -1718,7 +1699,10 @@ async fn main() -> Result<()> {
     // Port 4997 is dedicated for stdout/stderr
     let output_fd = create_output_vsock();
     if output_fd >= 0 {
-        eprintln!("[fc-agent] output vsock connected (port {})", OUTPUT_VSOCK_PORT);
+        eprintln!(
+            "[fc-agent] output vsock connected (port {})",
+            OUTPUT_VSOCK_PORT
+        );
     }
 
     // Stream stdout via vsock (wrapped in Arc for sharing across tasks)
@@ -1729,7 +1713,11 @@ async fn main() -> Result<()> {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                send_output_line(fd.load(std::sync::atomic::Ordering::Relaxed), "stdout", &line);
+                send_output_line(
+                    fd.load(std::sync::atomic::Ordering::Relaxed),
+                    "stdout",
+                    &line,
+                );
             }
         }))
     } else {
@@ -1743,7 +1731,11 @@ async fn main() -> Result<()> {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                send_output_line(fd.load(std::sync::atomic::Ordering::Relaxed), "stderr", &line);
+                send_output_line(
+                    fd.load(std::sync::atomic::Ordering::Relaxed),
+                    "stderr",
+                    &line,
+                );
             }
         }))
     } else {

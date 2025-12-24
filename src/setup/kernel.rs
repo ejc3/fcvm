@@ -123,10 +123,7 @@ async fn download_kernel(config: &KernelArchConfig) -> Result<PathBuf> {
     let extract_path = format!("./{}", config.path);
 
     let output = Command::new("tar")
-        .args([
-            "--use-compress-program=zstd",
-            "-xf",
-        ])
+        .args(["--use-compress-program=zstd", "-xf"])
         .arg(&tarball_path)
         .arg("-C")
         .arg(&cache_dir)
