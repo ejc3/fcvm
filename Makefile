@@ -370,9 +370,7 @@ CONTAINER_RUN_BASE_ROOT := sudo podman run --rm --privileged \
 # Container run options for fuse-pipe tests (non-root)
 CONTAINER_RUN_FUSE := $(CONTAINER_RUN_BASE) \
 	--device /dev/fuse \
-	--ulimit nofile=65536:65536 \
-	--ulimit nproc=65536:65536 \
-	--pids-limit=-1
+	--ulimit nofile=65536:65536
 
 # Container run options for fuse-pipe tests (root)
 # Note: --device-cgroup-rule not supported in rootless mode
@@ -380,9 +378,7 @@ CONTAINER_RUN_FUSE := $(CONTAINER_RUN_BASE) \
 CONTAINER_RUN_FUSE_ROOT := $(CONTAINER_RUN_BASE_ROOT) \
 	--user root \
 	--device /dev/fuse \
-	--ulimit nofile=65536:65536 \
-	--ulimit nproc=65536:65536 \
-	--pids-limit=-1
+	--ulimit nofile=65536:65536
 
 # Container run options for fcvm tests (adds KVM, btrfs, netns)
 # Used for bridged mode tests that require root/iptables
@@ -400,8 +396,6 @@ CONTAINER_RUN_FCVM := sudo podman run --rm --privileged \
 	--device /dev/kvm \
 	--device /dev/fuse \
 	--ulimit nofile=65536:65536 \
-	--ulimit nproc=65536:65536 \
-	--pids-limit=-1 \
 	-v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	-v /var/run/netns:/var/run/netns:rshared \
 	-v /run/systemd/resolve:/run/systemd/resolve:ro \
