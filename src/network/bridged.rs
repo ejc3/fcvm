@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::{
     get_host_dns_servers, namespace, portmap, types::generate_mac, veth, NetworkConfig,
