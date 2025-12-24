@@ -4,6 +4,8 @@
 //! The image is exported from the host using skopeo, mounted into the VM via FUSE,
 //! and then imported by fc-agent using skopeo before running with podman.
 
+#![cfg(feature = "integration-fast")]
+
 mod common;
 
 use anyhow::{Context, Result};

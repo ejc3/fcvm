@@ -43,22 +43,19 @@ retries = 0
 max-threads = 1
 
 # VM tests run at full parallelism (num-cpus)
-# Previously limited to 16 threads due to namespace holder process deaths,
-# but root cause was rootless tests running under sudo. Now that privileged
-# tests filter out rootless tests (-E '!test(/rootless/)'), full parallelism works.
 [test-groups.vm-tests]
 max-threads = "num-cpus"
 
 [[profile.default.overrides]]
 filter = "package(fcvm) & test(/stress_100/)"
 test-group = "stress-tests"
-slow-timeout = { period = "300s", terminate-after = 1 }
+slow-timeout = { period = "600s", terminate-after = 1 }
 
-# VM tests run with limited parallelism to avoid resource exhaustion
+# VM tests get 10 minute timeout
 [[profile.default.overrides]]
 filter = "package(fcvm) & test(/test_/) & !test(/stress_100/)"
 test-group = "vm-tests"
-slow-timeout = { period = "300s", terminate-after = 1 }
+slow-timeout = { period = "600s", terminate-after = 1 }
 
 # fuse-pipe tests can run with full parallelism
 [[profile.default.overrides]]

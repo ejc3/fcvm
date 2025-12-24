@@ -43,6 +43,13 @@ tokio-util = "0.7"
 regex = "1.12.2"
 
 [features]
+# By default, all tests compile
+default = ["integration-fast", "integration-slow"]
+
+# Test speed tiers (unit tests always run, no feature flag needed)
+integration-fast = []        # Quick VM tests, < 30s each (sanity, signal, exec, port forward)
+integration-slow = []        # Slow VM tests, > 30s each (clone, snapshot, fuse posix, egress)
+
 # Test category - only gate tests that require sudo
 # Unprivileged tests run by default (no feature flag needed)
 privileged-tests = []  # Tests requiring sudo (iptables, root podman storage)

@@ -29,21 +29,32 @@ FCVM_STRACE_AGENT :=
 endif
 
 #------------------------------------------------------------------------------
-# Test commands - use features to gate privileged tests
+# Test commands - use features to gate test tiers
 #------------------------------------------------------------------------------
 
-# Rootless = no features (privileged tests not compiled)
-TEST_ROOTLESS := CARGO_TARGET_DIR=$(TARGET_DIR) cargo nextest run --release
-
-# Root = with privileged-tests feature (requires sudo + KVM)
-TEST_ROOT := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR) FCVM_STRACE_AGENT=$(FCVM_STRACE_AGENT) \
+# Common environment for tests requiring sudo
+TEST_ENV := CARGO_TARGET_DIR=$(TARGET_DIR) \
+	FCVM_STRACE_AGENT=$(FCVM_STRACE_AGENT) \
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
-	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
-	cargo nextest run --release $(NEXTEST_CAPTURE) --features privileged-tests $(FILTER)"
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E'
+
+# Unit tests = fast, no VMs, no sudo (< 1s each)
+# --no-default-features disables integration-fast and integration-slow
+# Unit tests (cli parsing, state manager, health monitor, lint) always compile
+TEST_UNIT := CARGO_TARGET_DIR=$(TARGET_DIR) cargo nextest run --release --no-default-features
+
+# Integration-fast = unit + quick VM tests (< 30s each, requires sudo + KVM)
+TEST_INTEGRATION_FAST := $(TEST_ENV) cargo nextest run --release $(NEXTEST_CAPTURE) \
+	--no-default-features --features integration-fast,privileged-tests $(FILTER)
+
+# Root = all tests (default features = all tiers, requires sudo + KVM)
+TEST_ROOT := $(TEST_ENV) cargo nextest run --release $(NEXTEST_CAPTURE) \
+	--features privileged-tests $(FILTER)
 
 # Container test commands (call back to Makefile for single source of truth)
-CTEST_ROOTLESS := make test-rootless
-CTEST_ROOT := make test
+CTEST_UNIT := make test-unit
+CTEST_INTEGRATION_FAST := make test-integration-fast
+CTEST_ROOT := make test-root
 
 # Benchmarks
 BENCH_THROUGHPUT := cargo bench -p fuse-pipe --bench throughput
@@ -52,12 +63,12 @@ BENCH_PROTOCOL := cargo bench -p fuse-pipe --bench protocol
 BENCH_EXEC := cargo bench --bench exec
 
 .PHONY: all help build clean \
-	test test-rootless test-root \
+	test test-unit test-integration-fast test-root \
 	bench bench-throughput bench-operations bench-protocol bench-exec bench-quick bench-logs bench-clean \
 	lint fmt \
 	container-build container-build-root \
-	container-test container-test-rootless container-test-root container-shell container-clean \
-	ci-host ci-rootless ci-root setup-btrfs setup-fcvm setup-pjdfstest
+	container-test container-test-unit container-test-integration-fast container-test-root container-shell container-clean \
+	ci-host ci-unit ci-integration-fast ci-root setup-btrfs setup-fcvm setup-pjdfstest
 
 all: build
 
@@ -70,16 +81,18 @@ help:
 	@echo "  make lint   - Run clippy + fmt-check"
 	@echo ""
 	@echo "Testing (host):"
-	@echo "  make test           - All tests"
-	@echo "  make test-rootless  - Rootless tests only"
-	@echo "  make test-root      - Root tests (requires sudo + KVM)"
+	@echo "  make test                  - All tests (unit + integration + slow)"
+	@echo "  make test-unit             - Unit tests only (no VMs, <1s each)"
+	@echo "  make test-integration-fast - Quick tests (unit + VM tests <30s each)"
+	@echo "  make test-root             - All tests (requires sudo + KVM)"
 	@echo "  Options: FILTER=pattern STREAM=1"
 	@echo ""
 	@echo "Testing (container):"
-	@echo "  make container-test           - All tests"
-	@echo "  make container-test-rootless  - Rootless tests only"
-	@echo "  make container-test-root      - Root tests"
-	@echo "  make container-shell          - Interactive shell"
+	@echo "  make container-test                  - All tests"
+	@echo "  make container-test-unit             - Unit tests only"
+	@echo "  make container-test-integration-fast - Quick tests"
+	@echo "  make container-test-root             - All tests"
+	@echo "  make container-shell                 - Interactive shell"
 	@echo ""
 	@echo "Setup:"
 	@echo "  make setup-btrfs  - Create btrfs loopback"
@@ -178,18 +191,23 @@ clean:
 # Testing (host)
 #------------------------------------------------------------------------------
 
-# Rootless tests only (no sudo)
-test-rootless: build
-	@echo "==> Running rootless tests..."
-	$(TEST_ROOTLESS)
+# Unit tests only (no VMs, no sudo)
+test-unit: build
+	@echo "==> Running unit tests..."
+	$(TEST_UNIT)
 
-# Root tests only (requires sudo + KVM)
+# Integration-fast = unit + quick VM tests (requires sudo + KVM)
+test-integration-fast: setup-fcvm
+	@echo "==> Running integration-fast tests..."
+	$(TEST_INTEGRATION_FAST)
+
+# Root = all tests including slow ones (requires sudo + KVM)
 test-root: setup-fcvm setup-pjdfstest
-	@echo "==> Running root tests..."
+	@echo "==> Running all tests..."
 	$(TEST_ROOT)
 
 # All tests
-test: test-rootless test-root
+test: test-root
 
 #------------------------------------------------------------------------------
 # Benchmarks
@@ -291,18 +309,23 @@ container-build:
 container-build-root:
 	sudo podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) $(CACHE_FLAGS) .
 
-# Rootless tests only
-container-test-rootless: container-build
-	@echo "==> Running rootless tests in container..."
-	$(CONTAINER_RUN_ROOTLESS) --user testuser $(CONTAINER_TAG) $(CTEST_ROOTLESS)
+# Unit tests only (in container)
+container-test-unit: container-build
+	@echo "==> Running unit tests in container..."
+	$(CONTAINER_RUN_ROOTLESS) --user testuser $(CONTAINER_TAG) $(CTEST_UNIT)
 
-# Root tests only
+# Integration-fast tests (in container)
+container-test-integration-fast: container-build-root setup-fcvm
+	@echo "==> Running integration-fast tests in container..."
+	$(CONTAINER_RUN_ROOT) $(CONTAINER_TAG) $(CTEST_INTEGRATION_FAST)
+
+# Root tests only (in container)
 container-test-root: container-build-root setup-fcvm
-	@echo "==> Running root tests in container..."
+	@echo "==> Running all tests in container..."
 	$(CONTAINER_RUN_ROOT) $(CONTAINER_TAG) $(CTEST_ROOT)
 
 # All tests
-container-test: container-test-rootless container-test-root
+container-test: container-test-root
 
 container-shell: container-build
 	$(CONTAINER_RUN_ROOTLESS) -it $(CONTAINER_TAG) bash
@@ -317,8 +340,11 @@ ci-host: setup-fcvm
 	$(MAKE) lint
 	$(MAKE) test-root
 
-ci-rootless: container-build
-	$(CONTAINER_RUN_ROOTLESS) --user testuser $(CONTAINER_TAG) $(CTEST_ROOTLESS)
+ci-unit: container-build
+	$(CONTAINER_RUN_ROOTLESS) --user testuser $(CONTAINER_TAG) $(CTEST_UNIT)
+
+ci-integration-fast: container-build-root setup-fcvm
+	$(CONTAINER_RUN_ROOT) $(CONTAINER_TAG) $(CTEST_INTEGRATION_FAST)
 
 ci-root: container-build-root setup-fcvm
 	$(CONTAINER_RUN_ROOT) $(CONTAINER_TAG) $(CTEST_ROOT)

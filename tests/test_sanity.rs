@@ -3,6 +3,8 @@
 //! Uses common::spawn_fcvm() to prevent pipe buffer deadlock.
 //! See CLAUDE.md "Pipe Buffer Deadlock in Tests" for details.
 
+#![cfg(feature = "integration-fast")]
+
 mod common;
 
 use anyhow::{Context, Result};

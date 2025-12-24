@@ -7,6 +7,8 @@
 //! 4. Runs parallel curl commands from each clone to the local HTTP server
 //! 5. Verifies all requests succeed
 
+#![cfg(feature = "integration-slow")]
+
 mod common;
 
 use anyhow::{Context, Result};

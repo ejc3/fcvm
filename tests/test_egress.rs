@@ -9,6 +9,8 @@
 //!
 //! Both bridged and rootless networking modes are tested.
 
+#![cfg(feature = "integration-slow")]
+
 mod common;
 
 use anyhow::{Context, Result};

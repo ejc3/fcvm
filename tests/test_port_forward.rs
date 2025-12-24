@@ -2,6 +2,8 @@
 //!
 //! Verifies that --publish correctly forwards ports from host to guest
 
+#![cfg(feature = "integration-fast")]
+
 mod common;
 
 use anyhow::{Context, Result};
