@@ -56,6 +56,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     sudo \
     procps \
+    zstd \
     # Required for initrd creation (must be statically linked for kernel boot)
     busybox-static \
     cpio \
