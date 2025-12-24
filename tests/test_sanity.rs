@@ -14,6 +14,7 @@ async fn test_sanity_bridged() -> Result<()> {
 
 #[tokio::test]
 async fn test_sanity_rootless() -> Result<()> {
+    common::require_non_root("test_sanity_rootless")?;
     sanity_test_impl("rootless").await
 }
 
@@ -26,7 +27,7 @@ async fn sanity_test_impl(network: &str) -> Result<()> {
 
     // Start the VM using spawn_fcvm helper (uses Stdio::inherit to prevent deadlock)
     println!("Starting VM...");
-    let vm_name = format!("sanity-test-{}", network);
+    let (vm_name, _, _, _) = common::unique_names(&format!("sanity-{}", network));
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
         "podman",
         "run",

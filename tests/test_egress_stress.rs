@@ -37,6 +37,7 @@ async fn test_egress_stress_bridged() -> Result<()> {
 /// Test egress stress with rootless networking using local HTTP server
 #[tokio::test]
 async fn test_egress_stress_rootless() -> Result<()> {
+    common::require_non_root("test_egress_stress_rootless")?;
     egress_stress_impl("rootless", NUM_CLONES, REQUESTS_PER_CLONE).await
 }
 
@@ -45,7 +46,10 @@ async fn egress_stress_impl(
     num_clones: usize,
     requests_per_clone: usize,
 ) -> Result<()> {
-    let test_name = format!("egress-stress-{}", network);
+    // Use unique prefix for all resources
+    let (baseline_name, _, snapshot_name, _) =
+        common::unique_names(&format!("estress-{}", network));
+    let test_name = baseline_name.clone(); // Use for clone naming
 
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!(
@@ -84,7 +88,6 @@ async fn egress_stress_impl(
     let fcvm_path = common::find_fcvm_binary()?;
 
     // Step 1: Start baseline VM
-    let baseline_name = format!("{}-baseline", test_name);
     println!("\nStep 1: Starting baseline VM '{}'...", baseline_name);
 
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
@@ -146,7 +149,6 @@ async fn egress_stress_impl(
     println!("  ✓ Baseline egress works");
 
     // Step 2: Create snapshot
-    let snapshot_name = format!("{}-snapshot", test_name);
     println!("\nStep 2: Creating snapshot '{}'...", snapshot_name);
 
     let output = tokio::process::Command::new(&fcvm_path)

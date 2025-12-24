@@ -18,6 +18,7 @@ async fn test_exec_bridged() -> Result<()> {
 
 #[tokio::test]
 async fn test_exec_rootless() -> Result<()> {
+    common::require_non_root("test_exec_rootless")?;
     exec_test_impl("rootless").await
 }
 
@@ -26,7 +27,7 @@ async fn exec_test_impl(network: &str) -> Result<()> {
     println!("================================");
 
     let fcvm_path = common::find_fcvm_binary()?;
-    let vm_name = format!("exec-test-{}", network);
+    let (vm_name, _, _, _) = common::unique_names(&format!("exec-{}", network));
 
     // Start the VM using spawn_fcvm helper (uses Stdio::inherit to prevent deadlock)
     println!("Starting VM...");

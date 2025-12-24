@@ -378,37 +378,89 @@ Each VM has:
 
 ## Networking
 
-### Rootless Mode (slirp4netns)
+### Rootless Mode (slirp4netns with Dual-TAP Architecture)
+
+**Key Insight**: slirp4netns and Firecracker CANNOT share a TAP device (both need exclusive access).
+**Solution**: Use two TAP devices with IP forwarding between them inside a user namespace.
 
 **Topology**:
 ```
-┌─────────────┐
-│ Host Process│
-└──────┬──────┘
-       │
-       ├─── Firecracker VM (VM namespace)
-       │      └─── eth0: 10.0.2.15
-       │
-       └─── slirp4netns (User namespace)
-              └─── Provides NAT + port forwarding
+Host                     │ User Namespace (unshare --user --map-root-user --net)
+                         │
+slirp4netns <────────────┼── slirp0 (10.0.2.100/24)
+  (userspace NAT)        │        │
+                         │        │ IP forwarding + iptables NAT
+                         │        ▼
+                         │   tap0 (192.168.1.1/24)
+                         │        │
+                         │        ▼
+                         │   Firecracker VM
+                         │     eth0: 192.168.1.2
 ```
 
-**Port Forwarding**:
+**Setup Sequence** (3-phase with nsenter):
+1. Spawn holder process: `unshare --user --map-root-user --net -- sleep infinity`
+2. Run setup via nsenter: create TAPs, iptables, enable IP forwarding
+3. Start slirp4netns attached to holder's namespace
+4. Run Firecracker via nsenter: `nsenter -t HOLDER_PID -U -n -- firecracker ...`
+5. Health checks via nsenter: `nsenter -t HOLDER_PID -U -n -- curl guest_ip:80`
+
+**Network Setup Script** (executed via nsenter):
 ```bash
+# Create slirp0 TAP for slirp4netns connectivity
+ip tuntap add slirp0 mode tap
+ip addr add 10.0.2.100/24 dev slirp0
+ip link set slirp0 up
+ip route add default via 10.0.2.2 dev slirp0
+
+# Create tap0 for Firecracker (guest uses 192.168.1.2)
+ip tuntap add tap0 mode tap
+ip addr add 192.168.1.1/24 dev tap0
+ip link set tap0 up
+
+# Enable IP forwarding
+echo 1 > /proc/sys/net/ipv4/ip_forward
+
+# Allow forwarding between slirp0 and FC TAP
+iptables -A FORWARD -i slirp0 -o tap0 -j ACCEPT
+iptables -A FORWARD -i tap0 -o slirp0 -j ACCEPT
+
+# NAT guest traffic (192.168.x.x) to slirp0's address (10.0.2.100)
+iptables -t nat -A POSTROUTING -s 192.168.1.0/24 -o slirp0 -j MASQUERADE
+```
+
+**Port Forwarding** (unique loopback IPs):
+```bash
+# Each VM gets a unique loopback IP (127.x.y.z) for port forwarding
+# No IP aliasing needed - Linux routes all 127.0.0.0/8 to loopback
 slirp4netns \
   --configure \
   --mtu=65520 \
-  --port tcp:8080:80 \
-  --port udp:53:53 \
-  <vm-pid> \
-  tap0
+  --api-socket /tmp/slirp-{vm_id}.sock \
+  <holder-pid> \
+  slirp0
+
+# Port forwarding via JSON-RPC API:
+echo '{"execute":"add_hostfwd","arguments":{"proto":"tcp","host_addr":"127.0.0.2","host_port":8080,"guest_addr":"10.0.2.100","guest_port":8080}}' | nc -U /tmp/slirp-{vm_id}.sock
+```
+
+**Traffic Flow** (VM to Internet):
+```
+Guest (192.168.1.2) → tap0 → iptables MASQUERADE → slirp0 (10.0.2.100) → slirp4netns → Host → Internet
+```
+
+**Traffic Flow** (Host to VM port forward):
+```
+Host (127.0.0.2:8080) → slirp4netns → slirp0 (10.0.2.100:8080) → IP forward → tap0 → Guest (192.168.1.2:80)
 ```
 
 **Characteristics**:
-- No root required
-- Slightly slower than native networking
-- Works in nested VMs
-- Fully compatible with rootless Podman
+- No root required (runs entirely in user namespace)
+- Isolated 192.168.1.0/24 subnet per VM (no conflicts)
+- Unique loopback IP per VM enables same port on multiple VMs
+- Slightly slower than bridged (~10-20% overhead)
+- Works in nested VMs and restricted environments
+- Fully compatible with rootless Podman in guest
 
 ### Privileged Mode (nftables + bridge)
 
@@ -1326,6 +1378,28 @@ RUST_LOG=trace fcvm run nginx:latest
 
 ## Testing Strategy
 
+### Test Infrastructure
+
+**Network Mode Guards**: The fcvm binary enforces proper network mode usage:
+- **Bridged without root**: Fails with helpful error message suggesting `sudo` or `--network rootless`
+- **Rootless with root**: Runs but prints warning that bridged would be faster
+
+**Test Isolation**: All tests use unique resource names to enable parallel execution:
+- `unique_names()` helper generates timestamp+counter-based names
+- PID-based naming for additional uniqueness
+- Automatic cleanup on test exit
+
+**Dynamic NBD Device Selection**: When creating rootfs (extracting qcow2 images):
+- Scans `/dev/nbd0` through `/dev/nbd15` to find a free device
+- Checks `/sys/block/nbdN/pid` to detect in-use devices
+- Includes retry logic for race conditions during parallel execution
+
+**Root/Rootless Test Organization**:
+- Rootless tests: Use `require_non_root()` guard, fail loudly if run as root
+- Bridged tests: Rely on fcvm binary's built-in check
+- Makefile targets: Split by network mode (`test-vm-exec-bridged`/`test-vm-exec-rootless`)
+- Container tests: Use appropriate container run configurations (CONTAINER_RUN_FCVM vs CONTAINER_RUN_ROOTLESS)
+
 ### Unit Tests
 
 Test individual components in isolation:
@@ -1541,6 +1615,6 @@ kill $CLONE_PID $SERVE_PID $BASELINE_PID
 
 **End of Design Specification**
 
-*Version: 2.0*
-*Date: 2025-12-14*
+*Version: 2.1*
+*Date: 2025-12-21*
 *Author: fcvm project*

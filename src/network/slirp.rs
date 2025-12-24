@@ -151,17 +151,17 @@ impl SlirpNetwork {
 
     /// Build the setup script to run inside the namespace via nsenter
     ///
-    /// This script creates both TAP devices and sets up iptables rules for egress.
-    /// Health checks use nsenter to curl the guest directly, no port forwarding needed.
+    /// This script creates both TAP devices and configures networking.
     /// Run via: nsenter -t HOLDER_PID -U -n -- bash -c '<this script>'
     pub fn build_setup_script(&self) -> String {
         format!(
             r#"
 set -e
 
-# Create slirp0 TAP for slirp4netns (slirp4netns will attach to this)
+# Create slirp0 TAP for slirp4netns connectivity
+# Use 10.0.2.100 as the address for DNAT to work with port forwarding
 ip tuntap add {slirp_dev} mode tap
-ip addr add 10.0.2.1/24 dev {slirp_dev}
+ip addr add 10.0.2.100/24 dev {slirp_dev}
 ip link set {slirp_dev} up
 
 # Create TAP device for Firecracker (must exist before Firecracker starts)
@@ -183,12 +183,19 @@ iptables -A FORWARD -i {slirp_dev} -o {fc_tap} -j ACCEPT 2>/dev/null || true
 iptables -A FORWARD -i {fc_tap} -o {slirp_dev} -j ACCEPT 2>/dev/null || true
 
 # Set up iptables MASQUERADE for traffic from guest subnet (egress)
+# This NATs guest traffic (192.168.x.x) to slirp0's address (10.0.2.100)
 iptables -t nat -A POSTROUTING -s {guest_subnet} -o {slirp_dev} -j MASQUERADE 2>/dev/null || true
+
+# Set up DNAT for inbound connections from slirp4netns
+# When slirp4netns forwards traffic to 10.0.2.100, redirect it to the actual guest IP
+# This enables port forwarding: host -> slirp4netns -> 10.0.2.100 -> DNAT -> guest (192.168.x.2)
+iptables -t nat -A PREROUTING -d 10.0.2.100 -j DNAT --to-destination {guest_ip} 2>/dev/null || true
 "#,
             slirp_dev = self.slirp_device,
             fc_tap = self.tap_device,
             ns_ip = self.namespace_ip,
             guest_subnet = self.guest_subnet,
+            guest_ip = self.guest_ip,
         )
     }
 

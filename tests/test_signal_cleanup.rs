@@ -52,12 +52,6 @@ fn send_signal(pid: u32, signal: &str) -> Result<()> {
 /// Test that SIGINT properly kills the VM and cleans up firecracker
 #[test]
 fn test_sigint_kills_firecracker() -> Result<()> {
-    // This test requires root for bridged networking
-    if !nix::unistd::geteuid().is_root() {
-        eprintln!("Skipping test_sigint_kills_firecracker: requires root");
-        return Ok(());
-    }
-
     println!("\ntest_sigint_kills_firecracker");
 
     // Get initial firecracker count
@@ -76,12 +70,13 @@ fn test_sigint_kills_firecracker() -> Result<()> {
 
     // Start fcvm in background
     let fcvm_path = common::find_fcvm_binary()?;
+    let vm_name = format!("signal-int-{}", std::process::id());
     let mut fcvm = Command::new(&fcvm_path)
         .args([
             "podman",
             "run",
             "--name",
-            "signal-test",
+            &vm_name,
             "--network",
             "bridged",
             "nginx:alpine",
@@ -210,22 +205,17 @@ fn test_sigint_kills_firecracker() -> Result<()> {
 /// Test that SIGTERM properly kills the VM and cleans up firecracker
 #[test]
 fn test_sigterm_kills_firecracker() -> Result<()> {
-    // This test requires root for bridged networking
-    if !nix::unistd::geteuid().is_root() {
-        eprintln!("Skipping test_sigterm_kills_firecracker: requires root");
-        return Ok(());
-    }
-
     println!("\ntest_sigterm_kills_firecracker");
 
     // Start fcvm in background
     let fcvm_path = common::find_fcvm_binary()?;
+    let vm_name = format!("signal-term-{}", std::process::id());
     let mut fcvm = Command::new(&fcvm_path)
         .args([
             "podman",
             "run",
             "--name",
-            "signal-test-term",
+            &vm_name,
             "--network",
             "bridged",
             "nginx:alpine",

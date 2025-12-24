@@ -274,6 +274,22 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     state_manager.init().await?;
 
     // Setup networking based on mode
+    // Bridged mode requires root for iptables and network namespace setup
+    if matches!(args.network, NetworkMode::Bridged) && !nix::unistd::geteuid().is_root() {
+        bail!(
+            "Bridged networking requires root. Either:\n  \
+             - Run with sudo: sudo fcvm podman run ...\n  \
+             - Use rootless mode: fcvm podman run --network rootless ..."
+        );
+    }
+    // Rootless with sudo is pointless - bridged would be faster
+    if matches!(args.network, NetworkMode::Rootless) && nix::unistd::geteuid().is_root() {
+        warn!(
+            "Running rootless mode as root is unnecessary. \
+             Consider using --network bridged for better performance."
+        );
+    }
+
     let tap_device = format!("tap-{}", truncate_id(&vm_id, 8));
     let mut network: Box<dyn NetworkManager> = match args.network {
         NetworkMode::Bridged => Box::new(BridgedNetwork::new(
