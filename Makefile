@@ -98,6 +98,7 @@ BENCH_EXEC := cargo bench --bench exec
         container-build container-build-root container-build-rootless container-build-only container-build-allow-other \
         container-test container-test-unit container-test-noroot container-test-root container-test-fuse \
         container-test-vm container-test-pjdfstest container-test-all container-test-allow-other \
+        ci-container-rootless ci-container-sudo \
         container-bench container-bench-throughput container-bench-operations container-bench-protocol container-bench-exec \
         container-shell container-clean \
         setup-btrfs setup-rootfs setup-all
@@ -502,6 +503,27 @@ container-test-pjdfstest: container-build-root
 
 # Run everything in container
 container-test-all: container-test container-test-vm container-test-pjdfstest
+
+#------------------------------------------------------------------------------
+# CI Targets (one command per job)
+#------------------------------------------------------------------------------
+
+# CI Job 1: Lint + rootless FUSE tests
+ci-container-rootless: container-build
+	@echo "==> CI: Lint + rootless FUSE tests..."
+	$(MAKE) lint
+	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) $(CTEST_UNIT)
+	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) $(CTEST_FUSE_NOROOT)
+	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) $(CTEST_FUSE_STRESS)
+
+# CI Job 2: Root FUSE tests + POSIX compliance
+ci-container-sudo: container-build-root
+	@echo "==> CI: Root FUSE tests + POSIX compliance..."
+	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) $(CTEST_FUSE_ROOT)
+	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) $(CTEST_FUSE_PERMISSION)
+	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) $(CTEST_PJDFSTEST)
+
+# CI Job 3: VM tests (container-test-vm already exists above)
 
 # Container benchmarks - uses same commands as native benchmarks
 container-bench: container-build
