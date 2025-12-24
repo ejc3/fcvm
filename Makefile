@@ -397,6 +397,7 @@ CONTAINER_RUN_FUSE_ROOT := $(CONTAINER_RUN_BASE_ROOT) \
 # Used for bridged mode tests that require root/iptables
 # REQUIRES sudo - network namespace creation needs real root, not user namespace root
 # Uses VOLUME_TARGET_ROOT for isolation from rootless podman builds
+# Note: /run/systemd/resolve mount provides real DNS servers when host uses systemd-resolved
 CONTAINER_RUN_FCVM := sudo podman run --rm --privileged \
 	--group-add keep-groups \
 	-v .:/workspace/fcvm \
@@ -409,6 +410,7 @@ CONTAINER_RUN_FCVM := sudo podman run --rm --privileged \
 	--device /dev/fuse \
 	-v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	-v /var/run/netns:/var/run/netns:rshared \
+	-v /run/systemd/resolve:/run/systemd/resolve:ro \
 	--network host
 
 # Container run for rootless networking tests

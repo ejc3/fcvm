@@ -337,7 +337,7 @@ pub async fn poll_health_by_pid(pid: u32, timeout_secs: u64) -> anyhow::Result<(
         };
 
         // Check if VM is healthy using proper enum comparison
-        if let Some(display) = vms.first() {
+        for display in &vms {
             if matches!(display.vm.health_status, fcvm::state::HealthStatus::Healthy) {
                 return Ok(());
             }
