@@ -18,6 +18,9 @@ retries = 0
 # Status level for output
 status-level = "pass"
 final-status-level = "flaky"
+# Show output immediately (don't capture)
+success-output = "immediate"
+failure-output = "immediate"
 
 # CI profile - more verbose, stricter
 [profile.ci]
