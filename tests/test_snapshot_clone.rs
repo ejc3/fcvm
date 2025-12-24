@@ -17,14 +17,12 @@ use tokio::sync::Mutex;
 /// Full snapshot/clone workflow test with rootless networking (10 clones)
 #[tokio::test]
 async fn test_snapshot_clone_rootless_10() -> Result<()> {
-    common::require_non_root("test_snapshot_clone_rootless_10")?;
     snapshot_clone_test_impl("rootless", 10).await
 }
 
 /// Stress test with 100 clones using rootless networking
 #[tokio::test]
 async fn test_snapshot_clone_stress_100() -> Result<()> {
-    common::require_non_root("test_snapshot_clone_stress_100")?;
     snapshot_clone_test_impl("rootless", 100).await
 }
 
@@ -377,6 +375,7 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
 /// This tests for vsock socket path conflicts: when cloning from a running baseline,
 /// both the baseline and clone need separate vsock sockets. Without mount namespace
 /// isolation, Firecracker would try to bind to the same socket path stored in vmstate.bin.
+#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_clone_while_baseline_running() -> Result<()> {
     let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("running");
@@ -524,6 +523,7 @@ async fn test_clone_while_baseline_running() -> Result<()> {
 ///
 /// This verifies that DNS resolution and outbound connectivity work after snapshot restore.
 /// The clone should be able to resolve hostnames and make HTTP requests.
+#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_clone_internet_bridged() -> Result<()> {
     clone_internet_test_impl("bridged").await
@@ -532,7 +532,6 @@ async fn test_clone_internet_bridged() -> Result<()> {
 /// Test that clones can reach the internet in rootless mode
 #[tokio::test]
 async fn test_clone_internet_rootless() -> Result<()> {
-    common::require_non_root("test_clone_internet_rootless")?;
     clone_internet_test_impl("rootless").await
 }
 
@@ -765,6 +764,7 @@ async fn test_clone_http(fcvm_path: &std::path::Path, clone_pid: u32) -> Result<
 ///
 /// Verifies that --publish correctly forwards ports to cloned VMs.
 /// This tests the full port forwarding path: host → iptables DNAT → clone VM → nginx.
+#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_clone_port_forward_bridged() -> Result<()> {
     let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("pf-bridged");
@@ -883,10 +883,13 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
 
     println!("  Clone guest IP: {}", guest_ip);
 
-    // Test 1: Direct access to guest IP
-    println!("  Testing direct access to guest...");
+    // Note: Direct access to guest IP (172.30.x.y) is NOT expected to work for clones.
+    // Clones use In-Namespace NAT where the guest IP is only reachable inside the namespace.
+    // Port forwarding goes through veth_inner_ip (10.x.y.z) which then gets DNATed to guest_ip.
+    // We test this only to document the expected behavior.
+    println!("  Testing direct access to guest (expected to fail for clones)...");
     let direct_result = tokio::process::Command::new("curl")
-        .args(["-s", "--max-time", "10", &format!("http://{}:80", guest_ip)])
+        .args(["-s", "--max-time", "5", &format!("http://{}:80", guest_ip)])
         .output()
         .await;
 
@@ -894,8 +897,8 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
         .map(|o| o.status.success() && !o.stdout.is_empty())
         .unwrap_or(false);
     println!(
-        "    Direct access: {}",
-        if direct_works { "✓ OK" } else { "✗ FAIL" }
+        "    Direct access: {} (expected for clones)",
+        if direct_works { "✓ OK" } else { "✗ N/A" }
     );
 
     // Test 2: Access via host's primary IP and forwarded port
@@ -958,12 +961,8 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
     println!("║                         RESULTS                               ║");
     println!("╠═══════════════════════════════════════════════════════════════╣");
     println!(
-        "║  Direct access to guest:    {}                                 ║",
-        if direct_works {
-            "✓ PASSED"
-        } else {
-            "✗ FAILED"
-        }
+        "║  Direct access to guest:    {} (N/A for clones)            ║",
+        if direct_works { "✓ WORKS" } else { "✗ N/A  " }
     );
     println!(
         "║  Port forward (host IP):    {}                                 ║",
@@ -983,14 +982,14 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
     );
     println!("╚═══════════════════════════════════════════════════════════════╝");
 
-    // All port forwarding methods must work
-    if direct_works && forward_works && localhost_works {
+    // For clones, only port forwarding methods must work.
+    // Direct access is NOT expected to work due to In-Namespace NAT architecture.
+    if forward_works && localhost_works {
         println!("\n✅ CLONE PORT FORWARDING TEST PASSED!");
         Ok(())
     } else {
         anyhow::bail!(
-            "Clone port forwarding test failed: direct={}, forward={}, localhost={}",
-            direct_works,
+            "Clone port forwarding test failed: forward={}, localhost={}",
             forward_works,
             localhost_works
         )
@@ -1003,8 +1002,6 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
 /// Port forwarding is done via slirp4netns API, accessing via unique loopback IP.
 #[tokio::test]
 async fn test_clone_port_forward_rootless() -> Result<()> {
-    common::require_non_root("test_clone_port_forward_rootless")?;
-
     let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("pf-rootless");
 
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
@@ -1185,6 +1182,7 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
 }
 
 /// Test snapshot run --exec with bridged networking
+#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_snapshot_run_exec_bridged() -> Result<()> {
     snapshot_run_exec_test_impl("bridged").await
@@ -1193,7 +1191,6 @@ async fn test_snapshot_run_exec_bridged() -> Result<()> {
 /// Test snapshot run --exec with rootless networking
 #[tokio::test]
 async fn test_snapshot_run_exec_rootless() -> Result<()> {
-    common::require_non_root("test_snapshot_run_exec_rootless")?;
     snapshot_run_exec_test_impl("rootless").await
 }
 

@@ -5,6 +5,16 @@ fcvm is a Firecracker VM manager for running Podman containers in lightweight mi
 
 ## Quick Reference
 
+### Streaming Test Output
+
+**Use `STREAM=1` to see test output in real-time:**
+```bash
+make test-vm FILTER=sanity STREAM=1              # Host tests with streaming
+make container-test-vm FILTER=sanity STREAM=1   # Container tests with streaming
+```
+
+Without `STREAM=1`, nextest captures output and only shows it after tests complete (better for parallel runs).
+
 ### Common Commands
 ```bash
 # Build
@@ -51,7 +61,13 @@ fcvm exec --pid <PID> -c -- wget -q -O - --timeout=10 http://ifconfig.me
 
 ### Code Philosophy
 
-**NO LEGACY/BACKWARD COMPATIBILITY in our own implementation.** When we change an API, we update all callers. No deprecated functions, no compatibility shims, no `_old` suffixes. Clean breaks only.
+**NO LEGACY/BACKWARD COMPATIBILITY.** This applies to everything: code, Makefile, documentation.
+
+- When we change an API, we update all callers
+- No deprecated functions, no compatibility shims, no `_old` suffixes
+- No legacy Makefile targets or aliases
+- No "keep this for backwards compatibility" comments
+- Clean breaks only - delete the old thing entirely
 
 Exception: For **forked libraries** (like fuse-backend-rs), we maintain compatibility with upstream to enable merging upstream changes.
 
@@ -85,6 +101,41 @@ Exception: For **forked libraries** (like fuse-backend-rs), we maintain compatib
 - PRs provide CI validation before merge
 - Can stack multiple PRs without waiting
 - Merge at end when CI is green
+
+### Commit Messages
+
+**Detailed messages with context and testing.** Commit messages should capture the nuance from the session that created them.
+
+**What to include:**
+- **What changed** - specific files, functions, behaviors modified
+- **Why it changed** - the problem being solved or feature being added
+- **How it was tested** - "show don't tell" with actual commands/output
+
+**Good example:**
+```
+Remove obsolete require_non_root guard function
+
+The function was a no-op kept for "API compatibility" - exactly what
+our NO LEGACY policy prohibits. Rootless tests work fine under sudo.
+
+Removed function and all 12 call sites across test files.
+
+Tested: make test-vm FILTER=sanity (both rootless and bridged pass)
+```
+
+**Bad example:**
+```
+Fix tests
+```
+
+**Testing section format** - show actual commands:
+```
+Tested:
+  make test-vm FILTER=sanity     # 2 passed
+  make container-test-vm FILTER=sanity  # 2 passed
+```
+
+Not vague claims like "tested and works" or "verified manually".
 
 ### JSON Parsing
 
@@ -122,6 +173,38 @@ Why: String matching breaks when JSON formatting changes (spaces, newlines, fiel
 
 If a test fails intermittently, that's a **concurrency bug** or **race condition** that must be fixed, not ignored.
 
+### Race Condition Debugging Protocol
+
+**Workarounds are NOT acceptable.** When a test fails due to a race condition:
+
+1. **NEVER "fix" it with timing changes** like:
+   - Increasing timeouts
+   - Adding sleeps
+   - Separating phases that should work concurrently
+   - Reducing parallelism
+
+2. **ALWAYS examine the actual output:**
+   - Capture FULL logs from failing test runs
+   - Look at what the SPECIFIC failing component did/didn't do
+   - Trace timestamps to understand ordering
+   - Find the EXACT operation that failed
+
+3. **Ask the right questions:**
+   - What's different about the failing component vs. successful ones?
+   - What resource/state is being contended?
+   - What initialization happens on first access?
+   - Are there orphaned processes or stale state?
+
+4. **Find and fix the ROOT CAUSE:**
+   - If it's a lock ordering issue, fix the locking
+   - If it's uninitialized state, fix the initialization
+   - If it's resource exhaustion, fix the resource management
+   - If it's a cleanup issue, fix the cleanup
+
+**Example bad fix:** "Clone-0 times out while clones 1-99 succeed" → "Let's wait for all spawns before health checking"
+
+**Correct approach:** Look at clone-0's logs to see WHY it specifically failed. What did clone-0 do differently? What resource did it touch first?
+
 ### NO TEST HEDGES
 
 **Test assertions must be DEFINITIVE.** A test either PASSES or FAILS - no middle ground.
@@ -157,11 +240,17 @@ assert!(localhost_works, "Localhost port forwarding should work (requires route_
 
 **Tests MUST work when run in parallel.** Resource conflicts are bugs, not excuses.
 
+**Test feature flags:**
+- `#[cfg(feature = "privileged-tests")]`: Tests requiring sudo (iptables, root podman storage)
+- No feature flag: Unprivileged tests run by default
+- Features are compile-time gates - tests won't exist unless the feature is enabled
+- Use `FILTER=` to further filter by name pattern: `make test-vm FILTER=exec`
+
 **Common parallel test pitfalls and fixes:**
 
-1. **Unique resource names**: Use `unique_names()` helper to generate timestamp+counter-based names
+1. **Unique resource names**: Use `common::unique_names()` helper to generate timestamp+counter-based names
    ```rust
-   let (baseline, clone, snapshot, serve) = unique_names("mytest");
+   let (baseline, clone, snapshot, serve) = common::unique_names("mytest");
    // Returns: mytest-base-12345-0, mytest-clone-12345-0, etc.
    ```
 
@@ -183,17 +272,41 @@ assert!(localhost_works, "Localhost port forwarding should work (requires route_
 
 ### Build and Test Rules
 
-**Use Makefile targets for common operations:**
+**CRITICAL: NEVER run `cargo build` or `cargo test` directly. ALWAYS use Makefile targets.**
+
+The Makefile handles:
+- Correct `CARGO_TARGET_DIR` for sudo vs non-sudo builds (avoids permission conflicts)
+- Proper feature flags (`--features privileged-tests`)
+- btrfs setup prerequisites
+- Container image building for container tests
 
 ```bash
-# Correct - always use make
-make build              # Build fcvm + fc-agent
-make test               # Run fuse-pipe tests
-make test-vm            # Run VM tests
-make test-vm-rootless   # Run rootless VM test only
-make container-test     # Run tests in container
-make clean              # Clean build artifacts
+# CORRECT - always use make
+make build                  # Build fcvm + fc-agent
+make test                   # Run fuse-pipe tests
+make test-vm                # All VM tests (runs with sudo via target runner)
+make test-vm FILTER=exec    # Only exec tests
+make test-vm FILTER=sanity  # Only sanity tests
+make container-test         # Run tests in container
+make clean                  # Clean build artifacts
+
+# WRONG - never do this
+sudo cargo build ...        # Wrong target dir, permission issues
+cargo test -p fcvm ...      # Missing feature flags, setup
 ```
+
+**Test feature flags**: Tests use `#[cfg(feature = "privileged-tests")]` for tests requiring sudo. Unprivileged tests run by default (no feature flag). Use `FILTER=` to further filter by name.
+
+### Container Build Rules
+
+**Container builds work naturally with layer caching.** No workarounds needed.
+
+- Podman caches layers based on Containerfile content
+- When you modify a line, that layer and all subsequent layers rebuild automatically
+- Just run `make container-build-root` and let caching work
+- NEVER use `--no-cache` or add dummy comments to invalidate cache
+
+**Symlinks for sudo access**: The Containerfile creates symlinks in `/usr/local/bin/` so that `sudo cargo` works (sudo uses secure_path which includes `/usr/local/bin`). This matches how the host is configured.
 
 The `fuse-pipe/Cargo.toml` uses a local path dependency:
 ```toml
@@ -213,7 +326,33 @@ sleep 20 && tail -20 /tmp/test.log
 sleep 5 && ...
 
 # Bad - too slow (miss important output)
-sleep 60 && ...
+```
+
+### Preserving Logs from Failed Tests
+
+**When a test fails, IMMEDIATELY save the log to a uniquely-named file for diagnosis:**
+
+```bash
+# Pattern: /tmp/fcvm-failed-{test_name}-{timestamp}.log
+# Example after test_exec_rootless fails:
+cp /tmp/test.log /tmp/fcvm-failed-test_exec_rootless-$(date +%Y%m%d-%H%M%S).log
+
+# Then continue with other tests using a fresh log file
+make test-vm 2>&1 | tee /tmp/test-run2.log
+```
+
+**Why this matters:**
+- Test logs get overwritten when running the suite again
+- Failed test output is essential for root cause analysis
+- Timestamps prevent filename collisions across sessions
+
+**Automated approach:**
+```bash
+# After a test suite run, check for failures and save logs
+if grep -q "FAIL\|TIMEOUT" /tmp/test.log; then
+  cp /tmp/test.log /tmp/fcvm-failed-$(date +%Y%m%d-%H%M%S).log
+  echo "Saved failed test log"
+fi
 ```
 
 ### Debugging fuse-pipe Tests
@@ -271,14 +410,14 @@ All 8789 pjdfstest tests pass when running in a container with proper device cgr
 
 ### Key Makefile Targets
 
-| Target | What | Root? |
-|--------|------|-------|
-| `make test` | fuse-pipe noroot + root tests | Mixed |
-| `make test-vm` | VM tests (rootless + bridged) | Mixed |
-| `make container-test` | fuse-pipe in container | No |
-| `make container-test-pjdfstest` | 8789 POSIX tests | No |
-| `make container-test-vm` | VM tests in container | No |
-| `make bench` | All fuse-pipe benchmarks | No |
+| Target | What |
+|--------|------|
+| `make test` | fuse-pipe tests |
+| `make test-vm` | All VM tests (rootless + bridged) |
+| `make test-vm FILTER=exec` | Only exec tests |
+| `make container-test` | fuse-pipe in container |
+| `make container-test-vm` | VM tests in container |
+| `make test-all` | Everything |
 
 ### Path Overrides for CI
 
@@ -328,6 +467,28 @@ On serve process exit (SIGTERM/SIGINT):
 2. Kill each clone process: `kill -TERM <clone_pid>`
 3. Remove socket file: `/mnt/fcvm-btrfs/uffd-{snapshot}-{pid}.sock`
 4. Delete serve state from state manager
+
+### Stale State File Handling
+
+**Problem**: State files persist when VMs crash (SIGKILL, test abort). When the OS reuses a PID, the old state file causes collisions when querying by PID.
+
+**Solution**: `StateManager::save_state()` automatically cleans up stale state files:
+- Before saving, checks if any OTHER state file claims the same PID
+- If found, that file is stale (the process is dead, PID was reused)
+- Deletes the stale file with a warning log
+- Then saves the new state
+
+**Why it works**: If process A has PID 5000 and we're saving state for process B with PID 5000, process A must be dead (OS wouldn't reuse the PID otherwise). So A's state file is safe to delete.
+
+**State file layout**: Individual files per VM, keyed by `vm_id` (UUID):
+```
+/mnt/fcvm-btrfs/state/
+├── vm-abc123.json    # { vm_id: "vm-abc123", pid: 5000, ... }
+├── vm-def456.json    # { vm_id: "vm-def456", pid: 5001, ... }
+└── loopback-ip.lock  # Global lock for IP allocation
+```
+
+No master state file - `list_vms()` globs all `.json` files.
 
 ### Test Integration
 
@@ -400,9 +561,7 @@ fuse-pipe/tests/
 ├── test_mount_stress.rs        # Mount/unmount stress tests
 ├── test_allow_other.rs         # AllowOther flag tests
 ├── test_unmount_race.rs        # Unmount race condition tests
-├── pjdfstest_full.rs           # Full POSIX compliance (8789 tests)
-├── pjdfstest_fast.rs           # Fast POSIX subset
-├── pjdfstest_stress.rs         # Parallel POSIX stress
+├── pjdfstest_matrix.rs         # POSIX compliance (17 categories, parallel via nextest)
 └── pjdfstest_common.rs         # Shared pjdfstest utilities
 
 fuse-pipe/benches/
@@ -494,8 +653,16 @@ fuse-pipe/benches/
 
 **Architecture:**
 - All data under `/mnt/fcvm-btrfs/` (btrfs filesystem)
-- Base rootfs: `/mnt/fcvm-btrfs/rootfs/base.ext4` (~1GB Ubuntu 24.04 + Podman)
-- VM disks: `/mnt/fcvm-btrfs/vm-disks/{vm_id}/disks/rootfs.ext4`
+- Base rootfs: `/mnt/fcvm-btrfs/rootfs/layer2-{sha}.raw` (~10GB raw disk with Ubuntu 24.04 + Podman)
+- VM disks: `/mnt/fcvm-btrfs/vm-disks/{vm_id}/disks/rootfs.raw`
+- Initrd: `/mnt/fcvm-btrfs/initrd/fc-agent-{sha}.initrd` (injects fc-agent at boot)
+
+**Layer System:**
+The rootfs is named after the SHA of the setup script + kernel URL. This ensures automatic cache invalidation when:
+- The init logic, install script, or setup script changes
+- The kernel URL changes (different kernel version)
+
+The initrd contains a statically-linked busybox and fc-agent binary, injected at boot before systemd.
 
 ```rust
 // src/storage/disk.rs - create_cow_disk()
@@ -521,10 +688,10 @@ pub fn vm_runtime_dir(vm_id: &str) -> PathBuf {
 **⚠️ CRITICAL: Changing VM base image (fc-agent, rootfs)**
 
 ALWAYS use Makefile commands to update the VM base:
-- `make rebuild` - Rebuild fc-agent and update rootfs
-- `make rootfs` - Update fc-agent in existing rootfs only
+- `make rebuild` - Rebuild fc-agent and regenerate rootfs/initrd
+- Rootfs is auto-regenerated when setup script changes (via SHA-based caching)
 
-NEVER manually edit `/mnt/fcvm-btrfs/rootfs/base.ext4` or mount it directly. The Makefile handles mount/unmount correctly and ensures proper cleanup.
+NEVER manually edit rootfs files. The setup script in `rootfs-plan.toml` and `src/setup/rootfs.rs` control what gets installed. Changes trigger automatic regeneration on next VM start.
 
 ### Memory Sharing (UFFD)
 
@@ -594,20 +761,13 @@ Run `make help` for full list. Key targets:
 #### Testing
 | Target | Description |
 |--------|-------------|
-| `make test` | Run fuse-pipe tests: noroot + root |
-| `make test-noroot` | Tests without root: unit + integration + stress |
-| `make test-root` | Tests requiring root: integration_root + permission |
-| `make test-unit` | Unit tests only |
-| `make test-fuse` | All fuse-pipe tests explicitly |
-| `make test-vm` | Run VM tests: rootless + bridged |
-| `make test-vm-rootless` | VM test with slirp4netns (no root) |
-| `make test-vm-bridged` | VM test with bridged networking |
-| `make test-pjdfstest` | POSIX compliance (8789 tests) |
-| `make test-all` | Everything: test + test-vm + test-pjdfstest |
-| `make container-test` | Run fuse-pipe tests (in container) |
-| `make container-test-vm` | Run VM tests (in container) |
-| `make container-test-pjdfstest` | POSIX compliance in container |
-| `make container-shell` | Interactive shell in container |
+| `make test` | fuse-pipe tests |
+| `make test-vm` | All VM tests (rootless + bridged) |
+| `make test-vm FILTER=exec` | Only exec tests |
+| `make test-all` | Everything |
+| `make container-test` | fuse-pipe in container |
+| `make container-test-vm` | VM tests in container |
+| `make container-shell` | Interactive shell |
 
 #### Linting
 | Target | Description |
@@ -631,37 +791,33 @@ Run `make help` for full list. Key targets:
 #### Setup (idempotent, run automatically by tests)
 | Target | Description |
 |--------|-------------|
-| `make setup-all` | Full setup: btrfs + kernel + rootfs |
 | `make setup-btrfs` | Create btrfs loopback |
-| `make setup-kernel` | Copy kernel to btrfs |
-| `make setup-rootfs` | Create base rootfs (~90 sec first run) |
-
-#### Rootfs Updates
-| Target | Description |
-|--------|-------------|
-| `make rootfs` | Update fc-agent in existing rootfs |
-| `make rebuild` | Build + update rootfs |
+| `make setup-rootfs` | Trigger rootfs creation (~90 sec first run) |
 
 ### How Setup Works
 
 **What Makefile does (prerequisites):**
 1. `setup-btrfs` - Creates 20GB btrfs loopback at `/mnt/fcvm-btrfs`
-2. `setup-kernel` - Copies pre-built kernel from `~/linux-firecracker/arch/arm64/boot/Image`
 
 **What fcvm binary does (auto on first VM start):**
-1. `ensure_kernel()` - Checks for `/mnt/fcvm-btrfs/kernels/vmlinux.bin` (already copied by Makefile)
-2. `ensure_rootfs()` - If missing, downloads Ubuntu 24.04 cloud image (~590MB), customizes with virt-customize, installs podman/crun/etc, embeds fc-agent binary (~90 sec)
+1. `ensure_kernel()` - Downloads Kata kernel from URL in `rootfs-plan.toml` if not present (cached by URL hash)
+2. `ensure_rootfs()` - Creates Layer 2 rootfs if SHA doesn't match (downloads Ubuntu cloud image, runs setup in VM, creates initrd with fc-agent)
+
+**Kernel source**: Kata Containers kernel (6.12.47 from Kata 3.24.0 release) with `CONFIG_FUSE_FS=y` built-in. This is specified in `rootfs-plan.toml` and auto-downloaded on first run.
 
 ### Data Layout
 ```
 /mnt/fcvm-btrfs/           # btrfs filesystem (CoW reflinks work here)
 ├── kernels/
-│   └── vmlinux.bin        # Firecracker kernel
+│   ├── vmlinux.bin        # Symlink to active kernel
+│   └── vmlinux-{sha}.bin  # Kernel files (SHA of URL for cache key)
 ├── rootfs/
-│   └── base.ext4          # Base Ubuntu + Podman image (~10GB)
+│   └── layer2-{sha}.raw   # Base Ubuntu + Podman image (~10GB, SHA of setup script)
+├── initrd/
+│   └── fc-agent-{sha}.initrd  # fc-agent injection initrd (SHA of binary)
 ├── vm-disks/
 │   └── vm-{id}/
-│       └── rootfs.ext4    # CoW reflink copy per VM
+│       └── disks/rootfs.raw   # CoW reflink copy per VM
 ├── snapshots/             # Firecracker snapshots
 ├── state/                 # VM state JSON files
 └── cache/                 # Downloaded cloud images
@@ -735,26 +891,16 @@ let (mut child, pid) = common::spawn_fcvm(&["podman", "run", "--name", &vm_name,
 
 ## fuse-pipe Testing
 
-**Quick reference**: See `README.md` for testing guide and Makefile targets.
+**Quick reference**: See `make help` for all targets.
 
-### Quick Reference (Container - Recommended)
-
-| Command | Description |
-|---------|-------------|
-| `make container-test` | Run all fuse-pipe tests |
-| `make container-test-vm` | Run fcvm VM tests (rootless + bridged) |
-| `make container-test-pjdfstest` | POSIX compliance (8789 tests) |
-| `make container-shell` | Interactive shell for debugging |
-
-### Quick Reference (Native)
+### Quick Reference
 
 | Command | Description |
 |---------|-------------|
-| `sudo cargo test --release -p fuse-pipe --test integration` | Basic FUSE ops (15 tests) |
-| `sudo cargo test --release -p fuse-pipe --test test_permission_edge_cases` | Permission tests (18 tests) |
-| `sudo cargo test --release -p fuse-pipe --test pjdfstest_full` | POSIX compliance (8789 tests) |
-| `sudo cargo test --release -p fuse-pipe --test pjdfstest_stress` | Parallel stress (85 jobs) |
-| `sudo cargo bench -p fuse-pipe --bench throughput` | I/O benchmarks |
+| `make container-test` | fuse-pipe tests |
+| `make container-test-vm` | VM tests (rootless + bridged) |
+| `make container-test-vm FILTER=exec` | Only exec tests |
+| `make container-shell` | Interactive shell |
 
 ### Tracing Targets
 

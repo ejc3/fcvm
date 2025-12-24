@@ -1,7 +1,7 @@
 //! Egress stress test - many clones, parallel exec
 //!
 //! This test:
-//! 1. Starts a local HTTP server on the host
+//! 1. Starts a local HTTP server on the host (dynamic port for parallel test isolation)
 //! 2. Creates a baseline VM and snapshot
 //! 3. Spawns multiple clones in parallel
 //! 4. Runs parallel curl commands from each clone to the local HTTP server
@@ -10,6 +10,7 @@
 mod common;
 
 use anyhow::{Context, Result};
+use std::net::TcpListener;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -22,13 +23,11 @@ const NUM_CLONES: usize = 10;
 /// Number of parallel requests per clone
 const REQUESTS_PER_CLONE: usize = 5;
 
-/// Port for local HTTP server
-const HTTP_SERVER_PORT: u16 = 18080;
-
 /// Test egress stress with bridged networking using local HTTP server
 ///
 /// Uses CONNMARK-based routing to ensure each clone's egress traffic is routed
 /// back to the correct clone, even though they all share the same guest IP.
+#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_egress_stress_bridged() -> Result<()> {
     egress_stress_impl("bridged", NUM_CLONES, REQUESTS_PER_CLONE).await
@@ -37,7 +36,6 @@ async fn test_egress_stress_bridged() -> Result<()> {
 /// Test egress stress with rootless networking using local HTTP server
 #[tokio::test]
 async fn test_egress_stress_rootless() -> Result<()> {
-    common::require_non_root("test_egress_stress_rootless")?;
     egress_stress_impl("rootless", NUM_CLONES, REQUESTS_PER_CLONE).await
 }
 
@@ -58,12 +56,15 @@ async fn egress_stress_impl(
     );
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
+    // Allocate a unique port for this test (parallel test isolation)
+    let http_server_port = find_free_port()?;
+
     // Step 0: Start local HTTP server
     println!(
         "Step 0: Starting local HTTP server on port {}...",
-        HTTP_SERVER_PORT
+        http_server_port
     );
-    let http_server = start_http_server(HTTP_SERVER_PORT).await?;
+    let http_server = start_http_server(http_server_port).await?;
     println!(
         "  ✓ HTTP server started (PID: {})",
         http_server.id().unwrap_or(0)
@@ -74,12 +75,12 @@ async fn egress_stress_impl(
     // goes through NAT (MASQUERADE), so CONNMARK-based routing ensures correct return path.
     // For rootless mode, slirp4netns handles all routing so local traffic works fine (10.0.2.2).
     let egress_url = match network {
-        "rootless" => format!("http://10.0.2.2:{}/", HTTP_SERVER_PORT),
+        "rootless" => format!("http://10.0.2.2:{}/", http_server_port),
         "bridged" => {
             // Get host's primary interface IP (the IP used to reach external networks)
             // Traffic to this IP from VMs goes through NAT, so CONNMARK works
             let host_ip = get_host_primary_ip().await?;
-            format!("http://{}:{}/", host_ip, HTTP_SERVER_PORT)
+            format!("http://{}:{}/", host_ip, http_server_port)
         }
         _ => anyhow::bail!("Unknown network type: {}", network),
     };
@@ -394,6 +395,16 @@ async fn egress_stress_impl(
         );
         anyhow::bail!("Success rate {:.1}% below threshold 95%", success_rate)
     }
+}
+
+/// Find a free port for the HTTP server (parallel test isolation)
+fn find_free_port() -> Result<u16> {
+    // Bind to port 0 to let the OS allocate a free port
+    let listener = TcpListener::bind("0.0.0.0:0").context("binding to find free port")?;
+    let port = listener.local_addr()?.port();
+    // Drop the listener - there's a tiny race window but it's acceptable for tests
+    drop(listener);
+    Ok(port)
 }
 
 /// Start a simple HTTP server using Python

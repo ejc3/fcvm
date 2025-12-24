@@ -75,6 +75,8 @@ pub struct RunArgs {
     pub env: Vec<String>,
 
     /// Command to run inside container
+    ///
+    /// Example: --cmd "nginx -g 'daemon off;'"
     #[arg(long)]
     pub cmd: Option<String>,
 
@@ -100,6 +102,11 @@ pub struct RunArgs {
     /// Use for POSIX compliance tests that need full filesystem capabilities
     #[arg(long)]
     pub privileged: bool,
+
+    /// Debug fc-agent with strace (output to /tmp/fc-agent.strace in guest)
+    /// Useful for diagnosing fc-agent startup issues
+    #[arg(long)]
+    pub strace_agent: bool,
 }
 
 // ============================================================================

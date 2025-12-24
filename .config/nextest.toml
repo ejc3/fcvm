@@ -1,0 +1,67 @@
+# cargo-nextest configuration
+# https://nexte.st/book/configuration.html
+
+[store]
+# Store test results for analysis
+dir = "target/nextest"
+
+# Default profile
+[profile.default]
+# Run tests in parallel by default
+test-threads = "num-cpus"
+# Timeout per test (VM tests can be slow)
+slow-timeout = { period = "60s", terminate-after = 2 }
+# Fail fast on first failure
+fail-fast = false
+# Retry flaky tests once
+retries = 0
+# Status level for output
+status-level = "pass"
+final-status-level = "flaky"
+# Show output immediately (don't capture)
+success-output = "immediate"
+failure-output = "immediate"
+
+# CI profile - more verbose, stricter
+[profile.ci]
+test-threads = "num-cpus"
+slow-timeout = { period = "120s", terminate-after = 2 }
+fail-fast = false
+retries = 0
+status-level = "all"
+final-status-level = "all"
+
+# Quick profile for development
+[profile.quick]
+test-threads = "num-cpus"
+slow-timeout = { period = "30s", terminate-after = 1 }
+fail-fast = true
+retries = 0
+
+# Stress tests need exclusive access (100 VMs at once)
+[test-groups.stress-tests]
+max-threads = 1
+
+# VM tests run at full parallelism (num-cpus)
+# Previously limited to 16 threads due to namespace holder process deaths,
+# but root cause was rootless tests running under sudo. Now that privileged
+# tests filter out rootless tests (-E '!test(/rootless/)'), full parallelism works.
+[test-groups.vm-tests]
+max-threads = "num-cpus"
+
+[[profile.default.overrides]]
+filter = "package(fcvm) & test(/stress_100/)"
+test-group = "stress-tests"
+slow-timeout = { period = "300s", terminate-after = 1 }
+
+# VM tests run with limited parallelism to avoid resource exhaustion
+[[profile.default.overrides]]
+filter = "package(fcvm) & test(/test_/) & !test(/stress_100/)"
+test-group = "vm-tests"
+slow-timeout = { period = "300s", terminate-after = 1 }
+
+# fuse-pipe tests can run with full parallelism
+[[profile.default.overrides]]
+filter = "package(fuse-pipe)"
+test-group = "@global"
+slow-timeout = { period = "120s", terminate-after = 1 }

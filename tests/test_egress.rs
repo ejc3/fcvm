@@ -18,6 +18,7 @@ use std::time::Duration;
 const EGRESS_TEST_URL: &str = "https://auth.docker.io/token?service=registry.docker.io";
 
 /// Test egress connectivity for fresh VM with bridged networking
+#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_egress_fresh_bridged() -> Result<()> {
     egress_fresh_test_impl("bridged").await
@@ -26,11 +27,11 @@ async fn test_egress_fresh_bridged() -> Result<()> {
 /// Test egress connectivity for fresh VM with rootless networking
 #[tokio::test]
 async fn test_egress_fresh_rootless() -> Result<()> {
-    common::require_non_root("test_egress_fresh_rootless")?;
     egress_fresh_test_impl("rootless").await
 }
 
 /// Test egress connectivity for cloned VM with bridged networking
+#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_egress_clone_bridged() -> Result<()> {
     egress_clone_test_impl("bridged").await
@@ -39,7 +40,6 @@ async fn test_egress_clone_bridged() -> Result<()> {
 /// Test egress connectivity for cloned VM with rootless networking
 #[tokio::test]
 async fn test_egress_clone_rootless() -> Result<()> {
-    common::require_non_root("test_egress_clone_rootless")?;
     egress_clone_test_impl("rootless").await
 }
 

@@ -54,7 +54,6 @@ fi
 run_step "stress" sudo env STRESS_WORKERS="${STRESS_WORKERS:-4}" STRESS_OPS="${STRESS_OPS:-1000}" \
     cargo test --test stress -- --nocapture || die "stress test failed"
 
-run_step "pjdfstest-fast" sudo cargo test --test pjdfstest_fast -- --nocapture || die "pjdfstest_fast failed"
-run_step "pjdfstest-full" sudo cargo test --test pjdfstest_full -- --nocapture || die "pjdfstest_full failed"
+run_step "pjdfstest-matrix" sudo cargo test --test pjdfstest_matrix -- --nocapture || die "pjdfstest_matrix failed"
 
 echo -e "\n==> ALL TESTS PASSED" | tee -a "${LOG_FILE}"

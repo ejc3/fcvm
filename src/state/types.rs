@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn test_process_type_serialization() {
-        // Test that ProcessType serializes to lowercase strings for backward compatibility
+        // ProcessType serializes to lowercase strings (matching JSON convention)
         let vm = ProcessType::Vm;
         let serve = ProcessType::Serve;
         let clone = ProcessType::Clone;
@@ -154,7 +154,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&serve).unwrap(), "\"serve\"");
         assert_eq!(serde_json::to_string(&clone).unwrap(), "\"clone\"");
 
-        // Test deserialization from lowercase strings (backward compatibility)
+        // Test round-trip deserialization
         let vm_from_str: ProcessType = serde_json::from_str("\"vm\"").unwrap();
         let serve_from_str: ProcessType = serde_json::from_str("\"serve\"").unwrap();
         let clone_from_str: ProcessType = serde_json::from_str("\"clone\"").unwrap();

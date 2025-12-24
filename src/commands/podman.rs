@@ -53,7 +53,7 @@ impl VolumeMapping {
     }
 }
 
-use super::common::{VSOCK_STATUS_PORT, VSOCK_VOLUME_PORT_BASE};
+use super::common::{VSOCK_OUTPUT_PORT, VSOCK_STATUS_PORT, VSOCK_VOLUME_PORT_BASE};
 
 /// Main dispatcher for podman commands
 pub async fn cmd_podman(args: PodmanArgs) -> Result<()> {
@@ -147,19 +147,125 @@ async fn run_status_listener(
     Ok(())
 }
 
+/// Bidirectional I/O listener for container stdin/stdout/stderr.
+///
+/// Listens on port 4997 for raw output from fc-agent.
+/// Protocol (all lines are newline-terminated):
+///   Guest → Host: "stdout:content" or "stderr:content"
+///   Host → Guest: "stdin:content" (written to container stdin)
+///
+/// Returns collected output lines as Vec<(stream, line)>.
+async fn run_output_listener(
+    socket_path: &str,
+    vm_id: &str,
+) -> Result<Vec<(String, String)>> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+
+    // Remove stale socket if it exists
+    let _ = std::fs::remove_file(socket_path);
+
+    let listener = UnixListener::bind(socket_path)
+        .with_context(|| format!("binding output listener to {}", socket_path))?;
+
+    // Make socket accessible by Firecracker
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o777))
+        .with_context(|| format!("chmod output socket {}", socket_path))?;
+
+    info!(socket = %socket_path, "Output listener started");
+
+    let mut output_lines: Vec<(String, String)> = Vec::new();
+
+    // Accept connection from fc-agent
+    let accept_result = tokio::time::timeout(
+        std::time::Duration::from_secs(120), // Wait up to 2 min for connection
+        listener.accept(),
+    )
+    .await;
+
+    let (stream, _) = match accept_result {
+        Ok(Ok(conn)) => conn,
+        Ok(Err(e)) => {
+            warn!(vm_id = %vm_id, error = %e, "Error accepting output connection");
+            let _ = std::fs::remove_file(socket_path);
+            return Ok(output_lines);
+        }
+        Err(_) => {
+            // Timeout - container probably didn't produce output
+            debug!(vm_id = %vm_id, "Output listener timeout, no connection");
+            let _ = std::fs::remove_file(socket_path);
+            return Ok(output_lines);
+        }
+    };
+
+    debug!(vm_id = %vm_id, "Output connection established");
+
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut line_buf = String::new();
+
+    // Read lines until connection closes
+    loop {
+        line_buf.clear();
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(300), // 5 min read timeout
+            reader.read_line(&mut line_buf),
+        )
+        .await
+        {
+            Ok(Ok(0)) => {
+                // EOF - connection closed
+                debug!(vm_id = %vm_id, "Output connection closed");
+                break;
+            }
+            Ok(Ok(_)) => {
+                // Parse raw line format: stream:content
+                let line = line_buf.trim_end();
+                if let Some((stream, content)) = line.split_once(':') {
+                    // Print to host's stderr with prefix (using tracing)
+                    eprintln!("[ctr:{}] {}", stream, content);
+                    output_lines.push((stream.to_string(), content.to_string()));
+
+                    // Send ack back (bidirectional)
+                    let _ = writer.write_all(b"ack\n").await;
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(vm_id = %vm_id, error = %e, "Error reading output");
+                break;
+            }
+            Err(_) => {
+                // Read timeout
+                debug!(vm_id = %vm_id, "Output read timeout");
+                break;
+            }
+        }
+    }
+
+    // Clean up
+    let _ = std::fs::remove_file(socket_path);
+
+    info!(vm_id = %vm_id, lines = output_lines.len(), "Output listener finished");
+    Ok(output_lines)
+}
+
 async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     info!("Starting fcvm podman run");
 
     // Validate VM name before any setup work
     validate_vm_name(&args.name).context("invalid VM name")?;
 
-    // Ensure kernel and rootfs exist (auto-setup on first run)
+    // Ensure kernel, rootfs, and initrd exist (auto-setup on first run)
     let kernel_path = crate::setup::ensure_kernel()
         .await
         .context("setting up kernel")?;
     let base_rootfs = crate::setup::ensure_rootfs()
         .await
         .context("setting up rootfs")?;
+    let initrd_path = crate::setup::ensure_fc_agent_initrd()
+        .await
+        .context("setting up fc-agent initrd")?;
 
     // Generate VM ID
     let vm_id = generate_vm_id();
@@ -362,6 +468,23 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         })
     };
 
+    // Start bidirectional output listener for container stdout/stderr
+    // Port 4997 receives JSON lines: {"stream":"stdout|stderr","line":"..."}
+    let output_socket_path = format!("{}_{}", vsock_socket_path.display(), VSOCK_OUTPUT_PORT);
+    let _output_handle = {
+        let socket_path = output_socket_path.clone();
+        let vm_id_clone = vm_id.clone();
+        tokio::spawn(async move {
+            match run_output_listener(&socket_path, &vm_id_clone).await {
+                Ok(lines) => lines,
+                Err(e) => {
+                    tracing::warn!("Output listener error: {}", e);
+                    Vec::new()
+                }
+            }
+        })
+    };
+
     // Run the main VM setup in a helper to ensure cleanup on error
     let setup_result = run_vm_setup(
         &args,
@@ -370,6 +493,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         &base_rootfs,
         &socket_path,
         &kernel_path,
+        &initrd_path,
         &network_config,
         network.as_mut(),
         cmd_args,
@@ -484,6 +608,7 @@ async fn run_vm_setup(
     base_rootfs: &std::path::Path,
     socket_path: &std::path::Path,
     kernel_path: &std::path::Path,
+    initrd_path: &std::path::Path,
     network_config: &crate::network::NetworkConfig,
     network: &mut dyn NetworkManager,
     cmd_args: Option<Vec<String>>,
@@ -492,7 +617,7 @@ async fn run_vm_setup(
     volume_mappings: &[VolumeMapping],
     vsock_socket_path: &std::path::Path,
 ) -> Result<(VmManager, Option<tokio::process::Child>)> {
-    // Setup storage
+    // Setup storage - just need CoW copy (fc-agent is injected via initrd at boot)
     let vm_dir = data_dir.join("disks");
     let disk_manager =
         DiskManager::new(vm_id.to_string(), base_rootfs.to_path_buf(), vm_dir.clone());
@@ -512,7 +637,7 @@ async fn run_vm_setup(
             .context("setting disk file permissions for rootless mode")?;
     }
 
-    info!(rootfs = %rootfs_path.display(), "disk prepared");
+    info!(rootfs = %rootfs_path.display(), "disk prepared (fc-agent baked into Layer 2)");
 
     let vm_name = args.name.clone();
     info!(vm_name = %vm_name, vm_id = %vm_id, "creating VM manager");
@@ -719,9 +844,10 @@ async fn run_vm_setup(
     info!("configuring VM via Firecracker API");
 
     // Boot source with network configuration via kernel cmdline
+    // The rootfs is a raw disk with partitions, root=/dev/vda1 specifies partition 1
     // Format: ip=<client-ip>:<server-ip>:<gw-ip>:<netmask>:<hostname>:<device>:<autoconf>:<dns0>
     // Example: ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off:172.16.0.1
-    let boot_args = if let (Some(guest_ip), Some(host_ip)) =
+    let mut boot_args = if let (Some(guest_ip), Some(host_ip)) =
         (&network_config.guest_ip, &network_config.host_ip)
     {
         // Extract just the IP without CIDR notation if present
@@ -737,18 +863,26 @@ async fn run_vm_setup(
             .unwrap_or_default();
 
         // Format: ip=<client>:<server>:<gw>:<netmask>:<hostname>:<device>:<autoconf>[:<dns0>]
+        // root=/dev/vda - the disk IS the ext4 filesystem (no partition table)
         format!(
-            "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=1 systemd.log_color=no ip={}::{}:255.255.255.252::eth0:off{}",
+            "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=1 systemd.log_color=no root=/dev/vda rw ip={}::{}:255.255.255.252::eth0:off{}",
             guest_ip_clean, host_ip_clean, dns_suffix
         )
     } else {
-        "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=1 systemd.log_color=no".to_string()
+        // No network config - used for basic boot (e.g., during setup)
+        "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=1 systemd.log_color=no root=/dev/vda rw".to_string()
     };
+
+    // Enable fc-agent strace debugging if requested
+    if args.strace_agent {
+        boot_args.push_str(" fc_agent_strace=1");
+        info!("fc-agent strace debugging enabled - output will be in /tmp/fc-agent.strace");
+    }
 
     client
         .set_boot_source(crate::firecracker::api::BootSource {
             kernel_image_path: kernel_path.display().to_string(),
-            initrd_path: None,
+            initrd_path: Some(initrd_path.display().to_string()),
             boot_args: Some(boot_args),
         })
         .await?;

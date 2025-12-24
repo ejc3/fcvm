@@ -44,6 +44,9 @@ fuse = ["fuse3"]
 # System services
 system = ["haveged", "chrony"]
 
+# Debugging tools
+debug = ["strace"]
+
 [services]
 # Services to enable
 # NOTE: fc-agent is NOT enabled here - it's injected per-VM via initrd

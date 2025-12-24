@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::{
-    namespace, portmap, types::generate_mac, veth, NetworkConfig, NetworkManager, PortMapping,
+    get_host_dns_servers, namespace, portmap, types::generate_mac, veth, NetworkConfig,
+    NetworkManager, PortMapping,
 };
 use crate::state::truncate_id;
 
@@ -39,6 +40,8 @@ pub struct BridgedNetwork {
     subnet_cidr: Option<String>,
     port_mapping_rules: Vec<String>,
     is_clone: bool,
+    /// For clones: the veth IP inside the namespace (used for port forwarding)
+    veth_inner_ip: Option<String>,
 }
 
 impl BridgedNetwork {
@@ -56,6 +59,7 @@ impl BridgedNetwork {
             subnet_cidr: None,
             port_mapping_rules: Vec::new(),
             is_clone: false,
+            veth_inner_ip: None,
         }
     }
 
@@ -86,7 +90,7 @@ impl NetworkManager for BridgedNetwork {
 
         // For clones, use In-Namespace NAT with unique 10.x.y.0/30 for veth
         // For baseline VMs, use 172.30.x.y/30 with L2 bridge
-        let (host_ip, veth_subnet, guest_ip, guest_gateway_ip) = if self.is_clone {
+        let (host_ip, veth_subnet, guest_ip, guest_gateway_ip, veth_inner_ip) = if self.is_clone {
             // Clone case: veth gets unique 10.x.y.0/30 IP
             // Guest keeps its original 172.30.x.y IP from snapshot
             let third_octet = (subnet_id / 64) as u8;
@@ -94,11 +98,18 @@ impl NetworkManager for BridgedNetwork {
             let subnet_base = subnet_within_block * 4;
 
             // Use 10.x.y.0/30 for veth IPs (unique per clone)
+            // host_ip = .1 (host side), veth_inner_ip = .2 (namespace side)
             let host_ip = format!(
                 "10.{}.{}.{}",
                 third_octet,
                 subnet_within_block,
                 subnet_base + 1
+            );
+            let veth_inner_ip = format!(
+                "10.{}.{}.{}",
+                third_octet,
+                subnet_within_block,
+                subnet_base + 2
             );
             let veth_subnet = format!(
                 "10.{}.{}.{}/30",
@@ -118,11 +129,12 @@ impl NetworkManager for BridgedNetwork {
                 guest_ip = %guest_ip,
                 guest_gateway = %orig_gateway,
                 veth_host_ip = %host_ip,
+                veth_inner_ip = %veth_inner_ip,
                 veth_subnet = %veth_subnet,
                 "clone using In-Namespace NAT"
             );
 
-            (host_ip, veth_subnet, guest_ip, Some(orig_gateway))
+            (host_ip, veth_subnet, guest_ip, Some(orig_gateway), Some(veth_inner_ip))
         } else {
             // Baseline VM case: use 172.30.x.y/30 for everything
             let third_octet = (subnet_id / 64) as u8;
@@ -133,7 +145,7 @@ impl NetworkManager for BridgedNetwork {
             let veth_subnet = format!("172.30.{}.{}/30", third_octet, subnet_base);
             let guest_ip = format!("172.30.{}.{}", third_octet, subnet_base + 2);
 
-            (host_ip, veth_subnet, guest_ip, None)
+            (host_ip, veth_subnet, guest_ip, None, None)
         };
 
         // Extract CIDR for host IP assignment
@@ -144,6 +156,7 @@ impl NetworkManager for BridgedNetwork {
         self.host_ip = Some(host_ip.clone());
         self.guest_ip = Some(guest_ip.clone());
         self.subnet_cidr = Some(veth_subnet.clone());
+        self.veth_inner_ip = veth_inner_ip.clone();
 
         // Step 1: Create network namespace
         let namespace_id = format!("fcvm-{}", truncate_id(&self.vm_id, 8));
@@ -250,21 +263,29 @@ impl NetworkManager for BridgedNetwork {
             return Err(e).context("ensuring global NAT for 10.0.0.0/8");
         }
 
-        // Step 7: Setup port mappings if any
+        // Step 7: Get DNS server for VM
+        let dns_servers = get_host_dns_servers().context("getting DNS servers")?;
+        let dns_server = dns_servers.first().cloned();
+
+        // Step 8: Setup port mappings if any
         if !self.port_mappings.is_empty() {
-            match portmap::setup_port_mappings(&guest_ip, &self.port_mappings).await {
+            // For clones: DNAT to veth_inner_ip (host-reachable), blanket DNAT in namespace
+            //             already forwards veth_inner_ip → guest_ip (set up in step 5)
+            // For baseline: DNAT directly to guest_ip (host can route to it)
+            let target_ip = if self.is_clone {
+                self.veth_inner_ip
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("clone missing veth_inner_ip"))?
+                    .clone()
+            } else {
+                guest_ip.clone()
+            };
+
+            match portmap::setup_port_mappings(&target_ip, &self.port_mappings).await {
                 Ok(rules) => self.port_mapping_rules = rules,
                 Err(e) => {
                     let _ = self.cleanup().await;
                     return Err(e).context("setting up port mappings");
-                }
-            }
-
-            // Enable route_localnet on host veth for localhost port forwarding
-            // This allows DNAT'd packets from 127.0.0.1 to be routed to the guest
-            if let Some(ref host_veth) = self.host_veth {
-                if let Err(e) = portmap::enable_route_localnet(host_veth).await {
-                    warn!(error = %e, "failed to enable route_localnet (localhost port forwarding may not work)");
                 }
             }
         }
@@ -291,7 +312,7 @@ impl NetworkManager for BridgedNetwork {
             loopback_ip: None,
             health_check_port: Some(80),
             health_check_url: Some(format!("http://{}:80/", health_check_ip)),
-            dns_server: super::get_host_dns_servers().first().cloned(),
+            dns_server,
         })
     }
 
@@ -313,7 +334,7 @@ impl NetworkManager for BridgedNetwork {
             veth::delete_veth_pair(host_veth).await?;
         }
 
-        // Step 3: Delete network namespace (this will cleanup everything inside it)
+        // Step 3: Delete network namespace (this cleans up everything inside it)
         // Including all NAT rules, bridge, and veth peer
         if let Some(ref namespace_id) = self.namespace_id {
             namespace::delete_namespace(namespace_id).await?;
