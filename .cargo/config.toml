@@ -1,0 +1,7 @@
+# Target runner for running tests with elevated privileges
+# This allows cargo/rustup to run as normal user while test binaries run as root
+[target.aarch64-unknown-linux-gnu]
+runner = "sudo -E"
+
+[target.x86_64-unknown-linux-gnu]
+runner = "sudo -E"
