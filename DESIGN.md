@@ -1616,6 +1616,43 @@ kill $CLONE_PID $SERVE_PID $BASELINE_PID
 
 ---
 
+## Build Performance
+
+Benchmarked on c6g.metal (64 ARM cores, 128GB RAM).
+
+### Compilation Times
+
+| Scenario | Time | Notes |
+|----------|------|-------|
+| Cold build (clean target) | 44s | ~12 parallel rustc processes |
+| Incremental (touch main.rs) | 13s | Only recompiles fcvm |
+| test-unit LIST (cold) | 24s | Compiles test binaries |
+| test-unit LIST (warm) | 1.2s | No recompilation |
+
+### Optimization Attempts
+
+| Tool | Cold Build | Incremental | Verdict |
+|------|------------|-------------|---------|
+| Default (no tools) | 44s | 13.7s | Baseline |
+| mold linker | 43s | 12.7s | ~1s savings, not worth config |
+| sccache | 52s cold / 21s warm | 13s | Overhead > benefit for local dev |
+
+### Why Only 12 Parallel Processes?
+
+Cargo parallelizes by **crate**, limited by the dependency graph:
+- Early build: many leaf crates → high parallelism (11+ rustc)
+- Late build: waiting on syn, tokio → low parallelism (1-3 rustc)
+
+The 64 CPUs help within each crate (LLVM codegen), but crate-level parallelism is dependency-limited.
+
+### Recommendations
+
+- **Local dev**: Use defaults. Incremental builds are fast (13s).
+- **CI**: Consider sccache if rebuilding from scratch frequently.
+- **mold**: Not worth it - linking is not the bottleneck.
+
+---
+
 ## References
 
 - [Firecracker Documentation](https://github.com/firecracker-microvm/firecracker/tree/main/docs)
