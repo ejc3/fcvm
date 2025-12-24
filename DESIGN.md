@@ -40,7 +40,11 @@
    - Process blocks until VM exits (hanging/foreground mode)
    - VM dies when process is killed (lifetime binding)
 
-2. **`fcvm snapshot` Commands**
+2. **`fcvm exec` Command**
+   - Execute commands in running VMs
+   - Supports running in guest OS or inside container (`-c` flag)
+
+3. **`fcvm snapshot` Commands**
    - `fcvm snapshot create`: Create snapshot from running VM
    - `fcvm snapshot serve`: Start UFFD memory server for cloning
    - `fcvm snapshot run`: Spawn clone from memory server
@@ -48,23 +52,23 @@
    - Shares memory via UFFD page fault handler
    - Creates independent VM with its own networking
 
-3. **Networking Modes**
+4. **Networking Modes**
    - **Rootless**: Works without root privileges using slirp4netns
-   - **Privileged**: Uses nftables + bridge for better performance
+   - **Privileged**: Uses iptables + TAP for better performance
    - **Port mapping**: `[HOSTIP:]HOSTPORT:GUESTPORT[/PROTO]` syntax
    - Support multiple ports, TCP/UDP protocols
 
-4. **Volume Mounting**
+5. **Volume Mounting**
    - Map local directories to guest filesystem
    - Support block devices, sshfs, and NFS modes
    - Read-only and read-write mounts
 
-5. **Resource Configuration**
+6. **Resource Configuration**
    - vCPU overcommit (more vCPUs than physical cores)
    - Memory overcommit with balloon device
    - Configurable memory ballooning
 
-6. **Snapshot & Clone**
+7. **Snapshot & Clone**
    - Save VM state at "warm" checkpoint (after container ready)
    - Fast restore from snapshot
    - CoW disks for instant cloning
@@ -240,7 +244,7 @@ async fn setup() -> Result<NetworkConfig> {
 
 #### Privileged Networking (`bridged.rs`)
 
-Uses Linux bridge + nftables for native performance.
+Uses TAP devices + iptables for native performance.
 
 **Features**:
 - Requires root or CAP_NET_ADMIN
@@ -465,61 +469,58 @@ Host (127.0.0.2:8080) → slirp4netns → slirp0 (10.0.2.100:8080) → IP forwar
 - Works in nested VMs and restricted environments
 - Fully compatible with rootless Podman in guest
 
-### Privileged Mode (nftables + bridge)
+### Privileged Mode (iptables + TAP)
 
 **Topology**:
 ```
 ┌───────────────────────────────────────┐
 │ Host                                   │
-│  ┌─────────┐                          │
-│  │ fcvmbr0 │ (172.16.0.1)             │
-│  └────┬────┘                          │
-│       │                                │
-│  ┌────┴─────┐                         │
-│  │ tap-vm1  │ ← connected to VM       │
-│  └──────────┘                         │
-│                                        │
-│  nftables DNAT rules:                 │
-│    tcp dport 8080 → 172.16.0.10:80   │
+│  ┌──────────────┐                     │
+│  │ tap-{vm-id}  │ (172.16.x.1/24)     │
+│  └──────┬───────┘                     │
+│         │                              │
+│  iptables DNAT rules:                 │
+│    PREROUTING + OUTPUT chains         │
+│    tcp dport 8080 → 172.16.x.2:80    │
 └───────────────────────────────────────┘
           │
           ▼
     ┌──────────────┐
     │ Firecracker  │
     │  eth0:       │
-    │  172.16.0.10 │
+    │  172.16.x.2  │
     └──────────────┘
 ```
 
-**Bridge Setup**:
+**TAP Device Setup** (per VM):
 ```bash
-ip link add fcvmbr0 type bridge
-ip addr add 172.16.0.1/24 dev fcvmbr0
-ip link set fcvmbr0 up
+# Create TAP device
+ip tuntap add tap-{vm-id} mode tap
+ip link set tap-{vm-id} up
+
+# Configure TAP with unique /24 subnet
+ip addr add 172.16.{x}.1/24 dev tap-{vm-id}
+
+# Enable forwarding
+echo 1 > /proc/sys/net/ipv4/ip_forward
 ```
 
-**TAP Device**:
+**iptables Rules** (from `src/network/portmap.rs`):
 ```bash
-ip tuntap add tap-vm1 mode tap
-ip link set tap-vm1 master fcvmbr0
-ip link set tap-vm1 up
-```
+# DNAT for external traffic (PREROUTING chain)
+iptables -t nat -A PREROUTING -p tcp --dport 8080 -j DNAT --to-destination 172.16.x.2:80
 
-**nftables Rules**:
-```bash
-# Create NAT table
-nft add table ip nat
+# DNAT for localhost traffic (OUTPUT chain)
+iptables -t nat -A OUTPUT -p tcp --dport 8080 -j DNAT --to-destination 172.16.x.2:80
 
-# DNAT for port forwarding
-nft add rule ip nat PREROUTING tcp dport 8080 dnat to 172.16.0.10:80
-
-# MASQUERADE for outbound
-nft add rule ip nat POSTROUTING oifname "eth0" masquerade
+# MASQUERADE for outbound (guest → internet)
+iptables -t nat -A POSTROUTING -s 172.16.x.0/24 -j MASQUERADE
 ```
 
 **IP Allocation**:
-- Bridge: `172.16.0.1/24`
-- VMs: `172.16.0.10`, `172.16.0.11`, ... (incrementing)
+- Each VM gets unique /24 subnet: `172.16.{x}.0/24`
+- TAP gateway: `172.16.{x}.1`
+- Guest IP: `172.16.{x}.2`
 
 ---
 
@@ -972,6 +973,36 @@ sudo fcvm podman run \
   ml-training:latest
 ```
 
+#### `fcvm exec`
+
+**Purpose**: Execute a command in a running VM.
+
+**Usage**:
+```bash
+fcvm exec --pid <PID> [OPTIONS] -- <COMMAND> [ARGS...]
+```
+
+**Options**:
+```
+--pid <PID>        PID of the fcvm process managing the VM (required)
+-c, --container    Run command inside the container (not just guest OS)
+```
+
+**Examples**:
+```bash
+# Run command in guest OS
+sudo fcvm exec --pid 12345 -- ls -la /
+
+# Run command inside container
+sudo fcvm exec --pid 12345 -c -- curl -s http://localhost/health
+
+# Check egress connectivity from guest
+sudo fcvm exec --pid 12345 -- curl -s ifconfig.me
+
+# Check egress connectivity from container
+sudo fcvm exec --pid 12345 -c -- wget -q -O - http://ifconfig.me
+```
+
 #### `fcvm snapshot create`
 
 **Purpose**: Create a snapshot from a running VM.
@@ -1111,13 +1142,13 @@ fcvm/
 │   │
 │   ├── commands/           # CLI command implementations
 │   │   ├── mod.rs
+│   │   ├── common.rs       # Shared utilities
+│   │   ├── exec.rs         # fcvm exec
 │   │   ├── ls.rs           # fcvm ls
 │   │   ├── podman.rs       # fcvm podman run
-│   │   ├── snapshot.rs     # fcvm snapshot {create,serve,run}
-│   │   ├── snapshots.rs    # fcvm snapshots
 │   │   ├── setup.rs        # fcvm setup
-│   │   ├── memory_server.rs # UFFD memory server subprocess
-│   │   └── common.rs       # Shared utilities
+│   │   ├── snapshot.rs     # fcvm snapshot {create,serve,run} + UFFD server
+│   │   └── snapshots.rs    # fcvm snapshots
 │   │
 │   ├── firecracker/        # Firecracker integration
 │   │   ├── mod.rs
@@ -1234,94 +1265,78 @@ All builds are done via the root Makefile.
 make build         # Build fcvm + fc-agent
 make clean         # Clean build artifacts
 
-# Testing
-make test          # Run fuse-pipe tests (noroot + root)
-make test-vm       # Run VM tests (rootless + bridged)
-make test-all      # Everything: test + test-vm + test-pjdfstest
+# Testing (3 tiers)
+make test-unit             # Unit tests only (no VMs, <1s each)
+make test-integration-fast # Quick VM tests (<30s each)
+make test-root             # All tests including slow (pjdfstest)
+
+# Container testing
+make container-test-unit             # Unit tests in container
+make container-test-integration-fast # Quick VM tests in container
+make container-test-root             # All tests in container
+make container-shell                 # Interactive shell
 
 # Linting
 make lint          # Run clippy + fmt-check
 make fmt           # Format code
 
-# Container testing
-make container-test    # fuse-pipe tests in container
-make container-test-vm # VM tests in container
-make container-shell   # Interactive shell
+# Options
+FILTER=pattern     # Filter tests by name
+STREAM=1           # Stream output (no capture)
+LIST=1             # List tests without running
 ```
 
 See `make help` for the complete list of targets.
 
-### Configuration File
+### Data Directory
 
-**Location**: `~/.config/fcvm/config.yml` or `/etc/fcvm/config.yml`
+All fcvm data is stored under `/mnt/fcvm-btrfs/` (btrfs filesystem for CoW reflinks).
+Override with `FCVM_BASE_DIR` environment variable.
 
-**Format**:
-```yaml
-# Data directory for VM state
-data_dir: /var/lib/fcvm
-
-# Firecracker binary path
-firecracker_bin: /usr/local/bin/firecracker
-
-# Kernel image
-kernel_path: /var/lib/fcvm/kernels/vmlinux.bin
-
-# Base rootfs directory (layer2-{sha}.raw files)
-rootfs_dir: /var/lib/fcvm/rootfs
-
-# Default settings
-defaults:
-  mode: auto
-  vcpu: 2
-  memory_mib: 2048
-  map_mode: block
-  logs: stream
-
-# Network configuration
-network:
-  mode: auto
-  bridge: fcvmbr0
-  subnet: 172.16.0.0/24
-  guest_ip_start: 172.16.0.10
-
-# Logging
-logging:
-  level: info
-  format: json
+**Layout** (from `src/paths.rs`):
+```
+/mnt/fcvm-btrfs/
+├── kernels/           # Kernel binaries
+│   └── vmlinux-{sha}.bin
+├── rootfs/            # Base rootfs images
+│   └── layer2-{sha}.raw
+├── initrd/            # fc-agent injection initrds
+│   └── fc-agent-{sha}.initrd
+├── vm-disks/          # Per-VM CoW disk copies
+│   └── {vm-id}/disks/rootfs.raw
+├── snapshots/         # Firecracker snapshots
+├── state/             # VM state JSON files
+│   └── {vm-id}.json
+└── cache/             # Downloaded images
 ```
 
 ### State Persistence
 
-**VM State** (`~/.local/share/fcvm/vms/<vm-id>/state.json`):
+**VM State** (`/mnt/fcvm-btrfs/state/{vm-id}.json`):
 ```json
 {
-  "vm_id": "abc123",
+  "schema_version": 1,
+  "vm_id": "vm-abc123...",
   "name": "my-nginx",
   "status": "running",
+  "health_status": "healthy",
+  "exit_code": null,
   "pid": 12345,
   "created_at": "2025-01-09T12:00:00Z",
+  "last_updated": "2025-01-09T12:00:05Z",
   "config": {
-    "image": "nginx:latest",
+    "image": "nginx:alpine",
     "vcpu": 2,
     "memory_mib": 2048,
     "network": {
-      "mode": "rootless",
       "tap_device": "tap-abc123",
-      "guest_mac": "02:aa:bb:cc:dd:ee",
-      "guest_ip": "10.0.2.15",
-      "port_mappings": [
-        {"host_port": 8080, "guest_port": 80, "proto": "tcp"}
-      ]
+      "guest_ip": "172.16.29.2",
+      "loopback_ip": "127.0.0.2"
     },
-    "disks": [
-      {
-        "path": "/var/lib/fcvm/vms/abc123/rootfs.raw",
-        "is_root": true
-      }
-    ],
-    "volumes": [
-      {"host": "/data", "guest": "/mnt/data", "readonly": false}
-    ]
+    "volumes": [],
+    "process_type": "vm",
+    "snapshot_name": null,
+    "serve_pid": null
   }
 }
 ```
@@ -1406,13 +1421,12 @@ RUST_LOG=trace fcvm run nginx:latest
 - PID-based naming for additional uniqueness
 - Automatic cleanup on test exit
 
-**Privileged/Unprivileged Test Organization**:
-- Tests requiring sudo use `#[cfg(feature = "privileged-tests")]`
-- Unprivileged tests run by default (no feature flag needed)
-- Privileged tests: Need sudo for iptables, root podman storage
-- Unprivileged tests: Run without sudo, use slirp4netns networking
-- Makefile uses `--features` for selection: `make test-vm FILTER=exec` runs all exec tests
-- Container tests: Use appropriate container run configurations (CONTAINER_RUN_FCVM vs CONTAINER_RUN_UNPRIVILEGED)
+**Test Tier Organization** (feature-gated):
+- `test-unit`: No feature flags, fast tests without VMs
+- `test-integration-fast`: `--features integration-fast,privileged-tests` (quick VM tests <30s)
+- `test-root`: All features including `integration-slow` (pjdfstest, slow VM tests)
+- Filter by name pattern: `make test-root FILTER=exec`
+- Container configs: `CONTAINER_RUN_ROOTLESS` (unit) and `CONTAINER_RUN_ROOT` (VM tests)
 
 ### Unit Tests
 
@@ -1484,6 +1498,40 @@ kill $CLONE_PID $SERVE_PID $BASELINE_PID
 
 **Note**: `--network rootless` uses slirp4netns (no root required). `--network bridged` (default) uses iptables/TAP devices (requires sudo).
 
+### POSIX Compliance (pjdfstest)
+
+The fuse-pipe library passes the pjdfstest POSIX compliance suite. Tests run via `make test-root` or `make container-test-root`.
+
+**Test Counts**:
+- 237 total test files in pjdfstest
+- 54 skipped on Linux (FreeBSD/ZFS/UFS-specific)
+- 183 real test files run
+- **8789 assertions** pass
+
+**Skipped Categories** (via `quick_exit()` - outputs trivial "ok 1"):
+
+| Category | Files | Skipped | Real | Reason |
+|----------|-------|---------|------|--------|
+| granular | 7 | 7 | 0 | FreeBSD extended ACLs only |
+| open | 26 | 8 | 18 | FreeBSD-specific open behaviors |
+| link | 18 | 6 | 12 | FreeBSD hardlink semantics |
+| rename | 25 | 5 | 20 | FreeBSD rename edge cases |
+| rmdir | 16 | 4 | 12 | FreeBSD rmdir behaviors |
+| ftruncate | 15 | 3 | 12 | FreeBSD:UFS specific |
+| mkdir | 13 | 3 | 10 | FreeBSD:UFS specific |
+| mkfifo | 13 | 3 | 10 | FreeBSD:UFS specific |
+| symlink | 13 | 3 | 10 | FreeBSD:UFS specific |
+| truncate | 15 | 3 | 12 | FreeBSD:UFS specific |
+| unlink | 15 | 3 | 12 | FreeBSD:UFS specific |
+| chflags | 14 | 2 | 12 | Some UFS-specific flags |
+| chmod | 13 | 2 | 11 | FreeBSD:ZFS specific |
+| chown | 11 | 2 | 9 | FreeBSD:ZFS specific |
+| mknod | 12 | 0 | 12 | All run |
+| posix_fallocate | 1 | 0 | 1 | All run |
+| utimensat | 10 | 0 | 10 | All run |
+
+**Skip mechanism**: Tests check `${os}:${fs}` and call `quick_exit()` for unsupported OS/filesystem combinations. This outputs TAP format `1..1` + `ok 1` (trivial pass) rather than running real assertions.
+
 ---
 
 ## Performance Targets
@@ -1541,7 +1589,7 @@ kill $CLONE_PID $SERVE_PID $BASELINE_PID
 
 ### Privileged Mode
 
-- **Requires CAP_NET_ADMIN**: For TAP/bridge/nftables setup
+- **Requires CAP_NET_ADMIN**: For TAP/iptables setup
 - **Minimal privileges**: Only for network setup, not VM execution
 - **Firecracker jailer**: Can use jailer for additional sandboxing (future)
 
@@ -1610,7 +1658,7 @@ kill $CLONE_PID $SERVE_PID $BASELINE_PID
 - **TAP device**: Virtual network interface (TUN/TAP)
 - **slirp4netns**: User-mode networking for rootless containers
 - **CoW**: Copy-on-Write, disk strategy for fast cloning
-- **nftables**: Linux firewall/NAT configuration tool
+- **iptables**: Linux firewall/NAT configuration tool
 - **vsock**: Virtual socket for host-guest communication
 - **Balloon device**: Memory reclamation mechanism for VMs
 
@@ -1659,13 +1707,13 @@ The 64 CPUs help within each crate (LLVM codegen), but crate-level parallelism i
 - [Firecracker API Specification](https://github.com/firecracker-microvm/firecracker/blob/main/src/api_server/swagger/firecracker.yaml)
 - [Podman Documentation](https://docs.podman.io/)
 - [slirp4netns](https://github.com/rootless-containers/slirp4netns)
-- [nftables Wiki](https://wiki.nftables.org/)
+- [iptables Documentation](https://netfilter.org/documentation/)
 - [KVM Documentation](https://www.linux-kvm.org/page/Documents)
 
 ---
 
 **End of Design Specification**
 
-*Version: 2.1*
-*Date: 2025-12-21*
+*Version: 2.2*
+*Date: 2025-12-24*
 *Author: fcvm project*

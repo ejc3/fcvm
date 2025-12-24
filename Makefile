@@ -59,9 +59,9 @@ TEST_ROOT := $(TEST_ENV) cargo nextest $(NEXTEST_CMD) --release $(NEXTEST_CAPTUR
 	--features privileged-tests $(FILTER)
 
 # Container test commands (call back to Makefile for single source of truth)
-CTEST_UNIT := make test-unit
-CTEST_INTEGRATION_FAST := make test-integration-fast
-CTEST_ROOT := make test-root
+CTEST_UNIT := make test-unit LIST=$(LIST)
+CTEST_INTEGRATION_FAST := make test-integration-fast LIST=$(LIST)
+CTEST_ROOT := make test-root LIST=$(LIST)
 
 # Benchmarks
 BENCH_THROUGHPUT := cargo bench -p fuse-pipe --bench throughput
