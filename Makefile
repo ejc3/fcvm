@@ -354,8 +354,10 @@ CONTAINER_RUN_BASE := podman run --rm --privileged \
 	$(VOLUME_CARGO) \
 	-e CARGO_HOME=/home/testuser/.cargo
 
-# Same as CONTAINER_RUN_BASE but uses separate target volume for root tests
-CONTAINER_RUN_BASE_ROOT := podman run --rm --privileged \
+# Same as CONTAINER_RUN_BASE but uses sudo podman for root tests
+# Must use sudo because container-build-root builds with sudo podman,
+# and sudo/rootless podman have separate image stores
+CONTAINER_RUN_BASE_ROOT := sudo podman run --rm --privileged \
 	--group-add keep-groups \
 	-v .:/workspace/fcvm \
 	-v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs \
