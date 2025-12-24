@@ -58,7 +58,8 @@ TEST_FUSE_STRESS := CARGO_TARGET_DIR=$(TARGET_DIR) cargo nextest run --release -
 # Root required (uses TARGET_DIR_ROOT):
 TEST_FUSE_ROOT := CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo nextest run --release -p fuse-pipe --test integration_root
 # Note: test_permission_edge_cases requires C pjdfstest with -u/-g flags, only available in container
-TEST_PJDFSTEST := CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo nextest run --release -p fuse-pipe --test pjdfstest_full
+# Matrix tests run categories in parallel via nextest process isolation
+TEST_PJDFSTEST := CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo nextest run --release -p fuse-pipe --test pjdfstest_matrix
 
 # VM tests: privileged-tests feature gates tests that require sudo
 # Unprivileged tests run by default (no feature flag)
@@ -77,7 +78,7 @@ CTEST_FUSE_NOROOT := cargo nextest run --release -p fuse-pipe --test integration
 CTEST_FUSE_STRESS := cargo nextest run --release -p fuse-pipe --test test_mount_stress
 CTEST_FUSE_ROOT := cargo nextest run --release -p fuse-pipe --test integration_root
 CTEST_FUSE_PERMISSION := cargo nextest run --release -p fuse-pipe --test test_permission_edge_cases
-CTEST_PJDFSTEST := cargo nextest run --release -p fuse-pipe --test pjdfstest_full
+CTEST_PJDFSTEST := cargo nextest run --release -p fuse-pipe --test pjdfstest_matrix
 
 # Container VM tests now use `make test-vm-*` inside container (see container-test-vm-* targets)
 
