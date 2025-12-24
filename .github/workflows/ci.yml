@@ -10,9 +10,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Rootless container: lint + unit + FUSE noroot tests
   container-rootless:
-    name: Lint + FUSE noroot [container/ubuntu-latest]
+    name: Lint + Tests (rootless)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,9 +39,8 @@ jobs:
           make lint
           make container-test-noroot
 
-  # Sudo container: FUSE root + pjdfstest
   container-sudo:
-    name: FUSE root + POSIX [container/ubuntu-latest]
+    name: FUSE + POSIX (sudo)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -70,9 +68,8 @@ jobs:
           make container-test-root
           make container-test-pjdfstest
 
-  # VM tests on BuildJet (requires KVM)
   vm:
-    name: VM tests [container/buildjet-32cpu]
+    name: VM Tests (KVM)
     runs-on: buildjet-32vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
