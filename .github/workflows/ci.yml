@@ -85,6 +85,13 @@ jobs:
           repository: ejc3/fuser
           ref: master
           path: fuser
+      - name: Update podman
+        run: |
+          sudo mkdir -p /etc/apt/keyrings
+          curl -fsSL https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/unstable/xUbuntu_22.04/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/devel_kubic_libcontainers_unstable.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/devel_kubic_libcontainers_unstable.gpg] https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/unstable/xUbuntu_22.04/ /" | sudo tee /etc/apt/sources.list.d/devel:kubic:libcontainers:unstable.list
+          sudo apt-get update
+          sudo apt-get -y install podman
       - name: Login to ghcr.io
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u ${{ github.actor }} --password-stdin
