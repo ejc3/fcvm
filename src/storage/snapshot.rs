@@ -153,7 +153,7 @@ mod tests {
             vm_id: "abc123".to_string(),
             memory_path: PathBuf::from("/path/to/memory.bin"),
             vmstate_path: PathBuf::from("/path/to/vmstate.bin"),
-            disk_path: PathBuf::from("/path/to/disk.ext4"),
+            disk_path: PathBuf::from("/path/to/disk.raw"),
             created_at: chrono::Utc::now(),
             metadata: SnapshotMetadata {
                 image: "nginx:alpine".to_string(),
@@ -199,7 +199,7 @@ mod tests {
             "vm_id": "def456",
             "memory_path": "/mnt/fcvm-btrfs/snapshots/nginx-snap/memory.bin",
             "vmstate_path": "/mnt/fcvm-btrfs/snapshots/nginx-snap/vmstate.bin",
-            "disk_path": "/mnt/fcvm-btrfs/snapshots/nginx-snap/disk.ext4",
+            "disk_path": "/mnt/fcvm-btrfs/snapshots/nginx-snap/disk.raw",
             "created_at": "2024-01-15T10:30:00Z",
             "metadata": {
                 "image": "nginx:alpine",
@@ -260,7 +260,7 @@ mod tests {
             vm_id: "test123".to_string(),
             memory_path: PathBuf::from("/memory.bin"),
             vmstate_path: PathBuf::from("/vmstate.bin"),
-            disk_path: PathBuf::from("/disk.ext4"),
+            disk_path: PathBuf::from("/disk.raw"),
             created_at: chrono::Utc::now(),
             metadata: SnapshotMetadata {
                 image: "alpine:latest".to_string(),
@@ -311,7 +311,7 @@ mod tests {
                 vm_id: format!("vm-{}", name),
                 memory_path: PathBuf::from("/memory.bin"),
                 vmstate_path: PathBuf::from("/vmstate.bin"),
-                disk_path: PathBuf::from("/disk.ext4"),
+                disk_path: PathBuf::from("/disk.raw"),
                 created_at: chrono::Utc::now(),
                 metadata: SnapshotMetadata {
                     image: "alpine".to_string(),
@@ -350,7 +350,7 @@ mod tests {
             vm_id: "vm123".to_string(),
             memory_path: PathBuf::from("/memory.bin"),
             vmstate_path: PathBuf::from("/vmstate.bin"),
-            disk_path: PathBuf::from("/disk.ext4"),
+            disk_path: PathBuf::from("/disk.raw"),
             created_at: chrono::Utc::now(),
             metadata: SnapshotMetadata {
                 image: "alpine".to_string(),

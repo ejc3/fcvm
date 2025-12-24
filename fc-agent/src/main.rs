@@ -585,6 +585,9 @@ const STATUS_VSOCK_PORT: u32 = 4999;
 /// Exec server port for running commands from host
 const EXEC_VSOCK_PORT: u32 = 4998;
 
+/// Container output streaming port
+const OUTPUT_VSOCK_PORT: u32 = 4997;
+
 /// Host CID for vsock (always 2)
 const HOST_CID: u32 = 2;
 
@@ -1144,6 +1147,59 @@ fn send_status_to_host(message: &[u8]) -> bool {
     written == message.len() as isize
 }
 
+/// Create a vsock connection to host for container output streaming.
+/// Returns the file descriptor if successful, or -1 on failure.
+fn create_output_vsock() -> i32 {
+    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        eprintln!(
+            "[fc-agent] WARNING: failed to create output vsock socket: {}",
+            std::io::Error::last_os_error()
+        );
+        return -1;
+    }
+
+    let addr = libc::sockaddr_vm {
+        svm_family: libc::AF_VSOCK as u16,
+        svm_reserved1: 0,
+        svm_port: OUTPUT_VSOCK_PORT,
+        svm_cid: HOST_CID,
+        svm_zero: [0u8; 4],
+    };
+
+    let result = unsafe {
+        libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_vm>() as u32,
+        )
+    };
+
+    if result < 0 {
+        eprintln!(
+            "[fc-agent] WARNING: failed to connect output vsock: {}",
+            std::io::Error::last_os_error()
+        );
+        unsafe { libc::close(fd) };
+        return -1;
+    }
+
+    fd
+}
+
+/// Send a line of container output to host via vsock.
+/// Format: stdout:line or stderr:line (raw, no JSON)
+fn send_output_line(fd: i32, stream: &str, line: &str) {
+    if fd < 0 {
+        return;
+    }
+    // Raw format: stream:line\n
+    let data = format!("{}:{}\n", stream, line);
+    unsafe {
+        libc::write(fd, data.as_ptr() as *const libc::c_void, data.len());
+    }
+}
+
 /// Notify host of container exit status via vsock.
 ///
 /// Sends "exit:{code}\n" message to the host on the status vsock port.
@@ -1490,37 +1546,117 @@ async fn main() -> Result<()> {
         const MAX_RETRIES: u32 = 3;
         const RETRY_DELAY_SECS: u64 = 2;
 
+        let mut last_error = String::new();
+        let mut pull_succeeded = false;
+
         for attempt in 1..=MAX_RETRIES {
             eprintln!(
-                "[fc-agent] pulling image: {} (attempt {}/{})",
+                "[fc-agent] =========================================="
+            );
+            eprintln!(
+                "[fc-agent] PULLING IMAGE: {} (attempt {}/{})",
                 plan.image, attempt, MAX_RETRIES
             );
+            eprintln!(
+                "[fc-agent] =========================================="
+            );
 
-            let output = Command::new("podman")
+            // Spawn podman pull and stream output in real-time
+            let mut child = Command::new("podman")
                 .arg("pull")
                 .arg(&plan.image)
-                .output()
-                .await
-                .context("running podman pull")?;
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .context("spawning podman pull")?;
 
-            if output.status.success() {
+            // Stream stdout in real-time
+            let stdout_task = if let Some(stdout) = child.stdout.take() {
+                Some(tokio::spawn(async move {
+                    let reader = BufReader::new(stdout);
+                    let mut lines = reader.lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        eprintln!("[fc-agent] [podman] {}", line);
+                    }
+                }))
+            } else {
+                None
+            };
+
+            // Stream stderr in real-time and capture for error reporting
+            let stderr_task = if let Some(stderr) = child.stderr.take() {
+                Some(tokio::spawn(async move {
+                    let reader = BufReader::new(stderr);
+                    let mut lines = reader.lines();
+                    let mut captured = Vec::new();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        eprintln!("[fc-agent] [podman] {}", line);
+                        captured.push(line);
+                    }
+                    captured
+                }))
+            } else {
+                None
+            };
+
+            // Wait for podman to finish
+            let status = child.wait().await.context("waiting for podman pull")?;
+
+            // Wait for output streaming to complete
+            if let Some(task) = stdout_task {
+                let _ = task.await;
+            }
+            let stderr_lines = if let Some(task) = stderr_task {
+                task.await.unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            if status.success() {
                 eprintln!("[fc-agent] ✓ image pulled successfully");
+                pull_succeeded = true;
                 break;
             }
 
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!("[fc-agent] image pull failed: {}", stderr.trim());
+            // Capture error for final bail message
+            last_error = stderr_lines.join("\n");
+            eprintln!(
+                "[fc-agent] =========================================="
+            );
+            eprintln!(
+                "[fc-agent] IMAGE PULL FAILED (attempt {}/{})",
+                attempt, MAX_RETRIES
+            );
+            eprintln!(
+                "[fc-agent] exit code: {:?}",
+                status.code()
+            );
+            eprintln!(
+                "[fc-agent] =========================================="
+            );
 
             if attempt < MAX_RETRIES {
                 eprintln!("[fc-agent] retrying in {} seconds...", RETRY_DELAY_SECS);
                 tokio::time::sleep(std::time::Duration::from_secs(RETRY_DELAY_SECS)).await;
-            } else {
-                anyhow::bail!(
-                    "Failed to pull image after {} attempts: {}",
-                    MAX_RETRIES,
-                    stderr.trim()
-                );
             }
+        }
+
+        if !pull_succeeded {
+            eprintln!(
+                "[fc-agent] =========================================="
+            );
+            eprintln!(
+                "[fc-agent] FATAL: IMAGE PULL FAILED AFTER {} ATTEMPTS",
+                MAX_RETRIES
+            );
+            eprintln!(
+                "[fc-agent] =========================================="
+            );
+            anyhow::bail!(
+                "Failed to pull image after {} attempts:\n{}",
+                MAX_RETRIES,
+                last_error
+            );
         }
     }
 
@@ -1567,7 +1703,8 @@ async fn main() -> Result<()> {
         cmd.args(cmd_args);
     }
 
-    // Spawn container
+    // Spawn container with piped stdin/stdout/stderr for bidirectional I/O
+    cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -1577,31 +1714,100 @@ async fn main() -> Result<()> {
     // The host listens on vsock.sock_4999 for status messages
     notify_container_started();
 
-    // Stream stdout to serial console
-    if let Some(stdout) = child.stdout.take() {
-        tokio::spawn(async move {
+    // Create vsock connection for container output streaming
+    // Port 4997 is dedicated for stdout/stderr
+    let output_fd = create_output_vsock();
+    if output_fd >= 0 {
+        eprintln!("[fc-agent] output vsock connected (port {})", OUTPUT_VSOCK_PORT);
+    }
+
+    // Stream stdout via vsock (wrapped in Arc for sharing across tasks)
+    let output_fd_arc = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(output_fd));
+    let stdout_task = if let Some(stdout) = child.stdout.take() {
+        let fd = output_fd_arc.clone();
+        Some(tokio::spawn(async move {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                println!("[ctr:out] {}", line);
+                send_output_line(fd.load(std::sync::atomic::Ordering::Relaxed), "stdout", &line);
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
-    // Stream stderr to serial console
-    if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(async move {
+    // Stream stderr via vsock
+    let stderr_task = if let Some(stderr) = child.stderr.take() {
+        let fd = output_fd_arc.clone();
+        Some(tokio::spawn(async move {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("[ctr:err] {}", line);
+                send_output_line(fd.load(std::sync::atomic::Ordering::Relaxed), "stderr", &line);
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
+
+    // Read stdin from vsock and forward to container (bidirectional I/O)
+    let stdin_task = if output_fd >= 0 {
+        if let Some(mut stdin) = child.stdin.take() {
+            // Duplicate the fd for reading (original used for writing)
+            let read_fd = unsafe { libc::dup(output_fd) };
+            if read_fd >= 0 {
+                Some(tokio::spawn(async move {
+                    use std::os::unix::io::FromRawFd;
+                    use tokio::io::AsyncWriteExt;
+                    // Convert to async file for reading
+                    let file = unsafe { std::fs::File::from_raw_fd(read_fd) };
+                    let file = tokio::fs::File::from_std(file);
+                    let reader = BufReader::new(file);
+                    let mut lines = reader.lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        // Parse stdin:content format
+                        if let Some(content) = line.strip_prefix("stdin:") {
+                            // Write to container stdin
+                            if stdin.write_all(content.as_bytes()).await.is_err() {
+                                break;
+                            }
+                            if stdin.write_all(b"\n").await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Wait for container to exit
     let status = child.wait().await?;
     let exit_code = status.code().unwrap_or(1);
+
+    // Abort stdin task (container exited, no more input needed)
+    if let Some(task) = stdin_task {
+        task.abort();
+    }
+
+    // Wait for output streams to complete before closing vsock
+    if let Some(task) = stdout_task {
+        let _ = task.await;
+    }
+    if let Some(task) = stderr_task {
+        let _ = task.await;
+    }
+
+    // Close output vsock
+    if output_fd >= 0 {
+        unsafe { libc::close(output_fd) };
+    }
 
     if status.success() {
         eprintln!("[fc-agent] container exited successfully");

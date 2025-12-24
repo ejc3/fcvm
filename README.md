@@ -24,11 +24,11 @@ A Rust implementation that launches Firecracker microVMs to run Podman container
 - Firecracker binary in PATH
 - For bridged networking: sudo, iptables, iproute2, dnsmasq
 - For rootless networking: slirp4netns
-- For building rootfs: virt-customize (libguestfs-tools), qemu-utils, e2fsprogs
+- For building rootfs: qemu-utils, e2fsprogs
 
 **Storage**
 - btrfs filesystem at `/mnt/fcvm-btrfs` (for CoW disk snapshots)
-- Pre-built Firecracker kernel at `/mnt/fcvm-btrfs/kernels/vmlinux.bin`
+- Kernel auto-downloaded from Kata Containers release on first run
 
 ---
 
@@ -38,8 +38,8 @@ A Rust implementation that launches Firecracker microVMs to run Podman container
 ```bash
 # Just needs podman and /dev/kvm
 make container-test          # fuse-pipe tests
-make container-test-vm       # VM tests
-make container-test-pjdfstest # POSIX compliance (8789 tests)
+make container-test-vm       # VM tests (rootless + bridged)
+make container-test-all      # Everything
 ```
 
 **Native Testing** - Additional dependencies required:
@@ -51,7 +51,7 @@ make container-test-pjdfstest # POSIX compliance (8789 tests)
 | pjdfstest runtime | perl |
 | bindgen (userfaultfd-sys) | libclang-dev, clang |
 | VM tests | iproute2, iptables, slirp4netns, dnsmasq |
-| Rootfs build | qemu-utils, libguestfs-tools, e2fsprogs |
+| Rootfs build | qemu-utils, e2fsprogs |
 | User namespaces | uidmap (for newuidmap/newgidmap) |
 
 **pjdfstest Setup** (for POSIX compliance tests):
@@ -67,7 +67,7 @@ sudo apt-get update && sudo apt-get install -y \
     autoconf automake libtool perl \
     libclang-dev clang \
     iproute2 iptables slirp4netns dnsmasq \
-    qemu-utils libguestfs-tools e2fsprogs \
+    qemu-utils e2fsprogs \
     uidmap
 ```
 
@@ -492,27 +492,20 @@ Run `make help` for the full list. Key targets:
 | `make build` | Build fcvm and fc-agent |
 | `make clean` | Clean build artifacts |
 
-#### Testing
-| Target | Description |
-|--------|-------------|
-| `make test` | Run fuse-pipe tests: noroot + root |
-| `make test-noroot` | Tests without root: unit + integration + stress |
-| `make test-root` | Tests requiring root: integration_root + permission |
-| `make test-unit` | Unit tests only (no root) |
-| `make test-fuse` | All fuse-pipe tests explicitly |
-| `make test-vm` | Run VM tests: rootless + bridged |
-| `make test-vm-rootless` | VM test with slirp4netns (no root) |
-| `make test-vm-bridged` | VM test with bridged networking |
-| `make test-pjdfstest` | POSIX compliance (8789 tests) |
-| `make test-all` | Everything: test + test-vm + test-pjdfstest |
+#### Testing (with optional FILTER and STREAM)
 
-#### Container Testing (Recommended)
+VM tests run with sudo via `CARGO_TARGET_*_RUNNER` env vars (set in Makefile).
+Use `FILTER=` to filter tests by name, `STREAM=1` for live output.
+
 | Target | Description |
 |--------|-------------|
-| `make container-test` | Run fuse-pipe tests in container |
-| `make container-test-vm` | Run VM tests in container |
-| `make container-test-pjdfstest` | POSIX compliance in container |
-| `make container-shell` | Interactive shell in container |
+| `make test-vm` | All VM tests (runs with sudo via target runner) |
+| `make test-vm FILTER=sanity` | Only sanity tests |
+| `make test-vm FILTER=exec` | Only exec tests |
+| `make test-vm STREAM=1` | All tests with live output |
+| `make container-test-vm` | VM tests in container |
+| `make container-test-vm FILTER=exec` | Only exec tests in container |
+| `make test-all` | Everything |
 
 #### Linting
 | Target | Description |
@@ -556,9 +549,7 @@ Run `make help` for the full list. Key targets:
 | `test_mount_stress.rs` | Mount/unmount stress tests |
 | `test_allow_other.rs` | AllowOther flag tests |
 | `test_unmount_race.rs` | Unmount race condition tests |
-| `pjdfstest_full.rs` | Full POSIX compliance (8789 tests) |
-| `pjdfstest_fast.rs` | Fast POSIX subset |
-| `pjdfstest_stress.rs` | Parallel stress test |
+| `pjdfstest_matrix.rs` | POSIX compliance (17 categories run in parallel via nextest) |
 
 ### Running Tests
 
@@ -606,12 +597,17 @@ sudo fusermount3 -u /tmp/fuse-*-mount*
 
 ```
 /mnt/fcvm-btrfs/
-├── kernels/vmlinux.bin     # Firecracker kernel
-├── rootfs/base.ext4        # Base Ubuntu + Podman image
-├── vm-disks/{vm_id}/       # Per-VM disk (CoW reflink)
-├── snapshots/              # Firecracker snapshots
-├── state/                  # VM state JSON files
-└── cache/                  # Downloaded cloud images
+├── kernels/
+│   ├── vmlinux.bin            # Symlink to active kernel
+│   └── vmlinux-{sha}.bin      # Kernel (SHA of URL for cache key)
+├── rootfs/
+│   └── layer2-{sha}.raw       # Base Ubuntu + Podman (~10GB, SHA of setup script)
+├── initrd/
+│   └── fc-agent-{sha}.initrd  # fc-agent injection initrd (SHA of binary)
+├── vm-disks/{vm_id}/          # Per-VM disk (CoW reflink)
+├── snapshots/                 # Firecracker snapshots
+├── state/                     # VM state JSON files
+└── cache/                     # Downloaded cloud images
 ```
 
 ---

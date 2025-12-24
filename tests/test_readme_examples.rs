@@ -3,9 +3,7 @@
 //! Verifies that examples shown in README.md actually work.
 //! Each test corresponds to a specific example or feature documented.
 //!
-//! These tests spawn Firecracker VMs which consume significant resources
-//! (memory, network, disk). They must run sequentially to avoid resource
-//! contention and IP address conflicts.
+//! Tests use unique names via `common::unique_names()` to allow parallel execution.
 //!
 //! IMPORTANT: All tests use `common::spawn_fcvm()` helper which uses
 //! `Stdio::inherit()` to prevent pipe buffer deadlock. See CLAUDE.md
@@ -15,7 +13,6 @@ mod common;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use serial_test::serial;
 use std::time::Duration;
 
 /// Test read-only volume mapping (--map /host:/guest:ro)
@@ -24,14 +21,14 @@ use std::time::Duration;
 /// ```
 /// sudo fcvm podman run --name web1 --map /host/config:/config:ro nginx:alpine
 /// ```
+#[cfg(feature = "privileged-tests")]
 #[tokio::test]
-#[serial]
-async fn test_readonly_volume() -> Result<()> {
-    println!("\ntest_readonly_volume");
-    println!("====================");
+async fn test_readonly_volume_bridged() -> Result<()> {
+    println!("\ntest_readonly_volume_bridged");
+    println!("============================");
 
-    let test_id = format!("ro-{}", std::process::id());
-    let vm_name = format!("ro-vol-{}", std::process::id());
+    let (vm_name, _, _, _) = common::unique_names("ro-vol");
+    let test_id = vm_name.clone();
 
     // Create test directory with a file
     let host_dir = format!("/tmp/{}", test_id);
@@ -111,7 +108,7 @@ async fn test_readonly_volume() -> Result<()> {
     let _ = child.wait().await;
     let _ = tokio::fs::remove_dir_all(&host_dir).await;
 
-    println!("✅ test_readonly_volume PASSED");
+    println!("✅ test_readonly_volume_bridged PASSED");
     Ok(())
 }
 
@@ -121,13 +118,13 @@ async fn test_readonly_volume() -> Result<()> {
 /// ```
 /// sudo fcvm podman run --name web1 --env DEBUG=1 nginx:alpine
 /// ```
+#[cfg(feature = "privileged-tests")]
 #[tokio::test]
-#[serial]
-async fn test_env_variables() -> Result<()> {
-    println!("\ntest_env_variables");
-    println!("==================");
+async fn test_env_variables_bridged() -> Result<()> {
+    println!("\ntest_env_variables_bridged");
+    println!("==========================");
 
-    let vm_name = format!("env-test-{}", std::process::id());
+    let (vm_name, _, _, _) = common::unique_names("env-test");
 
     // Start VM with environment variables using bridged mode for reliable health checks
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
@@ -190,7 +187,7 @@ async fn test_env_variables() -> Result<()> {
     common::kill_process(fcvm_pid).await;
     let _ = child.wait().await;
 
-    println!("✅ test_env_variables PASSED");
+    println!("✅ test_env_variables_bridged PASSED");
     Ok(())
 }
 
@@ -200,13 +197,13 @@ async fn test_env_variables() -> Result<()> {
 /// ```
 /// sudo fcvm podman run --name web1 --cpu 4 --mem 4096 nginx:alpine
 /// ```
+#[cfg(feature = "privileged-tests")]
 #[tokio::test]
-#[serial]
-async fn test_custom_resources() -> Result<()> {
-    println!("\ntest_custom_resources");
-    println!("=====================");
+async fn test_custom_resources_bridged() -> Result<()> {
+    println!("\ntest_custom_resources_bridged");
+    println!("=============================");
 
-    let vm_name = format!("resources-test-{}", std::process::id());
+    let (vm_name, _, _, _) = common::unique_names("resources-test");
 
     // Start VM with custom resources using bridged mode for reliable health checks
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
@@ -267,7 +264,7 @@ async fn test_custom_resources() -> Result<()> {
     common::kill_process(fcvm_pid).await;
     let _ = child.wait().await;
 
-    println!("✅ test_custom_resources PASSED");
+    println!("✅ test_custom_resources_bridged PASSED");
     Ok(())
 }
 
@@ -279,14 +276,14 @@ async fn test_custom_resources() -> Result<()> {
 /// fcvm ls --json
 /// fcvm ls --pid 12345
 /// ```
+#[cfg(feature = "privileged-tests")]
 #[tokio::test]
-#[serial]
-async fn test_fcvm_ls() -> Result<()> {
-    println!("\ntest_fcvm_ls");
-    println!("============");
+async fn test_fcvm_ls_bridged() -> Result<()> {
+    println!("\ntest_fcvm_ls_bridged");
+    println!("====================");
 
     let fcvm_path = common::find_fcvm_binary()?;
-    let vm_name = format!("ls-test-{}", std::process::id());
+    let (vm_name, _, _, _) = common::unique_names("ls-test");
 
     // Start a VM to list using bridged mode for reliable health checks
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
@@ -400,7 +397,7 @@ async fn test_fcvm_ls() -> Result<()> {
     common::kill_process(fcvm_pid).await;
     let _ = child.wait().await;
 
-    println!("✅ test_fcvm_ls PASSED");
+    println!("✅ test_fcvm_ls_bridged PASSED");
     Ok(())
 }
 
@@ -410,13 +407,13 @@ async fn test_fcvm_ls() -> Result<()> {
 /// ```
 /// sudo fcvm podman run --name web1 --cmd "nginx -g 'daemon off;'" nginx:alpine
 /// ```
+#[cfg(feature = "privileged-tests")]
 #[tokio::test]
-#[serial]
-async fn test_custom_command() -> Result<()> {
-    println!("\ntest_custom_command");
-    println!("===================");
+async fn test_custom_command_bridged() -> Result<()> {
+    println!("\ntest_custom_command_bridged");
+    println!("===========================");
 
-    let vm_name = format!("cmd-test-{}", std::process::id());
+    let (vm_name, _, _, _) = common::unique_names("cmd-test");
 
     // Use nginx:alpine with a custom command that:
     // 1. Creates a marker file to prove our command ran
@@ -472,6 +469,6 @@ async fn test_custom_command() -> Result<()> {
     common::kill_process(fcvm_pid).await;
     let _ = child.wait().await;
 
-    println!("✅ test_custom_command PASSED");
+    println!("✅ test_custom_command_bridged PASSED");
     Ok(())
 }

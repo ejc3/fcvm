@@ -43,7 +43,28 @@ impl StateManager {
 
     /// Save VM state atomically (write to temp file, then rename)
     /// Uses file locking to prevent concurrent writes
+    ///
+    /// If another state file claims our PID, it's stale (that process is dead
+    /// and its PID was reused by the OS). We delete it to prevent collisions
+    /// when querying by PID.
     pub async fn save_state(&self, state: &VmState) -> Result<()> {
+        // Clean up any stale state files that claim our PID
+        // This happens when a VM crashes and its PID is later reused
+        if let Some(pid) = state.pid {
+            if let Ok(existing_vms) = self.list_vms().await {
+                for existing in existing_vms {
+                    if existing.pid == Some(pid) && existing.vm_id != state.vm_id {
+                        tracing::warn!(
+                            stale_vm_id = %existing.vm_id,
+                            pid = pid,
+                            "deleting stale state file with reused PID (previous VM crashed without cleanup)"
+                        );
+                        let _ = self.delete_state(&existing.vm_id).await;
+                    }
+                }
+            }
+        }
+
         let state_file = self.state_dir.join(format!("{}.json", state.vm_id));
         let temp_file = self.state_dir.join(format!("{}.json.tmp", state.vm_id));
         let lock_file = self.state_dir.join(format!("{}.json.lock", state.vm_id));
@@ -116,14 +137,65 @@ impl StateManager {
         Ok(state)
     }
 
-    /// Delete VM state
+    /// Delete VM state and associated lock/temp files
     pub async fn delete_state(&self, vm_id: &str) -> Result<()> {
         let state_file = self.state_dir.join(format!("{}.json", vm_id));
-        // Ignore NotFound errors - avoids TOCTOU race and handles concurrent cleanup
+        let lock_file = self.state_dir.join(format!("{}.json.lock", vm_id));
+        let temp_file = self.state_dir.join(format!("{}.json.tmp", vm_id));
+
+        // Delete state file - ignore NotFound (TOCTOU race / concurrent cleanup)
         match fs::remove_file(&state_file).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e).context("deleting VM state"),
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context("deleting VM state"),
+        }
+
+        // Clean up lock file (ignore errors - may not exist or be held by another process)
+        let _ = fs::remove_file(&lock_file).await;
+
+        // Clean up temp file (ignore errors - may not exist)
+        let _ = fs::remove_file(&temp_file).await;
+
+        Ok(())
+    }
+
+    /// Clean up stale state files from processes that no longer exist.
+    ///
+    /// This frees up loopback IPs that were allocated but not properly cleaned up
+    /// (e.g., due to crashes or SIGKILL). Called lazily during IP allocation.
+    async fn cleanup_stale_state(&self) {
+        let entries = match std::fs::read_dir(&self.state_dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            // Only process .json files
+            if path.extension().map(|e| e == "json").unwrap_or(false) {
+                // Read the state file to get the PID
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(state) = serde_json::from_str::<serde_json::Value>(&content) {
+                        if let Some(pid) = state.get("pid").and_then(|p| p.as_u64()) {
+                            // Check if process exists
+                            let proc_path = format!("/proc/{}", pid);
+                            if !std::path::Path::new(&proc_path).exists() {
+                                // Process doesn't exist - remove stale state
+                                tracing::warn!(
+                                    pid = pid,
+                                    path = %path.display(),
+                                    "cleanup_stale_state: removing state file for dead process"
+                                );
+                                let _ = std::fs::remove_file(&path);
+                                // Also remove lock file if exists
+                                let lock_path = path.with_extension("json.lock");
+                                let _ = std::fs::remove_file(&lock_path);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -291,6 +363,10 @@ impl StateManager {
         let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
             .map_err(|(_, err)| err)
             .context("acquiring exclusive lock for loopback IP allocation")?;
+
+        // Lazily clean up stale state files from dead processes
+        // This frees up loopback IPs that were allocated but not properly cleaned up
+        self.cleanup_stale_state().await;
 
         // Collect IPs from all VM state files
         let used_ips: HashSet<String> = match self.list_vms().await {

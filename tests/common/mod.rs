@@ -13,29 +13,6 @@ use tokio::time::sleep;
 /// Global counter for unique test IDs
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// Fail loudly if running as actual host root.
-///
-/// Rootless tests break when run with `sudo` on the host because user namespace
-/// mapping doesn't work correctly when you're already root.
-///
-/// However, running as root inside a container is fine - the container provides
-/// the isolation boundary, not the UID inside it.
-///
-/// Call this at the start of any rootless test function.
-pub fn require_non_root(test_name: &str) -> anyhow::Result<()> {
-    // Skip check if we're in a container - container is the isolation boundary
-    if is_in_container() {
-        return Ok(());
-    }
-
-    if nix::unistd::geteuid().is_root() {
-        anyhow::bail!(
-            "Rootless test '{}' cannot run as root! Run without sudo.",
-            test_name
-        );
-    }
-    Ok(())
-}
 
 /// Check if we're running inside a container.
 ///
@@ -176,8 +153,9 @@ impl Drop for VmFixture {
 /// Tuple of (Child process, PID)
 pub async fn spawn_fcvm(args: &[&str]) -> anyhow::Result<(tokio::process::Child, u32)> {
     let fcvm_path = find_fcvm_binary()?;
+    let final_args = maybe_add_strace_flag(args);
     let child = tokio::process::Command::new(&fcvm_path)
-        .args(args)
+        .args(&final_args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -188,6 +166,26 @@ pub async fn spawn_fcvm(args: &[&str]) -> anyhow::Result<(tokio::process::Child,
         .ok_or_else(|| anyhow::anyhow!("failed to get fcvm PID"))?;
 
     Ok((child, pid))
+}
+
+/// Check FCVM_STRACE_AGENT env var and insert --strace-agent flag for podman run commands
+fn maybe_add_strace_flag(args: &[&str]) -> Vec<String> {
+    let strace_enabled = std::env::var("FCVM_STRACE_AGENT")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    let mut result: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+
+    // Only add for "podman run" commands
+    if strace_enabled && args.len() >= 2 && args[0] == "podman" && args[1] == "run" {
+        // Find position to insert (before the image name, which is the last non-flag arg)
+        // Insert after "run" and before any positional args
+        // Simplest: insert right after "run" at position 2
+        result.insert(2, "--strace-agent".to_string());
+        eprintln!(">>> STRACE MODE: Adding --strace-agent flag");
+    }
+
+    result
 }
 
 /// Spawn fcvm with piped IO and automatic log consumers.
@@ -219,8 +217,9 @@ pub async fn spawn_fcvm_with_logs(
     name: &str,
 ) -> anyhow::Result<(tokio::process::Child, u32)> {
     let fcvm_path = find_fcvm_binary()?;
+    let final_args = maybe_add_strace_flag(args);
     let mut child = tokio::process::Command::new(&fcvm_path)
-        .args(args)
+        .args(&final_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -338,7 +337,7 @@ pub async fn poll_health_by_pid(pid: u32, timeout_secs: u64) -> anyhow::Result<(
         };
 
         // Check if VM is healthy using proper enum comparison
-        if let Some(display) = vms.first() {
+        for display in &vms {
             if matches!(display.vm.health_status, fcvm::state::HealthStatus::Healthy) {
                 return Ok(());
             }

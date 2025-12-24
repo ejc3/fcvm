@@ -1,6 +1,8 @@
 target/
+target-root/
+target-sudo/
 artifacts/
-.container-built
+.container-*
 sync-test/
 
 # Local settings (machine-specific)

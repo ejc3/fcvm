@@ -142,12 +142,10 @@ mod tests {
         delete_namespace(ns_name).await.unwrap();
     }
 
+    // Requires CAP_SYS_ADMIN to remount /sys in new namespace (doesn't work in containers)
+    #[cfg(feature = "privileged-tests")]
     #[tokio::test]
     async fn test_exec_in_namespace() {
-        if unsafe { libc::geteuid() } != 0 {
-            eprintln!("Skipping test_exec_in_namespace - requires root");
-            return;
-        }
 
         let ns_name = "fcvm-test-exec";
 

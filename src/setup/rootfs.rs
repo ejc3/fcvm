@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use nix::fcntl::{Flock, FlockArg};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -72,6 +73,8 @@ pub struct PackagesConfig {
     pub runtime: Vec<String>,
     pub fuse: Vec<String>,
     pub system: Vec<String>,
+    #[serde(default)]
+    pub debug: Vec<String>,
 }
 
 impl PackagesConfig {
@@ -80,6 +83,7 @@ impl PackagesConfig {
             .iter()
             .chain(&self.fuse)
             .chain(&self.system)
+            .chain(&self.debug)
             .map(|s| s.as_str())
             .collect()
     }
@@ -577,6 +581,7 @@ pub fn find_fc_agent_binary() -> Result<PathBuf> {
 // ============================================================================
 
 /// The fc-agent systemd service unit file content
+/// Supports optional strace via kernel cmdline parameter fc_agent_strace=1
 const FC_AGENT_SERVICE: &str = r#"[Unit]
 Description=fcvm guest agent for container orchestration
 After=network.target
@@ -586,6 +591,27 @@ Type=simple
 ExecStart=/usr/local/bin/fc-agent
 Restart=on-failure
 RestartSec=1
+# Send stdout/stderr to serial console so fcvm host can see fc-agent logs
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target
+"#;
+
+/// The fc-agent systemd service unit file with strace enabled
+const FC_AGENT_SERVICE_STRACE: &str = r#"[Unit]
+Description=fcvm guest agent for container orchestration (with strace)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fc-agent-strace-wrapper
+Restart=on-failure
+RestartSec=1
+# Send stdout/stderr to serial console so fcvm host can see fc-agent logs
+StandardOutput=journal+console
+StandardError=journal+console
 
 [Install]
 WantedBy=multi-user.target
@@ -607,12 +633,17 @@ mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 
-# Parse kernel cmdline to find root device
+# Parse kernel cmdline to find root device and debug flags
 ROOT=""
+FC_AGENT_STRACE=""
 for param in $(cat /proc/cmdline); do
     case "$param" in
         root=*)
             ROOT="${param#root=}"
+            ;;
+        fc_agent_strace=1)
+            FC_AGENT_STRACE="1"
+            echo "fc-agent strace debugging ENABLED"
             ;;
     esac
 done
@@ -650,8 +681,21 @@ echo "Installing fc-agent..."
 cp /fc-agent /newroot/usr/local/bin/fc-agent
 chmod 755 /newroot/usr/local/bin/fc-agent
 
-# Copy service file
-cp /fc-agent.service /newroot/etc/systemd/system/fc-agent.service
+# Copy service file (use strace version if debugging enabled)
+if [ -n "$FC_AGENT_STRACE" ]; then
+    echo "Installing fc-agent with strace wrapper..."
+    cp /fc-agent.service.strace /newroot/etc/systemd/system/fc-agent.service
+    # Create wrapper script that tees strace to both file and serial console
+    cat > /newroot/usr/local/bin/fc-agent-strace-wrapper << 'STRACE_WRAPPER'
+#!/bin/bash
+# Write strace output to both file and serial console (/dev/console)
+# This ensures we see crash info in Firecracker serial output
+exec strace -f -o >(tee /tmp/fc-agent.strace > /dev/console 2>&1) /usr/local/bin/fc-agent "$@"
+STRACE_WRAPPER
+    chmod 755 /newroot/usr/local/bin/fc-agent-strace-wrapper
+else
+    cp /fc-agent.service /newroot/etc/systemd/system/fc-agent.service
+fi
 
 # Enable the service (create symlink)
 mkdir -p /newroot/etc/systemd/system/multi-user.target.wants
@@ -693,44 +737,91 @@ exec switch_root /newroot /sbin/init
 
 /// Ensure the fc-agent initrd exists, creating if needed
 ///
-/// The initrd is cached by fc-agent binary hash. When fc-agent is rebuilt,
-/// a new initrd is automatically created.
+/// The initrd is cached by a combined hash of:
+/// - fc-agent binary
+/// - init script content (INITRD_INIT_SCRIPT)
+/// - service file content (FC_AGENT_SERVICE, FC_AGENT_SERVICE_STRACE)
+///
+/// This ensures the initrd is regenerated when any of these change.
 ///
 /// Returns the path to the initrd file.
+///
+/// Uses file locking to prevent race conditions when multiple VMs start
+/// simultaneously and all try to create the initrd.
 pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
     // Find fc-agent binary
     let fc_agent_path = find_fc_agent_binary()?;
     let fc_agent_bytes = std::fs::read(&fc_agent_path)
         .with_context(|| format!("reading fc-agent binary at {}", fc_agent_path.display()))?;
-    let fc_agent_sha = compute_sha256(&fc_agent_bytes);
-    let fc_agent_sha_short = &fc_agent_sha[..12];
 
-    // Check if initrd already exists for this fc-agent version
+    // Compute combined hash of all initrd contents
+    let mut combined = fc_agent_bytes.clone();
+    combined.extend_from_slice(INITRD_INIT_SCRIPT.as_bytes());
+    combined.extend_from_slice(FC_AGENT_SERVICE.as_bytes());
+    combined.extend_from_slice(FC_AGENT_SERVICE_STRACE.as_bytes());
+    let initrd_sha = compute_sha256(&combined);
+    let initrd_sha_short = &initrd_sha[..12];
+
+    // Check if initrd already exists for this version (fast path, no lock)
     let initrd_dir = paths::base_dir().join("initrd");
-    let initrd_path = initrd_dir.join(format!("fc-agent-{}.initrd", fc_agent_sha_short));
+    let initrd_path = initrd_dir.join(format!("fc-agent-{}.initrd", initrd_sha_short));
 
     if initrd_path.exists() {
         debug!(
             path = %initrd_path.display(),
-            fc_agent_sha = %fc_agent_sha_short,
+            initrd_sha = %initrd_sha_short,
             "using cached fc-agent initrd"
         );
         return Ok(initrd_path);
     }
 
-    // Create initrd directory
+    // Create initrd directory (needed for lock file)
     tokio::fs::create_dir_all(&initrd_dir)
         .await
         .context("creating initrd directory")?;
 
+    // Acquire exclusive lock to prevent race conditions
+    let lock_file = initrd_dir.join(format!("fc-agent-{}.lock", initrd_sha_short));
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock_fd = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&lock_file)
+        .context("opening initrd lock file")?;
+
+    let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
+        .map_err(|(_, err)| err)
+        .context("acquiring exclusive lock for initrd creation")?;
+
+    // Double-check after acquiring lock - another process may have created it
+    if initrd_path.exists() {
+        debug!(
+            path = %initrd_path.display(),
+            initrd_sha = %initrd_sha_short,
+            "using cached fc-agent initrd (created by another process)"
+        );
+        flock
+            .unlock()
+            .map_err(|(_, err)| err)
+            .context("releasing initrd lock")?;
+        return Ok(initrd_path);
+    }
+
     info!(
         fc_agent = %fc_agent_path.display(),
-        fc_agent_sha = %fc_agent_sha_short,
+        initrd_sha = %initrd_sha_short,
         "creating fc-agent initrd"
     );
 
     // Create temporary directory for initrd contents
-    let temp_dir = initrd_dir.join(format!(".initrd-build-{}", fc_agent_sha_short));
+    // Use PID in temp dir name to avoid conflicts even with same sha
+    let temp_dir = initrd_dir.join(format!(
+        ".initrd-build-{}-{}",
+        initrd_sha_short,
+        std::process::id()
+    ));
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     tokio::fs::create_dir_all(&temp_dir).await?;
 
@@ -765,16 +856,18 @@ pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
         .output()
         .await?;
 
-    // Write service file
+    // Write service files (normal and strace version)
     tokio::fs::write(temp_dir.join("fc-agent.service"), FC_AGENT_SERVICE).await?;
+    tokio::fs::write(temp_dir.join("fc-agent.service.strace"), FC_AGENT_SERVICE_STRACE).await?;
 
     // Create cpio archive (initrd format)
+    // Use bash with pipefail so cpio errors aren't masked by gzip success (v3)
     let temp_initrd = initrd_path.with_extension("initrd.tmp");
-    let output = Command::new("sh")
+    let output = Command::new("bash")
         .args([
             "-c",
             &format!(
-                "cd {} && find . | cpio -o -H newc 2>/dev/null | gzip > {}",
+                "set -o pipefail && cd {} && find . | cpio -o -H newc | gzip > {}",
                 temp_dir.display(),
                 temp_initrd.display()
             ),
@@ -784,13 +877,16 @@ pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
         .context("creating initrd cpio archive")?;
 
     if !output.status.success() {
+        // Release lock before bailing
+        let _ = flock.unlock();
         bail!(
-            "Failed to create initrd: {}",
+            "Failed to create initrd: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
     }
 
-    // Rename to final path
+    // Rename to final path (atomic)
     tokio::fs::rename(&temp_initrd, &initrd_path).await?;
 
     // Cleanup temp directory
@@ -798,9 +894,15 @@ pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
 
     info!(
         path = %initrd_path.display(),
-        fc_agent_sha = %fc_agent_sha_short,
+        initrd_sha = %initrd_sha_short,
         "fc-agent initrd created"
     );
+
+    // Release lock (file created successfully)
+    flock
+        .unlock()
+        .map_err(|(_, err)| err)
+        .context("releasing initrd lock after creation")?;
 
     Ok(initrd_path)
 }
@@ -1130,7 +1232,9 @@ async fn create_layer2_setup_initrd(
 ) -> Result<PathBuf> {
     info!("creating Layer 2 setup initrd with embedded packages");
 
-    let temp_dir = PathBuf::from("/tmp/fcvm-layer2-initrd");
+    // Use UID in path to avoid permission conflicts between root and non-root
+    let uid = unsafe { libc::getuid() };
+    let temp_dir = PathBuf::from(format!("/tmp/fcvm-layer2-initrd-{}", uid));
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     tokio::fs::create_dir_all(&temp_dir).await?;
 
@@ -1152,8 +1256,8 @@ async fn create_layer2_setup_initrd(
         bail!("Failed to chmod init: {}", String::from_utf8_lossy(&output.stderr));
     }
 
-    // Copy busybox static binary
-    let busybox_src = PathBuf::from("/bin/busybox");
+    // Copy busybox static binary (prefer busybox-static if available)
+    let busybox_src = find_busybox()?;
     let busybox_dst = temp_dir.join("bin").join("busybox");
     tokio::fs::create_dir_all(temp_dir.join("bin")).await?;
     tokio::fs::copy(&busybox_src, &busybox_dst)
@@ -1188,12 +1292,13 @@ async fn create_layer2_setup_initrd(
     info!(count = package_count, "embedded packages in initrd");
 
     // Create the initrd using cpio
+    // Use bash with pipefail so cpio errors aren't masked by gzip success
     let initrd_path = temp_dir.join("initrd.cpio.gz");
-    let cpio_output = Command::new("sh")
+    let cpio_output = Command::new("bash")
         .args([
             "-c",
             &format!(
-                "cd {} && find . | cpio -o -H newc 2>/dev/null | gzip > {}",
+                "set -o pipefail && cd {} && find . | cpio -o -H newc | gzip > {}",
                 temp_dir.display(),
                 initrd_path.display()
             ),
@@ -1204,7 +1309,8 @@ async fn create_layer2_setup_initrd(
 
     if !cpio_output.status.success() {
         bail!(
-            "Failed to create initrd: {}",
+            "Failed to create initrd: stdout={}, stderr={}",
+            String::from_utf8_lossy(&cpio_output.stdout),
             String::from_utf8_lossy(&cpio_output.stderr)
         );
     }
@@ -1415,7 +1521,9 @@ async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
     use tokio::time::timeout;
 
     // Create a temporary directory for this setup VM
-    let temp_dir = PathBuf::from("/tmp/fcvm-layer2-setup");
+    // Use UID in path to avoid permission conflicts between root and non-root
+    let uid = unsafe { libc::getuid() };
+    let temp_dir = PathBuf::from(format!("/tmp/fcvm-layer2-setup-{}", uid));
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     tokio::fs::create_dir_all(&temp_dir).await?;
 

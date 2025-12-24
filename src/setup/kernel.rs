@@ -1,8 +1,9 @@
 use anyhow::{bail, Context, Result};
+use nix::fcntl::{Flock, FlockArg};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use tokio::process::Command;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::paths;
 use crate::setup::rootfs::{load_plan, KernelArchConfig};
@@ -31,7 +32,10 @@ pub async fn ensure_kernel() -> Result<PathBuf> {
     download_kernel(kernel_config).await
 }
 
-/// Download kernel from Kata release tarball
+/// Download kernel from Kata release tarball.
+///
+/// Uses file locking to prevent race conditions when multiple VMs start
+/// simultaneously and all try to download the same kernel.
 async fn download_kernel(config: &KernelArchConfig) -> Result<PathBuf> {
     let kernel_dir = paths::kernel_dir();
 
@@ -39,18 +43,48 @@ async fn download_kernel(config: &KernelArchConfig) -> Result<PathBuf> {
     let url_hash = compute_sha256_short(config.url.as_bytes());
     let kernel_path = kernel_dir.join(format!("vmlinux-{}.bin", url_hash));
 
+    // Fast path: kernel already exists
     if kernel_path.exists() {
         info!(path = %kernel_path.display(), url_hash = %url_hash, "kernel already exists");
         return Ok(kernel_path);
     }
 
-    println!("⚙️  Downloading kernel (first run)...");
-    info!(url = %config.url, path_in_archive = %config.path, "downloading kernel from Kata release");
-
-    // Create directory
+    // Create directory (needed for lock file)
     tokio::fs::create_dir_all(&kernel_dir)
         .await
         .context("creating kernel directory")?;
+
+    // Acquire exclusive lock to prevent multiple downloads
+    let lock_file = kernel_dir.join(format!("vmlinux-{}.lock", url_hash));
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock_fd = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&lock_file)
+        .context("opening kernel lock file")?;
+
+    let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
+        .map_err(|(_, err)| err)
+        .context("acquiring exclusive lock for kernel download")?;
+
+    // Double-check after acquiring lock - another process may have downloaded it
+    if kernel_path.exists() {
+        debug!(
+            path = %kernel_path.display(),
+            url_hash = %url_hash,
+            "kernel already exists (created by another process)"
+        );
+        flock
+            .unlock()
+            .map_err(|(_, err)| err)
+            .context("releasing kernel lock")?;
+        return Ok(kernel_path);
+    }
+
+    println!("⚙️  Downloading kernel (first run)...");
+    info!(url = %config.url, path_in_archive = %config.path, "downloading kernel from Kata release");
 
     // Download and extract in one pipeline:
     // curl -> zstd -d -> tar --extract
@@ -72,6 +106,7 @@ async fn download_kernel(config: &KernelArchConfig) -> Result<PathBuf> {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            let _ = flock.unlock();
             bail!("Failed to download kernel: {}", stderr);
         }
 
@@ -102,12 +137,14 @@ async fn download_kernel(config: &KernelArchConfig) -> Result<PathBuf> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = flock.unlock();
         bail!("Failed to extract kernel: {}", stderr);
     }
 
     // Move extracted kernel to final location
     let extracted_path = cache_dir.join(&config.path);
     if !extracted_path.exists() {
+        let _ = flock.unlock();
         bail!(
             "Kernel not found after extraction at {}",
             extracted_path.display()
@@ -130,6 +167,12 @@ async fn download_kernel(config: &KernelArchConfig) -> Result<PathBuf> {
         url_hash = %url_hash,
         "kernel downloaded and cached"
     );
+
+    // Release lock
+    flock
+        .unlock()
+        .map_err(|(_, err)| err)
+        .context("releasing kernel lock after download")?;
 
     Ok(kernel_path)
 }

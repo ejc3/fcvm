@@ -113,8 +113,13 @@ impl UffdServer {
                             info!(target: "uffd", vm_id = %vm_id, "new VM connection");
 
                             // Convert tokio UnixStream to std UnixStream for SCM_RIGHTS
+                            // IMPORTANT: tokio sockets are non-blocking, but recv_with_fd needs
+                            // blocking mode to wait for Firecracker to send the UFFD fd.
+                            // Without this, recvmsg returns EAGAIN immediately if data isn't ready.
                             let mut std_stream = stream.into_std()
                                 .context("converting to std stream")?;
+                            std_stream.set_nonblocking(false)
+                                .context("setting socket to blocking mode")?;
 
                             // Receive UFFD and mappings for this VM
                             match receive_uffd_and_mappings(&mut std_stream) {
@@ -141,7 +146,8 @@ impl UffdServer {
                                     info!(target: "uffd", active_vms = vm_tasks.len(), "VM connected");
                                 }
                                 Err(e) => {
-                                    error!(target: "uffd", vm_id = %vm_id, error = %e, "failed to receive UFFD");
+                                    // Log full error chain for debugging (includes syscall errors)
+                                    error!(target: "uffd", vm_id = %vm_id, error = ?e, "failed to receive UFFD");
                                 }
                             }
                         }

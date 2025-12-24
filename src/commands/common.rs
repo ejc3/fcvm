@@ -21,6 +21,9 @@ pub const VSOCK_VOLUME_PORT_BASE: u32 = 5000;
 /// Vsock port for status channel (fc-agent notifies when container starts)
 pub const VSOCK_STATUS_PORT: u32 = 4999;
 
+/// Vsock port for container output streaming (bidirectional)
+pub const VSOCK_OUTPUT_PORT: u32 = 4997;
+
 /// Minimum required Firecracker version for network_overrides support
 const MIN_FIRECRACKER_VERSION: (u32, u32, u32) = (1, 13, 1);
 

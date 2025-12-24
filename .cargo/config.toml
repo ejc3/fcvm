@@ -1,0 +1,6 @@
+# Cargo configuration for fcvm
+#
+# Note: NO global target runner here. Tests that need sudo explicitly
+# set CARGO_TARGET_*_RUNNER in the Makefile. This is more secure
+# (opt-in to privileges) and avoids needing to clear the env var
+# for non-root tests.
