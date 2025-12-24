@@ -33,8 +33,6 @@ jobs:
           export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
           export FUSER=${{ github.workspace }}/fuser
           export CONTAINER_ARCH=x86_64
-          export CI=1
-          mkdir -p cargo-home
           make container-build
           make lint
           make container-test-noroot
@@ -62,8 +60,6 @@ jobs:
           export FUSE_BACKEND_RS=${{ github.workspace }}/fuse-backend-rs
           export FUSER=${{ github.workspace }}/fuser
           export CONTAINER_ARCH=x86_64
-          export CI=1
-          mkdir -p cargo-home
           make container-build-root
           make container-test-root
           make container-test-pjdfstest
