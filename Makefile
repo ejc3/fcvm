@@ -64,12 +64,10 @@ TEST_PJDFSTEST := CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo nextest run --releas
 # Unprivileged tests run by default (no feature flag)
 # Use -p fcvm to only run fcvm package tests (excludes fuse-pipe)
 #
-# IMPORTANT: Privileged tests filter out 'rootless' tests because:
-# - Rootless tests already run in the unprivileged phase (no sudo needed)
-# - Running rootless tests under sudo causes process group signal issues
-#   that kill namespace holder processes when tests run at full parallelism
-TEST_VM_UNPRIVILEGED := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR) FCVM_STRACE_AGENT=$(FCVM_STRACE_AGENT) cargo nextest run -p fcvm --release $(NEXTEST_CAPTURE) $(FILTER)"
-TEST_VM_PRIVILEGED := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) FCVM_STRACE_AGENT=$(FCVM_STRACE_AGENT) cargo nextest run -p fcvm --release $(NEXTEST_CAPTURE) --features privileged-tests -E '!test(/rootless/)' $(FILTER)"
+# VM test command - runs all tests with privileged-tests feature
+# Test binaries run via target runner (sudo -E) from .cargo/config.toml
+# Excludes rootless tests which have signal handling issues under sudo
+TEST_VM := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR) FCVM_STRACE_AGENT=$(FCVM_STRACE_AGENT) cargo nextest run -p fcvm --release $(NEXTEST_CAPTURE) --features privileged-tests -E '!test(/rootless/)' $(FILTER)"
 
 # Container test commands (no CARGO_TARGET_DIR - volume mounts provide isolation)
 CTEST_UNIT := cargo nextest run --release --lib
@@ -90,14 +88,13 @@ BENCH_PROTOCOL := cargo bench -p fuse-pipe --bench protocol
 BENCH_EXEC := cargo bench --bench exec
 
 .PHONY: all help build build-root build-all clean \
-        test test-noroot test-root test-unit test-fuse test-vm test-vm-unprivileged test-vm-privileged test-all \
+        test test-noroot test-root test-unit test-fuse test-vm test-all \
         test-pjdfstest test-all-host test-all-container ci-local pre-push \
         bench bench-throughput bench-operations bench-protocol bench-exec bench-quick bench-logs bench-clean \
         lint clippy fmt fmt-check \
         container-build container-build-root container-build-rootless container-build-only container-build-allow-other \
         container-test container-test-unit container-test-noroot container-test-root container-test-fuse \
-        container-test-vm container-test-vm-unprivileged container-test-vm-privileged \
-        container-test-pjdfstest container-test-all container-test-allow-other \
+        container-test-vm container-test-pjdfstest container-test-all container-test-allow-other \
         container-bench container-bench-throughput container-bench-operations container-bench-protocol container-bench-exec \
         container-shell container-clean \
         setup-btrfs setup-rootfs setup-all
@@ -112,15 +109,12 @@ help:
 	@echo "  make clean       - Clean build artifacts"
 	@echo ""
 	@echo "Testing (with optional FILTER and STREAM):"
-	@echo "  Tests use Cargo feature: privileged-tests (needs sudo). Unprivileged tests run by default."
+	@echo "  Test binaries run via target runner (sudo -E) from .cargo/config.toml"
 	@echo "  Use FILTER= to filter tests matching a pattern, STREAM=1 for live output."
 	@echo ""
-	@echo "  make test-vm                    - All VM tests (unprivileged + privileged)"
-	@echo "  make test-vm-unprivileged       - Unprivileged tests only (no sudo)"
-	@echo "  make test-vm-privileged         - All tests including privileged (sudo)"
+	@echo "  make test-vm                    - All VM tests"
 	@echo "  make test-vm FILTER=exec        - Only *exec* tests"
 	@echo "  make test-vm FILTER=sanity      - Only *sanity* tests"
-	@echo "  make test-vm-privileged FILTER=egress - Only privileged *egress* tests"
 	@echo ""
 	@echo "  make test            - All fuse-pipe tests"
 	@echo "  make test-pjdfstest  - POSIX compliance (8789 tests)"
@@ -244,27 +238,16 @@ test-fuse: build build-root
 	$(TEST_FUSE_STRESS)
 	sudo $(TEST_FUSE_ROOT)
 
-# VM tests - unprivileged (no sudo needed)
-test-vm-unprivileged: build setup-btrfs
-ifeq ($(STREAM),1)
-	@echo "==> STREAM=1: Output streams live (parallel disabled)"
-else
-	@echo "==> STREAM=0: Output captured until test completes (use STREAM=1 for live output)"
-endif
-	$(TEST_VM_UNPRIVILEGED)
-
-# VM tests - privileged (requires sudo, runs ALL tests including unprivileged)
-test-vm-privileged: build-root setup-btrfs
-ifeq ($(STREAM),1)
-	@echo "==> STREAM=1: Output streams live (parallel disabled)"
-else
-	@echo "==> STREAM=0: Output captured until test completes (use STREAM=1 for live output)"
-endif
-	sudo $(TEST_VM_PRIVILEGED)
-
-# All VM tests: unprivileged first, then privileged
+# VM tests - runs all tests with privileged-tests feature
+# Test binaries run via target runner (sudo -E) from .cargo/config.toml
 # Use FILTER= to run subset, e.g.: make test-vm FILTER=exec
-test-vm: test-vm-unprivileged test-vm-privileged
+test-vm: build setup-btrfs
+ifeq ($(STREAM),1)
+	@echo "==> STREAM=1: Output streams live (parallel disabled)"
+else
+	@echo "==> STREAM=0: Output captured until test completes (use STREAM=1 for live output)"
+endif
+	$(TEST_VM)
 
 # POSIX compliance tests (host - requires pjdfstest installed)
 test-pjdfstest: build-root
@@ -501,17 +484,11 @@ container-test-allow-other: container-build-allow-other
 # All fuse-pipe tests: noroot first, then root
 container-test: container-test-noroot container-test-root
 
-# VM tests - runs make targets inside container
-# Override TARGET_DIR/TARGET_DIR_ROOT to use the volume-mounted target directory
-container-test-vm-unprivileged: container-build-rootless setup-btrfs
-	$(CONTAINER_RUN_ROOTLESS) $(CONTAINER_TAG) make test-vm-unprivileged TARGET_DIR=target TARGET_DIR_ROOT=target FILTER=$(FILTER) STREAM=$(STREAM) STRACE=$(STRACE)
-
-container-test-vm-privileged: container-build-root setup-btrfs
-	$(CONTAINER_RUN_FCVM) $(CONTAINER_TAG) make test-vm-privileged TARGET_DIR=target TARGET_DIR_ROOT=target FILTER=$(FILTER) STREAM=$(STREAM) STRACE=$(STRACE)
-
-# All VM tests: privileged first (creates rootfs), then unprivileged
+# VM tests in container
+# Uses privileged container since test binaries run via target runner (sudo -E)
 # Use FILTER= to run subset, e.g.: make container-test-vm FILTER=exec
-container-test-vm: container-test-vm-privileged container-test-vm-unprivileged
+container-test-vm: container-build-root setup-btrfs
+	$(CONTAINER_RUN_FCVM) $(CONTAINER_TAG) make test-vm TARGET_DIR=target FILTER=$(FILTER) STREAM=$(STREAM) STRACE=$(STRACE)
 
 container-test-pjdfstest: container-build-root
 	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) $(CTEST_PJDFSTEST)
