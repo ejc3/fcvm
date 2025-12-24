@@ -153,8 +153,9 @@ impl Drop for VmFixture {
 /// Tuple of (Child process, PID)
 pub async fn spawn_fcvm(args: &[&str]) -> anyhow::Result<(tokio::process::Child, u32)> {
     let fcvm_path = find_fcvm_binary()?;
+    let final_args = maybe_add_strace_flag(args);
     let child = tokio::process::Command::new(&fcvm_path)
-        .args(args)
+        .args(&final_args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -165,6 +166,26 @@ pub async fn spawn_fcvm(args: &[&str]) -> anyhow::Result<(tokio::process::Child,
         .ok_or_else(|| anyhow::anyhow!("failed to get fcvm PID"))?;
 
     Ok((child, pid))
+}
+
+/// Check FCVM_STRACE_AGENT env var and insert --strace-agent flag for podman run commands
+fn maybe_add_strace_flag(args: &[&str]) -> Vec<String> {
+    let strace_enabled = std::env::var("FCVM_STRACE_AGENT")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    let mut result: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+
+    // Only add for "podman run" commands
+    if strace_enabled && args.len() >= 2 && args[0] == "podman" && args[1] == "run" {
+        // Find position to insert (before the image name, which is the last non-flag arg)
+        // Insert after "run" and before any positional args
+        // Simplest: insert right after "run" at position 2
+        result.insert(2, "--strace-agent".to_string());
+        eprintln!(">>> STRACE MODE: Adding --strace-agent flag");
+    }
+
+    result
 }
 
 /// Spawn fcvm with piped IO and automatic log consumers.
@@ -196,8 +217,9 @@ pub async fn spawn_fcvm_with_logs(
     name: &str,
 ) -> anyhow::Result<(tokio::process::Child, u32)> {
     let fcvm_path = find_fcvm_binary()?;
+    let final_args = maybe_add_strace_flag(args);
     let mut child = tokio::process::Command::new(&fcvm_path)
-        .args(args)
+        .args(&final_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

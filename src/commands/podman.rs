@@ -847,7 +847,7 @@ async fn run_vm_setup(
     // The rootfs is a raw disk with partitions, root=/dev/vda1 specifies partition 1
     // Format: ip=<client-ip>:<server-ip>:<gw-ip>:<netmask>:<hostname>:<device>:<autoconf>:<dns0>
     // Example: ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off:172.16.0.1
-    let boot_args = if let (Some(guest_ip), Some(host_ip)) =
+    let mut boot_args = if let (Some(guest_ip), Some(host_ip)) =
         (&network_config.guest_ip, &network_config.host_ip)
     {
         // Extract just the IP without CIDR notation if present
@@ -872,6 +872,12 @@ async fn run_vm_setup(
         // No network config - used for basic boot (e.g., during setup)
         "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=1 systemd.log_color=no root=/dev/vda rw".to_string()
     };
+
+    // Enable fc-agent strace debugging if requested
+    if args.strace_agent {
+        boot_args.push_str(" fc_agent_strace=1");
+        info!("fc-agent strace debugging enabled - output will be in /tmp/fc-agent.strace");
+    }
 
     client
         .set_boot_source(crate::firecracker::api::BootSource {
