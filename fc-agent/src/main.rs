@@ -1546,37 +1546,117 @@ async fn main() -> Result<()> {
         const MAX_RETRIES: u32 = 3;
         const RETRY_DELAY_SECS: u64 = 2;
 
+        let mut last_error = String::new();
+        let mut pull_succeeded = false;
+
         for attempt in 1..=MAX_RETRIES {
             eprintln!(
-                "[fc-agent] pulling image: {} (attempt {}/{})",
+                "[fc-agent] =========================================="
+            );
+            eprintln!(
+                "[fc-agent] PULLING IMAGE: {} (attempt {}/{})",
                 plan.image, attempt, MAX_RETRIES
             );
+            eprintln!(
+                "[fc-agent] =========================================="
+            );
 
-            let output = Command::new("podman")
+            // Spawn podman pull and stream output in real-time
+            let mut child = Command::new("podman")
                 .arg("pull")
                 .arg(&plan.image)
-                .output()
-                .await
-                .context("running podman pull")?;
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .context("spawning podman pull")?;
 
-            if output.status.success() {
+            // Stream stdout in real-time
+            let stdout_task = if let Some(stdout) = child.stdout.take() {
+                Some(tokio::spawn(async move {
+                    let reader = BufReader::new(stdout);
+                    let mut lines = reader.lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        eprintln!("[fc-agent] [podman] {}", line);
+                    }
+                }))
+            } else {
+                None
+            };
+
+            // Stream stderr in real-time and capture for error reporting
+            let stderr_task = if let Some(stderr) = child.stderr.take() {
+                Some(tokio::spawn(async move {
+                    let reader = BufReader::new(stderr);
+                    let mut lines = reader.lines();
+                    let mut captured = Vec::new();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        eprintln!("[fc-agent] [podman] {}", line);
+                        captured.push(line);
+                    }
+                    captured
+                }))
+            } else {
+                None
+            };
+
+            // Wait for podman to finish
+            let status = child.wait().await.context("waiting for podman pull")?;
+
+            // Wait for output streaming to complete
+            if let Some(task) = stdout_task {
+                let _ = task.await;
+            }
+            let stderr_lines = if let Some(task) = stderr_task {
+                task.await.unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            if status.success() {
                 eprintln!("[fc-agent] ✓ image pulled successfully");
+                pull_succeeded = true;
                 break;
             }
 
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!("[fc-agent] image pull failed: {}", stderr.trim());
+            // Capture error for final bail message
+            last_error = stderr_lines.join("\n");
+            eprintln!(
+                "[fc-agent] =========================================="
+            );
+            eprintln!(
+                "[fc-agent] IMAGE PULL FAILED (attempt {}/{})",
+                attempt, MAX_RETRIES
+            );
+            eprintln!(
+                "[fc-agent] exit code: {:?}",
+                status.code()
+            );
+            eprintln!(
+                "[fc-agent] =========================================="
+            );
 
             if attempt < MAX_RETRIES {
                 eprintln!("[fc-agent] retrying in {} seconds...", RETRY_DELAY_SECS);
                 tokio::time::sleep(std::time::Duration::from_secs(RETRY_DELAY_SECS)).await;
-            } else {
-                anyhow::bail!(
-                    "Failed to pull image after {} attempts: {}",
-                    MAX_RETRIES,
-                    stderr.trim()
-                );
             }
+        }
+
+        if !pull_succeeded {
+            eprintln!(
+                "[fc-agent] =========================================="
+            );
+            eprintln!(
+                "[fc-agent] FATAL: IMAGE PULL FAILED AFTER {} ATTEMPTS",
+                MAX_RETRIES
+            );
+            eprintln!(
+                "[fc-agent] =========================================="
+            );
+            anyhow::bail!(
+                "Failed to pull image after {} attempts:\n{}",
+                MAX_RETRIES,
+                last_error
+            );
         }
     }
 
