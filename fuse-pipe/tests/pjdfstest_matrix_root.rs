@@ -3,9 +3,9 @@
 //! The C pjdfstest suite uses chown/mknod/user-switching which require root.
 //! Each category runs as a separate test for parallel execution via nextest.
 //!
-//! Run with: cargo nextest run -p fuse-pipe --test pjdfstest_matrix_root --features privileged-tests
+//! Run with: cargo nextest run -p fuse-pipe --test pjdfstest_matrix_root --features privileged-tests,integration-slow
 
-#![cfg(feature = "privileged-tests")]
+#![cfg(all(feature = "privileged-tests", feature = "integration-slow"))]
 
 mod pjdfstest_common;
 
