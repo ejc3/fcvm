@@ -50,16 +50,12 @@ endif
 # - No doctests by default (no --tests flag needed)
 # - Better output: progress, timing, failures highlighted
 
-# No root required (uses TARGET_DIR):
+# No root required
 TEST_UNIT := CARGO_TARGET_DIR=$(TARGET_DIR) cargo nextest run --release --lib
-TEST_FUSE_NOROOT := CARGO_TARGET_DIR=$(TARGET_DIR) cargo nextest run --release -p fuse-pipe --test integration
-TEST_FUSE_STRESS := CARGO_TARGET_DIR=$(TARGET_DIR) cargo nextest run --release -p fuse-pipe --test test_mount_stress
+TEST_FUSE_NOROOT := CARGO_TARGET_DIR=$(TARGET_DIR) cargo nextest run --release -p fuse-pipe --test integration --test test_mount_stress --test test_unmount_race
 
-# Root required (uses TARGET_DIR_ROOT):
-TEST_FUSE_ROOT := CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo nextest run --release -p fuse-pipe --test integration_root
-# Note: test_permission_edge_cases requires C pjdfstest with -u/-g flags, only available in container
-# Matrix tests run categories in parallel via nextest process isolation
-TEST_PJDFSTEST := CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo nextest run --release -p fuse-pipe --test pjdfstest_matrix
+# Root required - all root-needing fuse-pipe tests
+TEST_FUSE_ROOT := CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo nextest run --release -p fuse-pipe --test integration_root --test test_permission_edge_cases --test pjdfstest_matrix
 
 # VM tests: privileged-tests feature gates tests that require sudo
 # Unprivileged tests run by default (no feature flag)
@@ -72,13 +68,9 @@ TEST_PJDFSTEST := CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo nextest run --releas
 TEST_VM := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR) FCVM_STRACE_AGENT=$(FCVM_STRACE_AGENT) CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' cargo nextest run -p fcvm --release $(NEXTEST_CAPTURE) --features privileged-tests -E '!test(/rootless/)' $(FILTER)"
 
 # Container test commands (no CARGO_TARGET_DIR - volume mounts provide isolation)
-# No global target runner in .cargo/config.toml, so these run without sudo by default
 CTEST_UNIT := cargo nextest run --release --lib
-CTEST_FUSE_NOROOT := cargo nextest run --release -p fuse-pipe --test integration
-CTEST_FUSE_STRESS := cargo nextest run --release -p fuse-pipe --test test_mount_stress
-CTEST_FUSE_ROOT := cargo nextest run --release -p fuse-pipe --test integration_root
-CTEST_FUSE_PERMISSION := cargo nextest run --release -p fuse-pipe --test test_permission_edge_cases
-CTEST_PJDFSTEST := cargo nextest run --release -p fuse-pipe --test pjdfstest_matrix
+CTEST_FUSE_NOROOT := cargo nextest run --release -p fuse-pipe --test integration --test test_mount_stress --test test_unmount_race
+CTEST_FUSE_ROOT := cargo nextest run --release -p fuse-pipe --test integration_root --test test_permission_edge_cases --test pjdfstest_matrix
 
 # Container VM tests now use `make test-vm-*` inside container (see container-test-vm-* targets)
 
@@ -92,12 +84,12 @@ BENCH_EXEC := cargo bench --bench exec
 
 .PHONY: all help build build-root build-all clean \
         test test-noroot test-root test-unit test-fuse test-vm test-all \
-        test-pjdfstest test-all-host test-all-container ci-local pre-push \
+        test-all-host test-all-container ci-local pre-push \
         bench bench-throughput bench-operations bench-protocol bench-exec bench-quick bench-logs bench-clean \
         lint clippy fmt fmt-check \
         container-build container-build-root container-build-rootless container-build-only container-build-allow-other \
         container-test container-test-unit container-test-noroot container-test-root container-test-fuse \
-        container-test-vm container-test-pjdfstest container-test-all container-test-allow-other \
+        container-test-vm container-test-all container-test-allow-other \
         ci-container-rootless ci-container-sudo \
         container-bench container-bench-throughput container-bench-operations container-bench-protocol container-bench-exec \
         container-shell container-clean \
@@ -120,15 +112,13 @@ help:
 	@echo "  make test-vm FILTER=exec        - Only *exec* tests"
 	@echo "  make test-vm FILTER=sanity      - Only *sanity* tests"
 	@echo ""
-	@echo "  make test            - All fuse-pipe tests"
-	@echo "  make test-pjdfstest  - POSIX compliance (8789 tests)"
+	@echo "  make test            - All fuse-pipe tests (includes pjdfstest)"
 	@echo "  make test-all        - Everything"
 	@echo ""
 	@echo "Container Testing:"
 	@echo "  make container-test-vm             - All VM tests"
 	@echo "  make container-test-vm FILTER=exec - Only *exec* tests"
-	@echo "  make container-test                - fuse-pipe tests"
-	@echo "  make container-test-pjdfstest      - POSIX compliance"
+	@echo "  make container-test                - fuse-pipe tests (includes pjdfstest)"
 	@echo "  make container-test-all            - Everything"
 	@echo "  make container-shell               - Interactive shell"
 	@echo ""
@@ -222,7 +212,6 @@ test-noroot: build
 	@echo "==> Running tests (no root required)..."
 	$(TEST_UNIT)
 	$(TEST_FUSE_NOROOT)
-	$(TEST_FUSE_STRESS)
 
 # Tests that require root
 test-root: build-root
@@ -239,7 +228,6 @@ test-unit: build
 # All fuse-pipe tests (needs both builds)
 test-fuse: build build-root
 	$(TEST_FUSE_NOROOT)
-	$(TEST_FUSE_STRESS)
 	sudo $(TEST_FUSE_ROOT)
 
 # VM tests - runs all tests with privileged-tests feature
@@ -253,13 +241,8 @@ else
 endif
 	$(TEST_VM)
 
-# POSIX compliance tests (host - requires pjdfstest installed)
-test-pjdfstest: build-root
-	@echo "==> Running POSIX compliance tests (8789 tests)..."
-	sudo $(TEST_PJDFSTEST)
-
-# Run everything (use container-test-pjdfstest for POSIX compliance)
-test-all: test test-vm test-pjdfstest
+# Run everything
+test-all: test test-vm
 
 #------------------------------------------------------------------------------
 # Benchmarks (native)
@@ -456,24 +439,18 @@ container-test-unit: container-build
 
 container-test-noroot: container-build
 	@echo "==> Running tests as non-root user..."
-	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) $(CTEST_UNIT)
-	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) $(CTEST_FUSE_NOROOT)
-	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) $(CTEST_FUSE_STRESS)
+	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) make test-noroot
 
 # Root tests run as root inside container (uses separate volume)
 container-test-root: container-build-root
 	@echo "==> Running tests as root..."
-	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) $(CTEST_FUSE_ROOT)
-	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) $(CTEST_FUSE_PERMISSION)
+	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) make test-root
 
-# All fuse-pipe tests (explicit) - matches native test-fuse
-# Note: Uses both volumes since it mixes root and non-root tests
+# All fuse-pipe tests - matches native test-fuse
 container-test-fuse: container-build container-build-root
 	@echo "==> Running all fuse-pipe tests..."
-	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) $(CTEST_FUSE_NOROOT)
-	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) $(CTEST_FUSE_STRESS)
-	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) $(CTEST_FUSE_ROOT)
-	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) $(CTEST_FUSE_PERMISSION)
+	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) make test-noroot
+	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) make test-root
 
 # Test AllowOther with user_allow_other configured (non-root with config)
 # Uses separate image with user_allow_other pre-configured
@@ -496,11 +473,8 @@ container-test: container-test-noroot container-test-root
 container-test-vm: container-build-root setup-btrfs
 	$(CONTAINER_RUN_FCVM) $(CONTAINER_TAG) make test-vm TARGET_DIR=target FILTER=$(FILTER) STREAM=$(STREAM) STRACE=$(STRACE)
 
-container-test-pjdfstest: container-build-root
-	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) $(CTEST_PJDFSTEST)
-
-# Run everything in container
-container-test-all: container-test container-test-vm container-test-pjdfstest
+# Run everything in container (pjdfstest included in test-root)
+container-test-all: container-test container-test-vm
 
 #------------------------------------------------------------------------------
 # CI Targets (one command per job)
@@ -509,13 +483,11 @@ container-test-all: container-test container-test-vm container-test-pjdfstest
 # CI Job 1: Lint + rootless FUSE tests
 ci-container-rootless: container-build
 	$(MAKE) lint
-	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) \
-		cargo nextest run --release --lib -p fuse-pipe --test integration --test test_mount_stress --test test_unmount_race
+	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) make test-noroot
 
 # CI Job 2: Root FUSE tests + POSIX compliance
 ci-container-sudo: container-build-root
-	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) \
-		cargo nextest run --release -p fuse-pipe --test integration_root --test test_permission_edge_cases --test pjdfstest_matrix
+	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) make test-root
 
 # CI Job 3: VM tests (container-test-vm already exists above)
 
@@ -564,11 +536,9 @@ ci-local:
 		lint \
 		test-unit \
 		test-fuse \
-		test-pjdfstest \
 		test-vm \
 		container-test-noroot \
 		container-test-root \
-		container-test-pjdfstest \
 		container-test-vm
 	@echo "==> CI local complete"
 
@@ -578,12 +548,11 @@ pre-push: build
 	@echo "==> Ready to push"
 
 # Host-only tests (parallel, builds both target dirs first)
-# test-vm runs all VM tests (privileged + unprivileged)
 test-all-host:
 	$(MAKE) -j build build-root
-	$(MAKE) -j lint test-unit test-fuse test-pjdfstest test-vm
+	$(MAKE) -j lint test-unit test-fuse test-vm
 
 # Container-only tests (parallel, builds all 3 container target dirs first)
 test-all-container:
 	$(MAKE) -j container-build container-build-root container-build-rootless
-	$(MAKE) -j container-test-noroot container-test-root container-test-pjdfstest container-test-vm
+	$(MAKE) -j container-test-noroot container-test-root container-test-vm
