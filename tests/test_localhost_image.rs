@@ -77,7 +77,9 @@ async fn test_localhost_hello_world_bridged() -> Result<()> {
                     found_hello = true;
                 }
                 // Check for container exit with code 0
-                if line.contains("Container exit notification received") && line.contains("exit_code=0") {
+                if line.contains("Container exit notification received")
+                    && line.contains("exit_code=0")
+                {
                     exited_zero = true;
                 }
             }
@@ -121,7 +123,9 @@ async fn test_localhost_hello_world_bridged() -> Result<()> {
         Ok(())
     } else {
         println!("\n❌ LOCALHOST IMAGE TEST FAILED!");
-        println!("  - Did not find expected output: '[ctr:stdout] Hello from localhost container!'");
+        println!(
+            "  - Did not find expected output: '[ctr:stdout] Hello from localhost container!'"
+        );
         println!("  - Check logs above for error details");
         anyhow::bail!("Localhost image test failed")
     }

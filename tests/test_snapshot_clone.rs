@@ -962,7 +962,11 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
     println!("╠═══════════════════════════════════════════════════════════════╣");
     println!(
         "║  Direct access to guest:    {} (N/A for clones)            ║",
-        if direct_works { "✓ WORKS" } else { "✗ N/A  " }
+        if direct_works {
+            "✓ WORKS"
+        } else {
+            "✗ N/A  "
+        }
     );
     println!(
         "║  Port forward (host IP):    {}                                 ║",

@@ -155,10 +155,7 @@ async fn run_status_listener(
 ///   Host → Guest: "stdin:content" (written to container stdin)
 ///
 /// Returns collected output lines as Vec<(stream, line)>.
-async fn run_output_listener(
-    socket_path: &str,
-    vm_id: &str,
-) -> Result<Vec<(String, String)>> {
+async fn run_output_listener(socket_path: &str, vm_id: &str) -> Result<Vec<(String, String)>> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 

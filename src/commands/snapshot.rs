@@ -428,7 +428,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
                 let running_clones: Vec<crate::state::VmState> = all_vms
                     .into_iter()
                     .filter(|vm| vm.config.serve_pid == Some(my_pid))
-                    .filter(|vm| vm.pid.map(|p| crate::utils::is_process_alive(p)).unwrap_or(false))
+                    .filter(|vm| vm.pid.map(crate::utils::is_process_alive).unwrap_or(false))
                     .collect();
 
                 if running_clones.is_empty() {

@@ -13,7 +13,6 @@ use tokio::time::sleep;
 /// Global counter for unique test IDs
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-
 /// Check if we're running inside a container.
 ///
 /// Containers create marker files that we can use to detect containerized environments.

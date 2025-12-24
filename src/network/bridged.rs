@@ -134,7 +134,13 @@ impl NetworkManager for BridgedNetwork {
                 "clone using In-Namespace NAT"
             );
 
-            (host_ip, veth_subnet, guest_ip, Some(orig_gateway), Some(veth_inner_ip))
+            (
+                host_ip,
+                veth_subnet,
+                guest_ip,
+                Some(orig_gateway),
+                Some(veth_inner_ip),
+            )
         } else {
             // Baseline VM case: use 172.30.x.y/30 for everything
             let third_octet = (subnet_id / 64) as u8;
