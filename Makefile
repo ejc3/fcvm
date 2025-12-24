@@ -4,6 +4,9 @@ SHELL := /bin/bash
 FUSE_BACKEND_RS ?= /home/ubuntu/fuse-backend-rs
 FUSER ?= /home/ubuntu/fuser
 
+# SUDO prefix - override to empty when already root (e.g., in container)
+SUDO ?= sudo
+
 # Separate target directories for sudo vs non-sudo builds
 # This prevents permission conflicts when running tests in parallel
 TARGET_DIR := target
@@ -17,6 +20,24 @@ CONTAINER_ARCH ?= aarch64
 # Usage: make test-vm FILTER=sanity    (runs only *sanity* tests)
 #        make test-vm FILTER=exec      (runs only *exec* tests)
 FILTER ?=
+
+# Stream test output (disable capture) - use for debugging
+# Usage: make test-vm STREAM=1         (show output as tests run)
+STREAM ?= 0
+ifeq ($(STREAM),1)
+NEXTEST_CAPTURE := --no-capture
+else
+NEXTEST_CAPTURE :=
+endif
+
+# Enable fc-agent strace debugging - use to diagnose fc-agent crashes
+# Usage: make test-vm STRACE=1         (runs fc-agent under strace in VM)
+STRACE ?= 0
+ifeq ($(STRACE),1)
+FCVM_STRACE_AGENT := 1
+else
+FCVM_STRACE_AGENT :=
+endif
 
 # Test commands - organized by root requirement
 # Uses cargo-nextest for better parallelism and output handling
@@ -47,8 +68,8 @@ TEST_PJDFSTEST := CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo nextest run --releas
 # - Rootless tests already run in the unprivileged phase (no sudo needed)
 # - Running rootless tests under sudo causes process group signal issues
 #   that kill namespace holder processes when tests run at full parallelism
-TEST_VM_UNPRIVILEGED := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR) cargo nextest run -p fcvm --release $(FILTER)"
-TEST_VM_PRIVILEGED := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo nextest run -p fcvm --release --features privileged-tests -E '!test(/rootless/)' $(FILTER)"
+TEST_VM_UNPRIVILEGED := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR) FCVM_STRACE_AGENT=$(FCVM_STRACE_AGENT) cargo nextest run -p fcvm --release $(NEXTEST_CAPTURE) $(FILTER)"
+TEST_VM_PRIVILEGED := sh -c "CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) FCVM_STRACE_AGENT=$(FCVM_STRACE_AGENT) cargo nextest run -p fcvm --release $(NEXTEST_CAPTURE) --features privileged-tests -E '!test(/rootless/)' $(FILTER)"
 
 # Container test commands (no CARGO_TARGET_DIR - volume mounts provide isolation)
 CTEST_UNIT := cargo nextest run --release --lib
@@ -58,15 +79,7 @@ CTEST_FUSE_ROOT := cargo nextest run --release -p fuse-pipe --test integration_r
 CTEST_FUSE_PERMISSION := cargo nextest run --release -p fuse-pipe --test test_permission_edge_cases
 CTEST_PJDFSTEST := cargo nextest run --release -p fuse-pipe --test pjdfstest_full
 
-# VM tests: privileged-tests feature gates tests that require sudo
-# Use -p fcvm to only run fcvm package tests (excludes fuse-pipe)
-# Filter out rootless tests from privileged run (same reason as host tests above)
-# Build all packages first (fc-agent needed by VM tests), then run tests
-# Wrapped in sh -c to ensure && runs inside container, not on host
-CTEST_VM_UNPRIVILEGED := sh -c 'cargo build --release && cargo nextest run -p fcvm --release $(FILTER)'
-# Build all packages first (fc-agent needed by VM tests), then run tests
-# Wrapped in sh -c to ensure && runs inside container, not on host
-CTEST_VM_PRIVILEGED := sh -c 'cargo build --release && cargo nextest run -p fcvm --release --features privileged-tests -E "!test(/rootless/)" $(FILTER)'
+# Container VM tests now use `make test-vm-*` inside container (see container-test-vm-* targets)
 
 # Benchmark commands (fuse-pipe)
 BENCH_THROUGHPUT := cargo bench -p fuse-pipe --bench throughput
@@ -98,9 +111,9 @@ help:
 	@echo "  make build       - Build fcvm and fc-agent"
 	@echo "  make clean       - Clean build artifacts"
 	@echo ""
-	@echo "Testing (with optional FILTER):"
+	@echo "Testing (with optional FILTER and STREAM):"
 	@echo "  Tests use Cargo feature: privileged-tests (needs sudo). Unprivileged tests run by default."
-	@echo "  Use FILTER= to further filter tests matching a pattern."
+	@echo "  Use FILTER= to filter tests matching a pattern, STREAM=1 for live output."
 	@echo ""
 	@echo "  make test-vm                    - All VM tests (unprivileged + privileged)"
 	@echo "  make test-vm-unprivileged       - Unprivileged tests only (no sudo)"
@@ -161,18 +174,38 @@ setup-all: setup-btrfs setup-rootfs
 # Build targets
 #------------------------------------------------------------------------------
 
+# Detect musl target for current architecture
+ARCH := $(shell uname -m)
+ifeq ($(ARCH),aarch64)
+MUSL_TARGET := aarch64-unknown-linux-musl
+else ifeq ($(ARCH),x86_64)
+MUSL_TARGET := x86_64-unknown-linux-musl
+else
+MUSL_TARGET := unknown
+endif
+
 # Build non-root targets (uses TARGET_DIR)
 # Builds fcvm, fc-agent binaries AND test harnesses
+# fc-agent is built with musl for static linking (portable across glibc versions)
 build:
 	@echo "==> Building non-root targets..."
-	CARGO_TARGET_DIR=$(TARGET_DIR) cargo build --release
+	CARGO_TARGET_DIR=$(TARGET_DIR) cargo build --release -p fcvm
+	@echo "==> Building fc-agent with musl (statically linked)..."
+	CARGO_TARGET_DIR=$(TARGET_DIR) cargo build --release -p fc-agent --target $(MUSL_TARGET)
+	@mkdir -p $(TARGET_DIR)/release
+	cp $(TARGET_DIR)/$(MUSL_TARGET)/release/fc-agent $(TARGET_DIR)/release/fc-agent
 	CARGO_TARGET_DIR=$(TARGET_DIR) cargo test --release --all-targets --no-run
 
 # Build root targets (uses TARGET_DIR_ROOT, run with sudo)
 # Builds fcvm, fc-agent binaries AND test harnesses
+# fc-agent is built with musl for static linking (portable across glibc versions)
 build-root:
 	@echo "==> Building root targets..."
-	sudo CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo build --release
+	sudo CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo build --release -p fcvm
+	@echo "==> Building fc-agent with musl (statically linked)..."
+	sudo CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo build --release -p fc-agent --target $(MUSL_TARGET)
+	sudo mkdir -p $(TARGET_DIR_ROOT)/release
+	sudo cp -f $(TARGET_DIR_ROOT)/$(MUSL_TARGET)/release/fc-agent $(TARGET_DIR_ROOT)/release/fc-agent
 	sudo CARGO_TARGET_DIR=$(TARGET_DIR_ROOT) cargo test --release --all-targets --no-run
 
 # Build everything (both target dirs)
@@ -213,10 +246,20 @@ test-fuse: build build-root
 
 # VM tests - unprivileged (no sudo needed)
 test-vm-unprivileged: build setup-btrfs
+ifeq ($(STREAM),1)
+	@echo "==> STREAM=1: Output streams live (parallel disabled)"
+else
+	@echo "==> STREAM=0: Output captured until test completes (use STREAM=1 for live output)"
+endif
 	$(TEST_VM_UNPRIVILEGED)
 
 # VM tests - privileged (requires sudo, runs ALL tests including unprivileged)
 test-vm-privileged: build-root setup-btrfs
+ifeq ($(STREAM),1)
+	@echo "==> STREAM=1: Output streams live (parallel disabled)"
+else
+	@echo "==> STREAM=0: Output captured until test completes (use STREAM=1 for live output)"
+endif
 	sudo $(TEST_VM_PRIVILEGED)
 
 # All VM tests: unprivileged first, then privileged
@@ -453,14 +496,13 @@ container-test-allow-other: container-build-allow-other
 # All fuse-pipe tests: noroot first, then root
 container-test: container-test-noroot container-test-root
 
-# VM tests - unprivileged (tests fcvm without sudo inside container)
-# Uses CONTAINER_RUN_ROOTLESS with rootless podman --privileged
+# VM tests - runs make targets inside container
+# Override TARGET_DIR/TARGET_DIR_ROOT to use the volume-mounted target directory
 container-test-vm-unprivileged: container-build-rootless setup-btrfs
-	$(CONTAINER_RUN_ROOTLESS) $(CONTAINER_TAG) $(CTEST_VM_UNPRIVILEGED)
+	$(CONTAINER_RUN_ROOTLESS) $(CONTAINER_TAG) make test-vm-unprivileged TARGET_DIR=target TARGET_DIR_ROOT=target FILTER=$(FILTER) STREAM=$(STREAM) STRACE=$(STRACE)
 
-# VM tests - privileged (runs ALL tests including unprivileged)
 container-test-vm-privileged: container-build-root setup-btrfs
-	$(CONTAINER_RUN_FCVM) $(CONTAINER_TAG) $(CTEST_VM_PRIVILEGED)
+	$(CONTAINER_RUN_FCVM) $(CONTAINER_TAG) make test-vm-privileged TARGET_DIR=target TARGET_DIR_ROOT=target FILTER=$(FILTER) STREAM=$(STREAM) STRACE=$(STRACE)
 
 # All VM tests: privileged first (creates rootfs), then unprivileged
 # Use FILTER= to run subset, e.g.: make container-test-vm FILTER=exec
