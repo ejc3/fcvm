@@ -438,13 +438,17 @@ CONTAINER_RUN_ROOTLESS := podman --root=/tmp/podman-rootless run --rm \
 
 # Build containers - podman layer caching handles incremental builds
 # CONTAINER_ARCH can be overridden: export CONTAINER_ARCH=x86_64 for CI
+# CACHE_REGISTRY enables registry-based layer caching (e.g., ghcr.io/user/repo)
+CACHE_REGISTRY ?=
+CACHE_FLAGS := $(if $(CACHE_REGISTRY),--cache-from=$(CACHE_REGISTRY) --cache-to=$(CACHE_REGISTRY),)
+
 container-build:
 	@echo "==> Building rootless container (ARCH=$(CONTAINER_ARCH))..."
-	podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) .
+	podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) $(CACHE_FLAGS) .
 
 container-build-root:
 	@echo "==> Building root container (ARCH=$(CONTAINER_ARCH))..."
-	sudo podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) .
+	sudo podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) $(CACHE_FLAGS) .
 
 container-build-rootless: container-build
 
