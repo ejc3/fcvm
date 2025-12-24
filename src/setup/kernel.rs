@@ -24,19 +24,22 @@ pub fn get_kernel_url_hash() -> Result<String> {
     Ok(compute_sha256_short(kernel_config.url.as_bytes()))
 }
 
-/// Ensure kernel exists, downloading from Kata release if needed
-pub async fn ensure_kernel() -> Result<PathBuf> {
+/// Ensure kernel exists, downloading from Kata release if needed.
+/// If `allow_create` is false, bail if kernel doesn't exist.
+pub async fn ensure_kernel(allow_create: bool) -> Result<PathBuf> {
     let (plan, _, _) = load_plan()?;
     let kernel_config = plan.kernel.current_arch()?;
 
-    download_kernel(kernel_config).await
+    download_kernel(kernel_config, allow_create).await
 }
 
 /// Download kernel from Kata release tarball.
 ///
 /// Uses file locking to prevent race conditions when multiple VMs start
 /// simultaneously and all try to download the same kernel.
-async fn download_kernel(config: &KernelArchConfig) -> Result<PathBuf> {
+///
+/// If `allow_create` is false, bail if kernel doesn't exist.
+async fn download_kernel(config: &KernelArchConfig, allow_create: bool) -> Result<PathBuf> {
     let kernel_dir = paths::kernel_dir();
 
     // Cache by URL hash - changing URL triggers re-download
@@ -47,6 +50,11 @@ async fn download_kernel(config: &KernelArchConfig) -> Result<PathBuf> {
     if kernel_path.exists() {
         info!(path = %kernel_path.display(), url_hash = %url_hash, "kernel already exists");
         return Ok(kernel_path);
+    }
+
+    // Bail if creation not allowed
+    if !allow_create {
+        bail!("Kernel not found. Run 'fcvm setup' first, or use --setup flag.");
     }
 
     // Create directory (needed for lock file)

@@ -253,14 +253,15 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // Validate VM name before any setup work
     validate_vm_name(&args.name).context("invalid VM name")?;
 
-    // Ensure kernel, rootfs, and initrd exist (auto-setup on first run)
-    let kernel_path = crate::setup::ensure_kernel()
+    // Get kernel, rootfs, and initrd paths
+    // With --setup: create if missing; without: fail if missing
+    let kernel_path = crate::setup::ensure_kernel(args.setup)
         .await
         .context("setting up kernel")?;
-    let base_rootfs = crate::setup::ensure_rootfs()
+    let base_rootfs = crate::setup::ensure_rootfs(args.setup)
         .await
         .context("setting up rootfs")?;
-    let initrd_path = crate::setup::ensure_fc_agent_initrd()
+    let initrd_path = crate::setup::ensure_fc_agent_initrd(args.setup)
         .await
         .context("setting up fc-agent initrd")?;
 
