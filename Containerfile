@@ -14,10 +14,12 @@ COPY rust-toolchain.toml /tmp/rust-toolchain.toml
 
 # Install toolchain version from rust-toolchain.toml (avoids version drift)
 # Edition 2024 is stable since Rust 1.85
+# Also add musl targets for statically linked fc-agent (portable across glibc versions)
 RUN RUST_VERSION=$(grep 'channel' /tmp/rust-toolchain.toml | cut -d'"' -f2) && \
     rustup toolchain install $RUST_VERSION && \
     rustup default $RUST_VERSION && \
-    rustup component add rustfmt clippy
+    rustup component add rustfmt clippy && \
+    rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
 
 # Install cargo-nextest for better test parallelism and output
 RUN cargo install cargo-nextest --locked
@@ -36,6 +38,8 @@ RUN apt-get update && apt-get install -y \
     # Build deps for bindgen (userfaultfd-sys)
     libclang-dev \
     clang \
+    # musl libc for statically linked fc-agent (portable across glibc versions)
+    musl-tools \
     # fcvm VM test dependencies
     iproute2 \
     iptables \
@@ -78,10 +82,13 @@ RUN groupadd -f fuse \
     && usermod -aG fuse testuser
 
 # Rust tools are installed system-wide at /usr/local/cargo (owned by root)
-# Both root and testuser can use rustup/cargo since it's in PATH
-# No need for per-user installs - system-wide toolchain is sufficient
-USER root
-WORKDIR /workspace
+# Symlink to /usr/local/bin so sudo can find them (sudo uses secure_path)
+RUN ln -s /usr/local/cargo/bin/cargo /usr/local/bin/cargo \
+    && ln -s /usr/local/cargo/bin/rustc /usr/local/bin/rustc \
+    && ln -s /usr/local/cargo/bin/cargo-nextest /usr/local/bin/cargo-nextest
+
+# Allow testuser to sudo without password (like host dev setup)
+RUN echo "testuser ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
 # Configure subordinate UIDs/GIDs for rootless user namespaces
 # testuser (UID 1000) gets subordinate range 100000-165535 (65536 IDs)
@@ -105,8 +112,8 @@ RUN chown -R testuser:testuser /workspace
 
 WORKDIR /workspace/fcvm
 
-# No entrypoint needed - non-root tests run with --user testuser,
-# root tests run as root. Volumes get correct ownership automatically.
+# Switch to testuser - tests run as normal user with sudo like on host
+USER testuser
 
 # Default command runs all fuse-pipe tests
 CMD ["cargo", "nextest", "run", "--release", "-p", "fuse-pipe"]
