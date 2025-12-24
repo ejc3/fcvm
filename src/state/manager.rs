@@ -182,6 +182,11 @@ impl StateManager {
                             let proc_path = format!("/proc/{}", pid);
                             if !std::path::Path::new(&proc_path).exists() {
                                 // Process doesn't exist - remove stale state
+                                tracing::warn!(
+                                    pid = pid,
+                                    path = %path.display(),
+                                    "cleanup_stale_state: removing state file for dead process"
+                                );
                                 let _ = std::fs::remove_file(&path);
                                 // Also remove lock file if exists
                                 let lock_path = path.with_extension("json.lock");
