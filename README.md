@@ -492,22 +492,19 @@ Run `make help` for the full list. Key targets:
 | `make build` | Build fcvm and fc-agent |
 | `make clean` | Clean build artifacts |
 
-#### Testing (with optional FILTER)
+#### Testing (with optional FILTER and STREAM)
 
-Tests use Cargo feature: `privileged-tests` (needs sudo). Unprivileged tests run by default.
-Use `FILTER=` to further filter tests by name pattern.
+VM tests run with sudo via `CARGO_TARGET_*_RUNNER` env vars (set in Makefile).
+Use `FILTER=` to filter tests by name, `STREAM=1` for live output.
 
 | Target | Description |
 |--------|-------------|
-| `make test-vm` | All VM tests (unprivileged + privileged) |
-| `make test-vm-unprivileged` | Unprivileged tests only (no sudo) |
-| `make test-vm-privileged` | All tests including privileged (sudo) |
+| `make test-vm` | All VM tests (runs with sudo via target runner) |
 | `make test-vm FILTER=sanity` | Only sanity tests |
 | `make test-vm FILTER=exec` | Only exec tests |
-| `make test-vm FILTER=egress` | Only egress tests |
-| `make test-vm-privileged FILTER=clone` | Only privileged clone tests |
+| `make test-vm STREAM=1` | All tests with live output |
 | `make container-test-vm` | VM tests in container |
-| `make container-test-vm FILTER=exec` | Only exec tests |
+| `make container-test-vm FILTER=exec` | Only exec tests in container |
 | `make test-all` | Everything |
 
 #### Linting
@@ -552,9 +549,7 @@ Use `FILTER=` to further filter tests by name pattern.
 | `test_mount_stress.rs` | Mount/unmount stress tests |
 | `test_allow_other.rs` | AllowOther flag tests |
 | `test_unmount_race.rs` | Unmount race condition tests |
-| `pjdfstest_full.rs` | Full POSIX compliance (8789 tests) |
-| `pjdfstest_fast.rs` | Fast POSIX subset |
-| `pjdfstest_stress.rs` | Parallel stress test |
+| `pjdfstest_matrix.rs` | POSIX compliance (17 categories run in parallel via nextest) |
 
 ### Running Tests
 
