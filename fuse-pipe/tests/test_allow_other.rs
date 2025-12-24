@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{cleanup, require_nonroot, unique_paths, FuseMount};
+use common::{cleanup, unique_paths, FuseMount};
 use std::fs;
 use std::process::Command;
 
@@ -13,16 +13,12 @@ use std::process::Command;
 /// This test creates a file as the mounting user, then verifies another user can access it.
 #[test]
 fn test_allow_other_with_fuse_conf() {
-    require_nonroot();
-
-    // Skip if user_allow_other is not configured
+    // Require user_allow_other in fuse.conf - fail if not configured
     let fuse_conf = fs::read_to_string("/etc/fuse.conf").unwrap_or_default();
-    if !fuse_conf.lines().any(|l| l.trim() == "user_allow_other") {
-        eprintln!(
-            "Skipping test_allow_other_with_fuse_conf - user_allow_other not in /etc/fuse.conf"
-        );
-        return;
-    }
+    assert!(
+        fuse_conf.lines().any(|l| l.trim() == "user_allow_other"),
+        "Test requires user_allow_other in /etc/fuse.conf"
+    );
 
     let (data_dir, mount_dir) = unique_paths("allow-other");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);

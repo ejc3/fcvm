@@ -5,12 +5,29 @@ fcvm is a Firecracker VM manager for running Podman containers in lightweight mi
 
 ## Quick Reference
 
+### Shell Scripts to /tmp
+
+**Write complex shell logic to /tmp instead of fighting escaping issues:**
+```bash
+# BAD - escaping nightmare
+for dir in ...; do count=$(grep ... | wc -l); done
+
+# GOOD - write to file, execute
+cat > /tmp/script.sh << 'EOF'
+for dir in */; do
+  count=$(grep -c pattern "$dir"/*.rs)
+  echo "$dir: $count"
+done
+EOF
+chmod +x /tmp/script.sh && /tmp/script.sh
+```
+
 ### Streaming Test Output
 
 **Use `STREAM=1` to see test output in real-time:**
 ```bash
-make test-vm FILTER=sanity STREAM=1              # Host tests with streaming
-make container-test-vm FILTER=sanity STREAM=1   # Container tests with streaming
+make test-root FILTER=sanity STREAM=1              # Host tests with streaming
+make container-test-root FILTER=sanity STREAM=1   # Container tests with streaming
 ```
 
 Without `STREAM=1`, nextest captures output and only shows it after tests complete (better for parallel runs).
@@ -120,7 +137,7 @@ our NO LEGACY policy prohibits. Rootless tests work fine under sudo.
 
 Removed function and all 12 call sites across test files.
 
-Tested: make test-vm FILTER=sanity (both rootless and bridged pass)
+Tested: make test-root FILTER=sanity (both rootless and bridged pass)
 ```
 
 **Bad example:**
@@ -131,8 +148,8 @@ Fix tests
 **Testing section format** - show actual commands:
 ```
 Tested:
-  make test-vm FILTER=sanity     # 2 passed
-  make container-test-vm FILTER=sanity  # 2 passed
+  make test-root FILTER=sanity            # passed
+  make container-test-root FILTER=sanity  # passed
 ```
 
 Not vague claims like "tested and works" or "verified manually".
@@ -244,7 +261,7 @@ assert!(localhost_works, "Localhost port forwarding should work (requires route_
 - `#[cfg(feature = "privileged-tests")]`: Tests requiring sudo (iptables, root podman storage)
 - No feature flag: Unprivileged tests run by default
 - Features are compile-time gates - tests won't exist unless the feature is enabled
-- Use `FILTER=` to further filter by name pattern: `make test-vm FILTER=exec`
+- Use `FILTER=` to further filter by name pattern: `make test-root FILTER=exec`
 
 **Common parallel test pitfalls and fixes:**
 
@@ -278,16 +295,15 @@ The Makefile handles:
 - Correct `CARGO_TARGET_DIR` for sudo vs non-sudo builds (avoids permission conflicts)
 - Proper feature flags (`--features privileged-tests`)
 - btrfs setup prerequisites
-- Container image building for container tests
+- Container image building
 
 ```bash
 # CORRECT - always use make
 make build                  # Build fcvm + fc-agent
-make test                   # Run fuse-pipe tests
-make test-vm                # All VM tests (runs with sudo via target runner)
-make test-vm FILTER=exec    # Only exec tests
-make test-vm FILTER=sanity  # Only sanity tests
-make container-test         # Run tests in container
+make test                   # All tests (rootless + root)
+make test-rootless          # Rootless tests only
+make test-root              # Root tests (requires sudo + KVM)
+make container-test         # All tests in container
 make clean                  # Clean build artifacts
 
 # WRONG - never do this
@@ -295,7 +311,9 @@ sudo cargo build ...        # Wrong target dir, permission issues
 cargo test -p fcvm ...      # Missing feature flags, setup
 ```
 
-**Test feature flags**: Tests use `#[cfg(feature = "privileged-tests")]` for tests requiring sudo. Unprivileged tests run by default (no feature flag). Use `FILTER=` to further filter by name.
+**Containers have full KVM access.** Both host and container tests run all packages (fuse-pipe + fcvm). The container mounts `/dev/kvm` and `/dev/fuse`.
+
+**Test feature flags**: Tests use `#[cfg(feature = "privileged-tests")]` for compile-time gating. Rootless tests compile without the feature. Use `FILTER=` to filter by name pattern.
 
 ### Container Build Rules
 
@@ -338,7 +356,7 @@ sleep 5 && ...
 cp /tmp/test.log /tmp/fcvm-failed-test_exec_rootless-$(date +%Y%m%d-%H%M%S).log
 
 # Then continue with other tests using a fresh log file
-make test-vm 2>&1 | tee /tmp/test-run2.log
+make test-root 2>&1 | tee /tmp/test-run2.log
 ```
 
 **Why this matters:**
@@ -398,11 +416,9 @@ When a FUSE operation fails unexpectedly, trace the full path from kernel to fus
 
 This pattern found the ftruncate bug: kernel sends `FATTR_FH` with file handle, but fuse-pipe's `VolumeRequest::Setattr` didn't have an `fh` field.
 
-### Container Testing for Full POSIX Compliance
+### POSIX Compliance (pjdfstest)
 
-All 8789 pjdfstest tests pass when running in a container with proper device cgroup rules. Use `make container-test-pjdfstest` for the full POSIX compliance test.
-
-**Why containers work better**: The container runs with `sudo podman` and `--device-cgroup-rule` flags that allow mknod for block/char devices.
+All 8789 pjdfstest tests pass. These are gated by `#[cfg(feature = "privileged-tests")]` and run as part of `make test-root` or `make container-test-root`.
 
 ## CI and Testing Philosophy
 
@@ -412,12 +428,11 @@ All 8789 pjdfstest tests pass when running in a container with proper device cgr
 
 | Target | What |
 |--------|------|
-| `make test` | fuse-pipe tests |
-| `make test-vm` | All VM tests (rootless + bridged) |
-| `make test-vm FILTER=exec` | Only exec tests |
-| `make container-test` | fuse-pipe in container |
-| `make container-test-vm` | VM tests in container |
-| `make test-all` | Everything |
+| `make test` | All tests (rootless + root) |
+| `make test-rootless` | Rootless tests only |
+| `make test-root` | Root tests (requires sudo + KVM) |
+| `make test-root FILTER=exec` | Only exec tests |
+| `make container-test` | All tests in container |
 
 ### Path Overrides for CI
 
@@ -425,7 +440,7 @@ Makefile paths can be overridden via environment:
 ```bash
 export FUSE_BACKEND_RS=/path/to/fuse-backend-rs
 export FUSER=/path/to/fuser
-make container-test-pjdfstest
+make container-test
 ```
 
 ### CI Structure
@@ -683,7 +698,7 @@ pub fn vm_runtime_dir(vm_id: &str) -> PathBuf {
 }
 ```
 
-**Setup**: Automatic via `make test-vm` or `make container-test-vm` (idempotent btrfs loopback + kernel copy).
+**Setup**: Automatic via `make test-root` or `make container-test-root` (idempotent btrfs loopback + kernel copy).
 
 **⚠️ CRITICAL: Changing VM base image (fc-agent, rootfs)**
 
@@ -761,12 +776,11 @@ Run `make help` for full list. Key targets:
 #### Testing
 | Target | Description |
 |--------|-------------|
-| `make test` | fuse-pipe tests |
-| `make test-vm` | All VM tests (rootless + bridged) |
-| `make test-vm FILTER=exec` | Only exec tests |
-| `make test-all` | Everything |
-| `make container-test` | fuse-pipe in container |
-| `make container-test-vm` | VM tests in container |
+| `make test` | All tests (rootless + root) |
+| `make test-rootless` | Rootless tests only |
+| `make test-root` | Root tests (requires sudo + KVM) |
+| `make test-root FILTER=exec` | Only exec tests |
+| `make container-test` | All tests in container |
 | `make container-shell` | Interactive shell |
 
 #### Linting
@@ -897,9 +911,9 @@ let (mut child, pid) = common::spawn_fcvm(&["podman", "run", "--name", &vm_name,
 
 | Command | Description |
 |---------|-------------|
-| `make container-test` | fuse-pipe tests |
-| `make container-test-vm` | VM tests (rootless + bridged) |
-| `make container-test-vm FILTER=exec` | Only exec tests |
+| `make container-test` | All tests in container |
+| `make container-test-rootless` | Rootless tests in container |
+| `make container-test-root` | Root tests in container |
 | `make container-shell` | Interactive shell |
 
 ### Tracing Targets

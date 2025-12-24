@@ -1,7 +1,11 @@
-//! Matrix pjdfstest runner - each category is a separate test for parallel execution.
+//! pjdfstest runner - all categories require root.
 //!
-//! Run with: cargo nextest run -p fuse-pipe --test pjdfstest_matrix
-//! Categories run in parallel via nextest's process isolation.
+//! The C pjdfstest suite uses chown/mknod/user-switching which require root.
+//! Each category runs as a separate test for parallel execution via nextest.
+//!
+//! Run with: cargo nextest run -p fuse-pipe --test pjdfstest_matrix_root --features privileged-tests
+
+#![cfg(feature = "privileged-tests")]
 
 mod pjdfstest_common;
 
@@ -22,8 +26,7 @@ macro_rules! pjdfstest_category {
     };
 }
 
-// Generate a test function for each pjdfstest category
-// These will run in parallel via nextest
+// All categories require root for chown/mknod/user-switching
 pjdfstest_category!(test_pjdfstest_chflags, "chflags");
 pjdfstest_category!(test_pjdfstest_chmod, "chmod");
 pjdfstest_category!(test_pjdfstest_chown, "chown");
