@@ -10,7 +10,7 @@ fcvm is a Firecracker VM manager for running Podman containers in lightweight mi
 **Use `STREAM=1` to see test output in real-time:**
 ```bash
 make test-vm FILTER=sanity STREAM=1              # Host tests with streaming
-make container-test-vm-privileged FILTER=sanity STREAM=1  # Container tests with streaming
+make container-test-vm FILTER=sanity STREAM=1   # Container tests with streaming
 ```
 
 Without `STREAM=1`, nextest captures output and only shows it after tests complete (better for parallel runs).
@@ -284,10 +284,9 @@ The Makefile handles:
 # CORRECT - always use make
 make build                  # Build fcvm + fc-agent
 make test                   # Run fuse-pipe tests
-make test-vm                # All VM tests (unprivileged + privileged)
-make test-vm-unprivileged   # Unprivileged tests only (no sudo)
-make test-vm-privileged     # Privileged tests only (sudo)
+make test-vm                # All VM tests (runs with sudo via target runner)
 make test-vm FILTER=exec    # Only exec tests
+make test-vm FILTER=sanity  # Only sanity tests
 make container-test         # Run tests in container
 make clean                  # Clean build artifacts
 
@@ -562,9 +561,7 @@ fuse-pipe/tests/
 ├── test_mount_stress.rs        # Mount/unmount stress tests
 ├── test_allow_other.rs         # AllowOther flag tests
 ├── test_unmount_race.rs        # Unmount race condition tests
-├── pjdfstest_full.rs           # Full POSIX compliance (8789 tests)
-├── pjdfstest_fast.rs           # Fast POSIX subset
-├── pjdfstest_stress.rs         # Parallel POSIX stress
+├── pjdfstest_matrix.rs         # POSIX compliance (17 categories, parallel via nextest)
 └── pjdfstest_common.rs         # Shared pjdfstest utilities
 
 fuse-pipe/benches/
