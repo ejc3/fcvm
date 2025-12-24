@@ -1,5 +1,7 @@
 //! Lint tests - run fmt, clippy, audit, deny in parallel via cargo test.
 
+#![cfg(feature = "integration-fast")]
+
 use std::process::Command;
 
 fn run_cargo(args: &[&str]) -> std::process::Output {

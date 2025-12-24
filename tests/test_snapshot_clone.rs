@@ -7,6 +7,8 @@
 //! 4. Spawn clones from snapshot (concurrently)
 //! 5. Verify clones become healthy (concurrently)
 
+#![cfg(feature = "integration-slow")]
+
 mod common;
 
 use anyhow::{Context, Result};

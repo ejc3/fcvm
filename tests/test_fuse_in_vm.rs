@@ -11,6 +11,8 @@
 //! - Guest: fc-agent mounting via fuse-pipe FuseClient
 //! - Guest: pjdfstest container running against the mount
 
+#![cfg(feature = "integration-slow")]
+
 mod common;
 
 use anyhow::{Context, Result};

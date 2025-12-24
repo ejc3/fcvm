@@ -6,6 +6,8 @@
 //! 3. We snapshot and clone the VM
 //! 4. Observe: does the clone's connection reset? Can it reconnect?
 
+#![cfg(feature = "integration-slow")]
+
 mod common;
 
 use anyhow::{Context, Result};

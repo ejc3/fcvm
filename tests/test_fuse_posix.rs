@@ -22,6 +22,8 @@
 //! cargo test --test test_fuse_posix -- --ignored --nocapture --test-threads=4
 //! ```
 
+#![cfg(feature = "integration-slow")]
+
 mod common;
 
 use std::fs;

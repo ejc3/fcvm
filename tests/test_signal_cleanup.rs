@@ -3,6 +3,8 @@
 //! Verifies that when fcvm receives SIGINT/SIGTERM, it properly cleans up
 //! child processes (firecracker, slirp4netns, etc.)
 
+#![cfg(feature = "integration-fast")]
+
 mod common;
 
 use anyhow::{Context, Result};
