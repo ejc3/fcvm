@@ -48,6 +48,9 @@ RUN apt-get update && apt-get install -y \
     qemu-utils \
     e2fsprogs \
     parted \
+    # Container runtime for localhost image tests
+    podman \
+    skopeo \
     # Utilities
     git \
     curl \
