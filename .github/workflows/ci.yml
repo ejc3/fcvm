@@ -11,14 +11,11 @@ env:
   FUSE_BACKEND_RS: ${{ github.workspace }}/fuse-backend-rs
   FUSER: ${{ github.workspace }}/fuser
   CONTAINER_ARCH: x86_64
-  CACHE_REGISTRY: ghcr.io/${{ github.repository }}/cache
 
 jobs:
   container-rootless:
     name: Container (rootless)
-    runs-on: ubuntu-latest
-    permissions:
-      packages: write
+    runs-on: buildjet-32vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,17 +30,13 @@ jobs:
           repository: ejc3/fuser
           ref: master
           path: fuser
-      - name: Login to ghcr.io
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u ${{ github.actor }} --password-stdin
       - name: make ci-container-rootless
         working-directory: fcvm
         run: make ci-container-rootless
 
   container-sudo:
     name: Container (sudo)
-    runs-on: ubuntu-latest
-    permissions:
-      packages: write
+    runs-on: buildjet-32vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
         with:
@@ -58,10 +51,6 @@ jobs:
           repository: ejc3/fuser
           ref: master
           path: fuser
-      - name: Login to ghcr.io (rootless + root)
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u ${{ github.actor }} --password-stdin
-          echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u ${{ github.actor }} --password-stdin
       - name: make ci-container-sudo
         working-directory: fcvm
         run: make ci-container-sudo
