@@ -13,6 +13,68 @@ use tokio::time::sleep;
 /// Global counter for unique test IDs
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+/// Fail loudly if running as actual host root.
+///
+/// Rootless tests break when run with `sudo` on the host because user namespace
+/// mapping doesn't work correctly when you're already root.
+///
+/// However, running as root inside a container is fine - the container provides
+/// the isolation boundary, not the UID inside it.
+///
+/// Call this at the start of any rootless test function.
+pub fn require_non_root(test_name: &str) -> anyhow::Result<()> {
+    // Skip check if we're in a container - container is the isolation boundary
+    if is_in_container() {
+        return Ok(());
+    }
+
+    if nix::unistd::geteuid().is_root() {
+        anyhow::bail!(
+            "Rootless test '{}' cannot run as root! Run without sudo.",
+            test_name
+        );
+    }
+    Ok(())
+}
+
+/// Check if we're running inside a container.
+///
+/// Containers create marker files that we can use to detect containerized environments.
+fn is_in_container() -> bool {
+    // Podman creates /run/.containerenv
+    if std::path::Path::new("/run/.containerenv").exists() {
+        return true;
+    }
+    // Docker creates /.dockerenv
+    if std::path::Path::new("/.dockerenv").exists() {
+        return true;
+    }
+    false
+}
+
+/// Generate unique names for snapshot/clone tests.
+///
+/// Returns (baseline_name, clone_name, snapshot_name, serve_name) with unique suffixes.
+/// Uses process ID and atomic counter to ensure uniqueness across parallel tests.
+///
+/// # Arguments
+/// * `prefix` - Base name for the test (e.g., "portfwd", "internet")
+///
+/// # Returns
+/// Tuple of (baseline, clone, snapshot, serve) names
+pub fn unique_names(prefix: &str) -> (String, String, String, String) {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    let suffix = format!("{}-{}", pid, id);
+
+    (
+        format!("{}-base-{}", prefix, suffix),
+        format!("{}-clone-{}", prefix, suffix),
+        format!("{}-snap-{}", prefix, suffix),
+        format!("{}-serve-{}", prefix, suffix),
+    )
+}
+
 /// Fixture for managing a VM with FUSE volume for testing
 pub struct VmFixture {
     pub child: tokio::process::Child,

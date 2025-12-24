@@ -30,12 +30,6 @@ async fn test_readonly_volume() -> Result<()> {
     println!("\ntest_readonly_volume");
     println!("====================");
 
-    // Requires root for bridged networking (more reliable health checks)
-    if !nix::unistd::geteuid().is_root() {
-        eprintln!("Skipping test_readonly_volume: requires root for bridged networking");
-        return Ok(());
-    }
-
     let test_id = format!("ro-{}", std::process::id());
     let vm_name = format!("ro-vol-{}", std::process::id());
 
@@ -133,12 +127,6 @@ async fn test_env_variables() -> Result<()> {
     println!("\ntest_env_variables");
     println!("==================");
 
-    // Requires root for bridged networking (more reliable health checks)
-    if !nix::unistd::geteuid().is_root() {
-        eprintln!("Skipping test_env_variables: requires root for bridged networking");
-        return Ok(());
-    }
-
     let vm_name = format!("env-test-{}", std::process::id());
 
     // Start VM with environment variables using bridged mode for reliable health checks
@@ -218,12 +206,6 @@ async fn test_custom_resources() -> Result<()> {
     println!("\ntest_custom_resources");
     println!("=====================");
 
-    // Requires root for bridged networking (more reliable health checks)
-    if !nix::unistd::geteuid().is_root() {
-        eprintln!("Skipping test_custom_resources: requires root for bridged networking");
-        return Ok(());
-    }
-
     let vm_name = format!("resources-test-{}", std::process::id());
 
     // Start VM with custom resources using bridged mode for reliable health checks
@@ -302,12 +284,6 @@ async fn test_custom_resources() -> Result<()> {
 async fn test_fcvm_ls() -> Result<()> {
     println!("\ntest_fcvm_ls");
     println!("============");
-
-    // Requires root for bridged networking (more reliable health checks)
-    if !nix::unistd::geteuid().is_root() {
-        eprintln!("Skipping test_fcvm_ls: requires root for bridged networking");
-        return Ok(());
-    }
 
     let fcvm_path = common::find_fcvm_binary()?;
     let vm_name = format!("ls-test-{}", std::process::id());
@@ -439,12 +415,6 @@ async fn test_fcvm_ls() -> Result<()> {
 async fn test_custom_command() -> Result<()> {
     println!("\ntest_custom_command");
     println!("===================");
-
-    // Requires root for bridged networking (more reliable for custom commands)
-    if !nix::unistd::geteuid().is_root() {
-        eprintln!("Skipping test_custom_command: requires root for bridged networking");
-        return Ok(());
-    }
 
     let vm_name = format!("cmd-test-{}", std::process::id());
 

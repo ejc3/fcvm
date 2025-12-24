@@ -22,15 +22,10 @@ struct VmDisplay {
 /// Test port forwarding with bridged networking
 #[test]
 fn test_port_forward_bridged() -> Result<()> {
-    // Requires root for bridged networking
-    if !nix::unistd::geteuid().is_root() {
-        eprintln!("Skipping test_port_forward_bridged: requires root");
-        return Ok(());
-    }
-
     println!("\ntest_port_forward_bridged");
 
     let fcvm_path = common::find_fcvm_binary()?;
+    let vm_name = format!("port-bridged-{}", std::process::id());
 
     // Start VM with port forwarding
     let mut fcvm = Command::new(&fcvm_path)
@@ -38,7 +33,7 @@ fn test_port_forward_bridged() -> Result<()> {
             "podman",
             "run",
             "--name",
-            "port-test",
+            &vm_name,
             "--network",
             "bridged",
             "--publish",
@@ -187,9 +182,11 @@ fn test_port_forward_bridged() -> Result<()> {
 /// allowing multiple VMs to all forward the same port.
 #[test]
 fn test_port_forward_rootless() -> Result<()> {
+    common::require_non_root("test_port_forward_rootless")?;
     println!("\ntest_port_forward_rootless");
 
     let fcvm_path = common::find_fcvm_binary()?;
+    let vm_name = format!("port-rootless-{}", std::process::id());
 
     // Start VM with rootless networking and port forwarding
     // Use unprivileged port 8080 since rootless can't bind to 80
@@ -198,7 +195,7 @@ fn test_port_forward_rootless() -> Result<()> {
             "podman",
             "run",
             "--name",
-            "port-test-rootless",
+            &vm_name,
             "--network",
             "rootless",
             "--publish",
