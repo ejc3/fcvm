@@ -430,7 +430,9 @@ pub fn compute_sha256(data: &[u8]) -> String {
 ///
 /// NOTE: fc-agent is NOT included in Layer 2. It will be injected per-VM at boot time.
 /// Layer 2 only contains packages (podman, crun, etc.).
-pub async fn ensure_rootfs() -> Result<PathBuf> {
+///
+/// If `allow_create` is false, bail if rootfs doesn't exist.
+pub async fn ensure_rootfs(allow_create: bool) -> Result<PathBuf> {
     let (plan, _plan_sha_full, _plan_sha_short) = load_plan()?;
 
     // Generate all scripts and compute hash of the complete init script
@@ -465,6 +467,11 @@ pub async fn ensure_rootfs() -> Result<PathBuf> {
             "rootfs exists for current script (using cached)"
         );
         return Ok(rootfs_path);
+    }
+
+    // Bail if creation not allowed
+    if !allow_create {
+        bail!("Rootfs not found. Run 'fcvm setup' first, or use --setup flag.");
     }
 
     // Create directory for lock file
@@ -754,7 +761,9 @@ exec switch_root /newroot /sbin/init
 ///
 /// Uses file locking to prevent race conditions when multiple VMs start
 /// simultaneously and all try to create the initrd.
-pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
+///
+/// If `allow_create` is false, bail if initrd doesn't exist.
+pub async fn ensure_fc_agent_initrd(allow_create: bool) -> Result<PathBuf> {
     // Find fc-agent binary
     let fc_agent_path = find_fc_agent_binary()?;
     let fc_agent_bytes = std::fs::read(&fc_agent_path)
@@ -779,6 +788,11 @@ pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
             "using cached fc-agent initrd"
         );
         return Ok(initrd_path);
+    }
+
+    // Bail if creation not allowed
+    if !allow_create {
+        bail!("fc-agent initrd not found. Run 'fcvm setup' first, or use --setup flag.");
     }
 
     // Create initrd directory (needed for lock file)
@@ -1565,7 +1579,8 @@ async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
     let log_path = temp_dir.join("firecracker.log");
 
     // Find kernel - downloaded from Kata release if needed
-    let kernel_path = crate::setup::kernel::ensure_kernel().await?;
+    // We pass true since we're in the rootfs creation path (allow_create=true)
+    let kernel_path = crate::setup::kernel::ensure_kernel(true).await?;
 
     // Create serial console output file
     let serial_path = temp_dir.join("serial.log");
