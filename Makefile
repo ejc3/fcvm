@@ -510,18 +510,14 @@ container-test-all: container-test container-test-vm container-test-pjdfstest
 
 # CI Job 1: Lint + rootless FUSE tests
 ci-container-rootless: container-build
-	@echo "==> CI: Lint + rootless FUSE tests..."
 	$(MAKE) lint
-	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) $(CTEST_UNIT)
-	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) $(CTEST_FUSE_NOROOT)
-	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) $(CTEST_FUSE_STRESS)
+	$(CONTAINER_RUN_FUSE) --user testuser $(CONTAINER_TAG) \
+		cargo nextest run --release --lib -p fuse-pipe --test integration --test test_mount_stress --test test_unmount_race
 
 # CI Job 2: Root FUSE tests + POSIX compliance
 ci-container-sudo: container-build-root
-	@echo "==> CI: Root FUSE tests + POSIX compliance..."
-	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) $(CTEST_FUSE_ROOT)
-	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) $(CTEST_FUSE_PERMISSION)
-	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) $(CTEST_PJDFSTEST)
+	$(CONTAINER_RUN_FUSE_ROOT) $(CONTAINER_TAG) \
+		cargo nextest run --release -p fuse-pipe --test integration_root --test test_permission_edge_cases --test pjdfstest_matrix
 
 # CI Job 3: VM tests (container-test-vm already exists above)
 
