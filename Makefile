@@ -57,7 +57,7 @@ BENCH_EXEC := cargo bench --bench exec
 	lint fmt \
 	container-build container-build-root \
 	container-test container-test-rootless container-test-root container-shell container-clean \
-	ci-host ci-rootless ci-root setup-btrfs setup-pjdfstest
+	ci-host ci-rootless ci-root setup-btrfs setup-fcvm setup-pjdfstest
 
 all: build
 
@@ -83,6 +83,7 @@ help:
 	@echo ""
 	@echo "Setup:"
 	@echo "  make setup-btrfs  - Create btrfs loopback"
+	@echo "  make setup-fcvm   - Download kernel and create rootfs"
 
 #------------------------------------------------------------------------------
 # Setup
@@ -113,6 +114,11 @@ setup-btrfs:
 		sudo chown -R $$(id -un):$$(id -gn) /mnt/fcvm-btrfs && \
 		echo '==> btrfs ready at /mnt/fcvm-btrfs'; \
 	fi
+
+# Download kernel and create rootfs (runs fcvm setup)
+setup-fcvm: build setup-btrfs
+	@echo "==> Running fcvm setup..."
+	./$(TARGET_DIR)/release/fcvm setup
 
 #------------------------------------------------------------------------------
 # Build
@@ -148,7 +154,7 @@ test-rootless: build
 	$(TEST_ROOTLESS)
 
 # Root tests only (requires sudo + KVM)
-test-root: build setup-btrfs setup-pjdfstest
+test-root: setup-fcvm setup-pjdfstest
 	@echo "==> Running root tests..."
 	$(TEST_ROOT)
 
@@ -174,7 +180,7 @@ bench-operations: build
 bench-protocol: build
 	$(BENCH_PROTOCOL)
 
-bench-exec: build setup-btrfs
+bench-exec: setup-fcvm
 	sudo $(BENCH_EXEC)
 
 bench-quick: build
@@ -261,7 +267,7 @@ container-test-rootless: container-build
 	$(CONTAINER_RUN_ROOTLESS) --user testuser $(CONTAINER_TAG) $(CTEST_ROOTLESS)
 
 # Root tests only
-container-test-root: container-build-root setup-btrfs
+container-test-root: container-build-root setup-fcvm
 	@echo "==> Running root tests in container..."
 	$(CONTAINER_RUN_ROOT) $(CONTAINER_TAG) $(CTEST_ROOT)
 
@@ -277,12 +283,12 @@ container-clean:
 	podman volume rm fcvm-cargo-target fcvm-cargo-target-root fcvm-cargo-home 2>/dev/null || true
 
 # CI targets (called by GitHub Actions)
-ci-host: setup-btrfs
+ci-host: setup-fcvm
 	$(MAKE) lint
 	$(MAKE) test-root
 
 ci-rootless: container-build
 	$(CONTAINER_RUN_ROOTLESS) --user testuser $(CONTAINER_TAG) $(CTEST_ROOTLESS)
 
-ci-root: container-build-root setup-btrfs
+ci-root: container-build-root setup-fcvm
 	$(CONTAINER_RUN_ROOT) $(CONTAINER_TAG) $(CTEST_ROOT)
