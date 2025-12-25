@@ -64,6 +64,8 @@ jobs:
           fi
           sudo chmod 666 /dev/userfaultfd
           sudo sysctl -w vm.unprivileged_userfaultfd=1
+          # Enable FUSE allow_other for tests
+          echo "user_allow_other" | sudo tee /etc/fuse.conf
       - name: test-unit
         working-directory: fcvm
         run: make test-unit
