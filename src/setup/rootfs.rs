@@ -1688,15 +1688,13 @@ async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
                     return Ok(elapsed);
                 }
                 Ok(None) => {
-                    // Still running, check for new serial output and log it
+                    // Still running, stream serial output to show progress
                     if let Ok(serial_content) = tokio::fs::read_to_string(&serial_path).await {
                         if serial_content.len() > last_serial_len {
-                            // Log new output (trimmed to avoid excessive logging)
                             let new_output = &serial_content[last_serial_len..];
                             for line in new_output.lines() {
-                                // Skip empty lines and lines that are just timestamps
                                 if !line.trim().is_empty() {
-                                    debug!(target: "layer2_setup", "{}", line);
+                                    info!(target: "layer2_setup", "{}", line);
                                 }
                             }
                             last_serial_len = serial_content.len();
