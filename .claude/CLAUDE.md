@@ -424,7 +424,14 @@ This pattern found the ftruncate bug: kernel sends `FATTR_FH` with file handle, 
 
 ### POSIX Compliance (pjdfstest)
 
-All 8789 pjdfstest tests pass. These are gated by `#[cfg(feature = "privileged-tests")]` and run as part of `make test-root` or `make container-test-root`.
+All 8789 pjdfstest tests pass via two parallel test matrices:
+
+| Matrix | Location | What it tests |
+|--------|----------|---------------|
+| Host-side | `fuse-pipe/tests/pjdfstest_matrix_root.rs` | fuse-pipe FUSE directly (no VM) |
+| In-VM | `tests/test_fuse_in_vm_matrix.rs` | Full stack: host VolumeServer → vsock → guest FUSE |
+
+Both matrices run 17 categories in parallel via nextest. Each category is a separate test, so all 34 tests (17 × 2) can run concurrently. Total time is ~2-3 minutes (limited by slowest category: chown ~82s).
 
 ## CI and Testing Philosophy
 
@@ -434,10 +441,11 @@ All 8789 pjdfstest tests pass. These are gated by `#[cfg(feature = "privileged-t
 
 | Target | What |
 |--------|------|
-| `make test` | All tests (rootless + root) |
-| `make test-rootless` | Rootless tests only |
-| `make test-root` | Root tests (requires sudo + KVM) |
-| `make test-root FILTER=exec` | Only exec tests |
+| `make test-unit` | Unit tests only (no VMs, no sudo) |
+| `make test-fast` | + quick VM tests (rootless, no sudo) |
+| `make test-all` | + slow VM tests (rootless, no sudo) |
+| `make test-root` | + privileged tests (bridged, pjdfstest, sudo) |
+| `make test` | Alias for test-root |
 | `make container-test` | All tests in container |
 
 ### Path Overrides for CI
@@ -566,14 +574,13 @@ src/
 └── setup/            # Setup subcommands
 
 tests/
-├── common/mod.rs           # Shared test utilities (VmFixture, poll_health_by_pid)
-├── test_sanity.rs          # End-to-end VM sanity tests (rootless + bridged)
-├── test_state_manager.rs   # State manager unit tests
-├── test_health_monitor.rs  # Health monitoring tests
-├── test_fuse_posix.rs      # FUSE POSIX compliance in VM
-├── test_fuse_in_vm.rs      # FUSE integration in VM
-├── test_localhost_image.rs # Local image tests
-└── test_snapshot_clone.rs  # Snapshot/clone workflow tests
+├── common/mod.rs              # Shared test utilities (VmFixture, poll_health_by_pid)
+├── test_sanity.rs             # End-to-end VM sanity tests (rootless + bridged)
+├── test_state_manager.rs      # State manager unit tests
+├── test_health_monitor.rs     # Health monitoring tests
+├── test_fuse_in_vm_matrix.rs  # In-VM pjdfstest (17 categories, parallel via nextest)
+├── test_localhost_image.rs    # Local image tests
+└── test_snapshot_clone.rs     # Snapshot/clone workflow tests
 
 fuse-pipe/tests/
 ├── integration.rs              # Basic FUSE operations (no root)
@@ -582,7 +589,7 @@ fuse-pipe/tests/
 ├── test_mount_stress.rs        # Mount/unmount stress tests
 ├── test_allow_other.rs         # AllowOther flag tests
 ├── test_unmount_race.rs        # Unmount race condition tests
-├── pjdfstest_matrix.rs         # POSIX compliance (17 categories, parallel via nextest)
+├── pjdfstest_matrix_root.rs    # Host-side pjdfstest (17 categories, parallel)
 └── pjdfstest_common.rs         # Shared pjdfstest utilities
 
 fuse-pipe/benches/
@@ -784,10 +791,11 @@ Run `make help` for full list. Key targets:
 #### Testing
 | Target | Description |
 |--------|-------------|
-| `make test` | All tests (rootless + root) |
-| `make test-rootless` | Rootless tests only |
-| `make test-root` | Root tests (requires sudo + KVM) |
-| `make test-root FILTER=exec` | Only exec tests |
+| `make test-unit` | Unit tests only (no VMs, no sudo) |
+| `make test-fast` | + quick VM tests (rootless, no sudo) |
+| `make test-all` | + slow VM tests (rootless, no sudo) |
+| `make test-root` | + privileged tests (bridged, pjdfstest, sudo) |
+| `make test` | Alias for test-root |
 | `make container-test` | All tests in container |
 | `make container-shell` | Interactive shell |
 
@@ -935,9 +943,11 @@ let (mut child, pid) = common::spawn_fcvm(&["podman", "run", "--name", &vm_name,
 
 | Command | Description |
 |---------|-------------|
-| `make container-test` | All tests in container |
-| `make container-test-rootless` | Rootless tests in container |
-| `make container-test-root` | Root tests in container |
+| `make container-test-unit` | Unit tests in container |
+| `make container-test-fast` | + quick VM tests (rootless) |
+| `make container-test-all` | + slow VM tests (rootless) |
+| `make container-test-root` | + privileged tests |
+| `make container-test` | Alias for container-test-root |
 | `make container-shell` | Interactive shell |
 
 ### Tracing Targets
