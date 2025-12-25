@@ -6,6 +6,8 @@
 //! 3. Spawns multiple clones in parallel
 //! 4. Runs parallel curl commands from each clone to the local HTTP server
 //! 5. Verifies all requests succeed
+//!
+//! Debug logs are automatically written to /tmp/fcvm-test-logs/ and uploaded as CI artifacts.
 
 #![cfg(feature = "integration-slow")]
 
@@ -332,11 +334,22 @@ async fn egress_stress_impl(
                         if out.status.success() && code.trim() == "200" {
                             success.fetch_add(1, Ordering::Relaxed);
                         } else {
+                            // Show last 3 lines of stderr to capture error messages
+                            let stderr_lines: Vec<&str> = stderr.lines().collect();
+                            let stderr_tail = stderr_lines
+                                .iter()
+                                .rev()
+                                .take(3)
+                                .rev()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(" | ");
                             eprintln!(
-                                "Request failed: status={}, stdout='{}', stderr='{}'",
+                                "Request failed: clone_pid={}, status={}, stdout='{}', stderr='{}'",
+                                clone_pid,
                                 out.status,
                                 code.trim(),
-                                stderr.lines().next().unwrap_or("")
+                                stderr_tail
                             );
                             failure.fetch_add(1, Ordering::Relaxed);
                         }

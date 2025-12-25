@@ -138,7 +138,7 @@ impl UffdServer {
                                     vm_tasks.spawn(async move {
                                         match handle_vm_page_faults(vm_id_clone.clone(), uffd, mappings, mmap).await {
                                             Ok(()) => info!(target: "uffd", vm_id = %vm_id_clone, "VM handler exited cleanly"),
-                                            Err(e) => error!(target: "uffd", vm_id = %vm_id_clone, error = %e, "VM handler error"),
+                                            Err(e) => error!(target: "uffd", vm_id = %vm_id_clone, error = ?e, "VM handler error"),
                                         }
                                         vm_id_clone
                                     });

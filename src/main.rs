@@ -40,12 +40,14 @@ async fn main() -> Result<()> {
     // Parent process already shows timestamp and level, so subprocess just shows the message
     // But KEEP target tags to show the nesting hierarchy!
     // Otherwise, show full formatting (outermost process)
+    // Use RUST_LOG if set, otherwise default to INFO
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
     if cli.sub_process {
         // Subprocesses NEVER have colors (their output is captured and re-logged)
         tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()),
-            )
+            .with_env_filter(env_filter)
             .with_writer(std::io::stderr) // Logs to stderr, keep stdout clean for command output
             .with_target(true) // KEEP targets to show nesting hierarchy
             .without_time()
@@ -57,9 +59,7 @@ async fn main() -> Result<()> {
         use std::io::IsTerminal;
         let use_color = std::io::stderr().is_terminal();
         tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()),
-            )
+            .with_env_filter(env_filter)
             .with_writer(std::io::stderr) // Logs to stderr, keep stdout clean for command output
             .with_target(true) // Show targets for all processes
             .with_ansi(use_color) // Only use ANSI when outputting to TTY

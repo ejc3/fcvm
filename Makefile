@@ -38,11 +38,15 @@ else
 CARGO_CACHE_MOUNT :=
 endif
 
+# Test log directory (mounted into container)
+TEST_LOG_DIR := /tmp/fcvm-test-logs
+
 # Container run command
 CONTAINER_RUN := podman run --rm --privileged \
 	-v .:/workspace/fcvm -v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs -v $(FUSER):/workspace/fuser \
 	--device /dev/fuse --device /dev/kvm \
-	--ulimit nofile=65536:65536 --pids-limit=65536 -v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs $(CARGO_CACHE_MOUNT)
+	--ulimit nofile=65536:65536 --pids-limit=65536 -v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
+	-v $(TEST_LOG_DIR):$(TEST_LOG_DIR) $(CARGO_CACHE_MOUNT)
 
 .PHONY: all help build clean test test-unit test-fast test-all test-root \
 	_test-unit _test-fast _test-all _test-root \
