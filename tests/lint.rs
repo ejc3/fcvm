@@ -1,8 +1,6 @@
 //! Lint tests - run fmt, clippy, audit, deny in parallel via cargo test.
-//! Gated by "lint-tests" feature so they don't run during VM tests.
-//! Run explicitly with: make lint
 
-#![cfg(feature = "lint-tests")]
+#![cfg(feature = "integration-fast")]
 
 use std::process::Command;
 

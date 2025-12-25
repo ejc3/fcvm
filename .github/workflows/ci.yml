@@ -60,8 +60,8 @@ jobs:
             release-v1.14.0-x86_64/jailer-v1.14.0-x86_64
           sudo mv /usr/local/bin/firecracker-v1.14.0-x86_64 /usr/local/bin/firecracker
           sudo mv /usr/local/bin/jailer-v1.14.0-x86_64 /usr/local/bin/jailer
-      - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked
+      - name: Install cargo tools
+        run: cargo install cargo-nextest cargo-audit cargo-deny --locked
       - name: Setup KVM and networking
         run: |
           sudo chmod 666 /dev/kvm

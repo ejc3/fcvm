@@ -163,7 +163,7 @@ bench: build
 	cargo bench -p fuse-pipe --bench protocol
 
 lint:
-	cargo test --test lint --features lint-tests
+	cargo test --test lint
 
 fmt:
 	cargo fmt
