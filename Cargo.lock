@@ -562,6 +562,7 @@ dependencies = [
  "chrono",
  "clap",
  "criterion",
+ "fs2",
  "fuse-pipe",
  "hex",
  "hyper 0.14.32",

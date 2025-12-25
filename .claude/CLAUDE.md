@@ -195,35 +195,33 @@ If a test fails intermittently, that's a **concurrency bug** or **race condition
 
 ### Race Condition Debugging Protocol
 
-**Workarounds are NOT acceptable.** When a test fails due to a race condition:
+**Show, don't tell. We have extensive logs - it's NEVER a guess.**
 
-1. **NEVER "fix" it with timing changes** like:
-   - Increasing timeouts
-   - Adding sleeps
-   - Separating phases that should work concurrently
-   - Reducing parallelism
+1. **NEVER "fix" with timing changes** (timeouts, sleeps, reducing parallelism)
 
-2. **ALWAYS examine the actual output:**
-   - Capture FULL logs from failing test runs
-   - Look at what the SPECIFIC failing component did/didn't do
-   - Trace timestamps to understand ordering
-   - Find the EXACT operation that failed
+2. **ALWAYS find the smoking gun in logs** - compare failing vs passing timestamps
 
-3. **Ask the right questions:**
-   - What's different about the failing component vs. successful ones?
-   - What resource/state is being contended?
-   - What initialization happens on first access?
-   - Are there orphaned processes or stale state?
+3. **Real example - Firecracker crash during parallel tests:**
 
-4. **Find and fix the ROOT CAUSE:**
-   - If it's a lock ordering issue, fix the locking
-   - If it's uninitialized state, fix the initialization
-   - If it's resource exhaustion, fix the resource management
-   - If it's a cleanup issue, fix the cleanup
+   ```
+   # FAILING (truncate):
+   05:01:26 Exporting image with skopeo
+   05:03:34 Image exported (122s later - lock contention!)
+   05:03:34.835 Firecracker spawned
+   05:03:34.859 VM setup failed (24ms - crashed immediately)
 
-**Example bad fix:** "Clone-0 times out while clones 1-99 succeed" → "Let's wait for all spawns before health checking"
+   # PASSING (chmod):
+   05:01:27 Exporting image with skopeo
+   05:03:10 Image exported (103s - finished earlier)
+   05:03:11.258 Firecracker spawned
+   05:03:11.258 API server received request (success)
+   ```
 
-**Correct approach:** Look at clone-0's logs to see WHY it specifically failed. What did clone-0 do differently? What resource did it touch first?
+   **Root cause from logs:** All 17 tests serialize on podman storage lock, then thundering herd of VMs start at once.
+
+   **Fix:** Content-addressable image cache - first test exports, others hit cache.
+
+4. **The mantra:** What do timestamps show? What's different between failing and passing? The logs ALWAYS have the answer.
 
 ### NO TEST HEDGES
 
