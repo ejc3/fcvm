@@ -77,6 +77,8 @@ jobs:
           sudo sysctl -w vm.unprivileged_userfaultfd=1
           # Enable FUSE allow_other for tests
           echo "user_allow_other" | sudo tee /etc/fuse.conf
+      - name: Create test log directory
+        run: mkdir -p /tmp/fcvm-test-logs
       - name: test-unit
         working-directory: fcvm
         run: make test-unit
@@ -89,6 +91,14 @@ jobs:
       - name: test-root
         working-directory: fcvm
         run: make test-root
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-host
+          path: /tmp/fcvm-test-logs/
+          if-no-files-found: ignore
+          retention-days: 7
 
   # Runner 2: Container (podman)
   # Runs same tests as Host but inside a container
@@ -126,6 +136,8 @@ jobs:
           path: ${{ github.workspace }}/cargo-cache
           key: container-cargo-${{ hashFiles('fcvm/Cargo.lock') }}
           restore-keys: container-cargo-
+      - name: Create test log directory
+        run: mkdir -p /tmp/fcvm-test-logs
       - name: container-test-unit
         env:
           CARGO_CACHE_DIR: ${{ github.workspace }}/cargo-cache
@@ -141,3 +153,11 @@ jobs:
           CARGO_CACHE_DIR: ${{ github.workspace }}/cargo-cache
         working-directory: fcvm
         run: make container-test
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-container
+          path: /tmp/fcvm-test-logs/
+          if-no-files-found: ignore
+          retention-days: 7

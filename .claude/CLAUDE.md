@@ -45,6 +45,18 @@ make container-test-root FILTER=sanity STREAM=1   # Container tests with streami
 
 Without `STREAM=1`, nextest captures output and only shows it after tests complete (better for parallel runs).
 
+### Debug Logs
+
+**All tests automatically capture debug-level logs to files:**
+```
+/tmp/fcvm-test-logs/{name}-{timestamp}.log
+```
+
+- Console shows INFO/WARN/ERROR (clean)
+- Files contain DEBUG/TRACE (full detail)
+- CI uploads logs as artifacts on every run
+- Each spawned fcvm process gets its own log file
+
 ### Common Commands
 ```bash
 # Build
