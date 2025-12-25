@@ -75,10 +75,11 @@ jobs:
         run: make test-root
 
   # Runner 2: Container (podman)
-  # Runs: container-test-unit → container-test-fast → container-test-all (sequential)
+  # Only runs unit tests - VM tests require KVM (covered by Host job)
+  # Uses ubuntu-latest which has proper rootless podman support
   container:
     name: Container
-    runs-on: buildjet-32vcpu-ubuntu-2204
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -96,9 +97,3 @@ jobs:
       - name: container-test-unit
         working-directory: fcvm
         run: make container-test-unit
-      - name: container-test-fast
-        working-directory: fcvm
-        run: make container-test-fast
-      - name: container-test-all
-        working-directory: fcvm
-        run: make container-test-all
