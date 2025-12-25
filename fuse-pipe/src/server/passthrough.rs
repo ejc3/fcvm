@@ -1262,7 +1262,9 @@ mod tests {
 
     #[test]
     fn test_passthrough_hardlink() {
-        let dir = tempfile::tempdir().unwrap();
+        // Use .local/ instead of /tmp to support hardlinks on overlayfs
+        let _ = std::fs::create_dir_all(".local");
+        let dir = tempfile::tempdir_in(".local").unwrap();
         let fs = PassthroughFs::new(dir.path());
 
         let uid = nix::unistd::Uid::effective().as_raw();
