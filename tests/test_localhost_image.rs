@@ -4,7 +4,7 @@
 //! The image is exported from the host using skopeo, mounted into the VM via FUSE,
 //! and then imported by fc-agent using skopeo before running with podman.
 
-#![cfg(feature = "integration-fast")]
+#![cfg(all(feature = "integration-fast", feature = "privileged-tests"))]
 
 mod common;
 
@@ -14,7 +14,6 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// Test that a localhost/ container image can be built and run in a VM
-#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_localhost_hello_world_bridged() -> Result<()> {
     println!("\nLocalhost Image Test");
@@ -90,7 +89,8 @@ async fn test_localhost_hello_world_bridged() -> Result<()> {
     });
 
     // Wait for the process to exit (with timeout)
-    let timeout = Duration::from_secs(60);
+    // 120s to handle podman storage lock contention during parallel test runs
+    let timeout = Duration::from_secs(120);
     let result = tokio::time::timeout(timeout, child.wait()).await;
 
     match result {

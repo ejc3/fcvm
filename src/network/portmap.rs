@@ -352,30 +352,28 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "privileged-tests")]
     #[tokio::test]
     async fn test_port_mapping_lifecycle() {
-        // Test that we can create and cleanup rules
-        // Note: This test requires root and modifies iptables, so it's
-        // more of an integration test. Skip in CI.
-        let guest_ip = "172.30.0.2";
+        // Test that we can create and cleanup rules (requires root for iptables)
+        // Use a scoped host_ip so rules don't conflict with parallel tests
+        let veth_ip = "172.30.99.1"; // Fake veth IP for testing
+        let guest_ip = "172.30.99.2";
         let mappings = vec![PortMapping {
-            host_ip: None,
-            host_port: 18080,
+            host_ip: Some(veth_ip.to_string()), // Scope DNAT to this IP
+            host_port: 8080,
             guest_port: 80,
             proto: Protocol::Tcp,
         }];
 
         // Setup
-        let rules = setup_port_mappings(guest_ip, &mappings).await;
+        let rules = setup_port_mappings(guest_ip, &mappings)
+            .await
+            .expect("setup port mappings (requires root)");
 
-        if let Ok(rules) = rules {
-            assert_eq!(rules.len(), 4); // DNAT (PREROUTING) + DNAT (OUTPUT) + MASQUERADE + FORWARD
+        assert_eq!(rules.len(), 4); // DNAT (PREROUTING) + DNAT (OUTPUT) + MASQUERADE + FORWARD
 
-            // Cleanup
-            cleanup_port_mappings(&rules).await.unwrap();
-        } else {
-            // If we can't setup (not root), that's OK for this test
-            println!("Skipping port mapping test (requires root)");
-        }
+        // Cleanup
+        cleanup_port_mappings(&rules).await.unwrap();
     }
 }

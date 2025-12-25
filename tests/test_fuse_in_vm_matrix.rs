@@ -28,10 +28,7 @@ async fn run_category_in_vm(category: &str) -> Result<()> {
     let fcvm_path = common::find_fcvm_binary()?;
 
     // Build prove command for this category
-    let prove_cmd = format!(
-        "prove -v -j {} -r /opt/pjdfstest/tests/{}/",
-        JOBS, category
-    );
+    let prove_cmd = format!("prove -v -j {} -r /opt/pjdfstest/tests/{}/", JOBS, category);
 
     // Check if pjdfstest container exists
     let check = tokio::process::Command::new("podman")
@@ -42,7 +39,14 @@ async fn run_category_in_vm(category: &str) -> Result<()> {
     if !check.status.success() {
         // Build pjdfstest container
         let build = tokio::process::Command::new("podman")
-            .args(["build", "-t", "pjdfstest", "-f", "Containerfile.pjdfstest", "."])
+            .args([
+                "build",
+                "-t",
+                "pjdfstest",
+                "-f",
+                "Containerfile.pjdfstest",
+                ".",
+            ])
             .output()
             .await
             .context("building pjdfstest container")?;
@@ -70,12 +74,17 @@ async fn run_category_in_vm(category: &str) -> Result<()> {
     // Start VM with pjdfstest container
     let mut cmd = tokio::process::Command::new(&fcvm_path);
     cmd.args([
-        "podman", "run",
-        "--name", &vm_name,
-        "--network", "bridged",
-        "--map", &map_arg,
-        "--cmd", &prove_cmd,
-        "--privileged",  // Needed for mknod tests
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        "--map",
+        &map_arg,
+        "--cmd",
+        &prove_cmd,
+        "--privileged", // Needed for mknod tests
         "localhost/pjdfstest",
     ])
     .stdout(Stdio::piped())
@@ -121,8 +130,7 @@ async fn run_category_in_vm(category: &str) -> Result<()> {
     }
 
     println!(
-        "[FUSE-VM] {} {} ({:.1}s)",
-        "\u{2713}", // checkmark
+        "[FUSE-VM] \u{2713} {} ({:.1}s)",
         category,
         duration.as_secs_f64()
     );
@@ -134,9 +142,11 @@ macro_rules! pjdfstest_vm_category {
     ($name:ident, $category:literal) => {
         #[tokio::test]
         async fn $name() {
-            run_category_in_vm($category)
-                .await
-                .expect(concat!("pjdfstest category ", $category, " failed in VM"));
+            run_category_in_vm($category).await.expect(concat!(
+                "pjdfstest category ",
+                $category,
+                " failed in VM"
+            ));
         }
     };
 }
