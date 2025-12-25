@@ -665,56 +665,150 @@ async fn run_vm_setup(
         // This is fully rootless - no sudo required!
 
         // Step 1: Spawn holder process (keeps namespace alive)
+        // Retry for up to 2 seconds if holder dies (transient failures under load)
         let holder_cmd = slirp_net.build_holder_command();
         info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
 
-        // Spawn holder with piped stderr to capture errors if it fails
-        let mut child = tokio::process::Command::new(&holder_cmd[0])
-            .args(&holder_cmd[1..])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .with_context(|| format!("failed to spawn holder: {:?}", holder_cmd))?;
+        let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut attempt = 0;
+        #[allow(unused_assignments)]
+        let mut _last_error: Option<String> = None;
 
-        let holder_pid = child.id().context("getting holder process PID")?;
-        info!(holder_pid = holder_pid, "namespace holder started");
+        let (mut child, holder_pid, mut holder_stderr) = loop {
+            attempt += 1;
 
-        // Give holder a moment to potentially fail, then check status
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // Holder exited - capture stderr to see why
-                let stderr = if let Some(mut stderr_pipe) = child.stderr.take() {
+            // Spawn holder with piped stderr to capture errors if it fails
+            let mut child = tokio::process::Command::new(&holder_cmd[0])
+                .args(&holder_cmd[1..])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .with_context(|| format!("failed to spawn holder: {:?}", holder_cmd))?;
+
+            let holder_pid = child.id().context("getting holder process PID")?;
+            if attempt > 1 {
+                info!(
+                    holder_pid = holder_pid,
+                    attempt = attempt,
+                    "namespace holder started (retry)"
+                );
+            } else {
+                info!(holder_pid = holder_pid, "namespace holder started");
+            }
+
+            // Give holder a moment to potentially fail, then check status
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            // Take stderr pipe - we'll use it for diagnostics if holder dies later
+            let mut holder_stderr = child.stderr.take();
+
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    // Holder exited - capture stderr to see why
+                    let stderr = if let Some(ref mut pipe) = holder_stderr {
+                        use tokio::io::AsyncReadExt;
+                        let mut buf = String::new();
+                        let _ = pipe.read_to_string(&mut buf).await;
+                        buf
+                    } else {
+                        String::new()
+                    };
+
+                    _last_error = Some(format!(
+                        "holder exited immediately: status={}, stderr='{}'",
+                        status,
+                        stderr.trim()
+                    ));
+
+                    if std::time::Instant::now() < retry_deadline {
+                        warn!(
+                            holder_pid = holder_pid,
+                            attempt = attempt,
+                            status = %status,
+                            stderr = %stderr.trim(),
+                            "holder died, retrying..."
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    } else {
+                        bail!(
+                            "holder process exited immediately after {} attempts: status={}, stderr={}, cmd={:?}",
+                            attempt,
+                            status,
+                            stderr.trim(),
+                            holder_cmd
+                        );
+                    }
+                }
+                Ok(None) => {
+                    debug!(holder_pid = holder_pid, "holder still running after 50ms");
+                }
+                Err(e) => {
+                    warn!(holder_pid = holder_pid, error = ?e, "failed to check holder status");
+                }
+            }
+
+            // Additional delay for namespace setup
+            // The --map-root-user option invokes setuid helpers asynchronously
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            // Check if holder is still alive before proceeding
+            if !crate::utils::is_process_alive(holder_pid) {
+                // Try to capture stderr from the dead holder process
+                let holder_stderr_content = if let Some(ref mut pipe) = holder_stderr {
                     use tokio::io::AsyncReadExt;
                     let mut buf = String::new();
-                    let _ = stderr_pipe.read_to_string(&mut buf).await;
-                    buf
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        pipe.read_to_string(&mut buf),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => buf,
+                        _ => String::new(),
+                    }
                 } else {
                     String::new()
                 };
-                bail!(
-                    "holder process exited immediately: status={}, stderr={}, cmd={:?}",
-                    status,
-                    stderr.trim(),
-                    holder_cmd
-                );
-            }
-            Ok(None) => {
-                debug!(holder_pid = holder_pid, "holder still running after 50ms");
-                // Holder is running - drop the stderr pipe so it doesn't block
-                drop(child.stderr.take());
-            }
-            Err(e) => {
-                warn!(holder_pid = holder_pid, error = ?e, "failed to check holder status");
-            }
-        }
 
-        // Additional delay for namespace setup (already waited 50ms above)
-        // The --map-auto option invokes setuid helpers asynchronously
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let _ = child.kill().await;
+
+                _last_error = Some(format!(
+                    "holder died after 100ms: stderr='{}'",
+                    holder_stderr_content.trim()
+                ));
+
+                if std::time::Instant::now() < retry_deadline {
+                    warn!(
+                        holder_pid = holder_pid,
+                        attempt = attempt,
+                        holder_stderr = %holder_stderr_content.trim(),
+                        "holder died after initial check, retrying..."
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                } else {
+                    let max_user_ns = std::fs::read_to_string("/proc/sys/user/max_user_namespaces")
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    bail!(
+                        "holder process (PID {}) died after {} attempts. \
+                         stderr='{}', max_user_namespaces={}. \
+                         This may indicate resource exhaustion or namespace limit reached.",
+                        holder_pid,
+                        attempt,
+                        holder_stderr_content.trim(),
+                        max_user_ns.trim()
+                    );
+                }
+            }
+
+            // Holder is alive - break out of retry loop
+            break (child, holder_pid, holder_stderr);
+        };
 
         // Step 2: Run setup script via nsenter (creates TAPs, iptables, etc.)
+        // This is also inside retry logic - if holder dies during nsenter, retry everything
         let setup_script = slirp_net.build_setup_script();
         let nsenter_prefix = slirp_net.build_nsenter_prefix(holder_pid);
 
@@ -741,15 +835,6 @@ async fn run_vm_setup(
             warn!("/dev/net/tun not available - TAP device creation will fail");
         }
 
-        // Verify holder is still alive before attempting nsenter
-        if !crate::utils::is_process_alive(holder_pid) {
-            let _ = child.kill().await;
-            bail!(
-                "holder process (PID {}) died before network setup could run",
-                holder_pid
-            );
-        }
-
         info!(holder_pid = holder_pid, "running network setup via nsenter");
 
         // Log the setup script for debugging
@@ -771,32 +856,171 @@ async fn run_vm_setup(
         if !setup_output.status.success() {
             let stderr = String::from_utf8_lossy(&setup_output.stderr);
             let stdout = String::from_utf8_lossy(&setup_output.stdout);
-            // Kill holder before bailing
-            let _ = child.kill().await;
+
             // Re-check state for diagnostics
             let holder_alive = std::path::Path::new(&proc_dir).exists();
             let ns_user_exists = std::path::Path::new(&ns_user).exists();
             let ns_net_exists = std::path::Path::new(&ns_net).exists();
 
-            // Log comprehensive error info at ERROR level (always visible)
-            warn!(
-                holder_pid = holder_pid,
-                holder_alive = holder_alive,
-                tun_exists = tun_exists,
-                ns_user_exists = ns_user_exists,
-                ns_net_exists = ns_net_exists,
-                stderr = %stderr.trim(),
-                stdout = %stdout.trim(),
-                "network setup failed - diagnostics"
-            );
+            // If holder died during nsenter, this is a retryable error
+            if !holder_alive && std::time::Instant::now() < retry_deadline {
+                // Holder died during nsenter - retry the whole thing
+                let holder_stderr_content = if let Some(ref mut pipe) = holder_stderr {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = String::new();
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        pipe.read_to_string(&mut buf),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => buf,
+                        _ => String::new(),
+                    }
+                } else {
+                    String::new()
+                };
 
-            bail!(
-                "network setup failed: {} (tun={}, holder_alive={}, ns_user={}, ns_net={})",
-                stderr.trim(),
-                tun_exists,
-                holder_alive,
-                ns_user_exists,
-                ns_net_exists
+                let _ = child.kill().await;
+
+                warn!(
+                    holder_pid = holder_pid,
+                    attempt = attempt,
+                    holder_stderr = %holder_stderr_content.trim(),
+                    nsenter_stderr = %stderr.trim(),
+                    "holder died during nsenter, retrying..."
+                );
+
+                // Jump back to the retry loop by recursing into this block
+                // We need to restructure - for now just retry once more inline
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                // Retry: spawn new holder
+                attempt += 1;
+                let mut retry_child = tokio::process::Command::new(&holder_cmd[0])
+                    .args(&holder_cmd[1..])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .with_context(|| {
+                        format!("failed to spawn holder on retry: {:?}", holder_cmd)
+                    })?;
+
+                let retry_holder_pid = retry_child.id().context("getting retry holder PID")?;
+                info!(
+                    holder_pid = retry_holder_pid,
+                    attempt = attempt,
+                    "namespace holder started (retry after nsenter failure)"
+                );
+
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                if !crate::utils::is_process_alive(retry_holder_pid) {
+                    let _ = retry_child.kill().await;
+                    bail!(
+                        "holder died on retry after nsenter failure (attempt {})",
+                        attempt
+                    );
+                }
+
+                // Retry nsenter with new holder
+                let retry_nsenter_prefix = slirp_net.build_nsenter_prefix(retry_holder_pid);
+                let retry_output = tokio::process::Command::new(&retry_nsenter_prefix[0])
+                    .args(&retry_nsenter_prefix[1..])
+                    .arg("bash")
+                    .arg("-c")
+                    .arg(&setup_script)
+                    .output()
+                    .await
+                    .context("running network setup via nsenter (retry)")?;
+
+                if !retry_output.status.success() {
+                    let retry_stderr = String::from_utf8_lossy(&retry_output.stderr);
+                    let _ = retry_child.kill().await;
+                    bail!(
+                        "network setup failed on retry: {} (attempt {})",
+                        retry_stderr.trim(),
+                        attempt
+                    );
+                }
+
+                // Success on retry - update variables for rest of function
+                child = retry_child;
+                // Note: holder_pid is shadowed in the outer scope, but we continue with retry_holder_pid
+                info!(
+                    holder_pid = retry_holder_pid,
+                    attempts = attempt,
+                    "network setup succeeded after retry"
+                );
+            } else {
+                // If holder died, try to capture its stderr for more context
+                let holder_stderr_content = if !holder_alive {
+                    if let Some(ref mut pipe) = holder_stderr {
+                        use tokio::io::AsyncReadExt;
+                        let mut buf = String::new();
+                        match tokio::time::timeout(
+                            std::time::Duration::from_millis(100),
+                            pipe.read_to_string(&mut buf),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => buf,
+                            _ => String::new(),
+                        }
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+
+                // Kill holder before bailing
+                let _ = child.kill().await;
+
+                // Log comprehensive error info at ERROR level (always visible)
+                warn!(
+                    holder_pid = holder_pid,
+                    holder_alive = holder_alive,
+                    holder_stderr = %holder_stderr_content.trim(),
+                    tun_exists = tun_exists,
+                    ns_user_exists = ns_user_exists,
+                    ns_net_exists = ns_net_exists,
+                    nsenter_stderr = %stderr.trim(),
+                    nsenter_stdout = %stdout.trim(),
+                    "network setup failed - diagnostics"
+                );
+
+                if !holder_alive {
+                    bail!(
+                        "network setup failed: holder died during nsenter after {} attempts. \
+                         nsenter_stderr='{}', holder_stderr='{}', \
+                         (tun={}, ns_user={}, ns_net={})",
+                        attempt,
+                        stderr.trim(),
+                        holder_stderr_content.trim(),
+                        tun_exists,
+                        ns_user_exists,
+                        ns_net_exists
+                    );
+                } else {
+                    bail!(
+                        "network setup failed: {} (tun={}, holder_alive={}, ns_user={}, ns_net={})",
+                        stderr.trim(),
+                        tun_exists,
+                        holder_alive,
+                        ns_user_exists,
+                        ns_net_exists
+                    );
+                }
+            }
+        }
+
+        if attempt > 1 {
+            info!(
+                holder_pid = holder_pid,
+                attempts = attempt,
+                "namespace setup succeeded after retries"
             );
         }
 

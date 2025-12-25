@@ -63,7 +63,7 @@ fn test_sigint_kills_firecracker_bridged() -> Result<()> {
     let start = std::time::Instant::now();
     let mut healthy = false;
     while start.elapsed() < Duration::from_secs(60) {
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(common::POLL_INTERVAL);
 
         let output = Command::new(&fcvm_path)
             .args(["ls", "--json"])
@@ -116,7 +116,7 @@ fn test_sigint_kills_firecracker_bridged() -> Result<()> {
                 break;
             }
             Ok(None) => {
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(common::POLL_INTERVAL);
             }
             Err(e) => {
                 println!("Error waiting for fcvm: {}", e);
@@ -132,7 +132,7 @@ fn test_sigint_kills_firecracker_bridged() -> Result<()> {
     }
 
     // Give a moment for cleanup
-    std::thread::sleep(Duration::from_secs(2));
+    std::thread::sleep(common::POLL_INTERVAL);
 
     // Check if our specific firecracker is still running
     let still_running = process_exists(fc_pid);
@@ -194,7 +194,7 @@ fn test_sigterm_kills_firecracker_bridged() -> Result<()> {
     let start = std::time::Instant::now();
     let mut healthy = false;
     while start.elapsed() < Duration::from_secs(60) {
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(common::POLL_INTERVAL);
 
         let output = Command::new(&fcvm_path)
             .args(["ls", "--json"])
@@ -240,14 +240,14 @@ fn test_sigterm_kills_firecracker_bridged() -> Result<()> {
                 break;
             }
             Ok(None) => {
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(common::POLL_INTERVAL);
             }
             Err(_) => break,
         }
     }
 
     // Give a moment for cleanup
-    std::thread::sleep(Duration::from_secs(2));
+    std::thread::sleep(common::POLL_INTERVAL);
 
     // Check if our specific firecracker is still running
     let still_running = process_exists(fc_pid);
@@ -307,7 +307,7 @@ fn test_sigterm_cleanup_rootless() -> Result<()> {
     let start = std::time::Instant::now();
     let mut healthy = false;
     while start.elapsed() < Duration::from_secs(60) {
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(common::POLL_INTERVAL);
 
         let output = Command::new(&fcvm_path)
             .args(["ls", "--json"])
@@ -357,14 +357,14 @@ fn test_sigterm_cleanup_rootless() -> Result<()> {
                 break;
             }
             Ok(None) => {
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(common::POLL_INTERVAL);
             }
             Err(_) => break,
         }
     }
 
     // Give a moment for cleanup
-    std::thread::sleep(Duration::from_secs(2));
+    std::thread::sleep(common::POLL_INTERVAL);
 
     // Verify our SPECIFIC processes are cleaned up
     if let Some(fc_pid) = our_fc_pid {
@@ -511,7 +511,7 @@ fn test_sigterm_cleanup_bridged() -> Result<()> {
     let start = std::time::Instant::now();
     let mut healthy = false;
     while start.elapsed() < Duration::from_secs(60) {
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(common::POLL_INTERVAL);
 
         let output = Command::new(&fcvm_path)
             .args(["ls", "--json"])
@@ -555,12 +555,12 @@ fn test_sigterm_cleanup_bridged() -> Result<()> {
                 println!("fcvm exited with status: {:?}", status);
                 break;
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Ok(None) => std::thread::sleep(common::POLL_INTERVAL),
             Err(_) => break,
         }
     }
 
-    std::thread::sleep(Duration::from_secs(2));
+    std::thread::sleep(common::POLL_INTERVAL);
 
     // Verify our SPECIFIC processes are cleaned up
     if let Some(fc_pid) = our_fc_pid {
