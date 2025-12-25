@@ -1,10 +1,9 @@
 //! In-VM pjdfstest matrix - runs pjdfstest categories inside VMs
 //!
-//! This parallels fuse-pipe's pjdfstest_matrix_root but runs tests INSIDE a VM.
-//! Each category is a separate test, allowing nextest to run them in parallel.
+//! Each category is a separate test, allowing nextest to run all 17 in parallel.
+//! Tests the full stack: host VolumeServer → vsock → guest FUSE mount.
 //!
-//! The host-side matrix tests fuse-pipe's FUSE implementation directly.
-//! The in-VM matrix tests the full stack: host VolumeServer → vsock → guest FUSE mount.
+//! See also: fuse-pipe/tests/pjdfstest_matrix_root.rs (host-side matrix, tests fuse-pipe directly)
 //!
 //! Run with: cargo nextest run --test test_fuse_in_vm_matrix --features privileged-tests
 

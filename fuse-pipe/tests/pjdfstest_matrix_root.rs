@@ -1,7 +1,9 @@
-//! pjdfstest runner - all categories require root.
+//! Host-side pjdfstest matrix - tests fuse-pipe FUSE directly (no VM)
 //!
-//! The C pjdfstest suite uses chown/mknod/user-switching which require root.
-//! Each category runs as a separate test for parallel execution via nextest.
+//! Each category is a separate test, allowing nextest to run all 17 in parallel.
+//! Tests fuse-pipe's PassthroughFs via local FUSE mount.
+//!
+//! See also: tests/test_fuse_in_vm_matrix.rs (in-VM matrix, tests full vsock stack)
 //!
 //! Run with: cargo nextest run -p fuse-pipe --test pjdfstest_matrix_root --features privileged-tests,integration-slow
 
