@@ -1553,6 +1553,7 @@ cp /var/cache/apt/archives/*.deb /packages/ 2>/dev/null || true
         .args([
             "run",
             "--rm",
+            "--cgroups=disabled",
             "-v",
             &format!("{}:/packages", packages_dir.display()),
             &container_image,
