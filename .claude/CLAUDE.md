@@ -1,5 +1,18 @@
 # fcvm Development Log
 
+## NO HACKS
+
+**Fix the root cause, not the symptom.** When something fails:
+1. Understand WHY it's failing
+2. Fix the actual problem
+3. Don't hide errors, disable tests, or add workarounds
+
+Examples of hacks to avoid:
+- Gating tests behind feature flags to skip failures
+- Adding sleeps or retries without understanding the race
+- Clearing caches instead of updating tools
+- Using `|| true` to ignore errors
+
 ## Overview
 fcvm is a Firecracker VM manager for running Podman containers in lightweight microVMs. This document tracks implementation findings and decisions.
 
