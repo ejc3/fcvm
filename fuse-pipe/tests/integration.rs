@@ -170,13 +170,22 @@ fn test_symlink_and_readlink() {
 #[test]
 fn test_hardlink_survives_source_removal() {
     let (data_dir, mount_dir) = unique_paths("fuse-integ");
+    eprintln!("=== Hardlink test paths ===");
+    eprintln!("data_dir: {:?}", data_dir);
+    eprintln!("mount_dir: {:?}", mount_dir);
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
     let mount = fuse.mount_path();
 
     let source = mount.join("source.txt");
     let link = mount.join("link.txt");
     fs::write(&source, "hardlink").expect("write source");
-    fs::hard_link(&source, &link).expect("create hardlink");
+    if let Err(e) = fs::hard_link(&source, &link) {
+        eprintln!("=== Hardlink failed ===");
+        eprintln!("source: {:?} exists={}", source, source.exists());
+        eprintln!("link: {:?}", link);
+        eprintln!("mount contents: {:?}", fs::read_dir(mount).ok().map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name()).collect::<Vec<_>>()));
+        panic!("create hardlink failed: {}", e);
+    }
 
     fs::remove_file(&source).expect("remove source");
 
