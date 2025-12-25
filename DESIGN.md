@@ -249,32 +249,37 @@ Uses TAP devices + iptables for native performance.
 **Features**:
 - Requires root or CAP_NET_ADMIN
 - Better performance than rootless
-- Uses DNAT for port forwarding
-- Bridge networking for VM isolation
+- Uses DNAT for port forwarding (scoped to veth IP)
+- Network namespace isolation per VM
 
 **Implementation**:
 ```rust
-struct PrivilegedNetwork {
+struct BridgedNetwork {
     vm_id: String,
     tap_device: String,
-    bridge: String,
+    namespace_id: String,
+    host_veth: String,      // veth_outer in host namespace
+    guest_veth: String,     // veth_inner in VM namespace
     guest_ip: String,
-    host_ip: String,
+    host_ip: String,        // veth's host IP (used for port forwarding)
     port_mappings: Vec<PortMapping>,
 }
 
 async fn setup() -> Result<NetworkConfig> {
-    create_tap_device(tap_name)
-    add_to_bridge(tap_name, bridge)
+    create_namespace(namespace_id)
+    create_veth_pair(host_veth, guest_veth)
+    move_veth_to_namespace(guest_veth, namespace_id)
+    create_tap_device_in_namespace(tap_name, namespace_id)
     for mapping in port_mappings {
-        setup_nat_rule(mapping, guest_ip)
+        // Scope DNAT to veth IP so same port works across VMs
+        setup_nat_rule(mapping, guest_ip, host_ip)
     }
 }
 ```
 
-**NAT Rule Example**:
+**NAT Rule Example** (scoped to veth IP):
 ```bash
-nft add rule ip nat PREROUTING tcp dport 8080 dnat to 172.16.0.10:80
+iptables -t nat -A PREROUTING -d 172.30.x.1 -p tcp --dport 8080 -j DNAT --to-destination 172.30.x.2:80
 ```
 
 #### Port Mapping Format
@@ -469,58 +474,65 @@ Host (127.0.0.2:8080) → slirp4netns → slirp0 (10.0.2.100:8080) → IP forwar
 - Works in nested VMs and restricted environments
 - Fully compatible with rootless Podman in guest
 
-### Privileged Mode (iptables + TAP)
+### Privileged Mode (Network Namespace + veth + iptables)
 
 **Topology**:
 ```
-┌───────────────────────────────────────┐
-│ Host                                   │
-│  ┌──────────────┐                     │
-│  │ tap-{vm-id}  │ (172.16.x.1/24)     │
-│  └──────┬───────┘                     │
-│         │                              │
-│  iptables DNAT rules:                 │
-│    PREROUTING + OUTPUT chains         │
-│    tcp dport 8080 → 172.16.x.2:80    │
-└───────────────────────────────────────┘
-          │
-          ▼
-    ┌──────────────┐
-    │ Firecracker  │
-    │  eth0:       │
-    │  172.16.x.2  │
-    └──────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│ Host Namespace                                                   │
+│  ┌──────────────┐        veth pair         ┌──────────────────┐ │
+│  │ veth_outer   │◄─────────────────────────►│ VM Namespace     │ │
+│  │ 172.30.x.1   │                          │ (fcvm-vm-xxxxx)  │ │
+│  └──────────────┘                          │                  │ │
+│                                            │  veth_inner      │ │
+│  iptables DNAT (scoped to veth IP):        │  172.30.x.2      │ │
+│  -d 172.30.x.1 --dport 8080 → 172.30.x.2   │       │          │ │
+│                                            │       ▼          │ │
+│                                            │  ┌──────────┐    │ │
+│                                            │  │ TAP      │    │ │
+│                                            │  └────┬─────┘    │ │
+│                                            │       │          │ │
+│                                            │  ┌────▼─────┐    │ │
+│                                            │  │Firecracker│   │ │
+│                                            │  │eth0:      │   │ │
+│                                            │  │172.30.x.2 │   │ │
+│                                            │  └───────────┘   │ │
+│                                            └──────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-**TAP Device Setup** (per VM):
+**Accessing port-forwarded services**:
 ```bash
-# Create TAP device
-ip tuntap add tap-{vm-id} mode tap
-ip link set tap-{vm-id} up
+# Curl the veth's host IP (172.30.x.1), NOT localhost
+curl http://172.30.x.1:8080
 
-# Configure TAP with unique /24 subnet
-ip addr add 172.16.{x}.1/24 dev tap-{vm-id}
-
-# Enable forwarding
-echo 1 > /proc/sys/net/ipv4/ip_forward
+# Get the veth IP from VM state
+fcvm ls --json | jq '.[0].config.network.host_ip'
 ```
 
 **iptables Rules** (from `src/network/portmap.rs`):
 ```bash
-# DNAT for external traffic (PREROUTING chain)
-iptables -t nat -A PREROUTING -p tcp --dport 8080 -j DNAT --to-destination 172.16.x.2:80
+# DNAT for external traffic - scoped to veth's host IP to avoid port conflicts
+# Each VM has unique veth IP (172.30.x.y) so same port works across VMs
+iptables -t nat -A PREROUTING -d 172.30.x.1 -p tcp --dport 8080 -j DNAT --to-destination 172.30.x.2:80
 
-# DNAT for localhost traffic (OUTPUT chain)
-iptables -t nat -A OUTPUT -p tcp --dport 8080 -j DNAT --to-destination 172.16.x.2:80
+# DNAT for localhost traffic (OUTPUT chain) - also scoped to veth IP
+iptables -t nat -A OUTPUT -d 172.30.x.1 -p tcp --dport 8080 -j DNAT --to-destination 172.30.x.2:80
 
 # MASQUERADE for outbound (guest → internet)
-iptables -t nat -A POSTROUTING -s 172.16.x.0/24 -j MASQUERADE
+iptables -t nat -A POSTROUTING -s 172.30.x.0/30 -j MASQUERADE
+```
+
+**Accessing port-forwarded services**:
+```bash
+# Curl the veth's host IP (172.30.x.1), NOT localhost
+curl http://172.30.x.1:8080
 ```
 
 **IP Allocation**:
-- Each VM gets unique /24 subnet: `172.16.{x}.0/24`
-- TAP gateway: `172.16.{x}.1`
-- Guest IP: `172.16.{x}.2`
+- Each VM gets unique /30 subnet: `172.30.{x}.{y}/30`
+- Veth host IP: `172.30.{x}.{y}` (used for port forwarding)
+- Guest IP: `172.30.{x}.{y+1}`
 
 ---
 

@@ -27,12 +27,8 @@ else
 MUSL_TARGET := x86_64-unknown-linux-musl
 endif
 
-# Test commands
-TEST_UNIT := CARGO_TARGET_DIR=target cargo nextest $(NEXTEST_CMD) --release --no-default-features
-TEST_FAST := CARGO_TARGET_DIR=target cargo nextest $(NEXTEST_CMD) --release $(NEXTEST_CAPTURE) --no-default-features --features integration-fast $(FILTER)
-TEST_ALL := CARGO_TARGET_DIR=target cargo nextest $(NEXTEST_CMD) --release $(NEXTEST_CAPTURE) $(FILTER)
-TEST_ROOT := CARGO_TARGET_DIR=target CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
-	cargo nextest $(NEXTEST_CMD) --release $(NEXTEST_CAPTURE) --features privileged-tests $(FILTER)
+# Base test command
+NEXTEST := CARGO_TARGET_DIR=target cargo nextest $(NEXTEST_CMD) --release
 
 # Container run command
 CONTAINER_RUN := podman run --rm --privileged --userns=keep-id --group-add keep-groups \
@@ -41,16 +37,16 @@ CONTAINER_RUN := podman run --rm --privileged --userns=keep-id --group-add keep-
 	-e CARGO_HOME=/home/testuser/.cargo --device /dev/fuse --device /dev/kvm \
 	--ulimit nofile=65536:65536 --pids-limit=65536 -v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs
 
-.PHONY: all help build clean test test-unit test-fast test-all test-root bench lint fmt \
+.PHONY: all help build clean test test-unit test-fast test-all test-root \
+	_test-unit _test-fast _test-all _test-root \
 	container-build container-test container-test-unit container-test-fast container-test-all \
-	container-shell container-clean setup-btrfs setup-fcvm setup-pjdfstest
+	container-shell container-clean setup-btrfs setup-fcvm setup-pjdfstest bench lint fmt
 
 all: build
 
 help:
 	@echo "fcvm: make build | test-unit | test-fast | test-all | test-root"
-	@echo "      make container-test-unit | container-test-fast | container-test-all | container-shell"
-	@echo "      make setup-btrfs | setup-fcvm | lint | bench | clean"
+	@echo "      make container-test-unit | container-test-fast | container-test-all"
 	@echo "Options: FILTER=pattern STREAM=1 LIST=1"
 
 build:
@@ -60,47 +56,61 @@ build:
 	@mkdir -p target/release && cp target/$(MUSL_TARGET)/release/fc-agent target/release/fc-agent
 
 clean:
-	sudo rm -rf target
+	sudo rm -rf target cargo-home
 
-test-unit: build
-	@echo "==> Running unit tests..."
-	$(TEST_UNIT)
+# Run-only targets (no setup deps, used by container)
+_test-unit:
+	$(NEXTEST) --no-default-features
 
-test-fast: setup-fcvm
-	@echo "==> Running fast tests..."
-	$(TEST_FAST)
+_test-fast:
+	$(NEXTEST) $(NEXTEST_CAPTURE) --no-default-features --features integration-fast $(FILTER)
 
-test-all: setup-fcvm
-	@echo "==> Running all tests..."
-	$(TEST_ALL)
+_test-all:
+	$(NEXTEST) $(NEXTEST_CAPTURE) $(FILTER)
 
-test-root: setup-fcvm setup-pjdfstest
-	@echo "==> Running all tests (including privileged)..."
-	$(TEST_ROOT)
+_test-root:
+	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
+	$(NEXTEST) $(NEXTEST_CAPTURE) --features privileged-tests $(FILTER)
 
+# Host targets (with setup)
+test-unit: build _test-unit
+test-fast: setup-fcvm _test-fast
+test-all: setup-fcvm _test-all
+test-root: setup-fcvm setup-pjdfstest _test-root
 test: test-root
 
-bench: build
-	@echo "==> Running benchmarks..."
-	sudo cargo bench -p fuse-pipe --bench throughput
-	sudo cargo bench -p fuse-pipe --bench operations
-	cargo bench -p fuse-pipe --bench protocol
+# Container targets (setup on host where needed, run-only in container)
+container-test-unit: container-build
+	@echo "==> Running unit tests in container..."
+	$(CONTAINER_RUN) $(CONTAINER_TAG) make build _test-unit
 
-lint:
-	cargo test --test lint
+container-test-fast: setup-fcvm container-build
+	@echo "==> Running fast tests in container..."
+	$(CONTAINER_RUN) $(CONTAINER_TAG) make _test-fast
 
-fmt:
-	cargo fmt
+container-test-all: setup-fcvm container-build
+	@echo "==> Running all tests in container..."
+	$(CONTAINER_RUN) $(CONTAINER_TAG) make _test-all
+
+container-test: container-test-all
+
+container-build:
+	podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) .
+
+container-shell: container-build
+	$(CONTAINER_RUN) -it $(CONTAINER_TAG) bash
+
+container-clean:
+	podman rmi $(CONTAINER_TAG) 2>/dev/null || true
 
 # Setup targets
-PJDFSTEST_DIR := /tmp/pjdfstest-check
-
 setup-pjdfstest:
-	@if [ ! -x $(PJDFSTEST_DIR)/pjdfstest ]; then \
+	@if [ ! -x /tmp/pjdfstest-check/pjdfstest ]; then \
 		echo '==> Building pjdfstest...'; \
-		rm -rf $(PJDFSTEST_DIR) && \
-		git clone --depth 1 https://github.com/pjd/pjdfstest $(PJDFSTEST_DIR) && \
-		cd $(PJDFSTEST_DIR) && autoreconf -ifs && ./configure && make; \
+		rm -rf /tmp/pjdfstest-check && \
+		git clone --depth 1 https://github.com/pjd/pjdfstest /tmp/pjdfstest-check && \
+		cd /tmp/pjdfstest-check && autoreconf -ifs && ./configure && make; \
 	fi
 
 setup-btrfs:
@@ -119,32 +129,20 @@ setup-btrfs:
 setup-fcvm: build setup-btrfs
 	@FREE_GB=$$(df -BG /mnt/fcvm-btrfs 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \
 	if [ -n "$$FREE_GB" ] && [ "$$FREE_GB" -lt 15 ]; then \
-		echo "ERROR: Need 15GB on /mnt/fcvm-btrfs (have $${FREE_GB}GB). Run: sudo btrfs filesystem resize max /mnt/fcvm-btrfs"; \
+		echo "ERROR: Need 15GB on /mnt/fcvm-btrfs (have $${FREE_GB}GB)"; \
 		exit 1; \
 	fi
 	@echo "==> Running fcvm setup..."
 	./target/release/fcvm setup
 
-# Container targets
-container-build:
-	podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) .
+bench: build
+	@echo "==> Running benchmarks..."
+	sudo cargo bench -p fuse-pipe --bench throughput
+	sudo cargo bench -p fuse-pipe --bench operations
+	cargo bench -p fuse-pipe --bench protocol
 
-container-test-unit: container-build
-	@echo "==> Running unit tests in container..."
-	$(CONTAINER_RUN) $(CONTAINER_TAG) make test-unit LIST=$(LIST)
+lint:
+	cargo test --test lint
 
-container-test-fast: setup-fcvm container-build
-	@echo "==> Running fast tests in container..."
-	$(CONTAINER_RUN) $(CONTAINER_TAG) make test-fast LIST=$(LIST)
-
-container-test-all: setup-fcvm container-build
-	@echo "==> Running all tests in container..."
-	$(CONTAINER_RUN) $(CONTAINER_TAG) make test-all LIST=$(LIST)
-
-container-test: container-test-all
-
-container-shell: container-build
-	$(CONTAINER_RUN) -it $(CONTAINER_TAG) bash
-
-container-clean:
-	podman rmi $(CONTAINER_TAG) 2>/dev/null || true
+fmt:
+	cargo fmt

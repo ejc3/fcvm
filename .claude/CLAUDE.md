@@ -274,9 +274,16 @@ assert!(localhost_works, "Localhost port forwarding should work (requires route_
    // Returns: mytest-base-12345-0, mytest-clone-12345-0, etc.
    ```
 
-2. **Port conflicts**: Loopback IP allocation checks port availability before assigning
-   - If orphaned processes hold ports, allocation skips those IPs
-   - Implemented in `state/manager.rs::is_port_available()`
+2. **Port forwarding**: Both networking modes use unique IPs, so same port works
+   ```rust
+   // BRIDGED: DNAT scoped to veth IP (172.30.x.y) - same port works across VMs
+   "--publish", "8080:80"  // Test curls veth's host_ip:8080
+
+   // ROOTLESS: each VM gets unique loopback IP (127.x.y.z) - same port works
+   "--publish", "8080:80"  // Test curls loopback_ip:8080
+   ```
+   - Tests must curl the VM's assigned IP (veth host_ip or loopback_ip), not localhost
+   - Get the IP from VM state: `config.network.host_ip` (bridged) or `config.network.loopback_ip` (rootless)
 
 3. **Disk cleanup**: VM data directories are cleaned up on exit
    - `podman.rs` and `snapshot.rs` both delete `data_dir` on VM exit
@@ -898,6 +905,34 @@ ip addr add 172.16.29.1/24 dev tap-vm-c93e8   # Guest is 172.16.29.2
 - For systemd-resolved hosts, falls back to `/run/systemd/resolve/resolv.conf`
 - Traffic flows: Guest → NAT → Host's DNS servers
 - No dnsmasq required
+
+### Container Resource Limits (EAGAIN Debugging)
+
+**Symptom:** Tests fail with "Resource temporarily unavailable (os error 11)" or "fork/exec: resource temporarily unavailable"
+
+**Debugging steps:**
+1. Check dmesg for cgroup rejections:
+   ```bash
+   sudo dmesg | grep -i "fork rejected"
+   # Look for: "cgroup: fork rejected by pids controller in /machine.slice/libpod-..."
+   ```
+
+2. Check actual process/thread counts (usually much lower than limits):
+   ```bash
+   ps aux | wc -l          # Process count
+   ps -eLf | wc -l         # Thread count
+   ps -eo user,nlwp,comm --sort=-nlwp | head -20  # Top by threads
+   ```
+
+3. Check container pids limit (NOT ulimit - cgroup is separate!):
+   ```bash
+   sudo podman run --rm alpine cat /sys/fs/cgroup/pids.max
+   # Default: 2048 (way too low for parallel VM tests)
+   ```
+
+**Root cause:** Podman sets cgroup pids limit to 2048 by default. This is NOT the same as `ulimit -u` (nproc). The cgroup pids controller limits total processes/threads in the container.
+
+**Fix:** Use `--pids-limit=65536` in container run command (already in Makefile).
 
 ### Pipe Buffer Deadlock in Tests (CRITICAL)
 

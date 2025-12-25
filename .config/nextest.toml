@@ -53,9 +53,15 @@ slow-timeout = { period = "600s", terminate-after = 1 }
 
 # VM tests get 10 minute timeout
 [[profile.default.overrides]]
-filter = "package(fcvm) & test(/test_/) & !test(/stress_100/)"
+filter = "package(fcvm) & test(/test_/) & !test(/stress_100/) & !test(/pjdfstest_vm/)"
 test-group = "vm-tests"
 slow-timeout = { period = "600s", terminate-after = 1 }
+
+# In-VM pjdfstest needs 15 minutes (image import via FUSE over vsock is slow)
+[[profile.default.overrides]]
+filter = "package(fcvm) & test(/pjdfstest_vm/)"
+test-group = "vm-tests"
+slow-timeout = { period = "900s", terminate-after = 1 }
 
 # fuse-pipe tests can run with full parallelism
 [[profile.default.overrides]]
