@@ -159,29 +159,23 @@ echo 'FCVM: Packages installed successfully'
     .to_string()
 }
 
-/// Generate the script used to download packages via podman.
-/// This script is included in the hash to ensure cache invalidation
-/// when the download method or target Ubuntu version changes.
+/// Generate the bash script that runs INSIDE the ubuntu container to download packages.
+/// This script is included in the hash to ensure cache invalidation when the
+/// download method or package list changes. The same script is used for execution
+/// in download_packages().
 pub fn generate_download_script(plan: &Plan) -> String {
     let packages = plan.packages.all_packages();
     let packages_str = packages.join(" ");
     let codename = &plan.base.codename;
 
+    // This is the script that runs inside the ubuntu container
+    // Format: codename is used for the container image, packages for apt-get
     format!(
-        r#"#!/bin/bash
-# Download packages for Ubuntu {codename} using podman
-# This script is hashed to invalidate cache when download method changes
-set -euo pipefail
-CONTAINER_IMAGE="ubuntu:{codename}"
-PACKAGES="{packages}"
-
-podman run --rm --cgroups=disabled -v "$PACKAGES_DIR:/packages" "$CONTAINER_IMAGE" bash -c '
+        r#"# Download packages for Ubuntu {codename}
 set -euo pipefail
 apt-get update -qq
-# Use apt-get install --download-only to properly resolve dependencies
-apt-get install --download-only --yes --no-install-recommends '"$PACKAGES"'
+apt-get install --download-only --yes --no-install-recommends {packages}
 cp /var/cache/apt/archives/*.deb /packages/ 2>/dev/null || true
-'
 "#,
         codename = codename,
         packages = packages_str
@@ -1515,39 +1509,13 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
     let _ = tokio::fs::remove_dir_all(&packages_dir).await;
     tokio::fs::create_dir_all(&packages_dir).await?;
 
-    // Get list of packages
-    let packages = plan.packages.all_packages();
-    let packages_str = packages.join(" ");
-
-    // Use podman to download packages from the target Ubuntu version
-    // This ensures we get packages for Noble (24.04) even if host runs Jammy (22.04)
     let codename = &plan.base.codename;
     let container_image = format!("ubuntu:{}", codename);
 
-    info!(
-        packages = %packages_str,
-        codename = %codename,
-        "downloading .deb packages using container"
-    );
+    info!(codename = %codename, "downloading .deb packages using container");
 
-    // Download script that runs inside the container:
-    // 1. apt-get update to get package lists
-    // 2. apt-get install --download-only to resolve and download packages
-    //    This properly resolves conflicts (unlike apt-cache depends which gets ALL alternatives)
-    // 3. Copy downloaded .deb files to output directory
-    let download_script = format!(
-        r#"set -euo pipefail
-apt-get update -qq
-
-# Use apt-get install --download-only to properly resolve dependencies
-# This avoids conflicts like libqt5gui5t64 vs libqt5gui5-gles
-apt-get install --download-only --yes --no-install-recommends {packages}
-
-# Copy all downloaded .deb files to output directory
-cp /var/cache/apt/archives/*.deb /packages/ 2>/dev/null || true
-"#,
-        packages = packages_str
-    );
+    // Use the same script that's included in the hash
+    let download_script = generate_download_script(plan);
 
     let output = Command::new("podman")
         .args([
