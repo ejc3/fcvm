@@ -12,6 +12,8 @@
 # Ubuntu 24.04 LTS (Noble Numbat) cloud images
 # Using "current" for latest updates - URL changes trigger plan SHA change
 version = "24.04"
+# Codename used to download packages from correct Ubuntu release
+codename = "noble"
 
 [base.arm64]
 url = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img"

@@ -34,6 +34,8 @@ pub struct Plan {
 #[derive(Debug, Deserialize, Clone)]
 pub struct BaseConfig {
     pub version: String,
+    /// Ubuntu codename (e.g., "noble" for 24.04) - used to download packages
+    pub codename: String,
     pub arm64: ArchConfig,
     pub amd64: ArchConfig,
 }
@@ -121,19 +123,69 @@ pub struct CleanupConfig {
 /// This script installs packages from /mnt/packages and removes conflicting packages.
 pub fn generate_install_script() -> String {
     r#"#!/bin/bash
-set -e
+set -euo pipefail
+
 echo 'FCVM: Removing conflicting packages before install...'
 # Remove time-daemon provider that conflicts with chrony
-apt-get remove -y --purge systemd-timesyncd 2>/dev/null || true
+apt-get remove -y --purge systemd-timesyncd || true
 # Remove packages we don't need in microVM (also frees space)
-apt-get remove -y --purge cloud-init snapd ubuntu-server 2>/dev/null || true
+apt-get remove -y --purge cloud-init snapd ubuntu-server || true
 
 echo 'FCVM: Installing packages from initrd...'
-dpkg -i /mnt/packages/*.deb || true
-apt-get -f install -y || true
+PKG_COUNT=$(ls /mnt/packages/*.deb 2>/dev/null | wc -l)
+echo "FCVM: Found $PKG_COUNT .deb files"
+
+# Capture dpkg output for error reporting
+DPKG_LOG=/tmp/dpkg-install.log
+dpkg -i /mnt/packages/*.deb 2>&1 | tee "$DPKG_LOG"
+DPKG_STATUS=${PIPESTATUS[0]}
+
+if [ $DPKG_STATUS -ne 0 ]; then
+    echo ''
+    echo '=========================================='
+    echo 'FCVM ERROR: dpkg -i failed!'
+    echo '=========================================='
+    echo 'Failed packages:'
+    grep -E '^dpkg: error|^Errors were encountered' "$DPKG_LOG" || true
+    echo ''
+    echo 'Dependency problems:'
+    grep -E 'dependency problems|depends on' "$DPKG_LOG" || true
+    echo '=========================================='
+    exit 1
+fi
+
 echo 'FCVM: Packages installed successfully'
 "#
     .to_string()
+}
+
+/// Generate the script used to download packages via podman.
+/// This script is included in the hash to ensure cache invalidation
+/// when the download method or target Ubuntu version changes.
+pub fn generate_download_script(plan: &Plan) -> String {
+    let packages = plan.packages.all_packages();
+    let packages_str = packages.join(" ");
+    let codename = &plan.base.codename;
+
+    format!(
+        r#"#!/bin/bash
+# Download packages for Ubuntu {codename} using podman
+# This script is hashed to invalidate cache when download method changes
+set -euo pipefail
+CONTAINER_IMAGE="ubuntu:{codename}"
+PACKAGES="{packages}"
+
+podman run --rm -v "$PACKAGES_DIR:/packages" "$CONTAINER_IMAGE" bash -c '
+set -euo pipefail
+apt-get update -qq
+# Use apt-get install --download-only to properly resolve dependencies
+apt-get install --download-only --yes --no-install-recommends '"$PACKAGES"'
+cp /var/cache/apt/archives/*.deb /packages/ 2>/dev/null || true
+'
+"#,
+        codename = codename,
+        packages = packages_str
+    )
 }
 
 /// Generate the init script that runs in the initrd during Layer 2 setup.
@@ -205,12 +257,20 @@ echo "FCVM Layer 2 Setup: Installing packages..."
 chroot /newroot /bin/bash /tmp/install-packages.sh
 INSTALL_RESULT=$?
 echo "FCVM Layer 2 Setup: Package installation returned: $INSTALL_RESULT"
+if [ $INSTALL_RESULT -ne 0 ]; then
+    echo "FCVM_SETUP_FAILED: Package installation failed with exit code $INSTALL_RESULT"
+    poweroff -f
+fi
 
 # Run setup script using chroot
 echo "FCVM Layer 2 Setup: Running setup script..."
 chroot /newroot /bin/bash /tmp/fcvm-setup.sh
 SETUP_RESULT=$?
 echo "FCVM Layer 2 Setup: Setup script returned: $SETUP_RESULT"
+if [ $SETUP_RESULT -ne 0 ]; then
+    echo "FCVM_SETUP_FAILED: Setup script failed with exit code $SETUP_RESULT"
+    poweroff -f
+fi
 
 # Cleanup chroot mounts (use lazy unmount as fallback)
 echo "FCVM Layer 2 Setup: Cleaning up..."
@@ -220,6 +280,10 @@ umount /newroot/proc 2>/dev/null || umount -l /newroot/proc 2>/dev/null || true
 rm -rf /newroot/mnt/packages
 rm -f /newroot/tmp/install-packages.sh
 rm -f /newroot/tmp/fcvm-setup.sh
+
+# Write marker file to rootfs (proves setup completed successfully)
+date -u '+%Y-%m-%dT%H:%M:%SZ' > /newroot/etc/fcvm-setup-complete
+echo "FCVM Layer 2 Setup: Wrote marker file /etc/fcvm-setup-complete"
 
 # Sync and unmount rootfs
 sync
@@ -269,6 +333,8 @@ pub fn generate_setup_script(plan: &Plan) -> String {
                 s.push_str(&format!("mkdir -p {}\n", parent.display()));
             }
         }
+        // Remove dangling symlinks (e.g., /etc/resolv.conf -> /run/systemd/...)
+        s.push_str(&format!("rm -f {} 2>/dev/null || true\n", path));
         s.push_str(&format!("cat > {} << 'FCVM_EOF'\n", path));
         s.push_str(&config.content);
         if !config.content.ends_with('\n') {
@@ -439,19 +505,23 @@ pub async fn ensure_rootfs(allow_create: bool) -> Result<PathBuf> {
     let setup_script = generate_setup_script(&plan);
     let install_script = generate_install_script();
     let init_script = generate_init_script(&install_script, &setup_script);
+    let download_script = generate_download_script(&plan);
 
     // Get kernel URL for the current architecture
     let kernel_config = plan.kernel.current_arch()?;
     let kernel_url = &kernel_config.url;
 
-    // Hash the complete init script + kernel URL
+    // Hash the complete init script + kernel URL + download script
     // Any change to:
     // - init logic, install script, or setup script
     // - kernel URL (different kernel version/release)
+    // - download method (podman image, codename, packages)
     // invalidates the cache
     let mut combined = init_script.clone();
     combined.push_str("\n# KERNEL_URL: ");
     combined.push_str(kernel_url);
+    combined.push_str("\n# DOWNLOAD_SCRIPT:\n");
+    combined.push_str(&download_script);
     let script_sha = compute_sha256(combined.as_bytes());
     let script_sha_short = &script_sha[..12];
 
@@ -1403,61 +1473,54 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
     let packages = plan.packages.all_packages();
     let packages_str = packages.join(" ");
 
-    info!(packages = %packages_str, "downloading .deb packages on host");
+    // Use podman to download packages from the target Ubuntu version
+    // This ensures we get packages for Noble (24.04) even if host runs Jammy (22.04)
+    let codename = &plan.base.codename;
+    let container_image = format!("ubuntu:{}", codename);
 
-    // Download packages with dependencies using apt-get download
-    // We need to run this in a way that downloads packages for the target system
-    // Using apt-get download with proper architecture
-    let output = Command::new("apt-get")
+    info!(
+        packages = %packages_str,
+        codename = %codename,
+        "downloading .deb packages using container"
+    );
+
+    // Download script that runs inside the container:
+    // 1. apt-get update to get package lists
+    // 2. apt-get install --download-only to resolve and download packages
+    //    This properly resolves conflicts (unlike apt-cache depends which gets ALL alternatives)
+    // 3. Copy downloaded .deb files to output directory
+    let download_script = format!(
+        r#"set -euo pipefail
+apt-get update -qq
+
+# Use apt-get install --download-only to properly resolve dependencies
+# This avoids conflicts like libqt5gui5t64 vs libqt5gui5-gles
+apt-get install --download-only --yes --no-install-recommends {packages}
+
+# Copy all downloaded .deb files to output directory
+cp /var/cache/apt/archives/*.deb /packages/ 2>/dev/null || true
+"#,
+        packages = packages_str
+    );
+
+    let output = Command::new("podman")
         .args([
-            "download",
-            "-o",
-            &format!("Dir::Cache::archives={}", packages_dir.display()),
+            "run",
+            "--rm",
+            "-v",
+            &format!("{}:/packages", packages_dir.display()),
+            &container_image,
+            "bash",
+            "-c",
+            &download_script,
         ])
-        .args(&packages)
-        .current_dir(&packages_dir)
         .output()
         .await
-        .context("downloading packages with apt-get")?;
+        .context("downloading packages with podman")?;
 
     if !output.status.success() {
-        // apt-get download might fail, try with apt-cache to get dependencies first
-        warn!("apt-get download failed, trying alternative method");
-
-        // Alternative: use apt-rdepends or manually download
-        for pkg in &packages {
-            let output = Command::new("apt-get")
-                .args(["download", pkg])
-                .current_dir(&packages_dir)
-                .output()
-                .await;
-
-            if let Ok(out) = output {
-                if !out.status.success() {
-                    warn!(package = %pkg, "failed to download package, continuing...");
-                }
-            }
-        }
-    }
-
-    // Also download dependencies
-    info!("downloading package dependencies");
-    let deps_output = Command::new("sh")
-        .args([
-            "-c",
-            &format!(
-                "apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts \
-                 --no-breaks --no-replaces --no-enhances {} | \
-                 grep '^\\w' | sort -u | xargs apt-get download 2>/dev/null || true",
-                packages_str
-            ),
-        ])
-        .current_dir(&packages_dir)
-        .output()
-        .await;
-
-    if let Err(e) = deps_output {
-        warn!(error = %e, "failed to download some dependencies, continuing...");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(stderr = %stderr, "podman download had errors, checking results...");
     }
 
     // Count downloaded packages
@@ -1474,10 +1537,15 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
             }
         }
     }
-    info!(count = count, "downloaded .deb packages");
 
     if count == 0 {
-        bail!("No packages downloaded. Check network and apt configuration.");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "No packages downloaded. stdout={}, stderr={}",
+            stdout.trim(),
+            stderr.trim()
+        );
     }
 
     info!(path = %packages_dir.display(), count = count, "packages downloaded");
@@ -1719,6 +1787,14 @@ async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
             let serial_content = tokio::fs::read_to_string(&serial_path)
                 .await
                 .unwrap_or_default();
+            if serial_content.contains("FCVM_SETUP_FAILED") {
+                warn!("Setup failed! Serial console output:\n{}", serial_content);
+                if let Ok(log_content) = tokio::fs::read_to_string(&log_path).await {
+                    warn!("Firecracker log:\n{}", log_content);
+                }
+                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+                bail!("Layer 2 setup failed (script exited with error - check logs above)");
+            }
             if !serial_content.contains("FCVM_SETUP_COMPLETE") {
                 warn!("Setup failed! Serial console output:\n{}", serial_content);
                 if let Ok(log_content) = tokio::fs::read_to_string(&log_path).await {
@@ -1727,6 +1803,31 @@ async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
                 let _ = tokio::fs::remove_dir_all(&temp_dir).await;
                 bail!("Layer 2 setup failed (no FCVM_SETUP_COMPLETE marker found)");
             }
+
+            // Verify marker file exists in the rootfs
+            let mount_dir = temp_dir.join("verify-mount");
+            tokio::fs::create_dir_all(&mount_dir).await?;
+            let mount_output = Command::new("mount")
+                .args(["-o", "ro", path_to_str(disk_path)?, path_to_str(&mount_dir)?])
+                .output()
+                .await?;
+            if !mount_output.status.success() {
+                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+                bail!(
+                    "Failed to mount rootfs for verification: {}",
+                    String::from_utf8_lossy(&mount_output.stderr)
+                );
+            }
+            let marker_path = mount_dir.join("etc/fcvm-setup-complete");
+            let marker_exists = marker_path.exists();
+            // Unmount before checking result
+            let _ = Command::new("umount").arg(&mount_dir).output().await;
+            if !marker_exists {
+                warn!("Setup failed! Serial console output:\n{}", serial_content);
+                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+                bail!("Layer 2 setup failed: marker file /etc/fcvm-setup-complete not found in rootfs");
+            }
+
             let _ = tokio::fs::remove_dir_all(&temp_dir).await;
             info!(
                 elapsed_secs = elapsed.as_secs(),
