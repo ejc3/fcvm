@@ -193,6 +193,24 @@ Why: String matching breaks when JSON formatting changes (spaces, newlines, fiel
 
 If a test fails intermittently, that's a **concurrency bug** or **race condition** that must be fixed, not ignored.
 
+### POSIX Compliance Testing
+
+**fuse-pipe must pass pjdfstest** - the POSIX filesystem test suite.
+
+When a POSIX test fails:
+1. **Understand the POSIX requirement** - What behavior does the spec require?
+2. **Check kernel vs userspace** - FUSE operations go through the kernel, which handles inode lifecycle. Unit tests calling PassthroughFs directly bypass this.
+3. **Use integration tests for complex behavior** - Hardlinks, permissions, and refcounting require the full FUSE stack (kernel manages inodes).
+4. **Unit tests for simple operations** - Single file create/read/write can be tested directly.
+
+**Key FUSE concepts:**
+- Kernel maintains `nlookup` (lookup count) for inodes
+- `release()` closes file handles, does NOT decrement nlookup
+- `forget()` decrements nlookup; inode removed when count reaches zero
+- Hardlinks work because kernel resolves paths to inodes before calling LINK
+
+**If a unit test works locally but fails in CI:** Add diagnostics to understand the exact failure. Don't assume - investigate filesystem type, inode tracking, and timing.
+
 ### Race Condition Debugging Protocol
 
 **Show, don't tell. We have extensive logs - it's NEVER a guess.**

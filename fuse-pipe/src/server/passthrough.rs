@@ -1262,13 +1262,7 @@ mod tests {
 
     #[test]
     fn test_passthrough_hardlink() {
-        // Use .local/ in project root to support hardlinks on overlayfs
-        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join(".local");
-        let _ = std::fs::create_dir_all(&base);
-        let dir = tempfile::tempdir_in(&base).unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let fs = PassthroughFs::new(dir.path());
 
         let uid = nix::unistd::Uid::effective().as_raw();
@@ -1282,10 +1276,22 @@ mod tests {
             _ => panic!("Expected Created response"),
         };
 
-        // Write to source
+        // Write to source and release handle
         let resp = fs.write(source_ino, fh, 0, b"hardlink test content", uid, gid, 0);
         assert!(matches!(resp, VolumeResponse::Written { .. }));
         fs.release(source_ino, fh);
+
+        // In real FUSE, the kernel calls LOOKUP on the source before LINK.
+        // This lookup refreshes the inode reference in fuse-backend-rs.
+        // We must do the same when calling PassthroughFs directly.
+        let resp = fs.lookup(1, "source.txt", uid, gid, 0);
+        let source_ino = match resp {
+            VolumeResponse::Entry { attr, .. } => attr.ino,
+            VolumeResponse::Error { errno } => {
+                panic!("Lookup after release failed: errno={}", errno);
+            }
+            _ => panic!("Expected Entry response"),
+        };
 
         // Create hardlink
         let resp = fs.link(source_ino, 1, "link.txt", uid, gid, 0);
@@ -1296,14 +1302,6 @@ mod tests {
                 attr.ino
             }
             VolumeResponse::Error { errno } => {
-                // Dump diagnostics on failure
-                eprintln!("=== Hardlink test diagnostics ===");
-                eprintln!("base dir: {:?}", base);
-                eprintln!("temp dir: {:?}", dir.path());
-                eprintln!("dir exists: {}", dir.path().exists());
-                eprintln!("dir contents: {:?}", std::fs::read_dir(dir.path()).ok().map(|d| d.map(|e| e.ok().map(|e| e.file_name())).collect::<Vec<_>>()));
-                eprintln!("source_ino: {}", source_ino);
-                eprintln!("errno: {} ({})", errno, std::io::Error::from_raw_os_error(errno));
                 panic!("Link failed with errno: {}", errno);
             }
             _ => panic!("Expected Entry response"),

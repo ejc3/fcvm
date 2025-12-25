@@ -70,18 +70,12 @@ pub fn is_fuse_mount(path: &Path) -> bool {
 }
 
 /// Create unique paths for each test with the given prefix.
-/// Uses .local/ in project root to support hardlinks on overlayfs.
+/// Uses /tmp for temp directories.
 pub fn unique_paths(prefix: &str) -> (PathBuf, PathBuf) {
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let pid = std::process::id();
-    // Use project root's .local/ directory (CARGO_MANIFEST_DIR is fuse-pipe/)
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join(".local");
-    let _ = fs::create_dir_all(&base);
-    let data_dir = base.join(format!("{}-data-{}-{}", prefix, pid, id));
-    let mount_dir = base.join(format!("{}-mount-{}-{}", prefix, pid, id));
+    let data_dir = PathBuf::from(format!("/tmp/{}-data-{}-{}", prefix, pid, id));
+    let mount_dir = PathBuf::from(format!("/tmp/{}-mount-{}-{}", prefix, pid, id));
 
     // Cleanup any stale state - only unmount if actually mounted
     let _ = fs::remove_dir_all(&data_dir);
