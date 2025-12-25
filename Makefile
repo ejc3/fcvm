@@ -33,8 +33,7 @@ NEXTEST := CARGO_TARGET_DIR=target cargo nextest $(NEXTEST_CMD) --release
 # Container run command
 CONTAINER_RUN := podman run --rm --privileged --userns=keep-id --group-add keep-groups \
 	-v .:/workspace/fcvm -v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs -v $(FUSER):/workspace/fuser \
-	-v ./target:/workspace/fcvm/target -v ./cargo-home:/home/testuser/.cargo \
-	-e CARGO_HOME=/home/testuser/.cargo --device /dev/fuse --device /dev/kvm \
+	-v ./target:/workspace/fcvm/target --device /dev/fuse --device /dev/kvm \
 	--ulimit nofile=65536:65536 --pids-limit=65536 -v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs
 
 .PHONY: all help build clean test test-unit test-fast test-all test-root \
@@ -56,7 +55,7 @@ build:
 	@mkdir -p target/release && cp target/$(MUSL_TARGET)/release/fc-agent target/release/fc-agent
 
 clean:
-	sudo rm -rf target cargo-home
+	sudo rm -rf target
 
 # Run-only targets (no setup deps, used by container)
 _test-unit:
@@ -96,7 +95,7 @@ container-test-all: setup-fcvm container-build
 container-test: container-test-all
 
 container-build:
-	@mkdir -p target cargo-home
+	@mkdir -p target
 	@sudo mkdir -p /mnt/fcvm-btrfs 2>/dev/null || true
 	podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) .
 
