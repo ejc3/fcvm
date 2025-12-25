@@ -47,15 +47,16 @@ Without `STREAM=1`, nextest captures output and only shows it after tests comple
 
 ### Debug Logs
 
-**All tests automatically capture debug-level logs to files:**
-```
-/tmp/fcvm-test-logs/{name}-{timestamp}.log
-```
+**All tests automatically capture debug-level logs to files.**
 
-- Console shows INFO/WARN/ERROR (clean)
-- Files contain DEBUG/TRACE (full detail)
-- CI uploads logs as artifacts on every run
-- Each spawned fcvm process gets its own log file
+How it works:
+- `spawn_fcvm()` and `spawn_fcvm_with_logs()` always create a log file
+- fcvm runs with `RUST_LOG=debug` for full debug output
+- Console shows INFO/WARN/ERROR only (DEBUG filtered out)
+- Log file has everything including DEBUG/TRACE
+- Path printed at end: `📋 Debug log: /tmp/fcvm-test-logs/{name}-{timestamp}.log`
+- CI uploads `/tmp/fcvm-test-logs/` as artifacts (7 day retention)
+- Tests add `--setup` flag automatically, so missing initrd auto-creates
 
 ### Common Commands
 ```bash
