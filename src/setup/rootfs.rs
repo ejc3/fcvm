@@ -284,6 +284,38 @@ rm -rf /newroot/mnt/packages
 rm -f /newroot/tmp/install-packages.sh
 rm -f /newroot/tmp/fcvm-setup.sh
 
+# Sanity checks before writing marker file
+echo "FCVM Layer 2 Setup: Running sanity checks..."
+SANITY_FAILED=0
+
+# Check critical binaries exist
+for bin in podman crun skopeo; do
+    if [ ! -x "/newroot/usr/bin/$bin" ]; then
+        echo "FCVM ERROR: $bin not found at /newroot/usr/bin/$bin"
+        SANITY_FAILED=1
+    fi
+done
+
+# Check systemd exists
+if [ ! -x "/newroot/lib/systemd/systemd" ] && [ ! -x "/newroot/usr/lib/systemd/systemd" ]; then
+    echo "FCVM ERROR: systemd not found"
+    SANITY_FAILED=1
+fi
+
+# Check resolv.conf exists
+if [ ! -f "/newroot/etc/resolv.conf" ]; then
+    echo "FCVM ERROR: /etc/resolv.conf not found"
+    SANITY_FAILED=1
+fi
+
+if [ $SANITY_FAILED -ne 0 ]; then
+    echo "FCVM_SETUP_FAILED: Sanity checks failed"
+    mount -t proc proc /proc 2>/dev/null || true
+    echo o > /proc/sysrq-trigger 2>/dev/null || poweroff -f
+fi
+
+echo "FCVM Layer 2 Setup: Sanity checks passed"
+
 # Write marker file to rootfs (proves setup completed successfully)
 date -u '+%Y-%m-%dT%H:%M:%SZ' > /newroot/etc/fcvm-setup-complete
 echo "FCVM Layer 2 Setup: Wrote marker file /etc/fcvm-setup-complete"
@@ -295,13 +327,18 @@ umount /newroot 2>/dev/null || umount -l /newroot 2>/dev/null || true
 echo "FCVM_SETUP_COMPLETE"
 echo "FCVM Layer 2 Setup: Complete! Powering off..."
 
-# Use sysrq trigger for reliable shutdown (poweroff may not work in minimal initrd)
+# Re-mount /proc in case bind unmount affected it, then use sysrq for reliable shutdown
+mount -t proc proc /proc 2>/dev/null || true
 echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
 echo o > /proc/sysrq-trigger 2>/dev/null || true
 
-# Fallback: try poweroff if sysrq didn't work
+# Fallback methods if sysrq didn't work
 sleep 1
-poweroff -f
+reboot -f 2>/dev/null || true
+poweroff -f 2>/dev/null || true
+
+# Last resort: halt via kernel
+echo b > /proc/sysrq-trigger 2>/dev/null || true
 "#,
         install_script, setup_script
     )
@@ -1813,24 +1850,13 @@ async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
                 bail!("Layer 2 setup failed (no FCVM_SETUP_COMPLETE marker found)");
             }
 
-            // Verify marker file exists in the rootfs
-            let mount_dir = temp_dir.join("verify-mount");
-            tokio::fs::create_dir_all(&mount_dir).await?;
-            let mount_output = Command::new("mount")
-                .args(["-o", "ro", path_to_str(disk_path)?, path_to_str(&mount_dir)?])
+            // Verify marker file exists in the rootfs using debugfs (no root needed)
+            let debugfs_output = Command::new("debugfs")
+                .args(["-R", "stat /etc/fcvm-setup-complete", path_to_str(disk_path)?])
                 .output()
                 .await?;
-            if !mount_output.status.success() {
-                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-                bail!(
-                    "Failed to mount rootfs for verification: {}",
-                    String::from_utf8_lossy(&mount_output.stderr)
-                );
-            }
-            let marker_path = mount_dir.join("etc/fcvm-setup-complete");
-            let marker_exists = marker_path.exists();
-            // Unmount before checking result
-            let _ = Command::new("umount").arg(&mount_dir).output().await;
+            let marker_exists = debugfs_output.status.success()
+                && !String::from_utf8_lossy(&debugfs_output.stdout).contains("not found");
             if !marker_exists {
                 warn!("Setup failed! Serial console output:\n{}", serial_content);
                 let _ = tokio::fs::remove_dir_all(&temp_dir).await;
