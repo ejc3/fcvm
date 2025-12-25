@@ -13,50 +13,10 @@ env:
   CONTAINER_ARCH: x86_64
 
 jobs:
-  container-rootless:
-    name: Container (rootless)
-    runs-on: buildjet-32vcpu-ubuntu-2204
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: fcvm
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuse-backend-rs
-          ref: master
-          path: fuse-backend-rs
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuser
-          ref: master
-          path: fuser
-      - name: make ci-container-rootless
-        working-directory: fcvm
-        run: make ci-container-rootless
-
-  container-sudo:
-    name: Container (sudo)
-    runs-on: buildjet-32vcpu-ubuntu-2204
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: fcvm
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuse-backend-rs
-          ref: master
-          path: fuse-backend-rs
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuser
-          ref: master
-          path: fuser
-      - name: make ci-container-sudo
-        working-directory: fcvm
-        run: make ci-container-sudo
-
-  vm:
-    name: VM (bare metal)
+  # Runner 1: Host (bare metal with KVM)
+  # Runs: test-unit → test-fast → test-root (sequential)
+  host:
+    name: Host
     runs-on: buildjet-32vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
@@ -81,7 +41,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y fuse3 libfuse3-dev libclang-dev clang musl-tools \
             iproute2 iptables slirp4netns dnsmasq qemu-utils e2fsprogs parted \
-            podman skopeo busybox-static cpio zstd
+            podman skopeo busybox-static cpio zstd autoconf automake libtool
       - name: Install Firecracker
         run: |
           curl -L -o /tmp/firecracker.tgz \
@@ -104,6 +64,41 @@ jobs:
           fi
           sudo chmod 666 /dev/userfaultfd
           sudo sysctl -w vm.unprivileged_userfaultfd=1
-      - name: make test-vm
+      - name: test-unit
         working-directory: fcvm
-        run: make test-vm
+        run: make test-unit
+      - name: test-fast
+        working-directory: fcvm
+        run: make test-fast
+      - name: test-root
+        working-directory: fcvm
+        run: make test-root
+
+  # Runner 2: Container (podman)
+  # Runs: container-test-unit → container-test-fast → container-test-all (sequential)
+  container:
+    name: Container
+    runs-on: buildjet-32vcpu-ubuntu-2204
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fcvm
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+      - name: container-test-unit
+        working-directory: fcvm
+        run: make container-test-unit
+      - name: container-test-fast
+        working-directory: fcvm
+        run: make container-test-fast
+      - name: container-test-all
+        working-directory: fcvm
+        run: make container-test-all
