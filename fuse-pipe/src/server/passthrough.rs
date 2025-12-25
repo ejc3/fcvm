@@ -1355,7 +1355,10 @@ mod tests {
         };
 
         // Create hardlink
-        eprintln!("Calling link(source_ino={}, parent=1, name='link.txt')...", source_ino);
+        eprintln!(
+            "Calling link(source_ino={}, parent=1, name='link.txt')...",
+            source_ino
+        );
         let resp = fs.link(source_ino, 1, "link.txt", uid, gid, 0);
         let link_ino = match resp {
             VolumeResponse::Entry { attr, .. } => {
@@ -1369,7 +1372,11 @@ mod tests {
                 let src_path = dir.path().join("source.txt");
                 let link_path = dir.path().join("link.txt");
                 eprintln!("=== link() FAILED ===");
-                eprintln!("errno: {} ({})", errno, std::io::Error::from_raw_os_error(errno));
+                eprintln!(
+                    "errno: {} ({})",
+                    errno,
+                    std::io::Error::from_raw_os_error(errno)
+                );
                 eprintln!("source.txt exists: {}", src_path.exists());
                 eprintln!("link.txt exists: {}", link_path.exists());
                 eprintln!(

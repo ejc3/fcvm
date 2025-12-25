@@ -210,7 +210,13 @@ fn test_hardlink_survives_source_removal() {
         eprintln!("=== Hardlink failed ===");
         eprintln!("source: {:?} exists={}", source, source.exists());
         eprintln!("link: {:?}", link);
-        eprintln!("mount contents: {:?}", fs::read_dir(mount).ok().map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name()).collect::<Vec<_>>()));
+        eprintln!(
+            "mount contents: {:?}",
+            fs::read_dir(mount).ok().map(|d| d
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>())
+        );
         panic!("create hardlink failed: {}", e);
     }
 

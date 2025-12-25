@@ -365,7 +365,10 @@ pub fn supports_at_empty_path(dir: &Path) -> bool {
         eprintln!("AT_EMPTY_PATH: supported");
     } else {
         let err = std::io::Error::last_os_error();
-        eprintln!("AT_EMPTY_PATH: not supported ({}) - skipping hardlink test", err);
+        eprintln!(
+            "AT_EMPTY_PATH: not supported ({}) - skipping hardlink test",
+            err
+        );
     }
     supported
 }

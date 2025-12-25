@@ -15,7 +15,7 @@ RUN cargo install cargo-nextest cargo-audit cargo-deny --locked
 RUN apt-get update && apt-get install -y \
     fuse3 libfuse3-dev autoconf automake libtool perl libclang-dev clang \
     musl-tools iproute2 iptables slirp4netns dnsmasq qemu-utils e2fsprogs \
-    parted podman skopeo git curl sudo procps zstd busybox-static cpio uidmap \
+    parted fdisk podman skopeo git curl sudo procps zstd busybox-static cpio uidmap \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Firecracker
