@@ -97,6 +97,7 @@ container-test: container-test-all
 
 container-build:
 	@mkdir -p target cargo-home
+	@sudo mkdir -p /mnt/fcvm-btrfs 2>/dev/null || true
 	podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) .
 
 container-shell: container-build
