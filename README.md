@@ -99,6 +99,13 @@ fcvm setup
 
 Subsequent runs are instant - everything is cached by content hash.
 
+**Alternative: Auto-setup on first run (rootless only)**
+```bash
+# Skip explicit setup - does it automatically on first run
+fcvm podman run --name web1 --network rootless --setup nginx:alpine
+```
+The `--setup` flag triggers setup if kernel/rootfs are missing. Only works with `--network rootless` (no sudo).
+
 ### Run a Container
 ```bash
 # Run nginx in a Firecracker VM (using AWS ECR public registry to avoid Docker Hub rate limits)
