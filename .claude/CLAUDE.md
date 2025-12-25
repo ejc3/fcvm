@@ -488,6 +488,24 @@ make container-test
 **Nightly (scheduled):**
 - Full benchmarks with artifact upload
 
+### Getting Logs from In-Progress CI Runs
+
+**`gh run view --log` only works after ALL jobs complete.** To get logs from a completed job while other jobs are still running:
+
+```bash
+# Get job ID for the completed job
+gh api repos/OWNER/REPO/actions/runs/RUN_ID/jobs --jq '.jobs[] | select(.name=="Host") | .id'
+
+# Fetch logs for that specific job
+gh api repos/OWNER/REPO/actions/runs/RUN_ID/jobs --jq '.jobs[] | select(.name=="Host") | .id' \
+  | xargs -I{} gh api repos/OWNER/REPO/actions/jobs/{}/logs 2>&1 \
+  | grep -E "pattern"
+```
+
+### linkat AT_EMPTY_PATH Limitation
+
+fuse-backend-rs hardlinks use `linkat(..., AT_EMPTY_PATH)` which requires `CAP_DAC_READ_SEARCH`. BuildJet runners lack this → ENOENT. Hardlink tests must detect and skip. See [linkat(2)](https://man7.org/linux/man-pages/man2/linkat.2.html).
+
 ## PID-Based Process Management
 
 **Core Principle:** All fcvm processes store their own PID (via `std::process::id()`), not child process PIDs.
