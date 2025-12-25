@@ -1741,6 +1741,13 @@ async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
             Err(e)
         }
         Err(_) => {
+            // Print serial log on timeout for debugging
+            if let Ok(serial_content) = tokio::fs::read_to_string(&serial_path).await {
+                eprintln!("=== Layer 2 setup VM timed out! Serial console output: ===\n{}", serial_content);
+            }
+            if let Ok(log_content) = tokio::fs::read_to_string(&log_path).await {
+                eprintln!("=== Firecracker log: ===\n{}", log_content);
+            }
             let _ = tokio::fs::remove_dir_all(&temp_dir).await;
             bail!("Layer 2 setup VM timed out after 15 minutes")
         }
