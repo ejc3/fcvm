@@ -193,42 +193,12 @@ fn test_hardlink_survives_source_removal() {
         }
     }
 
-    // Also check linkat with AT_EMPTY_PATH (used by fuse-backend-rs passthrough)
-    // This can fail on CI environments even when direct hardlinks work
-    use std::ffi::CString;
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
-    let test_link2 = data_dir.join("at_empty_test.txt");
-    let test_link2_name = CString::new("at_empty_test.txt").unwrap();
-    let dir_fd = fs::File::open(&data_dir).expect("open dir");
-    let src_fd = fs::File::options()
-        .custom_flags(libc::O_PATH)
-        .read(true)
-        .open(&test_src)
-        .expect("open src with O_PATH");
-    let empty = CString::new("").unwrap();
-    let res = unsafe {
-        libc::linkat(
-            src_fd.as_raw_fd(),
-            empty.as_ptr(),
-            dir_fd.as_raw_fd(),
-            test_link2_name.as_ptr(),
-            libc::AT_EMPTY_PATH,
-        )
-    };
-    if res == 0 {
-        eprintln!("linkat with AT_EMPTY_PATH: SUPPORTED");
-        fs::remove_file(&test_link2).ok();
-    } else {
-        let err = std::io::Error::last_os_error();
-        eprintln!("linkat with AT_EMPTY_PATH: FAILED - {}", err);
-        eprintln!("fuse-backend-rs uses AT_EMPTY_PATH for hardlinks");
-        eprintln!("Skipping test - AT_EMPTY_PATH not supported on this system");
-        fs::remove_file(&test_src).ok();
-        cleanup(&data_dir, &mount_dir);
-        return; // Skip test
-    }
+    // Check linkat with AT_EMPTY_PATH (used by fuse-backend-rs passthrough)
     fs::remove_file(&test_src).ok();
+    if !common::supports_at_empty_path(&data_dir) {
+        cleanup(&data_dir, &mount_dir);
+        return;
+    }
 
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
     let mount = fuse.mount_path();

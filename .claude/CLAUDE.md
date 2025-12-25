@@ -504,7 +504,7 @@ gh api repos/OWNER/REPO/actions/runs/RUN_ID/jobs --jq '.jobs[] | select(.name=="
 
 ### linkat AT_EMPTY_PATH Limitation
 
-fuse-backend-rs hardlinks use `linkat(..., AT_EMPTY_PATH)` which requires `CAP_DAC_READ_SEARCH`. BuildJet runners lack this → ENOENT. Hardlink tests must detect and skip. See [linkat(2)](https://man7.org/linux/man-pages/man2/linkat.2.html).
+fuse-backend-rs hardlinks use `linkat(..., AT_EMPTY_PATH)`. Older kernels require `CAP_DAC_READ_SEARCH` capability; newer kernels (≥5.12ish) relaxed this. BuildJet runs older kernel → ENOENT. Localhost (kernel 6.14) works fine. Hardlink tests detect and skip. See [linkat(2)](https://man7.org/linux/man-pages/man2/linkat.2.html), [kernel patch](https://lwn.net/Articles/565122/).
 
 ## PID-Based Process Management
 
