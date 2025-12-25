@@ -1295,7 +1295,17 @@ mod tests {
                 assert_eq!(attr.ino, source_ino);
                 attr.ino
             }
-            VolumeResponse::Error { errno } => panic!("Link failed with errno: {}", errno),
+            VolumeResponse::Error { errno } => {
+                // Dump diagnostics on failure
+                eprintln!("=== Hardlink test diagnostics ===");
+                eprintln!("base dir: {:?}", base);
+                eprintln!("temp dir: {:?}", dir.path());
+                eprintln!("dir exists: {}", dir.path().exists());
+                eprintln!("dir contents: {:?}", std::fs::read_dir(dir.path()).ok().map(|d| d.map(|e| e.ok().map(|e| e.file_name())).collect::<Vec<_>>()));
+                eprintln!("source_ino: {}", source_ino);
+                eprintln!("errno: {} ({})", errno, std::io::Error::from_raw_os_error(errno));
+                panic!("Link failed with errno: {}", errno);
+            }
             _ => panic!("Expected Entry response"),
         };
 
