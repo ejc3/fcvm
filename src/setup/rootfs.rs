@@ -175,7 +175,7 @@ set -euo pipefail
 CONTAINER_IMAGE="ubuntu:{codename}"
 PACKAGES="{packages}"
 
-podman run --rm -v "$PACKAGES_DIR:/packages" "$CONTAINER_IMAGE" bash -c '
+podman run --rm --cgroups=disabled -v "$PACKAGES_DIR:/packages" "$CONTAINER_IMAGE" bash -c '
 set -euo pipefail
 apt-get update -qq
 # Use apt-get install --download-only to properly resolve dependencies
