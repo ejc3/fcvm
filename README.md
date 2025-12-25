@@ -83,10 +83,21 @@ cargo build --release --workspace
 
 ### Setup (First Time)
 ```bash
-# Create btrfs filesystem and download kernel + rootfs (takes 5-10 minutes)
+# Create btrfs filesystem
 make setup-btrfs
+
+# Download kernel and create rootfs (takes 5-10 minutes first time)
 fcvm setup
 ```
+
+**What `fcvm setup` does:**
+1. Downloads Kata kernel (~15MB, cached by URL hash)
+2. Downloads packages via `podman run ubuntu:noble` (ensures correct Ubuntu 24.04 versions)
+3. Creates Layer 2 rootfs (~10GB): boots VM, installs packages, writes config files
+4. Verifies setup completed successfully (checks marker file)
+5. Creates fc-agent initrd
+
+Subsequent runs are instant - everything is cached by content hash.
 
 ### Run a Container
 ```bash
