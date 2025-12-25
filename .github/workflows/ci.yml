@@ -45,6 +45,7 @@ jobs:
         with:
           cache-provider: buildjet
           workspaces: fcvm -> target
+          shared-key: build-and-test
       - name: Install dependencies
         run: |
           sudo apt-get update
