@@ -30,11 +30,10 @@ endif
 # Base test command
 NEXTEST := CARGO_TARGET_DIR=target cargo nextest $(NEXTEST_CMD) --release
 
-# Container run command
+# Container run command (no target mount - let container use its own to avoid permission issues)
 CONTAINER_RUN := podman run --rm --privileged --userns=keep-id --group-add keep-groups \
 	-v .:/workspace/fcvm -v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs -v $(FUSER):/workspace/fuser \
-	-v ./target:/workspace/fcvm/target -e CARGO_HOME=/home/testuser/.cargo \
-	--device /dev/fuse --device /dev/kvm \
+	-e CARGO_HOME=/home/testuser/.cargo --device /dev/fuse --device /dev/kvm \
 	--ulimit nofile=65536:65536 --pids-limit=65536 -v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs
 
 .PHONY: all help build clean test test-unit test-fast test-all test-root \
@@ -96,7 +95,6 @@ container-test-all: setup-fcvm container-build
 container-test: container-test-all
 
 container-build:
-	@mkdir -p target
 	@sudo mkdir -p /mnt/fcvm-btrfs 2>/dev/null || true
 	podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) .
 
