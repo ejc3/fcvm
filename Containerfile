@@ -1,118 +1,48 @@
-# fcvm test container
-#
-# Build context must include fuse-backend-rs and fuser alongside fcvm:
-#   cd ~/fcvm && podman build -t fcvm-test -f Containerfile \
-#       --build-context fuse-backend-rs=../fuse-backend-rs \
-#       --build-context fuser=../fuser .
-#
-# Test with: podman run --rm --privileged --device /dev/fuse fcvm-test
-
 FROM docker.io/library/rust:1.83-bookworm
 
-# Copy rust-toolchain.toml to read version from single source of truth
+# Install Rust toolchain from rust-toolchain.toml
 COPY rust-toolchain.toml /tmp/rust-toolchain.toml
-
-# Install toolchain version from rust-toolchain.toml (avoids version drift)
-# Edition 2024 is stable since Rust 1.85
-# Also add musl targets for statically linked fc-agent (portable across glibc versions)
 RUN RUST_VERSION=$(grep 'channel' /tmp/rust-toolchain.toml | cut -d'"' -f2) && \
     rustup toolchain install $RUST_VERSION && \
     rustup default $RUST_VERSION && \
     rustup component add rustfmt clippy && \
     rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
 
-# Install cargo-nextest for test parallelism
-RUN cargo install cargo-nextest --locked
+# Install cargo tools
+RUN cargo install cargo-nextest cargo-audit cargo-deny --locked
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
-    # FUSE support
-    fuse3 \
-    libfuse3-dev \
-    # pjdfstest build deps
-    autoconf \
-    automake \
-    libtool \
-    # pjdfstest runtime deps
-    perl \
-    # Build deps for bindgen (userfaultfd-sys)
-    libclang-dev \
-    clang \
-    # musl libc for statically linked fc-agent (portable across glibc versions)
-    musl-tools \
-    # fcvm VM test dependencies
-    iproute2 \
-    iptables \
-    slirp4netns \
-    dnsmasq \
-    qemu-utils \
-    e2fsprogs \
-    parted \
-    # Container runtime for localhost image tests
-    podman \
-    skopeo \
-    # Utilities
-    git \
-    curl \
-    sudo \
-    procps \
-    zstd \
-    # Required for initrd creation (must be statically linked for kernel boot)
-    busybox-static \
-    cpio \
-    # Clean up
+    fuse3 libfuse3-dev autoconf automake libtool perl libclang-dev clang \
+    musl-tools iproute2 iptables slirp4netns dnsmasq qemu-utils e2fsprogs \
+    parted podman skopeo git curl sudo procps zstd busybox-static cpio uidmap \
     && rm -rf /var/lib/apt/lists/*
 
-# Download and install Firecracker (architecture-aware)
-# v1.14.0 adds network_overrides support for snapshot cloning
+# Install Firecracker
 ARG ARCH=aarch64
-RUN curl -L -o /tmp/firecracker.tgz \
+RUN curl -fsSL -o /tmp/fc.tgz \
     https://github.com/firecracker-microvm/firecracker/releases/download/v1.14.0/firecracker-v1.14.0-${ARCH}.tgz \
-    && tar --no-same-owner -xzf /tmp/firecracker.tgz -C /tmp \
+    && tar --no-same-owner -xzf /tmp/fc.tgz -C /tmp \
     && mv /tmp/release-v1.14.0-${ARCH}/firecracker-v1.14.0-${ARCH} /usr/local/bin/firecracker \
-    && chmod +x /usr/local/bin/firecracker \
-    && rm -rf /tmp/firecracker.tgz /tmp/release-v1.14.0-${ARCH}
+    && rm -rf /tmp/fc.tgz /tmp/release-v1.14.0-${ARCH}
 
-# pjdfstest is built via `make setup-pjdfstest` when tests run
-
-# Create non-root test user with access to fuse group
-RUN groupadd -f fuse \
+# Setup testuser with sudo and namespace support
+RUN echo "user_allow_other" >> /etc/fuse.conf \
+    && groupadd -f fuse && groupadd -f kvm \
     && useradd -m -s /bin/bash testuser \
-    && usermod -aG fuse testuser
-
-# Rust tools are installed system-wide at /usr/local/cargo (owned by root)
-# Symlink to /usr/local/bin so sudo can find them (sudo uses secure_path)
-RUN ln -s /usr/local/cargo/bin/cargo /usr/local/bin/cargo \
-    && ln -s /usr/local/cargo/bin/rustc /usr/local/bin/rustc \
-    && ln -s /usr/local/cargo/bin/cargo-nextest /usr/local/bin/cargo-nextest
-
-# Allow testuser to sudo without password (like host dev setup)
-RUN echo "testuser ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
-
-# Configure subordinate UIDs/GIDs for rootless user namespaces
-# testuser (UID 1000) gets subordinate range 100000-165535 (65536 IDs)
-# This enables `unshare --user --map-auto` without root
-RUN echo "testuser:100000:65536" >> /etc/subuid \
+    && usermod -aG fuse,kvm testuser \
+    && echo "testuser ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \
+    && echo "testuser:100000:65536" >> /etc/subuid \
     && echo "testuser:100000:65536" >> /etc/subgid
 
-# Install uidmap package for newuidmap/newgidmap setuid helpers
-# These are required for --map-auto to work
-RUN apt-get update && apt-get install -y uidmap && rm -rf /var/lib/apt/lists/*
+# Symlink cargo tools to /usr/local/bin for sudo
+RUN for bin in cargo rustc rustfmt cargo-clippy clippy-driver cargo-nextest cargo-audit cargo-deny; do \
+    ln -s /usr/local/cargo/bin/$bin /usr/local/bin/$bin 2>/dev/null || true; done
 
-# Create workspace structure matching local paths
-# Source code is mounted at runtime, not copied - ensures code is always fresh
-WORKDIR /workspace
-
-# Create directories that will be mount points
-RUN mkdir -p /workspace/fcvm /workspace/fuse-backend-rs /workspace/fuser
-
-# Make workspace owned by testuser for non-root tests
-RUN chown -R testuser:testuser /workspace
-
+# Setup workspace
 WORKDIR /workspace/fcvm
+RUN mkdir -p /workspace/fcvm /workspace/fuse-backend-rs /workspace/fuser \
+    && chown -R testuser:testuser /workspace
 
-# Switch to testuser - tests run as normal user with sudo like on host
 USER testuser
-
-# Default command runs all fuse-pipe tests
-CMD ["cargo", "nextest", "run", "--release", "-p", "fuse-pipe"]
+CMD ["make", "test-unit"]
