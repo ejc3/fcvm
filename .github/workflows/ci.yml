@@ -80,11 +80,11 @@ jobs:
         run: make test-root
 
   # Runner 2: Container (podman)
-  # Only runs unit tests - VM tests require KVM (covered by Host job)
-  # Uses ubuntu-latest which has proper rootless podman support
+  # Runs same tests as Host but inside a container
+  # Needs KVM for VM tests (container mounts /dev/kvm)
   container:
     name: Container
-    runs-on: ubuntu-latest
+    runs-on: buildjet-32vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
         with:
@@ -99,6 +99,14 @@ jobs:
           repository: ejc3/fuser
           ref: master
           path: fuser
+      - name: Setup KVM
+        run: sudo chmod 666 /dev/kvm
       - name: container-test-unit
         working-directory: fcvm
         run: make container-test-unit
+      - name: setup-fcvm
+        working-directory: fcvm
+        run: make setup-fcvm
+      - name: container-test
+        working-directory: fcvm
+        run: make container-test
