@@ -135,6 +135,19 @@ setup-fcvm: build setup-btrfs
 	@echo "==> Running fcvm setup..."
 	./target/release/fcvm setup
 
+# Run setup inside container (for CI - container has Firecracker)
+container-setup-fcvm: container-build setup-btrfs
+	@echo "==> Running fcvm setup in container..."
+	$(CONTAINER_RUN) $(CONTAINER_TAG) make _setup-fcvm
+
+_setup-fcvm:
+	@FREE_GB=$$(df -BG /mnt/fcvm-btrfs 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \
+	if [ -n "$$FREE_GB" ] && [ "$$FREE_GB" -lt 15 ]; then \
+		echo "ERROR: Need 15GB on /mnt/fcvm-btrfs (have $${FREE_GB}GB)"; \
+		exit 1; \
+	fi
+	./target/release/fcvm setup
+
 bench: build
 	@echo "==> Running benchmarks..."
 	sudo cargo bench -p fuse-pipe --bench throughput
