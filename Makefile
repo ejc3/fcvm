@@ -96,6 +96,7 @@ container-test-all: setup-fcvm container-build
 container-test: container-test-all
 
 container-build:
+	@mkdir -p target cargo-home
 	podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) .
 
 container-shell: container-build
