@@ -224,7 +224,8 @@ mount -o rw /dev/vda /newroot
 if [ $? -ne 0 ]; then
     echo "ERROR: Failed to mount rootfs"
     sleep 5
-    poweroff -f
+    echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
+    echo o > /proc/sysrq-trigger 2>/dev/null || poweroff -f
 fi
 
 # Copy embedded packages from initrd to rootfs
@@ -259,7 +260,8 @@ INSTALL_RESULT=$?
 echo "FCVM Layer 2 Setup: Package installation returned: $INSTALL_RESULT"
 if [ $INSTALL_RESULT -ne 0 ]; then
     echo "FCVM_SETUP_FAILED: Package installation failed with exit code $INSTALL_RESULT"
-    poweroff -f
+    echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
+    echo o > /proc/sysrq-trigger 2>/dev/null || poweroff -f
 fi
 
 # Run setup script using chroot
@@ -269,7 +271,8 @@ SETUP_RESULT=$?
 echo "FCVM Layer 2 Setup: Setup script returned: $SETUP_RESULT"
 if [ $SETUP_RESULT -ne 0 ]; then
     echo "FCVM_SETUP_FAILED: Setup script failed with exit code $SETUP_RESULT"
-    poweroff -f
+    echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
+    echo o > /proc/sysrq-trigger 2>/dev/null || poweroff -f
 fi
 
 # Cleanup chroot mounts (use lazy unmount as fallback)
@@ -291,7 +294,13 @@ umount /newroot 2>/dev/null || umount -l /newroot 2>/dev/null || true
 
 echo "FCVM_SETUP_COMPLETE"
 echo "FCVM Layer 2 Setup: Complete! Powering off..."
-umount /proc /sys /dev 2>/dev/null || true
+
+# Use sysrq trigger for reliable shutdown (poweroff may not work in minimal initrd)
+echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
+echo o > /proc/sysrq-trigger 2>/dev/null || true
+
+# Fallback: try poweroff if sysrq didn't work
+sleep 1
 poweroff -f
 "#,
         install_script, setup_script
