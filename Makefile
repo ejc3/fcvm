@@ -125,7 +125,7 @@ setup-btrfs:
 	@if ! mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then \
 		echo '==> Creating btrfs loopback...'; \
 		if [ ! -f /var/fcvm-btrfs.img ]; then \
-			sudo truncate -s 20G /var/fcvm-btrfs.img && sudo mkfs.btrfs /var/fcvm-btrfs.img; \
+			sudo truncate -s 60G /var/fcvm-btrfs.img && sudo mkfs.btrfs /var/fcvm-btrfs.img; \
 		fi && \
 		sudo mkdir -p /mnt/fcvm-btrfs && \
 		sudo mount -o loop /var/fcvm-btrfs.img /mnt/fcvm-btrfs && \
