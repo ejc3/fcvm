@@ -99,8 +99,14 @@ jobs:
           repository: ejc3/fuser
           ref: master
           path: fuser
-      - name: Setup KVM
-        run: sudo chmod 666 /dev/kvm
+      - name: Setup KVM and rootless podman
+        run: |
+          sudo chmod 666 /dev/kvm
+          # Configure rootless podman to use cgroupfs (no systemd session on CI)
+          mkdir -p ~/.config/containers
+          echo '[containers]' > ~/.config/containers/containers.conf
+          echo 'cgroup_manager = "cgroupfs"' >> ~/.config/containers/containers.conf
+          echo 'events_logger = "file"' >> ~/.config/containers/containers.conf
       - name: container-test-unit
         working-directory: fcvm
         run: make container-test-unit
