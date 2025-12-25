@@ -426,6 +426,13 @@ fn spawn_log_consumer_to_file<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
                     eprintln!("{}", formatted);
                 }
             }
+
+            // Print log file path when stderr stream ends (once per process)
+            if is_stderr {
+                if let Some(ref log) = logger {
+                    eprintln!("📋 Debug log: {}", log.path().display());
+                }
+            }
         });
     }
 }
