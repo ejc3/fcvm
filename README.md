@@ -104,7 +104,7 @@ Subsequent runs are instant - everything is cached by content hash.
 # Skip explicit setup - does it automatically on first run
 fcvm podman run --name web1 --network rootless --setup nginx:alpine
 ```
-The `--setup` flag triggers setup if kernel/rootfs are missing. Only works with `--network rootless` (no sudo).
+The `--setup` flag triggers setup if kernel/rootfs are missing. Only works with `--network rootless` to avoid file ownership issues when running as root.
 
 ### Run a Container
 ```bash
