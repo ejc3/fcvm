@@ -43,6 +43,7 @@ fuse-pipe = { path = "fuse-pipe", default-features = false }
 url = "2"
 tokio-util = "0.7"
 regex = "1.12.2"
+fs2 = "0.4.3"
 
 [features]
 # Default: all integration tests that work without sudo (rootless networking)

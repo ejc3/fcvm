@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use fs2::FileExt;
 use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{debug, info, warn};
@@ -291,43 +292,91 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .collect::<Result<Vec<_>>>()
         .context("parsing volume mappings")?;
 
-    // For localhost/ images, use skopeo to copy image to a directory
-    // The guest will use skopeo to import it into local storage
+    // For localhost/ images, use content-addressable cache for skopeo export
+    // This avoids lock contention when multiple VMs export the same image
     let _image_export_dir = if args.image.starts_with("localhost/") {
-        let image_dir = paths::vm_runtime_dir(&vm_id).join("image-export");
-        tokio::fs::create_dir_all(&image_dir)
-            .await
-            .context("creating image export directory")?;
-
-        info!(image = %args.image, "Exporting localhost image with skopeo");
-
-        let output = tokio::process::Command::new("skopeo")
-            .arg("copy")
-            .arg(format!("containers-storage:{}", args.image))
-            .arg(format!("dir:{}", image_dir.display()))
+        // Get image digest for content-addressable storage
+        let inspect_output = tokio::process::Command::new("podman")
+            .args(["image", "inspect", &args.image, "--format", "{{.Digest}}"])
             .output()
             .await
-            .context("running skopeo copy")?;
+            .context("inspecting image digest")?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        if !inspect_output.status.success() {
+            let stderr = String::from_utf8_lossy(&inspect_output.stderr);
             bail!(
-                "Failed to export image '{}' with skopeo: {}",
+                "Failed to get digest for image '{}': {}",
                 args.image,
                 stderr
             );
         }
 
-        info!(dir = %image_dir.display(), "Image exported to OCI directory");
+        let digest = String::from_utf8_lossy(&inspect_output.stdout)
+            .trim()
+            .to_string();
 
-        // Add the image directory as a read-only volume mount
+        // Use content-addressable cache: /mnt/fcvm-btrfs/image-cache/{digest}/
+        let image_cache_dir = paths::base_dir().join("image-cache");
+        tokio::fs::create_dir_all(&image_cache_dir)
+            .await
+            .context("creating image-cache directory")?;
+
+        let cache_dir = image_cache_dir.join(&digest);
+
+        // Lock per-digest to prevent concurrent exports of the same image
+        let lock_path = image_cache_dir.join(format!("{}.lock", &digest));
+        let lock_file =
+            std::fs::File::create(&lock_path).context("creating image cache lock file")?;
+        lock_file
+            .lock_exclusive()
+            .context("acquiring image cache lock")?;
+
+        // Check if already cached (inside lock to prevent race)
+        let manifest_path = cache_dir.join("manifest.json");
+        if !manifest_path.exists() {
+            info!(image = %args.image, digest = %digest, "Exporting localhost image with skopeo");
+
+            // Create cache dir
+            tokio::fs::create_dir_all(&cache_dir)
+                .await
+                .context("creating image cache directory")?;
+
+            let output = tokio::process::Command::new("skopeo")
+                .arg("copy")
+                .arg(format!("containers-storage:{}", args.image))
+                .arg(format!("dir:{}", cache_dir.display()))
+                .output()
+                .await
+                .context("running skopeo copy")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // Clean up partial export
+                let _ = tokio::fs::remove_dir_all(&cache_dir).await;
+                drop(lock_file); // Release lock before bailing
+                bail!(
+                    "Failed to export image '{}' with skopeo: {}",
+                    args.image,
+                    stderr
+                );
+            }
+
+            info!(dir = %cache_dir.display(), "Image exported to OCI directory");
+        } else {
+            info!(image = %args.image, digest = %digest, "Using cached image export");
+        }
+
+        // Lock released when lock_file is dropped
+        drop(lock_file);
+
+        // Add the cached image directory as a read-only volume mount
         volume_mappings.push(VolumeMapping {
-            host_path: image_dir.clone(),
+            host_path: cache_dir.clone(),
             guest_path: "/tmp/fcvm-image".to_string(),
             read_only: true,
         });
 
-        Some(image_dir)
+        Some(cache_dir)
     } else {
         None
     };
