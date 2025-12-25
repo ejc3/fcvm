@@ -41,8 +41,7 @@ RUN for bin in cargo rustc rustfmt cargo-clippy clippy-driver cargo-nextest carg
 
 # Setup workspace
 WORKDIR /workspace/fcvm
-RUN mkdir -p /workspace/fcvm /workspace/fuse-backend-rs /workspace/fuser \
-    && chown -R testuser:testuser /workspace
+RUN mkdir -p /workspace/fcvm /workspace/fuse-backend-rs /workspace/fuser
 
-USER testuser
+# Run as root (--privileged container, simpler than user namespace mapping)
 CMD ["make", "test-unit"]
