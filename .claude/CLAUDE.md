@@ -727,9 +727,25 @@ fuse-pipe/benches/
 - Initrd: `/mnt/fcvm-btrfs/initrd/fc-agent-{sha}.initrd` (injects fc-agent at boot)
 
 **Layer System:**
-The rootfs is named after the SHA of the setup script + kernel URL. This ensures automatic cache invalidation when:
+The rootfs is named after the SHA of a combined script that includes:
+- Init script (embeds install script + setup script)
+- Kernel URL
+- Download script (packages + Ubuntu codename)
+
+This ensures automatic cache invalidation when:
 - The init logic, install script, or setup script changes
 - The kernel URL changes (different kernel version)
+- The package list or target Ubuntu version changes
+
+**Package Download:**
+Packages are downloaded using `podman run ubuntu:{codename}` with `apt-get install --download-only`.
+This ensures packages match the target Ubuntu version (Noble/24.04), not the host OS.
+The `codename` is specified in `rootfs-plan.toml`.
+
+**Setup Verification:**
+Layer 2 setup writes a marker file `/etc/fcvm-setup-complete` on successful completion.
+After the setup VM exits, fcvm mounts the rootfs and verifies this marker exists.
+If missing, setup fails with a clear error.
 
 The initrd contains a statically-linked busybox and fc-agent binary, injected at boot before systemd.
 
@@ -887,8 +903,15 @@ ERROR fcvm: Error: setting up rootfs: Rootfs not found. Run 'fcvm setup' first, 
 
 **What `fcvm setup` does:**
 1. Downloads Kata kernel from URL in `rootfs-plan.toml` (~15MB, cached by URL hash)
-2. Creates Layer 2 rootfs (~10GB, downloads Ubuntu cloud image, boots VM to install packages)
-3. Creates fc-agent initrd (embeds statically-linked fc-agent binary)
+2. Downloads packages using `podman run ubuntu:noble` with `apt-get install --download-only`
+   - Packages specified in `rootfs-plan.toml` (podman, crun, fuse-overlayfs, skopeo, fuse3, haveged, chrony, strace)
+   - Uses target Ubuntu version (noble/24.04) to get correct package versions
+3. Creates Layer 2 rootfs (~10GB):
+   - Downloads Ubuntu cloud image
+   - Boots VM with packages embedded in initrd
+   - Runs install script (dpkg) + setup script (config files, services)
+   - Verifies setup completed by checking for `/etc/fcvm-setup-complete` marker file
+4. Creates fc-agent initrd (embeds statically-linked fc-agent binary)
 
 **Kernel source**: Kata Containers kernel (6.12.47 from Kata 3.24.0 release) with `CONFIG_FUSE_FS=y` built-in.
 
