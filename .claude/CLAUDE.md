@@ -292,31 +292,34 @@ assert!(localhost_works, "Localhost port forwarding should work (requires route_
 
 ### Build and Test Rules
 
-**CRITICAL: NEVER run `cargo build` or `cargo test` directly. ALWAYS use Makefile targets.**
+**CRITICAL: NEVER use `sudo cargo` or `sudo cargo test`. ALWAYS use Makefile targets.**
 
-The Makefile handles:
-- Correct `CARGO_TARGET_DIR` for sudo vs non-sudo builds (avoids permission conflicts)
-- Proper feature flags (`--features privileged-tests`)
-- btrfs setup prerequisites
-- Container image building
+The Makefile uses `CARGO_TARGET_*_RUNNER='sudo -E'` to run test **binaries** with sudo, not cargo itself. Using `sudo cargo` creates root-owned files in `target/` that break subsequent non-sudo builds.
 
 ```bash
 # CORRECT - always use make
-make build                  # Build fcvm + fc-agent
-make test                   # All tests (rootless + root)
-make test-rootless          # Rootless tests only
-make test-root              # Root tests (requires sudo + KVM)
-make container-test         # All tests in container
-make clean                  # Clean build artifacts
+make build       # Build fcvm + fc-agent (no sudo)
+make test-unit   # Unit tests only, no sudo
+make test-fast   # + quick VM tests, no sudo (rootless only)
+make test-all    # + slow VM tests, no sudo (rootless only)
+make test-root   # + privileged tests (bridged, pjdfstest), uses sudo runner
+make test        # Alias for test-root
 
 # WRONG - never do this
-sudo cargo build ...        # Wrong target dir, permission issues
+sudo cargo build ...        # Creates root-owned target/, breaks everything
+sudo cargo test ...         # Same problem
 cargo test -p fcvm ...      # Missing feature flags, setup
 ```
 
-**Containers have full KVM access.** Both host and container tests run all packages (fuse-pipe + fcvm). The container mounts `/dev/kvm` and `/dev/fuse`.
+**Test tiers (additive):**
+| Target | Features | Sudo | Tests |
+|--------|----------|------|-------|
+| test-unit | none | no | lint, cli, state manager |
+| test-fast | integration-fast | no | + quick VM (rootless) |
+| test-all | + integration-slow | no | + slow VM (rootless) |
+| test-root | + privileged-tests | yes | + bridged, pjdfstest |
 
-**Test feature flags**: Tests use `#[cfg(feature = "privileged-tests")]` for compile-time gating. Rootless tests compile without the feature. Use `FILTER=` to filter by name pattern.
+**Feature flags**: `privileged-tests` gates bridged networking tests and pjdfstest. Rootless tests compile without it. Use `FILTER=` to filter by name pattern.
 
 ### Container Build Rules
 

@@ -55,7 +55,7 @@ fn test_port_forward_bridged() -> Result<()> {
     let mut guest_ip = String::new();
 
     while start.elapsed() < Duration::from_secs(60) {
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(common::POLL_INTERVAL);
 
         let output = Command::new(&fcvm_path)
             .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
@@ -164,7 +164,7 @@ fn test_port_forward_bridged() -> Result<()> {
         .args(["-TERM", &fcvm_pid.to_string()])
         .output();
 
-    std::thread::sleep(Duration::from_secs(2));
+    std::thread::sleep(common::POLL_INTERVAL);
     let _ = fcvm.wait();
 
     // Assertions - ALL port forwarding methods must work
@@ -216,7 +216,7 @@ fn test_port_forward_rootless() -> Result<()> {
     let mut loopback_ip = String::new();
 
     while start.elapsed() < Duration::from_secs(90) {
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(common::POLL_INTERVAL);
 
         let output = Command::new(&fcvm_path)
             .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
@@ -289,7 +289,7 @@ fn test_port_forward_rootless() -> Result<()> {
         .args(["-TERM", &fcvm_pid.to_string()])
         .output();
 
-    std::thread::sleep(Duration::from_secs(2));
+    std::thread::sleep(common::POLL_INTERVAL);
     let _ = fcvm.wait();
 
     // Assertions
