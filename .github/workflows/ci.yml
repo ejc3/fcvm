@@ -62,7 +62,8 @@ jobs:
           sudo mv /usr/local/bin/firecracker-v1.14.0-x86_64 /usr/local/bin/firecracker
           sudo mv /usr/local/bin/jailer-v1.14.0-x86_64 /usr/local/bin/jailer
       - name: Install cargo tools
-        run: cargo install cargo-nextest cargo-audit cargo-deny --locked
+        # cargo-audit >= 0.22.0 required for CVSS 4.0 support
+        run: cargo install cargo-nextest@0.9.115 cargo-audit@0.22.0 cargo-deny@0.18.9 --locked
       - name: Setup KVM and networking
         run: |
           sudo chmod 666 /dev/kvm
