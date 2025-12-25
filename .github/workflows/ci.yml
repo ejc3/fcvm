@@ -114,12 +114,26 @@ jobs:
           # Configure rootless podman to use cgroupfs (no systemd session on CI)
           mkdir -p ~/.config/containers
           printf '[engine]\ncgroup_manager = "cgroupfs"\nevents_logger = "file"\n' > ~/.config/containers/containers.conf
+          # Create cargo cache directory for container
+          mkdir -p ${{ github.workspace }}/cargo-cache/registry ${{ github.workspace }}/cargo-cache/target
+      - name: Cache container cargo
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/cargo-cache
+          key: container-cargo-${{ hashFiles('fcvm/Cargo.lock') }}
+          restore-keys: container-cargo-
       - name: container-test-unit
+        env:
+          CARGO_CACHE_DIR: ${{ github.workspace }}/cargo-cache
         working-directory: fcvm
         run: make container-test-unit
       - name: container-setup-fcvm
+        env:
+          CARGO_CACHE_DIR: ${{ github.workspace }}/cargo-cache
         working-directory: fcvm
         run: make container-setup-fcvm
       - name: container-test
+        env:
+          CARGO_CACHE_DIR: ${{ github.workspace }}/cargo-cache
         working-directory: fcvm
         run: make container-test
