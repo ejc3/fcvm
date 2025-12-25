@@ -104,9 +104,11 @@ jobs:
           sudo chmod 666 /dev/kvm
           # Configure rootless podman to use cgroupfs (no systemd session on CI)
           mkdir -p ~/.config/containers
-          echo '[containers]' > ~/.config/containers/containers.conf
-          echo 'cgroup_manager = "cgroupfs"' >> ~/.config/containers/containers.conf
-          echo 'events_logger = "file"' >> ~/.config/containers/containers.conf
+          cat > ~/.config/containers/containers.conf << 'EOF'
+          [engine]
+          cgroup_manager = "cgroupfs"
+          events_logger = "file"
+          EOF
       - name: container-test-unit
         working-directory: fcvm
         run: make container-test-unit
