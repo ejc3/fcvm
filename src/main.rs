@@ -41,8 +41,7 @@ async fn main() -> Result<()> {
     // But KEEP target tags to show the nesting hierarchy!
     // Otherwise, show full formatting (outermost process)
     // Use RUST_LOG if set, otherwise default to INFO
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     if cli.sub_process {
         // Subprocesses NEVER have colors (their output is captured and re-logged)
