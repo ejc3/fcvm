@@ -104,6 +104,10 @@ jobs:
           repository: ejc3/fuser
           ref: master
           path: fuser
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-utils e2fsprogs podman skopeo busybox-static cpio zstd
       - name: Setup KVM and rootless podman
         run: |
           sudo chmod 666 /dev/kvm
