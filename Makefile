@@ -84,11 +84,11 @@ container-test-unit: container-build
 	@echo "==> Running unit tests in container..."
 	$(CONTAINER_RUN) $(CONTAINER_TAG) make build _test-unit
 
-container-test-fast: setup-fcvm container-build
+container-test-fast: container-setup-fcvm
 	@echo "==> Running fast tests in container..."
 	$(CONTAINER_RUN) $(CONTAINER_TAG) make _test-fast
 
-container-test-all: setup-fcvm container-build
+container-test-all: container-setup-fcvm
 	@echo "==> Running all tests in container..."
 	$(CONTAINER_RUN) $(CONTAINER_TAG) make _test-all
 
@@ -138,7 +138,7 @@ setup-fcvm: build setup-btrfs
 # Run setup inside container (for CI - container has Firecracker)
 container-setup-fcvm: container-build setup-btrfs
 	@echo "==> Running fcvm setup in container..."
-	$(CONTAINER_RUN) $(CONTAINER_TAG) make _setup-fcvm
+	$(CONTAINER_RUN) $(CONTAINER_TAG) make build _setup-fcvm
 
 _setup-fcvm:
 	@FREE_GB=$$(df -BG /mnt/fcvm-btrfs 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \
