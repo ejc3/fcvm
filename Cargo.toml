@@ -56,6 +56,9 @@ integration-slow = []        # Slow VM tests, > 30s each (clone, snapshot, fuse 
 # Privileged tests require sudo (bridged networking, pjdfstest, iptables)
 privileged-tests = []
 
+# Lint tests (fmt, clippy, audit, deny) - run separately via: make lint
+lint-tests = []
+
 [dev-dependencies]
 serial_test = "3"
 criterion = "0.5"
