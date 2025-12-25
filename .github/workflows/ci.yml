@@ -112,7 +112,11 @@ jobs:
       - name: Setup KVM and rootless podman
         run: |
           sudo chmod 666 /dev/kvm
-          # Enable userfaultfd for snapshot cloning (container inherits host sysctl)
+          # Create userfaultfd device for snapshot cloning
+          if [ ! -e /dev/userfaultfd ]; then
+            sudo mknod /dev/userfaultfd c 10 126
+          fi
+          sudo chmod 666 /dev/userfaultfd
           sudo sysctl -w vm.unprivileged_userfaultfd=1
           # Configure rootless podman to use cgroupfs (no systemd session on CI)
           mkdir -p ~/.config/containers
