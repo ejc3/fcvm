@@ -317,14 +317,9 @@ fn maybe_add_test_flags(args: &[&str]) -> Vec<String> {
     let is_podman_run = args.len() >= 2 && args[0] == "podman" && args[1] == "run";
     let is_snapshot_run = args.len() >= 2 && args[0] == "snapshot" && args[1] == "run";
 
-    if is_podman_run || is_snapshot_run {
-        // Always add --setup so tests auto-create initrd if needed
-        result.insert(2, "--setup".to_string());
-
-        if strace_enabled {
-            result.insert(2, "--strace-agent".to_string());
-            eprintln!(">>> STRACE MODE: Adding --strace-agent flag");
-        }
+    if (is_podman_run || is_snapshot_run) && strace_enabled {
+        result.insert(2, "--strace-agent".to_string());
+        eprintln!(">>> STRACE MODE: Adding --strace-agent flag");
     }
 
     result
