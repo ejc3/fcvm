@@ -19,6 +19,39 @@ env:
   CONTAINER_ARCH: x86_64
 
 jobs:
+  # Runner 0: Packaging (default GitHub runner, no KVM needed)
+  # Verifies cargo install works without source tree access
+  packaging:
+    name: Packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fcvm
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fcvm -> target
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev libclang-dev clang
+      - name: Build release
+        working-directory: fcvm
+        run: cargo build --release -p fcvm
+      - name: Test packaging
+        working-directory: fcvm
+        run: ./scripts/test-packaging.sh ./target/release/fcvm
+
   # Runner 1: Host (bare metal with KVM)
   # Runs: test-unit → test-fast → test-root (sequential)
   host:
