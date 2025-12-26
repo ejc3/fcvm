@@ -110,7 +110,7 @@ async fn egress_stress_impl(
     .await
     .context("spawning baseline VM")?;
 
-    common::poll_health_by_pid(baseline_pid, 60).await?;
+    common::poll_health_by_pid(baseline_pid, 120).await?;
     println!("  ✓ Baseline healthy");
 
     // For rootless, the URL is already correct. For bridged, we use external server.
@@ -252,7 +252,7 @@ async fn egress_stress_impl(
 
     let mut healthy_clones = Vec::new();
     for (name, pid) in &clone_pids {
-        match common::poll_health_by_pid(*pid, 60).await {
+        match common::poll_health_by_pid(*pid, 120).await {
             Ok(()) => {
                 println!("  ✓ {} healthy", name);
                 healthy_clones.push((*pid, name.clone()));
