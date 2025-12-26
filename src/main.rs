@@ -73,6 +73,10 @@ async fn main() -> Result<()> {
         Commands::Snapshots => commands::cmd_snapshots().await,
         Commands::Exec(args) => commands::cmd_exec(args).await,
         Commands::Setup(args) => commands::cmd_setup(args).await,
+        Commands::Completions(args) => {
+            commands::cmd_completions(args);
+            Ok(())
+        }
     };
 
     // Handle errors

@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -33,6 +34,8 @@ pub enum Commands {
     Exec(ExecArgs),
     /// Setup kernel and rootfs (kernel ~15MB download, rootfs ~10GB creation, takes 5-10 minutes)
     Setup(SetupArgs),
+    /// Generate shell completions
+    Completions(CompletionsArgs),
 }
 
 // ============================================================================
@@ -52,6 +55,17 @@ pub struct SetupArgs {
     /// Path to custom rootfs config file
     #[arg(long)]
     pub config: Option<String>,
+}
+
+// ============================================================================
+// Completions Command
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct CompletionsArgs {
+    /// Shell to generate completions for
+    #[arg(value_enum)]
+    pub shell: Shell,
 }
 
 // ============================================================================

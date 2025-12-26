@@ -174,9 +174,7 @@ fn ensure_config_exists() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             panic!("Failed to generate config: {}", stderr);
         }
-        eprintln!(
-            ">>> Generated config at ~/.config/fcvm/rootfs-config.toml"
-        );
+        eprintln!(">>> Generated config at ~/.config/fcvm/rootfs-config.toml");
     });
 }
 

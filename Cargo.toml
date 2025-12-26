@@ -11,10 +11,34 @@ resolver = "2"
 name = "fcvm"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.75"
+authors = ["ejc3"]
+description = "Firecracker VM runner for Podman containers with sub-second cloning"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/ejc3/fcvm"
+homepage = "https://github.com/ejc3/fcvm"
+keywords = ["firecracker", "vm", "container", "podman", "microvm"]
+categories = ["command-line-utilities", "virtualization"]
+exclude = [
+    ".github/",
+    ".claude/",
+    "tests/",
+    "benches/",
+    "scripts/",
+    "Containerfile",
+    "Makefile",
+]
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
 
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

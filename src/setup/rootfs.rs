@@ -459,8 +459,8 @@ pub fn generate_setup_script(plan: &Plan) -> String {
 ///
 /// Writes the embedded default config to ~/.config/fcvm/rootfs-config.toml
 pub fn generate_config(force: bool) -> Result<PathBuf> {
-    let proj_dirs = ProjectDirs::from("", "", "fcvm")
-        .context("Could not determine config directory")?;
+    let proj_dirs =
+        ProjectDirs::from("", "", "fcvm").context("Could not determine config directory")?;
     let config_dir = proj_dirs.config_dir();
     let config_path = config_dir.join(CONFIG_FILE);
 
@@ -546,7 +546,9 @@ pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
          <binary-dir>/{}\n\n\
          Generate the default config with:\n  \
          fcvm setup --generate-config",
-        CONFIG_FILE, CONFIG_FILE, CONFIG_FILE
+        CONFIG_FILE,
+        CONFIG_FILE,
+        CONFIG_FILE
     );
 }
 
