@@ -9,7 +9,7 @@ This is useful for:
 - Deduplication operations (with REMAP_FILE_DEDUP flag)
 
 The implementation follows the same pattern as copy_file_range:
-- New opcode FUSE_REMAP_FILE_RANGE (53)
+- New opcode FUSE_REMAP_FILE_RANGE (54)
 - New wire protocol struct fuse_remap_file_range_in
 - Kernel sends request to userspace daemon
 - Daemon performs the actual remap on backing filesystem
@@ -21,18 +21,18 @@ Signed-off-by: Claude <claude@anthropic.com>
 ---
 --- a/include/uapi/linux/fuse.h
 +++ b/include/uapi/linux/fuse.h
-@@ -638,6 +638,7 @@
+@@ -638,6 +638,7 @@ enum fuse_opcode {
  	FUSE_SYNCFS		= 50,
  	FUSE_TMPFILE		= 51,
  	FUSE_STATX		= 52,
-+	FUSE_REMAP_FILE_RANGE	= 53,
- 
++	FUSE_REMAP_FILE_RANGE	= 54,
+
  	/* CUSE specific operations */
  	CUSE_INIT		= 4096,
-@@ -1206,4 +1207,15 @@
+@@ -1206,4 +1207,15 @@ struct fuse_supp_groups {
  	uint32_t	groups[];
  };
- 
+
 +struct fuse_remap_file_range_in {
 +	uint64_t	fh_in;
 +	uint64_t	off_in;
@@ -47,22 +47,22 @@ Signed-off-by: Claude <claude@anthropic.com>
  #endif /* _LINUX_FUSE_H */
 --- a/fs/fuse/fuse_i.h
 +++ b/fs/fuse/fuse_i.h
-@@ -821,6 +821,9 @@
+@@ -821,6 +821,9 @@ struct fuse_conn {
  	/** Does the filesystem support copy_file_range? */
  	unsigned no_copy_file_range:1;
- 
+
 +	/** Does the filesystem support remap_file_range (FICLONE)? */
 +	unsigned no_remap_file_range:1;
 +
  	/* Send DESTROY request */
  	unsigned int destroy:1;
- 
+
 --- a/fs/fuse/file.c
 +++ b/fs/fuse/file.c
-@@ -3333,6 +3333,104 @@
+@@ -3333,6 +3333,104 @@ static ssize_t fuse_copy_file_range(struct file *file_in, loff_t pos_in,
  	return ret;
  }
- 
+
 +static loff_t fuse_remap_file_range(struct file *file_in, loff_t pos_in,
 +				    struct file *file_out, loff_t pos_out,
 +				    loff_t len, unsigned int remap_flags)
@@ -164,11 +164,11 @@ Signed-off-by: Claude <claude@anthropic.com>
  static const struct file_operations fuse_file_operations = {
  	.llseek		= fuse_file_llseek,
  	.read_iter	= fuse_file_read_iter,
-@@ -3352,6 +3450,7 @@
+@@ -3352,6 +3450,7 @@ static const struct file_operations fuse_file_operations = {
  	.poll		= fuse_file_poll,
  	.fallocate	= fuse_file_fallocate,
  	.copy_file_range = fuse_copy_file_range,
 +	.remap_file_range = fuse_remap_file_range,
  };
- 
+
  static const struct address_space_operations fuse_file_aops  = {

@@ -77,6 +77,22 @@ fcvm snapshot serve my-snapshot      # Start UFFD server (prints serve PID)
 fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
 ```
 
+### Local Test Containers
+
+**Build test logic into a container, run with fcvm.** No weird feature flags or binary copying.
+
+```bash
+# Build with localhost/ prefix
+podman build -t localhost/mytest -f Containerfile.mytest .
+
+# Run with fcvm (exports via skopeo automatically)
+sudo fcvm podman run --name test --network bridged \
+    --map /mnt/fcvm-btrfs/test-data:/data \
+    localhost/mytest
+```
+
+See `Containerfile.libfuse-remap` and `Containerfile.pjdfstest` for examples.
+
 ### Manual E2E Testing with Claude Code
 
 **CRITICAL: VM commands BLOCK the terminal.** You MUST use Claude's `run_in_background: true` feature.

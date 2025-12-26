@@ -1,0 +1,77 @@
+# Test container for libfuse remap_file_range (FICLONE) support
+#
+# Build:
+#   podman build -t localhost/libfuse-remap-test -f Containerfile.libfuse-remap .
+#
+# Run with patched kernel:
+#   sudo fcvm podman run --name libfuse-test --network bridged --privileged \
+#     --kernel /mnt/fcvm-btrfs/kernels/vmlinux-6.12.10-*.bin \
+#     --map /mnt/fcvm-btrfs/test-libfuse:/data \
+#     localhost/libfuse-remap-test
+
+FROM alpine:latest AS builder
+
+RUN apk add --no-cache git meson ninja gcc g++ musl-dev linux-headers python3 eudev-dev patch
+
+WORKDIR /build
+RUN git clone --depth 1 https://github.com/libfuse/libfuse.git
+
+# Copy and apply the full remap_file_range patch
+COPY fuse-pipe/tests/libfuse_remap/libfuse-remap.patch /build/
+WORKDIR /build/libfuse
+RUN patch -p1 < /build/libfuse-remap.patch
+
+# Build libfuse static library
+RUN meson setup build --default-library=static -Dexamples=false -Dtests=false -Duseroot=false && \
+    ninja -C build
+
+# Build passthrough_ll statically linked
+RUN gcc -static -O2 -I/build/libfuse/include -I/build/libfuse/build \
+    -o /build/passthrough_ll /build/libfuse/example/passthrough_ll.c \
+    /build/libfuse/build/lib/libfuse3.a -lpthread
+
+# Build ficlone_test
+COPY fuse-pipe/tests/libfuse_remap/ficlone_test.c /build/
+RUN gcc -static -O2 -o /build/ficlone_test /build/ficlone_test.c
+
+# Final image
+FROM alpine:latest
+RUN apk add --no-cache fuse3 btrfs-progs e2fsprogs-extra
+
+COPY --from=builder /build/passthrough_ll /usr/local/bin/
+COPY --from=builder /build/ficlone_test /usr/local/bin/
+
+# Create test script - uses btrfs loopback so FICLONE actually works
+RUN printf '#!/bin/sh\n\
+set -e\n\
+echo "=== libfuse remap_file_range test ==="\n\
+echo "Creating btrfs loopback filesystem..."\n\
+dd if=/dev/zero of=/tmp/btrfs.img bs=1M count=150 2>/dev/null\n\
+mkfs.btrfs -q /tmp/btrfs.img\n\
+mkdir -p /btrfs /fuse-mnt\n\
+mount -o loop /tmp/btrfs.img /btrfs\n\
+echo "Created btrfs filesystem"\n\
+dd if=/dev/urandom of=/btrfs/source.bin bs=1M count=1 2>/dev/null\n\
+echo "Created 1MB test file on btrfs"\n\
+echo "Starting passthrough_ll on btrfs..."\n\
+/usr/local/bin/passthrough_ll -d -o source=/btrfs /fuse-mnt 2>&1 &\n\
+FUSE_PID=$!\n\
+sleep 2\n\
+if ! mountpoint -q /fuse-mnt; then echo "ERROR: FUSE mount failed"; kill $FUSE_PID 2>/dev/null; exit 1; fi\n\
+echo "Testing FICLONE through FUSE->btrfs..."\n\
+/usr/local/bin/ficlone_test /fuse-mnt/source.bin /fuse-mnt/dest.bin\n\
+RESULT=$?\n\
+fusermount3 -u /fuse-mnt 2>/dev/null || true\n\
+wait $FUSE_PID 2>/dev/null || true\n\
+if [ $RESULT -eq 0 ]; then\n\
+  echo "SUCCESS: libfuse FICLONE works!"\n\
+  ls -la /btrfs/\n\
+  echo "Verifying reflink - check shared extents:"\n\
+  filefrag -v /btrfs/source.bin | head -5\n\
+  filefrag -v /btrfs/dest.bin | head -5\n\
+fi\n\
+umount /btrfs\n\
+exit $RESULT\n' > /usr/local/bin/test-libfuse-remap.sh && \
+    chmod +x /usr/local/bin/test-libfuse-remap.sh
+
+CMD ["/usr/local/bin/test-libfuse-remap.sh"]
