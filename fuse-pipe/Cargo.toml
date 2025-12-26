@@ -9,9 +9,10 @@ keywords = ["fuse", "filesystem", "vsock", "async", "pipelining"]
 categories = ["filesystem", "asynchronous"]
 
 [features]
-default = ["fuse-client"]
-fuse-client = ["dep:fuser"]
+default = ["integration-slow"]
 trace-benchmarks = []  # Enable tracing in benchmarks
+privileged-tests = []  # Gate tests requiring root
+integration-slow = []  # Gate slow tests (pjdfstest)
 
 [dependencies]
 # Core
@@ -36,9 +37,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Using local path for development - synced to EC2 via `make sync`
 fuse-backend-rs = { path = "../../fuse-backend-rs", default-features = false, features = ["fusedev"] }
 
-# Optional: FUSE client (local fork with multi-reader support via FUSE_DEV_IOC_CLONE)
+# FUSE client (local fork with multi-reader support via FUSE_DEV_IOC_CLONE)
 # Using local path for development - synced to EC2 via `make sync`
-fuser = { path = "../../fuser", optional = true }
+fuser = { path = "../../fuser" }
 
 # Concurrent data structures
 dashmap = "5.5"
@@ -61,5 +62,5 @@ name = "operations"
 harness = false
 
 [[test]]
-name = "pjdfstest_matrix"
-path = "tests/pjdfstest_matrix.rs"
+name = "pjdfstest_matrix_root"
+path = "tests/pjdfstest_matrix_root.rs"

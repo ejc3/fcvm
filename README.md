@@ -22,7 +22,7 @@ A Rust implementation that launches Firecracker microVMs to run Podman container
 **Runtime Dependencies**
 - Rust 1.83+ with cargo (nightly for fuser crate)
 - Firecracker binary in PATH
-- For bridged networking: sudo, iptables, iproute2, dnsmasq
+- For bridged networking: sudo, iptables, iproute2
 - For rootless networking: slirp4netns
 - For building rootfs: qemu-utils, e2fsprogs
 
@@ -37,9 +37,9 @@ A Rust implementation that launches Firecracker microVMs to run Podman container
 **Container Testing (Recommended)** - All dependencies bundled:
 ```bash
 # Just needs podman and /dev/kvm
-make container-test          # fuse-pipe tests
-make container-test-vm       # VM tests (rootless + bridged)
-make container-test-all      # Everything
+make container-test-unit             # Unit tests (no VMs)
+make container-test-integration-fast # Quick VM tests (<30s each)
+make container-test-root             # All tests including pjdfstest
 ```
 
 **Native Testing** - Additional dependencies required:
@@ -50,7 +50,7 @@ make container-test-all      # Everything
 | pjdfstest build | autoconf, automake, libtool |
 | pjdfstest runtime | perl |
 | bindgen (userfaultfd-sys) | libclang-dev, clang |
-| VM tests | iproute2, iptables, slirp4netns, dnsmasq |
+| VM tests | iproute2, iptables, slirp4netns |
 | Rootfs build | qemu-utils, e2fsprogs |
 | User namespaces | uidmap (for newuidmap/newgidmap) |
 
@@ -66,7 +66,7 @@ sudo apt-get update && sudo apt-get install -y \
     fuse3 libfuse3-dev \
     autoconf automake libtool perl \
     libclang-dev clang \
-    iproute2 iptables slirp4netns dnsmasq \
+    iproute2 iptables slirp4netns \
     qemu-utils e2fsprogs \
     uidmap
 ```
@@ -79,6 +79,13 @@ sudo apt-get update && sudo apt-get install -y \
 ```bash
 # Build host CLI and guest agent
 cargo build --release --workspace
+```
+
+### Setup (First Time)
+```bash
+# Create btrfs filesystem and download kernel + rootfs (takes 5-10 minutes)
+make setup-btrfs
+fcvm setup
 ```
 
 ### Run a Container
@@ -262,310 +269,108 @@ sudo fcvm podman run --name full \
 
 ```
 fcvm/
-├── src/                    # Host CLI
-│   ├── main.rs             # Entry point
-│   ├── cli/                # Command-line parsing
-│   ├── commands/           # Command implementations (podman, snapshot, ls)
-│   ├── firecracker/        # Firecracker API client
-│   ├── network/            # Networking (bridged, slirp)
-│   ├── storage/            # Disk/snapshot management
-│   ├── state/              # VM state persistence
-│   ├── health.rs           # Health monitoring
-│   ├── uffd/               # UFFD memory sharing
-│   └── volume/             # Volume/FUSE mount handling
-│
-├── fc-agent/               # Guest agent
-│   └── src/main.rs         # Container orchestration inside VM
-│
-├── fuse-pipe/              # FUSE passthrough library
-│   ├── src/                # Client/server for host directory sharing
-│   ├── tests/              # Integration tests
-│   └── benches/            # Performance benchmarks
-│
-└── tests/                  # Integration tests
-    ├── common/mod.rs       # Shared test utilities
-    ├── test_sanity.rs      # Basic VM lifecycle
-    ├── test_state_manager.rs
-    ├── test_health_monitor.rs
-    ├── test_fuse_posix.rs
-    ├── test_fuse_in_vm.rs
-    ├── test_localhost_image.rs
-    └── test_snapshot_clone.rs
+├── src/           # Host CLI (fcvm binary)
+├── fc-agent/      # Guest agent (runs inside VM)
+├── fuse-pipe/     # FUSE passthrough library
+└── tests/         # Integration tests (16 files)
 ```
+
+See [DESIGN.md](DESIGN.md#directory-structure) for detailed structure.
 
 ---
 
 ## CLI Reference
 
-### Global Options
-
-| Option | Description |
-|--------|-------------|
-| `--base-dir <PATH>` | Base directory for all fcvm data (default: `/mnt/fcvm-btrfs` or `FCVM_BASE_DIR` env) |
-| `--sub-process` | Running as subprocess (disables timestamp/level in logs) |
+Run `fcvm --help` or `fcvm <command> --help` for full options.
 
 ### Commands
 
-#### `fcvm ls`
-List running VMs.
+| Command | Description |
+|---------|-------------|
+| `fcvm setup` | Download kernel (~15MB) and create rootfs (~10GB). Takes 5-10 min first run |
+| `fcvm podman run` | Run container in Firecracker VM |
+| `fcvm exec` | Execute command in running VM/container |
+| `fcvm ls` | List running VMs (`--json` for JSON output) |
+| `fcvm snapshot create` | Create snapshot from running VM |
+| `fcvm snapshot serve` | Start UFFD memory server for cloning |
+| `fcvm snapshot run` | Spawn clone from memory server |
+| `fcvm snapshots` | List available snapshots |
 
-| Option | Description |
-|--------|-------------|
-| `--json` | Output in JSON format |
-| `--pid <PID>` | Filter by fcvm process PID |
+See [DESIGN.md](DESIGN.md#commands) for full option reference.
 
-#### `fcvm snapshots`
-List available snapshots.
+### Key Options
 
-#### `fcvm podman run`
-Run a container in a Firecracker VM.
+**`fcvm podman run`** - Essential options:
+```
+--name <NAME>       VM name (required)
+--network <MODE>    bridged (default, needs sudo) or rootless
+--publish <H:G>     Port forward host:guest (e.g., 8080:80)
+--map <H:G[:ro]>    Volume mount host:guest (optional :ro for read-only)
+--env <K=V>         Environment variable
+--setup             Auto-setup if kernel/rootfs missing (rootless only)
+```
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `<IMAGE>` | (required) | Container image (e.g., `nginx:alpine` or `localhost/myimage`) |
-| `--name <NAME>` | (required) | VM name |
-| `--cpu <N>` | 2 | Number of vCPUs |
-| `--mem <MiB>` | 2048 | Memory in MiB |
-| `--map <HOST:GUEST[:ro]>` | | Volume mapping(s), comma-separated. Append `:ro` for read-only |
-| `--env <KEY=VALUE>` | | Environment variables, comma-separated or repeated |
-| `--cmd <COMMAND>` | | Command to run inside container |
-| `--publish <[IP:]HPORT:GPORT[/PROTO]>` | | Port forwarding, comma-separated |
-| `--network <MODE>` | bridged | Network mode: `bridged` or `rootless` |
-| `--health-check <URL>` | | HTTP health check URL. If not specified, uses container ready signal via vsock |
-| `--balloon <MiB>` | (none) | Balloon device target MiB. If not specified, no balloon device is configured |
-| `--privileged` | false | Run container in privileged mode (allows mknod, device access) |
-
-#### `fcvm snapshot create`
-Create a snapshot from a running VM.
-
-| Option | Description |
-|--------|-------------|
-| `<NAME>` | VM name to snapshot (mutually exclusive with `--pid`) |
-| `--pid <PID>` | VM PID to snapshot (mutually exclusive with name) |
-| `--tag <TAG>` | Custom snapshot name (defaults to VM name) |
-
-#### `fcvm snapshot serve <SNAPSHOT>`
-Start UFFD memory server to serve pages on-demand for cloning.
-
-#### `fcvm snapshot run`
-Run a clone from a snapshot.
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--pid <PID>` | (required) | Serve process PID to clone from |
-| `--name <NAME>` | (auto) | Custom name for cloned VM |
-| `--publish <[IP:]HPORT:GPORT[/PROTO]>` | | Port forwarding |
-| `--network <MODE>` | bridged | Network mode: `bridged` or `rootless` |
-| `--exec <CMD>` | | Execute command in container after clone starts, then cleanup |
-
-#### `fcvm snapshot ls`
-List running snapshot servers.
-
-#### `fcvm exec`
-Execute a command in a running VM or container. Mirrors `podman exec` behavior.
-
-| Option | Description |
-|--------|-------------|
-| `<NAME>` | VM name (mutually exclusive with `--pid`) |
-| `--pid <PID>` | VM PID (mutually exclusive with name) |
-| `--vm` | Execute in the VM instead of inside the container |
-| `-i, --interactive` | Keep STDIN open |
-| `-t, --tty` | Allocate pseudo-TTY |
-| `-- <COMMAND>...` | Command and arguments to execute |
-
-**Auto-detection**: When running a shell (bash, sh, zsh, etc.) with a TTY stdin, `-it` is enabled automatically.
-
-**Examples:**
+**`fcvm exec`** - Execute in VM/container:
 ```bash
-# Execute inside container (default, sudo needed to read VM state)
-sudo fcvm exec my-vm -- cat /etc/os-release
-sudo fcvm exec --pid 12345 -- wget -q -O - ifconfig.me
-
-# Execute in VM (guest OS)
-sudo fcvm exec my-vm --vm -- hostname
-sudo fcvm exec --pid 12345 --vm -- curl -s ifconfig.me
-
-# Interactive shell (auto-detects -it when stdin is a TTY)
-sudo fcvm exec my-vm -- bash
-sudo fcvm exec my-vm --vm -- bash
-
-# Explicit TTY flags (like podman exec -it)
-sudo fcvm exec my-vm -it -- sh
-sudo fcvm exec my-vm --vm -it -- bash
+sudo fcvm exec my-vm -- cat /etc/os-release     # In container
+sudo fcvm exec my-vm --vm -- curl -s ifconfig.me # In guest OS
+sudo fcvm exec my-vm -- bash                     # Interactive shell
 ```
 
 ---
 
 ## Network Modes
 
-| Mode | Flag | Root Required | Performance |
-|------|------|---------------|-------------|
-| Bridged | `--network bridged` | Yes | Better |
-| Rootless | `--network rootless` | No | Good |
+| Mode | Flag | Root | Notes |
+|------|------|------|-------|
+| Bridged | `--network bridged` | Yes | iptables NAT, better performance |
+| Rootless | `--network rootless` | No | slirp4netns, works without root |
 
-**Bridged**: Uses iptables NAT, requires sudo. Port forwarding via DNAT rules.
-
-**Rootless**: Uses slirp4netns in user namespace. Port forwarding via slirp4netns API.
+See [DESIGN.md](DESIGN.md#networking) for architecture details.
 
 ---
 
 ## Container Behavior
 
-### Exit Code Forwarding
+- **Exit codes**: Container exit code forwarded to host via vsock
+- **Logs**: Container stdout/stderr prefixed with `[ctr:out]`/`[ctr:err]`
+- **Health**: Default uses vsock ready signal; optional `--health-check` for HTTP
 
-When a container exits, fcvm forwards its exit code:
-
-```bash
-# Container exits with code 0 → fcvm returns 0
-sudo fcvm podman run --name test --cmd "exit 0" public.ecr.aws/nginx/nginx:alpine
-echo $?  # 0
-
-# Container exits with code 42 → fcvm returns error
-sudo fcvm podman run --name test --cmd "exit 42" public.ecr.aws/nginx/nginx:alpine
-# ERROR fcvm: Error: container exited with code 42
-echo $?  # 1
-```
-
-Exit codes are communicated from fc-agent (inside VM) to fcvm (host) via vsock status channel (port 4999).
-
-### Container Logs
-
-Container stdout/stderr flows through the serial console:
-1. Container writes to stdout/stderr
-2. fc-agent prefixes with `[ctr:out]` or `[ctr:err]` and writes to serial console
-3. Firecracker sends serial output to fcvm
-4. fcvm logs via tracing (visible on stderr)
-
-Example output:
-```
-INFO firecracker: fc-agent[292]: [ctr:out] hello world
-INFO firecracker: fc-agent[292]: [ctr:err] error message
-```
-
-### Health Checks
-
-**Default behavior**: fcvm waits for fc-agent to signal container readiness via vsock. No HTTP polling needed.
-
-**Custom HTTP health check**: Use `--health-check` for HTTP-based health monitoring:
-```bash
-sudo fcvm podman run --name web --health-check http://localhost:80/health nginx:alpine
-```
-
-With custom health checks, fcvm polls the URL until it returns 2xx status.
+See [DESIGN.md](DESIGN.md#guest-agent) for details.
 
 ---
 
 ## Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `FCVM_BASE_DIR` | Base directory for all fcvm data | `/mnt/fcvm-btrfs` |
-| `RUST_LOG` | Logging level and filters | `info` |
-
-### Examples
-
-```bash
-# Use different base directory
-FCVM_BASE_DIR=/data/fcvm sudo fcvm podman run ...
-
-# Increase logging verbosity
-RUST_LOG=debug sudo fcvm podman run ...
-
-# Debug specific component
-RUST_LOG=firecracker=debug,health-monitor=debug sudo fcvm podman run ...
-
-# Silence all logs
-RUST_LOG=off sudo fcvm podman run ... 2>/dev/null
-```
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FCVM_BASE_DIR` | `/mnt/fcvm-btrfs` | Base directory for all data |
+| `RUST_LOG` | `info` | Logging level (e.g., `debug`, `firecracker=debug`) |
 
 ---
 
 ## Testing
 
-### Makefile Targets
-
-Run `make help` for the full list. Key targets:
-
-#### Development
-| Target | Description |
-|--------|-------------|
-| `make build` | Build fcvm and fc-agent |
-| `make clean` | Clean build artifacts |
-
-#### Testing (with optional FILTER and STREAM)
-
-VM tests run with sudo via `CARGO_TARGET_*_RUNNER` env vars (set in Makefile).
-Use `FILTER=` to filter tests by name, `STREAM=1` for live output.
-
-| Target | Description |
-|--------|-------------|
-| `make test-vm` | All VM tests (runs with sudo via target runner) |
-| `make test-vm FILTER=sanity` | Only sanity tests |
-| `make test-vm FILTER=exec` | Only exec tests |
-| `make test-vm STREAM=1` | All tests with live output |
-| `make container-test-vm` | VM tests in container |
-| `make container-test-vm FILTER=exec` | Only exec tests in container |
-| `make test-all` | Everything |
-
-#### Linting
-| Target | Description |
-|--------|-------------|
-| `make lint` | Run clippy + fmt-check |
-| `make clippy` | Run cargo clippy |
-| `make fmt` | Format code |
-| `make fmt-check` | Check formatting |
-
-#### Benchmarks
-| Target | Description |
-|--------|-------------|
-| `make bench` | All benchmarks (throughput + operations + protocol) |
-| `make bench-throughput` | I/O throughput benchmarks |
-| `make bench-operations` | FUSE operation latency benchmarks |
-| `make bench-protocol` | Wire protocol benchmarks |
-| `make bench-quick` | Quick benchmarks (faster iteration) |
-| `make bench-logs` | View recent benchmark logs/telemetry |
-| `make bench-clean` | Clean benchmark artifacts |
-
-### Test Files
-
-#### fcvm Integration Tests (`tests/`)
-| File | Description |
-|------|-------------|
-| `test_sanity.rs` | Basic VM startup and health check (rootless + bridged) |
-| `test_state_manager.rs` | State management unit tests |
-| `test_health_monitor.rs` | Health monitoring tests |
-| `test_fuse_posix.rs` | POSIX FUSE compliance tests |
-| `test_fuse_in_vm.rs` | FUSE-in-VM integration |
-| `test_localhost_image.rs` | Local image tests |
-| `test_snapshot_clone.rs` | Snapshot/clone workflow, clone port forwarding |
-| `test_port_forward.rs` | Port forwarding for regular VMs |
-
-#### fuse-pipe Tests (`fuse-pipe/tests/`)
-| File | Description |
-|------|-------------|
-| `integration.rs` | Basic FUSE operations (no root) |
-| `integration_root.rs` | FUSE operations requiring root |
-| `test_permission_edge_cases.rs` | Permission edge cases, setuid/setgid |
-| `test_mount_stress.rs` | Mount/unmount stress tests |
-| `test_allow_other.rs` | AllowOther flag tests |
-| `test_unmount_race.rs` | Unmount race condition tests |
-| `pjdfstest_matrix.rs` | POSIX compliance (17 categories run in parallel via nextest) |
-
-### Running Tests
-
 ```bash
-# Container testing (recommended)
-make container-test      # All fuse-pipe tests
-make container-test-vm   # VM tests
+# Quick start
+make build                           # Build fcvm + fc-agent
+make test-root                       # Run all tests (requires sudo + KVM)
 
-# Native testing
-make test               # fuse-pipe tests
-make test-vm            # VM tests
+# Test tiers
+make test-unit                       # Unit tests only (no VMs)
+make test-integration-fast           # Quick VM tests (<30s each)
+make test-root                       # All tests including pjdfstest
 
-# Direct cargo commands (for debugging)
-cargo test --release -p fuse-pipe --test integration -- --nocapture
-sudo cargo test --release --test test_sanity -- --nocapture
+# Container testing (recommended - all deps bundled)
+make container-test-root             # All tests in container
+
+# Options
+make test-root FILTER=exec           # Filter by name
+make test-root STREAM=1              # Live output
+make test-root LIST=1                # List without running
 ```
+
+See [DESIGN.md](DESIGN.md#test-infrastructure) for test architecture and file listing.
 
 ### Debugging Tests
 
@@ -595,50 +400,12 @@ sudo fusermount3 -u /tmp/fuse-*-mount*
 
 ## Data Layout
 
-```
-/mnt/fcvm-btrfs/
-├── kernels/
-│   ├── vmlinux.bin            # Symlink to active kernel
-│   └── vmlinux-{sha}.bin      # Kernel (SHA of URL for cache key)
-├── rootfs/
-│   └── layer2-{sha}.raw       # Base Ubuntu + Podman (~10GB, SHA of setup script)
-├── initrd/
-│   └── fc-agent-{sha}.initrd  # fc-agent injection initrd (SHA of binary)
-├── vm-disks/{vm_id}/          # Per-VM disk (CoW reflink)
-├── snapshots/                 # Firecracker snapshots
-├── state/                     # VM state JSON files
-└── cache/                     # Downloaded cloud images
-```
-
----
-
-## Setup
-
-### dnsmasq Setup
+All data stored under `/mnt/fcvm-btrfs/` (btrfs for CoW reflinks). See [DESIGN.md](DESIGN.md#data-directory) for details.
 
 ```bash
-# One-time: Install dnsmasq for DNS forwarding to VMs
-sudo apt-get update && sudo apt-get install -y dnsmasq
-sudo tee /etc/dnsmasq.d/fcvm.conf > /dev/null <<EOF
-bind-dynamic
-server=8.8.8.8
-server=8.8.4.4
-no-resolv
-cache-size=1000
-EOF
-sudo systemctl restart dnsmasq
-```
-
-### btrfs Setup
-
-```bash
-# Create btrfs loopback (done automatically by make setup-btrfs)
-sudo truncate -s 20G /var/fcvm-btrfs.img
-sudo mkfs.btrfs /var/fcvm-btrfs.img
-sudo mkdir -p /mnt/fcvm-btrfs
-sudo mount -o loop /var/fcvm-btrfs.img /mnt/fcvm-btrfs
-sudo mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,state,snapshots,vm-disks,cache}
-sudo chown -R $USER:$USER /mnt/fcvm-btrfs
+# Setup btrfs (done automatically by make setup-btrfs)
+make setup-btrfs
+make setup-fcvm   # Download kernel, create rootfs
 ```
 
 ---
@@ -652,7 +419,7 @@ sudo chown -R $USER:$USER /mnt/fcvm-btrfs
 ### "timeout waiting for VM to become healthy"
 - Check VM logs: `sudo fcvm ls --json`
 - Verify kernel and rootfs exist: `ls -la /mnt/fcvm-btrfs/`
-- Check dnsmasq is running: `systemctl status dnsmasq`
+- Check networking: VMs use host DNS servers directly (no dnsmasq needed)
 
 ### Tests hang indefinitely
 - VMs may not be cleaning up properly

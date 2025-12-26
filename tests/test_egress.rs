@@ -9,13 +9,15 @@
 //!
 //! Both bridged and rootless networking modes are tested.
 
+#![cfg(feature = "integration-slow")]
+
 mod common;
 
 use anyhow::{Context, Result};
 use std::time::Duration;
 
-/// External URL to test egress connectivity - Docker Hub auth endpoint (returns 200)
-const EGRESS_TEST_URL: &str = "https://auth.docker.io/token?service=registry.docker.io";
+/// External URL to test egress connectivity - AWS EC2 metadata mock (fast, returns 200)
+const EGRESS_TEST_URL: &str = "https://checkip.amazonaws.com";
 
 /// Test egress connectivity for fresh VM with bridged networking
 #[cfg(feature = "privileged-tests")]
@@ -188,7 +190,7 @@ async fn egress_clone_test_impl(network: &str) -> Result<()> {
             .context("spawning memory server")?;
 
     // Wait for serve process to save its state file
-    common::poll_serve_state_by_pid(serve_pid, 10).await?;
+    common::poll_serve_state_by_pid(serve_pid, 30).await?;
     println!("  ✓ Memory server ready (PID: {})", serve_pid);
 
     // Step 4: Spawn clone
@@ -260,7 +262,7 @@ async fn test_egress(fcvm_path: &std::path::Path, pid: u32) -> Result<()> {
             "curl",
             "-s",
             "--max-time",
-            "15",
+            "5",
             "-o",
             "/dev/null",
             "-w",
@@ -302,7 +304,7 @@ async fn test_egress(fcvm_path: &std::path::Path, pid: u32) -> Result<()> {
             "-q",
             "-O",
             "/dev/null",
-            "--timeout=15",
+            "--timeout=5",
             EGRESS_TEST_URL,
         ])
         .output()

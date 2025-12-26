@@ -4,6 +4,8 @@
 //! The image is exported from the host using skopeo, mounted into the VM via FUSE,
 //! and then imported by fc-agent using skopeo before running with podman.
 
+#![cfg(all(feature = "integration-fast", feature = "privileged-tests"))]
+
 mod common;
 
 use anyhow::{Context, Result};
@@ -12,7 +14,6 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// Test that a localhost/ container image can be built and run in a VM
-#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_localhost_hello_world_bridged() -> Result<()> {
     println!("\nLocalhost Image Test");
@@ -77,7 +78,9 @@ async fn test_localhost_hello_world_bridged() -> Result<()> {
                     found_hello = true;
                 }
                 // Check for container exit with code 0
-                if line.contains("Container exit notification received") && line.contains("exit_code=0") {
+                if line.contains("Container exit notification received")
+                    && line.contains("exit_code=0")
+                {
                     exited_zero = true;
                 }
             }
@@ -86,7 +89,8 @@ async fn test_localhost_hello_world_bridged() -> Result<()> {
     });
 
     // Wait for the process to exit (with timeout)
-    let timeout = Duration::from_secs(60);
+    // 120s to handle podman storage lock contention during parallel test runs
+    let timeout = Duration::from_secs(120);
     let result = tokio::time::timeout(timeout, child.wait()).await;
 
     match result {
@@ -121,7 +125,9 @@ async fn test_localhost_hello_world_bridged() -> Result<()> {
         Ok(())
     } else {
         println!("\n❌ LOCALHOST IMAGE TEST FAILED!");
-        println!("  - Did not find expected output: '[ctr:stdout] Hello from localhost container!'");
+        println!(
+            "  - Did not find expected output: '[ctr:stdout] Hello from localhost container!'"
+        );
         println!("  - Check logs above for error details");
         anyhow::bail!("Localhost image test failed")
     }

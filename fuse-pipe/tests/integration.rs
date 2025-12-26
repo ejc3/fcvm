@@ -12,12 +12,11 @@ mod common;
 use std::fs;
 use std::os::unix::io::AsRawFd;
 
-use common::{cleanup, require_nonroot, unique_paths, FuseMount};
+use common::{cleanup, unique_paths, FuseMount};
 use nix::unistd::{lseek, Whence};
 
 #[test]
 fn test_create_and_read_file() {
-    require_nonroot();
     let (data_dir, mount_dir) = unique_paths("fuse-integ");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
 
@@ -33,7 +32,6 @@ fn test_create_and_read_file() {
 
 #[test]
 fn test_create_directory() {
-    require_nonroot();
     let (data_dir, mount_dir) = unique_paths("fuse-integ");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
 
@@ -48,7 +46,6 @@ fn test_create_directory() {
 
 #[test]
 fn test_list_directory() {
-    require_nonroot();
     let (data_dir, mount_dir) = unique_paths("fuse-integ");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
     let mount = fuse.mount_path();
@@ -77,7 +74,6 @@ fn test_list_directory() {
 
 #[test]
 fn test_nested_file() {
-    require_nonroot();
     let (data_dir, mount_dir) = unique_paths("fuse-integ");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
 
@@ -99,7 +95,6 @@ fn test_nested_file() {
 
 #[test]
 fn test_file_metadata() {
-    require_nonroot();
     let (data_dir, mount_dir) = unique_paths("fuse-integ");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
 
@@ -120,7 +115,6 @@ fn test_file_metadata() {
 
 #[test]
 fn test_rename_across_directories() {
-    require_nonroot();
     let (data_dir, mount_dir) = unique_paths("fuse-integ");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
     let mount = fuse.mount_path();
@@ -150,7 +144,6 @@ fn test_rename_across_directories() {
 
 #[test]
 fn test_symlink_and_readlink() {
-    require_nonroot();
     let (data_dir, mount_dir) = unique_paths("fuse-integ");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
     let mount = fuse.mount_path();
@@ -176,7 +169,6 @@ fn test_symlink_and_readlink() {
 
 #[test]
 fn test_hardlink_survives_source_removal() {
-    require_nonroot();
     let (data_dir, mount_dir) = unique_paths("fuse-integ");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
     let mount = fuse.mount_path();
@@ -199,7 +191,6 @@ fn test_hardlink_survives_source_removal() {
 
 #[test]
 fn test_multi_reader_mount_basic_io() {
-    require_nonroot();
     let (data_dir, mount_dir) = unique_paths("fuse-integ");
     let fuse = FuseMount::new(&data_dir, &mount_dir, 4);
     let mount = fuse.mount_path().to_path_buf();
@@ -229,7 +220,6 @@ fn test_multi_reader_mount_basic_io() {
 /// Test that lseek supports negative offsets relative to SEEK_END.
 #[test]
 fn test_lseek_supports_negative_offsets() {
-    require_nonroot();
     common::increase_ulimit();
 
     let (data_dir, mount_dir) = unique_paths("fuse-integ");

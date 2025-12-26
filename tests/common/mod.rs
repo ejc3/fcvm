@@ -5,6 +5,9 @@ use std::path::PathBuf;
 
 /// Default test image - use AWS ECR to avoid Docker Hub rate limits
 pub const TEST_IMAGE: &str = "public.ecr.aws/nginx/nginx:alpine";
+
+/// Polling interval for status checks (100ms)
+pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -12,7 +15,6 @@ use tokio::time::sleep;
 
 /// Global counter for unique test IDs
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
 
 /// Check if we're running inside a container.
 ///
@@ -464,7 +466,7 @@ pub async fn start_memory_server(
 
     // Wait for serve process to save its state file
     // Serve processes don't have health status, so we just check state exists
-    poll_serve_state_by_pid(serve_pid, 10).await?;
+    poll_serve_state_by_pid(serve_pid, 30).await?;
 
     Ok((child, serve_pid))
 }

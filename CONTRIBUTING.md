@@ -40,12 +40,16 @@ Have an idea? [Open an issue](https://github.com/ejc3/fcvm/issues/new) describin
 # Build everything
 make build
 
+# First-time setup (downloads kernel + creates rootfs, ~5-10 min)
+make setup-btrfs
+fcvm setup
+
 # Run lints (must pass before PR)
 make lint
 
 # Run tests
 make test              # fuse-pipe tests
-make test-vm           # VM integration tests (requires KVM)
+make test-root         # VM tests (requires sudo + KVM)
 
 # Format code
 make fmt

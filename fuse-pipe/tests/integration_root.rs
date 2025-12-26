@@ -5,7 +5,9 @@
 //! - setfsuid()/setfsgid() credential switching
 //! - mkdir as non-root user via credential switching
 //!
-//! Run with: `sudo cargo test --release -p fuse-pipe --test integration_root`
+//! Run with: `sudo cargo test --release -p fuse-pipe --features privileged-tests --test integration_root`
+
+#![cfg(feature = "privileged-tests")]
 
 mod common;
 

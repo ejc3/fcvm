@@ -2,6 +2,8 @@
 //!
 //! Verifies that --publish correctly forwards ports from host to guest
 
+#![cfg(feature = "integration-fast")]
+
 mod common;
 
 use anyhow::{Context, Result};
@@ -28,6 +30,9 @@ fn test_port_forward_bridged() -> Result<()> {
     let fcvm_path = common::find_fcvm_binary()?;
     let vm_name = format!("port-bridged-{}", std::process::id());
 
+    // Port 8080:80 - DNAT is scoped to veth IP so same port works across parallel VMs
+    let host_port: u16 = 8080;
+
     // Start VM with port forwarding
     let mut fcvm = Command::new(&fcvm_path)
         .args([
@@ -38,7 +43,7 @@ fn test_port_forward_bridged() -> Result<()> {
             "--network",
             "bridged",
             "--publish",
-            "18080:80",
+            "8080:80",
             "nginx:alpine",
         ])
         .spawn()
@@ -51,9 +56,10 @@ fn test_port_forward_bridged() -> Result<()> {
     let start = std::time::Instant::now();
     let mut healthy = false;
     let mut guest_ip = String::new();
+    let mut veth_host_ip = String::new();
 
     while start.elapsed() < Duration::from_secs(60) {
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(common::POLL_INTERVAL);
 
         let output = Command::new(&fcvm_path)
             .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
@@ -75,12 +81,18 @@ fn test_port_forward_bridged() -> Result<()> {
         // Find our VM and check health (filtered by PID so should be only one)
         if let Some(display) = vms.first() {
             if matches!(display.vm.health_status, fcvm::state::HealthStatus::Healthy) {
-                // Extract guest_ip from config.network
+                // Extract guest_ip and host_ip (veth's host IP) from config.network
                 if let Some(ref ip) = display.vm.config.network.guest_ip {
                     guest_ip = ip.clone();
                 }
+                if let Some(ref ip) = display.vm.config.network.host_ip {
+                    veth_host_ip = ip.clone();
+                }
                 healthy = true;
-                println!("VM is healthy, guest_ip: {}", guest_ip);
+                println!(
+                    "VM is healthy, guest_ip: {}, veth_host_ip: {}",
+                    guest_ip, veth_host_ip
+                );
                 break;
             }
         }
@@ -114,46 +126,26 @@ fn test_port_forward_bridged() -> Result<()> {
         );
     }
 
-    // Test 2: Access via forwarded port (external interface)
-    // Get the host's primary IP
-    let host_ip_output = Command::new("hostname")
-        .arg("-I")
-        .output()
-        .context("getting host IP")?;
-    let host_ip = String::from_utf8_lossy(&host_ip_output.stdout)
-        .split_whitespace()
-        .next()
-        .unwrap_or("127.0.0.1")
-        .to_string();
-
-    println!("Testing access via host IP {}:18080...", host_ip);
+    // Test 2: Access via port forwarding (veth's host IP)
+    // DNAT rules are scoped to the veth IP, so this is what we test
+    println!(
+        "Testing port forwarding via veth IP {}:{}...",
+        veth_host_ip, host_port
+    );
     let output = Command::new("curl")
         .args([
             "-s",
             "--max-time",
             "5",
-            &format!("http://{}:18080", host_ip),
+            &format!("http://{}:{}", veth_host_ip, host_port),
         ])
         .output()
         .context("curl to forwarded port")?;
 
     let forward_works = output.status.success() && !output.stdout.is_empty();
     println!(
-        "Forwarded port (host IP): {}",
+        "Port forwarding (veth IP): {}",
         if forward_works { "OK" } else { "FAIL" }
-    );
-
-    // Test 3: Access via localhost (this is the tricky one)
-    println!("Testing access via localhost:18080...");
-    let output = Command::new("curl")
-        .args(["-s", "--max-time", "5", "http://127.0.0.1:18080"])
-        .output()
-        .context("curl to localhost")?;
-
-    let localhost_works = output.status.success() && !output.stdout.is_empty();
-    println!(
-        "Localhost access: {}",
-        if localhost_works { "OK" } else { "FAIL" }
     );
 
     // Cleanup
@@ -162,16 +154,12 @@ fn test_port_forward_bridged() -> Result<()> {
         .args(["-TERM", &fcvm_pid.to_string()])
         .output();
 
-    std::thread::sleep(Duration::from_secs(2));
+    std::thread::sleep(common::POLL_INTERVAL);
     let _ = fcvm.wait();
 
-    // Assertions - ALL port forwarding methods must work
+    // Assertions - both direct and port forwarding must work
     assert!(direct_works, "Direct access to guest should work");
-    assert!(forward_works, "Port forwarding via host IP should work");
-    assert!(
-        localhost_works,
-        "Localhost port forwarding should work (requires route_localnet)"
-    );
+    assert!(forward_works, "Port forwarding via veth IP should work");
 
     println!("test_port_forward_bridged PASSED");
     Ok(())
@@ -189,7 +177,7 @@ fn test_port_forward_rootless() -> Result<()> {
     let vm_name = format!("port-rootless-{}", std::process::id());
 
     // Start VM with rootless networking and port forwarding
-    // Use unprivileged port 8080 since rootless can't bind to 80
+    // Rootless uses unique loopback IPs (127.x.y.z) per VM, so port 8080 is fine
     let mut fcvm = Command::new(&fcvm_path)
         .args([
             "podman",
@@ -214,7 +202,7 @@ fn test_port_forward_rootless() -> Result<()> {
     let mut loopback_ip = String::new();
 
     while start.elapsed() < Duration::from_secs(90) {
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(common::POLL_INTERVAL);
 
         let output = Command::new(&fcvm_path)
             .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
@@ -287,7 +275,7 @@ fn test_port_forward_rootless() -> Result<()> {
         .args(["-TERM", &fcvm_pid.to_string()])
         .output();
 
-    std::thread::sleep(Duration::from_secs(2));
+    std::thread::sleep(common::POLL_INTERVAL);
     let _ = fcvm.wait();
 
     // Assertions

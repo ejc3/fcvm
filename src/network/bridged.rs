@@ -134,7 +134,13 @@ impl NetworkManager for BridgedNetwork {
                 "clone using In-Namespace NAT"
             );
 
-            (host_ip, veth_subnet, guest_ip, Some(orig_gateway), Some(veth_inner_ip))
+            (
+                host_ip,
+                veth_subnet,
+                guest_ip,
+                Some(orig_gateway),
+                Some(veth_inner_ip),
+            )
         } else {
             // Baseline VM case: use 172.30.x.y/30 for everything
             let third_octet = (subnet_id / 64) as u8;
@@ -281,7 +287,18 @@ impl NetworkManager for BridgedNetwork {
                 guest_ip.clone()
             };
 
-            match portmap::setup_port_mappings(&target_ip, &self.port_mappings).await {
+            // Scope DNAT rules to the veth's host IP - this allows parallel VMs to use
+            // the same port since each VM has a unique veth IP
+            let scoped_mappings: Vec<_> = self
+                .port_mappings
+                .iter()
+                .map(|m| super::PortMapping {
+                    host_ip: Some(host_ip.clone()),
+                    ..m.clone()
+                })
+                .collect();
+
+            match portmap::setup_port_mappings(&target_ip, &scoped_mappings).await {
                 Ok(rules) => self.port_mapping_rules = rules,
                 Err(e) => {
                     let _ = self.cleanup().await;

@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use fs2::FileExt;
 use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{debug, info, warn};
@@ -155,10 +156,7 @@ async fn run_status_listener(
 ///   Host → Guest: "stdin:content" (written to container stdin)
 ///
 /// Returns collected output lines as Vec<(stream, line)>.
-async fn run_output_listener(
-    socket_path: &str,
-    vm_id: &str,
-) -> Result<Vec<(String, String)>> {
+async fn run_output_listener(socket_path: &str, vm_id: &str) -> Result<Vec<(String, String)>> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
@@ -256,14 +254,21 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // Validate VM name before any setup work
     validate_vm_name(&args.name).context("invalid VM name")?;
 
-    // Ensure kernel, rootfs, and initrd exist (auto-setup on first run)
-    let kernel_path = crate::setup::ensure_kernel()
+    // Disallow --setup when running as root
+    // Root users should run `fcvm setup` explicitly
+    if args.setup && nix::unistd::geteuid().is_root() {
+        bail!("--setup is not allowed when running as root. Run 'fcvm setup' first.");
+    }
+
+    // Get kernel, rootfs, and initrd paths
+    // With --setup: create if missing; without: fail if missing
+    let kernel_path = crate::setup::ensure_kernel(args.setup)
         .await
         .context("setting up kernel")?;
-    let base_rootfs = crate::setup::ensure_rootfs()
+    let base_rootfs = crate::setup::ensure_rootfs(args.setup)
         .await
         .context("setting up rootfs")?;
-    let initrd_path = crate::setup::ensure_fc_agent_initrd()
+    let initrd_path = crate::setup::ensure_fc_agent_initrd(args.setup)
         .await
         .context("setting up fc-agent initrd")?;
 
@@ -287,43 +292,91 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .collect::<Result<Vec<_>>>()
         .context("parsing volume mappings")?;
 
-    // For localhost/ images, use skopeo to copy image to a directory
-    // The guest will use skopeo to import it into local storage
+    // For localhost/ images, use content-addressable cache for skopeo export
+    // This avoids lock contention when multiple VMs export the same image
     let _image_export_dir = if args.image.starts_with("localhost/") {
-        let image_dir = paths::vm_runtime_dir(&vm_id).join("image-export");
-        tokio::fs::create_dir_all(&image_dir)
-            .await
-            .context("creating image export directory")?;
-
-        info!(image = %args.image, "Exporting localhost image with skopeo");
-
-        let output = tokio::process::Command::new("skopeo")
-            .arg("copy")
-            .arg(format!("containers-storage:{}", args.image))
-            .arg(format!("dir:{}", image_dir.display()))
+        // Get image digest for content-addressable storage
+        let inspect_output = tokio::process::Command::new("podman")
+            .args(["image", "inspect", &args.image, "--format", "{{.Digest}}"])
             .output()
             .await
-            .context("running skopeo copy")?;
+            .context("inspecting image digest")?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        if !inspect_output.status.success() {
+            let stderr = String::from_utf8_lossy(&inspect_output.stderr);
             bail!(
-                "Failed to export image '{}' with skopeo: {}",
+                "Failed to get digest for image '{}': {}",
                 args.image,
                 stderr
             );
         }
 
-        info!(dir = %image_dir.display(), "Image exported to OCI directory");
+        let digest = String::from_utf8_lossy(&inspect_output.stdout)
+            .trim()
+            .to_string();
 
-        // Add the image directory as a read-only volume mount
+        // Use content-addressable cache: /mnt/fcvm-btrfs/image-cache/{digest}/
+        let image_cache_dir = paths::base_dir().join("image-cache");
+        tokio::fs::create_dir_all(&image_cache_dir)
+            .await
+            .context("creating image-cache directory")?;
+
+        let cache_dir = image_cache_dir.join(&digest);
+
+        // Lock per-digest to prevent concurrent exports of the same image
+        let lock_path = image_cache_dir.join(format!("{}.lock", &digest));
+        let lock_file =
+            std::fs::File::create(&lock_path).context("creating image cache lock file")?;
+        lock_file
+            .lock_exclusive()
+            .context("acquiring image cache lock")?;
+
+        // Check if already cached (inside lock to prevent race)
+        let manifest_path = cache_dir.join("manifest.json");
+        if !manifest_path.exists() {
+            info!(image = %args.image, digest = %digest, "Exporting localhost image with skopeo");
+
+            // Create cache dir
+            tokio::fs::create_dir_all(&cache_dir)
+                .await
+                .context("creating image cache directory")?;
+
+            let output = tokio::process::Command::new("skopeo")
+                .arg("copy")
+                .arg(format!("containers-storage:{}", args.image))
+                .arg(format!("dir:{}", cache_dir.display()))
+                .output()
+                .await
+                .context("running skopeo copy")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // Clean up partial export
+                let _ = tokio::fs::remove_dir_all(&cache_dir).await;
+                drop(lock_file); // Release lock before bailing
+                bail!(
+                    "Failed to export image '{}' with skopeo: {}",
+                    args.image,
+                    stderr
+                );
+            }
+
+            info!(dir = %cache_dir.display(), "Image exported to OCI directory");
+        } else {
+            info!(image = %args.image, digest = %digest, "Using cached image export");
+        }
+
+        // Lock released when lock_file is dropped
+        drop(lock_file);
+
+        // Add the cached image directory as a read-only volume mount
         volume_mappings.push(VolumeMapping {
-            host_path: image_dir.clone(),
+            host_path: cache_dir.clone(),
             guest_path: "/tmp/fcvm-image".to_string(),
             read_only: true,
         });
 
-        Some(image_dir)
+        Some(cache_dir)
     } else {
         None
     };
@@ -661,56 +714,150 @@ async fn run_vm_setup(
         // This is fully rootless - no sudo required!
 
         // Step 1: Spawn holder process (keeps namespace alive)
+        // Retry for up to 2 seconds if holder dies (transient failures under load)
         let holder_cmd = slirp_net.build_holder_command();
         info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
 
-        // Spawn holder with piped stderr to capture errors if it fails
-        let mut child = tokio::process::Command::new(&holder_cmd[0])
-            .args(&holder_cmd[1..])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .with_context(|| format!("failed to spawn holder: {:?}", holder_cmd))?;
+        let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut attempt = 0;
+        #[allow(unused_assignments)]
+        let mut _last_error: Option<String> = None;
 
-        let holder_pid = child.id().context("getting holder process PID")?;
-        info!(holder_pid = holder_pid, "namespace holder started");
+        let (mut child, holder_pid, mut holder_stderr) = loop {
+            attempt += 1;
 
-        // Give holder a moment to potentially fail, then check status
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // Holder exited - capture stderr to see why
-                let stderr = if let Some(mut stderr_pipe) = child.stderr.take() {
+            // Spawn holder with piped stderr to capture errors if it fails
+            let mut child = tokio::process::Command::new(&holder_cmd[0])
+                .args(&holder_cmd[1..])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .with_context(|| format!("failed to spawn holder: {:?}", holder_cmd))?;
+
+            let holder_pid = child.id().context("getting holder process PID")?;
+            if attempt > 1 {
+                info!(
+                    holder_pid = holder_pid,
+                    attempt = attempt,
+                    "namespace holder started (retry)"
+                );
+            } else {
+                info!(holder_pid = holder_pid, "namespace holder started");
+            }
+
+            // Give holder a moment to potentially fail, then check status
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            // Take stderr pipe - we'll use it for diagnostics if holder dies later
+            let mut holder_stderr = child.stderr.take();
+
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    // Holder exited - capture stderr to see why
+                    let stderr = if let Some(ref mut pipe) = holder_stderr {
+                        use tokio::io::AsyncReadExt;
+                        let mut buf = String::new();
+                        let _ = pipe.read_to_string(&mut buf).await;
+                        buf
+                    } else {
+                        String::new()
+                    };
+
+                    _last_error = Some(format!(
+                        "holder exited immediately: status={}, stderr='{}'",
+                        status,
+                        stderr.trim()
+                    ));
+
+                    if std::time::Instant::now() < retry_deadline {
+                        warn!(
+                            holder_pid = holder_pid,
+                            attempt = attempt,
+                            status = %status,
+                            stderr = %stderr.trim(),
+                            "holder died, retrying..."
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    } else {
+                        bail!(
+                            "holder process exited immediately after {} attempts: status={}, stderr={}, cmd={:?}",
+                            attempt,
+                            status,
+                            stderr.trim(),
+                            holder_cmd
+                        );
+                    }
+                }
+                Ok(None) => {
+                    debug!(holder_pid = holder_pid, "holder still running after 50ms");
+                }
+                Err(e) => {
+                    warn!(holder_pid = holder_pid, error = ?e, "failed to check holder status");
+                }
+            }
+
+            // Additional delay for namespace setup
+            // The --map-root-user option invokes setuid helpers asynchronously
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            // Check if holder is still alive before proceeding
+            if !crate::utils::is_process_alive(holder_pid) {
+                // Try to capture stderr from the dead holder process
+                let holder_stderr_content = if let Some(ref mut pipe) = holder_stderr {
                     use tokio::io::AsyncReadExt;
                     let mut buf = String::new();
-                    let _ = stderr_pipe.read_to_string(&mut buf).await;
-                    buf
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        pipe.read_to_string(&mut buf),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => buf,
+                        _ => String::new(),
+                    }
                 } else {
                     String::new()
                 };
-                bail!(
-                    "holder process exited immediately: status={}, stderr={}, cmd={:?}",
-                    status,
-                    stderr.trim(),
-                    holder_cmd
-                );
-            }
-            Ok(None) => {
-                debug!(holder_pid = holder_pid, "holder still running after 50ms");
-                // Holder is running - drop the stderr pipe so it doesn't block
-                drop(child.stderr.take());
-            }
-            Err(e) => {
-                warn!(holder_pid = holder_pid, error = ?e, "failed to check holder status");
-            }
-        }
 
-        // Additional delay for namespace setup (already waited 50ms above)
-        // The --map-auto option invokes setuid helpers asynchronously
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let _ = child.kill().await;
+
+                _last_error = Some(format!(
+                    "holder died after 100ms: stderr='{}'",
+                    holder_stderr_content.trim()
+                ));
+
+                if std::time::Instant::now() < retry_deadline {
+                    warn!(
+                        holder_pid = holder_pid,
+                        attempt = attempt,
+                        holder_stderr = %holder_stderr_content.trim(),
+                        "holder died after initial check, retrying..."
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                } else {
+                    let max_user_ns = std::fs::read_to_string("/proc/sys/user/max_user_namespaces")
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    bail!(
+                        "holder process (PID {}) died after {} attempts. \
+                         stderr='{}', max_user_namespaces={}. \
+                         This may indicate resource exhaustion or namespace limit reached.",
+                        holder_pid,
+                        attempt,
+                        holder_stderr_content.trim(),
+                        max_user_ns.trim()
+                    );
+                }
+            }
+
+            // Holder is alive - break out of retry loop
+            break (child, holder_pid, holder_stderr);
+        };
 
         // Step 2: Run setup script via nsenter (creates TAPs, iptables, etc.)
+        // This is also inside retry logic - if holder dies during nsenter, retry everything
         let setup_script = slirp_net.build_setup_script();
         let nsenter_prefix = slirp_net.build_nsenter_prefix(holder_pid);
 
@@ -737,15 +884,6 @@ async fn run_vm_setup(
             warn!("/dev/net/tun not available - TAP device creation will fail");
         }
 
-        // Verify holder is still alive before attempting nsenter
-        if !crate::utils::is_process_alive(holder_pid) {
-            let _ = child.kill().await;
-            bail!(
-                "holder process (PID {}) died before network setup could run",
-                holder_pid
-            );
-        }
-
         info!(holder_pid = holder_pid, "running network setup via nsenter");
 
         // Log the setup script for debugging
@@ -767,32 +905,171 @@ async fn run_vm_setup(
         if !setup_output.status.success() {
             let stderr = String::from_utf8_lossy(&setup_output.stderr);
             let stdout = String::from_utf8_lossy(&setup_output.stdout);
-            // Kill holder before bailing
-            let _ = child.kill().await;
+
             // Re-check state for diagnostics
             let holder_alive = std::path::Path::new(&proc_dir).exists();
             let ns_user_exists = std::path::Path::new(&ns_user).exists();
             let ns_net_exists = std::path::Path::new(&ns_net).exists();
 
-            // Log comprehensive error info at ERROR level (always visible)
-            warn!(
-                holder_pid = holder_pid,
-                holder_alive = holder_alive,
-                tun_exists = tun_exists,
-                ns_user_exists = ns_user_exists,
-                ns_net_exists = ns_net_exists,
-                stderr = %stderr.trim(),
-                stdout = %stdout.trim(),
-                "network setup failed - diagnostics"
-            );
+            // If holder died during nsenter, this is a retryable error
+            if !holder_alive && std::time::Instant::now() < retry_deadline {
+                // Holder died during nsenter - retry the whole thing
+                let holder_stderr_content = if let Some(ref mut pipe) = holder_stderr {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = String::new();
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        pipe.read_to_string(&mut buf),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => buf,
+                        _ => String::new(),
+                    }
+                } else {
+                    String::new()
+                };
 
-            bail!(
-                "network setup failed: {} (tun={}, holder_alive={}, ns_user={}, ns_net={})",
-                stderr.trim(),
-                tun_exists,
-                holder_alive,
-                ns_user_exists,
-                ns_net_exists
+                let _ = child.kill().await;
+
+                warn!(
+                    holder_pid = holder_pid,
+                    attempt = attempt,
+                    holder_stderr = %holder_stderr_content.trim(),
+                    nsenter_stderr = %stderr.trim(),
+                    "holder died during nsenter, retrying..."
+                );
+
+                // Jump back to the retry loop by recursing into this block
+                // We need to restructure - for now just retry once more inline
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                // Retry: spawn new holder
+                attempt += 1;
+                let mut retry_child = tokio::process::Command::new(&holder_cmd[0])
+                    .args(&holder_cmd[1..])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .with_context(|| {
+                        format!("failed to spawn holder on retry: {:?}", holder_cmd)
+                    })?;
+
+                let retry_holder_pid = retry_child.id().context("getting retry holder PID")?;
+                info!(
+                    holder_pid = retry_holder_pid,
+                    attempt = attempt,
+                    "namespace holder started (retry after nsenter failure)"
+                );
+
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                if !crate::utils::is_process_alive(retry_holder_pid) {
+                    let _ = retry_child.kill().await;
+                    bail!(
+                        "holder died on retry after nsenter failure (attempt {})",
+                        attempt
+                    );
+                }
+
+                // Retry nsenter with new holder
+                let retry_nsenter_prefix = slirp_net.build_nsenter_prefix(retry_holder_pid);
+                let retry_output = tokio::process::Command::new(&retry_nsenter_prefix[0])
+                    .args(&retry_nsenter_prefix[1..])
+                    .arg("bash")
+                    .arg("-c")
+                    .arg(&setup_script)
+                    .output()
+                    .await
+                    .context("running network setup via nsenter (retry)")?;
+
+                if !retry_output.status.success() {
+                    let retry_stderr = String::from_utf8_lossy(&retry_output.stderr);
+                    let _ = retry_child.kill().await;
+                    bail!(
+                        "network setup failed on retry: {} (attempt {})",
+                        retry_stderr.trim(),
+                        attempt
+                    );
+                }
+
+                // Success on retry - update variables for rest of function
+                child = retry_child;
+                // Note: holder_pid is shadowed in the outer scope, but we continue with retry_holder_pid
+                info!(
+                    holder_pid = retry_holder_pid,
+                    attempts = attempt,
+                    "network setup succeeded after retry"
+                );
+            } else {
+                // If holder died, try to capture its stderr for more context
+                let holder_stderr_content = if !holder_alive {
+                    if let Some(ref mut pipe) = holder_stderr {
+                        use tokio::io::AsyncReadExt;
+                        let mut buf = String::new();
+                        match tokio::time::timeout(
+                            std::time::Duration::from_millis(100),
+                            pipe.read_to_string(&mut buf),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => buf,
+                            _ => String::new(),
+                        }
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+
+                // Kill holder before bailing
+                let _ = child.kill().await;
+
+                // Log comprehensive error info at ERROR level (always visible)
+                warn!(
+                    holder_pid = holder_pid,
+                    holder_alive = holder_alive,
+                    holder_stderr = %holder_stderr_content.trim(),
+                    tun_exists = tun_exists,
+                    ns_user_exists = ns_user_exists,
+                    ns_net_exists = ns_net_exists,
+                    nsenter_stderr = %stderr.trim(),
+                    nsenter_stdout = %stdout.trim(),
+                    "network setup failed - diagnostics"
+                );
+
+                if !holder_alive {
+                    bail!(
+                        "network setup failed: holder died during nsenter after {} attempts. \
+                         nsenter_stderr='{}', holder_stderr='{}', \
+                         (tun={}, ns_user={}, ns_net={})",
+                        attempt,
+                        stderr.trim(),
+                        holder_stderr_content.trim(),
+                        tun_exists,
+                        ns_user_exists,
+                        ns_net_exists
+                    );
+                } else {
+                    bail!(
+                        "network setup failed: {} (tun={}, holder_alive={}, ns_user={}, ns_net={})",
+                        stderr.trim(),
+                        tun_exists,
+                        holder_alive,
+                        ns_user_exists,
+                        ns_net_exists
+                    );
+                }
+            }
+        }
+
+        if attempt > 1 {
+            info!(
+                holder_pid = holder_pid,
+                attempts = attempt,
+                "namespace setup succeeded after retries"
             );
         }
 

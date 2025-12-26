@@ -282,7 +282,10 @@ pub fn generate_setup_script(plan: &Plan) -> String {
         s.push_str("# Fix /etc/fstab\n");
         for pattern in &plan.fstab.remove_patterns {
             // Use sed to remove lines containing the pattern
-            s.push_str(&format!("sed -i '/{}/d' /etc/fstab\n", pattern.replace('/', "\\/")));
+            s.push_str(&format!(
+                "sed -i '/{}/d' /etc/fstab\n",
+                pattern.replace('/', "\\/")
+            ));
         }
         s.push('\n');
     }
@@ -338,7 +341,6 @@ pub fn generate_setup_script(plan: &Plan) -> String {
     s
 }
 
-
 // ============================================================================
 // Plan Loading and SHA256
 // ============================================================================
@@ -359,7 +361,7 @@ fn find_plan_file() -> Result<PathBuf> {
 
     for path in &candidates {
         if path.exists() {
-            return Ok(path.canonicalize().context("canonicalizing plan file path")?);
+            return path.canonicalize().context("canonicalizing plan file path");
         }
     }
 
@@ -371,7 +373,10 @@ fn find_plan_file() -> Result<PathBuf> {
 
     bail!(
         "rootfs-plan.toml not found. Checked: {:?}",
-        candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()
+        candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
     )
 }
 
@@ -425,7 +430,9 @@ pub fn compute_sha256(data: &[u8]) -> String {
 ///
 /// NOTE: fc-agent is NOT included in Layer 2. It will be injected per-VM at boot time.
 /// Layer 2 only contains packages (podman, crun, etc.).
-pub async fn ensure_rootfs() -> Result<PathBuf> {
+///
+/// If `allow_create` is false, bail if rootfs doesn't exist.
+pub async fn ensure_rootfs(allow_create: bool) -> Result<PathBuf> {
     let (plan, _plan_sha_full, _plan_sha_short) = load_plan()?;
 
     // Generate all scripts and compute hash of the complete init script
@@ -460,6 +467,11 @@ pub async fn ensure_rootfs() -> Result<PathBuf> {
             "rootfs exists for current script (using cached)"
         );
         return Ok(rootfs_path);
+    }
+
+    // Bail if creation not allowed
+    if !allow_create {
+        bail!("Rootfs not found. Run 'fcvm setup' first, or use --setup flag.");
     }
 
     // Create directory for lock file
@@ -506,7 +518,8 @@ pub async fn ensure_rootfs() -> Result<PathBuf> {
     let temp_rootfs_path = rootfs_path.with_extension("raw.tmp");
     let _ = tokio::fs::remove_file(&temp_rootfs_path).await;
 
-    let result = create_layer2_rootless(&plan, script_sha_short, &setup_script, &temp_rootfs_path).await;
+    let result =
+        create_layer2_rootless(&plan, script_sha_short, &setup_script, &temp_rootfs_path).await;
 
     if result.is_ok() {
         tokio::fs::rename(&temp_rootfs_path, &rootfs_path)
@@ -748,7 +761,9 @@ exec switch_root /newroot /sbin/init
 ///
 /// Uses file locking to prevent race conditions when multiple VMs start
 /// simultaneously and all try to create the initrd.
-pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
+///
+/// If `allow_create` is false, bail if initrd doesn't exist.
+pub async fn ensure_fc_agent_initrd(allow_create: bool) -> Result<PathBuf> {
     // Find fc-agent binary
     let fc_agent_path = find_fc_agent_binary()?;
     let fc_agent_bytes = std::fs::read(&fc_agent_path)
@@ -773,6 +788,11 @@ pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
             "using cached fc-agent initrd"
         );
         return Ok(initrd_path);
+    }
+
+    // Bail if creation not allowed
+    if !allow_create {
+        bail!("fc-agent initrd not found. Run 'fcvm setup' first, or use --setup flag.");
     }
 
     // Create initrd directory (needed for lock file)
@@ -858,7 +878,11 @@ pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
 
     // Write service files (normal and strace version)
     tokio::fs::write(temp_dir.join("fc-agent.service"), FC_AGENT_SERVICE).await?;
-    tokio::fs::write(temp_dir.join("fc-agent.service.strace"), FC_AGENT_SERVICE_STRACE).await?;
+    tokio::fs::write(
+        temp_dir.join("fc-agent.service.strace"),
+        FC_AGENT_SERVICE_STRACE,
+    )
+    .await?;
 
     // Create cpio archive (initrd format)
     // Use bash with pipefail so cpio errors aren't masked by gzip success (v3)
@@ -910,7 +934,12 @@ pub async fn ensure_fc_agent_initrd() -> Result<PathBuf> {
 /// Find busybox binary (prefer static version)
 fn find_busybox() -> Result<PathBuf> {
     // Check for busybox-static first
-    for path in &["/bin/busybox-static", "/usr/bin/busybox-static", "/bin/busybox", "/usr/bin/busybox"] {
+    for path in &[
+        "/bin/busybox-static",
+        "/usr/bin/busybox-static",
+        "/bin/busybox",
+        "/usr/bin/busybox",
+    ] {
         let p = PathBuf::from(path);
         if p.exists() {
             return Ok(p);
@@ -960,8 +989,10 @@ async fn create_layer2_rootless(
     let output = Command::new("qemu-img")
         .args([
             "convert",
-            "-f", "qcow2",
-            "-O", "raw",
+            "-f",
+            "qcow2",
+            "-O",
+            "raw",
             path_to_str(&cloud_image)?,
             path_to_str(&full_disk_path)?,
         ])
@@ -1010,11 +1041,14 @@ async fn create_layer2_rootless(
         ptype: String,
     }
 
-    let sfdisk_output: SfdiskOutput = serde_json::from_slice(&output.stdout)
-        .context("parsing sfdisk JSON output")?;
+    let sfdisk_output: SfdiskOutput =
+        serde_json::from_slice(&output.stdout).context("parsing sfdisk JSON output")?;
 
     // Find the Linux filesystem partition (type ends with 0FC63DAF-8483-4772-8E79-3D69D8477DE4 or similar)
-    let root_part = sfdisk_output.partitiontable.partitions.iter()
+    let root_part = sfdisk_output
+        .partitiontable
+        .partitions
+        .iter()
         .find(|p| p.ptype.contains("0FC63DAF") || p.node.ends_with("1"))
         .ok_or_else(|| anyhow::anyhow!("Could not find root partition in GPT disk"))?;
 
@@ -1055,7 +1089,10 @@ async fn create_layer2_rootless(
         .context("expanding partition")?;
 
     if !output.status.success() {
-        bail!("truncate failed: {}", String::from_utf8_lossy(&output.stderr));
+        bail!(
+            "truncate failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // Resize the ext4 filesystem to fill the partition
@@ -1074,7 +1111,10 @@ async fn create_layer2_rootless(
         .context("running resize2fs")?;
 
     if !output.status.success() {
-        bail!("resize2fs failed: {}", String::from_utf8_lossy(&output.stderr));
+        bail!(
+            "resize2fs failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // Step 4b: Fix /etc/fstab to remove BOOT and UEFI entries
@@ -1141,9 +1181,7 @@ async fn fix_fstab_in_image(image_path: &Path) -> Result<()> {
     // Filter out BOOT and UEFI entries
     let new_fstab: String = fstab_content
         .lines()
-        .filter(|line| {
-            !line.contains("LABEL=BOOT") && !line.contains("LABEL=UEFI")
-        })
+        .filter(|line| !line.contains("LABEL=BOOT") && !line.contains("LABEL=UEFI"))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -1158,12 +1196,7 @@ async fn fix_fstab_in_image(image_path: &Path) -> Result<()> {
     // Write the new fstab back using debugfs -w
     // debugfs command: rm /etc/fstab; write /tmp/fstab.new /etc/fstab
     let output = Command::new("debugfs")
-        .args([
-            "-w",
-            "-R",
-            &format!("rm /etc/fstab"),
-            path_to_str(image_path)?,
-        ])
+        .args(["-w", "-R", "rm /etc/fstab", path_to_str(image_path)?])
         .output()
         .await
         .context("removing old fstab with debugfs")?;
@@ -1253,7 +1286,10 @@ async fn create_layer2_setup_initrd(
         .context("making init executable")?;
 
     if !output.status.success() {
-        bail!("Failed to chmod init: {}", String::from_utf8_lossy(&output.stderr));
+        bail!(
+            "Failed to chmod init: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // Copy busybox static binary (prefer busybox-static if available)
@@ -1271,7 +1307,10 @@ async fn create_layer2_setup_initrd(
         .context("making busybox executable")?;
 
     if !output.status.success() {
-        bail!("Failed to chmod busybox: {}", String::from_utf8_lossy(&output.stderr));
+        bail!(
+            "Failed to chmod busybox: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // Copy packages into initrd
@@ -1339,7 +1378,12 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
         if let Ok(mut entries) = tokio::fs::read_dir(&packages_dir).await {
             let mut has_debs = false;
             while let Ok(Some(entry)) = entries.next_entry().await {
-                if entry.path().extension().map(|e| e == "deb").unwrap_or(false) {
+                if entry
+                    .path()
+                    .extension()
+                    .map(|e| e == "deb")
+                    .unwrap_or(false)
+                {
                     has_debs = true;
                     break;
                 }
@@ -1367,7 +1411,8 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
     let output = Command::new("apt-get")
         .args([
             "download",
-            "-o", &format!("Dir::Cache::archives={}", packages_dir.display()),
+            "-o",
+            &format!("Dir::Cache::archives={}", packages_dir.display()),
         ])
         .args(&packages)
         .current_dir(&packages_dir)
@@ -1419,7 +1464,12 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
     let mut count = 0;
     if let Ok(mut entries) = tokio::fs::read_dir(&packages_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if entry.path().extension().map(|e| e == "deb").unwrap_or(false) {
+            if entry
+                .path()
+                .extension()
+                .map(|e| e == "deb")
+                .unwrap_or(false)
+            {
                 count += 1;
             }
         }
@@ -1458,9 +1508,7 @@ async fn download_cloud_image(plan: &Plan) -> Result<PathBuf> {
     let url_hash = &compute_sha256(arch_config.url.as_bytes())[..12];
     let image_path = cache_dir.join(format!(
         "ubuntu-{}-{}-{}.img",
-        plan.base.version,
-        arch_name,
-        url_hash
+        plan.base.version, arch_name, url_hash
     ));
 
     // If cached, use it
@@ -1531,20 +1579,27 @@ async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
     let log_path = temp_dir.join("firecracker.log");
 
     // Find kernel - downloaded from Kata release if needed
-    let kernel_path = crate::setup::kernel::ensure_kernel().await?;
+    // We pass true since we're in the rootfs creation path (allow_create=true)
+    let kernel_path = crate::setup::kernel::ensure_kernel(true).await?;
 
     // Create serial console output file
     let serial_path = temp_dir.join("serial.log");
-    let serial_file = std::fs::File::create(&serial_path)
-        .context("creating serial console file")?;
+    let serial_file =
+        std::fs::File::create(&serial_path).context("creating serial console file")?;
 
     // Start Firecracker with serial console output
-    info!("starting Firecracker for Layer 2 setup (serial output: {})", serial_path.display());
+    info!(
+        "starting Firecracker for Layer 2 setup (serial output: {})",
+        serial_path.display()
+    );
     let mut fc_process = Command::new("firecracker")
         .args([
-            "--api-sock", path_to_str(&api_socket)?,
-            "--log-path", path_to_str(&log_path)?,
-            "--level", "Info",
+            "--api-sock",
+            path_to_str(&api_socket)?,
+            "--log-path",
+            path_to_str(&log_path)?,
+            "--level",
+            "Info",
         ])
         .stdout(serial_file.try_clone().context("cloning serial file")?)
         .stderr(std::process::Stdio::null())
@@ -1611,7 +1666,9 @@ async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
     // No network needed! Packages are installed from local ISO.
 
     // Start the VM
-    client.put_action(crate::firecracker::api::InstanceAction::InstanceStart).await?;
+    client
+        .put_action(crate::firecracker::api::InstanceAction::InstanceStart)
+        .await?;
     info!("Layer 2 setup VM started, waiting for completion (this takes several minutes)");
 
     // Wait for VM to shut down (setup script runs shutdown -h now when done)
@@ -1624,7 +1681,10 @@ async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
             match fc_process.try_wait() {
                 Ok(Some(status)) => {
                     let elapsed = start.elapsed();
-                    info!("Firecracker exited with status: {:?} after {:?}", status, elapsed);
+                    info!(
+                        "Firecracker exited with status: {:?} after {:?}",
+                        status, elapsed
+                    );
                     return Ok(elapsed);
                 }
                 Ok(None) => {
@@ -1658,7 +1718,9 @@ async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
     match result {
         Ok(Ok(elapsed)) => {
             // Check for completion marker in serial output
-            let serial_content = tokio::fs::read_to_string(&serial_path).await.unwrap_or_default();
+            let serial_content = tokio::fs::read_to_string(&serial_path)
+                .await
+                .unwrap_or_default();
             if !serial_content.contains("FCVM_SETUP_COMPLETE") {
                 warn!("Setup failed! Serial console output:\n{}", serial_content);
                 if let Ok(log_content) = tokio::fs::read_to_string(&log_path).await {
@@ -1668,7 +1730,10 @@ async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
                 bail!("Layer 2 setup failed (no FCVM_SETUP_COMPLETE marker found)");
             }
             let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-            info!(elapsed_secs = elapsed.as_secs(), "Layer 2 setup VM completed successfully");
+            info!(
+                elapsed_secs = elapsed.as_secs(),
+                "Layer 2 setup VM completed successfully"
+            );
             Ok(())
         }
         Ok(Err(e)) => {
