@@ -32,8 +32,21 @@ async fn main() -> Result<()> {
     // Parse CLI arguments
     let cli = cli::Cli::parse();
 
-    // Initialize base directory from CLI argument (must be done before any path access)
-    paths::init_base_dir(cli.base_dir.as_deref());
+    // Initialize paths - some commands don't need config
+    match &cli.cmd {
+        Commands::Setup(args) if args.generate_config => {
+            // --generate-config doesn't need existing config
+            paths::init_with_defaults();
+        }
+        Commands::Completions(_) => {
+            // Shell completions don't need config
+            paths::init_with_defaults();
+        }
+        _ => {
+            // All other commands require config
+            paths::init_from_config();
+        }
+    }
 
     // Initialize logging
     // If --sub-process flag is set, disable timestamps AND level (subprocess mode)

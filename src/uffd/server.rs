@@ -26,7 +26,7 @@ pub struct UffdServer {
 impl UffdServer {
     /// Create a new UFFD server for a snapshot
     pub async fn new(snapshot_id: String, mem_file_path: &Path) -> Result<Self> {
-        let socket_path = paths::base_dir().join(format!("uffd-{}.sock", snapshot_id));
+        let socket_path = paths::data_dir().join(format!("uffd-{}.sock", snapshot_id));
         Self::new_with_path(snapshot_id, mem_file_path, &socket_path).await
     }
 

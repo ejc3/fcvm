@@ -25,6 +25,8 @@ const LAYER2_SIZE: &str = "10G";
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Plan {
+    #[serde(default)]
+    pub paths: PathsConfig,
     pub base: BaseConfig,
     pub kernel: KernelConfig,
     pub packages: PackagesConfig,
@@ -33,6 +35,29 @@ pub struct Plan {
     pub fstab: FstabConfig,
     #[serde(default)]
     pub cleanup: CleanupConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PathsConfig {
+    /// Directory for mutable VM data (vm-disks, state, snapshots)
+    #[serde(default = "default_base_dir")]
+    pub data_dir: String,
+    /// Directory for shared content-addressed assets (kernels, rootfs, initrd, image-cache)
+    #[serde(default = "default_base_dir")]
+    pub assets_dir: String,
+}
+
+fn default_base_dir() -> String {
+    "/mnt/fcvm-btrfs".to_string()
+}
+
+impl Default for PathsConfig {
+    fn default() -> Self {
+        Self {
+            data_dir: default_base_dir(),
+            assets_dir: default_base_dir(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -963,7 +988,7 @@ pub async fn ensure_fc_agent_initrd(allow_create: bool) -> Result<PathBuf> {
     let initrd_sha_short = &initrd_sha[..12];
 
     // Check if initrd already exists for this version (fast path, no lock)
-    let initrd_dir = paths::base_dir().join("initrd");
+    let initrd_dir = paths::initrd_dir();
     let initrd_path = initrd_dir.join(format!("fc-agent-{}.initrd", initrd_sha_short));
 
     if initrd_path.exists() {
@@ -1555,7 +1580,7 @@ async fn create_layer2_setup_initrd(
 ///
 /// NOTE: fc-agent is NOT included - it will be injected per-VM at boot time.
 async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBuf> {
-    let cache_dir = paths::base_dir().join("cache");
+    let cache_dir = paths::cache_dir();
     let packages_dir = cache_dir.join(format!("packages-{}", script_sha_short));
 
     // If packages directory already exists with .deb files, use it
@@ -1644,7 +1669,7 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
 
 /// Download cloud image (cached by URL hash)
 async fn download_cloud_image(plan: &Plan) -> Result<PathBuf> {
-    let cache_dir = paths::base_dir().join("cache");
+    let cache_dir = paths::cache_dir();
     tokio::fs::create_dir_all(&cache_dir)
         .await
         .context("creating cache directory")?;

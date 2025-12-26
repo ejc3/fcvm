@@ -229,14 +229,7 @@ fn test_copy_file_range() {
 
     // Call copy_file_range through the FUSE mount
     let result = unsafe {
-        libc::copy_file_range(
-            fd_in,
-            &mut off_in,
-            fd_out,
-            &mut off_out,
-            test_data.len(),
-            0,
-        )
+        libc::copy_file_range(fd_in, &mut off_in, fd_out, &mut off_out, test_data.len(), 0)
     };
 
     assert!(

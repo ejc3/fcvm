@@ -316,7 +316,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
             .to_string();
 
         // Use content-addressable cache: /mnt/fcvm-btrfs/image-cache/{digest}/
-        let image_cache_dir = paths::base_dir().join("image-cache");
+        let image_cache_dir = paths::image_cache_dir();
         tokio::fs::create_dir_all(&image_cache_dir)
             .await
             .context("creating image-cache directory")?;

@@ -269,7 +269,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     // Generate unique socket name with PID to allow multiple serves per snapshot
     let my_pid = std::process::id();
     let socket_path =
-        paths::base_dir().join(format!("uffd-{}-{}.sock", args.snapshot_name, my_pid));
+        paths::data_dir().join(format!("uffd-{}-{}.sock", args.snapshot_name, my_pid));
 
     // Create UFFD server with custom socket path
     let server = UffdServer::new_with_path(
@@ -557,7 +557,7 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Note: We already verified the serve process is alive above.
     // We do NOT check socket existence here (TOCTOU race) - let the actual
     // connection attempt fail with a meaningful error instead.
-    let uffd_socket = paths::base_dir().join(format!("uffd-{}-{}.sock", snapshot_name, args.pid));
+    let uffd_socket = paths::data_dir().join(format!("uffd-{}-{}.sock", snapshot_name, args.pid));
 
     info!(
         uffd_socket = %uffd_socket.display(),

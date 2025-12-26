@@ -276,7 +276,14 @@ pub trait FilesystemHandler: Send + Sync {
                 len,
                 flags,
             } => self.copy_file_range(
-                *ino_in, *fh_in, *offset_in, *ino_out, *fh_out, *offset_out, *len, *flags,
+                *ino_in,
+                *fh_in,
+                *offset_in,
+                *ino_out,
+                *fh_out,
+                *offset_out,
+                *len,
+                *flags,
             ),
         }
     }

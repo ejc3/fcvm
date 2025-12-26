@@ -774,7 +774,7 @@ This ensures automatic cache invalidation when:
 **Package Download:**
 Packages are downloaded using `podman run ubuntu:{codename}` with `apt-get install --download-only`.
 This ensures packages match the target Ubuntu version (Noble/24.04), not the host OS.
-The `codename` is specified in `rootfs-plan.toml`.
+The `codename` is specified in `rootfs-config.toml`.
 
 **Setup Verification:**
 Layer 2 setup writes a marker file `/etc/fcvm-setup-complete` on successful completion.
@@ -792,13 +792,12 @@ tokio::process::Command::new("cp")
 ```
 
 ```rust
-// src/paths.rs
-pub fn base_dir() -> PathBuf {
-    PathBuf::from("/mnt/fcvm-btrfs")
-}
+// src/paths.rs - paths loaded from rootfs-config.toml [paths] section
+pub fn assets_dir() -> PathBuf  // Content-addressed: kernels, rootfs, initrd, image-cache
+pub fn data_dir() -> PathBuf    // Mutable: vm-disks, state, snapshots
 
 pub fn vm_runtime_dir(vm_id: &str) -> PathBuf {
-    base_dir().join("vm-disks").join(vm_id)
+    data_dir().join("vm-disks").join(vm_id)
 }
 ```
 
@@ -812,7 +811,7 @@ When you change fc-agent or setup scripts, regenerate the rootfs:
 
 The rootfs is cached by SHA of setup script + kernel URL. Changes to these automatically invalidate the cache.
 
-NEVER manually edit rootfs files. The setup script in `rootfs-plan.toml` and `src/setup/rootfs.rs` control what gets installed.
+NEVER manually edit rootfs files. The setup script in `rootfs-config.toml` and `src/setup/rootfs.rs` control what gets installed.
 
 ### Memory Sharing (UFFD)
 
@@ -936,9 +935,9 @@ ERROR fcvm: Error: setting up rootfs: Rootfs not found. Run 'fcvm setup' first, 
 ```
 
 **What `fcvm setup` does:**
-1. Downloads Kata kernel from URL in `rootfs-plan.toml` (~15MB, cached by URL hash)
+1. Downloads Kata kernel from URL in `rootfs-config.toml` (~15MB, cached by URL hash)
 2. Downloads packages using `podman run ubuntu:noble` with `apt-get install --download-only`
-   - Packages specified in `rootfs-plan.toml` (podman, crun, fuse-overlayfs, skopeo, fuse3, haveged, chrony, strace)
+   - Packages specified in `rootfs-config.toml` (podman, crun, fuse-overlayfs, skopeo, fuse3, haveged, chrony, strace)
    - Uses target Ubuntu version (noble/24.04) to get correct package versions
 3. Creates Layer 2 rootfs (~10GB):
    - Downloads Ubuntu cloud image
@@ -950,21 +949,23 @@ ERROR fcvm: Error: setting up rootfs: Rootfs not found. Run 'fcvm setup' first, 
 **Kernel source**: Kata Containers kernel (6.12.47 from Kata 3.24.0 release) with `CONFIG_FUSE_FS=y` built-in.
 
 ### Data Layout
+
+Paths are configured in `rootfs-config.toml` under `[paths]`:
+- `assets_dir`: Content-addressed files (shared across inception levels)
+- `data_dir`: Mutable per-instance data (separate per inception level)
+
 ```
-/mnt/fcvm-btrfs/           # btrfs filesystem (CoW reflinks work here)
-├── kernels/
-│   ├── vmlinux.bin        # Symlink to active kernel
-│   └── vmlinux-{sha}.bin  # Kernel files (SHA of URL for cache key)
-├── rootfs/
-│   └── layer2-{sha}.raw   # Base Ubuntu + Podman image (~10GB, SHA of setup script)
-├── initrd/
-│   └── fc-agent-{sha}.initrd  # fc-agent injection initrd (SHA of binary)
-├── vm-disks/
-│   └── vm-{id}/
-│       └── disks/rootfs.raw   # CoW reflink copy per VM
-├── snapshots/             # Firecracker snapshots
-├── state/                 # VM state JSON files
-└── cache/                 # Downloaded cloud images
+assets_dir (default: /mnt/fcvm-btrfs)
+├── kernels/vmlinux-{sha}.bin     # Kernel (SHA of URL)
+├── rootfs/layer2-{sha}.raw       # Base image (~10GB, SHA of setup script)
+├── initrd/fc-agent-{sha}.initrd  # fc-agent injection (SHA of binary)
+├── image-cache/sha256:{digest}/  # Container image layers
+└── cache/                        # Downloaded cloud images
+
+data_dir (default: /mnt/fcvm-btrfs, override per inception level)
+├── vm-disks/{vm_id}/disks/       # CoW reflink copies per VM
+├── state/{vm_id}.json            # VM state files
+└── snapshots/{name}/             # Firecracker snapshots
 ```
 
 ## Key Learnings

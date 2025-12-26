@@ -96,7 +96,7 @@ async fn download_kernel(config: &KernelArchConfig, allow_create: bool) -> Resul
 
     // Download and extract in one pipeline:
     // curl -> zstd -d -> tar --extract
-    let cache_dir = paths::base_dir().join("cache");
+    let cache_dir = paths::cache_dir();
     tokio::fs::create_dir_all(&cache_dir).await?;
 
     let tarball_path = cache_dir.join(format!("kata-kernel-{}.tar.zst", url_hash));
