@@ -266,6 +266,18 @@ pub trait FilesystemHandler: Send + Sync {
                 gid,
                 pid,
             } => self.readdirplus(*ino, *fh, *offset, *uid, *gid, *pid),
+            VolumeRequest::CopyFileRange {
+                ino_in,
+                fh_in,
+                offset_in,
+                ino_out,
+                fh_out,
+                offset_out,
+                len,
+                flags,
+            } => self.copy_file_range(
+                *ino_in, *fh_in, *offset_in, *ino_out, *fh_out, *offset_out, *len, *flags,
+            ),
         }
     }
 
@@ -658,6 +670,25 @@ pub trait FilesystemHandler: Send + Sync {
         _uid: u32,
         _gid: u32,
         _pid: u32,
+    ) -> VolumeResponse {
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
+    }
+
+    /// Copy data between two files without going through userspace.
+    /// On btrfs, this creates a reflink (instant copy-on-write).
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range(
+        &self,
+        _ino_in: u64,
+        _fh_in: u64,
+        _offset_in: u64,
+        _ino_out: u64,
+        _fh_out: u64,
+        _offset_out: u64,
+        _len: u64,
+        _flags: u32,
     ) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
