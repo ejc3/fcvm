@@ -1,5 +1,18 @@
 # fcvm Development Log
 
+## NO HACKS
+
+**Fix the root cause, not the symptom.** When something fails:
+1. Understand WHY it's failing
+2. Fix the actual problem
+3. Don't hide errors, disable tests, or add workarounds
+
+Examples of hacks to avoid:
+- Gating tests behind feature flags to skip failures
+- Adding sleeps or retries without understanding the race
+- Clearing caches instead of updating tools
+- Using `|| true` to ignore errors
+
 ## Overview
 fcvm is a Firecracker VM manager for running Podman containers in lightweight microVMs. This document tracks implementation findings and decisions.
 
@@ -31,6 +44,19 @@ make container-test-root FILTER=sanity STREAM=1   # Container tests with streami
 ```
 
 Without `STREAM=1`, nextest captures output and only shows it after tests complete (better for parallel runs).
+
+### Debug Logs
+
+**All tests automatically capture debug-level logs to files.**
+
+How it works:
+- `spawn_fcvm()` and `spawn_fcvm_with_logs()` always create a log file
+- fcvm runs with `RUST_LOG=debug` for full debug output
+- Console shows INFO/WARN/ERROR only (DEBUG filtered out)
+- Log file has everything including DEBUG/TRACE
+- Path printed at end: `📋 Debug log: /tmp/fcvm-test-logs/{name}-{timestamp}.log`
+- CI uploads `/tmp/fcvm-test-logs/` as artifacts (7 day retention)
+- Tests add `--setup` flag automatically, so missing initrd auto-creates
 
 ### Common Commands
 ```bash
@@ -192,6 +218,24 @@ Why: String matching breaks when JSON formatting changes (spaces, newlines, fiel
 4. Add regression tests if needed
 
 If a test fails intermittently, that's a **concurrency bug** or **race condition** that must be fixed, not ignored.
+
+### POSIX Compliance Testing
+
+**fuse-pipe must pass pjdfstest** - the POSIX filesystem test suite.
+
+When a POSIX test fails:
+1. **Understand the POSIX requirement** - What behavior does the spec require?
+2. **Check kernel vs userspace** - FUSE operations go through the kernel, which handles inode lifecycle. Unit tests calling PassthroughFs directly bypass this.
+3. **Use integration tests for complex behavior** - Hardlinks, permissions, and refcounting require the full FUSE stack (kernel manages inodes).
+4. **Unit tests for simple operations** - Single file create/read/write can be tested directly.
+
+**Key FUSE concepts:**
+- Kernel maintains `nlookup` (lookup count) for inodes
+- `release()` closes file handles, does NOT decrement nlookup
+- `forget()` decrements nlookup; inode removed when count reaches zero
+- Hardlinks work because kernel resolves paths to inodes before calling LINK
+
+**If a unit test works locally but fails in CI:** Add diagnostics to understand the exact failure. Don't assume - investigate filesystem type, inode tracking, and timing.
 
 ### Race Condition Debugging Protocol
 
@@ -464,11 +508,37 @@ make container-test
 
 ### CI Structure
 
-**PR/Push (7 parallel jobs):**
-- Lint, Build, Unit Tests, FUSE Integration, CLI Tests, FUSE Permissions, POSIX Compliance
+**PR/Push (2 parallel jobs):**
+- Host: Runs on bare metal with KVM
+- Container: Runs in privileged container
 
 **Nightly (scheduled):**
 - Full benchmarks with artifact upload
+
+### Manual CI Trigger
+
+CI only auto-runs on PRs to `main`. To test other branches:
+```bash
+gh workflow run ci.yml --ref <branch-name>
+```
+
+### Getting Logs from In-Progress CI Runs
+
+**`gh run view --log` only works after ALL jobs complete.** To get logs from a completed job while other jobs are still running:
+
+```bash
+# Get job ID for the completed job
+gh api repos/OWNER/REPO/actions/runs/RUN_ID/jobs --jq '.jobs[] | select(.name=="Host") | .id'
+
+# Fetch logs for that specific job
+gh api repos/OWNER/REPO/actions/runs/RUN_ID/jobs --jq '.jobs[] | select(.name=="Host") | .id' \
+  | xargs -I{} gh api repos/OWNER/REPO/actions/jobs/{}/logs 2>&1 \
+  | grep -E "pattern"
+```
+
+### linkat AT_EMPTY_PATH Limitation
+
+fuse-backend-rs hardlinks use `linkat(..., AT_EMPTY_PATH)`. Older kernels require `CAP_DAC_READ_SEARCH` capability; newer kernels (≥5.12ish) relaxed this. BuildJet runs older kernel → ENOENT. Localhost (kernel 6.14) works fine. Hardlink tests detect and skip. See [linkat(2)](https://man7.org/linux/man-pages/man2/linkat.2.html), [kernel patch](https://lwn.net/Articles/565122/).
 
 ## PID-Based Process Management
 
@@ -691,9 +761,25 @@ fuse-pipe/benches/
 - Initrd: `/mnt/fcvm-btrfs/initrd/fc-agent-{sha}.initrd` (injects fc-agent at boot)
 
 **Layer System:**
-The rootfs is named after the SHA of the setup script + kernel URL. This ensures automatic cache invalidation when:
+The rootfs is named after the SHA of a combined script that includes:
+- Init script (embeds install script + setup script)
+- Kernel URL
+- Download script (packages + Ubuntu codename)
+
+This ensures automatic cache invalidation when:
 - The init logic, install script, or setup script changes
 - The kernel URL changes (different kernel version)
+- The package list or target Ubuntu version changes
+
+**Package Download:**
+Packages are downloaded using `podman run ubuntu:{codename}` with `apt-get install --download-only`.
+This ensures packages match the target Ubuntu version (Noble/24.04), not the host OS.
+The `codename` is specified in `rootfs-plan.toml`.
+
+**Setup Verification:**
+Layer 2 setup writes a marker file `/etc/fcvm-setup-complete` on successful completion.
+After the setup VM exits, fcvm mounts the rootfs and verifies this marker exists.
+If missing, setup fails with a clear error.
 
 The initrd contains a statically-linked busybox and fc-agent binary, injected at boot before systemd.
 
@@ -851,8 +937,15 @@ ERROR fcvm: Error: setting up rootfs: Rootfs not found. Run 'fcvm setup' first, 
 
 **What `fcvm setup` does:**
 1. Downloads Kata kernel from URL in `rootfs-plan.toml` (~15MB, cached by URL hash)
-2. Creates Layer 2 rootfs (~10GB, downloads Ubuntu cloud image, boots VM to install packages)
-3. Creates fc-agent initrd (embeds statically-linked fc-agent binary)
+2. Downloads packages using `podman run ubuntu:noble` with `apt-get install --download-only`
+   - Packages specified in `rootfs-plan.toml` (podman, crun, fuse-overlayfs, skopeo, fuse3, haveged, chrony, strace)
+   - Uses target Ubuntu version (noble/24.04) to get correct package versions
+3. Creates Layer 2 rootfs (~10GB):
+   - Downloads Ubuntu cloud image
+   - Boots VM with packages embedded in initrd
+   - Runs install script (dpkg) + setup script (config files, services)
+   - Verifies setup completed by checking for `/etc/fcvm-setup-complete` marker file
+4. Creates fc-agent initrd (embeds statically-linked fc-agent binary)
 
 **Kernel source**: Kata Containers kernel (6.12.47 from Kata 3.24.0 release) with `CONFIG_FUSE_FS=y` built-in.
 

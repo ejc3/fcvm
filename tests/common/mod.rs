@@ -1,10 +1,147 @@
 // Common test utilities for fcvm integration tests
 #![allow(dead_code)]
 
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 /// Default test image - use AWS ECR to avoid Docker Hub rate limits
 pub const TEST_IMAGE: &str = "public.ecr.aws/nginx/nginx:alpine";
+
+/// Standard log directory for test logs
+const TEST_LOG_DIR: &str = "/tmp/fcvm-test-logs";
+
+/// Test logger that writes detailed logs to a file while keeping console output clean.
+///
+/// Usage:
+/// ```ignore
+/// let logger = TestLogger::new("my_test_name");
+/// logger.info("Starting test...");
+/// logger.debug("Detailed info that would clutter console");
+/// // At test end, logger.finish() prints the log file path
+/// ```
+pub struct TestLogger {
+    test_name: String,
+    log_path: PathBuf,
+    file: Arc<Mutex<std::fs::File>>,
+    start_time: std::time::Instant,
+}
+
+impl TestLogger {
+    /// Create a new test logger. Logs are written to /tmp/fcvm-test-logs/{test_name}-{timestamp}.log
+    pub fn new(test_name: &str) -> Self {
+        // Create log directory if needed
+        std::fs::create_dir_all(TEST_LOG_DIR).ok();
+
+        let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        let log_path = PathBuf::from(format!("{}/{}-{}.log", TEST_LOG_DIR, test_name, timestamp));
+
+        let file = std::fs::File::create(&log_path).expect("Failed to create test log file");
+
+        let logger = Self {
+            test_name: test_name.to_string(),
+            log_path,
+            file: Arc::new(Mutex::new(file)),
+            start_time: std::time::Instant::now(),
+        };
+
+        logger.log_raw(&format!(
+            "=== Test: {} ===\nStarted: {}\n\n",
+            test_name,
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+        ));
+
+        logger
+    }
+
+    /// Log a raw message (no prefix)
+    pub fn log_raw(&self, msg: &str) {
+        if let Ok(mut file) = self.file.lock() {
+            writeln!(file, "{}", msg).ok();
+        }
+    }
+
+    /// Log an info message with timestamp
+    pub fn info(&self, msg: &str) {
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        self.log_raw(&format!("[{:>8.3}s] INFO  {}", elapsed, msg));
+    }
+
+    /// Log a debug message with timestamp (detailed info)
+    pub fn debug(&self, msg: &str) {
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        self.log_raw(&format!("[{:>8.3}s] DEBUG {}", elapsed, msg));
+    }
+
+    /// Log an error message with timestamp
+    pub fn error(&self, msg: &str) {
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        self.log_raw(&format!("[{:>8.3}s] ERROR {}", elapsed, msg));
+    }
+
+    /// Log a section header
+    pub fn section(&self, name: &str) {
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        self.log_raw(&format!("\n[{:>8.3}s] === {} ===", elapsed, name));
+    }
+
+    /// Log command output (stdout and stderr)
+    pub fn log_output(&self, label: &str, output: &std::process::Output) {
+        self.debug(&format!("{} status: {}", label, output.status));
+        if !output.stdout.is_empty() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            self.debug(&format!("{} stdout:\n{}", label, stdout));
+        }
+        if !output.stderr.is_empty() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            self.debug(&format!("{} stderr:\n{}", label, stderr));
+        }
+    }
+
+    /// Get the log file path
+    pub fn path(&self) -> &PathBuf {
+        &self.log_path
+    }
+
+    /// Finish logging and print the log file path to console.
+    /// Call this at the end of the test.
+    pub fn finish(&self, success: bool) {
+        let status = if success { "PASSED" } else { "FAILED" };
+        let elapsed = self.start_time.elapsed();
+
+        self.log_raw(&format!(
+            "\n=== Test {} in {:.2}s ===",
+            status,
+            elapsed.as_secs_f64()
+        ));
+
+        // Print log path to console (visible in test output)
+        eprintln!(
+            "\n📋 Test log: {} ({:.2}s)",
+            self.log_path.display(),
+            elapsed.as_secs_f64()
+        );
+    }
+
+    /// Finish with failure and print the log file path prominently
+    pub fn finish_failed(&self, error: &str) {
+        self.error(error);
+        self.finish(false);
+        // Also print error to console for immediate visibility
+        eprintln!("❌ Test failed: {}", error);
+    }
+}
+
+impl Clone for TestLogger {
+    fn clone(&self) -> Self {
+        Self {
+            test_name: self.test_name.clone(),
+            log_path: self.log_path.clone(),
+            file: self.file.clone(),
+            start_time: self.start_time,
+        }
+    }
+}
 
 /// Polling interval for status checks (100ms)
 pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -146,6 +283,9 @@ impl Drop for VmFixture {
 /// Uses `Stdio::inherit()` - output goes directly to parent's stdout/stderr.
 /// Simple and safe, but output is not prefixed with process name.
 ///
+/// **Debug logging:** When `FCVM_DEBUG_LOGS=1`, logs are written to
+/// `/tmp/fcvm-test-logs/` with RUST_LOG=debug.
+///
 /// For prefixed output like `[vm-name] ...`, use `spawn_fcvm_with_logs()` instead.
 ///
 /// # Arguments
@@ -154,35 +294,30 @@ impl Drop for VmFixture {
 /// # Returns
 /// Tuple of (Child process, PID)
 pub async fn spawn_fcvm(args: &[&str]) -> anyhow::Result<(tokio::process::Child, u32)> {
-    let fcvm_path = find_fcvm_binary()?;
-    let final_args = maybe_add_strace_flag(args);
-    let child = tokio::process::Command::new(&fcvm_path)
-        .args(&final_args)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn fcvm: {}", e))?;
+    // Extract name from args (--name value) for log file naming
+    let name = args
+        .windows(2)
+        .find(|w| w[0] == "--name")
+        .map(|w| w[1])
+        .unwrap_or("fcvm");
 
-    let pid = child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("failed to get fcvm PID"))?;
-
-    Ok((child, pid))
+    // Delegate to spawn_fcvm_with_logs which handles debug logging
+    spawn_fcvm_with_logs(args, name).await
 }
 
-/// Check FCVM_STRACE_AGENT env var and insert --strace-agent flag for podman run commands
-fn maybe_add_strace_flag(args: &[&str]) -> Vec<String> {
+/// Add implicit flags to fcvm commands for tests
+fn maybe_add_test_flags(args: &[&str]) -> Vec<String> {
     let strace_enabled = std::env::var("FCVM_STRACE_AGENT")
         .map(|v| v == "1")
         .unwrap_or(false);
 
     let mut result: Vec<String> = args.iter().map(|s| s.to_string()).collect();
 
-    // Only add for "podman run" commands
-    if strace_enabled && args.len() >= 2 && args[0] == "podman" && args[1] == "run" {
-        // Find position to insert (before the image name, which is the last non-flag arg)
-        // Insert after "run" and before any positional args
-        // Simplest: insert right after "run" at position 2
+    // Only add flags for "podman run" and "snapshot run" commands
+    let is_podman_run = args.len() >= 2 && args[0] == "podman" && args[1] == "run";
+    let is_snapshot_run = args.len() >= 2 && args[0] == "snapshot" && args[1] == "run";
+
+    if (is_podman_run || is_snapshot_run) && strace_enabled {
         result.insert(2, "--strace-agent".to_string());
         eprintln!(">>> STRACE MODE: Adding --strace-agent flag");
     }
@@ -195,8 +330,9 @@ fn maybe_add_strace_flag(args: &[&str]) -> Vec<String> {
 /// Output is prefixed with `[name]` for stdout and `[name ERR]` for stderr,
 /// useful when running multiple VMs in parallel.
 ///
-/// This is safe from pipe buffer deadlock because log consumer tasks are
-/// spawned immediately to drain the pipes.
+/// **Logging:** All output is automatically written to `/tmp/fcvm-test-logs/{name}-{timestamp}.log`
+/// with RUST_LOG=debug for full debug output. Console shows only INFO/WARN/ERROR.
+/// Log files are uploaded as CI artifacts on failure.
 ///
 /// # Arguments
 /// * `args` - Arguments to pass to fcvm
@@ -204,26 +340,23 @@ fn maybe_add_strace_flag(args: &[&str]) -> Vec<String> {
 ///
 /// # Returns
 /// Tuple of (Child process, PID)
-///
-/// # Example
-/// ```ignore
-/// let (mut child, pid) = spawn_fcvm_with_logs(&[
-///     "podman", "run", "--name", "test", "--network", "bridged", TEST_IMAGE,
-/// ], "test-vm").await?;
-/// // Output will appear as:
-/// // [test-vm] Starting container...
-/// // [test-vm ERR] Warning: ...
-/// ```
 pub async fn spawn_fcvm_with_logs(
     args: &[&str],
     name: &str,
 ) -> anyhow::Result<(tokio::process::Child, u32)> {
     let fcvm_path = find_fcvm_binary()?;
-    let final_args = maybe_add_strace_flag(args);
-    let mut child = tokio::process::Command::new(&fcvm_path)
-        .args(&final_args)
+    let final_args = maybe_add_test_flags(args);
+
+    // Always create logger for debug output to file
+    let logger = TestLogger::new(name);
+
+    let mut cmd = tokio::process::Command::new(&fcvm_path);
+    cmd.args(&final_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .env("RUST_LOG", "debug");
+
+    let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn fcvm: {}", e))?;
 
@@ -231,38 +364,69 @@ pub async fn spawn_fcvm_with_logs(
         .id()
         .ok_or_else(|| anyhow::anyhow!("failed to get fcvm PID"))?;
 
+    logger.info(&format!("Spawned fcvm PID={} args={:?}", pid, args));
+
     // Spawn log consumers immediately to prevent pipe buffer deadlock
-    spawn_log_consumer(child.stdout.take(), name);
-    spawn_log_consumer_stderr(child.stderr.take(), name);
+    spawn_log_consumer_to_file(child.stdout.take(), name, Some(logger.clone()), false);
+    spawn_log_consumer_to_file(child.stderr.take(), name, Some(logger), true);
 
     Ok((child, pid))
 }
 
 /// Spawn a task to consume stdout and print with `[name]` prefix
 pub fn spawn_log_consumer(stdout: Option<tokio::process::ChildStdout>, name: &str) {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    if let Some(stdout) = stdout {
-        let name = name.to_string();
-        tokio::spawn(async move {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("[{}] {}", name, line);
-            }
-        });
-    }
+    spawn_log_consumer_to_file(stdout, name, None, false);
 }
 
 /// Spawn a task to consume stderr and print with `[name ERR]` prefix
 pub fn spawn_log_consumer_stderr(stderr: Option<tokio::process::ChildStderr>, name: &str) {
+    spawn_log_consumer_to_file(stderr, name, None, true);
+}
+
+/// Internal: spawn log consumer that writes to console and optionally to a file
+///
+/// When a logger is provided:
+/// - All lines (including DEBUG/TRACE) are written to the file
+/// - Only non-debug lines are printed to console for cleaner output
+fn spawn_log_consumer_to_file<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+    reader: Option<R>,
+    name: &str,
+    logger: Option<TestLogger>,
+    is_stderr: bool,
+) {
     use tokio::io::{AsyncBufReadExt, BufReader};
-    if let Some(stderr) = stderr {
+    if let Some(reader) = reader {
         let name = name.to_string();
+        let has_logger = logger.is_some();
         tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
+            let reader = BufReader::new(reader);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("[{} ERR] {}", name, line);
+                let prefix = if is_stderr {
+                    format!("[{} ERR]", name)
+                } else {
+                    format!("[{}]", name)
+                };
+                let formatted = format!("{} {}", prefix, line);
+
+                // Always write to file if logger provided
+                if let Some(ref log) = logger {
+                    log.log_raw(&formatted);
+                }
+
+                // Only print non-debug lines to console when logging to file
+                // This keeps console clean while file has full debug output
+                let is_debug = line.contains(" DEBUG ") || line.contains(" TRACE ");
+                if !has_logger || !is_debug {
+                    eprintln!("{}", formatted);
+                }
+            }
+
+            // Print log file path when stderr stream ends (once per process)
+            if is_stderr {
+                if let Some(ref log) = logger {
+                    eprintln!("📋 Debug log: {}", log.path().display());
+                }
             }
         });
     }

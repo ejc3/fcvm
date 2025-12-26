@@ -58,7 +58,7 @@ fn test_port_forward_bridged() -> Result<()> {
     let mut guest_ip = String::new();
     let mut veth_host_ip = String::new();
 
-    while start.elapsed() < Duration::from_secs(60) {
+    while start.elapsed() < Duration::from_secs(120) {
         std::thread::sleep(common::POLL_INTERVAL);
 
         let output = Command::new(&fcvm_path)

@@ -1,10 +1,25 @@
 name: CI
 
 on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: 'Which job to run'
+        type: choice
+        default: 'both'
+        options:
+          - both
+          - host
+          - container
   pull_request:
     branches: [main]
   push:
     branches: [main]
+
+# Cancel in-progress runs when a new revision is pushed
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,50 +28,11 @@ env:
   CONTAINER_ARCH: x86_64
 
 jobs:
-  container-rootless:
-    name: Container (rootless)
-    runs-on: buildjet-32vcpu-ubuntu-2204
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: fcvm
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuse-backend-rs
-          ref: master
-          path: fuse-backend-rs
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuser
-          ref: master
-          path: fuser
-      - name: make ci-container-rootless
-        working-directory: fcvm
-        run: make ci-container-rootless
-
-  container-sudo:
-    name: Container (sudo)
-    runs-on: buildjet-32vcpu-ubuntu-2204
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: fcvm
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuse-backend-rs
-          ref: master
-          path: fuse-backend-rs
-      - uses: actions/checkout@v4
-        with:
-          repository: ejc3/fuser
-          ref: master
-          path: fuser
-      - name: make ci-container-sudo
-        working-directory: fcvm
-        run: make ci-container-sudo
-
-  vm:
-    name: VM (bare metal)
+  # Runner 1: Host (bare metal with KVM)
+  # Runs: test-unit → test-fast → test-root (sequential)
+  host:
+    name: Host
+    if: ${{ github.event.inputs.job != 'container' }}
     runs-on: buildjet-32vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
@@ -76,12 +52,17 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-provider: buildjet
+          workspaces: fcvm -> target
+          cache-on-failure: "true"
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y fuse3 libfuse3-dev libclang-dev clang musl-tools \
             iproute2 iptables slirp4netns dnsmasq qemu-utils e2fsprogs parted \
-            podman skopeo busybox-static cpio zstd
+            podman skopeo busybox-static cpio zstd autoconf automake libtool
       - name: Install Firecracker
         run: |
           curl -L -o /tmp/firecracker.tgz \
@@ -91,8 +72,17 @@ jobs:
             release-v1.14.0-x86_64/jailer-v1.14.0-x86_64
           sudo mv /usr/local/bin/firecracker-v1.14.0-x86_64 /usr/local/bin/firecracker
           sudo mv /usr/local/bin/jailer-v1.14.0-x86_64 /usr/local/bin/jailer
-      - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked
+      - name: Install cargo tools
+        # cargo-audit >= 0.22.0 required for CVSS 4.0 support
+        # Use --force to override any stale cached versions
+        # Create symlinks in /usr/local/bin so sudo can find cargo tools
+        run: |
+          cargo install cargo-nextest@0.9.115 cargo-audit@0.22.0 cargo-deny@0.18.9 --locked --force
+          sudo ln -sf $HOME/.cargo/bin/cargo /usr/local/bin/
+          sudo ln -sf $HOME/.cargo/bin/cargo-audit /usr/local/bin/
+          sudo ln -sf $HOME/.cargo/bin/cargo-deny /usr/local/bin/
+          sudo ln -sf $HOME/.cargo/bin/cargo-fmt /usr/local/bin/
+          sudo ln -sf $HOME/.cargo/bin/cargo-clippy /usr/local/bin/
       - name: Setup KVM and networking
         run: |
           sudo chmod 666 /dev/kvm
@@ -104,6 +94,100 @@ jobs:
           fi
           sudo chmod 666 /dev/userfaultfd
           sudo sysctl -w vm.unprivileged_userfaultfd=1
-      - name: make test-vm
+          # Enable FUSE allow_other for tests
+          echo "user_allow_other" | sudo tee /etc/fuse.conf
+      - name: Create test log directory
+        run: mkdir -p /tmp/fcvm-test-logs
+      - name: test-unit
         working-directory: fcvm
-        run: make test-vm
+        run: make test-unit
+      - name: setup-fcvm
+        working-directory: fcvm
+        run: make setup-fcvm
+      - name: test-fast
+        working-directory: fcvm
+        run: make test-fast
+      - name: test-root
+        working-directory: fcvm
+        run: make test-root
+      - name: Capture kernel logs
+        if: always()
+        run: |
+          # Filter dmesg for UFFD/memory/VM related messages only
+          sudo dmesg | grep -iE 'userfault|uffd|kvm|firecracker|oom|killed|segfault|page.fault' > /tmp/fcvm-test-logs/dmesg-filtered.log || true
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-host
+          path: /tmp/fcvm-test-logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Runner 2: Container (podman)
+  # Runs same tests as Host but inside a container
+  # Needs KVM for VM tests (container mounts /dev/kvm)
+  container:
+    name: Container
+    if: ${{ github.event.inputs.job != 'host' }}
+    runs-on: buildjet-32vcpu-ubuntu-2204
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fcvm
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+      - name: Setup KVM and rootless podman
+        run: |
+          sudo chmod 666 /dev/kvm
+          # Enable userfaultfd syscall for snapshot cloning
+          sudo sysctl -w vm.unprivileged_userfaultfd=1
+          # Configure rootless podman to use cgroupfs (no systemd session on CI)
+          mkdir -p ~/.config/containers
+          printf '[engine]\ncgroup_manager = "cgroupfs"\nevents_logger = "file"\n' > ~/.config/containers/containers.conf
+          # Create cargo cache directory for container
+          mkdir -p ${{ github.workspace }}/cargo-cache/registry ${{ github.workspace }}/cargo-cache/target
+      - name: Cache container cargo
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/cargo-cache
+          key: container-cargo-${{ hashFiles('fcvm/Cargo.lock') }}
+          restore-keys: container-cargo-
+      - name: Create test log directory
+        run: mkdir -p /tmp/fcvm-test-logs
+      - name: container-test-unit
+        env:
+          CARGO_CACHE_DIR: ${{ github.workspace }}/cargo-cache
+        working-directory: fcvm
+        run: make container-test-unit
+      - name: container-setup-fcvm
+        env:
+          CARGO_CACHE_DIR: ${{ github.workspace }}/cargo-cache
+        working-directory: fcvm
+        run: make container-setup-fcvm
+      - name: container-test
+        env:
+          CARGO_CACHE_DIR: ${{ github.workspace }}/cargo-cache
+        working-directory: fcvm
+        run: make container-test
+      - name: Capture kernel logs
+        if: always()
+        run: |
+          # Filter dmesg for UFFD/memory/VM related messages only
+          sudo dmesg | grep -iE 'userfault|uffd|kvm|firecracker|oom|killed|segfault|page.fault' > /tmp/fcvm-test-logs/dmesg-filtered.log || true
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-container
+          path: /tmp/fcvm-test-logs/
+          if-no-files-found: ignore
+          retention-days: 14

@@ -42,6 +42,10 @@ retries = 0
 [test-groups.stress-tests]
 max-threads = 1
 
+# Snapshot tests limited to 3 concurrent (each snapshot is ~5.6GB on disk)
+[test-groups.snapshot-tests]
+max-threads = 3
+
 # VM tests run at full parallelism (num-cpus)
 [test-groups.vm-tests]
 max-threads = "num-cpus"
@@ -51,9 +55,15 @@ filter = "package(fcvm) & test(/stress_100/)"
 test-group = "stress-tests"
 slow-timeout = { period = "600s", terminate-after = 1 }
 
-# VM tests get 10 minute timeout
+# Snapshot tests: limited to 3 concurrent (each creates ~5.6GB snapshot on disk)
 [[profile.default.overrides]]
-filter = "package(fcvm) & test(/test_/) & !test(/stress_100/) & !test(/pjdfstest_vm/)"
+filter = "package(fcvm) & (test(/snapshot/) | test(/clone/))"
+test-group = "snapshot-tests"
+slow-timeout = { period = "600s", terminate-after = 1 }
+
+# VM tests get 10 minute timeout (non-snapshot tests)
+[[profile.default.overrides]]
+filter = "package(fcvm) & test(/test_/) & !test(/stress_100/) & !test(/pjdfstest_vm/) & !test(/snapshot/) & !test(/clone/)"
 test-group = "vm-tests"
 slow-timeout = { period = "600s", terminate-after = 1 }
 

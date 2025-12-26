@@ -12,6 +12,7 @@
 mod common;
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use std::process::Stdio;
 use std::time::Instant;
 
@@ -30,7 +31,18 @@ async fn run_category_in_vm(category: &str) -> Result<()> {
     // Build prove command for this category
     let prove_cmd = format!("prove -v -j {} -r /opt/pjdfstest/tests/{}/", JOBS, category);
 
-    // Check if pjdfstest container exists
+    // Use file lock to prevent parallel builds of pjdfstest container
+    // (17 tests run in parallel via nextest)
+    let lock_path = "/tmp/pjdfstest-build.lock";
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(lock_path)
+        .context("opening build lock file")?;
+    lock_file.lock_exclusive().context("acquiring build lock")?;
+
+    // Check if pjdfstest container exists (inside lock to prevent race)
     let check = tokio::process::Command::new("podman")
         .args(["image", "exists", "localhost/pjdfstest"])
         .output()
@@ -52,12 +64,17 @@ async fn run_category_in_vm(category: &str) -> Result<()> {
             .context("building pjdfstest container")?;
 
         if !build.status.success() {
+            // Release lock before bailing
+            let _ = lock_file.unlock();
             anyhow::bail!(
                 "Failed to build pjdfstest: {}",
                 String::from_utf8_lossy(&build.stderr)
             );
         }
     }
+
+    // Release lock - image is now available
+    let _ = lock_file.unlock();
 
     // Create temp directory for FUSE mount
     let data_dir = format!("/tmp/fuse-{}-data", test_id);

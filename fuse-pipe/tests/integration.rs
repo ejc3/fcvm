@@ -170,13 +170,55 @@ fn test_symlink_and_readlink() {
 #[test]
 fn test_hardlink_survives_source_removal() {
     let (data_dir, mount_dir) = unique_paths("fuse-integ");
+    eprintln!("=== Hardlink test paths ===");
+    eprintln!("data_dir: {:?}", data_dir);
+    eprintln!("mount_dir: {:?}", mount_dir);
+
+    // First check if the underlying data_dir filesystem supports hardlinks
+    fs::create_dir_all(&data_dir).expect("create data_dir");
+    let test_src = data_dir.join("hardlink_test.txt");
+    let test_link = data_dir.join("hardlink_test_link.txt");
+    fs::write(&test_src, "test").expect("write test file");
+    match fs::hard_link(&test_src, &test_link) {
+        Ok(()) => {
+            eprintln!("Underlying FS supports hardlinks");
+            fs::remove_file(&test_link).ok();
+        }
+        Err(e) => {
+            eprintln!("Underlying FS does NOT support hardlinks: {}", e);
+            eprintln!("Skipping test - this is expected on overlayfs/CI environments");
+            fs::remove_file(&test_src).ok();
+            cleanup(&data_dir, &mount_dir);
+            return; // Skip test
+        }
+    }
+
+    // Check linkat with AT_EMPTY_PATH (used by fuse-backend-rs passthrough)
+    fs::remove_file(&test_src).ok();
+    if !common::supports_at_empty_path(&data_dir) {
+        cleanup(&data_dir, &mount_dir);
+        return;
+    }
+
     let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
     let mount = fuse.mount_path();
 
     let source = mount.join("source.txt");
     let link = mount.join("link.txt");
     fs::write(&source, "hardlink").expect("write source");
-    fs::hard_link(&source, &link).expect("create hardlink");
+    if let Err(e) = fs::hard_link(&source, &link) {
+        eprintln!("=== Hardlink failed ===");
+        eprintln!("source: {:?} exists={}", source, source.exists());
+        eprintln!("link: {:?}", link);
+        eprintln!(
+            "mount contents: {:?}",
+            fs::read_dir(mount).ok().map(|d| d
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>())
+        );
+        panic!("create hardlink failed: {}", e);
+    }
 
     fs::remove_file(&source).expect("remove source");
 

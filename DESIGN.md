@@ -920,7 +920,14 @@ The guest is configured to support rootless Podman:
 fcvm setup
 ```
 
-This downloads the Kata kernel (~15MB) and creates the Layer 2 rootfs (~10GB with Ubuntu + Podman). Takes 5-10 minutes on first run.
+**What it does:**
+1. Downloads Kata kernel (~15MB, cached by URL hash)
+2. Downloads packages via `podman run ubuntu:noble` with `apt-get install --download-only`
+3. Creates Layer 2 rootfs (~10GB): boots VM, installs packages, writes config
+4. Verifies setup by checking `/etc/fcvm-setup-complete` marker file
+5. Creates fc-agent initrd (embeds statically-linked fc-agent binary)
+
+Takes 5-10 minutes on first run. Subsequent runs are instant (cached by content hash).
 
 **Note**: Must be run before `fcvm podman run` with bridged networking. For rootless mode, you can use `--setup` flag on `fcvm podman run` instead.
 
@@ -1310,7 +1317,7 @@ Override with `FCVM_BASE_DIR` environment variable.
 /mnt/fcvm-btrfs/
 ├── kernels/           # Kernel binaries
 │   └── vmlinux-{sha}.bin
-├── rootfs/            # Base rootfs images
+├── rootfs/            # Base rootfs images (contains /etc/fcvm-setup-complete marker)
 │   └── layer2-{sha}.raw
 ├── initrd/            # fc-agent injection initrds
 │   └── fc-agent-{sha}.initrd
@@ -1319,8 +1326,18 @@ Override with `FCVM_BASE_DIR` environment variable.
 ├── snapshots/         # Firecracker snapshots
 ├── state/             # VM state JSON files
 │   └── {vm-id}.json
-└── cache/             # Downloaded images
+└── cache/             # Downloaded images and packages
+    ├── ubuntu-24.04-arm64-{sha}.img  # Cloud image cache
+    └── packages-{sha}/               # Downloaded .deb files
 ```
+
+**Rootfs Hash Calculation:**
+The layer2-{sha}.raw name is computed from:
+- Init script (embeds install + setup scripts)
+- Kernel URL
+- Download script (package list + Ubuntu codename)
+
+This ensures automatic cache invalidation when any component changes.
 
 ### State Persistence
 
@@ -1726,6 +1743,6 @@ The 64 CPUs help within each crate (LLVM codegen), but crate-level parallelism i
 
 **End of Design Specification**
 
-*Version: 2.2*
-*Date: 2025-12-24*
+*Version: 2.3*
+*Date: 2025-12-25*
 *Author: fcvm project*

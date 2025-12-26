@@ -30,12 +30,23 @@ endif
 # Base test command
 NEXTEST := CARGO_TARGET_DIR=target cargo nextest $(NEXTEST_CMD) --release
 
+# Optional cargo cache directory (for CI caching)
+CARGO_CACHE_DIR ?=
+ifneq ($(CARGO_CACHE_DIR),)
+CARGO_CACHE_MOUNT := -v $(CARGO_CACHE_DIR)/registry:/usr/local/cargo/registry -v $(CARGO_CACHE_DIR)/target:/workspace/fcvm/target
+else
+CARGO_CACHE_MOUNT :=
+endif
+
+# Test log directory (mounted into container)
+TEST_LOG_DIR := /tmp/fcvm-test-logs
+
 # Container run command
-CONTAINER_RUN := podman run --rm --privileged --userns=keep-id --group-add keep-groups \
+CONTAINER_RUN := podman run --rm --privileged \
 	-v .:/workspace/fcvm -v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs -v $(FUSER):/workspace/fuser \
-	-v ./target:/workspace/fcvm/target -v ./cargo-home:/home/testuser/.cargo \
-	-e CARGO_HOME=/home/testuser/.cargo --device /dev/fuse --device /dev/kvm \
-	--ulimit nofile=65536:65536 --pids-limit=65536 -v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs
+	--device /dev/fuse --device /dev/kvm \
+	--ulimit nofile=65536:65536 --pids-limit=65536 -v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
+	-v $(TEST_LOG_DIR):$(TEST_LOG_DIR) $(CARGO_CACHE_MOUNT)
 
 .PHONY: all help build clean test test-unit test-fast test-all test-root \
 	_test-unit _test-fast _test-all _test-root \
@@ -56,7 +67,7 @@ build:
 	@mkdir -p target/release && cp target/$(MUSL_TARGET)/release/fc-agent target/release/fc-agent
 
 clean:
-	sudo rm -rf target cargo-home
+	sudo rm -rf target
 
 # Run-only targets (no setup deps, used by container)
 _test-unit:
@@ -85,17 +96,18 @@ container-test-unit: container-build
 	@echo "==> Running unit tests in container..."
 	$(CONTAINER_RUN) $(CONTAINER_TAG) make build _test-unit
 
-container-test-fast: setup-fcvm container-build
+container-test-fast: container-setup-fcvm
 	@echo "==> Running fast tests in container..."
 	$(CONTAINER_RUN) $(CONTAINER_TAG) make _test-fast
 
-container-test-all: setup-fcvm container-build
+container-test-all: container-setup-fcvm
 	@echo "==> Running all tests in container..."
 	$(CONTAINER_RUN) $(CONTAINER_TAG) make _test-all
 
 container-test: container-test-all
 
 container-build:
+	@sudo mkdir -p /mnt/fcvm-btrfs 2>/dev/null || true
 	podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) .
 
 container-shell: container-build
@@ -117,7 +129,7 @@ setup-btrfs:
 	@if ! mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then \
 		echo '==> Creating btrfs loopback...'; \
 		if [ ! -f /var/fcvm-btrfs.img ]; then \
-			sudo truncate -s 20G /var/fcvm-btrfs.img && sudo mkfs.btrfs /var/fcvm-btrfs.img; \
+			sudo truncate -s 60G /var/fcvm-btrfs.img && sudo mkfs.btrfs /var/fcvm-btrfs.img; \
 		fi && \
 		sudo mkdir -p /mnt/fcvm-btrfs && \
 		sudo mount -o loop /var/fcvm-btrfs.img /mnt/fcvm-btrfs && \
@@ -133,6 +145,19 @@ setup-fcvm: build setup-btrfs
 		exit 1; \
 	fi
 	@echo "==> Running fcvm setup..."
+	./target/release/fcvm setup
+
+# Run setup inside container (for CI - container has Firecracker)
+container-setup-fcvm: container-build setup-btrfs
+	@echo "==> Running fcvm setup in container..."
+	$(CONTAINER_RUN) $(CONTAINER_TAG) make build _setup-fcvm
+
+_setup-fcvm:
+	@FREE_GB=$$(df -BG /mnt/fcvm-btrfs 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \
+	if [ -n "$$FREE_GB" ] && [ "$$FREE_GB" -lt 15 ]; then \
+		echo "ERROR: Need 15GB on /mnt/fcvm-btrfs (have $${FREE_GB}GB)"; \
+		exit 1; \
+	fi
 	./target/release/fcvm setup
 
 bench: build

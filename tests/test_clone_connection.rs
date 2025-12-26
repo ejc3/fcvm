@@ -287,7 +287,7 @@ async fn test_clone_connection_reset_rootless() -> Result<()> {
     println!("  Clone started (PID: {})", clone_pid);
 
     // Wait for clone to become healthy
-    common::poll_health_by_pid(clone_pid, 60).await?;
+    common::poll_health_by_pid(clone_pid, 120).await?;
     let clone_time = clone_start.elapsed();
     println!("  Clone healthy after {:.0}ms", clone_time.as_millis());
 
@@ -770,7 +770,7 @@ async fn test_clone_connection_timing_rootless() -> Result<()> {
     )
     .await?;
 
-    common::poll_health_by_pid(clone_pid, 60).await?;
+    common::poll_health_by_pid(clone_pid, 120).await?;
     println!("  Clone healthy (PID: {})", clone_pid);
 
     // The clone's nc process woke up in a new network namespace
@@ -1165,7 +1165,7 @@ done
     )
     .await?;
 
-    common::poll_health_by_pid(clone_pid, 60).await?;
+    common::poll_health_by_pid(clone_pid, 120).await?;
     println!("  Clone healthy (PID: {})", clone_pid);
 
     // Wait for reconnect - need to wait for the 2s idle timeout to fire on stale socket

@@ -1263,6 +1263,61 @@ mod tests {
     #[test]
     fn test_passthrough_hardlink() {
         let dir = tempfile::tempdir().unwrap();
+        eprintln!("=== Hardlink unit test diagnostics ===");
+        eprintln!("tempdir: {:?}", dir.path());
+
+        // Check if underlying filesystem supports hardlinks by trying one directly
+        let test_src = dir.path().join("direct_test.txt");
+        let test_link = dir.path().join("direct_link.txt");
+        std::fs::write(&test_src, "test").expect("write direct test file");
+        match std::fs::hard_link(&test_src, &test_link) {
+            Ok(()) => {
+                eprintln!("Direct hardlink: SUPPORTED");
+                std::fs::remove_file(&test_link).ok();
+            }
+            Err(e) => {
+                eprintln!("Direct hardlink: NOT SUPPORTED - {}", e);
+                eprintln!("Skipping test - filesystem does not support hardlinks");
+                std::fs::remove_file(&test_src).ok();
+                return; // Skip test on filesystems that don't support hardlinks
+            }
+        }
+
+        // Also test linkat with AT_EMPTY_PATH (used by fuse-backend-rs)
+        use std::ffi::CString;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        let test_link2 = dir.path().join("at_empty_test.txt");
+        let test_link2_name = CString::new("at_empty_test.txt").unwrap();
+        let dir_fd = std::fs::File::open(dir.path()).expect("open dir");
+        let src_fd = std::fs::File::options()
+            .custom_flags(libc::O_PATH)
+            .read(true)
+            .open(&test_src)
+            .expect("open src with O_PATH");
+        let empty = CString::new("").unwrap();
+        let res = unsafe {
+            libc::linkat(
+                src_fd.as_raw_fd(),
+                empty.as_ptr(),
+                dir_fd.as_raw_fd(),
+                test_link2_name.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if res == 0 {
+            eprintln!("linkat with AT_EMPTY_PATH: SUPPORTED");
+            std::fs::remove_file(&test_link2).ok();
+        } else {
+            let err = std::io::Error::last_os_error();
+            eprintln!("linkat with AT_EMPTY_PATH: FAILED - {}", err);
+            eprintln!("This means fuse-backend-rs link() will also fail");
+            eprintln!("Skipping test - AT_EMPTY_PATH not supported");
+            std::fs::remove_file(&test_src).ok();
+            return; // Skip test
+        }
+        std::fs::remove_file(&test_src).ok();
+
         let fs = PassthroughFs::new(dir.path());
 
         let uid = nix::unistd::Uid::effective().as_raw();
@@ -1271,25 +1326,65 @@ mod tests {
         // Create source file
         let resp = fs.create(1, "source.txt", 0o644, libc::O_RDWR as u32, uid, gid, 0);
         let (source_ino, fh) = match resp {
-            VolumeResponse::Created { attr, fh, .. } => (attr.ino, fh),
+            VolumeResponse::Created { attr, fh, .. } => {
+                eprintln!("create() returned inode={}, fh={}", attr.ino, fh);
+                (attr.ino, fh)
+            }
             VolumeResponse::Error { errno } => panic!("Create failed with errno: {}", errno),
             _ => panic!("Expected Created response"),
         };
 
-        // Write to source
+        // Write to source and release handle
         let resp = fs.write(source_ino, fh, 0, b"hardlink test content", uid, gid, 0);
         assert!(matches!(resp, VolumeResponse::Written { .. }));
         fs.release(source_ino, fh);
 
+        // In real FUSE, the kernel calls LOOKUP on the source before LINK.
+        // This lookup refreshes the inode reference in fuse-backend-rs.
+        // We must do the same when calling PassthroughFs directly.
+        let resp = fs.lookup(1, "source.txt", uid, gid, 0);
+        let source_ino = match resp {
+            VolumeResponse::Entry { attr, .. } => {
+                eprintln!("lookup() returned inode={}", attr.ino);
+                attr.ino
+            }
+            VolumeResponse::Error { errno } => {
+                panic!("Lookup after release failed: errno={}", errno);
+            }
+            _ => panic!("Expected Entry response"),
+        };
+
         // Create hardlink
+        eprintln!(
+            "Calling link(source_ino={}, parent=1, name='link.txt')...",
+            source_ino
+        );
         let resp = fs.link(source_ino, 1, "link.txt", uid, gid, 0);
         let link_ino = match resp {
             VolumeResponse::Entry { attr, .. } => {
+                eprintln!("link() succeeded with inode={}", attr.ino);
                 // Hardlinks share the same inode
                 assert_eq!(attr.ino, source_ino);
                 attr.ino
             }
-            VolumeResponse::Error { errno } => panic!("Link failed with errno: {}", errno),
+            VolumeResponse::Error { errno } => {
+                // Extra diagnostics on failure
+                let src_path = dir.path().join("source.txt");
+                let link_path = dir.path().join("link.txt");
+                eprintln!("=== link() FAILED ===");
+                eprintln!(
+                    "errno: {} ({})",
+                    errno,
+                    std::io::Error::from_raw_os_error(errno)
+                );
+                eprintln!("source.txt exists: {}", src_path.exists());
+                eprintln!("link.txt exists: {}", link_path.exists());
+                eprintln!(
+                    "Direct hardlink attempt: {:?}",
+                    std::fs::hard_link(&src_path, dir.path().join("link2.txt"))
+                );
+                panic!("Link failed with errno: {}", errno);
+            }
             _ => panic!("Expected Entry response"),
         };
 
