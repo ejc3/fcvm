@@ -75,11 +75,14 @@ jobs:
       - name: Install cargo tools
         # cargo-audit >= 0.22.0 required for CVSS 4.0 support
         # Use --force to override any stale cached versions
-        # Create symlinks in /usr/local/bin so sudo can find them
+        # Create symlinks in /usr/local/bin so sudo can find cargo tools
         run: |
           cargo install cargo-nextest@0.9.115 cargo-audit@0.22.0 cargo-deny@0.18.9 --locked --force
+          sudo ln -sf $HOME/.cargo/bin/cargo /usr/local/bin/
           sudo ln -sf $HOME/.cargo/bin/cargo-audit /usr/local/bin/
           sudo ln -sf $HOME/.cargo/bin/cargo-deny /usr/local/bin/
+          sudo ln -sf $HOME/.cargo/bin/cargo-fmt /usr/local/bin/
+          sudo ln -sf $HOME/.cargo/bin/cargo-clippy /usr/local/bin/
       - name: Setup KVM and networking
         run: |
           sudo chmod 666 /dev/kvm
@@ -119,7 +122,7 @@ jobs:
           name: test-logs-host
           path: /tmp/fcvm-test-logs/
           if-no-files-found: ignore
-          retention-days: ${{ failure() && 30 || 7 }}
+          retention-days: 14
 
   # Runner 2: Container (podman)
   # Runs same tests as Host but inside a container
@@ -187,4 +190,4 @@ jobs:
           name: test-logs-container
           path: /tmp/fcvm-test-logs/
           if-no-files-found: ignore
-          retention-days: ${{ failure() && 30 || 7 }}
+          retention-days: 14
