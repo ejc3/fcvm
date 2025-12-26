@@ -92,6 +92,11 @@ jobs:
       - name: test-root
         working-directory: fcvm
         run: make test-root
+      - name: Capture kernel logs
+        if: always()
+        run: |
+          # Filter dmesg for UFFD/memory/VM related messages only
+          sudo dmesg | grep -iE 'userfault|uffd|kvm|firecracker|oom|killed|segfault|page.fault' > /tmp/fcvm-test-logs/dmesg-filtered.log || true
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -154,6 +159,11 @@ jobs:
           CARGO_CACHE_DIR: ${{ github.workspace }}/cargo-cache
         working-directory: fcvm
         run: make container-test
+      - name: Capture kernel logs
+        if: always()
+        run: |
+          # Filter dmesg for UFFD/memory/VM related messages only
+          sudo dmesg | grep -iE 'userfault|uffd|kvm|firecracker|oom|killed|segfault|page.fault' > /tmp/fcvm-test-logs/dmesg-filtered.log || true
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v4
