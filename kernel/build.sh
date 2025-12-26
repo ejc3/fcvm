@@ -226,11 +226,27 @@ FC_CONFIG_URL="https://raw.githubusercontent.com/firecracker-microvm/firecracker
 echo "Downloading Firecracker base config..."
 curl -fSL "$FC_CONFIG_URL" -o .config
 
-# Enable FUSE, KVM, and BTRFS
-echo "Enabling FUSE, KVM, and BTRFS..."
-./scripts/config --enable CONFIG_FUSE_FS
-./scripts/config --enable CONFIG_VIRTUALIZATION
-./scripts/config --enable CONFIG_KVM
+# Apply options from inception.conf
+echo "Applying options from inception.conf..."
+INCEPTION_CONF="$SCRIPT_DIR/inception.conf"
+if [[ -f "$INCEPTION_CONF" ]]; then
+    # Parse each CONFIG_*=y line and enable it
+    while IFS= read -r line; do
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+        # Extract option name (everything before =)
+        if [[ "$line" =~ ^(CONFIG_[A-Z0-9_]+)=y ]]; then
+            opt="${BASH_REMATCH[1]}"
+            echo "  Enabling $opt"
+            ./scripts/config --enable "$opt"
+        fi
+    done < "$INCEPTION_CONF"
+else
+    echo "  WARNING: $INCEPTION_CONF not found"
+fi
+
+# Also enable BTRFS (always needed for fcvm)
 ./scripts/config --enable CONFIG_BTRFS_FS
 
 # Update config with defaults for new options
@@ -239,7 +255,7 @@ make ARCH="$KERNEL_ARCH" olddefconfig
 # Show enabled options
 echo ""
 echo "Verifying configuration:"
-grep -E "^CONFIG_(FUSE_FS|KVM|VIRTUALIZATION|BTRFS_FS)=" .config || true
+grep -E "^CONFIG_(FUSE_FS|KVM|VIRTUALIZATION|BTRFS_FS|TUN|VETH)=" .config || true
 echo ""
 
 # Build kernel
