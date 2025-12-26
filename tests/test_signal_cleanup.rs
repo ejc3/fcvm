@@ -473,7 +473,10 @@ fn is_descendant_of(pid: u32, ancestor_pid: u32) -> bool {
     // Walk up the parent chain (max 10 levels to prevent infinite loops)
     for _ in 0..10 {
         if current == ancestor_pid {
-            println!("    parent chain: {:?} -> found ancestor {}", chain, ancestor_pid);
+            println!(
+                "    parent chain: {:?} -> found ancestor {}",
+                chain, ancestor_pid
+            );
             return true;
         }
         if current <= 1 {
