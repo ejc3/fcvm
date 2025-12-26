@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use directories::ProjectDirs;
 use nix::fcntl::{Flock, FlockArg};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -9,8 +10,11 @@ use tracing::{debug, info, warn};
 
 use crate::paths;
 
-/// Plan file location (relative to workspace root)
-const PLAN_FILE: &str = "rootfs-plan.toml";
+/// Config file name
+const CONFIG_FILE: &str = "rootfs-config.toml";
+
+/// Embedded default config (used by --generate-config)
+const EMBEDDED_CONFIG: &str = include_str!("../../rootfs-config.toml");
 
 /// Size of the Layer 2 disk image
 const LAYER2_SIZE: &str = "10G";
@@ -21,6 +25,8 @@ const LAYER2_SIZE: &str = "10G";
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Plan {
+    #[serde(default)]
+    pub paths: PathsConfig,
     pub base: BaseConfig,
     pub kernel: KernelConfig,
     pub packages: PackagesConfig,
@@ -29,6 +35,29 @@ pub struct Plan {
     pub fstab: FstabConfig,
     #[serde(default)]
     pub cleanup: CleanupConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PathsConfig {
+    /// Directory for mutable VM data (vm-disks, state, snapshots)
+    #[serde(default = "default_base_dir")]
+    pub data_dir: String,
+    /// Directory for shared content-addressed assets (kernels, rootfs, initrd, image-cache)
+    #[serde(default = "default_base_dir")]
+    pub assets_dir: String,
+}
+
+fn default_base_dir() -> String {
+    "/mnt/fcvm-btrfs".to_string()
+}
+
+impl Default for PathsConfig {
+    fn default() -> Self {
+        Self {
+            data_dir: default_base_dir(),
+            assets_dir: default_base_dir(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -54,9 +83,23 @@ pub struct KernelConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct KernelArchConfig {
     /// URL to the kernel archive (e.g., Kata release tarball)
+    /// Required unless `local_path` is provided
+    #[serde(default)]
     pub url: String,
-    /// Path within the archive to extract
+    /// Path within the archive to extract (only used with URL)
+    #[serde(default)]
     pub path: String,
+    /// Local filesystem path to kernel binary (overrides url if provided)
+    /// Use for custom-built kernels (e.g., inception kernel with CONFIG_KVM)
+    #[serde(default)]
+    pub local_path: Option<String>,
+}
+
+impl KernelArchConfig {
+    /// Check if this config uses a local path
+    pub fn is_local(&self) -> bool {
+        self.local_path.is_some()
+    }
 }
 
 impl KernelConfig {
@@ -448,64 +491,135 @@ pub fn generate_setup_script(plan: &Plan) -> String {
 }
 
 // ============================================================================
-// Plan Loading and SHA256
+// Config File Loading
 // ============================================================================
 
-/// Find the plan file in the workspace
-fn find_plan_file() -> Result<PathBuf> {
-    // Try relative to current exe (for installed binary)
-    let exe_path = std::env::current_exe().context("getting current executable path")?;
-    let exe_dir = exe_path.parent().context("getting executable directory")?;
+/// Generate default config file at XDG config directory.
+///
+/// Writes the embedded default config to ~/.config/fcvm/rootfs-config.toml
+pub fn generate_config(force: bool) -> Result<PathBuf> {
+    let proj_dirs =
+        ProjectDirs::from("", "", "fcvm").context("Could not determine config directory")?;
+    let config_dir = proj_dirs.config_dir();
+    let config_path = config_dir.join(CONFIG_FILE);
 
-    // Check various locations
-    let candidates = [
-        exe_dir.join(PLAN_FILE),
-        exe_dir.join("..").join(PLAN_FILE),
-        exe_dir.join("../..").join(PLAN_FILE),
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(PLAN_FILE),
-    ];
+    if config_path.exists() && !force {
+        bail!(
+            "Config file already exists at {}\n\n\
+             Use --force to overwrite, or edit the existing file.",
+            config_path.display()
+        );
+    }
 
-    for path in &candidates {
-        if path.exists() {
-            return path.canonicalize().context("canonicalizing plan file path");
+    std::fs::create_dir_all(config_dir)
+        .with_context(|| format!("creating config directory: {}", config_dir.display()))?;
+    std::fs::write(&config_path, EMBEDDED_CONFIG)
+        .with_context(|| format!("writing config file: {}", config_path.display()))?;
+
+    info!("Generated config at {}", config_path.display());
+    Ok(config_path)
+}
+
+/// Find the config file using the lookup chain.
+///
+/// Lookup order:
+/// 1. Explicit path (--config flag)
+/// 2. XDG user config (~/.config/fcvm/rootfs-config.toml)
+/// 3. System config (/etc/fcvm/rootfs-config.toml)
+/// 4. Next to binary (development)
+/// 5. ERROR (no embedded fallback)
+pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
+    // 1. Explicit --config
+    if let Some(path) = explicit_path {
+        let p = PathBuf::from(path);
+        if !p.exists() {
+            bail!("Config file not found: {}", path);
+        }
+        return Ok(p);
+    }
+
+    // 2. XDG user config
+    if let Some(proj_dirs) = ProjectDirs::from("", "", "fcvm") {
+        let p = proj_dirs.config_dir().join(CONFIG_FILE);
+        if p.exists() {
+            return Ok(p);
         }
     }
 
-    // Fallback to CARGO_MANIFEST_DIR for development
-    let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(PLAN_FILE);
-    if manifest_path.exists() {
-        return Ok(manifest_path);
+    // 3. System config
+    let system = Path::new("/etc/fcvm").join(CONFIG_FILE);
+    if system.exists() {
+        return Ok(system);
     }
 
+    // 4. Next to binary (development)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            // Check next to binary
+            let p = exe_dir.join(CONFIG_FILE);
+            if p.exists() {
+                return Ok(p);
+            }
+            // Check parent directories (for development)
+            for parent in &[".", "..", "../.."] {
+                let p = exe_dir.join(parent).join(CONFIG_FILE);
+                if p.exists() {
+                    return p.canonicalize().context("canonicalizing config path");
+                }
+            }
+        }
+    }
+
+    // 5. Check CARGO_MANIFEST_DIR for development builds (debug only)
+    // In release builds (cargo install), this path would be stale and misleading
+    #[cfg(debug_assertions)]
+    {
+        let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(CONFIG_FILE);
+        if manifest_path.exists() {
+            return Ok(manifest_path);
+        }
+    }
+
+    // 6. Error with helpful message
     bail!(
-        "rootfs-plan.toml not found. Checked: {:?}",
-        candidates
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-    )
+        "No rootfs config found.\n\n\
+         Searched:\n  \
+         ~/.config/fcvm/{}\n  \
+         /etc/fcvm/{}\n  \
+         <binary-dir>/{}\n\n\
+         Generate the default config with:\n  \
+         fcvm setup --generate-config",
+        CONFIG_FILE,
+        CONFIG_FILE,
+        CONFIG_FILE
+    );
 }
 
-/// Load and parse the plan file
-pub fn load_plan() -> Result<(Plan, String, String)> {
-    let plan_path = find_plan_file()?;
-    let plan_content = std::fs::read_to_string(&plan_path)
-        .with_context(|| format!("reading plan file: {}", plan_path.display()))?;
+/// Load and parse the config file
+pub fn load_config(explicit_path: Option<&str>) -> Result<(Plan, String, String)> {
+    let config_path = find_config_file(explicit_path)?;
+    let config_content = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("reading config file: {}", config_path.display()))?;
 
-    // Compute SHA256 of plan content (first 12 chars for image naming)
-    let plan_sha = compute_sha256(plan_content.as_bytes());
-    let plan_sha_short = plan_sha[..12].to_string();
+    // Compute SHA256 of config content (first 12 chars for image naming)
+    let config_sha = compute_sha256(config_content.as_bytes());
+    let config_sha_short = config_sha[..12].to_string();
 
-    let plan: Plan = toml::from_str(&plan_content)
-        .with_context(|| format!("parsing plan file: {}", plan_path.display()))?;
+    let config: Plan = toml::from_str(&config_content)
+        .with_context(|| format!("parsing config file: {}", config_path.display()))?;
 
     info!(
-        plan_file = %plan_path.display(),
-        plan_sha = %plan_sha_short,
-        "loaded rootfs plan"
+        config_file = %config_path.display(),
+        config_sha = %config_sha_short,
+        "loaded rootfs config"
     );
 
-    Ok((plan, plan_sha, plan_sha_short))
+    Ok((config, config_sha, config_sha_short))
+}
+
+/// Legacy alias for load_config (for backward compatibility during migration)
+pub fn load_plan() -> Result<(Plan, String, String)> {
+    load_config(None)
 }
 
 /// Compute SHA256 of bytes, return hex string
@@ -888,7 +1002,7 @@ pub async fn ensure_fc_agent_initrd(allow_create: bool) -> Result<PathBuf> {
     let initrd_sha_short = &initrd_sha[..12];
 
     // Check if initrd already exists for this version (fast path, no lock)
-    let initrd_dir = paths::base_dir().join("initrd");
+    let initrd_dir = paths::initrd_dir();
     let initrd_path = initrd_dir.join(format!("fc-agent-{}.initrd", initrd_sha_short));
 
     if initrd_path.exists() {
@@ -1480,7 +1594,7 @@ async fn create_layer2_setup_initrd(
 ///
 /// NOTE: fc-agent is NOT included - it will be injected per-VM at boot time.
 async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBuf> {
-    let cache_dir = paths::base_dir().join("cache");
+    let cache_dir = paths::cache_dir();
     let packages_dir = cache_dir.join(format!("packages-{}", script_sha_short));
 
     // If packages directory already exists with .deb files, use it
@@ -1569,7 +1683,7 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
 
 /// Download cloud image (cached by URL hash)
 async fn download_cloud_image(plan: &Plan) -> Result<PathBuf> {
-    let cache_dir = paths::base_dir().join("cache");
+    let cache_dir = paths::cache_dir();
     tokio::fs::create_dir_all(&cache_dir)
         .await
         .context("creating cache directory")?;

@@ -1,0 +1,216 @@
+diff --git a/example/passthrough_ll.c b/example/passthrough_ll.c
+index 7dfaee3..e2c3afc 100644
+--- a/example/passthrough_ll.c
++++ b/example/passthrough_ll.c
+@@ -1200,6 +1200,63 @@ static void lo_copy_file_range(fuse_req_t req, fuse_ino_t ino_in, off_t off_in,
+ }
+ #endif
+ 
++/* FICLONERANGE ioctl for remap_file_range */
++#include <sys/ioctl.h>
++#include <linux/fs.h>
++
++static void lo_remap_file_range(fuse_req_t req, fuse_ino_t ino_in, off_t off_in,
++				struct fuse_file_info *fi_in,
++				fuse_ino_t ino_out, off_t off_out,
++				struct fuse_file_info *fi_out, size_t len,
++				unsigned int remap_flags)
++{
++	int res;
++	size_t cloned_len;
++
++	(void)ino_in;
++	(void)ino_out;
++
++	if (lo_debug(req))
++		fuse_log(FUSE_LOG_DEBUG,
++			"%s(ino=%lld fd=%lld off=%jd ino=%lld fd=%lld off=%jd, size=%zd, flags=0x%x)\n",
++			__func__, (unsigned long long)ino_in,
++			(unsigned long long)fi_in->fh,
++			(intmax_t)off_in, (unsigned long long)ino_out,
++			(unsigned long long)fi_out->fh, (intmax_t)off_out,
++			len, remap_flags);
++
++	if (len == 0 && off_in == 0 && off_out == 0 && remap_flags == 0) {
++		/* Whole-file clone: use FICLONE (simpler, faster) */
++		res = ioctl((int)fi_out->fh, FICLONE, (int)fi_in->fh);
++	} else {
++		/* Partial clone: use FICLONERANGE */
++		struct file_clone_range range;
++		range.src_fd = fi_in->fh;
++		range.src_offset = off_in;
++		range.src_length = len;
++		range.dest_offset = off_out;
++		res = ioctl((int)fi_out->fh, FICLONERANGE, &range);
++	}
++
++	if (res < 0) {
++		fuse_reply_err(req, errno);
++		return;
++	}
++
++	/* For whole-file clone (len=0), get actual size from source file */
++	if (len == 0) {
++		struct stat st;
++		if (fstat((int)fi_in->fh, &st) == 0)
++			cloned_len = st.st_size;
++		else
++			cloned_len = 0;
++	} else {
++		cloned_len = len;
++	}
++
++	fuse_reply_write(req, cloned_len);
++}
++
+ static void lo_lseek(fuse_req_t req, fuse_ino_t ino, off_t off, int whence,
+ 		     struct fuse_file_info *fi)
+ {
+@@ -1278,6 +1335,7 @@ static const struct fuse_lowlevel_ops lo_oper = {
+ #ifdef HAVE_STATX
+ 	.statx		= lo_statx,
+ #endif
++	.remap_file_range = lo_remap_file_range,
+ };
+ 
+ int main(int argc, char *argv[])
+diff --git a/include/fuse_kernel.h b/include/fuse_kernel.h
+index 94621f6..feabbe9 100644
+--- a/include/fuse_kernel.h
++++ b/include/fuse_kernel.h
+@@ -239,6 +239,10 @@
+  *  7.45
+  *  - add FUSE_COPY_FILE_RANGE_64
+  *  - add struct fuse_copy_file_range_out
++ *
++ *  7.46 (proposed - not yet upstream)
++ *  - add FUSE_REMAP_FILE_RANGE for FICLONE/FICLONERANGE support
++ *  - add struct fuse_remap_file_range_in
+  */
+ 
+ #ifndef _LINUX_FUSE_H
+@@ -662,6 +666,7 @@ enum fuse_opcode {
+ 	FUSE_TMPFILE		= 51,
+ 	FUSE_STATX		= 52,
+ 	FUSE_COPY_FILE_RANGE_64	= 53,
++	FUSE_REMAP_FILE_RANGE	= 54,
+ 
+ 	/* CUSE specific operations */
+ 	CUSE_INIT		= 4096,
+@@ -1158,6 +1163,18 @@ struct fuse_copy_file_range_out {
+ 	uint64_t	bytes_copied;
+ };
+ 
++/* For FUSE_REMAP_FILE_RANGE (FICLONE/FICLONERANGE support) */
++struct fuse_remap_file_range_in {
++	uint64_t	fh_in;
++	uint64_t	off_in;
++	uint64_t	nodeid_out;
++	uint64_t	fh_out;
++	uint64_t	off_out;
++	uint64_t	len;
++	uint32_t	remap_flags;	/* REMAP_FILE_DEDUP, REMAP_FILE_CAN_SHORTEN */
++	uint32_t	padding;
++};
++
+ #define FUSE_SETUPMAPPING_FLAG_WRITE (1ull << 0)
+ #define FUSE_SETUPMAPPING_FLAG_READ (1ull << 1)
+ struct fuse_setupmapping_in {
+diff --git a/include/fuse_lowlevel.h b/include/fuse_lowlevel.h
+index 6be0295..898baa3 100644
+--- a/include/fuse_lowlevel.h
++++ b/include/fuse_lowlevel.h
+@@ -1341,6 +1341,39 @@ struct fuse_lowlevel_ops {
+ 	 */
+ 	void (*statx)(fuse_req_t req, fuse_ino_t ino, int flags, int mask,
+ 		      struct fuse_file_info *fi);
++
++	/**
++	 * Remap file range (for FICLONE/FICLONERANGE support)
++	 *
++	 * This is called when the application uses the FICLONE or
++	 * FICLONERANGE ioctls (which call remap_file_range internally).
++	 * This allows creating reflinks (copy-on-write clones) of files
++	 * on filesystems that support it (like btrfs).
++	 *
++	 * If this request is answered with an error code of ENOSYS, this is
++	 * treated as a permanent failure with error code EOPNOTSUPP, i.e. all
++	 * future remap_file_range() requests will fail with EOPNOTSUPP without
++	 * being sent to the filesystem process.
++	 *
++	 * Valid replies:
++	 *   fuse_reply_write
++	 *   fuse_reply_err
++	 *
++	 * @param req request handle
++	 * @param ino_in the inode number of the source file
++	 * @param off_in starting point from where to read
++	 * @param fi_in file information of the source file
++	 * @param ino_out the inode number of the destination file
++	 * @param off_out starting point where to write
++	 * @param fi_out file information of the destination file
++	 * @param len length of range to remap (0 means to EOF)
++	 * @param remap_flags REMAP_FILE_DEDUP or REMAP_FILE_CAN_SHORTEN
++	 */
++	void (*remap_file_range) (fuse_req_t req, fuse_ino_t ino_in,
++				  off_t off_in, struct fuse_file_info *fi_in,
++				  fuse_ino_t ino_out, off_t off_out,
++				  struct fuse_file_info *fi_out, size_t len,
++				  unsigned int remap_flags);
+ };
+ 
+ /**
+diff --git a/lib/fuse_lowlevel.c b/lib/fuse_lowlevel.c
+index d420b25..29c63ee 100644
+--- a/lib/fuse_lowlevel.c
++++ b/lib/fuse_lowlevel.c
+@@ -2488,6 +2488,33 @@ static void do_copy_file_range_64(fuse_req_t req, const fuse_ino_t nodeid_in,
+ 	_do_copy_file_range_64(req, nodeid_in, inarg, NULL);
+ }
+ 
++static void _do_remap_file_range(fuse_req_t req, const fuse_ino_t nodeid_in,
++				 const void *op_in, const void *in_payload)
++{
++	(void) in_payload;
++	const struct fuse_remap_file_range_in *arg = op_in;
++	struct fuse_file_info fi_in, fi_out;
++
++	memset(&fi_in, 0, sizeof(fi_in));
++	fi_in.fh = arg->fh_in;
++
++	memset(&fi_out, 0, sizeof(fi_out));
++	fi_out.fh = arg->fh_out;
++
++	if (req->se->op.remap_file_range)
++		req->se->op.remap_file_range(req, nodeid_in, arg->off_in, &fi_in,
++					     arg->nodeid_out, arg->off_out,
++					     &fi_out, arg->len, arg->remap_flags);
++	else
++		fuse_reply_err(req, ENOSYS);
++}
++
++static void do_remap_file_range(fuse_req_t req, const fuse_ino_t nodeid_in,
++				const void *inarg)
++{
++	_do_remap_file_range(req, nodeid_in, inarg, NULL);
++}
++
+ /*
+  * Note that the uint64_t offset in struct fuse_lseek_in is derived from
+  * linux kernel loff_t and is therefore signed.
+@@ -3444,6 +3471,7 @@ static struct {
+ 	[FUSE_RENAME2]     = { do_rename2,      "RENAME2"    },
+ 	[FUSE_COPY_FILE_RANGE] = { do_copy_file_range, "COPY_FILE_RANGE" },
+ 	[FUSE_COPY_FILE_RANGE_64] = { do_copy_file_range_64, "COPY_FILE_RANGE_64" },
++	[FUSE_REMAP_FILE_RANGE] = { do_remap_file_range, "REMAP_FILE_RANGE" },
+ 	[FUSE_LSEEK]	   = { do_lseek,       "LSEEK"	     },
+ 	[FUSE_STATX]	   = { do_statx,       "STATX"	     },
+ 	[CUSE_INIT]	   = { cuse_lowlevel_init, "CUSE_INIT"   },
+@@ -3500,6 +3528,7 @@ static struct {
+ 	[FUSE_RENAME2]		= { _do_rename2,	"RENAME2" },
+ 	[FUSE_COPY_FILE_RANGE]	= { _do_copy_file_range, "COPY_FILE_RANGE" },
+ 	[FUSE_COPY_FILE_RANGE_64]	= { _do_copy_file_range_64, "COPY_FILE_RANGE_64" },
++	[FUSE_REMAP_FILE_RANGE]	= { _do_remap_file_range, "REMAP_FILE_RANGE" },
+ 	[FUSE_LSEEK]		= { _do_lseek,		"LSEEK" },
+ 	[FUSE_STATX]		= { _do_statx,		"STATX" },
+ 	[CUSE_INIT]		= { _cuse_lowlevel_init, "CUSE_INIT" },

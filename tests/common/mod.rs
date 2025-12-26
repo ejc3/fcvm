@@ -147,11 +147,36 @@ impl Clone for TestLogger {
 pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Once;
 use std::time::Duration;
 use tokio::time::sleep;
 
 /// Global counter for unique test IDs
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// Ensure config is generated once per test run
+static CONFIG_INIT: Once = Once::new();
+
+/// Ensure the fcvm config file exists.
+///
+/// Runs `fcvm setup --generate-config --force` once per test process to ensure
+/// the config file exists at ~/.config/fcvm/rootfs-config.toml.
+/// Uses std::sync::Once to ensure this runs only once even with parallel tests.
+fn ensure_config_exists() {
+    CONFIG_INIT.call_once(|| {
+        let fcvm_path = find_fcvm_binary().expect("fcvm binary not found");
+        let output = Command::new(&fcvm_path)
+            .args(["setup", "--generate-config", "--force"])
+            .output()
+            .expect("failed to run fcvm setup --generate-config");
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("Failed to generate config: {}", stderr);
+        }
+        eprintln!(">>> Generated config at ~/.config/fcvm/rootfs-config.toml");
+    });
+}
 
 /// Check if we're running inside a container.
 ///
@@ -344,6 +369,9 @@ pub async fn spawn_fcvm_with_logs(
     args: &[&str],
     name: &str,
 ) -> anyhow::Result<(tokio::process::Child, u32)> {
+    // Ensure config exists (runs once per test process)
+    ensure_config_exists();
+
     let fcvm_path = find_fcvm_binary()?;
     let final_args = maybe_add_test_flags(args);
 
@@ -718,10 +746,8 @@ pub async fn poll_serve_ready(
     serve_pid: u32,
     timeout_secs: u64,
 ) -> anyhow::Result<()> {
-    let socket_path = PathBuf::from(format!(
-        "/mnt/fcvm-btrfs/uffd-{}-{}.sock",
-        snapshot_name, serve_pid
-    ));
+    let socket_path =
+        fcvm::paths::data_dir().join(format!("uffd-{}-{}.sock", snapshot_name, serve_pid));
 
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(timeout_secs);

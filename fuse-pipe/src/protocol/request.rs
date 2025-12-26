@@ -300,6 +300,34 @@ pub enum VolumeRequest {
         gid: u32,
         pid: u32,
     },
+
+    /// Copy data between two files without going through userspace.
+    /// On btrfs, this creates a reflink (instant copy-on-write).
+    CopyFileRange {
+        ino_in: u64,
+        fh_in: u64,
+        offset_in: u64,
+        ino_out: u64,
+        fh_out: u64,
+        offset_out: u64,
+        len: u64,
+        flags: u32,
+    },
+
+    /// Remap file range (FICLONE/FICLONERANGE support).
+    /// Creates instant copy-on-write clones on btrfs/xfs.
+    /// Requires kernel patch - not yet upstream.
+    RemapFileRange {
+        ino_in: u64,
+        fh_in: u64,
+        offset_in: u64,
+        ino_out: u64,
+        fh_out: u64,
+        offset_out: u64,
+        len: u64,
+        /// REMAP_FILE_DEDUP (1), REMAP_FILE_CAN_SHORTEN (2)
+        remap_flags: u32,
+    },
 }
 
 impl VolumeRequest {
@@ -339,6 +367,8 @@ impl VolumeRequest {
             VolumeRequest::Getlk { .. } => "getlk",
             VolumeRequest::Setlk { .. } => "setlk",
             VolumeRequest::Readdirplus { .. } => "readdirplus",
+            VolumeRequest::CopyFileRange { .. } => "copy_file_range",
+            VolumeRequest::RemapFileRange { .. } => "remap_file_range",
         }
     }
 

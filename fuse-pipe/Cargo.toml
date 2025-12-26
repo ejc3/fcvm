@@ -32,6 +32,7 @@ async-trait = "0.1"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-log = "0.2"  # Bridge log crate to tracing
 
 # fuse-backend-rs for passthrough filesystem (Cloud Hypervisor's production-grade FUSE backend)
 # Using local path for development - synced to EC2 via `make sync`
@@ -39,7 +40,7 @@ fuse-backend-rs = { path = "../../fuse-backend-rs", default-features = false, fe
 
 # FUSE client (local fork with multi-reader support via FUSE_DEV_IOC_CLONE)
 # Using local path for development - synced to EC2 via `make sync`
-fuser = { path = "../../fuser" }
+fuser = { path = "../../fuser", features = ["abi-7-28"] }
 
 # Concurrent data structures
 dashmap = "5.5"
