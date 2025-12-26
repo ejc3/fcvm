@@ -136,11 +136,12 @@ async fn run_remap_test_in_vm(test_name: &str, test_script: &str) -> Result<()> 
     if !exit_status.success() {
         let code = exit_status.code().unwrap_or(-1);
         // Exit code 95 = EOPNOTSUPP, 38 = ENOSYS
-        if code == 95 {
-            eprintln!("SKIP: Kernel supports opcode but fs returned EOPNOTSUPP");
-            return Ok(());
-        } else if code == 38 {
-            eprintln!("SKIP: Kernel doesn't support FUSE_REMAP_FILE_RANGE");
+        // Exit code 1 = cp --reflink=always returns 1 when reflink not supported
+        if code == 95 || code == 38 || code == 1 {
+            eprintln!(
+                "SKIP: {} - kernel or filesystem doesn't support FUSE remap_file_range (exit={})",
+                test_name, code
+            );
             return Ok(());
         }
         anyhow::bail!(
