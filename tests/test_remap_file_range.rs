@@ -6,10 +6,13 @@
 //! Similar to test_fuse_in_vm_matrix.rs but tests reflink operations.
 //!
 //! Requires:
-//! - Kernel with FUSE_REMAP_FILE_RANGE support (set REMAP_KERNEL env var)
 //! - btrfs filesystem at /mnt/fcvm-btrfs
 //!
-//! Run with: `REMAP_KERNEL=/path/to/kernel make test-root FILTER=remap`
+//! Optional:
+//! - REMAP_KERNEL env var to use a specific kernel (otherwise uses default)
+//!
+//! If the kernel doesn't support FUSE_REMAP_FILE_RANGE (ENOSYS), test skips.
+//! Run with: `make test-root FILTER=remap`
 
 #![cfg(feature = "privileged-tests")]
 
@@ -19,14 +22,19 @@ use anyhow::{Context, Result};
 use std::process::Stdio;
 use std::time::Instant;
 
-/// Get patched kernel path from REMAP_KERNEL env var
+/// Get optional patched kernel path from REMAP_KERNEL env var.
+/// If not set, returns None and the test will use the default kernel.
 fn get_patched_kernel() -> Option<String> {
-    std::env::var("REMAP_KERNEL").ok().filter(|p| {
-        let exists = std::path::Path::new(p).exists();
-        if !exists {
-            eprintln!("REMAP_KERNEL={} does not exist", p);
+    std::env::var("REMAP_KERNEL").ok().and_then(|p| {
+        if p.is_empty() {
+            return None;
         }
-        exists
+        let exists = std::path::Path::new(&p).exists();
+        if !exists {
+            eprintln!("REMAP_KERNEL={} does not exist, using default kernel", p);
+            return None;
+        }
+        Some(p)
     })
 }
 
@@ -35,15 +43,11 @@ fn has_btrfs() -> bool {
     std::path::Path::new("/mnt/fcvm-btrfs").exists()
 }
 
-/// Run remap_file_range tests in a VM with patched kernel.
+/// Run remap_file_range tests in a VM.
+/// Uses REMAP_KERNEL if set, otherwise uses default kernel.
+/// If kernel doesn't support FUSE_REMAP_FILE_RANGE, test skips via exit code.
 async fn run_remap_test_in_vm(test_name: &str, test_script: &str) -> Result<()> {
-    let kernel = match get_patched_kernel() {
-        Some(k) => k,
-        None => {
-            eprintln!("SKIP: {} requires REMAP_KERNEL env var pointing to patched kernel", test_name);
-            return Ok(());
-        }
-    };
+    let kernel = get_patched_kernel();
 
     if !has_btrfs() {
         eprintln!("SKIP: {} requires btrfs at /mnt/fcvm-btrfs", test_name);
@@ -67,23 +71,27 @@ async fn run_remap_test_in_vm(test_name: &str, test_script: &str) -> Result<()> 
     let map_arg = format!("{}:/data", data_dir);
     let fcvm_path = common::find_fcvm_binary()?;
 
-    // Start VM with patched kernel
+    // Start VM (with optional patched kernel)
     let mut cmd = tokio::process::Command::new(&fcvm_path);
-    cmd.args([
+    let mut args = vec![
         "podman",
         "run",
         "--name",
         &vm_name,
         "--network",
         "bridged",
-        "--kernel",
-        &kernel,
-        "--map",
-        &map_arg,
-        "--cmd",
-        test_script,
-        "alpine:latest",
-    ])
+    ];
+
+    // Add --kernel only if REMAP_KERNEL is set
+    let kernel_ref: String;
+    if let Some(ref k) = kernel {
+        kernel_ref = k.clone();
+        args.push("--kernel");
+        args.push(&kernel_ref);
+    }
+
+    args.extend(["--map", &map_arg, "--cmd", test_script, "alpine:latest"]);
+    cmd.args(&args)
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
 
@@ -196,22 +204,17 @@ async fn test_ficlone_cp_reflink_in_vm() {
 ///   podman build -t localhost/libfuse-remap-test -f Containerfile.libfuse-remap .
 ///
 /// Gated by libfuse-test feature since it requires the container to be pre-built.
+/// Uses REMAP_KERNEL if set, otherwise uses default kernel.
 #[tokio::test]
 #[cfg(feature = "libfuse-test")]
 async fn test_libfuse_remap_container() {
-    let kernel = match get_patched_kernel() {
-        Some(k) => k,
-        None => {
-            eprintln!("SKIP: requires REMAP_KERNEL env var pointing to patched kernel");
-            return;
-        }
-    };
+    let kernel = get_patched_kernel();
 
     let fcvm_path = common::find_fcvm_binary().expect("fcvm binary");
     let vm_name = format!("libfuse-remap-{}", std::process::id());
 
     let mut cmd = tokio::process::Command::new(&fcvm_path);
-    cmd.args([
+    let mut args = vec![
         "podman",
         "run",
         "--name",
@@ -219,10 +222,18 @@ async fn test_libfuse_remap_container() {
         "--network",
         "bridged",
         "--privileged",
-        "--kernel",
-        &kernel,
-        "localhost/libfuse-remap-test",
-    ])
+    ];
+
+    // Add --kernel only if REMAP_KERNEL is set
+    let kernel_ref: String;
+    if let Some(ref k) = kernel {
+        kernel_ref = k.clone();
+        args.push("--kernel");
+        args.push(&kernel_ref);
+    }
+
+    args.push("localhost/libfuse-remap-test");
+    cmd.args(&args)
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
 
