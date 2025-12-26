@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
 use tokio::net::UnixListener;
 use tokio::task::JoinSet;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use memmap2::MmapOptions;
 use userfaultfd::{Event, Uffd};
@@ -332,7 +332,24 @@ async fn handle_vm_page_faults(
                     };
 
                     if let Err(e) = copy_result {
-                        // Log detailed error info for debugging (use Debug format to show errno)
+                        // EEXIST means page was already filled (race with another fault for same page)
+                        // This is normal on older kernels with less aggressive page fault coalescing.
+                        // See: https://docs.kernel.org/admin-guide/mm/userfaultfd.html
+                        // "the kernel must cope with it returning -EEXIST from ioctl(UFFDIO_COPY) as expected"
+                        if let userfaultfd::Error::CopyFailed(errno) = &e {
+                            // Compare raw errno value since we may have different nix versions
+                            if (*errno as i32) == libc::EEXIST {
+                                debug!(
+                                    target: "uffd",
+                                    vm_id = %vm_id,
+                                    fault_addr = format!("0x{:x}", fault_page),
+                                    "UFFD copy skipped - page already filled (EEXIST)"
+                                );
+                                continue;
+                            }
+                        }
+
+                        // Real error - log with Debug format to show errno
                         error!(
                             target: "uffd",
                             vm_id = %vm_id,
