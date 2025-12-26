@@ -65,8 +65,9 @@ fn test_sigint_kills_firecracker_bridged() -> Result<()> {
     while start.elapsed() < Duration::from_secs(60) {
         std::thread::sleep(common::POLL_INTERVAL);
 
+        // IMPORTANT: Use --pid to query only OUR VM, not all VMs (parallel test safety)
         let output = Command::new(&fcvm_path)
-            .args(["ls", "--json"])
+            .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
             .output()
             .context("running fcvm ls")?;
 
@@ -191,13 +192,14 @@ fn test_sigterm_kills_firecracker_bridged() -> Result<()> {
     println!("Started fcvm with PID: {}", fcvm_pid);
 
     // Wait for VM to become healthy (max 60 seconds)
+    // IMPORTANT: Use --pid to query only OUR VM, not all VMs (parallel test safety)
     let start = std::time::Instant::now();
     let mut healthy = false;
     while start.elapsed() < Duration::from_secs(60) {
         std::thread::sleep(common::POLL_INTERVAL);
 
         let output = Command::new(&fcvm_path)
-            .args(["ls", "--json"])
+            .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
             .output()
             .context("running fcvm ls")?;
 
@@ -304,13 +306,14 @@ fn test_sigterm_cleanup_rootless() -> Result<()> {
     println!("Started fcvm with PID: {}", fcvm_pid);
 
     // Wait for VM to become healthy (max 60 seconds)
+    // IMPORTANT: Use --pid to query only OUR VM, not all VMs (parallel test safety)
     let start = std::time::Instant::now();
     let mut healthy = false;
     while start.elapsed() < Duration::from_secs(60) {
         std::thread::sleep(common::POLL_INTERVAL);
 
         let output = Command::new(&fcvm_path)
-            .args(["ls", "--json"])
+            .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
             .output()
             .context("running fcvm ls")?;
 
@@ -537,13 +540,14 @@ fn test_sigterm_cleanup_bridged() -> Result<()> {
     println!("Started fcvm with PID: {}", fcvm_pid);
 
     // Wait for VM to become healthy
+    // IMPORTANT: Use --pid to query only OUR VM, not all VMs (parallel test safety)
     let start = std::time::Instant::now();
     let mut healthy = false;
     while start.elapsed() < Duration::from_secs(60) {
         std::thread::sleep(common::POLL_INTERVAL);
 
         let output = Command::new(&fcvm_path)
-            .args(["ls", "--json"])
+            .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
             .output()
             .context("running fcvm ls")?;
 
