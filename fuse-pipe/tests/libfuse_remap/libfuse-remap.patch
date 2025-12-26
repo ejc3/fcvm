@@ -1,8 +1,8 @@
 diff --git a/example/passthrough_ll.c b/example/passthrough_ll.c
-index 7dfaee3..cda3342 100644
+index 7dfaee3..e2c3afc 100644
 --- a/example/passthrough_ll.c
 +++ b/example/passthrough_ll.c
-@@ -1200,6 +1200,44 @@ static void lo_copy_file_range(fuse_req_t req, fuse_ino_t ino_in, off_t off_in,
+@@ -1200,6 +1200,63 @@ static void lo_copy_file_range(fuse_req_t req, fuse_ino_t ino_in, off_t off_in,
  }
  #endif
  
@@ -17,7 +17,7 @@ index 7dfaee3..cda3342 100644
 +				unsigned int remap_flags)
 +{
 +	int res;
-+	struct file_clone_range range;
++	size_t cloned_len;
 +
 +	(void)ino_in;
 +	(void)ino_out;
@@ -31,23 +31,42 @@ index 7dfaee3..cda3342 100644
 +			(unsigned long long)fi_out->fh, (intmax_t)off_out,
 +			len, remap_flags);
 +
-+	/* Use FICLONERANGE ioctl for the actual remap */
-+	range.src_fd = fi_in->fh;
-+	range.src_offset = off_in;
-+	range.src_length = len;
-+	range.dest_offset = off_out;
++	if (len == 0 && off_in == 0 && off_out == 0 && remap_flags == 0) {
++		/* Whole-file clone: use FICLONE (simpler, faster) */
++		res = ioctl((int)fi_out->fh, FICLONE, (int)fi_in->fh);
++	} else {
++		/* Partial clone: use FICLONERANGE */
++		struct file_clone_range range;
++		range.src_fd = fi_in->fh;
++		range.src_offset = off_in;
++		range.src_length = len;
++		range.dest_offset = off_out;
++		res = ioctl((int)fi_out->fh, FICLONERANGE, &range);
++	}
 +
-+	res = ioctl(fi_out->fh, FICLONERANGE, &range);
-+	if (res < 0)
++	if (res < 0) {
 +		fuse_reply_err(req, errno);
-+	else
-+		fuse_reply_write(req, len);
++		return;
++	}
++
++	/* For whole-file clone (len=0), get actual size from source file */
++	if (len == 0) {
++		struct stat st;
++		if (fstat((int)fi_in->fh, &st) == 0)
++			cloned_len = st.st_size;
++		else
++			cloned_len = 0;
++	} else {
++		cloned_len = len;
++	}
++
++	fuse_reply_write(req, cloned_len);
 +}
 +
  static void lo_lseek(fuse_req_t req, fuse_ino_t ino, off_t off, int whence,
  		     struct fuse_file_info *fi)
  {
-@@ -1278,6 +1316,7 @@ static const struct fuse_lowlevel_ops lo_oper = {
+@@ -1278,6 +1335,7 @@ static const struct fuse_lowlevel_ops lo_oper = {
  #ifdef HAVE_STATX
  	.statx		= lo_statx,
  #endif
