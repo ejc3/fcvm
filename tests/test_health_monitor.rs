@@ -1,6 +1,7 @@
 use chrono::Utc;
 use fcvm::health::spawn_health_monitor_with_state_dir;
 use fcvm::network::NetworkConfig;
+use fcvm::paths;
 use fcvm::state::{HealthStatus, ProcessType, StateManager, VmConfig, VmState, VmStatus};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::time::{sleep, Duration};
@@ -28,6 +29,10 @@ fn create_unique_test_dir() -> std::path::PathBuf {
 async fn test_health_monitor_behaviors() {
     // Create unique temp directory for this test instance
     let base_dir = create_unique_test_dir();
+
+    // Initialize paths module with test directory (required for paths::vm_runtime_dir calls)
+    // OnceLock::set() is idempotent - safe to call multiple times
+    paths::init_with_paths(&base_dir, &base_dir);
 
     // Use the shared base dir so the monitor and test agree on where state lives.
     let manager = StateManager::new(base_dir.join("state"));

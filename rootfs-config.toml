@@ -1,8 +1,22 @@
+# fcvm Configuration
+#
+# This file configures both runtime paths and rootfs setup.
+# The rootfs SHA is computed from [base], [kernel], [packages], [services], etc.
+# The [paths] section does NOT affect rootfs SHA.
+
+[paths]
+# Directory for mutable VM data (vm-disks, state, snapshots)
+# Override per inception level (e.g., /mnt/fcvm-btrfs/level-1)
+data_dir = "/mnt/fcvm-btrfs"
+
+# Directory for shared content-addressed assets (kernels, rootfs, initrd, image-cache)
+# All inception levels share this for deduplication via btrfs reflinks
+assets_dir = "/mnt/fcvm-btrfs"
+
 # Rootfs Modification Plan
 #
-# This file describes all modifications applied to the base Ubuntu cloud image.
 # The SHA256 of the generated setup script determines the image name: layer2-{sha}.raw
-# If this file changes, Layer 2 is rebuilt automatically.
+# If base, kernel, packages, services, files, fstab, or cleanup change, Layer 2 is rebuilt.
 #
 # fc-agent is NOT in Layer 2 at all (neither binary nor service).
 # Both are injected per-VM at boot time via initrd.

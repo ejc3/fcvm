@@ -41,9 +41,14 @@ endif
 # Test log directory (mounted into container)
 TEST_LOG_DIR := /tmp/fcvm-test-logs
 
+# Container target directory (shadows host's target/ to avoid permission conflicts)
+CONTAINER_TARGET_DIR := /tmp/fcvm-container-target
+
 # Container run command
 CONTAINER_RUN := podman run --rm --privileged \
-	-v .:/workspace/fcvm -v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs -v $(FUSER):/workspace/fuser \
+	-v .:/workspace/fcvm \
+	-v $(CONTAINER_TARGET_DIR):/workspace/fcvm/target \
+	-v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs -v $(FUSER):/workspace/fuser \
 	--device /dev/fuse --device /dev/kvm \
 	--ulimit nofile=65536:65536 --pids-limit=65536 -v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	-v $(TEST_LOG_DIR):$(TEST_LOG_DIR) $(CARGO_CACHE_MOUNT)
@@ -69,7 +74,7 @@ build:
 # Test that the release binary works without source tree (simulates cargo install)
 test-packaging: build
 	@echo "==> Testing packaging (simulates cargo install)..."
-	./scripts/test-packaging.sh ./target/release/fcvm
+	./scripts/test-packaging.sh target/release/fcvm
 
 clean:
 	sudo rm -rf target
@@ -97,6 +102,7 @@ test-root: setup-fcvm setup-pjdfstest _test-root
 test: test-root
 
 # Container targets (setup on host where needed, run-only in container)
+# Container uses shadowed target/ mount to avoid permission conflicts
 container-test-unit: container-build
 	@echo "==> Running unit tests in container..."
 	$(CONTAINER_RUN) $(CONTAINER_TAG) make build _test-unit
@@ -113,6 +119,7 @@ container-test: container-test-all
 
 container-build:
 	@sudo mkdir -p /mnt/fcvm-btrfs 2>/dev/null || true
+	@mkdir -p $(CONTAINER_TARGET_DIR)
 	podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) .
 
 container-shell: container-build

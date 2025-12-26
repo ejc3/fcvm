@@ -746,10 +746,8 @@ pub async fn poll_serve_ready(
     serve_pid: u32,
     timeout_secs: u64,
 ) -> anyhow::Result<()> {
-    let socket_path = PathBuf::from(format!(
-        "/mnt/fcvm-btrfs/uffd-{}-{}.sock",
-        snapshot_name, serve_pid
-    ));
+    let socket_path =
+        fcvm::paths::data_dir().join(format!("uffd-{}-{}.sock", snapshot_name, serve_pid));
 
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
