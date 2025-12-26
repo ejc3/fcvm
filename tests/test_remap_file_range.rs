@@ -185,6 +185,74 @@ async fn test_ficlone_cp_reflink_in_vm() {
         .expect("FICLONE test failed");
 }
 
-// NOTE: FICLONE/FICLONERANGE ioctl tests would require a compiled binary
-// inside the container. The cp --reflink=always test above covers the
-// end-to-end functionality through FUSE.
+/// Test libfuse remap_file_range via container.
+///
+/// Runs the localhost/libfuse-remap-test container which:
+/// 1. Creates a btrfs loopback filesystem
+/// 2. Runs passthrough_ll (patched libfuse) on top of it
+/// 3. Tests FICLONE through FUSE -> btrfs
+///
+/// Build container first:
+///   podman build -t localhost/libfuse-remap-test -f Containerfile.libfuse-remap .
+///
+/// Gated by libfuse-test feature since it requires the container to be pre-built.
+#[tokio::test]
+#[cfg(feature = "libfuse-test")]
+async fn test_libfuse_remap_container() {
+    let kernel = match get_patched_kernel() {
+        Some(k) => k,
+        None => {
+            eprintln!("SKIP: requires REMAP_KERNEL env var pointing to patched kernel");
+            return;
+        }
+    };
+
+    let fcvm_path = common::find_fcvm_binary().expect("fcvm binary");
+    let vm_name = format!("libfuse-remap-{}", std::process::id());
+
+    let mut cmd = tokio::process::Command::new(&fcvm_path);
+    cmd.args([
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        "--privileged",
+        "--kernel",
+        &kernel,
+        "localhost/libfuse-remap-test",
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+
+    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        cmd.env("SUDO_USER", sudo_user);
+    }
+
+    let mut child = cmd.spawn().expect("spawning VM");
+    let vm_pid = child.id().expect("VM PID");
+
+    common::spawn_log_consumer(child.stdout.take(), "libfuse-remap");
+    common::spawn_log_consumer_stderr(child.stderr.take(), "libfuse-remap");
+
+    let timeout = std::time::Duration::from_secs(180);
+    let result = tokio::time::timeout(timeout, child.wait()).await;
+
+    let exit_status = match result {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => panic!("Error waiting for VM: {}", e),
+        Err(_) => {
+            common::kill_process(vm_pid).await;
+            panic!("VM timeout after {} seconds", timeout.as_secs());
+        }
+    };
+
+    assert!(
+        exit_status.success(),
+        "libfuse-remap-test container failed with exit code {:?}",
+        exit_status.code()
+    );
+
+    println!("[REMAP-VM] ✓ libfuse container test passed");
+}

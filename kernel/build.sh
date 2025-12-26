@@ -100,11 +100,12 @@ FC_CONFIG_URL="https://raw.githubusercontent.com/firecracker-microvm/firecracker
 echo "Downloading Firecracker base config..."
 curl -fSL "$FC_CONFIG_URL" -o .config
 
-# Enable FUSE and KVM
-echo "Enabling FUSE and KVM..."
+# Enable FUSE, KVM, and BTRFS
+echo "Enabling FUSE, KVM, and BTRFS..."
 ./scripts/config --enable CONFIG_FUSE_FS
 ./scripts/config --enable CONFIG_VIRTUALIZATION
 ./scripts/config --enable CONFIG_KVM
+./scripts/config --enable CONFIG_BTRFS_FS
 
 # Update config with defaults for new options
 make ARCH="$KERNEL_ARCH" olddefconfig
@@ -112,7 +113,7 @@ make ARCH="$KERNEL_ARCH" olddefconfig
 # Show enabled options
 echo ""
 echo "Verifying configuration:"
-grep -E "^CONFIG_(FUSE_FS|KVM|VIRTUALIZATION)=" .config || true
+grep -E "^CONFIG_(FUSE_FS|KVM|VIRTUALIZATION|BTRFS_FS)=" .config || true
 echo ""
 
 # Build kernel
