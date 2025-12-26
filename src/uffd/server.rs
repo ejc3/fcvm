@@ -296,7 +296,7 @@ async fn handle_vm_page_faults(
                                 target: "uffd",
                                 vm_id = %vm_id,
                                 fault_addr = format!("0x{:x}", fault_page),
-                                error = %e,
+                                error = ?e,
                                 "UFFD zero-page copy failed"
                             );
                             return Err(e.into());
@@ -332,13 +332,13 @@ async fn handle_vm_page_faults(
                     };
 
                     if let Err(e) = copy_result {
-                        // Log detailed error info for debugging
+                        // Log detailed error info for debugging (use Debug format to show errno)
                         error!(
                             target: "uffd",
                             vm_id = %vm_id,
                             fault_addr = format!("0x{:x}", fault_page),
                             offset_in_file,
-                            error = %e,
+                            error = ?e,
                             "UFFD copy failed"
                         );
                         return Err(e.into());
