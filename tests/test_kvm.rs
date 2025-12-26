@@ -10,95 +10,80 @@
 mod common;
 
 use anyhow::{bail, Context, Result};
-use std::path::Path;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-/// Path to the inception kernel with CONFIG_KVM=y
-/// Built by kernel/build.sh
-const INCEPTION_KERNEL: &str = "/mnt/fcvm-btrfs/kernels/vmlinux-6.12.10-73d51d811398.bin";
+const KERNEL_VERSION: &str = "6.12.10";
+const KERNEL_DIR: &str = "/mnt/fcvm-btrfs/kernels";
 
-/// Generate a custom rootfs-config.toml pointing to the inception kernel
-fn generate_inception_config() -> Result<std::path::PathBuf> {
-    let config_dir = std::path::PathBuf::from("/tmp/fcvm-inception-test");
-    std::fs::create_dir_all(&config_dir)?;
+/// Compute inception kernel path from build script contents
+fn inception_kernel_path() -> Result<PathBuf> {
+    let kernel_dir = Path::new("kernel");
+    let mut content = Vec::new();
 
-    let config_path = config_dir.join("rootfs-config.toml");
+    // Read build.sh
+    let script = kernel_dir.join("build.sh");
+    if script.exists() {
+        content.extend(std::fs::read(&script)?);
+    }
 
-    // Read the default config and modify the kernel section
-    let config_content = format!(r#"# Inception test config - points to KVM-enabled kernel
+    // Read inception.conf
+    let conf = kernel_dir.join("inception.conf");
+    if conf.exists() {
+        content.extend(std::fs::read(&conf)?);
+    }
 
-[paths]
-data_dir = "/mnt/fcvm-btrfs"
-assets_dir = "/mnt/fcvm-btrfs"
+    // Read patches/*.patch (sorted)
+    let patches_dir = kernel_dir.join("patches");
+    if patches_dir.exists() {
+        let mut patches: Vec<_> = std::fs::read_dir(&patches_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "patch"))
+            .collect();
+        patches.sort_by_key(|e| e.path());
+        for patch in patches {
+            content.extend(std::fs::read(patch.path())?);
+        }
+    }
 
-[base]
-version = "24.04"
-codename = "noble"
+    // Compute SHA (first 12 hex chars)
+    let mut hasher = Sha256::new();
+    hasher.update(&content);
+    let hash = hasher.finalize();
+    let sha = hex::encode(&hash[..6]);
 
-[base.arm64]
-url = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img"
+    Ok(PathBuf::from(KERNEL_DIR).join(format!("vmlinux-{}-{}.bin", KERNEL_VERSION, sha)))
+}
 
-[base.amd64]
-url = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+/// Ensure inception kernel exists, building it if necessary
+async fn ensure_inception_kernel() -> Result<PathBuf> {
+    let kernel_path = inception_kernel_path()?;
 
-[kernel]
-# Inception kernel with CONFIG_KVM=y - local file, not URL
-# The kernel was built by kernel/build.sh
+    if kernel_path.exists() {
+        println!("✓ Inception kernel found: {}", kernel_path.display());
+        return Ok(kernel_path);
+    }
 
-[kernel.arm64]
-# Local kernel path - fcvm will use this directly
-path = "{}"
+    println!("Building inception kernel: {}", kernel_path.display());
+    println!("  This may take 10-20 minutes on first run...");
 
-[kernel.amd64]
-path = "{}"
+    let status = tokio::process::Command::new("./kernel/build.sh")
+        .env("KERNEL_PATH", &kernel_path)
+        .status()
+        .await
+        .context("running kernel/build.sh")?;
 
-[packages]
-runtime = ["podman", "crun", "fuse-overlayfs", "skopeo"]
-fuse = ["fuse3"]
-system = ["haveged", "chrony"]
-debug = ["strace"]
+    if !status.success() {
+        bail!("Kernel build failed with exit code: {:?}", status.code());
+    }
 
-[services]
-enable = ["haveged", "chrony", "systemd-networkd"]
-disable = ["multipathd", "snapd", "cloud-init", "cloud-config", "cloud-final"]
+    if !kernel_path.exists() {
+        bail!("Kernel build completed but file not found: {}", kernel_path.display());
+    }
 
-[files."/etc/resolv.conf"]
-content = """
-nameserver 127.0.0.53
-"""
-
-[files."/etc/chrony/chrony.conf"]
-content = """
-pool pool.ntp.org iburst
-makestep 1.0 3
-driftfile /var/lib/chrony/drift
-"""
-
-[files."/etc/systemd/network/10-eth0.network"]
-content = """
-[Match]
-Name=eth0
-
-[Network]
-KeepConfiguration=yes
-"""
-
-[files."/etc/systemd/network/10-eth0.network.d/mmds.conf"]
-content = """
-[Route]
-Destination=169.254.169.254/32
-Scope=link
-"""
-
-[fstab]
-remove_patterns = ["LABEL=BOOT", "LABEL=UEFI"]
-
-[cleanup]
-remove_dirs = ["/usr/share/doc/*", "/usr/share/man/*", "/var/cache/apt/archives/*"]
-"#, INCEPTION_KERNEL, INCEPTION_KERNEL);
-
-    std::fs::write(&config_path, config_content)?;
-    Ok(config_path)
+    println!("✓ Kernel built: {}", kernel_path.display());
+    Ok(kernel_path)
 }
 
 #[tokio::test]
@@ -107,17 +92,8 @@ async fn test_kvm_available_in_vm() -> Result<()> {
     println!("==================");
     println!("Verifying /dev/kvm works with inception kernel");
 
-    // Check if inception kernel exists
-    let kernel_path = Path::new(INCEPTION_KERNEL);
-    if !kernel_path.exists() {
-        bail!(
-            "Inception kernel not found: {}\n\
-            Build it with: ./kernel/build.sh\n\
-            Or run: make inception-kernel",
-            INCEPTION_KERNEL
-        );
-    }
-    println!("✓ Inception kernel found: {}", INCEPTION_KERNEL);
+    // Ensure inception kernel exists (builds if needed)
+    let inception_kernel = ensure_inception_kernel().await?;
 
     let fcvm_path = common::find_fcvm_binary()?;
     let (vm_name, _, _, _) = common::unique_names("inception-kvm");
@@ -125,6 +101,7 @@ async fn test_kvm_available_in_vm() -> Result<()> {
     // Start the VM with custom kernel via --kernel flag
     // Use --privileged so the container can access /dev/kvm
     println!("\nStarting VM with inception kernel (privileged mode)...");
+    let kernel_str = inception_kernel.to_str().context("kernel path not valid UTF-8")?;
     let (mut _child, fcvm_pid) = common::spawn_fcvm(&[
         "podman",
         "run",
@@ -133,7 +110,7 @@ async fn test_kvm_available_in_vm() -> Result<()> {
         "--network",
         "bridged",
         "--kernel",
-        INCEPTION_KERNEL,
+        kernel_str,
         "--privileged",
         common::TEST_IMAGE,
     ])
@@ -286,15 +263,8 @@ async fn test_inception_run_fcvm_inside_vm() -> Result<()> {
     println!("\nInception Test: Run fcvm inside fcvm");
     println!("=====================================");
 
-    // Check inception kernel exists
-    let kernel_path = Path::new(INCEPTION_KERNEL);
-    if !kernel_path.exists() {
-        bail!(
-            "Inception kernel not found: {}\n\
-            Build it with: ./kernel/build.sh",
-            INCEPTION_KERNEL
-        );
-    }
+    // Ensure inception kernel exists (builds if needed)
+    let inception_kernel = ensure_inception_kernel().await?;
 
     let fcvm_path = common::find_fcvm_binary()?;
     let fcvm_dir = fcvm_path.parent().unwrap();
@@ -304,11 +274,12 @@ async fn test_inception_run_fcvm_inside_vm() -> Result<()> {
     println!("\n1. Starting outer VM with inception kernel...");
     println!("   Mounting: /mnt/fcvm-btrfs (assets) and fcvm binary");
 
+    let kernel_str = inception_kernel.to_str().context("kernel path not valid UTF-8")?;
     let (mut _child, outer_pid) = common::spawn_fcvm(&[
         "podman", "run",
         "--name", &vm_name,
         "--network", "bridged",
-        "--kernel", INCEPTION_KERNEL,
+        "--kernel", kernel_str,
         "--privileged",
         "--volume", "/mnt/fcvm-btrfs:/mnt/fcvm-btrfs",
         "--volume", &format!("{}:/opt/fcvm", fcvm_dir.display()),
