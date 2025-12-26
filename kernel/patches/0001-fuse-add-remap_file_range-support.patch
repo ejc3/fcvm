@@ -19,6 +19,13 @@ REMAP_FILE_CAN_SHORTEN flags to userspace.
 
 Signed-off-by: Claude <claude@anthropic.com>
 ---
+ fs/fuse/file.c                |  99 +++++++++++++++++++++++++++++++++++
+ fs/fuse/fuse_i.h              |   3 ++
+ include/uapi/linux/fuse.h     |  15 ++++++
+ 3 files changed, 117 insertions(+)
+
+diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
+index 1234567..abcdefg 100644
 --- a/include/uapi/linux/fuse.h
 +++ b/include/uapi/linux/fuse.h
 @@ -638,6 +638,7 @@ enum fuse_opcode {
@@ -29,10 +36,15 @@ Signed-off-by: Claude <claude@anthropic.com>
 
  	/* CUSE specific operations */
  	CUSE_INIT		= 4096,
-@@ -1206,4 +1207,15 @@ struct fuse_supp_groups {
+@@ -1198,4 +1199,18 @@ struct fuse_supp_groups {
  	uint32_t	groups[];
  };
 
++/**
++ * struct fuse_remap_file_range_in - FUSE_REMAP_FILE_RANGE request
++ *
++ * Used for FICLONE/FICLONERANGE support through FUSE.
++ */
 +struct fuse_remap_file_range_in {
 +	uint64_t	fh_in;
 +	uint64_t	off_in;
@@ -40,14 +52,16 @@ Signed-off-by: Claude <claude@anthropic.com>
 +	uint64_t	fh_out;
 +	uint64_t	off_out;
 +	uint64_t	len;
-+	uint32_t	remap_flags;	/* REMAP_FILE_DEDUP, REMAP_FILE_CAN_SHORTEN */
++	uint32_t	remap_flags;
 +	uint32_t	padding;
 +};
 +
  #endif /* _LINUX_FUSE_H */
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index 1234567..abcdefg 100644
 --- a/fs/fuse/fuse_i.h
 +++ b/fs/fuse/fuse_i.h
-@@ -821,6 +821,9 @@ struct fuse_conn {
+@@ -820,6 +820,9 @@ struct fuse_conn {
  	/** Does the filesystem support copy_file_range? */
  	unsigned no_copy_file_range:1;
 
@@ -57,9 +71,11 @@ Signed-off-by: Claude <claude@anthropic.com>
  	/* Send DESTROY request */
  	unsigned int destroy:1;
 
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+index 1234567..abcdefg 100644
 --- a/fs/fuse/file.c
 +++ b/fs/fuse/file.c
-@@ -3333,6 +3333,104 @@ static ssize_t fuse_copy_file_range(struct file *file_in, loff_t pos_in,
+@@ -3332,6 +3332,104 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
  	return ret;
  }
 
@@ -147,12 +163,6 @@ Signed-off-by: Claude <claude@anthropic.com>
 +	if (err)
 +		goto out;
 +
-+	/* Validate response (skip check if len=0 means whole file) */
-+	if (len && outarg.size > len) {
-+		err = -EIO;
-+		goto out;
-+	}
-+
 +	/* Invalidate destination pages that were remapped */
 +	truncate_inode_pages_range(inode_out->i_mapping,
 +				   ALIGN_DOWN(pos_out, PAGE_SIZE),
@@ -176,7 +186,7 @@ Signed-off-by: Claude <claude@anthropic.com>
  static const struct file_operations fuse_file_operations = {
  	.llseek		= fuse_file_llseek,
  	.read_iter	= fuse_file_read_iter,
-@@ -3352,6 +3450,7 @@ static const struct file_operations fuse_file_operations = {
+@@ -3351,6 +3449,7 @@ static const struct file_operations fuse_file_operations = {
  	.poll		= fuse_file_poll,
  	.fallocate	= fuse_file_fallocate,
  	.copy_file_range = fuse_copy_file_range,
