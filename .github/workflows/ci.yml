@@ -75,7 +75,11 @@ jobs:
       - name: Install cargo tools
         # cargo-audit >= 0.22.0 required for CVSS 4.0 support
         # Use --force to override any stale cached versions
-        run: cargo install cargo-nextest@0.9.115 cargo-audit@0.22.0 cargo-deny@0.18.9 --locked --force
+        # Create symlinks in /usr/local/bin so sudo can find them
+        run: |
+          cargo install cargo-nextest@0.9.115 cargo-audit@0.22.0 cargo-deny@0.18.9 --locked --force
+          sudo ln -sf $HOME/.cargo/bin/cargo-audit /usr/local/bin/
+          sudo ln -sf $HOME/.cargo/bin/cargo-deny /usr/local/bin/
       - name: Setup KVM and networking
         run: |
           sudo chmod 666 /dev/kvm
