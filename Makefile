@@ -66,6 +66,11 @@ build:
 	CARGO_TARGET_DIR=target cargo build --release -p fc-agent --target $(MUSL_TARGET)
 	@mkdir -p target/release && cp target/$(MUSL_TARGET)/release/fc-agent target/release/fc-agent
 
+# Test that the release binary works without source tree (simulates cargo install)
+test-packaging: build
+	@echo "==> Testing packaging (simulates cargo install)..."
+	./scripts/test-packaging.sh ./target/release/fcvm
+
 clean:
 	sudo rm -rf target
 

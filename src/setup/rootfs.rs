@@ -531,13 +531,17 @@ pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
         }
     }
 
-    // 5. Check CARGO_MANIFEST_DIR for development builds
-    let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(CONFIG_FILE);
-    if manifest_path.exists() {
-        return Ok(manifest_path);
+    // 5. Check CARGO_MANIFEST_DIR for development builds (debug only)
+    // In release builds (cargo install), this path would be stale and misleading
+    #[cfg(debug_assertions)]
+    {
+        let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(CONFIG_FILE);
+        if manifest_path.exists() {
+            return Ok(manifest_path);
+        }
     }
 
-    // 5. Error with helpful message
+    // 6. Error with helpful message
     bail!(
         "No rootfs config found.\n\n\
          Searched:\n  \
