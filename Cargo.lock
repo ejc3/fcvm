@@ -616,6 +616,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
  "url",
  "userfaultfd",
@@ -693,6 +694,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
 ]
 
