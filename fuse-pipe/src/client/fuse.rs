@@ -1047,4 +1047,35 @@ impl Filesystem for FuseClient {
             _ => reply.error(libc::EIO),
         }
     }
+
+    fn copy_file_range(
+        &mut self,
+        _req: &Request,
+        ino_in: u64,
+        fh_in: u64,
+        offset_in: i64,
+        ino_out: u64,
+        fh_out: u64,
+        offset_out: i64,
+        len: u64,
+        flags: u32,
+        reply: ReplyWrite,
+    ) {
+        let response = self.send_request_sync(VolumeRequest::CopyFileRange {
+            ino_in,
+            fh_in,
+            offset_in: offset_in as u64,
+            ino_out,
+            fh_out,
+            offset_out: offset_out as u64,
+            len,
+            flags,
+        });
+
+        match response {
+            VolumeResponse::Written { size } => reply.written(size),
+            VolumeResponse::Error { errno } => reply.error(errno),
+            _ => reply.error(libc::EIO),
+        }
+    }
 }
