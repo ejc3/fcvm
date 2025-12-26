@@ -70,6 +70,7 @@ pub fn is_fuse_mount(path: &Path) -> bool {
 }
 
 /// Create unique paths for each test with the given prefix.
+/// Uses /tmp for temp directories.
 pub fn unique_paths(prefix: &str) -> (PathBuf, PathBuf) {
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let pid = std::process::id();
@@ -307,6 +308,69 @@ impl Drop for FuseMount {
 
         info!(target: TARGET, "FuseMount::drop complete");
     }
+}
+
+/// Check if the filesystem and kernel support linkat with AT_EMPTY_PATH.
+/// fuse-backend-rs uses this for hardlinks. Older kernels require CAP_DAC_READ_SEARCH.
+/// Returns true if supported, false otherwise.
+pub fn supports_at_empty_path(dir: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let test_src = dir.join("at_empty_path_check.txt");
+    let test_link = dir.join("at_empty_path_link.txt");
+
+    // Create test file
+    if fs::write(&test_src, "test").is_err() {
+        return false;
+    }
+
+    let dir_fd = match fs::File::open(dir) {
+        Ok(f) => f,
+        Err(_) => {
+            let _ = fs::remove_file(&test_src);
+            return false;
+        }
+    };
+    let src_fd = match fs::File::options()
+        .custom_flags(libc::O_PATH)
+        .read(true)
+        .open(&test_src)
+    {
+        Ok(f) => f,
+        Err(_) => {
+            let _ = fs::remove_file(&test_src);
+            return false;
+        }
+    };
+
+    let link_name = CString::new("at_empty_path_link.txt").unwrap();
+    let empty = CString::new("").unwrap();
+    let res = unsafe {
+        libc::linkat(
+            src_fd.as_raw_fd(),
+            empty.as_ptr(),
+            dir_fd.as_raw_fd(),
+            link_name.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        )
+    };
+
+    let supported = res == 0;
+    let _ = fs::remove_file(&test_link);
+    let _ = fs::remove_file(&test_src);
+
+    if supported {
+        eprintln!("AT_EMPTY_PATH: supported");
+    } else {
+        let err = std::io::Error::last_os_error();
+        eprintln!(
+            "AT_EMPTY_PATH: not supported ({}) - skipping hardlink test",
+            err
+        );
+    }
+    supported
 }
 
 /// Setup test data in a directory.

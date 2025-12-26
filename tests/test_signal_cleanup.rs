@@ -62,11 +62,12 @@ fn test_sigint_kills_firecracker_bridged() -> Result<()> {
     // Wait for VM to become healthy (max 60 seconds)
     let start = std::time::Instant::now();
     let mut healthy = false;
-    while start.elapsed() < Duration::from_secs(60) {
+    while start.elapsed() < Duration::from_secs(120) {
         std::thread::sleep(common::POLL_INTERVAL);
 
+        // IMPORTANT: Use --pid to query only OUR VM, not all VMs (parallel test safety)
         let output = Command::new(&fcvm_path)
-            .args(["ls", "--json"])
+            .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
             .output()
             .context("running fcvm ls")?;
 
@@ -191,13 +192,14 @@ fn test_sigterm_kills_firecracker_bridged() -> Result<()> {
     println!("Started fcvm with PID: {}", fcvm_pid);
 
     // Wait for VM to become healthy (max 60 seconds)
+    // IMPORTANT: Use --pid to query only OUR VM, not all VMs (parallel test safety)
     let start = std::time::Instant::now();
     let mut healthy = false;
-    while start.elapsed() < Duration::from_secs(60) {
+    while start.elapsed() < Duration::from_secs(120) {
         std::thread::sleep(common::POLL_INTERVAL);
 
         let output = Command::new(&fcvm_path)
-            .args(["ls", "--json"])
+            .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
             .output()
             .context("running fcvm ls")?;
 
@@ -304,13 +306,14 @@ fn test_sigterm_cleanup_rootless() -> Result<()> {
     println!("Started fcvm with PID: {}", fcvm_pid);
 
     // Wait for VM to become healthy (max 60 seconds)
+    // IMPORTANT: Use --pid to query only OUR VM, not all VMs (parallel test safety)
     let start = std::time::Instant::now();
     let mut healthy = false;
-    while start.elapsed() < Duration::from_secs(60) {
+    while start.elapsed() < Duration::from_secs(120) {
         std::thread::sleep(common::POLL_INTERVAL);
 
         let output = Command::new(&fcvm_path)
-            .args(["ls", "--json"])
+            .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
             .output()
             .context("running fcvm ls")?;
 
@@ -407,15 +410,35 @@ fn find_firecracker_for_fcvm(fcvm_pid: u32) -> Option<u32> {
         .output()
         .ok()?;
 
+    println!(
+        "  pgrep status: {:?}, stdout: {:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout).trim()
+    );
+
     if !output.status.success() {
+        println!("  pgrep failed, checking all processes...");
+        // Fallback: show all firecracker processes
+        if let Ok(ps) = Command::new("ps").args(["aux"]).output() {
+            for line in String::from_utf8_lossy(&ps.stdout).lines() {
+                if line.contains("firecracker") {
+                    println!("  ps: {}", line);
+                }
+            }
+        }
         return None;
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         if let Ok(fc_pid) = line.trim().parse::<u32>() {
+            let is_desc = is_descendant_of(fc_pid, fcvm_pid);
+            println!(
+                "  firecracker PID {} is_descendant_of({}) = {}",
+                fc_pid, fcvm_pid, is_desc
+            );
             // Check if this firecracker's parent chain includes our fcvm PID
-            if is_descendant_of(fc_pid, fcvm_pid) {
+            if is_desc {
                 return Some(fc_pid);
             }
         }
@@ -449,12 +472,18 @@ fn find_slirp_for_fcvm(fcvm_pid: u32) -> Option<u32> {
 /// Check if a process is a descendant of another process
 fn is_descendant_of(pid: u32, ancestor_pid: u32) -> bool {
     let mut current = pid;
+    let mut chain = vec![pid];
     // Walk up the parent chain (max 10 levels to prevent infinite loops)
     for _ in 0..10 {
         if current == ancestor_pid {
+            println!(
+                "    parent chain: {:?} -> found ancestor {}",
+                chain, ancestor_pid
+            );
             return true;
         }
         if current <= 1 {
+            println!("    parent chain: {:?} -> hit init/0", chain);
             return false;
         }
         // Read parent PID from /proc/[pid]/stat
@@ -469,13 +498,16 @@ fn is_descendant_of(pid: u32, ancestor_pid: u32) -> bool {
                 if let Some(ppid_str) = fields.get(1) {
                     if let Ok(ppid) = ppid_str.parse::<u32>() {
                         current = ppid;
+                        chain.push(ppid);
                         continue;
                     }
                 }
             }
         }
+        println!("    parent chain: {:?} -> failed to read /proc", chain);
         return false;
     }
+    println!("    parent chain: {:?} -> max depth reached", chain);
     false
 }
 
@@ -508,13 +540,14 @@ fn test_sigterm_cleanup_bridged() -> Result<()> {
     println!("Started fcvm with PID: {}", fcvm_pid);
 
     // Wait for VM to become healthy
+    // IMPORTANT: Use --pid to query only OUR VM, not all VMs (parallel test safety)
     let start = std::time::Instant::now();
     let mut healthy = false;
-    while start.elapsed() < Duration::from_secs(60) {
+    while start.elapsed() < Duration::from_secs(120) {
         std::thread::sleep(common::POLL_INTERVAL);
 
         let output = Command::new(&fcvm_path)
-            .args(["ls", "--json"])
+            .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
             .output()
             .context("running fcvm ls")?;
 

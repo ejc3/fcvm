@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
 use tokio::net::UnixListener;
 use tokio::task::JoinSet;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use memmap2::MmapOptions;
 use userfaultfd::{Event, Uffd};
@@ -138,7 +138,7 @@ impl UffdServer {
                                     vm_tasks.spawn(async move {
                                         match handle_vm_page_faults(vm_id_clone.clone(), uffd, mappings, mmap).await {
                                             Ok(()) => info!(target: "uffd", vm_id = %vm_id_clone, "VM handler exited cleanly"),
-                                            Err(e) => error!(target: "uffd", vm_id = %vm_id_clone, error = %e, "VM handler error"),
+                                            Err(e) => error!(target: "uffd", vm_id = %vm_id_clone, error = ?e, "VM handler error"),
                                         }
                                         vm_id_clone
                                     });
@@ -283,20 +283,30 @@ async fn handle_vm_page_faults(
                             "page fault past end of snapshot memory, zero-filling page"
                         );
                         let zero_page = [0u8; PAGE_SIZE];
-                        unsafe {
+                        let result = unsafe {
                             guard.get_inner().copy(
                                 zero_page.as_ptr() as *const std::ffi::c_void,
                                 fault_page as *mut std::ffi::c_void,
                                 PAGE_SIZE,
                                 true,
-                            )?;
+                            )
+                        };
+                        if let Err(e) = result {
+                            error!(
+                                target: "uffd",
+                                vm_id = %vm_id,
+                                fault_addr = format!("0x{:x}", fault_page),
+                                error = ?e,
+                                "UFFD zero-page copy failed"
+                            );
+                            return Err(e.into());
                         }
                         continue;
                     }
 
                     let bytes_available = mmap_len - offset_in_file;
 
-                    if bytes_available >= PAGE_SIZE {
+                    let copy_result = if bytes_available >= PAGE_SIZE {
                         let page_data = &mmap[offset_in_file..offset_in_file + PAGE_SIZE];
                         unsafe {
                             guard.get_inner().copy(
@@ -304,7 +314,7 @@ async fn handle_vm_page_faults(
                                 fault_page as *mut std::ffi::c_void,
                                 PAGE_SIZE,
                                 true,
-                            )?;
+                            )
                         }
                     } else {
                         let mut temp = [0u8; PAGE_SIZE];
@@ -317,8 +327,38 @@ async fn handle_vm_page_faults(
                                 fault_page as *mut std::ffi::c_void,
                                 PAGE_SIZE,
                                 true,
-                            )?;
+                            )
                         }
+                    };
+
+                    if let Err(e) = copy_result {
+                        // EEXIST means page was already filled (race with another fault for same page)
+                        // This is normal on older kernels with less aggressive page fault coalescing.
+                        // See: https://docs.kernel.org/admin-guide/mm/userfaultfd.html
+                        // "the kernel must cope with it returning -EEXIST from ioctl(UFFDIO_COPY) as expected"
+                        if let userfaultfd::Error::CopyFailed(errno) = &e {
+                            // Compare raw errno value since we may have different nix versions
+                            if (*errno as i32) == libc::EEXIST {
+                                debug!(
+                                    target: "uffd",
+                                    vm_id = %vm_id,
+                                    fault_addr = format!("0x{:x}", fault_page),
+                                    "UFFD copy skipped - page already filled (EEXIST)"
+                                );
+                                continue;
+                            }
+                        }
+
+                        // Real error - log with Debug format to show errno
+                        error!(
+                            target: "uffd",
+                            vm_id = %vm_id,
+                            fault_addr = format!("0x{:x}", fault_page),
+                            offset_in_file,
+                            error = ?e,
+                            "UFFD copy failed"
+                        );
+                        return Err(e.into());
                     }
                 }
                 Event::Remove { start, end } => {

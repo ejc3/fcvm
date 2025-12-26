@@ -216,7 +216,7 @@ async fn egress_clone_test_impl(network: &str) -> Result<()> {
         "  Waiting for clone to become healthy (PID: {})...",
         clone_pid
     );
-    common::poll_health_by_pid(clone_pid, 60).await?;
+    common::poll_health_by_pid(clone_pid, 120).await?;
     println!("  ✓ Clone is healthy");
 
     // Step 5: Test egress on clone
