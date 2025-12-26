@@ -1,0 +1,174 @@
+Subject: [RFC PATCH] fuse: add remap_file_range support for FICLONE
+
+Add support for the remap_file_range file operation to FUSE, enabling
+FICLONE and FICLONERANGE ioctls to work on FUSE filesystems.
+
+This is useful for:
+- Container filesystems that need to support btrfs-style reflinks
+- Copy-on-write operations through FUSE passthrough filesystems
+- Deduplication operations (with REMAP_FILE_DEDUP flag)
+
+The implementation follows the same pattern as copy_file_range:
+- New opcode FUSE_REMAP_FILE_RANGE (53)
+- New wire protocol struct fuse_remap_file_range_in
+- Kernel sends request to userspace daemon
+- Daemon performs the actual remap on backing filesystem
+
+The remap_flags field passes through REMAP_FILE_DEDUP and
+REMAP_FILE_CAN_SHORTEN flags to userspace.
+
+Signed-off-by: Claude <claude@anthropic.com>
+---
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@ -638,6 +638,7 @@
+ 	FUSE_SYNCFS		= 50,
+ 	FUSE_TMPFILE		= 51,
+ 	FUSE_STATX		= 52,
++	FUSE_REMAP_FILE_RANGE	= 53,
+ 
+ 	/* CUSE specific operations */
+ 	CUSE_INIT		= 4096,
+@@ -1206,4 +1207,15 @@
+ 	uint32_t	groups[];
+ };
+ 
++struct fuse_remap_file_range_in {
++	uint64_t	fh_in;
++	uint64_t	off_in;
++	uint64_t	nodeid_out;
++	uint64_t	fh_out;
++	uint64_t	off_out;
++	uint64_t	len;
++	uint32_t	remap_flags;	/* REMAP_FILE_DEDUP, REMAP_FILE_CAN_SHORTEN */
++	uint32_t	padding;
++};
++
+ #endif /* _LINUX_FUSE_H */
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -821,6 +821,9 @@
+ 	/** Does the filesystem support copy_file_range? */
+ 	unsigned no_copy_file_range:1;
+ 
++	/** Does the filesystem support remap_file_range (FICLONE)? */
++	unsigned no_remap_file_range:1;
++
+ 	/* Send DESTROY request */
+ 	unsigned int destroy:1;
+ 
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -3333,6 +3333,104 @@
+ 	return ret;
+ }
+ 
++static loff_t fuse_remap_file_range(struct file *file_in, loff_t pos_in,
++				    struct file *file_out, loff_t pos_out,
++				    loff_t len, unsigned int remap_flags)
++{
++	struct fuse_file *ff_in = file_in->private_data;
++	struct fuse_file *ff_out = file_out->private_data;
++	struct inode *inode_in = file_inode(file_in);
++	struct inode *inode_out = file_inode(file_out);
++	struct fuse_inode *fi_out = get_fuse_inode(inode_out);
++	struct fuse_mount *fm = ff_in->fm;
++	struct fuse_conn *fc = fm->fc;
++	FUSE_ARGS(args);
++	struct fuse_remap_file_range_in inarg = {
++		.fh_in = ff_in->fh,
++		.off_in = pos_in,
++		.nodeid_out = ff_out->nodeid,
++		.fh_out = ff_out->fh,
++		.off_out = pos_out,
++		.len = len,
++		.remap_flags = remap_flags,
++	};
++	struct fuse_write_out outarg;
++	loff_t err;
++	bool is_unstable = (!fc->writeback_cache) &&
++			   ((pos_out + len) > inode_out->i_size);
++
++	if (fc->no_remap_file_range)
++		return -EOPNOTSUPP;
++
++	/* Must be on same FUSE mount */
++	if (file_inode(file_in)->i_sb != file_inode(file_out)->i_sb)
++		return -EXDEV;
++
++	/* Flush source file dirty pages */
++	inode_lock(inode_in);
++	err = fuse_writeback_range(inode_in, pos_in, pos_in + len - 1);
++	inode_unlock(inode_in);
++	if (err)
++		return err;
++
++	inode_lock(inode_out);
++
++	err = file_modified(file_out);
++	if (err)
++		goto out;
++
++	/* Flush destination file dirty pages */
++	err = fuse_writeback_range(inode_out, pos_out, pos_out + len - 1);
++	if (err)
++		goto out;
++
++	if (is_unstable)
++		set_bit(FUSE_I_SIZE_UNSTABLE, &fi_out->state);
++
++	args.opcode = FUSE_REMAP_FILE_RANGE;
++	args.nodeid = ff_in->nodeid;
++	args.in_numargs = 1;
++	args.in_args[0].size = sizeof(inarg);
++	args.in_args[0].value = &inarg;
++	args.out_numargs = 1;
++	args.out_args[0].size = sizeof(outarg);
++	args.out_args[0].value = &outarg;
++
++	err = fuse_simple_request(fm, &args);
++	if (err == -ENOSYS) {
++		fc->no_remap_file_range = 1;
++		err = -EOPNOTSUPP;
++		goto out;
++	}
++	if (err)
++		goto out;
++
++	/* Validate response */
++	if (outarg.size > len) {
++		err = -EIO;
++		goto out;
++	}
++
++	/* Invalidate destination pages that were remapped */
++	truncate_inode_pages_range(inode_out->i_mapping,
++				   ALIGN_DOWN(pos_out, PAGE_SIZE),
++				   ALIGN(pos_out + outarg.size, PAGE_SIZE) - 1);
++
++	file_update_time(file_out);
++	fuse_write_update_attr(inode_out, pos_out + outarg.size, outarg.size);
++
++	err = outarg.size;
++out:
++	if (is_unstable)
++		clear_bit(FUSE_I_SIZE_UNSTABLE, &fi_out->state);
++
++	inode_unlock(inode_out);
++	file_accessed(file_in);
++	fuse_flush_time_update(inode_out);
++
++	return err;
++}
++
+ static const struct file_operations fuse_file_operations = {
+ 	.llseek		= fuse_file_llseek,
+ 	.read_iter	= fuse_file_read_iter,
+@@ -3352,6 +3450,7 @@
+ 	.poll		= fuse_file_poll,
+ 	.fallocate	= fuse_file_fallocate,
+ 	.copy_file_range = fuse_copy_file_range,
++	.remap_file_range = fuse_remap_file_range,
+ };
+ 
+ static const struct address_space_operations fuse_file_aops  = {

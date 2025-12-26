@@ -285,6 +285,25 @@ pub trait FilesystemHandler: Send + Sync {
                 *len,
                 *flags,
             ),
+            VolumeRequest::RemapFileRange {
+                ino_in,
+                fh_in,
+                offset_in,
+                ino_out,
+                fh_out,
+                offset_out,
+                len,
+                remap_flags,
+            } => self.remap_file_range(
+                *ino_in,
+                *fh_in,
+                *offset_in,
+                *ino_out,
+                *fh_out,
+                *offset_out,
+                *len,
+                *remap_flags,
+            ),
         }
     }
 
@@ -696,6 +715,26 @@ pub trait FilesystemHandler: Send + Sync {
         _offset_out: u64,
         _len: u64,
         _flags: u32,
+    ) -> VolumeResponse {
+        VolumeResponse::Error {
+            errno: libc::ENOSYS,
+        }
+    }
+
+    /// Remap file range (FICLONE/FICLONERANGE support).
+    /// Creates instant copy-on-write clones on btrfs/xfs.
+    /// Requires kernel patch - not yet upstream.
+    #[allow(clippy::too_many_arguments)]
+    fn remap_file_range(
+        &self,
+        _ino_in: u64,
+        _fh_in: u64,
+        _offset_in: u64,
+        _ino_out: u64,
+        _fh_out: u64,
+        _offset_out: u64,
+        _len: u64,
+        _remap_flags: u32,
     ) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
