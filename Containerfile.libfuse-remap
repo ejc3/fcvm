@@ -11,15 +11,12 @@
 
 FROM alpine:latest AS builder
 
-RUN apk add --no-cache git meson ninja gcc g++ musl-dev linux-headers python3 eudev-dev patch
+RUN apk add --no-cache git meson ninja gcc g++ musl-dev linux-headers python3 eudev-dev
 
 WORKDIR /build
-RUN git clone --depth 1 https://github.com/libfuse/libfuse.git
+RUN git clone --depth 1 -b remap-file-range https://github.com/ejc3/libfuse.git
 
-# Copy and apply the full remap_file_range patch
-COPY fuse-pipe/tests/libfuse_remap/libfuse-remap.patch /build/
 WORKDIR /build/libfuse
-RUN patch -p1 < /build/libfuse-remap.patch
 
 # Build libfuse static library
 RUN meson setup build --default-library=static -Dexamples=false -Dtests=false -Duseroot=false && \
