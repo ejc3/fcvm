@@ -11,10 +11,34 @@ resolver = "2"
 name = "fcvm"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.75"
+authors = ["ejc3"]
+description = "Firecracker VM runner for Podman containers with sub-second cloning"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/ejc3/fcvm"
+homepage = "https://github.com/ejc3/fcvm"
+keywords = ["firecracker", "vm", "container", "podman", "microvm"]
+categories = ["command-line-utilities", "virtualization"]
+exclude = [
+    ".github/",
+    ".claude/",
+    "tests/",
+    "benches/",
+    "scripts/",
+    "Containerfile",
+    "Makefile",
+]
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
 
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -26,6 +50,7 @@ which = "6"
 uuid = { version = "1", features = ["v4", "serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-log = "0.2"  # Bridge log crate to tracing (for fuse-backend-rs)
 libc = "0.2"
 nix = { version = "0.29", features = ["sched", "net", "fs", "user", "mount"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -44,6 +69,7 @@ url = "2"
 tokio-util = "0.7"
 regex = "1.12.2"
 fs2 = "0.4.3"
+directories = "5"
 
 [features]
 # Default: all integration tests that work without sudo (rootless networking)
@@ -55,6 +81,9 @@ integration-slow = []        # Slow VM tests, > 30s each (clone, snapshot, fuse 
 
 # Privileged tests require sudo (bridged networking, pjdfstest, iptables)
 privileged-tests = []
+
+# libfuse remap_file_range container test (requires pre-built container)
+libfuse-test = []
 
 [dev-dependencies]
 serial_test = "3"

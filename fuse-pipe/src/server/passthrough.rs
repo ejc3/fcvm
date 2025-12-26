@@ -1110,6 +1110,97 @@ impl FilesystemHandler for PassthroughFs {
         tracing::debug!(target: "passthrough", ino, offset, count = entries.len(), "readdirplus succeeded");
         VolumeResponse::DirEntriesPlus { entries }
     }
+
+    fn copy_file_range(
+        &self,
+        _ino_in: u64,
+        fh_in: u64,
+        offset_in: u64,
+        _ino_out: u64,
+        fh_out: u64,
+        offset_out: u64,
+        len: u64,
+        flags: u32,
+    ) -> VolumeResponse {
+        tracing::debug!(
+            target: "passthrough",
+            fh_in, offset_in, fh_out, offset_out, len, flags,
+            "copy_file_range"
+        );
+
+        // fh_in and fh_out are raw file descriptors from the underlying filesystem
+        let fd_in = fh_in as libc::c_int;
+        let fd_out = fh_out as libc::c_int;
+        let mut off_in = offset_in as libc::off64_t;
+        let mut off_out = offset_out as libc::off64_t;
+
+        // Call the copy_file_range syscall directly
+        // On btrfs, this creates a reflink (instant copy-on-write)
+        let result = unsafe {
+            libc::copy_file_range(
+                fd_in,
+                &mut off_in,
+                fd_out,
+                &mut off_out,
+                len as libc::size_t,
+                flags as libc::c_uint,
+            )
+        };
+
+        if result < 0 {
+            let errno = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+            tracing::debug!(target: "passthrough", errno, "copy_file_range failed");
+            VolumeResponse::error(errno)
+        } else {
+            tracing::debug!(target: "passthrough", copied = result, "copy_file_range succeeded");
+            VolumeResponse::Written {
+                size: result as u32,
+            }
+        }
+    }
+
+    fn remap_file_range(
+        &self,
+        ino_in: u64,
+        fh_in: u64,
+        offset_in: u64,
+        ino_out: u64,
+        fh_out: u64,
+        offset_out: u64,
+        len: u64,
+        remap_flags: u32,
+    ) -> VolumeResponse {
+        tracing::debug!(
+            target: "passthrough",
+            ino_in, fh_in, offset_in, ino_out, fh_out, offset_out, len, remap_flags,
+            "remap_file_range called"
+        );
+
+        let ctx = Context::new();
+
+        match self.inner.remap_file_range(
+            &ctx,
+            ino_in,
+            fh_in,
+            offset_in,
+            ino_out,
+            fh_out,
+            offset_out,
+            len,
+            remap_flags,
+        ) {
+            Ok(n) => {
+                tracing::debug!(target: "passthrough", cloned = n, "remap_file_range succeeded");
+                VolumeResponse::Written { size: n as u32 }
+            }
+            Err(e) => {
+                tracing::debug!(target: "passthrough", error = ?e, "remap_file_range failed");
+                VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1466,5 +1557,194 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// Test remap_file_range (FICLONE) functionality.
+    /// This test only works on filesystems that support FICLONE (btrfs, xfs with reflinks).
+    /// On other filesystems, the ioctl returns EOPNOTSUPP which is expected.
+    #[test]
+    fn test_remap_file_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PassthroughFs::new(dir.path());
+
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+
+        // Create source file with test data
+        let test_data = b"Hello, FICLONE! This tests reflink remap support.";
+        let resp = fs.create(1, "source.txt", 0o644, libc::O_RDWR as u32, uid, gid, 0);
+        let (src_ino, src_fh) = match resp {
+            VolumeResponse::Created { attr, fh, .. } => (attr.ino, fh),
+            VolumeResponse::Error { errno } => panic!("Create source failed: {}", errno),
+            _ => panic!("Expected Created response"),
+        };
+
+        // Write test data
+        let resp = fs.write(src_ino, src_fh, 0, test_data, uid, gid, 0);
+        assert!(matches!(resp, VolumeResponse::Written { .. }));
+
+        // Sync the source file
+        let resp = fs.fsync(src_ino, src_fh, false);
+        assert!(resp.is_ok());
+
+        // Create destination file
+        let resp = fs.create(1, "dest.txt", 0o644, libc::O_RDWR as u32, uid, gid, 0);
+        let (dst_ino, dst_fh) = match resp {
+            VolumeResponse::Created { attr, fh, .. } => (attr.ino, fh),
+            VolumeResponse::Error { errno } => panic!("Create dest failed: {}", errno),
+            _ => panic!("Expected Created response"),
+        };
+
+        // Call remap_file_range (FICLONE equivalent - whole file)
+        let resp = fs.remap_file_range(
+            src_ino, src_fh, 0,   // source: ino, fh, offset
+            dst_ino, dst_fh, 0,   // dest: ino, fh, offset
+            0,                    // len = 0 means whole file clone
+            0,                    // no special flags
+        );
+
+        match resp {
+            VolumeResponse::Written { size } => {
+                eprintln!("remap_file_range succeeded, size={}", size);
+
+                // For whole-file clone (len=0), we return 0 on success
+                assert_eq!(size, 0, "FICLONE should return 0 for whole file");
+
+                // Verify the data was cloned by reading destination
+                let resp = fs.read(dst_ino, dst_fh, 0, 100, uid, gid, 0);
+                match resp {
+                    VolumeResponse::Data { data } => {
+                        assert_eq!(
+                            data.as_slice(),
+                            test_data,
+                            "cloned data should match source"
+                        );
+                    }
+                    VolumeResponse::Error { errno } => panic!("Read dest failed: {}", errno),
+                    _ => panic!("Expected Data response"),
+                }
+            }
+            VolumeResponse::Error { errno } => {
+                // EOPNOTSUPP or EINVAL is expected on filesystems without reflink support
+                // tmpfs returns EINVAL, ext4/xfs without reflinks return EOPNOTSUPP
+                if errno == libc::EOPNOTSUPP || errno == libc::EINVAL {
+                    eprintln!("FICLONE not supported on this filesystem (errno={}) - OK", errno);
+                    // Check filesystem type
+                    eprintln!("tempdir path: {:?}", dir.path());
+                    // Try direct FICLONE to confirm
+                    let src_path = dir.path().join("direct_src.txt");
+                    let dst_path = dir.path().join("direct_dst.txt");
+                    std::fs::write(&src_path, b"test").unwrap();
+                    std::fs::write(&dst_path, b"").unwrap();
+
+                    let src_file = std::fs::File::open(&src_path).unwrap();
+                    let dst_file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&dst_path)
+                        .unwrap();
+
+                    use std::os::unix::io::AsRawFd;
+                    let result = unsafe {
+                        nix::libc::ioctl(dst_file.as_raw_fd(), 0x40049409, src_file.as_raw_fd())
+                    };
+                    if result < 0 {
+                        let err = std::io::Error::last_os_error();
+                        eprintln!("Direct FICLONE also failed: {} - filesystem doesn't support reflinks", err);
+                    }
+                } else {
+                    panic!(
+                        "remap_file_range failed with unexpected errno: {} ({})",
+                        errno,
+                        std::io::Error::from_raw_os_error(errno)
+                    );
+                }
+            }
+            _ => panic!("Unexpected response"),
+        }
+
+        // Cleanup
+        fs.release(src_ino, src_fh);
+        fs.release(dst_ino, dst_fh);
+    }
+
+    /// Test FICLONERANGE (partial clone) functionality.
+    #[test]
+    fn test_remap_file_range_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PassthroughFs::new(dir.path());
+
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+
+        // Create source file - must be 4K aligned for FICLONERANGE on most filesystems
+        // Use 8K to ensure we have full blocks
+        let block_size = 4096usize;
+        let test_data: Vec<u8> = (0..block_size * 2).map(|i| (i % 256) as u8).collect();
+        let resp = fs.create(1, "source.txt", 0o644, libc::O_RDWR as u32, uid, gid, 0);
+        let (src_ino, src_fh) = match resp {
+            VolumeResponse::Created { attr, fh, .. } => (attr.ino, fh),
+            VolumeResponse::Error { errno } => panic!("Create source failed: {}", errno),
+            _ => panic!("Expected Created response"),
+        };
+
+        let resp = fs.write(src_ino, src_fh, 0, &test_data, uid, gid, 0);
+        assert!(matches!(resp, VolumeResponse::Written { .. }));
+        fs.fsync(src_ino, src_fh, false);
+
+        // Create destination file, pre-allocate to same size
+        let resp = fs.create(1, "dest.txt", 0o644, libc::O_RDWR as u32, uid, gid, 0);
+        let (dst_ino, dst_fh) = match resp {
+            VolumeResponse::Created { attr, fh, .. } => (attr.ino, fh),
+            VolumeResponse::Error { errno } => panic!("Create dest failed: {}", errno),
+            _ => panic!("Expected Created response"),
+        };
+
+        // Pre-fill destination with zeros
+        let zeros: Vec<u8> = vec![0; block_size * 2];
+        fs.write(dst_ino, dst_fh, 0, &zeros, uid, gid, 0);
+        fs.fsync(dst_ino, dst_fh, false);
+
+        // Clone second block from source to first block of destination
+        let resp = fs.remap_file_range(
+            src_ino, src_fh, block_size as u64,  // source offset: second block
+            dst_ino, dst_fh, 0,                  // dest offset: first block
+            block_size as u64,                   // length: one block
+            0,                                   // no special flags
+        );
+
+        match resp {
+            VolumeResponse::Written { size } => {
+                eprintln!("FICLONERANGE succeeded, size={}", size);
+                assert_eq!(size, block_size as u32, "should clone requested size");
+
+                // Verify: first block of dest should equal second block of source
+                let resp = fs.read(dst_ino, dst_fh, 0, block_size as u32, uid, gid, 0);
+                match resp {
+                    VolumeResponse::Data { data } => {
+                        assert_eq!(
+                            data.as_slice(),
+                            &test_data[block_size..block_size * 2],
+                            "cloned block should match source's second block"
+                        );
+                    }
+                    VolumeResponse::Error { errno } => panic!("Read dest failed: {}", errno),
+                    _ => panic!("Expected Data response"),
+                }
+            }
+            VolumeResponse::Error { errno } => {
+                if errno == libc::EOPNOTSUPP || errno == libc::EINVAL {
+                    eprintln!(
+                        "FICLONERANGE not supported or invalid on this filesystem (errno={}) - OK",
+                        errno
+                    );
+                } else {
+                    panic!("FICLONERANGE failed with unexpected errno: {}", errno);
+                }
+            }
+            _ => panic!("Unexpected response"),
+        }
+
+        fs.release(src_ino, src_fh);
+        fs.release(dst_ino, dst_fh);
     }
 }

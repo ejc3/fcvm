@@ -225,7 +225,7 @@ iptables -t nat -A PREROUTING -d 10.0.2.100 -j DNAT --to-destination {guest_ip} 
     /// Called after Firecracker has started (so we have the namespace PID)
     pub async fn start_slirp(&mut self, namespace_pid: u32) -> Result<()> {
         let api_socket =
-            paths::base_dir().join(format!("slirp-{}.sock", truncate_id(&self.vm_id, 8)));
+            paths::data_dir().join(format!("slirp-{}.sock", truncate_id(&self.vm_id, 8)));
 
         if api_socket.exists() {
             tokio::fs::remove_file(&api_socket).await?;

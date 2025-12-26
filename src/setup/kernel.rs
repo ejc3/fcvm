@@ -26,9 +26,30 @@ pub fn get_kernel_url_hash() -> Result<String> {
 
 /// Ensure kernel exists, downloading from Kata release if needed.
 /// If `allow_create` is false, bail if kernel doesn't exist.
+///
+/// If config specifies `local_path`, uses that directly (no download).
 pub async fn ensure_kernel(allow_create: bool) -> Result<PathBuf> {
     let (plan, _, _) = load_plan()?;
     let kernel_config = plan.kernel.current_arch()?;
+
+    // Check for local path first
+    if let Some(local_path) = &kernel_config.local_path {
+        let path = PathBuf::from(local_path);
+        if !path.exists() {
+            bail!(
+                "Kernel local_path not found: {}\n\
+                Build it with: ./kernel/build.sh",
+                path.display()
+            );
+        }
+        info!(path = %path.display(), "using local kernel");
+        return Ok(path);
+    }
+
+    // URL-based download
+    if kernel_config.url.is_empty() {
+        bail!("Kernel config must specify either 'url' or 'local_path'");
+    }
 
     download_kernel(kernel_config, allow_create).await
 }
@@ -96,7 +117,7 @@ async fn download_kernel(config: &KernelArchConfig, allow_create: bool) -> Resul
 
     // Download and extract in one pipeline:
     // curl -> zstd -d -> tar --extract
-    let cache_dir = paths::base_dir().join("cache");
+    let cache_dir = paths::cache_dir();
     tokio::fs::create_dir_all(&cache_dir).await?;
 
     let tarball_path = cache_dir.join(format!("kata-kernel-{}.tar.zst", url_hash));

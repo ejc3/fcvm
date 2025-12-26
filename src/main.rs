@@ -3,6 +3,7 @@ use clap::Parser;
 use fcvm::cli::Commands;
 use fcvm::{cli, commands, paths};
 use tracing::error;
+use tracing_log::LogTracer;
 use tracing_subscriber::EnvFilter;
 
 /// Raise file descriptor limit for high-parallelism workloads.
@@ -32,17 +33,30 @@ async fn main() -> Result<()> {
     // Parse CLI arguments
     let cli = cli::Cli::parse();
 
-    // Initialize base directory from CLI argument (must be done before any path access)
-    paths::init_base_dir(cli.base_dir.as_deref());
+    // Initialize paths - some commands don't need config
+    match &cli.cmd {
+        Commands::Setup(args) if args.generate_config => {
+            // --generate-config doesn't need existing config
+            paths::init_with_defaults();
+        }
+        Commands::Completions(_) => {
+            // Shell completions don't need config
+            paths::init_with_defaults();
+        }
+        _ => {
+            // All other commands require config
+            paths::init_from_config();
+        }
+    }
 
     // Initialize logging
+    // Use RUST_LOG if set, otherwise default to INFO
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
     // If --sub-process flag is set, disable timestamps AND level (subprocess mode)
     // Parent process already shows timestamp and level, so subprocess just shows the message
     // But KEEP target tags to show the nesting hierarchy!
     // Otherwise, show full formatting (outermost process)
-    // Use RUST_LOG if set, otherwise default to INFO
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-
     if cli.sub_process {
         // Subprocesses NEVER have colors (their output is captured and re-logged)
         tracing_subscriber::fmt()
@@ -52,7 +66,8 @@ async fn main() -> Result<()> {
             .without_time()
             .with_level(false) // Disable level prefix too (INFO, DEBUG, etc.)
             .with_ansi(false) // NEVER use ANSI in subprocesses
-            .init();
+            .try_init()
+            .ok();
     } else {
         // Parent process: only use colors when outputting to a TTY (not when piped to file)
         use std::io::IsTerminal;
@@ -62,8 +77,13 @@ async fn main() -> Result<()> {
             .with_writer(std::io::stderr) // Logs to stderr, keep stdout clean for command output
             .with_target(true) // Show targets for all processes
             .with_ansi(use_color) // Only use ANSI when outputting to TTY
-            .init();
+            .try_init()
+            .ok();
     }
+
+    // Bridge log crate (used by fuse-backend-rs) to tracing
+    // This must be done AFTER setting up the tracing subscriber
+    let _ = LogTracer::init();
 
     // Dispatch to appropriate command handler
     let result = match cli.cmd {
@@ -72,7 +92,11 @@ async fn main() -> Result<()> {
         Commands::Snapshot(args) => commands::cmd_snapshot(args).await,
         Commands::Snapshots => commands::cmd_snapshots().await,
         Commands::Exec(args) => commands::cmd_exec(args).await,
-        Commands::Setup => commands::cmd_setup().await,
+        Commands::Setup(args) => commands::cmd_setup(args).await,
+        Commands::Completions(args) => {
+            commands::cmd_completions(args);
+            Ok(())
+        }
     };
 
     // Handle errors

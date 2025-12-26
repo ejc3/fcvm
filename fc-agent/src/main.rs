@@ -1076,6 +1076,46 @@ fn handle_exec_pipe(fd: i32, request: &ExecRequest) {
     unsafe { libc::close(fd) };
 }
 
+/// Create /dev/kvm device node for inception support.
+/// This allows running Firecracker inside Firecracker (nested virtualization).
+/// Requires kernel with CONFIG_KVM=y.
+fn create_kvm_device() {
+    use std::path::Path;
+
+    let kvm_path = Path::new("/dev/kvm");
+    if kvm_path.exists() {
+        eprintln!("[fc-agent] /dev/kvm already exists");
+        return;
+    }
+
+    // /dev/kvm is a character device with major 10, minor 232
+    // (MISC_DYNAMIC_MINOR for kvm, but historically it's 232)
+    // We use libc::mknod to create it
+    let dev = libc::makedev(10, 232);
+    let result = unsafe {
+        libc::mknod(
+            b"/dev/kvm\0".as_ptr() as *const libc::c_char,
+            libc::S_IFCHR | 0o666, // char device, rw-rw-rw-
+            dev,
+        )
+    };
+
+    if result == 0 {
+        eprintln!("[fc-agent] ✓ created /dev/kvm (10:232)");
+    } else {
+        let err = std::io::Error::last_os_error();
+        // ENOENT means the kernel doesn't have KVM support
+        // This is expected with standard Firecracker kernel
+        if err.kind() == std::io::ErrorKind::NotFound
+            || err.raw_os_error() == Some(libc::ENOENT)
+        {
+            eprintln!("[fc-agent] /dev/kvm not available (kernel needs CONFIG_KVM)");
+        } else {
+            eprintln!("[fc-agent] WARNING: failed to create /dev/kvm: {}", err);
+        }
+    }
+}
+
 /// Raise resource limits for high parallelism workloads.
 /// This prevents EMFILE (too many open files) errors when running
 /// tests with many parallel jobs.
@@ -1446,6 +1486,10 @@ async fn main() -> Result<()> {
 
     // Raise resource limits early to support high parallelism workloads
     raise_resource_limits();
+
+    // Create /dev/kvm device for inception support (nested virtualization)
+    // This is a no-op if kernel doesn't have CONFIG_KVM
+    create_kvm_device();
 
     // Configure DNS from kernel boot parameters before any network operations
     configure_dns_from_cmdline();
