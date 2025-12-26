@@ -508,11 +508,19 @@ make container-test
 
 ### CI Structure
 
-**PR/Push (7 parallel jobs):**
-- Lint, Build, Unit Tests, FUSE Integration, CLI Tests, FUSE Permissions, POSIX Compliance
+**PR/Push (2 parallel jobs):**
+- Host: Runs on bare metal with KVM
+- Container: Runs in privileged container
 
 **Nightly (scheduled):**
 - Full benchmarks with artifact upload
+
+### Manual CI Trigger
+
+CI only auto-runs on PRs to `main`. To test other branches:
+```bash
+gh workflow run ci.yml --ref <branch-name>
+```
 
 ### Getting Logs from In-Progress CI Runs
 
