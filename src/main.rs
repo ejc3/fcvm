@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
         Commands::Snapshot(args) => commands::cmd_snapshot(args).await,
         Commands::Snapshots => commands::cmd_snapshots().await,
         Commands::Exec(args) => commands::cmd_exec(args).await,
-        Commands::Setup => commands::cmd_setup().await,
+        Commands::Setup(args) => commands::cmd_setup(args).await,
     };
 
     // Handle errors
