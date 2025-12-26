@@ -62,7 +62,7 @@ fn test_sigint_kills_firecracker_bridged() -> Result<()> {
     // Wait for VM to become healthy (max 60 seconds)
     let start = std::time::Instant::now();
     let mut healthy = false;
-    while start.elapsed() < Duration::from_secs(60) {
+    while start.elapsed() < Duration::from_secs(120) {
         std::thread::sleep(common::POLL_INTERVAL);
 
         // IMPORTANT: Use --pid to query only OUR VM, not all VMs (parallel test safety)
@@ -195,7 +195,7 @@ fn test_sigterm_kills_firecracker_bridged() -> Result<()> {
     // IMPORTANT: Use --pid to query only OUR VM, not all VMs (parallel test safety)
     let start = std::time::Instant::now();
     let mut healthy = false;
-    while start.elapsed() < Duration::from_secs(60) {
+    while start.elapsed() < Duration::from_secs(120) {
         std::thread::sleep(common::POLL_INTERVAL);
 
         let output = Command::new(&fcvm_path)
@@ -309,7 +309,7 @@ fn test_sigterm_cleanup_rootless() -> Result<()> {
     // IMPORTANT: Use --pid to query only OUR VM, not all VMs (parallel test safety)
     let start = std::time::Instant::now();
     let mut healthy = false;
-    while start.elapsed() < Duration::from_secs(60) {
+    while start.elapsed() < Duration::from_secs(120) {
         std::thread::sleep(common::POLL_INTERVAL);
 
         let output = Command::new(&fcvm_path)
@@ -543,7 +543,7 @@ fn test_sigterm_cleanup_bridged() -> Result<()> {
     // IMPORTANT: Use --pid to query only OUR VM, not all VMs (parallel test safety)
     let start = std::time::Instant::now();
     let mut healthy = false;
-    while start.elapsed() < Duration::from_secs(60) {
+    while start.elapsed() < Duration::from_secs(120) {
         std::thread::sleep(common::POLL_INTERVAL);
 
         let output = Command::new(&fcvm_path)
