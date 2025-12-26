@@ -283,20 +283,30 @@ async fn handle_vm_page_faults(
                             "page fault past end of snapshot memory, zero-filling page"
                         );
                         let zero_page = [0u8; PAGE_SIZE];
-                        unsafe {
+                        let result = unsafe {
                             guard.get_inner().copy(
                                 zero_page.as_ptr() as *const std::ffi::c_void,
                                 fault_page as *mut std::ffi::c_void,
                                 PAGE_SIZE,
                                 true,
-                            )?;
+                            )
+                        };
+                        if let Err(e) = result {
+                            error!(
+                                target: "uffd",
+                                vm_id = %vm_id,
+                                fault_addr = format!("0x{:x}", fault_page),
+                                error = %e,
+                                "UFFD zero-page copy failed"
+                            );
+                            return Err(e.into());
                         }
                         continue;
                     }
 
                     let bytes_available = mmap_len - offset_in_file;
 
-                    if bytes_available >= PAGE_SIZE {
+                    let copy_result = if bytes_available >= PAGE_SIZE {
                         let page_data = &mmap[offset_in_file..offset_in_file + PAGE_SIZE];
                         unsafe {
                             guard.get_inner().copy(
@@ -304,7 +314,7 @@ async fn handle_vm_page_faults(
                                 fault_page as *mut std::ffi::c_void,
                                 PAGE_SIZE,
                                 true,
-                            )?;
+                            )
                         }
                     } else {
                         let mut temp = [0u8; PAGE_SIZE];
@@ -317,8 +327,21 @@ async fn handle_vm_page_faults(
                                 fault_page as *mut std::ffi::c_void,
                                 PAGE_SIZE,
                                 true,
-                            )?;
+                            )
                         }
+                    };
+
+                    if let Err(e) = copy_result {
+                        // Log detailed error info for debugging
+                        error!(
+                            target: "uffd",
+                            vm_id = %vm_id,
+                            fault_addr = format!("0x{:x}", fault_page),
+                            offset_in_file,
+                            error = %e,
+                            "UFFD copy failed"
+                        );
+                        return Err(e.into());
                     }
                 }
                 Event::Remove { start, end } => {
