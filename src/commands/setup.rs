@@ -1,10 +1,22 @@
 use anyhow::{Context, Result};
 
+use crate::cli::args::SetupArgs;
+use crate::setup::rootfs::generate_config;
+
 /// Run setup to download kernel and create rootfs.
 ///
 /// This downloads the Kata kernel (~15MB) and creates the Layer 2 rootfs (~10GB).
 /// The rootfs creation downloads Ubuntu cloud image and installs podman, taking 5-10 minutes.
-pub async fn cmd_setup() -> Result<()> {
+pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
+    // Handle --generate-config: write default config and exit
+    if args.generate_config {
+        let config_path = generate_config(args.force)?;
+        println!("Generated config at: {}", config_path.display());
+        println!("\nCustomize the config file, then run:");
+        println!("  fcvm setup");
+        return Ok(());
+    }
+
     println!("Setting up fcvm (this may take 5-10 minutes on first run)...");
 
     // Ensure kernel exists (downloads Kata kernel if missing)
