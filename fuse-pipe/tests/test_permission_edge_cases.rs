@@ -3,9 +3,9 @@
 //! These tests reproduce specific pjdfstest failures to enable fast iteration.
 //! They test edge cases in chmod, chown, open, truncate, and link operations.
 //!
-//! Run with: `sudo cargo test --test test_permission_edge_cases -- --nocapture`
+//! Run with: `sudo cargo test --features privileged-tests --test test_permission_edge_cases -- --nocapture`
 
-// Allow unused variables - test code often has unused return values
+#![cfg(feature = "privileged-tests")]
 #![allow(unused_variables)]
 
 mod common;

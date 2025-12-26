@@ -13,7 +13,7 @@ fn create_unique_test_dir() -> std::path::PathBuf {
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let pid = std::process::id();
     let temp_dir = tempfile::tempdir().expect("create temp base dir");
-    let path = temp_dir.into_path();
+    let path = temp_dir.keep();
     // Rename to include unique suffix for debugging
     let unique_path = std::path::PathBuf::from(format!("/tmp/fcvm-test-health-{}-{}", pid, id));
     let _ = std::fs::remove_dir_all(&unique_path);

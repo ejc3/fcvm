@@ -7,6 +7,8 @@
 //! 4. Runs parallel curl commands from each clone to the local HTTP server
 //! 5. Verifies all requests succeed
 
+#![cfg(feature = "integration-slow")]
+
 mod common;
 
 use anyhow::{Context, Result};
@@ -185,8 +187,8 @@ async fn egress_stress_impl(
             .await
             .context("spawning memory server")?;
 
-    // Wait for server to be ready
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait for serve process to save its state file
+    common::poll_serve_state_by_pid(serve_pid, 30).await?;
     println!("  ✓ Memory server ready (PID: {})", serve_pid);
 
     // Step 4: Spawn clones in parallel

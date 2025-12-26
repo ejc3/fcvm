@@ -111,17 +111,12 @@ pub async fn list_namespaces() -> Result<Vec<String>> {
     Ok(namespaces)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "privileged-tests"))]
 mod tests {
     use super::*;
 
     #[tokio::test]
     async fn test_namespace_lifecycle() {
-        if unsafe { libc::geteuid() } != 0 {
-            eprintln!("Skipping test_namespace_lifecycle - requires root");
-            return;
-        }
-
         let ns_name = "fcvm-test-ns";
 
         // Clean up if exists from previous test
@@ -143,10 +138,8 @@ mod tests {
     }
 
     // Requires CAP_SYS_ADMIN to remount /sys in new namespace (doesn't work in containers)
-    #[cfg(feature = "privileged-tests")]
     #[tokio::test]
     async fn test_exec_in_namespace() {
-
         let ns_name = "fcvm-test-exec";
 
         // Clean up if exists

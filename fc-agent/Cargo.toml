@@ -11,5 +11,5 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs
 reqwest = { version = "0.11", default-features = false, features = ["json"] }
 libc = "0.2"
 fs2 = "0.4"
-fuse-pipe = { path = "../fuse-pipe" }
+fuse-pipe = { path = "../fuse-pipe", default-features = false }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

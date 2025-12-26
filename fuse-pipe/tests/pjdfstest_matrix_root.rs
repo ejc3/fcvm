@@ -1,7 +1,13 @@
-//! Matrix pjdfstest runner - each category is a separate test for parallel execution.
+//! Host-side pjdfstest matrix - tests fuse-pipe FUSE directly (no VM)
 //!
-//! Run with: cargo nextest run -p fuse-pipe --test pjdfstest_matrix
-//! Categories run in parallel via nextest's process isolation.
+//! Each category is a separate test, allowing nextest to run all 17 in parallel.
+//! Tests fuse-pipe's PassthroughFs via local FUSE mount.
+//!
+//! See also: tests/test_fuse_in_vm_matrix.rs (in-VM matrix, tests full vsock stack)
+//!
+//! Run with: cargo nextest run -p fuse-pipe --test pjdfstest_matrix_root --features privileged-tests,integration-slow
+
+#![cfg(all(feature = "privileged-tests", feature = "integration-slow"))]
 
 mod pjdfstest_common;
 
@@ -22,8 +28,7 @@ macro_rules! pjdfstest_category {
     };
 }
 
-// Generate a test function for each pjdfstest category
-// These will run in parallel via nextest
+// All categories require root for chown/mknod/user-switching
 pjdfstest_category!(test_pjdfstest_chflags, "chflags");
 pjdfstest_category!(test_pjdfstest_chmod, "chmod");
 pjdfstest_category!(test_pjdfstest_chown, "chown");

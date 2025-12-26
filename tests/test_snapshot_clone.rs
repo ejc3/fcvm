@@ -7,6 +7,8 @@
 //! 4. Spawn clones from snapshot (concurrently)
 //! 5. Verify clones become healthy (concurrently)
 
+#![cfg(feature = "integration-slow")]
+
 mod common;
 
 use anyhow::{Context, Result};
@@ -769,6 +771,9 @@ async fn test_clone_http(fcvm_path: &std::path::Path, clone_pid: u32) -> Result<
 async fn test_clone_port_forward_bridged() -> Result<()> {
     let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("pf-bridged");
 
+    // Port 8080:80 - DNAT is scoped to veth IP so same port works across parallel VMs
+    let host_port: u16 = 8080;
+
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!("║     Clone Port Forwarding Test (bridged)                      ║");
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
@@ -833,7 +838,8 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
     println!("  ✓ Memory server ready (PID: {})", serve_pid);
 
     // Step 4: Spawn clone WITH port forwarding
-    println!("\nStep 4: Spawning clone with --publish 19080:80...");
+    let publish_arg = format!("{}:80", host_port);
+    println!("\nStep 4: Spawning clone with --publish {}...", publish_arg);
     let serve_pid_str = serve_pid.to_string();
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
         &[
@@ -846,7 +852,7 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
             "--network",
             "bridged",
             "--publish",
-            "19080:80",
+            &publish_arg,
         ],
         &clone_name,
     )
@@ -869,55 +875,35 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
         .context("getting clone state")?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let guest_ip: String = serde_json::from_str::<Vec<serde_json::Value>>(&stdout)
-        .ok()
-        .and_then(|v| v.first().cloned())
-        .and_then(|v| {
-            v.get("config")?
-                .get("network")?
-                .get("guest_ip")?
-                .as_str()
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_default();
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap_or_default();
+    let network = parsed.first().and_then(|v| v.get("config")?.get("network"));
 
-    println!("  Clone guest IP: {}", guest_ip);
+    let guest_ip = network
+        .and_then(|n| n.get("guest_ip")?.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let veth_host_ip = network
+        .and_then(|n| n.get("host_ip")?.as_str())
+        .unwrap_or_default()
+        .to_string();
 
-    // Note: Direct access to guest IP (172.30.x.y) is NOT expected to work for clones.
-    // Clones use In-Namespace NAT where the guest IP is only reachable inside the namespace.
-    // Port forwarding goes through veth_inner_ip (10.x.y.z) which then gets DNATed to guest_ip.
-    // We test this only to document the expected behavior.
-    println!("  Testing direct access to guest (expected to fail for clones)...");
-    let direct_result = tokio::process::Command::new("curl")
-        .args(["-s", "--max-time", "5", &format!("http://{}:80", guest_ip)])
-        .output()
-        .await;
-
-    let direct_works = direct_result
-        .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(false);
     println!(
-        "    Direct access: {} (expected for clones)",
-        if direct_works { "✓ OK" } else { "✗ N/A" }
+        "  Clone guest_ip: {}, veth_host_ip: {}",
+        guest_ip, veth_host_ip
     );
 
-    // Test 2: Access via host's primary IP and forwarded port
-    let host_ip = tokio::process::Command::new("hostname")
-        .arg("-I")
-        .output()
-        .await
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.split_whitespace().next().map(|ip| ip.to_string()))
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-
-    println!("  Testing access via host IP {}:19080...", host_ip);
+    // Test: Access via port forwarding (veth's host IP)
+    // DNAT rules are scoped to the veth IP, so this is what we test
+    println!(
+        "  Testing port forwarding via veth IP {}:{}...",
+        veth_host_ip, host_port
+    );
     let forward_result = tokio::process::Command::new("curl")
         .args([
             "-s",
             "--max-time",
             "10",
-            &format!("http://{}:19080", host_ip),
+            &format!("http://{}:{}", veth_host_ip, host_port),
         ])
         .output()
         .await;
@@ -926,27 +912,8 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
         .map(|o| o.status.success() && !o.stdout.is_empty())
         .unwrap_or(false);
     println!(
-        "    Port forward (host IP): {}",
+        "    Port forward (veth IP): {}",
         if forward_works { "✓ OK" } else { "✗ FAIL" }
-    );
-
-    // Test 3: Access via localhost
-    println!("  Testing access via localhost:19080...");
-    let localhost_result = tokio::process::Command::new("curl")
-        .args(["-s", "--max-time", "10", "http://127.0.0.1:19080"])
-        .output()
-        .await;
-
-    let localhost_works = localhost_result
-        .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(false);
-    println!(
-        "    Localhost access: {}",
-        if localhost_works {
-            "✓ OK"
-        } else {
-            "✗ FAIL"
-        }
     );
 
     // Cleanup
@@ -961,20 +928,8 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
     println!("║                         RESULTS                               ║");
     println!("╠═══════════════════════════════════════════════════════════════╣");
     println!(
-        "║  Direct access to guest:    {} (N/A for clones)            ║",
-        if direct_works { "✓ WORKS" } else { "✗ N/A  " }
-    );
-    println!(
-        "║  Port forward (host IP):    {}                                 ║",
+        "║  Port forward (veth IP):    {}                                 ║",
         if forward_works {
-            "✓ PASSED"
-        } else {
-            "✗ FAILED"
-        }
-    );
-    println!(
-        "║  Localhost port forward:    {}                                 ║",
-        if localhost_works {
             "✓ PASSED"
         } else {
             "✗ FAILED"
@@ -982,16 +937,14 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
     );
     println!("╚═══════════════════════════════════════════════════════════════╝");
 
-    // For clones, only port forwarding methods must work.
-    // Direct access is NOT expected to work due to In-Namespace NAT architecture.
-    if forward_works && localhost_works {
+    // Port forwarding via veth IP must work
+    if forward_works {
         println!("\n✅ CLONE PORT FORWARDING TEST PASSED!");
         Ok(())
     } else {
         anyhow::bail!(
-            "Clone port forwarding test failed: forward={}, localhost={}",
-            forward_works,
-            localhost_works
+            "Clone port forwarding test failed: forward={}",
+            forward_works
         )
     }
 }

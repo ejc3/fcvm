@@ -6,6 +6,8 @@
 //! 3. We snapshot and clone the VM
 //! 4. Observe: does the clone's connection reset? Can it reconnect?
 
+#![cfg(feature = "integration-slow")]
+
 mod common;
 
 use anyhow::{Context, Result};
@@ -101,6 +103,33 @@ impl BroadcastServer {
                 clients.len()
             );
         })
+    }
+}
+
+/// Timeout for waiting for connections
+const CONNECTION_TIMEOUT_SECS: u64 = 30;
+
+/// Poll until connection count exceeds threshold, with timeout
+async fn wait_for_connections(counter: &Arc<AtomicU64>, min_count: u64) -> Result<u64> {
+    let start = Instant::now();
+    let timeout = Duration::from_secs(CONNECTION_TIMEOUT_SECS);
+
+    loop {
+        let count = counter.load(Ordering::Relaxed);
+        if count >= min_count {
+            return Ok(count);
+        }
+
+        if start.elapsed() > timeout {
+            anyhow::bail!(
+                "timeout ({}s) waiting for connections: got {}, need {}",
+                CONNECTION_TIMEOUT_SECS,
+                count,
+                min_count
+            );
+        }
+
+        tokio::time::sleep(common::POLL_INTERVAL).await;
     }
 }
 
@@ -364,6 +393,7 @@ async fn test_clone_reconnect_latency_rootless() -> Result<()> {
     let server_port = server.port();
     let stop_handle = server.stop_handle();
     let server_seq = Arc::clone(&server.seq);
+    let conn_counter = Arc::clone(&server.conn_counter);
     let _server_thread = server.run_in_background();
     println!("  Listening on port {}", server_port);
 
@@ -437,7 +467,7 @@ async fn test_clone_reconnect_latency_rootless() -> Result<()> {
     };
 
     // Wait for client to connect
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    wait_for_connections(&conn_counter, 1).await?;
     let seq_before_snapshot = server_seq.load(Ordering::Relaxed);
     println!("  Client connected (server seq: {})", seq_before_snapshot);
 
@@ -568,6 +598,7 @@ async fn test_clone_connection_timing_rootless() -> Result<()> {
     let server_port = server.port();
     let stop_handle = server.stop_handle();
     let server_seq = Arc::clone(&server.seq);
+    let conn_counter = Arc::clone(&server.conn_counter);
     let _server_thread = server.run_in_background();
     println!("  Listening on port {}", server_port);
 
@@ -637,7 +668,7 @@ async fn test_clone_connection_timing_rootless() -> Result<()> {
     }
 
     // Wait for connection
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    wait_for_connections(&conn_counter, 1).await?;
     let seq_at_connect = server_seq.load(Ordering::Relaxed);
     println!(
         "  Persistent client connected! (server seq: {})",
@@ -743,8 +774,8 @@ async fn test_clone_connection_timing_rootless() -> Result<()> {
     println!("  Clone healthy (PID: {})", clone_pid);
 
     // The clone's nc process woke up in a new network namespace
-    // It has a stale socket fd - what happened?
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // It has a stale socket fd - give it a moment to react
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     println!("\nStep 8: Checking clone's inherited nc process...");
     let output = tokio::process::Command::new(&fcvm_path)
@@ -997,7 +1028,7 @@ done
         .await?;
 
     // Wait for initial connection
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    wait_for_connections(&conn_counter, 1).await?;
     let initial_conns = conn_counter.load(Ordering::Relaxed);
     println!(
         "  Client connected! (server has {} connections)",

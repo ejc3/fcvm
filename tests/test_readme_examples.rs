@@ -9,6 +9,8 @@
 //! `Stdio::inherit()` to prevent pipe buffer deadlock. See CLAUDE.md
 //! "Pipe Buffer Deadlock in Tests" for details.
 
+#![cfg(all(feature = "integration-fast", feature = "privileged-tests"))]
+
 mod common;
 
 use anyhow::{Context, Result};
@@ -21,7 +23,6 @@ use std::time::Duration;
 /// ```
 /// sudo fcvm podman run --name web1 --map /host/config:/config:ro nginx:alpine
 /// ```
-#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_readonly_volume_bridged() -> Result<()> {
     println!("\ntest_readonly_volume_bridged");
@@ -118,7 +119,6 @@ async fn test_readonly_volume_bridged() -> Result<()> {
 /// ```
 /// sudo fcvm podman run --name web1 --env DEBUG=1 nginx:alpine
 /// ```
-#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_env_variables_bridged() -> Result<()> {
     println!("\ntest_env_variables_bridged");
@@ -197,7 +197,6 @@ async fn test_env_variables_bridged() -> Result<()> {
 /// ```
 /// sudo fcvm podman run --name web1 --cpu 4 --mem 4096 nginx:alpine
 /// ```
-#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_custom_resources_bridged() -> Result<()> {
     println!("\ntest_custom_resources_bridged");
@@ -276,7 +275,6 @@ async fn test_custom_resources_bridged() -> Result<()> {
 /// fcvm ls --json
 /// fcvm ls --pid 12345
 /// ```
-#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_fcvm_ls_bridged() -> Result<()> {
     println!("\ntest_fcvm_ls_bridged");
@@ -407,7 +405,6 @@ async fn test_fcvm_ls_bridged() -> Result<()> {
 /// ```
 /// sudo fcvm podman run --name web1 --cmd "nginx -g 'daemon off;'" nginx:alpine
 /// ```
-#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_custom_command_bridged() -> Result<()> {
     println!("\ntest_custom_command_bridged");
