@@ -261,10 +261,20 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     }
 
     // Get kernel, rootfs, and initrd paths
+    // With --kernel: use custom kernel (for inception with KVM-enabled kernel)
     // With --setup: create if missing; without: fail if missing
-    let kernel_path = crate::setup::ensure_kernel(args.setup)
-        .await
-        .context("setting up kernel")?;
+    let kernel_path = if let Some(custom_kernel) = &args.kernel {
+        let path = PathBuf::from(custom_kernel);
+        if !path.exists() {
+            bail!("Custom kernel not found: {}", path.display());
+        }
+        info!(kernel = %path.display(), "using custom kernel");
+        path
+    } else {
+        crate::setup::ensure_kernel(args.setup)
+            .await
+            .context("setting up kernel")?
+    };
     let base_rootfs = crate::setup::ensure_rootfs(args.setup)
         .await
         .context("setting up rootfs")?;

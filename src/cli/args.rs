@@ -143,6 +143,11 @@ pub struct RunArgs {
     /// Without this flag, fcvm will fail if setup hasn't been run
     #[arg(long)]
     pub setup: bool,
+
+    /// Custom kernel path (overrides default kernel from setup)
+    /// Use for inception support with a KVM-enabled kernel
+    #[arg(long)]
+    pub kernel: Option<String>,
 }
 
 // ============================================================================

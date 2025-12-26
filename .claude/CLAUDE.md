@@ -803,13 +803,35 @@ pub fn vm_runtime_dir(vm_id: &str) -> PathBuf {
 
 **Setup**: Run `make setup-fcvm` before tests (called automatically by `make test-root` or `make container-test-root`).
 
-**⚠️ CRITICAL: Changing VM base image (fc-agent, rootfs)**
+**Content-Addressed Caching**
 
-When you change fc-agent or setup scripts, regenerate the rootfs:
-1. Delete existing rootfs: `sudo rm -f /mnt/fcvm-btrfs/rootfs/layer2-*.raw /mnt/fcvm-btrfs/initrd/fc-agent-*.initrd`
-2. Run setup: `make setup-fcvm`
+All assets are content-addressed - changing the input automatically creates new output:
+- **Kernel**: Cached by URL hash. Different URL = new kernel.
+- **Rootfs**: Cached by setup script SHA. Change script = new rootfs.
+- **Initrd**: Cached by fc-agent binary SHA. Rebuild fc-agent = new initrd.
 
-The rootfs is cached by SHA of setup script + kernel URL. Changes to these automatically invalidate the cache.
+**NEVER manually delete cached assets.** Just rebuild and run `make setup-fcvm`:
+```bash
+# Change fc-agent code, then:
+cargo build --release -p fc-agent
+make setup-fcvm  # Creates new initrd with new SHA
+
+# Change rootfs-config.toml, then:
+make setup-fcvm  # Creates new rootfs with new SHA
+```
+
+**Custom Kernel (Inception Support)**
+
+Use `--kernel` flag to specify a local kernel path:
+```bash
+# Build custom kernel with CONFIG_KVM=y
+./kernel/build.sh
+
+# Run VM with custom kernel
+sudo fcvm podman run --name my-vm --network bridged \
+    --kernel /mnt/fcvm-btrfs/kernels/vmlinux-6.12.10-785344093fa0.bin \
+    nginx:alpine
+```
 
 NEVER manually edit rootfs files. The setup script in `rootfs-config.toml` and `src/setup/rootfs.rs` control what gets installed.
 

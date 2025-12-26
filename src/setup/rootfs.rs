@@ -83,9 +83,23 @@ pub struct KernelConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct KernelArchConfig {
     /// URL to the kernel archive (e.g., Kata release tarball)
+    /// Required unless `local_path` is provided
+    #[serde(default)]
     pub url: String,
-    /// Path within the archive to extract
+    /// Path within the archive to extract (only used with URL)
+    #[serde(default)]
     pub path: String,
+    /// Local filesystem path to kernel binary (overrides url if provided)
+    /// Use for custom-built kernels (e.g., inception kernel with CONFIG_KVM)
+    #[serde(default)]
+    pub local_path: Option<String>,
+}
+
+impl KernelArchConfig {
+    /// Check if this config uses a local path
+    pub fn is_local(&self) -> bool {
+        self.local_path.is_some()
+    }
 }
 
 impl KernelConfig {
