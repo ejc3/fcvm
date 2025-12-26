@@ -2,6 +2,15 @@ name: CI
 
 on:
   workflow_dispatch:
+    inputs:
+      job:
+        description: 'Which job to run'
+        type: choice
+        default: 'both'
+        options:
+          - both
+          - host
+          - container
   pull_request:
     branches: [main]
   push:
@@ -23,6 +32,7 @@ jobs:
   # Runs: test-unit → test-fast → test-root (sequential)
   host:
     name: Host
+    if: ${{ github.event.inputs.job != 'container' }}
     runs-on: buildjet-32vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
@@ -112,6 +122,7 @@ jobs:
   # Needs KVM for VM tests (container mounts /dev/kvm)
   container:
     name: Container
+    if: ${{ github.event.inputs.job != 'host' }}
     runs-on: buildjet-32vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
