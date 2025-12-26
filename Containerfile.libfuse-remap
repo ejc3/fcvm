@@ -38,37 +38,66 @@ RUN apk add --no-cache fuse3 btrfs-progs e2fsprogs-extra
 COPY --from=builder /build/passthrough_ll /usr/local/bin/
 COPY --from=builder /build/ficlone_test /usr/local/bin/
 
-# Create test script - uses btrfs loopback so FICLONE actually works
+# Create test script - tests both FICLONE and FICLONERANGE
 RUN printf '#!/bin/sh\n\
 set -e\n\
 echo "=== libfuse remap_file_range test ==="\n\
+echo ""\n\
 echo "Creating btrfs loopback filesystem..."\n\
 dd if=/dev/zero of=/tmp/btrfs.img bs=1M count=150 2>/dev/null\n\
 mkfs.btrfs -q /tmp/btrfs.img\n\
 mkdir -p /btrfs /fuse-mnt\n\
 mount -o loop /tmp/btrfs.img /btrfs\n\
 echo "Created btrfs filesystem"\n\
-dd if=/dev/urandom of=/btrfs/source.bin bs=1M count=1 2>/dev/null\n\
-echo "Created 1MB test file on btrfs"\n\
+\n\
+# Create test file (must be block-aligned for FICLONERANGE)\n\
+dd if=/dev/urandom of=/btrfs/source.bin bs=4096 count=256 2>/dev/null\n\
+echo "Created 1MB test file on btrfs (256 x 4KB blocks)"\n\
+\n\
 echo "Starting passthrough_ll on btrfs..."\n\
 /usr/local/bin/passthrough_ll -d -o source=/btrfs /fuse-mnt 2>&1 &\n\
 FUSE_PID=$!\n\
 sleep 2\n\
 if ! mountpoint -q /fuse-mnt; then echo "ERROR: FUSE mount failed"; kill $FUSE_PID 2>/dev/null; exit 1; fi\n\
-echo "Testing FICLONE through FUSE->btrfs..."\n\
-/usr/local/bin/ficlone_test /fuse-mnt/source.bin /fuse-mnt/dest.bin\n\
-RESULT=$?\n\
+\n\
+echo ""\n\
+echo "=== Test 1: FICLONE (whole file clone) ==="\n\
+/usr/local/bin/ficlone_test /fuse-mnt/source.bin /fuse-mnt/dest1.bin\n\
+RESULT1=$?\n\
+\n\
+echo ""\n\
+echo "=== Test 2: FICLONERANGE (partial clone, offset=0, len=512KB) ==="\n\
+/usr/local/bin/ficlone_test --range /fuse-mnt/source.bin /fuse-mnt/dest2.bin 0 524288\n\
+RESULT2=$?\n\
+\n\
+echo ""\n\
+echo "=== Test 3: FICLONERANGE (partial clone, offset=512KB, len=512KB) ==="\n\
+/usr/local/bin/ficlone_test --range /fuse-mnt/source.bin /fuse-mnt/dest3.bin 524288 524288\n\
+RESULT3=$?\n\
+\n\
 fusermount3 -u /fuse-mnt 2>/dev/null || true\n\
 wait $FUSE_PID 2>/dev/null || true\n\
-if [ $RESULT -eq 0 ]; then\n\
-  echo "SUCCESS: libfuse FICLONE works!"\n\
-  ls -la /btrfs/\n\
-  echo "Verifying reflink - check shared extents:"\n\
-  filefrag -v /btrfs/source.bin | head -5\n\
-  filefrag -v /btrfs/dest.bin | head -5\n\
-fi\n\
+\n\
+echo ""\n\
+echo "=== Results ==="\n\
+ls -la /btrfs/\n\
+echo ""\n\
+echo "Verifying shared extents with filefrag:"\n\
+for f in source.bin dest1.bin dest2.bin dest3.bin; do\n\
+  echo "--- $f ---"\n\
+  filefrag -v /btrfs/$f 2>/dev/null | grep -E "^\\s+[0-9]+:|flags:" || true\n\
+done\n\
+\n\
 umount /btrfs\n\
-exit $RESULT\n' > /usr/local/bin/test-libfuse-remap.sh && \
+\n\
+# All tests must pass\n\
+if [ $RESULT1 -ne 0 ] || [ $RESULT2 -ne 0 ] || [ $RESULT3 -ne 0 ]; then\n\
+  echo "FAILED: FICLONE=$RESULT1 FICLONERANGE1=$RESULT2 FICLONERANGE2=$RESULT3"\n\
+  exit 1\n\
+fi\n\
+echo ""\n\
+echo "SUCCESS: All FICLONE/FICLONERANGE tests passed!"\n\
+exit 0\n' > /usr/local/bin/test-libfuse-remap.sh && \
     chmod +x /usr/local/bin/test-libfuse-remap.sh
 
 CMD ["/usr/local/bin/test-libfuse-remap.sh"]
