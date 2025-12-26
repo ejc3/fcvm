@@ -19,7 +19,50 @@ env:
   CONTAINER_ARCH: x86_64
 
 jobs:
-  # Runner 0: Packaging (default GitHub runner, no KVM needed)
+  # Runner 0: Lint (default GitHub runner, no KVM needed)
+  # Fast checks: fmt, clippy, audit, deny
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fcvm
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fcvm -> target
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev libclang-dev clang
+      - name: Install cargo tools
+        run: cargo install cargo-audit cargo-deny --locked
+      - name: Check formatting
+        working-directory: fcvm
+        run: cargo fmt --all --check
+      - name: Clippy
+        working-directory: fcvm
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Audit
+        working-directory: fcvm
+        run: cargo audit
+      - name: Deny
+        working-directory: fcvm
+        run: cargo deny check
+
+  # Runner 0b: Packaging (default GitHub runner, no KVM needed)
   # Verifies cargo install works without source tree access
   packaging:
     name: Packaging
