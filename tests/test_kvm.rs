@@ -15,7 +15,7 @@ use std::process::Stdio;
 
 /// Path to the inception kernel with CONFIG_KVM=y
 /// Built by kernel/build.sh
-const INCEPTION_KERNEL: &str = "/mnt/fcvm-btrfs/kernels/vmlinux-6.12.10-785344093fa0.bin";
+const INCEPTION_KERNEL: &str = "/mnt/fcvm-btrfs/kernels/vmlinux-6.12.10-73d51d811398.bin";
 
 /// Generate a custom rootfs-config.toml pointing to the inception kernel
 fn generate_inception_config() -> Result<std::path::PathBuf> {
@@ -272,4 +272,140 @@ async fn test_kvm_available_in_vm() -> Result<()> {
 
     println!("\n✅ INCEPTION TEST PASSED - container can use /dev/kvm!");
     Ok(())
+}
+
+/// Test running fcvm inside an fcvm VM (single level inception)
+///
+/// This test:
+/// 1. Starts an outer VM with inception kernel + privileged mode
+/// 2. Mounts host fcvm binary and assets into the VM
+/// 3. Runs fcvm inside the outer VM to create an inner VM
+/// 4. Verifies the inner VM runs successfully
+#[tokio::test]
+async fn test_inception_run_fcvm_inside_vm() -> Result<()> {
+    println!("\nInception Test: Run fcvm inside fcvm");
+    println!("=====================================");
+
+    // Check inception kernel exists
+    let kernel_path = Path::new(INCEPTION_KERNEL);
+    if !kernel_path.exists() {
+        bail!(
+            "Inception kernel not found: {}\n\
+            Build it with: ./kernel/build.sh",
+            INCEPTION_KERNEL
+        );
+    }
+
+    let fcvm_path = common::find_fcvm_binary()?;
+    let fcvm_dir = fcvm_path.parent().unwrap();
+    let (vm_name, _, _, _) = common::unique_names("inception-full");
+
+    // 1. Start outer VM with volumes for fcvm binary and assets
+    println!("\n1. Starting outer VM with inception kernel...");
+    println!("   Mounting: /mnt/fcvm-btrfs (assets) and fcvm binary");
+
+    let (mut _child, outer_pid) = common::spawn_fcvm(&[
+        "podman", "run",
+        "--name", &vm_name,
+        "--network", "bridged",
+        "--kernel", INCEPTION_KERNEL,
+        "--privileged",
+        "--volume", "/mnt/fcvm-btrfs:/mnt/fcvm-btrfs",
+        "--volume", &format!("{}:/opt/fcvm", fcvm_dir.display()),
+        "alpine:latest", "sleep", "300",
+    ])
+    .await
+    .context("spawning outer VM")?;
+
+    println!("   Outer VM started (PID: {})", outer_pid);
+
+    // Wait for outer VM
+    println!("   Waiting for outer VM to be healthy...");
+    if let Err(e) = common::poll_health_by_pid(outer_pid, 120).await {
+        common::kill_process(outer_pid).await;
+        return Err(e.context("outer VM failed to become healthy"));
+    }
+    println!("   ✓ Outer VM is healthy!");
+
+    // 2. Verify mounts and /dev/kvm inside outer VM
+    println!("\n2. Verifying mounts inside outer VM...");
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "exec", "--pid", &outer_pid.to_string(), "--vm", "--",
+            "sh", "-c",
+            "ls -la /opt/fcvm/fcvm /mnt/fcvm-btrfs/kernels/ /dev/kvm 2>&1 | head -10",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("   {}", stdout.trim().replace('\n', "\n   "));
+
+    if !stdout.contains("fcvm") || !stdout.contains("vmlinux") {
+        common::kill_process(outer_pid).await;
+        bail!("Required files not mounted in outer VM:\n{}", stdout);
+    }
+    println!("   ✓ All required files mounted");
+
+    // 3. Run fcvm inside the outer VM
+    println!("\n3. Running fcvm inside outer VM (INCEPTION)...");
+    println!("   This will create a nested VM inside the outer VM");
+
+    // Run fcvm with rootless networking (simpler, no iptables needed)
+    // Use --setup to auto-create any missing assets
+    let inner_cmd = r#"
+        export PATH=/opt/fcvm:$PATH
+        cd /mnt/fcvm-btrfs
+        fcvm podman run \
+            --name inner-test \
+            --network rootless \
+            alpine:latest \
+            echo 'INCEPTION_SUCCESS_INNER_VM_WORKS'
+    "#;
+
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "exec", "--pid", &outer_pid.to_string(), "--vm", "--",
+            "sh", "-c", inner_cmd,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("running fcvm inside outer VM")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    println!("   Inner VM output:");
+    for line in stdout.lines().take(20) {
+        println!("     {}", line);
+    }
+    if !stderr.is_empty() {
+        println!("   Inner VM stderr (last 10 lines):");
+        for line in stderr.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev() {
+            println!("     {}", line);
+        }
+    }
+
+    // 4. Cleanup
+    println!("\n4. Cleaning up outer VM...");
+    common::kill_process(outer_pid).await;
+
+    // 5. Verify success
+    if stdout.contains("INCEPTION_SUCCESS_INNER_VM_WORKS") {
+        println!("\n✅ INCEPTION TEST PASSED!");
+        println!("   Successfully ran fcvm inside fcvm (nested virtualization)");
+        Ok(())
+    } else {
+        bail!(
+            "Inception failed - inner VM did not produce expected output\n\
+             Expected: INCEPTION_SUCCESS_INNER_VM_WORKS\n\
+             Got stdout: {}\n\
+             Got stderr: {}",
+            stdout, stderr
+        );
+    }
 }
