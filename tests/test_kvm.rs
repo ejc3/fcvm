@@ -10,7 +10,7 @@
 //! - KVM_CAP_ARM_EL2 (capability 240) returns 1, indicating nested virt is supported
 //! - vCPU init with KVM_ARM_VCPU_HAS_EL2 (bit 7) + HAS_EL2_E2H0 (bit 8) succeeds
 //! - Firecracker patched to:
-//!   - Enable HAS_EL2 + HAS_EL2_E2H0 features (FCVM_NV2=1 env var)
+//!   - Enable HAS_EL2 + HAS_EL2_E2H0 features (--enable-nv2 CLI flag)
 //!   - Boot vCPU at EL2h (PSTATE_FAULT_BITS_64_EL2) so guest sees HYP mode
 //!   - Set EL2 registers: HCR_EL2, CNTHCTL_EL2, VMPIDR_EL2, VPIDR_EL2
 //!

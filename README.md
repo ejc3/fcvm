@@ -345,7 +345,7 @@ cd /mnt/fcvm-btrfs
 
 ### How It Works
 
-1. **FCVM_NV2=1** environment variable triggers Firecracker to enable nested virt
+1. **FCVM_NV2=1** environment variable (auto-set when `--kernel` is used) triggers fcvm to pass `--enable-nv2` to Firecracker
 2. **HAS_EL2 + HAS_EL2_E2H0** vCPU features are enabled
    - HAS_EL2 (bit 7): Enables virtual EL2 for guest
    - HAS_EL2_E2H0 (bit 8): Forces nVHE mode (avoids timer trap storm)
