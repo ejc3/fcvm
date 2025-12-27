@@ -189,6 +189,12 @@ impl VmManager {
         // Disable seccomp for now (can enable later for production)
         cmd.arg("--no-seccomp");
 
+        // Pass FCVM_NV2 environment variable to enable nested virtualization in Firecracker
+        if let Ok(nv2) = std::env::var("FCVM_NV2") {
+            info!(target: "vm", "Passing FCVM_NV2={} to Firecracker", nv2);
+            cmd.env("FCVM_NV2", &nv2);
+        }
+
         // Setup namespace isolation if specified (network namespace and/or mount namespace)
         // We need to handle these in a single pre_exec because it can only be called once
         let ns_id_clone = self.namespace_id.clone();
