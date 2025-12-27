@@ -488,7 +488,10 @@ except OSError as e:
     common::kill_process(outer_pid).await;
 
     // 6. Verify success
-    if stdout.contains("INCEPTION_SUCCESS_INNER_VM_WORKS") {
+    // Check both stdout and stderr since fcvm logs container output to its own stderr
+    // with [ctr:stdout] prefix, so when running via exec, the output appears in stderr
+    let combined = format!("{}\n{}", stdout, stderr);
+    if combined.contains("INCEPTION_SUCCESS_INNER_VM_WORKS") {
         println!("\n✅ INCEPTION TEST PASSED!");
         println!("   Successfully ran fcvm inside fcvm (nested virtualization)");
         Ok(())
