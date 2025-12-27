@@ -189,10 +189,10 @@ impl VmManager {
         // Disable seccomp for now (can enable later for production)
         cmd.arg("--no-seccomp");
 
-        // Pass FCVM_NV2 environment variable to enable nested virtualization in Firecracker
-        if let Ok(nv2) = std::env::var("FCVM_NV2") {
-            info!(target: "vm", "Passing FCVM_NV2={} to Firecracker", nv2);
-            cmd.env("FCVM_NV2", &nv2);
+        // Enable nested virtualization (ARM64 NV2) if FCVM_NV2=1
+        if std::env::var("FCVM_NV2").map(|v| v == "1").unwrap_or(false) {
+            info!(target: "vm", "Enabling nested virtualization (--enable-nv2)");
+            cmd.arg("--enable-nv2");
         }
 
         // Setup namespace isolation if specified (network namespace and/or mount namespace)
