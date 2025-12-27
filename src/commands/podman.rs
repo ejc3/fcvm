@@ -1178,7 +1178,8 @@ async fn run_vm_setup(
     //
     // 3. numa=off - Disable NUMA to avoid percpu allocation issues
     //    The percpu allocator can fail with "cpu has no node" errors in nested contexts
-    boot_args.push_str(" id_aa64mmfr1.vh=0 kvm-arm.mode=nvhe numa=off");
+    // Temporarily removed id_aa64mmfr1.vh=0 to test NV2 boot
+    boot_args.push_str(" kvm-arm.mode=nvhe numa=off");
 
     client
         .set_boot_source(crate::firecracker::api::BootSource {
