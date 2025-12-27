@@ -3,6 +3,34 @@
 //! This test generates a custom rootfs-config.toml pointing to the inception
 //! kernel (with CONFIG_KVM=y), then verifies /dev/kvm works in the VM.
 //!
+//! # Nested Virtualization Status (2025-12-27)
+//!
+//! ## What Works
+//! - Host kernel 6.18.2-nested with `kvm-arm.mode=nested` properly initializes NV2 mode
+//! - KVM_CAP_ARM_EL2 (capability 240) returns 1, indicating nested virt is supported
+//! - vCPU init with KVM_ARM_VCPU_HAS_EL2 (bit 7) succeeds
+//! - KVM automatically sets PSTATE to EL2h (0x3c9) when HAS_EL2 is enabled
+//! - Firecracker patched to set HAS_EL2 feature and PSTATE_FAULT_BITS_64_EL2
+//!
+//! ## Current Blocker
+//! Guest kernel reports "HYP mode not available" despite PSTATE being set to EL2h.
+//! The guest's `init_kernel_el()` reads `CurrentEL` via `mrs x1, CurrentEL` and
+//! gets EL1 instead of EL2, causing `__boot_cpu_mode` to be set to BOOT_CPU_MODE_EL1.
+//!
+//! ## Investigation Notes
+//! - Test program confirms PSTATE = 0x3c9 (EL2h mode bits) after KVM_ARM_VCPU_INIT
+//! - But when guest kernel boots and reads CurrentEL, it sees EL1 not EL2
+//! - This suggests KVM may not be properly emulating CurrentEL for nested guests,
+//!   or something resets exception level between vCPU init and first instruction
+//!
+//! ## Hardware
+//! - c7g.metal (Graviton3 / Neoverse-V1) supports FEAT_NV2
+//! - MIDR: 0x411fd401 (ARM Neoverse-V1)
+//!
+//! ## References
+//! - KVM nested virt patches: https://lwn.net/Articles/921783/
+//! - ARM boot protocol: arch/arm64/kernel/head.S (init_kernel_el)
+//!
 //! FAILS LOUDLY if /dev/kvm is not available.
 
 #![cfg(feature = "privileged-tests")]
@@ -260,9 +288,8 @@ async fn test_kvm_available_in_vm() -> Result<()> {
 /// 4. Tests if nested KVM actually works (KVM_CREATE_VM ioctl)
 /// 5. If nested KVM works, runs fcvm inside the outer VM
 ///
-/// NOTE: Nested KVM on ARM64 with Firecracker is not currently supported.
-/// Firecracker doesn't expose virtualization extensions (VHE) to guests.
-/// This test will verify the setup but may skip the nested VM creation.
+/// REQUIRES: ARM64 with FEAT_NV2 (ARMv8.4+) and kvm-arm.mode=nested
+/// Skips if nested KVM isn't available.
 #[tokio::test]
 async fn test_inception_run_fcvm_inside_vm() -> Result<()> {
     println!("\nInception Test: Run fcvm inside fcvm");
@@ -282,7 +309,9 @@ async fn test_inception_run_fcvm_inside_vm() -> Result<()> {
     let kernel_str = inception_kernel.to_str().context("kernel path not valid UTF-8")?;
     let fcvm_volume = format!("{}:/opt/fcvm", fcvm_dir.display());
     // Mount host config dir so inner fcvm can find its config
-    let config_mount = "/root/.config/fcvm:/root/.config/fcvm:ro";
+    // Use $HOME which is set by spawn_fcvm based on the current user
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let config_mount = format!("{0}/.config/fcvm:/root/.config/fcvm:ro", home);
     // Use nginx so health check works (bridged networking does HTTP health check to port 80)
     // Note: firecracker is in /mnt/fcvm-btrfs/bin which is mounted via the btrfs mount
     let (mut _child, outer_pid) = common::spawn_fcvm(&[
@@ -293,7 +322,7 @@ async fn test_inception_run_fcvm_inside_vm() -> Result<()> {
         "--privileged",
         "--map", "/mnt/fcvm-btrfs:/mnt/fcvm-btrfs",
         "--map", &fcvm_volume,
-        "--map", config_mount,
+        "--map", &config_mount,
         common::TEST_IMAGE,  // nginx:alpine - has HTTP server on port 80
     ])
     .await
@@ -333,6 +362,41 @@ async fn test_inception_run_fcvm_inside_vm() -> Result<()> {
 
     // 3. Test if nested KVM actually works
     println!("\n3. Testing if nested KVM works (KVM_CREATE_VM ioctl)...");
+
+    // First, check kernel config and dmesg for KVM-related messages
+    let debug_output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "exec", "--pid", &outer_pid.to_string(), "--vm", "--",
+            "sh", "-c", r#"
+echo "=== Kernel config (KVM/VIRTUALIZATION) ==="
+zcat /proc/config.gz 2>/dev/null | grep -E "^CONFIG_(KVM|VIRTUALIZATION)" || echo "config.gz not available"
+
+echo ""
+echo "=== dmesg: KVM messages ==="
+dmesg 2>/dev/null | grep -i kvm | head -20 || echo "dmesg not available"
+
+echo ""
+echo "=== dmesg: VHE/EL2 messages ==="
+dmesg 2>/dev/null | grep -iE "(vhe|el2|hyp)" | head -10 || echo "none found"
+
+echo ""
+echo "=== CPU features ==="
+cat /proc/cpuinfo | grep -E "^(Features|CPU implementer)" | head -2
+
+echo ""
+echo "=== /dev/kvm status ==="
+ls -la /dev/kvm 2>&1
+"#,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("getting debug info")?;
+
+    let debug_stdout = String::from_utf8_lossy(&debug_output.stdout);
+    println!("   Debug info:\n{}", debug_stdout.lines().map(|l| format!("   {}", l)).collect::<Vec<_>>().join("\n"));
+
     let output = tokio::process::Command::new(&fcvm_path)
         .args([
             "exec", "--pid", &outer_pid.to_string(), "--vm", "--",
@@ -359,30 +423,18 @@ except OSError as e:
         .context("testing nested KVM")?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
 
-    if stdout.contains("NESTED_KVM_WORKS") {
-        println!("   ✓ Nested KVM works! Proceeding with inception test.");
-    } else {
-        // Nested KVM doesn't work - this is expected on ARM64 with Firecracker
-        println!("   ⚠ Nested KVM not supported (expected on ARM64 + Firecracker)");
-        println!("   Output: {}", stdout.trim());
-        if !stderr.is_empty() {
-            println!("   Stderr: {}", stderr.trim());
-        }
-
-        // Clean up and pass the test with a note
+    if !stdout.contains("NESTED_KVM_WORKS") {
+        // Nested KVM not available - skip the test
         common::kill_process(outer_pid).await;
-
-        println!("\n✅ INCEPTION SETUP VERIFIED");
-        println!("   - Outer VM started with inception kernel");
-        println!("   - /dev/kvm exists and is accessible");
-        println!("   - Assets mounted correctly");
-        println!("   - Nested KVM not available (Firecracker limitation)");
-        println!("\n   Full nested virtualization requires hypervisor support");
-        println!("   for exposing VHE (Virtualization Host Extensions) to guests.");
+        println!("SKIPPED: Nested KVM not available (KVM_CREATE_VM failed)");
+        println!("         This requires: ARM64 with FEAT_NV2 + kvm-arm.mode=nested");
+        if stdout.contains("NESTED_KVM_FAILED") {
+            println!("         Error: {}", stdout.trim());
+        }
         return Ok(());
     }
+    println!("   ✓ Nested KVM works! Proceeding with inception test.");
 
     // 4. Run fcvm inside the outer VM (only if nested KVM works)
     println!("\n4. Running fcvm inside outer VM (INCEPTION)...");

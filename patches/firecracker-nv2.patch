@@ -1,0 +1,182 @@
+diff --git a/src/vmm/src/arch/aarch64/fdt.rs b/src/vmm/src/arch/aarch64/fdt.rs
+index 949435e..ab8f19c 100644
+--- a/src/vmm/src/arch/aarch64/fdt.rs
++++ b/src/vmm/src/arch/aarch64/fdt.rs
+@@ -70,6 +70,7 @@ pub fn create_fdt(
+     device_manager: &DeviceManager,
+     gic_device: &GICDevice,
+     initrd: &Option<InitrdConfig>,
++    nested_virt: bool,
+ ) -> Result<Vec<u8>, FdtError> {
+     // Allocate stuff necessary for storing the blob.
+     let mut fdt_writer = FdtWriter::new()?;
+@@ -94,7 +95,7 @@ pub fn create_fdt(
+     create_gic_node(&mut fdt_writer, gic_device)?;
+     create_timer_node(&mut fdt_writer)?;
+     create_clock_node(&mut fdt_writer)?;
+-    create_psci_node(&mut fdt_writer)?;
++    create_psci_node(&mut fdt_writer, nested_virt)?;
+     create_devices_node(&mut fdt_writer, device_manager)?;
+     create_vmgenid_node(&mut fdt_writer, &device_manager.acpi_devices.vmgenid)?;
+     create_pci_nodes(&mut fdt_writer, &device_manager.pci_devices)?;
+@@ -360,15 +361,18 @@ fn create_timer_node(fdt: &mut FdtWriter) -> Result<(), FdtError> {
+     Ok(())
+ }
+ 
+-fn create_psci_node(fdt: &mut FdtWriter) -> Result<(), FdtError> {
++fn create_psci_node(fdt: &mut FdtWriter, use_smc: bool) -> Result<(), FdtError> {
+     let compatible = "arm,psci-0.2";
+ 
+     let psci = fdt.begin_node("psci")?;
+     fdt.property_string("compatible", compatible)?;
+     // Two methods available: hvc and smc.
+-    // As per documentation, PSCI calls between a guest and hypervisor may use the HVC conduit
+-    // instead of SMC. So, since we are using kvm, we need to use hvc.
+-    fdt.property_string("method", "hvc")?;
++    // When nested virtualization is enabled (guest has EL2), we MUST use SMC.
++    // HVC would trap to the guest's virtual EL2 which has no handler.
++    // SMC goes to the host's EL3 emulation (KVM's secure monitor) which handles PSCI.
++    // When nested virt is disabled, either method works, but we use HVC for compatibility.
++    let method = if use_smc { "smc" } else { "hvc" };
++    fdt.property_string("method", method)?;
+     fdt.end_node(psci)?;
+ 
+     Ok(())
+@@ -584,6 +588,7 @@ mod tests {
+             &device_manager,
+             &gic,
+             &None,
++            false, // nested_virt - false to match saved DTB
+         )
+         .unwrap();
+     }
+@@ -609,6 +614,7 @@ mod tests {
+             &device_manager,
+             &gic,
+             &None,
++            false, // nested_virt - false to match saved DTB
+         )
+         .unwrap();
+ 
+@@ -671,6 +677,7 @@ mod tests {
+             &device_manager,
+             &gic,
+             &Some(initrd),
++            false, // nested_virt - false to match saved DTB
+         )
+         .unwrap();
+ 
+diff --git a/src/vmm/src/arch/aarch64/mod.rs b/src/vmm/src/arch/aarch64/mod.rs
+index 4e82a7d..bd13111 100644
+--- a/src/vmm/src/arch/aarch64/mod.rs
++++ b/src/vmm/src/arch/aarch64/mod.rs
+@@ -127,6 +127,11 @@ pub fn configure_system_for_boot(
+         .as_cstring()
+         .expect("Cannot create cstring from cmdline string");
+ 
++    // Enable SMC for PSCI when nested virtualization is enabled (HAS_EL2).
++    // With nested virt, HVC traps to the guest's virtual EL2 which has no handler.
++    // SMC goes to KVM's secure monitor emulation which handles PSCI correctly.
++    let nested_virt = true; // TODO: Make this configurable via machine config
++
+     let fdt = fdt::create_fdt(
+         vm.guest_memory(),
+         vcpu_mpidr,
+@@ -134,6 +139,7 @@ pub fn configure_system_for_boot(
+         device_manager,
+         vm.get_irqchip(),
+         initrd,
++        nested_virt,
+     )?;
+ 
+     let fdt_address = GuestAddress(get_fdt_addr(vm.guest_memory()));
+diff --git a/src/vmm/src/arch/aarch64/regs.rs b/src/vmm/src/arch/aarch64/regs.rs
+index 7a24337..2865be3 100644
+--- a/src/vmm/src/arch/aarch64/regs.rs
++++ b/src/vmm/src/arch/aarch64/regs.rs
+@@ -15,12 +15,17 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
+ /// PSR (Processor State Register) bits.
+ /// Taken from arch/arm64/include/uapi/asm/ptrace.h.
+ const PSR_MODE_EL1h: u64 = 0x0000_0005;
++const PSR_MODE_EL2h: u64 = 0x0000_0009;
+ const PSR_F_BIT: u64 = 0x0000_0040;
+ const PSR_I_BIT: u64 = 0x0000_0080;
+ const PSR_A_BIT: u64 = 0x0000_0100;
+ const PSR_D_BIT: u64 = 0x0000_0200;
+ /// Taken from arch/arm64/kvm/inject_fault.c.
+ pub const PSTATE_FAULT_BITS_64: u64 = PSR_MODE_EL1h | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
++/// PSTATE for EL2 boot (nested virtualization).
++/// When HAS_EL2 is enabled, the guest kernel should boot at EL2 so that
++/// `__boot_cpu_mode` is set correctly and `is_hyp_mode_available()` returns true.
++pub const PSTATE_FAULT_BITS_64_EL2: u64 = PSR_MODE_EL2h | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
+ 
+ /// Gets a core id.
+ macro_rules! arm64_core_reg_id {
+diff --git a/src/vmm/src/arch/aarch64/vcpu.rs b/src/vmm/src/arch/aarch64/vcpu.rs
+index 39020b6..00d05fd 100644
+--- a/src/vmm/src/arch/aarch64/vcpu.rs
++++ b/src/vmm/src/arch/aarch64/vcpu.rs
+@@ -224,6 +224,14 @@ impl KvmVcpu {
+         // We already checked that the capability is supported.
+         kvi.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
+ 
++        // Enable nested virtualization with HAS_EL2 (bit 7).
++        // This enables full nested virt (vCPU has virtual EL2).
++        //
++        // Note: Testing HAS_EL2 alone to debug the boot-at-EL2 issue.
++        // Previously with HAS_EL2+E2H0, guest still reported "HYP mode not available".
++        const KVM_ARM_VCPU_HAS_EL2: u32 = 7;
++        kvi.features[0] |= 1 << KVM_ARM_VCPU_HAS_EL2;
++
+         Ok(kvi)
+     }
+ 
+@@ -332,12 +340,21 @@ impl KvmVcpu {
+         let kreg_off = offset_of!(kvm_regs, regs);
+ 
+         // Get the register index of the PSTATE (Processor State) register.
++        // When nested virtualization is enabled (HAS_EL2), boot at EL2 so the guest
++        // kernel's is_hyp_mode_available() returns true.
+         let pstate = offset_of!(user_pt_regs, pstate) + kreg_off;
+         let id = arm64_core_reg_id!(KVM_REG_SIZE_U64, pstate);
++        const KVM_ARM_VCPU_HAS_EL2: u32 = 7;
++        let has_el2 = (self.kvi.features[0] & (1 << KVM_ARM_VCPU_HAS_EL2)) != 0;
++        let pstate_value = if has_el2 {
++            PSTATE_FAULT_BITS_64_EL2
++        } else {
++            PSTATE_FAULT_BITS_64
++        };
+         self.fd
+-            .set_one_reg(id, &PSTATE_FAULT_BITS_64.to_le_bytes())
++            .set_one_reg(id, &pstate_value.to_le_bytes())
+             .map_err(|err| {
+-                VcpuArchError::SetOneReg(id, format!("{PSTATE_FAULT_BITS_64:#x}"), err)
++                VcpuArchError::SetOneReg(id, format!("{pstate_value:#x}"), err)
+             })?;
+ 
+         // Other vCPUs are powered off initially awaiting PSCI wakeup.
+diff --git a/src/vmm/src/vstate/vcpu.rs b/src/vmm/src/vstate/vcpu.rs
+index 1efeee5..57c0baf 100644
+--- a/src/vmm/src/vstate/vcpu.rs
++++ b/src/vmm/src/vstate/vcpu.rs
+@@ -23,7 +23,7 @@ pub use crate::arch::{KvmVcpu, KvmVcpuConfigureError, KvmVcpuError, Peripherals,
+ use crate::cpu_config::templates::{CpuConfiguration, GuestConfigError};
+ #[cfg(feature = "gdb")]
+ use crate::gdb::target::{GdbTargetError, get_raw_tid};
+-use crate::logger::{IncMetric, METRICS};
++use crate::logger::{IncMetric, METRICS, debug};
+ use crate::seccomp::{BpfProgram, BpfProgramRef};
+ use crate::utils::signal::{Killable, register_signal_handler, sigrtmin};
+ use crate::utils::sm::StateMachine;
+@@ -408,7 +408,10 @@ impl Vcpu {
+             return Ok(VcpuEmulation::Interrupted);
+         }
+ 
+-        match self.kvm_vcpu.fd.run() {
++        let run_result = self.kvm_vcpu.fd.run();
++        // Debug: log every vCPU exit
++        debug!("vCPU {} run returned: {:?}", self.kvm_vcpu.index, run_result);
++        match run_result {
+             Err(ref err) if err.errno() == libc::EINTR => {
+                 self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
+                 // Notify that this KVM_RUN was interrupted.
