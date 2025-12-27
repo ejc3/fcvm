@@ -1166,6 +1166,20 @@ async fn run_vm_setup(
         info!("fc-agent strace debugging enabled - output will be in /tmp/fc-agent.strace");
     }
 
+    // Nested virtualization boot parameters for ARM64.
+    // When HAS_EL2 is enabled, the guest kernel sees EL2 as available.
+    // These parameters help ensure proper initialization:
+    //
+    // 1. id_aa64mmfr1.vh=0 - Override VHE detection to prevent VHE mode usage
+    //    See: https://lore.kernel.org/linux-arm-kernel/20201228104958.1848833-13-maz@kernel.org/
+    //
+    // 2. kvm-arm.mode=nvhe - Force guest KVM to use nVHE mode
+    //    This is the proper mode for L1 guests running nested VMs
+    //
+    // 3. numa=off - Disable NUMA to avoid percpu allocation issues
+    //    The percpu allocator can fail with "cpu has no node" errors in nested contexts
+    boot_args.push_str(" id_aa64mmfr1.vh=0 kvm-arm.mode=nvhe numa=off");
+
     client
         .set_boot_source(crate::firecracker::api::BootSource {
             kernel_image_path: kernel_path.display().to_string(),
