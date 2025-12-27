@@ -29,7 +29,7 @@ fcvm supports running inside another fcvm VM ("inception") using ARM64 FEAT_NV2.
 ### How It Works
 
 1. Set `FCVM_NV2=1` environment variable (auto-set when `--kernel` flag is used)
-2. Firecracker enables `HAS_EL2` + `HAS_EL2_E2H0` vCPU features
+2. fcvm passes `--enable-nv2` to Firecracker, which enables `HAS_EL2` + `HAS_EL2_E2H0` vCPU features
 3. vCPU boots at EL2h so guest kernel sees HYP mode available
 4. EL2 registers are initialized: HCR_EL2, CNTHCTL_EL2, VMPIDR_EL2, VPIDR_EL2
 5. Guest kernel initializes KVM: "Hyp nVHE mode initialized successfully"
@@ -41,8 +41,8 @@ fcvm supports running inside another fcvm VM ("inception") using ARM64 FEAT_NV2.
 # Build inception kernel (first time only, ~10-20 min)
 ./kernel/build.sh
 
-# Run outer VM with inception kernel
-sudo FCVM_NV2=1 fcvm podman run \
+# Run outer VM with inception kernel (--kernel auto-sets FCVM_NV2=1)
+sudo fcvm podman run \
     --name outer \
     --network bridged \
     --kernel /mnt/fcvm-btrfs/kernels/vmlinux-6.12.10-*.bin \
