@@ -53,7 +53,8 @@ CONTAINER_RUN := podman run --rm --privileged \
 	--ulimit nofile=65536:65536 --pids-limit=65536 -v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	-v $(TEST_LOG_DIR):$(TEST_LOG_DIR) $(CARGO_CACHE_MOUNT)
 
-.PHONY: all help build clean test test-unit test-fast test-all test-root \
+.PHONY: all help build clean clean-target clean-test-data check-disk \
+	test test-unit test-fast test-all test-root \
 	_test-unit _test-fast _test-all _test-root \
 	container-build container-test container-test-unit container-test-fast container-test-all \
 	container-shell container-clean setup-btrfs setup-fcvm setup-pjdfstest bench lint fmt
@@ -63,7 +64,46 @@ all: build
 help:
 	@echo "fcvm: make build | test-unit | test-fast | test-all | test-root"
 	@echo "      make container-test-unit | container-test-fast | container-test-all"
+	@echo "      make clean-target | clean-test-data | check-disk"
 	@echo "Options: FILTER=pattern STREAM=1 LIST=1"
+
+# Disk space check - fails if either root or btrfs is too full
+# Requires 10GB free on root (for cargo target) and 15GB on btrfs (for VMs)
+check-disk:
+	@ROOT_FREE=$$(df -BG / 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \
+	BTRFS_FREE=$$(df -BG /mnt/fcvm-btrfs 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \
+	if [ -n "$$ROOT_FREE" ] && [ "$$ROOT_FREE" -lt 10 ]; then \
+		echo "ERROR: Need 10GB free on / (have $${ROOT_FREE}GB)"; \
+		echo "Try: make clean-target"; \
+		exit 1; \
+	fi; \
+	if [ -n "$$BTRFS_FREE" ] && [ "$$BTRFS_FREE" -lt 15 ]; then \
+		echo "ERROR: Need 15GB free on /mnt/fcvm-btrfs (have $${BTRFS_FREE}GB)"; \
+		echo "Try: make clean-test-data"; \
+		exit 1; \
+	fi; \
+	echo "Disk check passed: / has $${ROOT_FREE}GB, /mnt/fcvm-btrfs has $${BTRFS_FREE}GB"
+
+# Clean target directory (frees space on /)
+clean-target:
+	@echo "==> Cleaning target directory..."
+	rm -rf target
+	@echo "==> Cleaned target/"
+
+# Clean leftover test data (VM disks, snapshots, state files)
+# Preserves cached assets (kernels, rootfs, initrd, image-cache)
+clean-test-data:
+	@echo "==> Cleaning leftover VM disks..."
+	sudo rm -rf /mnt/fcvm-btrfs/vm-disks/*
+	@echo "==> Cleaning snapshots..."
+	sudo rm -rf /mnt/fcvm-btrfs/snapshots/*
+	@echo "==> Cleaning state files..."
+	sudo rm -rf /mnt/fcvm-btrfs/state/*.json
+	@echo "==> Cleaning UFFD sockets..."
+	sudo rm -f /mnt/fcvm-btrfs/uffd-*.sock
+	@echo "==> Cleaning test logs..."
+	rm -rf /tmp/fcvm-test-logs/*
+	@echo "==> Cleaned test data (preserved cached assets)"
 
 build:
 	@echo "==> Building..."
@@ -94,24 +134,25 @@ _test-root:
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
 	$(NEXTEST) $(NEXTEST_CAPTURE) --features privileged-tests $(FILTER)
 
-# Host targets (with setup)
-test-unit: build _test-unit
-test-fast: setup-fcvm _test-fast
-test-all: setup-fcvm _test-all
-test-root: setup-fcvm setup-pjdfstest _test-root
+# Host targets (with setup, check-disk first to fail fast if disk is full)
+test-unit: check-disk build _test-unit
+test-fast: check-disk setup-fcvm _test-fast
+test-all: check-disk setup-fcvm _test-all
+test-root: check-disk setup-fcvm setup-pjdfstest _test-root
 test: test-root
 
 # Container targets (setup on host where needed, run-only in container)
 # Container uses shadowed target/ mount to avoid permission conflicts
-container-test-unit: container-build
+# check-disk runs on host before container tests start
+container-test-unit: check-disk container-build
 	@echo "==> Running unit tests in container..."
 	$(CONTAINER_RUN) $(CONTAINER_TAG) make build _test-unit
 
-container-test-fast: container-setup-fcvm
+container-test-fast: check-disk container-setup-fcvm
 	@echo "==> Running fast tests in container..."
 	$(CONTAINER_RUN) $(CONTAINER_TAG) make _test-fast
 
-container-test-all: container-setup-fcvm
+container-test-all: check-disk container-setup-fcvm
 	@echo "==> Running all tests in container..."
 	$(CONTAINER_RUN) $(CONTAINER_TAG) make _test-all
 
