@@ -1,6 +1,7 @@
 // Common test utilities for fcvm integration tests
 #![allow(dead_code)]
 
+use fs2::FileExt;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -159,22 +160,59 @@ static CONFIG_INIT: Once = Once::new();
 
 /// Ensure the fcvm config file exists.
 ///
-/// Runs `fcvm setup --generate-config --force` once per test process to ensure
-/// the config file exists at ~/.config/fcvm/rootfs-config.toml.
-/// Uses std::sync::Once to ensure this runs only once even with parallel tests.
+/// Uses file locking to prevent race conditions when multiple test processes
+/// try to generate the config simultaneously. Each process:
+/// 1. Acquires an exclusive lock on /tmp/fcvm-config-gen.lock
+/// 2. Checks if config already exists and is valid
+/// 3. If not, generates it with `fcvm setup --generate-config --force`
+/// 4. Releases lock (automatically on drop)
 fn ensure_config_exists() {
     CONFIG_INIT.call_once(|| {
-        let fcvm_path = find_fcvm_binary().expect("fcvm binary not found");
-        let output = Command::new(&fcvm_path)
-            .args(["setup", "--generate-config", "--force"])
-            .output()
-            .expect("failed to run fcvm setup --generate-config");
+        let lock_path = "/tmp/fcvm-config-gen.lock";
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(lock_path)
+            .expect("failed to open config generation lock file");
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            panic!("Failed to generate config: {}", stderr);
+        // Acquire exclusive lock (blocks until available)
+        lock_file
+            .lock_exclusive()
+            .expect("failed to acquire config generation lock");
+
+        // Check if config already exists and is valid
+        let config_path = std::env::var("HOME")
+            .map(|h| PathBuf::from(h).join(".config/fcvm/rootfs-config.toml"))
+            .unwrap_or_else(|_| PathBuf::from("/tmp/fcvm-config/rootfs-config.toml"));
+
+        let needs_generation = if config_path.exists() {
+            // Try to parse it - if parsing fails, regenerate
+            match std::fs::read_to_string(&config_path) {
+                Ok(content) => {
+                    // Check if it has the required [base] section
+                    !content.contains("[base]")
+                }
+                Err(_) => true,
+            }
+        } else {
+            true
+        };
+
+        if needs_generation {
+            let fcvm_path = find_fcvm_binary().expect("fcvm binary not found");
+            let output = Command::new(&fcvm_path)
+                .args(["setup", "--generate-config", "--force"])
+                .output()
+                .expect("failed to run fcvm setup --generate-config");
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                panic!("Failed to generate config: {}", stderr);
+            }
+            eprintln!(">>> Generated config at ~/.config/fcvm/rootfs-config.toml");
         }
-        eprintln!(">>> Generated config at ~/.config/fcvm/rootfs-config.toml");
+        // Lock is released when lock_file is dropped
     });
 }
 
