@@ -369,7 +369,6 @@ make test-root FILTER=inception
 
 - ARM64 only (x86_64 nested virt uses different mechanism)
 - Requires bare-metal instance (c7g.metal) or host with nested virt enabled
-- Performance overhead from nested virtualization
 - Maximum 2 levels tested (host → outer VM → inner VM)
 
 ---
