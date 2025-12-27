@@ -104,7 +104,10 @@ async fn ensure_inception_kernel() -> Result<PathBuf> {
     }
 
     if !kernel_path.exists() {
-        bail!("Kernel build completed but file not found: {}", kernel_path.display());
+        bail!(
+            "Kernel build completed but file not found: {}",
+            kernel_path.display()
+        );
     }
 
     println!("✓ Kernel built: {}", kernel_path.display());
@@ -126,7 +129,9 @@ async fn test_kvm_available_in_vm() -> Result<()> {
     // Start the VM with custom kernel via --kernel flag
     // Use --privileged so the container can access /dev/kvm
     println!("\nStarting VM with inception kernel (privileged mode)...");
-    let kernel_str = inception_kernel.to_str().context("kernel path not valid UTF-8")?;
+    let kernel_str = inception_kernel
+        .to_str()
+        .context("kernel path not valid UTF-8")?;
     let (mut _child, fcvm_pid) = common::spawn_fcvm(&[
         "podman",
         "run",
@@ -303,7 +308,9 @@ async fn test_inception_run_fcvm_inside_vm() -> Result<()> {
     println!("\n1. Starting outer VM with inception kernel...");
     println!("   Mounting: /mnt/fcvm-btrfs (assets) and fcvm binary");
 
-    let kernel_str = inception_kernel.to_str().context("kernel path not valid UTF-8")?;
+    let kernel_str = inception_kernel
+        .to_str()
+        .context("kernel path not valid UTF-8")?;
     let fcvm_volume = format!("{}:/opt/fcvm", fcvm_dir.display());
     // Mount host config dir so inner fcvm can find its config
     // Use $HOME which is set by spawn_fcvm based on the current user
@@ -312,15 +319,22 @@ async fn test_inception_run_fcvm_inside_vm() -> Result<()> {
     // Use nginx so health check works (bridged networking does HTTP health check to port 80)
     // Note: firecracker is in /mnt/fcvm-btrfs/bin which is mounted via the btrfs mount
     let (mut _child, outer_pid) = common::spawn_fcvm(&[
-        "podman", "run",
-        "--name", &vm_name,
-        "--network", "bridged",
-        "--kernel", kernel_str,
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        "--kernel",
+        kernel_str,
         "--privileged",
-        "--map", "/mnt/fcvm-btrfs:/mnt/fcvm-btrfs",
-        "--map", &fcvm_volume,
-        "--map", &config_mount,
-        common::TEST_IMAGE,  // nginx:alpine - has HTTP server on port 80
+        "--map",
+        "/mnt/fcvm-btrfs:/mnt/fcvm-btrfs",
+        "--map",
+        &fcvm_volume,
+        "--map",
+        &config_mount,
+        common::TEST_IMAGE, // nginx:alpine - has HTTP server on port 80
     ])
     .await
     .context("spawning outer VM")?;
@@ -339,8 +353,13 @@ async fn test_inception_run_fcvm_inside_vm() -> Result<()> {
     println!("\n2. Verifying mounts inside outer VM...");
     let output = tokio::process::Command::new(&fcvm_path)
         .args([
-            "exec", "--pid", &outer_pid.to_string(), "--vm", "--",
-            "sh", "-c",
+            "exec",
+            "--pid",
+            &outer_pid.to_string(),
+            "--vm",
+            "--",
+            "sh",
+            "-c",
             "ls -la /opt/fcvm/fcvm /mnt/fcvm-btrfs/kernels/ /dev/kvm 2>&1 | head -10",
         ])
         .stdout(Stdio::piped())
@@ -392,12 +411,25 @@ ls -la /dev/kvm 2>&1
         .context("getting debug info")?;
 
     let debug_stdout = String::from_utf8_lossy(&debug_output.stdout);
-    println!("   Debug info:\n{}", debug_stdout.lines().map(|l| format!("   {}", l)).collect::<Vec<_>>().join("\n"));
+    println!(
+        "   Debug info:\n{}",
+        debug_stdout
+            .lines()
+            .map(|l| format!("   {}", l))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 
     let output = tokio::process::Command::new(&fcvm_path)
         .args([
-            "exec", "--pid", &outer_pid.to_string(), "--vm", "--",
-            "python3", "-c", r#"
+            "exec",
+            "--pid",
+            &outer_pid.to_string(),
+            "--vm",
+            "--",
+            "python3",
+            "-c",
+            r#"
 import os
 import fcntl
 KVM_GET_API_VERSION = 0xAE00
@@ -460,8 +492,14 @@ except OSError as e:
 
     let output = tokio::process::Command::new(&fcvm_path)
         .args([
-            "exec", "--pid", &outer_pid.to_string(), "--vm", "--",
-            "sh", "-c", inner_cmd,
+            "exec",
+            "--pid",
+            &outer_pid.to_string(),
+            "--vm",
+            "--",
+            "sh",
+            "-c",
+            inner_cmd,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -478,7 +516,14 @@ except OSError as e:
     }
     if !stderr.is_empty() {
         println!("   Inner VM stderr (last 10 lines):");
-        for line in stderr.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev() {
+        for line in stderr
+            .lines()
+            .rev()
+            .take(10)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
             println!("     {}", line);
         }
     }
@@ -501,7 +546,8 @@ except OSError as e:
              Expected: INCEPTION_SUCCESS_INNER_VM_WORKS\n\
              Got stdout: {}\n\
              Got stderr: {}",
-            stdout, stderr
+            stdout,
+            stderr
         );
     }
 }
