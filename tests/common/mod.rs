@@ -384,6 +384,12 @@ pub async fn spawn_fcvm_with_logs(
         .stderr(Stdio::piped())
         .env("RUST_LOG", "debug");
 
+    // Enable nested virtualization when using inception kernel (--kernel flag)
+    // This sets FCVM_NV2=1 which makes Firecracker enable HAS_EL2 vCPU feature
+    if args.iter().any(|a| *a == "--kernel") {
+        cmd.env("FCVM_NV2", "1");
+    }
+
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn fcvm: {}", e))?;

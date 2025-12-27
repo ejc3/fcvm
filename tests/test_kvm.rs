@@ -5,23 +5,20 @@
 //!
 //! # Nested Virtualization Status (2025-12-27)
 //!
-//! ## What Works
+//! ## Implementation Complete
 //! - Host kernel 6.18.2-nested with `kvm-arm.mode=nested` properly initializes NV2 mode
 //! - KVM_CAP_ARM_EL2 (capability 240) returns 1, indicating nested virt is supported
-//! - vCPU init with KVM_ARM_VCPU_HAS_EL2 (bit 7) succeeds
-//! - KVM automatically sets PSTATE to EL2h (0x3c9) when HAS_EL2 is enabled
-//! - Firecracker patched to set HAS_EL2 feature and PSTATE_FAULT_BITS_64_EL2
+//! - vCPU init with KVM_ARM_VCPU_HAS_EL2 (bit 7) + HAS_EL2_E2H0 (bit 8) succeeds
+//! - Firecracker patched to:
+//!   - Enable HAS_EL2 + HAS_EL2_E2H0 features (FCVM_NV2=1 env var)
+//!   - Boot vCPU at EL2h (PSTATE_FAULT_BITS_64_EL2) so guest sees HYP mode
+//!   - Set EL2 registers: HCR_EL2, CNTHCTL_EL2, VMPIDR_EL2, VPIDR_EL2
 //!
-//! ## Current Blocker
-//! Guest kernel reports "HYP mode not available" despite PSTATE being set to EL2h.
-//! The guest's `init_kernel_el()` reads `CurrentEL` via `mrs x1, CurrentEL` and
-//! gets EL1 instead of EL2, causing `__boot_cpu_mode` to be set to BOOT_CPU_MODE_EL1.
-//!
-//! ## Investigation Notes
-//! - Test program confirms PSTATE = 0x3c9 (EL2h mode bits) after KVM_ARM_VCPU_INIT
-//! - But when guest kernel boots and reads CurrentEL, it sees EL1 not EL2
-//! - This suggests KVM may not be properly emulating CurrentEL for nested guests,
-//!   or something resets exception level between vCPU init and first instruction
+//! ## Guest kernel boot (working)
+//! - Guest dmesg shows: "CPU: All CPU(s) started at EL2"
+//! - KVM initializes: "kvm [1]: nv: 554 coarse grained trap handlers"
+//! - "kvm [1]: Hyp nVHE mode initialized successfully"
+//! - /dev/kvm can be opened successfully
 //!
 //! ## Hardware
 //! - c7g.metal (Graviton3 / Neoverse-V1) supports FEAT_NV2
