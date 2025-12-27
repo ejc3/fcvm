@@ -99,9 +99,9 @@ fn check_kernel_remap_support(mount_path: &std::path::Path) -> Option<bool> {
     } else {
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         match errno {
-            libc::ENOSYS => None,                 // Kernel doesn't support
+            libc::ENOSYS => None,                           // Kernel doesn't support
             libc::EOPNOTSUPP | libc::EINVAL => Some(false), // Kernel supports, fs doesn't
-            _ => Some(false),                     // Other error, assume kernel supports
+            _ => Some(false),                               // Other error, assume kernel supports
         }
     }
 }
@@ -154,7 +154,9 @@ fn run_ficlone_test_with_paths(data_dir: &std::path::Path, mount_dir: &std::path
     // Check kernel support first
     match check_kernel_remap_support(mount) {
         None => {
-            eprintln!("SKIP: test_ficlone_whole_file requires kernel FUSE_REMAP_FILE_RANGE support");
+            eprintln!(
+                "SKIP: test_ficlone_whole_file requires kernel FUSE_REMAP_FILE_RANGE support"
+            );
             eprintln!("      Got ENOSYS - kernel patch not applied");
             return;
         }
@@ -186,7 +188,11 @@ fn run_ficlone_test_with_paths(data_dir: &std::path::Path, mount_dir: &std::path
 
     if ret != 0 {
         let err = std::io::Error::last_os_error();
-        panic!("FICLONE failed: {} (errno {})", err, err.raw_os_error().unwrap_or(0));
+        panic!(
+            "FICLONE failed: {} (errno {})",
+            err,
+            err.raw_os_error().unwrap_or(0)
+        );
     }
 
     drop(src_file);
@@ -194,7 +200,11 @@ fn run_ficlone_test_with_paths(data_dir: &std::path::Path, mount_dir: &std::path
 
     // Verify content is identical
     let dst_content = fs::read(&dst_path).expect("read dest");
-    assert_eq!(dst_content.len(), test_data.len(), "cloned file size mismatch");
+    assert_eq!(
+        dst_content.len(),
+        test_data.len(),
+        "cloned file size mismatch"
+    );
     assert_eq!(dst_content, test_data, "cloned file content mismatch");
 
     // Verify on underlying filesystem that extents are shared
@@ -243,7 +253,9 @@ fn run_ficlonerange_test_with_paths(data_dir: &std::path::Path, mount_dir: &std:
     // Check kernel support first
     match check_kernel_remap_support(mount) {
         None => {
-            eprintln!("SKIP: test_ficlonerange_partial requires kernel FUSE_REMAP_FILE_RANGE support");
+            eprintln!(
+                "SKIP: test_ficlonerange_partial requires kernel FUSE_REMAP_FILE_RANGE support"
+            );
             return;
         }
         Some(false) => {
@@ -257,7 +269,9 @@ fn run_ficlonerange_test_with_paths(data_dir: &std::path::Path, mount_dir: &std:
     // btrfs block size is typically 4096
     let block_size = 4096usize;
     let num_blocks = 4;
-    let test_data: Vec<u8> = (0..block_size * num_blocks).map(|i| (i % 256) as u8).collect();
+    let test_data: Vec<u8> = (0..block_size * num_blocks)
+        .map(|i| (i % 256) as u8)
+        .collect();
     let src_path = mount.join("clonerange_source.bin");
     let dst_path = mount.join("clonerange_dest.bin");
 
@@ -276,7 +290,7 @@ fn run_ficlonerange_test_with_paths(data_dir: &std::path::Path, mount_dir: &std:
     // Clone middle 2 blocks from source to dest
     let clone_range = FileCloneRange {
         src_fd: src_file.as_raw_fd() as i64,
-        src_offset: block_size as u64,      // Start at block 1
+        src_offset: block_size as u64,       // Start at block 1
         src_length: (block_size * 2) as u64, // Clone 2 blocks
         dest_offset: block_size as u64,      // Write to same offset in dest
     };
@@ -291,7 +305,11 @@ fn run_ficlonerange_test_with_paths(data_dir: &std::path::Path, mount_dir: &std:
 
     if ret != 0 {
         let err = std::io::Error::last_os_error();
-        panic!("FICLONERANGE failed: {} (errno {})", err, err.raw_os_error().unwrap_or(0));
+        panic!(
+            "FICLONERANGE failed: {} (errno {})",
+            err,
+            err.raw_os_error().unwrap_or(0)
+        );
     }
 
     drop(src_file);
@@ -379,7 +397,11 @@ fn run_cp_reflink_test_with_paths(data_dir: &std::path::Path, mount_dir: &std::p
 
     // Run cp --reflink=always
     let output = std::process::Command::new("cp")
-        .args(["--reflink=always", src_path.to_str().unwrap(), dst_path.to_str().unwrap()])
+        .args([
+            "--reflink=always",
+            src_path.to_str().unwrap(),
+            dst_path.to_str().unwrap(),
+        ])
         .output()
         .expect("run cp");
 
@@ -421,7 +443,10 @@ fn verify_shared_extents(src: &std::path::Path, dst: &std::path::Path) {
             }
         }
         Err(e) => {
-            eprintln!("Note: filefrag not available ({}), skipping extent verification", e);
+            eprintln!(
+                "Note: filefrag not available ({}), skipping extent verification",
+                e
+            );
         }
     }
 }

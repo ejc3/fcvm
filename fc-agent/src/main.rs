@@ -1106,9 +1106,7 @@ fn create_kvm_device() {
         let err = std::io::Error::last_os_error();
         // ENOENT means the kernel doesn't have KVM support
         // This is expected with standard Firecracker kernel
-        if err.kind() == std::io::ErrorKind::NotFound
-            || err.raw_os_error() == Some(libc::ENOENT)
-        {
+        if err.kind() == std::io::ErrorKind::NotFound || err.raw_os_error() == Some(libc::ENOENT) {
             eprintln!("[fc-agent] /dev/kvm not available (kernel needs CONFIG_KVM)");
         } else {
             eprintln!("[fc-agent] WARNING: failed to create /dev/kvm: {}", err);

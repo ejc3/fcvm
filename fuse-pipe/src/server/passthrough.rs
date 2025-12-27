@@ -1597,10 +1597,10 @@ mod tests {
 
         // Call remap_file_range (FICLONE equivalent - whole file)
         let resp = fs.remap_file_range(
-            src_ino, src_fh, 0,   // source: ino, fh, offset
-            dst_ino, dst_fh, 0,   // dest: ino, fh, offset
-            0,                    // len = 0 means whole file clone
-            0,                    // no special flags
+            src_ino, src_fh, 0, // source: ino, fh, offset
+            dst_ino, dst_fh, 0, // dest: ino, fh, offset
+            0, // len = 0 means whole file clone
+            0, // no special flags
         );
 
         match resp {
@@ -1628,7 +1628,10 @@ mod tests {
                 // EOPNOTSUPP or EINVAL is expected on filesystems without reflink support
                 // tmpfs returns EINVAL, ext4/xfs without reflinks return EOPNOTSUPP
                 if errno == libc::EOPNOTSUPP || errno == libc::EINVAL {
-                    eprintln!("FICLONE not supported on this filesystem (errno={}) - OK", errno);
+                    eprintln!(
+                        "FICLONE not supported on this filesystem (errno={}) - OK",
+                        errno
+                    );
                     // Check filesystem type
                     eprintln!("tempdir path: {:?}", dir.path());
                     // Try direct FICLONE to confirm
@@ -1649,7 +1652,10 @@ mod tests {
                     };
                     if result < 0 {
                         let err = std::io::Error::last_os_error();
-                        eprintln!("Direct FICLONE also failed: {} - filesystem doesn't support reflinks", err);
+                        eprintln!(
+                            "Direct FICLONE also failed: {} - filesystem doesn't support reflinks",
+                            err
+                        );
                     }
                 } else {
                     panic!(
@@ -1706,10 +1712,14 @@ mod tests {
 
         // Clone second block from source to first block of destination
         let resp = fs.remap_file_range(
-            src_ino, src_fh, block_size as u64,  // source offset: second block
-            dst_ino, dst_fh, 0,                  // dest offset: first block
-            block_size as u64,                   // length: one block
-            0,                                   // no special flags
+            src_ino,
+            src_fh,
+            block_size as u64, // source offset: second block
+            dst_ino,
+            dst_fh,
+            0,                 // dest offset: first block
+            block_size as u64, // length: one block
+            0,                 // no special flags
         );
 
         match resp {
