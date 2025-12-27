@@ -1094,7 +1094,7 @@ fn create_kvm_device() {
     let dev = libc::makedev(10, 232);
     let result = unsafe {
         libc::mknod(
-            b"/dev/kvm\0".as_ptr() as *const libc::c_char,
+            c"/dev/kvm".as_ptr(),
             libc::S_IFCHR | 0o666, // char device, rw-rw-rw-
             dev,
         )
