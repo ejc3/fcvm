@@ -329,9 +329,9 @@ impl VmFixture {
 
 impl Drop for VmFixture {
     fn drop(&mut self) {
-        // Kill the VM process (start_kill is synchronous)
-        let _ = self.child.start_kill();
-        // try_wait is synchronous - check for exit without blocking
+        // Use centralized graceful kill (SIGTERM first, then SIGKILL)
+        // This allows fcvm to run cleanup handlers
+        fcvm::utils::graceful_kill(self.pid, 2000);
         let _ = self.child.try_wait();
 
         // Cleanup directories
