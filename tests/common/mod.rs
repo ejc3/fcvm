@@ -168,7 +168,8 @@ static CONFIG_INIT: Once = Once::new();
 /// 4. Releases lock (automatically on drop)
 fn ensure_config_exists() {
     CONFIG_INIT.call_once(|| {
-        let lock_path = "/tmp/fcvm-config-gen.lock";
+        let uid = unsafe { libc::getuid() };
+        let lock_path = format!("/tmp/fcvm-config-gen-{}.lock", uid);
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
