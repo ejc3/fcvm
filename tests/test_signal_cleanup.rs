@@ -82,8 +82,9 @@ fn test_sigint_kills_firecracker_bridged() -> Result<()> {
     }
 
     if !healthy {
-        // Kill fcvm if it didn't become healthy
-        let _ = fcvm.kill();
+        // Kill fcvm gracefully if it didn't become healthy
+        fcvm::utils::graceful_kill(fcvm_pid, 2000);
+        let _ = fcvm.wait();
         anyhow::bail!("VM did not become healthy within 60 seconds");
     }
 
@@ -214,7 +215,8 @@ fn test_sigterm_kills_firecracker_bridged() -> Result<()> {
     }
 
     if !healthy {
-        let _ = fcvm.kill();
+        fcvm::utils::graceful_kill(fcvm_pid, 2000);
+        let _ = fcvm.wait();
         anyhow::bail!("VM did not become healthy within 60 seconds");
     }
 
@@ -328,7 +330,8 @@ fn test_sigterm_cleanup_rootless() -> Result<()> {
     }
 
     if !healthy {
-        let _ = fcvm.kill();
+        fcvm::utils::graceful_kill(fcvm_pid, 2000);
+        let _ = fcvm.wait();
         anyhow::bail!("VM did not become healthy within 60 seconds");
     }
 
@@ -562,7 +565,8 @@ fn test_sigterm_cleanup_bridged() -> Result<()> {
     }
 
     if !healthy {
-        let _ = fcvm.kill();
+        fcvm::utils::graceful_kill(fcvm_pid, 2000);
+        let _ = fcvm.wait();
         anyhow::bail!("VM did not become healthy within 60 seconds");
     }
 
