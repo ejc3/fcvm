@@ -41,6 +41,8 @@ use std::process::Stdio;
 
 const KERNEL_VERSION: &str = "6.12.10";
 const KERNEL_DIR: &str = "/mnt/fcvm-btrfs/kernels";
+const FIRECRACKER_NV2_REPO: &str = "https://github.com/ejc3/firecracker.git";
+const FIRECRACKER_NV2_BRANCH: &str = "nv2-inception";
 
 /// Compute inception kernel path from build script contents
 fn inception_kernel_path() -> Result<PathBuf> {
@@ -114,13 +116,134 @@ async fn ensure_inception_kernel() -> Result<PathBuf> {
     Ok(kernel_path)
 }
 
+/// Check if Firecracker supports --enable-nv2 flag
+async fn firecracker_has_nv2() -> bool {
+    let output = tokio::process::Command::new("firecracker")
+        .arg("--help")
+        .output()
+        .await;
+
+    match output {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).contains("enable-nv2"),
+        Err(_) => false,
+    }
+}
+
+/// Ensure Firecracker with NV2 support is installed
+async fn ensure_firecracker_nv2() -> Result<()> {
+    if firecracker_has_nv2().await {
+        println!("✓ Firecracker with NV2 support found");
+        return Ok(());
+    }
+
+    println!("Building Firecracker with NV2 support...");
+    println!("  This may take 5-10 minutes on first run...");
+
+    let build_dir = PathBuf::from("/tmp/firecracker-nv2-build");
+
+    // Clone or update the repo
+    if build_dir.exists() {
+        println!("  Updating existing repo...");
+        let status = tokio::process::Command::new("git")
+            .args(["fetch", "origin", FIRECRACKER_NV2_BRANCH])
+            .current_dir(&build_dir)
+            .status()
+            .await?;
+        if !status.success() {
+            // If fetch fails, remove and re-clone
+            tokio::fs::remove_dir_all(&build_dir).await?;
+        }
+    }
+
+    if !build_dir.exists() {
+        println!("  Cloning {}...", FIRECRACKER_NV2_REPO);
+        let status = tokio::process::Command::new("git")
+            .args([
+                "clone",
+                "--depth=1",
+                "-b",
+                FIRECRACKER_NV2_BRANCH,
+                FIRECRACKER_NV2_REPO,
+                build_dir.to_str().unwrap(),
+            ])
+            .status()
+            .await
+            .context("cloning Firecracker repo")?;
+
+        if !status.success() {
+            bail!("Failed to clone Firecracker repo");
+        }
+    }
+
+    // Checkout the correct branch
+    let status = tokio::process::Command::new("git")
+        .args(["checkout", FIRECRACKER_NV2_BRANCH])
+        .current_dir(&build_dir)
+        .status()
+        .await?;
+
+    if !status.success() {
+        bail!("Failed to checkout branch {}", FIRECRACKER_NV2_BRANCH);
+    }
+
+    // Build Firecracker
+    println!("  Building Firecracker (release)...");
+    let status = tokio::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "firecracker"])
+        .current_dir(&build_dir)
+        .status()
+        .await
+        .context("building Firecracker")?;
+
+    if !status.success() {
+        bail!("Firecracker build failed");
+    }
+
+    // Install to /usr/local/bin (requires sudo)
+    // Firecracker uses target/release when built with cargo directly
+    let mut binary = build_dir.join("target/release/firecracker");
+    if !binary.exists() {
+        // Try alternative path (Firecracker's custom build system)
+        let alt_binary = build_dir.join("build/cargo_target/release/firecracker");
+        if alt_binary.exists() {
+            binary = alt_binary;
+        } else {
+            bail!(
+                "Firecracker binary not found at {} or {}",
+                binary.display(),
+                alt_binary.display()
+            );
+        }
+    }
+
+    println!("  Installing Firecracker to /usr/local/bin...");
+    let status = tokio::process::Command::new("sudo")
+        .args(["cp", binary.to_str().unwrap(), "/usr/local/bin/firecracker"])
+        .status()
+        .await
+        .context("installing Firecracker")?;
+
+    if !status.success() {
+        bail!("Failed to install Firecracker");
+    }
+
+    // Verify installation
+    if !firecracker_has_nv2().await {
+        bail!("Firecracker installed but --enable-nv2 flag not found");
+    }
+
+    println!("✓ Firecracker with NV2 support installed");
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_kvm_available_in_vm() -> Result<()> {
     println!("\nInception KVM test");
     println!("==================");
     println!("Verifying /dev/kvm works with inception kernel");
 
-    // Ensure inception kernel exists (builds if needed)
+    // Ensure prerequisites are installed
+    ensure_firecracker_nv2().await?;
     let inception_kernel = ensure_inception_kernel().await?;
 
     let fcvm_path = common::find_fcvm_binary()?;
@@ -297,7 +420,8 @@ async fn test_inception_run_fcvm_inside_vm() -> Result<()> {
     println!("\nInception Test: Run fcvm inside fcvm");
     println!("=====================================");
 
-    // Ensure inception kernel exists (builds if needed)
+    // Ensure prerequisites are installed
+    ensure_firecracker_nv2().await?;
     let inception_kernel = ensure_inception_kernel().await?;
 
     let fcvm_path = common::find_fcvm_binary()?;
