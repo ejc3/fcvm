@@ -386,7 +386,7 @@ pub async fn spawn_fcvm_with_logs(
 
     // Enable nested virtualization when using inception kernel (--kernel flag)
     // FCVM_NV2=1 tells fcvm to pass --enable-nv2 to Firecracker for HAS_EL2 vCPU feature
-    if args.iter().any(|a| *a == "--kernel") {
+    if args.contains(&"--kernel") {
         cmd.env("FCVM_NV2", "1");
     }
 
