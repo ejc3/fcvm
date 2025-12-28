@@ -191,34 +191,46 @@ Exception: For **forked libraries** (like fuse-backend-rs), we maintain compatib
 
 ### Development Workflow (PR-Based)
 
-**Local commits are fast. Branch before push.**
+**Main branch is protected. All changes MUST go through pull requests.**
 
-1. **Commit locally to main** as you work - no interruption
-2. **Before pushing**, create a branch and PR:
-   ```bash
-   # Create branch from current main
-   git checkout -b feature/description
-   git push -u origin feature/description
-   gh pr create --fill
-   # Go back to main for next work
-   git checkout main
-   ```
-3. **Continue working** - more local commits to main
-4. **End of session** - check CI on all PRs, merge in order:
-   ```bash
-   # Check all PR statuses
-   gh pr list --author @me
-   gh pr checks <pr-number>
-   # Merge when green
-   gh pr merge <pr-number> --merge --delete-branch
-   git pull  # Update local main
-   ```
+#### Creating a PR (Required for ALL Changes)
 
-**Why this works:**
-- Feels like committing to main (local commits are instant)
-- PRs provide CI validation before merge
-- Can stack multiple PRs without waiting
-- Merge at end when CI is green
+```bash
+# 1. Create feature branch
+git checkout -b fix-something
+
+# 2. Make changes and commit
+git add -A && git commit -m "Fix something"
+
+# 3. Push and create PR
+git push -u origin fix-something
+gh pr create --fill
+
+# 4. Wait for CI to pass
+gh pr checks <pr-number>
+
+# 5. Merge when green
+gh pr merge <pr-number> --merge --delete-branch
+
+# 6. Update local main
+git checkout main && git pull
+```
+
+#### Quick Reference
+
+| Action | Command |
+|--------|---------|
+| Create branch | `git checkout -b branch-name` |
+| Push & create PR | `git push -u origin branch-name && gh pr create --fill` |
+| Check CI | `gh pr checks <pr-number>` |
+| Merge PR | `gh pr merge <pr-number> --merge --delete-branch` |
+| List my PRs | `gh pr list --author @me` |
+
+**Why PRs are required:**
+- CI validates all changes before merge
+- Clear history of what changed and why
+- Easy to revert individual changes
+- Prevents accidental pushes to main
 
 **Stacking PRs:** When work builds on unmerged PRs, create a chain:
 ```bash
@@ -250,6 +262,44 @@ git push origin feature-b --force
 ```
 
 **One PR per concern:** Unrelated changes get separate PRs. If you're fixing a bug and notice a typo in docs, that's two PRs. This keeps reviews focused and makes reverts clean.
+
+### PR Descriptions: Show, Don't Tell
+
+**PRs should include evidence that changes work.** Actual output, not vague claims.
+
+#### What to Include
+
+- **Summary** - Brief description of what and why
+- **Test evidence** - Local test output is fine! Don't need to wait for CI.
+
+Be reasonable about detail level. Simple changes need simple evidence.
+
+#### Good Examples
+
+```markdown
+## Fix cargo fmt scope
+Changed to only check workspace packages (not external deps).
+
+Tested:
+  cargo fmt -p fcvm -p fuse-pipe --check  # passes
+```
+
+```markdown
+## Add timeout parameter
+Tested locally:
+  make test-root FILTER=sanity  # passed in 45s
+```
+
+#### Bad Example
+
+```markdown
+Fixed CI. Tested and it works.
+```
+
+**Why evidence matters:**
+- Proves the fix works, not just "looks right"
+- Local testing is sufficient - don't need CI green first
+- Helps future debugging if issues recur
 
 ### Commit Messages
 

@@ -25,6 +25,9 @@ async fn run_category_in_vm(category: &str) -> Result<()> {
     let vm_name = format!("pjdfs-{}-{}", category, std::process::id());
     let start = Instant::now();
 
+    // Create logger for this test
+    let logger = common::TestLogger::new(&format!("pjdfs-vm-{}", category));
+
     // Find fcvm binary
     let fcvm_path = common::find_fcvm_binary()?;
 
@@ -113,12 +116,23 @@ async fn run_category_in_vm(category: &str) -> Result<()> {
     let mut child = cmd.spawn().context("spawning VM")?;
     let vm_pid = child.id().ok_or_else(|| anyhow::anyhow!("no VM PID"))?;
 
-    // Consume output
-    common::spawn_log_consumer(child.stdout.take(), &format!("vm-{}", category));
-    common::spawn_log_consumer_stderr(child.stderr.take(), &format!("vm-{}", category));
+    logger.info(&format!("Spawned VM PID={}", vm_pid));
 
-    // Wait for completion (10 min timeout per category)
-    let timeout = std::time::Duration::from_secs(600);
+    // Consume output with file logging
+    common::spawn_log_consumer_with_logger(
+        child.stdout.take(),
+        &format!("vm-{}", category),
+        logger.clone(),
+    );
+    common::spawn_log_consumer_stderr_with_logger(
+        child.stderr.take(),
+        &format!("vm-{}", category),
+        logger.clone(),
+    );
+
+    // Wait for completion (15 min timeout per category)
+    // Note: skopeo import can take ~6 min on x86_64, plus test execution time
+    let timeout = std::time::Duration::from_secs(900);
     let result = tokio::time::timeout(timeout, child.wait()).await;
 
     // Cleanup

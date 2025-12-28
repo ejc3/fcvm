@@ -474,6 +474,24 @@ pub fn spawn_log_consumer_stderr(stderr: Option<tokio::process::ChildStderr>, na
     spawn_log_consumer_to_file(stderr, name, None, true);
 }
 
+/// Spawn a task to consume stdout with file logging
+pub fn spawn_log_consumer_with_logger(
+    stdout: Option<tokio::process::ChildStdout>,
+    name: &str,
+    logger: TestLogger,
+) {
+    spawn_log_consumer_to_file(stdout, name, Some(logger), false);
+}
+
+/// Spawn a task to consume stderr with file logging
+pub fn spawn_log_consumer_stderr_with_logger(
+    stderr: Option<tokio::process::ChildStderr>,
+    name: &str,
+    logger: TestLogger,
+) {
+    spawn_log_consumer_to_file(stderr, name, Some(logger), true);
+}
+
 /// Internal: spawn log consumer that writes to console and optionally to a file
 ///
 /// When a logger is provided:
