@@ -110,10 +110,15 @@ impl UffdHandler {
 
 impl Drop for UffdHandler {
     fn drop(&mut self) {
-        // Best-effort cleanup
+        // Best-effort graceful cleanup
         if self.is_alive() {
-            warn!("uffd_handler still running during drop, sending kill signal");
-            let _ = self.process.start_kill();
+            if let Some(pid) = self.process.id() {
+                warn!("uffd_handler still running during drop, sending graceful kill");
+                crate::utils::graceful_kill(pid, 1000);
+            } else {
+                // Fallback to start_kill if no PID available
+                let _ = self.process.start_kill();
+            }
         }
 
         // Clean up socket file

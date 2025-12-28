@@ -169,10 +169,10 @@ impl VmFixture {
         elapsed
     }
 
-    /// Kill the VM and wait for it to exit
+    /// Kill the VM gracefully (SIGTERM first, then SIGKILL)
     fn kill(&mut self) {
-        // Kill the child process
-        let _ = self.child.kill();
+        // Use centralized graceful kill to allow cleanup
+        fcvm::utils::graceful_kill(self.pid, 2000);
         // Wait to reap the process and avoid zombies
         let _ = self.child.wait();
     }
@@ -586,9 +586,11 @@ impl CloneFixture {
     }
 
     fn kill(&mut self) {
-        // Kill both processes and wait to reap them
-        let _ = self.serve_child.kill();
-        let _ = self.baseline_child.kill();
+        // Gracefully kill both processes (SIGTERM first, then SIGKILL)
+        // Kill serve first (it will cascade to clones)
+        fcvm::utils::graceful_kill(self.serve_pid, 2000);
+        fcvm::utils::graceful_kill(self.baseline_child.id(), 2000);
+        // Wait to reap and avoid zombies
         let _ = self.serve_child.wait();
         let _ = self.baseline_child.wait();
     }
