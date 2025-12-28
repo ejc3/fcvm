@@ -118,9 +118,10 @@ jobs:
 
   # Runner 1: Host (bare metal with KVM)
   # Runs: test-unit → test-fast → test-root (sequential)
+  # DISABLED: x86_64 runners lack nested virt, tests designed for ARM64
   host:
     name: Host
-    if: ${{ github.event.inputs.job != 'container' }}
+    if: false
     runs-on: buildjet-32vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v6
