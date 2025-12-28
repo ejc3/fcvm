@@ -197,7 +197,10 @@ async fn test_btrfs_in_container() -> Result<()> {
             "--",
             "sh",
             "-c",
-            &format!("echo '{}' > /btrfs/test.txt && cat /btrfs/test.txt", test_content),
+            &format!(
+                "echo '{}' > /btrfs/test.txt && cat /btrfs/test.txt",
+                test_content
+            ),
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -285,11 +288,7 @@ async fn test_btrfs_in_container() -> Result<()> {
     if !stdout.contains("copy done") {
         cleanup_btrfs(&btrfs_path).await;
         common::kill_process(fcvm_pid).await;
-        bail!(
-            "cp command failed!\nstdout: {}\nstderr: {}",
-            stdout,
-            stderr
-        );
+        bail!("cp command failed!\nstdout: {}\nstderr: {}", stdout, stderr);
     }
     println!("   ✓ File copied successfully");
 
@@ -402,7 +401,10 @@ async fn test_btrfs_in_container() -> Result<()> {
     if !stdout.trim().contains("755") {
         cleanup_btrfs(&btrfs_path).await;
         common::kill_process(fcvm_pid).await;
-        bail!("Permission not set correctly. Expected 755, got: {}", stdout);
+        bail!(
+            "Permission not set correctly. Expected 755, got: {}",
+            stdout
+        );
     }
     println!("   ✓ File permissions work correctly");
 
