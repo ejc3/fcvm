@@ -263,6 +263,52 @@ git push origin feature-b --force
 
 **One PR per concern:** Unrelated changes get separate PRs. If you're fixing a bug and notice a typo in docs, that's two PRs. This keeps reviews focused and makes reverts clean.
 
+### PR Descriptions: Show, Don't Tell
+
+**Every PR MUST include evidence that it works.** Not claims - actual proof.
+
+#### Required Sections
+
+1. **What changed** - List specific files and changes
+2. **Why it changed** - The problem being solved
+3. **Test evidence** - Actual output showing it works
+
+#### Good Example (CI fix PR)
+
+```markdown
+## Changes
+- Fixed `cargo fmt` to only check workspace packages
+- Root cause: `--all` was checking fuse-backend-rs (external dep)
+
+## Test Evidence
+
+### Before (failing):
+```
+Diff in /fuse-backend-rs/src/passthrough/sync_io.rs:2024
+```
+
+### After (passing):
+```
+Check formatting... OK
+```
+```
+
+#### Bad Example
+
+```markdown
+## Changes
+- Fixed CI
+
+## Testing
+- Tested and it works
+```
+
+**Why evidence matters:**
+- Proves the fix actually works, not just "looks right"
+- Helps future debugging if the issue recurs
+- CI logs are ephemeral - PR descriptions persist
+- Reviewers can verify without re-running
+
 ### Commit Messages
 
 **Detailed messages with context and testing.** Commit messages should capture the nuance from the session that created them.
