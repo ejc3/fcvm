@@ -37,21 +37,22 @@ NEXTEST := CARGO_TARGET_DIR=target cargo nextest $(NEXTEST_CMD) --release
 # Optional cargo cache directory (for CI caching)
 CARGO_CACHE_DIR ?=
 ifneq ($(CARGO_CACHE_DIR),)
-CARGO_CACHE_MOUNT := -v $(CARGO_CACHE_DIR)/registry:/usr/local/cargo/registry -v $(CARGO_CACHE_DIR)/target:/workspace/fcvm/target
+# CI mode: use cache directory for both registry and target
+CARGO_CACHE_MOUNT := -v $(CARGO_CACHE_DIR)/registry:/usr/local/cargo/registry
+TARGET_MOUNT := -v $(CARGO_CACHE_DIR)/target:/workspace/fcvm/target
 else
+# Local mode: use temp directory for target (avoids permission conflicts)
 CARGO_CACHE_MOUNT :=
+TARGET_MOUNT := -v /tmp/fcvm-container-target:/workspace/fcvm/target
 endif
 
 # Test log directory (mounted into container)
 TEST_LOG_DIR := /tmp/fcvm-test-logs
 
-# Container target directory (shadows host's target/ to avoid permission conflicts)
-CONTAINER_TARGET_DIR := /tmp/fcvm-container-target
-
 # Container run command
 CONTAINER_RUN := podman run --rm --privileged \
 	-v .:/workspace/fcvm \
-	-v $(CONTAINER_TARGET_DIR):/workspace/fcvm/target \
+	$(TARGET_MOUNT) \
 	-v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs -v $(FUSER):/workspace/fuser \
 	--device /dev/fuse --device /dev/kvm \
 	--ulimit nofile=65536:65536 --pids-limit=65536 -v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
@@ -170,7 +171,7 @@ container-test: container-test-all
 
 container-build:
 	@sudo mkdir -p /mnt/fcvm-btrfs 2>/dev/null || true
-	@mkdir -p $(CONTAINER_TARGET_DIR)
+	@mkdir -p /tmp/fcvm-container-target
 	podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) .
 
 container-shell: container-build
