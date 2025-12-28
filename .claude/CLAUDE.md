@@ -235,6 +235,20 @@ gh pr list --json number,headRefName,baseRefName
 ```
 Merge in order (#1 first, then #2). After merging #1, GitHub auto-updates #2's base to main.
 
+**CRITICAL: Maintain Stack Coherence.** When PRs are stacked, the branch for PR #2 MUST actually be based on PR #1's branch - not just have the GitHub base set correctly. Verify with:
+```bash
+# PR #2's commits should include PR #1's commits
+git log --oneline origin/main..feature-b
+# Should show: PR #2 commits THEN PR #1 commits
+```
+
+If PR #2's branch is based on main instead of feature-a, tests will fail because PR #2 won't have PR #1's changes. Fix with:
+```bash
+git checkout -B feature-b origin/feature-a
+git cherry-pick <pr2-commit>
+git push origin feature-b --force
+```
+
 **One PR per concern:** Unrelated changes get separate PRs. If you're fixing a bug and notice a typo in docs, that's two PRs. This keeps reviews focused and makes reverts clean.
 
 ### Commit Messages
