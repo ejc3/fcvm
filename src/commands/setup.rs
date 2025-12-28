@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 
 use crate::cli::args::SetupArgs;
-use crate::setup::rootfs::generate_config;
+use crate::paths;
+use crate::setup::rootfs::{generate_config, load_config};
 
 /// Run setup to download kernel and create rootfs.
 ///
@@ -16,6 +17,10 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         println!("  fcvm setup");
         return Ok(());
     }
+
+    // Load config and initialize paths (with helpful error if config missing)
+    let (config, _, _) = load_config(None)?;
+    paths::init_with_paths(&config.paths.data_dir, &config.paths.assets_dir);
 
     println!("Setting up fcvm (this may take 5-10 minutes on first run)...");
 

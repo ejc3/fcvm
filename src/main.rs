@@ -35,8 +35,8 @@ async fn main() -> Result<()> {
 
     // Initialize paths - some commands don't need config
     match &cli.cmd {
-        Commands::Setup(args) if args.generate_config => {
-            // --generate-config doesn't need existing config
+        Commands::Setup(_) => {
+            // Setup handles its own config loading with proper error messages
             paths::init_with_defaults();
         }
         Commands::Completions(_) => {
