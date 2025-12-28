@@ -13,15 +13,15 @@ jobs:
     name: Benchmarks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           path: fcvm
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ejc3/fuse-backend-rs
           ref: master
           path: fuse-backend-rs
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ejc3/fuser
           ref: master
@@ -34,7 +34,7 @@ jobs:
           export CONTAINER_ARCH=x86_64
           make container-bench
       - name: Upload results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: benchmark-results-${{ github.run_id }}
           path: fcvm/target/criterion/

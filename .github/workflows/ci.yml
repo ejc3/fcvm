@@ -34,15 +34,15 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           path: fcvm
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ejc3/fuse-backend-rs
           ref: master
           path: fuse-backend-rs
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ejc3/fuser
           ref: master
@@ -66,7 +66,7 @@ jobs:
         run: cargo install cargo-audit cargo-deny --locked
       - name: Check formatting
         working-directory: fcvm
-        run: cargo fmt --all --check
+        run: cargo fmt -p fcvm -p fuse-pipe -p fc-agent --check
       - name: Clippy
         working-directory: fcvm
         run: cargo clippy --all-targets -- -D warnings
@@ -83,15 +83,15 @@ jobs:
     name: Packaging
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           path: fcvm
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ejc3/fuse-backend-rs
           ref: master
           path: fuse-backend-rs
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ejc3/fuser
           ref: master
@@ -123,15 +123,15 @@ jobs:
     if: ${{ github.event.inputs.job != 'container' }}
     runs-on: buildjet-32vcpu-ubuntu-2204
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           path: fcvm
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ejc3/fuse-backend-rs
           ref: master
           path: fuse-backend-rs
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ejc3/fuser
           ref: master
@@ -211,7 +211,7 @@ jobs:
           sudo dmesg | grep -iE 'userfault|uffd|kvm|firecracker|oom|killed|segfault|page.fault' > /tmp/fcvm-test-logs/dmesg-filtered.log || true
       - name: Upload test logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: test-logs-host
           path: /tmp/fcvm-test-logs/
@@ -226,15 +226,15 @@ jobs:
     if: ${{ github.event.inputs.job != 'host' }}
     runs-on: buildjet-32vcpu-ubuntu-2204
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           path: fcvm
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ejc3/fuse-backend-rs
           ref: master
           path: fuse-backend-rs
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ejc3/fuser
           ref: master
@@ -279,7 +279,7 @@ jobs:
           sudo dmesg | grep -iE 'userfault|uffd|kvm|firecracker|oom|killed|segfault|page.fault' > /tmp/fcvm-test-logs/dmesg-filtered.log || true
       - name: Upload test logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: test-logs-container
           path: /tmp/fcvm-test-logs/
