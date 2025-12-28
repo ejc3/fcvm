@@ -283,6 +283,96 @@ sudo fcvm podman run --name full \
 
 ---
 
+## Nested Virtualization (Inception)
+
+fcvm supports running inside another fcvm VM using ARM64 FEAT_NV2 nested virtualization. This enables "inception" - VMs inside VMs.
+
+### Requirements
+
+| Requirement | Details |
+|-------------|---------|
+| **Hardware** | ARM64 with FEAT_NV2 (Graviton3+: c7g.metal, c7gn.metal, r7g.metal) |
+| **Host kernel** | 6.18+ with `kvm-arm.mode=nested` boot parameter |
+| **Inception kernel** | Custom kernel with CONFIG_KVM=y (built by `kernel/build.sh`) |
+| **Firecracker** | Fork with NV2 support: `ejc3/firecracker:nv2-inception` |
+
+### Building the Inception Kernel
+
+```bash
+# Build kernel with KVM support (~10-20 minutes first time)
+./kernel/build.sh
+
+# Kernel will be at /mnt/fcvm-btrfs/kernels/vmlinux-6.12.10-*.bin
+```
+
+The inception kernel adds these configs on top of the standard Firecracker kernel:
+- `CONFIG_KVM=y` - KVM hypervisor support
+- `CONFIG_VIRTUALIZATION=y` - Virtualization support
+- `CONFIG_TUN=y`, `CONFIG_VETH=y` - Network devices for nested VMs
+- `CONFIG_NETFILTER*` - iptables/nftables for bridged networking
+
+### Running Inception
+
+**Step 1: Start outer VM with inception kernel**
+```bash
+# FCVM_NV2=1 is auto-set when --kernel flag is used
+sudo fcvm podman run \
+    --name outer-vm \
+    --network bridged \
+    --kernel /mnt/fcvm-btrfs/kernels/vmlinux-6.12.10-*.bin \
+    --privileged \
+    --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
+    --map /path/to/fcvm/binary:/opt/fcvm \
+    nginx:alpine
+```
+
+**Step 2: Verify nested KVM works**
+```bash
+# Check guest sees HYP mode
+fcvm exec --pid <outer_pid> --vm -- dmesg | grep -i kvm
+# Should show: "kvm [1]: Hyp nVHE mode initialized successfully"
+
+# Verify /dev/kvm is accessible
+fcvm exec --pid <outer_pid> --vm -- ls -la /dev/kvm
+```
+
+**Step 3: Run inner VM**
+```bash
+# Inside outer VM (via exec or SSH)
+cd /mnt/fcvm-btrfs
+/opt/fcvm/fcvm podman run --name inner-vm --network bridged alpine:latest echo "Hello from inception!"
+```
+
+### How It Works
+
+1. **FCVM_NV2=1** environment variable (auto-set when `--kernel` is used) triggers fcvm to pass `--enable-nv2` to Firecracker
+2. **HAS_EL2 + HAS_EL2_E2H0** vCPU features are enabled
+   - HAS_EL2 (bit 7): Enables virtual EL2 for guest
+   - HAS_EL2_E2H0 (bit 8): Forces nVHE mode (avoids timer trap storm)
+3. **vCPU boots at EL2h** so guest kernel's `is_hyp_mode_available()` returns true
+4. **EL2 registers initialized**: HCR_EL2, CNTHCTL_EL2, VMPIDR_EL2, VPIDR_EL2
+5. Guest kernel initializes KVM: "CPU: All CPU(s) started at EL2"
+6. Nested fcvm creates VMs using the guest's KVM
+
+### Testing Inception
+
+```bash
+# Run inception tests
+make test-root FILTER=inception
+
+# Tests:
+# - test_kvm_available_in_vm: Verifies /dev/kvm works in guest
+# - test_inception_run_fcvm_inside_vm: Full inception (fcvm inside fcvm)
+```
+
+### Limitations
+
+- ARM64 only (x86_64 nested virt uses different mechanism)
+- Requires bare-metal instance (c7g.metal) or host with nested virt enabled
+- Maximum 2 levels tested (host → outer VM → inner VM)
+
+---
+
 ## Project Structure
 
 ```
