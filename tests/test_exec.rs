@@ -324,6 +324,7 @@ async fn run_exec_with_tty(
     // -q: quiet mode (no "Script started" message)
     // -c: run command instead of shell
     // /dev/null: discard typescript file
+    // Note: -t flag now auto-suppresses fcvm logs, so no filtering needed
     let output = tokio::process::Command::new("script")
         .args(["-q", "-c", &fcvm_cmd, "/dev/null"])
         .output()
@@ -334,19 +335,13 @@ async fn run_exec_with_tty(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // Filter out log lines from fcvm and script artifacts
+    // Filter out script artifacts and empty lines only
+    // (fcvm logs are now suppressed by -t flag)
     let result: String = stdout
         .lines()
         .chain(stderr.lines())
         .filter(|line| {
-            !line.contains(" INFO ")
-                && !line.contains(" WARN ")
-                && !line.contains(" DEBUG ")
-                && !line.contains(" TRACE ")
-                && !line.contains(" ERROR ")
-                && !line.contains("Script started")
-                && !line.contains("Script done")
-                && !line.is_empty()
+            !line.contains("Script started") && !line.contains("Script done") && !line.is_empty()
         })
         .collect::<Vec<_>>()
         .join("\n");
