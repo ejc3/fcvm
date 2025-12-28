@@ -272,6 +272,10 @@ pub struct ExecArgs {
     #[arg(short, long)]
     pub tty: bool,
 
+    /// Suppress log output (auto-enabled with -t)
+    #[arg(short, long)]
+    pub quiet: bool,
+
     /// Command and arguments to execute
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
