@@ -1530,7 +1530,7 @@ async fn main() -> Result<()> {
     // Mount FUSE volumes from host before launching container
     // Note: mounted_volumes tracks which mounts succeeded, but we bind from plan.volumes
     // since they use the same guest_path for both FUSE mount and container bind
-    let has_shared_volume = if !plan.volumes.is_empty() {
+    let mounted_fuse_paths: Vec<String> = if !plan.volumes.is_empty() {
         eprintln!(
             "[fc-agent] mounting {} FUSE volume(s) from host",
             plan.volumes.len()
@@ -1538,18 +1538,18 @@ async fn main() -> Result<()> {
         match mount_fuse_volumes(&plan.volumes) {
             Ok(paths) => {
                 eprintln!("[fc-agent] ✓ FUSE volumes mounted successfully");
-                // Check if we have a /mnt/shared volume for lock testing
-                paths.iter().any(|p| p == "/mnt/shared")
+                paths
             }
             Err(e) => {
                 eprintln!("[fc-agent] ERROR: failed to mount FUSE volumes: {:?}", e);
                 // Continue without volumes - container can still run
-                false
+                Vec::new()
             }
         }
     } else {
-        false
+        Vec::new()
     };
+    let has_shared_volume = mounted_fuse_paths.iter().any(|p| p == "/mnt/shared");
 
     // If we have a shared volume, start lock test watcher
     // This allows clones to run POSIX lock tests on demand
@@ -1855,6 +1855,42 @@ async fn main() -> Result<()> {
     // Notify host of container exit status via vsock
     // The host can use this to determine if the container succeeded
     notify_container_exit(exit_code);
+
+    // Unmount FUSE volumes before shutting down
+    // This prevents poweroff from hanging on busy FUSE mounts
+    if !mounted_fuse_paths.is_empty() {
+        eprintln!(
+            "[fc-agent] unmounting {} FUSE volume(s) before shutdown",
+            mounted_fuse_paths.len()
+        );
+        for path in &mounted_fuse_paths {
+            eprintln!("[fc-agent] unmounting FUSE volume at {}", path);
+            // Use lazy unmount (-l) to detach immediately even if busy
+            // This allows the FUSE threads to exit cleanly
+            match std::process::Command::new("umount")
+                .arg("-l")
+                .arg(path)
+                .output()
+            {
+                Ok(output) => {
+                    if output.status.success() {
+                        eprintln!("[fc-agent] ✓ unmounted {}", path);
+                    } else {
+                        eprintln!(
+                            "[fc-agent] umount {} failed: {}",
+                            path,
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[fc-agent] umount {} error: {}", path, e);
+                }
+            }
+        }
+        // Give FUSE threads time to notice the unmount and exit
+        sleep(Duration::from_millis(100)).await;
+    }
 
     // Shut down the VM when the container exits (success or failure)
     // This is the expected behavior - the VM exists to run one container

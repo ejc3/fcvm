@@ -220,6 +220,23 @@ Exception: For **forked libraries** (like fuse-backend-rs), we maintain compatib
 - Can stack multiple PRs without waiting
 - Merge at end when CI is green
 
+**Stacking PRs:** When work builds on unmerged PRs, create a chain:
+```bash
+# PR #1 is on main
+git checkout -b feature-a && git push -u origin feature-a
+gh pr create --base main
+
+# PR #2 builds on PR #1
+git checkout -b feature-b && git push -u origin feature-b
+gh pr create --base feature-a  # Not main!
+
+# Verify the chain
+gh pr list --json number,headRefName,baseRefName
+```
+Merge in order (#1 first, then #2). After merging #1, GitHub auto-updates #2's base to main.
+
+**One PR per concern:** Unrelated changes get separate PRs. If you're fixing a bug and notice a typo in docs, that's two PRs. This keeps reviews focused and makes reverts clean.
+
 ### Commit Messages
 
 **Detailed messages with context and testing.** Commit messages should capture the nuance from the session that created them.

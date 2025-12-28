@@ -271,11 +271,17 @@ async fn run_exec_with_flags(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // Filter out INFO log lines from fcvm
+    // Filter out log lines from fcvm (INFO, WARN, DEBUG, TRACE, ERROR from tracing)
     let result: String = stdout
         .lines()
         .chain(stderr.lines())
-        .filter(|line| !line.contains("INFO") && !line.contains("WARN"))
+        .filter(|line| {
+            !line.contains(" INFO ")
+                && !line.contains(" WARN ")
+                && !line.contains(" DEBUG ")
+                && !line.contains(" TRACE ")
+                && !line.contains(" ERROR ")
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -328,13 +334,16 @@ async fn run_exec_with_tty(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // Filter out INFO log lines from fcvm and script artifacts
+    // Filter out log lines from fcvm and script artifacts
     let result: String = stdout
         .lines()
         .chain(stderr.lines())
         .filter(|line| {
-            !line.contains("INFO")
-                && !line.contains("WARN")
+            !line.contains(" INFO ")
+                && !line.contains(" WARN ")
+                && !line.contains(" DEBUG ")
+                && !line.contains(" TRACE ")
+                && !line.contains(" ERROR ")
                 && !line.contains("Script started")
                 && !line.contains("Script done")
                 && !line.is_empty()
