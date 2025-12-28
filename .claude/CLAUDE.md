@@ -265,49 +265,41 @@ git push origin feature-b --force
 
 ### PR Descriptions: Show, Don't Tell
 
-**Every PR MUST include evidence that it works.** Not claims - actual proof.
+**PRs should include evidence that changes work.** Actual output, not vague claims.
 
-#### Required Sections
+#### What to Include
 
-1. **What changed** - List specific files and changes
-2. **Why it changed** - The problem being solved
-3. **Test evidence** - Actual output showing it works
+- **Summary** - Brief description of what and why
+- **Test evidence** - Local test output is fine! Don't need to wait for CI.
 
-#### Good Example (CI fix PR)
+Be reasonable about detail level. Simple changes need simple evidence.
+
+#### Good Examples
 
 ```markdown
-## Changes
-- Fixed `cargo fmt` to only check workspace packages
-- Root cause: `--all` was checking fuse-backend-rs (external dep)
+## Fix cargo fmt scope
+Changed to only check workspace packages (not external deps).
 
-## Test Evidence
-
-### Before (failing):
-```
-Diff in /fuse-backend-rs/src/passthrough/sync_io.rs:2024
+Tested:
+  cargo fmt -p fcvm -p fuse-pipe --check  # passes
 ```
 
-### After (passing):
-```
-Check formatting... OK
-```
+```markdown
+## Add timeout parameter
+Tested locally:
+  make test-root FILTER=sanity  # passed in 45s
 ```
 
 #### Bad Example
 
 ```markdown
-## Changes
-- Fixed CI
-
-## Testing
-- Tested and it works
+Fixed CI. Tested and it works.
 ```
 
 **Why evidence matters:**
-- Proves the fix actually works, not just "looks right"
-- Helps future debugging if the issue recurs
-- CI logs are ephemeral - PR descriptions persist
-- Reviewers can verify without re-running
+- Proves the fix works, not just "looks right"
+- Local testing is sufficient - don't need CI green first
+- Helps future debugging if issues recur
 
 ### Commit Messages
 
