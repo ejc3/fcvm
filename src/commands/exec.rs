@@ -113,12 +113,16 @@ pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
     let vm_dir = paths::vm_runtime_dir(&vm_state.vm_id);
     let vsock_socket = vm_dir.join("vsock.sock");
 
-    info!(
-        vm_id = %vm_state.vm_id,
-        socket = %vsock_socket.display(),
-        port = EXEC_VSOCK_PORT,
-        "connecting to VM exec server via vsock"
-    );
+    // Suppress logs when in TTY or quiet mode (they mix with command output)
+    let quiet = args.quiet || args.tty;
+    if !quiet {
+        info!(
+            vm_id = %vm_state.vm_id,
+            socket = %vsock_socket.display(),
+            port = EXEC_VSOCK_PORT,
+            "connecting to VM exec server via vsock"
+        );
+    }
 
     // Connect to the vsock Unix socket
     let mut stream = UnixStream::connect(&vsock_socket).with_context(|| {
@@ -156,7 +160,9 @@ pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
         );
     }
 
-    info!("connected to guest exec server");
+    if !quiet {
+        info!("connected to guest exec server");
+    }
 
     // Check if stdin is a TTY
     let stdin_is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
@@ -185,7 +191,9 @@ pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
         (args.interactive, args.tty)
     } else if is_shell && stdin_is_tty {
         // Auto-detect: shell + TTY stdin = interactive mode
-        info!("auto-detected shell with TTY, enabling -it");
+        if !quiet {
+            info!("auto-detected shell with TTY, enabling -it");
+        }
         (true, true)
     } else {
         (false, false)
@@ -205,13 +213,15 @@ pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
     writeln!(stream, "{}", request_json)?;
     stream.flush()?;
 
-    info!(
-        command = ?args.command,
-        in_container = !args.vm,
-        interactive,
-        tty,
-        "sent exec request"
-    );
+    if !quiet {
+        info!(
+            command = ?args.command,
+            in_container = !args.vm,
+            interactive,
+            tty,
+            "sent exec request"
+        );
+    }
 
     if tty {
         run_tty_mode(stream)
