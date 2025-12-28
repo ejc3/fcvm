@@ -8,6 +8,10 @@ FUSER ?= /home/ubuntu/fuser
 CONTAINER_TAG := fcvm-test:latest
 CONTAINER_ARCH ?= aarch64
 
+# Per-mode data directories (prevents UID conflicts between test modes)
+ROOT_DATA_DIR := /mnt/fcvm-btrfs/root
+CONTAINER_DATA_DIR := /mnt/fcvm-btrfs/container
+
 # Test options: FILTER=pattern STREAM=1 LIST=1
 FILTER ?=
 ifeq ($(STREAM),1)
@@ -51,7 +55,8 @@ CONTAINER_RUN := podman run --rm --privileged \
 	-v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs -v $(FUSER):/workspace/fuser \
 	--device /dev/fuse --device /dev/kvm \
 	--ulimit nofile=65536:65536 --pids-limit=65536 -v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
-	-v $(TEST_LOG_DIR):$(TEST_LOG_DIR) $(CARGO_CACHE_MOUNT)
+	-v $(TEST_LOG_DIR):$(TEST_LOG_DIR) $(CARGO_CACHE_MOUNT) \
+	-e FCVM_DATA_DIR=$(CONTAINER_DATA_DIR)
 
 .PHONY: all help build clean clean-target clean-test-data check-disk \
 	test test-unit test-fast test-all test-root \
@@ -95,12 +100,16 @@ clean-target:
 clean-test-data:
 	@echo "==> Cleaning leftover VM disks..."
 	sudo rm -rf /mnt/fcvm-btrfs/vm-disks/*
+	sudo rm -rf $(ROOT_DATA_DIR)/vm-disks/* $(CONTAINER_DATA_DIR)/vm-disks/*
 	@echo "==> Cleaning snapshots..."
 	sudo rm -rf /mnt/fcvm-btrfs/snapshots/*
+	sudo rm -rf $(ROOT_DATA_DIR)/snapshots/* $(CONTAINER_DATA_DIR)/snapshots/*
 	@echo "==> Cleaning state files..."
 	sudo rm -rf /mnt/fcvm-btrfs/state/*.json
+	sudo rm -rf $(ROOT_DATA_DIR)/state/*.json $(CONTAINER_DATA_DIR)/state/*.json
 	@echo "==> Cleaning UFFD sockets..."
 	sudo rm -f /mnt/fcvm-btrfs/uffd-*.sock
+	sudo rm -f $(ROOT_DATA_DIR)/uffd-*.sock $(CONTAINER_DATA_DIR)/uffd-*.sock
 	@echo "==> Cleaning test logs..."
 	rm -rf /tmp/fcvm-test-logs/*
 	@echo "==> Cleaned test data (preserved cached assets)"
@@ -130,6 +139,7 @@ _test-all:
 	$(NEXTEST) $(NEXTEST_CAPTURE) $(FILTER)
 
 _test-root:
+	FCVM_DATA_DIR=$(ROOT_DATA_DIR) \
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
 	$(NEXTEST) $(NEXTEST_CAPTURE) --features privileged-tests $(FILTER)
@@ -190,6 +200,9 @@ setup-btrfs:
 		sudo chown -R $$(id -un):$$(id -gn) /mnt/fcvm-btrfs && \
 		echo '==> btrfs ready at /mnt/fcvm-btrfs'; \
 	fi
+	@# Create per-mode data directories with world-writable permissions
+	@sudo mkdir -p $(ROOT_DATA_DIR)/{state,snapshots,vm-disks} && sudo chmod -R 777 $(ROOT_DATA_DIR)
+	@sudo mkdir -p $(CONTAINER_DATA_DIR)/{state,snapshots,vm-disks} && sudo chmod -R 777 $(CONTAINER_DATA_DIR)
 
 setup-fcvm: build setup-btrfs
 	@FREE_GB=$$(df -BG /mnt/fcvm-btrfs 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \

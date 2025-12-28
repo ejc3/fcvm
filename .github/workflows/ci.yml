@@ -51,9 +51,15 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Get dependency SHAs
+        id: deps
+        run: |
+          echo "fuser=$(git -C fuser rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "fuse-backend-rs=$(git -C fuse-backend-rs rev-parse HEAD)" >> $GITHUB_OUTPUT
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fcvm -> target
+          shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev libclang-dev clang
       - name: Install cargo tools
@@ -92,9 +98,15 @@ jobs:
           path: fuser
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: Get dependency SHAs
+        id: deps
+        run: |
+          echo "fuser=$(git -C fuser rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "fuse-backend-rs=$(git -C fuse-backend-rs rev-parse HEAD)" >> $GITHUB_OUTPUT
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fcvm -> target
+          shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev libclang-dev clang
       - name: Build release
@@ -128,11 +140,17 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - name: Get dependency SHAs
+        id: deps
+        run: |
+          echo "fuser=$(git -C fuser rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "fuse-backend-rs=$(git -C fuse-backend-rs rev-parse HEAD)" >> $GITHUB_OUTPUT
       - uses: Swatinem/rust-cache@v2
         with:
           cache-provider: buildjet
           workspaces: fcvm -> target
           cache-on-failure: "true"
+          shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
       - name: Install dependencies
         run: |
           sudo apt-get update

@@ -432,24 +432,33 @@ async fn start_http_server(port: u16) -> Result<tokio::process::Child> {
         .spawn()
         .context("starting Python HTTP server")?;
 
-    // Give it a moment to start
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Wait for server to start with retries (container environments may be slower)
+    for attempt in 1..=10 {
+        tokio::time::sleep(Duration::from_millis(200 * attempt)).await;
 
-    // Verify it's running
-    let check = tokio::process::Command::new("curl")
-        .args([
-            "-s",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            &format!("http://127.0.0.1:{}/", port),
-        ])
-        .output()
-        .await?;
+        let check = tokio::process::Command::new("curl")
+            .args([
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                &format!("http://127.0.0.1:{}/", port),
+            ])
+            .output()
+            .await?;
 
-    if String::from_utf8_lossy(&check.stdout).trim() != "200" {
-        anyhow::bail!("HTTP server not responding on port {}", port);
+        if String::from_utf8_lossy(&check.stdout).trim() == "200" {
+            return Ok(child);
+        }
+
+        if attempt == 10 {
+            anyhow::bail!(
+                "HTTP server not responding on port {} after {} attempts",
+                port,
+                attempt
+            );
+        }
     }
 
     Ok(child)
