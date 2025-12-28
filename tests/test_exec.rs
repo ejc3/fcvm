@@ -11,6 +11,7 @@
 mod common;
 
 use anyhow::{Context, Result};
+use std::process::Stdio;
 use std::time::Duration;
 
 #[cfg(feature = "privileged-tests")]
@@ -164,8 +165,14 @@ async fn exec_test_impl(network: &str) -> Result<()> {
     // Test 9: TTY allocated WITH -t flag (VM exec)
     // Uses `script` to provide a PTY for the test harness
     println!("\nTest 9: TTY with -t flag (VM)");
-    let output =
-        run_exec_with_tty(&fcvm_path, fcvm_pid, ExecFlags::vm().with_tty(), &["tty"]).await?;
+    let (_, _, output) = run_exec_tty(
+        &fcvm_path,
+        fcvm_pid,
+        true,
+        &["tty"],
+        InterruptCondition::None,
+    )
+    .await?;
     println!("  tty output: {}", output.trim());
     // With TTY, should return a device path like /dev/pts/0
     assert!(
@@ -176,11 +183,12 @@ async fn exec_test_impl(network: &str) -> Result<()> {
 
     // Test 10: TTY allocated WITH -t flag (container exec)
     println!("\nTest 10: TTY with -t flag (container)");
-    let output = run_exec_with_tty(
+    let (_, _, output) = run_exec_tty(
         &fcvm_path,
         fcvm_pid,
-        ExecFlags::container().with_tty(),
+        false,
         &["tty"],
+        InterruptCondition::None,
     )
     .await?;
     println!("  tty output: {}", output.trim());
@@ -190,73 +198,71 @@ async fn exec_test_impl(network: &str) -> Result<()> {
         output
     );
 
+    // Test 11: TTY mode interrupt with SIGINT (Ctrl+C)
+    // Print READY then sleep - we poll for READY, then send SIGINT
+    println!("\nTest 11: TTY interrupt with SIGINT (VM)");
+    let (exit_code, duration, output) = run_exec_tty(
+        &fcvm_path,
+        fcvm_pid,
+        true,
+        &["sh", "-c", "echo READY; sleep 999"],
+        InterruptCondition::WaitForOutput("READY"),
+    )
+    .await?;
+    println!("  exit code: {}, duration: {:?}", exit_code, duration);
+    assert!(
+        output.contains("READY"),
+        "should see READY before interrupt, got: {}",
+        output
+    );
+    println!("  ✓ sleep was interrupted by SIGINT");
+
+    // Test 12: Verify Ctrl-C interrupts a shell script before completion
+    // Script prints STARTED, sleeps, then prints FINISHED
+    // We interrupt after seeing STARTED - should NOT see FINISHED
+    println!("\nTest 12: Ctrl-C interrupts shell script (VM)");
+    let (exit_code, duration, output) = run_exec_tty(
+        &fcvm_path,
+        fcvm_pid,
+        true,
+        &["sh", "-c", "echo STARTED; sleep 999; echo FINISHED"],
+        InterruptCondition::WaitForOutput("STARTED"),
+    )
+    .await?;
+    println!("  exit code: {}, duration: {:?}", exit_code, duration);
+    println!("  output: {}", output.trim());
+    // Should see STARTED but not FINISHED (interrupted by ^C)
+    assert!(
+        output.contains("STARTED"),
+        "should see STARTED before interrupt, got: {}",
+        output
+    );
+    assert!(
+        !output.contains("FINISHED"),
+        "should NOT see FINISHED (interrupted), got: {}",
+        output
+    );
+    println!("  ✓ script was interrupted by Ctrl-C");
+
     // Cleanup
     println!("\nCleaning up...");
     common::kill_process(fcvm_pid).await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
 
     println!("✅ EXEC TEST PASSED! (network: {})", network);
     Ok(())
 }
 
-/// Exec flags for tests
-#[derive(Default)]
-struct ExecFlags {
-    in_vm: bool,
-    interactive: bool,
-    tty: bool,
-}
-
-impl ExecFlags {
-    fn vm() -> Self {
-        Self {
-            in_vm: true,
-            ..Default::default()
-        }
-    }
-
-    fn container() -> Self {
-        Self::default()
-    }
-
-    fn with_tty(mut self) -> Self {
-        self.tty = true;
-        self
-    }
-}
-
-/// Run fcvm exec and return stdout
+/// Run fcvm exec (no TTY) and return stdout
 async fn run_exec(
     fcvm_path: &std::path::Path,
     pid: u32,
     in_vm: bool,
     cmd: &[&str],
 ) -> Result<String> {
-    let flags = if in_vm {
-        ExecFlags::vm()
-    } else {
-        ExecFlags::container()
-    };
-    run_exec_with_flags(fcvm_path, pid, flags, cmd).await
-}
-
-/// Run fcvm exec with flags and return stdout
-async fn run_exec_with_flags(
-    fcvm_path: &std::path::Path,
-    pid: u32,
-    flags: ExecFlags,
-    cmd: &[&str],
-) -> Result<String> {
     let pid_str = pid.to_string();
     let mut args = vec!["exec", "--pid", &pid_str];
-    if flags.in_vm {
+    if in_vm {
         args.push("--vm");
-    }
-    if flags.interactive {
-        args.push("-i");
-    }
-    if flags.tty {
-        args.push("-t");
     }
     args.push("--");
     args.extend(cmd.iter().copied());
@@ -288,63 +294,131 @@ async fn run_exec_with_flags(
     Ok(result)
 }
 
-/// Run fcvm exec with TTY using `script` to provide a PTY
-/// The `script` command allocates a pseudo-terminal, allowing us to test TTY mode
-async fn run_exec_with_tty(
+/// Interrupt condition for TTY exec
+enum InterruptCondition {
+    /// No interrupt - wait for command to complete naturally
+    None,
+    /// Send SIGINT after seeing this string in output
+    WaitForOutput(&'static str),
+}
+
+/// Run fcvm exec with TTY (uses `script` to allocate PTY)
+///
+/// Returns (exit_code, duration, output)
+async fn run_exec_tty(
     fcvm_path: &std::path::Path,
     pid: u32,
-    flags: ExecFlags,
+    in_vm: bool,
     cmd: &[&str],
-) -> Result<String> {
+    interrupt: InterruptCondition,
+) -> Result<(i32, Duration, String)> {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+    use tokio::io::AsyncReadExt;
+
     let pid_str = pid.to_string();
 
-    // Build the fcvm exec command string
+    // Build the fcvm exec command with proper shell quoting
     let mut fcvm_args = vec![
-        fcvm_path.to_string_lossy().to_string(),
+        shell_words::quote(&fcvm_path.to_string_lossy()).into_owned(),
         "exec".to_string(),
         "--pid".to_string(),
         pid_str,
+        "-t".to_string(), // TTY mode
     ];
-    if flags.in_vm {
+    if in_vm {
         fcvm_args.push("--vm".to_string());
     }
-    if flags.interactive {
-        fcvm_args.push("-i".to_string());
-    }
-    if flags.tty {
-        fcvm_args.push("-t".to_string());
-    }
     fcvm_args.push("--".to_string());
-    fcvm_args.extend(cmd.iter().map(|s| s.to_string()));
+    // Shell-escape each command argument
+    fcvm_args.extend(cmd.iter().map(|s| shell_words::quote(s).into_owned()));
 
     // Join into a single command for script -c
     let fcvm_cmd = fcvm_args.join(" ");
+    let start = std::time::Instant::now();
 
-    // Use script to wrap the command with a PTY
+    // Use script to wrap the command with a PTY (test harness doesn't have a TTY)
     // -q: quiet mode (no "Script started" message)
     // -c: run command instead of shell
     // /dev/null: discard typescript file
-    // Note: -t flag now auto-suppresses fcvm logs, so no filtering needed
-    let output = tokio::process::Command::new("script")
+    let mut child = tokio::process::Command::new("script")
         .args(["-q", "-c", &fcvm_cmd, "/dev/null"])
-        .output()
-        .await
-        .context("running fcvm exec with script")?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning fcvm exec with script")?;
 
-    // Combine stdout and stderr
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let child_pid = child.id().context("getting child pid")?;
 
-    // Filter out script artifacts and empty lines only
-    // (fcvm logs are now suppressed by -t flag)
-    let result: String = stdout
+    let (status, collected_output) = match interrupt {
+        InterruptCondition::None => {
+            // Use wait_with_output for atomic output collection
+            let output = child
+                .wait_with_output()
+                .await
+                .context("waiting for child")?;
+            (output.status, output.stdout)
+        }
+        InterruptCondition::WaitForOutput(expected) => {
+            // Take stdout for incremental reading
+            let mut stdout = child.stdout.take().context("taking stdout")?;
+            let mut collected = Vec::new();
+
+            // Poll for expected output, then send SIGINT
+            let mut buf = [0u8; 256];
+            let timeout = Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + timeout;
+
+            loop {
+                if std::time::Instant::now() > deadline {
+                    kill(Pid::from_raw(child_pid as i32), Signal::SIGKILL).ok();
+                    anyhow::bail!("timeout waiting for '{}' in output", expected);
+                }
+
+                // Read with timeout
+                match tokio::time::timeout(Duration::from_millis(100), stdout.read(&mut buf)).await
+                {
+                    Ok(Ok(0)) => break, // EOF
+                    Ok(Ok(n)) => {
+                        collected.extend_from_slice(&buf[..n]);
+                        let output_str = String::from_utf8_lossy(&collected);
+                        if output_str.contains(expected) {
+                            // Found expected output - send SIGINT
+                            kill(Pid::from_raw(child_pid as i32), Signal::SIGINT).ok();
+                            // Continue reading remaining output
+                            stdout
+                                .read_to_end(&mut collected)
+                                .await
+                                .context("reading remaining stdout")?;
+                            break;
+                        }
+                    }
+                    Ok(Err(e)) => return Err(e).context("reading stdout"),
+                    Err(_) => continue, // Timeout, try again
+                }
+            }
+
+            // Wait for the process to exit
+            let status = child.wait().await.context("waiting for child")?;
+            (status, collected)
+        }
+    };
+
+    let duration = start.elapsed();
+    let exit_code = status.code().unwrap_or(-1);
+
+    // Filter script artifacts from output
+    let stdout_str = String::from_utf8_lossy(&collected_output);
+    let combined: String = stdout_str
         .lines()
-        .chain(stderr.lines())
         .filter(|line| {
-            !line.contains("Script started") && !line.contains("Script done") && !line.is_empty()
+            !line.contains("Script started")
+                && !line.contains("Script done")
+                && !line.contains("Session terminated")
+                && !line.is_empty()
         })
         .collect::<Vec<_>>()
         .join("\n");
 
-    Ok(result)
+    Ok((exit_code, duration, combined))
 }
