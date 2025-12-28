@@ -804,9 +804,6 @@ fn handle_exec_connection_blocking(fd: i32) {
 
 /// Handle exec in TTY mode with PTY allocation
 fn handle_exec_tty(fd: i32, request: &ExecRequest) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-
     // Allocate a PTY
     let mut master_fd: libc::c_int = 0;
     let mut slave_fd: libc::c_int = 0;
@@ -912,16 +909,38 @@ fn handle_exec_tty(fd: i32, request: &ExecRequest) {
     // Parent process
     unsafe { libc::close(slave_fd) };
 
-    let done = Arc::new(AtomicBool::new(false));
+    // Dup fd for the reader thread (both threads need to use the same vsock)
+    // Reader writes to vsock, writer reads from vsock
+    let fd_for_reader = unsafe { libc::dup(fd) };
+    if fd_for_reader < 0 {
+        let response = ExecResponse::Error("Failed to dup fd".to_string());
+        write_line_to_fd(fd, &serde_json::to_string(&response).unwrap());
+        unsafe {
+            libc::close(master_fd);
+            libc::close(fd);
+        }
+        return;
+    }
+
+    // Dup master_fd for the reader thread
+    let master_fd_for_reader = unsafe { libc::dup(master_fd) };
+    if master_fd_for_reader < 0 {
+        let response = ExecResponse::Error("Failed to dup master_fd".to_string());
+        write_line_to_fd(fd, &serde_json::to_string(&response).unwrap());
+        unsafe {
+            libc::close(master_fd);
+            libc::close(fd);
+            libc::close(fd_for_reader);
+        }
+        return;
+    }
 
     // Thread: read from vsock (fd), write to PTY master
-    let done_writer = done.clone();
-    let _writer_thread = std::thread::spawn(move || {
+    // Exits when read returns EOF (we'll shutdown fd read side after child exits)
+    // Does NOT own the fds - main thread will close them
+    let writer_thread = std::thread::spawn(move || {
         let mut buf = [0u8; 1024];
         loop {
-            if done_writer.load(Ordering::Relaxed) {
-                break;
-            }
             let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n <= 0 {
                 break;
@@ -932,26 +951,40 @@ fn handle_exec_tty(fd: i32, request: &ExecRequest) {
                 break;
             }
         }
+        // Don't close - main thread owns fd and master_fd
     });
 
-    // Thread: read from PTY master, write to vsock (fd)
-    let done_reader = done.clone();
-    let _reader_thread = std::thread::spawn(move || {
+    // Thread: read from PTY master, write to vsock
+    // Owns the duped fds and closes them when done
+    let reader_thread = std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
-            if done_reader.load(Ordering::Relaxed) {
-                break;
-            }
-            let n =
-                unsafe { libc::read(master_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            let n = unsafe {
+                libc::read(
+                    master_fd_for_reader,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
             if n <= 0 {
+                // EOF or error - child has exited and we've drained the buffer
                 break;
             }
-            let written =
-                unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, n as usize) };
+            let written = unsafe {
+                libc::write(
+                    fd_for_reader,
+                    buf.as_ptr() as *const libc::c_void,
+                    n as usize,
+                )
+            };
             if written <= 0 {
                 break;
             }
+        }
+        // Close our duped fds
+        unsafe {
+            libc::close(master_fd_for_reader);
+            libc::close(fd_for_reader);
         }
     });
 
@@ -967,11 +1000,16 @@ fn handle_exec_tty(fd: i32, request: &ExecRequest) {
         1
     };
 
-    // Signal threads to stop
-    done.store(true, Ordering::Relaxed);
+    // Wait for reader thread to finish draining PTY buffer
+    // Reader will get EOF from master_fd when all child output is read
+    let _ = reader_thread.join();
 
-    // Give threads time to finish
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    // Shutdown the vsock read side to unblock the writer thread
+    // This causes read(fd) to return 0 (EOF)
+    unsafe { libc::shutdown(fd, libc::SHUT_RD) };
+
+    // Now writer thread will exit, join it
+    let _ = writer_thread.join();
 
     // Send exit code (in TTY mode, send as raw JSON line)
     let response = ExecResponse::Exit(exit_code);
