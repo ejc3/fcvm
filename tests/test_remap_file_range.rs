@@ -73,14 +73,7 @@ async fn run_remap_test_in_vm(test_name: &str, test_script: &str) -> Result<()> 
 
     // Start VM (with optional patched kernel)
     let mut cmd = tokio::process::Command::new(&fcvm_path);
-    let mut args = vec![
-        "podman",
-        "run",
-        "--name",
-        &vm_name,
-        "--network",
-        "bridged",
-    ];
+    let mut args = vec!["podman", "run", "--name", &vm_name, "--network", "bridged"];
 
     // Add --kernel only if REMAP_KERNEL is set
     let kernel_ref: String;
@@ -92,8 +85,8 @@ async fn run_remap_test_in_vm(test_name: &str, test_script: &str) -> Result<()> 
 
     args.extend(["--map", &map_arg, "--cmd", test_script, "alpine:latest"]);
     cmd.args(&args)
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     if let Ok(sudo_user) = std::env::var("SUDO_USER") {
         cmd.env("SUDO_USER", sudo_user);
@@ -235,8 +228,8 @@ async fn test_libfuse_remap_container() {
 
     args.push("localhost/libfuse-remap-test");
     cmd.args(&args)
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     if let Ok(sudo_user) = std::env::var("SUDO_USER") {
         cmd.env("SUDO_USER", sudo_user);

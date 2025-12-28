@@ -64,17 +64,15 @@ async fn run_category_in_vm(category: &str) -> Result<()> {
             .context("building pjdfstest container")?;
 
         if !build.status.success() {
-            // Release lock before bailing
-            let _ = lock_file.unlock();
+            // lock_file is dropped here, releasing lock
             anyhow::bail!(
                 "Failed to build pjdfstest: {}",
                 String::from_utf8_lossy(&build.stderr)
             );
         }
     }
-
     // Release lock - image is now available
-    let _ = lock_file.unlock();
+    drop(lock_file);
 
     // Create temp directory for FUSE mount
     let data_dir = format!("/tmp/fuse-{}-data", test_id);

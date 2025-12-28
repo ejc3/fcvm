@@ -1113,10 +1113,10 @@ impl FilesystemHandler for PassthroughFs {
 
     fn copy_file_range(
         &self,
-        _ino_in: u64,
+        ino_in: u64,
         fh_in: u64,
         offset_in: u64,
-        _ino_out: u64,
+        ino_out: u64,
         fh_out: u64,
         offset_out: u64,
         len: u64,
@@ -1124,39 +1124,30 @@ impl FilesystemHandler for PassthroughFs {
     ) -> VolumeResponse {
         tracing::debug!(
             target: "passthrough",
-            fh_in, offset_in, fh_out, offset_out, len, flags,
+            ino_in, fh_in, offset_in, ino_out, fh_out, offset_out, len, flags,
             "copy_file_range"
         );
 
-        // fh_in and fh_out are raw file descriptors from the underlying filesystem
-        let fd_in = fh_in as libc::c_int;
-        let fd_out = fh_out as libc::c_int;
-        let mut off_in = offset_in as libc::off64_t;
-        let mut off_out = offset_out as libc::off64_t;
+        let ctx = Context::new();
 
-        // Call the copy_file_range syscall directly
-        // On btrfs, this creates a reflink (instant copy-on-write)
-        let result = unsafe {
-            libc::copy_file_range(
-                fd_in,
-                &mut off_in,
-                fd_out,
-                &mut off_out,
-                len as libc::size_t,
-                flags as libc::c_uint,
-            )
-        };
-
-        if result < 0 {
-            let errno = std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EIO);
-            tracing::debug!(target: "passthrough", errno, "copy_file_range failed");
-            VolumeResponse::error(errno)
-        } else {
-            tracing::debug!(target: "passthrough", copied = result, "copy_file_range succeeded");
-            VolumeResponse::Written {
-                size: result as u32,
+        match self.inner.copy_file_range(
+            &ctx,
+            ino_in,
+            fh_in,
+            offset_in,
+            ino_out,
+            fh_out,
+            offset_out,
+            len,
+            flags as u64,
+        ) {
+            Ok(n) => {
+                tracing::debug!(target: "passthrough", copied = n, "copy_file_range succeeded");
+                VolumeResponse::Written { size: n as u32 }
+            }
+            Err(e) => {
+                tracing::debug!(target: "passthrough", error = ?e, "copy_file_range failed");
+                VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO))
             }
         }
     }
@@ -1597,10 +1588,10 @@ mod tests {
 
         // Call remap_file_range (FICLONE equivalent - whole file)
         let resp = fs.remap_file_range(
-            src_ino, src_fh, 0,   // source: ino, fh, offset
-            dst_ino, dst_fh, 0,   // dest: ino, fh, offset
-            0,                    // len = 0 means whole file clone
-            0,                    // no special flags
+            src_ino, src_fh, 0, // source: ino, fh, offset
+            dst_ino, dst_fh, 0, // dest: ino, fh, offset
+            0, // len = 0 means whole file clone
+            0, // no special flags
         );
 
         match resp {
@@ -1628,7 +1619,10 @@ mod tests {
                 // EOPNOTSUPP or EINVAL is expected on filesystems without reflink support
                 // tmpfs returns EINVAL, ext4/xfs without reflinks return EOPNOTSUPP
                 if errno == libc::EOPNOTSUPP || errno == libc::EINVAL {
-                    eprintln!("FICLONE not supported on this filesystem (errno={}) - OK", errno);
+                    eprintln!(
+                        "FICLONE not supported on this filesystem (errno={}) - OK",
+                        errno
+                    );
                     // Check filesystem type
                     eprintln!("tempdir path: {:?}", dir.path());
                     // Try direct FICLONE to confirm
@@ -1649,7 +1643,10 @@ mod tests {
                     };
                     if result < 0 {
                         let err = std::io::Error::last_os_error();
-                        eprintln!("Direct FICLONE also failed: {} - filesystem doesn't support reflinks", err);
+                        eprintln!(
+                            "Direct FICLONE also failed: {} - filesystem doesn't support reflinks",
+                            err
+                        );
                     }
                 } else {
                     panic!(
@@ -1706,10 +1703,14 @@ mod tests {
 
         // Clone second block from source to first block of destination
         let resp = fs.remap_file_range(
-            src_ino, src_fh, block_size as u64,  // source offset: second block
-            dst_ino, dst_fh, 0,                  // dest offset: first block
-            block_size as u64,                   // length: one block
-            0,                                   // no special flags
+            src_ino,
+            src_fh,
+            block_size as u64, // source offset: second block
+            dst_ino,
+            dst_fh,
+            0,                 // dest offset: first block
+            block_size as u64, // length: one block
+            0,                 // no special flags
         );
 
         match resp {

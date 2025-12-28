@@ -1166,6 +1166,16 @@ async fn run_vm_setup(
         info!("fc-agent strace debugging enabled - output will be in /tmp/fc-agent.strace");
     }
 
+    // Nested virtualization boot parameters for ARM64 (only when using custom kernel).
+    // When --kernel is used with an inception kernel, FCVM_NV2=1 is set and Firecracker
+    // enables HAS_EL2 vCPU features. These kernel params help the guest initialize properly:
+    //
+    // - kvm-arm.mode=nvhe - Force guest KVM to use nVHE mode (proper for L1 guests)
+    // - numa=off - Disable NUMA to avoid percpu allocation issues in nested contexts
+    if args.kernel.is_some() {
+        boot_args.push_str(" kvm-arm.mode=nvhe numa=off");
+    }
+
     client
         .set_boot_source(crate::firecracker::api::BootSource {
             kernel_image_path: kernel_path.display().to_string(),

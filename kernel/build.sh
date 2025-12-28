@@ -1,19 +1,29 @@
 #!/bin/bash
 # Build a custom Linux kernel with FUSE and KVM support for fcvm inception
 #
-# The output kernel name includes version + build script hash for caching:
-#   vmlinux-{version}-{script_sha}.bin
+# Required env vars:
+#   KERNEL_PATH - output path (caller computes SHA-based filename)
 #
-# This script must be idempotent - it checks for existing builds before running.
+# Optional env vars:
+#   KERNEL_VERSION - kernel version (default: 6.12.10)
+#   BUILD_DIR - build directory (default: /tmp/kernel-build)
+#   NPROC - parallel jobs (default: nproc)
 
 set -euo pipefail
+
+# Validate required input
+if [[ -z "${KERNEL_PATH:-}" ]]; then
+    echo "ERROR: KERNEL_PATH env var required"
+    echo "Caller must compute the output path (including SHA)"
+    exit 1
+fi
 
 # Configuration
 KERNEL_VERSION="${KERNEL_VERSION:-6.12.10}"
 KERNEL_MAJOR="${KERNEL_VERSION%%.*}"
-OUTPUT_DIR="${OUTPUT_DIR:-/mnt/fcvm-btrfs/kernels}"
 BUILD_DIR="${BUILD_DIR:-/tmp/kernel-build}"
 NPROC="${NPROC:-$(nproc)}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Architecture detection
 ARCH=$(uname -m)
@@ -23,19 +33,9 @@ case "$ARCH" in
     *)       echo "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
-# Compute build script hash (for cache key)
-# Include build.sh, config, and all patches in the hash
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT_SHA=$(cat "$SCRIPT_DIR/build.sh" "$SCRIPT_DIR/inception.conf" "$SCRIPT_DIR/patches"/*.patch 2>/dev/null | sha256sum | cut -c1-12)
-
-# Output kernel name
-KERNEL_NAME="vmlinux-${KERNEL_VERSION}-${SCRIPT_SHA}.bin"
-KERNEL_PATH="${OUTPUT_DIR}/${KERNEL_NAME}"
-
 echo "=== fcvm Inception Kernel Build ==="
 echo "Kernel version: $KERNEL_VERSION"
 echo "Architecture: $KERNEL_ARCH"
-echo "Build script SHA: $SCRIPT_SHA"
 echo "Output: $KERNEL_PATH"
 echo ""
 
@@ -47,7 +47,7 @@ if [[ -f "$KERNEL_PATH" ]]; then
 fi
 
 # Create directories
-mkdir -p "$OUTPUT_DIR" "$BUILD_DIR"
+mkdir -p "$(dirname "$KERNEL_PATH")" "$BUILD_DIR"
 cd "$BUILD_DIR"
 
 # Download kernel source if needed
@@ -226,11 +226,27 @@ FC_CONFIG_URL="https://raw.githubusercontent.com/firecracker-microvm/firecracker
 echo "Downloading Firecracker base config..."
 curl -fSL "$FC_CONFIG_URL" -o .config
 
-# Enable FUSE, KVM, and BTRFS
-echo "Enabling FUSE, KVM, and BTRFS..."
-./scripts/config --enable CONFIG_FUSE_FS
-./scripts/config --enable CONFIG_VIRTUALIZATION
-./scripts/config --enable CONFIG_KVM
+# Apply options from inception.conf
+echo "Applying options from inception.conf..."
+INCEPTION_CONF="$SCRIPT_DIR/inception.conf"
+if [[ -f "$INCEPTION_CONF" ]]; then
+    # Parse each CONFIG_*=y line and enable it
+    while IFS= read -r line; do
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+        # Extract option name (everything before =)
+        if [[ "$line" =~ ^(CONFIG_[A-Z0-9_]+)=y ]]; then
+            opt="${BASH_REMATCH[1]}"
+            echo "  Enabling $opt"
+            ./scripts/config --enable "$opt"
+        fi
+    done < "$INCEPTION_CONF"
+else
+    echo "  WARNING: $INCEPTION_CONF not found"
+fi
+
+# Also enable BTRFS (always needed for fcvm)
 ./scripts/config --enable CONFIG_BTRFS_FS
 
 # Update config with defaults for new options
@@ -239,7 +255,7 @@ make ARCH="$KERNEL_ARCH" olddefconfig
 # Show enabled options
 echo ""
 echo "Verifying configuration:"
-grep -E "^CONFIG_(FUSE_FS|KVM|VIRTUALIZATION|BTRFS_FS)=" .config || true
+grep -E "^CONFIG_(FUSE_FS|KVM|VIRTUALIZATION|BTRFS_FS|TUN|VETH)=" .config || true
 echo ""
 
 # Build kernel

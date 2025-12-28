@@ -189,6 +189,12 @@ impl VmManager {
         // Disable seccomp for now (can enable later for production)
         cmd.arg("--no-seccomp");
 
+        // Enable nested virtualization (ARM64 NV2) if FCVM_NV2=1
+        if std::env::var("FCVM_NV2").map(|v| v == "1").unwrap_or(false) {
+            info!(target: "vm", "Enabling nested virtualization (--enable-nv2)");
+            cmd.arg("--enable-nv2");
+        }
+
         // Setup namespace isolation if specified (network namespace and/or mount namespace)
         // We need to handle these in a single pre_exec because it can only be called once
         let ns_id_clone = self.namespace_id.clone();
