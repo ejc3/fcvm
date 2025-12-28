@@ -48,6 +48,13 @@ impl StateManager {
     /// and its PID was reused by the OS). We delete it to prevent collisions
     /// when querying by PID.
     pub async fn save_state(&self, state: &VmState) -> Result<()> {
+        tracing::debug!(
+            vm_id = %state.vm_id,
+            pid = ?state.pid,
+            state_dir = %self.state_dir.display(),
+            "save_state: starting save"
+        );
+
         // Clean up any stale state files that claim our PID
         // This happens when a VM crashes and its PID is later reused
         if let Some(pid) = state.pid {
@@ -113,6 +120,13 @@ impl StateManager {
                 .await
                 .context("renaming temp state file")?;
 
+            tracing::debug!(
+                vm_id = %state.vm_id,
+                pid = ?state.pid,
+                path = %state_file.display(),
+                "save_state: successfully saved state"
+            );
+
             Ok::<(), anyhow::Error>(())
         }
         .await;
@@ -143,10 +157,28 @@ impl StateManager {
         let lock_file = self.state_dir.join(format!("{}.json.lock", vm_id));
         let temp_file = self.state_dir.join(format!("{}.json.tmp", vm_id));
 
+        tracing::debug!(
+            vm_id = vm_id,
+            path = %state_file.display(),
+            "delete_state: deleting state file"
+        );
+
         // Delete state file - ignore NotFound (TOCTOU race / concurrent cleanup)
         match fs::remove_file(&state_file).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(()) => {
+                tracing::debug!(
+                    vm_id = vm_id,
+                    path = %state_file.display(),
+                    "delete_state: successfully deleted state file"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!(
+                    vm_id = vm_id,
+                    path = %state_file.display(),
+                    "delete_state: state file already gone (NotFound)"
+                );
+            }
             Err(e) => return Err(e).context("deleting VM state"),
         }
 
@@ -164,10 +196,25 @@ impl StateManager {
     /// This frees up loopback IPs that were allocated but not properly cleaned up
     /// (e.g., due to crashes or SIGKILL). Called lazily during IP allocation.
     async fn cleanup_stale_state(&self) {
+        tracing::debug!(
+            state_dir = %self.state_dir.display(),
+            "cleanup_stale_state: starting scan"
+        );
+
         let entries = match std::fs::read_dir(&self.state_dir) {
             Ok(entries) => entries,
-            Err(_) => return,
+            Err(e) => {
+                tracing::debug!(
+                    state_dir = %self.state_dir.display(),
+                    error = %e,
+                    "cleanup_stale_state: failed to read directory"
+                );
+                return;
+            }
         };
+
+        let mut examined = 0;
+        let mut removed = 0;
 
         for entry in entries.flatten() {
             let path = entry.path();
@@ -180,7 +227,17 @@ impl StateManager {
                         if let Some(pid) = state.get("pid").and_then(|p| p.as_u64()) {
                             // Check if process exists
                             let proc_path = format!("/proc/{}", pid);
-                            if !std::path::Path::new(&proc_path).exists() {
+                            let proc_exists = std::path::Path::new(&proc_path).exists();
+
+                            examined += 1;
+                            tracing::trace!(
+                                pid = pid,
+                                path = %path.display(),
+                                proc_exists = proc_exists,
+                                "cleanup_stale_state: examined state file"
+                            );
+
+                            if !proc_exists {
                                 // Process doesn't exist - remove stale state
                                 tracing::warn!(
                                     pid = pid,
@@ -191,12 +248,19 @@ impl StateManager {
                                 // Also remove lock file if exists
                                 let lock_path = path.with_extension("json.lock");
                                 let _ = std::fs::remove_file(&lock_path);
+                                removed += 1;
                             }
                         }
                     }
                 }
             }
         }
+
+        tracing::debug!(
+            examined = examined,
+            removed = removed,
+            "cleanup_stale_state: scan complete"
+        );
     }
 
     /// Load VM state by name
@@ -209,10 +273,58 @@ impl StateManager {
 
     /// Load VM state by PID
     pub async fn load_state_by_pid(&self, pid: u32) -> Result<VmState> {
+        tracing::debug!(pid = pid, "load_state_by_pid: searching for VM");
+
         let vms = self.list_vms().await?;
-        vms.into_iter()
-            .find(|vm| vm.pid == Some(pid))
-            .ok_or_else(|| anyhow::anyhow!("VM not found with PID: {}", pid))
+        let vm_count = vms.len();
+
+        tracing::debug!(
+            pid = pid,
+            vm_count = vm_count,
+            "load_state_by_pid: found {} VMs to search",
+            vm_count
+        );
+
+        // Log each VM we're checking
+        for vm in &vms {
+            tracing::trace!(
+                search_pid = pid,
+                vm_pid = ?vm.pid,
+                vm_id = %vm.vm_id,
+                vm_name = ?vm.name,
+                "load_state_by_pid: checking VM"
+            );
+        }
+
+        match vms.into_iter().find(|vm| vm.pid == Some(pid)) {
+            Some(vm) => {
+                tracing::debug!(
+                    pid = pid,
+                    vm_id = %vm.vm_id,
+                    vm_name = ?vm.name,
+                    "load_state_by_pid: found matching VM"
+                );
+                Ok(vm)
+            }
+            None => {
+                // Log all available PIDs to help debug
+                let available_pids: Vec<u32> = self
+                    .list_vms()
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|v| v.pid)
+                    .collect();
+
+                tracing::error!(
+                    search_pid = pid,
+                    available_pids = ?available_pids,
+                    state_dir = %self.state_dir.display(),
+                    "load_state_by_pid: VM not found - no state file has this PID"
+                );
+                Err(anyhow::anyhow!("No VM found with PID: {}", pid))
+            }
+        }
     }
 
     /// List all VMs
@@ -220,8 +332,17 @@ impl StateManager {
         let mut vms = Vec::new();
 
         if !self.state_dir.exists() {
+            tracing::trace!(
+                state_dir = %self.state_dir.display(),
+                "list_vms: state directory does not exist"
+            );
             return Ok(vms);
         }
+
+        tracing::trace!(
+            state_dir = %self.state_dir.display(),
+            "list_vms: scanning directory"
+        );
 
         let mut entries = fs::read_dir(&self.state_dir)
             .await
@@ -230,13 +351,42 @@ impl StateManager {
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                if let Ok(state_json) = fs::read_to_string(&path).await {
-                    if let Ok(state) = serde_json::from_str::<VmState>(&state_json) {
-                        vms.push(state);
+                tracing::trace!(
+                    path = %path.display(),
+                    "list_vms: reading state file"
+                );
+
+                match fs::read_to_string(&path).await {
+                    Ok(state_json) => match serde_json::from_str::<VmState>(&state_json) {
+                        Ok(state) => {
+                            tracing::trace!(
+                                path = %path.display(),
+                                vm_id = %state.vm_id,
+                                pid = ?state.pid,
+                                "list_vms: parsed state file"
+                            );
+                            vms.push(state);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %path.display(),
+                                error = %e,
+                                "list_vms: failed to parse state file"
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "list_vms: failed to read state file"
+                        );
                     }
                 }
             }
         }
+
+        tracing::trace!(vm_count = vms.len(), "list_vms: scan complete");
 
         Ok(vms)
     }

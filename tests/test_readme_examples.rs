@@ -459,7 +459,11 @@ async fn test_custom_command_bridged() -> Result<()> {
     println!("Checking nginx is serving requests...");
     let output =
         common::exec_in_container(fcvm_pid, &["wget", "-q", "-O", "-", "http://localhost/"]).await;
-    assert!(output.is_ok(), "nginx should be responding to requests");
+    assert!(
+        output.is_ok(),
+        "nginx should be responding to requests: {:?}",
+        output.err()
+    );
     println!("  nginx is serving requests");
 
     // Cleanup
