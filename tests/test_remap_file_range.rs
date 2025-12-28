@@ -58,6 +58,9 @@ async fn run_remap_test_in_vm(test_name: &str, test_script: &str) -> Result<()> 
     let test_id = format!("remap-{}-{}", test_name, std::process::id());
     let vm_name = format!("remap-{}-{}", test_name, std::process::id());
 
+    // Create logger for file output
+    let logger = common::TestLogger::new(&format!("remap-{}", test_name));
+
     // Create btrfs-backed temp directory
     let data_dir = format!("/mnt/fcvm-btrfs/test-{}", test_id);
     tokio::fs::create_dir_all(&data_dir).await?;
@@ -94,10 +97,19 @@ async fn run_remap_test_in_vm(test_name: &str, test_script: &str) -> Result<()> 
 
     let mut child = cmd.spawn().context("spawning VM")?;
     let vm_pid = child.id().ok_or_else(|| anyhow::anyhow!("no VM PID"))?;
+    logger.info(&format!("Spawned VM PID={}", vm_pid));
 
-    // Consume output
-    common::spawn_log_consumer(child.stdout.take(), &format!("remap-{}", test_name));
-    common::spawn_log_consumer_stderr(child.stderr.take(), &format!("remap-{}", test_name));
+    // Consume output with file logging
+    common::spawn_log_consumer_with_logger(
+        child.stdout.take(),
+        &format!("remap-{}", test_name),
+        logger.clone(),
+    );
+    common::spawn_log_consumer_stderr_with_logger(
+        child.stderr.take(),
+        &format!("remap-{}", test_name),
+        logger.clone(),
+    );
 
     // Wait for completion (5 min timeout)
     let timeout = std::time::Duration::from_secs(300);
@@ -204,6 +216,9 @@ async fn test_ficlone_cp_reflink_in_vm() {
 async fn test_libfuse_remap_container() {
     let kernel = get_patched_kernel();
 
+    // Create logger for file output
+    let logger = common::TestLogger::new("libfuse-remap");
+
     let fcvm_path = common::find_fcvm_binary().expect("fcvm binary");
     let vm_name = format!("libfuse-remap-{}", std::process::id());
 
@@ -237,9 +252,14 @@ async fn test_libfuse_remap_container() {
 
     let mut child = cmd.spawn().expect("spawning VM");
     let vm_pid = child.id().expect("VM PID");
+    logger.info(&format!("Spawned VM PID={}", vm_pid));
 
-    common::spawn_log_consumer(child.stdout.take(), "libfuse-remap");
-    common::spawn_log_consumer_stderr(child.stderr.take(), "libfuse-remap");
+    common::spawn_log_consumer_with_logger(child.stdout.take(), "libfuse-remap", logger.clone());
+    common::spawn_log_consumer_stderr_with_logger(
+        child.stderr.take(),
+        "libfuse-remap",
+        logger.clone(),
+    );
 
     let timeout = std::time::Duration::from_secs(180);
     let result = tokio::time::timeout(timeout, child.wait()).await;

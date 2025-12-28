@@ -102,6 +102,9 @@ async fn test_copy_file_range_in_vm() -> Result<()> {
     println!("\nFUSE copy_file_range test (in VM with patched kernel)");
     println!("=====================================================");
 
+    // Create logger for file output
+    let logger = common::TestLogger::new("fuse-cfr");
+
     // Ensure inception kernel exists (includes FUSE remap_file_range patch)
     let inception_kernel = ensure_inception_kernel().await?;
 
@@ -216,10 +219,11 @@ echo "SUCCESS: copy_file_range works through FUSE!"
     let mut child = cmd.spawn().context("spawning VM")?;
     let vm_pid = child.id().ok_or_else(|| anyhow::anyhow!("no VM PID"))?;
     println!("  VM started (PID: {})", vm_pid);
+    logger.info(&format!("Spawned VM PID={}", vm_pid));
 
-    // Consume output
-    common::spawn_log_consumer(child.stdout.take(), "fuse-cfr");
-    common::spawn_log_consumer_stderr(child.stderr.take(), "fuse-cfr");
+    // Consume output with file logging
+    common::spawn_log_consumer_with_logger(child.stdout.take(), "fuse-cfr", logger.clone());
+    common::spawn_log_consumer_stderr_with_logger(child.stderr.take(), "fuse-cfr", logger.clone());
 
     // Wait for completion (5 min timeout)
     let timeout = std::time::Duration::from_secs(300);
