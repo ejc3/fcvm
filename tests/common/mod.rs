@@ -29,15 +29,33 @@ pub struct TestLogger {
 }
 
 impl TestLogger {
-    /// Create a new test logger. Logs are written to /tmp/fcvm-test-logs/{test_name}-{timestamp}.log
+    /// Create a new test logger. Logs are written to /tmp/fcvm-test-logs/{test_name}-{timestamp}-{pid}.log
     pub fn new(test_name: &str) -> Self {
         // Create log directory if needed
         std::fs::create_dir_all(TEST_LOG_DIR).ok();
 
+        // Include PID to avoid conflicts between host and container tests
         let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-        let log_path = PathBuf::from(format!("{}/{}-{}.log", TEST_LOG_DIR, test_name, timestamp));
+        let pid = std::process::id();
+        let log_path = PathBuf::from(format!(
+            "{}/{}-{}-{}.log",
+            TEST_LOG_DIR, test_name, timestamp, pid
+        ));
 
-        let file = std::fs::File::create(&log_path).expect("Failed to create test log file");
+        // Try to create the file, fall back to /tmp if log dir has permission issues
+        let (file, log_path) = match std::fs::File::create(&log_path) {
+            Ok(f) => (f, log_path),
+            Err(_) => {
+                // Fall back to /tmp with a unique name
+                let fallback = PathBuf::from(format!(
+                    "/tmp/fcvm-test-{}-{}-{}.log",
+                    test_name, timestamp, pid
+                ));
+                let f = std::fs::File::create(&fallback)
+                    .expect("Failed to create test log file even in /tmp");
+                (f, fallback)
+            }
+        };
 
         let logger = Self {
             test_name: test_name.to_string(),

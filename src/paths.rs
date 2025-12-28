@@ -15,7 +15,19 @@ const DEFAULT_BASE_DIR: &str = "/mnt/fcvm-btrfs";
 ///
 /// For inception support, each nesting level uses a different data_dir
 /// while sharing the same assets_dir for content-addressed files.
+///
+/// The FCVM_DATA_DIR environment variable overrides config data_dir,
+/// allowing test isolation between root/container/rootless modes.
 pub fn init_from_config() {
+    // Check for env var override first (test isolation)
+    if let Ok(data_dir) = std::env::var("FCVM_DATA_DIR") {
+        let (config, _, _) = crate::setup::rootfs::load_config(None)
+            .expect("Failed to load config - run 'fcvm setup --generate-config' first");
+        let _ = DATA_DIR.set(PathBuf::from(data_dir));
+        let _ = ASSETS_DIR.set(PathBuf::from(&config.paths.assets_dir));
+        return;
+    }
+
     let (config, _, _) = crate::setup::rootfs::load_config(None)
         .expect("Failed to load config - run 'fcvm setup --generate-config' first");
     let _ = DATA_DIR.set(PathBuf::from(&config.paths.data_dir));
@@ -38,9 +50,14 @@ pub fn init_with_paths(data_dir: impl Into<PathBuf>, assets_dir: impl Into<PathB
 
 /// Directory for mutable per-instance data (vm-disks, state, snapshots).
 /// Configure via `paths.data_dir` in rootfs-config.toml for inception nesting.
+/// FCVM_DATA_DIR environment variable overrides config value.
 pub fn data_dir() -> PathBuf {
     DATA_DIR
         .get_or_init(|| {
+            // Check env var first (test isolation)
+            if let Ok(data_dir) = std::env::var("FCVM_DATA_DIR") {
+                return PathBuf::from(data_dir);
+            }
             let (config, _, _) =
                 crate::setup::rootfs::load_config(None).expect("Failed to load config");
             PathBuf::from(&config.paths.data_dir)
