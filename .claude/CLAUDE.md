@@ -20,6 +20,9 @@ fcvm is a Firecracker VM manager for running Podman containers in lightweight mi
 
 fcvm supports running inside another fcvm VM ("inception") using ARM64 FEAT_NV2.
 
+**LIMITATION**: Only **one level** of nesting currently works (Host → L1). Recursive nesting
+(L1 → L2 → L3...) is blocked because L1's KVM reports `KVM_CAP_ARM_EL2=0`.
+
 ### Requirements
 
 - **Hardware**: ARM64 with FEAT_NV2 (Graviton3+, c7g.metal)
@@ -71,6 +74,14 @@ make test-root FILTER=inception
 
 - `test_kvm_available_in_vm`: Verifies /dev/kvm works in guest
 - `test_inception_run_fcvm_inside_vm`: Full inception test
+
+### Recursive Nesting Limitation
+
+L1's KVM reports `KVM_CAP_ARM_EL2=0`, blocking L2+ VMs.
+
+**Root cause**: `kvm-arm.mode=nested` requires VHE (kernel at EL2), but NV2's E2H0 flag forces nVHE (kernel at EL1). E2H0 is required to avoid timer trap storms.
+
+**Status**: Waiting for kernel improvements. Kernel NV2 patches mark recursive nesting as "not tested yet".
 
 ## Quick Reference
 

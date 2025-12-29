@@ -3,9 +3,9 @@
 //! This test generates a custom rootfs-config.toml pointing to the inception
 //! kernel (with CONFIG_KVM=y), then verifies /dev/kvm works in the VM.
 //!
-//! # Nested Virtualization Status (2025-12-27)
+//! # Nested Virtualization Status (2025-12-29)
 //!
-//! ## Implementation Complete
+//! ## Implementation Complete (L1 only)
 //! - Host kernel 6.18.2-nested with `kvm-arm.mode=nested` properly initializes NV2 mode
 //! - KVM_CAP_ARM_EL2 (capability 240) returns 1, indicating nested virt is supported
 //! - vCPU init with KVM_ARM_VCPU_HAS_EL2 (bit 7) + HAS_EL2_E2H0 (bit 8) succeeds
@@ -20,6 +20,20 @@
 //! - "kvm [1]: Hyp nVHE mode initialized successfully"
 //! - /dev/kvm can be opened successfully
 //!
+//! ## Recursive Nesting Limitation (L2+)
+//! L1's KVM reports KVM_CAP_ARM_EL2=0, preventing L2+ VMs from using NV2.
+//! Root cause analysis (2025-12-29):
+//!
+//! 1. `kvm-arm.mode=nested` requires VHE mode (kernel at EL2)
+//! 2. VHE requires `is_kernel_in_hyp_mode()` = true at early boot
+//! 3. But NV2's `HAS_EL2_E2H0` flag forces nVHE mode (kernel at EL1)
+//! 4. E2H0 is required to avoid timer trap storms in NV2 contexts
+//! 5. Without VHE, L1's kernel uses `kvm-arm.mode=nvhe` and cannot advertise KVM_CAP_ARM_EL2
+//!
+//! The kernel's nested virt patches include recursive nesting code, but it's marked
+//! as "not tested yet". Until VHE mode works reliably with NV2, recursive nesting
+//! (host → L1 → L2 → L3...) is not possible.
+//!
 //! ## Hardware
 //! - c7g.metal (Graviton3 / Neoverse-V1) supports FEAT_NV2
 //! - MIDR: 0x411fd401 (ARM Neoverse-V1)
@@ -27,6 +41,8 @@
 //! ## References
 //! - KVM nested virt patches: https://lwn.net/Articles/921783/
 //! - ARM boot protocol: arch/arm64/kernel/head.S (init_kernel_el)
+//! - E2H0 handling: arch/arm64/include/asm/el2_setup.h (init_el2_hcr)
+//! - Nested config: arch/arm64/kvm/nested.c (case SYS_ID_AA64MMFR4_EL1)
 //!
 //! FAILS LOUDLY if /dev/kvm is not available.
 
@@ -676,23 +692,26 @@ except OSError as e:
     }
 }
 
-/// Test 4 levels of nested VMs (inception chain)
+/// Run an inception chain test with configurable depth.
 ///
-/// This test verifies that we can run VMs nested 4 levels deep:
-/// Host → Level 1 → Level 2 → Level 3 → Level 4
+/// This function attempts to run VMs nested N levels deep:
+/// Host → Level 1 → Level 2 → ... → Level N
 ///
-/// Each level runs nginx:alpine with health checks to ensure full functionality.
-/// The innermost level (4) runs a success command to prove the chain works.
+/// LIMITATION (2025-12-29): Recursive nesting beyond L1 is NOT currently possible.
+/// L1's KVM reports KVM_CAP_ARM_EL2=0 because:
+/// - VHE mode is required for `kvm-arm.mode=nested`
+/// - But NV2's E2H0 flag forces nVHE mode to avoid timer trap storms
+/// - Without VHE, L1 cannot advertise nested virt capability
+///
+/// This test is kept for documentation and future testing when VHE+NV2 works.
 ///
 /// REQUIRES: ARM64 with FEAT_NV2 (ARMv8.4+) and kvm-arm.mode=nested
-#[tokio::test]
-async fn test_inception_chain_4_levels() -> Result<()> {
-    const TOTAL_LEVELS: usize = 4;
-    const SUCCESS_MARKER: &str = "INCEPTION_CHAIN_4_LEVELS_SUCCESS";
+async fn run_inception_chain(total_levels: usize) -> Result<()> {
+    let success_marker = format!("INCEPTION_CHAIN_{}_LEVELS_SUCCESS", total_levels);
 
     println!(
         "\nInception Chain Test: {} levels of nested VMs",
-        TOTAL_LEVELS
+        total_levels
     );
     println!("{}", "=".repeat(50));
 
@@ -793,17 +812,17 @@ except OSError as e:
     println!("[Level 1] ✓ Nested KVM works!");
 
     // Build a nested script that chains all levels
-    // Level 2 starts Level 3, which starts Level 4, which echoes success
+    // Each level starts the next, innermost level echoes success
     // This creates a single deeply-nested command that runs through all levels
 
     // Start from innermost level and work outward
-    let mut nested_cmd = format!("echo {}", SUCCESS_MARKER);
+    let mut nested_cmd = format!("echo {}", success_marker);
 
-    // Build the nested inception chain from inside out (Level 4 -> Level 3 -> Level 2)
-    for level in (2..=TOTAL_LEVELS).rev() {
+    // Build the nested inception chain from inside out (Level N -> ... -> Level 2)
+    for level in (2..=total_levels).rev() {
         let vm_name = format!("inception-L{}-{}", level, std::process::id());
 
-        // Use alpine for all levels to speed up boot (nginx not needed for this test)
+        // Use alpine for all levels to speed up boot
         let image = "alpine:latest";
 
         // Escape the inner command for shell embedding
@@ -836,8 +855,14 @@ fcvm podman run \
         );
     }
 
-    println!("\n[Levels 2-4] Starting nested inception chain from Level 1...");
-    println!("  This will boot Level 2 → Level 3 → Level 4 sequentially");
+    println!(
+        "\n[Levels 2-{}] Starting nested inception chain from Level 1...",
+        total_levels
+    );
+    println!(
+        "  This will boot {} VMs sequentially",
+        total_levels - 1
+    );
 
     let output = tokio::process::Command::new(&fcvm_path)
         .args([
@@ -860,11 +885,11 @@ fcvm podman run \
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{}\n{}", stdout, stderr);
 
-    println!("\n[Chain Output] (last 20 lines):");
+    println!("\n[Chain Output] (last 30 lines):");
     for line in combined
         .lines()
         .rev()
-        .take(20)
+        .take(30)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -876,19 +901,48 @@ fcvm podman run \
     println!("\nCleaning up all VMs...");
     cleanup_vms(level_pids.clone()).await;
 
-    if combined.contains(SUCCESS_MARKER) {
+    if combined.contains(&success_marker) {
         println!("\n✅ INCEPTION CHAIN TEST PASSED!");
-        println!("   Successfully ran {} levels of nested VMs", TOTAL_LEVELS);
+        println!("   Successfully ran {} levels of nested VMs", total_levels);
         Ok(())
     } else {
         bail!(
-            "Inception chain failed\n\
+            "Inception chain failed at {} levels\n\
              Expected marker: {}\n\
-             stdout: {}\n\
-             stderr: {}",
-            SUCCESS_MARKER,
-            stdout,
-            stderr
+             stdout (last 1000 chars): {}\n\
+             stderr (last 1000 chars): {}",
+            total_levels,
+            success_marker,
+            stdout.chars().rev().take(1000).collect::<String>().chars().rev().collect::<String>(),
+            stderr.chars().rev().take(1000).collect::<String>().chars().rev().collect::<String>()
         )
     }
+}
+
+/// Test 4 levels of nested VMs (inception chain)
+///
+/// BLOCKED: Recursive nesting not possible - L1's KVM_CAP_ARM_EL2=0.
+/// See module docs for root cause analysis. Keeping for future testing.
+#[tokio::test]
+#[ignore]
+async fn test_inception_chain_4_levels() -> Result<()> {
+    run_inception_chain(4).await
+}
+
+/// Test 32 levels of nested VMs (deep inception chain)
+///
+/// BLOCKED: Recursive nesting not possible - L1's KVM_CAP_ARM_EL2=0.
+#[tokio::test]
+#[ignore]
+async fn test_inception_chain_32_levels() -> Result<()> {
+    run_inception_chain(32).await
+}
+
+/// Test 64 levels of nested VMs (extreme inception chain)
+///
+/// BLOCKED: Recursive nesting not possible - L1's KVM_CAP_ARM_EL2=0.
+#[tokio::test]
+#[ignore]
+async fn test_inception_chain_64_levels() -> Result<()> {
+    run_inception_chain(64).await
 }

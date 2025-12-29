@@ -285,25 +285,21 @@ sudo fcvm podman run --name full \
 
 ## Nested Virtualization (Inception)
 
-fcvm supports running VMs inside VMs using ARM64 FEAT_NV2 nested virtualization. This enables **4 levels of nesting**: Host → VM₁ → VM₂ → VM₃ → VM₄, all running full Firecracker microVMs.
+fcvm supports running VMs inside VMs using ARM64 FEAT_NV2 nested virtualization. Currently **one level of nesting works**: Host → L1 VM with full KVM support.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
 │  Host (bare metal c7g.metal)                            │
 │  ┌───────────────────────────────────────────────────┐  │
 │  │  Level 1 VM (fcvm + inception kernel)             │  │
-│  │  ┌─────────────────────────────────────────────┐  │  │
-│  │  │  Level 2 VM                                 │  │  │
-│  │  │  ┌───────────────────────────────────────┐  │  │  │
-│  │  │  │  Level 3 VM                           │  │  │  │
-│  │  │  │  ┌─────────────────────────────────┐  │  │  │  │
-│  │  │  │  │  Level 4 VM (container runs)    │  │  │  │  │
-│  │  │  │  └─────────────────────────────────┘  │  │  │  │
-│  │  │  └───────────────────────────────────────┘  │  │  │
-│  │  └─────────────────────────────────────────────┘  │  │
+│  │  - KVM works (/dev/kvm accessible)                │  │
+│  │  - Can run Firecracker VMs                        │  │
+│  │  - Nested VMs run containers                      │  │
 │  └───────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────┘
 ```
+
+**Limitation**: Recursive nesting (L1 → L2 → L3...) is currently blocked. L1's KVM reports `KVM_CAP_ARM_EL2=0` because NV2's E2H0 flag forces nVHE mode, but `kvm-arm.mode=nested` requires VHE mode. See `.claude/CLAUDE.md` for technical details.
 
 ### Requirements
 
@@ -381,21 +377,13 @@ make test-root FILTER=inception
 # Tests:
 # - test_kvm_available_in_vm: Verifies /dev/kvm works in guest
 # - test_inception_run_fcvm_inside_vm: Full inception (fcvm inside fcvm)
-# - test_inception_chain_4_levels: 4 levels deep (Host → L1 → L2 → L3 → L4)
 ```
-
-### Performance
-
-The 4-level inception chain completes in ~28 seconds:
-- Level 1 boot + health check: ~5s
-- Nested KVM verification: ~1s
-- Levels 2-4 chain (each boots, runs command, exits): ~20s
 
 ### Limitations
 
 - ARM64 only (x86_64 nested virt uses different mechanism)
 - Requires bare-metal instance (c7g.metal) or host with nested virt enabled
-- Tested up to 4 levels; theoretical limit unknown
+- Recursive nesting (L2+) blocked - see `.claude/CLAUDE.md` for details
 
 ---
 
