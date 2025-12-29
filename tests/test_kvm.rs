@@ -901,6 +901,25 @@ fcvm podman run \
     println!("\nCleaning up all VMs...");
     cleanup_vms(level_pids.clone()).await;
 
+    // Debug: Check what we're looking for
+    println!("\n[Debug] Looking for marker: {}", success_marker);
+    println!("[Debug] Marker found in output: {}", combined.contains(&success_marker));
+    println!("[Debug] exec exit status: {:?}", output.status);
+
+    // First check if the exec command itself failed
+    if !output.status.success() {
+        bail!(
+            "Inception chain failed - exec command exited with status {:?}\n\
+             Expected marker: {}\n\
+             stdout (last 500 chars): {}\n\
+             stderr (last 500 chars): {}",
+            output.status,
+            success_marker,
+            stdout.chars().rev().take(500).collect::<String>().chars().rev().collect::<String>(),
+            stderr.chars().rev().take(500).collect::<String>().chars().rev().collect::<String>()
+        );
+    }
+
     if combined.contains(&success_marker) {
         println!("\n✅ INCEPTION CHAIN TEST PASSED!");
         println!("   Successfully ran {} levels of nested VMs", total_levels);
@@ -921,10 +940,8 @@ fcvm podman run \
 
 /// Test 4 levels of nested VMs (inception chain)
 ///
-/// BLOCKED: Recursive nesting not possible - L1's KVM_CAP_ARM_EL2=0.
-/// See module docs for root cause analysis. Keeping for future testing.
+/// Requires VHE mode in guest (HAS_EL2 without HAS_EL2_E2H0).
 #[tokio::test]
-#[ignore]
 async fn test_inception_chain_4_levels() -> Result<()> {
     run_inception_chain(4).await
 }
