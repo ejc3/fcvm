@@ -3,9 +3,9 @@
 //! This test generates a custom rootfs-config.toml pointing to the inception
 //! kernel (with CONFIG_KVM=y), then verifies /dev/kvm works in the VM.
 //!
-//! # Nested Virtualization Status (2025-12-27)
+//! # Nested Virtualization Status (2025-12-29)
 //!
-//! ## Implementation Complete
+//! ## Implementation Complete (L1 only)
 //! - Host kernel 6.18.2-nested with `kvm-arm.mode=nested` properly initializes NV2 mode
 //! - KVM_CAP_ARM_EL2 (capability 240) returns 1, indicating nested virt is supported
 //! - vCPU init with KVM_ARM_VCPU_HAS_EL2 (bit 7) + HAS_EL2_E2H0 (bit 8) succeeds
@@ -20,6 +20,20 @@
 //! - "kvm [1]: Hyp nVHE mode initialized successfully"
 //! - /dev/kvm can be opened successfully
 //!
+//! ## Recursive Nesting Limitation (L2+)
+//! L1's KVM reports KVM_CAP_ARM_EL2=0, preventing L2+ VMs from using NV2.
+//! Root cause analysis (2025-12-29):
+//!
+//! 1. `kvm-arm.mode=nested` requires VHE mode (kernel at EL2)
+//! 2. VHE requires `is_kernel_in_hyp_mode()` = true at early boot
+//! 3. But NV2's `HAS_EL2_E2H0` flag forces nVHE mode (kernel at EL1)
+//! 4. E2H0 is required to avoid timer trap storms in NV2 contexts
+//! 5. Without VHE, L1's kernel uses `kvm-arm.mode=nvhe` and cannot advertise KVM_CAP_ARM_EL2
+//!
+//! The kernel's nested virt patches include recursive nesting code, but it's marked
+//! as "not tested yet". Until VHE mode works reliably with NV2, recursive nesting
+//! (host → L1 → L2 → L3...) is not possible.
+//!
 //! ## Hardware
 //! - c7g.metal (Graviton3 / Neoverse-V1) supports FEAT_NV2
 //! - MIDR: 0x411fd401 (ARM Neoverse-V1)
@@ -27,6 +41,8 @@
 //! ## References
 //! - KVM nested virt patches: https://lwn.net/Articles/921783/
 //! - ARM boot protocol: arch/arm64/kernel/head.S (init_kernel_el)
+//! - E2H0 handling: arch/arm64/include/asm/el2_setup.h (init_el2_hcr)
+//! - Nested config: arch/arm64/kvm/nested.c (case SYS_ID_AA64MMFR4_EL1)
 //!
 //! FAILS LOUDLY if /dev/kvm is not available.
 
@@ -678,11 +694,16 @@ except OSError as e:
 
 /// Run an inception chain test with configurable depth.
 ///
-/// This function verifies that we can run VMs nested N levels deep:
+/// This function attempts to run VMs nested N levels deep:
 /// Host → Level 1 → Level 2 → ... → Level N
 ///
-/// Each level uses alpine:latest for fast boot. The innermost level
-/// runs a success command to prove the chain works.
+/// LIMITATION (2025-12-29): Recursive nesting beyond L1 is NOT currently possible.
+/// L1's KVM reports KVM_CAP_ARM_EL2=0 because:
+/// - VHE mode is required for `kvm-arm.mode=nested`
+/// - But NV2's E2H0 flag forces nVHE mode to avoid timer trap storms
+/// - Without VHE, L1 cannot advertise nested virt capability
+///
+/// This test is kept for documentation and future testing when VHE+NV2 works.
 ///
 /// REQUIRES: ARM64 with FEAT_NV2 (ARMv8.4+) and kvm-arm.mode=nested
 async fn run_inception_chain(total_levels: usize) -> Result<()> {
@@ -899,21 +920,29 @@ fcvm podman run \
 }
 
 /// Test 4 levels of nested VMs (inception chain)
+///
+/// BLOCKED: Recursive nesting not possible - L1's KVM_CAP_ARM_EL2=0.
+/// See module docs for root cause analysis. Keeping for future testing.
 #[tokio::test]
+#[ignore]
 async fn test_inception_chain_4_levels() -> Result<()> {
     run_inception_chain(4).await
 }
 
 /// Test 32 levels of nested VMs (deep inception chain)
+///
+/// BLOCKED: Recursive nesting not possible - L1's KVM_CAP_ARM_EL2=0.
 #[tokio::test]
-#[ignore] // Takes ~3-4 minutes - run manually with: cargo test inception_32 -- --ignored
+#[ignore]
 async fn test_inception_chain_32_levels() -> Result<()> {
     run_inception_chain(32).await
 }
 
 /// Test 64 levels of nested VMs (extreme inception chain)
+///
+/// BLOCKED: Recursive nesting not possible - L1's KVM_CAP_ARM_EL2=0.
 #[tokio::test]
-#[ignore] // Takes ~6-8 minutes - run manually with: cargo test inception_64 -- --ignored
+#[ignore]
 async fn test_inception_chain_64_levels() -> Result<()> {
     run_inception_chain(64).await
 }
