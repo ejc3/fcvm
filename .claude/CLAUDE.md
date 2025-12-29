@@ -19,9 +19,7 @@ fcvm is a Firecracker VM manager for running Podman containers in lightweight mi
 ## Nested Virtualization (Inception)
 
 fcvm supports running inside another fcvm VM ("inception") using ARM64 FEAT_NV2.
-
-**LIMITATION**: Only **one level** of nesting currently works (Host → L1). Recursive nesting
-(L1 → L2 → L3...) is blocked because L1's KVM reports `KVM_CAP_ARM_EL2=0`.
+Recursive nesting (Host → L1 → L2 → ...) is enabled via the `arm64.nv2` kernel boot parameter.
 
 ### Requirements
 
@@ -36,7 +34,8 @@ fcvm supports running inside another fcvm VM ("inception") using ARM64 FEAT_NV2.
 3. vCPU boots at EL2h in VHE mode (E2H=1) so guest kernel sees HYP mode available
 4. EL2 registers are initialized: HCR_EL2, VMPIDR_EL2, VPIDR_EL2
 5. Guest kernel initializes KVM: "VHE mode initialized successfully"
-6. L1 can create L2 VMs (but L2 can't create L3 due to ID register limitation)
+6. `arm64.nv2` boot param overrides MMFR4 to advertise NV2 support
+7. L1 KVM reports `KVM_CAP_ARM_EL2=1`, enabling recursive L2+ VMs
 
 ### Running Inception
 
@@ -75,32 +74,36 @@ make test-root FILTER=inception
 - `test_kvm_available_in_vm`: Verifies /dev/kvm works in guest
 - `test_inception_run_fcvm_inside_vm`: Full inception test
 
-### Recursive Nesting Limitation
+### Recursive Nesting: The ID Register Problem (Solved)
 
-L1's KVM reports `KVM_CAP_ARM_EL2=0`, blocking L2+ VMs.
+**Problem**: L1's KVM initially reported `KVM_CAP_ARM_EL2=0`, blocking L2+ VMs.
 
-**Root cause (2025-12-29)**: ARM architecture provides no mechanism to virtualize ID registers for virtual EL2.
+**Root cause**: ARM architecture provides no mechanism to virtualize ID registers for virtual EL2.
 
-**The problem in detail**:
 1. Host KVM stores correct emulated ID values in `kvm->arch.id_regs[]`
 2. `HCR_EL2.TID3` controls trapping of ID register reads - but only for **EL1 reads**
 3. When guest runs at virtual EL2 (with NV2), ID register reads are EL2-level accesses
 4. EL2-level accesses don't trap via TID3 - they read hardware directly
 5. Guest sees `MMFR4=0` (hardware), not `MMFR4=NV2_ONLY` (emulated)
-6. L1's KVM sees no NV2 capability → refuses to create L2 VMs
 
-**Evidence from tracing**:
-- 38,904 sysreg traps, ZERO were ID registers (Op0=3, CRn=0)
-- `access_id_reg()` never called despite 1,920 `perform_access` calls
-- Guest dmesg shows "VHE mode initialized successfully" but "unavailable: Nested Virtualization Support"
+**Solution**: Use kernel's ID register override mechanism with `arm64.nv2` boot parameter.
 
-**Why there's no fix**:
-- ARM only provides VPIDR_EL2/VMPIDR_EL2 for virtualizing MIDR/MPIDR
-- No equivalent exists for ID_AA64MMFR4_EL1 or other feature registers
-- Would require new ARM architecture features to virtualize arbitrary ID registers for nested guests
-- Upstream kernel NV2 patches note "recursive nesting not tested"
+1. Added `arm64.nv2` alias for `id_aa64mmfr4.nv_frac=2` (NV2_ONLY)
+2. Changed `FTR_LOWER_SAFE` to `FTR_HIGHER_SAFE` for MMFR4 to allow upward overrides
+3. Kernel patch: `kernel/patches/mmfr4-override.patch`
 
-**Status**: Architectural limitation. Recursive nesting requires ARM to add new mechanisms for ID register virtualization at EL2.
+**Why it's safe**: The host KVM *does* provide NV2 emulation - we're just fixing the guest's
+view of this capability. We're not faking a feature, we're correcting a visibility issue.
+
+**Verification**:
+```
+$ dmesg | grep mmfr4
+CPU features: SYS_ID_AA64MMFR4_EL1[23:20]: forced to 2
+
+$ check_kvm_caps
+KVM_CAP_ARM_EL2 (cap 240) = 1
+  -> Nested virtualization IS supported by KVM (VHE mode)
+```
 
 ## Quick Reference
 
@@ -337,6 +340,58 @@ Tested locally:
 ```markdown
 Fixed CI. Tested and it works.
 ```
+
+#### Complex/Advanced PRs
+
+**For non-trivial changes (architectural, workarounds, kernel patches), include:**
+
+1. **The Problem** - What was failing and why. Include root cause analysis.
+2. **The Solution** - How you fixed it. Explain the approach, not just "what" but "why this way".
+3. **Why It's Safe** - For workarounds or unusual approaches, explain why it won't break things.
+4. **Alternatives Considered** - What else you tried and why it didn't work.
+5. **Test Results** - Actual command output proving it works.
+
+**Example structure for complex PRs:**
+
+```markdown
+## Summary
+One-line description of what this enables.
+
+## The Problem
+- What was broken
+- Root cause analysis (be specific)
+- Why existing approaches didn't work
+
+## The Solution
+1. First key change and why
+2. Second key change and why
+3. Why this approach over alternatives
+
+### Why This Is Safe
+- Explain non-obvious safety guarantees
+- Address potential concerns upfront
+
+### Alternatives Considered
+1. Alternative A - why it didn't work
+2. Alternative B - why it was more invasive
+
+## Test Results
+\`\`\`
+$ actual-command-run
+actual output proving it works
+\`\`\`
+
+## Test Plan
+- [x] Test case 1
+- [x] Test case 2
+```
+
+**When to use this format:**
+- Kernel patches or low-level system changes
+- Workarounds for architectural limitations
+- Changes that might seem "wrong" without context
+- Multi-commit PRs with complex interactions
+- Anything where a reviewer might ask "why not just...?"
 
 **Why evidence matters:**
 - Proves the fix works, not just "looks right"
