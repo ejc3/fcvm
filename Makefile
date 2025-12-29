@@ -63,7 +63,8 @@ CONTAINER_RUN := podman run --rm --privileged \
 	test test-unit test-fast test-all test-root \
 	_test-unit _test-fast _test-all _test-root \
 	container-build container-test container-test-unit container-test-fast container-test-all \
-	container-shell container-clean setup-btrfs setup-fcvm setup-pjdfstest bench lint fmt
+	container-shell container-clean setup-btrfs setup-fcvm setup-pjdfstest bench lint fmt \
+	rebuild-fc dev-fc-test
 
 all: build
 
@@ -238,3 +239,30 @@ lint:
 
 fmt:
 	cargo fmt
+
+# Firecracker development targets
+# Rebuild Firecracker from source and install to /usr/local/bin
+# Usage: make rebuild-fc
+FIRECRACKER_SRC ?= /home/ubuntu/firecracker
+FIRECRACKER_BIN := $(FIRECRACKER_SRC)/build/cargo_target/release/firecracker
+
+rebuild-fc:
+	@echo "==> Force rebuilding Firecracker..."
+	touch $(FIRECRACKER_SRC)/src/vmm/src/arch/aarch64/vcpu.rs
+	cd $(FIRECRACKER_SRC) && cargo build --release
+	@echo "==> Installing Firecracker to /usr/local/bin..."
+	sudo rm -f /usr/local/bin/firecracker
+	sudo cp $(FIRECRACKER_BIN) /usr/local/bin/firecracker
+	@echo "==> Verifying installation..."
+	@strings /usr/local/bin/firecracker | grep -q "NV2 DEBUG" && echo "NV2 debug strings: OK" || echo "WARNING: NV2 debug strings missing"
+	/usr/local/bin/firecracker --version
+
+# Full rebuild cycle: Firecracker + fcvm + run test
+# Usage: make dev-fc-test FILTER=inception
+dev-fc-test: rebuild-fc build
+	@echo "==> Running test with FILTER=$(FILTER)..."
+	FCVM_DATA_DIR=$(ROOT_DATA_DIR) \
+	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
+	RUST_LOG=debug \
+	$(NEXTEST) $(NEXTEST_CAPTURE) --features privileged-tests $(FILTER)
