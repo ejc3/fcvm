@@ -79,9 +79,25 @@ make test-root FILTER=inception
 
 L1's KVM reports `KVM_CAP_ARM_EL2=0`, blocking L2+ VMs.
 
-**Root cause**: `kvm-arm.mode=nested` requires VHE (kernel at EL2), but NV2's E2H0 flag forces nVHE (kernel at EL1). E2H0 is required to avoid timer trap storms.
+**Root cause discovered (2025-12-29)**: ID register reads from virtual EL2 with VHE bypass KVM emulation.
 
-**Status**: Waiting for kernel improvements. Kernel NV2 patches mark recursive nesting as "not tested yet".
+When L1 guest runs at virtual EL2 with VHE mode (E2H=1):
+- Host KVM correctly stores emulated ID values: `MMFR4=0xe100000` (NV_frac=NV2_ONLY), `PFR0.EL2=IMP`
+- But ID register reads do NOT trap to host's `access_id_reg()` handler
+- Guest reads hardware directly: `MMFR4=0`, `PFR0.EL2=0` (EL2 not implemented)
+- L1's KVM sees no NV2 capability → refuses to create L2 VMs
+
+**Why traps don't fire**: With NV2, when guest is at virtual EL2 with VHE:
+- `HCR_EL2.TID3` traps "EL1 reads" of ID registers
+- But accesses from virtual EL2+VHE may bypass this trap mechanism
+- The emulated values in `kvm->arch.id_regs[]` are never delivered to guest
+
+**Evidence from tracing**:
+- 38,904 sysreg traps recorded, ZERO were ID registers (3,0,0,x,x)
+- `access_id_reg` never called despite 1,920 `perform_access` calls
+- Guest reads hardware values directly
+
+**Status**: Kernel limitation. Would require changes to how NV2 handles ID register accesses from virtual EL2 with VHE mode. Upstream kernel patches mark recursive nesting as "not tested yet".
 
 ## Quick Reference
 
