@@ -676,23 +676,21 @@ except OSError as e:
     }
 }
 
-/// Test 4 levels of nested VMs (inception chain)
+/// Run an inception chain test with configurable depth.
 ///
-/// This test verifies that we can run VMs nested 4 levels deep:
-/// Host → Level 1 → Level 2 → Level 3 → Level 4
+/// This function verifies that we can run VMs nested N levels deep:
+/// Host → Level 1 → Level 2 → ... → Level N
 ///
-/// Each level runs nginx:alpine with health checks to ensure full functionality.
-/// The innermost level (4) runs a success command to prove the chain works.
+/// Each level uses alpine:latest for fast boot. The innermost level
+/// runs a success command to prove the chain works.
 ///
 /// REQUIRES: ARM64 with FEAT_NV2 (ARMv8.4+) and kvm-arm.mode=nested
-#[tokio::test]
-async fn test_inception_chain_4_levels() -> Result<()> {
-    const TOTAL_LEVELS: usize = 4;
-    const SUCCESS_MARKER: &str = "INCEPTION_CHAIN_4_LEVELS_SUCCESS";
+async fn run_inception_chain(total_levels: usize) -> Result<()> {
+    let success_marker = format!("INCEPTION_CHAIN_{}_LEVELS_SUCCESS", total_levels);
 
     println!(
         "\nInception Chain Test: {} levels of nested VMs",
-        TOTAL_LEVELS
+        total_levels
     );
     println!("{}", "=".repeat(50));
 
@@ -793,17 +791,17 @@ except OSError as e:
     println!("[Level 1] ✓ Nested KVM works!");
 
     // Build a nested script that chains all levels
-    // Level 2 starts Level 3, which starts Level 4, which echoes success
+    // Each level starts the next, innermost level echoes success
     // This creates a single deeply-nested command that runs through all levels
 
     // Start from innermost level and work outward
-    let mut nested_cmd = format!("echo {}", SUCCESS_MARKER);
+    let mut nested_cmd = format!("echo {}", success_marker);
 
-    // Build the nested inception chain from inside out (Level 4 -> Level 3 -> Level 2)
-    for level in (2..=TOTAL_LEVELS).rev() {
+    // Build the nested inception chain from inside out (Level N -> ... -> Level 2)
+    for level in (2..=total_levels).rev() {
         let vm_name = format!("inception-L{}-{}", level, std::process::id());
 
-        // Use alpine for all levels to speed up boot (nginx not needed for this test)
+        // Use alpine for all levels to speed up boot
         let image = "alpine:latest";
 
         // Escape the inner command for shell embedding
@@ -836,8 +834,14 @@ fcvm podman run \
         );
     }
 
-    println!("\n[Levels 2-4] Starting nested inception chain from Level 1...");
-    println!("  This will boot Level 2 → Level 3 → Level 4 sequentially");
+    println!(
+        "\n[Levels 2-{}] Starting nested inception chain from Level 1...",
+        total_levels
+    );
+    println!(
+        "  This will boot {} VMs sequentially",
+        total_levels - 1
+    );
 
     let output = tokio::process::Command::new(&fcvm_path)
         .args([
@@ -860,11 +864,11 @@ fcvm podman run \
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{}\n{}", stdout, stderr);
 
-    println!("\n[Chain Output] (last 20 lines):");
+    println!("\n[Chain Output] (last 30 lines):");
     for line in combined
         .lines()
         .rev()
-        .take(20)
+        .take(30)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -876,19 +880,40 @@ fcvm podman run \
     println!("\nCleaning up all VMs...");
     cleanup_vms(level_pids.clone()).await;
 
-    if combined.contains(SUCCESS_MARKER) {
+    if combined.contains(&success_marker) {
         println!("\n✅ INCEPTION CHAIN TEST PASSED!");
-        println!("   Successfully ran {} levels of nested VMs", TOTAL_LEVELS);
+        println!("   Successfully ran {} levels of nested VMs", total_levels);
         Ok(())
     } else {
         bail!(
-            "Inception chain failed\n\
+            "Inception chain failed at {} levels\n\
              Expected marker: {}\n\
-             stdout: {}\n\
-             stderr: {}",
-            SUCCESS_MARKER,
-            stdout,
-            stderr
+             stdout (last 1000 chars): {}\n\
+             stderr (last 1000 chars): {}",
+            total_levels,
+            success_marker,
+            stdout.chars().rev().take(1000).collect::<String>().chars().rev().collect::<String>(),
+            stderr.chars().rev().take(1000).collect::<String>().chars().rev().collect::<String>()
         )
     }
+}
+
+/// Test 4 levels of nested VMs (inception chain)
+#[tokio::test]
+async fn test_inception_chain_4_levels() -> Result<()> {
+    run_inception_chain(4).await
+}
+
+/// Test 32 levels of nested VMs (deep inception chain)
+#[tokio::test]
+#[ignore] // Takes ~3-4 minutes - run manually with: cargo test inception_32 -- --ignored
+async fn test_inception_chain_32_levels() -> Result<()> {
+    run_inception_chain(32).await
+}
+
+/// Test 64 levels of nested VMs (extreme inception chain)
+#[tokio::test]
+#[ignore] // Takes ~6-8 minutes - run manually with: cargo test inception_64 -- --ignored
+async fn test_inception_chain_64_levels() -> Result<()> {
+    run_inception_chain(64).await
 }
