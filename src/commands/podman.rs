@@ -1171,6 +1171,8 @@ async fn run_vm_setup(
     // enables HAS_EL2 vCPU features. These kernel params help the guest initialize properly:
     //
     // - kvm-arm.mode=nvhe - Force guest KVM to use nVHE mode (proper for L1 guests)
+    //   Note: kvm-arm.mode=nested requires VHE mode (kernel at EL2), but NV2's E2H0
+    //   flag forces nVHE mode, so recursive nesting is not currently possible.
     // - numa=off - Disable NUMA to avoid percpu allocation issues in nested contexts
     if args.kernel.is_some() {
         boot_args.push_str(" kvm-arm.mode=nvhe numa=off");
