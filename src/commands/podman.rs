@@ -1182,8 +1182,10 @@ async fn run_vm_setup(
     //   VHE mode (E2H=1) allows the guest kernel to run at EL2, which is required
     //   for kvm-arm.mode=nested. This enables recursive nested virtualization.
     // - numa=off - Disable NUMA to avoid percpu allocation issues in nested contexts
+    // - arm64.nv2 - Override MMFR4.NV_frac to advertise NV2 support. Required because
+    //   virtual EL2 reads ID registers directly from hardware (TID3 only traps EL1 reads).
     if args.kernel.is_some() {
-        boot_args.push_str(" kvm-arm.mode=nested numa=off");
+        boot_args.push_str(" kvm-arm.mode=nested numa=off arm64.nv2");
     }
 
     client

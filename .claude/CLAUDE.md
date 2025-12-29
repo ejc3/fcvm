@@ -32,11 +32,11 @@ fcvm supports running inside another fcvm VM ("inception") using ARM64 FEAT_NV2.
 ### How It Works
 
 1. Set `FCVM_NV2=1` environment variable (auto-set when `--kernel` flag is used)
-2. fcvm passes `--enable-nv2` to Firecracker, which enables `HAS_EL2` + `HAS_EL2_E2H0` vCPU features
-3. vCPU boots at EL2h so guest kernel sees HYP mode available
-4. EL2 registers are initialized: HCR_EL2, CNTHCTL_EL2, VMPIDR_EL2, VPIDR_EL2
-5. Guest kernel initializes KVM: "Hyp nVHE mode initialized successfully"
-6. Nested fcvm can now create VMs using the guest's KVM
+2. fcvm passes `--enable-nv2` to Firecracker, which enables `HAS_EL2` vCPU feature
+3. vCPU boots at EL2h in VHE mode (E2H=1) so guest kernel sees HYP mode available
+4. EL2 registers are initialized: HCR_EL2, VMPIDR_EL2, VPIDR_EL2
+5. Guest kernel initializes KVM: "VHE mode initialized successfully"
+6. L1 can create L2 VMs (but L2 can't create L3 due to ID register limitation)
 
 ### Running Inception
 
@@ -61,9 +61,9 @@ fcvm podman run --name inner --network bridged alpine:latest
 
 Firecracker fork with NV2 support: `ejc3/firecracker:nv2-inception`
 
-- `HAS_EL2` (bit 7): Enables virtual EL2 for guest
-- `HAS_EL2_E2H0` (bit 8): Forces nVHE mode (avoids timer trap storm)
+- `HAS_EL2` (bit 7): Enables virtual EL2 for guest in VHE mode
 - Boot at EL2h: Guest kernel must see CurrentEL=EL2 on boot
+- VHE mode (E2H=1): Required for NV2 support in guest (nVHE mode doesn't support NV2)
 - VMPIDR_EL2/VPIDR_EL2: Proper processor IDs for nested guests
 
 ### Tests
@@ -79,25 +79,28 @@ make test-root FILTER=inception
 
 L1's KVM reports `KVM_CAP_ARM_EL2=0`, blocking L2+ VMs.
 
-**Root cause discovered (2025-12-29)**: ID register reads from virtual EL2 with VHE bypass KVM emulation.
+**Root cause (2025-12-29)**: ARM architecture provides no mechanism to virtualize ID registers for virtual EL2.
 
-When L1 guest runs at virtual EL2 with VHE mode (E2H=1):
-- Host KVM correctly stores emulated ID values: `MMFR4=0xe100000` (NV_frac=NV2_ONLY), `PFR0.EL2=IMP`
-- But ID register reads do NOT trap to host's `access_id_reg()` handler
-- Guest reads hardware directly: `MMFR4=0`, `PFR0.EL2=0` (EL2 not implemented)
-- L1's KVM sees no NV2 capability → refuses to create L2 VMs
-
-**Why traps don't fire**: With NV2, when guest is at virtual EL2 with VHE:
-- `HCR_EL2.TID3` traps "EL1 reads" of ID registers
-- But accesses from virtual EL2+VHE may bypass this trap mechanism
-- The emulated values in `kvm->arch.id_regs[]` are never delivered to guest
+**The problem in detail**:
+1. Host KVM stores correct emulated ID values in `kvm->arch.id_regs[]`
+2. `HCR_EL2.TID3` controls trapping of ID register reads - but only for **EL1 reads**
+3. When guest runs at virtual EL2 (with NV2), ID register reads are EL2-level accesses
+4. EL2-level accesses don't trap via TID3 - they read hardware directly
+5. Guest sees `MMFR4=0` (hardware), not `MMFR4=NV2_ONLY` (emulated)
+6. L1's KVM sees no NV2 capability → refuses to create L2 VMs
 
 **Evidence from tracing**:
-- 38,904 sysreg traps recorded, ZERO were ID registers (3,0,0,x,x)
-- `access_id_reg` never called despite 1,920 `perform_access` calls
-- Guest reads hardware values directly
+- 38,904 sysreg traps, ZERO were ID registers (Op0=3, CRn=0)
+- `access_id_reg()` never called despite 1,920 `perform_access` calls
+- Guest dmesg shows "VHE mode initialized successfully" but "unavailable: Nested Virtualization Support"
 
-**Status**: Kernel limitation. Would require changes to how NV2 handles ID register accesses from virtual EL2 with VHE mode. Upstream kernel patches mark recursive nesting as "not tested yet".
+**Why there's no fix**:
+- ARM only provides VPIDR_EL2/VMPIDR_EL2 for virtualizing MIDR/MPIDR
+- No equivalent exists for ID_AA64MMFR4_EL1 or other feature registers
+- Would require new ARM architecture features to virtualize arbitrary ID registers for nested guests
+- Upstream kernel NV2 patches note "recursive nesting not tested"
+
+**Status**: Architectural limitation. Recursive nesting requires ARM to add new mechanisms for ID register virtualization at EL2.
 
 ## Quick Reference
 
