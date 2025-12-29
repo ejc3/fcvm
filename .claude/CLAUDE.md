@@ -195,6 +195,8 @@ Exception: For **forked libraries** (like fuse-backend-rs), we maintain compatib
 
 #### Creating a PR (Required for ALL Changes)
 
+**CRITICAL: TEST LOCALLY BEFORE PUSHING.** CI is for validation, not discovery. Run `make lint` and relevant tests locally first.
+
 ```bash
 # 1. Create feature branch
 git checkout -b fix-something
@@ -202,17 +204,21 @@ git checkout -b fix-something
 # 2. Make changes and commit
 git add -A && git commit -m "Fix something"
 
-# 3. Push and create PR
+# 3. TEST LOCALLY FIRST (required!)
+make lint                    # Must pass
+make test-root FILTER=<relevant>  # Run relevant tests
+
+# 4. Push and create PR (only after local tests pass)
 git push -u origin fix-something
 gh pr create --fill
 
-# 4. Wait for CI to pass
+# 5. Wait for CI to pass
 gh pr checks <pr-number>
 
-# 5. Merge when green
+# 6. Merge when green
 gh pr merge <pr-number> --merge --delete-branch
 
-# 6. Update local main
+# 7. Update local main
 git checkout main && git pull
 ```
 
@@ -221,10 +227,16 @@ git checkout main && git pull
 | Action | Command |
 |--------|---------|
 | Create branch | `git checkout -b branch-name` |
+| **Test locally first** | `make lint && make test-root FILTER=<relevant>` |
 | Push & create PR | `git push -u origin branch-name && gh pr create --fill` |
 | Check CI | `gh pr checks <pr-number>` |
 | Merge PR | `gh pr merge <pr-number> --merge --delete-branch` |
 | List my PRs | `gh pr list --author @me` |
+
+**Why test locally first:**
+- CI is slow and flaky - local tests give immediate feedback
+- Catches issues before wasting CI cycles
+- Shows actual test output for debugging
 
 **Why PRs are required:**
 - CI validates all changes before merge

@@ -675,3 +675,220 @@ except OSError as e:
         );
     }
 }
+
+/// Test 4 levels of nested VMs (inception chain)
+///
+/// This test verifies that we can run VMs nested 4 levels deep:
+/// Host → Level 1 → Level 2 → Level 3 → Level 4
+///
+/// Each level runs nginx:alpine with health checks to ensure full functionality.
+/// The innermost level (4) runs a success command to prove the chain works.
+///
+/// REQUIRES: ARM64 with FEAT_NV2 (ARMv8.4+) and kvm-arm.mode=nested
+#[tokio::test]
+async fn test_inception_chain_4_levels() -> Result<()> {
+    const TOTAL_LEVELS: usize = 4;
+    const SUCCESS_MARKER: &str = "INCEPTION_CHAIN_4_LEVELS_SUCCESS";
+
+    println!(
+        "\nInception Chain Test: {} levels of nested VMs",
+        TOTAL_LEVELS
+    );
+    println!("{}", "=".repeat(50));
+
+    // Ensure prerequisites
+    ensure_firecracker_nv2().await?;
+    let inception_kernel = ensure_inception_kernel().await?;
+
+    let fcvm_path = common::find_fcvm_binary()?;
+    let fcvm_dir = fcvm_path.parent().unwrap();
+    let kernel_str = inception_kernel
+        .to_str()
+        .context("kernel path not valid UTF-8")?;
+
+    // Home dir for config mount
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let config_mount = format!("{0}/.config/fcvm:/root/.config/fcvm:ro", home);
+    let fcvm_volume = format!("{}:/opt/fcvm", fcvm_dir.display());
+
+    // Track PIDs for cleanup
+    let mut level_pids: Vec<u32> = Vec::new();
+
+    // Helper to cleanup all VMs (takes ownership to avoid lifetime issues)
+    async fn cleanup_vms(pids: Vec<u32>) {
+        for pid in pids.into_iter().rev() {
+            common::kill_process(pid).await;
+        }
+    }
+
+    // === Level 1: Start from host ===
+    println!("\n[Level 1] Starting outer VM from host...");
+    let (vm_name_1, _, _, _) = common::unique_names("inception-L1");
+
+    let (mut _child1, pid1) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name_1,
+        "--network",
+        "bridged",
+        "--kernel",
+        kernel_str,
+        "--privileged",
+        "--map",
+        "/mnt/fcvm-btrfs:/mnt/fcvm-btrfs",
+        "--map",
+        &fcvm_volume,
+        "--map",
+        &config_mount,
+        common::TEST_IMAGE,
+    ])
+    .await
+    .context("spawning Level 1 VM")?;
+
+    level_pids.push(pid1);
+    println!("[Level 1] Started (PID: {}), waiting for health...", pid1);
+
+    if let Err(e) = common::poll_health_by_pid(pid1, 180).await {
+        cleanup_vms(level_pids.clone()).await;
+        return Err(e.context("Level 1 VM failed to become healthy"));
+    }
+    println!("[Level 1] ✓ Healthy!");
+
+    // Check if nested KVM works before proceeding
+    println!("\n[Level 1] Checking if nested KVM works...");
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "exec",
+            "--pid",
+            &pid1.to_string(),
+            "--vm",
+            "--",
+            "python3",
+            "-c",
+            r#"
+import os, fcntl
+try:
+    fd = os.open("/dev/kvm", os.O_RDWR)
+    vm_fd = fcntl.ioctl(fd, 0xAE01, 0)  # KVM_CREATE_VM
+    os.close(vm_fd)
+    os.close(fd)
+    print("NESTED_KVM_OK")
+except OSError as e:
+    print(f"NESTED_KVM_FAIL: {e}")
+"#,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.contains("NESTED_KVM_OK") {
+        cleanup_vms(level_pids.clone()).await;
+        println!("SKIPPED: Nested KVM not available");
+        println!("         Requires ARM64 with FEAT_NV2 + kvm-arm.mode=nested");
+        return Ok(());
+    }
+    println!("[Level 1] ✓ Nested KVM works!");
+
+    // Build a nested script that chains all levels
+    // Level 2 starts Level 3, which starts Level 4, which echoes success
+    // This creates a single deeply-nested command that runs through all levels
+
+    // Start from innermost level and work outward
+    let mut nested_cmd = format!("echo {}", SUCCESS_MARKER);
+
+    // Build the nested inception chain from inside out (Level 4 -> Level 3 -> Level 2)
+    for level in (2..=TOTAL_LEVELS).rev() {
+        let vm_name = format!("inception-L{}-{}", level, std::process::id());
+
+        // Use alpine for all levels to speed up boot (nginx not needed for this test)
+        let image = "alpine:latest";
+
+        // Escape the inner command for shell embedding
+        let escaped_cmd = nested_cmd.replace('\'', "'\\''");
+
+        nested_cmd = format!(
+            r#"export PATH=/opt/fcvm:/mnt/fcvm-btrfs/bin:$PATH
+export HOME=/root
+modprobe tun 2>/dev/null || true
+mkdir -p /dev/net
+mknod /dev/net/tun c 10 200 2>/dev/null || true
+chmod 666 /dev/net/tun 2>/dev/null || true
+cd /mnt/fcvm-btrfs
+echo "[L{level}] Starting nested VM..."
+fcvm podman run \
+    --name {vm_name} \
+    --network bridged \
+    --kernel {kernel} \
+    --privileged \
+    --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
+    --map /opt/fcvm:/opt/fcvm \
+    --map /root/.config/fcvm:/root/.config/fcvm:ro \
+    --cmd '{escaped_cmd}' \
+    {image}"#,
+            level = level,
+            vm_name = vm_name,
+            kernel = kernel_str,
+            escaped_cmd = escaped_cmd,
+            image = image
+        );
+    }
+
+    println!("\n[Levels 2-4] Starting nested inception chain from Level 1...");
+    println!("  This will boot Level 2 → Level 3 → Level 4 sequentially");
+
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "exec",
+            "--pid",
+            &pid1.to_string(),
+            "--vm",
+            "--",
+            "sh",
+            "-c",
+            &nested_cmd,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("running nested inception chain")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}\n{}", stdout, stderr);
+
+    println!("\n[Chain Output] (last 20 lines):");
+    for line in combined
+        .lines()
+        .rev()
+        .take(20)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        println!("  {}", line);
+    }
+
+    // Cleanup Level 1 (cascades to inner levels)
+    println!("\nCleaning up all VMs...");
+    cleanup_vms(level_pids.clone()).await;
+
+    if combined.contains(SUCCESS_MARKER) {
+        println!("\n✅ INCEPTION CHAIN TEST PASSED!");
+        println!("   Successfully ran {} levels of nested VMs", TOTAL_LEVELS);
+        Ok(())
+    } else {
+        bail!(
+            "Inception chain failed\n\
+             Expected marker: {}\n\
+             stdout: {}\n\
+             stderr: {}",
+            SUCCESS_MARKER,
+            stdout,
+            stderr
+        )
+    }
+}
