@@ -704,7 +704,7 @@ async fn ensure_inception_image() -> Result<()> {
     let combined_sha = hex::encode(&hasher.finalize()[..6]);
 
     // Check if we have a marker file with the current SHA
-    let marker_path = PathBuf::from("bin/.inception-sha");
+    let marker_path = PathBuf::from("artifacts/.inception-sha");
     let cached_sha = std::fs::read_to_string(&marker_path).unwrap_or_default();
 
     let need_rebuild = cached_sha.trim() != combined_sha;
@@ -721,10 +721,10 @@ async fn ensure_inception_image() -> Result<()> {
         );
 
         // Copy all inputs to build context
-        tokio::fs::create_dir_all("bin").await.ok();
-        std::fs::copy(&src_fcvm, "bin/fcvm").context("copying fcvm to bin/")?;
-        std::fs::copy(&src_agent, "bin/fc-agent").context("copying fc-agent to bin/")?;
-        std::fs::copy(&src_firecracker, "firecracker-nv2").ok();
+        tokio::fs::create_dir_all("artifacts").await.ok();
+        std::fs::copy(&src_fcvm, "artifacts/fcvm").context("copying fcvm to artifacts/")?;
+        std::fs::copy(&src_agent, "artifacts/fc-agent").context("copying fc-agent to artifacts/")?;
+        std::fs::copy(&src_firecracker, "artifacts/firecracker-nv2").ok();
 
         // Force rebuild by removing old image
         tokio::process::Command::new("podman")
