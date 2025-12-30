@@ -302,9 +302,9 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .collect::<Result<Vec<_>>>()
         .context("parsing volume mappings")?;
 
-    // For localhost/ images, use content-addressable cache for skopeo export
-    // This avoids lock contention when multiple VMs export the same image
-    let _image_export_dir = if args.image.starts_with("localhost/") {
+    // For localhost/ images, export as OCI archive for direct podman run
+    // Uses content-addressable cache to avoid re-exporting the same image
+    let image_archive_name = if args.image.starts_with("localhost/") {
         // Get image digest for content-addressable storage
         let inspect_output = tokio::process::Command::new("podman")
             .args(["image", "inspect", &args.image, "--format", "{{.Digest}}"])
@@ -323,6 +323,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
         let digest = String::from_utf8_lossy(&inspect_output.stdout)
             .trim()
+            // Strip "sha256:" prefix for use in filenames (colons invalid in paths)
+            .trim_start_matches("sha256:")
             .to_string();
 
         // Use content-addressable cache: /mnt/fcvm-btrfs/image-cache/{digest}/
@@ -342,51 +344,54 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
             .context("acquiring image cache lock")?;
 
         // Check if already cached (inside lock to prevent race)
-        let manifest_path = cache_dir.join("manifest.json");
-        if !manifest_path.exists() {
-            info!(image = %args.image, digest = %digest, "Exporting localhost image with skopeo");
+        // Use OCI archive format (single tar file) for faster FUSE transfer
+        let archive_path = cache_dir.with_extension("oci.tar");
+        if !archive_path.exists() {
+            info!(image = %args.image, digest = %digest, "Exporting localhost image as OCI archive");
 
-            // Create cache dir
-            tokio::fs::create_dir_all(&cache_dir)
-                .await
-                .context("creating image cache directory")?;
-
-            let output = tokio::process::Command::new("skopeo")
-                .arg("copy")
-                .arg(format!("containers-storage:{}", args.image))
-                .arg(format!("dir:{}", cache_dir.display()))
+            let output = tokio::process::Command::new("podman")
+                .args([
+                    "save",
+                    "--format",
+                    "oci-archive",
+                    "-o",
+                    archive_path.to_str().unwrap(),
+                    &args.image,
+                ])
                 .output()
                 .await
-                .context("running skopeo copy")?;
+                .context("running podman save")?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 // Clean up partial export
-                let _ = tokio::fs::remove_dir_all(&cache_dir).await;
+                let _ = tokio::fs::remove_file(&archive_path).await;
                 drop(lock_file); // Release lock before bailing
                 bail!(
-                    "Failed to export image '{}' with skopeo: {}",
+                    "Failed to export image '{}' with podman save: {}",
                     args.image,
                     stderr
                 );
             }
 
-            info!(dir = %cache_dir.display(), "Image exported to OCI directory");
+            info!(path = %archive_path.display(), "Image exported as OCI archive");
         } else {
-            info!(image = %args.image, digest = %digest, "Using cached image export");
+            info!(image = %args.image, digest = %digest, "Using cached OCI archive");
         }
 
         // Lock released when lock_file is dropped
         drop(lock_file);
 
-        // Add the cached image directory as a read-only volume mount
+        // Add the image-cache directory as a read-only volume mount
+        // Guest will access the archive at /tmp/fcvm-image/{digest}.oci.tar
         volume_mappings.push(VolumeMapping {
-            host_path: cache_dir.clone(),
+            host_path: image_cache_dir.clone(),
             guest_path: "/tmp/fcvm-image".to_string(),
             read_only: true,
         });
 
-        Some(cache_dir)
+        // Return the archive filename (relative to mount point)
+        Some(format!("{}.oci.tar", digest))
     } else {
         None
     };
@@ -564,6 +569,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         &mut vm_state,
         &volume_mappings,
         &vsock_socket_path,
+        image_archive_name.as_deref(),
     )
     .await;
 
@@ -679,6 +685,7 @@ async fn run_vm_setup(
     vm_state: &mut VmState,
     volume_mappings: &[VolumeMapping],
     vsock_socket_path: &std::path::Path,
+    image_archive_name: Option<&str>,
 ) -> Result<(VmManager, Option<tokio::process::Child>)> {
     // Setup storage - just need CoW copy (fc-agent is injected via initrd at boot)
     let vm_dir = data_dir.join("disks");
@@ -1302,7 +1309,7 @@ async fn run_vm_setup(
                 }).collect::<std::collections::HashMap<_, _>>(),
                 "cmd": cmd_args,
                 "volumes": volume_mounts,
-                "image_dir": if args.image.starts_with("localhost/") { Some("/tmp/fcvm-image") } else { None },
+                "image_archive": image_archive_name.map(|name| format!("/tmp/fcvm-image/{}", name)),
                 "privileged": args.privileged,
             },
             "host-time": chrono::Utc::now().timestamp().to_string(),
