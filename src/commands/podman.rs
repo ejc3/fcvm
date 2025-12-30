@@ -1188,6 +1188,12 @@ async fn run_vm_setup(
         boot_args.push_str(" kvm-arm.mode=nested numa=off arm64.nv2");
     }
 
+    // Pass FUSE reader count to fc-agent via kernel command line.
+    // Used to reduce memory at deeper nesting levels (256 readers × 8MB = 2GB per mount).
+    if let Ok(readers) = std::env::var("FCVM_FUSE_READERS") {
+        boot_args.push_str(&format!(" fuse_readers={}", readers));
+    }
+
     client
         .set_boot_source(crate::firecracker::api::BootSource {
             kernel_image_path: kernel_path.display().to_string(),

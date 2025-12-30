@@ -443,8 +443,10 @@ pub async fn spawn_fcvm_with_logs(
 
     // Enable nested virtualization when using inception kernel (--kernel flag)
     // FCVM_NV2=1 tells fcvm to pass --enable-nv2 to Firecracker for HAS_EL2 vCPU feature
+    // FCVM_FUSE_READERS=64 reduces memory usage for nested VMs (256 readers × 8MB = 2GB per mount)
     if args.contains(&"--kernel") {
         cmd.env("FCVM_NV2", "1");
+        cmd.env("FCVM_FUSE_READERS", "64");
     }
 
     let mut child = cmd
