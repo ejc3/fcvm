@@ -686,7 +686,13 @@ async fn ensure_inception_image() -> Result<()> {
     // All inputs that affect the container image
     let src_fcvm = fcvm_dir.join("fcvm");
     let src_agent = fcvm_dir.join("fc-agent");
-    let src_firecracker = PathBuf::from("/usr/local/bin/firecracker");
+    // Use NV2 fork if available, otherwise fall back to system firecracker
+    let nv2_fork = PathBuf::from("/home/ubuntu/firecracker/build/cargo_target/release/firecracker");
+    let src_firecracker = if nv2_fork.exists() {
+        nv2_fork
+    } else {
+        PathBuf::from("/usr/local/bin/firecracker")
+    };
     let src_inception = PathBuf::from("inception.sh");
     let src_containerfile = PathBuf::from("Containerfile.inception");
 
