@@ -28,6 +28,36 @@ env:
   CONTAINER_ARCH: aarch64
 
 jobs:
+  # Ensure self-hosted runner EC2 is running
+  ensure-runner:
+    name: Ensure Runner
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-1
+      - name: Start EC2 if stopped
+        run: |
+          INSTANCE_ID="i-0f116a86a2fd78cbe"
+          STATE=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --query 'Reservations[0].Instances[0].State.Name' --output text)
+          echo "Current state: $STATE"
+          if [ "$STATE" = "stopped" ]; then
+            echo "Starting instance..."
+            aws ec2 start-instances --instance-ids $INSTANCE_ID
+            aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+            echo "Instance started, waiting 60s for runner to register..."
+            sleep 60
+          elif [ "$STATE" = "running" ]; then
+            echo "Instance already running"
+          else
+            echo "Instance in state: $STATE - waiting..."
+            aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+            sleep 60
+          fi
+
   # Runner 0: Lint (default GitHub runner, no KVM needed)
   # Fast checks: fmt, clippy, audit, deny
   lint:
@@ -121,6 +151,7 @@ jobs:
   # Self-hosted ARM64 runner with nested virtualization (c7g.metal)
   host:
     name: Host
+    needs: ensure-runner
     if: ${{ github.event.inputs.job != 'container' }}
     runs-on: [self-hosted, Linux, ARM64]
     steps:
@@ -223,6 +254,7 @@ jobs:
   # Needs KVM for VM tests (container mounts /dev/kvm)
   container:
     name: Container
+    needs: ensure-runner
     if: ${{ github.event.inputs.job != 'host' }}
     runs-on: [self-hosted, Linux, ARM64]
     steps:
