@@ -712,7 +712,11 @@ async fn ensure_inception_image() -> Result<()> {
     if need_rebuild {
         println!(
             "Inputs changed (sha: {} → {}), rebuilding inception container...",
-            if cached_sha.is_empty() { "none" } else { cached_sha.trim() },
+            if cached_sha.is_empty() {
+                "none"
+            } else {
+                cached_sha.trim()
+            },
             combined_sha
         );
 
@@ -737,7 +741,10 @@ async fn ensure_inception_image() -> Result<()> {
         .await?;
 
     if check.status.success() && !need_rebuild {
-        println!("✓ localhost/inception-test up to date (sha: {})", combined_sha);
+        println!(
+            "✓ localhost/inception-test up to date (sha: {})",
+            combined_sha
+        );
         return Ok(());
     }
 
@@ -942,9 +949,14 @@ except OSError as e:
         .output()
         .await
         .context("getting image digest")?;
-    let image_digest = String::from_utf8_lossy(&digest_output.stdout).trim().to_string();
+    let image_digest = String::from_utf8_lossy(&digest_output.stdout)
+        .trim()
+        .to_string();
     if image_digest.is_empty() || !image_digest.starts_with("sha256:") {
-        bail!("Failed to get image digest: {:?}", String::from_utf8_lossy(&digest_output.stderr));
+        bail!(
+            "Failed to get image digest: {:?}",
+            String::from_utf8_lossy(&digest_output.stderr)
+        );
     }
     let image_cache_path = format!("/mnt/fcvm-btrfs/image-cache/{}", image_digest);
     println!("[Setup] Image digest: {}", image_digest);
@@ -962,10 +974,7 @@ except OSError as e:
         "\n[Levels 2-{}] Starting nested inception chain from Level 1...",
         total_levels
     );
-    println!(
-        "  This will boot {} VMs sequentially",
-        total_levels - 1
-    );
+    println!("  This will boot {} VMs sequentially", total_levels - 1);
 
     // Run in container (default, no --vm) because the inception script is in the container
     let output = tokio::process::Command::new(&fcvm_path)
@@ -1007,7 +1016,10 @@ except OSError as e:
 
     // Debug: Check what we're looking for
     println!("\n[Debug] Looking for marker: {}", success_marker);
-    println!("[Debug] Marker found in output: {}", combined.contains(&success_marker));
+    println!(
+        "[Debug] Marker found in output: {}",
+        combined.contains(&success_marker)
+    );
     println!("[Debug] exec exit status: {:?}", output.status);
 
     // First check if the exec command itself failed
@@ -1019,8 +1031,22 @@ except OSError as e:
              stderr (last 500 chars): {}",
             output.status,
             success_marker,
-            stdout.chars().rev().take(500).collect::<String>().chars().rev().collect::<String>(),
-            stderr.chars().rev().take(500).collect::<String>().chars().rev().collect::<String>()
+            stdout
+                .chars()
+                .rev()
+                .take(500)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>(),
+            stderr
+                .chars()
+                .rev()
+                .take(500)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
         );
     }
 
@@ -1036,8 +1062,22 @@ except OSError as e:
              stderr (last 1000 chars): {}",
             total_levels,
             success_marker,
-            stdout.chars().rev().take(1000).collect::<String>().chars().rev().collect::<String>(),
-            stderr.chars().rev().take(1000).collect::<String>().chars().rev().collect::<String>()
+            stdout
+                .chars()
+                .rev()
+                .take(1000)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>(),
+            stderr
+                .chars()
+                .rev()
+                .take(1000)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
         )
     }
 }
@@ -1050,26 +1090,38 @@ except OSError as e:
 async fn test_inception_l2() -> Result<()> {
     ensure_inception_image().await?;
     let inception_kernel = ensure_inception_kernel().await?;
-    let kernel_str = inception_kernel.to_str().context("kernel path not valid UTF-8")?;
+    let kernel_str = inception_kernel
+        .to_str()
+        .context("kernel path not valid UTF-8")?;
 
     // Get the digest of localhost/inception-test so L2 can import from shared cache
     let digest_out = tokio::process::Command::new("podman")
-        .args(["inspect", "localhost/inception-test", "--format", "{{.Digest}}"])
+        .args([
+            "inspect",
+            "localhost/inception-test",
+            "--format",
+            "{{.Digest}}",
+        ])
         .output()
         .await?;
-    let digest = String::from_utf8_lossy(&digest_out.stdout).trim().to_string();
+    let digest = String::from_utf8_lossy(&digest_out.stdout)
+        .trim()
+        .to_string();
     println!("Image digest: {}", digest);
 
     // For L1→L2, just write a simple script that does both steps:
     // 1. Import image from shared cache
     // 2. Run fcvm with --cmd to echo the marker
-    let l1_script = format!(r#"#!/bin/bash
+    let l1_script = format!(
+        r#"#!/bin/bash
 set -ex
 echo "L1: Importing image from shared cache..."
 skopeo copy dir:/mnt/fcvm-btrfs/image-cache/{} containers-storage:localhost/inception-test
 echo "L1: Starting L2 VM..."
 fcvm podman run --name l2 --network bridged --privileged localhost/inception-test --cmd "echo MARKER_L2_OK_12345"
-"#, digest);
+"#,
+        digest
+    );
 
     let script_path = "/mnt/fcvm-btrfs/l1-inception.sh";
     tokio::fs::write(script_path, &l1_script).await?;
@@ -1083,14 +1135,20 @@ fcvm podman run --name l2 --network bridged --privileged localhost/inception-tes
     let output = tokio::process::Command::new("sudo")
         .args([
             "./target/release/fcvm",
-            "podman", "run",
-            "--name", "l1-inception",
-            "--network", "bridged",
+            "podman",
+            "run",
+            "--name",
+            "l1-inception",
+            "--network",
+            "bridged",
             "--privileged",
-            "--kernel", kernel_str,
-            "--map", "/mnt/fcvm-btrfs:/mnt/fcvm-btrfs",
+            "--kernel",
+            kernel_str,
+            "--map",
+            "/mnt/fcvm-btrfs:/mnt/fcvm-btrfs",
             "localhost/inception-test",
-            "--cmd", "/mnt/fcvm-btrfs/l1-inception.sh",
+            "--cmd",
+            "/mnt/fcvm-btrfs/l1-inception.sh",
         ])
         .output()
         .await?;
@@ -1108,22 +1166,172 @@ fcvm podman run --name l2 --network bridged --privileged localhost/inception-tes
     Ok(())
 }
 
-/// Test 32 levels of nested VMs (deep inception chain)
+/// Test L1→L2→L3 inception: 3 levels of nesting
 ///
-/// BLOCKED: Recursive nesting not possible - L1's KVM_CAP_ARM_EL2=0.
+/// BLOCKED: 3-hop FUSE chain (L3→L2→L1→HOST) causes ~3-5 second latency per
+/// request due to PassthroughFs + spawn_blocking serialization. FUSE mount
+/// initialization alone takes 10+ minutes. Need to implement request pipelining
+/// or async PassthroughFs before this test can complete in reasonable time.
 #[tokio::test]
 #[ignore]
-async fn test_inception_chain_32_levels() -> Result<()> {
-    run_inception_chain(32).await
+async fn test_inception_l3() -> Result<()> {
+    run_inception_n_levels(3, "MARKER_L3_OK_12345").await
 }
 
-/// Test 64 levels of nested VMs (extreme inception chain)
+/// Test L1→L2→L3→L4 inception: 4 levels of nesting
 ///
-/// BLOCKED: Recursive nesting not possible - L1's KVM_CAP_ARM_EL2=0.
+/// BLOCKED: Same issue as L3, but worse. 4-hop FUSE chain would be even slower.
 #[tokio::test]
 #[ignore]
-async fn test_inception_chain_64_levels() -> Result<()> {
-    run_inception_chain(64).await
+async fn test_inception_l4() -> Result<()> {
+    run_inception_n_levels(4, "MARKER_L4_OK_12345").await
+}
+
+/// Run N levels of inception, building scripts from deepest level upward
+async fn run_inception_n_levels(n: usize, marker: &str) -> Result<()> {
+    assert!(n >= 2, "Need at least 2 levels for inception");
+
+    ensure_inception_image().await?;
+    let inception_kernel = ensure_inception_kernel().await?;
+    let kernel_str = inception_kernel
+        .to_str()
+        .context("kernel path not valid UTF-8")?;
+
+    // Get the digest of localhost/inception-test
+    let digest_out = tokio::process::Command::new("podman")
+        .args([
+            "inspect",
+            "localhost/inception-test",
+            "--format",
+            "{{.Digest}}",
+        ])
+        .output()
+        .await?;
+    let digest = String::from_utf8_lossy(&digest_out.stdout)
+        .trim()
+        .to_string();
+    println!("Image digest: {}", digest);
+
+    // Memory allocation strategy:
+    // - Each VM needs enough memory to run its child's Firecracker (~2GB) + OS overhead (~500MB)
+    // - Intermediate levels (L1..L(n-1)): 4GB each to accommodate child VM + OS
+    // - Deepest level (Ln): 2GB (default) since it just runs echo
+    let intermediate_mem = "4096"; // 4GB for VMs that spawn children
+
+    // Build scripts from deepest level (Ln) upward to L1
+    // Ln (deepest): just echo the marker
+    // L1..L(n-1): import image + run fcvm with next level's script
+
+    let scripts_dir = "/mnt/fcvm-btrfs/inception-scripts";
+    tokio::fs::create_dir_all(scripts_dir).await.ok();
+
+    // Deepest level (Ln): just echo the marker
+    let ln_script = format!("#!/bin/bash\necho {}\n", marker);
+    let ln_path = format!("{}/l{}.sh", scripts_dir, n);
+    tokio::fs::write(&ln_path, &ln_script).await?;
+    tokio::process::Command::new("chmod")
+        .args(["+x", &ln_path])
+        .status()
+        .await?;
+    println!("L{}: echo marker", n);
+
+    // Build L(n-1) down to L1: each imports image and runs fcvm with next script
+    // Each level needs:
+    // - --map to access shared storage
+    // - --mem for intermediate levels to fit child VM
+    // - --kernel for intermediate levels that spawn VMs (need KVM)
+    //
+    // The inception kernel path is accessible via the shared FUSE mount.
+    let inception_kernel_path = kernel_str; // Same kernel used at all levels
+
+    for level in (1..n).rev() {
+        let next_script = format!("{}/l{}.sh", scripts_dir, level + 1);
+
+        // Every level in this loop runs `fcvm podman run`, spawning a child VM.
+        // Each spawned VM runs Firecracker which needs ~2GB. So every level that
+        // spawns a VM needs extra memory (4GB) to fit:
+        // - Firecracker process for child VM (~2GB)
+        // - OS overhead and containers (~1-2GB)
+        //
+        // L(n) (deepest, created outside this loop) just runs echo, no child VMs.
+        // All other levels (1 to n-1) spawn VMs and need 4GB.
+        let mem_arg = format!("--mem {}", intermediate_mem);
+        // ALL levels need --kernel because they all spawn VMs with Firecracker
+        let kernel_arg = format!("--kernel {}", inception_kernel_path);
+
+        let script = format!(
+            r#"#!/bin/bash
+set -ex
+echo "L{}: Importing image from shared cache..."
+skopeo copy dir:/mnt/fcvm-btrfs/image-cache/{} containers-storage:localhost/inception-test
+echo "L{}: Starting L{} VM..."
+fcvm podman run --name l{} --network bridged --privileged {} {} --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs localhost/inception-test --cmd {}
+"#,
+            level,
+            digest,
+            level,
+            level + 1,
+            level + 1,
+            mem_arg,
+            kernel_arg,
+            next_script
+        );
+        let script_path = format!("{}/l{}.sh", scripts_dir, level);
+        tokio::fs::write(&script_path, &script).await?;
+        tokio::process::Command::new("chmod")
+            .args(["+x", &script_path])
+            .status()
+            .await?;
+        println!(
+            "L{}: import + fcvm {} {} --map + --cmd {}",
+            level, mem_arg, kernel_arg, next_script
+        );
+    }
+
+    // Run L1 from host with inception kernel
+    // L1 needs extra memory since it spawns L2
+    let l1_script = format!("{}/l1.sh", scripts_dir);
+    println!(
+        "\nStarting {} levels of inception with 4GB per intermediate VM...",
+        n
+    );
+
+    // Use sh -c with tee to stream output in real-time AND capture for marker check
+    let log_file = format!("/tmp/inception-l{}.log", n);
+    let fcvm_cmd = format!(
+        "sudo ./target/release/fcvm podman run \
+         --name l1-inception-{} \
+         --network bridged \
+         --privileged \
+         --mem {} \
+         --kernel {} \
+         --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
+         localhost/inception-test \
+         --cmd {} 2>&1 | tee {}",
+        n, intermediate_mem, kernel_str, l1_script, log_file
+    );
+
+    let status = tokio::process::Command::new("sh")
+        .args(["-c", &fcvm_cmd])
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .await?;
+
+    // Read log file to check for marker
+    let log_content = tokio::fs::read_to_string(&log_file)
+        .await
+        .unwrap_or_default();
+
+    // Look for the marker in output
+    assert!(
+        log_content.contains(marker),
+        "L{} VM should echo marker '{}'. Exit status: {:?}. Check output above.",
+        n,
+        marker,
+        status
+    );
+    Ok(())
 }
 
 /// Test skopeo import performance over FUSE (localhost/inception-test)
@@ -1143,10 +1351,17 @@ async fn test_skopeo_import_over_fuse() -> Result<()> {
     // 2. Get image digest and export to CAS cache
     println!("2. Getting image digest...");
     let digest_output = tokio::process::Command::new("podman")
-        .args(["inspect", "localhost/inception-test", "--format", "{{.Digest}}"])
+        .args([
+            "inspect",
+            "localhost/inception-test",
+            "--format",
+            "{{.Digest}}",
+        ])
         .output()
         .await?;
-    let digest = String::from_utf8_lossy(&digest_output.stdout).trim().to_string();
+    let digest = String::from_utf8_lossy(&digest_output.stdout)
+        .trim()
+        .to_string();
 
     if digest.is_empty() || !digest.starts_with("sha256:") {
         bail!("Invalid digest: {}", digest);
@@ -1157,10 +1372,17 @@ async fn test_skopeo_import_over_fuse() -> Result<()> {
 
     // Get image size
     let size_output = tokio::process::Command::new("podman")
-        .args(["images", "localhost/inception-test", "--format", "{{.Size}}"])
+        .args([
+            "images",
+            "localhost/inception-test",
+            "--format",
+            "{{.Size}}",
+        ])
         .output()
         .await?;
-    let size = String::from_utf8_lossy(&size_output.stdout).trim().to_string();
+    let size = String::from_utf8_lossy(&size_output.stdout)
+        .trim()
+        .to_string();
     println!("   Size: {}", size);
 
     // Check if already in CAS cache
@@ -1194,7 +1416,9 @@ async fn test_skopeo_import_over_fuse() -> Result<()> {
     println!("3. Starting L1 VM with FUSE mount...");
 
     let inception_kernel = ensure_inception_kernel().await?;
-    let kernel_str = inception_kernel.to_str().context("kernel path not valid UTF-8")?;
+    let kernel_str = inception_kernel
+        .to_str()
+        .context("kernel path not valid UTF-8")?;
 
     let (vm_name, _, _, _) = common::unique_names("fuse-large");
     let fcvm_path = common::find_fcvm_binary()?;

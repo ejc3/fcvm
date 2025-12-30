@@ -187,13 +187,22 @@ async fn request_reader<H: FilesystemHandler + 'static>(
     tx: mpsc::Sender<PendingResponse>,
 ) -> anyhow::Result<()> {
     let mut len_buf = [0u8; 4];
+    let mut count = 0u64;
 
     loop {
         // Read request length
         match read_half.read_exact(&mut len_buf).await {
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                tracing::debug!(target: "fuse-pipe::server", count, "client disconnected");
+                break;
+            }
             Err(e) => return Err(e.into()),
+        }
+
+        count += 1;
+        if count <= 10 || count.is_multiple_of(100) {
+            tracing::info!(target: "fuse-pipe::server", count, "server: received requests");
         }
 
         // Mark server_recv as soon as we have the length header

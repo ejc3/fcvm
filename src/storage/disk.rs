@@ -31,10 +31,13 @@ impl DiskManager {
         }
     }
 
-    /// Create a CoW disk from base rootfs, preferring reflinks but falling back to copies
+    /// Create a CoW disk from base rootfs using btrfs reflinks
     ///
     /// The base rootfs is a raw disk image with partitions (e.g., /dev/vda1 for root).
     /// This operation is completely rootless - just a file copy with btrfs reflinks.
+    ///
+    /// Reflinks work through nested FUSE mounts when the kernel has the
+    /// FUSE_REMAP_FILE_RANGE patch (inception kernel 6.18+).
     pub async fn create_cow_disk(&self) -> Result<PathBuf> {
         info!(vm_id = %self.vm_id, "creating CoW disk");
 
@@ -53,9 +56,7 @@ impl DiskManager {
                 "creating instant reflink copy (btrfs CoW)"
             );
 
-            // Use cp --reflink=always for instant CoW copy on btrfs
-            // Requires btrfs filesystem - no fallback to regular copy
-            let output = tokio::process::Command::new("cp")
+            let reflink_output = tokio::process::Command::new("cp")
                 .arg("--reflink=always")
                 .arg(&self.base_rootfs)
                 .arg(&disk_path)
@@ -63,11 +64,11 @@ impl DiskManager {
                 .await
                 .context("executing cp --reflink=always")?;
 
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
+            if !reflink_output.status.success() {
+                let stderr = String::from_utf8_lossy(&reflink_output.stderr);
                 anyhow::bail!(
-                    "Failed to create reflink copy. Ensure {} is a btrfs filesystem. Error: {}",
-                    disk_path.parent().unwrap_or(&disk_path).display(),
+                    "Reflink copy failed (required for CoW disk). Error: {}. \
+                    Ensure the kernel has FUSE_REMAP_FILE_RANGE support (inception kernel 6.18+).",
                     stderr
                 );
             }
