@@ -63,7 +63,7 @@ CONTAINER_RUN := podman run --rm --privileged \
 	test test-unit test-fast test-all test-root \
 	_test-unit _test-fast _test-all _test-root \
 	container-build container-test container-test-unit container-test-fast container-test-all \
-	container-shell container-clean setup-btrfs setup-fcvm setup-pjdfstest bench lint fmt \
+	container-shell container-clean setup-btrfs setup-fcvm setup-pjdfstest setup-inception bench lint fmt \
 	rebuild-fc dev-fc-test inception-vm inception-exec inception-wait-exec inception-stop inception-status
 
 all: build
@@ -227,6 +227,37 @@ _setup-fcvm:
 		exit 1; \
 	fi
 	./target/release/fcvm setup
+
+# Inception test setup - builds container with matching CAS chain
+# Ensures: bin/fc-agent == target/release/fc-agent, initrd SHA matches, container cached
+setup-inception: setup-fcvm
+	@echo "==> Setting up inception test container..."
+	@echo "==> Copying binaries to bin/..."
+	mkdir -p bin
+	cp target/release/fcvm bin/
+	cp target/$(MUSL_TARGET)/release/fc-agent bin/
+	cp /usr/local/bin/firecracker firecracker-nv2 2>/dev/null || true
+	@echo "==> Building inception-test container..."
+	podman rmi localhost/inception-test 2>/dev/null || true
+	podman build -t localhost/inception-test -f Containerfile.inception .
+	@echo "==> Exporting container to CAS cache..."
+	@DIGEST=$$(podman inspect localhost/inception-test --format '{{.Digest}}'); \
+	CACHE_DIR="/mnt/fcvm-btrfs/image-cache/$${DIGEST}"; \
+	if [ -d "$$CACHE_DIR" ]; then \
+		echo "Cache already exists: $$CACHE_DIR"; \
+	else \
+		echo "Creating cache: $$CACHE_DIR"; \
+		sudo mkdir -p "$$CACHE_DIR"; \
+		sudo skopeo copy containers-storage:localhost/inception-test "dir:$$CACHE_DIR"; \
+	fi
+	@echo "==> Verification..."
+	@echo "fc-agent SHA: $$(sha256sum bin/fc-agent | cut -c1-12)"
+	@echo "Container fc-agent SHA: $$(podman run --rm localhost/inception-test sha256sum /usr/local/bin/fc-agent | cut -c1-12)"
+	@echo "Initrd: $$(ls -1 /mnt/fcvm-btrfs/initrd/fc-agent-*.initrd | tail -1)"
+	@DIGEST=$$(podman inspect localhost/inception-test --format '{{.Digest}}'); \
+	echo "Image digest: $$DIGEST"; \
+	echo "Cache path: /mnt/fcvm-btrfs/image-cache/$$DIGEST"
+	@echo "==> Inception setup complete!"
 
 bench: build
 	@echo "==> Running benchmarks..."

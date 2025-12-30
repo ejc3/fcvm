@@ -6,9 +6,38 @@
 
 use fuse_pipe::transport::HOST_CID;
 
-/// Number of FUSE reader threads for parallel I/O.
-/// Benchmarks show 256 readers gives best throughput.
-const NUM_READERS: usize = 256;
+/// Default number of FUSE reader threads for parallel I/O.
+/// Benchmarks show 256 readers gives best throughput on L1.
+/// Can be overridden via FCVM_FUSE_READERS environment variable.
+const DEFAULT_NUM_READERS: usize = 256;
+
+/// Get the configured number of FUSE readers.
+/// Checks (in order):
+/// 1. FCVM_FUSE_READERS environment variable
+/// 2. fuse_readers=N kernel boot parameter (from /proc/cmdline)
+/// 3. DEFAULT_NUM_READERS (256)
+fn get_num_readers() -> usize {
+    // First check environment variable
+    if let Some(n) = std::env::var("FCVM_FUSE_READERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        return n;
+    }
+
+    // Then check kernel command line
+    if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
+        for part in cmdline.split_whitespace() {
+            if let Some(value) = part.strip_prefix("fuse_readers=") {
+                if let Ok(n) = value.parse() {
+                    return n;
+                }
+            }
+        }
+    }
+
+    DEFAULT_NUM_READERS
+}
 
 /// Mount a FUSE filesystem from host via vsock.
 ///
@@ -21,11 +50,12 @@ const NUM_READERS: usize = 256;
 /// * `port` - The vsock port where the host VolumeServer is listening
 /// * `mount_point` - The path where the filesystem will be mounted
 pub fn mount_vsock(port: u32, mount_point: &str) -> anyhow::Result<()> {
+    let num_readers = get_num_readers();
     eprintln!(
         "[fc-agent] mounting FUSE volume at {} via vsock port {} ({} readers)",
-        mount_point, port, NUM_READERS
+        mount_point, port, num_readers
     );
-    fuse_pipe::mount_vsock_with_readers(HOST_CID, port, mount_point, NUM_READERS)
+    fuse_pipe::mount_vsock_with_readers(HOST_CID, port, mount_point, num_readers)
 }
 
 /// Mount a FUSE filesystem with multiple reader threads.
