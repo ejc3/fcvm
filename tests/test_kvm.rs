@@ -696,11 +696,11 @@ async fn ensure_inception_image() -> Result<()> {
     }
 
     let mut hasher = Sha256::new();
-    hasher.update(&file_bytes(&src_fcvm));
-    hasher.update(&file_bytes(&src_agent));
-    hasher.update(&file_bytes(&src_firecracker));
-    hasher.update(&file_bytes(&src_inception));
-    hasher.update(&file_bytes(&src_containerfile));
+    hasher.update(file_bytes(&src_fcvm));
+    hasher.update(file_bytes(&src_agent));
+    hasher.update(file_bytes(&src_firecracker));
+    hasher.update(file_bytes(&src_inception));
+    hasher.update(file_bytes(&src_containerfile));
     let combined_sha = hex::encode(&hasher.finalize()[..6]);
 
     // Check if we have a marker file with the current SHA
@@ -831,6 +831,7 @@ async fn ensure_inception_image() -> Result<()> {
 /// Each nested level uses localhost/inception-test which has fcvm baked in.
 ///
 /// REQUIRES: ARM64 with FEAT_NV2 (ARMv8.4+) and kvm-arm.mode=nested
+#[allow(dead_code)] // Helper for future L3+ tests (currently L3 is too slow)
 async fn run_inception_chain(total_levels: usize) -> Result<()> {
     let success_marker = format!("INCEPTION_CHAIN_{}_LEVELS_SUCCESS", total_levels);
 
@@ -1269,11 +1270,7 @@ fcvm podman run --name l2 --network bridged --privileged \
             || line.contains("FUSE_READ_L")
         {
             // Strip ANSI codes and prefixes
-            let clean = line
-                .split("stdout]")
-                .last()
-                .unwrap_or(line)
-                .trim();
+            let clean = line.split("stdout]").last().unwrap_or(line).trim();
             println!("{}", clean);
         }
     }

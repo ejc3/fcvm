@@ -23,9 +23,9 @@ struct Plan {
     /// Volume mounts from host (FUSE-over-vsock)
     #[serde(default)]
     volumes: Vec<VolumeMount>,
-    /// Directory containing exported OCI image (for localhost/ images)
+    /// Path to OCI archive for localhost/ images (run directly without import)
     #[serde(default)]
-    image_dir: Option<String>,
+    image_archive: Option<String>,
     /// Run container in privileged mode (allows mknod, device access, etc.)
     #[serde(default)]
     privileged: bool,
@@ -1602,25 +1602,12 @@ async fn main() -> Result<()> {
         });
     }
 
-    // If image_dir is set, use skopeo to import the image from the FUSE-mounted directory
-    if let Some(image_dir) = &plan.image_dir {
-        eprintln!("[fc-agent] importing image from {} using skopeo", image_dir);
-
-        let output = Command::new("skopeo")
-            .arg("copy")
-            .arg(format!("dir:{}", image_dir))
-            .arg(format!("containers-storage:{}", plan.image))
-            .output()
-            .await
-            .context("running skopeo copy to import image")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!("[fc-agent] ERROR: skopeo copy failed: {}", stderr);
-            anyhow::bail!("Failed to import image with skopeo: {}", stderr);
-        }
-
-        eprintln!("[fc-agent] ✓ image imported successfully");
+    // Determine the image reference for podman run
+    // If image_archive is set, we run directly from the OCI archive (no import needed)
+    // Otherwise, pull from registry
+    let image_ref = if let Some(archive_path) = &plan.image_archive {
+        eprintln!("[fc-agent] using OCI archive: {}", archive_path);
+        format!("oci-archive:{}", archive_path)
     } else {
         // Pull image with retries to handle transient DNS/network errors
         const MAX_RETRIES: u32 = 3;
@@ -1719,9 +1706,12 @@ async fn main() -> Result<()> {
                 last_error
             );
         }
-    }
 
-    eprintln!("[fc-agent] launching container: {}", plan.image);
+        // Return the image name for podman run
+        plan.image.clone()
+    };
+
+    eprintln!("[fc-agent] launching container: {}", image_ref);
 
     // Build Podman command
     let mut cmd = Command::new("podman");
@@ -1756,8 +1746,8 @@ async fn main() -> Result<()> {
         cmd.arg("-v").arg(mount_spec);
     }
 
-    // Image
-    cmd.arg(&plan.image);
+    // Image (either oci-archive:/path or image name from registry)
+    cmd.arg(&image_ref);
 
     // Command override
     if let Some(cmd_args) = &plan.cmd {
