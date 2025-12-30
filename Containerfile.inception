@@ -1,0 +1,53 @@
+# Inception test container - self-contained with fcvm, fc-agent, firecracker
+#
+# Uses Ubuntu 24.04 to match host glibc (2.39).
+#
+# Build:
+#   cp target/release/fcvm target/release/fc-agent artifacts/
+#   cp /usr/local/bin/firecracker artifacts/firecracker-nv2
+#   sudo podman build -t localhost/inception-test -f Containerfile.inception .
+#
+# The inception test is driven by test_inception_chain.rs which:
+# 1. Runs L1 with --cmd "sleep infinity"
+# 2. Execs into L1's container to verify KVM works
+# 3. Execs into L1's container to start L2
+# 4. Repeats for each level
+
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    iproute2 iptables podman skopeo python3 kmod procps fuse3 curl nginx \
+    fuse-overlayfs sudo \
+    && rm -rf /var/lib/apt/lists/*
+
+# Configure podman to use fuse-overlayfs (required for nested containers)
+# Must set runroot/graphroot explicitly for nested container environments
+RUN mkdir -p /etc/containers /var/lib/containers/storage && \
+    printf '%s\n' \
+        '[storage]' \
+        'driver = "overlay"' \
+        'runroot = "/run/containers/storage"' \
+        'graphroot = "/var/lib/containers/storage"' \
+        '[storage.options.overlay]' \
+        'mount_program = "/usr/bin/fuse-overlayfs"' \
+        > /etc/containers/storage.conf
+
+# Copy pre-built binaries (host glibc 2.39 matches ubuntu:24.04)
+COPY artifacts/fcvm artifacts/fc-agent /usr/local/bin/
+COPY artifacts/firecracker-nv2 /usr/local/bin/firecracker
+RUN chmod +x /usr/local/bin/fcvm /usr/local/bin/fc-agent /usr/local/bin/firecracker
+
+# Copy config file for nested fcvm (uses same paths as host via FUSE mount)
+RUN mkdir -p /etc/fcvm
+COPY rootfs-config.toml /etc/fcvm/rootfs-config.toml
+
+# Recursive inception script: /usr/local/bin/inception
+# Usage: inception <current_level> <max_level> <kernel_path> <image_cache_path>
+# When current == max, echoes success marker. Otherwise starts nested VM.
+COPY inception.sh /usr/local/bin/inception
+RUN chmod +x /usr/local/bin/inception
+
+# Default command - create runtime dirs, start nginx (for health checks), and sleep
+# /run/netns is needed for ip netns (bridged networking)
+# /run/containers/storage is needed for podman
+CMD ["sh", "-c", "mkdir -p /run/netns /run/containers/storage && nginx && sleep infinity"]

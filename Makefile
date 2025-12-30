@@ -229,14 +229,14 @@ _setup-fcvm:
 	./target/release/fcvm setup
 
 # Inception test setup - builds container with matching CAS chain
-# Ensures: bin/fc-agent == target/release/fc-agent, initrd SHA matches, container cached
+# Ensures: artifacts/fc-agent == target/release/fc-agent, initrd SHA matches, container cached
 setup-inception: setup-fcvm
 	@echo "==> Setting up inception test container..."
-	@echo "==> Copying binaries to bin/..."
-	mkdir -p bin
-	cp target/release/fcvm bin/
-	cp target/$(MUSL_TARGET)/release/fc-agent bin/
-	cp /usr/local/bin/firecracker firecracker-nv2 2>/dev/null || true
+	@echo "==> Copying binaries to artifacts/..."
+	mkdir -p artifacts
+	cp target/release/fcvm artifacts/
+	cp target/$(MUSL_TARGET)/release/fc-agent artifacts/
+	cp /usr/local/bin/firecracker artifacts/firecracker-nv2 2>/dev/null || true
 	@echo "==> Building inception-test container..."
 	podman rmi localhost/inception-test 2>/dev/null || true
 	podman build -t localhost/inception-test -f Containerfile.inception .
@@ -251,7 +251,7 @@ setup-inception: setup-fcvm
 		sudo skopeo copy containers-storage:localhost/inception-test "dir:$$CACHE_DIR"; \
 	fi
 	@echo "==> Verification..."
-	@echo "fc-agent SHA: $$(sha256sum bin/fc-agent | cut -c1-12)"
+	@echo "fc-agent SHA: $$(sha256sum artifacts/fc-agent | cut -c1-12)"
 	@echo "Container fc-agent SHA: $$(podman run --rm localhost/inception-test sha256sum /usr/local/bin/fc-agent | cut -c1-12)"
 	@echo "Initrd: $$(ls -1 /mnt/fcvm-btrfs/initrd/fc-agent-*.initrd | tail -1)"
 	@DIGEST=$$(podman inspect localhost/inception-test --format '{{.Digest}}'); \
