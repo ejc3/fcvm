@@ -1109,27 +1109,118 @@ async fn test_inception_l2() -> Result<()> {
         .to_string();
     println!("Image digest: {}", digest);
 
-    // For L1→L2, just write a simple script that does both steps:
-    // 1. Import image from shared cache
-    // 2. Run fcvm with --cmd to echo the marker
+    // Create inception-scripts directory
+    tokio::fs::create_dir_all("/mnt/fcvm-btrfs/inception-scripts").await?;
+
+    // Benchmark script that runs at each level
+    // Tests: egress, local disk, FUSE disk
+    let bench_script = r#"#!/bin/bash
+set -e
+LEVEL=${1:-unknown}
+
+echo "=== BENCHMARK L${LEVEL} ==="
+
+# Test 1: Egress - can we reach the internet?
+echo "--- Egress Test ---"
+if curl -s --max-time 10 http://ifconfig.me > /tmp/egress.txt 2>&1; then
+    IP=$(cat /tmp/egress.txt)
+    echo "EGRESS_L${LEVEL}=OK ip=${IP}"
+else
+    echo "EGRESS_L${LEVEL}=FAIL"
+fi
+
+# Test 2: Local disk performance (dd to /tmp which is on rootfs)
+echo "--- Local Disk Test ---"
+# Write 10MB
+START=$(date +%s%N)
+dd if=/dev/zero of=/tmp/bench.dat bs=1M count=10 conv=fsync 2>/dev/null
+END=$(date +%s%N)
+WRITE_MS=$(( (END - START) / 1000000 ))
+echo "LOCAL_WRITE_L${LEVEL}=${WRITE_MS}ms (10MB)"
+
+# Read back
+START=$(date +%s%N)
+dd if=/tmp/bench.dat of=/dev/null bs=1M 2>/dev/null
+END=$(date +%s%N)
+READ_MS=$(( (END - START) / 1000000 ))
+echo "LOCAL_READ_L${LEVEL}=${READ_MS}ms (10MB)"
+rm -f /tmp/bench.dat
+
+# Test 3: FUSE disk performance (if /mnt/fcvm-btrfs is mounted)
+if mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then
+    echo "--- FUSE Disk Test ---"
+    FUSE_DIR="/mnt/fcvm-btrfs/bench-${LEVEL}-$$"
+    mkdir -p "$FUSE_DIR"
+
+    # Write 10MB
+    START=$(date +%s%N)
+    dd if=/dev/zero of="${FUSE_DIR}/bench.dat" bs=1M count=10 conv=fsync 2>/dev/null
+    END=$(date +%s%N)
+    WRITE_MS=$(( (END - START) / 1000000 ))
+    echo "FUSE_WRITE_L${LEVEL}=${WRITE_MS}ms (10MB)"
+
+    # Read back
+    START=$(date +%s%N)
+    dd if="${FUSE_DIR}/bench.dat" of=/dev/null bs=1M 2>/dev/null
+    END=$(date +%s%N)
+    READ_MS=$(( (END - START) / 1000000 ))
+    echo "FUSE_READ_L${LEVEL}=${READ_MS}ms (10MB)"
+
+    rm -rf "$FUSE_DIR"
+else
+    echo "FUSE_L${LEVEL}=NOT_MOUNTED"
+fi
+
+echo "=== END BENCHMARK L${LEVEL} ==="
+echo "MARKER_L${LEVEL}_OK"
+"#;
+
+    let bench_path = "/mnt/fcvm-btrfs/inception-scripts/bench.sh";
+    tokio::fs::write(bench_path, bench_script).await?;
+    tokio::process::Command::new("chmod")
+        .args(["+x", bench_path])
+        .status()
+        .await?;
+
+    // L2 script: just run benchmark
+    let l2_script = r#"#!/bin/bash
+set -ex
+/mnt/fcvm-btrfs/inception-scripts/bench.sh 2
+"#;
+    let l2_path = "/mnt/fcvm-btrfs/inception-scripts/l2.sh";
+    tokio::fs::write(l2_path, l2_script).await?;
+    tokio::process::Command::new("chmod")
+        .args(["+x", l2_path])
+        .status()
+        .await?;
+
+    // L1 script: run L1 benchmark, import image, start L2 with benchmark
     let l1_script = format!(
         r#"#!/bin/bash
 set -ex
+
+# Run L1 benchmark first
+/mnt/fcvm-btrfs/inception-scripts/bench.sh 1
+
 echo "L1: Importing image from shared cache..."
-skopeo copy dir:/mnt/fcvm-btrfs/image-cache/{} containers-storage:localhost/inception-test
-echo "L1: Starting L2 VM..."
-fcvm podman run --name l2 --network bridged --privileged localhost/inception-test --cmd "echo MARKER_L2_OK_12345"
+skopeo copy dir:/mnt/fcvm-btrfs/image-cache/{digest} containers-storage:localhost/inception-test
+
+echo "L1: Starting L2 VM with benchmarks..."
+fcvm podman run --name l2 --network bridged --privileged \
+    --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
+    localhost/inception-test \
+    --cmd /mnt/fcvm-btrfs/inception-scripts/l2.sh
 "#,
-        digest
+        digest = digest
     );
 
-    let script_path = "/mnt/fcvm-btrfs/l1-inception.sh";
-    tokio::fs::write(script_path, &l1_script).await?;
+    let l1_path = "/mnt/fcvm-btrfs/inception-scripts/l1.sh";
+    tokio::fs::write(l1_path, &l1_script).await?;
     tokio::process::Command::new("chmod")
-        .args(["+x", script_path])
+        .args(["+x", l1_path])
         .status()
         .await?;
-    println!("Wrote L1 script to {}", script_path);
+    println!("Wrote inception scripts to /mnt/fcvm-btrfs/inception-scripts/");
 
     // Run L1 with --cmd that executes the script
     let output = tokio::process::Command::new("sudo")
@@ -1148,7 +1239,7 @@ fcvm podman run --name l2 --network bridged --privileged localhost/inception-tes
             "/mnt/fcvm-btrfs:/mnt/fcvm-btrfs",
             "localhost/inception-test",
             "--cmd",
-            "/mnt/fcvm-btrfs/l1-inception.sh",
+            "/mnt/fcvm-btrfs/inception-scripts/l1.sh",
         ])
         .output()
         .await?;
@@ -1158,11 +1249,36 @@ fcvm podman run --name l2 --network bridged --privileged localhost/inception-tes
     println!("stdout: {}", stdout);
     println!("stderr: {}", stderr);
 
-    // Look for the marker in stderr where container output appears
+    // Check for L1 and L2 markers
     assert!(
-        stderr.contains("MARKER_L2_OK_12345"),
-        "L2 VM should run inside L1 and echo the marker. Check stderr above."
+        stderr.contains("MARKER_L1_OK"),
+        "L1 benchmark should complete. Check stderr above."
     );
+    assert!(
+        stderr.contains("MARKER_L2_OK"),
+        "L2 benchmark should complete. Check stderr above."
+    );
+
+    // Extract and display benchmark results
+    println!("\n=== BENCHMARK SUMMARY ===");
+    for line in stderr.lines() {
+        if line.contains("EGRESS_L")
+            || line.contains("LOCAL_WRITE_L")
+            || line.contains("LOCAL_READ_L")
+            || line.contains("FUSE_WRITE_L")
+            || line.contains("FUSE_READ_L")
+        {
+            // Strip ANSI codes and prefixes
+            let clean = line
+                .split("stdout]")
+                .last()
+                .unwrap_or(line)
+                .trim();
+            println!("{}", clean);
+        }
+    }
+    println!("=========================\n");
+
     Ok(())
 }
 
