@@ -7,15 +7,22 @@
 use fuse_pipe::transport::HOST_CID;
 
 /// Default number of FUSE reader threads for parallel I/O.
-/// Benchmarks show 256 readers gives best throughput on L1.
+///
+/// Benchmarks (256 workers, 1024 × 4KB files):
+/// - 1 reader: 3.0s writes (serialization bottleneck, 18x slower)
+/// - 16 readers: 61ms reads (optimal for reads)
+/// - 64 readers: 165ms writes ≈ host 161ms (optimal for writes)
+/// - 256 readers: 162ms writes (negligible improvement, 4x memory)
+///
+/// 64 balances performance with memory (each reader stack ≈ 8MB).
 /// Can be overridden via FCVM_FUSE_READERS environment variable.
-const DEFAULT_NUM_READERS: usize = 256;
+const DEFAULT_NUM_READERS: usize = 64;
 
 /// Get the configured number of FUSE readers.
 /// Checks (in order):
 /// 1. FCVM_FUSE_READERS environment variable
 /// 2. fuse_readers=N kernel boot parameter (from /proc/cmdline)
-/// 3. DEFAULT_NUM_READERS (256)
+/// 3. DEFAULT_NUM_READERS (64)
 fn get_num_readers() -> usize {
     // First check environment variable
     if let Some(n) = std::env::var("FCVM_FUSE_READERS")
