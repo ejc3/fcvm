@@ -192,33 +192,54 @@ impl Span {
     }
 
     /// Print the span as a breakdown (all times in µs)
-    pub fn print(&self, unique: u64) {
-        let delta = |a: u64, b: u64| -> i64 {
+    ///
+    /// Note: Cross-machine deltas (to_srv, to_cli) are unreliable when clocks differ.
+    /// Server-side deltas (deser, spawn, fs, chan) are always accurate.
+    /// Client-side total (t0 → client_done) is always accurate.
+    pub fn print(&self, unique: u64, op_name: &str) {
+        // Safe delta that handles clock skew (returns None if b < a or either is 0)
+        let delta = |a: u64, b: u64| -> Option<i64> {
             if a == 0 || b == 0 {
-                -1
-            } else {
-                ((b - a) / 1000) as i64
+                return None;
+            }
+            // Use checked_sub to detect underflow from clock skew
+            b.checked_sub(a).map(|d| (d / 1000) as i64)
+        };
+
+        // Format delta, showing "?" for invalid/skewed values
+        let fmt = |d: Option<i64>| -> String {
+            match d {
+                Some(v) if v >= 0 => v.to_string(),
+                _ => "?".to_string(),
             }
         };
+
         let total = delta(self.t0, self.client_done);
 
-        // to_server: client send → server receive (includes client serialize, socket write, network)
-        // deser: deserialize request
-        // spawn: task scheduling delay
-        // fs: filesystem operation
-        // chan: response channel wait
-        // to_client: server serialize + write + flush + network + client receive
+        // Server-side deltas (same machine, always valid)
+        let server_total = delta(self.server_recv, self.server_resp_chan);
+        let deser = delta(self.server_recv, self.server_deser);
+        let spawn = delta(self.server_deser, self.server_spawn);
+        let fs = delta(self.server_spawn, self.server_fs_done);
+        let chan = delta(self.server_fs_done, self.server_resp_chan);
+
+        // Client-side round-trip (same machine, always valid)
+        let client_rtt = delta(self.t0, self.client_done);
+        let done = delta(self.client_recv, self.client_done);
+
+        // Cross-machine deltas (may be invalid due to clock skew)
+        let to_srv = delta(self.t0, self.server_recv);
+        let to_cli = delta(self.server_resp_chan, self.client_recv);
+
+        // Server time is reliable; cross-machine times may show "?" if clocks differ
         eprintln!(
-            "[TRACE {}] total={}µs | to_srv={} deser={} spawn={} fs={} chan={} | to_cli={} done={}",
-            unique,
-            total,
-            delta(self.t0, self.server_recv),
-            delta(self.server_recv, self.server_deser),
-            delta(self.server_deser, self.server_spawn),
-            delta(self.server_spawn, self.server_fs_done),
-            delta(self.server_fs_done, self.server_resp_chan),
-            delta(self.server_resp_chan, self.client_recv), // Includes serialize + write + flush + network
-            delta(self.client_recv, self.client_done),
+            "[TRACE {:>12}] total={}µs srv={}µs | fs={} | to_srv={} to_cli={}",
+            op_name,
+            fmt(client_rtt),
+            fmt(server_total),
+            fmt(fs),
+            fmt(to_srv),
+            fmt(to_cli),
         );
     }
 }

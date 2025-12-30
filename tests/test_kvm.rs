@@ -1153,12 +1153,19 @@ if mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then
     FUSE_DIR="/mnt/fcvm-btrfs/bench-${LEVEL}-$$"
     mkdir -p "$FUSE_DIR"
 
-    # Write 10MB
+    # Write 10MB (with fsync)
     START=$(date +%s%N)
     dd if=/dev/zero of="${FUSE_DIR}/bench.dat" bs=1M count=10 conv=fsync 2>/dev/null
     END=$(date +%s%N)
     WRITE_MS=$(( (END - START) / 1000000 ))
     echo "FUSE_WRITE_L${LEVEL}=${WRITE_MS}ms (10MB)"
+
+    # Write 10MB (no fsync - async)
+    START=$(date +%s%N)
+    dd if=/dev/zero of="${FUSE_DIR}/bench2.dat" bs=1M count=10 2>/dev/null
+    END=$(date +%s%N)
+    ASYNC_MS=$(( (END - START) / 1000000 ))
+    echo "FUSE_ASYNC_L${LEVEL}=${ASYNC_MS}ms (10MB no-sync)"
 
     # Read back
     START=$(date +%s%N)
@@ -1171,6 +1178,41 @@ if mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then
 else
     echo "FUSE_L${LEVEL}=NOT_MOUNTED"
 fi
+
+# Test 4: FUSE latency (small ops to measure per-op overhead)
+if mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then
+    echo "--- FUSE Latency Test ---"
+    FUSE_DIR="/mnt/fcvm-btrfs/bench-lat-${LEVEL}-$$"
+    mkdir -p "$FUSE_DIR"
+
+    # Create test file
+    echo "test" > "${FUSE_DIR}/lat.txt"
+
+    # 100 stat operations
+    START=$(date +%s%N)
+    for i in $(seq 1 100); do stat "${FUSE_DIR}/lat.txt" > /dev/null; done
+    END=$(date +%s%N)
+    STAT_US=$(( (END - START) / 100000 ))
+    echo "FUSE_STAT_L${LEVEL}=${STAT_US}us/op (100 ops)"
+
+    # 100 small reads (4 bytes each)
+    START=$(date +%s%N)
+    for i in $(seq 1 100); do cat "${FUSE_DIR}/lat.txt" > /dev/null; done
+    END=$(date +%s%N)
+    READ_US=$(( (END - START) / 100000 ))
+    echo "FUSE_SMALLREAD_L${LEVEL}=${READ_US}us/op (100 ops)"
+
+    rm -rf "$FUSE_DIR"
+fi
+
+# Test 5: Memory usage (RSS)
+echo "--- Memory Test ---"
+MEM_TOTAL=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+MEM_AVAIL=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
+MEM_USED=$((MEM_TOTAL - MEM_AVAIL))
+MEM_USED_MB=$((MEM_USED / 1024))
+MEM_TOTAL_MB=$((MEM_TOTAL / 1024))
+echo "MEM_L${LEVEL}=${MEM_USED_MB}MB/${MEM_TOTAL_MB}MB"
 
 echo "=== END BENCHMARK L${LEVEL} ==="
 echo "MARKER_L${LEVEL}_OK"
@@ -1206,8 +1248,8 @@ set -ex
 echo "L1: Importing image from shared cache..."
 skopeo copy dir:/mnt/fcvm-btrfs/image-cache/{digest} containers-storage:localhost/inception-test
 
-echo "L1: Starting L2 VM with benchmarks..."
-fcvm podman run --name l2 --network bridged --privileged \
+echo "L1: Starting L2 VM with benchmarks (tracing enabled)..."
+FCVM_FUSE_TRACE_RATE=100 fcvm podman run --name l2 --network bridged --privileged \
     --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
     localhost/inception-test \
     --cmd /mnt/fcvm-btrfs/inception-scripts/l2.sh
@@ -1234,6 +1276,8 @@ fcvm podman run --name l2 --network bridged --privileged \
             "--network",
             "bridged",
             "--privileged",
+            "--mem",
+            "4096",
             "--kernel",
             kernel_str,
             "--map",
@@ -1267,7 +1311,11 @@ fcvm podman run --name l2 --network bridged --privileged \
             || line.contains("LOCAL_WRITE_L")
             || line.contains("LOCAL_READ_L")
             || line.contains("FUSE_WRITE_L")
+            || line.contains("FUSE_ASYNC_L")
             || line.contains("FUSE_READ_L")
+            || line.contains("FUSE_STAT_L")
+            || line.contains("FUSE_SMALLREAD_L")
+            || line.contains("MEM_L")
         {
             // Strip ANSI codes and prefixes
             let clean = line.split("stdout]").last().unwrap_or(line).trim();

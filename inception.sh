@@ -46,7 +46,7 @@ NEXT=$((LEVEL + 1))
 # VM memory: reduce at each level to fit in parent's memory
 case $NEXT in
     1) READERS=64; MEM=2048 ;;
-    2) READERS=16; MEM=1024 ;;
+    2) READERS=64; MEM=1536 ;;
     3) READERS=8;  MEM=768 ;;
     *) READERS=4;  MEM=512 ;;
 esac

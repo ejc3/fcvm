@@ -105,6 +105,59 @@ KVM_CAP_ARM_EL2 (cap 240) = 1
   -> Nested virtualization IS supported by KVM (VHE mode)
 ```
 
+## FUSE Performance Tracing
+
+Enable per-operation tracing to diagnose FUSE latency issues (especially in nested VMs).
+
+### Enabling Tracing
+
+Set `FCVM_FUSE_TRACE_RATE=N` to trace every Nth FUSE operation:
+
+```bash
+# Trace every 100th request (recommended for benchmarks)
+FCVM_FUSE_TRACE_RATE=100 fcvm podman run --name test nginx:alpine
+
+# Trace every request (high overhead, use for debugging specific issues)
+FCVM_FUSE_TRACE_RATE=1 fcvm podman run ...
+```
+
+The env var is automatically passed to the guest via kernel boot parameters (`fuse_trace_rate=N`).
+
+### Trace Output Format
+
+```
+[TRACE     lookup] total=8940µs srv=159µs | fs=149 | to_srv=33 to_cli=1974
+[TRACE      fsync] total=70000µs srv=3000µs | fs=2900 | to_srv=? to_cli=?
+```
+
+| Field | Meaning |
+|-------|---------|
+| `total` | End-to-end client round-trip time |
+| `srv` | Server-side processing (reliable) |
+| `fs` | Filesystem operation time (subset of srv) |
+| `to_srv` | Network: client → server (may show `?` if clocks differ) |
+| `to_cli` | Network: server → client (may show `?` if clocks differ) |
+
+### L2 Performance Expectations
+
+Based on FUSE-over-FUSE architecture:
+
+| Operation | Expected L2/L1 Ratio | Notes |
+|-----------|---------------------|-------|
+| `stat`/metadata | ~2x | One extra FUSE layer |
+| Async writes | ~3x | Data transfer overhead |
+| Sync writes (fsync) | ~8-10x | fsync propagates synchronously through layers |
+
+The fsync amplification occurs because each L2 fsync must wait for L1's fsync to complete,
+which itself waits for the host disk sync. This is fundamental to FUSE-over-FUSE durability.
+
+### Related Configuration
+
+```bash
+# Reduce FUSE readers for nested VMs (saves memory)
+FCVM_FUSE_READERS=8 fcvm podman run ...  # Default: 64 readers × 8MB stack = 512MB
+```
+
 ## Quick Reference
 
 ### Shell Scripts to /tmp

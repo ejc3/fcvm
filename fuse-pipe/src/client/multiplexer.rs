@@ -204,7 +204,8 @@ impl Multiplexer {
                 collector.record(unique, op, s);
             } else {
                 // No collector - print trace directly
-                s.print(unique);
+                let op = op_name.as_deref().unwrap_or("unknown");
+                s.print(unique, op);
             }
         }
 

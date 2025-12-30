@@ -1201,6 +1201,12 @@ async fn run_vm_setup(
         boot_args.push_str(&format!(" fuse_readers={}", readers));
     }
 
+    // Pass FUSE trace rate to fc-agent via kernel command line.
+    // Used for debugging FUSE latency. Rate N means trace every Nth request.
+    if let Ok(rate) = std::env::var("FCVM_FUSE_TRACE_RATE") {
+        boot_args.push_str(&format!(" fuse_trace_rate={}", rate));
+    }
+
     client
         .set_boot_source(crate::firecracker::api::BootSource {
             kernel_image_path: kernel_path.display().to_string(),
