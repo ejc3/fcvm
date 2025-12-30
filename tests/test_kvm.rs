@@ -723,7 +723,8 @@ async fn ensure_inception_image() -> Result<()> {
         // Copy all inputs to build context
         tokio::fs::create_dir_all("artifacts").await.ok();
         std::fs::copy(&src_fcvm, "artifacts/fcvm").context("copying fcvm to artifacts/")?;
-        std::fs::copy(&src_agent, "artifacts/fc-agent").context("copying fc-agent to artifacts/")?;
+        std::fs::copy(&src_agent, "artifacts/fc-agent")
+            .context("copying fc-agent to artifacts/")?;
         std::fs::copy(&src_firecracker, "artifacts/firecracker-nv2").ok();
 
         // Force rebuild by removing old image

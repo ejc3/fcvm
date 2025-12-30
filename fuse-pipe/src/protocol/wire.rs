@@ -196,7 +196,7 @@ impl Span {
     /// Note: Cross-machine deltas (to_srv, to_cli) are unreliable when clocks differ.
     /// Server-side deltas (deser, spawn, fs, chan) are always accurate.
     /// Client-side total (t0 → client_done) is always accurate.
-    pub fn print(&self, unique: u64, op_name: &str) {
+    pub fn print(&self, _unique: u64, op_name: &str) {
         // Safe delta that handles clock skew (returns None if b < a or either is 0)
         let delta = |a: u64, b: u64| -> Option<i64> {
             if a == 0 || b == 0 {
@@ -214,18 +214,12 @@ impl Span {
             }
         };
 
-        let total = delta(self.t0, self.client_done);
-
         // Server-side deltas (same machine, always valid)
         let server_total = delta(self.server_recv, self.server_resp_chan);
-        let deser = delta(self.server_recv, self.server_deser);
-        let spawn = delta(self.server_deser, self.server_spawn);
         let fs = delta(self.server_spawn, self.server_fs_done);
-        let chan = delta(self.server_fs_done, self.server_resp_chan);
 
         // Client-side round-trip (same machine, always valid)
         let client_rtt = delta(self.t0, self.client_done);
-        let done = delta(self.client_recv, self.client_done);
 
         // Cross-machine deltas (may be invalid due to clock skew)
         let to_srv = delta(self.t0, self.server_recv);
