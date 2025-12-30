@@ -291,8 +291,12 @@ build-firecracker-nv2:
 		echo "  Cloning $(FIRECRACKER_NV2_REPO)..."; \
 		git clone --depth=1 -b $(FIRECRACKER_NV2_BRANCH) $(FIRECRACKER_NV2_REPO) $(FIRECRACKER_SRC); \
 	else \
-		echo "  Repo exists, fetching latest..."; \
-		cd $(FIRECRACKER_SRC) && git fetch origin $(FIRECRACKER_NV2_BRANCH) && git checkout $(FIRECRACKER_NV2_BRANCH) && git pull; \
+		echo "  Repo exists, checking out $(FIRECRACKER_NV2_BRANCH)..."; \
+		cd $(FIRECRACKER_SRC) && \
+		git remote set-url origin $(FIRECRACKER_NV2_REPO) 2>/dev/null || \
+		git remote add origin $(FIRECRACKER_NV2_REPO) 2>/dev/null || true; \
+		git fetch origin $(FIRECRACKER_NV2_BRANCH) && \
+		git checkout $(FIRECRACKER_NV2_BRANCH); \
 	fi
 	@echo "  Building release binary..."
 	cd $(FIRECRACKER_SRC) && cargo build --release
