@@ -236,7 +236,13 @@ setup-inception: setup-fcvm
 	mkdir -p artifacts
 	cp target/release/fcvm artifacts/
 	cp target/$(MUSL_TARGET)/release/fc-agent artifacts/
-	cp /usr/local/bin/firecracker artifacts/firecracker-nv2 2>/dev/null || true
+	@if [ -f "$(FIRECRACKER_BIN)" ]; then \
+		cp $(FIRECRACKER_BIN) artifacts/firecracker-nv2; \
+	else \
+		echo "ERROR: NV2 firecracker not found at $(FIRECRACKER_BIN)"; \
+		echo "Run 'make build-firecracker-nv2' first"; \
+		exit 1; \
+	fi
 	@echo "==> Building inception-test container..."
 	podman rmi localhost/inception-test 2>/dev/null || true
 	podman build -t localhost/inception-test -f Containerfile.inception .
@@ -272,10 +278,26 @@ fmt:
 	cargo fmt
 
 # Firecracker development targets
-# Rebuild Firecracker from source and install to /usr/local/bin
-# Usage: make rebuild-fc
+# Build NV2 Firecracker fork for inception tests
+# Usage: make build-firecracker-nv2
 FIRECRACKER_SRC ?= /home/ubuntu/firecracker
 FIRECRACKER_BIN := $(FIRECRACKER_SRC)/build/cargo_target/release/firecracker
+FIRECRACKER_NV2_REPO := https://github.com/ejc3/firecracker.git
+FIRECRACKER_NV2_BRANCH := nv2-inception
+
+build-firecracker-nv2:
+	@echo "==> Building NV2 Firecracker fork..."
+	@if [ ! -d "$(FIRECRACKER_SRC)" ]; then \
+		echo "  Cloning $(FIRECRACKER_NV2_REPO)..."; \
+		git clone --depth=1 -b $(FIRECRACKER_NV2_BRANCH) $(FIRECRACKER_NV2_REPO) $(FIRECRACKER_SRC); \
+	else \
+		echo "  Repo exists, fetching latest..."; \
+		cd $(FIRECRACKER_SRC) && git fetch origin $(FIRECRACKER_NV2_BRANCH) && git checkout $(FIRECRACKER_NV2_BRANCH) && git pull; \
+	fi
+	@echo "  Building release binary..."
+	cd $(FIRECRACKER_SRC) && cargo build --release
+	@echo "==> NV2 Firecracker built at $(FIRECRACKER_BIN)"
+	$(FIRECRACKER_BIN) --version
 
 rebuild-fc:
 	@echo "==> Force rebuilding Firecracker..."
