@@ -46,6 +46,34 @@ fn get_num_readers() -> usize {
     DEFAULT_NUM_READERS
 }
 
+/// Get trace rate from FCVM_FUSE_TRACE_RATE env var or kernel boot param (0 = disabled).
+/// Checks (in order):
+/// 1. FCVM_FUSE_TRACE_RATE environment variable
+/// 2. fuse_trace_rate=N kernel boot parameter (from /proc/cmdline)
+/// 3. Default: 0 (disabled)
+fn get_trace_rate() -> u64 {
+    // First check environment variable
+    if let Some(n) = std::env::var("FCVM_FUSE_TRACE_RATE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        return n;
+    }
+
+    // Then check kernel command line
+    if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
+        for part in cmdline.split_whitespace() {
+            if let Some(value) = part.strip_prefix("fuse_trace_rate=") {
+                if let Ok(n) = value.parse() {
+                    return n;
+                }
+            }
+        }
+    }
+
+    0
+}
+
 /// Mount a FUSE filesystem from host via vsock.
 ///
 /// This connects to the host VolumeServer at the given port and mounts
@@ -58,11 +86,12 @@ fn get_num_readers() -> usize {
 /// * `mount_point` - The path where the filesystem will be mounted
 pub fn mount_vsock(port: u32, mount_point: &str) -> anyhow::Result<()> {
     let num_readers = get_num_readers();
+    let trace_rate = get_trace_rate();
     eprintln!(
-        "[fc-agent] mounting FUSE volume at {} via vsock port {} ({} readers)",
-        mount_point, port, num_readers
+        "[fc-agent] mounting FUSE volume at {} via vsock port {} ({} readers, trace_rate={})",
+        mount_point, port, num_readers, trace_rate
     );
-    fuse_pipe::mount_vsock_with_readers(HOST_CID, port, mount_point, num_readers)
+    fuse_pipe::mount_vsock_with_options(HOST_CID, port, mount_point, num_readers, trace_rate)
 }
 
 /// Mount a FUSE filesystem with multiple reader threads.
