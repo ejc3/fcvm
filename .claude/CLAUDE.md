@@ -1475,5 +1475,6 @@ RUST_LOG="passthrough=debug" sudo -E cargo test --release -p fuse-pipe --test in
 
 ## References
 - Main documentation: `README.md`
+- Performance guide: `PERFORMANCE.md`
 - Design specification: `DESIGN.md`
 - Firecracker docs: https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md
