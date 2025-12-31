@@ -307,23 +307,30 @@ fcvm supports running VMs inside VMs using ARM64 FEAT_NV2 nested virtualization.
 |-------------|---------|
 | **Hardware** | ARM64 with FEAT_NV2 (Graviton3+: c7g.metal, c7gn.metal, r7g.metal) |
 | **Host kernel** | 6.18+ with `kvm-arm.mode=nested` boot parameter |
-| **Inception kernel** | Custom kernel with CONFIG_KVM=y (built by `kernel/build.sh`) |
+| **Inception kernel** | Pre-built from [releases](https://github.com/ejc3/firepod/releases) or build with `kernel/build.sh` |
 | **Firecracker** | Fork with NV2 support: `ejc3/firecracker:nv2-inception` |
 
-### Building the Inception Kernel
+### Getting the Inception Kernel
 
 ```bash
-# Build kernel with KVM support (~10-20 minutes first time)
-./kernel/build.sh
+# Download pre-built kernel from GitHub releases (~20MB)
+fcvm setup --inception
 
-# Kernel will be at /mnt/fcvm-btrfs/kernels/vmlinux-6.12.10-*.bin
+# Kernel will be at /mnt/fcvm-btrfs/kernels/vmlinux-inception-6.18-aarch64-*.bin
 ```
 
-The inception kernel adds these configs on top of the standard Firecracker kernel:
-- `CONFIG_KVM=y` - KVM hypervisor support
-- `CONFIG_VIRTUALIZATION=y` - Virtualization support
-- `CONFIG_TUN=y`, `CONFIG_VETH=y` - Network devices for nested VMs
-- `CONFIG_NETFILTER*` - iptables/nftables for bridged networking
+Or build locally (takes 10-20 minutes):
+```bash
+fcvm setup --inception --build-kernels
+# Or manually: ./kernel/build.sh
+```
+
+The inception kernel (6.18) includes:
+- **CONFIG_KVM=y** - KVM hypervisor for nested virtualization
+- **EL2 support** - ARM Exception Level 2 (hypervisor mode)
+- **MMFR4 patch** - Enables `arm64.nv2` boot param for NV2 capability
+- **FUSE** - For volume mounts between host and guest
+- **Networking** - TUN/VETH/netfilter for bridged networking in nested VMs
 
 ### Running Inception
 
@@ -333,7 +340,7 @@ The inception kernel adds these configs on top of the standard Firecracker kerne
 sudo fcvm podman run \
     --name outer-vm \
     --network bridged \
-    --kernel /mnt/fcvm-btrfs/kernels/vmlinux-6.12.10-*.bin \
+    --kernel /mnt/fcvm-btrfs/kernels/vmlinux-inception-6.18-aarch64-*.bin \
     --privileged \
     --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
     --map /path/to/fcvm/binary:/opt/fcvm \
