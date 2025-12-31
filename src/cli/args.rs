@@ -51,6 +51,15 @@ pub struct SetupArgs {
     /// Path to custom rootfs config file
     #[arg(long)]
     pub config: Option<String>,
+
+    /// Also setup inception kernel for nested virtualization
+    #[arg(long)]
+    pub inception: bool,
+
+    /// Build kernels locally instead of downloading from releases
+    /// (use if download fails or you've modified kernel sources)
+    #[arg(long)]
+    pub build_kernels: bool,
 }
 
 // ============================================================================

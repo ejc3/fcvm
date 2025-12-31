@@ -1,0 +1,158 @@
+name: Build Kernels
+
+on:
+  push:
+    paths:
+      - 'kernel/**'
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force rebuild even if release exists'
+        type: boolean
+        default: false
+
+# Cancel in-progress runs when a new revision is pushed
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Ensure self-hosted runner EC2 is running
+  ensure-runner:
+    name: Ensure Runner
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-1
+      - name: Start EC2 if stopped
+        run: |
+          INSTANCE_ID="i-0f116a86a2fd78cbe"
+          STATE=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --query 'Reservations[0].Instances[0].State.Name' --output text)
+          echo "Current state: $STATE"
+          if [ "$STATE" = "stopped" ]; then
+            echo "Starting instance..."
+            aws ec2 start-instances --instance-ids $INSTANCE_ID
+            aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+            echo "Instance started, waiting for runner to register..."
+            sleep 60
+          fi
+
+  build-inception-kernel:
+    name: Build Inception Kernel
+    needs: ensure-runner
+    runs-on: [self-hosted, Linux, ARM64]
+    permissions:
+      contents: write  # Required for creating releases
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute kernel version and SHA
+        id: kernel
+        run: |
+          # Extract version from build.sh
+          VERSION=$(grep '^KERNEL_VERSION=' kernel/build.sh | head -1 | cut -d'"' -f2 || echo "6.18")
+          if [ -z "$VERSION" ]; then
+            VERSION=$(grep 'KERNEL_VERSION:-' kernel/build.sh | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "6.18")
+          fi
+
+          # Compute SHA from build inputs
+          SHA=$(cat kernel/build.sh kernel/inception.conf kernel/patches/*.patch 2>/dev/null | sha256sum | cut -c1-12)
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "tag=kernel-inception-${VERSION}-${SHA}" >> $GITHUB_OUTPUT
+          echo "filename=vmlinux-inception-${VERSION}-${SHA}.bin" >> $GITHUB_OUTPUT
+
+          echo "Kernel version: $VERSION"
+          echo "Build SHA: $SHA"
+
+      - name: Check if release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.kernel.outputs.tag }}"
+          if gh release view "$TAG" &>/dev/null; then
+            echo "Release $TAG already exists"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Release $TAG does not exist"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build kernel
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        run: |
+          KERNEL_PATH="/tmp/${{ steps.kernel.outputs.filename }}"
+          echo "Building kernel to: $KERNEL_PATH"
+
+          # Run build script
+          KERNEL_PATH="$KERNEL_PATH" ./kernel/build.sh
+
+          # Verify output
+          if [ ! -f "$KERNEL_PATH" ]; then
+            echo "ERROR: Kernel not found at $KERNEL_PATH"
+            exit 1
+          fi
+
+          ls -lh "$KERNEL_PATH"
+          file "$KERNEL_PATH"
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.kernel.outputs.tag }}"
+          FILENAME="${{ steps.kernel.outputs.filename }}"
+          VERSION="${{ steps.kernel.outputs.version }}"
+          SHA="${{ steps.kernel.outputs.sha }}"
+
+          # Delete existing release if force rebuilding
+          if [ "${{ inputs.force_build }}" == "true" ]; then
+            gh release delete "$TAG" --yes 2>/dev/null || true
+          fi
+
+          # Create release with kernel binary
+          gh release create "$TAG" \
+            --title "Inception Kernel ${VERSION} (${SHA})" \
+            --notes "Auto-built inception kernel for fcvm nested virtualization.
+
+          **Kernel Version:** ${VERSION}
+          **Build SHA:** ${SHA}
+          **Architecture:** ARM64
+
+          This kernel includes:
+          - CONFIG_KVM=y for nested virtualization
+          - FUSE support for volume mounts
+          - MMFR4 override patch for NV2 guest support
+
+          **Usage:**
+          \`\`\`bash
+          fcvm setup  # Downloads automatically
+          fcvm podman run --kernel <path> --privileged ...
+          \`\`\`
+          " \
+            "/tmp/$FILENAME"
+
+          echo "✅ Created release: $TAG"
+
+      - name: Summary
+        run: |
+          echo "### Kernel Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | ${{ steps.kernel.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SHA | ${{ steps.kernel.outputs.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | ${{ steps.kernel.outputs.tag }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Filename | ${{ steps.kernel.outputs.filename }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Already Existed | ${{ steps.check.outputs.exists }} |" >> $GITHUB_STEP_SUMMARY
