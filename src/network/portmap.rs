@@ -41,8 +41,7 @@ pub async fn setup_port_mappings(guest_ip: &str, mappings: &[PortMapping]) -> Re
             )
         };
 
-        let output = Command::new("sudo")
-            .arg("iptables")
+        let output = Command::new("iptables")
             .args(dnat_rule.split_whitespace())
             .output()
             .await
@@ -72,8 +71,7 @@ pub async fn setup_port_mappings(guest_ip: &str, mappings: &[PortMapping]) -> Re
             )
         };
 
-        let output = Command::new("sudo")
-            .arg("iptables")
+        let output = Command::new("iptables")
             .args(output_dnat_rule.split_whitespace())
             .output()
             .await
@@ -98,8 +96,7 @@ pub async fn setup_port_mappings(guest_ip: &str, mappings: &[PortMapping]) -> Re
             guest_ip, proto_str, mapping.guest_port
         );
 
-        let output = Command::new("sudo")
-            .arg("iptables")
+        let output = Command::new("iptables")
             .args(masq_rule.split_whitespace())
             .output()
             .await
@@ -121,8 +118,7 @@ pub async fn setup_port_mappings(guest_ip: &str, mappings: &[PortMapping]) -> Re
             proto_str, guest_ip, mapping.guest_port
         );
 
-        let output = Command::new("sudo")
-            .arg("iptables")
+        let output = Command::new("iptables")
             .args(forward_rule.split_whitespace())
             .output()
             .await
@@ -159,8 +155,8 @@ pub async fn setup_port_mappings(guest_ip: &str, mappings: &[PortMapping]) -> Re
 pub async fn enable_route_localnet(interface: &str) -> Result<()> {
     let sysctl_path = format!("net.ipv4.conf.{}.route_localnet", interface);
 
-    let output = Command::new("sudo")
-        .args(["sysctl", "-w", &format!("{}=1", sysctl_path)])
+    let output = Command::new("sysctl")
+        .args(["-w", &format!("{}=1", sysctl_path)])
         .output()
         .await
         .with_context(|| format!("enabling route_localnet on {}", interface))?;
@@ -188,8 +184,7 @@ async fn delete_rule(rule: &str) -> Result<()> {
     // Convert -A to -D for deletion
     let delete_rule = rule.replace(" -A ", " -D ");
 
-    let output = Command::new("sudo")
-        .arg("iptables")
+    let output = Command::new("iptables")
         .args(delete_rule.split_whitespace())
         .output()
         .await
@@ -242,8 +237,8 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
     );
 
     // Enable IP forwarding
-    let output = Command::new("sudo")
-        .args(["sysctl", "-w", "net.ipv4.ip_forward=1"])
+    let output = Command::new("sysctl")
+        .args(["-w", "net.ipv4.ip_forward=1"])
         .output()
         .await
         .context("enabling IP forwarding")?;
@@ -254,9 +249,8 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
     }
 
     // Check if MASQUERADE rule already exists
-    let output = Command::new("sudo")
+    let output = Command::new("iptables")
         .args([
-            "iptables",
             "-t",
             "nat",
             "-C",
@@ -278,9 +272,8 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
     }
 
     // Add MASQUERADE rule for outbound traffic
-    let output = Command::new("sudo")
+    let output = Command::new("iptables")
         .args([
-            "iptables",
             "-t",
             "nat",
             "-A",
