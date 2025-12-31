@@ -796,69 +796,133 @@ fn handle_exec_connection_blocking(fd: i32) {
         return;
     }
 
-    if request.tty {
-        handle_exec_tty(fd, &request);
+    // Use framed protocol for TTY or interactive modes
+    // JSON line protocol only for plain non-interactive
+    if request.tty || request.interactive {
+        handle_exec_framed(fd, &request);
     } else {
         handle_exec_pipe(fd, &request);
     }
 }
 
-/// Handle exec in TTY mode with PTY allocation
-fn handle_exec_tty(fd: i32, request: &ExecRequest) {
-    // Allocate a PTY
-    let mut master_fd: libc::c_int = 0;
-    let mut slave_fd: libc::c_int = 0;
+/// Handle exec with binary framing protocol
+///
+/// Uses the binary framing protocol (exec_proto) to cleanly separate
+/// control messages (exit code) from raw terminal/pipe data.
+///
+/// - If `tty=true`: allocates PTY for terminal emulation
+/// - If `tty=false`: uses pipes for stdin/stdout/stderr
+fn handle_exec_framed(fd: i32, request: &ExecRequest) {
+    use std::io::Read;
+    use std::os::unix::io::FromRawFd;
 
-    let result = unsafe {
-        libc::openpty(
-            &mut master_fd,
-            &mut slave_fd,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
+    // Wrap vsock fd in File for clean I/O
+    let mut vsock = unsafe { std::fs::File::from_raw_fd(fd) };
+
+    // For TTY mode, allocate a PTY
+    // For non-TTY, we'll use pipes (set up after fork)
+    let (master_fd, slave_fd) = if request.tty {
+        let mut master: libc::c_int = 0;
+        let mut slave: libc::c_int = 0;
+
+        let result = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+
+        if result != 0 {
+            let _ = exec_proto::write_error(&mut vsock, "Failed to allocate PTY");
+            return;
+        }
+        (master, slave)
+    } else {
+        (-1, -1) // Will use pipes instead
     };
 
-    if result != 0 {
-        let response = ExecResponse::Error("Failed to allocate PTY".to_string());
-        write_line_to_fd(fd, &serde_json::to_string(&response).unwrap());
-        unsafe { libc::close(fd) };
-        return;
-    }
+    // For non-TTY mode, create pipes
+    let (stdin_read, stdin_write, stdout_read, stdout_write) = if !request.tty {
+        let mut stdin_pipe = [0i32; 2];
+        let mut stdout_pipe = [0i32; 2];
+        unsafe {
+            if libc::pipe(stdin_pipe.as_mut_ptr()) != 0 {
+                let _ = exec_proto::write_error(&mut vsock, "Failed to create stdin pipe");
+                return;
+            }
+            if libc::pipe(stdout_pipe.as_mut_ptr()) != 0 {
+                libc::close(stdin_pipe[0]);
+                libc::close(stdin_pipe[1]);
+                let _ = exec_proto::write_error(&mut vsock, "Failed to create stdout pipe");
+                return;
+            }
+        }
+        (stdin_pipe[0], stdin_pipe[1], stdout_pipe[0], stdout_pipe[1])
+    } else {
+        (-1, -1, -1, -1)
+    };
 
     // Fork
     let pid = unsafe { libc::fork() };
 
     if pid < 0 {
-        let response = ExecResponse::Error("Failed to fork".to_string());
-        write_line_to_fd(fd, &serde_json::to_string(&response).unwrap());
-        unsafe {
-            libc::close(master_fd);
-            libc::close(slave_fd);
-            libc::close(fd);
+        let _ = exec_proto::write_error(&mut vsock, "Failed to fork");
+        if request.tty {
+            unsafe {
+                libc::close(master_fd);
+                libc::close(slave_fd);
+            }
+        } else {
+            unsafe {
+                libc::close(stdin_read);
+                libc::close(stdin_write);
+                libc::close(stdout_read);
+                libc::close(stdout_write);
+            }
         }
         return;
     }
 
     if pid == 0 {
-        // Child process
-        unsafe {
-            // Create new session and set controlling terminal
-            libc::setsid();
-            libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
+        // Child process - don't let File destructor close fd
+        std::mem::forget(vsock);
 
-            // Redirect stdin/stdout/stderr to slave
-            libc::dup2(slave_fd, 0);
-            libc::dup2(slave_fd, 1);
-            libc::dup2(slave_fd, 2);
+        if request.tty {
+            unsafe {
+                // Create new session and set controlling terminal
+                libc::setsid();
+                libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
 
-            // Close fds we don't need
-            if slave_fd > 2 {
-                libc::close(slave_fd);
+                // Redirect stdin/stdout/stderr to PTY slave
+                libc::dup2(slave_fd, 0);
+                libc::dup2(slave_fd, 1);
+                libc::dup2(slave_fd, 2);
+
+                // Close fds we don't need
+                if slave_fd > 2 {
+                    libc::close(slave_fd);
+                }
+                libc::close(master_fd);
             }
-            libc::close(master_fd);
-            libc::close(fd);
+        } else {
+            unsafe {
+                // Redirect stdin/stdout/stderr to pipes
+                libc::dup2(stdin_read, 0);
+                libc::dup2(stdout_write, 1);
+                libc::dup2(stdout_write, 2); // stderr also to stdout pipe
+
+                // Close unused pipe ends
+                libc::close(stdin_read);
+                libc::close(stdin_write);
+                libc::close(stdout_read);
+                libc::close(stdout_write);
+            }
         }
+
+        unsafe { libc::close(fd) };
 
         // Build and exec command
         if request.in_container {
@@ -866,12 +930,11 @@ fn handle_exec_tty(fd: i32, request: &ExecRequest) {
                 std::ffi::CString::new("podman").unwrap(),
                 std::ffi::CString::new("exec").unwrap(),
             ];
-            // Pass -i and/or -t flags based on request
-            if request.interactive && request.tty {
-                args.push(std::ffi::CString::new("-it").unwrap());
-            } else if request.interactive {
+            // Pass -i and -t separately, matching podman's semantics
+            if request.interactive {
                 args.push(std::ffi::CString::new("-i").unwrap());
-            } else if request.tty {
+            }
+            if request.tty {
                 args.push(std::ffi::CString::new("-t").unwrap());
             }
             args.push(std::ffi::CString::new("--latest").unwrap());
@@ -903,90 +966,96 @@ fn handle_exec_tty(fd: i32, request: &ExecRequest) {
             }
         }
 
-        // execvp failed
         unsafe { libc::_exit(127) };
     }
 
-    // Parent process
-    unsafe { libc::close(slave_fd) };
-
-    // Dup fd for the reader thread (both threads need to use the same vsock)
-    // Reader writes to vsock, writer reads from vsock
-    let fd_for_reader = unsafe { libc::dup(fd) };
-    if fd_for_reader < 0 {
-        let response = ExecResponse::Error("Failed to dup fd".to_string());
-        write_line_to_fd(fd, &serde_json::to_string(&response).unwrap());
+    // Parent process - close child ends of pipes/pty
+    if request.tty {
+        unsafe { libc::close(slave_fd) };
+    } else {
         unsafe {
-            libc::close(master_fd);
-            libc::close(fd);
+            libc::close(stdin_read);
+            libc::close(stdout_write);
         }
-        return;
     }
 
-    // Dup master_fd for the reader thread
-    let master_fd_for_reader = unsafe { libc::dup(master_fd) };
-    if master_fd_for_reader < 0 {
-        let response = ExecResponse::Error("Failed to dup master_fd".to_string());
-        write_line_to_fd(fd, &serde_json::to_string(&response).unwrap());
-        unsafe {
-            libc::close(master_fd);
-            libc::close(fd);
-            libc::close(fd_for_reader);
-        }
-        return;
-    }
+    // Wrap master fd or stdout pipe in File for reading output
+    let output_reader = if request.tty {
+        unsafe { std::fs::File::from_raw_fd(master_fd) }
+    } else {
+        unsafe { std::fs::File::from_raw_fd(stdout_read) }
+    };
 
-    // Thread: read from vsock (fd), write to PTY master
-    // Exits when read returns EOF (we'll shutdown fd read side after child exits)
-    // Does NOT own the fds - main thread will close them
-    let writer_thread = std::thread::spawn(move || {
-        let mut buf = [0u8; 1024];
-        loop {
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-            if n <= 0 {
-                break;
-            }
-            let written =
-                unsafe { libc::write(master_fd, buf.as_ptr() as *const libc::c_void, n as usize) };
-            if written <= 0 {
-                break;
-            }
-        }
-        // Don't close - main thread owns fd and master_fd
-    });
+    // For non-TTY, wrap stdin pipe for writing
+    let stdin_writer = if !request.tty {
+        Some(unsafe { std::fs::File::from_raw_fd(stdin_write) })
+    } else {
+        None
+    };
 
-    // Thread: read from PTY master, write to vsock
-    // Owns the duped fds and closes them when done
+    // Use output_reader as the "pty_master" equivalent
+    let pty_master = output_reader;
+
+    // Only forward stdin if interactive mode is enabled
+    let writer_thread = if request.interactive {
+        let vsock_for_writer = vsock.try_clone().expect("clone vsock");
+        // For TTY mode, write to PTY; for non-TTY, write to stdin pipe
+        let stdin_target: std::fs::File = if request.tty {
+            pty_master.try_clone().expect("clone pty")
+        } else {
+            stdin_writer.expect("stdin_writer should exist for interactive non-TTY")
+        };
+
+        // Thread: read STDIN messages from vsock, write to PTY/stdin pipe
+        Some(std::thread::spawn(move || {
+            use std::io::Write;
+            let mut vsock = vsock_for_writer;
+            let mut target = stdin_target;
+
+            loop {
+                match exec_proto::Message::read_from(&mut vsock) {
+                    Ok(exec_proto::Message::Stdin(data)) => {
+                        if target.write_all(&data).is_err() {
+                            break;
+                        }
+                        if target.flush().is_err() {
+                            break;
+                        }
+                    }
+                    Ok(exec_proto::Message::Exit(_)) | Ok(exec_proto::Message::Error(_)) => break,
+                    Ok(_) => {} // Ignore unexpected message types
+                    Err(_) => break,
+                }
+            }
+            // Drop target to close stdin pipe, signaling EOF to child
+            drop(target);
+        }))
+    } else {
+        // Drop stdin_writer if not interactive (closes pipe)
+        drop(stdin_writer);
+        None
+    };
+
+    // Thread: read from PTY, write DATA messages to vsock
     let reader_thread = std::thread::spawn(move || {
+        let mut vsock = vsock;
+        let mut pty = pty_master;
         let mut buf = [0u8; 4096];
+
         loop {
-            let n = unsafe {
-                libc::read(
-                    master_fd_for_reader,
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
-                )
-            };
-            if n <= 0 {
-                // EOF or error - child has exited and we've drained the buffer
-                break;
-            }
-            let written = unsafe {
-                libc::write(
-                    fd_for_reader,
-                    buf.as_ptr() as *const libc::c_void,
-                    n as usize,
-                )
-            };
-            if written <= 0 {
-                break;
+            match pty.read(&mut buf) {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    if exec_proto::write_data(&mut vsock, &buf[..n]).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
             }
         }
-        // Close our duped fds
-        unsafe {
-            libc::close(master_fd_for_reader);
-            libc::close(fd_for_reader);
-        }
+
+        // Return vsock for exit message
+        vsock
     });
 
     // Wait for child to exit
@@ -1001,26 +1070,14 @@ fn handle_exec_tty(fd: i32, request: &ExecRequest) {
         1
     };
 
-    // Wait for reader thread to finish draining PTY buffer
-    // Reader will get EOF from master_fd when all child output is read
-    let _ = reader_thread.join();
+    // Wait for reader (it will get EOF when PTY closes)
+    let mut vsock = reader_thread.join().expect("reader thread");
 
-    // Shutdown the vsock read side to unblock the writer thread
-    // This causes read(fd) to return 0 (EOF)
-    unsafe { libc::shutdown(fd, libc::SHUT_RD) };
+    // Writer may be blocked on read - abort it by dropping
+    drop(writer_thread);
 
-    // Now writer thread will exit, join it
-    let _ = writer_thread.join();
-
-    // Send exit code (in TTY mode, send as raw JSON line)
-    let response = ExecResponse::Exit(exit_code);
-    write_line_to_fd(fd, &serde_json::to_string(&response).unwrap());
-
-    // Cleanup
-    unsafe {
-        libc::close(master_fd);
-        libc::close(fd);
-    }
+    // Send exit code
+    let _ = exec_proto::write_exit(&mut vsock, exit_code);
 }
 
 /// Handle exec in pipe mode (non-TTY)
