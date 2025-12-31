@@ -145,23 +145,44 @@ jobs:
           fi
 
           # Create release with kernel binary
+          ARCH="${{ steps.kernel.outputs.arch }}"
           gh release create "$TAG" \
-            --title "Inception Kernel ${VERSION} (${SHA})" \
-            --notes "Auto-built inception kernel for fcvm nested virtualization.
+            --title "Inception Kernel ${VERSION} (${ARCH}) - ${SHA}" \
+            --notes "Inception kernel for running fcvm inside fcvm (nested virtualization).
 
-          **Kernel Version:** ${VERSION}
-          **Build SHA:** ${SHA}
-          **Architecture:** ARM64
+          ## Kernel Details
 
-          This kernel includes:
-          - CONFIG_KVM=y for nested virtualization
-          - FUSE support for volume mounts
-          - MMFR4 override patch for NV2 guest support
+          | Property | Value |
+          |----------|-------|
+          | Version | ${VERSION} |
+          | Build SHA | ${SHA} |
+          | Architecture | ${ARCH} |
 
-          **Usage:**
+          ## Features
+
+          - **CONFIG_KVM=y** - KVM hypervisor built-in for nested virtualization
+          - **FUSE support** - For volume mounts between host and guest
+          - **MMFR4 override patch** - Enables \`arm64.nv2\` boot parameter for NV2 support
+
+          ## ARM64 Nested Virtualization (EL2)
+
+          This kernel enables recursive VM nesting on ARM64 using FEAT_NV2:
+
+          - **EL2** - ARM Exception Level 2 (hypervisor mode), required for KVM
+          - **VHE mode** - Virtualization Host Extensions for efficient hypervisor
+          - **NV2** - Nested Virtualization v2, allows guest kernels to run their own KVM
+
+          ## Requirements
+
+          - **Host**: ARM64 with FEAT_NV2 (AWS Graviton3+: c7g.metal, m7g.metal)
+          - **Host kernel**: 6.18+ with \`kvm-arm.mode=nested\` boot parameter
+
+          ## Usage
+
           \`\`\`bash
-          fcvm setup  # Downloads automatically
-          fcvm podman run --kernel <path> --privileged ...
+          fcvm setup --inception
+          fcvm podman run --kernel <path> --privileged --name outer alpine:latest
+          # Inside VM: fcvm podman run --name inner alpine:latest
           \`\`\`
           " \
             "/tmp/$FILENAME"
