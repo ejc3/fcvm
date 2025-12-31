@@ -14,6 +14,10 @@ const GITHUB_REPO: &str = "ejc3/firepod";
 /// Inception kernel version (must match kernel/build.sh)
 const INCEPTION_KERNEL_VERSION: &str = "6.18";
 
+/// Inception kernel SHA computed at compile time from kernel sources.
+/// This allows downloads to work after `cargo install` when kernel sources aren't present.
+const INCEPTION_KERNEL_SHA_COMPILED: &str = env!("INCEPTION_KERNEL_SHA");
+
 /// Compute SHA256 of bytes, return hex string (first 12 chars)
 fn compute_sha256_short(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -215,38 +219,55 @@ async fn download_kernel(config: &KernelArchConfig, allow_create: bool) -> Resul
 
 /// Compute SHA for inception kernel based on build inputs.
 /// This matches the SHA computed in kernel/build.sh and CI workflow.
-pub fn compute_inception_kernel_sha() -> Result<String> {
+///
+/// If kernel sources are present (e.g., running from git repo), computes SHA at runtime.
+/// If sources are not present (e.g., after `cargo install`), uses compile-time SHA.
+pub fn compute_inception_kernel_sha() -> String {
     let kernel_dir = Path::new("kernel");
+
+    // Check if kernel sources exist
+    let script = kernel_dir.join("build.sh");
+    if !script.exists() {
+        // Sources not present - use compile-time SHA
+        debug!(
+            sha = %INCEPTION_KERNEL_SHA_COMPILED,
+            "kernel sources not found, using compile-time SHA"
+        );
+        return INCEPTION_KERNEL_SHA_COMPILED.to_string();
+    }
+
+    // Sources present - compute at runtime for development workflow
     let mut content = Vec::new();
 
     // Read build.sh
-    let script = kernel_dir.join("build.sh");
-    if script.exists() {
-        content.extend(std::fs::read(&script).context("reading kernel/build.sh")?);
-    } else {
-        bail!("kernel/build.sh not found");
+    if let Ok(data) = std::fs::read(&script) {
+        content.extend(data);
     }
 
     // Read inception.conf
     let conf = kernel_dir.join("inception.conf");
-    if conf.exists() {
-        content.extend(std::fs::read(&conf).context("reading kernel/inception.conf")?);
+    if let Ok(data) = std::fs::read(&conf) {
+        content.extend(data);
     }
 
     // Read patches/*.patch (sorted for determinism)
     let patches_dir = kernel_dir.join("patches");
     if patches_dir.exists() {
-        let mut patches: Vec<_> = std::fs::read_dir(&patches_dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "patch"))
-            .collect();
-        patches.sort_by_key(|e| e.path());
-        for patch in patches {
-            content.extend(std::fs::read(patch.path())?);
+        if let Ok(entries) = std::fs::read_dir(&patches_dir) {
+            let mut patches: Vec<_> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "patch"))
+                .collect();
+            patches.sort_by_key(|e| e.path());
+            for patch in patches {
+                if let Ok(data) = std::fs::read(patch.path()) {
+                    content.extend(data);
+                }
+            }
         }
     }
 
-    Ok(compute_sha256_short(&content))
+    compute_sha256_short(&content)
 }
 
 /// Get the inception kernel filename.
@@ -277,7 +298,7 @@ pub fn inception_kernel_tag(sha: &str) -> String {
 ///
 /// Returns the path to the kernel binary.
 pub async fn ensure_inception_kernel(allow_build: bool) -> Result<PathBuf> {
-    let sha = compute_inception_kernel_sha()?;
+    let sha = compute_inception_kernel_sha();
     let filename = inception_kernel_filename(&sha);
     let kernel_dir = paths::kernel_dir();
     let kernel_path = kernel_dir.join(&filename);
@@ -408,10 +429,22 @@ async fn download_inception_kernel(url: &str, dest: &Path) -> Result<()> {
 }
 
 /// Build inception kernel locally using kernel/build.sh.
+///
+/// This only works when running from the git repository (not after `cargo install`).
 async fn build_inception_kernel_locally(dest: &Path) -> Result<()> {
     let script = Path::new("kernel/build.sh");
     if !script.exists() {
-        bail!("kernel/build.sh not found - are you in the fcvm repository root?");
+        bail!(
+            "kernel/build.sh not found.\n\
+            \n\
+            Local kernel builds require the fcvm git repository.\n\
+            If you installed via `cargo install fcvm`, you cannot use --build-kernels.\n\
+            \n\
+            Options:\n\
+            1. Clone the repo: git clone https://github.com/ejc3/firepod\n\
+            2. Run from repo: cd firepod && cargo run -- setup --inception --build-kernels\n\
+            3. Or wait for CI to publish pre-built kernels and retry without --build-kernels"
+        );
     }
 
     let output = Command::new(script)
@@ -490,7 +523,10 @@ pub async fn install_host_kernel(inception_kernel: &Path) -> Result<()> {
     println!("     sudo reboot");
     println!();
     println!("  After reboot, verify with:");
-    println!("     uname -r                              # Should show {}-inception", INCEPTION_KERNEL_VERSION);
+    println!(
+        "     uname -r                              # Should show {}-inception",
+        INCEPTION_KERNEL_VERSION
+    );
     println!("     cat /sys/module/kvm/parameters/mode   # Should show 'nested'");
 
     Ok(())

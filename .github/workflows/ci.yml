@@ -229,6 +229,9 @@ jobs:
       - name: setup-fcvm
         working-directory: fcvm
         run: make setup-fcvm
+      - name: test-packaging-e2e
+        working-directory: fcvm
+        run: ./scripts/test-packaging-e2e.sh ./target/release/fcvm
       - name: test-fast
         working-directory: fcvm
         run: make test-fast
