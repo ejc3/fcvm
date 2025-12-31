@@ -50,11 +50,14 @@ endif
 TEST_LOG_DIR := /tmp/fcvm-test-logs
 
 # Container run command
+# Note: Use -v instead of --device for /dev/kvm to preserve group permissions in rootless mode
+# See: https://github.com/containers/podman/issues/16701
 CONTAINER_RUN := podman run --rm --privileged \
+	--security-opt label=disable --group-add keep-groups \
 	-v .:/workspace/fcvm \
 	$(TARGET_MOUNT) \
 	-v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs -v $(FUSER):/workspace/fuser \
-	--device /dev/fuse --device /dev/kvm \
+	--device /dev/fuse -v /dev/kvm:/dev/kvm \
 	--ulimit nofile=65536:65536 --pids-limit=65536 -v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	-v $(TEST_LOG_DIR):$(TEST_LOG_DIR) $(CARGO_CACHE_MOUNT) \
 	-e FCVM_DATA_DIR=$(CONTAINER_DATA_DIR)
