@@ -733,6 +733,10 @@ fuse-backend-rs = { path = "../../fuse-backend-rs", ... }
 
 This ensures changes to fuse-backend-rs are immediately available without git commits.
 
+### Container KVM Access (Rootless Podman)
+
+`--device /dev/kvm` fails silently in rootless podman (ignores group membership). Use `-v` bind mount with `--group-add keep-groups` instead. See Makefile `CONTAINER_RUN` and [podman#16701](https://github.com/containers/podman/issues/16701).
+
 ### Monitoring Long-Running Tests
 
 When tailing logs, check every **20 seconds** (not 5, not 60):
