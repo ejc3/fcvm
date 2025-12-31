@@ -765,9 +765,12 @@ async fn run_exec_with_pty(
                 args.push(CString::new(*c).unwrap());
             }
 
-            // Exec fcvm
-            nix::unistd::execvp(&prog, &args).expect("execvp failed");
-            unreachable!();
+            // Exec fcvm - on success, this replaces the process image
+            #[allow(unreachable_code)]
+            {
+                nix::unistd::execvp(&prog, &args).expect("execvp failed");
+                std::process::exit(1); // Never reached
+            }
         }
         ForkResult::Parent { child } => {
             // Parent: close slave, use master for I/O
