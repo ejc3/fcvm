@@ -244,12 +244,275 @@ async fn exec_test_impl(network: &str) -> Result<()> {
     );
     println!("  ✓ script was interrupted by Ctrl-C");
 
+    // Test 13: Exit code propagation (non-zero exit codes) - non-TTY mode
+    // Uses non-TTY mode to avoid script wrapper issues with exit codes
+    println!("\nTest 13: Exit code propagation (VM - non-TTY)");
+    let exit_code =
+        run_exec_with_exit_code(&fcvm_path, fcvm_pid, true, &["sh", "-c", "exit 42"]).await?;
+    println!("  exit code: {}", exit_code);
+    assert_eq!(exit_code, 42, "exit code should be 42, got: {}", exit_code);
+    println!("  ✓ exit code 42 propagated correctly");
+
+    // Test 14: Exit code propagation (container) - non-TTY mode
+    println!("\nTest 14: Exit code propagation (container - non-TTY)");
+    let exit_code =
+        run_exec_with_exit_code(&fcvm_path, fcvm_pid, false, &["sh", "-c", "exit 7"]).await?;
+    println!("  exit code: {}", exit_code);
+    assert_eq!(exit_code, 7, "exit code should be 7, got: {}", exit_code);
+    println!("  ✓ exit code 7 propagated correctly");
+
+    // Test 15: stdin input is received by command (-it mode)
+    // Use head -1 instead of cat - it exits after reading one line
+    // (cat would hang waiting for EOF which doesn't propagate through PTY layers)
+    println!("\nTest 15: stdin input received (VM -it)");
+    let (exit_code, _, output) = run_exec_with_pty(
+        &fcvm_path,
+        fcvm_pid,
+        true, // in_vm
+        true, // interactive (-i)
+        true, // tty (-t)
+        &["head", "-1"],
+        Some("hello from stdin\n"),
+    )
+    .await?;
+    println!("  exit code: {}", exit_code);
+    println!("  output: {:?}", output);
+    assert!(
+        output.contains("hello from stdin"),
+        "should echo stdin input, got: {:?}",
+        output
+    );
+    println!("  ✓ stdin was received and echoed back");
+
+    // Test 16: stdin input (container -it)
+    println!("\nTest 16: stdin input received (container -it)");
+    let (exit_code, _, output) = run_exec_with_pty(
+        &fcvm_path,
+        fcvm_pid,
+        false, // in_vm=false (container)
+        true,  // interactive (-i)
+        true,  // tty (-t)
+        &["head", "-1"],
+        Some("container stdin test\n"),
+    )
+    .await?;
+    println!("  exit code: {}", exit_code);
+    println!("  output: {:?}", output);
+    assert!(
+        output.contains("container stdin test"),
+        "should echo stdin input, got: {:?}",
+        output
+    );
+    println!("  ✓ container stdin was received and echoed back");
+
+    // ======================================================================
+    // Test all 4 flag combinations for -i and -t (symmetric with podman)
+    // ======================================================================
+
+    // Test 17: -t only (VM) - TTY for output, no stdin
+    // Use `ls --color=auto` which needs TTY for colors but no stdin
+    println!("\nTest 17: -t only (VM) - TTY output, no stdin");
+    let (exit_code, _, output) = run_exec_with_pty(
+        &fcvm_path,
+        fcvm_pid,
+        true,  // in_vm
+        false, // interactive=false (no -i)
+        true,  // tty=true (-t)
+        &["echo", "tty-only-test"],
+        None, // no stdin input
+    )
+    .await?;
+    println!("  exit code: {}", exit_code);
+    println!("  output: {:?}", output);
+    assert!(
+        output.contains("tty-only-test"),
+        "should get output with -t only: {:?}",
+        output
+    );
+    assert_eq!(exit_code, 0, "exit code should be 0");
+    println!("  ✓ -t only works for VM exec");
+
+    // Test 18: -t only (container) - TTY for output, no stdin
+    println!("\nTest 18: -t only (container) - TTY output, no stdin");
+    let (exit_code, _, output) = run_exec_with_pty(
+        &fcvm_path,
+        fcvm_pid,
+        false, // in_vm=false (container)
+        false, // interactive=false (no -i)
+        true,  // tty=true (-t)
+        &["echo", "container-tty-only"],
+        None, // no stdin input
+    )
+    .await?;
+    println!("  exit code: {}", exit_code);
+    println!("  output: {:?}", output);
+    assert!(
+        output.contains("container-tty-only"),
+        "should get output with -t only: {:?}",
+        output
+    );
+    assert_eq!(exit_code, 0, "exit code should be 0");
+    println!("  ✓ -t only works for container exec");
+
+    // Test 19: -i only (VM) - stdin but no TTY (piping data)
+    // This uses non-TTY mode but with stdin - test via regular exec with -i
+    println!("\nTest 19: -i only (VM) - stdin without TTY");
+    {
+        let pid_str = fcvm_pid.to_string();
+        let mut child = tokio::process::Command::new(&fcvm_path)
+            .args(["exec", "--pid", &pid_str, "--vm", "-i", "--", "head", "-1"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawning exec with -i")?;
+
+        // Write to stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(b"vm-interactive-input\n").await?;
+            stdin.flush().await?;
+            drop(stdin);
+        }
+
+        let output = child.wait_with_output().await?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        println!("  output: {:?}", stdout);
+        assert!(
+            stdout.contains("vm-interactive-input"),
+            "should echo stdin with -i: {:?}",
+            stdout
+        );
+        println!("  ✓ -i only works for VM exec");
+    }
+
+    // Test 20: -i only (container) - stdin but no TTY
+    println!("\nTest 20: -i only (container) - stdin without TTY");
+    {
+        let pid_str = fcvm_pid.to_string();
+        let mut child = tokio::process::Command::new(&fcvm_path)
+            .args(["exec", "--pid", &pid_str, "-i", "--", "head", "-1"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawning exec with -i")?;
+
+        // Write to stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(b"container-interactive-input\n").await?;
+            stdin.flush().await?;
+            drop(stdin);
+        }
+
+        let output = child.wait_with_output().await?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        println!("  output: {:?}", stdout);
+        assert!(
+            stdout.contains("container-interactive-input"),
+            "should echo stdin with -i: {:?}",
+            stdout
+        );
+        println!("  ✓ -i only works for container exec");
+    }
+
+    // Test 21: neither -i nor -t (VM) - plain exec, no stdin, no TTY
+    println!("\nTest 21: neither -i nor -t (VM)");
+    let output = run_exec(&fcvm_path, fcvm_pid, true, &["echo", "plain-vm"]).await?;
+    println!("  output: {:?}", output.trim());
+    assert!(
+        output.contains("plain-vm"),
+        "should get output: {:?}",
+        output
+    );
+    println!("  ✓ plain exec (no flags) works for VM");
+
+    // Test 22: neither -i nor -t (container) - plain exec
+    println!("\nTest 22: neither -i nor -t (container)");
+    let output = run_exec(&fcvm_path, fcvm_pid, false, &["echo", "plain-container"]).await?;
+    println!("  output: {:?}", output.trim());
+    assert!(
+        output.contains("plain-container"),
+        "should get output: {:?}",
+        output
+    );
+    println!("  ✓ plain exec (no flags) works for container");
+
+    // Test 23: Verify -t without -i does NOT forward stdin (VM)
+    println!("\nTest 23: -t without -i should NOT forward stdin (VM)");
+    let (exit_code, _, output) = run_exec_with_pty(
+        &fcvm_path,
+        fcvm_pid,
+        true,                             // in_vm
+        false,                            // interactive=false (no -i)
+        true,                             // tty=true (-t)
+        &["head", "-1"],                  // waits for input
+        Some("this-should-not-appear\n"), // we send input but it should be ignored
+    )
+    .await?;
+    println!("  exit code: {} (expected timeout/signal)", exit_code);
+    println!("  output: {:?}", output);
+    // head -1 should timeout because stdin is not forwarded
+    assert!(
+        !output.contains("this-should-not-appear"),
+        "-t without -i should NOT forward stdin, but got: {:?}",
+        output
+    );
+    println!("  ✓ -t without -i correctly ignores stdin (VM)");
+
+    // Test 24: Verify -t without -i does NOT forward stdin (container)
+    println!("\nTest 24: -t without -i should NOT forward stdin (container)");
+    let (exit_code, _, output) = run_exec_with_pty(
+        &fcvm_path,
+        fcvm_pid,
+        false,                             // in_vm=false (container)
+        false,                             // interactive=false (no -i)
+        true,                              // tty=true (-t)
+        &["head", "-1"],                   // waits for input
+        Some("container-stdin-ignored\n"), // we send input but it should be ignored
+    )
+    .await?;
+    println!("  exit code: {} (expected timeout/signal)", exit_code);
+    println!("  output: {:?}", output);
+    // head -1 should timeout because stdin is not forwarded
+    assert!(
+        !output.contains("container-stdin-ignored"),
+        "-t without -i should NOT forward stdin, but got: {:?}",
+        output
+    );
+    println!("  ✓ -t without -i correctly ignores stdin (container)");
+
     // Cleanup
     println!("\nCleaning up...");
     common::kill_process(fcvm_pid).await;
 
     println!("✅ EXEC TEST PASSED! (network: {})", network);
     Ok(())
+}
+
+/// Run fcvm exec (no TTY) and return exit code
+async fn run_exec_with_exit_code(
+    fcvm_path: &std::path::Path,
+    pid: u32,
+    in_vm: bool,
+    cmd: &[&str],
+) -> Result<i32> {
+    let pid_str = pid.to_string();
+    let mut args = vec!["exec", "--pid", &pid_str];
+    if in_vm {
+        args.push("--vm");
+    }
+    args.push("--");
+    args.extend(cmd.iter().copied());
+
+    let output = tokio::process::Command::new(fcvm_path)
+        .args(&args)
+        .output()
+        .await
+        .context("running fcvm exec")?;
+
+    Ok(output.status.code().unwrap_or(-1))
 }
 
 /// Run fcvm exec (no TTY) and return stdout
@@ -341,8 +604,10 @@ async fn run_exec_tty(
     // -q: quiet mode (no "Script started" message)
     // -c: run command instead of shell
     // /dev/null: discard typescript file
+    // stdin must be null to prevent garbage from test harness being sent to VM PTY
     let mut child = tokio::process::Command::new("script")
         .args(["-q", "-c", &fcvm_cmd, "/dev/null"])
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -421,4 +686,324 @@ async fn run_exec_tty(
         .join("\n");
 
     Ok((exit_code, duration, combined))
+}
+
+/// Run fcvm exec with PTY and optional stdin input
+///
+/// Uses nix::pty to properly allocate a PTY for the child process.
+///
+/// Flags:
+/// - `interactive`: Pass -i flag (stdin forwarding)
+/// - `tty`: Pass -t flag (TTY allocation)
+/// - `stdin_input`: Input to send (only makes sense with interactive=true)
+///
+/// Returns (exit_code, duration, output)
+async fn run_exec_with_pty(
+    fcvm_path: &std::path::Path,
+    pid: u32,
+    in_vm: bool,
+    interactive: bool,
+    tty: bool,
+    cmd: &[&str],
+    stdin_input: Option<&str>,
+) -> Result<(i32, Duration, String)> {
+    use nix::pty::openpty;
+    use nix::unistd::{close, dup2, fork, ForkResult};
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    let pid_str = pid.to_string();
+    let start = std::time::Instant::now();
+
+    // Allocate a PTY pair
+    let pty = openpty(None, None).context("opening PTY")?;
+
+    // CRITICAL: Disable echo on the PTY slave BEFORE forking.
+    // Otherwise there's a race condition: if the child (fcvm exec) doesn't
+    // set raw mode fast enough (which happens under heavy load), input
+    // written to the PTY master gets echoed back as output.
+    // This caused Test 24 to fail in parallel runs but pass in isolation.
+    unsafe {
+        let slave_fd = pty.slave.as_raw_fd();
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(slave_fd, &mut termios) == 0 {
+            // Disable echo (ECHO) and canonical mode (ICANON)
+            // This prevents input from being echoed before the child sets raw mode
+            termios.c_lflag &= !(libc::ECHO | libc::ICANON);
+            // Also disable ISIG so Ctrl-C doesn't get processed locally
+            termios.c_lflag &= !libc::ISIG;
+            libc::tcsetattr(slave_fd, libc::TCSANOW, &termios);
+        }
+    }
+
+    // Fork to run fcvm exec in child with PTY as stdin/stdout/stderr
+    match unsafe { fork() }.context("forking")? {
+        ForkResult::Child => {
+            // Child: set up PTY slave as stdin/stdout/stderr
+            unsafe {
+                // Create new session
+                libc::setsid();
+
+                // Set controlling terminal
+                libc::ioctl(pty.slave.as_raw_fd(), libc::TIOCSCTTY as _, 0);
+
+                // Redirect stdio to PTY slave
+                dup2(pty.slave.as_raw_fd(), 0).ok();
+                dup2(pty.slave.as_raw_fd(), 1).ok();
+                dup2(pty.slave.as_raw_fd(), 2).ok();
+
+                // Close original fds
+                if pty.slave.as_raw_fd() > 2 {
+                    close(pty.slave.as_raw_fd()).ok();
+                }
+                close(pty.master.as_raw_fd()).ok();
+            }
+
+            // Build command args as CStrings
+            use std::ffi::CString;
+            let prog = CString::new(fcvm_path.to_str().unwrap()).unwrap();
+            let mut args: Vec<CString> = vec![
+                CString::new(fcvm_path.to_str().unwrap()).unwrap(),
+                CString::new("exec").unwrap(),
+                CString::new("--pid").unwrap(),
+                CString::new(pid_str.as_str()).unwrap(),
+            ];
+            // Add flags based on parameters
+            if interactive && tty {
+                args.push(CString::new("-it").unwrap());
+            } else if interactive {
+                args.push(CString::new("-i").unwrap());
+            } else if tty {
+                args.push(CString::new("-t").unwrap());
+            }
+            if in_vm {
+                args.push(CString::new("--vm").unwrap());
+            }
+            args.push(CString::new("--").unwrap());
+            for c in cmd {
+                args.push(CString::new(*c).unwrap());
+            }
+
+            // Exec fcvm - on success, this replaces the process image
+            #[allow(unreachable_code)]
+            {
+                nix::unistd::execvp(&prog, &args).expect("execvp failed");
+                std::process::exit(1); // Never reached
+            }
+        }
+        ForkResult::Parent { child } => {
+            // Parent: close slave, use master for I/O
+            close(pty.slave.as_raw_fd()).ok();
+
+            // Wrap master fd in File for I/O
+            let mut master = unsafe { std::fs::File::from_raw_fd(pty.master.as_raw_fd()) };
+
+            // Delay to let child start - container exec via podman needs more time
+            std::thread::sleep(Duration::from_millis(500));
+
+            // Write stdin input only if provided
+            if let Some(input) = stdin_input {
+                use std::io::Write;
+                master
+                    .write_all(input.as_bytes())
+                    .context("writing stdin")?;
+                master.flush().context("flushing")?;
+            }
+
+            // Read output with timeout
+            let mut output = Vec::new();
+            let mut buf = [0u8; 4096];
+
+            // Set non-blocking
+            unsafe {
+                let flags = libc::fcntl(pty.master.as_raw_fd(), libc::F_GETFL);
+                libc::fcntl(
+                    pty.master.as_raw_fd(),
+                    libc::F_SETFL,
+                    flags | libc::O_NONBLOCK,
+                );
+            }
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if std::time::Instant::now() > deadline {
+                    // Timeout - kill child
+                    nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL).ok();
+                    break;
+                }
+
+                use std::io::Read;
+                match master.read(&mut buf) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => output.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Check if child exited
+                        match nix::sys::wait::waitpid(
+                            child,
+                            Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+                        ) {
+                            Ok(nix::sys::wait::WaitStatus::Exited(_, _)) => break,
+                            Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
+                            _ => {
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            // Wait for child to fully exit
+            let status = nix::sys::wait::waitpid(child, None).context("waiting for child")?;
+            let exit_code = match status {
+                nix::sys::wait::WaitStatus::Exited(_, code) => code,
+                _ => -1,
+            };
+
+            let duration = start.elapsed();
+            let output_str = String::from_utf8_lossy(&output).to_string();
+
+            Ok((exit_code, duration, output_str))
+        }
+    }
+}
+
+/// Stress test: Run 100 parallel TTY execs to verify no race conditions
+///
+/// This test verifies that the TTY stdin fix works under heavy parallel load.
+/// Each exec runs `tty` command which should return /dev/pts/N.
+/// A null byte (`\x00`) in output would indicate a race condition bug.
+///
+/// Uses waves of 10 concurrent execs to avoid overwhelming vsock backlog.
+#[tokio::test]
+async fn test_exec_parallel_tty_stress() -> Result<()> {
+    const TOTAL_EXECS: usize = 100;
+    const WAVE_SIZE: usize = 10; // Run 10 at a time to avoid vsock backlog overflow
+
+    println!(
+        "\nParallel TTY Stress Test ({} execs in waves of {})",
+        TOTAL_EXECS, WAVE_SIZE
+    );
+    println!("==========================================================");
+
+    let fcvm_path = common::find_fcvm_binary()?;
+    let (vm_name, _, _, _) = common::unique_names("stress-tty");
+
+    // Start VM with nginx (keeps running)
+    println!("Starting VM...");
+    let (mut _child, fcvm_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "rootless",
+        common::TEST_IMAGE, // nginx:alpine
+    ])
+    .await
+    .context("spawning VM")?;
+
+    println!("  fcvm process started (PID: {})", fcvm_pid);
+
+    // Wait for VM to become healthy
+    common::poll_health_by_pid(fcvm_pid, 60)
+        .await
+        .context("waiting for VM to be healthy")?;
+    println!("  VM is healthy");
+
+    // Run execs in waves to avoid overwhelming vsock connection backlog
+    println!(
+        "\nRunning {} execs in waves of {}...",
+        TOTAL_EXECS, WAVE_SIZE
+    );
+    let start = std::time::Instant::now();
+
+    let mut success_count = 0;
+    let mut null_byte_failures = 0;
+    let mut other_failures = 0;
+    let mut failures: Vec<(usize, String)> = Vec::new();
+
+    for wave in 0..(TOTAL_EXECS / WAVE_SIZE) {
+        let mut handles = Vec::new();
+        for i in 0..WAVE_SIZE {
+            let idx = wave * WAVE_SIZE + i;
+            let fcvm_path = fcvm_path.clone();
+            let pid = fcvm_pid;
+            handles.push(tokio::spawn(async move {
+                let result = run_exec_tty(
+                    &fcvm_path,
+                    pid,
+                    true, // in_vm
+                    &["tty"],
+                    InterruptCondition::None,
+                )
+                .await;
+                (idx, result)
+            }));
+        }
+
+        // Collect wave results
+        for handle in handles {
+            let (idx, result) = handle.await.context("joining task")?;
+            match result {
+                Ok((exit_code, _duration, output)) => {
+                    if output.contains("/dev/pts") && exit_code == 0 {
+                        success_count += 1;
+                    } else if output.contains('\x00') || output == "^@" {
+                        // This is the null byte bug we're testing for
+                        null_byte_failures += 1;
+                        failures.push((
+                            idx,
+                            format!("NULL BYTE: exit={}, output={:?}", exit_code, output),
+                        ));
+                    } else {
+                        other_failures += 1;
+                        failures.push((idx, format!("exit={}, output={:?}", exit_code, output)));
+                    }
+                }
+                Err(e) => {
+                    other_failures += 1;
+                    failures.push((idx, format!("error: {}", e)));
+                }
+            }
+        }
+
+        // Brief pause between waves to let vsock recover
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let elapsed = start.elapsed();
+    println!("\n===== STRESS TEST RESULTS =====");
+    println!("Total execs: {}", TOTAL_EXECS);
+    println!("Success: {}", success_count);
+    println!(
+        "Null byte failures: {} (the bug we're testing for)",
+        null_byte_failures
+    );
+    println!("Other failures: {}", other_failures);
+    println!("Duration: {:?}", elapsed);
+    println!(
+        "Throughput: {:.1} execs/sec",
+        TOTAL_EXECS as f64 / elapsed.as_secs_f64()
+    );
+
+    if !failures.is_empty() {
+        println!("\n=== FAILURES (first 10) ===");
+        for (idx, msg) in failures.iter().take(10) {
+            println!("  #{}: {}", idx, msg);
+        }
+    }
+
+    // Cleanup
+    println!("\nCleaning up...");
+    common::kill_process(fcvm_pid).await;
+
+    // Assert 100% success - no failures are acceptable
+    assert_eq!(
+        success_count, TOTAL_EXECS,
+        "Expected 100% success rate, got {}/{} (null_byte={}, other={})",
+        success_count, TOTAL_EXECS, null_byte_failures, other_failures
+    );
+
+    println!("✓ ALL {} PARALLEL TTY EXECS PASSED!", TOTAL_EXECS);
+    Ok(())
 }

@@ -1,5 +1,16 @@
 # fcvm Development Log
 
+## STACKED PRs BY DEFAULT
+
+**All work goes in stacked PRs.** Each new PR should be based on the previous one, not main.
+
+```
+main → PR#55 → PR#56 → PR#57  (correct)
+main → PR#55, main → PR#56    (wrong - parallel branches)
+```
+
+Only branch directly from main when explicitly starting independent work.
+
 ## NO HACKS
 
 **Fix the root cause, not the symptom.** When something fails:
@@ -13,15 +24,56 @@ Examples of hacks to avoid:
 - Clearing caches instead of updating tools
 - Using `|| true` to ignore errors
 
+## Test Failure Investigation
+
+**Never say "likely" - always find the actual root cause.**
+
+When tests fail in CI or parallel runs:
+1. Re-running in isolation to verify the test itself is correct is fine
+2. But you MUST root cause why it failed when run together
+3. All tests must pass together - that's the point of parallel testing
+4. If a test passes alone but fails in parallel, there's a race condition - find it
+
+**The pattern:**
+```
+Test failed in parallel run
+  → Re-run alone: passes
+  → "Probably resource contention" ← WRONG, this is speculation
+  → Look at actual error message ← CORRECT
+  → Find the race condition ← REQUIRED
+```
+
+## Debugging Test Hangs
+
+**When a test hangs, look at what it's ACTUALLY DOING - don't blame "stale processes".**
+
+```bash
+# WRONG approach: blindly killing "old" processes
+ps aux | grep fcvm   # "I see old processes, they must be blocking!"
+sudo pkill -9 fcvm   # "Fixed it!" (No, you didn't debug anything)
+
+# CORRECT approach: understand what the test is doing
+ps aux | grep -E "fcvm|script|cat"
+# See: script -q -c ./target/release/fcvm exec --pid 1083915 -t -- cat
+# The test is running `cat` in TTY mode - it's waiting for input!
+# The bug is in the test, not "stale processes"
+```
+
+**Common causes of hanging tests:**
+- Command waiting for stdin (like `cat` without EOF signal)
+- Missing Ctrl+D (0x04) in TTY mode tests
+- Blocking reads without timeout
+- Deadlocks in async code
+
+**The process list tells you EXACTLY what's happening.** Read it.
+
 ## Overview
 fcvm is a Firecracker VM manager for running Podman containers in lightweight microVMs. This document tracks implementation findings and decisions.
 
 ## Nested Virtualization (Inception)
 
 fcvm supports running inside another fcvm VM ("inception") using ARM64 FEAT_NV2.
-
-**LIMITATION**: Only **one level** of nesting currently works (Host → L1). Recursive nesting
-(L1 → L2 → L3...) is blocked because L1's KVM reports `KVM_CAP_ARM_EL2=0`.
+Recursive nesting (Host → L1 → L2 → ...) is enabled via the `arm64.nv2` kernel boot parameter.
 
 ### Requirements
 
@@ -32,11 +84,12 @@ fcvm supports running inside another fcvm VM ("inception") using ARM64 FEAT_NV2.
 ### How It Works
 
 1. Set `FCVM_NV2=1` environment variable (auto-set when `--kernel` flag is used)
-2. fcvm passes `--enable-nv2` to Firecracker, which enables `HAS_EL2` + `HAS_EL2_E2H0` vCPU features
-3. vCPU boots at EL2h so guest kernel sees HYP mode available
-4. EL2 registers are initialized: HCR_EL2, CNTHCTL_EL2, VMPIDR_EL2, VPIDR_EL2
-5. Guest kernel initializes KVM: "Hyp nVHE mode initialized successfully"
-6. Nested fcvm can now create VMs using the guest's KVM
+2. fcvm passes `--enable-nv2` to Firecracker, which enables `HAS_EL2` vCPU feature
+3. vCPU boots at EL2h in VHE mode (E2H=1) so guest kernel sees HYP mode available
+4. EL2 registers are initialized: HCR_EL2, VMPIDR_EL2, VPIDR_EL2
+5. Guest kernel initializes KVM: "VHE mode initialized successfully"
+6. `arm64.nv2` boot param overrides MMFR4 to advertise NV2 support
+7. L1 KVM reports `KVM_CAP_ARM_EL2=1`, enabling recursive L2+ VMs
 
 ### Running Inception
 
@@ -61,9 +114,9 @@ fcvm podman run --name inner --network bridged alpine:latest
 
 Firecracker fork with NV2 support: `ejc3/firecracker:nv2-inception`
 
-- `HAS_EL2` (bit 7): Enables virtual EL2 for guest
-- `HAS_EL2_E2H0` (bit 8): Forces nVHE mode (avoids timer trap storm)
+- `HAS_EL2` (bit 7): Enables virtual EL2 for guest in VHE mode
 - Boot at EL2h: Guest kernel must see CurrentEL=EL2 on boot
+- VHE mode (E2H=1): Required for NV2 support in guest (nVHE mode doesn't support NV2)
 - VMPIDR_EL2/VPIDR_EL2: Proper processor IDs for nested guests
 
 ### Tests
@@ -75,13 +128,89 @@ make test-root FILTER=inception
 - `test_kvm_available_in_vm`: Verifies /dev/kvm works in guest
 - `test_inception_run_fcvm_inside_vm`: Full inception test
 
-### Recursive Nesting Limitation
+### Recursive Nesting: The ID Register Problem (Solved)
 
-L1's KVM reports `KVM_CAP_ARM_EL2=0`, blocking L2+ VMs.
+**Problem**: L1's KVM initially reported `KVM_CAP_ARM_EL2=0`, blocking L2+ VMs.
 
-**Root cause**: `kvm-arm.mode=nested` requires VHE (kernel at EL2), but NV2's E2H0 flag forces nVHE (kernel at EL1). E2H0 is required to avoid timer trap storms.
+**Root cause**: ARM architecture provides no mechanism to virtualize ID registers for virtual EL2.
 
-**Status**: Waiting for kernel improvements. Kernel NV2 patches mark recursive nesting as "not tested yet".
+1. Host KVM stores correct emulated ID values in `kvm->arch.id_regs[]`
+2. `HCR_EL2.TID3` controls trapping of ID register reads - but only for **EL1 reads**
+3. When guest runs at virtual EL2 (with NV2), ID register reads are EL2-level accesses
+4. EL2-level accesses don't trap via TID3 - they read hardware directly
+5. Guest sees `MMFR4=0` (hardware), not `MMFR4=NV2_ONLY` (emulated)
+
+**Solution**: Use kernel's ID register override mechanism with `arm64.nv2` boot parameter.
+
+1. Added `arm64.nv2` alias for `id_aa64mmfr4.nv_frac=2` (NV2_ONLY)
+2. Changed `FTR_LOWER_SAFE` to `FTR_HIGHER_SAFE` for MMFR4 to allow upward overrides
+3. Kernel patch: `kernel/patches/mmfr4-override.patch`
+
+**Why it's safe**: The host KVM *does* provide NV2 emulation - we're just fixing the guest's
+view of this capability. We're not faking a feature, we're correcting a visibility issue.
+
+**Verification**:
+```
+$ dmesg | grep mmfr4
+CPU features: SYS_ID_AA64MMFR4_EL1[23:20]: forced to 2
+
+$ check_kvm_caps
+KVM_CAP_ARM_EL2 (cap 240) = 1
+  -> Nested virtualization IS supported by KVM (VHE mode)
+```
+
+## FUSE Performance Tracing
+
+Enable per-operation tracing to diagnose FUSE latency issues (especially in nested VMs).
+
+### Enabling Tracing
+
+Set `FCVM_FUSE_TRACE_RATE=N` to trace every Nth FUSE operation:
+
+```bash
+# Trace every 100th request (recommended for benchmarks)
+FCVM_FUSE_TRACE_RATE=100 fcvm podman run --name test nginx:alpine
+
+# Trace every request (high overhead, use for debugging specific issues)
+FCVM_FUSE_TRACE_RATE=1 fcvm podman run ...
+```
+
+The env var is automatically passed to the guest via kernel boot parameters (`fuse_trace_rate=N`).
+
+### Trace Output Format
+
+```
+[TRACE     lookup] total=8940µs srv=159µs | fs=149 | to_srv=33 to_cli=1974
+[TRACE      fsync] total=70000µs srv=3000µs | fs=2900 | to_srv=? to_cli=?
+```
+
+| Field | Meaning |
+|-------|---------|
+| `total` | End-to-end client round-trip time |
+| `srv` | Server-side processing (reliable) |
+| `fs` | Filesystem operation time (subset of srv) |
+| `to_srv` | Network: client → server (may show `?` if clocks differ) |
+| `to_cli` | Network: server → client (may show `?` if clocks differ) |
+
+### L2 Performance Expectations
+
+Based on FUSE-over-FUSE architecture:
+
+| Operation | Expected L2/L1 Ratio | Notes |
+|-----------|---------------------|-------|
+| `stat`/metadata | ~2x | One extra FUSE layer |
+| Async writes | ~3x | Data transfer overhead |
+| Sync writes (fsync) | ~8-10x | fsync propagates synchronously through layers |
+
+The fsync amplification occurs because each L2 fsync must wait for L1's fsync to complete,
+which itself waits for the host disk sync. This is fundamental to FUSE-over-FUSE durability.
+
+### Related Configuration
+
+```bash
+# Reduce FUSE readers for nested VMs (saves memory)
+FCVM_FUSE_READERS=8 fcvm podman run ...  # Default: 64 readers × 8MB stack = 512MB
+```
 
 ## Quick Reference
 
@@ -111,6 +240,11 @@ make container-test-root FILTER=sanity STREAM=1   # Container tests with streami
 ```
 
 Without `STREAM=1`, nextest captures output and only shows it after tests complete (better for parallel runs).
+
+**Log levels:** Tests run with `fcvm=debug` by default (FUSE spam suppressed). Override with:
+```bash
+RUST_LOG=debug make test-root  # Full debug (slow, 18x more output)
+```
 
 ### Debug Logs
 
@@ -319,6 +453,58 @@ Tested locally:
 Fixed CI. Tested and it works.
 ```
 
+#### Complex/Advanced PRs
+
+**For non-trivial changes (architectural, workarounds, kernel patches), include:**
+
+1. **The Problem** - What was failing and why. Include root cause analysis.
+2. **The Solution** - How you fixed it. Explain the approach, not just "what" but "why this way".
+3. **Why It's Safe** - For workarounds or unusual approaches, explain why it won't break things.
+4. **Alternatives Considered** - What else you tried and why it didn't work.
+5. **Test Results** - Actual command output proving it works.
+
+**Example structure for complex PRs:**
+
+```markdown
+## Summary
+One-line description of what this enables.
+
+## The Problem
+- What was broken
+- Root cause analysis (be specific)
+- Why existing approaches didn't work
+
+## The Solution
+1. First key change and why
+2. Second key change and why
+3. Why this approach over alternatives
+
+### Why This Is Safe
+- Explain non-obvious safety guarantees
+- Address potential concerns upfront
+
+### Alternatives Considered
+1. Alternative A - why it didn't work
+2. Alternative B - why it was more invasive
+
+## Test Results
+\`\`\`
+$ actual-command-run
+actual output proving it works
+\`\`\`
+
+## Test Plan
+- [x] Test case 1
+- [x] Test case 2
+```
+
+**When to use this format:**
+- Kernel patches or low-level system changes
+- Workarounds for architectural limitations
+- Changes that might seem "wrong" without context
+- Multi-commit PRs with complex interactions
+- Anything where a reviewer might ask "why not just...?"
+
 **Why evidence matters:**
 - Proves the fix works, not just "looks right"
 - Local testing is sufficient - don't need CI green first
@@ -382,18 +568,25 @@ Why: String matching breaks when JSON formatting changes (spaces, newlines, fiel
 **This project is designed for extreme scale, speed, and correctness.** Test failures are bugs, not excuses.
 
 **NEVER dismiss failures as:**
-- "Resource contention"
-- "Timing issues"
-- "Flaky tests"
-- "Works on my machine"
+- "Resource contention" - **This is NEVER the answer. It's always a race condition.**
+- "Timing issues" - **This means there's a race condition. Find and fix it.**
+- "Flaky tests" - **No such thing. The test found a bug. Fix the bug.**
+- "Works on my machine" - **Your machine just got lucky. The bug is real.**
+
+**"Resource contention" is a lie you tell yourself to avoid finding the real bug.** When a test fails under load:
+1. The test is correct - it found a bug
+2. The bug only manifests under certain timing conditions
+3. This is called a **race condition**
+4. You MUST find the race and fix it
 
 **ALWAYS:**
-1. Investigate the actual root cause
-2. Find evidence in logs, traces, or code
-3. Fix the underlying bug
-4. Add regression tests if needed
+1. **Look at the logs** - The answer is always there
+2. Investigate the actual root cause with evidence
+3. Find the race condition - there IS one
+4. Fix the underlying bug
+5. Add regression tests if needed
 
-If a test fails intermittently, that's a **concurrency bug** or **race condition** that must be fixed, not ignored.
+If a test fails intermittently or only under parallel execution, that's a **concurrency bug** or **race condition** that must be fixed, not ignored. The test passed in isolation? Great - that narrows down the timing window where the race occurs.
 
 ### POSIX Compliance Testing
 
@@ -564,33 +757,76 @@ fuse-backend-rs = { path = "../../fuse-backend-rs", ... }
 
 This ensures changes to fuse-backend-rs are immediately available without git commits.
 
+### Container KVM Access (Rootless Podman)
+
+`--device /dev/kvm` fails silently in rootless podman (ignores group membership). Use `-v` bind mount with `--group-add keep-groups` instead. See Makefile `CONTAINER_RUN` and [podman#16701](https://github.com/containers/podman/issues/16701).
+
 ### Monitoring Long-Running Tests
 
-When tailing logs, check every **20 seconds** (not 5, not 60):
+When waiting for test results, use **max 30 second sleeps**:
 ```bash
-# Good - check every 20 seconds
-sleep 20 && tail -20 /tmp/test.log
+# Good - 20-30 second waits
+sleep 20 && tail -50 /tmp/test.log
+sleep 30 && grep -E "PASS|FAIL" /tmp/test.log
+
+# Bad - too long (wastes time, user gets impatient)
+sleep 60 && ...
+sleep 90 && ...
+sleep 120 && ...
 
 # Bad - too frequent (wastes API calls)
 sleep 5 && ...
+```
 
-# Bad - too slow (miss important output)
+**NEVER sleep longer than 30 seconds** when waiting for results. If a command needs more time, use shorter sleeps with multiple checks.
+
+**Provide play-by-play updates** as tests run. Don't wait silently - report progress as it happens:
+```
+"Tests starting, 238 total..."
+"30s in, 50 passed so far..."
+"Found 2 failures: test_foo, test_bar"
+"Still running, 180/238 complete..."
 ```
 
 ### Preserving Logs from Failed Tests
 
+**CRITICAL: ALWAYS include branch name in tee log filenames.**
+
+Without the branch name, logs from different branches overwrite each other and you lose the ability to compare results or diagnose issues. This is especially important when:
+- Working on stacked PRs (branch A depends on branch B)
+- Developing two features in parallel
+- Switching between branches to compare behavior
+- Using multiple worktrees
+
+```bash
+# ALWAYS get branch name first
+BRANCH=$(git branch --show-current)
+
+# Run full test suite - include branch AND target
+make test-root 2>&1 | tee /tmp/test-${BRANCH}-root.log
+
+# Run filtered tests - include branch, target, AND filter
+make test-root FILTER=exec 2>&1 | tee /tmp/test-${BRANCH}-root-exec.log
+make test-root FILTER=sanity 2>&1 | tee /tmp/test-${BRANCH}-root-sanity.log
+```
+
 **When a test fails, IMMEDIATELY save the log to a uniquely-named file for diagnosis:**
 
 ```bash
-# Pattern: /tmp/fcvm-failed-{test_name}-{timestamp}.log
-# Example after test_exec_rootless fails:
-cp /tmp/test.log /tmp/fcvm-failed-test_exec_rootless-$(date +%Y%m%d-%H%M%S).log
+# Pattern: /tmp/fcvm-failed-{branch}-{target}-{test_name}-{timestamp}.log
+BRANCH=$(git branch --show-current)
+
+# Example after test_exec_rootless fails in test-root run:
+cp /tmp/test-${BRANCH}-root.log /tmp/fcvm-failed-${BRANCH}-root-test_exec_rootless-$(date +%Y%m%d-%H%M%S).log
 
 # Then continue with other tests using a fresh log file
-make test-root 2>&1 | tee /tmp/test-run2.log
+make test-root 2>&1 | tee /tmp/test-${BRANCH}-root-run2.log
 ```
 
 **Why this matters:**
+- Branch names prevent confusion when working across multiple worktrees
+- Target names (root, fast, unit) identify which test tier was run
+- Filter names (exec, sanity) identify which subset was tested
 - Test logs get overwritten when running the suite again
 - Failed test output is essential for root cause analysis
 - Timestamps prevent filename collisions across sessions
@@ -598,8 +834,9 @@ make test-root 2>&1 | tee /tmp/test-run2.log
 **Automated approach:**
 ```bash
 # After a test suite run, check for failures and save logs
-if grep -q "FAIL\|TIMEOUT" /tmp/test.log; then
-  cp /tmp/test.log /tmp/fcvm-failed-$(date +%Y%m%d-%H%M%S).log
+BRANCH=$(git branch --show-current)
+if grep -q "FAIL\|TIMEOUT" /tmp/test-${BRANCH}-root.log; then
+  cp /tmp/test-${BRANCH}-root.log /tmp/fcvm-failed-${BRANCH}-root-$(date +%Y%m%d-%H%M%S).log
   echo "Saved failed test log"
 fi
 ```
@@ -1294,7 +1531,18 @@ RUST_LOG="fuse_pipe=info,fuse-pipe=info,passthrough=debug" sudo -E cargo test --
 RUST_LOG="passthrough=debug" sudo -E cargo test --release -p fuse-pipe --test integration test_list_directory -- --nocapture
 ```
 
+## Exec Command Flags
+
+`fcvm exec` uses `-i` and `-t` separately, matching podman/docker:
+- `-t`: allocate PTY (for colors/formatting)
+- `-i`: forward stdin
+- `-it`: both (interactive shell)
+- neither: plain exec
+
+**NO backward compatibility wrappers.** When the API changed from `run_tty_mode(stream)` to `run_tty_mode(stream, interactive)`, all callers were updated directly - no deprecated functions or compatibility shims.
+
 ## References
 - Main documentation: `README.md`
+- Performance guide: `PERFORMANCE.md`
 - Design specification: `DESIGN.md`
 - Firecracker docs: https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md

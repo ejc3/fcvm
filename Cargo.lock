@@ -563,6 +563,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "exec-proto"
+version = "0.1.0"
+
+[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -573,6 +577,7 @@ name = "fc-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "exec-proto",
  "fs2",
  "fuse-pipe",
  "libc",
@@ -594,6 +599,7 @@ dependencies = [
  "clap_complete",
  "criterion",
  "directories",
+ "exec-proto",
  "fs2",
  "fuse-pipe",
  "hex",

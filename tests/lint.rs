@@ -1,6 +1,5 @@
-//! Lint tests - run fmt, clippy, audit, deny in parallel via cargo test.
-
-#![cfg(feature = "integration-fast")]
+//! Lint tests - fmt/audit/deny run in test-unit, clippy in test-fast.
+//! Fast tests run before privileged tests to avoid root-owned advisory-db files.
 
 use std::process::Command;
 
@@ -27,6 +26,7 @@ fn fmt() {
 }
 
 #[test]
+#[cfg(feature = "integration-fast")]
 fn clippy() {
     assert_success(
         "cargo clippy",

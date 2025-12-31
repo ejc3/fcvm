@@ -204,7 +204,8 @@ impl Multiplexer {
                 collector.record(unique, op, s);
             } else {
                 // No collector - print trace directly
-                s.print(unique);
+                let op = op_name.as_deref().unwrap_or("unknown");
+                s.print(unique, op);
             }
         }
 
@@ -228,12 +229,25 @@ fn writer_loop(
     request_rx: Receiver<PendingRequest>,
     pending: Arc<DashMap<u64, Sender<ResponsePayload>>>,
 ) {
+    let mut count = 0u64;
     while let Ok(req) = request_rx.recv() {
+        count += 1;
+        if count <= 10 || count.is_multiple_of(100) {
+            tracing::info!(target: "fuse-pipe::mux", count, pending_count = pending.len(), "writer: sent requests");
+        }
+
         // Register the response channel BEFORE writing (to avoid race)
         pending.insert(req.unique, req.response_tx);
 
         // Write to socket
-        if socket.write_all(&req.data).is_err() || socket.flush().is_err() {
+        let write_result = socket.write_all(&req.data);
+        let flush_result = if write_result.is_ok() {
+            socket.flush()
+        } else {
+            Ok(())
+        };
+        if let Err(e) = write_result.as_ref().and(flush_result.as_ref()) {
+            tracing::warn!(target: "fuse-pipe::mux", unique = req.unique, error = %e, error_kind = ?e.kind(), "writer: socket write failed");
             // Remove from pending and signal error
             if let Some((_, tx)) = pending.remove(&req.unique) {
                 let _ = tx.send((VolumeResponse::error(libc::EIO), None));
@@ -242,22 +256,26 @@ fn writer_loop(
         // Note: client_socket_write is marked by server_recv on the server side
         // since we can't update the span after serialization
     }
+    tracing::info!(target: "fuse-pipe::mux", count, "writer: exiting");
 }
 
 /// Reader thread: reads responses from socket, routes to waiting readers.
 fn reader_loop(mut socket: UnixStream, pending: Arc<DashMap<u64, Sender<ResponsePayload>>>) {
     let mut len_buf = [0u8; 4];
+    let mut count = 0u64;
 
     loop {
         // Read response length
         if socket.read_exact(&mut len_buf).is_err() {
             // Server disconnected - fail all pending requests
+            tracing::warn!(target: "fuse-pipe::mux", count, pending_count = pending.len(), "reader: socket read failed, disconnected");
             fail_all_pending(&pending);
             break;
         }
 
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > MAX_MESSAGE_SIZE {
+            tracing::error!(target: "fuse-pipe::mux", len, "reader: oversized message");
             fail_all_pending(&pending);
             break;
         }
@@ -265,8 +283,14 @@ fn reader_loop(mut socket: UnixStream, pending: Arc<DashMap<u64, Sender<Response
         // Read response body
         let mut resp_buf = vec![0u8; len];
         if socket.read_exact(&mut resp_buf).is_err() {
+            tracing::warn!(target: "fuse-pipe::mux", count, "reader: failed to read response body");
             fail_all_pending(&pending);
             break;
+        }
+
+        count += 1;
+        if count <= 10 || count.is_multiple_of(100) {
+            tracing::info!(target: "fuse-pipe::mux", count, pending_count = pending.len(), "reader: received responses");
         }
 
         // Deserialize and route to waiting reader (lock-free lookup + remove)
@@ -282,6 +306,7 @@ fn reader_loop(mut socket: UnixStream, pending: Arc<DashMap<u64, Sender<Response
             }
         }
     }
+    tracing::info!(target: "fuse-pipe::mux", count, "reader: exiting");
 }
 
 /// Fail all pending requests on disconnect.
