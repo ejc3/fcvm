@@ -329,7 +329,7 @@ pub async fn ensure_inception_kernel(allow_build: bool) -> Result<PathBuf> {
             println!("  ✓ Inception kernel downloaded");
             info!(path = %kernel_path.display(), "inception kernel ready");
             flock.unlock().map_err(|(_, err)| err)?;
-            return Ok(kernel_path);
+            Ok(kernel_path)
         }
         Err(e) => {
             warn!(error = %e, "failed to download inception kernel");
@@ -339,7 +339,7 @@ pub async fn ensure_inception_kernel(allow_build: bool) -> Result<PathBuf> {
                 build_inception_kernel_locally(&kernel_path).await?;
                 println!("  ✓ Inception kernel built");
                 flock.unlock().map_err(|(_, err)| err)?;
-                return Ok(kernel_path);
+                Ok(kernel_path)
             } else {
                 flock.unlock().map_err(|(_, err)| err)?;
                 bail!(
