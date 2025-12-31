@@ -557,6 +557,7 @@ make setup-fcvm   # Download kernel, create rootfs
 ## Documentation
 
 - `DESIGN.md` - Comprehensive design specification and architecture
+- `PERFORMANCE.md` - Performance benchmarks, tuning guide, and tracing
 - `.claude/CLAUDE.md` - Development notes, debugging tips, implementation details
 - `LICENSE` - MIT License
 

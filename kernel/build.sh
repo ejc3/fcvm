@@ -11,19 +11,32 @@
 
 set -euo pipefail
 
-# Validate required input
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Compute SHA from build inputs if KERNEL_PATH not provided
+compute_sha() {
+    # SHA is based on: build.sh + inception.conf + all patches
+    (
+        cat "$SCRIPT_DIR/build.sh"
+        cat "$SCRIPT_DIR/inception.conf"
+        cat "$SCRIPT_DIR/patches/"*.patch 2>/dev/null || true
+    ) | sha256sum | cut -c1-12
+}
+
+# Set KERNEL_PATH if not provided
 if [[ -z "${KERNEL_PATH:-}" ]]; then
-    echo "ERROR: KERNEL_PATH env var required"
-    echo "Caller must compute the output path (including SHA)"
-    exit 1
+    KERNEL_VERSION="${KERNEL_VERSION:-6.18}"
+    BUILD_SHA=$(compute_sha)
+    KERNEL_PATH="/mnt/fcvm-btrfs/kernels/vmlinux-${KERNEL_VERSION}-${BUILD_SHA}.bin"
+    echo "Computed KERNEL_PATH: $KERNEL_PATH"
 fi
 
-# Configuration
-KERNEL_VERSION="${KERNEL_VERSION:-6.12.10}"
+# Configuration (may already be set above)
+KERNEL_VERSION="${KERNEL_VERSION:-6.18}"
 KERNEL_MAJOR="${KERNEL_VERSION%%.*}"
 BUILD_DIR="${BUILD_DIR:-/tmp/kernel-build}"
 NPROC="${NPROC:-$(nproc)}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Architecture detection
 ARCH=$(uname -m)
@@ -219,6 +232,18 @@ FUNC
 	.remap_file_range = fuse_remap_file_range,' fs/fuse/file.c
 
     echo "  FUSE remap_file_range support applied successfully"
+fi
+
+# Apply MMFR4 override patch for NV2 recursive nesting
+MMFR4_PATCH="$PATCHES_DIR/mmfr4-override.patch"
+if [[ -f "$MMFR4_PATCH" ]]; then
+    if grep -q "id_aa64mmfr4_override" arch/arm64/kernel/cpufeature.c 2>/dev/null; then
+        echo "  MMFR4 override support already applied"
+    else
+        echo "  Applying MMFR4 override patch for NV2 recursive nesting..."
+        patch -p1 < "$MMFR4_PATCH"
+        echo "  MMFR4 override patch applied successfully"
+    fi
 fi
 
 # Download Firecracker base config

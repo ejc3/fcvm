@@ -38,9 +38,9 @@ pub async fn create_veth_pair(host_veth: &str, guest_veth: &str, ns_name: &str) 
     );
 
     // Create veth pair in root namespace
-    let output = Command::new("sudo")
+    let output = Command::new("ip")
         .args([
-            "ip", "link", "add", host_veth, "type", "veth", "peer", "name", guest_veth,
+            "link", "add", host_veth, "type", "veth", "peer", "name", guest_veth,
         ])
         .output()
         .await
@@ -52,8 +52,8 @@ pub async fn create_veth_pair(host_veth: &str, guest_veth: &str, ns_name: &str) 
     }
 
     // Move guest side into namespace
-    let output = Command::new("sudo")
-        .args(["ip", "link", "set", guest_veth, "netns", ns_name])
+    let output = Command::new("ip")
+        .args(["link", "set", guest_veth, "netns", ns_name])
         .output()
         .await
         .context("moving veth to namespace")?;
@@ -61,8 +61,8 @@ pub async fn create_veth_pair(host_veth: &str, guest_veth: &str, ns_name: &str) 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // Cleanup host veth on failure
-        let _ = Command::new("sudo")
-            .args(["ip", "link", "del", host_veth])
+        let _ = Command::new("ip")
+            .args(["link", "del", host_veth])
             .output()
             .await;
         anyhow::bail!("failed to move veth to namespace: {}", stderr);
@@ -142,8 +142,8 @@ pub async fn setup_host_veth(veth_name: &str, ip_with_cidr: &str) -> Result<()> 
     cleanup_stale_veth_with_ip(ip_with_cidr, veth_name).await?;
 
     // Bring up the interface
-    let output = Command::new("sudo")
-        .args(["ip", "link", "set", veth_name, "up"])
+    let output = Command::new("ip")
+        .args(["link", "set", veth_name, "up"])
         .output()
         .await
         .context("bringing up host veth")?;
@@ -154,8 +154,8 @@ pub async fn setup_host_veth(veth_name: &str, ip_with_cidr: &str) -> Result<()> 
     }
 
     // Assign primary IP address
-    let output = Command::new("sudo")
-        .args(["ip", "addr", "add", ip_with_cidr, "dev", veth_name])
+    let output = Command::new("ip")
+        .args(["addr", "add", ip_with_cidr, "dev", veth_name])
         .output()
         .await
         .context("assigning IP to host veth")?;
@@ -173,8 +173,8 @@ pub async fn setup_host_veth(veth_name: &str, ip_with_cidr: &str) -> Result<()> 
 
     // Add FORWARD rule to allow outbound traffic from this veth
     let forward_rule = format!("-A FORWARD -i {} -j ACCEPT", veth_name);
-    let output = Command::new("sudo")
-        .args(["iptables", "-t", "filter", "-C", "FORWARD"]) // Include chain name for -C check
+    let output = Command::new("iptables")
+        .args(["-t", "filter", "-C", "FORWARD"]) // Include chain name for -C check
         .args(forward_rule.split_whitespace().skip(2)) // Skip "-A FORWARD"
         .output()
         .await
@@ -182,8 +182,8 @@ pub async fn setup_host_veth(veth_name: &str, ip_with_cidr: &str) -> Result<()> 
 
     if !output.status.success() {
         // Rule doesn't exist, add it
-        let output = Command::new("sudo")
-            .args(["iptables", "-t", "filter"])
+        let output = Command::new("iptables")
+            .args(["-t", "filter"])
             .args(forward_rule.split_whitespace())
             .output()
             .await
@@ -552,8 +552,8 @@ pub async fn setup_in_namespace_nat(
 pub async fn delete_veth_pair(host_veth: &str) -> Result<()> {
     debug!(veth = %host_veth, "deleting veth pair");
 
-    let output = Command::new("sudo")
-        .args(["ip", "link", "del", host_veth])
+    let output = Command::new("ip")
+        .args(["link", "del", host_veth])
         .output()
         .await
         .context("deleting veth pair")?;
@@ -579,8 +579,8 @@ pub async fn delete_veth_forward_rule(veth_name: &str) -> Result<()> {
     debug!(veth = %veth_name, "deleting FORWARD rule");
 
     let forward_rule = format!("-D FORWARD -i {} -j ACCEPT", veth_name);
-    let output = Command::new("sudo")
-        .args(["iptables", "-t", "filter"])
+    let output = Command::new("iptables")
+        .args(["-t", "filter"])
         .args(forward_rule.split_whitespace())
         .output()
         .await
