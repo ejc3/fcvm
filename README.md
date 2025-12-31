@@ -386,6 +386,8 @@ sudo reboot
 
 ### Getting the Inception Kernel
 
+> **Note**: If you followed "Setting Up an EC2 Instance" above, the kernel is already downloaded. This section is for users who already have a host with nested KVM enabled.
+
 ```bash
 # Download pre-built kernel from GitHub releases (~20MB)
 fcvm setup --inception
@@ -425,7 +427,7 @@ sudo fcvm podman run \
 ```bash
 # Check guest sees HYP mode
 fcvm exec --pid <outer_pid> --vm -- dmesg | grep -i kvm
-# Should show: "kvm [1]: Hyp nVHE mode initialized successfully"
+# Should show: "kvm [1]: VHE mode initialized successfully"
 
 # Verify /dev/kvm is accessible
 fcvm exec --pid <outer_pid> --vm -- ls -la /dev/kvm
