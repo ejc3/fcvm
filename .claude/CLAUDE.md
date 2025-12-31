@@ -24,6 +24,25 @@ Examples of hacks to avoid:
 - Clearing caches instead of updating tools
 - Using `|| true` to ignore errors
 
+## Test Failure Investigation
+
+**Never say "likely" - always find the actual root cause.**
+
+When tests fail in CI or parallel runs:
+1. Re-running in isolation to verify the test itself is correct is fine
+2. But you MUST root cause why it failed when run together
+3. All tests must pass together - that's the point of parallel testing
+4. If a test passes alone but fails in parallel, there's a race condition - find it
+
+**The pattern:**
+```
+Test failed in parallel run
+  → Re-run alone: passes
+  → "Probably resource contention" ← WRONG, this is speculation
+  → Look at actual error message ← CORRECT
+  → Find the race condition ← REQUIRED
+```
+
 ## Debugging Test Hangs
 
 **When a test hangs, look at what it's ACTUALLY DOING - don't blame "stale processes".**
@@ -221,6 +240,11 @@ make container-test-root FILTER=sanity STREAM=1   # Container tests with streami
 ```
 
 Without `STREAM=1`, nextest captures output and only shows it after tests complete (better for parallel runs).
+
+**Log levels:** Tests run with `fcvm=debug` by default (FUSE spam suppressed). Override with:
+```bash
+RUST_LOG=debug make test-root  # Full debug (slow, 18x more output)
+```
 
 ### Debug Logs
 
@@ -739,44 +763,70 @@ This ensures changes to fuse-backend-rs are immediately available without git co
 
 ### Monitoring Long-Running Tests
 
-When tailing logs, check every **20 seconds** (not 5, not 60):
+When waiting for test results, use **max 30 second sleeps**:
 ```bash
-# Good - check every 20 seconds
-sleep 20 && tail -20 /tmp/test.log
+# Good - 20-30 second waits
+sleep 20 && tail -50 /tmp/test.log
+sleep 30 && grep -E "PASS|FAIL" /tmp/test.log
+
+# Bad - too long (wastes time, user gets impatient)
+sleep 60 && ...
+sleep 90 && ...
+sleep 120 && ...
 
 # Bad - too frequent (wastes API calls)
 sleep 5 && ...
+```
 
-# Bad - too slow (miss important output)
+**NEVER sleep longer than 30 seconds** when waiting for results. If a command needs more time, use shorter sleeps with multiple checks.
+
+**Provide play-by-play updates** as tests run. Don't wait silently - report progress as it happens:
+```
+"Tests starting, 238 total..."
+"30s in, 50 passed so far..."
+"Found 2 failures: test_foo, test_bar"
+"Still running, 180/238 complete..."
 ```
 
 ### Preserving Logs from Failed Tests
 
-**When running tests, ALWAYS include the branch name in log filenames:**
+**CRITICAL: ALWAYS include branch name in tee log filenames.**
+
+Without the branch name, logs from different branches overwrite each other and you lose the ability to compare results or diagnose issues. This is especially important when:
+- Working on stacked PRs (branch A depends on branch B)
+- Developing two features in parallel
+- Switching between branches to compare behavior
+- Using multiple worktrees
 
 ```bash
-# Get current branch for log filename
+# ALWAYS get branch name first
 BRANCH=$(git branch --show-current)
 
-# Run tests with branch-named log file
-make test-root 2>&1 | tee /tmp/test-${BRANCH}.log
+# Run full test suite - include branch AND target
+make test-root 2>&1 | tee /tmp/test-${BRANCH}-root.log
+
+# Run filtered tests - include branch, target, AND filter
+make test-root FILTER=exec 2>&1 | tee /tmp/test-${BRANCH}-root-exec.log
+make test-root FILTER=sanity 2>&1 | tee /tmp/test-${BRANCH}-root-sanity.log
 ```
 
 **When a test fails, IMMEDIATELY save the log to a uniquely-named file for diagnosis:**
 
 ```bash
-# Pattern: /tmp/fcvm-failed-{branch}-{test_name}-{timestamp}.log
+# Pattern: /tmp/fcvm-failed-{branch}-{target}-{test_name}-{timestamp}.log
 BRANCH=$(git branch --show-current)
 
-# Example after test_exec_rootless fails:
-cp /tmp/test-${BRANCH}.log /tmp/fcvm-failed-${BRANCH}-test_exec_rootless-$(date +%Y%m%d-%H%M%S).log
+# Example after test_exec_rootless fails in test-root run:
+cp /tmp/test-${BRANCH}-root.log /tmp/fcvm-failed-${BRANCH}-root-test_exec_rootless-$(date +%Y%m%d-%H%M%S).log
 
 # Then continue with other tests using a fresh log file
-make test-root 2>&1 | tee /tmp/test-${BRANCH}-run2.log
+make test-root 2>&1 | tee /tmp/test-${BRANCH}-root-run2.log
 ```
 
 **Why this matters:**
 - Branch names prevent confusion when working across multiple worktrees
+- Target names (root, fast, unit) identify which test tier was run
+- Filter names (exec, sanity) identify which subset was tested
 - Test logs get overwritten when running the suite again
 - Failed test output is essential for root cause analysis
 - Timestamps prevent filename collisions across sessions
@@ -785,8 +835,8 @@ make test-root 2>&1 | tee /tmp/test-${BRANCH}-run2.log
 ```bash
 # After a test suite run, check for failures and save logs
 BRANCH=$(git branch --show-current)
-if grep -q "FAIL\|TIMEOUT" /tmp/test-${BRANCH}.log; then
-  cp /tmp/test-${BRANCH}.log /tmp/fcvm-failed-${BRANCH}-$(date +%Y%m%d-%H%M%S).log
+if grep -q "FAIL\|TIMEOUT" /tmp/test-${BRANCH}-root.log; then
+  cp /tmp/test-${BRANCH}-root.log /tmp/fcvm-failed-${BRANCH}-root-$(date +%Y%m%d-%H%M%S).log
   echo "Saved failed test log"
 fi
 ```

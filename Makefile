@@ -14,6 +14,10 @@ CONTAINER_DATA_DIR := /mnt/fcvm-btrfs/container
 
 # Test options: FILTER=pattern STREAM=1 LIST=1
 FILTER ?=
+
+# Default log level: fcvm debug, suppress FUSE spam
+# Override with: RUST_LOG=debug make test-root
+TEST_LOG ?= fcvm=debug,health-monitor=info,fuser=warn,fuse_backend_rs=warn,passthrough=warn
 ifeq ($(STREAM),1)
 NEXTEST_CAPTURE := --no-capture
 endif
@@ -138,12 +142,15 @@ _test-unit:
 	$(NEXTEST) --no-default-features
 
 _test-fast:
+	RUST_LOG="$(TEST_LOG)" \
 	$(NEXTEST) $(NEXTEST_CAPTURE) --no-default-features --features integration-fast $(FILTER)
 
 _test-all:
+	RUST_LOG="$(TEST_LOG)" \
 	$(NEXTEST) $(NEXTEST_CAPTURE) $(FILTER)
 
 _test-root:
+	RUST_LOG="$(TEST_LOG)" \
 	FCVM_DATA_DIR=$(ROOT_DATA_DIR) \
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
@@ -321,10 +328,10 @@ rebuild-fc:
 # Usage: make dev-fc-test FILTER=inception
 dev-fc-test: rebuild-fc build
 	@echo "==> Running test with FILTER=$(FILTER)..."
+	RUST_LOG="$(TEST_LOG)" \
 	FCVM_DATA_DIR=$(ROOT_DATA_DIR) \
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
-	RUST_LOG=debug \
 	$(NEXTEST) $(NEXTEST_CAPTURE) --features privileged-tests $(FILTER)
 
 # =============================================================================
