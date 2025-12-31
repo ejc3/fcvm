@@ -646,6 +646,16 @@ make setup-fcvm   # Download kernel, create rootfs
 
 ---
 
+## CI Infrastructure
+
+CI runs on self-hosted ARM64 runners (c7g.metal spot instances) managed by [ejc3/aws-setup](https://github.com/ejc3/aws-setup).
+
+- **Auto-scaling**: Runners launch on demand, stop after 30 mins idle
+- **Hardware**: c7g.metal with /dev/kvm for VM tests
+- **Cost**: ~$0.50/hr spot pricing, $0 when idle
+
+---
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
