@@ -42,7 +42,20 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         .context("setting up fc-agent initrd")?;
     println!("  ✓ Initrd ready: {}", initrd_path.display());
 
+    // Setup inception kernel if requested
+    if args.inception {
+        println!("\nSetting up inception kernel for nested virtualization...");
+        let inception_path = crate::setup::ensure_inception_kernel(args.build_kernels)
+            .await
+            .context("setting up inception kernel")?;
+        println!("  ✓ Inception kernel ready: {}", inception_path.display());
+    }
+
     println!("\nSetup complete! You can now run VMs with: fcvm podman run ...");
+    if args.inception {
+        println!("\nFor nested virtualization, use:");
+        println!("  fcvm podman run --kernel <inception-kernel-path> --privileged ...");
+    }
 
     Ok(())
 }
