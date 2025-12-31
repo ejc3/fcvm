@@ -75,15 +75,20 @@ jobs:
             VERSION=$(grep 'KERNEL_VERSION:-' kernel/build.sh | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "6.18")
           fi
 
+          # Get architecture
+          ARCH=$(uname -m)
+
           # Compute SHA from build inputs
           SHA=$(cat kernel/build.sh kernel/inception.conf kernel/patches/*.patch 2>/dev/null | sha256sum | cut -c1-12)
 
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "arch=$ARCH" >> $GITHUB_OUTPUT
           echo "sha=$SHA" >> $GITHUB_OUTPUT
-          echo "tag=kernel-inception-${VERSION}-${SHA}" >> $GITHUB_OUTPUT
-          echo "filename=vmlinux-inception-${VERSION}-${SHA}.bin" >> $GITHUB_OUTPUT
+          echo "tag=kernel-inception-${VERSION}-${ARCH}-${SHA}" >> $GITHUB_OUTPUT
+          echo "filename=vmlinux-inception-${VERSION}-${ARCH}-${SHA}.bin" >> $GITHUB_OUTPUT
 
           echo "Kernel version: $VERSION"
+          echo "Architecture: $ARCH"
           echo "Build SHA: $SHA"
 
       - name: Check if release already exists
@@ -170,6 +175,7 @@ jobs:
           echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Version | ${{ steps.kernel.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Architecture | ${{ steps.kernel.outputs.arch }} |" >> $GITHUB_STEP_SUMMARY
           echo "| SHA | ${{ steps.kernel.outputs.sha }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Tag | ${{ steps.kernel.outputs.tag }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Filename | ${{ steps.kernel.outputs.filename }} |" >> $GITHUB_STEP_SUMMARY

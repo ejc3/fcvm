@@ -251,12 +251,22 @@ pub fn compute_inception_kernel_sha() -> Result<String> {
 
 /// Get the inception kernel filename.
 pub fn inception_kernel_filename(sha: &str) -> String {
-    format!("vmlinux-inception-{}-{}.bin", INCEPTION_KERNEL_VERSION, sha)
+    format!(
+        "vmlinux-inception-{}-{}-{}.bin",
+        INCEPTION_KERNEL_VERSION,
+        std::env::consts::ARCH,
+        sha
+    )
 }
 
 /// Get the inception kernel release tag.
 pub fn inception_kernel_tag(sha: &str) -> String {
-    format!("kernel-inception-{}-{}", INCEPTION_KERNEL_VERSION, sha)
+    format!(
+        "kernel-inception-{}-{}-{}",
+        INCEPTION_KERNEL_VERSION,
+        std::env::consts::ARCH,
+        sha
+    )
 }
 
 /// Ensure inception kernel exists.
