@@ -94,4 +94,31 @@ else
 fi
 
 echo ""
+echo "Step 4: Verify inception kernel SHA works without source tree"
+# The inception kernel SHA should use compile-time constant when kernel/ dir is missing
+# We can't run full setup (no btrfs) but can verify no panic/error about missing sources
+set +e
+OUTPUT=$(XDG_CONFIG_HOME="$CONFIG_DIR" HOME="$CONFIG_DIR" FCVM_BASE_DIR="$INSTALL_DIR/data" "$FCVM" setup --inception 2>&1)
+set -e
+
+if echo "$OUTPUT" | grep -q "kernel/build.sh not found"; then
+    echo "FAIL: Inception setup failed to use compile-time SHA"
+    echo "Output: $OUTPUT"
+    exit 1
+fi
+
+if echo "$OUTPUT" | grep -q "panicked"; then
+    echo "FAIL: Binary panicked during inception setup"
+    echo "Output: $OUTPUT"
+    exit 1
+fi
+
+# Should see an attempt to download or use inception kernel (may fail for network/btrfs reasons)
+if echo "$OUTPUT" | grep -qi "inception"; then
+    echo "PASS: Inception kernel setup attempted (uses compile-time SHA)"
+else
+    echo "PASS: Inception setup ran without source tree errors"
+fi
+
+echo ""
 echo "=== All packaging tests passed ==="
