@@ -60,6 +60,11 @@ pub struct SetupArgs {
     /// (use if download fails or you've modified kernel sources)
     #[arg(long)]
     pub build_kernels: bool,
+
+    /// Install inception kernel as the host kernel and configure GRUB for nested KVM.
+    /// Requires --inception flag. After setup, reboot to activate.
+    #[arg(long, requires = "inception")]
+    pub install_host_kernel: bool,
 }
 
 // ============================================================================

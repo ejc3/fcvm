@@ -434,3 +434,131 @@ async fn build_inception_kernel_locally(dest: &Path) -> Result<()> {
 
     Ok(())
 }
+
+// ============================================================================
+// Host Kernel Installation (for EC2 setup)
+// ============================================================================
+
+/// Install inception kernel as the host kernel and configure GRUB for nested KVM.
+///
+/// This:
+/// 1. Copies the inception kernel to /boot/vmlinuz-{version}-inception
+/// 2. Updates GRUB to add kvm-arm.mode=nested boot parameter
+/// 3. Sets the inception kernel as the default boot kernel
+///
+/// Requires root privileges.
+pub async fn install_host_kernel(inception_kernel: &Path) -> Result<()> {
+    // Check we're running as root
+    if !nix::unistd::geteuid().is_root() {
+        bail!("Installing host kernel requires root privileges. Run with sudo.");
+    }
+
+    let kernel_name = format!("vmlinuz-{}-inception", INCEPTION_KERNEL_VERSION);
+    let boot_path = Path::new("/boot").join(&kernel_name);
+
+    info!(
+        src = %inception_kernel.display(),
+        dest = %boot_path.display(),
+        "installing inception kernel to /boot"
+    );
+
+    // Copy kernel to /boot
+    tokio::fs::copy(inception_kernel, &boot_path)
+        .await
+        .context("copying kernel to /boot")?;
+
+    println!("  → Installed kernel to {}", boot_path.display());
+
+    // Update GRUB configuration
+    update_grub_config(&kernel_name).await?;
+
+    // Update GRUB
+    println!("  → Running update-grub...");
+    let output = Command::new("update-grub")
+        .output()
+        .await
+        .context("running update-grub")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(stderr = %stderr, "update-grub had warnings");
+    }
+
+    println!("  ✓ Host kernel installed and GRUB updated");
+    println!();
+    println!("  ⚠️  Reboot required to activate the new kernel:");
+    println!("     sudo reboot");
+    println!();
+    println!("  After reboot, verify with:");
+    println!("     uname -r                              # Should show {}-inception", INCEPTION_KERNEL_VERSION);
+    println!("     cat /sys/module/kvm/parameters/mode   # Should show 'nested'");
+
+    Ok(())
+}
+
+/// Update GRUB configuration to add kvm-arm.mode=nested and set default kernel.
+async fn update_grub_config(kernel_name: &str) -> Result<()> {
+    let grub_default = Path::new("/etc/default/grub");
+
+    if !grub_default.exists() {
+        bail!("/etc/default/grub not found - is GRUB installed?");
+    }
+
+    // Read current config
+    let content = tokio::fs::read_to_string(grub_default)
+        .await
+        .context("reading /etc/default/grub")?;
+
+    let mut modified = false;
+    let mut new_lines = Vec::new();
+
+    for line in content.lines() {
+        if line.starts_with("GRUB_CMDLINE_LINUX_DEFAULT=") {
+            // Add kvm-arm.mode=nested if not already present
+            if !line.contains("kvm-arm.mode=nested") {
+                let new_line = if line.contains("=\"\"") {
+                    line.replace("=\"\"", "=\"kvm-arm.mode=nested\"")
+                } else {
+                    // Insert after the opening quote
+                    line.replacen("=\"", "=\"kvm-arm.mode=nested ", 1)
+                };
+                new_lines.push(new_line);
+                modified = true;
+                println!("  → Added kvm-arm.mode=nested to GRUB_CMDLINE_LINUX_DEFAULT");
+            } else {
+                new_lines.push(line.to_string());
+            }
+        } else if line.starts_with("GRUB_DEFAULT=") {
+            // Set default to our kernel
+            let new_default = format!(
+                "GRUB_DEFAULT=\"Advanced options for Ubuntu>Ubuntu, with Linux {}\"",
+                kernel_name
+            );
+            new_lines.push(new_default);
+            modified = true;
+            println!("  → Set GRUB_DEFAULT to {}", kernel_name);
+        } else {
+            new_lines.push(line.to_string());
+        }
+    }
+
+    if modified {
+        // Backup original
+        let backup = grub_default.with_extension("grub.bak");
+        tokio::fs::copy(grub_default, &backup)
+            .await
+            .context("backing up /etc/default/grub")?;
+
+        // Write new config
+        let new_content = new_lines.join("\n") + "\n";
+        tokio::fs::write(grub_default, new_content)
+            .await
+            .context("writing /etc/default/grub")?;
+
+        info!(backup = %backup.display(), "GRUB config updated, backup saved");
+    } else {
+        println!("  → GRUB config already configured for nested KVM");
+    }
+
+    Ok(())
+}
