@@ -322,7 +322,37 @@ aws ec2 run-instances \
     --image-id ami-0xyz...  # Ubuntu 24.04 ARM64
 ```
 
-**Step 2: Build and install kernel 6.18+ with nested KVM**
+**Step 2: Install fcvm and set up host kernel**
+
+```bash
+# Install fcvm (or build from source)
+cargo install fcvm
+
+# Download inception kernel and install as host kernel
+# This also configures GRUB with kvm-arm.mode=nested
+sudo fcvm setup --inception --install-host-kernel
+
+# Reboot into the new kernel
+sudo reboot
+```
+
+**Step 3: Verify nested KVM is enabled**
+
+```bash
+# Check kernel version
+uname -r  # Should show 6.18-inception
+
+# Check nested mode is enabled
+cat /sys/module/kvm/parameters/mode  # Should show "nested"
+
+# Verify KVM works
+ls -la /dev/kvm
+```
+
+<details>
+<summary>Manual kernel build (alternative)</summary>
+
+If you prefer to build the host kernel manually:
 
 ```bash
 # Install build dependencies
@@ -345,31 +375,14 @@ make defconfig
 make -j$(nproc)
 sudo make modules_install
 sudo make install
-```
 
-**Step 3: Configure GRUB for nested KVM**
-
-```bash
-# Add kvm-arm.mode=nested to kernel boot parameters
+# Configure GRUB
 sudo sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="kvm-arm.mode=nested /' /etc/default/grub
 sudo update-grub
-
-# Reboot into new kernel
 sudo reboot
 ```
 
-**Step 4: Verify nested KVM is enabled**
-
-```bash
-# Check kernel version
-uname -r  # Should show 6.18.2 or higher
-
-# Check nested mode is enabled
-cat /sys/module/kvm/parameters/mode  # Should show "nested"
-
-# Verify KVM works
-ls -la /dev/kvm
-```
+</details>
 
 ### Getting the Inception Kernel
 

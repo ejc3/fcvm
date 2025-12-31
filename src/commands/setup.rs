@@ -49,6 +49,15 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
             .await
             .context("setting up inception kernel")?;
         println!("  ✓ Inception kernel ready: {}", inception_path.display());
+
+        // Install as host kernel if requested
+        if args.install_host_kernel {
+            println!("\nInstalling inception kernel as host kernel...");
+            crate::setup::install_host_kernel(&inception_path)
+                .await
+                .context("installing host kernel")?;
+            return Ok(());
+        }
     }
 
     println!("\nSetup complete! You can now run VMs with: fcvm podman run ...");
