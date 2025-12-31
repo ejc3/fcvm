@@ -9,7 +9,7 @@ use crate::paths;
 use crate::setup::rootfs::{load_plan, KernelArchConfig};
 
 /// GitHub repository for kernel releases
-const GITHUB_REPO: &str = "ejc3/fcvm";
+const GITHUB_REPO: &str = "ejc3/firepod";
 
 /// Inception kernel version (must match kernel/build.sh)
 const INCEPTION_KERNEL_VERSION: &str = "6.18";
@@ -373,7 +373,7 @@ async fn download_inception_kernel(url: &str, dest: &Path) -> Result<()> {
         bail!("curl failed: {}", stderr);
     }
 
-    // Verify it's a valid ELF binary
+    // Verify it's a valid kernel binary (ELF or ARM64 Image)
     let output = Command::new("file")
         .arg(&temp_path)
         .output()
@@ -381,10 +381,10 @@ async fn download_inception_kernel(url: &str, dest: &Path) -> Result<()> {
         .context("running file command")?;
 
     let file_type = String::from_utf8_lossy(&output.stdout);
-    if !file_type.contains("ELF") {
+    if !file_type.contains("ELF") && !file_type.contains("Linux kernel") {
         let _ = tokio::fs::remove_file(&temp_path).await;
         bail!(
-            "Downloaded file is not a valid kernel (not ELF): {}",
+            "Downloaded file is not a valid kernel (not ELF or ARM64 Image): {}",
             file_type
         );
     }
