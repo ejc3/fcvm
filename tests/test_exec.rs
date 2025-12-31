@@ -717,6 +717,24 @@ async fn run_exec_with_pty(
     // Allocate a PTY pair
     let pty = openpty(None, None).context("opening PTY")?;
 
+    // CRITICAL: Disable echo on the PTY slave BEFORE forking.
+    // Otherwise there's a race condition: if the child (fcvm exec) doesn't
+    // set raw mode fast enough (which happens under heavy load), input
+    // written to the PTY master gets echoed back as output.
+    // This caused Test 24 to fail in parallel runs but pass in isolation.
+    unsafe {
+        let slave_fd = pty.slave.as_raw_fd();
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(slave_fd, &mut termios) == 0 {
+            // Disable echo (ECHO) and canonical mode (ICANON)
+            // This prevents input from being echoed before the child sets raw mode
+            termios.c_lflag &= !(libc::ECHO | libc::ICANON);
+            // Also disable ISIG so Ctrl-C doesn't get processed locally
+            termios.c_lflag &= !libc::ISIG;
+            libc::tcsetattr(slave_fd, libc::TCSANOW, &termios);
+        }
+    }
+
     // Fork to run fcvm exec in child with PTY as stdin/stdout/stderr
     match unsafe { fork() }.context("forking")? {
         ForkResult::Child => {
