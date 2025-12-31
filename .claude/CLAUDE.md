@@ -1,5 +1,16 @@
 # fcvm Development Log
 
+## STACKED PRs BY DEFAULT
+
+**All work goes in stacked PRs.** Each new PR should be based on the previous one, not main.
+
+```
+main → PR#55 → PR#56 → PR#57  (correct)
+main → PR#55, main → PR#56    (wrong - parallel branches)
+```
+
+Only branch directly from main when explicitly starting independent work.
+
 ## NO HACKS
 
 **Fix the root cause, not the symptom.** When something fails:
@@ -12,6 +23,30 @@ Examples of hacks to avoid:
 - Adding sleeps or retries without understanding the race
 - Clearing caches instead of updating tools
 - Using `|| true` to ignore errors
+
+## Debugging Test Hangs
+
+**When a test hangs, look at what it's ACTUALLY DOING - don't blame "stale processes".**
+
+```bash
+# WRONG approach: blindly killing "old" processes
+ps aux | grep fcvm   # "I see old processes, they must be blocking!"
+sudo pkill -9 fcvm   # "Fixed it!" (No, you didn't debug anything)
+
+# CORRECT approach: understand what the test is doing
+ps aux | grep -E "fcvm|script|cat"
+# See: script -q -c ./target/release/fcvm exec --pid 1083915 -t -- cat
+# The test is running `cat` in TTY mode - it's waiting for input!
+# The bug is in the test, not "stale processes"
+```
+
+**Common causes of hanging tests:**
+- Command waiting for stdin (like `cat` without EOF signal)
+- Missing Ctrl+D (0x04) in TTY mode tests
+- Blocking reads without timeout
+- Deadlocks in async code
+
+**The process list tells you EXACTLY what's happening.** Read it.
 
 ## Overview
 fcvm is a Firecracker VM manager for running Podman containers in lightweight microVMs. This document tracks implementation findings and decisions.
@@ -509,18 +544,25 @@ Why: String matching breaks when JSON formatting changes (spaces, newlines, fiel
 **This project is designed for extreme scale, speed, and correctness.** Test failures are bugs, not excuses.
 
 **NEVER dismiss failures as:**
-- "Resource contention"
-- "Timing issues"
-- "Flaky tests"
-- "Works on my machine"
+- "Resource contention" - **This is NEVER the answer. It's always a race condition.**
+- "Timing issues" - **This means there's a race condition. Find and fix it.**
+- "Flaky tests" - **No such thing. The test found a bug. Fix the bug.**
+- "Works on my machine" - **Your machine just got lucky. The bug is real.**
+
+**"Resource contention" is a lie you tell yourself to avoid finding the real bug.** When a test fails under load:
+1. The test is correct - it found a bug
+2. The bug only manifests under certain timing conditions
+3. This is called a **race condition**
+4. You MUST find the race and fix it
 
 **ALWAYS:**
-1. Investigate the actual root cause
-2. Find evidence in logs, traces, or code
-3. Fix the underlying bug
-4. Add regression tests if needed
+1. **Look at the logs** - The answer is always there
+2. Investigate the actual root cause with evidence
+3. Find the race condition - there IS one
+4. Fix the underlying bug
+5. Add regression tests if needed
 
-If a test fails intermittently, that's a **concurrency bug** or **race condition** that must be fixed, not ignored.
+If a test fails intermittently or only under parallel execution, that's a **concurrency bug** or **race condition** that must be fixed, not ignored. The test passed in isolation? Great - that narrows down the timing window where the race occurs.
 
 ### POSIX Compliance Testing
 
@@ -1420,6 +1462,16 @@ RUST_LOG="fuse_pipe=info,fuse-pipe=info,passthrough=debug" sudo -E cargo test --
 # Just passthrough operations
 RUST_LOG="passthrough=debug" sudo -E cargo test --release -p fuse-pipe --test integration test_list_directory -- --nocapture
 ```
+
+## Exec Command Flags
+
+`fcvm exec` uses `-i` and `-t` separately, matching podman/docker:
+- `-t`: allocate PTY (for colors/formatting)
+- `-i`: forward stdin
+- `-it`: both (interactive shell)
+- neither: plain exec
+
+**NO backward compatibility wrappers.** When the API changed from `run_tty_mode(stream)` to `run_tty_mode(stream, interactive)`, all callers were updated directly - no deprecated functions or compatibility shims.
 
 ## References
 - Main documentation: `README.md`
