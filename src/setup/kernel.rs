@@ -383,7 +383,10 @@ async fn download_inception_kernel(url: &str, dest: &Path) -> Result<()> {
     let file_type = String::from_utf8_lossy(&output.stdout);
     if !file_type.contains("ELF") {
         let _ = tokio::fs::remove_file(&temp_path).await;
-        bail!("Downloaded file is not a valid kernel (not ELF): {}", file_type);
+        bail!(
+            "Downloaded file is not a valid kernel (not ELF): {}",
+            file_type
+        );
     }
 
     // Move to final location
@@ -413,7 +416,10 @@ async fn build_inception_kernel_locally(dest: &Path) -> Result<()> {
     }
 
     if !dest.exists() {
-        bail!("Kernel build completed but file not found at {}", dest.display());
+        bail!(
+            "Kernel build completed but file not found at {}",
+            dest.display()
+        );
     }
 
     Ok(())
