@@ -752,18 +752,31 @@ sleep 5 && ...
 
 ### Preserving Logs from Failed Tests
 
+**When running tests, ALWAYS include the branch name in log filenames:**
+
+```bash
+# Get current branch for log filename
+BRANCH=$(git branch --show-current)
+
+# Run tests with branch-named log file
+make test-root 2>&1 | tee /tmp/test-${BRANCH}.log
+```
+
 **When a test fails, IMMEDIATELY save the log to a uniquely-named file for diagnosis:**
 
 ```bash
-# Pattern: /tmp/fcvm-failed-{test_name}-{timestamp}.log
+# Pattern: /tmp/fcvm-failed-{branch}-{test_name}-{timestamp}.log
+BRANCH=$(git branch --show-current)
+
 # Example after test_exec_rootless fails:
-cp /tmp/test.log /tmp/fcvm-failed-test_exec_rootless-$(date +%Y%m%d-%H%M%S).log
+cp /tmp/test-${BRANCH}.log /tmp/fcvm-failed-${BRANCH}-test_exec_rootless-$(date +%Y%m%d-%H%M%S).log
 
 # Then continue with other tests using a fresh log file
-make test-root 2>&1 | tee /tmp/test-run2.log
+make test-root 2>&1 | tee /tmp/test-${BRANCH}-run2.log
 ```
 
 **Why this matters:**
+- Branch names prevent confusion when working across multiple worktrees
 - Test logs get overwritten when running the suite again
 - Failed test output is essential for root cause analysis
 - Timestamps prevent filename collisions across sessions
@@ -771,8 +784,9 @@ make test-root 2>&1 | tee /tmp/test-run2.log
 **Automated approach:**
 ```bash
 # After a test suite run, check for failures and save logs
-if grep -q "FAIL\|TIMEOUT" /tmp/test.log; then
-  cp /tmp/test.log /tmp/fcvm-failed-$(date +%Y%m%d-%H%M%S).log
+BRANCH=$(git branch --show-current)
+if grep -q "FAIL\|TIMEOUT" /tmp/test-${BRANCH}.log; then
+  cp /tmp/test-${BRANCH}.log /tmp/fcvm-failed-${BRANCH}-$(date +%Y%m%d-%H%M%S).log
   echo "Saved failed test log"
 fi
 ```

@@ -10,8 +10,8 @@ use tracing::{debug, warn};
 pub async fn create_namespace(ns_name: &str) -> Result<()> {
     debug!(namespace = %ns_name, "creating network namespace");
 
-    let output = Command::new("sudo")
-        .args(["ip", "netns", "add", ns_name])
+    let output = Command::new("ip")
+        .args(["netns", "add", ns_name])
         .output()
         .await
         .context("executing ip netns add")?;
@@ -36,8 +36,8 @@ pub async fn create_namespace(ns_name: &str) -> Result<()> {
 pub async fn delete_namespace(ns_name: &str) -> Result<()> {
     debug!(namespace = %ns_name, "deleting network namespace");
 
-    let output = Command::new("sudo")
-        .args(["ip", "netns", "del", ns_name])
+    let output = Command::new("ip")
+        .args(["netns", "del", ns_name])
         .output()
         .await
         .context("executing ip netns del")?;
@@ -70,10 +70,10 @@ pub async fn exec_in_namespace(ns_name: &str, command: &[&str]) -> Result<std::p
         anyhow::bail!("command cannot be empty");
     }
 
-    let mut args = vec!["ip", "netns", "exec", ns_name];
+    let mut args = vec!["netns", "exec", ns_name];
     args.extend_from_slice(command);
 
-    let output = Command::new("sudo")
+    let output = Command::new("ip")
         .args(&args)
         .output()
         .await

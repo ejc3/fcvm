@@ -216,8 +216,8 @@ async fn ensure_firecracker_nv2() -> Result<()> {
     }
 
     println!("  Installing Firecracker to /usr/local/bin...");
-    let status = tokio::process::Command::new("sudo")
-        .args(["cp", binary.to_str().unwrap(), "/usr/local/bin/firecracker"])
+    let status = tokio::process::Command::new("cp")
+        .args([binary.to_str().unwrap(), "/usr/local/bin/firecracker"])
         .status()
         .await
         .context("installing Firecracker")?;
@@ -796,13 +796,12 @@ async fn ensure_inception_image() -> Result<()> {
 
         if !PathBuf::from(&cache_dir).exists() {
             println!("Exporting to CAS cache: {}", cache_dir);
-            tokio::process::Command::new("sudo")
-                .args(["mkdir", "-p", &cache_dir])
+            tokio::process::Command::new("mkdir")
+                .args(["-p", &cache_dir])
                 .output()
                 .await?;
-            let skopeo_out = tokio::process::Command::new("sudo")
+            let skopeo_out = tokio::process::Command::new("skopeo")
                 .args([
-                    "skopeo",
                     "copy",
                     "containers-storage:localhost/inception-test",
                     &format!("dir:{}", cache_dir),
@@ -1275,9 +1274,8 @@ FCVM_FUSE_TRACE_RATE=100 fcvm podman run --name l2 --network bridged --privilege
     println!("Wrote inception scripts to /mnt/fcvm-btrfs/inception-scripts/");
 
     // Run L1 with --cmd that executes the script
-    let output = tokio::process::Command::new("sudo")
+    let output = tokio::process::Command::new("./target/release/fcvm")
         .args([
-            "./target/release/fcvm",
             "podman",
             "run",
             "--name",
@@ -1558,14 +1556,13 @@ async fn test_skopeo_import_over_fuse() -> Result<()> {
     // Check if already in CAS cache
     if !std::path::Path::new(&cache_dir).exists() {
         println!("   Exporting to CAS cache...");
-        tokio::process::Command::new("sudo")
-            .args(["mkdir", "-p", &cache_dir])
+        tokio::process::Command::new("mkdir")
+            .args(["-p", &cache_dir])
             .output()
             .await?;
 
-        let export_output = tokio::process::Command::new("sudo")
+        let export_output = tokio::process::Command::new("skopeo")
             .args([
-                "skopeo",
                 "copy",
                 "containers-storage:localhost/inception-test",
                 &format!("dir:{}", cache_dir),
