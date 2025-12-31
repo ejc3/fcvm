@@ -334,11 +334,19 @@ fn run_tty_mode(stream: UnixStream) -> Result<()> {
             match read_stream.read(&mut buf) {
                 Ok(0) => break, // EOF
                 Ok(n) => {
-                    // Check for exit message (JSON line with exit code)
                     let data = &buf[..n];
 
-                    // Try to find exit message in the data
+                    // Check for exit message - but write output data FIRST
+                    // The exit JSON may be in the same buffer as command output
                     if let Some(exit_code) = try_parse_exit(data) {
+                        // Write everything BEFORE the exit JSON line
+                        // The exit JSON is on its own line at the end
+                        if let Some(pos) = find_exit_json_start(data) {
+                            if pos > 0 {
+                                let _ = stdout.write_all(&data[..pos]);
+                                let _ = stdout.flush();
+                            }
+                        }
                         reader_done.store(true, Ordering::Relaxed);
                         return Some(exit_code);
                     }
@@ -409,6 +417,30 @@ fn try_parse_exit(data: &[u8]) -> Option<i32> {
     for line in s.lines() {
         if let Ok(ExecResponse::Exit(code)) = serde_json::from_str::<ExecResponse>(line) {
             return Some(code);
+        }
+    }
+    None
+}
+
+/// Find the byte position where the exit JSON starts in the data
+/// The exit JSON is always on its own line, so we look for the pattern
+fn find_exit_json_start(data: &[u8]) -> Option<usize> {
+    // The exit JSON looks like: {"type":"exit","data":...}
+    // It's always at the end of a line
+    let s = String::from_utf8_lossy(data);
+    for (i, line) in s.lines().enumerate() {
+        if serde_json::from_str::<ExecResponse>(line)
+            .map(|r| matches!(r, ExecResponse::Exit(_)))
+            .unwrap_or(false)
+        {
+            // Find the byte offset of this line
+            let mut offset = 0;
+            for (j, l) in s.lines().enumerate() {
+                if j == i {
+                    return Some(offset);
+                }
+                offset += l.len() + 1; // +1 for newline
+            }
         }
     }
     None
