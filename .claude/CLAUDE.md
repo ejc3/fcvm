@@ -24,6 +24,25 @@ Examples of hacks to avoid:
 - Clearing caches instead of updating tools
 - Using `|| true` to ignore errors
 
+## NEVER Parse JSON with Regex
+
+**Always use `jq` to parse JSON.** Never use grep, sed, awk, or string matching on JSON.
+
+```bash
+# WRONG - will break on whitespace/formatting differences
+grep '"health_status":"healthy"' output.json
+echo "$JSON" | grep -o '"pid":[0-9]*' | cut -d: -f2
+
+# CORRECT - use jq
+jq -r '.[] | select(.health_status == "healthy")' output.json
+echo "$JSON" | jq -r '.pid'
+```
+
+**Why this matters:**
+- JSON formatting varies (spaces after colons, newlines, field order)
+- Regex patterns break silently when format changes
+- jq is robust, self-documenting, and handles edge cases
+
 ## Test Failure Investigation
 
 **Never say "likely" - always find the actual root cause.**
