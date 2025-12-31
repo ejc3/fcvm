@@ -1,6 +1,5 @@
 //! Lint tests - run fmt, clippy, audit, deny in parallel via cargo test.
-
-#![cfg(feature = "integration-fast")]
+//! These run in test-unit tier (no feature gate) to avoid root-owned advisory-db files.
 
 use std::process::Command;
 
