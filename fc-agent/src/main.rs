@@ -675,8 +675,9 @@ async fn run_exec_server() {
         return;
     }
 
-    // Start listening
-    let listen_result = unsafe { libc::listen(listener_fd, 5) };
+    // Start listening with larger backlog for parallel exec stress
+    // Default of 5 is too small when many execs arrive simultaneously
+    let listen_result = unsafe { libc::listen(listener_fd, 128) };
     if listen_result < 0 {
         eprintln!(
             "[fc-agent] ERROR: failed to listen on vsock: {}",

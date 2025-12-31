@@ -341,8 +341,10 @@ async fn run_exec_tty(
     // -q: quiet mode (no "Script started" message)
     // -c: run command instead of shell
     // /dev/null: discard typescript file
+    // stdin must be null to prevent garbage from test harness being sent to VM PTY
     let mut child = tokio::process::Command::new("script")
         .args(["-q", "-c", &fcvm_cmd, "/dev/null"])
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -421,4 +423,130 @@ async fn run_exec_tty(
         .join("\n");
 
     Ok((exit_code, duration, combined))
+}
+
+/// Stress test: Run 100 parallel TTY execs to verify no race conditions
+///
+/// This test verifies that the TTY stdin fix works under heavy parallel load.
+/// Each exec runs `tty` command which should return /dev/pts/N.
+/// A null byte (`\x00`) in output would indicate a race condition bug.
+///
+/// Uses waves of 10 concurrent execs to avoid overwhelming vsock backlog.
+#[tokio::test]
+async fn test_exec_parallel_tty_stress() -> Result<()> {
+    const TOTAL_EXECS: usize = 100;
+    const WAVE_SIZE: usize = 10; // Run 10 at a time to avoid vsock backlog overflow
+
+    println!("\nParallel TTY Stress Test ({} execs in waves of {})", TOTAL_EXECS, WAVE_SIZE);
+    println!("==========================================================");
+
+    let fcvm_path = common::find_fcvm_binary()?;
+    let (vm_name, _, _, _) = common::unique_names("stress-tty");
+
+    // Start VM with nginx (keeps running)
+    println!("Starting VM...");
+    let (mut _child, fcvm_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "rootless",
+        common::TEST_IMAGE, // nginx:alpine
+    ])
+    .await
+    .context("spawning VM")?;
+
+    println!("  fcvm process started (PID: {})", fcvm_pid);
+
+    // Wait for VM to become healthy
+    common::poll_health_by_pid(fcvm_pid, 60)
+        .await
+        .context("waiting for VM to be healthy")?;
+    println!("  VM is healthy");
+
+    // Run execs in waves to avoid overwhelming vsock connection backlog
+    println!("\nRunning {} execs in waves of {}...", TOTAL_EXECS, WAVE_SIZE);
+    let start = std::time::Instant::now();
+
+    let mut success_count = 0;
+    let mut null_byte_failures = 0;
+    let mut other_failures = 0;
+    let mut failures: Vec<(usize, String)> = Vec::new();
+
+    for wave in 0..(TOTAL_EXECS / WAVE_SIZE) {
+        let mut handles = Vec::new();
+        for i in 0..WAVE_SIZE {
+            let idx = wave * WAVE_SIZE + i;
+            let fcvm_path = fcvm_path.clone();
+            let pid = fcvm_pid;
+            handles.push(tokio::spawn(async move {
+                let result = run_exec_tty(
+                    &fcvm_path,
+                    pid,
+                    true, // in_vm
+                    &["tty"],
+                    InterruptCondition::None,
+                )
+                .await;
+                (idx, result)
+            }));
+        }
+
+        // Collect wave results
+        for handle in handles {
+            let (idx, result) = handle.await.context("joining task")?;
+            match result {
+                Ok((exit_code, _duration, output)) => {
+                    if output.contains("/dev/pts") && exit_code == 0 {
+                        success_count += 1;
+                    } else if output.contains('\x00') || output == "^@" {
+                        // This is the null byte bug we're testing for
+                        null_byte_failures += 1;
+                        failures.push((idx, format!("NULL BYTE: exit={}, output={:?}", exit_code, output)));
+                    } else {
+                        other_failures += 1;
+                        failures.push((idx, format!("exit={}, output={:?}", exit_code, output)));
+                    }
+                }
+                Err(e) => {
+                    other_failures += 1;
+                    failures.push((idx, format!("error: {}", e)));
+                }
+            }
+        }
+
+        // Brief pause between waves to let vsock recover
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let elapsed = start.elapsed();
+    println!("\n===== STRESS TEST RESULTS =====");
+    println!("Total execs: {}", TOTAL_EXECS);
+    println!("Success: {}", success_count);
+    println!("Null byte failures: {} (the bug we're testing for)", null_byte_failures);
+    println!("Other failures: {}", other_failures);
+    println!("Duration: {:?}", elapsed);
+    println!("Throughput: {:.1} execs/sec", TOTAL_EXECS as f64 / elapsed.as_secs_f64());
+
+    if !failures.is_empty() {
+        println!("\n=== FAILURES (first 10) ===");
+        for (idx, msg) in failures.iter().take(10) {
+            println!("  #{}: {}", idx, msg);
+        }
+    }
+
+    // Cleanup
+    println!("\nCleaning up...");
+    common::kill_process(fcvm_pid).await;
+
+    // Assert 100% success - no failures are acceptable
+    assert_eq!(
+        success_count, TOTAL_EXECS,
+        "Expected 100% success rate, got {}/{} (null_byte={}, other={})",
+        success_count, TOTAL_EXECS, null_byte_failures, other_failures
+    );
+
+    println!("✓ ALL {} PARALLEL TTY EXECS PASSED!", TOTAL_EXECS);
+    Ok(())
 }
