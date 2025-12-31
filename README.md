@@ -310,6 +310,67 @@ fcvm supports running VMs inside VMs using ARM64 FEAT_NV2 nested virtualization.
 | **Inception kernel** | Pre-built from [releases](https://github.com/ejc3/firepod/releases) or build with `kernel/build.sh` |
 | **Firecracker** | Fork with NV2 support: `ejc3/firecracker:nv2-inception` |
 
+### Setting Up an EC2 Instance for Inception
+
+**Step 1: Launch a metal instance**
+
+```bash
+# Must be a metal instance for FEAT_NV2 hardware support
+# Recommended: c7g.metal, m7g.metal, r7g.metal (Graviton3)
+aws ec2 run-instances \
+    --instance-type c7g.metal \
+    --image-id ami-0xyz...  # Ubuntu 24.04 ARM64
+```
+
+**Step 2: Build and install kernel 6.18+ with nested KVM**
+
+```bash
+# Install build dependencies
+sudo apt-get update
+sudo apt-get install -y build-essential flex bison bc libelf-dev libssl-dev
+
+# Download kernel source
+cd /tmp
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.2.tar.xz
+tar xf linux-6.18.2.tar.xz
+cd linux-6.18.2
+
+# Configure for ARM64 with KVM
+make defconfig
+./scripts/config --enable VIRTUALIZATION
+./scripts/config --enable KVM
+./scripts/config --enable CONFIG_FUSE_FS
+
+# Build and install (~10-20 minutes on metal)
+make -j$(nproc)
+sudo make modules_install
+sudo make install
+```
+
+**Step 3: Configure GRUB for nested KVM**
+
+```bash
+# Add kvm-arm.mode=nested to kernel boot parameters
+sudo sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="kvm-arm.mode=nested /' /etc/default/grub
+sudo update-grub
+
+# Reboot into new kernel
+sudo reboot
+```
+
+**Step 4: Verify nested KVM is enabled**
+
+```bash
+# Check kernel version
+uname -r  # Should show 6.18.2 or higher
+
+# Check nested mode is enabled
+cat /sys/module/kvm/parameters/mode  # Should show "nested"
+
+# Verify KVM works
+ls -la /dev/kvm
+```
+
 ### Getting the Inception Kernel
 
 ```bash
