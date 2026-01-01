@@ -226,9 +226,28 @@ jobs:
       - name: test-fast
         working-directory: fcvm
         run: make test-fast
-      - name: Build inception kernel
+      - name: Get inception kernel
         working-directory: fcvm
-        run: ./kernel/build.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Compute kernel SHA and path
+          SHA=$(cat kernel/build.sh kernel/inception.conf kernel/patches/*.patch 2>/dev/null | sha256sum | cut -c1-12)
+          VERSION=$(grep '^KERNEL_VERSION=' kernel/build.sh | head -1 | cut -d'"' -f2 || echo "6.18")
+          ARCH=$(uname -m)
+          TAG="kernel-inception-${VERSION}-${ARCH}-${SHA}"
+          FILENAME="vmlinux-inception-${VERSION}-${ARCH}-${SHA}.bin"
+          KERNEL_PATH="/mnt/fcvm-btrfs/kernels/vmlinux-6.12.10-${SHA}.bin"
+
+          # Try to download from release
+          if gh release download "$TAG" --pattern "$FILENAME" --dir /tmp 2>/dev/null; then
+            echo "Downloaded kernel from release $TAG"
+            sudo mkdir -p /mnt/fcvm-btrfs/kernels
+            sudo mv "/tmp/$FILENAME" "$KERNEL_PATH"
+          else
+            echo "No release found, building kernel..."
+            ./kernel/build.sh
+          fi
       - name: test-root
         working-directory: fcvm
         run: make test-root
