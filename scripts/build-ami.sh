@@ -39,11 +39,17 @@ create_user_data() {
 exec > >(tee /var/log/ami-build.log) 2>&1
 set -euxo pipefail
 
-INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+# Get IMDSv2 token and instance ID
+TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" -s)
+INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s http://169.254.169.254/latest/meta-data/instance-id)
+
+# Install AWS CLI first (needed for tagging)
+apt-get update
+apt-get install -y awscli
+
 aws ec2 create-tags --resources $INSTANCE_ID --tags Key=BuildStatus,Value=building --region us-west-1
 
-# Install build deps
-apt-get update
+# Install build deps (apt-get update already done above)
 apt-get install -y build-essential bc bison flex libssl-dev \
   libelf-dev libncurses-dev debhelper-compat rsync kmod cpio curl jq wget git \
   podman uidmap slirp4netns fuse-overlayfs containernetworking-plugins \
