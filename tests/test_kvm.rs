@@ -38,7 +38,6 @@ use nix::fcntl::{Flock, FlockArg};
 use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -149,7 +148,7 @@ async fn ensure_firecracker_nv2() -> Result<()> {
         .open(&lock_file)
         .context("opening firecracker build lock file")?;
 
-    let flock = Flock::lock(lock_fd.as_fd(), FlockArg::LockExclusive)
+    let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
         .map_err(|(_, err)| err)
         .context("acquiring exclusive lock for firecracker build")?;
 
