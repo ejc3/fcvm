@@ -21,33 +21,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Ensure self-hosted runner EC2 is running
-  ensure-runner:
-    name: Ensure Runner
-    runs-on: ubuntu-latest
-    steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-west-1
-      - name: Start EC2 if stopped
-        run: |
-          INSTANCE_ID="i-0f116a86a2fd78cbe"
-          STATE=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --query 'Reservations[0].Instances[0].State.Name' --output text)
-          echo "Current state: $STATE"
-          if [ "$STATE" = "stopped" ]; then
-            echo "Starting instance..."
-            aws ec2 start-instances --instance-ids $INSTANCE_ID
-            aws ec2 wait instance-running --instance-ids $INSTANCE_ID
-            echo "Instance started, waiting for runner to register..."
-            sleep 60
-          fi
-
   build-inception-kernel:
     name: Build Inception Kernel
-    needs: ensure-runner
     runs-on: [self-hosted, Linux, ARM64]
     permissions:
       contents: write  # Required for creating releases
