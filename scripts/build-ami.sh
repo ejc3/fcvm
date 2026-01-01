@@ -148,6 +148,16 @@ main() {
 
   echo "No cached AMI, building..."
 
+  # Clean up any orphaned builder instances (from cancelled runs)
+  orphans=$(aws ec2 describe-instances \
+    --region "$REGION" \
+    --filters "Name=tag:Name,Values=ami-builder-temp" "Name=instance-state-name,Values=running,pending" \
+    --query 'Reservations[].Instances[].InstanceId' --output text)
+  if [ -n "$orphans" ]; then
+    echo "Cleaning up orphaned instances: $orphans"
+    aws ec2 terminate-instances --region "$REGION" --instance-ids $orphans || true
+  fi
+
   # Get base AMI
   base_ami=$(get_base_ami)
   echo "Base AMI: $base_ami"
@@ -164,6 +174,7 @@ main() {
     --subnet-id subnet-05c215519b2150ecd \
     --security-group-ids sg-0ebf2d8c6a0acc1a3 \
     --iam-instance-profile Name=jumpbox-admin-profile \
+    --associate-public-ip-address \
     --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":100,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
     --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=ami-builder-temp},{Key=BuildStatus,Value=starting}]' \
     --user-data "file://$user_data_file" \
