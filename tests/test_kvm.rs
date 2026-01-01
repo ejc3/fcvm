@@ -41,81 +41,13 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-const KERNEL_VERSION: &str = "6.18";
-const KERNEL_DIR: &str = "/mnt/fcvm-btrfs/kernels";
 const FIRECRACKER_NV2_REPO: &str = "https://github.com/ejc3/firecracker.git";
 const FIRECRACKER_NV2_BRANCH: &str = "nv2-inception";
 
-/// Compute inception kernel path from build script contents
-fn inception_kernel_path() -> Result<PathBuf> {
-    let kernel_dir = Path::new("kernel");
-    let mut content = Vec::new();
-
-    // Read build.sh
-    let script = kernel_dir.join("build.sh");
-    if script.exists() {
-        content.extend(std::fs::read(&script)?);
-    }
-
-    // Read inception.conf
-    let conf = kernel_dir.join("inception.conf");
-    if conf.exists() {
-        content.extend(std::fs::read(&conf)?);
-    }
-
-    // Read patches/*.patch (sorted)
-    let patches_dir = kernel_dir.join("patches");
-    if patches_dir.exists() {
-        let mut patches: Vec<_> = std::fs::read_dir(&patches_dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "patch"))
-            .collect();
-        patches.sort_by_key(|e| e.path());
-        for patch in patches {
-            content.extend(std::fs::read(patch.path())?);
-        }
-    }
-
-    // Compute SHA (first 12 hex chars)
-    let mut hasher = Sha256::new();
-    hasher.update(&content);
-    let hash = hasher.finalize();
-    let sha = hex::encode(&hash[..6]);
-
-    Ok(PathBuf::from(KERNEL_DIR).join(format!("vmlinux-{}-{}.bin", KERNEL_VERSION, sha)))
-}
-
-/// Ensure inception kernel exists, building it if necessary
+/// Ensure inception kernel exists (downloads from release or builds locally)
 async fn ensure_inception_kernel() -> Result<PathBuf> {
-    let kernel_path = inception_kernel_path()?;
-
-    if kernel_path.exists() {
-        println!("✓ Inception kernel found: {}", kernel_path.display());
-        return Ok(kernel_path);
-    }
-
-    println!("Building inception kernel: {}", kernel_path.display());
-    println!("  This may take 10-20 minutes on first run...");
-
-    let status = tokio::process::Command::new("./kernel/build.sh")
-        .env("KERNEL_PATH", &kernel_path)
-        .status()
-        .await
-        .context("running kernel/build.sh")?;
-
-    if !status.success() {
-        bail!("Kernel build failed with exit code: {:?}", status.code());
-    }
-
-    if !kernel_path.exists() {
-        bail!(
-            "Kernel build completed but file not found: {}",
-            kernel_path.display()
-        );
-    }
-
-    println!("✓ Kernel built: {}", kernel_path.display());
-    Ok(kernel_path)
+    // Use the library function which downloads from GitHub releases first
+    fcvm::setup::ensure_inception_kernel(true).await
 }
 
 /// Check if Firecracker supports --enable-nv2 flag
