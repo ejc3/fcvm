@@ -34,7 +34,11 @@
 mod common;
 
 use anyhow::{bail, Context, Result};
+use nix::fcntl::{Flock, FlockArg};
 use sha2::{Digest, Sha256};
+use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -135,6 +139,27 @@ async fn ensure_firecracker_nv2() -> Result<()> {
         return Ok(());
     }
 
+    // Acquire exclusive lock to prevent parallel builds
+    let lock_file = PathBuf::from("/tmp/firecracker-nv2-build.lock");
+    let lock_fd = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&lock_file)
+        .context("opening firecracker build lock file")?;
+
+    let flock = Flock::lock(lock_fd.as_fd(), FlockArg::LockExclusive)
+        .map_err(|(_, err)| err)
+        .context("acquiring exclusive lock for firecracker build")?;
+
+    // Double-check after acquiring lock - another process may have built it
+    if firecracker_has_nv2().await {
+        println!("✓ Firecracker with NV2 support found (built by another process)");
+        let _ = flock.unlock();
+        return Ok(());
+    }
+
     println!("Building Firecracker with NV2 support...");
     println!("  This may take 5-10 minutes on first run...");
 
@@ -228,9 +253,11 @@ async fn ensure_firecracker_nv2() -> Result<()> {
 
     // Verify installation
     if !firecracker_has_nv2().await {
+        let _ = flock.unlock();
         bail!("Firecracker installed but --enable-nv2 flag not found");
     }
 
+    let _ = flock.unlock();
     println!("✓ Firecracker with NV2 support installed");
     Ok(())
 }
