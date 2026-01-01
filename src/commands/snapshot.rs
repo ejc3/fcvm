@@ -956,12 +956,23 @@ async fn run_clone_setup(
         let ready_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         loop {
             let probe = tokio::process::Command::new("nsenter")
-                .args(["-t", &holder_pid.to_string(), "-U", "-n", "--preserve-credentials", "--", "true"])
+                .args([
+                    "-t",
+                    &holder_pid.to_string(),
+                    "-U",
+                    "-n",
+                    "--preserve-credentials",
+                    "--",
+                    "true",
+                ])
                 .output()
                 .await;
             match probe {
                 Ok(output) if output.status.success() => {
-                    debug!(holder_pid = holder_pid, "namespace ready (nsenter probe succeeded)");
+                    debug!(
+                        holder_pid = holder_pid,
+                        "namespace ready (nsenter probe succeeded)"
+                    );
                     break;
                 }
                 Ok(output) => {

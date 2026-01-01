@@ -771,12 +771,24 @@ async fn run_vm_setup(
             loop {
                 wait_iterations += 1;
                 let probe = tokio::process::Command::new("nsenter")
-                    .args(["-t", &holder_pid.to_string(), "-U", "-n", "--preserve-credentials", "--", "true"])
+                    .args([
+                        "-t",
+                        &holder_pid.to_string(),
+                        "-U",
+                        "-n",
+                        "--preserve-credentials",
+                        "--",
+                        "true",
+                    ])
                     .output()
                     .await;
                 match probe {
                     Ok(output) if output.status.success() => {
-                        debug!(holder_pid = holder_pid, iterations = wait_iterations, "namespace ready (nsenter probe succeeded)");
+                        debug!(
+                            holder_pid = holder_pid,
+                            iterations = wait_iterations,
+                            "namespace ready (nsenter probe succeeded)"
+                        );
                         break;
                     }
                     Ok(output) => {
@@ -794,7 +806,11 @@ async fn run_vm_setup(
                     }
                 }
                 if std::time::Instant::now() >= ready_deadline {
-                    warn!(holder_pid = holder_pid, iterations = wait_iterations, "namespace not ready after 500ms");
+                    warn!(
+                        holder_pid = holder_pid,
+                        iterations = wait_iterations,
+                        "namespace not ready after 500ms"
+                    );
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
