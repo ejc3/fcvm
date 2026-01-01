@@ -631,7 +631,7 @@ async fn run_exec_tty(
 
             // Poll for expected output, then send SIGINT
             let mut buf = [0u8; 256];
-            let timeout = Duration::from_secs(10);
+            let timeout = Duration::from_secs(30); // 30s for CI under load
             let deadline = std::time::Instant::now() + timeout;
 
             loop {
@@ -823,7 +823,7 @@ async fn run_exec_with_pty(
                 );
             }
 
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + Duration::from_secs(30); // 30s for CI under load
             loop {
                 if std::time::Instant::now() > deadline {
                     // Timeout - kill child
