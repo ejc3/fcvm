@@ -26,6 +26,9 @@ env:
   FUSE_BACKEND_RS: ${{ github.workspace }}/fuse-backend-rs
   FUSER: ${{ github.workspace }}/fuser
   CONTAINER_ARCH: aarch64
+  # Cache keys for cargo tools (update versions here when bumping)
+  CACHE_KEY_LINT: cargo-tools-audit-0.22.0-deny-0.18.9
+  CACHE_KEY_HOST: cargo-tools-nextest-0.9.115-audit-0.22.0-deny-0.18.9
 
 jobs:
   # Runner 0: Lint (default GitHub runner, no KVM needed)
@@ -66,7 +69,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin
-          key: cargo-tools-${{ runner.os }}-${{ runner.arch }}-audit-0.22.0-deny-0.18.9
+          key: ${{ env.CACHE_KEY_LINT }}-${{ runner.os }}-${{ runner.arch }}
       - name: Install cargo tools
         run: |
           which cargo-audit || cargo install cargo-audit@0.22.0 --locked
@@ -173,11 +176,12 @@ jobs:
             release-v1.14.0-aarch64/jailer-v1.14.0-aarch64
           sudo mv /usr/local/bin/firecracker-v1.14.0-aarch64 /usr/local/bin/firecracker
           sudo mv /usr/local/bin/jailer-v1.14.0-aarch64 /usr/local/bin/jailer
-      - name: Cache cargo tools
-        uses: actions/cache@v4
+      - name: Restore cargo tools cache
+        id: cache-cargo-tools
+        uses: actions/cache/restore@v4
         with:
           path: ~/.cargo/bin
-          key: cargo-tools-${{ runner.os }}-${{ runner.arch }}-nextest-0.9.115-audit-0.22-deny-0.18
+          key: ${{ env.CACHE_KEY_HOST }}-${{ runner.os }}-${{ runner.arch }}
       - name: Install cargo tools
         # Skip if already cached
         # Create symlinks in /usr/local/bin so sudo can find cargo tools
@@ -236,6 +240,12 @@ jobs:
           path: /tmp/fcvm-test-logs/
           if-no-files-found: ignore
           retention-days: 14
+      - name: Save cargo tools cache
+        if: always() && steps.cache-cargo-tools.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cargo/bin
+          key: ${{ env.CACHE_KEY_HOST }}-${{ runner.os }}-${{ runner.arch }}
 
   # Runner 2: Container (podman)
   # Runs same tests as Host but inside a container

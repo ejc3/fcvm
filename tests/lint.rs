@@ -1,5 +1,4 @@
-//! Lint tests - fmt/audit/deny run in test-unit, clippy in test-fast.
-//! Fast tests run before privileged tests to avoid root-owned advisory-db files.
+//! Lint tests - run in test-unit only (not test-root, which runs as root without rustup).
 
 use std::process::Command;
 
@@ -20,13 +19,15 @@ fn assert_success(name: &str, output: std::process::Output) {
     );
 }
 
+// All lint tests excluded from privileged-tests (test-root runs as root without rustup)
 #[test]
+#[cfg(not(feature = "privileged-tests"))]
 fn fmt() {
     assert_success("cargo fmt", run_cargo(&["fmt", "--", "--check"]));
 }
 
 #[test]
-#[cfg(feature = "integration-fast")]
+#[cfg(all(feature = "integration-fast", not(feature = "privileged-tests")))]
 fn clippy() {
     assert_success(
         "cargo clippy",
@@ -42,11 +43,13 @@ fn clippy() {
 }
 
 #[test]
+#[cfg(not(feature = "privileged-tests"))]
 fn audit() {
     assert_success("cargo audit", run_cargo(&["audit"]));
 }
 
 #[test]
+#[cfg(not(feature = "privileged-tests"))]
 fn deny() {
     assert_success("cargo deny", run_cargo(&["deny", "check"]));
 }
