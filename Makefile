@@ -84,6 +84,9 @@ help:
 # Disk space check - fails if either root or btrfs is too full
 # Requires 10GB free on root (for cargo target) and 15GB on btrfs (for VMs)
 check-disk:
+	@# Fix advisory-db ownership (sudo/non-sudo mixing corrupts it)
+	@sudo chown -R $$(id -u):$$(id -g) "$$HOME/.cargo/advisory-db" 2>/dev/null || true
+	@sudo chown -R $$(id -u):$$(id -g) "$$HOME/.cargo/advisory-dbs" 2>/dev/null || true
 	@ROOT_FREE=$$(df -BG / 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \
 	BTRFS_FREE=$$(df -BG /mnt/fcvm-btrfs 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \
 	if [ -n "$$ROOT_FREE" ] && [ "$$ROOT_FREE" -lt 10 ]; then \
