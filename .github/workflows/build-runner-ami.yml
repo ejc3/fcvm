@@ -25,187 +25,28 @@ jobs:
           role-to-assume: arn:aws:iam::928413605543:role/github-actions-terraform
           aws-region: us-west-1
 
-      - name: Get base AMI
-        id: base-ami
+      - name: Build AMI
+        id: build
         run: |
-          AMI=$(aws ec2 describe-images \
-            --owners 099720109477 \
-            --filters "Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*" \
-            --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
-            --output text)
-          echo "ami=$AMI" >> $GITHUB_OUTPUT
-          echo "Base AMI: $AMI"
-
-      - name: Create user data script
-        run: |
-          cat > /tmp/user-data.sh << 'USERDATA'
-          #!/bin/bash
-          exec > >(tee /var/log/ami-build.log) 2>&1
-          set -euxo pipefail
-
-          # Signal start
-          INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
-          aws ec2 create-tags --resources $INSTANCE_ID --tags Key=BuildStatus,Value=building --region us-west-1
-
-          # Install build deps
-          apt-get update
-          apt-get install -y build-essential bc bison flex libssl-dev \
-            libelf-dev libncurses-dev debhelper-compat rsync kmod cpio curl jq wget git \
-            podman uidmap slirp4netns fuse-overlayfs containernetworking-plugins \
-            fuse3 libfuse3-dev libclang-dev clang musl-tools \
-            iproute2 iptables dnsmasq qemu-utils e2fsprogs parted \
-            skopeo busybox-static cpio zstd autoconf automake libtool
-
-          # Download kernel build script from repo
-          mkdir -p /tmp/kernel/patches
-          curl -fsSL https://raw.githubusercontent.com/ejc3/firepod/main/kernel/build-host.sh -o /tmp/kernel/build-host.sh
-          curl -fsSL https://raw.githubusercontent.com/ejc3/firepod/main/kernel/inception.conf -o /tmp/kernel/inception.conf
-          curl -fsSL https://raw.githubusercontent.com/ejc3/firepod/main/kernel/patches/mmfr4-override.patch -o /tmp/kernel/patches/mmfr4-override.patch 2>/dev/null || true
-          chmod +x /tmp/kernel/build-host.sh
-
-          # Extract kernel version from build.sh (uses same default as inception kernel)
-          KERNEL_VERSION=$(grep -oP 'KERNEL_VERSION:-\K[0-9.]+' /tmp/kernel/build-host.sh | head -1)
-          echo "Building kernel version: $KERNEL_VERSION"
-
-          # Tag instance with kernel version for AMI naming
-          aws ec2 create-tags --resources $INSTANCE_ID --tags Key=KernelVersion,Value=$KERNEL_VERSION --region us-west-1
-
-          # Build kernel
-          cd /tmp/kernel
-          KERNEL_VERSION="$KERNEL_VERSION" ./build-host.sh /tmp/kernel-out
-
-          # Install kernel
-          dpkg -i /tmp/kernel-out/linux-image-*.deb
-
-          # Node.js 22.x
-          curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-          apt-get install -y nodejs
-
-          # Rust for ubuntu user
-          sudo -u ubuntu bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
-
-          # Firecracker
-          FIRECRACKER_VERSION="v1.14.0"
-          curl -L -o /tmp/firecracker.tgz \
-            "https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}/firecracker-${FIRECRACKER_VERSION}-aarch64.tgz"
-          tar -xzf /tmp/firecracker.tgz -C /usr/local/bin --strip-components=1 \
-            "release-${FIRECRACKER_VERSION}-aarch64/firecracker-${FIRECRACKER_VERSION}-aarch64" \
-            "release-${FIRECRACKER_VERSION}-aarch64/jailer-${FIRECRACKER_VERSION}-aarch64"
-          mv "/usr/local/bin/firecracker-${FIRECRACKER_VERSION}-aarch64" /usr/local/bin/firecracker
-          mv "/usr/local/bin/jailer-${FIRECRACKER_VERSION}-aarch64" /usr/local/bin/jailer
-
-          # Podman rootless
-          echo "ubuntu:100000:65536" >> /etc/subuid
-          echo "ubuntu:100000:65536" >> /etc/subgid
-
-          # FUSE config
-          echo "user_allow_other" > /etc/fuse.conf
-
-          # GitHub Actions Runner (pre-download)
-          mkdir -p /opt/actions-runner
-          RUNNER_VERSION=$(curl -s https://api.github.com/repos/actions/runner/releases/latest | jq -r '.tag_name' | sed 's/v//')
-          curl -o /tmp/actions-runner.tar.gz -L \
-            "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-arm64-${RUNNER_VERSION}.tar.gz"
-          tar xzf /tmp/actions-runner.tar.gz -C /opt/actions-runner
-          chown -R ubuntu:ubuntu /opt/actions-runner
-          /opt/actions-runner/bin/installdependencies.sh
-
-          # Clean up
-          apt-get clean
-          rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
-
-          # Signal done
-          aws ec2 create-tags --resources $INSTANCE_ID --tags Key=BuildStatus,Value=complete --region us-west-1
-          USERDATA
-
-          # Base64 encode
-          base64 -w0 /tmp/user-data.sh > /tmp/user-data.b64
-
-      - name: Launch builder instance
-        id: launch
-        run: |
-          INSTANCE_ID=$(aws ec2 run-instances \
-            --image-id ${{ steps.base-ami.outputs.ami }} \
-            --instance-type c7g.2xlarge \
-            --subnet-id subnet-05c215519b2150ecd \
-            --security-group-ids sg-0ebf2d8c6a0acc1a3 \
-            --iam-instance-profile Name=jumpbox-admin-profile \
-            --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":100,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
-            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=ami-builder-temp},{Key=BuildStatus,Value=starting}]' \
-            --user-data file:///tmp/user-data.b64 \
-            --query 'Instances[0].InstanceId' \
-            --output text)
-          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
-          echo "Launched instance: $INSTANCE_ID"
-
-      - name: Wait for build to complete
-        run: |
-          echo "Waiting for build to complete (this takes ~30-45 minutes)..."
-          for i in {1..120}; do
-            STATUS=$(aws ec2 describe-tags \
-              --filters "Name=resource-id,Values=${{ steps.launch.outputs.instance_id }}" "Name=key,Values=BuildStatus" \
-              --query 'Tags[0].Value' --output text)
-            echo "[$i/120] Build status: $STATUS"
-            if [ "$STATUS" = "complete" ]; then
-              echo "Build complete!"
-              exit 0
-            fi
-            sleep 30
-          done
-          echo "Build timeout!"
-          exit 1
-
-      - name: Stop instance
-        run: |
-          aws ec2 stop-instances --instance-ids ${{ steps.launch.outputs.instance_id }}
-          aws ec2 wait instance-stopped --instance-ids ${{ steps.launch.outputs.instance_id }}
-
-      - name: Create AMI
-        id: create-ami
-        run: |
-          # Get kernel version from instance tags (set during build)
-          KERNEL_VERSION=$(aws ec2 describe-tags \
-            --filters "Name=resource-id,Values=${{ steps.launch.outputs.instance_id }}" "Name=key,Values=KernelVersion" \
-            --query 'Tags[0].Value' --output text 2>/dev/null || echo "unknown")
-
-          TIMESTAMP=$(date +%Y%m%d-%H%M)
-          AMI_NAME="firepod-runner-${KERNEL_VERSION}-${TIMESTAMP}"
-
-          AMI_ID=$(aws ec2 create-image \
-            --instance-id ${{ steps.launch.outputs.instance_id }} \
-            --name "$AMI_NAME" \
-            --description "Firepod CI runner with kernel ${KERNEL_VERSION}-nested" \
-            --query 'ImageId' --output text)
-
-          echo "ami_id=$AMI_ID" >> $GITHUB_OUTPUT
-          echo "kernel_version=$KERNEL_VERSION" >> $GITHUB_OUTPUT
-          echo "Created AMI: $AMI_ID ($AMI_NAME)"
-
-          # Wait for AMI
-          echo "Waiting for AMI to be available..."
-          aws ec2 wait image-available --image-ids $AMI_ID
-
-          # Tag it
-          aws ec2 create-tags --resources $AMI_ID --tags \
-            Key=Name,Value="$AMI_NAME" \
-            Key=Kernel,Value="${KERNEL_VERSION}-nested" \
-            Key=Purpose,Value=github-runner
-
-      - name: Terminate builder instance
-        if: always()
-        run: |
-          aws ec2 terminate-instances --instance-ids ${{ steps.launch.outputs.instance_id }} || true
+          chmod +x scripts/build-ami.sh
+          scripts/build-ami.sh
 
       - name: Summary
         run: |
-          echo "## Runner AMI Built" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**AMI ID:** \`${{ steps.create-ami.outputs.ami_id }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Kernel:** \`${{ steps.create-ami.outputs.kernel_version }}-nested\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Update \`firecracker_ami\` in terraform:" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`hcl" >> $GITHUB_STEP_SUMMARY
-          echo "variable \"firecracker_ami\" {" >> $GITHUB_STEP_SUMMARY
-          echo "  default = \"${{ steps.create-ami.outputs.ami_id }}\"" >> $GITHUB_STEP_SUMMARY
-          echo "}" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.build.outputs.cached }}" = "true" ]; then
+            echo "## Runner AMI (Cached)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**AMI ID:** \`${{ steps.build.outputs.ami_id }}\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## Runner AMI Built" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**AMI ID:** \`${{ steps.build.outputs.ami_id }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "**Kernel:** \`${{ steps.build.outputs.kernel_version }}-nested\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Update \`firecracker_ami\` in terraform:" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`hcl" >> $GITHUB_STEP_SUMMARY
+            echo "variable \"firecracker_ami\" {" >> $GITHUB_STEP_SUMMARY
+            echo "  default = \"${{ steps.build.outputs.ami_id }}\"" >> $GITHUB_STEP_SUMMARY
+            echo "}" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
