@@ -189,6 +189,8 @@ jobs:
           which cargo-nextest || cargo install cargo-nextest@0.9.115 --locked
           which cargo-audit || cargo install cargo-audit@0.22.0 --locked
           which cargo-deny || cargo install cargo-deny@0.18.9 --locked
+          sudo ln -sf $HOME/.cargo/bin/cargo /usr/local/bin/
+          sudo ln -sf $HOME/.cargo/bin/rustc /usr/local/bin/
           sudo ln -sf $HOME/.cargo/bin/cargo-nextest /usr/local/bin/
           sudo ln -sf $HOME/.cargo/bin/cargo-audit /usr/local/bin/
           sudo ln -sf $HOME/.cargo/bin/cargo-deny /usr/local/bin/
