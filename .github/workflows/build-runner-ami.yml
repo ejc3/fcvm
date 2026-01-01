@@ -1,0 +1,59 @@
+name: Build Runner AMI
+
+on:
+  workflow_run:
+    workflows: ["Build Kernels"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel in-progress runs when a new run is triggered
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-west-1
+
+jobs:
+  build-ami:
+    name: Build Runner AMI
+    # Only run if kernel build succeeded (or manual dispatch)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::928413605543:role/github-actions-terraform
+          aws-region: us-west-1
+
+      - name: Build AMI
+        id: build
+        run: |
+          chmod +x scripts/build-ami.sh
+          scripts/build-ami.sh
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.build.outputs.cached }}" = "true" ]; then
+            echo "## Runner AMI (Cached)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**AMI ID:** \`${{ steps.build.outputs.ami_id }}\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## Runner AMI Built" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**AMI ID:** \`${{ steps.build.outputs.ami_id }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "**Kernel:** \`${{ steps.build.outputs.kernel_version }}-nested\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Update \`firecracker_ami\` in terraform:" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`hcl" >> $GITHUB_STEP_SUMMARY
+            echo "variable \"firecracker_ami\" {" >> $GITHUB_STEP_SUMMARY
+            echo "  default = \"${{ steps.build.outputs.ami_id }}\"" >> $GITHUB_STEP_SUMMARY
+            echo "}" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi

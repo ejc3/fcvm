@@ -180,10 +180,13 @@ container-test-all: check-disk container-setup-fcvm
 
 container-test: container-test-all
 
+CONTAINER_CACHE_REPO ?= ghcr.io/ejc3/fcvm-cache
+
 container-build:
 	@sudo mkdir -p /mnt/fcvm-btrfs 2>/dev/null || true
 	@mkdir -p /tmp/fcvm-container-target
-	podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) .
+	podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) \
+		--layers --cache-from $(CONTAINER_CACHE_REPO) --cache-to $(CONTAINER_CACHE_REPO) .
 
 container-shell: container-build
 	$(CONTAINER_RUN) -it $(CONTAINER_TAG) bash
