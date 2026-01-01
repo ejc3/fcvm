@@ -1,11 +1,11 @@
 name: Build Runner AMI
 
 on:
-  workflow_dispatch:
-  push:
+  workflow_run:
+    workflows: ["Build Kernels"]
+    types: [completed]
     branches: [main]
-    paths:
-      - 'kernel/**'
+  workflow_dispatch:
 
 env:
   AWS_REGION: us-west-1
@@ -13,6 +13,8 @@ env:
 jobs:
   build-ami:
     name: Build Runner AMI
+    # Only run if kernel build succeeded (or manual dispatch)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write
