@@ -62,8 +62,15 @@ jobs:
           shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev libclang-dev clang
+      - name: Cache cargo tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: cargo-tools-${{ runner.os }}-audit-0.22-deny-0.18
       - name: Install cargo tools
-        run: cargo install cargo-audit cargo-deny --locked
+        run: |
+          which cargo-audit || cargo install cargo-audit@0.22.0 --locked
+          which cargo-deny || cargo install cargo-deny@0.18.9 --locked
       - name: Check formatting
         working-directory: fcvm
         run: cargo fmt -p fcvm -p fuse-pipe -p fc-agent --check
