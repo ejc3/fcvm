@@ -70,8 +70,8 @@ CONTAINER_RUN := podman run --rm --privileged \
 	test test-unit test-fast test-all test-root \
 	_test-unit _test-fast _test-all _test-root \
 	container-build container-test container-test-unit container-test-fast container-test-all \
-	container-shell container-clean setup-btrfs setup-fcvm setup-pjdfstest setup-inception bench lint fmt \
-	rebuild-fc dev-fc-test inception-vm inception-exec inception-wait-exec inception-stop inception-status
+	container-shell container-clean setup-btrfs setup-fcvm setup-pjdfstest bench lint fmt \
+	dev-fc-test inception-vm inception-exec inception-wait-exec inception-stop inception-status
 
 all: build
 
@@ -241,43 +241,6 @@ _setup-fcvm:
 	fi
 	./target/release/fcvm setup
 
-# Inception test setup - builds container with matching CAS chain
-# Ensures: artifacts/fc-agent == target/release/fc-agent, initrd SHA matches, container cached
-setup-inception: setup-fcvm
-	@echo "==> Setting up inception test container..."
-	@echo "==> Copying binaries to artifacts/..."
-	mkdir -p artifacts
-	cp target/release/fcvm artifacts/
-	cp target/$(MUSL_TARGET)/release/fc-agent artifacts/
-	@if [ -f "$(FIRECRACKER_BIN)" ]; then \
-		cp $(FIRECRACKER_BIN) artifacts/firecracker-nv2; \
-	else \
-		echo "ERROR: NV2 firecracker not found at $(FIRECRACKER_BIN)"; \
-		echo "Run 'make build-firecracker-nv2' first"; \
-		exit 1; \
-	fi
-	@echo "==> Building inception-test container..."
-	podman rmi localhost/inception-test 2>/dev/null || true
-	podman build -t localhost/inception-test -f Containerfile.inception .
-	@echo "==> Exporting container to CAS cache..."
-	@DIGEST=$$(podman inspect localhost/inception-test --format '{{.Digest}}'); \
-	CACHE_DIR="/mnt/fcvm-btrfs/image-cache/$${DIGEST}"; \
-	if [ -d "$$CACHE_DIR" ]; then \
-		echo "Cache already exists: $$CACHE_DIR"; \
-	else \
-		echo "Creating cache: $$CACHE_DIR"; \
-		sudo mkdir -p "$$CACHE_DIR"; \
-		sudo skopeo copy containers-storage:localhost/inception-test "dir:$$CACHE_DIR"; \
-	fi
-	@echo "==> Verification..."
-	@echo "fc-agent SHA: $$(sha256sum artifacts/fc-agent | cut -c1-12)"
-	@echo "Container fc-agent SHA: $$(podman run --rm localhost/inception-test sha256sum /usr/local/bin/fc-agent | cut -c1-12)"
-	@echo "Initrd: $$(ls -1 /mnt/fcvm-btrfs/initrd/fc-agent-*.initrd | tail -1)"
-	@DIGEST=$$(podman inspect localhost/inception-test --format '{{.Digest}}'); \
-	echo "Image digest: $$DIGEST"; \
-	echo "Cache path: /mnt/fcvm-btrfs/image-cache/$$DIGEST"
-	@echo "==> Inception setup complete!"
-
 bench: build
 	@echo "==> Running benchmarks..."
 	sudo cargo bench -p fuse-pipe --bench throughput
@@ -290,46 +253,9 @@ lint:
 fmt:
 	cargo fmt
 
-# Firecracker development targets
-# Build NV2 Firecracker fork for inception tests
-# Usage: make build-firecracker-nv2
-FIRECRACKER_SRC ?= /home/ubuntu/firecracker
-FIRECRACKER_BIN := $(FIRECRACKER_SRC)/build/cargo_target/release/firecracker
-FIRECRACKER_NV2_REPO := https://github.com/ejc3/firecracker.git
-FIRECRACKER_NV2_BRANCH := nv2-inception
-
-build-firecracker-nv2:
-	@echo "==> Building NV2 Firecracker fork..."
-	@if [ ! -d "$(FIRECRACKER_SRC)" ]; then \
-		echo "  Cloning $(FIRECRACKER_NV2_REPO)..."; \
-		git clone --depth=1 -b $(FIRECRACKER_NV2_BRANCH) $(FIRECRACKER_NV2_REPO) $(FIRECRACKER_SRC); \
-	else \
-		echo "  Repo exists, checking out $(FIRECRACKER_NV2_BRANCH)..."; \
-		cd $(FIRECRACKER_SRC) && \
-		git remote set-url origin $(FIRECRACKER_NV2_REPO) 2>/dev/null || \
-		git remote add origin $(FIRECRACKER_NV2_REPO) 2>/dev/null || true; \
-		git fetch origin $(FIRECRACKER_NV2_BRANCH) && \
-		git checkout $(FIRECRACKER_NV2_BRANCH); \
-	fi
-	@echo "  Building release binary..."
-	cd $(FIRECRACKER_SRC) && cargo build --release
-	@echo "==> NV2 Firecracker built at $(FIRECRACKER_BIN)"
-	$(FIRECRACKER_BIN) --version
-
-rebuild-fc:
-	@echo "==> Force rebuilding Firecracker..."
-	touch $(FIRECRACKER_SRC)/src/vmm/src/arch/aarch64/vcpu.rs
-	cd $(FIRECRACKER_SRC) && cargo build --release
-	@echo "==> Installing Firecracker to /usr/local/bin..."
-	sudo rm -f /usr/local/bin/firecracker
-	sudo cp $(FIRECRACKER_BIN) /usr/local/bin/firecracker
-	@echo "==> Verifying installation..."
-	@strings /usr/local/bin/firecracker | grep -q "NV2 DEBUG" && echo "NV2 debug strings: OK" || echo "WARNING: NV2 debug strings missing"
-	/usr/local/bin/firecracker --version
-
-# Full rebuild cycle: Firecracker + fcvm + run test
+# Development test target for inception tests
 # Usage: make dev-fc-test FILTER=inception
-dev-fc-test: rebuild-fc build
+dev-fc-test: build
 	@echo "==> Running test with FILTER=$(FILTER)..."
 	RUST_LOG="$(TEST_LOG)" \
 	FCVM_DATA_DIR=$(ROOT_DATA_DIR) \
