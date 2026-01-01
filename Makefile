@@ -35,8 +35,8 @@ else
 MUSL_TARGET := x86_64-unknown-linux-musl
 endif
 
-# Base test command (--status-level all shows each test as it runs for CI visibility)
-NEXTEST := CARGO_TARGET_DIR=target cargo nextest $(NEXTEST_CMD) --release --status-level all
+# Base test command
+NEXTEST := CARGO_TARGET_DIR=target cargo nextest $(NEXTEST_CMD) --release
 
 # Optional cargo cache directory (for CI caching)
 CARGO_CACHE_DIR ?=
