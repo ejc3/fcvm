@@ -66,7 +66,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin
-          key: cargo-tools-${{ runner.os }}-audit-0.22-deny-0.18
+          key: cargo-tools-${{ runner.os }}-${{ runner.arch }}-audit-0.22.0-deny-0.18.9
       - name: Install cargo tools
         run: |
           which cargo-audit || cargo install cargo-audit@0.22.0 --locked
@@ -173,18 +173,21 @@ jobs:
             release-v1.14.0-aarch64/jailer-v1.14.0-aarch64
           sudo mv /usr/local/bin/firecracker-v1.14.0-aarch64 /usr/local/bin/firecracker
           sudo mv /usr/local/bin/jailer-v1.14.0-aarch64 /usr/local/bin/jailer
+      - name: Cache cargo tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: cargo-tools-${{ runner.os }}-${{ runner.arch }}-nextest-0.9.115-audit-0.22-deny-0.18
       - name: Install cargo tools
-        # cargo-audit >= 0.22.0 required for CVSS 4.0 support
-        # Use --force to override any stale cached versions
+        # Skip if already cached
         # Create symlinks in /usr/local/bin so sudo can find cargo tools
         run: |
-          cargo install cargo-nextest@0.9.115 cargo-audit@0.22.0 cargo-deny@0.18.9 --locked --force
-          sudo ln -sf $HOME/.cargo/bin/cargo /usr/local/bin/
+          which cargo-nextest || cargo install cargo-nextest@0.9.115 --locked
+          which cargo-audit || cargo install cargo-audit@0.22.0 --locked
+          which cargo-deny || cargo install cargo-deny@0.18.9 --locked
+          sudo ln -sf $HOME/.cargo/bin/cargo-nextest /usr/local/bin/
           sudo ln -sf $HOME/.cargo/bin/cargo-audit /usr/local/bin/
           sudo ln -sf $HOME/.cargo/bin/cargo-deny /usr/local/bin/
-          sudo ln -sf $HOME/.cargo/bin/cargo-fmt /usr/local/bin/
-          sudo ln -sf $HOME/.cargo/bin/cargo-clippy /usr/local/bin/
-          sudo ln -sf $HOME/.cargo/bin/rustfmt /usr/local/bin/
       - name: Setup KVM and networking
         run: |
           sudo chmod 666 /dev/kvm
@@ -198,6 +201,8 @@ jobs:
           sudo sysctl -w vm.unprivileged_userfaultfd=1
           # Enable FUSE allow_other for tests
           echo "user_allow_other" | sudo tee /etc/fuse.conf
+          # Reset podman state if corrupted from previous runs
+          podman system migrate || true
       - name: Create test log directory
         run: mkdir -p /tmp/fcvm-test-logs
       - name: Clean test data
@@ -239,6 +244,8 @@ jobs:
     name: Container
     if: ${{ github.event.inputs.job != 'host' }}
     runs-on: [self-hosted, Linux, ARM64]
+    permissions:
+      packages: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -261,8 +268,12 @@ jobs:
           # Configure rootless podman to use cgroupfs (no systemd session on CI)
           mkdir -p ~/.config/containers
           printf '[engine]\ncgroup_manager = "cgroupfs"\nevents_logger = "file"\n' > ~/.config/containers/containers.conf
+          # Reset podman state if corrupted from previous runs
+          podman system migrate || true
           # Create cargo cache directory for container
           mkdir -p ${{ github.workspace }}/cargo-cache/registry ${{ github.workspace }}/cargo-cache/target
+      - name: Login to ghcr.io
+        run: echo "${{ github.token }}" | podman login ghcr.io -u ${{ github.actor }} --password-stdin
       - name: Cache container cargo
         uses: actions/cache@v5
         with:
