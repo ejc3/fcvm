@@ -9,9 +9,11 @@ on:
     types: [created]
 
 jobs:
-  # Auto-review on every PR
+  # Auto-review PRs from org members (OWNER, MEMBER, COLLABORATOR)
   review:
-    if: github.event_name == 'pull_request'
+    if: |
+      github.event_name == 'pull_request' &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -42,10 +44,10 @@ jobs:
             echo "✅ No blocking issues found"
           fi
 
-  # Respond to @claude mentions in comments (repo owners only)
+  # Respond to @claude mentions in comments (org members only)
   respond:
     if: |
-      github.event.repository.owner.login == github.actor &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
       ((github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')))
     runs-on: ubuntu-latest
