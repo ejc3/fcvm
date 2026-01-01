@@ -75,7 +75,10 @@ async fn firecracker_nv2_exists() -> bool {
 /// Also sets FCVM_FIRECRACKER_BIN env var so fcvm uses it
 async fn ensure_firecracker_nv2() -> Result<()> {
     if firecracker_nv2_exists().await {
-        println!("✓ Firecracker with NV2 support found at {}", FIRECRACKER_NV2_PATH);
+        println!(
+            "✓ Firecracker with NV2 support found at {}",
+            FIRECRACKER_NV2_PATH
+        );
         std::env::set_var("FCVM_FIRECRACKER_BIN", FIRECRACKER_NV2_PATH);
         return Ok(());
     }
@@ -200,7 +203,10 @@ async fn ensure_firecracker_nv2() -> Result<()> {
 
     let _ = flock.unlock();
     std::env::set_var("FCVM_FIRECRACKER_BIN", FIRECRACKER_NV2_PATH);
-    println!("✓ Firecracker with NV2 support installed at {}", FIRECRACKER_NV2_PATH);
+    println!(
+        "✓ Firecracker with NV2 support installed at {}",
+        FIRECRACKER_NV2_PATH
+    );
     Ok(())
 }
 
