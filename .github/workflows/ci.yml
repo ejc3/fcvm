@@ -255,8 +255,6 @@ jobs:
           repository: ejc3/fuser
           ref: master
           path: fuser
-      - name: Login to ghcr.io
-        run: echo "${{ github.token }}" | podman login ghcr.io -u ${{ github.actor }} --password-stdin
       - name: Setup KVM and rootless podman
         run: |
           sudo chmod 666 /dev/kvm
@@ -265,8 +263,12 @@ jobs:
           # Configure rootless podman to use cgroupfs (no systemd session on CI)
           mkdir -p ~/.config/containers
           printf '[engine]\ncgroup_manager = "cgroupfs"\nevents_logger = "file"\n' > ~/.config/containers/containers.conf
+          # Reset podman state if corrupted from previous runs
+          podman system migrate || true
           # Create cargo cache directory for container
           mkdir -p ${{ github.workspace }}/cargo-cache/registry ${{ github.workspace }}/cargo-cache/target
+      - name: Login to ghcr.io
+        run: echo "${{ github.token }}" | podman login ghcr.io -u ${{ github.actor }} --password-stdin
       - name: Cache container cargo
         uses: actions/cache@v5
         with:
