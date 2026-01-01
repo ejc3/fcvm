@@ -252,9 +252,19 @@ main() {
     --query 'ImageId' --output text)
   echo "Created AMI: $ami_id ($ami_name)"
 
-  # Wait for AMI
+  # Wait for AMI (custom loop - default waiter times out on large disks)
   echo "Waiting for AMI to be available..."
-  aws ec2 wait image-available --region "$REGION" --image-ids "$ami_id"
+  for i in $(seq 1 60); do  # 60 * 30s = 30 min max
+    state=$(aws ec2 describe-images --region "$REGION" --image-ids "$ami_id" --query 'Images[0].State' --output text)
+    echo "[$i/60] AMI state: $state"
+    if [ "$state" = "available" ]; then
+      break
+    elif [ "$state" = "failed" ]; then
+      echo "AMI creation failed!"
+      exit 1
+    fi
+    sleep 30
+  done
 
   # Tag AMI
   aws ec2 create-tags --region "$REGION" --resources "$ami_id" --tags \
