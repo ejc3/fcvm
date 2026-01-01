@@ -1346,21 +1346,14 @@ Run `make help` for full list. Key targets:
 #### Linting
 | Target | Description |
 |--------|-------------|
-| `make lint` | Run clippy + fmt-check |
-| `make clippy` | Run cargo clippy |
+| `make lint` | Run lint tests (fmt, clippy, audit, deny) |
 | `make fmt` | Format code |
-| `make fmt-check` | Check formatting |
 
 #### Benchmarks
 | Target | Description |
 |--------|-------------|
 | `make bench` | All benchmarks (throughput + operations + protocol) |
-| `make bench-throughput` | I/O throughput benchmarks |
-| `make bench-operations` | FUSE operation latency benchmarks |
-| `make bench-protocol` | Wire protocol benchmarks |
-| `make bench-quick` | Quick benchmarks (faster iteration) |
-| `make bench-logs` | View recent benchmark logs/telemetry |
-| `make bench-clean` | Clean benchmark artifacts |
+| `make container-bench` | Run benchmarks in container (used by nightly CI) |
 
 #### Setup (idempotent, run automatically by tests)
 | Target | Description |

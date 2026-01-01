@@ -36,11 +36,10 @@ A Rust implementation that launches Firecracker microVMs to run Podman container
 
 **Container Testing (Recommended)** - All dependencies bundled:
 ```bash
-# Just needs podman and /dev/kvm
-make container-test-unit             # Unit tests (no VMs)
-make container-test-integration-fast # Quick VM tests (<30s each)
-make container-test-root             # All tests including pjdfstest
+make container-test  # All tests in container (just needs podman + /dev/kvm)
 ```
+
+See [CLAUDE.md](.claude/CLAUDE.md#makefile-targets) for all Makefile targets.
 
 **Native Testing** - Additional dependencies required:
 
@@ -557,25 +556,12 @@ See [DESIGN.md](DESIGN.md#guest-agent) for details.
 ## Testing
 
 ```bash
-# Quick start
-make build                           # Build fcvm + fc-agent
-make test-root                       # Run all tests (requires sudo + KVM)
-
-# Test tiers
-make test-unit                       # Unit tests only (no VMs)
-make test-integration-fast           # Quick VM tests (<30s each)
-make test-root                       # All tests including pjdfstest
-
-# Container testing (recommended - all deps bundled)
-make container-test-root             # All tests in container
-
-# Options
-make test-root FILTER=exec           # Filter by name
-make test-root STREAM=1              # Live output
-make test-root LIST=1                # List without running
+make build       # Build fcvm + fc-agent
+make test-root   # Run all tests (requires sudo + KVM)
+make test-root FILTER=exec STREAM=1  # Filter by name, live output
 ```
 
-See [DESIGN.md](DESIGN.md#test-infrastructure) for test architecture and file listing.
+See [CLAUDE.md](.claude/CLAUDE.md#makefile-targets) for all Makefile targets.
 
 ### Debugging Tests
 

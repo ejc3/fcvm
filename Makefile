@@ -67,10 +67,11 @@ CONTAINER_RUN := podman run --rm --privileged \
 	-e FCVM_DATA_DIR=$(CONTAINER_DATA_DIR)
 
 .PHONY: all help build clean clean-target clean-test-data check-disk \
-	test test-unit test-fast test-all test-root \
-	_test-unit _test-fast _test-all _test-root \
+	test test-unit test-fast test-all test-root test-packaging \
+	_test-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all \
-	container-shell container-clean setup-btrfs setup-fcvm setup-pjdfstest bench lint fmt \
+	container-setup-fcvm container-shell container-clean container-bench \
+	setup-btrfs setup-fcvm setup-pjdfstest bench lint fmt \
 	dev-fc-test inception-vm inception-exec inception-wait-exec inception-stop inception-status
 
 all: build
@@ -102,9 +103,10 @@ check-disk:
 	echo "Disk check passed: / has $${ROOT_FREE}GB, /mnt/fcvm-btrfs has $${BTRFS_FREE}GB"
 
 # Clean target directory (frees space on /)
+# Uses sudo because target may have root-owned files from sudo tests
 clean-target:
 	@echo "==> Cleaning target directory..."
-	rm -rf target
+	sudo rm -rf target
 	@echo "==> Cleaned target/"
 
 # Clean leftover test data (VM disks, snapshots, state files)
@@ -248,6 +250,17 @@ bench: build
 	@echo "==> Running benchmarks..."
 	sudo cargo bench -p fuse-pipe --bench throughput
 	sudo cargo bench -p fuse-pipe --bench operations
+	cargo bench -p fuse-pipe --bench protocol
+
+# Container benchmark target (used by nightly CI)
+container-bench: container-build
+	@echo "==> Running benchmarks in container..."
+	$(CONTAINER_RUN) $(CONTAINER_TAG) make build _bench
+
+_bench:
+	@echo "==> Running benchmarks..."
+	cargo bench -p fuse-pipe --bench throughput
+	cargo bench -p fuse-pipe --bench operations
 	cargo bench -p fuse-pipe --bench protocol
 
 lint:

@@ -1276,36 +1276,13 @@ reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 
 ### Build System (Makefile)
 
-All builds are done via the root Makefile.
+All builds are done via the root Makefile. See [CLAUDE.md](/.claude/CLAUDE.md#makefile-targets) for the complete target list.
 
-**Key targets**:
 ```bash
-# Development
-make build         # Build fcvm + fc-agent
-make clean         # Clean build artifacts
-
-# Testing (3 tiers)
-make test-unit             # Unit tests only (no VMs, <1s each)
-make test-integration-fast # Quick VM tests (<30s each)
-make test-root             # All tests including slow (pjdfstest)
-
-# Container testing
-make container-test-unit             # Unit tests in container
-make container-test-integration-fast # Quick VM tests in container
-make container-test-root             # All tests in container
-make container-shell                 # Interactive shell
-
-# Linting
-make lint          # Run clippy + fmt-check
-make fmt           # Format code
-
-# Options
-FILTER=pattern     # Filter tests by name
-STREAM=1           # Stream output (no capture)
-LIST=1             # List tests without running
+make build      # Build fcvm + fc-agent
+make test-root  # Run all tests (requires sudo + KVM)
+make help       # Show available targets
 ```
-
-See `make help` for the complete list of targets.
 
 ### Data Directory
 
