@@ -34,7 +34,6 @@ get_base_ami() {
 
 # Create user data script for AMI builder
 create_user_data() {
-  local kernel_version="$1"
   cat << 'USERDATA'
 #!/bin/bash
 exec > >(tee /var/log/ami-build.log) 2>&1
