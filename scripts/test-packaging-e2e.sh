@@ -70,6 +70,13 @@ fi
 echo "PASS: Binary runs from /tmp"
 
 echo ""
+echo "Step 1b: Generate config (required for installed binary)"
+# When running from an isolated location, we need to generate the config
+# This downloads kernel/rootfs and creates rootfs-config.toml
+sudo "$FCVM" setup --generate-config
+echo "PASS: Config generated"
+
+echo ""
 echo "Step 2: Start VM using installed binary"
 # Use bridged networking with sudo (standard production usage)
 # The binary should use existing setup (kernel, rootfs, initrd already present)
