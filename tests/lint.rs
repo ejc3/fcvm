@@ -1,4 +1,4 @@
-//! Lint tests - run in test-unit only (not test-root, which runs as root without rustup).
+//! Lint tests - verify code quality in CI.
 
 use std::process::Command;
 
@@ -19,15 +19,12 @@ fn assert_success(name: &str, output: std::process::Output) {
     );
 }
 
-// All lint tests excluded from privileged-tests (test-root runs as root without rustup)
 #[test]
-#[cfg(not(feature = "privileged-tests"))]
 fn fmt() {
     assert_success("cargo fmt", run_cargo(&["fmt", "--", "--check"]));
 }
 
 #[test]
-#[cfg(all(feature = "integration-fast", not(feature = "privileged-tests")))]
 fn clippy() {
     assert_success(
         "cargo clippy",
@@ -43,13 +40,11 @@ fn clippy() {
 }
 
 #[test]
-#[cfg(not(feature = "privileged-tests"))]
 fn audit() {
     assert_success("cargo audit", run_cargo(&["audit"]));
 }
 
 #[test]
-#[cfg(not(feature = "privileged-tests"))]
 fn deny() {
     assert_success("cargo deny", run_cargo(&["deny", "check"]));
 }
