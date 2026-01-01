@@ -2,15 +2,13 @@ name: Build Runner AMI
 
 on:
   workflow_dispatch:
-    inputs:
-      kernel_version:
-        description: 'Kernel version'
-        default: '6.18.2'
-        type: string
+  push:
+    branches: [main]
+    paths:
+      - 'kernel/**'
 
 env:
   AWS_REGION: us-west-1
-  KERNEL_VERSION: ${{ inputs.kernel_version || '6.18.2' }}
 
 jobs:
   build-ami:
@@ -59,16 +57,22 @@ jobs:
             skopeo busybox-static cpio zstd autoconf automake libtool
 
           # Download kernel build script from repo
-          mkdir -p /tmp/kernel
+          mkdir -p /tmp/kernel/patches
           curl -fsSL https://raw.githubusercontent.com/ejc3/firepod/main/kernel/build-host.sh -o /tmp/kernel/build-host.sh
           curl -fsSL https://raw.githubusercontent.com/ejc3/firepod/main/kernel/inception.conf -o /tmp/kernel/inception.conf
-          mkdir -p /tmp/kernel/patches
           curl -fsSL https://raw.githubusercontent.com/ejc3/firepod/main/kernel/patches/mmfr4-override.patch -o /tmp/kernel/patches/mmfr4-override.patch 2>/dev/null || true
           chmod +x /tmp/kernel/build-host.sh
 
+          # Extract kernel version from build.sh (uses same default as inception kernel)
+          KERNEL_VERSION=$(grep -oP 'KERNEL_VERSION:-\K[0-9.]+' /tmp/kernel/build-host.sh | head -1)
+          echo "Building kernel version: $KERNEL_VERSION"
+
+          # Tag instance with kernel version for AMI naming
+          aws ec2 create-tags --resources $INSTANCE_ID --tags Key=KernelVersion,Value=$KERNEL_VERSION --region us-west-1
+
           # Build kernel
           cd /tmp/kernel
-          KERNEL_VERSION="${KERNEL_VERSION:-6.18.2}" ./build-host.sh /tmp/kernel-out
+          KERNEL_VERSION="$KERNEL_VERSION" ./build-host.sh /tmp/kernel-out
 
           # Install kernel
           dpkg -i /tmp/kernel-out/linux-image-*.deb
@@ -159,16 +163,22 @@ jobs:
       - name: Create AMI
         id: create-ami
         run: |
+          # Get kernel version from instance tags (set during build)
+          KERNEL_VERSION=$(aws ec2 describe-tags \
+            --filters "Name=resource-id,Values=${{ steps.launch.outputs.instance_id }}" "Name=key,Values=KernelVersion" \
+            --query 'Tags[0].Value' --output text 2>/dev/null || echo "unknown")
+
           TIMESTAMP=$(date +%Y%m%d-%H%M)
-          AMI_NAME="firepod-runner-${{ env.KERNEL_VERSION }}-${TIMESTAMP}"
+          AMI_NAME="firepod-runner-${KERNEL_VERSION}-${TIMESTAMP}"
 
           AMI_ID=$(aws ec2 create-image \
             --instance-id ${{ steps.launch.outputs.instance_id }} \
             --name "$AMI_NAME" \
-            --description "Firepod CI runner with kernel ${{ env.KERNEL_VERSION }}-nested" \
+            --description "Firepod CI runner with kernel ${KERNEL_VERSION}-nested" \
             --query 'ImageId' --output text)
 
           echo "ami_id=$AMI_ID" >> $GITHUB_OUTPUT
+          echo "kernel_version=$KERNEL_VERSION" >> $GITHUB_OUTPUT
           echo "Created AMI: $AMI_ID ($AMI_NAME)"
 
           # Wait for AMI
@@ -178,7 +188,7 @@ jobs:
           # Tag it
           aws ec2 create-tags --resources $AMI_ID --tags \
             Key=Name,Value="$AMI_NAME" \
-            Key=Kernel,Value="${{ env.KERNEL_VERSION }}-nested" \
+            Key=Kernel,Value="${KERNEL_VERSION}-nested" \
             Key=Purpose,Value=github-runner
 
       - name: Terminate builder instance
@@ -191,8 +201,11 @@ jobs:
           echo "## Runner AMI Built" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**AMI ID:** \`${{ steps.create-ami.outputs.ami_id }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Kernel:** \`${{ steps.create-ami.outputs.kernel_version }}-nested\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Update \`firecracker_ami\` in terraform:" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          echo "default = \"${{ steps.create-ami.outputs.ami_id }}\"" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`hcl" >> $GITHUB_STEP_SUMMARY
+          echo "variable \"firecracker_ami\" {" >> $GITHUB_STEP_SUMMARY
+          echo "  default = \"${{ steps.create-ami.outputs.ami_id }}\"" >> $GITHUB_STEP_SUMMARY
+          echo "}" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
