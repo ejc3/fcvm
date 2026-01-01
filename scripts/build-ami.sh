@@ -130,11 +130,36 @@ wait_for_build() {
       --region "$REGION" \
       --filters "Name=resource-id,Values=$instance_id" "Name=key,Values=BuildStatus" \
       --query 'Tags[0].Value' --output text)
-    echo "[$i/$timeout] Build status: $status"
+
+    # Get last log line via SSM for progress visibility
+    log_line=""
+    if [ "$status" = "building" ]; then
+      cmd_id=$(aws ssm send-command \
+        --region "$REGION" \
+        --instance-ids "$instance_id" \
+        --document-name "AWS-RunShellScript" \
+        --parameters 'commands=["tail -1 /var/log/ami-build.log 2>/dev/null || echo waiting..."]' \
+        --query 'Command.CommandId' --output text 2>/dev/null) || true
+      if [ -n "$cmd_id" ]; then
+        sleep 2
+        log_line=$(aws ssm get-command-invocation \
+          --region "$REGION" \
+          --command-id "$cmd_id" \
+          --instance-id "$instance_id" \
+          --query 'StandardOutputContent' --output text 2>/dev/null | tr -d '\n' | cut -c1-80) || true
+      fi
+    fi
+
+    if [ -n "$log_line" ]; then
+      echo "[$i/$timeout] $status: $log_line"
+    else
+      echo "[$i/$timeout] Build status: $status"
+    fi
+
     if [ "$status" = "complete" ]; then
       return 0
     fi
-    sleep 30
+    sleep 28  # 2s already spent on SSM
   done
   echo "Build timeout!"
   return 1
