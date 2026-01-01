@@ -226,9 +226,11 @@ jobs:
       - name: test-fast
         working-directory: fcvm
         run: make test-fast
-      - name: Build inception kernel
+      - name: Get inception kernel
         working-directory: fcvm
-        run: ./kernel/build.sh
+        run: |
+          # Downloads from GitHub release if available, builds locally if not
+          sudo ./target/release/fcvm setup --inception
       - name: test-root
         working-directory: fcvm
         run: make test-root
