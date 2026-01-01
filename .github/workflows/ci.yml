@@ -174,16 +174,15 @@ jobs:
           sudo mv /usr/local/bin/firecracker-v1.14.0-aarch64 /usr/local/bin/firecracker
           sudo mv /usr/local/bin/jailer-v1.14.0-aarch64 /usr/local/bin/jailer
       - name: Install cargo tools
-        # cargo-audit >= 0.22.0 required for CVSS 4.0 support
-        # Use --force to override any stale cached versions
+        # Skip if already installed (self-hosted runners persist tools)
         # Create symlinks in /usr/local/bin so sudo can find cargo tools
         run: |
-          cargo install cargo-nextest@0.9.115 cargo-audit@0.22.0 cargo-deny@0.18.9 --locked --force
-          sudo ln -sf $HOME/.cargo/bin/cargo /usr/local/bin/
+          which cargo-nextest || cargo install cargo-nextest@0.9.115 --locked
+          which cargo-audit || cargo install cargo-audit@0.22.0 --locked
+          which cargo-deny || cargo install cargo-deny@0.18.9 --locked
+          sudo ln -sf $HOME/.cargo/bin/cargo-nextest /usr/local/bin/
           sudo ln -sf $HOME/.cargo/bin/cargo-audit /usr/local/bin/
           sudo ln -sf $HOME/.cargo/bin/cargo-deny /usr/local/bin/
-          sudo ln -sf $HOME/.cargo/bin/cargo-fmt /usr/local/bin/
-          sudo ln -sf $HOME/.cargo/bin/cargo-clippy /usr/local/bin/
       - name: Setup KVM and networking
         run: |
           sudo chmod 666 /dev/kvm
