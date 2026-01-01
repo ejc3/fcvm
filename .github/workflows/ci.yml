@@ -66,7 +66,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin
-          key: cargo-tools-${{ runner.os }}-audit-0.22-deny-0.18
+          key: cargo-tools-${{ runner.os }}-${{ runner.arch }}-audit-0.22.0-deny-0.18.9
       - name: Install cargo tools
         run: |
           which cargo-audit || cargo install cargo-audit@0.22.0 --locked
@@ -173,8 +173,13 @@ jobs:
             release-v1.14.0-aarch64/jailer-v1.14.0-aarch64
           sudo mv /usr/local/bin/firecracker-v1.14.0-aarch64 /usr/local/bin/firecracker
           sudo mv /usr/local/bin/jailer-v1.14.0-aarch64 /usr/local/bin/jailer
+      - name: Cache cargo tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: cargo-tools-${{ runner.os }}-${{ runner.arch }}-nextest-0.9.115-audit-0.22-deny-0.18
       - name: Install cargo tools
-        # Skip if already installed (self-hosted runners persist tools)
+        # Skip if already cached
         # Create symlinks in /usr/local/bin so sudo can find cargo tools
         run: |
           which cargo-nextest || cargo install cargo-nextest@0.9.115 --locked
