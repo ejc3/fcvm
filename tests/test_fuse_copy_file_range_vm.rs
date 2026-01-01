@@ -13,82 +13,10 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::Stdio;
 
-// Reuse inception kernel functions from test_kvm.rs
-const KERNEL_VERSION: &str = "6.12.10";
-const KERNEL_DIR: &str = "/mnt/fcvm-btrfs/kernels";
-
-/// Compute inception kernel path from build script contents
-fn inception_kernel_path() -> Result<PathBuf> {
-    use sha2::{Digest, Sha256};
-
-    let kernel_dir = std::path::Path::new("kernel");
-    let mut content = Vec::new();
-
-    // Read build.sh
-    let script = kernel_dir.join("build.sh");
-    if script.exists() {
-        content.extend(std::fs::read(&script)?);
-    }
-
-    // Read inception.conf
-    let conf = kernel_dir.join("inception.conf");
-    if conf.exists() {
-        content.extend(std::fs::read(&conf)?);
-    }
-
-    // Read patches/*.patch (sorted)
-    let patches_dir = kernel_dir.join("patches");
-    if patches_dir.exists() {
-        let mut patches: Vec<_> = std::fs::read_dir(&patches_dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "patch"))
-            .collect();
-        patches.sort_by_key(|e| e.path());
-        for patch in patches {
-            content.extend(std::fs::read(patch.path())?);
-        }
-    }
-
-    // Compute SHA (first 12 hex chars)
-    let mut hasher = Sha256::new();
-    hasher.update(&content);
-    let hash = hasher.finalize();
-    let sha = hex::encode(&hash[..6]);
-
-    Ok(PathBuf::from(KERNEL_DIR).join(format!("vmlinux-{}-{}.bin", KERNEL_VERSION, sha)))
-}
-
-/// Ensure inception kernel exists, building it if necessary
+/// Ensure inception kernel exists (downloads from release or builds locally)
 async fn ensure_inception_kernel() -> Result<PathBuf> {
-    let kernel_path = inception_kernel_path()?;
-
-    if kernel_path.exists() {
-        println!("✓ Inception kernel found: {}", kernel_path.display());
-        return Ok(kernel_path);
-    }
-
-    println!("Building inception kernel: {}", kernel_path.display());
-    println!("  This may take 10-20 minutes on first run...");
-
-    let status = tokio::process::Command::new("./kernel/build.sh")
-        .env("KERNEL_PATH", &kernel_path)
-        .status()
-        .await
-        .context("running kernel/build.sh")?;
-
-    if !status.success() {
-        anyhow::bail!("Kernel build failed with exit code: {:?}", status.code());
-    }
-
-    if !kernel_path.exists() {
-        anyhow::bail!(
-            "Kernel build completed but file not found: {}",
-            kernel_path.display()
-        );
-    }
-
-    println!("✓ Kernel built: {}", kernel_path.display());
-    Ok(kernel_path)
+    // Use the library function which downloads from GitHub releases first
+    fcvm::setup::ensure_inception_kernel(true).await
 }
 
 /// Test copy_file_range through FUSE inside a VM with the patched kernel.
