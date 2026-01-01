@@ -155,9 +155,8 @@ main() {
   # Create user data
   user_data_file=$(mktemp)
   create_user_data > "$user_data_file"
-  user_data_b64=$(base64 -w0 "$user_data_file")
 
-  # Launch instance
+  # Launch instance (AWS CLI base64-encodes file:// automatically)
   instance_id=$(aws ec2 run-instances \
     --region "$REGION" \
     --image-id "$base_ami" \
@@ -167,7 +166,7 @@ main() {
     --iam-instance-profile Name=jumpbox-admin-profile \
     --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":100,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
     --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=ami-builder-temp},{Key=BuildStatus,Value=starting}]' \
-    --user-data "$user_data_b64" \
+    --user-data "file://$user_data_file" \
     --query 'Instances[0].InstanceId' \
     --output text)
   echo "Launched instance: $instance_id"
