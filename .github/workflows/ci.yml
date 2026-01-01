@@ -196,6 +196,8 @@ jobs:
           sudo sysctl -w vm.unprivileged_userfaultfd=1
           # Enable FUSE allow_other for tests
           echo "user_allow_other" | sudo tee /etc/fuse.conf
+          # Reset podman state if corrupted from previous runs
+          podman system migrate || true
       - name: Create test log directory
         run: mkdir -p /tmp/fcvm-test-logs
       - name: Clean test data
