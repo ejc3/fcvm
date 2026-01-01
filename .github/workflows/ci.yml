@@ -237,6 +237,8 @@ jobs:
     name: Container
     if: ${{ github.event.inputs.job != 'host' }}
     runs-on: [self-hosted, Linux, ARM64]
+    permissions:
+      packages: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -251,6 +253,8 @@ jobs:
           repository: ejc3/fuser
           ref: master
           path: fuser
+      - name: Login to ghcr.io
+        run: echo "${{ github.token }}" | podman login ghcr.io -u ${{ github.actor }} --password-stdin
       - name: Setup KVM and rootless podman
         run: |
           sudo chmod 666 /dev/kvm
