@@ -78,6 +78,10 @@ apt-get install -y nodejs
 
 # Rust
 sudo -u ubuntu bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
+# Symlinks so cargo works under sudo
+ln -sf /home/ubuntu/.cargo/bin/cargo /usr/local/bin/cargo
+ln -sf /home/ubuntu/.cargo/bin/rustc /usr/local/bin/rustc
+ln -sf /home/ubuntu/.cargo/bin/rustup /usr/local/bin/rustup
 
 # Firecracker
 FIRECRACKER_VERSION="v1.14.0"
