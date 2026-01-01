@@ -31,8 +31,18 @@ const MIN_FIRECRACKER_VERSION: (u32, u32, u32) = (1, 13, 1);
 ///
 /// Returns the path to the Firecracker binary if it exists and meets minimum version requirements.
 /// Fails with a clear error if Firecracker is not found or version is too old.
+///
+/// Checks `FCVM_FIRECRACKER_BIN` env var first, then falls back to PATH lookup.
 pub fn find_firecracker() -> Result<std::path::PathBuf> {
-    let firecracker_bin = which::which("firecracker").context("firecracker not found in PATH")?;
+    let firecracker_bin = if let Ok(path) = std::env::var("FCVM_FIRECRACKER_BIN") {
+        let p = std::path::PathBuf::from(&path);
+        if !p.exists() {
+            anyhow::bail!("FCVM_FIRECRACKER_BIN={} does not exist", path);
+        }
+        p
+    } else {
+        which::which("firecracker").context("firecracker not found in PATH")?
+    };
 
     // Check version
     let output = std::process::Command::new(&firecracker_bin)

@@ -50,9 +50,17 @@ async fn ensure_inception_kernel() -> Result<PathBuf> {
     fcvm::setup::ensure_inception_kernel(true).await
 }
 
-/// Check if Firecracker supports --enable-nv2 flag
-async fn firecracker_has_nv2() -> bool {
-    let output = tokio::process::Command::new("firecracker")
+/// Path where NV2 firecracker fork is installed (separate from system firecracker)
+const FIRECRACKER_NV2_PATH: &str = "/usr/local/bin/firecracker-nv2";
+
+/// Check if NV2 Firecracker binary exists and supports --enable-nv2 flag
+async fn firecracker_nv2_exists() -> bool {
+    let path = std::path::Path::new(FIRECRACKER_NV2_PATH);
+    if !path.exists() {
+        return false;
+    }
+
+    let output = tokio::process::Command::new(FIRECRACKER_NV2_PATH)
         .arg("--help")
         .output()
         .await;
@@ -63,10 +71,12 @@ async fn firecracker_has_nv2() -> bool {
     }
 }
 
-/// Ensure Firecracker with NV2 support is installed
+/// Ensure Firecracker with NV2 support is installed at FIRECRACKER_NV2_PATH
+/// Also sets FCVM_FIRECRACKER_BIN env var so fcvm uses it
 async fn ensure_firecracker_nv2() -> Result<()> {
-    if firecracker_has_nv2().await {
-        println!("✓ Firecracker with NV2 support found");
+    if firecracker_nv2_exists().await {
+        println!("✓ Firecracker with NV2 support found at {}", FIRECRACKER_NV2_PATH);
+        std::env::set_var("FCVM_FIRECRACKER_BIN", FIRECRACKER_NV2_PATH);
         return Ok(());
     }
 
@@ -85,7 +95,7 @@ async fn ensure_firecracker_nv2() -> Result<()> {
         .context("acquiring exclusive lock for firecracker build")?;
 
     // Double-check after acquiring lock - another process may have built it
-    if firecracker_has_nv2().await {
+    if firecracker_nv2_exists().await {
         println!("✓ Firecracker with NV2 support found (built by another process)");
         let _ = flock.unlock();
         return Ok(());
@@ -171,25 +181,26 @@ async fn ensure_firecracker_nv2() -> Result<()> {
         }
     }
 
-    println!("  Installing Firecracker to /usr/local/bin...");
+    println!("  Installing Firecracker to {}...", FIRECRACKER_NV2_PATH);
     let status = tokio::process::Command::new("cp")
-        .args([binary.to_str().unwrap(), "/usr/local/bin/firecracker"])
+        .args([binary.to_str().unwrap(), FIRECRACKER_NV2_PATH])
         .status()
         .await
         .context("installing Firecracker")?;
 
     if !status.success() {
-        bail!("Failed to install Firecracker");
+        bail!("Failed to install Firecracker to {}", FIRECRACKER_NV2_PATH);
     }
 
     // Verify installation
-    if !firecracker_has_nv2().await {
+    if !firecracker_nv2_exists().await {
         let _ = flock.unlock();
         bail!("Firecracker installed but --enable-nv2 flag not found");
     }
 
     let _ = flock.unlock();
-    println!("✓ Firecracker with NV2 support installed");
+    std::env::set_var("FCVM_FIRECRACKER_BIN", FIRECRACKER_NV2_PATH);
+    println!("✓ Firecracker with NV2 support installed at {}", FIRECRACKER_NV2_PATH);
     Ok(())
 }
 
@@ -644,12 +655,11 @@ async fn ensure_inception_image() -> Result<()> {
     // All inputs that affect the container image
     let src_fcvm = fcvm_dir.join("fcvm");
     let src_agent = fcvm_dir.join("fc-agent");
-    // NV2 firecracker fork is REQUIRED for inception tests - no fallbacks
-    let src_firecracker =
-        PathBuf::from("/home/ubuntu/firecracker/build/cargo_target/release/firecracker");
+    // NV2 firecracker fork - installed by ensure_firecracker_nv2()
+    let src_firecracker = PathBuf::from(FIRECRACKER_NV2_PATH);
     if !src_firecracker.exists() {
         bail!(
-            "NV2 firecracker fork not found at {}. Run 'make build-firecracker-nv2' first.",
+            "NV2 firecracker fork not found at {}. ensure_firecracker_nv2() should have installed it.",
             src_firecracker.display()
         );
     }
