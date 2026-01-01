@@ -224,6 +224,9 @@ jobs:
       - name: test-fast
         working-directory: fcvm
         run: make test-fast
+      - name: Build inception kernel
+        working-directory: fcvm
+        run: ./kernel/build.sh
       - name: test-root
         working-directory: fcvm
         run: make test-root
