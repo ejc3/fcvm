@@ -73,7 +73,8 @@ echo ""
 echo "Step 1b: Generate config (required for installed binary)"
 # When running from an isolated location, we need to generate the config
 # This downloads kernel/rootfs and creates rootfs-config.toml
-sudo "$FCVM" setup --generate-config
+# Use --force to overwrite any existing config from previous runs
+sudo "$FCVM" setup --generate-config --force
 echo "PASS: Config generated"
 
 echo ""
