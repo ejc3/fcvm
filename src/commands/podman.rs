@@ -763,8 +763,42 @@ async fn run_vm_setup(
                 info!(holder_pid = holder_pid, "namespace holder started");
             }
 
-            // Give holder a moment to potentially fail, then check status
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Wait for namespace to be ready by testing nsenter directly
+            // The holder runs: unshare -> write uid_map/gid_map -> exec sleep -> sleep syscall
+            // setns() fails with EINVAL until this sequence completes, so we just retry.
+            let ready_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            let mut wait_iterations = 0u32;
+            loop {
+                wait_iterations += 1;
+                let probe = tokio::process::Command::new("nsenter")
+                    .args(["-t", &holder_pid.to_string(), "-U", "-n", "--preserve-credentials", "--", "true"])
+                    .output()
+                    .await;
+                match probe {
+                    Ok(output) if output.status.success() => {
+                        debug!(holder_pid = holder_pid, iterations = wait_iterations, "namespace ready (nsenter probe succeeded)");
+                        break;
+                    }
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        if !stderr.contains("Invalid argument") {
+                            // Some other error - don't retry
+                            warn!(holder_pid = holder_pid, stderr = %stderr.trim(), "nsenter probe failed with unexpected error");
+                            break;
+                        }
+                        // EINVAL means namespace not ready yet, retry
+                    }
+                    Err(e) => {
+                        warn!(holder_pid = holder_pid, error = %e, "nsenter probe spawn failed");
+                        break;
+                    }
+                }
+                if std::time::Instant::now() >= ready_deadline {
+                    warn!(holder_pid = holder_pid, iterations = wait_iterations, "namespace not ready after 500ms");
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
 
             // Take stderr pipe - we'll use it for diagnostics if holder dies later
             let mut holder_stderr = child.stderr.take();
@@ -808,16 +842,12 @@ async fn run_vm_setup(
                     }
                 }
                 Ok(None) => {
-                    debug!(holder_pid = holder_pid, "holder still running after 50ms");
+                    debug!(holder_pid = holder_pid, "holder running");
                 }
                 Err(e) => {
                     warn!(holder_pid = holder_pid, error = ?e, "failed to check holder status");
                 }
             }
-
-            // Additional delay for namespace setup
-            // The --map-root-user option invokes setuid helpers asynchronously
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             // Check if holder is still alive before proceeding
             if !crate::utils::is_process_alive(holder_pid) {

@@ -950,6 +950,39 @@ async fn run_clone_setup(
         let holder_pid = child.id().context("getting holder process PID")?;
         info!(holder_pid = holder_pid, "namespace holder started");
 
+        // Wait for namespace to be ready by testing nsenter directly
+        // The holder runs: unshare -> write uid_map/gid_map -> exec sleep -> sleep syscall
+        // setns() fails with EINVAL until this sequence completes, so we just retry.
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            let probe = tokio::process::Command::new("nsenter")
+                .args(["-t", &holder_pid.to_string(), "-U", "-n", "--preserve-credentials", "--", "true"])
+                .output()
+                .await;
+            match probe {
+                Ok(output) if output.status.success() => {
+                    debug!(holder_pid = holder_pid, "namespace ready (nsenter probe succeeded)");
+                    break;
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if !stderr.contains("Invalid argument") {
+                        warn!(holder_pid = holder_pid, stderr = %stderr.trim(), "nsenter probe failed with unexpected error");
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!(holder_pid = holder_pid, error = %e, "nsenter probe spawn failed");
+                    break;
+                }
+            }
+            if std::time::Instant::now() >= ready_deadline {
+                warn!(holder_pid = holder_pid, "namespace not ready after 500ms");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
         // Step 2: Run disk creation and network setup IN PARALLEL
         // This saves ~16ms by overlapping these independent operations
         let setup_script = slirp_net.build_setup_script();
