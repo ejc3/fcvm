@@ -192,6 +192,9 @@ jobs:
           echo "user_allow_other" | sudo tee /etc/fuse.conf
       - name: Create test log directory
         run: mkdir -p /tmp/fcvm-test-logs
+      - name: Clean test data
+        working-directory: fcvm
+        run: make clean-test-data || true
       - name: test-unit
         working-directory: fcvm
         run: make test-unit
@@ -260,6 +263,9 @@ jobs:
           restore-keys: container-cargo-
       - name: Create test log directory
         run: mkdir -p /tmp/fcvm-test-logs
+      - name: Clean test data
+        working-directory: fcvm
+        run: make clean-test-data || true
       - name: container-test-unit
         env:
           CARGO_CACHE_DIR: ${{ github.workspace }}/cargo-cache
