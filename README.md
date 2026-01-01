@@ -640,6 +640,18 @@ CI runs on self-hosted ARM64 runners (c7g.metal spot instances) managed by [ejc3
 - **Hardware**: c7g.metal with /dev/kvm for VM tests
 - **Cost**: ~$0.50/hr spot pricing, $0 when idle
 
+### Claude Code Review
+
+PRs are automatically reviewed by Claude. Reviews are blocking if critical issues are found.
+
+| Trigger | Description |
+|---------|-------------|
+| **Auto** | PRs from org members are reviewed automatically |
+| `/claude-review` | Comment on any PR to trigger manual review |
+| `@claude ...` | Ask Claude questions in PR comments |
+
+Reviews check for security issues, bugs, and breaking changes. Issues prefixed with `BLOCKING:` will fail the status check.
+
 ---
 
 ## License
