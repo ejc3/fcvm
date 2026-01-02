@@ -211,13 +211,11 @@ fn protocol_file_type_to_fuser(ft: u8) -> FileType {
     }
 }
 
-/// Default max_write size for FUSE operations (32KB).
+/// Default max_write size for FUSE operations (0 = unbounded, use kernel default).
 ///
-/// Under nested virtualization (FUSE-over-FUSE in L2), larger writes cause
+/// For nested virtualization (L2 VMs), set FCVM_FUSE_MAX_WRITE=32768 to avoid
 /// vsock data loss due to cache coherency issues in double Stage 2 translation.
-/// Raw vsock works fine with larger packets, but FUSE adds memory pressure
-/// that triggers the corruption.
-const DEFAULT_FUSE_MAX_WRITE: u32 = 32 * 1024;
+const DEFAULT_FUSE_MAX_WRITE: u32 = 0;
 
 impl Filesystem for FuseClient {
     fn init(

@@ -1124,7 +1124,7 @@ podman load -i /mnt/fcvm-btrfs/image-cache/{digest}.oci.tar
 podman tag sha256:{digest} localhost/nested-test 2>/dev/null || true
 
 echo "L{level}: Starting L{next_level} VM..."
-FCVM_FUSE_TRACE_RATE=100 fcvm podman run \
+FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE=32768 fcvm podman run \
     --name l{next_level} \
     --network bridged \
     --privileged \
@@ -1157,7 +1157,7 @@ podman load -i /mnt/fcvm-btrfs/image-cache/{digest}.oci.tar
 podman tag sha256:{digest} localhost/nested-test 2>/dev/null || true
 
 echo "L{level}: Starting L{next_level} VM..."
-FCVM_FUSE_TRACE_RATE=100 fcvm podman run \
+FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE=32768 fcvm podman run \
     --name l{next_level} \
     --network bridged \
     --privileged \
@@ -1405,4 +1405,32 @@ async fn test_podman_load_over_fuse() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Known failure: L2 FUSE-over-FUSE corrupts with unbounded max_write.
+///
+/// This test documents the corruption that occurs when FCVM_FUSE_MAX_WRITE is
+/// not set (unbounded). Under NV2 nested virtualization, large FUSE writes
+/// (~1MB+) cause vsock data loss due to cache coherency issues in double
+/// Stage 2 translation.
+///
+/// Symptoms:
+/// - STREAM CORRUPTION: zero-length message after ~7MB transferred
+/// - Raw vsock works fine with 2MB packets (4480/4480 tests pass)
+/// - Only FUSE-over-FUSE path triggers corruption
+///
+/// Workaround: Set FCVM_FUSE_MAX_WRITE=32768 for L2 VMs (done in other tests).
+#[ignore = "documents known L2 corruption with unbounded max_write - see FCVM_FUSE_MAX_WRITE"]
+#[tokio::test]
+async fn test_nested_l2_unbounded_fuse_corrupts() -> Result<()> {
+    // This test would run L2 without FCVM_FUSE_MAX_WRITE limit.
+    // It's expected to fail with vsock data loss.
+    //
+    // To investigate the corruption, run manually:
+    //   FCVM_FUSE_MAX_WRITE=0 make test-root FILTER=nested_l2_with_large
+    //
+    // Error will be:
+    //   STREAM CORRUPTION: zero-length message (vsock data loss?)
+    //   count=61 total_bytes_read=7343452 last_len=1048645
+    bail!("This test intentionally fails to document known corruption")
 }
