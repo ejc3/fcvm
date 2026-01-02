@@ -264,11 +264,12 @@ async fn ensure_firecracker_nv2() -> Result<()> {
         .await
         .context("getting built commit SHA")?;
 
-    let sha = String::from_utf8_lossy(&built_sha.stdout).trim().to_string();
+    let sha = String::from_utf8_lossy(&built_sha.stdout)
+        .trim()
+        .to_string();
 
     // Write SHA file (content-addressed cache marker)
-    std::fs::write(FIRECRACKER_NV2_SHA_PATH, &sha)
-        .context("writing SHA file")?;
+    std::fs::write(FIRECRACKER_NV2_SHA_PATH, &sha).context("writing SHA file")?;
 
     println!("  Built from commit {}", &sha[..12]);
 
