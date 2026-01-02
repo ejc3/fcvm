@@ -553,7 +553,10 @@ async fn build_kernel_locally(
 // ============================================================================
 
 /// Install profile kernel as the host kernel and configure GRUB.
-pub async fn install_host_kernel(profile_kernel: &Path) -> Result<()> {
+///
+/// `boot_args` are the kernel boot parameters from the profile config
+/// (e.g., "kvm-arm.mode=nested numa=off"). These are added to GRUB_CMDLINE_LINUX_DEFAULT.
+pub async fn install_host_kernel(profile_kernel: &Path, boot_args: Option<&str>) -> Result<()> {
     if !nix::unistd::geteuid().is_root() {
         bail!("Installing host kernel requires root privileges. Run with sudo.");
     }
@@ -588,7 +591,7 @@ pub async fn install_host_kernel(profile_kernel: &Path) -> Result<()> {
 
     println!("  → Installed kernel to {}", boot_path.display());
 
-    update_grub_config(&kernel_name).await?;
+    update_grub_config(&kernel_name, boot_args).await?;
 
     println!("  → Running update-grub...");
     let output = Command::new("update-grub")
@@ -608,7 +611,7 @@ pub async fn install_host_kernel(profile_kernel: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn update_grub_config(kernel_name: &str) -> Result<()> {
+async fn update_grub_config(kernel_name: &str, boot_args: Option<&str>) -> Result<()> {
     let grub_default = Path::new("/etc/default/grub");
 
     if !grub_default.exists() {
@@ -624,15 +627,27 @@ async fn update_grub_config(kernel_name: &str) -> Result<()> {
 
     for line in content.lines() {
         if line.starts_with("GRUB_CMDLINE_LINUX_DEFAULT=") {
-            if !line.contains("kvm-arm.mode=nested") {
-                let new_line = if line.contains("=\"\"") {
-                    line.replace("=\"\"", "=\"kvm-arm.mode=nested\"")
+            // Add boot_args from profile if provided
+            if let Some(args) = boot_args {
+                // Check if any of the args are already present
+                let args_to_add: Vec<&str> = args
+                    .split_whitespace()
+                    .filter(|arg| !line.contains(arg))
+                    .collect();
+
+                if !args_to_add.is_empty() {
+                    let args_str = args_to_add.join(" ");
+                    let new_line = if line.contains("=\"\"") {
+                        line.replace("=\"\"", &format!("=\"{}\"", args_str))
+                    } else {
+                        line.replacen("=\"", &format!("=\"{} ", args_str), 1)
+                    };
+                    new_lines.push(new_line);
+                    modified = true;
+                    println!("  → Added boot args: {}", args_str);
                 } else {
-                    line.replacen("=\"", "=\"kvm-arm.mode=nested ", 1)
-                };
-                new_lines.push(new_line);
-                modified = true;
-                println!("  → Added kvm-arm.mode=nested");
+                    new_lines.push(line.to_string());
+                }
             } else {
                 new_lines.push(line.to_string());
             }
