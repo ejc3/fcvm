@@ -197,6 +197,21 @@ jobs:
           sudo ln -sf $HOME/.cargo/bin/cargo-deny /usr/local/bin/
       - name: Setup KVM and networking
         run: |
+          # Print kernel version and check for nested virtualization support
+          echo "=== Host Kernel Info ==="
+          uname -a
+          cat /proc/cmdline
+          echo ""
+          echo "=== KVM Capabilities ==="
+          cat /sys/module/kvm/parameters/mode 2>/dev/null || echo "kvm mode param not available"
+          # Check if nested virt is available (NV2 on ARM64)
+          if grep -q "kvm-arm.mode=nested" /proc/cmdline; then
+            echo "✓ Nested virtualization ENABLED (kvm-arm.mode=nested)"
+          else
+            echo "⚠ Nested virtualization NOT enabled in kernel cmdline"
+            echo "  Inception tests will fail - add kvm-arm.mode=nested to GRUB_CMDLINE_LINUX"
+          fi
+          echo ""
           sudo chmod 666 /dev/kvm
           sudo mkdir -p /var/run/netns
           sudo iptables -P FORWARD ACCEPT
