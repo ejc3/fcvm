@@ -55,6 +55,15 @@ const FIRECRACKER_NV2_PATH: &str = "/usr/local/bin/firecracker-nv2";
 /// SHA file to track which commit the binary was built from
 const FIRECRACKER_NV2_SHA_PATH: &str = "/usr/local/bin/firecracker-nv2.sha";
 
+/// Set environment variables for inception mode (nested virtualization).
+/// Called before spawning fcvm with an inception kernel.
+fn set_inception_env() {
+    std::env::set_var("FCVM_FIRECRACKER_BIN", FIRECRACKER_NV2_PATH);
+    std::env::set_var("FCVM_FIRECRACKER_ARGS", "--enable-nv2");
+    std::env::set_var("FCVM_BOOT_ARGS", "kvm-arm.mode=nested numa=off arm64.nv2");
+    std::env::set_var("FCVM_FUSE_READERS", "64");
+}
+
 /// Get the HEAD SHA of the remote branch (without cloning)
 async fn get_remote_branch_sha() -> Result<String> {
     let output = tokio::process::Command::new("git")
@@ -289,6 +298,7 @@ async fn test_kvm_available_in_vm() -> Result<()> {
     // Ensure prerequisites are installed
     ensure_firecracker_nv2().await?;
     let inception_kernel = ensure_inception_kernel().await?;
+    set_inception_env();
 
     let fcvm_path = common::find_fcvm_binary()?;
     let (vm_name, _, _, _) = common::unique_names("inception-kvm");
@@ -467,6 +477,7 @@ async fn test_inception_run_fcvm_inside_vm() -> Result<()> {
     // Ensure prerequisites are installed
     ensure_firecracker_nv2().await?;
     let inception_kernel = ensure_inception_kernel().await?;
+    set_inception_env();
 
     let fcvm_path = common::find_fcvm_binary()?;
     let fcvm_dir = fcvm_path.parent().unwrap();
@@ -897,6 +908,7 @@ async fn run_inception_chain(total_levels: usize) -> Result<()> {
     ensure_firecracker_nv2().await?;
     let inception_kernel = ensure_inception_kernel().await?;
     ensure_inception_image().await?;
+    set_inception_env();
 
     let fcvm_path = common::find_fcvm_binary()?;
     let kernel_str = inception_kernel

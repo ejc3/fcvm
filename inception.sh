@@ -55,7 +55,12 @@ echo "[L${LEVEL}] Starting nested VM (L${NEXT}) with ${READERS} FUSE readers and
 
 # fcvm now automatically puts sockets in /tmp/fcvm-sockets (local) and
 # disks in data_dir (FUSE). No loopback btrfs needed!
-FCVM_NV2=1 FCVM_FUSE_READERS=$READERS /usr/local/bin/fcvm podman run \
+# Generic env vars: FCVM_FIRECRACKER_BIN, FCVM_FIRECRACKER_ARGS, FCVM_BOOT_ARGS
+FCVM_FIRECRACKER_BIN=/usr/local/bin/firecracker-nv2 \
+FCVM_FIRECRACKER_ARGS="--enable-nv2" \
+FCVM_BOOT_ARGS="kvm-arm.mode=nested numa=off arm64.nv2" \
+FCVM_FUSE_READERS=$READERS \
+/usr/local/bin/fcvm podman run \
     --name "inception-L${NEXT}-$$" \
     --network bridged \
     --kernel "$KERNEL" \
