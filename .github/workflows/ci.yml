@@ -166,7 +166,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y fuse3 libfuse3-dev libclang-dev clang musl-tools \
             iproute2 iptables slirp4netns dnsmasq qemu-utils e2fsprogs parted \
-            podman skopeo busybox-static cpio zstd autoconf automake libtool cmake
+            podman skopeo busybox-static cpio zstd autoconf automake libtool cmake \
+            libseccomp-dev
       - name: Install Firecracker
         run: |
           curl -L -o /tmp/firecracker.tgz \
