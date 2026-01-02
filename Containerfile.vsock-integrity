@@ -1,15 +1,17 @@
 # Vsock integrity test container
 #
-# Tests whether large vsock writes get corrupted under NV2 nested virtualization.
+# Builds on localhost/nested-test (which has fcvm) and adds vsock-integrity binary.
 #
 # Build:
+#   # First build nested-test if not exists
+#   podman build -t localhost/nested-test -f Containerfile.nested .
+#   # Then build this
 #   podman build -t localhost/vsock-integrity -f Containerfile.vsock-integrity .
 #
-# Run in nested VM:
-#   fcvm podman run --name vsock-test --network bridged localhost/vsock-integrity
-#
-# On host, start echo server first:
-#   ./vsock-integrity server /tmp/vsock-echo.sock
+# Test flow:
+#   1. Host starts L1 with this container
+#   2. L1 runs echo server + starts L2
+#   3. L2 runs vsock client, tests data integrity
 
 FROM docker.io/library/rust:1.83-slim AS builder
 
@@ -17,10 +19,14 @@ WORKDIR /build
 COPY tests/vsock-integrity/ .
 RUN cargo build --release
 
-FROM docker.io/library/debian:bookworm-slim
+FROM localhost/nested-test
 
+# Add vsock-integrity binary
 COPY --from=builder /build/target/release/vsock-integrity /usr/local/bin/
 
-# Default: run client connecting to host vsock (CID 2, port 9999)
-ENTRYPOINT ["/usr/local/bin/vsock-integrity"]
-CMD ["client-vsock", "2", "9999"]
+# Add test script
+COPY tests/vsock-integrity/run-test.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/run-test.sh
+
+# Default: run the vsock integrity test
+ENTRYPOINT ["/usr/local/bin/run-test.sh"]

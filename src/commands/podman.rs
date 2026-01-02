@@ -556,7 +556,16 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     // Generate vsock socket base path for volume servers
     // Firecracker binds to vsock.sock, VolumeServers listen on vsock.sock_{port}
-    let vsock_socket_path = data_dir.join("vsock.sock");
+    // Use custom vsock_dir if provided (for predictable socket paths)
+    let vsock_socket_path = if let Some(ref vsock_dir) = args.vsock_dir {
+        let vsock_dir = std::path::PathBuf::from(vsock_dir);
+        tokio::fs::create_dir_all(&vsock_dir)
+            .await
+            .with_context(|| format!("creating vsock dir: {:?}", vsock_dir))?;
+        vsock_dir.join("vsock.sock")
+    } else {
+        data_dir.join("vsock.sock")
+    };
 
     // Build VolumeConfigs and spawn VolumeServers BEFORE the VM starts
     // Each VolumeServer listens on vsock.sock_{port} (e.g., vsock.sock_5000)
