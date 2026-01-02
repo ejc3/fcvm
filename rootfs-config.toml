@@ -152,6 +152,19 @@ description = "Nested virtualization support for running VMs inside VMs"
 kernel_version = "6.18"
 kernel_repo = "ejc3/firepod"
 
+# Build configuration - these files determine when kernel needs rebuilding
+# SHA is computed from contents of all files matching these patterns
+build_inputs = [
+    "kernel/build.sh",
+    "kernel/nested.conf",
+    "kernel/patches/*.patch",
+]
+
+# Build paths (relative to repo root)
+build_script = "kernel/build.sh"
+kernel_config = "kernel/nested.conf"
+patches_dir = "kernel/patches"
+
 # Firecracker NV2 fork with --enable-nv2 support
 firecracker_bin = "/usr/local/bin/firecracker-nv2"
 firecracker_repo = "ejc3/firecracker"

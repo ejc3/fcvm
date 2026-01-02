@@ -60,6 +60,24 @@ pub struct KernelProfile {
     #[serde(default)]
     pub kernel_repo: String,
 
+    /// Files to hash for kernel SHA (globs supported)
+    /// These files determine when the kernel needs to be rebuilt.
+    /// Example: ["kernel/build.sh", "kernel/nested.conf", "kernel/patches/*.patch"]
+    #[serde(default)]
+    pub build_inputs: Vec<String>,
+
+    /// Build script path (relative to repo root)
+    #[serde(default)]
+    pub build_script: Option<String>,
+
+    /// Kernel config file path (relative to repo root)
+    #[serde(default)]
+    pub kernel_config: Option<String>,
+
+    /// Patches directory (relative to repo root)
+    #[serde(default)]
+    pub patches_dir: Option<String>,
+
     // ========== Runtime overrides ==========
     /// Path to firecracker binary (default: system firecracker)
     #[serde(default)]
