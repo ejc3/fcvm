@@ -170,41 +170,32 @@ async fn ensure_firecracker_nv2() -> Result<()> {
 
     let build_dir = PathBuf::from("/tmp/firecracker-nv2-build");
 
-    // Clone or update the repo
+    // Always remove old build dir to ensure fresh clone with correct SHA
+    // (shallow clones don't update properly with fetch)
     if build_dir.exists() {
-        println!("  Updating existing repo...");
-        let status = tokio::process::Command::new("git")
-            .args(["fetch", "origin", FIRECRACKER_NV2_BRANCH])
-            .current_dir(&build_dir)
-            .status()
-            .await?;
-        if !status.success() {
-            // If fetch fails, remove and re-clone
-            tokio::fs::remove_dir_all(&build_dir).await?;
-        }
+        println!("  Removing stale build directory...");
+        tokio::fs::remove_dir_all(&build_dir).await?;
     }
 
-    if !build_dir.exists() {
-        println!("  Cloning {}...", FIRECRACKER_NV2_REPO);
-        let status = tokio::process::Command::new("git")
-            .args([
-                "clone",
-                "--depth=1",
-                "-b",
-                FIRECRACKER_NV2_BRANCH,
-                FIRECRACKER_NV2_REPO,
-                build_dir.to_str().unwrap(),
-            ])
-            .status()
-            .await
-            .context("cloning Firecracker repo")?;
+    println!("  Cloning {}...", FIRECRACKER_NV2_REPO);
+    let status = tokio::process::Command::new("git")
+        .args([
+            "clone",
+            "--depth=1",
+            "-b",
+            FIRECRACKER_NV2_BRANCH,
+            FIRECRACKER_NV2_REPO,
+            build_dir.to_str().unwrap(),
+        ])
+        .status()
+        .await
+        .context("cloning Firecracker repo")?;
 
-        if !status.success() {
-            bail!("Failed to clone Firecracker repo");
-        }
+    if !status.success() {
+        bail!("Failed to clone Firecracker repo");
     }
 
-    // Checkout the correct branch
+    // Checkout the correct branch (redundant after clone -b, but ensures clean state)
     let status = tokio::process::Command::new("git")
         .args(["checkout", FIRECRACKER_NV2_BRANCH])
         .current_dir(&build_dir)
