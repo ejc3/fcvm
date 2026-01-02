@@ -1,7 +1,7 @@
-# Custom Kernel Build for fcvm Inception
+# Custom Kernel Build for fcvm Nested Virtualization
 
 This directory contains the build infrastructure for a custom Linux kernel
-with both FUSE and KVM support, enabling fcvm-in-fcvm (inception).
+with both FUSE and KVM support, enabling fcvm-in-fcvm (nested virtualization).
 
 ## Requirements
 
@@ -9,7 +9,7 @@ Base: Firecracker's microvm kernel config for ARM64
 Additions:
 - CONFIG_FUSE_FS=y (required for fuse-pipe volumes)
 - CONFIG_VIRTUALIZATION=y
-- CONFIG_KVM=y (required for inception)
+- CONFIG_KVM=y (required for nested virtualization)
 
 ## Build Process
 

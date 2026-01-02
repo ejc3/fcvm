@@ -15,8 +15,8 @@ fn main() {
         }
     }
 
-    // Read kernel.conf
-    let conf = kernel_dir.join("kernel.conf");
+    // Read nested.conf
+    let conf = kernel_dir.join("nested.conf");
     if conf.exists() {
         if let Ok(data) = fs::read(&conf) {
             content.extend(data);
@@ -54,6 +54,6 @@ fn main() {
 
     // Rerun if kernel sources change
     println!("cargo:rerun-if-changed=kernel/build.sh");
-    println!("cargo:rerun-if-changed=kernel/kernel.conf");
+    println!("cargo:rerun-if-changed=kernel/nested.conf");
     println!("cargo:rerun-if-changed=kernel/patches");
 }

@@ -282,7 +282,7 @@ sudo fcvm podman run --name full \
 
 ---
 
-## Nested Virtualization (Inception)
+## Nested Virtualization
 
 fcvm supports running VMs inside VMs using ARM64 FEAT_NV2 nested virtualization. Currently **one level of nesting works**: Host → L1 VM with full KVM support.
 
@@ -290,7 +290,7 @@ fcvm supports running VMs inside VMs using ARM64 FEAT_NV2 nested virtualization.
 ┌─────────────────────────────────────────────────────────┐
 │  Host (bare metal c7g.metal)                            │
 │  ┌───────────────────────────────────────────────────┐  │
-│  │  Level 1 VM (fcvm + inception kernel)             │  │
+│  │  Level 1 VM (fcvm + nested kernel profile)        │  │
 │  │  - KVM works (/dev/kvm accessible)                │  │
 │  │  - Can run Firecracker VMs                        │  │
 │  │  - Nested VMs run containers                      │  │
@@ -306,10 +306,10 @@ fcvm supports running VMs inside VMs using ARM64 FEAT_NV2 nested virtualization.
 |-------------|---------|
 | **Hardware** | ARM64 with FEAT_NV2 (Graviton3+: c7g.metal, c7gn.metal, r7g.metal) |
 | **Host kernel** | 6.18+ with `kvm-arm.mode=nested` boot parameter |
-| **Inception kernel** | Pre-built from [releases](https://github.com/ejc3/firepod/releases) or build with `kernel/build.sh` |
-| **Firecracker** | Fork with NV2 support: `ejc3/firecracker:nv2-inception` |
+| **Nested kernel** | Pre-built from releases or build with `kernel/build.sh` |
+| **Firecracker** | Fork with NV2 support (configured via kernel profile) |
 
-### Setting Up an EC2 Instance for Inception
+### Setting Up an EC2 Instance for Nested Virtualization
 
 **Step 1: Launch a metal instance**
 
@@ -327,9 +327,9 @@ aws ec2 run-instances \
 # Install fcvm (or build from source)
 cargo install fcvm
 
-# Download inception kernel and install as host kernel
+# Download nested kernel profile and install as host kernel
 # This also configures GRUB with kvm-arm.mode=nested
-sudo fcvm setup --inception --install-host-kernel
+sudo fcvm setup --kernel-profile nested --install-host-kernel
 
 # Reboot into the new kernel
 sudo reboot
@@ -339,7 +339,7 @@ sudo reboot
 
 ```bash
 # Check kernel version
-uname -r  # Should show 6.18-inception
+uname -r  # Should show 6.18-nested
 
 # Check nested mode is enabled
 cat /sys/module/kvm/parameters/mode  # Should show "nested"
@@ -383,39 +383,39 @@ sudo reboot
 
 </details>
 
-### Getting the Inception Kernel
+### Getting the Nested Kernel
 
 > **Note**: If you followed "Setting Up an EC2 Instance" above, the kernel is already downloaded. This section is for users who already have a host with nested KVM enabled.
 
 ```bash
 # Download pre-built kernel from GitHub releases (~20MB)
-fcvm setup --inception
+fcvm setup --kernel-profile nested
 
-# Kernel will be at /mnt/fcvm-btrfs/kernels/vmlinux-inception-6.18-aarch64-*.bin
+# Kernel will be at /mnt/fcvm-btrfs/kernels/vmlinux-nested-6.18-aarch64-*.bin
 ```
 
 Or build locally (takes 10-20 minutes):
 ```bash
-fcvm setup --inception --build-kernels
+fcvm setup --kernel-profile nested --build-kernels
 # Or manually: ./kernel/build.sh
 ```
 
-The inception kernel (6.18) includes:
+The nested kernel (6.18) includes:
 - **CONFIG_KVM=y** - KVM hypervisor for nested virtualization
 - **EL2 support** - ARM Exception Level 2 (hypervisor mode)
 - **MMFR4 patch** - Enables `arm64.nv2` boot param for NV2 capability
 - **FUSE** - For volume mounts between host and guest
 - **Networking** - TUN/VETH/netfilter for bridged networking in nested VMs
 
-### Running Inception
+### Running Nested VMs
 
-**Step 1: Start outer VM with inception kernel**
+**Step 1: Start outer VM with nested kernel profile**
 ```bash
-# FCVM_NV2=1 is auto-set when --kernel flag is used
+# Uses nested kernel profile from rootfs-config.toml
 sudo fcvm podman run \
     --name outer-vm \
     --network bridged \
-    --kernel /mnt/fcvm-btrfs/kernels/vmlinux-inception-6.18-aarch64-*.bin \
+    --kernel-profile nested \
     --privileged \
     --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
     --map /path/to/fcvm/binary:/opt/fcvm \
@@ -436,7 +436,7 @@ fcvm exec --pid <outer_pid> --vm -- ls -la /dev/kvm
 ```bash
 # Inside outer VM (via exec or SSH)
 cd /mnt/fcvm-btrfs
-/opt/fcvm/fcvm podman run --name inner-vm --network bridged alpine:latest echo "Hello from inception!"
+/opt/fcvm/fcvm podman run --name inner-vm --network bridged alpine:latest echo "Hello from nested VM!"
 ```
 
 ### How It Works
@@ -450,15 +450,15 @@ cd /mnt/fcvm-btrfs
 5. Guest kernel initializes KVM: "CPU: All CPU(s) started at EL2"
 6. Nested fcvm creates VMs using the guest's KVM
 
-### Testing Inception
+### Testing Nested Virtualization
 
 ```bash
-# Run inception tests
-make test-root FILTER=inception
+# Run nested virtualization tests
+make test-root FILTER=kvm
 
 # Tests:
-# - test_kvm_available_in_vm: Verifies /dev/kvm works in guest
-# - test_inception_run_fcvm_inside_vm: Full inception (fcvm inside fcvm)
+# - test_kvm_available_in_vm: Verifies /dev/kvm works in guest with nested profile
+# - test_nested_run_fcvm_inside_vm: Full test of running fcvm inside fcvm
 ```
 
 ### Limitations
