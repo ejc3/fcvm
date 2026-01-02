@@ -571,7 +571,9 @@ pub async fn poll_health(
     child: &mut tokio::process::Child,
     timeout_secs: u64,
 ) -> anyhow::Result<()> {
-    let pid = child.id().ok_or_else(|| anyhow::anyhow!("child has no pid"))?;
+    let pid = child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("child has no pid"))?;
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
 
@@ -667,7 +669,9 @@ pub async fn poll_health_by_pid(pid: u32, timeout_secs: u64) -> anyhow::Result<(
             stale: bool,
         }
 
-        if let Ok(vms) = serde_json::from_str::<Vec<VmDisplay>>(&String::from_utf8_lossy(&output.stdout)) {
+        if let Ok(vms) =
+            serde_json::from_str::<Vec<VmDisplay>>(&String::from_utf8_lossy(&output.stdout))
+        {
             for d in &vms {
                 if matches!(d.vm.health_status, fcvm::state::HealthStatus::Healthy) {
                     return Ok(());
