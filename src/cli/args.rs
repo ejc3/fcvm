@@ -167,6 +167,12 @@ pub struct RunArgs {
     /// Must be set up first with: fcvm setup --kernel-profile <name>
     #[arg(long)]
     pub kernel_profile: Option<String>,
+
+    /// Directory for vsock socket (default: auto-generated in vm-disks)
+    /// Use this to create a predictable socket path for external listeners.
+    /// Example: --vsock-dir /tmp/myvm creates /tmp/myvm/vsock.sock
+    #[arg(long)]
+    pub vsock_dir: Option<String>,
 }
 
 // ============================================================================
