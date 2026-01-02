@@ -823,10 +823,7 @@ async fn ensure_nested_image() -> Result<()> {
     if !digest.is_empty() && digest.starts_with("sha256:") {
         // Use the same format as fcvm: strip sha256: prefix and use .oci.tar extension
         let digest_stripped = digest.trim_start_matches("sha256:");
-        let archive_path = format!(
-            "/mnt/fcvm-btrfs/image-cache/{}.oci.tar",
-            digest_stripped
-        );
+        let archive_path = format!("/mnt/fcvm-btrfs/image-cache/{}.oci.tar", digest_stripped);
 
         if !PathBuf::from(&archive_path).exists() {
             println!("Exporting to CAS cache: {}", archive_path);
@@ -998,10 +995,7 @@ except OSError as e:
     }
     // Strip sha256: prefix to match fcvm's cache path format
     let digest_stripped = image_digest.trim_start_matches("sha256:");
-    let image_cache_path = format!(
-        "/mnt/fcvm-btrfs/image-cache/{}.oci.tar",
-        digest_stripped
-    );
+    let image_cache_path = format!("/mnt/fcvm-btrfs/image-cache/{}.oci.tar", digest_stripped);
     println!("[Setup] Image digest: {}", image_digest);
     println!("[Setup] Cache path: {}", image_cache_path);
 

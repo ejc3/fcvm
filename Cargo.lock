@@ -602,6 +602,7 @@ dependencies = [
  "exec-proto",
  "fs2",
  "fuse-pipe",
+ "glob",
  "hex",
  "hyper 0.14.32",
  "hyperlocal",

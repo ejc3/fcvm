@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use glob::glob;
 use nix::fcntl::{Flock, FlockArg};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -6,10 +7,7 @@ use tokio::process::Command;
 use tracing::{debug, info, warn};
 
 use crate::paths;
-use crate::setup::rootfs::{get_kernel_profile, load_plan};
-
-/// Custom kernel SHA computed at compile time from kernel sources.
-const CUSTOM_KERNEL_SHA_COMPILED: &str = env!("CUSTOM_KERNEL_SHA");
+use crate::setup::rootfs::{get_kernel_profile, load_plan, KernelProfile};
 
 /// Compute SHA256 of bytes, return hex string (first 12 chars)
 fn compute_sha256_short(data: &[u8]) -> String {
@@ -181,7 +179,10 @@ async fn ensure_default_kernel(allow_create: bool) -> Result<PathBuf> {
     let extracted_path = cache_dir.join(&kernel_config.path);
     if !extracted_path.exists() {
         let _ = flock.unlock();
-        bail!("Kernel not found after extraction at {}", extracted_path.display());
+        bail!(
+            "Kernel not found after extraction at {}",
+            extracted_path.display()
+        );
     }
 
     tokio::fs::copy(&extracted_path, &kernel_path)
@@ -206,9 +207,8 @@ async fn ensure_default_kernel(allow_create: bool) -> Result<PathBuf> {
 // ============================================================================
 
 fn get_profile_kernel_path(profile_name: &str) -> Result<PathBuf> {
-    let profile = get_kernel_profile(profile_name)?.ok_or_else(|| {
-        anyhow::anyhow!("kernel profile '{}' not found in config", profile_name)
-    })?;
+    let profile = get_kernel_profile(profile_name)?
+        .ok_or_else(|| anyhow::anyhow!("kernel profile '{}' not found in config", profile_name))?;
 
     if !profile.is_custom() {
         bail!(
@@ -219,7 +219,7 @@ fn get_profile_kernel_path(profile_name: &str) -> Result<PathBuf> {
         );
     }
 
-    let sha = compute_custom_kernel_sha();
+    let sha = compute_profile_kernel_sha(&profile);
     let filename = custom_kernel_filename(profile_name, &profile.kernel_version, &sha);
     Ok(paths::kernel_dir().join(filename))
 }
@@ -247,7 +247,7 @@ async fn ensure_profile_kernel(
         );
     }
 
-    let sha = compute_custom_kernel_sha();
+    let sha = compute_profile_kernel_sha(&profile);
     let filename = custom_kernel_filename(profile_name, &profile.kernel_version, &sha);
     let kernel_dir = paths::kernel_dir();
     let kernel_path = kernel_dir.join(&filename);
@@ -329,7 +329,7 @@ async fn ensure_profile_kernel(
 
             if allow_build {
                 println!("  → Building locally (may take 10-20 minutes)...");
-                build_kernel_locally(profile_name, &kernel_path).await?;
+                build_kernel_locally(&profile, profile_name, &kernel_path).await?;
                 println!("  ✓ Kernel built (profile: {})", profile_name);
                 flock.unlock().map_err(|(_, err)| err)?;
                 Ok(kernel_path)
@@ -354,41 +354,49 @@ async fn ensure_profile_kernel(
 // Custom Kernel Helpers
 // ============================================================================
 
-/// Compute SHA for custom kernel based on build inputs.
-pub fn compute_custom_kernel_sha() -> String {
-    let kernel_dir = Path::new("kernel");
-
-    let script = kernel_dir.join("build.sh");
-    if !script.exists() {
-        debug!(sha = %CUSTOM_KERNEL_SHA_COMPILED, "using compile-time SHA");
-        return CUSTOM_KERNEL_SHA_COMPILED.to_string();
+/// Compute SHA for custom kernel based on build inputs from profile config.
+///
+/// Reads the files listed in `profile.build_inputs` (supports globs) and
+/// computes SHA256 of their concatenated contents. This is purely config-driven -
+/// the binary has no hardcoded knowledge of which files matter.
+pub fn compute_profile_kernel_sha(profile: &KernelProfile) -> String {
+    if profile.build_inputs.is_empty() {
+        warn!("kernel profile has no build_inputs, using empty SHA");
+        return "000000000000".to_string();
     }
 
     let mut content = Vec::new();
 
-    if let Ok(data) = std::fs::read(&script) {
-        content.extend(data);
-    }
+    for pattern in &profile.build_inputs {
+        // Expand glob pattern
+        let paths: Vec<PathBuf> = match glob(pattern) {
+            Ok(entries) => {
+                let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok()).collect();
+                paths.sort(); // Deterministic order
+                paths
+            }
+            Err(e) => {
+                warn!(pattern = %pattern, error = %e, "invalid glob pattern");
+                continue;
+            }
+        };
 
-    let conf = kernel_dir.join("nested.conf");
-    if let Ok(data) = std::fs::read(&conf) {
-        content.extend(data);
-    }
-
-    let patches_dir = kernel_dir.join("patches");
-    if patches_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&patches_dir) {
-            let mut patches: Vec<_> = entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "patch"))
-                .collect();
-            patches.sort_by_key(|e| e.path());
-            for patch in patches {
-                if let Ok(data) = std::fs::read(patch.path()) {
+        for path in paths {
+            match std::fs::read(&path) {
+                Ok(data) => {
+                    debug!(path = %path.display(), bytes = data.len(), "hashing build input");
                     content.extend(data);
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "failed to read build input");
                 }
             }
         }
+    }
+
+    if content.is_empty() {
+        warn!("no build input files found, using empty SHA");
+        return "000000000000".to_string();
     }
 
     compute_sha256_short(&content)
@@ -441,22 +449,36 @@ async fn download_kernel_binary(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn build_kernel_locally(profile_name: &str, dest: &Path) -> Result<()> {
-    let script = Path::new("kernel/build.sh");
-    if !script.exists() {
+async fn build_kernel_locally(
+    profile: &KernelProfile,
+    profile_name: &str,
+    dest: &Path,
+) -> Result<()> {
+    let script = profile.build_script.as_deref().unwrap_or("kernel/build.sh");
+    let script_path = Path::new(script);
+
+    if !script_path.exists() {
         bail!(
-            "kernel/build.sh not found.\n\n\
+            "Build script '{}' not found.\n\n\
              Local builds require the fcvm git repository.\n\
              Clone it and run: cargo run -- setup --kernel-profile {} --build-kernels",
+            script,
             profile_name
         );
     }
 
-    let output = Command::new(script)
-        .env("KERNEL_PATH", dest)
-        .output()
-        .await
-        .context("running kernel/build.sh")?;
+    let mut cmd = Command::new(script_path);
+    cmd.env("KERNEL_PATH", dest);
+
+    // Pass config paths to build script via env vars
+    if let Some(ref config) = profile.kernel_config {
+        cmd.env("KERNEL_CONFIG", config);
+    }
+    if let Some(ref patches) = profile.patches_dir {
+        cmd.env("PATCHES_DIR", patches);
+    }
+
+    let output = cmd.output().await.context("running build script")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
