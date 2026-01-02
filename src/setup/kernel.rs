@@ -354,32 +354,88 @@ async fn ensure_profile_kernel(
 // Custom Kernel Helpers
 // ============================================================================
 
+/// Find the repo root by looking for Cargo.toml going up the directory tree.
+fn find_repo_root() -> Option<PathBuf> {
+    // Try CWD first
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        if dir.join("Cargo.toml").exists() && dir.join("rootfs-config.toml").exists() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+
+    // Try relative to executable
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            // Check a few levels up from target/release/fcvm
+            for ancestor in exe_dir.ancestors().take(5) {
+                if ancestor.join("Cargo.toml").exists()
+                    && ancestor.join("rootfs-config.toml").exists()
+                {
+                    return Some(ancestor.to_path_buf());
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Compute SHA for custom kernel based on build inputs from profile config.
 ///
 /// Reads the files listed in `profile.build_inputs` (supports globs) and
 /// computes SHA256 of their concatenated contents. This is purely config-driven -
 /// the binary has no hardcoded knowledge of which files matter.
+///
+/// Patterns are resolved relative to the repo root (directory containing Cargo.toml
+/// and rootfs-config.toml).
 pub fn compute_profile_kernel_sha(profile: &KernelProfile) -> String {
     if profile.build_inputs.is_empty() {
         warn!("kernel profile has no build_inputs, using empty SHA");
         return "000000000000".to_string();
     }
 
+    // Find repo root for relative path resolution
+    let repo_root = find_repo_root();
+    if let Some(ref root) = repo_root {
+        debug!(repo_root = %root.display(), "found repo root for build_inputs");
+    } else {
+        debug!("repo root not found, using CWD for build_inputs");
+    }
+
     let mut content = Vec::new();
 
     for pattern in &profile.build_inputs {
+        // If pattern is relative and we have a repo root, prepend it
+        let full_pattern = if !pattern.starts_with('/') {
+            if let Some(ref root) = repo_root {
+                root.join(pattern).to_string_lossy().into_owned()
+            } else {
+                pattern.clone()
+            }
+        } else {
+            pattern.clone()
+        };
+
         // Expand glob pattern
-        let paths: Vec<PathBuf> = match glob(pattern) {
+        let paths: Vec<PathBuf> = match glob(&full_pattern) {
             Ok(entries) => {
                 let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok()).collect();
                 paths.sort(); // Deterministic order
                 paths
             }
             Err(e) => {
-                warn!(pattern = %pattern, error = %e, "invalid glob pattern");
+                warn!(pattern = %full_pattern, error = %e, "invalid glob pattern");
                 continue;
             }
         };
+
+        if paths.is_empty() {
+            debug!(pattern = %full_pattern, "no files matched pattern");
+        }
 
         for path in paths {
             match std::fs::read(&path) {
