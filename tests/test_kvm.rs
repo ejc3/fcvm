@@ -1128,31 +1128,40 @@ except OSError as e:
 ///
 /// L1: Host starts VM with localhost/nested-test + nested kernel profile
 /// L2: L1 container imports image from shared cache, then runs fcvm
+///
+/// Uses the shared run_nested_n_levels infrastructure for consistency.
 #[tokio::test]
 async fn test_nested_l2() -> Result<()> {
-    ensure_nested_image().await?;
+    run_nested_n_levels(2, "NESTED_2_LEVELS_SUCCESS").await
+}
 
-    // Get the digest of localhost/nested-test so L2 can import from shared cache
-    let digest_out = tokio::process::Command::new("podman")
-        .args([
-            "inspect",
-            "localhost/nested-test",
-            "--format",
-            "{{.Digest}}",
-        ])
-        .output()
-        .await?;
-    let digest = String::from_utf8_lossy(&digest_out.stdout)
-        .trim()
-        .to_string();
-    println!("Image digest: {}", digest);
+/// Test L1→L2→L3: 3 levels of nesting
+///
+/// BLOCKED: 3-hop FUSE chain (L3→L2→L1→HOST) causes ~3-5 second latency per
+/// request due to PassthroughFs + spawn_blocking serialization. FUSE mount
+/// initialization alone takes 10+ minutes. Need to implement request pipelining
+/// or async PassthroughFs before this test can complete in reasonable time.
+#[tokio::test]
+#[ignore]
+async fn test_nested_l3() -> Result<()> {
+    run_nested_n_levels(3, "MARKER_L3_OK_12345").await
+}
 
-    // Create nested-scripts directory
-    tokio::fs::create_dir_all("/mnt/fcvm-btrfs/nested-scripts").await?;
+/// Test L1→L2→L3→L4: 4 levels of nesting
+///
+/// BLOCKED: Same issue as L3, but worse. 4-hop FUSE chain would be even slower.
+#[tokio::test]
+#[ignore]
+async fn test_nested_l4() -> Result<()> {
+    run_nested_n_levels(4, "MARKER_L4_OK_12345").await
+}
 
-    // Benchmark script that runs at each level
-    // Tests: egress, local disk, FUSE disk
-    let bench_script = r#"#!/bin/bash
+/// Benchmark script that runs at each nesting level
+///
+/// Measures: egress connectivity, local disk I/O, FUSE disk I/O, FUSE latency, memory usage.
+/// Outputs MARKER_L{level}_OK on success.
+fn benchmark_script() -> &'static str {
+    r#"#!/bin/bash
 set -e
 LEVEL=${1:-unknown}
 
@@ -1236,13 +1245,42 @@ if mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then
     START=$(date +%s%N)
     for i in $(seq 1 100); do cat "${FUSE_DIR}/lat.txt" > /dev/null; done
     END=$(date +%s%N)
-    READ_US=$(( (END - START) / 100000 ))
+    READ_US=$(( (END - START) / 1000 ))
     echo "FUSE_SMALLREAD_L${LEVEL}=${READ_US}us/op (100 ops)"
 
     rm -rf "$FUSE_DIR"
 fi
 
-# Test 5: Memory usage (RSS)
+# Test 5: Large FUSE copy (100MB to measure sustained throughput)
+if mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then
+    echo "--- Large Copy Test ---"
+    FUSE_DIR="/mnt/fcvm-btrfs/bench-copy-${LEVEL}-$$"
+    mkdir -p "$FUSE_DIR"
+
+    # Create 100MB source file on local disk
+    dd if=/dev/urandom of=/tmp/large.dat bs=1M count=100 2>/dev/null
+
+    # Copy local -> FUSE (100MB)
+    START=$(date +%s%N)
+    cp /tmp/large.dat "${FUSE_DIR}/large.dat"
+    sync
+    END=$(date +%s%N)
+    COPY_TO_MS=$(( (END - START) / 1000000 ))
+    COPY_TO_MBS=$(( 100 * 1000 / (COPY_TO_MS + 1) ))
+    echo "FUSE_COPY_TO_L${LEVEL}=${COPY_TO_MS}ms (100MB, ${COPY_TO_MBS}MB/s)"
+
+    # Copy FUSE -> local (100MB)
+    START=$(date +%s%N)
+    cp "${FUSE_DIR}/large.dat" /tmp/large2.dat
+    END=$(date +%s%N)
+    COPY_FROM_MS=$(( (END - START) / 1000000 ))
+    COPY_FROM_MBS=$(( 100 * 1000 / (COPY_FROM_MS + 1) ))
+    echo "FUSE_COPY_FROM_L${LEVEL}=${COPY_FROM_MS}ms (100MB, ${COPY_FROM_MBS}MB/s)"
+
+    rm -rf "$FUSE_DIR" /tmp/large.dat /tmp/large2.dat
+fi
+
+# Test 6: Memory usage (RSS)
 echo "--- Memory Test ---"
 MEM_TOTAL=$(grep MemTotal /proc/meminfo | awk '{print $2}')
 MEM_AVAIL=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
@@ -1253,98 +1291,13 @@ echo "MEM_L${LEVEL}=${MEM_USED_MB}MB/${MEM_TOTAL_MB}MB"
 
 echo "=== END BENCHMARK L${LEVEL} ==="
 echo "MARKER_L${LEVEL}_OK"
-"#;
+"#
+}
 
-    let bench_path = "/mnt/fcvm-btrfs/nested-scripts/bench.sh";
-    tokio::fs::write(bench_path, bench_script).await?;
-    tokio::process::Command::new("chmod")
-        .args(["+x", bench_path])
-        .status()
-        .await?;
-
-    // L2 script: just run benchmark
-    let l2_script = r#"#!/bin/bash
-set -ex
-/mnt/fcvm-btrfs/nested-scripts/bench.sh 2
-"#;
-    let l2_path = "/mnt/fcvm-btrfs/nested-scripts/l2.sh";
-    tokio::fs::write(l2_path, l2_script).await?;
-    tokio::process::Command::new("chmod")
-        .args(["+x", l2_path])
-        .status()
-        .await?;
-
-    // L1 script: run L1 benchmark, import image, start L2 with benchmark
-    // Use stripped digest (without sha256: prefix) to match fcvm's cache format
-    let digest_stripped = digest.trim_start_matches("sha256:");
-    let l1_script = format!(
-        r#"#!/bin/bash
-set -ex
-
-# Run L1 benchmark first
-/mnt/fcvm-btrfs/nested-scripts/bench.sh 1
-
-echo "L1: Importing image from shared cache..."
-podman load -i /mnt/fcvm-btrfs/image-cache/{digest}.oci.tar
-
-echo "L1: Starting L2 VM with benchmarks (tracing enabled)..."
-FCVM_FUSE_TRACE_RATE=100 fcvm podman run --name l2 --network bridged --privileged \
-    --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
-    localhost/nested-test \
-    --cmd /mnt/fcvm-btrfs/nested-scripts/l2.sh
-"#,
-        digest = digest_stripped
-    );
-
-    let l1_path = "/mnt/fcvm-btrfs/nested-scripts/l1.sh";
-    tokio::fs::write(l1_path, &l1_script).await?;
-    tokio::process::Command::new("chmod")
-        .args(["+x", l1_path])
-        .status()
-        .await?;
-    println!("Wrote nesting scripts to /mnt/fcvm-btrfs/nested-scripts/");
-
-    // Run L1 with --cmd that executes the script
-    let output = tokio::process::Command::new("./target/release/fcvm")
-        .args([
-            "podman",
-            "run",
-            "--name",
-            "l1-nested",
-            "--network",
-            "bridged",
-            "--privileged",
-            "--mem",
-            "4096",
-            "--kernel-profile",
-            "nested",
-            "--map",
-            "/mnt/fcvm-btrfs:/mnt/fcvm-btrfs",
-            "localhost/nested-test",
-            "--cmd",
-            "/mnt/fcvm-btrfs/nested-scripts/l1.sh",
-        ])
-        .output()
-        .await?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    println!("stdout: {}", stdout);
-    println!("stderr: {}", stderr);
-
-    // Check for L1 and L2 markers
-    assert!(
-        stderr.contains("MARKER_L1_OK"),
-        "L1 benchmark should complete. Check stderr above."
-    );
-    assert!(
-        stderr.contains("MARKER_L2_OK"),
-        "L2 benchmark should complete. Check stderr above."
-    );
-
-    // Extract and display benchmark results
+/// Print a summary of benchmark results from log content
+fn print_benchmark_summary(log_content: &str) {
     println!("\n=== BENCHMARK SUMMARY ===");
-    for line in stderr.lines() {
+    for line in log_content.lines() {
         if line.contains("EGRESS_L")
             || line.contains("LOCAL_WRITE_L")
             || line.contains("LOCAL_READ_L")
@@ -1353,6 +1306,8 @@ FCVM_FUSE_TRACE_RATE=100 fcvm podman run --name l2 --network bridged --privilege
             || line.contains("FUSE_READ_L")
             || line.contains("FUSE_STAT_L")
             || line.contains("FUSE_SMALLREAD_L")
+            || line.contains("FUSE_COPY_TO_L")
+            || line.contains("FUSE_COPY_FROM_L")
             || line.contains("MEM_L")
         {
             // Strip ANSI codes and prefixes
@@ -1361,36 +1316,23 @@ FCVM_FUSE_TRACE_RATE=100 fcvm podman run --name l2 --network bridged --privilege
         }
     }
     println!("=========================\n");
-
-    Ok(())
 }
 
-/// Test L1→L2→L3: 3 levels of nesting
+/// Run N levels of nesting with benchmarks at each level
 ///
-/// BLOCKED: 3-hop FUSE chain (L3→L2→L1→HOST) causes ~3-5 second latency per
-/// request due to PassthroughFs + spawn_blocking serialization. FUSE mount
-/// initialization alone takes 10+ minutes. Need to implement request pipelining
-/// or async PassthroughFs before this test can complete in reasonable time.
-#[tokio::test]
-#[ignore]
-async fn test_nested_l3() -> Result<()> {
-    run_nested_n_levels(3, "MARKER_L3_OK_12345").await
-}
-
-/// Test L1→L2→L3→L4: 4 levels of nesting
-///
-/// BLOCKED: Same issue as L3, but worse. 4-hop FUSE chain would be even slower.
-#[tokio::test]
-#[ignore]
-async fn test_nested_l4() -> Result<()> {
-    run_nested_n_levels(4, "MARKER_L4_OK_12345").await
-}
-
-/// Run N levels of nesting, building scripts from deepest level upward
+/// Each level runs performance benchmarks (egress, local disk, FUSE disk, memory)
+/// before starting the next level. Uses streaming output for real-time visibility.
 async fn run_nested_n_levels(n: usize, marker: &str) -> Result<()> {
     assert!(n >= 2, "Need at least 2 levels for nesting");
 
     ensure_nested_image().await?;
+
+    // Get the nested kernel path (with correct SHA computed on host)
+    // This is needed because inside L1, the kernel build inputs don't exist
+    // so the SHA computation would fail
+    let nested_kernel =
+        fcvm::setup::get_kernel_path(Some("nested")).context("getting nested kernel path")?;
+    let nested_kernel_path = nested_kernel.to_string_lossy();
 
     // Get the digest of localhost/nested-test
     let digest_out = tokio::process::Command::new("podman")
@@ -1405,6 +1347,8 @@ async fn run_nested_n_levels(n: usize, marker: &str) -> Result<()> {
     let digest = String::from_utf8_lossy(&digest_out.stdout)
         .trim()
         .to_string();
+    // Strip sha256: prefix for cache path (cache files don't have prefix)
+    let digest_stripped = digest.trim_start_matches("sha256:");
     println!("Image digest: {}", digest);
 
     // Memory allocation strategy:
@@ -1414,21 +1358,35 @@ async fn run_nested_n_levels(n: usize, marker: &str) -> Result<()> {
     let intermediate_mem = "4096"; // 4GB for VMs that spawn children
 
     // Build scripts from deepest level (Ln) upward to L1
-    // Ln (deepest): just echo the marker
-    // L1..L(n-1): import image + run fcvm with next level's script
+    // Every level runs benchmarks
+    // Ln (deepest): run benchmarks + echo marker
+    // L1..L(n-1): run benchmarks + import image + run fcvm with next level's script
 
     let scripts_dir = "/mnt/fcvm-btrfs/nested-scripts";
     tokio::fs::create_dir_all(scripts_dir).await.ok();
 
-    // Deepest level (Ln): just echo the marker
-    let ln_script = format!("#!/bin/bash\necho {}\n", marker);
+    // Write the benchmark script
+    let bench_path = format!("{}/bench.sh", scripts_dir);
+    tokio::fs::write(&bench_path, benchmark_script()).await?;
+    tokio::process::Command::new("chmod")
+        .args(["+x", &bench_path])
+        .status()
+        .await?;
+
+    // Deepest level (Ln): run benchmark + echo marker
+    let ln_script = format!(
+        "#!/bin/bash\nset -ex\n{scripts_dir}/bench.sh {n}\necho {marker}\n",
+        scripts_dir = scripts_dir,
+        n = n,
+        marker = marker
+    );
     let ln_path = format!("{}/l{}.sh", scripts_dir, n);
     tokio::fs::write(&ln_path, &ln_script).await?;
     tokio::process::Command::new("chmod")
         .args(["+x", &ln_path])
         .status()
         .await?;
-    println!("L{}: echo marker", n);
+    println!("L{}: benchmark + echo marker", n);
 
     // Build L(n-1) down to L1: each imports image and runs fcvm with next script
     // Each level needs:
@@ -1449,23 +1407,40 @@ async fn run_nested_n_levels(n: usize, marker: &str) -> Result<()> {
         // All other levels (1 to n-1) spawn VMs and need 4GB.
         let mem_arg = format!("--mem {}", intermediate_mem);
 
+        // Use both --kernel-profile (for runtime config: firecracker_bin, boot_args)
+        // AND --kernel (explicit path, since build_inputs don't exist inside container)
+        //
+        // Each intermediate level: run benchmark FIRST, then import + start next level
         let script = format!(
             r#"#!/bin/bash
 set -ex
-echo "L{}: Importing image from shared cache..."
-podman load -i /mnt/fcvm-btrfs/image-cache/{}.oci.tar
-podman tag sha256:{} localhost/nested-test 2>/dev/null || true
-echo "L{}: Starting L{} VM..."
-fcvm podman run --name l{} --network bridged --privileged {} --kernel-profile nested --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs localhost/nested-test --cmd {}
+
+# Run benchmarks for this level
+{scripts_dir}/bench.sh {level}
+
+echo "L{level}: Importing image from shared cache..."
+podman load -i /mnt/fcvm-btrfs/image-cache/{digest}.oci.tar
+podman tag sha256:{digest} localhost/nested-test 2>/dev/null || true
+
+echo "L{level}: Starting L{next_level} VM..."
+FCVM_FUSE_TRACE_RATE=100 fcvm podman run \
+    --name l{next_level} \
+    --network bridged \
+    --privileged \
+    {mem_arg} \
+    --kernel-profile nested \
+    --kernel {kernel} \
+    --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
+    localhost/nested-test \
+    --cmd {next_script}
 "#,
-            level,
-            digest,
-            digest,
-            level,
-            level + 1,
-            level + 1,
-            mem_arg,
-            next_script
+            scripts_dir = scripts_dir,
+            level = level,
+            next_level = level + 1,
+            digest = digest_stripped,
+            mem_arg = mem_arg,
+            kernel = nested_kernel_path,
+            next_script = next_script
         );
         let script_path = format!("{}/l{}.sh", scripts_dir, level);
         tokio::fs::write(&script_path, &script).await?;
@@ -1474,7 +1449,7 @@ fcvm podman run --name l{} --network bridged --privileged {} --kernel-profile ne
             .status()
             .await?;
         println!(
-            "L{}: import + fcvm {} --kernel-profile nested --map + --cmd {}",
+            "L{}: benchmark + import + fcvm {} --kernel-profile nested --kernel <path> --cmd {}",
             level, mem_arg, next_script
         );
     }
@@ -1514,14 +1489,29 @@ fcvm podman run --name l{} --network bridged --privileged {} --kernel-profile ne
         .await
         .unwrap_or_default();
 
-    // Look for the marker in output
+    // Verify all level markers present
+    for level in 1..=n {
+        let level_marker = format!("MARKER_L{}_OK", level);
+        assert!(
+            log_content.contains(&level_marker),
+            "L{} benchmark should complete (missing {}). Exit status: {:?}. Check output above.",
+            level,
+            level_marker,
+            status
+        );
+    }
+
+    // Also verify the final marker
     assert!(
         log_content.contains(marker),
-        "L{} VM should echo marker '{}'. Exit status: {:?}. Check output above.",
-        n,
+        "Final marker '{}' not found. Exit status: {:?}. Check output above.",
         marker,
         status
     );
+
+    // Extract and display benchmark summary
+    print_benchmark_summary(&log_content);
+
     Ok(())
 }
 
