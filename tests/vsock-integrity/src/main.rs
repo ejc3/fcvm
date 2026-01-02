@@ -13,14 +13,25 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread;
 
 const TEST_SIZES: &[usize] = &[
-    32 * 1024,   // 32KB - under vsock packet limit
-    64 * 1024,   // 64KB - exactly one packet
-    128 * 1024,  // 128KB - 2 packets (fragmentation)
-    256 * 1024,  // 256KB - 4 packets
-    512 * 1024,  // 512KB - 8 packets
+    32 * 1024,     // 32KB - under vsock packet limit
+    64 * 1024,     // 64KB - exactly one packet
+    128 * 1024,    // 128KB - 2 packets (fragmentation)
+    256 * 1024,    // 256KB - 4 packets
+    512 * 1024,    // 512KB - 8 packets
+    1024 * 1024,   // 1MB - stress test
+    2 * 1024 * 1024, // 2MB - stress test
 ];
+
+/// Number of iterations to run per thread (stress test)
+const ITERATIONS: usize = 10;
+
+/// Number of parallel threads for stress test (mimics FUSE reader count)
+const PARALLEL_THREADS: usize = 64;
 
 /// Generate a pattern that's easy to detect corruption in.
 /// Each 4KB block starts with its block number.
@@ -117,33 +128,66 @@ fn run_file_test(fuse_path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+fn handle_client(mut stream: UnixStream, client_id: usize) {
+    println!("[client {}] connected", client_id);
+
+    // Handle multiple messages on the same connection
+    loop {
+        // Read size header (4 bytes, little endian)
+        let mut size_buf = [0u8; 4];
+        match stream.read_exact(&mut size_buf) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                println!("[client {}] disconnected", client_id);
+                break;
+            }
+            Err(e) => {
+                eprintln!("[client {}] read error: {}", client_id, e);
+                break;
+            }
+        }
+        let size = u32::from_le_bytes(size_buf) as usize;
+
+        // Read data
+        let mut data = vec![0u8; size];
+        if let Err(e) = stream.read_exact(&mut data) {
+            eprintln!("[client {}] read data error: {}", client_id, e);
+            break;
+        }
+
+        // Echo back
+        if let Err(e) = stream.write_all(&size_buf) {
+            eprintln!("[client {}] write error: {}", client_id, e);
+            break;
+        }
+        if let Err(e) = stream.write_all(&data) {
+            eprintln!("[client {}] write data error: {}", client_id, e);
+            break;
+        }
+        if let Err(e) = stream.flush() {
+            eprintln!("[client {}] flush error: {}", client_id, e);
+            break;
+        }
+    }
+}
+
 fn run_server(socket_path: &str) -> std::io::Result<()> {
     // Remove existing socket
     let _ = std::fs::remove_file(socket_path);
 
     let listener = UnixListener::bind(socket_path)?;
-    println!("Server listening on {}", socket_path);
+    println!("Server listening on {} (multi-threaded)", socket_path);
 
+    let mut client_id = 0;
     for stream in listener.incoming() {
         match stream {
-            Ok(mut stream) => {
-                println!("Client connected");
-
-                // Read size header (4 bytes, little endian)
-                let mut size_buf = [0u8; 4];
-                stream.read_exact(&mut size_buf)?;
-                let size = u32::from_le_bytes(size_buf) as usize;
-
-                // Read data
-                let mut data = vec![0u8; size];
-                stream.read_exact(&mut data)?;
-                println!("Received {} bytes", size);
-
-                // Echo back
-                stream.write_all(&size_buf)?;
-                stream.write_all(&data)?;
-                stream.flush()?;
-                println!("Echoed {} bytes", size);
+            Ok(stream) => {
+                client_id += 1;
+                let id = client_id;
+                // Spawn a thread for each client to handle concurrent connections
+                thread::spawn(move || {
+                    handle_client(stream, id);
+                });
             }
             Err(e) => {
                 eprintln!("Accept error: {}", e);
@@ -204,11 +248,10 @@ fn run_client_unix(socket_path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Create a vsock connection and return as UnixStream
 #[cfg(target_os = "linux")]
-fn run_client_vsock(cid: u32, port: u32) -> std::io::Result<()> {
+fn connect_vsock(cid: u32, port: u32) -> std::io::Result<UnixStream> {
     use std::os::unix::io::FromRawFd;
-
-    println!("Connecting to vsock {}:{}", cid, port);
 
     // Create vsock socket
     let fd = unsafe {
@@ -242,57 +285,165 @@ fn run_client_vsock(cid: u32, port: u32) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
 
-    println!("Connected to vsock");
-
     // Convert to UnixStream for convenience (they're both sockets)
-    let stream = unsafe { UnixStream::from_raw_fd(fd) };
-    run_client_with_stream(stream)
+    Ok(unsafe { UnixStream::from_raw_fd(fd) })
+}
+
+/// Run a single thread's worth of tests
+fn run_thread_tests(mut stream: UnixStream, thread_id: usize,
+                    passed: Arc<AtomicUsize>, failed: Arc<AtomicUsize>) {
+    for iteration in 0..ITERATIONS {
+        for &size in TEST_SIZES {
+            let expected = generate_pattern(size);
+
+            // Send size header
+            if stream.write_all(&(size as u32).to_le_bytes()).is_err() {
+                failed.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+            // Send data
+            if stream.write_all(&expected).is_err() {
+                failed.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+            if stream.flush().is_err() {
+                failed.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+
+            // Read size header
+            let mut size_buf = [0u8; 4];
+            if stream.read_exact(&mut size_buf).is_err() {
+                failed.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+            let recv_size = u32::from_le_bytes(size_buf) as usize;
+
+            if recv_size != size {
+                eprintln!("[thread {}] ✗ {}KB: Size mismatch (got {})", thread_id, size / 1024, recv_size);
+                failed.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+
+            // Read data
+            let mut actual = vec![0u8; size];
+            if stream.read_exact(&mut actual).is_err() {
+                failed.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+
+            match check_pattern(&actual, &expected) {
+                Ok(()) => {
+                    passed.fetch_add(1, Ordering::SeqCst);
+                }
+                Err(e) => {
+                    eprintln!("[thread {}] ✗ {}KB iter {}: CORRUPTION\n  {}", thread_id, size / 1024, iteration, e);
+                    failed.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+    println!("[thread {}] finished {} tests", thread_id, TEST_SIZES.len() * ITERATIONS);
+}
+
+#[cfg(target_os = "linux")]
+fn run_client_vsock(cid: u32, port: u32) -> std::io::Result<()> {
+    let total_tests = TEST_SIZES.len() * ITERATIONS * PARALLEL_THREADS;
+    println!("Starting {} parallel threads, {} iterations each, {} sizes",
+             PARALLEL_THREADS, ITERATIONS, TEST_SIZES.len());
+    println!("Total tests: {} (transferring ~{}MB total)",
+             total_tests,
+             (TEST_SIZES.iter().sum::<usize>() * ITERATIONS * PARALLEL_THREADS) / (1024 * 1024));
+
+    let passed = Arc::new(AtomicUsize::new(0));
+    let failed = Arc::new(AtomicUsize::new(0));
+
+    // Spawn all threads
+    let mut handles = Vec::new();
+    for thread_id in 0..PARALLEL_THREADS {
+        let stream = connect_vsock(cid, port)?;
+        let p = passed.clone();
+        let f = failed.clone();
+        handles.push(thread::spawn(move || {
+            run_thread_tests(stream, thread_id, p, f);
+        }));
+    }
+
+    println!("All {} threads connected, running tests...", PARALLEL_THREADS);
+
+    // Wait for all threads
+    for handle in handles {
+        handle.join().expect("Thread panicked");
+    }
+
+    let final_passed = passed.load(Ordering::SeqCst);
+    let final_failed = failed.load(Ordering::SeqCst);
+
+    println!("\n=== Final Results ===");
+    println!("{} passed, {} failed (out of {})", final_passed, final_failed, total_tests);
+    if final_failed > 0 {
+        eprintln!("\nCORRUPTION DETECTED!");
+        std::process::exit(1);
+    }
+    println!("VSOCK_INTEGRITY_OK");
+    Ok(())
 }
 
 fn run_client_with_stream(mut stream: UnixStream) -> std::io::Result<()> {
     let mut passed = 0;
     let mut failed = 0;
+    let total_tests = TEST_SIZES.len() * ITERATIONS;
 
-    for &size in TEST_SIZES {
-        let expected = generate_pattern(size);
+    println!("Running {} iterations of {} sizes ({} total tests)",
+             ITERATIONS, TEST_SIZES.len(), total_tests);
 
-        // Send size header
-        stream.write_all(&(size as u32).to_le_bytes())?;
-        // Send data
-        stream.write_all(&expected)?;
-        stream.flush()?;
+    for iteration in 0..ITERATIONS {
+        println!("\n--- Iteration {}/{} ---", iteration + 1, ITERATIONS);
 
-        // Read size header
-        let mut size_buf = [0u8; 4];
-        stream.read_exact(&mut size_buf)?;
-        let recv_size = u32::from_le_bytes(size_buf) as usize;
+        for &size in TEST_SIZES {
+            let expected = generate_pattern(size);
 
-        if recv_size != size {
-            eprintln!("✗ {}KB: Size mismatch (got {})", size / 1024, recv_size);
-            failed += 1;
-            continue;
-        }
+            // Send size header
+            stream.write_all(&(size as u32).to_le_bytes())?;
+            // Send data
+            stream.write_all(&expected)?;
+            stream.flush()?;
 
-        // Read data
-        let mut actual = vec![0u8; size];
-        stream.read_exact(&mut actual)?;
+            // Read size header
+            let mut size_buf = [0u8; 4];
+            stream.read_exact(&mut size_buf)?;
+            let recv_size = u32::from_le_bytes(size_buf) as usize;
 
-        match check_pattern(&actual, &expected) {
-            Ok(()) => {
-                println!("✓ {}KB: OK", size / 1024);
-                passed += 1;
-            }
-            Err(e) => {
-                eprintln!("✗ {}KB: CORRUPTION\n  {}", size / 1024, e);
+            if recv_size != size {
+                eprintln!("✗ {}KB: Size mismatch (got {})", size / 1024, recv_size);
                 failed += 1;
+                continue;
+            }
+
+            // Read data
+            let mut actual = vec![0u8; size];
+            stream.read_exact(&mut actual)?;
+
+            match check_pattern(&actual, &expected) {
+                Ok(()) => {
+                    println!("✓ {}KB: OK", size / 1024);
+                    passed += 1;
+                }
+                Err(e) => {
+                    eprintln!("✗ {}KB: CORRUPTION\n  {}", size / 1024, e);
+                    failed += 1;
+                }
             }
         }
     }
 
-    println!("\nResults: {} passed, {} failed", passed, failed);
+    println!("\n=== Final Results ===");
+    println!("{} passed, {} failed (out of {})", passed, failed, total_tests);
     if failed > 0 {
+        eprintln!("\nCORRUPTION DETECTED!");
         std::process::exit(1);
     }
+    println!("VSOCK_INTEGRITY_OK");
     Ok(())
 }
 

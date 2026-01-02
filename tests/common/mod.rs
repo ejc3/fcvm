@@ -909,3 +909,102 @@ pub async fn poll_serve_ready(
         sleep(Duration::from_millis(50)).await;
     }
 }
+
+/// Build localhost/nested-test image (convenience wrapper)
+pub async fn ensure_nested_image() -> anyhow::Result<()> {
+    ensure_nested_container("localhost/nested-test", "Containerfile.nested").await
+}
+
+/// Build a container image for nested testing.
+///
+/// Always runs podman build - relies on podman's layer caching for speed.
+/// If the container extends localhost/nested-test, call ensure_nested_image() first.
+///
+/// # Arguments
+/// * `image_name` - Full image name (e.g., "localhost/vsock-integrity")
+/// * `containerfile` - Path to Containerfile (e.g., "Containerfile.vsock-integrity")
+pub async fn ensure_nested_container(
+    image_name: &str,
+    containerfile: &str,
+) -> anyhow::Result<()> {
+    let fcvm_path = find_fcvm_binary()?;
+    let fcvm_dir = fcvm_path.parent().unwrap();
+
+    // Copy binaries to build context (needed for nested-test base)
+    if image_name == "localhost/nested-test" {
+        let profile = fcvm::setup::get_kernel_profile("nested")?
+            .ok_or_else(|| anyhow::anyhow!("nested kernel profile not found"))?;
+        let src_firecracker = fcvm::setup::get_profile_firecracker_path(&profile, "nested")
+            .ok_or_else(|| anyhow::anyhow!("nested profile has no custom firecracker"))?;
+        if !src_firecracker.exists() {
+            anyhow::bail!(
+                "NV2 firecracker fork not found at {}. Run: fcvm setup --kernel-profile nested",
+                src_firecracker.display()
+            );
+        }
+
+        tokio::fs::create_dir_all("artifacts").await.ok();
+        std::fs::copy(fcvm_dir.join("fcvm"), "artifacts/fcvm")
+            .context("copying fcvm to artifacts/")?;
+        std::fs::copy(fcvm_dir.join("fc-agent"), "artifacts/fc-agent")
+            .context("copying fc-agent to artifacts/")?;
+        std::fs::copy(&src_firecracker, "artifacts/firecracker-nested")
+            .context("copying firecracker to artifacts/")?;
+    }
+
+    // Always build - podman handles layer caching
+    println!("Building {}...", image_name);
+    let output = tokio::process::Command::new("podman")
+        .args(["build", "-t", image_name, "-f", containerfile, "."])
+        .output()
+        .await
+        .context("running podman build")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to build {}: {}", image_name, stderr);
+    }
+
+    // Export to CAS cache so nested VMs can access it
+    let digest_out = tokio::process::Command::new("podman")
+        .args(["inspect", image_name, "--format", "{{.Digest}}"])
+        .output()
+        .await?;
+    let digest = String::from_utf8_lossy(&digest_out.stdout)
+        .trim()
+        .to_string();
+
+    if !digest.is_empty() && digest.starts_with("sha256:") {
+        let digest_stripped = digest.trim_start_matches("sha256:");
+        let archive_path = format!("/mnt/fcvm-btrfs/image-cache/{}.oci.tar", digest_stripped);
+
+        if !std::path::PathBuf::from(&archive_path).exists() {
+            println!("Exporting to CAS cache: {}", archive_path);
+            tokio::fs::create_dir_all("/mnt/fcvm-btrfs/image-cache")
+                .await
+                .ok();
+            let save_out = tokio::process::Command::new("podman")
+                .args(["save", "--format", "oci-archive", "-o", &archive_path, image_name])
+                .output()
+                .await?;
+            if !save_out.status.success() {
+                println!(
+                    "Warning: podman save failed: {}",
+                    String::from_utf8_lossy(&save_out.stderr)
+                );
+            }
+        }
+
+        println!(
+            "✓ {} ready (digest: {})",
+            image_name,
+            &digest[..std::cmp::min(19, digest.len())]
+        );
+    } else {
+        println!("✓ {} built", image_name);
+    }
+
+    Ok(())
+}
+
+use anyhow::Context as _;

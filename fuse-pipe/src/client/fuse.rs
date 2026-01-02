@@ -211,13 +211,13 @@ fn protocol_file_type_to_fuser(ft: u8) -> FileType {
     }
 }
 
-/// Maximum write size for FUSE operations (32KB).
+/// Default max_write size for FUSE operations (32KB).
 ///
-/// This limits FUSE writes to ensure they fit in a single vsock packet.
-/// Under nested virtualization (NV2), vsock packet fragmentation can trigger
-/// memory visibility issues due to double Stage 2 translation. By keeping
-/// writes under the kernel's 64KB vsock packet limit, we avoid fragmentation.
-const FUSE_MAX_WRITE: u32 = 32 * 1024;
+/// Under nested virtualization (FUSE-over-FUSE in L2), larger writes cause
+/// vsock data loss due to cache coherency issues in double Stage 2 translation.
+/// Raw vsock works fine with larger packets, but FUSE adds memory pressure
+/// that triggers the corruption.
+const DEFAULT_FUSE_MAX_WRITE: u32 = 32 * 1024;
 
 impl Filesystem for FuseClient {
     fn init(
@@ -225,14 +225,28 @@ impl Filesystem for FuseClient {
         _req: &Request<'_>,
         config: &mut fuser::KernelConfig,
     ) -> Result<(), libc::c_int> {
-        // Limit max_write to avoid vsock packet fragmentation under nested virtualization.
-        if let Err(max) = config.set_max_write(FUSE_MAX_WRITE) {
-            tracing::warn!(
-                target: "fuse-pipe::client",
-                requested = FUSE_MAX_WRITE,
-                max,
-                "Failed to set max_write, using kernel max"
-            );
+        // Limit max_write to avoid vsock data loss under nested virtualization.
+        // Override with FCVM_FUSE_MAX_WRITE env var (0 = unbounded).
+        let max_write = std::env::var("FCVM_FUSE_MAX_WRITE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_FUSE_MAX_WRITE);
+
+        if max_write > 0 {
+            if let Err(max) = config.set_max_write(max_write) {
+                tracing::warn!(
+                    target: "fuse-pipe::client",
+                    requested = max_write,
+                    max,
+                    "Failed to set max_write, using kernel max"
+                );
+            } else {
+                tracing::debug!(
+                    target: "fuse-pipe::client",
+                    max_write,
+                    "Set FUSE max_write"
+                );
+            }
         }
 
         // Spawn additional readers now that INIT is done

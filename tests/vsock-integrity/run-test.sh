@@ -12,6 +12,7 @@ set -e
 VSOCK_DIR="/tmp/vsock-test"
 VSOCK_PORT=9999
 MARKER="VSOCK_INTEGRITY_TEST_COMPLETE"
+RESULT_FILE="/mnt/fcvm-btrfs/vsock-test-result.txt"
 
 echo "=== Vsock Integrity Test ==="
 echo "Testing vsock data integrity under NV2 nested virtualization"
@@ -20,6 +21,10 @@ echo ""
 # Cleanup any previous run
 rm -rf "$VSOCK_DIR"
 mkdir -p "$VSOCK_DIR"
+
+# Copy vsock-integrity binary to shared storage so L2 can access it
+mkdir -p /mnt/fcvm-btrfs/bin
+cp /usr/local/bin/vsock-integrity /mnt/fcvm-btrfs/bin/
 
 # Start echo server in background
 echo "Starting echo server on $VSOCK_DIR port $VSOCK_PORT..."
@@ -34,13 +39,6 @@ if ! kill -0 $SERVER_PID 2>/dev/null; then
 fi
 echo "Echo server running (PID: $SERVER_PID)"
 
-# Get paths from environment or use defaults
-KERNEL_PATH="${KERNEL_PATH:-/mnt/fcvm-btrfs/kernels/vmlinux-nested.bin}"
-IMAGE_CACHE="${IMAGE_CACHE:-}"
-
-# Build L2 command - runs vsock-integrity client
-L2_CMD="vsock-integrity client-vsock 2 $VSOCK_PORT && echo $MARKER"
-
 echo ""
 echo "Starting L2 VM..."
 echo "  --vsock-dir $VSOCK_DIR"
@@ -48,33 +46,35 @@ echo "  L2 will connect to port $VSOCK_PORT"
 echo ""
 
 # Run L2 VM
-# Note: This container must have vsock-integrity binary and fcvm available
+# Note: L2 just needs to run the vsock client - no nested virtualization needed
+# Use alpine:latest with vsock-integrity from FUSE mount
 fcvm podman run \
     --name l2-vsock-test \
     --network bridged \
-    --privileged \
     --vsock-dir "$VSOCK_DIR" \
-    --kernel-profile nested \
     --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
-    localhost/vsock-integrity \
-    --cmd "$L2_CMD" 2>&1 | tee /tmp/l2-output.log
+    alpine:latest \
+    --cmd "/mnt/fcvm-btrfs/bin/vsock-integrity client-vsock 2 $VSOCK_PORT && echo $MARKER" 2>&1 | tee /tmp/l2-output.log
 
 # Kill echo server
 kill $SERVER_PID 2>/dev/null || true
 
-# Check results
+# Check results and write to shared storage
 echo ""
 echo "=== Test Results ==="
 if grep -q "VSOCK_INTEGRITY_OK" /tmp/l2-output.log; then
     echo "PASS: No corruption detected"
+    echo "PASS" > "$RESULT_FILE"
     echo "$MARKER"
     exit 0
 elif grep -q "CORRUPTION" /tmp/l2-output.log; then
     echo "FAIL: Data corruption detected!"
-    grep "CORRUPTION" /tmp/l2-output.log
+    grep "CORRUPTION" /tmp/l2-output.log | tee -a "$RESULT_FILE"
+    echo "CORRUPTION" > "$RESULT_FILE"
     exit 1
 else
     echo "UNKNOWN: Test did not complete"
     tail -20 /tmp/l2-output.log
+    echo "INCOMPLETE" > "$RESULT_FILE"
     exit 1
 fi

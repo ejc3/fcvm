@@ -464,167 +464,6 @@ except OSError as e:
     }
 }
 
-/// Build localhost/nested-test image with proper CAS invalidation
-///
-/// Computes a combined SHA of ALL inputs (binaries, scripts, Containerfile).
-/// Rebuilds and re-exports only when inputs change.
-async fn ensure_nested_image() -> Result<()> {
-    let fcvm_path = common::find_fcvm_binary()?;
-    let fcvm_dir = fcvm_path.parent().unwrap();
-
-    // All inputs that affect the container image
-    let src_fcvm = fcvm_dir.join("fcvm");
-    let src_agent = fcvm_dir.join("fc-agent");
-    // NV2 firecracker fork - installed by fcvm setup --kernel-profile nested
-    let profile = fcvm::setup::get_kernel_profile("nested")?
-        .ok_or_else(|| anyhow::anyhow!("nested kernel profile not found"))?;
-    let src_firecracker = fcvm::setup::get_profile_firecracker_path(&profile, "nested")
-        .ok_or_else(|| anyhow::anyhow!("nested profile has no custom firecracker"))?;
-    if !src_firecracker.exists() {
-        bail!(
-            "NV2 firecracker fork not found at {}. Run: fcvm setup --kernel-profile nested",
-            src_firecracker.display()
-        );
-    }
-    let src_nested = PathBuf::from("nested.sh");
-    let src_containerfile = PathBuf::from("Containerfile.nested");
-    let src_config = PathBuf::from("rootfs-config.toml");
-
-    // Compute combined SHA of all inputs
-    fn file_bytes(path: &Path) -> Vec<u8> {
-        std::fs::read(path).unwrap_or_default()
-    }
-
-    let mut hasher = Sha256::new();
-    hasher.update(file_bytes(&src_fcvm));
-    hasher.update(file_bytes(&src_agent));
-    hasher.update(file_bytes(&src_firecracker));
-    hasher.update(file_bytes(&src_nested));
-    hasher.update(file_bytes(&src_containerfile));
-    hasher.update(file_bytes(&src_config));
-    let combined_sha = hex::encode(&hasher.finalize()[..6]);
-
-    // Check if we have a marker file with the current SHA
-    let marker_path = PathBuf::from("artifacts/.nested-sha");
-    let cached_sha = std::fs::read_to_string(&marker_path).unwrap_or_default();
-
-    let need_rebuild = cached_sha.trim() != combined_sha;
-
-    if need_rebuild {
-        println!(
-            "Inputs changed (sha: {} → {}), rebuilding nested container...",
-            if cached_sha.is_empty() {
-                "none"
-            } else {
-                cached_sha.trim()
-            },
-            combined_sha
-        );
-
-        // Copy all inputs to build context
-        tokio::fs::create_dir_all("artifacts").await.ok();
-        std::fs::copy(&src_fcvm, "artifacts/fcvm").context("copying fcvm to artifacts/")?;
-        std::fs::copy(&src_agent, "artifacts/fc-agent")
-            .context("copying fc-agent to artifacts/")?;
-        std::fs::copy(&src_firecracker, "artifacts/firecracker-nested").ok();
-
-        // Force rebuild by removing old image
-        tokio::process::Command::new("podman")
-            .args(["rmi", "localhost/nested-test"])
-            .output()
-            .await
-            .ok();
-    }
-
-    // Check if image exists
-    let check = tokio::process::Command::new("podman")
-        .args(["image", "exists", "localhost/nested-test"])
-        .output()
-        .await?;
-
-    if check.status.success() && !need_rebuild {
-        println!("✓ localhost/nested-test up to date (sha: {})", combined_sha);
-        return Ok(());
-    }
-
-    // Build container
-    println!("Building localhost/nested-test...");
-    let output = tokio::process::Command::new("podman")
-        .args([
-            "build",
-            "-t",
-            "localhost/nested-test",
-            "-f",
-            "Containerfile.nested",
-            ".",
-        ])
-        .output()
-        .await
-        .context("running podman build")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("Failed to build nested container: {}", stderr);
-    }
-
-    // Export to CAS cache so nested VMs can access it
-    let digest_out = tokio::process::Command::new("podman")
-        .args([
-            "inspect",
-            "localhost/nested-test",
-            "--format",
-            "{{.Digest}}",
-        ])
-        .output()
-        .await?;
-    let digest = String::from_utf8_lossy(&digest_out.stdout)
-        .trim()
-        .to_string();
-
-    if !digest.is_empty() && digest.starts_with("sha256:") {
-        // Use the same format as fcvm: strip sha256: prefix and use .oci.tar extension
-        let digest_stripped = digest.trim_start_matches("sha256:");
-        let archive_path = format!("/mnt/fcvm-btrfs/image-cache/{}.oci.tar", digest_stripped);
-
-        if !PathBuf::from(&archive_path).exists() {
-            println!("Exporting to CAS cache: {}", archive_path);
-            tokio::fs::create_dir_all("/mnt/fcvm-btrfs/image-cache")
-                .await
-                .ok();
-            let save_out = tokio::process::Command::new("podman")
-                .args([
-                    "save",
-                    "--format",
-                    "oci-archive",
-                    "-o",
-                    &archive_path,
-                    "localhost/nested-test",
-                ])
-                .output()
-                .await?;
-            if !save_out.status.success() {
-                println!(
-                    "Warning: podman save failed: {}",
-                    String::from_utf8_lossy(&save_out.stderr)
-                );
-            }
-        }
-
-        // Save the combined SHA as marker
-        std::fs::write(&marker_path, &combined_sha).ok();
-
-        println!(
-            "✓ localhost/nested-test ready (sha: {}, digest: {})",
-            combined_sha,
-            &digest[..std::cmp::min(19, digest.len())]
-        );
-    } else {
-        println!("✓ localhost/nested-test built (no digest available)");
-    }
-
-    Ok(())
-}
-
 /// Run an nested chain test with configurable depth.
 ///
 /// This function attempts to run VMs nested N levels deep:
@@ -641,7 +480,7 @@ async fn run_nested_chain(total_levels: usize) -> Result<()> {
     println!("{}", "=".repeat(50));
 
     // Ensure prerequisites
-    ensure_nested_image().await?;
+    common::ensure_nested_image().await?;
 
     let fcvm_path = common::find_fcvm_binary()?;
 
@@ -1169,7 +1008,7 @@ fn print_benchmark_summary(log_content: &str, include_large_files: bool) {
 async fn run_nested_n_levels(n: usize, marker: &str, mode: BenchmarkMode) -> Result<()> {
     assert!(n >= 2, "Need at least 2 levels for nesting");
 
-    ensure_nested_image().await?;
+    common::ensure_nested_image().await?;
 
     // Get the nested kernel path (with correct SHA computed on host)
     // This is needed because inside L1, the kernel build inputs don't exist
@@ -1442,7 +1281,7 @@ async fn test_podman_load_over_fuse() -> Result<()> {
 
     // 1. Ensure localhost/nested-test exists and is cached
     println!("1. Ensuring localhost/nested-test exists...");
-    ensure_nested_image().await?;
+    common::ensure_nested_image().await?;
     println!("   ✓ Image ready");
 
     // 2. Get image digest and verify cache exists
