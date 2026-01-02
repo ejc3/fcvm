@@ -52,18 +52,19 @@ pub struct SetupArgs {
     #[arg(long)]
     pub config: Option<String>,
 
-    /// Also setup inception kernel for nested virtualization
+    /// Setup a kernel profile (e.g., "nested" for nested virtualization)
+    /// Profiles are defined in rootfs-config.toml under [kernel_profiles.*]
     #[arg(long)]
-    pub inception: bool,
+    pub kernel_profile: Option<String>,
 
     /// Build kernels locally instead of downloading from releases
     /// (use if download fails or you've modified kernel sources)
     #[arg(long)]
     pub build_kernels: bool,
 
-    /// Install inception kernel as the host kernel and configure GRUB for nested KVM.
-    /// Requires --inception flag. After setup, reboot to activate.
-    #[arg(long, requires = "inception")]
+    /// Install kernel as the host kernel and configure GRUB.
+    /// Requires --kernel-profile flag. After setup, reboot to activate.
+    #[arg(long, requires = "kernel_profile")]
     pub install_host_kernel: bool,
 }
 
@@ -159,9 +160,13 @@ pub struct RunArgs {
     pub setup: bool,
 
     /// Custom kernel path (overrides default kernel from setup)
-    /// Use for inception support with a KVM-enabled kernel
     #[arg(long)]
     pub kernel: Option<String>,
+
+    /// Kernel profile to use (e.g., "nested" for nested virtualization)
+    /// Must be set up first with: fcvm setup --kernel-profile <name>
+    #[arg(long)]
+    pub kernel_profile: Option<String>,
 }
 
 // ============================================================================

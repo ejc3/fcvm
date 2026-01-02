@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 
 use crate::cli::args::SetupArgs;
 use crate::paths;
-use crate::setup::rootfs::{generate_config, load_config};
+use crate::setup::rootfs::{generate_config, get_kernel_profile, load_config};
 
 /// Run setup to download kernel and create rootfs.
 ///
@@ -24,8 +24,8 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
 
     println!("Setting up fcvm (this may take 5-10 minutes on first run)...");
 
-    // Ensure kernel exists (downloads Kata kernel if missing)
-    let kernel_path = crate::setup::ensure_kernel(true)
+    // Ensure default kernel exists (downloads from [kernel] section if missing)
+    let kernel_path = crate::setup::ensure_kernel(None, true, false)
         .await
         .context("setting up kernel")?;
     println!("  ✓ Kernel ready: {}", kernel_path.display());
@@ -42,29 +42,44 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         .context("setting up fc-agent initrd")?;
     println!("  ✓ Initrd ready: {}", initrd_path.display());
 
-    // Setup inception kernel if requested
-    if args.inception {
-        println!("\nSetting up inception kernel for nested virtualization...");
-        let inception_path = crate::setup::ensure_inception_kernel(args.build_kernels)
-            .await
-            .context("setting up inception kernel")?;
-        println!("  ✓ Inception kernel ready: {}", inception_path.display());
+    // Setup kernel profile if requested (e.g., "nested" for nested virtualization)
+    if let Some(profile_name) = &args.kernel_profile {
+        let profile = get_kernel_profile(profile_name)?.ok_or_else(|| {
+            anyhow::anyhow!("kernel profile '{}' not found in config", profile_name)
+        })?;
+
+        println!(
+            "\nSetting up kernel profile '{}': {}",
+            profile_name, profile.description
+        );
+
+        // Download or build the profile kernel
+        let profile_kernel_path =
+            crate::setup::ensure_kernel(Some(profile_name), true, args.build_kernels)
+                .await
+                .context("setting up profile kernel")?;
+        println!(
+            "  ✓ Profile kernel ready: {}",
+            profile_kernel_path.display()
+        );
 
         // Install as host kernel if requested
         if args.install_host_kernel {
-            println!("\nInstalling inception kernel as host kernel...");
-            crate::setup::install_host_kernel(&inception_path)
+            println!("\nInstalling profile kernel as host kernel...");
+            crate::setup::install_host_kernel(&profile_kernel_path, profile.boot_args.as_deref())
                 .await
                 .context("installing host kernel")?;
             return Ok(());
         }
+
+        println!("\nFor '{}' profile, use:", profile_name);
+        println!(
+            "  fcvm podman run --kernel-profile {} --privileged ...",
+            profile_name
+        );
     }
 
     println!("\nSetup complete! You can now run VMs with: fcvm podman run ...");
-    if args.inception {
-        println!("\nFor nested virtualization, use:");
-        println!("  fcvm podman run --kernel <inception-kernel-path> --privileged ...");
-    }
 
     Ok(())
 }

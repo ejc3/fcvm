@@ -709,7 +709,7 @@ async fn run_exec_with_pty(
 ) -> Result<(i32, Duration, String)> {
     use nix::pty::openpty;
     use nix::unistd::{close, dup2, fork, ForkResult};
-    use std::os::unix::io::{AsRawFd, FromRawFd};
+    use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 
     let pid_str = pid.to_string();
     let start = std::time::Instant::now();
@@ -735,6 +735,13 @@ async fn run_exec_with_pty(
         }
     }
 
+    // Transfer ownership of fds from OwnedFd to raw fds.
+    // This prevents double-close: OwnedFd would close on drop, but we also
+    // wrap master in a File which owns the fd. Using into_raw_fd() transfers
+    // ownership so only the File (or manual close) is responsible for closing.
+    let master_fd = pty.master.into_raw_fd();
+    let slave_fd = pty.slave.into_raw_fd();
+
     // Fork to run fcvm exec in child with PTY as stdin/stdout/stderr
     match unsafe { fork() }.context("forking")? {
         ForkResult::Child => {
@@ -744,18 +751,18 @@ async fn run_exec_with_pty(
                 libc::setsid();
 
                 // Set controlling terminal
-                libc::ioctl(pty.slave.as_raw_fd(), libc::TIOCSCTTY as _, 0);
+                libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
 
                 // Redirect stdio to PTY slave
-                dup2(pty.slave.as_raw_fd(), 0).ok();
-                dup2(pty.slave.as_raw_fd(), 1).ok();
-                dup2(pty.slave.as_raw_fd(), 2).ok();
+                dup2(slave_fd, 0).ok();
+                dup2(slave_fd, 1).ok();
+                dup2(slave_fd, 2).ok();
 
                 // Close original fds
-                if pty.slave.as_raw_fd() > 2 {
-                    close(pty.slave.as_raw_fd()).ok();
+                if slave_fd > 2 {
+                    close(slave_fd).ok();
                 }
-                close(pty.master.as_raw_fd()).ok();
+                close(master_fd).ok();
             }
 
             // Build command args as CStrings
@@ -792,10 +799,10 @@ async fn run_exec_with_pty(
         }
         ForkResult::Parent { child } => {
             // Parent: close slave, use master for I/O
-            close(pty.slave.as_raw_fd()).ok();
+            close(slave_fd).ok();
 
-            // Wrap master fd in File for I/O
-            let mut master = unsafe { std::fs::File::from_raw_fd(pty.master.as_raw_fd()) };
+            // Wrap master fd in File for I/O (File takes ownership, will close on drop)
+            let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
 
             // Delay to let child start - container exec via podman needs more time
             std::thread::sleep(Duration::from_millis(500));
@@ -815,12 +822,8 @@ async fn run_exec_with_pty(
 
             // Set non-blocking
             unsafe {
-                let flags = libc::fcntl(pty.master.as_raw_fd(), libc::F_GETFL);
-                libc::fcntl(
-                    pty.master.as_raw_fd(),
-                    libc::F_SETFL,
-                    flags | libc::O_NONBLOCK,
-                );
+                let flags = libc::fcntl(master_fd, libc::F_GETFL);
+                libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
             }
 
             let deadline = std::time::Instant::now() + Duration::from_secs(30); // 30s for CI under load

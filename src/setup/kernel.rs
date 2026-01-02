@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use glob::glob;
 use nix::fcntl::{Flock, FlockArg};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -6,17 +7,7 @@ use tokio::process::Command;
 use tracing::{debug, info, warn};
 
 use crate::paths;
-use crate::setup::rootfs::{load_plan, KernelArchConfig};
-
-/// GitHub repository for kernel releases
-const GITHUB_REPO: &str = "ejc3/firepod";
-
-/// Inception kernel version (must match kernel/build.sh)
-const INCEPTION_KERNEL_VERSION: &str = "6.18";
-
-/// Inception kernel SHA computed at compile time from kernel sources.
-/// This allows downloads to work after `cargo install` when kernel sources aren't present.
-const INCEPTION_KERNEL_SHA_COMPILED: &str = env!("INCEPTION_KERNEL_SHA");
+use crate::setup::rootfs::{get_kernel_profile, load_plan, KernelProfile};
 
 /// Compute SHA256 of bytes, return hex string (first 12 chars)
 fn compute_sha256_short(data: &[u8]) -> String {
@@ -26,19 +17,59 @@ fn compute_sha256_short(data: &[u8]) -> String {
     hex::encode(&result[..6]) // 12 hex chars
 }
 
-/// Get the kernel URL hash for the current architecture
-/// This is used to include in Layer 2 SHA calculation
+// ============================================================================
+// Unified Kernel API
+// ============================================================================
+
+/// Ensure kernel exists, downloading or building if needed.
+///
+/// - If `profile` is None: uses default kernel from [kernel] section
+/// - If `profile` is Some("name"): uses [kernel_profiles.name] section
+///
+/// If `allow_create` is false, bails if kernel doesn't exist.
+/// If `allow_build` is true, falls back to local build for custom profiles.
+pub async fn ensure_kernel(
+    profile: Option<&str>,
+    allow_create: bool,
+    allow_build: bool,
+) -> Result<PathBuf> {
+    match profile {
+        None => ensure_default_kernel(allow_create).await,
+        Some(name) => ensure_profile_kernel(name, allow_create, allow_build).await,
+    }
+}
+
+/// Get kernel path (without downloading/building).
+///
+/// Returns the path where the kernel should exist.
+/// Used to check existence before running VM.
+pub fn get_kernel_path(profile: Option<&str>) -> Result<PathBuf> {
+    match profile {
+        None => get_default_kernel_path(),
+        Some(name) => get_profile_kernel_path(name),
+    }
+}
+
+/// Get the kernel URL hash for the default kernel.
+/// This is used to include in Layer 2 SHA calculation.
 pub fn get_kernel_url_hash() -> Result<String> {
     let (plan, _, _) = load_plan()?;
     let kernel_config = plan.kernel.current_arch()?;
     Ok(compute_sha256_short(kernel_config.url.as_bytes()))
 }
 
-/// Ensure kernel exists, downloading from Kata release if needed.
-/// If `allow_create` is false, bail if kernel doesn't exist.
-///
-/// If config specifies `local_path`, uses that directly (no download).
-pub async fn ensure_kernel(allow_create: bool) -> Result<PathBuf> {
+// ============================================================================
+// Default Kernel (from [kernel] section)
+// ============================================================================
+
+fn get_default_kernel_path() -> Result<PathBuf> {
+    let (plan, _, _) = load_plan()?;
+    let kernel_config = plan.kernel.current_arch()?;
+    let url_hash = compute_sha256_short(kernel_config.url.as_bytes());
+    Ok(paths::kernel_dir().join(format!("vmlinux-{}.bin", url_hash)))
+}
+
+async fn ensure_default_kernel(allow_create: bool) -> Result<PathBuf> {
     let (plan, _, _) = load_plan()?;
     let kernel_config = plan.kernel.current_arch()?;
 
@@ -46,54 +77,35 @@ pub async fn ensure_kernel(allow_create: bool) -> Result<PathBuf> {
     if let Some(local_path) = &kernel_config.local_path {
         let path = PathBuf::from(local_path);
         if !path.exists() {
-            bail!(
-                "Kernel local_path not found: {}\n\
-                Build it with: ./kernel/build.sh",
-                path.display()
-            );
+            bail!("Kernel local_path not found: {}", path.display());
         }
         info!(path = %path.display(), "using local kernel");
         return Ok(path);
     }
 
-    // URL-based download
     if kernel_config.url.is_empty() {
-        bail!("Kernel config must specify either 'url' or 'local_path'");
+        bail!("Kernel config must specify 'url' or 'local_path'");
     }
 
-    download_kernel(kernel_config, allow_create).await
-}
-
-/// Download kernel from Kata release tarball.
-///
-/// Uses file locking to prevent race conditions when multiple VMs start
-/// simultaneously and all try to download the same kernel.
-///
-/// If `allow_create` is false, bail if kernel doesn't exist.
-async fn download_kernel(config: &KernelArchConfig, allow_create: bool) -> Result<PathBuf> {
     let kernel_dir = paths::kernel_dir();
-
-    // Cache by URL hash - changing URL triggers re-download
-    let url_hash = compute_sha256_short(config.url.as_bytes());
+    let url_hash = compute_sha256_short(kernel_config.url.as_bytes());
     let kernel_path = kernel_dir.join(format!("vmlinux-{}.bin", url_hash));
 
-    // Fast path: kernel already exists
+    // Fast path: already exists
     if kernel_path.exists() {
         info!(path = %kernel_path.display(), url_hash = %url_hash, "kernel already exists");
         return Ok(kernel_path);
     }
 
-    // Bail if creation not allowed
     if !allow_create {
         bail!("Kernel not found. Run 'fcvm setup' first, or use --setup flag.");
     }
 
-    // Create directory (needed for lock file)
+    // Create directory and acquire lock
     tokio::fs::create_dir_all(&kernel_dir)
         .await
         .context("creating kernel directory")?;
 
-    // Acquire exclusive lock to prevent multiple downloads
     let lock_file = kernel_dir.join(format!("vmlinux-{}.lock", url_hash));
     use std::os::unix::fs::OpenOptionsExt;
     let lock_fd = std::fs::OpenOptions::new()
@@ -108,36 +120,27 @@ async fn download_kernel(config: &KernelArchConfig, allow_create: bool) -> Resul
         .map_err(|(_, err)| err)
         .context("acquiring exclusive lock for kernel download")?;
 
-    // Double-check after acquiring lock - another process may have downloaded it
+    // Double-check after lock
     if kernel_path.exists() {
-        debug!(
-            path = %kernel_path.display(),
-            url_hash = %url_hash,
-            "kernel already exists (created by another process)"
-        );
-        flock
-            .unlock()
-            .map_err(|(_, err)| err)
-            .context("releasing kernel lock")?;
+        debug!(path = %kernel_path.display(), "kernel exists (created by another process)");
+        flock.unlock().map_err(|(_, err)| err)?;
         return Ok(kernel_path);
     }
 
-    println!("⚙️  Downloading kernel (first run)...");
-    info!(url = %config.url, path_in_archive = %config.path, "downloading kernel from Kata release");
+    // Download
+    println!("⚙️  Downloading kernel...");
+    info!(url = %kernel_config.url, path_in_archive = %kernel_config.path, "downloading kernel");
 
-    // Download and extract in one pipeline:
-    // curl -> zstd -d -> tar --extract
     let cache_dir = paths::cache_dir();
     tokio::fs::create_dir_all(&cache_dir).await?;
 
-    let tarball_path = cache_dir.join(format!("kata-kernel-{}.tar.zst", url_hash));
+    let tarball_path = cache_dir.join(format!("kernel-{}.tar.zst", url_hash));
 
-    // Download if not cached
+    // Download tarball if not cached
     if !tarball_path.exists() {
-        println!("  → Downloading Kata release tarball...");
-
+        println!("  → Downloading tarball...");
         let output = Command::new("curl")
-            .args(["-fSL", &config.url, "-o"])
+            .args(["-fSL", &kernel_config.url, "-o"])
             .arg(&tarball_path)
             .output()
             .await
@@ -148,18 +151,13 @@ async fn download_kernel(config: &KernelArchConfig, allow_create: bool) -> Resul
             let _ = flock.unlock();
             bail!("Failed to download kernel: {}", stderr);
         }
-
-        info!(path = %tarball_path.display(), "downloaded Kata tarball");
     } else {
-        info!(path = %tarball_path.display(), "using cached Kata tarball");
+        info!(path = %tarball_path.display(), "using cached tarball");
     }
 
-    // Extract just the kernel file using tar with zstd
-    println!("  → Extracting kernel from tarball...");
-
-    // Use tar to extract, piping through zstd
-    // tar expects path with ./ prefix based on how Kata packages it
-    let extract_path = format!("./{}", config.path);
+    // Extract kernel from tarball
+    println!("  → Extracting kernel...");
+    let extract_path = format!("./{}", kernel_config.path);
 
     let output = Command::new("tar")
         .args(["--use-compress-program=zstd", "-xf"])
@@ -177,8 +175,8 @@ async fn download_kernel(config: &KernelArchConfig, allow_create: bool) -> Resul
         bail!("Failed to extract kernel: {}", stderr);
     }
 
-    // Move extracted kernel to final location
-    let extracted_path = cache_dir.join(&config.path);
+    // Move to final location
+    let extracted_path = cache_dir.join(&kernel_config.path);
     if !extracted_path.exists() {
         let _ = flock.unlock();
         bail!(
@@ -191,115 +189,66 @@ async fn download_kernel(config: &KernelArchConfig, allow_create: bool) -> Resul
         .await
         .context("copying kernel to final location")?;
 
-    // Clean up extracted files (keep tarball for cache)
+    // Clean up extracted files
     let opt_dir = cache_dir.join("opt");
     if opt_dir.exists() {
         tokio::fs::remove_dir_all(&opt_dir).await.ok();
     }
 
     println!("  ✓ Kernel ready");
-    info!(
-        path = %kernel_path.display(),
-        url_hash = %url_hash,
-        "kernel downloaded and cached"
-    );
+    info!(path = %kernel_path.display(), url_hash = %url_hash, "kernel ready");
 
-    // Release lock
-    flock
-        .unlock()
-        .map_err(|(_, err)| err)
-        .context("releasing kernel lock after download")?;
-
+    flock.unlock().map_err(|(_, err)| err)?;
     Ok(kernel_path)
 }
 
 // ============================================================================
-// Inception Kernel (for nested virtualization)
+// Profile Kernel (from [kernel_profiles] section)
 // ============================================================================
 
-/// Compute SHA for inception kernel based on build inputs.
-/// This matches the SHA computed in kernel/build.sh and CI workflow.
-///
-/// If kernel sources are present (e.g., running from git repo), computes SHA at runtime.
-/// If sources are not present (e.g., after `cargo install`), uses compile-time SHA.
-pub fn compute_inception_kernel_sha() -> String {
-    let kernel_dir = Path::new("kernel");
+fn get_profile_kernel_path(profile_name: &str) -> Result<PathBuf> {
+    let profile = get_kernel_profile(profile_name)?
+        .ok_or_else(|| anyhow::anyhow!("kernel profile '{}' not found in config", profile_name))?;
 
-    // Check if kernel sources exist
-    let script = kernel_dir.join("build.sh");
-    if !script.exists() {
-        // Sources not present - use compile-time SHA
-        debug!(
-            sha = %INCEPTION_KERNEL_SHA_COMPILED,
-            "kernel sources not found, using compile-time SHA"
+    if !profile.is_custom() {
+        bail!(
+            "kernel profile '{}' has no kernel source configured.\n\
+             Add kernel_version + kernel_repo to [kernel_profiles.{}]",
+            profile_name,
+            profile_name
         );
-        return INCEPTION_KERNEL_SHA_COMPILED.to_string();
     }
 
-    // Sources present - compute at runtime for development workflow
-    let mut content = Vec::new();
-
-    // Read build.sh
-    if let Ok(data) = std::fs::read(&script) {
-        content.extend(data);
-    }
-
-    // Read inception.conf
-    let conf = kernel_dir.join("inception.conf");
-    if let Ok(data) = std::fs::read(&conf) {
-        content.extend(data);
-    }
-
-    // Read patches/*.patch (sorted for determinism)
-    let patches_dir = kernel_dir.join("patches");
-    if patches_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&patches_dir) {
-            let mut patches: Vec<_> = entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "patch"))
-                .collect();
-            patches.sort_by_key(|e| e.path());
-            for patch in patches {
-                if let Ok(data) = std::fs::read(patch.path()) {
-                    content.extend(data);
-                }
-            }
-        }
-    }
-
-    compute_sha256_short(&content)
+    let sha = compute_profile_kernel_sha(&profile);
+    let filename = custom_kernel_filename(profile_name, &profile.kernel_version, &sha);
+    Ok(paths::kernel_dir().join(filename))
 }
 
-/// Get the inception kernel filename.
-pub fn inception_kernel_filename(sha: &str) -> String {
-    format!(
-        "vmlinux-inception-{}-{}-{}.bin",
-        INCEPTION_KERNEL_VERSION,
-        std::env::consts::ARCH,
-        sha
-    )
-}
+async fn ensure_profile_kernel(
+    profile_name: &str,
+    allow_create: bool,
+    allow_build: bool,
+) -> Result<PathBuf> {
+    let profile = get_kernel_profile(profile_name)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "kernel profile '{}' not found in config. \
+             Add [kernel_profiles.{}] section to rootfs-config.toml",
+            profile_name,
+            profile_name
+        )
+    })?;
 
-/// Get the inception kernel release tag.
-pub fn inception_kernel_tag(sha: &str) -> String {
-    format!(
-        "kernel-inception-{}-{}-{}",
-        INCEPTION_KERNEL_VERSION,
-        std::env::consts::ARCH,
-        sha
-    )
-}
+    if !profile.is_custom() {
+        bail!(
+            "kernel profile '{}' has no kernel source configured.\n\
+             Add kernel_version + kernel_repo to [kernel_profiles.{}]",
+            profile_name,
+            profile_name
+        );
+    }
 
-/// Ensure inception kernel exists.
-///
-/// 1. Check if already downloaded locally
-/// 2. Try to download from GitHub releases
-/// 3. If `allow_build` is true and download fails, build locally
-///
-/// Returns the path to the kernel binary.
-pub async fn ensure_inception_kernel(allow_build: bool) -> Result<PathBuf> {
-    let sha = compute_inception_kernel_sha();
-    let filename = inception_kernel_filename(&sha);
+    let sha = compute_profile_kernel_sha(&profile);
+    let filename = custom_kernel_filename(profile_name, &profile.kernel_version, &sha);
     let kernel_dir = paths::kernel_dir();
     let kernel_path = kernel_dir.join(&filename);
 
@@ -307,18 +256,28 @@ pub async fn ensure_inception_kernel(allow_build: bool) -> Result<PathBuf> {
     if kernel_path.exists() {
         info!(
             path = %kernel_path.display(),
+            profile = %profile_name,
             sha = %sha,
-            "inception kernel already exists"
+            "kernel already exists"
         );
         return Ok(kernel_path);
     }
 
-    // Create directory
+    if !allow_create {
+        bail!(
+            "Kernel not found for profile '{}' at {}.\n\
+             Run: fcvm setup --kernel-profile {}",
+            profile_name,
+            kernel_path.display(),
+            profile_name
+        );
+    }
+
+    // Create directory and acquire lock
     tokio::fs::create_dir_all(&kernel_dir)
         .await
         .context("creating kernel directory")?;
 
-    // Acquire lock to prevent race conditions
     let lock_file = kernel_dir.join(format!("{}.lock", filename));
     use std::os::unix::fs::OpenOptionsExt;
     let lock_fd = std::fs::OpenOptions::new()
@@ -327,68 +286,190 @@ pub async fn ensure_inception_kernel(allow_build: bool) -> Result<PathBuf> {
         .truncate(true)
         .mode(0o600)
         .open(&lock_file)
-        .context("opening inception kernel lock file")?;
+        .context("opening kernel lock file")?;
 
     let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
         .map_err(|(_, err)| err)
-        .context("acquiring exclusive lock for inception kernel")?;
+        .context("acquiring exclusive lock for kernel")?;
 
     // Double-check after lock
     if kernel_path.exists() {
-        debug!(
-            path = %kernel_path.display(),
-            "inception kernel already exists (created by another process)"
-        );
+        debug!(path = %kernel_path.display(), "kernel exists (created by another process)");
         flock.unlock().map_err(|(_, err)| err)?;
         return Ok(kernel_path);
     }
 
     // Try to download from GitHub releases
-    let tag = inception_kernel_tag(&sha);
+    let tag = format!(
+        "kernel-{}-{}-{}-{}",
+        profile_name,
+        profile.kernel_version,
+        std::env::consts::ARCH,
+        sha
+    );
     let download_url = format!(
         "https://github.com/{}/releases/download/{}/{}",
-        GITHUB_REPO, tag, filename
+        profile.kernel_repo, tag, filename
     );
 
-    println!("⚙️  Downloading inception kernel...");
-    info!(url = %download_url, tag = %tag, "downloading inception kernel from GitHub releases");
+    println!("⚙️  Downloading kernel (profile: {})...", profile_name);
+    info!(url = %download_url, tag = %tag, "downloading kernel from GitHub releases");
 
-    let download_result = download_inception_kernel(&download_url, &kernel_path).await;
+    let download_result = download_kernel_binary(&download_url, &kernel_path).await;
 
     match download_result {
         Ok(_) => {
-            println!("  ✓ Inception kernel downloaded");
-            info!(path = %kernel_path.display(), "inception kernel ready");
+            println!("  ✓ Kernel ready (profile: {})", profile_name);
+            info!(path = %kernel_path.display(), profile = %profile_name, "kernel ready");
             flock.unlock().map_err(|(_, err)| err)?;
             Ok(kernel_path)
         }
         Err(e) => {
-            warn!(error = %e, "failed to download inception kernel");
+            warn!(error = %e, profile = %profile_name, "download failed");
 
             if allow_build {
-                println!("  → Download failed, building locally (this may take 10-20 minutes)...");
-                build_inception_kernel_locally(&kernel_path).await?;
-                println!("  ✓ Inception kernel built");
+                println!("  → Building locally (may take 10-20 minutes)...");
+                build_kernel_locally(&profile, profile_name, &kernel_path).await?;
+                println!("  ✓ Kernel built (profile: {})", profile_name);
                 flock.unlock().map_err(|(_, err)| err)?;
                 Ok(kernel_path)
             } else {
                 flock.unlock().map_err(|(_, err)| err)?;
                 bail!(
-                    "Failed to download inception kernel: {}\n\
-                    \n\
-                    The kernel release may not exist yet. Options:\n\
-                    1. Wait for CI to build it (push to main triggers kernel build)\n\
-                    2. Build locally with: fcvm setup --build-kernels\n\
-                    3. Build manually with: ./kernel/build.sh",
-                    e
+                    "Failed to download '{}' kernel: {}\n\n\
+                     Options:\n\
+                     1. Build locally: fcvm setup --kernel-profile {} --build-kernels\n\
+                     2. Build manually: ./kernel/build.sh\n\
+                     3. Wait for CI to publish pre-built kernel",
+                    profile_name,
+                    e,
+                    profile_name
                 );
             }
         }
     }
 }
 
-/// Download inception kernel from URL.
-async fn download_inception_kernel(url: &str, dest: &Path) -> Result<()> {
+// ============================================================================
+// Custom Kernel Helpers
+// ============================================================================
+
+/// Find the repo root by looking for Cargo.toml going up the directory tree.
+fn find_repo_root() -> Option<PathBuf> {
+    // Try CWD first
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        if dir.join("Cargo.toml").exists() && dir.join("rootfs-config.toml").exists() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+
+    // Try relative to executable
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            // Check a few levels up from target/release/fcvm
+            for ancestor in exe_dir.ancestors().take(5) {
+                if ancestor.join("Cargo.toml").exists()
+                    && ancestor.join("rootfs-config.toml").exists()
+                {
+                    return Some(ancestor.to_path_buf());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Compute SHA for custom kernel based on build inputs from profile config.
+///
+/// Reads the files listed in `profile.build_inputs` (supports globs) and
+/// computes SHA256 of their concatenated contents. This is purely config-driven -
+/// the binary has no hardcoded knowledge of which files matter.
+///
+/// Patterns are resolved relative to the repo root (directory containing Cargo.toml
+/// and rootfs-config.toml).
+pub fn compute_profile_kernel_sha(profile: &KernelProfile) -> String {
+    if profile.build_inputs.is_empty() {
+        warn!("kernel profile has no build_inputs, using empty SHA");
+        return "000000000000".to_string();
+    }
+
+    // Find repo root for relative path resolution
+    let repo_root = find_repo_root();
+    if let Some(ref root) = repo_root {
+        debug!(repo_root = %root.display(), "found repo root for build_inputs");
+    } else {
+        debug!("repo root not found, using CWD for build_inputs");
+    }
+
+    let mut content = Vec::new();
+
+    for pattern in &profile.build_inputs {
+        // If pattern is relative and we have a repo root, prepend it
+        let full_pattern = if !pattern.starts_with('/') {
+            if let Some(ref root) = repo_root {
+                root.join(pattern).to_string_lossy().into_owned()
+            } else {
+                pattern.clone()
+            }
+        } else {
+            pattern.clone()
+        };
+
+        // Expand glob pattern
+        let paths: Vec<PathBuf> = match glob(&full_pattern) {
+            Ok(entries) => {
+                let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok()).collect();
+                paths.sort(); // Deterministic order
+                paths
+            }
+            Err(e) => {
+                warn!(pattern = %full_pattern, error = %e, "invalid glob pattern");
+                continue;
+            }
+        };
+
+        if paths.is_empty() {
+            debug!(pattern = %full_pattern, "no files matched pattern");
+        }
+
+        for path in paths {
+            match std::fs::read(&path) {
+                Ok(data) => {
+                    debug!(path = %path.display(), bytes = data.len(), "hashing build input");
+                    content.extend(data);
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "failed to read build input");
+                }
+            }
+        }
+    }
+
+    if content.is_empty() {
+        warn!("no build input files found, using empty SHA");
+        return "000000000000".to_string();
+    }
+
+    compute_sha256_short(&content)
+}
+
+/// Get the custom kernel filename.
+pub fn custom_kernel_filename(profile_name: &str, kernel_version: &str, sha: &str) -> String {
+    format!(
+        "vmlinux-{}-{}-{}-{}.bin",
+        profile_name,
+        kernel_version,
+        std::env::consts::ARCH,
+        sha
+    )
+}
+
+async fn download_kernel_binary(url: &str, dest: &Path) -> Result<()> {
     let temp_path = dest.with_extension("downloading");
 
     let output = Command::new("curl")
@@ -404,7 +485,7 @@ async fn download_inception_kernel(url: &str, dest: &Path) -> Result<()> {
         bail!("curl failed: {}", stderr);
     }
 
-    // Verify it's a valid kernel binary (ELF or ARM64 Image)
+    // Verify it's a valid kernel binary
     let output = Command::new("file")
         .arg(&temp_path)
         .output()
@@ -414,44 +495,46 @@ async fn download_inception_kernel(url: &str, dest: &Path) -> Result<()> {
     let file_type = String::from_utf8_lossy(&output.stdout);
     if !file_type.contains("ELF") && !file_type.contains("Linux kernel") {
         let _ = tokio::fs::remove_file(&temp_path).await;
-        bail!(
-            "Downloaded file is not a valid kernel (not ELF or ARM64 Image): {}",
-            file_type
-        );
+        bail!("Downloaded file is not a valid kernel: {}", file_type);
     }
 
-    // Move to final location
     tokio::fs::rename(&temp_path, dest)
         .await
-        .context("moving downloaded kernel to final location")?;
+        .context("moving kernel to final location")?;
 
     Ok(())
 }
 
-/// Build inception kernel locally using kernel/build.sh.
-///
-/// This only works when running from the git repository (not after `cargo install`).
-async fn build_inception_kernel_locally(dest: &Path) -> Result<()> {
-    let script = Path::new("kernel/build.sh");
-    if !script.exists() {
+async fn build_kernel_locally(
+    profile: &KernelProfile,
+    profile_name: &str,
+    dest: &Path,
+) -> Result<()> {
+    let script = profile.build_script.as_deref().unwrap_or("kernel/build.sh");
+    let script_path = Path::new(script);
+
+    if !script_path.exists() {
         bail!(
-            "kernel/build.sh not found.\n\
-            \n\
-            Local kernel builds require the fcvm git repository.\n\
-            If you installed via `cargo install fcvm`, you cannot use --build-kernels.\n\
-            \n\
-            Options:\n\
-            1. Clone the repo: git clone https://github.com/ejc3/firepod\n\
-            2. Run from repo: cd firepod && cargo run -- setup --inception --build-kernels\n\
-            3. Or wait for CI to publish pre-built kernels and retry without --build-kernels"
+            "Build script '{}' not found.\n\n\
+             Local builds require the fcvm git repository.\n\
+             Clone it and run: cargo run -- setup --kernel-profile {} --build-kernels",
+            script,
+            profile_name
         );
     }
 
-    let output = Command::new(script)
-        .env("KERNEL_PATH", dest)
-        .output()
-        .await
-        .context("running kernel/build.sh")?;
+    let mut cmd = Command::new(script_path);
+    cmd.env("KERNEL_PATH", dest);
+
+    // Pass config paths to build script via env vars
+    if let Some(ref config) = profile.kernel_config {
+        cmd.env("KERNEL_CONFIG", config);
+    }
+    if let Some(ref patches) = profile.patches_dir {
+        cmd.env("PATCHES_DIR", patches);
+    }
+
+    let output = cmd.output().await.context("running build script")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -459,10 +542,7 @@ async fn build_inception_kernel_locally(dest: &Path) -> Result<()> {
     }
 
     if !dest.exists() {
-        bail!(
-            "Kernel build completed but file not found at {}",
-            dest.display()
-        );
+        bail!("Build completed but kernel not found at {}", dest.display());
     }
 
     Ok(())
@@ -472,40 +552,47 @@ async fn build_inception_kernel_locally(dest: &Path) -> Result<()> {
 // Host Kernel Installation (for EC2 setup)
 // ============================================================================
 
-/// Install inception kernel as the host kernel and configure GRUB for nested KVM.
+/// Install profile kernel as the host kernel and configure GRUB.
 ///
-/// This:
-/// 1. Copies the inception kernel to /boot/vmlinuz-{version}-inception
-/// 2. Updates GRUB to add kvm-arm.mode=nested boot parameter
-/// 3. Sets the inception kernel as the default boot kernel
-///
-/// Requires root privileges.
-pub async fn install_host_kernel(inception_kernel: &Path) -> Result<()> {
-    // Check we're running as root
+/// `boot_args` are the kernel boot parameters from the profile config
+/// (e.g., "kvm-arm.mode=nested numa=off"). These are added to GRUB_CMDLINE_LINUX_DEFAULT.
+pub async fn install_host_kernel(profile_kernel: &Path, boot_args: Option<&str>) -> Result<()> {
     if !nix::unistd::geteuid().is_root() {
         bail!("Installing host kernel requires root privileges. Run with sudo.");
     }
 
-    let kernel_name = format!("vmlinuz-{}-inception", INCEPTION_KERNEL_VERSION);
+    let filename = profile_kernel
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("vmlinux");
+
+    let parts: Vec<&str> = filename
+        .strip_prefix("vmlinux-")
+        .unwrap_or(filename)
+        .strip_suffix(".bin")
+        .unwrap_or(filename)
+        .split('-')
+        .collect();
+
+    let (profile_name, kernel_version) = if parts.len() >= 2 {
+        (parts[0], parts[1])
+    } else {
+        ("custom", "unknown")
+    };
+
+    let kernel_name = format!("vmlinuz-{}-{}", kernel_version, profile_name);
     let boot_path = Path::new("/boot").join(&kernel_name);
 
-    info!(
-        src = %inception_kernel.display(),
-        dest = %boot_path.display(),
-        "installing inception kernel to /boot"
-    );
+    info!(src = %profile_kernel.display(), dest = %boot_path.display(), "installing kernel to /boot");
 
-    // Copy kernel to /boot
-    tokio::fs::copy(inception_kernel, &boot_path)
+    tokio::fs::copy(profile_kernel, &boot_path)
         .await
         .context("copying kernel to /boot")?;
 
     println!("  → Installed kernel to {}", boot_path.display());
 
-    // Update GRUB configuration
-    update_grub_config(&kernel_name).await?;
+    update_grub_config(&kernel_name, boot_args).await?;
 
-    // Update GRUB
     println!("  → Running update-grub...");
     let output = Command::new("update-grub")
         .output()
@@ -517,30 +604,20 @@ pub async fn install_host_kernel(inception_kernel: &Path) -> Result<()> {
         warn!(stderr = %stderr, "update-grub had warnings");
     }
 
-    println!("  ✓ Host kernel installed and GRUB updated");
+    println!("  ✓ Host kernel installed");
     println!();
-    println!("  ⚠️  Reboot required to activate the new kernel:");
-    println!("     sudo reboot");
-    println!();
-    println!("  After reboot, verify with:");
-    println!(
-        "     uname -r                              # Should show {}-inception",
-        INCEPTION_KERNEL_VERSION
-    );
-    println!("     cat /sys/module/kvm/parameters/mode   # Should show 'nested'");
+    println!("  ⚠️  Reboot required: sudo reboot");
 
     Ok(())
 }
 
-/// Update GRUB configuration to add kvm-arm.mode=nested and set default kernel.
-async fn update_grub_config(kernel_name: &str) -> Result<()> {
+async fn update_grub_config(kernel_name: &str, boot_args: Option<&str>) -> Result<()> {
     let grub_default = Path::new("/etc/default/grub");
 
     if !grub_default.exists() {
-        bail!("/etc/default/grub not found - is GRUB installed?");
+        bail!("/etc/default/grub not found");
     }
 
-    // Read current config
     let content = tokio::fs::read_to_string(grub_default)
         .await
         .context("reading /etc/default/grub")?;
@@ -550,22 +627,31 @@ async fn update_grub_config(kernel_name: &str) -> Result<()> {
 
     for line in content.lines() {
         if line.starts_with("GRUB_CMDLINE_LINUX_DEFAULT=") {
-            // Add kvm-arm.mode=nested if not already present
-            if !line.contains("kvm-arm.mode=nested") {
-                let new_line = if line.contains("=\"\"") {
-                    line.replace("=\"\"", "=\"kvm-arm.mode=nested\"")
+            // Add boot_args from profile if provided
+            if let Some(args) = boot_args {
+                // Check if any of the args are already present
+                let args_to_add: Vec<&str> = args
+                    .split_whitespace()
+                    .filter(|arg| !line.contains(arg))
+                    .collect();
+
+                if !args_to_add.is_empty() {
+                    let args_str = args_to_add.join(" ");
+                    let new_line = if line.contains("=\"\"") {
+                        line.replace("=\"\"", &format!("=\"{}\"", args_str))
+                    } else {
+                        line.replacen("=\"", &format!("=\"{} ", args_str), 1)
+                    };
+                    new_lines.push(new_line);
+                    modified = true;
+                    println!("  → Added boot args: {}", args_str);
                 } else {
-                    // Insert after the opening quote
-                    line.replacen("=\"", "=\"kvm-arm.mode=nested ", 1)
-                };
-                new_lines.push(new_line);
-                modified = true;
-                println!("  → Added kvm-arm.mode=nested to GRUB_CMDLINE_LINUX_DEFAULT");
+                    new_lines.push(line.to_string());
+                }
             } else {
                 new_lines.push(line.to_string());
             }
         } else if line.starts_with("GRUB_DEFAULT=") {
-            // Set default to our kernel
             let new_default = format!(
                 "GRUB_DEFAULT=\"Advanced options for Ubuntu>Ubuntu, with Linux {}\"",
                 kernel_name
@@ -579,21 +665,13 @@ async fn update_grub_config(kernel_name: &str) -> Result<()> {
     }
 
     if modified {
-        // Backup original
         let backup = grub_default.with_extension("grub.bak");
-        tokio::fs::copy(grub_default, &backup)
-            .await
-            .context("backing up /etc/default/grub")?;
+        tokio::fs::copy(grub_default, &backup).await?;
 
-        // Write new config
         let new_content = new_lines.join("\n") + "\n";
-        tokio::fs::write(grub_default, new_content)
-            .await
-            .context("writing /etc/default/grub")?;
+        tokio::fs::write(grub_default, new_content).await?;
 
-        info!(backup = %backup.display(), "GRUB config updated, backup saved");
-    } else {
-        println!("  → GRUB config already configured for nested KVM");
+        info!(backup = %backup.display(), "GRUB config updated");
     }
 
     Ok(())

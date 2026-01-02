@@ -209,7 +209,7 @@ jobs:
             echo "✓ Nested virtualization ENABLED (kvm-arm.mode=nested)"
           else
             echo "⚠ Nested virtualization NOT enabled in kernel cmdline"
-            echo "  Inception tests will fail - add kvm-arm.mode=nested to GRUB_CMDLINE_LINUX"
+            echo "  Nested virtualization tests will fail - add kvm-arm.mode=nested to GRUB_CMDLINE_LINUX"
           fi
           echo ""
           sudo chmod 666 /dev/kvm
@@ -258,7 +258,7 @@ jobs:
           key: ${{ env.CACHE_KEY_HOST }}-${{ runner.os }}-${{ runner.arch }}
 
   # Runner 1b: Host-Root (bare metal with KVM)
-  # Runs: test-root (privileged tests with inception kernel)
+  # Runs: test-root (privileged tests with nested kernel)
   # Parallel with Host job for faster CI
   host-root:
     name: Host-Root
@@ -341,11 +341,11 @@ jobs:
       - name: setup-fcvm
         working-directory: fcvm
         run: make setup-fcvm
-      - name: Get inception kernel
+      - name: Get nested kernel
         working-directory: fcvm
         run: |
           # Downloads from GitHub release if available, builds locally if not
-          sudo ./target/release/fcvm setup --inception
+          sudo ./target/release/fcvm setup --kernel-profile nested
       - name: test-root
         working-directory: fcvm
         run: make test-root
