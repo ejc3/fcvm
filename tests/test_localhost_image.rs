@@ -1,8 +1,8 @@
 //! Integration test for localhost/ container images
 //!
 //! This test verifies that locally-built container images can be run inside VMs.
-//! The image is exported from the host using skopeo, mounted into the VM via FUSE,
-//! and then imported by fc-agent using skopeo before running with podman.
+//! The image is exported from the host using `podman save`, mounted into the VM via FUSE,
+//! and then imported by fc-agent using `podman load` before running with podman.
 
 #![cfg(all(feature = "integration-fast", feature = "privileged-tests"))]
 
@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 async fn test_localhost_hello_world_bridged() -> Result<()> {
     println!("\nLocalhost Image Test");
     println!("====================");
-    println!("Testing that localhost/ container images work via skopeo");
+    println!("Testing that localhost/ container images work via podman save/load");
 
     // Find fcvm binary
     let fcvm_path = common::find_fcvm_binary()?;
@@ -116,8 +116,8 @@ async fn test_localhost_hello_world_bridged() -> Result<()> {
     // Check results - verify we got the container output
     if found_hello {
         println!("\n✅ LOCALHOST IMAGE TEST PASSED!");
-        println!("  - Image exported via skopeo on host");
-        println!("  - Image imported via skopeo in guest");
+        println!("  - Image exported via podman save on host");
+        println!("  - Image imported via podman load in guest");
         println!("  - Container ran and printed: Hello from localhost container!");
         if container_exited_zero {
             println!("  - Container exited with code 0");

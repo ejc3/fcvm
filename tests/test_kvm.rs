@@ -1453,11 +1453,13 @@ async fn run_nested_n_levels(n: usize, marker: &str) -> Result<()> {
             r#"#!/bin/bash
 set -ex
 echo "L{}: Importing image from shared cache..."
-skopeo copy dir:/mnt/fcvm-btrfs/image-cache/{} containers-storage:localhost/nested-test
+podman load -i /mnt/fcvm-btrfs/image-cache/{}.oci.tar
+podman tag sha256:{} localhost/nested-test 2>/dev/null || true
 echo "L{}: Starting L{} VM..."
 fcvm podman run --name l{} --network bridged --privileged {} --kernel-profile nested --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs localhost/nested-test --cmd {}
 "#,
             level,
+            digest,
             digest,
             level,
             level + 1,
@@ -1523,21 +1525,21 @@ fcvm podman run --name l{} --network bridged --privileged {} --kernel-profile ne
     Ok(())
 }
 
-/// Test skopeo import performance over FUSE (localhost/nested-test)
+/// Test podman load performance over FUSE (localhost/nested-test)
 ///
-/// Measures how long it takes to import the full nested container image
-/// inside a VM when the image layers are accessed over FUSE-over-vsock.
+/// Measures how long it takes to import the nested container image
+/// inside a VM when the image archive is accessed over FUSE-over-vsock.
 #[tokio::test]
-async fn test_skopeo_import_over_fuse() -> Result<()> {
-    println!("\nSkopeo Over FUSE Performance Test");
-    println!("==================================\n");
+async fn test_podman_load_over_fuse() -> Result<()> {
+    println!("\nPodman Load Over FUSE Performance Test");
+    println!("======================================\n");
 
-    // 1. Ensure localhost/nested-test exists
+    // 1. Ensure localhost/nested-test exists and is cached
     println!("1. Ensuring localhost/nested-test exists...");
     ensure_nested_image().await?;
     println!("   ✓ Image ready");
 
-    // 2. Get image digest and export to CAS cache
+    // 2. Get image digest and verify cache exists
     println!("2. Getting image digest...");
     let digest_output = tokio::process::Command::new("podman")
         .args([
@@ -1556,50 +1558,23 @@ async fn test_skopeo_import_over_fuse() -> Result<()> {
         bail!("Invalid digest: {}", digest);
     }
 
-    let cache_dir = format!("/mnt/fcvm-btrfs/image-cache/{}", digest);
-    println!("   Digest: {}", &digest[..19]);
+    let digest_stripped = digest.trim_start_matches("sha256:");
+    let archive_path = format!("/mnt/fcvm-btrfs/image-cache/{}.oci.tar", digest_stripped);
+    println!("   Digest: sha256:{}...", &digest_stripped[..12]);
 
-    // Get image size
-    let size_output = tokio::process::Command::new("podman")
-        .args(["images", "localhost/nested-test", "--format", "{{.Size}}"])
-        .output()
-        .await?;
-    let size = String::from_utf8_lossy(&size_output.stdout)
-        .trim()
-        .to_string();
-    println!("   Size: {}", size);
-
-    // Check if already in CAS cache
-    if !std::path::Path::new(&cache_dir).exists() {
-        println!("   Exporting to CAS cache...");
-        tokio::process::Command::new("mkdir")
-            .args(["-p", &cache_dir])
-            .output()
-            .await?;
-
-        let export_output = tokio::process::Command::new("skopeo")
-            .args([
-                "copy",
-                "containers-storage:localhost/nested-test",
-                &format!("dir:{}", cache_dir),
-            ])
-            .output()
-            .await?;
-
-        if !export_output.status.success() {
-            let stderr = String::from_utf8_lossy(&export_output.stderr);
-            bail!("Failed to export to CAS: {}", stderr);
-        }
-        println!("   ✓ Exported to CAS cache");
-    } else {
-        println!("   ✓ Already in CAS cache");
+    if !std::path::Path::new(&archive_path).exists() {
+        bail!("OCI archive not found at {}", archive_path);
     }
+
+    // Get archive size
+    let metadata = std::fs::metadata(&archive_path)?;
+    let size_mb = metadata.len() as f64 / (1024.0 * 1024.0);
+    println!("   Archive size: {:.1} MB", size_mb);
 
     // 3. Start L1 VM with FUSE mount
     println!("3. Starting L1 VM with FUSE mount...");
 
-    let (vm_name, _, _, _) = common::unique_names("fuse-large");
-    let fcvm_path = common::find_fcvm_binary()?;
+    let (vm_name, _, _, _) = common::unique_names("podman-load");
 
     let (mut _child, vm_pid) = common::spawn_fcvm(&[
         "podman",
@@ -1627,19 +1602,16 @@ async fn test_skopeo_import_over_fuse() -> Result<()> {
     }
     println!("   ✓ VM is healthy");
 
-    // 4. Time the skopeo import inside the VM
-    println!("\n4. Timing skopeo import inside VM...");
-    println!("   Source: {}", cache_dir);
-    println!("   Image size: {}", size);
+    // 4. Time the podman load inside the VM
+    println!("\n4. Timing podman load inside VM...");
+    println!("   Source: {}", archive_path);
 
+    let fcvm_path = common::find_fcvm_binary()?;
     let start = std::time::Instant::now();
 
-    let import_cmd = format!(
-        "time skopeo copy dir:{} containers-storage:localhost/imported 2>&1",
-        cache_dir
-    );
+    let load_cmd = format!("time podman load -i {} 2>&1", archive_path);
 
-    let import_output = tokio::process::Command::new(&fcvm_path)
+    let load_output = tokio::process::Command::new(&fcvm_path)
         .args([
             "exec",
             "--pid",
@@ -1648,7 +1620,7 @@ async fn test_skopeo_import_over_fuse() -> Result<()> {
             "--",
             "sh",
             "-c",
-            &import_cmd,
+            &load_cmd,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1657,67 +1629,34 @@ async fn test_skopeo_import_over_fuse() -> Result<()> {
 
     let elapsed = start.elapsed();
 
-    let stdout = String::from_utf8_lossy(&import_output.stdout);
+    let stdout = String::from_utf8_lossy(&load_output.stdout);
     println!("\n   Output:\n   {}", stdout.trim().replace('\n', "\n   "));
 
-    // 5. Verify the image was imported
-    println!("\n5. Verifying image was imported...");
-    let verify_output = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "exec",
-            "--pid",
-            &vm_pid.to_string(),
-            "--vm",
-            "--",
-            "podman",
-            "images",
-            "localhost/imported",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await?;
-
-    let verify_stdout = String::from_utf8_lossy(&verify_output.stdout);
-    println!("   {}", verify_stdout.trim().replace('\n', "\n   "));
-
-    if !verify_stdout.contains("localhost/imported") {
-        common::kill_process(vm_pid).await;
-        bail!("Image was not imported correctly");
-    }
-    println!("   ✓ Image imported!");
-
-    // 6. Clean up
-    println!("\n6. Cleaning up...");
+    // 5. Clean up
+    println!("\n5. Cleaning up...");
     common::kill_process(vm_pid).await;
 
-    // 7. Report results
+    // 6. Report results
     println!("\n==========================================");
-    println!("RESULT: {} image import over FUSE took {:?}", size, elapsed);
+    println!(
+        "RESULT: {:.1} MB image load over FUSE took {:?}",
+        size_mb, elapsed
+    );
     println!("==========================================");
 
-    // Calculate throughput
-    let size_mb: f64 = if size.contains("MB") {
-        size.replace(" MB", "").parse().unwrap_or(0.0)
-    } else if size.contains("GB") {
-        size.replace(" GB", "").parse::<f64>().unwrap_or(0.0) * 1024.0
-    } else {
-        0.0
-    };
-
-    if size_mb > 0.0 && elapsed.as_secs_f64() > 0.0 {
+    if elapsed.as_secs_f64() > 0.0 {
         let throughput = size_mb / elapsed.as_secs_f64();
         println!("Throughput: {:.1} MB/s", throughput);
     }
 
     if elapsed.as_secs() > 300 {
-        println!("\n⚠️  Import is VERY SLOW (>5min) - need optimization");
+        println!("\n⚠️  Load is VERY SLOW (>5min) - need optimization");
     } else if elapsed.as_secs() > 60 {
-        println!("\n⚠️  Import is SLOW (>60s) - consider optimization");
+        println!("\n⚠️  Load is SLOW (>60s) - consider optimization");
     } else if elapsed.as_secs() > 10 {
-        println!("\n⚠️  Import is MODERATE (10-60s)");
+        println!("\n⚠️  Load is MODERATE (10-60s)");
     } else {
-        println!("\n✓ Import is FAST (<10s)");
+        println!("\n✓ Load is FAST (<10s)");
     }
 
     Ok(())
