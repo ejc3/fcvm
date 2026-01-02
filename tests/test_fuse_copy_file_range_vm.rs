@@ -1,6 +1,6 @@
 //! Test copy_file_range through FUSE inside a VM with patched kernel.
 //!
-//! This test requires the inception kernel which includes the FUSE remap_file_range patch.
+//! This test requires the nested kernel profile which includes the FUSE remap_file_range patch.
 //! The patch adds kernel-side support for copy_file_range through FUSE filesystems.
 //!
 //! Run with: cargo nextest run --test test_fuse_copy_file_range_vm --features privileged-tests
@@ -10,19 +10,12 @@
 mod common;
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
 use std::process::Stdio;
-
-/// Ensure inception kernel exists (downloads from release or builds locally)
-async fn ensure_inception_kernel() -> Result<PathBuf> {
-    // Use the library function which downloads from GitHub releases first
-    fcvm::setup::ensure_inception_kernel(true).await
-}
 
 /// Test copy_file_range through FUSE inside a VM with the patched kernel.
 ///
 /// This test:
-/// 1. Ensures the inception kernel is built (includes FUSE remap patch)
+/// 1. Uses the nested kernel profile (includes FUSE remap patch)
 /// 2. Boots a VM with that kernel
 /// 3. Runs a copy_file_range test inside the VM's FUSE mount
 #[tokio::test]
@@ -32,9 +25,6 @@ async fn test_copy_file_range_in_vm() -> Result<()> {
 
     // Create logger for file output
     let logger = common::TestLogger::new("fuse-cfr");
-
-    // Ensure inception kernel exists (includes FUSE remap_file_range patch)
-    let inception_kernel = ensure_inception_kernel().await?;
 
     let fcvm_path = common::find_fcvm_binary()?;
     let (vm_name, _, _, _) = common::unique_names("fuse-cfr");
@@ -114,11 +104,8 @@ gcc /tmp/test_cfr.c -o /tmp/test_cfr
 echo "SUCCESS: copy_file_range works through FUSE!"
 '"#;
 
-    // Start VM with inception kernel
-    println!("\nStarting VM with inception kernel...");
-    let kernel_str = inception_kernel
-        .to_str()
-        .context("kernel path not valid UTF-8")?;
+    // Start VM with nested kernel profile
+    println!("\nStarting VM with nested kernel profile...");
 
     let mut cmd = tokio::process::Command::new(&fcvm_path);
     cmd.args([
@@ -128,8 +115,8 @@ echo "SUCCESS: copy_file_range works through FUSE!"
         &vm_name,
         "--network",
         "bridged",
-        "--kernel",
-        kernel_str,
+        "--kernel-profile",
+        "nested",
         "--map",
         &map_arg,
         "--cmd",

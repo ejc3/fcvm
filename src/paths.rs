@@ -13,7 +13,7 @@ const DEFAULT_BASE_DIR: &str = "/mnt/fcvm-btrfs";
 /// Initialize directories from config file.
 /// Must be called before any path functions are used.
 ///
-/// For inception support, each nesting level uses a different data_dir
+/// For nested VM support, each nesting level uses a different data_dir
 /// while sharing the same assets_dir for content-addressed files.
 ///
 /// The FCVM_DATA_DIR environment variable overrides config data_dir,
@@ -49,7 +49,7 @@ pub fn init_with_paths(data_dir: impl Into<PathBuf>, assets_dir: impl Into<PathB
 }
 
 /// Directory for mutable per-instance data (vm-disks, state, snapshots).
-/// Configure via `paths.data_dir` in rootfs-config.toml for inception nesting.
+/// Configure via `paths.data_dir` in rootfs-config.toml for nested VM nesting.
 /// FCVM_DATA_DIR environment variable overrides config value.
 pub fn data_dir() -> PathBuf {
     DATA_DIR

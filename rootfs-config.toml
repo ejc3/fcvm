@@ -133,3 +133,32 @@ remove_dirs = [
     "/usr/share/man/*",
     "/var/cache/apt/archives/*",
 ]
+
+# Kernel Profiles
+#
+# Each profile defines a kernel + optional firecracker override + runtime config.
+# Select via FCVM_KERNEL_PROFILE=<name> or auto-detected from kernel filename.
+#
+# Profile config is applied at runtime:
+# - firecracker_bin: path to firecracker binary (default: system firecracker)
+# - firecracker_repo/branch: build firecracker from source if binary missing
+# - firecracker_args: extra CLI args for firecracker
+# - boot_args: extra kernel boot parameters
+# - fuse_readers: override FUSE reader count
+
+[kernel_profiles.nested]
+# Kernel with CONFIG_KVM=y for nested virtualization (ARM64 NV2)
+description = "Nested virtualization support for running VMs inside VMs"
+kernel_version = "6.18"
+kernel_repo = "ejc3/firepod"
+kernel_tag_pattern = "kernel-nested-{version}-{arch}-{sha}"
+
+# Firecracker NV2 fork with --enable-nv2 support
+firecracker_bin = "/usr/local/bin/firecracker-nv2"
+firecracker_repo = "ejc3/firecracker"
+firecracker_branch = "nv2-inception"
+firecracker_args = "--enable-nv2"
+
+# Boot args for nested KVM
+boot_args = "kvm-arm.mode=nested numa=off arm64.nv2"
+fuse_readers = 64
