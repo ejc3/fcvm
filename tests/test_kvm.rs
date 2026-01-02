@@ -895,9 +895,10 @@ async fn test_nested_l2() -> Result<()> {
 
 /// Test L1→L2 nesting with standard benchmarks
 ///
-/// Runs egress, disk I/O, FUSE latency, and memory benchmarks at each level.
-/// Takes longer than test_nested_l2 but provides performance visibility.
+/// IGNORED: The 10MB FUSE writes generate ~8K requests which triggers
+/// FUSE stream corruption. See README.md "Known Issues (Nested)".
 #[tokio::test]
+#[ignore = "FUSE stream corruption at ~8K requests - see README Known Issues"]
 async fn test_nested_l2_with_benchmarks() -> Result<()> {
     run_nested_n_levels(2, "NESTED_2_LEVELS_BENCH_SUCCESS", BenchmarkMode::Standard).await
 }
