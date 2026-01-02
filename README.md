@@ -284,6 +284,8 @@ sudo fcvm podman run --name full \
 
 ## Nested Virtualization
 
+> ⚠️ **Experimental Feature**: Nested virtualization (L2+) is experimental. While basic functionality works, there are known stability issues under high I/O load. See [Known Issues](#known-issues-nested) below.
+
 fcvm supports running VMs inside VMs using ARM64 FEAT_NV2 nested virtualization. Currently **one level of nesting works**: Host → L1 VM with full KVM support.
 
 ```
@@ -496,6 +498,29 @@ Performance at each nesting level (measured on c7g.metal, ARM64 Graviton3):
 - ARM64 only (x86_64 nested virt uses different mechanism)
 - Requires bare-metal instance (c7g.metal) or host with nested virt enabled
 - L3+ nesting blocked by FUSE-over-FUSE latency (~5x per level)
+
+### Known Issues (Nested) {#known-issues-nested}
+
+**FUSE Stream Corruption Under High Load**
+
+Under sustained high I/O load in L2 VMs (100K+ FUSE requests/second), the FUSE-over-vsock protocol can experience stream corruption. Symptoms:
+
+```
+WARN fuse-pipe::server: deserialize error error=invalid value: integer 1275068416, expected variant index 0 <= i < 35
+WARN fuse-pipe::server: deserialize error error=io error: unexpected end of file
+```
+
+This appears to be a race condition in the vsock transport layer when L2's FUSE traffic saturates the L1→Host vsock connection. The issue is intermittent and typically occurs during:
+- Large file copies through FUSE (e.g., `cp -r` of 100MB+ files)
+- Parallel I/O from multiple processes in L2
+- Benchmark workloads with continuous writes
+
+**Workarounds:**
+- Reduce concurrent I/O in L2 VMs
+- Use local disk (`/tmp`) for high-throughput operations instead of FUSE-mounted volumes
+- Limit FUSE readers in L2: set `FCVM_FUSE_READERS=8` (default is 64)
+
+**Status:** Under investigation. The corruption pattern (`0x4C000000` = ASCII 'L') suggests data from different vsock streams may be mixing under pressure.
 
 ---
 

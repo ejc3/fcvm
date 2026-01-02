@@ -34,245 +34,9 @@
 mod common;
 
 use anyhow::{bail, Context, Result};
-use nix::fcntl::{Flock, FlockArg};
 use sha2::{Digest, Sha256};
-use std::fs::OpenOptions;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-
-const FIRECRACKER_NV2_REPO: &str = "https://github.com/ejc3/firecracker.git";
-const FIRECRACKER_NV2_BRANCH: &str = "nv2-nested";
-
-/// Path where NV2 firecracker fork is installed (separate from system firecracker)
-const FIRECRACKER_NV2_PATH: &str = "/usr/local/bin/firecracker-nv2";
-/// SHA file to track which commit the binary was built from
-const FIRECRACKER_NV2_SHA_PATH: &str = "/usr/local/bin/firecracker-nv2.sha";
-
-/// Get the HEAD SHA of the remote branch (without cloning)
-async fn get_remote_branch_sha() -> Result<String> {
-    let output = tokio::process::Command::new("git")
-        .args(["ls-remote", FIRECRACKER_NV2_REPO, FIRECRACKER_NV2_BRANCH])
-        .output()
-        .await
-        .context("running git ls-remote")?;
-
-    if !output.status.success() {
-        bail!("git ls-remote failed");
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Format: "<sha>\trefs/heads/<branch>"
-    let sha = stdout
-        .split_whitespace()
-        .next()
-        .context("parsing SHA from git ls-remote")?;
-
-    Ok(sha.to_string())
-}
-
-/// Check if NV2 Firecracker binary exists, supports --enable-nv2, AND matches remote SHA
-async fn firecracker_nv2_exists() -> bool {
-    let path = std::path::Path::new(FIRECRACKER_NV2_PATH);
-    if !path.exists() {
-        return false;
-    }
-
-    // Check if binary has --enable-nv2 support
-    let output = tokio::process::Command::new(FIRECRACKER_NV2_PATH)
-        .arg("--help")
-        .output()
-        .await;
-
-    let has_nv2_flag = match output {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).contains("enable-nv2"),
-        Err(_) => false,
-    };
-
-    if !has_nv2_flag {
-        return false;
-    }
-
-    // Check if SHA matches remote (content-addressed caching)
-    let sha_path = std::path::Path::new(FIRECRACKER_NV2_SHA_PATH);
-    if !sha_path.exists() {
-        println!("  No SHA file found, will rebuild to ensure correct version");
-        return false;
-    }
-
-    let cached_sha = match std::fs::read_to_string(sha_path) {
-        Ok(s) => s.trim().to_string(),
-        Err(_) => return false,
-    };
-
-    let remote_sha = match get_remote_branch_sha().await {
-        Ok(s) => s,
-        Err(e) => {
-            println!("  Warning: couldn't check remote SHA: {}", e);
-            // If we can't check remote, assume cached version is fine
-            return true;
-        }
-    };
-
-    if cached_sha != remote_sha {
-        println!(
-            "  Cached SHA {} != remote SHA {}, will rebuild",
-            &cached_sha[..8],
-            &remote_sha[..8]
-        );
-        return false;
-    }
-
-    true
-}
-
-/// Ensure Firecracker with NV2 support is installed at FIRECRACKER_NV2_PATH
-/// Also sets FCVM_FIRECRACKER_BIN env var so fcvm uses it
-async fn ensure_firecracker_nv2() -> Result<()> {
-    if firecracker_nv2_exists().await {
-        println!(
-            "✓ Firecracker with NV2 support found at {}",
-            FIRECRACKER_NV2_PATH
-        );
-        std::env::set_var("FCVM_FIRECRACKER_BIN", FIRECRACKER_NV2_PATH);
-        return Ok(());
-    }
-
-    // Acquire exclusive lock to prevent parallel builds
-    let lock_file = PathBuf::from("/tmp/firecracker-nv2-build.lock");
-    let lock_fd = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&lock_file)
-        .context("opening firecracker build lock file")?;
-
-    let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
-        .map_err(|(_, err)| err)
-        .context("acquiring exclusive lock for firecracker build")?;
-
-    // Double-check after acquiring lock - another process may have built it
-    if firecracker_nv2_exists().await {
-        println!("✓ Firecracker with NV2 support found (built by another process)");
-        let _ = flock.unlock();
-        return Ok(());
-    }
-
-    println!("Building Firecracker with NV2 support...");
-    println!("  This may take 5-10 minutes on first run...");
-
-    let build_dir = PathBuf::from("/tmp/firecracker-nv2-build");
-
-    // Always remove old build dir to ensure fresh clone with correct SHA
-    // (shallow clones don't update properly with fetch)
-    if build_dir.exists() {
-        println!("  Removing stale build directory...");
-        tokio::fs::remove_dir_all(&build_dir).await?;
-    }
-
-    println!("  Cloning {}...", FIRECRACKER_NV2_REPO);
-    let status = tokio::process::Command::new("git")
-        .args([
-            "clone",
-            "--depth=1",
-            "-b",
-            FIRECRACKER_NV2_BRANCH,
-            FIRECRACKER_NV2_REPO,
-            build_dir.to_str().unwrap(),
-        ])
-        .status()
-        .await
-        .context("cloning Firecracker repo")?;
-
-    if !status.success() {
-        bail!("Failed to clone Firecracker repo");
-    }
-
-    // Checkout the correct branch (redundant after clone -b, but ensures clean state)
-    let status = tokio::process::Command::new("git")
-        .args(["checkout", FIRECRACKER_NV2_BRANCH])
-        .current_dir(&build_dir)
-        .status()
-        .await?;
-
-    if !status.success() {
-        bail!("Failed to checkout branch {}", FIRECRACKER_NV2_BRANCH);
-    }
-
-    // Build Firecracker
-    println!("  Building Firecracker (release)...");
-    let status = tokio::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "firecracker"])
-        .current_dir(&build_dir)
-        .status()
-        .await
-        .context("building Firecracker")?;
-
-    if !status.success() {
-        bail!("Firecracker build failed");
-    }
-
-    // Install to /usr/local/bin (requires sudo)
-    // Firecracker uses target/release when built with cargo directly
-    let mut binary = build_dir.join("target/release/firecracker");
-    if !binary.exists() {
-        // Try alternative path (Firecracker's custom build system)
-        let alt_binary = build_dir.join("build/cargo_target/release/firecracker");
-        if alt_binary.exists() {
-            binary = alt_binary;
-        } else {
-            bail!(
-                "Firecracker binary not found at {} or {}",
-                binary.display(),
-                alt_binary.display()
-            );
-        }
-    }
-
-    println!("  Installing Firecracker to {}...", FIRECRACKER_NV2_PATH);
-    let status = tokio::process::Command::new("cp")
-        .args([binary.to_str().unwrap(), FIRECRACKER_NV2_PATH])
-        .status()
-        .await
-        .context("installing Firecracker")?;
-
-    if !status.success() {
-        bail!("Failed to install Firecracker to {}", FIRECRACKER_NV2_PATH);
-    }
-
-    // Get the SHA of what we just built
-    let built_sha = tokio::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(&build_dir)
-        .output()
-        .await
-        .context("getting built commit SHA")?;
-
-    let sha = String::from_utf8_lossy(&built_sha.stdout)
-        .trim()
-        .to_string();
-
-    // Write SHA file (content-addressed cache marker)
-    std::fs::write(FIRECRACKER_NV2_SHA_PATH, &sha).context("writing SHA file")?;
-
-    println!("  Built from commit {}", &sha[..12]);
-
-    // Verify installation (skip SHA check since we just wrote it)
-    let path = std::path::Path::new(FIRECRACKER_NV2_PATH);
-    if !path.exists() {
-        let _ = flock.unlock();
-        bail!("Firecracker binary not found after install");
-    }
-
-    let _ = flock.unlock();
-    std::env::set_var("FCVM_FIRECRACKER_BIN", FIRECRACKER_NV2_PATH);
-    println!(
-        "✓ Firecracker with NV2 support installed at {}",
-        FIRECRACKER_NV2_PATH
-    );
-    Ok(())
-}
 
 #[tokio::test]
 async fn test_kvm_available_in_vm() -> Result<()> {
@@ -280,16 +44,13 @@ async fn test_kvm_available_in_vm() -> Result<()> {
     println!("==================");
     println!("Verifying /dev/kvm works with nested kernel profile");
 
-    // Ensure NV2 firecracker is installed (profile config references it)
-    ensure_firecracker_nv2().await?;
-
     let fcvm_path = common::find_fcvm_binary()?;
     let (vm_name, _, _, _) = common::unique_names("nested-kvm");
 
     // Start the VM with nested kernel profile
     // Use --privileged so the container can access /dev/kvm
     println!("\nStarting VM with nested kernel profile (privileged mode)...");
-    let (mut _child, fcvm_pid) = common::spawn_fcvm(&[
+    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
         "podman",
         "run",
         "--name",
@@ -307,8 +68,8 @@ async fn test_kvm_available_in_vm() -> Result<()> {
 
     // Wait for VM to become healthy
     println!("  Waiting for VM to become healthy...");
-    if let Err(e) = common::poll_health_by_pid(fcvm_pid, 180).await {
-        common::kill_process(fcvm_pid).await;
+    if let Err(e) = common::poll_health(&mut child, 180).await {
+        let _ = child.kill().await;
         return Err(e.context("VM failed to become healthy"));
     }
     println!("  ✓ VM is healthy!");
@@ -453,9 +214,6 @@ async fn test_kvm_available_in_vm() -> Result<()> {
 async fn test_nested_run_fcvm_inside_vm() -> Result<()> {
     println!("\nNested VM Test: Run fcvm inside fcvm");
     println!("=====================================");
-
-    // Ensure NV2 firecracker is installed (profile config references it)
-    ensure_firecracker_nv2().await?;
 
     let fcvm_path = common::find_fcvm_binary()?;
     let fcvm_dir = fcvm_path.parent().unwrap();
@@ -717,11 +475,14 @@ async fn ensure_nested_image() -> Result<()> {
     // All inputs that affect the container image
     let src_fcvm = fcvm_dir.join("fcvm");
     let src_agent = fcvm_dir.join("fc-agent");
-    // NV2 firecracker fork - installed by ensure_firecracker_nv2()
-    let src_firecracker = PathBuf::from(FIRECRACKER_NV2_PATH);
+    // NV2 firecracker fork - installed by fcvm setup --kernel-profile nested
+    let profile = fcvm::setup::get_kernel_profile("nested")?
+        .ok_or_else(|| anyhow::anyhow!("nested kernel profile not found"))?;
+    let src_firecracker = fcvm::setup::get_profile_firecracker_path(&profile, "nested")
+        .ok_or_else(|| anyhow::anyhow!("nested profile has no custom firecracker"))?;
     if !src_firecracker.exists() {
         bail!(
-            "NV2 firecracker fork not found at {}. ensure_firecracker_nv2() should have installed it.",
+            "NV2 firecracker fork not found at {}. Run: fcvm setup --kernel-profile nested",
             src_firecracker.display()
         );
     }
@@ -765,7 +526,7 @@ async fn ensure_nested_image() -> Result<()> {
         std::fs::copy(&src_fcvm, "artifacts/fcvm").context("copying fcvm to artifacts/")?;
         std::fs::copy(&src_agent, "artifacts/fc-agent")
             .context("copying fc-agent to artifacts/")?;
-        std::fs::copy(&src_firecracker, "artifacts/firecracker-nv2").ok();
+        std::fs::copy(&src_firecracker, "artifacts/firecracker-nested").ok();
 
         // Force rebuild by removing old image
         tokio::process::Command::new("podman")
@@ -880,7 +641,6 @@ async fn run_nested_chain(total_levels: usize) -> Result<()> {
     println!("{}", "=".repeat(50));
 
     // Ensure prerequisites
-    ensure_firecracker_nv2().await?;
     ensure_nested_image().await?;
 
     let fcvm_path = common::find_fcvm_binary()?;

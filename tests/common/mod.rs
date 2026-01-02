@@ -565,14 +565,27 @@ pub fn find_fcvm_binary() -> anyhow::Result<PathBuf> {
     anyhow::bail!("fcvm binary not found. Build with: cargo build --release")
 }
 
-/// Poll VM health status by PID
-pub async fn poll_health_by_pid(pid: u32, timeout_secs: u64) -> anyhow::Result<()> {
+/// Poll VM health status, checking child process for early exit.
+/// Fails immediately if the child process exits.
+pub async fn poll_health(
+    child: &mut tokio::process::Child,
+    timeout_secs: u64,
+) -> anyhow::Result<()> {
+    let pid = child.id().ok_or_else(|| anyhow::anyhow!("child has no pid"))?;
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
 
     loop {
         if start.elapsed() > timeout {
             anyhow::bail!("timeout waiting for VM to become healthy");
+        }
+
+        // Check if child exited
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "fcvm process exited with code {:?}. Check logs above for details.",
+                status.code()
+            );
         }
 
         // Query health status
@@ -609,6 +622,56 @@ pub async fn poll_health_by_pid(pid: u32, timeout_secs: u64) -> anyhow::Result<(
         for display in &vms {
             if matches!(display.vm.health_status, fcvm::state::HealthStatus::Healthy) {
                 return Ok(());
+            }
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Poll VM health status by PID (legacy - prefer poll_health with child handle).
+pub async fn poll_health_by_pid(pid: u32, timeout_secs: u64) -> anyhow::Result<()> {
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(timeout_secs);
+
+    loop {
+        if start.elapsed() > timeout {
+            anyhow::bail!("timeout waiting for VM to become healthy");
+        }
+
+        // Check if process exited (zombie or gone)
+        let is_gone = std::fs::read_to_string(format!("/proc/{}/stat", pid))
+            .map(|s| s.contains(") Z "))
+            .unwrap_or(true);
+
+        if is_gone {
+            anyhow::bail!("fcvm process (pid {}) exited. Check logs above.", pid);
+        }
+
+        let fcvm_path = find_fcvm_binary()?;
+        let output = tokio::process::Command::new(&fcvm_path)
+            .args(["ls", "--json", "--pid", &pid.to_string()])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+
+        #[derive(serde::Deserialize)]
+        struct VmDisplay {
+            #[serde(flatten)]
+            vm: fcvm::state::VmState,
+            #[allow(dead_code)]
+            stale: bool,
+        }
+
+        if let Ok(vms) = serde_json::from_str::<Vec<VmDisplay>>(&String::from_utf8_lossy(&output.stdout)) {
+            for d in &vms {
+                if matches!(d.vm.health_status, fcvm::state::HealthStatus::Healthy) {
+                    return Ok(());
+                }
             }
         }
 

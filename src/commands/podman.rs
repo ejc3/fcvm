@@ -274,9 +274,18 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         info!(profile = %profile_name, "using kernel profile");
 
         // Apply runtime config from profile
-        if let Some(ref bin) = profile.firecracker_bin {
-            info!(firecracker_bin = %bin, "from profile");
-            std::env::set_var("FCVM_FIRECRACKER_BIN", bin);
+        // Use content-addressed firecracker path if profile has custom firecracker
+        if let Some(fc_path) = crate::setup::get_profile_firecracker_path(&profile, profile_name) {
+            if !fc_path.exists() {
+                bail!(
+                    "Profile '{}' firecracker not found at {}.\nRun: fcvm setup --kernel-profile {}",
+                    profile_name,
+                    fc_path.display(),
+                    profile_name
+                );
+            }
+            info!(firecracker_bin = %fc_path.display(), "from profile");
+            std::env::set_var("FCVM_FIRECRACKER_BIN", fc_path.to_string_lossy().as_ref());
         }
         if let Some(ref fc_args) = profile.firecracker_args {
             info!(firecracker_args = %fc_args, "from profile");

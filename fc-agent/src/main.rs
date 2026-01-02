@@ -1581,12 +1581,14 @@ fn configure_dns_from_cmdline() {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing (fuse-pipe uses tracing for logging)
+    // Disable ANSI codes since output goes through serial console/vsock
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("info,fuse_pipe=debug")),
         )
         .with_target(true)
+        .with_ansi(false)
         .with_writer(std::io::stderr)
         .init();
 
