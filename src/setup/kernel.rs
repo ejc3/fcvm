@@ -423,7 +423,13 @@ pub fn compute_profile_kernel_sha(profile: &KernelProfile) -> String {
         // Expand glob pattern
         let paths: Vec<PathBuf> = match glob(&full_pattern) {
             Ok(entries) => {
-                let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok()).collect();
+                let mut paths: Vec<PathBuf> = entries
+                    .filter_map(|e| e.ok())
+                    // Filter out .disabled files (allows disabling patches without changing SHA)
+                    .filter(|p| {
+                        !p.to_string_lossy().ends_with(".disabled")
+                    })
+                    .collect();
                 paths.sort(); // Deterministic order
                 paths
             }
