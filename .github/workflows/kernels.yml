@@ -21,8 +21,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-inception-kernel:
-    name: Build Inception Kernel
+  build-nested-kernel:
+    name: Build Nested Kernel
     runs-on: [self-hosted, Linux, ARM64]
     permissions:
       contents: write  # Required for creating releases
@@ -54,13 +54,13 @@ jobs:
           ARCH=$(uname -m)
 
           # Compute SHA from build inputs
-          SHA=$(cat kernel/build.sh kernel/inception.conf kernel/patches/*.patch 2>/dev/null | sha256sum | cut -c1-12)
+          SHA=$(cat kernel/build.sh kernel/nested.conf kernel/patches/*.patch 2>/dev/null | sha256sum | cut -c1-12)
 
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "arch=$ARCH" >> $GITHUB_OUTPUT
           echo "sha=$SHA" >> $GITHUB_OUTPUT
-          echo "tag=kernel-inception-${VERSION}-${ARCH}-${SHA}" >> $GITHUB_OUTPUT
-          echo "filename=vmlinux-inception-${VERSION}-${ARCH}-${SHA}.bin" >> $GITHUB_OUTPUT
+          echo "tag=kernel-nested-${VERSION}-${ARCH}-${SHA}" >> $GITHUB_OUTPUT
+          echo "filename=vmlinux-nested-${VERSION}-${ARCH}-${SHA}.bin" >> $GITHUB_OUTPUT
 
           echo "Kernel version: $VERSION"
           echo "Architecture: $ARCH"
@@ -122,8 +122,8 @@ jobs:
           # Create release with kernel binary
           ARCH="${{ steps.kernel.outputs.arch }}"
           gh release create "$TAG" \
-            --title "Inception Kernel ${VERSION} (${ARCH}) - ${SHA}" \
-            --notes "Inception kernel for running fcvm inside fcvm (nested virtualization).
+            --title "Nested Kernel ${VERSION} (${ARCH}) - ${SHA}" \
+            --notes "Nested kernel for running fcvm inside fcvm (nested virtualization).
 
           ## Kernel Details
 
@@ -155,8 +155,8 @@ jobs:
           ## Usage
 
           \`\`\`bash
-          fcvm setup --inception
-          fcvm podman run --kernel <path> --privileged --name outer alpine:latest
+          fcvm setup --kernel-profile nested
+          fcvm podman run --kernel-profile nested --privileged --name outer alpine:latest
           # Inside VM: fcvm podman run --name inner alpine:latest
           \`\`\`
           " \

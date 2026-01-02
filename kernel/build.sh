@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build a custom Linux kernel with FUSE and KVM support for fcvm inception
+# Build a custom Linux kernel with FUSE and KVM support for fcvm nested virtualization
 #
 # Required env vars:
 #   KERNEL_PATH - output path (caller computes SHA-based filename)
@@ -16,10 +16,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Compute SHA from build inputs if KERNEL_PATH not provided
 compute_sha() {
-    # SHA is based on: build.sh + inception.conf + all patches
+    # SHA is based on: build.sh + nested.conf + all patches
     (
         cat "$SCRIPT_DIR/build.sh"
-        cat "$SCRIPT_DIR/inception.conf"
+        cat "$SCRIPT_DIR/nested.conf"
         cat "$SCRIPT_DIR/patches/"*.patch 2>/dev/null || true
     ) | sha256sum | cut -c1-12
 }
@@ -46,7 +46,7 @@ case "$ARCH" in
     *)       echo "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
-echo "=== fcvm Inception Kernel Build ==="
+echo "=== fcvm Nested Kernel Build ==="
 echo "Kernel version: $KERNEL_VERSION"
 echo "Architecture: $KERNEL_ARCH"
 echo "Output: $KERNEL_PATH"
@@ -251,10 +251,10 @@ FC_CONFIG_URL="https://raw.githubusercontent.com/firecracker-microvm/firecracker
 echo "Downloading Firecracker base config..."
 curl -fSL "$FC_CONFIG_URL" -o .config
 
-# Apply options from inception.conf
-echo "Applying options from inception.conf..."
-INCEPTION_CONF="$SCRIPT_DIR/inception.conf"
-if [[ -f "$INCEPTION_CONF" ]]; then
+# Apply options from nested.conf
+echo "Applying options from nested.conf..."
+KERNEL_CONF="$SCRIPT_DIR/nested.conf"
+if [[ -f "$KERNEL_CONF" ]]; then
     # Parse each CONFIG_*=y line and enable it
     while IFS= read -r line; do
         # Skip comments and empty lines
@@ -266,9 +266,9 @@ if [[ -f "$INCEPTION_CONF" ]]; then
             echo "  Enabling $opt"
             ./scripts/config --enable "$opt"
         fi
-    done < "$INCEPTION_CONF"
+    done < "$KERNEL_CONF"
 else
-    echo "  WARNING: $INCEPTION_CONF not found"
+    echo "  WARNING: $KERNEL_CONF not found"
 fi
 
 # Also enable BTRFS (always needed for fcvm)

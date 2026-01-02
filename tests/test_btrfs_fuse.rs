@@ -141,6 +141,8 @@ async fn test_btrfs_in_container() -> Result<()> {
         &vm_name,
         "--network",
         "bridged",
+        "--kernel-profile",
+        "nested",
         "--map",
         &map_arg,
         "--privileged",

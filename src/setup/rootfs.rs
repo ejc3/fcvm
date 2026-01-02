@@ -35,6 +35,80 @@ pub struct Plan {
     pub fstab: FstabConfig,
     #[serde(default)]
     pub cleanup: CleanupConfig,
+    /// Kernel profiles: kernel_profiles.{name}.{arch} = KernelProfile
+    /// E.g., kernel_profiles.nested.arm64 = { kernel_version = "6.18", ... }
+    #[serde(default)]
+    pub kernel_profiles: HashMap<String, HashMap<String, KernelProfile>>,
+}
+
+/// Kernel profile configuration
+///
+/// Profiles override the default [kernel] section for special use cases.
+/// Custom kernels are built from source or downloaded from GitHub releases.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct KernelProfile {
+    /// Human-readable description
+    #[serde(default)]
+    pub description: String,
+
+    // ========== Custom kernel (build from source) ==========
+    /// Kernel version (e.g., "6.18")
+    #[serde(default)]
+    pub kernel_version: String,
+
+    /// GitHub repo for kernel releases (e.g., "owner/repo")
+    #[serde(default)]
+    pub kernel_repo: String,
+
+    /// Files to hash for kernel SHA (globs supported)
+    /// These files determine when the kernel needs to be rebuilt.
+    /// Example: ["kernel/build.sh", "kernel/nested.conf", "kernel/patches/*.patch"]
+    #[serde(default)]
+    pub build_inputs: Vec<String>,
+
+    /// Build script path (relative to repo root)
+    #[serde(default)]
+    pub build_script: Option<String>,
+
+    /// Kernel config file path (relative to repo root)
+    #[serde(default)]
+    pub kernel_config: Option<String>,
+
+    /// Patches directory (relative to repo root)
+    #[serde(default)]
+    pub patches_dir: Option<String>,
+
+    // ========== Runtime overrides ==========
+    /// Path to firecracker binary (default: system firecracker)
+    #[serde(default)]
+    pub firecracker_bin: Option<String>,
+
+    /// GitHub repo for firecracker fork (for building if binary missing)
+    #[serde(default)]
+    pub firecracker_repo: Option<String>,
+
+    /// Branch to build firecracker from
+    #[serde(default)]
+    pub firecracker_branch: Option<String>,
+
+    /// Extra CLI args for firecracker
+    #[serde(default)]
+    pub firecracker_args: Option<String>,
+
+    /// Extra kernel boot parameters
+    #[serde(default)]
+    pub boot_args: Option<String>,
+
+    /// Override FUSE reader count
+    #[serde(default)]
+    pub fuse_readers: Option<u32>,
+}
+
+impl KernelProfile {
+    /// Check if this profile has a custom kernel configured
+    pub fn is_custom(&self) -> bool {
+        !self.kernel_version.is_empty() && !self.kernel_repo.is_empty()
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -90,7 +164,7 @@ pub struct KernelArchConfig {
     #[serde(default)]
     pub path: String,
     /// Local filesystem path to kernel binary (overrides url if provided)
-    /// Use for custom-built kernels (e.g., inception kernel with CONFIG_KVM)
+    /// Use for custom-built kernels (e.g., profile kernel with CONFIG_KVM)
     #[serde(default)]
     pub local_path: Option<String>,
 }
@@ -620,6 +694,76 @@ pub fn load_config(explicit_path: Option<&str>) -> Result<(Plan, String, String)
 /// Legacy alias for load_config (for backward compatibility during migration)
 pub fn load_plan() -> Result<(Plan, String, String)> {
     load_config(None)
+}
+
+/// Get the arch name used in config files ("arm64" or "amd64")
+fn config_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    }
+}
+
+/// Get a kernel profile by name for the current architecture.
+///
+/// Looks up kernel_profiles.{name}.{arch} (e.g., kernel_profiles.nested.arm64).
+/// Returns the profile config if found, or None if not defined.
+pub fn get_kernel_profile(name: &str) -> Result<Option<KernelProfile>> {
+    let (plan, _, _) = load_plan()?;
+    let arch = config_arch();
+    Ok(plan
+        .kernel_profiles
+        .get(name)
+        .and_then(|arch_profiles| arch_profiles.get(arch))
+        .cloned())
+}
+
+/// Detect kernel profile from kernel path.
+///
+/// Checks if the kernel filename matches a configured profile name.
+/// Returns the profile name if matched.
+pub fn detect_kernel_profile(kernel_path: &Path) -> Option<String> {
+    let name = kernel_path.file_name()?.to_str()?;
+
+    // Load config to get all profile names
+    if let Ok((config, _, _)) = load_config(None) {
+        for profile_name in config.kernel_profiles.keys() {
+            // Check if filename contains the profile name
+            if name.contains(profile_name) {
+                return Some(profile_name.clone());
+            }
+        }
+    }
+
+    None
+}
+
+/// Get the active kernel profile from env var or auto-detection
+///
+/// Checks FCVM_KERNEL_PROFILE first, then tries to detect from kernel path.
+pub fn get_active_kernel_profile(kernel_path: Option<&Path>) -> Result<Option<KernelProfile>> {
+    // First check env var
+    if let Ok(profile_name) = std::env::var("FCVM_KERNEL_PROFILE") {
+        if let Some(profile) = get_kernel_profile(&profile_name)? {
+            info!(profile = %profile_name, "using kernel profile from FCVM_KERNEL_PROFILE");
+            return Ok(Some(profile));
+        } else {
+            warn!(profile = %profile_name, "FCVM_KERNEL_PROFILE specified but profile not found in config");
+        }
+    }
+
+    // Then try auto-detection from kernel path
+    if let Some(path) = kernel_path {
+        if let Some(profile_name) = detect_kernel_profile(path) {
+            if let Some(profile) = get_kernel_profile(&profile_name)? {
+                info!(profile = %profile_name, path = %path.display(), "auto-detected kernel profile from path");
+                return Ok(Some(profile));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 /// Compute SHA256 of bytes, return hex string
@@ -1775,9 +1919,12 @@ async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
     let api_socket = temp_dir.join("firecracker.sock");
     let log_path = temp_dir.join("firecracker.log");
 
+    // Create log file (Firecracker requires it to exist)
+    std::fs::File::create(&log_path).context("creating Firecracker log file")?;
+
     // Find kernel - downloaded from Kata release if needed
-    // We pass true since we're in the rootfs creation path (allow_create=true)
-    let kernel_path = crate::setup::kernel::ensure_kernel(true).await?;
+    // Use default kernel (None profile), allow_create=true, allow_build=false
+    let kernel_path = crate::setup::kernel::ensure_kernel(None, true, false).await?;
 
     // Create serial console output file
     let serial_path = temp_dir.join("serial.log");

@@ -69,10 +69,10 @@ fi
 echo "Creating base config..."
 make ARCH="$KERNEL_ARCH" defconfig
 
-# Enable options from inception.conf
-INCEPTION_CONF="$SCRIPT_DIR/inception.conf"
-if [[ -f "$INCEPTION_CONF" ]]; then
-    echo "Applying options from inception.conf..."
+# Enable options from nested.conf
+KERNEL_CONF="$SCRIPT_DIR/nested.conf"
+if [[ -f "$KERNEL_CONF" ]]; then
+    echo "Applying options from nested.conf..."
     while IFS= read -r line; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [[ -z "${line// }" ]] && continue
@@ -81,7 +81,7 @@ if [[ -f "$INCEPTION_CONF" ]]; then
             echo "  Enabling $opt"
             ./scripts/config --enable "$opt"
         fi
-    done < "$INCEPTION_CONF"
+    done < "$KERNEL_CONF"
 fi
 
 # Additional options for host kernel

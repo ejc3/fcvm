@@ -37,7 +37,7 @@ impl DiskManager {
     /// This operation is completely rootless - just a file copy with btrfs reflinks.
     ///
     /// Reflinks work through nested FUSE mounts when the kernel has the
-    /// FUSE_REMAP_FILE_RANGE patch (inception kernel 6.18+).
+    /// FUSE_REMAP_FILE_RANGE patch (kernel 6.18+ with nested profile).
     pub async fn create_cow_disk(&self) -> Result<PathBuf> {
         info!(vm_id = %self.vm_id, "creating CoW disk");
 
@@ -68,7 +68,7 @@ impl DiskManager {
                 let stderr = String::from_utf8_lossy(&reflink_output.stderr);
                 anyhow::bail!(
                     "Reflink copy failed (required for CoW disk). Error: {}. \
-                    Ensure the kernel has FUSE_REMAP_FILE_RANGE support (inception kernel 6.18+).",
+                    Ensure the kernel has FUSE_REMAP_FILE_RANGE support (requires a kernel profile with this patch).",
                     stderr
                 );
             }

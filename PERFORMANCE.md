@@ -114,7 +114,7 @@ Serialization overhead for fuse-pipe protocol:
 
 ---
 
-## Nested Virtualization (Inception)
+## Nested Virtualization
 
 fcvm supports running VMs inside VMs using ARM64 FEAT_NV2. This creates FUSE-over-FUSE:
 - **L1**: Host → VM (one FUSE layer)
@@ -259,21 +259,21 @@ make bench
 # Results printed to stdout, graphs in target/criterion/
 ```
 
-### 2. Inception Benchmarks
+### 2. Nested Virtualization Benchmarks
 
 ```bash
-# Build inception kernel (first time, ~20 min)
-./kernel/build.sh
+# Build nested kernel (first time, ~20 min)
+fcvm setup --kernel-profile nested --build-kernels
 
 # Run L2 test with benchmarks
-make test-root FILTER=inception_l2 STREAM=1
+make test-root FILTER=nested_l2 STREAM=1
 ```
 
 ### 3. FUSE Latency Tracing
 
 ```bash
 # Trace L2 operations
-FCVM_FUSE_TRACE_RATE=100 make test-root FILTER=inception_l2 STREAM=1 2>&1 | tee trace.log
+FCVM_FUSE_TRACE_RATE=100 make test-root FILTER=nested_l2 STREAM=1 2>&1 | tee trace.log
 
 # Extract traces
 grep "TRACE" trace.log

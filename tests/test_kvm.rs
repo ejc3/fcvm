@@ -1,21 +1,21 @@
-//! Integration tests for inception support - nested VMs using ARM64 FEAT_NV2.
+//! Integration tests for nested virtualization - nested VMs using ARM64 FEAT_NV2.
 //!
 //! # Nested Virtualization Status (2025-12-30)
 //!
 //! ## L1→L2 Working!
-//! - Host runs L1 with inception kernel (6.18) and `--privileged --map /mnt/fcvm-btrfs`
+//! - Host runs L1 with nested kernel (6.18) and `--privileged --map /mnt/fcvm-btrfs`
 //! - L1 runs fcvm inside container to start L2
 //! - L2 executes commands successfully
 //!
 //! ## Key Components
 //! - **Host kernel**: 6.18.2-nested with `kvm-arm.mode=nested`
-//! - **Inception kernel**: 6.18 with `CONFIG_KVM=y`, FUSE_REMAP_FILE_RANGE support
+//! - **Nested kernel**: 6.18 with `CONFIG_KVM=y`, FUSE_REMAP_FILE_RANGE support
 //! - **Firecracker**: Fork with NV2 support (`--enable-nv2` flag)
 //! - **Shared storage**: `/mnt/fcvm-btrfs` mounted via FUSE-over-vsock
 //!
 //! ## How L2 Works
-//! 1. Host writes L1 script to shared storage (`/mnt/fcvm-btrfs/l1-inception.sh`)
-//! 2. Host runs: `fcvm podman run --kernel {inception} --map /mnt/fcvm-btrfs --cmd /mnt/fcvm-btrfs/l1-inception.sh`
+//! 1. Host writes L1 script to shared storage (`/mnt/fcvm-btrfs/l1-nested.sh`)
+//! 2. Host runs: `fcvm podman run --kernel-profile nested --map /mnt/fcvm-btrfs --cmd /mnt/fcvm-btrfs/l1-nested.sh`
 //! 3. L1's script: imports image from shared cache, runs `fcvm podman run --cmd "echo MARKER"`
 //! 4. L2 echoes marker, exits
 //!
@@ -42,27 +42,12 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 const FIRECRACKER_NV2_REPO: &str = "https://github.com/ejc3/firecracker.git";
-const FIRECRACKER_NV2_BRANCH: &str = "nv2-inception";
-
-/// Ensure inception kernel exists (downloads from release or builds locally)
-async fn ensure_inception_kernel() -> Result<PathBuf> {
-    // Use the library function which downloads from GitHub releases first
-    fcvm::setup::ensure_inception_kernel(true).await
-}
+const FIRECRACKER_NV2_BRANCH: &str = "nv2-nested";
 
 /// Path where NV2 firecracker fork is installed (separate from system firecracker)
 const FIRECRACKER_NV2_PATH: &str = "/usr/local/bin/firecracker-nv2";
 /// SHA file to track which commit the binary was built from
 const FIRECRACKER_NV2_SHA_PATH: &str = "/usr/local/bin/firecracker-nv2.sha";
-
-/// Set environment variables for inception mode (nested virtualization).
-/// Called before spawning fcvm with an inception kernel.
-fn set_inception_env() {
-    std::env::set_var("FCVM_FIRECRACKER_BIN", FIRECRACKER_NV2_PATH);
-    std::env::set_var("FCVM_FIRECRACKER_ARGS", "--enable-nv2");
-    std::env::set_var("FCVM_BOOT_ARGS", "kvm-arm.mode=nested numa=off arm64.nv2");
-    std::env::set_var("FCVM_FUSE_READERS", "64");
-}
 
 /// Get the HEAD SHA of the remote branch (without cloning)
 async fn get_remote_branch_sha() -> Result<String> {
@@ -291,24 +276,19 @@ async fn ensure_firecracker_nv2() -> Result<()> {
 
 #[tokio::test]
 async fn test_kvm_available_in_vm() -> Result<()> {
-    println!("\nInception KVM test");
+    println!("\nNested KVM test");
     println!("==================");
-    println!("Verifying /dev/kvm works with inception kernel");
+    println!("Verifying /dev/kvm works with nested kernel profile");
 
-    // Ensure prerequisites are installed
+    // Ensure NV2 firecracker is installed (profile config references it)
     ensure_firecracker_nv2().await?;
-    let inception_kernel = ensure_inception_kernel().await?;
-    set_inception_env();
 
     let fcvm_path = common::find_fcvm_binary()?;
-    let (vm_name, _, _, _) = common::unique_names("inception-kvm");
+    let (vm_name, _, _, _) = common::unique_names("nested-kvm");
 
-    // Start the VM with custom kernel via --kernel flag
+    // Start the VM with nested kernel profile
     // Use --privileged so the container can access /dev/kvm
-    println!("\nStarting VM with inception kernel (privileged mode)...");
-    let kernel_str = inception_kernel
-        .to_str()
-        .context("kernel path not valid UTF-8")?;
+    println!("\nStarting VM with nested kernel profile (privileged mode)...");
     let (mut _child, fcvm_pid) = common::spawn_fcvm(&[
         "podman",
         "run",
@@ -316,13 +296,13 @@ async fn test_kvm_available_in_vm() -> Result<()> {
         &vm_name,
         "--network",
         "bridged",
-        "--kernel",
-        kernel_str,
+        "--kernel-profile",
+        "nested",
         "--privileged",
         common::TEST_IMAGE,
     ])
     .await
-    .context("spawning fcvm podman run with inception kernel")?;
+    .context("spawning fcvm podman run with nested profile")?;
     println!("  fcvm process started (PID: {})", fcvm_pid);
 
     // Wait for VM to become healthy
@@ -364,7 +344,7 @@ async fn test_kvm_available_in_vm() -> Result<()> {
         bail!(
             "/dev/kvm NOT FOUND!\n\
             \n\
-            The inception kernel was used but /dev/kvm doesn't exist.\n\
+            The nested kernel was used but /dev/kvm doesn't exist.\n\
             stderr: {}\n\
             \n\
             Check:\n\
@@ -416,7 +396,7 @@ async fn test_kvm_available_in_vm() -> Result<()> {
     println!("  ✓ /dev/kvm is readable and writable from VM");
 
     // Test 3: Check KVM is accessible from CONTAINER
-    // This is the real test for inception - the container needs to use KVM
+    // This is the real test for nested virtualization - the container needs to use KVM
     println!("\nTest 3: Verify /dev/kvm is accessible from CONTAINER");
     let output = tokio::process::Command::new(&fcvm_path)
         .args([
@@ -454,14 +434,14 @@ async fn test_kvm_available_in_vm() -> Result<()> {
     // Clean up
     common::kill_process(fcvm_pid).await;
 
-    println!("\n✅ INCEPTION TEST PASSED - container can use /dev/kvm!");
+    println!("\n✅ NESTED TEST PASSED - container can use /dev/kvm!");
     Ok(())
 }
 
-/// Test running fcvm inside an fcvm VM (single level inception)
+/// Test running fcvm inside an fcvm VM (single level nesting)
 ///
 /// This test:
-/// 1. Starts an outer VM with inception kernel + privileged mode
+/// 1. Starts an outer VM with nested kernel + privileged mode
 /// 2. Mounts host fcvm binary and assets into the VM
 /// 3. Verifies /dev/kvm is accessible from the guest
 /// 4. Tests if nested KVM actually works (KVM_CREATE_VM ioctl)
@@ -470,26 +450,21 @@ async fn test_kvm_available_in_vm() -> Result<()> {
 /// REQUIRES: ARM64 with FEAT_NV2 (ARMv8.4+) and kvm-arm.mode=nested
 /// Skips if nested KVM isn't available.
 #[tokio::test]
-async fn test_inception_run_fcvm_inside_vm() -> Result<()> {
-    println!("\nInception Test: Run fcvm inside fcvm");
+async fn test_nested_run_fcvm_inside_vm() -> Result<()> {
+    println!("\nNested VM Test: Run fcvm inside fcvm");
     println!("=====================================");
 
-    // Ensure prerequisites are installed
+    // Ensure NV2 firecracker is installed (profile config references it)
     ensure_firecracker_nv2().await?;
-    let inception_kernel = ensure_inception_kernel().await?;
-    set_inception_env();
 
     let fcvm_path = common::find_fcvm_binary()?;
     let fcvm_dir = fcvm_path.parent().unwrap();
-    let (vm_name, _, _, _) = common::unique_names("inception-full");
+    let (vm_name, _, _, _) = common::unique_names("nested-full");
 
-    // 1. Start outer VM with volumes for fcvm binary and assets
-    println!("\n1. Starting outer VM with inception kernel...");
+    // 1. Start outer VM with nested kernel profile
+    println!("\n1. Starting outer VM with nested kernel profile...");
     println!("   Mounting: /mnt/fcvm-btrfs (assets) and fcvm binary");
 
-    let kernel_str = inception_kernel
-        .to_str()
-        .context("kernel path not valid UTF-8")?;
     let fcvm_volume = format!("{}:/opt/fcvm", fcvm_dir.display());
     // Mount host config dir so inner fcvm can find its config
     // Use $HOME which is set by spawn_fcvm based on the current user
@@ -504,8 +479,8 @@ async fn test_inception_run_fcvm_inside_vm() -> Result<()> {
         &vm_name,
         "--network",
         "bridged",
-        "--kernel",
-        kernel_str,
+        "--kernel-profile",
+        "nested",
         "--privileged",
         "--map",
         "/mnt/fcvm-btrfs:/mnt/fcvm-btrfs",
@@ -642,10 +617,10 @@ except OSError as e:
         }
         return Ok(());
     }
-    println!("   ✓ Nested KVM works! Proceeding with inception test.");
+    println!("   ✓ Nested KVM works! Proceeding with nested VM test.");
 
     // 4. Run fcvm inside the outer VM (only if nested KVM works)
-    println!("\n4. Running fcvm inside outer VM (INCEPTION)...");
+    println!("\n4. Running fcvm inside outer VM (NESTED)...");
     println!("   This will create a nested VM inside the outer VM");
 
     // Run fcvm with bridged networking inside the outer VM
@@ -665,7 +640,7 @@ except OSError as e:
         fcvm podman run \
             --name inner-test \
             --network bridged \
-            --cmd "echo INCEPTION_SUCCESS_INNER_VM_WORKS" \
+            --cmd "echo NESTED_SUCCESS_INNER_VM_WORKS" \
             alpine:latest
     "#;
 
@@ -715,14 +690,14 @@ except OSError as e:
     // Check both stdout and stderr since fcvm logs container output to its own stderr
     // with [ctr:stdout] prefix, so when running via exec, the output appears in stderr
     let combined = format!("{}\n{}", stdout, stderr);
-    if combined.contains("INCEPTION_SUCCESS_INNER_VM_WORKS") {
-        println!("\n✅ INCEPTION TEST PASSED!");
+    if combined.contains("NESTED_SUCCESS_INNER_VM_WORKS") {
+        println!("\n✅ NESTED TEST PASSED!");
         println!("   Successfully ran fcvm inside fcvm (nested virtualization)");
         Ok(())
     } else {
         bail!(
-            "Inception failed - inner VM did not produce expected output\n\
-             Expected: INCEPTION_SUCCESS_INNER_VM_WORKS\n\
+            "Nested virtualization failed - inner VM did not produce expected output\n\
+             Expected: NESTED_SUCCESS_INNER_VM_WORKS\n\
              Got stdout: {}\n\
              Got stderr: {}",
             stdout,
@@ -731,11 +706,11 @@ except OSError as e:
     }
 }
 
-/// Build localhost/inception-test image with proper CAS invalidation
+/// Build localhost/nested-test image with proper CAS invalidation
 ///
 /// Computes a combined SHA of ALL inputs (binaries, scripts, Containerfile).
 /// Rebuilds and re-exports only when inputs change.
-async fn ensure_inception_image() -> Result<()> {
+async fn ensure_nested_image() -> Result<()> {
     let fcvm_path = common::find_fcvm_binary()?;
     let fcvm_dir = fcvm_path.parent().unwrap();
 
@@ -750,8 +725,9 @@ async fn ensure_inception_image() -> Result<()> {
             src_firecracker.display()
         );
     }
-    let src_inception = PathBuf::from("inception.sh");
-    let src_containerfile = PathBuf::from("Containerfile.inception");
+    let src_nested = PathBuf::from("nested.sh");
+    let src_containerfile = PathBuf::from("Containerfile.nested");
+    let src_config = PathBuf::from("rootfs-config.toml");
 
     // Compute combined SHA of all inputs
     fn file_bytes(path: &Path) -> Vec<u8> {
@@ -762,19 +738,20 @@ async fn ensure_inception_image() -> Result<()> {
     hasher.update(file_bytes(&src_fcvm));
     hasher.update(file_bytes(&src_agent));
     hasher.update(file_bytes(&src_firecracker));
-    hasher.update(file_bytes(&src_inception));
+    hasher.update(file_bytes(&src_nested));
     hasher.update(file_bytes(&src_containerfile));
+    hasher.update(file_bytes(&src_config));
     let combined_sha = hex::encode(&hasher.finalize()[..6]);
 
     // Check if we have a marker file with the current SHA
-    let marker_path = PathBuf::from("artifacts/.inception-sha");
+    let marker_path = PathBuf::from("artifacts/.nested-sha");
     let cached_sha = std::fs::read_to_string(&marker_path).unwrap_or_default();
 
     let need_rebuild = cached_sha.trim() != combined_sha;
 
     if need_rebuild {
         println!(
-            "Inputs changed (sha: {} → {}), rebuilding inception container...",
+            "Inputs changed (sha: {} → {}), rebuilding nested container...",
             if cached_sha.is_empty() {
                 "none"
             } else {
@@ -792,7 +769,7 @@ async fn ensure_inception_image() -> Result<()> {
 
         // Force rebuild by removing old image
         tokio::process::Command::new("podman")
-            .args(["rmi", "localhost/inception-test"])
+            .args(["rmi", "localhost/nested-test"])
             .output()
             .await
             .ok();
@@ -800,27 +777,24 @@ async fn ensure_inception_image() -> Result<()> {
 
     // Check if image exists
     let check = tokio::process::Command::new("podman")
-        .args(["image", "exists", "localhost/inception-test"])
+        .args(["image", "exists", "localhost/nested-test"])
         .output()
         .await?;
 
     if check.status.success() && !need_rebuild {
-        println!(
-            "✓ localhost/inception-test up to date (sha: {})",
-            combined_sha
-        );
+        println!("✓ localhost/nested-test up to date (sha: {})", combined_sha);
         return Ok(());
     }
 
     // Build container
-    println!("Building localhost/inception-test...");
+    println!("Building localhost/nested-test...");
     let output = tokio::process::Command::new("podman")
         .args([
             "build",
             "-t",
-            "localhost/inception-test",
+            "localhost/nested-test",
             "-f",
-            "Containerfile.inception",
+            "Containerfile.nested",
             ".",
         ])
         .output()
@@ -829,14 +803,14 @@ async fn ensure_inception_image() -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("Failed to build inception container: {}", stderr);
+        bail!("Failed to build nested container: {}", stderr);
     }
 
     // Export to CAS cache so nested VMs can access it
     let digest_out = tokio::process::Command::new("podman")
         .args([
             "inspect",
-            "localhost/inception-test",
+            "localhost/nested-test",
             "--format",
             "{{.Digest}}",
         ])
@@ -847,26 +821,30 @@ async fn ensure_inception_image() -> Result<()> {
         .to_string();
 
     if !digest.is_empty() && digest.starts_with("sha256:") {
-        let cache_dir = format!("/mnt/fcvm-btrfs/image-cache/{}", digest);
+        // Use the same format as fcvm: strip sha256: prefix and use .oci.tar extension
+        let digest_stripped = digest.trim_start_matches("sha256:");
+        let archive_path = format!("/mnt/fcvm-btrfs/image-cache/{}.oci.tar", digest_stripped);
 
-        if !PathBuf::from(&cache_dir).exists() {
-            println!("Exporting to CAS cache: {}", cache_dir);
-            tokio::process::Command::new("mkdir")
-                .args(["-p", &cache_dir])
-                .output()
-                .await?;
-            let skopeo_out = tokio::process::Command::new("skopeo")
+        if !PathBuf::from(&archive_path).exists() {
+            println!("Exporting to CAS cache: {}", archive_path);
+            tokio::fs::create_dir_all("/mnt/fcvm-btrfs/image-cache")
+                .await
+                .ok();
+            let save_out = tokio::process::Command::new("podman")
                 .args([
-                    "copy",
-                    "containers-storage:localhost/inception-test",
-                    &format!("dir:{}", cache_dir),
+                    "save",
+                    "--format",
+                    "oci-archive",
+                    "-o",
+                    &archive_path,
+                    "localhost/nested-test",
                 ])
                 .output()
                 .await?;
-            if !skopeo_out.status.success() {
+            if !save_out.status.success() {
                 println!(
-                    "Warning: skopeo export failed: {}",
-                    String::from_utf8_lossy(&skopeo_out.stderr)
+                    "Warning: podman save failed: {}",
+                    String::from_utf8_lossy(&save_out.stderr)
                 );
             }
         }
@@ -875,45 +853,37 @@ async fn ensure_inception_image() -> Result<()> {
         std::fs::write(&marker_path, &combined_sha).ok();
 
         println!(
-            "✓ localhost/inception-test ready (sha: {}, digest: {})",
+            "✓ localhost/nested-test ready (sha: {}, digest: {})",
             combined_sha,
             &digest[..std::cmp::min(19, digest.len())]
         );
     } else {
-        println!("✓ localhost/inception-test built (no digest available)");
+        println!("✓ localhost/nested-test built (no digest available)");
     }
 
     Ok(())
 }
 
-/// Run an inception chain test with configurable depth.
+/// Run an nested chain test with configurable depth.
 ///
 /// This function attempts to run VMs nested N levels deep:
 /// Host → Level 1 → Level 2 → ... → Level N
 ///
-/// Each nested level uses localhost/inception-test which has fcvm baked in.
+/// Each nested level uses localhost/nested-test which has fcvm baked in.
 ///
 /// REQUIRES: ARM64 with FEAT_NV2 (ARMv8.4+) and kvm-arm.mode=nested
 #[allow(dead_code)] // Helper for future L3+ tests (currently L3 is too slow)
-async fn run_inception_chain(total_levels: usize) -> Result<()> {
-    let success_marker = format!("INCEPTION_CHAIN_{}_LEVELS_SUCCESS", total_levels);
+async fn run_nested_chain(total_levels: usize) -> Result<()> {
+    let success_marker = format!("NESTED_CHAIN_{}_LEVELS_SUCCESS", total_levels);
 
-    println!(
-        "\nInception Chain Test: {} levels of nested VMs",
-        total_levels
-    );
+    println!("\nNested Chain Test: {} levels of nested VMs", total_levels);
     println!("{}", "=".repeat(50));
 
     // Ensure prerequisites
     ensure_firecracker_nv2().await?;
-    let inception_kernel = ensure_inception_kernel().await?;
-    ensure_inception_image().await?;
-    set_inception_env();
+    ensure_nested_image().await?;
 
     let fcvm_path = common::find_fcvm_binary()?;
-    let kernel_str = inception_kernel
-        .to_str()
-        .context("kernel path not valid UTF-8")?;
 
     // Home dir for config mount
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
@@ -929,10 +899,10 @@ async fn run_inception_chain(total_levels: usize) -> Result<()> {
         }
     }
 
-    // === Level 1: Start from host with localhost/inception-test ===
+    // === Level 1: Start from host with localhost/nested-test ===
     // This image has fcvm baked in, fcvm handles export to cache automatically
     println!("\n[Level 1] Starting outer VM from host...");
-    let (vm_name_1, _, _, _) = common::unique_names("inception-L1");
+    let (vm_name_1, _, _, _) = common::unique_names("nested-L1");
 
     // L1 uses 4GB RAM (needs to fit L2-L4 inside + overhead)
     let (mut _child1, pid1) = common::spawn_fcvm(&[
@@ -942,8 +912,8 @@ async fn run_inception_chain(total_levels: usize) -> Result<()> {
         &vm_name_1,
         "--network",
         "bridged",
-        "--kernel",
-        kernel_str,
+        "--kernel-profile",
+        "nested",
         "--privileged",
         "--mem",
         "4096", // L1 gets 4GB, nested VMs get progressively less
@@ -951,7 +921,7 @@ async fn run_inception_chain(total_levels: usize) -> Result<()> {
         "/mnt/fcvm-btrfs:/mnt/fcvm-btrfs",
         "--map",
         &config_mount,
-        "localhost/inception-test",
+        "localhost/nested-test",
     ])
     .await
     .context("spawning Level 1 VM")?;
@@ -1008,7 +978,7 @@ except OSError as e:
     // This creates a single deeply-nested command that runs through all levels
 
     // Get the exact image digest so we can pass the explicit cache path down the chain
-    let nested_image = "localhost/inception-test";
+    let nested_image = "localhost/nested-test";
     let digest_output = tokio::process::Command::new("podman")
         .args(["inspect", nested_image, "--format", "{{.Digest}}"])
         .output()
@@ -1023,25 +993,32 @@ except OSError as e:
             String::from_utf8_lossy(&digest_output.stderr)
         );
     }
-    let image_cache_path = format!("/mnt/fcvm-btrfs/image-cache/{}", image_digest);
+    // Strip sha256: prefix to match fcvm's cache path format
+    let digest_stripped = image_digest.trim_start_matches("sha256:");
+    let image_cache_path = format!("/mnt/fcvm-btrfs/image-cache/{}.oci.tar", digest_stripped);
     println!("[Setup] Image digest: {}", image_digest);
     println!("[Setup] Cache path: {}", image_cache_path);
 
-    // The inception script is baked into the container at /usr/local/bin/inception
-    // It takes: inception <current_level> <max_level> <kernel_path> <image_cache_path>
+    // Get the nested kernel path for the nesting script
+    let nested_kernel =
+        fcvm::setup::get_kernel_path(Some("nested")).context("getting nested kernel path")?;
+    let kernel_path_str = nested_kernel.to_string_lossy();
+
+    // The nesting script is baked into the container at /usr/local/bin/nested
+    // It takes: nested <current_level> <max_level> <kernel_path> <image_cache_path>
     // Starting from level 2 (L1 is already running), going to total_levels
-    let inception_cmd = format!(
-        "inception 2 {} {} {}",
-        total_levels, kernel_str, image_cache_path
+    let nested_cmd = format!(
+        "nested 2 {} {} {}",
+        total_levels, kernel_path_str, image_cache_path
     );
 
     println!(
-        "\n[Levels 2-{}] Starting nested inception chain from Level 1...",
+        "\n[Levels 2-{}] Starting nested nested chain from Level 1...",
         total_levels
     );
     println!("  This will boot {} VMs sequentially", total_levels - 1);
 
-    // Run in container (default, no --vm) because the inception script is in the container
+    // Run in container (default, no --vm) because the nesting script is in the container
     let output = tokio::process::Command::new(&fcvm_path)
         .args([
             "exec",
@@ -1051,13 +1028,13 @@ except OSError as e:
             "--",
             "sh",
             "-c",
-            &inception_cmd,
+            &nested_cmd,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .await
-        .context("running nested inception chain")?;
+        .context("running nested nested chain")?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1090,7 +1067,7 @@ except OSError as e:
     // First check if the exec command itself failed
     if !output.status.success() {
         bail!(
-            "Inception chain failed - exec command exited with status {:?}\n\
+            "Nested chain failed - exec command exited with status {:?}\n\
              Expected marker: {}\n\
              stdout (last 500 chars): {}\n\
              stderr (last 500 chars): {}",
@@ -1116,12 +1093,12 @@ except OSError as e:
     }
 
     if combined.contains(&success_marker) {
-        println!("\n✅ INCEPTION CHAIN TEST PASSED!");
+        println!("\n✅ NESTED CHAIN TEST PASSED!");
         println!("   Successfully ran {} levels of nested VMs", total_levels);
         Ok(())
     } else {
         bail!(
-            "Inception chain failed at {} levels\n\
+            "Nested chain failed at {} levels\n\
              Expected marker: {}\n\
              stdout (last 1000 chars): {}\n\
              stderr (last 1000 chars): {}",
@@ -1147,23 +1124,19 @@ except OSError as e:
     }
 }
 
-/// Test L1→L2 inception: run fcvm inside L1 to start L2
+/// Test L1→L2 nesting: run fcvm inside L1 to start L2
 ///
-/// L1: Host starts VM with localhost/inception-test + inception kernel
+/// L1: Host starts VM with localhost/nested-test + nested kernel profile
 /// L2: L1 container imports image from shared cache, then runs fcvm
 #[tokio::test]
-async fn test_inception_l2() -> Result<()> {
-    ensure_inception_image().await?;
-    let inception_kernel = ensure_inception_kernel().await?;
-    let kernel_str = inception_kernel
-        .to_str()
-        .context("kernel path not valid UTF-8")?;
+async fn test_nested_l2() -> Result<()> {
+    ensure_nested_image().await?;
 
-    // Get the digest of localhost/inception-test so L2 can import from shared cache
+    // Get the digest of localhost/nested-test so L2 can import from shared cache
     let digest_out = tokio::process::Command::new("podman")
         .args([
             "inspect",
-            "localhost/inception-test",
+            "localhost/nested-test",
             "--format",
             "{{.Digest}}",
         ])
@@ -1174,8 +1147,8 @@ async fn test_inception_l2() -> Result<()> {
         .to_string();
     println!("Image digest: {}", digest);
 
-    // Create inception-scripts directory
-    tokio::fs::create_dir_all("/mnt/fcvm-btrfs/inception-scripts").await?;
+    // Create nested-scripts directory
+    tokio::fs::create_dir_all("/mnt/fcvm-btrfs/nested-scripts").await?;
 
     // Benchmark script that runs at each level
     // Tests: egress, local disk, FUSE disk
@@ -1282,7 +1255,7 @@ echo "=== END BENCHMARK L${LEVEL} ==="
 echo "MARKER_L${LEVEL}_OK"
 "#;
 
-    let bench_path = "/mnt/fcvm-btrfs/inception-scripts/bench.sh";
+    let bench_path = "/mnt/fcvm-btrfs/nested-scripts/bench.sh";
     tokio::fs::write(bench_path, bench_script).await?;
     tokio::process::Command::new("chmod")
         .args(["+x", bench_path])
@@ -1292,9 +1265,9 @@ echo "MARKER_L${LEVEL}_OK"
     // L2 script: just run benchmark
     let l2_script = r#"#!/bin/bash
 set -ex
-/mnt/fcvm-btrfs/inception-scripts/bench.sh 2
+/mnt/fcvm-btrfs/nested-scripts/bench.sh 2
 "#;
-    let l2_path = "/mnt/fcvm-btrfs/inception-scripts/l2.sh";
+    let l2_path = "/mnt/fcvm-btrfs/nested-scripts/l2.sh";
     tokio::fs::write(l2_path, l2_script).await?;
     tokio::process::Command::new("chmod")
         .args(["+x", l2_path])
@@ -1302,32 +1275,34 @@ set -ex
         .await?;
 
     // L1 script: run L1 benchmark, import image, start L2 with benchmark
+    // Use stripped digest (without sha256: prefix) to match fcvm's cache format
+    let digest_stripped = digest.trim_start_matches("sha256:");
     let l1_script = format!(
         r#"#!/bin/bash
 set -ex
 
 # Run L1 benchmark first
-/mnt/fcvm-btrfs/inception-scripts/bench.sh 1
+/mnt/fcvm-btrfs/nested-scripts/bench.sh 1
 
 echo "L1: Importing image from shared cache..."
-skopeo copy dir:/mnt/fcvm-btrfs/image-cache/{digest} containers-storage:localhost/inception-test
+podman load -i /mnt/fcvm-btrfs/image-cache/{digest}.oci.tar
 
 echo "L1: Starting L2 VM with benchmarks (tracing enabled)..."
 FCVM_FUSE_TRACE_RATE=100 fcvm podman run --name l2 --network bridged --privileged \
     --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
-    localhost/inception-test \
-    --cmd /mnt/fcvm-btrfs/inception-scripts/l2.sh
+    localhost/nested-test \
+    --cmd /mnt/fcvm-btrfs/nested-scripts/l2.sh
 "#,
-        digest = digest
+        digest = digest_stripped
     );
 
-    let l1_path = "/mnt/fcvm-btrfs/inception-scripts/l1.sh";
+    let l1_path = "/mnt/fcvm-btrfs/nested-scripts/l1.sh";
     tokio::fs::write(l1_path, &l1_script).await?;
     tokio::process::Command::new("chmod")
         .args(["+x", l1_path])
         .status()
         .await?;
-    println!("Wrote inception scripts to /mnt/fcvm-btrfs/inception-scripts/");
+    println!("Wrote nesting scripts to /mnt/fcvm-btrfs/nested-scripts/");
 
     // Run L1 with --cmd that executes the script
     let output = tokio::process::Command::new("./target/release/fcvm")
@@ -1335,19 +1310,19 @@ FCVM_FUSE_TRACE_RATE=100 fcvm podman run --name l2 --network bridged --privilege
             "podman",
             "run",
             "--name",
-            "l1-inception",
+            "l1-nested",
             "--network",
             "bridged",
             "--privileged",
             "--mem",
             "4096",
-            "--kernel",
-            kernel_str,
+            "--kernel-profile",
+            "nested",
             "--map",
             "/mnt/fcvm-btrfs:/mnt/fcvm-btrfs",
-            "localhost/inception-test",
+            "localhost/nested-test",
             "--cmd",
-            "/mnt/fcvm-btrfs/inception-scripts/l1.sh",
+            "/mnt/fcvm-btrfs/nested-scripts/l1.sh",
         ])
         .output()
         .await?;
@@ -1390,7 +1365,7 @@ FCVM_FUSE_TRACE_RATE=100 fcvm podman run --name l2 --network bridged --privilege
     Ok(())
 }
 
-/// Test L1→L2→L3 inception: 3 levels of nesting
+/// Test L1→L2→L3: 3 levels of nesting
 ///
 /// BLOCKED: 3-hop FUSE chain (L3→L2→L1→HOST) causes ~3-5 second latency per
 /// request due to PassthroughFs + spawn_blocking serialization. FUSE mount
@@ -1398,34 +1373,30 @@ FCVM_FUSE_TRACE_RATE=100 fcvm podman run --name l2 --network bridged --privilege
 /// or async PassthroughFs before this test can complete in reasonable time.
 #[tokio::test]
 #[ignore]
-async fn test_inception_l3() -> Result<()> {
-    run_inception_n_levels(3, "MARKER_L3_OK_12345").await
+async fn test_nested_l3() -> Result<()> {
+    run_nested_n_levels(3, "MARKER_L3_OK_12345").await
 }
 
-/// Test L1→L2→L3→L4 inception: 4 levels of nesting
+/// Test L1→L2→L3→L4: 4 levels of nesting
 ///
 /// BLOCKED: Same issue as L3, but worse. 4-hop FUSE chain would be even slower.
 #[tokio::test]
 #[ignore]
-async fn test_inception_l4() -> Result<()> {
-    run_inception_n_levels(4, "MARKER_L4_OK_12345").await
+async fn test_nested_l4() -> Result<()> {
+    run_nested_n_levels(4, "MARKER_L4_OK_12345").await
 }
 
-/// Run N levels of inception, building scripts from deepest level upward
-async fn run_inception_n_levels(n: usize, marker: &str) -> Result<()> {
-    assert!(n >= 2, "Need at least 2 levels for inception");
+/// Run N levels of nesting, building scripts from deepest level upward
+async fn run_nested_n_levels(n: usize, marker: &str) -> Result<()> {
+    assert!(n >= 2, "Need at least 2 levels for nesting");
 
-    ensure_inception_image().await?;
-    let inception_kernel = ensure_inception_kernel().await?;
-    let kernel_str = inception_kernel
-        .to_str()
-        .context("kernel path not valid UTF-8")?;
+    ensure_nested_image().await?;
 
-    // Get the digest of localhost/inception-test
+    // Get the digest of localhost/nested-test
     let digest_out = tokio::process::Command::new("podman")
         .args([
             "inspect",
-            "localhost/inception-test",
+            "localhost/nested-test",
             "--format",
             "{{.Digest}}",
         ])
@@ -1446,7 +1417,7 @@ async fn run_inception_n_levels(n: usize, marker: &str) -> Result<()> {
     // Ln (deepest): just echo the marker
     // L1..L(n-1): import image + run fcvm with next level's script
 
-    let scripts_dir = "/mnt/fcvm-btrfs/inception-scripts";
+    let scripts_dir = "/mnt/fcvm-btrfs/nested-scripts";
     tokio::fs::create_dir_all(scripts_dir).await.ok();
 
     // Deepest level (Ln): just echo the marker
@@ -1463,10 +1434,7 @@ async fn run_inception_n_levels(n: usize, marker: &str) -> Result<()> {
     // Each level needs:
     // - --map to access shared storage
     // - --mem for intermediate levels to fit child VM
-    // - --kernel for intermediate levels that spawn VMs (need KVM)
-    //
-    // The inception kernel path is accessible via the shared FUSE mount.
-    let inception_kernel_path = kernel_str; // Same kernel used at all levels
+    // - --kernel-profile for nested virtualization
 
     for level in (1..n).rev() {
         let next_script = format!("{}/l{}.sh", scripts_dir, level + 1);
@@ -1480,16 +1448,14 @@ async fn run_inception_n_levels(n: usize, marker: &str) -> Result<()> {
         // L(n) (deepest, created outside this loop) just runs echo, no child VMs.
         // All other levels (1 to n-1) spawn VMs and need 4GB.
         let mem_arg = format!("--mem {}", intermediate_mem);
-        // ALL levels need --kernel because they all spawn VMs with Firecracker
-        let kernel_arg = format!("--kernel {}", inception_kernel_path);
 
         let script = format!(
             r#"#!/bin/bash
 set -ex
 echo "L{}: Importing image from shared cache..."
-skopeo copy dir:/mnt/fcvm-btrfs/image-cache/{} containers-storage:localhost/inception-test
+skopeo copy dir:/mnt/fcvm-btrfs/image-cache/{} containers-storage:localhost/nested-test
 echo "L{}: Starting L{} VM..."
-fcvm podman run --name l{} --network bridged --privileged {} {} --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs localhost/inception-test --cmd {}
+fcvm podman run --name l{} --network bridged --privileged {} --kernel-profile nested --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs localhost/nested-test --cmd {}
 "#,
             level,
             digest,
@@ -1497,7 +1463,6 @@ fcvm podman run --name l{} --network bridged --privileged {} {} --map /mnt/fcvm-
             level + 1,
             level + 1,
             mem_arg,
-            kernel_arg,
             next_script
         );
         let script_path = format!("{}/l{}.sh", scripts_dir, level);
@@ -1507,32 +1472,32 @@ fcvm podman run --name l{} --network bridged --privileged {} {} --map /mnt/fcvm-
             .status()
             .await?;
         println!(
-            "L{}: import + fcvm {} {} --map + --cmd {}",
-            level, mem_arg, kernel_arg, next_script
+            "L{}: import + fcvm {} --kernel-profile nested --map + --cmd {}",
+            level, mem_arg, next_script
         );
     }
 
-    // Run L1 from host with inception kernel
+    // Run L1 from host with nested kernel profile
     // L1 needs extra memory since it spawns L2
     let l1_script = format!("{}/l1.sh", scripts_dir);
     println!(
-        "\nStarting {} levels of inception with 4GB per intermediate VM...",
+        "\nStarting {} levels of nesting with 4GB per intermediate VM...",
         n
     );
 
     // Use sh -c with tee to stream output in real-time AND capture for marker check
-    let log_file = format!("/tmp/inception-l{}.log", n);
+    let log_file = format!("/tmp/nested-l{}.log", n);
     let fcvm_cmd = format!(
         "sudo ./target/release/fcvm podman run \
-         --name l1-inception-{} \
+         --name l1-nested-{} \
          --network bridged \
          --privileged \
          --mem {} \
-         --kernel {} \
+         --kernel-profile nested \
          --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
-         localhost/inception-test \
+         localhost/nested-test \
          --cmd {} 2>&1 | tee {}",
-        n, intermediate_mem, kernel_str, l1_script, log_file
+        n, intermediate_mem, l1_script, log_file
     );
 
     let status = tokio::process::Command::new("sh")
@@ -1558,18 +1523,18 @@ fcvm podman run --name l{} --network bridged --privileged {} {} --map /mnt/fcvm-
     Ok(())
 }
 
-/// Test skopeo import performance over FUSE (localhost/inception-test)
+/// Test skopeo import performance over FUSE (localhost/nested-test)
 ///
-/// Measures how long it takes to import the full inception container image
+/// Measures how long it takes to import the full nested container image
 /// inside a VM when the image layers are accessed over FUSE-over-vsock.
 #[tokio::test]
 async fn test_skopeo_import_over_fuse() -> Result<()> {
     println!("\nSkopeo Over FUSE Performance Test");
     println!("==================================\n");
 
-    // 1. Ensure localhost/inception-test exists
-    println!("1. Ensuring localhost/inception-test exists...");
-    ensure_inception_image().await?;
+    // 1. Ensure localhost/nested-test exists
+    println!("1. Ensuring localhost/nested-test exists...");
+    ensure_nested_image().await?;
     println!("   ✓ Image ready");
 
     // 2. Get image digest and export to CAS cache
@@ -1577,7 +1542,7 @@ async fn test_skopeo_import_over_fuse() -> Result<()> {
     let digest_output = tokio::process::Command::new("podman")
         .args([
             "inspect",
-            "localhost/inception-test",
+            "localhost/nested-test",
             "--format",
             "{{.Digest}}",
         ])
@@ -1596,12 +1561,7 @@ async fn test_skopeo_import_over_fuse() -> Result<()> {
 
     // Get image size
     let size_output = tokio::process::Command::new("podman")
-        .args([
-            "images",
-            "localhost/inception-test",
-            "--format",
-            "{{.Size}}",
-        ])
+        .args(["images", "localhost/nested-test", "--format", "{{.Size}}"])
         .output()
         .await?;
     let size = String::from_utf8_lossy(&size_output.stdout)
@@ -1620,7 +1580,7 @@ async fn test_skopeo_import_over_fuse() -> Result<()> {
         let export_output = tokio::process::Command::new("skopeo")
             .args([
                 "copy",
-                "containers-storage:localhost/inception-test",
+                "containers-storage:localhost/nested-test",
                 &format!("dir:{}", cache_dir),
             ])
             .output()
@@ -1638,11 +1598,6 @@ async fn test_skopeo_import_over_fuse() -> Result<()> {
     // 3. Start L1 VM with FUSE mount
     println!("3. Starting L1 VM with FUSE mount...");
 
-    let inception_kernel = ensure_inception_kernel().await?;
-    let kernel_str = inception_kernel
-        .to_str()
-        .context("kernel path not valid UTF-8")?;
-
     let (vm_name, _, _, _) = common::unique_names("fuse-large");
     let fcvm_path = common::find_fcvm_binary()?;
 
@@ -1653,8 +1608,8 @@ async fn test_skopeo_import_over_fuse() -> Result<()> {
         &vm_name,
         "--network",
         "bridged",
-        "--kernel",
-        kernel_str,
+        "--kernel-profile",
+        "nested",
         "--privileged",
         "--map",
         "/mnt/fcvm-btrfs:/mnt/fcvm-btrfs",
