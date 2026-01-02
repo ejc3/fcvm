@@ -52,23 +52,84 @@ async fn ensure_inception_kernel() -> Result<PathBuf> {
 
 /// Path where NV2 firecracker fork is installed (separate from system firecracker)
 const FIRECRACKER_NV2_PATH: &str = "/usr/local/bin/firecracker-nv2";
+/// SHA file to track which commit the binary was built from
+const FIRECRACKER_NV2_SHA_PATH: &str = "/usr/local/bin/firecracker-nv2.sha";
 
-/// Check if NV2 Firecracker binary exists and supports --enable-nv2 flag
+/// Get the HEAD SHA of the remote branch (without cloning)
+async fn get_remote_branch_sha() -> Result<String> {
+    let output = tokio::process::Command::new("git")
+        .args(["ls-remote", FIRECRACKER_NV2_REPO, FIRECRACKER_NV2_BRANCH])
+        .output()
+        .await
+        .context("running git ls-remote")?;
+
+    if !output.status.success() {
+        bail!("git ls-remote failed");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Format: "<sha>\trefs/heads/<branch>"
+    let sha = stdout
+        .split_whitespace()
+        .next()
+        .context("parsing SHA from git ls-remote")?;
+
+    Ok(sha.to_string())
+}
+
+/// Check if NV2 Firecracker binary exists, supports --enable-nv2, AND matches remote SHA
 async fn firecracker_nv2_exists() -> bool {
     let path = std::path::Path::new(FIRECRACKER_NV2_PATH);
     if !path.exists() {
         return false;
     }
 
+    // Check if binary has --enable-nv2 support
     let output = tokio::process::Command::new(FIRECRACKER_NV2_PATH)
         .arg("--help")
         .output()
         .await;
 
-    match output {
+    let has_nv2_flag = match output {
         Ok(out) => String::from_utf8_lossy(&out.stdout).contains("enable-nv2"),
         Err(_) => false,
+    };
+
+    if !has_nv2_flag {
+        return false;
     }
+
+    // Check if SHA matches remote (content-addressed caching)
+    let sha_path = std::path::Path::new(FIRECRACKER_NV2_SHA_PATH);
+    if !sha_path.exists() {
+        println!("  No SHA file found, will rebuild to ensure correct version");
+        return false;
+    }
+
+    let cached_sha = match std::fs::read_to_string(sha_path) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => return false,
+    };
+
+    let remote_sha = match get_remote_branch_sha().await {
+        Ok(s) => s,
+        Err(e) => {
+            println!("  Warning: couldn't check remote SHA: {}", e);
+            // If we can't check remote, assume cached version is fine
+            return true;
+        }
+    };
+
+    if cached_sha != remote_sha {
+        println!(
+            "  Cached SHA {} != remote SHA {}, will rebuild",
+            &cached_sha[..8],
+            &remote_sha[..8]
+        );
+        return false;
+    }
+
+    true
 }
 
 /// Ensure Firecracker with NV2 support is installed at FIRECRACKER_NV2_PATH
@@ -195,10 +256,27 @@ async fn ensure_firecracker_nv2() -> Result<()> {
         bail!("Failed to install Firecracker to {}", FIRECRACKER_NV2_PATH);
     }
 
-    // Verify installation
-    if !firecracker_nv2_exists().await {
+    // Get the SHA of what we just built
+    let built_sha = tokio::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&build_dir)
+        .output()
+        .await
+        .context("getting built commit SHA")?;
+
+    let sha = String::from_utf8_lossy(&built_sha.stdout).trim().to_string();
+
+    // Write SHA file (content-addressed cache marker)
+    std::fs::write(FIRECRACKER_NV2_SHA_PATH, &sha)
+        .context("writing SHA file")?;
+
+    println!("  Built from commit {}", &sha[..12]);
+
+    // Verify installation (skip SHA check since we just wrote it)
+    let path = std::path::Path::new(FIRECRACKER_NV2_PATH);
+    if !path.exists() {
         let _ = flock.unlock();
-        bail!("Firecracker installed but --enable-nv2 flag not found");
+        bail!("Firecracker binary not found after install");
     }
 
     let _ = flock.unlock();
