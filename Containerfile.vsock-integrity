@@ -15,14 +15,18 @@
 
 FROM docker.io/library/rust:1.83-slim AS builder
 
+# Install musl target for static linking (L2 runs alpine)
+RUN rustup target add aarch64-unknown-linux-musl && \
+    apt-get update && apt-get install -y musl-tools && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /build
 COPY tests/vsock-integrity/ .
-RUN cargo build --release
+RUN cargo build --release --target aarch64-unknown-linux-musl
 
 FROM localhost/nested-test
 
-# Add vsock-integrity binary
-COPY --from=builder /build/target/release/vsock-integrity /usr/local/bin/
+# Add vsock-integrity binary (musl-linked for alpine)
+COPY --from=builder /build/target/aarch64-unknown-linux-musl/release/vsock-integrity /usr/local/bin/
 
 # Add test script
 COPY tests/vsock-integrity/run-test.sh /usr/local/bin/

@@ -4,114 +4,52 @@
 //! due to cache coherency issues in double S2 translation.
 //!
 //! Test flow:
-//! 1. Host starts L1 VM with --vsock-dir for predictable socket path
-//! 2. Before L2 starts, echo server listens on vsock.sock_9999
-//! 3. L2 connects via vsock port 9999, sends data, receives echo
-//! 4. L2 verifies data integrity
+//! 1. Host starts L1 VM with localhost/vsock-integrity
+//! 2. Inside L1: echo server listens on vsock.sock_9999
+//! 3. L1 starts L2, which connects via vsock port 9999
+//! 4. L2 sends data, receives echo, verifies integrity
 
 #![cfg(feature = "privileged-tests")]
 
 mod common;
 
 use anyhow::{Context, Result};
-use std::process::Stdio;
-
-const VSOCK_TEST_PORT: u32 = 9999;
 
 /// Test vsock data integrity under nested virtualization.
 ///
 /// This test:
-/// 1. Builds vsock-integrity binary
-/// 2. Starts L1 VM with nested kernel + --vsock-dir
-/// 3. Inside L1: starts echo server, then starts L2 with vsock client
+/// 1. Builds localhost/vsock-integrity container (extends localhost/nested-test)
+/// 2. Starts L1 VM which runs the built-in test script
+/// 3. L1 starts echo server, then L2 with vsock client
 /// 4. Verifies no corruption in the vsock data path
 #[tokio::test]
 async fn test_vsock_integrity_nested() -> Result<()> {
     println!("\nVsock Integrity Test (NV2 Nested)");
     println!("==================================\n");
 
-    // 1. Build vsock-integrity binary
-    println!("1. Building vsock-integrity binary...");
-    let status = tokio::process::Command::new("cargo")
-        .args([
-            "build",
-            "--release",
-            "--manifest-path",
-            "tests/vsock-integrity/Cargo.toml",
-        ])
-        .status()
-        .await
-        .context("building vsock-integrity")?;
+    // 1. Build localhost/nested-test first (base image)
+    println!("1. Ensuring localhost/nested-test exists...");
+    common::ensure_nested_image().await?;
 
-    if !status.success() {
-        anyhow::bail!("Failed to build vsock-integrity");
-    }
-    println!("   ✓ Built");
-
-    // 2. Copy binary to shared storage
-    println!("2. Copying binary to shared storage...");
-    tokio::fs::create_dir_all("/mnt/fcvm-btrfs/bin")
-        .await
-        .ok();
-    tokio::fs::copy(
-        "tests/vsock-integrity/target/release/vsock-integrity",
-        "/mnt/fcvm-btrfs/bin/vsock-integrity",
+    // 2. Build localhost/vsock-integrity (extends nested-test)
+    println!("2. Building localhost/vsock-integrity container...");
+    common::ensure_nested_container(
+        "localhost/vsock-integrity",
+        "Containerfile.vsock-integrity",
     )
-    .await
-    .context("copying vsock-integrity to shared storage")?;
-    println!("   ✓ Copied to /mnt/fcvm-btrfs/bin/vsock-integrity");
+    .await?;
 
-    // 3. Start L1 VM
+    // 3. Start L1 VM with vsock-integrity container
+    // The container's ENTRYPOINT runs the test automatically
     let (vm_name, _, _, _) = common::unique_names("vsock-int");
-    let vsock_dir = format!("/tmp/vsock-test-{}", std::process::id());
 
-    println!("3. Starting L1 VM...");
-    println!("   --vsock-dir {}", vsock_dir);
+    println!("3. Starting L1 VM with localhost/vsock-integrity...");
 
-    let fcvm_path = common::find_fcvm_binary()?;
+    // Home dir for config mount (so L1 can find rootfs-config.toml)
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let config_mount = format!("{0}/.config/fcvm:/root/.config/fcvm:ro", home);
 
-    // L1 script: start echo server, start L2, L2 runs client
-    let l1_script = format!(
-        r#"#!/bin/bash
-set -ex
-
-VSOCK_DIR="{vsock_dir}"
-PORT={port}
-
-echo "=== L1: Starting echo server ==="
-mkdir -p "$VSOCK_DIR"
-/mnt/fcvm-btrfs/bin/vsock-integrity server "$VSOCK_DIR" $PORT &
-SERVER_PID=$!
-sleep 1
-
-echo "=== L1: Starting L2 VM ==="
-# L2 runs the vsock client
-fcvm podman run \
-    --name l2-vsock-client \
-    --network bridged \
-    --vsock-dir "$VSOCK_DIR" \
-    --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
-    alpine:latest \
-    --cmd "/mnt/fcvm-btrfs/bin/vsock-integrity client-vsock 2 $PORT"
-
-kill $SERVER_PID 2>/dev/null || true
-echo "VSOCK_TEST_COMPLETE"
-"#,
-        vsock_dir = vsock_dir,
-        port = VSOCK_TEST_PORT,
-    );
-
-    // Write L1 script to shared storage
-    let script_path = format!("/mnt/fcvm-btrfs/vsock-test-{}.sh", std::process::id());
-    tokio::fs::write(&script_path, &l1_script)
-        .await
-        .context("writing L1 script")?;
-    tokio::process::Command::new("chmod")
-        .args(["+x", &script_path])
-        .status()
-        .await?;
-
-    // Start L1 with nested kernel
+    // Start L1 - the container's entrypoint (run-test.sh) handles everything
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
         "podman",
         "run",
@@ -122,13 +60,13 @@ echo "VSOCK_TEST_COMPLETE"
         "--kernel-profile",
         "nested",
         "--privileged",
+        "--mem",
+        "2048", // Need enough for L2
         "--map",
         "/mnt/fcvm-btrfs:/mnt/fcvm-btrfs",
-        "--vsock-dir",
-        &vsock_dir,
-        "alpine:latest",
-        "--cmd",
-        &script_path,
+        "--map",
+        &config_mount,
+        "localhost/vsock-integrity",
     ])
     .await
     .context("spawning L1 VM")?;
@@ -136,38 +74,38 @@ echo "VSOCK_TEST_COMPLETE"
     println!("   L1 started (PID: {})", fcvm_pid);
 
     // Wait for completion (with timeout)
-    let output = tokio::time::timeout(std::time::Duration::from_secs(300), child.wait_with_output())
+    // Output streams to console via Stdio::inherit()
+    let _status = tokio::time::timeout(std::time::Duration::from_secs(300), child.wait())
         .await
         .context("timeout waiting for test")?
-        .context("waiting for test output")?;
+        .context("waiting for test")?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{}\n{}", stdout, stderr);
+    // Check results via marker file on shared storage
+    // run-test.sh writes PASS/CORRUPTION/INCOMPLETE to this file
+    let result_file = "/mnt/fcvm-btrfs/vsock-test-result.txt";
+    println!("\n4. Checking results from {}...", result_file);
 
-    // Cleanup
-    tokio::fs::remove_file(&script_path).await.ok();
+    let result = std::fs::read_to_string(result_file)
+        .context("reading result file")?
+        .trim()
+        .to_string();
 
-    // Check results
-    println!("\n4. Checking results...");
+    // Clean up result file
+    std::fs::remove_file(result_file).ok();
 
-    if combined.contains("VSOCK_INTEGRITY_OK") {
-        println!("   ✓ No corruption detected");
-        println!("\n✅ VSOCK INTEGRITY TEST PASSED");
-        Ok(())
-    } else if combined.contains("CORRUPTION") {
-        println!("   ✗ Data corruption detected!");
-        println!("\nOutput (last 50 lines):");
-        for line in combined.lines().rev().take(50).collect::<Vec<_>>().into_iter().rev() {
-            println!("   {}", line);
+    match result.as_str() {
+        "PASS" => {
+            println!("   ✓ No corruption detected");
+            println!("\n✅ VSOCK INTEGRITY TEST PASSED");
+            Ok(())
         }
-        anyhow::bail!("Vsock data corruption detected under NV2 nested virtualization")
-    } else {
-        println!("   ? Test did not complete");
-        println!("\nOutput (last 50 lines):");
-        for line in combined.lines().rev().take(50).collect::<Vec<_>>().into_iter().rev() {
-            println!("   {}", line);
+        "CORRUPTION" => {
+            println!("   ✗ Data corruption detected!");
+            anyhow::bail!("Vsock data corruption detected under NV2 nested virtualization")
         }
-        anyhow::bail!("Vsock integrity test did not complete")
+        _ => {
+            println!("   ? Test result: {}", result);
+            anyhow::bail!("Vsock integrity test did not complete (result: {})", result)
+        }
     }
 }
