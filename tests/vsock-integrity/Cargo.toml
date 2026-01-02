@@ -1,0 +1,10 @@
+[package]
+name = "vsock-integrity"
+version = "0.1.0"
+edition = "2021"
+
+# Keep this package independent of the parent workspace
+[workspace]
+
+[dependencies]
+libc = "0.2"
