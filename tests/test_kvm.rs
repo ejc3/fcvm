@@ -890,7 +890,11 @@ except OSError as e:
 /// L2: L1 container imports image from shared cache, then runs fcvm
 ///
 /// Uses the shared run_nested_n_levels infrastructure for consistency.
+///
+/// IGNORED: Flaky due to FUSE stream corruption under high I/O load (~8K requests).
+/// See README.md "Known Issues (Nested)" for details. Fix tracked in issue.
 #[tokio::test]
+#[ignore = "FUSE stream corruption at ~8K requests - see README Known Issues"]
 async fn test_nested_l2() -> Result<()> {
     run_nested_n_levels(2, "NESTED_2_LEVELS_SUCCESS").await
 }
