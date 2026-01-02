@@ -16,7 +16,7 @@
 FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    iproute2 iptables podman skopeo python3 kmod procps fuse3 curl nginx \
+    iproute2 iptables podman python3 kmod procps fuse3 curl nginx \
     fuse-overlayfs sudo \
     && rm -rf /var/lib/apt/lists/*
 
