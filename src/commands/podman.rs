@@ -1172,13 +1172,6 @@ async fn run_vm_setup(
 
     let firecracker_bin = super::common::find_firecracker()?;
 
-    // When --kernel is used (inception kernel), enable nested virtualization.
-    // This sets FCVM_NV2=1 which tells Firecracker to enable HAS_EL2 vCPU feature.
-    if args.kernel.is_some() {
-        std::env::set_var("FCVM_NV2", "1");
-        info!("Enabling nested virtualization (FCVM_NV2=1) for inception kernel");
-    }
-
     vm_manager
         .start(&firecracker_bin, None)
         .await
@@ -1226,19 +1219,10 @@ async fn run_vm_setup(
         info!("fc-agent strace debugging enabled - output will be in /tmp/fc-agent.strace");
     }
 
-    // Nested virtualization boot parameters for ARM64 (only when using custom kernel).
-    // When --kernel is used with an inception kernel, FCVM_NV2=1 is set and Firecracker
-    // enables HAS_EL2 vCPU features with VHE mode (E2H=1). These kernel params help the
-    // guest initialize properly:
-    //
-    // - kvm-arm.mode=nested - Enable nested virtualization support in guest KVM.
-    //   VHE mode (E2H=1) allows the guest kernel to run at EL2, which is required
-    //   for kvm-arm.mode=nested. This enables recursive nested virtualization.
-    // - numa=off - Disable NUMA to avoid percpu allocation issues in nested contexts
-    // - arm64.nv2 - Override MMFR4.NV_frac to advertise NV2 support. Required because
-    //   virtual EL2 reads ID registers directly from hardware (TID3 only traps EL1 reads).
-    if args.kernel.is_some() {
-        boot_args.push_str(" kvm-arm.mode=nested numa=off arm64.nv2");
+    // Additional boot args from environment (caller controls)
+    if let Ok(extra) = std::env::var("FCVM_BOOT_ARGS") {
+        boot_args.push_str(" ");
+        boot_args.push_str(&extra);
     }
 
     // Pass FUSE reader count to fc-agent via kernel command line.
