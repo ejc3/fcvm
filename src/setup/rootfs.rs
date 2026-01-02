@@ -35,6 +35,52 @@ pub struct Plan {
     pub fstab: FstabConfig,
     #[serde(default)]
     pub cleanup: CleanupConfig,
+    #[serde(default)]
+    pub kernel_profiles: HashMap<String, KernelProfile>,
+}
+
+/// Kernel profile configuration for specialized kernels (e.g., nested virtualization)
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct KernelProfile {
+    /// Human-readable description
+    #[serde(default)]
+    pub description: String,
+
+    /// Kernel version (e.g., "6.18")
+    #[serde(default)]
+    pub kernel_version: String,
+
+    /// GitHub repo for kernel releases (e.g., "ejc3/firepod")
+    #[serde(default)]
+    pub kernel_repo: String,
+
+    /// Tag pattern for releases (e.g., "kernel-nested-{version}-{arch}-{sha}")
+    #[serde(default)]
+    pub kernel_tag_pattern: String,
+
+    /// Path to firecracker binary (default: system firecracker)
+    #[serde(default)]
+    pub firecracker_bin: Option<String>,
+
+    /// GitHub repo for firecracker fork (for building if binary missing)
+    #[serde(default)]
+    pub firecracker_repo: Option<String>,
+
+    /// Branch to build firecracker from
+    #[serde(default)]
+    pub firecracker_branch: Option<String>,
+
+    /// Extra CLI args for firecracker
+    #[serde(default)]
+    pub firecracker_args: Option<String>,
+
+    /// Extra kernel boot parameters
+    #[serde(default)]
+    pub boot_args: Option<String>,
+
+    /// Override FUSE reader count
+    #[serde(default)]
+    pub fuse_readers: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -90,7 +136,7 @@ pub struct KernelArchConfig {
     #[serde(default)]
     pub path: String,
     /// Local filesystem path to kernel binary (overrides url if provided)
-    /// Use for custom-built kernels (e.g., inception kernel with CONFIG_KVM)
+    /// Use for custom-built kernels (e.g., profile kernel with CONFIG_KVM)
     #[serde(default)]
     pub local_path: Option<String>,
 }
@@ -620,6 +666,88 @@ pub fn load_config(explicit_path: Option<&str>) -> Result<(Plan, String, String)
 /// Legacy alias for load_config (for backward compatibility during migration)
 pub fn load_plan() -> Result<(Plan, String, String)> {
     load_config(None)
+}
+
+/// Get a kernel profile by name
+///
+/// Returns the profile config if found, or None if not defined.
+/// Use FCVM_KERNEL_PROFILE env var to select a profile at runtime.
+pub fn get_kernel_profile(name: &str) -> Result<Option<KernelProfile>> {
+    let (plan, _, _) = load_plan()?;
+    Ok(plan.kernel_profiles.get(name).cloned())
+}
+
+/// Detect kernel profile from kernel path
+///
+/// Checks if the kernel filename matches a configured profile pattern.
+/// Returns the profile name if matched.
+pub fn detect_kernel_profile(kernel_path: &Path) -> Option<String> {
+    let name = kernel_path.file_name()?.to_str()?;
+
+    // Load config to get all profile names
+    if let Ok((config, _, _)) = load_config(None) {
+        for profile_name in config.kernel_profiles.keys() {
+            // Check if filename contains the profile name
+            if name.contains(profile_name) {
+                return Some(profile_name.clone());
+            }
+        }
+    }
+
+    None
+}
+
+/// Get the active kernel profile from env var or auto-detection
+///
+/// Checks FCVM_KERNEL_PROFILE first, then tries to detect from kernel path.
+pub fn get_active_kernel_profile(kernel_path: Option<&Path>) -> Result<Option<KernelProfile>> {
+    // First check env var
+    if let Ok(profile_name) = std::env::var("FCVM_KERNEL_PROFILE") {
+        if let Some(profile) = get_kernel_profile(&profile_name)? {
+            info!(profile = %profile_name, "using kernel profile from FCVM_KERNEL_PROFILE");
+            return Ok(Some(profile));
+        } else {
+            warn!(profile = %profile_name, "FCVM_KERNEL_PROFILE specified but profile not found in config");
+        }
+    }
+
+    // Then try auto-detection from kernel path
+    if let Some(path) = kernel_path {
+        if let Some(profile_name) = detect_kernel_profile(path) {
+            if let Some(profile) = get_kernel_profile(&profile_name)? {
+                info!(profile = %profile_name, path = %path.display(), "auto-detected kernel profile from path");
+                return Ok(Some(profile));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Get the kernel path for a profile
+///
+/// Returns the path where the profile's kernel should be installed.
+/// The kernel is stored in kernels_dir with a profile-specific name pattern.
+pub fn get_profile_kernel_path(profile_name: &str) -> Result<PathBuf> {
+    let kernels_dir = paths::kernel_dir();
+
+    // Look for existing kernel matching this profile
+    // Pattern: vmlinux-{profile}-*.bin (e.g., vmlinux-nested-6.18-arm64-abc123.bin)
+    if kernels_dir.exists() {
+        for entry in std::fs::read_dir(&kernels_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with(&format!("vmlinux-{}-", profile_name))
+                && name_str.ends_with(".bin")
+            {
+                return Ok(entry.path());
+            }
+        }
+    }
+
+    // No kernel found - return expected path (caller will check existence)
+    Ok(kernels_dir.join(format!("vmlinux-{}-not-installed.bin", profile_name)))
 }
 
 /// Compute SHA256 of bytes, return hex string

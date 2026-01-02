@@ -3,7 +3,7 @@ use std::fs;
 use std::path::Path;
 
 fn main() {
-    // Compute inception kernel SHA from build inputs
+    // Compute custom kernel SHA from build inputs
     let kernel_dir = Path::new("kernel");
     let mut content = Vec::new();
 
@@ -15,8 +15,8 @@ fn main() {
         }
     }
 
-    // Read inception.conf
-    let conf = kernel_dir.join("inception.conf");
+    // Read kernel.conf
+    let conf = kernel_dir.join("kernel.conf");
     if conf.exists() {
         if let Ok(data) = fs::read(&conf) {
             content.extend(data);
@@ -50,10 +50,10 @@ fn main() {
         hex::encode(&result[..6])
     };
 
-    println!("cargo:rustc-env=INCEPTION_KERNEL_SHA={}", sha);
+    println!("cargo:rustc-env=CUSTOM_KERNEL_SHA={}", sha);
 
     // Rerun if kernel sources change
     println!("cargo:rerun-if-changed=kernel/build.sh");
-    println!("cargo:rerun-if-changed=kernel/inception.conf");
+    println!("cargo:rerun-if-changed=kernel/kernel.conf");
     println!("cargo:rerun-if-changed=kernel/patches");
 }

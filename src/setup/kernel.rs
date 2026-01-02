@@ -11,12 +11,12 @@ use crate::setup::rootfs::{load_plan, KernelArchConfig};
 /// GitHub repository for kernel releases
 const GITHUB_REPO: &str = "ejc3/firepod";
 
-/// Inception kernel version (must match kernel/build.sh)
-const INCEPTION_KERNEL_VERSION: &str = "6.18";
+/// Custom kernel version for profiles (must match kernel/build.sh)
+const CUSTOM_KERNEL_VERSION: &str = "6.18";
 
-/// Inception kernel SHA computed at compile time from kernel sources.
+/// Custom kernel SHA computed at compile time from kernel sources.
 /// This allows downloads to work after `cargo install` when kernel sources aren't present.
-const INCEPTION_KERNEL_SHA_COMPILED: &str = env!("INCEPTION_KERNEL_SHA");
+const CUSTOM_KERNEL_SHA_COMPILED: &str = env!("CUSTOM_KERNEL_SHA");
 
 /// Compute SHA256 of bytes, return hex string (first 12 chars)
 fn compute_sha256_short(data: &[u8]) -> String {
@@ -214,15 +214,15 @@ async fn download_kernel(config: &KernelArchConfig, allow_create: bool) -> Resul
 }
 
 // ============================================================================
-// Inception Kernel (for nested virtualization)
+// Profile Kernel (custom kernels for specific use cases like nested virtualization)
 // ============================================================================
 
-/// Compute SHA for inception kernel based on build inputs.
+/// Compute SHA for custom kernel based on build inputs.
 /// This matches the SHA computed in kernel/build.sh and CI workflow.
 ///
 /// If kernel sources are present (e.g., running from git repo), computes SHA at runtime.
 /// If sources are not present (e.g., after `cargo install`), uses compile-time SHA.
-pub fn compute_inception_kernel_sha() -> String {
+pub fn compute_custom_kernel_sha() -> String {
     let kernel_dir = Path::new("kernel");
 
     // Check if kernel sources exist
@@ -230,10 +230,10 @@ pub fn compute_inception_kernel_sha() -> String {
     if !script.exists() {
         // Sources not present - use compile-time SHA
         debug!(
-            sha = %INCEPTION_KERNEL_SHA_COMPILED,
+            sha = %CUSTOM_KERNEL_SHA_COMPILED,
             "kernel sources not found, using compile-time SHA"
         );
-        return INCEPTION_KERNEL_SHA_COMPILED.to_string();
+        return CUSTOM_KERNEL_SHA_COMPILED.to_string();
     }
 
     // Sources present - compute at runtime for development workflow
@@ -244,8 +244,8 @@ pub fn compute_inception_kernel_sha() -> String {
         content.extend(data);
     }
 
-    // Read inception.conf
-    let conf = kernel_dir.join("inception.conf");
+    // Read kernel.conf
+    let conf = kernel_dir.join("kernel.conf");
     if let Ok(data) = std::fs::read(&conf) {
         content.extend(data);
     }
@@ -270,36 +270,40 @@ pub fn compute_inception_kernel_sha() -> String {
     compute_sha256_short(&content)
 }
 
-/// Get the inception kernel filename.
-pub fn inception_kernel_filename(sha: &str) -> String {
+/// Get the profile kernel filename.
+/// Profile name is included in the filename for identification.
+pub fn profile_kernel_filename(profile_name: &str, sha: &str) -> String {
     format!(
-        "vmlinux-inception-{}-{}-{}.bin",
-        INCEPTION_KERNEL_VERSION,
+        "vmlinux-{}-{}-{}-{}.bin",
+        profile_name,
+        CUSTOM_KERNEL_VERSION,
         std::env::consts::ARCH,
         sha
     )
 }
 
-/// Get the inception kernel release tag.
-pub fn inception_kernel_tag(sha: &str) -> String {
+/// Get the profile kernel release tag.
+/// Uses the tag pattern from profile config if available, otherwise defaults.
+pub fn profile_kernel_tag(profile_name: &str, sha: &str) -> String {
     format!(
-        "kernel-inception-{}-{}-{}",
-        INCEPTION_KERNEL_VERSION,
+        "kernel-{}-{}-{}-{}",
+        profile_name,
+        CUSTOM_KERNEL_VERSION,
         std::env::consts::ARCH,
         sha
     )
 }
 
-/// Ensure inception kernel exists.
+/// Ensure profile kernel exists.
 ///
 /// 1. Check if already downloaded locally
 /// 2. Try to download from GitHub releases
 /// 3. If `allow_build` is true and download fails, build locally
 ///
 /// Returns the path to the kernel binary.
-pub async fn ensure_inception_kernel(allow_build: bool) -> Result<PathBuf> {
-    let sha = compute_inception_kernel_sha();
-    let filename = inception_kernel_filename(&sha);
+pub async fn ensure_profile_kernel(profile_name: &str, allow_build: bool) -> Result<PathBuf> {
+    let sha = compute_custom_kernel_sha();
+    let filename = profile_kernel_filename(profile_name, &sha);
     let kernel_dir = paths::kernel_dir();
     let kernel_path = kernel_dir.join(&filename);
 
@@ -307,8 +311,9 @@ pub async fn ensure_inception_kernel(allow_build: bool) -> Result<PathBuf> {
     if kernel_path.exists() {
         info!(
             path = %kernel_path.display(),
+            profile = %profile_name,
             sha = %sha,
-            "inception kernel already exists"
+            "profile kernel already exists"
         );
         return Ok(kernel_path);
     }
@@ -327,68 +332,71 @@ pub async fn ensure_inception_kernel(allow_build: bool) -> Result<PathBuf> {
         .truncate(true)
         .mode(0o600)
         .open(&lock_file)
-        .context("opening inception kernel lock file")?;
+        .context("opening profile kernel lock file")?;
 
     let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
         .map_err(|(_, err)| err)
-        .context("acquiring exclusive lock for inception kernel")?;
+        .context("acquiring exclusive lock for profile kernel")?;
 
     // Double-check after lock
     if kernel_path.exists() {
         debug!(
             path = %kernel_path.display(),
-            "inception kernel already exists (created by another process)"
+            profile = %profile_name,
+            "profile kernel already exists (created by another process)"
         );
         flock.unlock().map_err(|(_, err)| err)?;
         return Ok(kernel_path);
     }
 
     // Try to download from GitHub releases
-    let tag = inception_kernel_tag(&sha);
+    let tag = profile_kernel_tag(profile_name, &sha);
     let download_url = format!(
         "https://github.com/{}/releases/download/{}/{}",
         GITHUB_REPO, tag, filename
     );
 
-    println!("⚙️  Downloading inception kernel...");
-    info!(url = %download_url, tag = %tag, "downloading inception kernel from GitHub releases");
+    println!("⚙️  Downloading {} kernel...", profile_name);
+    info!(url = %download_url, tag = %tag, profile = %profile_name, "downloading profile kernel from GitHub releases");
 
-    let download_result = download_inception_kernel(&download_url, &kernel_path).await;
+    let download_result = download_profile_kernel(&download_url, &kernel_path).await;
 
     match download_result {
         Ok(_) => {
-            println!("  ✓ Inception kernel downloaded");
-            info!(path = %kernel_path.display(), "inception kernel ready");
+            println!("  ✓ Profile kernel '{}' downloaded", profile_name);
+            info!(path = %kernel_path.display(), profile = %profile_name, "profile kernel ready");
             flock.unlock().map_err(|(_, err)| err)?;
             Ok(kernel_path)
         }
         Err(e) => {
-            warn!(error = %e, "failed to download inception kernel");
+            warn!(error = %e, profile = %profile_name, "failed to download profile kernel");
 
             if allow_build {
                 println!("  → Download failed, building locally (this may take 10-20 minutes)...");
-                build_inception_kernel_locally(&kernel_path).await?;
-                println!("  ✓ Inception kernel built");
+                build_profile_kernel_locally(profile_name, &kernel_path).await?;
+                println!("  ✓ Profile kernel '{}' built", profile_name);
                 flock.unlock().map_err(|(_, err)| err)?;
                 Ok(kernel_path)
             } else {
                 flock.unlock().map_err(|(_, err)| err)?;
                 bail!(
-                    "Failed to download inception kernel: {}\n\
+                    "Failed to download '{}' kernel: {}\n\
                     \n\
                     The kernel release may not exist yet. Options:\n\
                     1. Wait for CI to build it (push to main triggers kernel build)\n\
-                    2. Build locally with: fcvm setup --build-kernels\n\
+                    2. Build locally with: fcvm setup --kernel-profile {} --build-kernels\n\
                     3. Build manually with: ./kernel/build.sh",
-                    e
+                    profile_name,
+                    e,
+                    profile_name
                 );
             }
         }
     }
 }
 
-/// Download inception kernel from URL.
-async fn download_inception_kernel(url: &str, dest: &Path) -> Result<()> {
+/// Download profile kernel from URL.
+async fn download_profile_kernel(url: &str, dest: &Path) -> Result<()> {
     let temp_path = dest.with_extension("downloading");
 
     let output = Command::new("curl")
@@ -428,10 +436,10 @@ async fn download_inception_kernel(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Build inception kernel locally using kernel/build.sh.
+/// Build profile kernel locally using kernel/build.sh.
 ///
 /// This only works when running from the git repository (not after `cargo install`).
-async fn build_inception_kernel_locally(dest: &Path) -> Result<()> {
+async fn build_profile_kernel_locally(profile_name: &str, dest: &Path) -> Result<()> {
     let script = Path::new("kernel/build.sh");
     if !script.exists() {
         bail!(
@@ -442,8 +450,9 @@ async fn build_inception_kernel_locally(dest: &Path) -> Result<()> {
             \n\
             Options:\n\
             1. Clone the repo: git clone https://github.com/ejc3/firepod\n\
-            2. Run from repo: cd firepod && cargo run -- setup --inception --build-kernels\n\
-            3. Or wait for CI to publish pre-built kernels and retry without --build-kernels"
+            2. Run from repo: cd firepod && cargo run -- setup --kernel-profile {} --build-kernels\n\
+            3. Or wait for CI to publish pre-built kernels and retry without --build-kernels",
+            profile_name
         );
     }
 
@@ -472,31 +481,44 @@ async fn build_inception_kernel_locally(dest: &Path) -> Result<()> {
 // Host Kernel Installation (for EC2 setup)
 // ============================================================================
 
-/// Install inception kernel as the host kernel and configure GRUB for nested KVM.
+/// Install profile kernel as the host kernel and configure GRUB for nested KVM.
 ///
 /// This:
-/// 1. Copies the inception kernel to /boot/vmlinuz-{version}-inception
+/// 1. Copies the profile kernel to /boot/vmlinuz-{version}-{profile}
 /// 2. Updates GRUB to add kvm-arm.mode=nested boot parameter
-/// 3. Sets the inception kernel as the default boot kernel
+/// 3. Sets the profile kernel as the default boot kernel
 ///
 /// Requires root privileges.
-pub async fn install_host_kernel(inception_kernel: &Path) -> Result<()> {
+pub async fn install_host_kernel(profile_kernel: &Path) -> Result<()> {
     // Check we're running as root
     if !nix::unistd::geteuid().is_root() {
         bail!("Installing host kernel requires root privileges. Run with sudo.");
     }
 
-    let kernel_name = format!("vmlinuz-{}-inception", INCEPTION_KERNEL_VERSION);
+    // Extract profile name from kernel path (vmlinux-{profile}-{version}-{arch}-{sha}.bin)
+    let filename = profile_kernel
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("vmlinux");
+
+    // Parse: vmlinux-{profile}-{version}-{arch}-{sha}.bin
+    let profile_name = filename
+        .strip_prefix("vmlinux-")
+        .and_then(|s| s.split('-').next())
+        .unwrap_or("custom");
+
+    let kernel_name = format!("vmlinuz-{}-{}", CUSTOM_KERNEL_VERSION, profile_name);
     let boot_path = Path::new("/boot").join(&kernel_name);
 
     info!(
-        src = %inception_kernel.display(),
+        src = %profile_kernel.display(),
         dest = %boot_path.display(),
-        "installing inception kernel to /boot"
+        profile = %profile_name,
+        "installing profile kernel to /boot"
     );
 
     // Copy kernel to /boot
-    tokio::fs::copy(inception_kernel, &boot_path)
+    tokio::fs::copy(profile_kernel, &boot_path)
         .await
         .context("copying kernel to /boot")?;
 
@@ -524,8 +546,8 @@ pub async fn install_host_kernel(inception_kernel: &Path) -> Result<()> {
     println!();
     println!("  After reboot, verify with:");
     println!(
-        "     uname -r                              # Should show {}-inception",
-        INCEPTION_KERNEL_VERSION
+        "     uname -r                              # Should show {}-{}",
+        CUSTOM_KERNEL_VERSION, profile_name
     );
     println!("     cat /sys/module/kvm/parameters/mode   # Should show 'nested'");
 
