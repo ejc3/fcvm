@@ -66,13 +66,12 @@ CONTAINER_RUN := podman run --rm --privileged \
 	-v $(TEST_LOG_DIR):$(TEST_LOG_DIR) $(CARGO_CACHE_MOUNT) \
 	-e FCVM_DATA_DIR=$(CONTAINER_DATA_DIR)
 
-.PHONY: all help build clean clean-target clean-test-data check-disk \
+.PHONY: all help build clean clean-test-data check-disk \
 	test test-unit test-fast test-all test-root test-packaging \
 	_test-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all \
 	container-setup-fcvm container-shell container-clean container-bench \
-	setup-btrfs setup-fcvm setup-pjdfstest bench lint fmt \
-	dev-fc-test inception-vm inception-exec inception-wait-exec inception-stop inception-status
+	setup-btrfs setup-fcvm setup-pjdfstest bench lint fmt
 
 all: build
 
@@ -108,7 +107,6 @@ help:
 	@echo "  bench              Run fuse-pipe benchmarks"
 	@echo "  lint               Run linting (fmt, clippy, audit)"
 	@echo "  fmt                Format code"
-	@echo "  clean-target       Remove target directory"
 	@echo "  clean-test-data    Remove VM disks, snapshots, state (keeps cached assets)"
 	@echo "  check-disk         Check disk space requirements"
 	@echo ""
@@ -133,13 +131,6 @@ check-disk:
 		exit 1; \
 	fi; \
 	echo "Disk check passed: / has $${ROOT_FREE}GB, /mnt/fcvm-btrfs has $${BTRFS_FREE}GB"
-
-# Clean target directory (frees space on /)
-# Uses sudo because target may have root-owned files from sudo tests
-clean-target:
-	@echo "==> Cleaning target directory..."
-	sudo rm -rf target
-	@echo "==> Cleaned target/"
 
 # Clean leftover test data (VM disks, snapshots, state files)
 # Preserves cached assets (kernels, rootfs, initrd, image-cache)
@@ -300,154 +291,3 @@ lint:
 
 fmt:
 	cargo fmt
-
-# Development test target for inception tests
-# Usage: make dev-fc-test FILTER=inception
-dev-fc-test: build
-	@echo "==> Running test with FILTER=$(FILTER)..."
-	RUST_LOG="$(TEST_LOG)" \
-	FCVM_DATA_DIR=$(ROOT_DATA_DIR) \
-	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
-	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
-	$(NEXTEST) $(NEXTEST_CAPTURE) --features privileged-tests $(FILTER)
-
-# =============================================================================
-# Inception VM development targets
-# =============================================================================
-# These targets manage a SINGLE inception VM for debugging.
-# Only ONE VM can exist at a time - inception-vm kills any existing VM first.
-
-# Find the inception kernel (latest vmlinux-*.bin with KVM support)
-INCEPTION_KERNEL := $(shell ls -t /mnt/fcvm-btrfs/kernels/vmlinux-*.bin 2>/dev/null | head -1)
-INCEPTION_VM_NAME := inception-dev
-INCEPTION_VM_LOG := /tmp/inception-vm.log
-INCEPTION_VM_PID := /tmp/inception-vm.pid
-
-# Start an inception VM (kills any existing VM first)
-# Usage: make inception-vm
-inception-vm: build
-	@echo "==> Ensuring clean environment (killing ALL existing VMs)..."
-	@sudo pkill -9 firecracker 2>/dev/null || true
-	@sudo pkill -9 -f "fcvm podman" 2>/dev/null || true
-	@sleep 2
-	@if pgrep firecracker >/dev/null 2>&1; then \
-		echo "ERROR: Could not kill existing firecracker"; \
-		exit 1; \
-	fi
-	@sudo rm -f $(INCEPTION_VM_PID) $(INCEPTION_VM_LOG)
-	@sudo rm -rf /mnt/fcvm-btrfs/state/vm-*.json
-	@if [ -z "$(INCEPTION_KERNEL)" ]; then \
-		echo "ERROR: No inception kernel found. Run ./kernel/build.sh first."; \
-		exit 1; \
-	fi
-	@echo "==> Starting SINGLE inception VM"
-	@echo "==> Kernel: $(INCEPTION_KERNEL)"
-	@echo "==> Log: $(INCEPTION_VM_LOG)"
-	@echo "==> Use 'make inception-exec CMD=...' to run commands"
-	@echo "==> Use 'make inception-stop' to stop"
-	@sudo ./target/release/fcvm podman run \
-		--name $(INCEPTION_VM_NAME) \
-		--network bridged \
-		--kernel $(INCEPTION_KERNEL) \
-		--privileged \
-		--map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
-		--cmd "sleep infinity" \
-		alpine:latest > $(INCEPTION_VM_LOG) 2>&1 & \
-	sleep 2; \
-	FCVM_PID=$$(pgrep -n -f "fcvm podman run.*$(INCEPTION_VM_NAME)"); \
-	echo "$$FCVM_PID" | sudo tee $(INCEPTION_VM_PID) > /dev/null; \
-	echo "==> VM started with fcvm PID $$FCVM_PID"; \
-	echo "==> Waiting for boot..."; \
-	sleep 20; \
-	FC_COUNT=$$(pgrep -c firecracker || echo 0); \
-	if [ "$$FC_COUNT" -ne 1 ]; then \
-		echo "ERROR: Expected 1 firecracker, got $$FC_COUNT"; \
-		exit 1; \
-	fi; \
-	echo "==> VM ready. Tailing log (Ctrl+C to stop tail, VM keeps running):"; \
-	tail -f $(INCEPTION_VM_LOG)
-
-# Run a command inside the running inception VM
-# Usage: make inception-exec CMD="ls -la /dev/kvm"
-# Usage: make inception-exec CMD="/mnt/fcvm-btrfs/check_kvm_caps"
-CMD ?= uname -a
-inception-exec:
-	@if [ ! -f $(INCEPTION_VM_PID) ]; then \
-		echo "ERROR: No PID file found at $(INCEPTION_VM_PID)"; \
-		echo "Start a VM with 'make inception-vm' first."; \
-		exit 1; \
-	fi; \
-	PID=$$(cat $(INCEPTION_VM_PID)); \
-	if ! kill -0 $$PID 2>/dev/null; then \
-		echo "ERROR: VM process $$PID is not running"; \
-		echo "Start a VM with 'make inception-vm' first."; \
-		rm -f $(INCEPTION_VM_PID); \
-		exit 1; \
-	fi; \
-	echo "==> Running in VM (PID $$PID): $(CMD)"; \
-	sudo ./target/release/fcvm exec --pid $$PID -- $(CMD)
-
-# Wait for VM to be ready and then run a command
-# Usage: make inception-wait-exec CMD="/mnt/fcvm-btrfs/check_kvm_caps"
-inception-wait-exec: build
-	@echo "==> Waiting for inception VM to be ready..."
-	@if [ ! -f $(INCEPTION_VM_PID) ]; then \
-		echo "ERROR: No PID file found. Start a VM with 'make inception-vm &' first."; \
-		exit 1; \
-	fi; \
-	PID=$$(cat $(INCEPTION_VM_PID)); \
-	for i in $$(seq 1 30); do \
-		if ! kill -0 $$PID 2>/dev/null; then \
-			echo "ERROR: VM process $$PID exited"; \
-			rm -f $(INCEPTION_VM_PID); \
-			exit 1; \
-		fi; \
-		if sudo ./target/release/fcvm exec --pid $$PID -- true 2>/dev/null; then \
-			echo "==> VM ready (PID $$PID)"; \
-			echo "==> Running: $(CMD)"; \
-			sudo ./target/release/fcvm exec --pid $$PID -- $(CMD); \
-			exit 0; \
-		fi; \
-		sleep 2; \
-		echo "  Waiting... ($$i/30)"; \
-	done; \
-	echo "ERROR: Timeout waiting for VM to be ready"; \
-	exit 1
-
-# Stop the inception VM
-inception-stop:
-	@if [ -f $(INCEPTION_VM_PID) ]; then \
-		PID=$$(cat $(INCEPTION_VM_PID)); \
-		if kill -0 $$PID 2>/dev/null; then \
-			echo "==> Stopping VM (PID $$PID)..."; \
-			sudo kill $$PID 2>/dev/null || true; \
-			sleep 1; \
-			if kill -0 $$PID 2>/dev/null; then \
-				echo "==> Force killing..."; \
-				sudo kill -9 $$PID 2>/dev/null || true; \
-			fi; \
-			echo "==> VM stopped."; \
-		else \
-			echo "==> VM process $$PID not running (stale PID file)"; \
-		fi; \
-		rm -f $(INCEPTION_VM_PID); \
-	else \
-		echo "==> No PID file found. No VM to stop."; \
-	fi
-
-# Show VM status
-inception-status:
-	@echo "=== Inception VM Status ==="
-	@if [ -f $(INCEPTION_VM_PID) ]; then \
-		PID=$$(cat $(INCEPTION_VM_PID)); \
-		if kill -0 $$PID 2>/dev/null; then \
-			echo "VM PID: $$PID (running)"; \
-			ps -p $$PID -o pid,ppid,user,%cpu,%mem,etime,cmd --no-headers 2>/dev/null || true; \
-		else \
-			echo "VM PID: $$PID (NOT running - stale PID file)"; \
-			rm -f $(INCEPTION_VM_PID); \
-		fi; \
-	else \
-		echo "No PID file found at $(INCEPTION_VM_PID)"; \
-		echo "No VM running."; \
-	fi
