@@ -199,9 +199,8 @@ From [`arch/arm64/kvm/arch_timer.c`](https://github.com/torvalds/linux/blob/mast
 issues due to double Stage 2 translation (L2 GPA → L1 S2 → L1 HPA → L0 S2 → physical). Large writes
 that fragment into multiple vsock packets may see stale/zero data instead of actual content.
 
-**Workaround**: FUSE max_write is limited to 32KB in nested VMs to reduce vsock fragmentation.
-This avoids triggering the memory coherency race while maintaining acceptable performance.
-See `fuse-pipe/src/client/fuse.rs` for implementation.
+**Fix**: FUSE max_write limited to 32KB in `fuse-pipe/src/client/fuse.rs`. This ensures each
+FUSE write fits in a single vsock packet (kernel's limit is 64KB), avoiding fragmentation.
 
 ## FUSE Performance Tracing
 
