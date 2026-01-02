@@ -263,14 +263,18 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // Get kernel path and apply profile config
     // Priority: --kernel-profile > --kernel > default kernel
     let kernel_path = if let Some(ref profile_name) = args.kernel_profile {
-        // Load profile and get kernel path
+        // Load profile for runtime config
         let profile = crate::setup::get_kernel_profile(profile_name)?.ok_or_else(|| {
-            anyhow::anyhow!("kernel profile '{}' not found in config", profile_name)
+            anyhow::anyhow!(
+                "kernel profile '{}' not found for {} in config",
+                profile_name,
+                std::env::consts::ARCH
+            )
         })?;
 
         info!(profile = %profile_name, "using kernel profile");
 
-        // Apply profile config
+        // Apply runtime config from profile
         if let Some(ref bin) = profile.firecracker_bin {
             info!(firecracker_bin = %bin, "from profile");
             std::env::set_var("FCVM_FIRECRACKER_BIN", bin);
@@ -288,11 +292,11 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
             std::env::set_var("FCVM_FUSE_READERS", readers.to_string());
         }
 
-        // Get kernel path for this profile (must be set up first)
-        let kernel = crate::setup::get_profile_kernel_path(profile_name)?;
+        // Get kernel path (must already exist)
+        let kernel = crate::setup::get_kernel_path(Some(profile_name))?;
         if !kernel.exists() {
             bail!(
-                "Profile '{}' kernel not found at {}. Run: fcvm setup --kernel-profile {}",
+                "Profile '{}' kernel not found at {}.\nRun: fcvm setup --kernel-profile {}",
                 profile_name,
                 kernel.display(),
                 profile_name
@@ -307,7 +311,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         info!(kernel = %path.display(), "using custom kernel");
         path
     } else {
-        crate::setup::ensure_kernel(args.setup)
+        // Default kernel (downloads if --setup is set)
+        crate::setup::ensure_kernel(None, args.setup, false)
             .await
             .context("setting up kernel")?
     };

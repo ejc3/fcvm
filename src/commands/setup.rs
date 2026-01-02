@@ -24,8 +24,8 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
 
     println!("Setting up fcvm (this may take 5-10 minutes on first run)...");
 
-    // Ensure kernel exists (downloads Kata kernel if missing)
-    let kernel_path = crate::setup::ensure_kernel(true)
+    // Ensure default kernel exists (downloads from [kernel] section if missing)
+    let kernel_path = crate::setup::ensure_kernel(None, true, false)
         .await
         .context("setting up kernel")?;
     println!("  ✓ Kernel ready: {}", kernel_path.display());
@@ -54,9 +54,8 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         );
 
         // Download or build the profile kernel
-        // Currently uses shared kernel download/build logic
         let profile_kernel_path =
-            crate::setup::ensure_profile_kernel(profile_name, args.build_kernels)
+            crate::setup::ensure_kernel(Some(profile_name), true, args.build_kernels)
                 .await
                 .context("setting up profile kernel")?;
         println!(

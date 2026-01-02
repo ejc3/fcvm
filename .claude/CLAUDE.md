@@ -89,20 +89,20 @@ ps aux | grep -E "fcvm|script|cat"
 ## Overview
 fcvm is a Firecracker VM manager for running Podman containers in lightweight microVMs. This document tracks implementation findings and decisions.
 
-## Nested Virtualization (Inception)
+## Nested Virtualization
 
-fcvm supports running inside another fcvm VM ("inception") using ARM64 FEAT_NV2.
+fcvm supports running inside another fcvm VM using ARM64 FEAT_NV2.
 Recursive nesting (Host → L1 → L2 → ...) is enabled via the `arm64.nv2` kernel boot parameter.
 
 ### Requirements
 
 - **Hardware**: ARM64 with FEAT_NV2 (Graviton3+, c7g.metal)
 - **Host kernel**: 6.18+ with `kvm-arm.mode=nested`
-- **Inception kernel**: Custom kernel with CONFIG_KVM=y (built by `kernel/build.sh`)
+- **Nested kernel**: Custom kernel with CONFIG_KVM=y (use `--kernel-profile nested`)
 
 ### How It Works
 
-1. Set `FCVM_NV2=1` environment variable (auto-set when `--kernel` flag is used)
+1. Set `FCVM_NV2=1` environment variable (auto-set when `--kernel-profile nested` is used)
 2. fcvm passes `--enable-nv2` to Firecracker, which enables `HAS_EL2` vCPU feature
 3. vCPU boots at EL2h in VHE mode (E2H=1) so guest kernel sees HYP mode available
 4. EL2 registers are initialized: HCR_EL2, VMPIDR_EL2, VPIDR_EL2
@@ -110,17 +110,17 @@ Recursive nesting (Host → L1 → L2 → ...) is enabled via the `arm64.nv2` ke
 6. `arm64.nv2` boot param overrides MMFR4 to advertise NV2 support
 7. L1 KVM reports `KVM_CAP_ARM_EL2=1`, enabling recursive L2+ VMs
 
-### Running Inception
+### Running Nested VMs
 
 ```bash
-# Build inception kernel (first time only, ~10-20 min)
-./kernel/build.sh
+# Build nested kernel (first time only, ~10-20 min)
+fcvm setup --kernel-profile nested --build-kernels
 
-# Run outer VM with inception kernel (--kernel auto-sets FCVM_NV2=1)
+# Run outer VM with nested kernel profile
 sudo fcvm podman run \
     --name outer \
     --network bridged \
-    --kernel /mnt/fcvm-btrfs/kernels/vmlinux-6.12.10-*.bin \
+    --kernel-profile nested \
     --privileged \
     --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
     nginx:alpine
@@ -131,7 +131,7 @@ fcvm podman run --name inner --network bridged alpine:latest
 
 ### Key Firecracker Changes
 
-Firecracker fork with NV2 support: `ejc3/firecracker:nv2-inception`
+Firecracker fork with NV2 support (configured in kernel profile)
 
 - `HAS_EL2` (bit 7): Enables virtual EL2 for guest in VHE mode
 - Boot at EL2h: Guest kernel must see CurrentEL=EL2 on boot
@@ -141,11 +141,11 @@ Firecracker fork with NV2 support: `ejc3/firecracker:nv2-inception`
 ### Tests
 
 ```bash
-make test-root FILTER=inception
+make test-root FILTER=kvm
 ```
 
 - `test_kvm_available_in_vm`: Verifies /dev/kvm works in guest
-- `test_inception_run_fcvm_inside_vm`: Full inception test
+- `test_nested_run_fcvm_inside_vm`: Full nested virtualization test
 
 ### Recursive Nesting: The ID Register Problem (Solved)
 
@@ -1252,16 +1252,16 @@ make setup-fcvm  # Creates new initrd with new SHA
 make setup-fcvm  # Creates new rootfs with new SHA
 ```
 
-**Custom Kernel (Inception Support)**
+**Custom Kernel (Nested Virtualization)**
 
-Use `--kernel` flag to specify a local kernel path:
+Use `--kernel-profile` flag for named kernel configurations:
 ```bash
-# Build custom kernel with CONFIG_KVM=y
-./kernel/build.sh
+# Build nested kernel with CONFIG_KVM=y
+fcvm setup --kernel-profile nested --build-kernels
 
-# Run VM with custom kernel
+# Run VM with nested kernel profile
 sudo fcvm podman run --name my-vm --network bridged \
-    --kernel /mnt/fcvm-btrfs/kernels/vmlinux-6.12.10-785344093fa0.bin \
+    --kernel-profile nested \
     nginx:alpine
 ```
 
@@ -1398,8 +1398,8 @@ ERROR fcvm: Error: setting up rootfs: Rootfs not found. Run 'fcvm setup' first, 
 ### Data Layout
 
 Paths are configured in `rootfs-config.toml` under `[paths]`:
-- `assets_dir`: Content-addressed files (shared across inception levels)
-- `data_dir`: Mutable per-instance data (separate per inception level)
+- `assets_dir`: Content-addressed files (shared across nesting levels)
+- `data_dir`: Mutable per-instance data (separate per nesting level)
 
 ```
 assets_dir (default: /mnt/fcvm-btrfs)
@@ -1409,7 +1409,7 @@ assets_dir (default: /mnt/fcvm-btrfs)
 ├── image-cache/sha256:{digest}/  # Container image layers
 └── cache/                        # Downloaded cloud images
 
-data_dir (default: /mnt/fcvm-btrfs, override per inception level)
+data_dir (default: /mnt/fcvm-btrfs, override per nesting level)
 ├── vm-disks/{vm_id}/disks/       # CoW reflink copies per VM
 ├── state/{vm_id}.json            # VM state files
 └── snapshots/{name}/             # Firecracker snapshots

@@ -1,13 +1,13 @@
-# Inception test container - self-contained with fcvm, fc-agent, firecracker
+# Nested virtualization test container - self-contained with fcvm, fc-agent, firecracker
 #
 # Uses Ubuntu 24.04 to match host glibc (2.39).
 #
 # Build:
 #   cp target/release/fcvm target/release/fc-agent artifacts/
 #   cp /usr/local/bin/firecracker artifacts/firecracker-nv2
-#   sudo podman build -t localhost/inception-test -f Containerfile.inception .
+#   sudo podman build -t localhost/nested-test -f Containerfile.nested .
 #
-# The inception test is driven by test_inception_chain.rs which:
+# The nested test is driven by test_nested_chain tests which:
 # 1. Runs L1 with --cmd "sleep infinity"
 # 2. Execs into L1's container to verify KVM works
 # 3. Execs into L1's container to start L2
@@ -41,11 +41,11 @@ RUN chmod +x /usr/local/bin/fcvm /usr/local/bin/fc-agent /usr/local/bin/firecrac
 RUN mkdir -p /etc/fcvm
 COPY rootfs-config.toml /etc/fcvm/rootfs-config.toml
 
-# Recursive inception script: /usr/local/bin/inception
-# Usage: inception <current_level> <max_level> <kernel_path> <image_cache_path>
+# Recursive nesting script: /usr/local/bin/nested
+# Usage: nested <current_level> <max_level> <kernel_path> <image_cache_path>
 # When current == max, echoes success marker. Otherwise starts nested VM.
-COPY inception.sh /usr/local/bin/inception
-RUN chmod +x /usr/local/bin/inception
+COPY nested.sh /usr/local/bin/nested
+RUN chmod +x /usr/local/bin/nested
 
 # Default command - create runtime dirs, start nginx (for health checks), and sleep
 # /run/netns is needed for ip netns (bridged networking)

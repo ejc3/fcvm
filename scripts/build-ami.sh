@@ -9,7 +9,7 @@ KERNEL_DIR="$(dirname "$SCRIPT_DIR")/kernel"
 
 # Compute build hash
 compute_hash() {
-  cat "$KERNEL_DIR/build-host.sh" "$KERNEL_DIR/inception.conf" "$KERNEL_DIR/patches/"*.patch 2>/dev/null | sha256sum | cut -c1-12
+  cat "$KERNEL_DIR/build-host.sh" "$KERNEL_DIR/nested.conf" "$KERNEL_DIR/patches/"*.patch 2>/dev/null | sha256sum | cut -c1-12
 }
 
 # Check for existing AMI with matching hash
@@ -63,7 +63,7 @@ apt-get install -y build-essential bc bison flex libssl-dev \
 # Download kernel build files
 mkdir -p /tmp/kernel/patches
 curl -fsSL https://raw.githubusercontent.com/ejc3/firepod/main/kernel/build-host.sh -o /tmp/kernel/build-host.sh
-curl -fsSL https://raw.githubusercontent.com/ejc3/firepod/main/kernel/inception.conf -o /tmp/kernel/inception.conf
+curl -fsSL https://raw.githubusercontent.com/ejc3/firepod/main/kernel/nested.conf -o /tmp/kernel/nested.conf
 curl -fsSL https://raw.githubusercontent.com/ejc3/firepod/main/kernel/patches/mmfr4-override.patch -o /tmp/kernel/patches/mmfr4-override.patch 2>/dev/null || true
 chmod +x /tmp/kernel/build-host.sh
 

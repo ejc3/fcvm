@@ -1172,7 +1172,7 @@ fn handle_exec_pipe(fd: i32, request: &ExecRequest) {
     unsafe { libc::close(fd) };
 }
 
-/// Create /dev/kvm device node for inception support.
+/// Create /dev/kvm device node for nested virtualization support.
 /// This allows running Firecracker inside Firecracker (nested virtualization).
 /// Requires kernel with CONFIG_KVM=y.
 fn create_kvm_device() {
@@ -1435,6 +1435,20 @@ fn mount_fuse_volumes(volumes: &[VolumeMount]) -> Result<Vec<String>> {
     if !volumes.is_empty() {
         eprintln!("[fc-agent] waiting for FUSE mounts to initialize...");
         std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Verify each mount point is accessible
+        for vol in volumes {
+            let path = std::path::Path::new(&vol.guest_path);
+            if let Ok(entries) = std::fs::read_dir(path) {
+                let count = entries.count();
+                eprintln!(
+                    "[fc-agent] ✓ mount {} accessible ({} entries)",
+                    vol.guest_path, count
+                );
+            } else {
+                eprintln!("[fc-agent] ✗ mount {} NOT accessible", vol.guest_path);
+            }
+        }
     }
 
     Ok(mounted_paths)
@@ -1581,7 +1595,7 @@ async fn main() -> Result<()> {
     // Raise resource limits early to support high parallelism workloads
     raise_resource_limits();
 
-    // Create /dev/kvm device for inception support (nested virtualization)
+    // Create /dev/kvm device for nested virtualization support (nested virtualization)
     // This is a no-op if kernel doesn't have CONFIG_KVM
     create_kvm_device();
 
@@ -1665,6 +1679,7 @@ async fn main() -> Result<()> {
     // Otherwise, pull from registry
     let image_ref = if let Some(archive_path) = &plan.image_archive {
         eprintln!("[fc-agent] using OCI archive: {}", archive_path);
+
         format!("oci-archive:{}", archive_path)
     } else {
         // Pull image with retries to handle transient DNS/network errors
