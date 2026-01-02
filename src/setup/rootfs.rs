@@ -1919,6 +1919,9 @@ async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
     let api_socket = temp_dir.join("firecracker.sock");
     let log_path = temp_dir.join("firecracker.log");
 
+    // Create log file (Firecracker requires it to exist)
+    std::fs::File::create(&log_path).context("creating Firecracker log file")?;
+
     // Find kernel - downloaded from Kata release if needed
     // Use default kernel (None profile), allow_create=true, allow_build=false
     let kernel_path = crate::setup::kernel::ensure_kernel(None, true, false).await?;
