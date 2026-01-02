@@ -140,8 +140,7 @@ remove_dirs = [
 # Select via FCVM_KERNEL_PROFILE=<name> or auto-detected from kernel filename.
 #
 # Profile config is applied at runtime:
-# - firecracker_bin: path to firecracker binary (default: system firecracker)
-# - firecracker_repo/branch: build firecracker from source if binary missing
+# - firecracker_repo/branch: build firecracker from source (content-addressed in ~/.local/share/fcvm/firecracker/)
 # - firecracker_args: extra CLI args for firecracker
 # - boot_args: extra kernel boot parameters
 # - fuse_readers: override FUSE reader count
@@ -166,9 +165,9 @@ kernel_config = "kernel/nested.conf"
 patches_dir = "kernel/patches"
 
 # Firecracker NV2 fork with --enable-nv2 support
-firecracker_bin = "/usr/local/bin/firecracker-nv2"
+# Binary is content-addressed: assets_dir/firecracker/firecracker-nested-{sha}.bin
 firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "nv2-nested"
+firecracker_branch = "nv2-vhe-mode"
 firecracker_args = "--enable-nv2"
 
 # Boot args for nested KVM
