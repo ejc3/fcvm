@@ -126,8 +126,8 @@ jobs:
         working-directory: fcvm
         run: ./scripts/test-packaging.sh ./target/release/fcvm
 
-  # Runner 1: Host (bare metal with KVM)
-  # Runs: test-unit → test-fast → test-root (sequential)
+  # Runner 1a: Host (bare metal with KVM)
+  # Runs: test-unit → test-fast (quick tests, no privileged)
   # Self-hosted ARM64 runner with nested virtualization (c7g.metal)
   host:
     name: Host
@@ -242,6 +242,105 @@ jobs:
       - name: test-fast
         working-directory: fcvm
         run: make test-fast
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: test-logs-host
+          path: /tmp/fcvm-test-logs/
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Save cargo tools cache
+        if: always() && steps.cache-cargo-tools.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cargo/bin
+          key: ${{ env.CACHE_KEY_HOST }}-${{ runner.os }}-${{ runner.arch }}
+
+  # Runner 1b: Host-Root (bare metal with KVM)
+  # Runs: test-root (privileged tests with inception kernel)
+  # Parallel with Host job for faster CI
+  host-root:
+    name: Host-Root
+    if: ${{ github.event.inputs.job != 'container' }}
+    runs-on: [self-hosted, Linux, ARM64]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: fcvm
+      - uses: actions/checkout@v6
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+      - uses: actions/checkout@v6
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - name: Get dependency SHAs
+        id: deps
+        run: |
+          echo "fuser=$(git -C fuser rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "fuse-backend-rs=$(git -C fuse-backend-rs rev-parse HEAD)" >> $GITHUB_OUTPUT
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fcvm -> target
+          cache-on-failure: "true"
+          shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev libclang-dev clang musl-tools \
+            iproute2 iptables slirp4netns dnsmasq qemu-utils e2fsprogs parted \
+            podman skopeo busybox-static cpio zstd autoconf automake libtool cmake \
+            libseccomp-dev
+      - name: Install Firecracker
+        run: |
+          curl -L -o /tmp/firecracker.tgz \
+            https://github.com/firecracker-microvm/firecracker/releases/download/v1.14.0/firecracker-v1.14.0-aarch64.tgz
+          sudo tar -xzf /tmp/firecracker.tgz -C /usr/local/bin --strip-components=1 \
+            release-v1.14.0-aarch64/firecracker-v1.14.0-aarch64 \
+            release-v1.14.0-aarch64/jailer-v1.14.0-aarch64
+          sudo mv /usr/local/bin/firecracker-v1.14.0-aarch64 /usr/local/bin/firecracker
+          sudo mv /usr/local/bin/jailer-v1.14.0-aarch64 /usr/local/bin/jailer
+      - name: Restore cargo tools cache
+        id: cache-cargo-tools
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cargo/bin
+          key: ${{ env.CACHE_KEY_HOST }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Install cargo tools
+        run: |
+          which cargo-nextest || cargo install cargo-nextest@0.9.115 --locked
+          sudo ln -sf $HOME/.cargo/bin/cargo /usr/local/bin/
+          sudo ln -sf $HOME/.cargo/bin/rustc /usr/local/bin/
+          sudo ln -sf $HOME/.cargo/bin/cargo-nextest /usr/local/bin/
+      - name: Setup KVM and networking
+        run: |
+          sudo chmod 666 /dev/kvm
+          sudo mkdir -p /var/run/netns
+          sudo iptables -P FORWARD ACCEPT
+          sudo iptables -t nat -A POSTROUTING -s 172.30.0.0/16 -o eth0 -j MASQUERADE || true
+          if [ ! -e /dev/userfaultfd ]; then
+            sudo mknod /dev/userfaultfd c 10 126
+          fi
+          sudo chmod 666 /dev/userfaultfd
+          sudo sysctl -w vm.unprivileged_userfaultfd=1
+          echo "user_allow_other" | sudo tee /etc/fuse.conf
+          podman system migrate || true
+      - name: Create test log directory
+        run: mkdir -p /tmp/fcvm-test-logs
+      - name: Clean test data
+        working-directory: fcvm
+        run: make clean-test-data || true
+      - name: setup-fcvm
+        working-directory: fcvm
+        run: make setup-fcvm
       - name: Get inception kernel
         working-directory: fcvm
         run: |
@@ -253,13 +352,12 @@ jobs:
       - name: Capture kernel logs
         if: always()
         run: |
-          # Filter dmesg for UFFD/memory/VM related messages only
           sudo dmesg | grep -iE 'userfault|uffd|kvm|firecracker|oom|killed|segfault|page.fault' > /tmp/fcvm-test-logs/dmesg-filtered.log || true
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: test-logs-host
+          name: test-logs-host-root
           path: /tmp/fcvm-test-logs/
           if-no-files-found: ignore
           retention-days: 14
