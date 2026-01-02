@@ -895,21 +895,20 @@ async fn test_nested_l2() -> Result<()> {
 
 /// Test L1→L2 nesting with standard benchmarks
 ///
-/// IGNORED: The 10MB FUSE writes generate ~8K requests which triggers
-/// FUSE stream corruption. See README.md "Known Issues (Nested)".
+/// IGNORED: This test runs extensive benchmarks at both L1 and L2 levels,
+/// which exceeds the 10-minute test timeout. Use for manual performance analysis.
 #[tokio::test]
-#[ignore = "FUSE stream corruption at ~8K requests - see README Known Issues"]
+#[ignore = "exceeds 10-minute timeout - use for manual benchmarking"]
 async fn test_nested_l2_with_benchmarks() -> Result<()> {
     run_nested_n_levels(2, "NESTED_2_LEVELS_BENCH_SUCCESS", BenchmarkMode::Standard).await
 }
 
 /// Test L1→L2 nesting with large file benchmarks (100MB copies)
 ///
-/// IGNORED: This test triggers FUSE stream corruption under high I/O load (~8K requests).
-/// The corruption manifests as bincode deserialization errors with value 0x4C000000.
-/// See README.md "Known Issues (Nested)" for details.
+/// Tests FUSE-over-vsock with 100MB file copies at each nesting level.
+/// This validates the 32KB max_write limit that prevents vsock fragmentation
+/// issues under nested virtualization.
 #[tokio::test]
-#[ignore = "FUSE stream corruption at ~8K requests - see README Known Issues"]
 async fn test_nested_l2_with_large_files() -> Result<()> {
     run_nested_n_levels(
         2,
@@ -947,7 +946,7 @@ enum BenchmarkMode {
     None,
     /// Standard benchmarks (egress, disk I/O, FUSE latency, memory)
     Standard,
-    /// Standard + large file tests (100MB copies) - can trigger FUSE corruption
+    /// Standard + large file tests (100MB copies)
     WithLargeFiles,
 }
 
