@@ -1011,34 +1011,27 @@ if mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then
     rm -rf "$FUSE_DIR"
 fi
 
-# Test 5: Large FUSE copy (100MB to measure sustained throughput)
-if mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then
-    echo "--- Large Copy Test ---"
-    FUSE_DIR="/mnt/fcvm-btrfs/bench-copy-${LEVEL}-$$"
-    mkdir -p "$FUSE_DIR"
-
-    # Create 100MB source file on local disk
-    dd if=/dev/urandom of=/tmp/large.dat bs=1M count=100 2>/dev/null
-
-    # Copy local -> FUSE (100MB)
-    START=$(date +%s%N)
-    cp /tmp/large.dat "${FUSE_DIR}/large.dat"
-    sync
-    END=$(date +%s%N)
-    COPY_TO_MS=$(( (END - START) / 1000000 ))
-    COPY_TO_MBS=$(( 100 * 1000 / (COPY_TO_MS + 1) ))
-    echo "FUSE_COPY_TO_L${LEVEL}=${COPY_TO_MS}ms (100MB, ${COPY_TO_MBS}MB/s)"
-
-    # Copy FUSE -> local (100MB)
-    START=$(date +%s%N)
-    cp "${FUSE_DIR}/large.dat" /tmp/large2.dat
-    END=$(date +%s%N)
-    COPY_FROM_MS=$(( (END - START) / 1000000 ))
-    COPY_FROM_MBS=$(( 100 * 1000 / (COPY_FROM_MS + 1) ))
-    echo "FUSE_COPY_FROM_L${LEVEL}=${COPY_FROM_MS}ms (100MB, ${COPY_FROM_MBS}MB/s)"
-
-    rm -rf "$FUSE_DIR" /tmp/large.dat /tmp/large2.dat
-fi
+# Test 5: Large FUSE copy - DISABLED (too slow at L2 with FUSE-over-FUSE)
+# if mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then
+#     echo "--- Large Copy Test ---"
+#     FUSE_DIR="/mnt/fcvm-btrfs/bench-copy-${LEVEL}-$$"
+#     mkdir -p "$FUSE_DIR"
+#     dd if=/dev/urandom of=/tmp/large.dat bs=1M count=100 2>/dev/null
+#     START=$(date +%s%N)
+#     cp /tmp/large.dat "${FUSE_DIR}/large.dat"
+#     sync
+#     END=$(date +%s%N)
+#     COPY_TO_MS=$(( (END - START) / 1000000 ))
+#     COPY_TO_MBS=$(( 100 * 1000 / (COPY_TO_MS + 1) ))
+#     echo "FUSE_COPY_TO_L${LEVEL}=${COPY_TO_MS}ms (100MB, ${COPY_TO_MBS}MB/s)"
+#     START=$(date +%s%N)
+#     cp "${FUSE_DIR}/large.dat" /tmp/large2.dat
+#     END=$(date +%s%N)
+#     COPY_FROM_MS=$(( (END - START) / 1000000 ))
+#     COPY_FROM_MBS=$(( 100 * 1000 / (COPY_FROM_MS + 1) ))
+#     echo "FUSE_COPY_FROM_L${LEVEL}=${COPY_FROM_MS}ms (100MB, ${COPY_FROM_MBS}MB/s)"
+#     rm -rf "$FUSE_DIR" /tmp/large.dat /tmp/large2.dat
+# fi
 
 # Test 6: Memory usage (RSS)
 echo "--- Memory Test ---"
@@ -1066,8 +1059,6 @@ fn print_benchmark_summary(log_content: &str) {
             || line.contains("FUSE_READ_L")
             || line.contains("FUSE_STAT_L")
             || line.contains("FUSE_SMALLREAD_L")
-            || line.contains("FUSE_COPY_TO_L")
-            || line.contains("FUSE_COPY_FROM_L")
             || line.contains("MEM_L")
         {
             // Strip ANSI codes and prefixes
