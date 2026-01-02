@@ -15,6 +15,12 @@ on:
     branches: [main]
   push:
     branches: [main]
+    paths-ignore:
+      - 'kernel/**'  # When kernel changes, wait for Build Kernels workflow
+  workflow_run:
+    workflows: ["Build Kernels"]
+    types: [completed]
+    branches: [main]
 
 # Cancel in-progress runs when a new revision is pushed
 concurrency:

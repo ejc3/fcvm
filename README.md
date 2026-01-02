@@ -290,15 +290,19 @@ fcvm supports running VMs inside VMs using ARM64 FEAT_NV2 nested virtualization.
 ┌─────────────────────────────────────────────────────────┐
 │  Host (bare metal c7g.metal)                            │
 │  ┌───────────────────────────────────────────────────┐  │
-│  │  Level 1 VM (fcvm + nested kernel profile)        │  │
-│  │  - KVM works (/dev/kvm accessible)                │  │
-│  │  - Can run Firecracker VMs                        │  │
-│  │  - Nested VMs run containers                      │  │
+│  │  L1 VM (fcvm + nested kernel profile)             │  │
+│  │  ┌─────────────────────────────────────────────┐  │  │
+│  │  │  L2 VM (fcvm inside L1)                     │  │  │
+│  │  │  - Runs containers                          │  │  │
+│  │  │  - Full VM isolation                        │  │  │
+│  │  └─────────────────────────────────────────────┘  │  │
 │  └───────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Limitation**: Recursive nesting (L1 → L2 → L3...) is currently blocked. L1's KVM reports `KVM_CAP_ARM_EL2=0` because NV2's E2H0 flag forces nVHE mode, but `kvm-arm.mode=nested` requires VHE mode. See `.claude/CLAUDE.md` for technical details.
+**What Works**: Host → L1 → L2 nesting is fully functional. The `arm64.nv2` kernel boot parameter enables recursive KVM (`KVM_CAP_ARM_EL2=1`).
+
+**Limitation**: L3+ nesting (L1 → L2 → L3...) is blocked by FUSE-over-FUSE latency. Each nesting level adds ~3-5 seconds per filesystem request due to the multi-hop FUSE chain. See `.claude/CLAUDE.md` for technical details.
 
 ### Requirements
 

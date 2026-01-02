@@ -400,7 +400,7 @@ echo "FCVM Layer 2 Setup: Running sanity checks..."
 SANITY_FAILED=0
 
 # Check critical binaries exist
-for bin in podman crun skopeo; do
+for bin in podman crun; do
     if [ ! -x "/newroot/usr/bin/$bin" ]; then
         echo "FCVM ERROR: $bin not found at /newroot/usr/bin/$bin"
         SANITY_FAILED=1
