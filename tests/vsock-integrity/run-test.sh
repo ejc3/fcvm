@@ -48,7 +48,8 @@ echo ""
 # Run L2 VM
 # Note: L2 just needs to run the vsock client - no nested virtualization needed
 # Use alpine:latest with vsock-integrity from FUSE mount
-fcvm podman run \
+# FCVM_FUSE_MAX_WRITE=32768 prevents vsock data loss in L2 FUSE-over-FUSE
+FCVM_FUSE_MAX_WRITE=32768 fcvm podman run \
     --name l2-vsock-test \
     --network bridged \
     --vsock-dir "$VSOCK_DIR" \
