@@ -601,6 +601,136 @@ make setup-fcvm   # Download kernel, create rootfs
 
 ---
 
+## Kernels and Base Images
+
+fcvm uses a config-driven approach for kernels and base images. All configuration is in `rootfs-config.toml`.
+
+### Default Kernel
+
+The default kernel is from [Kata Containers](https://github.com/kata-containers/kata-containers):
+
+| Property | Value |
+|----------|-------|
+| **Version** | 6.12.47 |
+| **Source** | Kata 3.24.0 release |
+| **Key Config** | `CONFIG_FUSE_FS=y` (required for volume mounts) |
+| **Architectures** | arm64, amd64 |
+
+The kernel is downloaded automatically during `fcvm setup` and cached by URL hash. Changing the URL in config triggers a re-download.
+
+### Base Image
+
+The guest OS is Ubuntu 24.04 LTS (Noble Numbat):
+
+| Property | Value |
+|----------|-------|
+| **Version** | 24.04 LTS |
+| **Source** | Ubuntu cloud images |
+| **Packages** | podman, crun, fuse-overlayfs, skopeo, fuse3, haveged, chrony |
+
+The rootfs is built automatically during `fcvm setup` and cached by script SHA. Changing packages, services, or files in config triggers a rebuild.
+
+### Kernel Profiles
+
+For advanced use cases (like nested virtualization), fcvm supports **kernel profiles**. Profiles define:
+
+- Custom kernel with specific configuration
+- Optional custom Firecracker binary
+- Boot arguments and runtime settings
+
+**Current profiles:**
+
+| Profile | Architecture | Description |
+|---------|--------------|-------------|
+| `nested` | arm64 | Nested virtualization (NV2) with CONFIG_KVM=y |
+
+Usage:
+```bash
+# Download/build kernel for profile
+fcvm setup --kernel-profile nested
+
+# Run VM with profile
+sudo fcvm podman run --name vm1 --kernel-profile nested --privileged nginx:alpine
+```
+
+### Adding a New Kernel Profile
+
+To add a custom kernel profile, edit `rootfs-config.toml`:
+
+```toml
+# Example: Add a minimal kernel profile for amd64
+[kernel_profiles.minimal.amd64]
+description = "Minimal kernel for fast boot"
+kernel_version = "6.12"
+kernel_repo = "your-org/your-kernel-repo"
+
+# Files that determine kernel SHA (supports globs)
+# When any of these change, kernel is rebuilt
+build_inputs = [
+    "kernel/build-minimal.sh",
+    "kernel/minimal.conf",
+]
+
+# Build paths (relative to repo root)
+build_script = "kernel/build-minimal.sh"
+kernel_config = "kernel/minimal.conf"
+
+# Optional: Custom Firecracker binary
+# firecracker_bin = "/usr/local/bin/firecracker-custom"
+
+# Optional: Extra boot arguments
+boot_args = "quiet"
+```
+
+**Key fields:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `kernel_version` | Yes | Kernel version (e.g., "6.18") |
+| `kernel_repo` | Yes | GitHub repo for releases (e.g., "ejc3/firepod") |
+| `build_inputs` | Yes | Files to hash for kernel SHA (supports globs) |
+| `build_script` | No | Local build script path |
+| `kernel_config` | No | Kernel .config file path |
+| `firecracker_bin` | No | Custom Firecracker binary path |
+| `firecracker_args` | No | Extra Firecracker CLI args |
+| `boot_args` | No | Extra kernel boot parameters |
+
+**How it works:**
+
+1. **SHA computation**: fcvm hashes all files matching `build_inputs` patterns
+2. **Download first**: Tries to download from `kernel_repo` releases with tag `kernel-{profile}-{version}-{arch}-{sha}`
+3. **Local build fallback**: If download fails and `--build-kernels` is set, runs `build_script`
+4. **No recompilation needed**: Changing config only requires updating the TOML file
+
+### Customizing the Base Image
+
+The rootfs is built from `rootfs-config.toml` sections:
+
+```toml
+[base]
+version = "24.04"
+codename = "noble"
+
+[packages]
+runtime = ["podman", "crun", "fuse-overlayfs", "skopeo"]
+fuse = ["fuse3"]
+system = ["haveged", "chrony"]
+debug = ["strace"]
+
+[services]
+enable = ["haveged", "chrony", "systemd-networkd"]
+disable = ["snapd", "cloud-init"]
+
+[files."/etc/myconfig"]
+content = """
+my custom config
+"""
+```
+
+After changing the config, run `fcvm setup` to rebuild the rootfs with the new SHA.
+
+---
+
 ## Troubleshooting
 
 ### "fcvm binary not found"
