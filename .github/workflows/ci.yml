@@ -230,6 +230,8 @@ jobs:
       - name: Clean test data
         working-directory: fcvm
         run: make clean-test-data || true
+      - name: Clear cached firecracker-nv2 (force rebuild with correct branch)
+        run: sudo rm -f /usr/local/bin/firecracker-nv2 /tmp/firecracker-nv2-build -rf
       - name: test-unit
         working-directory: fcvm
         run: make test-unit
