@@ -884,19 +884,38 @@ except OSError as e:
     }
 }
 
-/// Test L1→L2 nesting: run fcvm inside L1 to start L2
+/// Test L1→L2 nesting: basic check without benchmarks
 ///
-/// L1: Host starts VM with localhost/nested-test + nested kernel profile
-/// L2: L1 container imports image from shared cache, then runs fcvm
+/// Verifies that nested virtualization works by running a simple command chain.
+/// This is the fastest L2 test - no benchmarks, just basic functionality.
+#[tokio::test]
+async fn test_nested_l2() -> Result<()> {
+    run_nested_n_levels(2, "NESTED_2_LEVELS_SUCCESS", BenchmarkMode::None).await
+}
+
+/// Test L1→L2 nesting with standard benchmarks
 ///
-/// Uses the shared run_nested_n_levels infrastructure for consistency.
+/// Runs egress, disk I/O, FUSE latency, and memory benchmarks at each level.
+/// Takes longer than test_nested_l2 but provides performance visibility.
+#[tokio::test]
+async fn test_nested_l2_with_benchmarks() -> Result<()> {
+    run_nested_n_levels(2, "NESTED_2_LEVELS_BENCH_SUCCESS", BenchmarkMode::Standard).await
+}
+
+/// Test L1→L2 nesting with large file benchmarks (100MB copies)
 ///
-/// IGNORED: Flaky due to FUSE stream corruption under high I/O load (~8K requests).
-/// See README.md "Known Issues (Nested)" for details. Fix tracked in issue.
+/// IGNORED: This test triggers FUSE stream corruption under high I/O load (~8K requests).
+/// The corruption manifests as bincode deserialization errors with value 0x4C000000.
+/// See README.md "Known Issues (Nested)" for details.
 #[tokio::test]
 #[ignore = "FUSE stream corruption at ~8K requests - see README Known Issues"]
-async fn test_nested_l2() -> Result<()> {
-    run_nested_n_levels(2, "NESTED_2_LEVELS_SUCCESS").await
+async fn test_nested_l2_with_large_files() -> Result<()> {
+    run_nested_n_levels(
+        2,
+        "NESTED_2_LEVELS_LARGE_SUCCESS",
+        BenchmarkMode::WithLargeFiles,
+    )
+    .await
 }
 
 /// Test L1→L2→L3: 3 levels of nesting
@@ -908,7 +927,7 @@ async fn test_nested_l2() -> Result<()> {
 #[tokio::test]
 #[ignore]
 async fn test_nested_l3() -> Result<()> {
-    run_nested_n_levels(3, "MARKER_L3_OK_12345").await
+    run_nested_n_levels(3, "MARKER_L3_OK_12345", BenchmarkMode::None).await
 }
 
 /// Test L1→L2→L3→L4: 4 levels of nesting
@@ -917,7 +936,31 @@ async fn test_nested_l3() -> Result<()> {
 #[tokio::test]
 #[ignore]
 async fn test_nested_l4() -> Result<()> {
-    run_nested_n_levels(4, "MARKER_L4_OK_12345").await
+    run_nested_n_levels(4, "MARKER_L4_OK_12345", BenchmarkMode::None).await
+}
+
+/// Benchmark mode for nested tests
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BenchmarkMode {
+    /// No benchmarks - just verify nesting works
+    None,
+    /// Standard benchmarks (egress, disk I/O, FUSE latency, memory)
+    Standard,
+    /// Standard + large file tests (100MB copies) - can trigger FUSE corruption
+    WithLargeFiles,
+}
+
+/// Basic script that just echoes the success marker (no benchmarks)
+fn basic_script() -> &'static str {
+    r#"#!/bin/bash
+set -e
+LEVEL=${1:-unknown}
+echo "=== L${LEVEL} BASIC CHECK ==="
+echo "Kernel: $(uname -r)"
+echo "Memory: $(grep MemAvailable /proc/meminfo | awk '{print $2/1024 " MB"}')"
+echo "=== END L${LEVEL} ==="
+echo "MARKER_L${LEVEL}_OK"
+"#
 }
 
 /// Benchmark script that runs at each nesting level
@@ -1051,11 +1094,56 @@ echo "MARKER_L${LEVEL}_OK"
 "#
 }
 
+/// Large file benchmark script - tests 100MB copies over FUSE
+///
+/// WARNING: This can trigger FUSE stream corruption under high load (~8K requests).
+/// See README.md "Known Issues (Nested)" for details.
+fn large_file_script() -> &'static str {
+    r#"#!/bin/bash
+set -e
+LEVEL=${1:-unknown}
+
+echo "=== LARGE FILE BENCHMARK L${LEVEL} ==="
+
+if mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then
+    FUSE_DIR="/mnt/fcvm-btrfs/bench-large-${LEVEL}-$$"
+    mkdir -p "$FUSE_DIR"
+
+    echo "--- Generating 100MB random data ---"
+    dd if=/dev/urandom of=/tmp/large.dat bs=1M count=100 2>/dev/null
+
+    echo "--- Copy TO FUSE (100MB) ---"
+    START=$(date +%s%N)
+    cp /tmp/large.dat "${FUSE_DIR}/large.dat"
+    sync
+    END=$(date +%s%N)
+    COPY_TO_MS=$(( (END - START) / 1000000 ))
+    COPY_TO_MBS=$(( 100 * 1000 / (COPY_TO_MS + 1) ))
+    echo "FUSE_COPY_TO_L${LEVEL}=${COPY_TO_MS}ms (100MB, ${COPY_TO_MBS}MB/s)"
+
+    echo "--- Copy FROM FUSE (100MB) ---"
+    START=$(date +%s%N)
+    cp "${FUSE_DIR}/large.dat" /tmp/large2.dat
+    END=$(date +%s%N)
+    COPY_FROM_MS=$(( (END - START) / 1000000 ))
+    COPY_FROM_MBS=$(( 100 * 1000 / (COPY_FROM_MS + 1) ))
+    echo "FUSE_COPY_FROM_L${LEVEL}=${COPY_FROM_MS}ms (100MB, ${COPY_FROM_MBS}MB/s)"
+
+    rm -rf "$FUSE_DIR" /tmp/large.dat /tmp/large2.dat
+else
+    echo "FUSE_LARGE_L${LEVEL}=NOT_MOUNTED"
+fi
+
+echo "=== END LARGE FILE L${LEVEL} ==="
+echo "MARKER_LARGE_L${LEVEL}_OK"
+"#
+}
+
 /// Print a summary of benchmark results from log content
-fn print_benchmark_summary(log_content: &str) {
+fn print_benchmark_summary(log_content: &str, include_large_files: bool) {
     println!("\n=== BENCHMARK SUMMARY ===");
     for line in log_content.lines() {
-        if line.contains("EGRESS_L")
+        let is_standard = line.contains("EGRESS_L")
             || line.contains("LOCAL_WRITE_L")
             || line.contains("LOCAL_READ_L")
             || line.contains("FUSE_WRITE_L")
@@ -1063,8 +1151,10 @@ fn print_benchmark_summary(log_content: &str) {
             || line.contains("FUSE_READ_L")
             || line.contains("FUSE_STAT_L")
             || line.contains("FUSE_SMALLREAD_L")
-            || line.contains("MEM_L")
-        {
+            || line.contains("MEM_L");
+        let is_large_file = line.contains("FUSE_COPY_TO_L") || line.contains("FUSE_COPY_FROM_L");
+
+        if is_standard || (include_large_files && is_large_file) {
             // Strip ANSI codes and prefixes
             let clean = line.split("stdout]").last().unwrap_or(line).trim();
             println!("{}", clean);
@@ -1073,11 +1163,10 @@ fn print_benchmark_summary(log_content: &str) {
     println!("=========================\n");
 }
 
-/// Run N levels of nesting with benchmarks at each level
+/// Run N levels of nesting with configurable benchmarks
 ///
-/// Each level runs performance benchmarks (egress, local disk, FUSE disk, memory)
-/// before starting the next level. Uses streaming output for real-time visibility.
-async fn run_nested_n_levels(n: usize, marker: &str) -> Result<()> {
+/// Uses streaming output for real-time visibility.
+async fn run_nested_n_levels(n: usize, marker: &str, mode: BenchmarkMode) -> Result<()> {
     assert!(n >= 2, "Need at least 2 levels for nesting");
 
     ensure_nested_image().await?;
@@ -1105,6 +1194,7 @@ async fn run_nested_n_levels(n: usize, marker: &str) -> Result<()> {
     // Strip sha256: prefix for cache path (cache files don't have prefix)
     let digest_stripped = digest.trim_start_matches("sha256:");
     println!("Image digest: {}", digest);
+    println!("Benchmark mode: {:?}", mode);
 
     // Memory allocation strategy:
     // - Each VM needs enough memory to run its child's Firecracker (~2GB) + OS overhead (~500MB)
@@ -1112,66 +1202,83 @@ async fn run_nested_n_levels(n: usize, marker: &str) -> Result<()> {
     // - Deepest level (Ln): 2GB (default) since it just runs echo
     let intermediate_mem = "4096"; // 4GB for VMs that spawn children
 
-    // Build scripts from deepest level (Ln) upward to L1
-    // Every level runs benchmarks
-    // Ln (deepest): run benchmarks + echo marker
-    // L1..L(n-1): run benchmarks + import image + run fcvm with next level's script
-
     let scripts_dir = "/mnt/fcvm-btrfs/nested-scripts";
     tokio::fs::create_dir_all(scripts_dir).await.ok();
 
-    // Write the benchmark script
+    // Write scripts based on benchmark mode
     let bench_path = format!("{}/bench.sh", scripts_dir);
-    tokio::fs::write(&bench_path, benchmark_script()).await?;
-    tokio::process::Command::new("chmod")
-        .args(["+x", &bench_path])
-        .status()
-        .await?;
+    let basic_path = format!("{}/basic.sh", scripts_dir);
+    let large_path = format!("{}/large.sh", scripts_dir);
 
-    // Deepest level (Ln): run benchmark + echo marker
-    let ln_script = format!(
-        "#!/bin/bash\nset -ex\n{scripts_dir}/bench.sh {n}\necho {marker}\n",
-        scripts_dir = scripts_dir,
-        n = n,
-        marker = marker
-    );
+    tokio::fs::write(&bench_path, benchmark_script()).await?;
+    tokio::fs::write(&basic_path, basic_script()).await?;
+    tokio::fs::write(&large_path, large_file_script()).await?;
+
+    for path in [&bench_path, &basic_path, &large_path] {
+        tokio::process::Command::new("chmod")
+            .args(["+x", path])
+            .status()
+            .await?;
+    }
+
+    // Determine which script to run at each level based on mode
+    let level_script = match mode {
+        BenchmarkMode::None => format!("{}/basic.sh", scripts_dir),
+        BenchmarkMode::Standard => format!("{}/bench.sh", scripts_dir),
+        BenchmarkMode::WithLargeFiles => format!("{}/bench.sh", scripts_dir),
+    };
+
+    // For WithLargeFiles, also run the large file script
+    let large_script_call = if mode == BenchmarkMode::WithLargeFiles {
+        format!("{}/large.sh", scripts_dir)
+    } else {
+        String::new()
+    };
+
+    // Deepest level (Ln): run script(s) + echo marker
+    let ln_script = if mode == BenchmarkMode::WithLargeFiles {
+        format!(
+            "#!/bin/bash\nset -ex\n{level_script} {n}\n{large_script_call} {n}\necho {marker}\n",
+            level_script = level_script,
+            large_script_call = large_script_call,
+            n = n,
+            marker = marker
+        )
+    } else {
+        format!(
+            "#!/bin/bash\nset -ex\n{level_script} {n}\necho {marker}\n",
+            level_script = level_script,
+            n = n,
+            marker = marker
+        )
+    };
     let ln_path = format!("{}/l{}.sh", scripts_dir, n);
     tokio::fs::write(&ln_path, &ln_script).await?;
     tokio::process::Command::new("chmod")
         .args(["+x", &ln_path])
         .status()
         .await?;
-    println!("L{}: benchmark + echo marker", n);
 
-    // Build L(n-1) down to L1: each imports image and runs fcvm with next script
-    // Each level needs:
-    // - --map to access shared storage
-    // - --mem for intermediate levels to fit child VM
-    // - --kernel-profile for nested virtualization
+    let mode_desc = match mode {
+        BenchmarkMode::None => "basic check",
+        BenchmarkMode::Standard => "standard benchmarks",
+        BenchmarkMode::WithLargeFiles => "benchmarks + large files",
+    };
+    println!("L{}: {} + echo marker", n, mode_desc);
 
+    // Build L(n-1) down to L1: each runs script, imports image, runs fcvm
     for level in (1..n).rev() {
         let next_script = format!("{}/l{}.sh", scripts_dir, level + 1);
-
-        // Every level in this loop runs `fcvm podman run`, spawning a child VM.
-        // Each spawned VM runs Firecracker which needs ~2GB. So every level that
-        // spawns a VM needs extra memory (4GB) to fit:
-        // - Firecracker process for child VM (~2GB)
-        // - OS overhead and containers (~1-2GB)
-        //
-        // L(n) (deepest, created outside this loop) just runs echo, no child VMs.
-        // All other levels (1 to n-1) spawn VMs and need 4GB.
         let mem_arg = format!("--mem {}", intermediate_mem);
 
-        // Use both --kernel-profile (for runtime config: firecracker_bin, boot_args)
-        // AND --kernel (explicit path, since build_inputs don't exist inside container)
-        //
-        // Each intermediate level: run benchmark FIRST, then import + start next level
-        let script = format!(
-            r#"#!/bin/bash
+        let script = if mode == BenchmarkMode::WithLargeFiles {
+            format!(
+                r#"#!/bin/bash
 set -ex
 
 # Run benchmarks for this level
-{scripts_dir}/bench.sh {level}
+{level_script} {level}
+{large_script_call} {level}
 
 echo "L{level}: Importing image from shared cache..."
 podman load -i /mnt/fcvm-btrfs/image-cache/{digest}.oci.tar
@@ -1189,14 +1296,48 @@ FCVM_FUSE_TRACE_RATE=100 fcvm podman run \
     localhost/nested-test \
     --cmd {next_script}
 "#,
-            scripts_dir = scripts_dir,
-            level = level,
-            next_level = level + 1,
-            digest = digest_stripped,
-            mem_arg = mem_arg,
-            kernel = nested_kernel_path,
-            next_script = next_script
-        );
+                level_script = level_script,
+                large_script_call = large_script_call,
+                level = level,
+                next_level = level + 1,
+                digest = digest_stripped,
+                mem_arg = mem_arg,
+                kernel = nested_kernel_path,
+                next_script = next_script
+            )
+        } else {
+            format!(
+                r#"#!/bin/bash
+set -ex
+
+# Run script for this level
+{level_script} {level}
+
+echo "L{level}: Importing image from shared cache..."
+podman load -i /mnt/fcvm-btrfs/image-cache/{digest}.oci.tar
+podman tag sha256:{digest} localhost/nested-test 2>/dev/null || true
+
+echo "L{level}: Starting L{next_level} VM..."
+FCVM_FUSE_TRACE_RATE=100 fcvm podman run \
+    --name l{next_level} \
+    --network bridged \
+    --privileged \
+    {mem_arg} \
+    --kernel-profile nested \
+    --kernel {kernel} \
+    --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
+    localhost/nested-test \
+    --cmd {next_script}
+"#,
+                level_script = level_script,
+                level = level,
+                next_level = level + 1,
+                digest = digest_stripped,
+                mem_arg = mem_arg,
+                kernel = nested_kernel_path,
+                next_script = next_script
+            )
+        };
         let script_path = format!("{}/l{}.sh", scripts_dir, level);
         tokio::fs::write(&script_path, &script).await?;
         tokio::process::Command::new("chmod")
@@ -1204,13 +1345,12 @@ FCVM_FUSE_TRACE_RATE=100 fcvm podman run \
             .status()
             .await?;
         println!(
-            "L{}: benchmark + import + fcvm {} --kernel-profile nested --kernel <path> --cmd {}",
-            level, mem_arg, next_script
+            "L{}: {} + import + fcvm {} --cmd {}",
+            level, mode_desc, mem_arg, next_script
         );
     }
 
     // Run L1 from host with nested kernel profile
-    // L1 needs extra memory since it spawns L2
     let l1_script = format!("{}/l1.sh", scripts_dir);
     println!(
         "\nStarting {} levels of nesting with 4GB per intermediate VM...",
@@ -1218,10 +1358,15 @@ FCVM_FUSE_TRACE_RATE=100 fcvm podman run \
     );
 
     // Use sh -c with tee to stream output in real-time AND capture for marker check
-    let log_file = format!("/tmp/nested-l{}.log", n);
+    let mode_suffix = match mode {
+        BenchmarkMode::None => "basic",
+        BenchmarkMode::Standard => "bench",
+        BenchmarkMode::WithLargeFiles => "large",
+    };
+    let log_file = format!("/tmp/nested-l{}-{}.log", n, mode_suffix);
     let fcvm_cmd = format!(
         "sudo ./target/release/fcvm podman run \
-         --name l1-nested-{} \
+         --name l1-nested-{}-{} \
          --network bridged \
          --privileged \
          --mem {} \
@@ -1229,7 +1374,7 @@ FCVM_FUSE_TRACE_RATE=100 fcvm podman run \
          --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
          localhost/nested-test \
          --cmd {} 2>&1 | tee {}",
-        n, intermediate_mem, l1_script, log_file
+        n, mode_suffix, intermediate_mem, l1_script, log_file
     );
 
     let status = tokio::process::Command::new("sh")
@@ -1249,11 +1394,25 @@ FCVM_FUSE_TRACE_RATE=100 fcvm podman run \
         let level_marker = format!("MARKER_L{}_OK", level);
         assert!(
             log_content.contains(&level_marker),
-            "L{} benchmark should complete (missing {}). Exit status: {:?}. Check output above.",
+            "L{} should complete (missing {}). Exit status: {:?}. Check output above.",
             level,
             level_marker,
             status
         );
+    }
+
+    // For large file mode, also verify large file markers
+    if mode == BenchmarkMode::WithLargeFiles {
+        for level in 1..=n {
+            let large_marker = format!("MARKER_LARGE_L{}_OK", level);
+            assert!(
+                log_content.contains(&large_marker),
+                "L{} large file benchmark should complete (missing {}). Exit status: {:?}.",
+                level,
+                large_marker,
+                status
+            );
+        }
     }
 
     // Also verify the final marker
@@ -1265,7 +1424,9 @@ FCVM_FUSE_TRACE_RATE=100 fcvm podman run \
     );
 
     // Extract and display benchmark summary
-    print_benchmark_summary(&log_content);
+    if mode != BenchmarkMode::None {
+        print_benchmark_summary(&log_content, mode == BenchmarkMode::WithLargeFiles);
+    }
 
     Ok(())
 }
