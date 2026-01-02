@@ -33,9 +33,10 @@ RUN mkdir -p /etc/containers /var/lib/containers/storage && \
         > /etc/containers/storage.conf
 
 # Copy pre-built binaries (host glibc 2.39 matches ubuntu:24.04)
+# Note: firecracker-nv2 keeps its name so kernel profile's firecracker_bin path works
 COPY artifacts/fcvm artifacts/fc-agent /usr/local/bin/
-COPY artifacts/firecracker-nv2 /usr/local/bin/firecracker
-RUN chmod +x /usr/local/bin/fcvm /usr/local/bin/fc-agent /usr/local/bin/firecracker
+COPY artifacts/firecracker-nv2 /usr/local/bin/firecracker-nv2
+RUN chmod +x /usr/local/bin/fcvm /usr/local/bin/fc-agent /usr/local/bin/firecracker-nv2
 
 # Copy config file for nested fcvm (uses same paths as host via FUSE mount)
 RUN mkdir -p /etc/fcvm
