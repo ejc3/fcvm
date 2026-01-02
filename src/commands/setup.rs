@@ -66,7 +66,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         // Install as host kernel if requested
         if args.install_host_kernel {
             println!("\nInstalling profile kernel as host kernel...");
-            crate::setup::install_host_kernel(&profile_kernel_path)
+            crate::setup::install_host_kernel(&profile_kernel_path, profile.boot_args.as_deref())
                 .await
                 .context("installing host kernel")?;
             return Ok(());

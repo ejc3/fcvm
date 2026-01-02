@@ -68,7 +68,7 @@ impl DiskManager {
                 let stderr = String::from_utf8_lossy(&reflink_output.stderr);
                 anyhow::bail!(
                     "Reflink copy failed (required for CoW disk). Error: {}. \
-                    Ensure the kernel has FUSE_REMAP_FILE_RANGE support (kernel 6.18+ with --kernel-profile nested).",
+                    Ensure the kernel has FUSE_REMAP_FILE_RANGE support (requires a kernel profile with this patch).",
                     stderr
                 );
             }
