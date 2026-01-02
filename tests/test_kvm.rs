@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 const FIRECRACKER_NV2_REPO: &str = "https://github.com/ejc3/firecracker.git";
-const FIRECRACKER_NV2_BRANCH: &str = "nv2-inception";
+const FIRECRACKER_NV2_BRANCH: &str = "nv2-vhe-mode";
 
 /// Ensure inception kernel exists (downloads from release or builds locally)
 async fn ensure_inception_kernel() -> Result<PathBuf> {
