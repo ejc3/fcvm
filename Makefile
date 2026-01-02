@@ -71,7 +71,7 @@ CONTAINER_RUN := podman run --rm --privileged \
 	_test-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all \
 	container-setup-fcvm container-shell container-clean container-bench \
-	setup-btrfs setup-fcvm setup-pjdfstest bench lint fmt
+	setup-btrfs setup-fcvm setup-pjdfstest bench lint fmt ssh
 
 all: build
 
@@ -291,3 +291,8 @@ lint:
 
 fmt:
 	cargo fmt
+
+# SSH to jumpbox (IP from terraform: cd ~/src/aws && terraform output jumpbox_ssh_command)
+JUMPBOX_IP := 54.193.62.221
+ssh:
+	ssh -i ~/.ssh/fcvm-ec2 ubuntu@$(JUMPBOX_IP)
