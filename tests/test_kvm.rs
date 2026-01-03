@@ -755,15 +755,32 @@ async fn test_nested_l2_with_large_files() -> Result<()> {
     .await
 }
 
-/// Test L1→L2 nesting with network throughput benchmarks
+/// Test nested VMs with network throughput benchmarks
 ///
-/// Measures egress/ingress throughput from VMs to host using iperf3.
+/// Measures egress/ingress throughput from VMs at each level to host using iperf3.
 /// Tests various block sizes (128K, 1M) and parallelism (1, 4, 8 streams).
+/// Network tests don't depend on FUSE, so they work even at L3+.
 #[tokio::test]
 async fn test_nested_l2_with_network() -> Result<()> {
     run_nested_n_levels(
         2,
         "NESTED_2_LEVELS_NETWORK_SUCCESS",
+        BenchmarkMode::WithNetwork,
+    )
+    .await
+}
+
+/// Test L3 network: measures throughput degradation through triple NAT chain
+///
+/// BLOCKED: Even though network uses NAT (not FUSE), container startup requires
+/// FUSE for rootfs access. At L3, FUSE latency is ~15ms per operation, causing
+/// container startup to exceed the 10-minute test timeout.
+#[tokio::test]
+#[ignore]
+async fn test_nested_l3_with_network() -> Result<()> {
+    run_nested_n_levels(
+        3,
+        "NESTED_3_LEVELS_NETWORK_SUCCESS",
         BenchmarkMode::WithNetwork,
     )
     .await
