@@ -21,7 +21,7 @@ pub enum Commands {
     /// List running VMs
     Ls(LsArgs),
     /// Podman-compatible container operations
-    Podman(PodmanArgs),
+    Podman(Box<PodmanArgs>),
     /// Snapshot operations (create, serve, run)
     Snapshot(SnapshotArgs),
     /// List available snapshots
@@ -115,6 +115,15 @@ pub struct RunArgs {
     /// Volume mapping(s): HOST:GUEST[:ro] (repeat or comma-separated)
     #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
     pub map: Vec<String>,
+
+    /// Extra disk(s): HOST_PATH:GUEST_MOUNT[:ro] (repeat or comma-separated)
+    /// Disks appear as /dev/vdb, /dev/vdc, etc. in order specified.
+    /// Mounted at GUEST_MOUNT in both VM and container.
+    /// Read-only disks (:ro) can be used with snapshots/clones.
+    /// Read-write disks block snapshot/clone operations.
+    /// Example: --disk /data.raw:/data --disk /scratch.raw:/scratch:ro
+    #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
+    pub disk: Vec<String>,
 
     /// Environment vars KEY=VALUE (repeat or comma-separated)
     #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]

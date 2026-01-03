@@ -68,6 +68,7 @@ async fn test_health_monitor_behaviors() {
                 dns_server: None,
             },
             volumes: vec![],
+            extra_disks: vec![],
             env: vec![],
             health_check_url: Some("http://localhost/health".to_string()),
             snapshot_name: None,
