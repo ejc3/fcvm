@@ -267,8 +267,10 @@ for patch_file in "$PATCHES_DIR"/*.patch; do
         if patch -p1 --reverse --dry-run < "$patch_file" >/dev/null 2>&1; then
             echo "    Already applied (skipping)"
         else
-            echo "    WARNING: Patch does not apply cleanly"
-            patch -p1 --forward --dry-run < "$patch_file" || true
+            echo "    ERROR: Patch does not apply cleanly: $patch_name"
+            echo "    Showing what went wrong:"
+            patch -p1 --forward --dry-run < "$patch_file"
+            exit 1
         fi
     fi
 done

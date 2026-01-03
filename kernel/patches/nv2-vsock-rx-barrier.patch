@@ -1,0 +1,47 @@
+From: fcvm <fcvm@localhost>
+Subject: [PATCH] vsock/virtio: Add DSB barrier before reading virtqueue under NV2
+
+Under ARM64 nested virtualization (FEAT_NV2), there's a cache coherency
+race between L2 guest writes to the virtio ring and L1's reads. The
+existing DSB SY in kvm_nested_sync_hwstate() runs when L2 exits, but
+under high throughput, L1 may start reading the virtqueue before the
+barrier takes effect.
+
+Add a DSB SY barrier in virtio_transport_rx_work() before reading
+buffers from the RX virtqueue. This ensures cache coherency on the
+reader side, complementing the existing barrier on the exit path.
+
+This fixes FUSE-over-vsock stream corruption observed during nested
+L2 tests when transferring >300MB through NFS mounts.
+
+Signed-off-by: fcvm <fcvm@localhost>
+---
+ net/vmw_vsock/virtio_transport.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+--- a/net/vmw_vsock/virtio_transport.c
++++ b/net/vmw_vsock/virtio_transport.c
+@@ -17,6 +17,9 @@
+ #include <linux/virtio_ids.h>
+ #include <linux/virtio_config.h>
+ #include <linux/virtio_vsock.h>
++#ifdef CONFIG_ARM64
++#include <asm/barrier.h>
++#endif
+ #include <net/sock.h>
+ #include <linux/mutex.h>
+ #include <net/af_vsock.h>
+@@ -618,6 +621,14 @@
+
+ 	mutex_lock(&vsock->rx_lock);
+
++#ifdef CONFIG_ARM64
++	/*
++	 * Under nested virtualization (NV2), ensure L2's writes to the
++	 * virtqueue are visible before we read. See kvm_nested_sync_hwstate().
++	 */
++	dsb(sy);
++#endif
++
+ 	if (!vsock->rx_run)
+ 		goto out;
