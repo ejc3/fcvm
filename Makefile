@@ -170,6 +170,8 @@ build:
 	CARGO_TARGET_DIR=target cargo build --release -p fcvm
 	CARGO_TARGET_DIR=target cargo build --release -p fc-agent --target $(MUSL_TARGET)
 	@mkdir -p target/release && cp target/$(MUSL_TARGET)/release/fc-agent target/release/fc-agent
+	@# Sync embedded config to user config dir (config is embedded at compile time)
+	@./target/release/fcvm setup --generate-config --force 2>/dev/null || true
 
 # Test that the release binary works without source tree (simulates cargo install)
 test-packaging: build

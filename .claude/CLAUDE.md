@@ -1421,6 +1421,22 @@ sudo fcvm podman run --name my-vm --network bridged \
     nginx:alpine
 ```
 
+**Kernel Build Architecture:**
+- **Config is source of truth**: All kernel versions and build settings flow from `rootfs-config.toml`
+- **No hardcoded versions**: Version numbers like `6.18.3` are ONLY in config, never in Rust code
+- **Dynamic build scripts**: Rust generates build scripts on-the-fly (no `build.sh` or `build-host.sh` in source)
+- **Config sync**: `make build` automatically syncs embedded config to `~/.config/fcvm/` via `fcvm setup --generate-config --force`
+- **Content-addressed**: Kernel SHA computed from `build_inputs` patterns (config + patches)
+
+Key config fields in `[kernel_profiles.nested.arm64]`:
+```toml
+kernel_version = "6.18.3"              # Version to download/build
+kernel_repo = "ejc3/firepod"           # GitHub repo for releases
+build_inputs = ["kernel/nested.conf", "kernel/patches/*.patch"]  # Files for SHA
+kernel_config = "kernel/nested.conf"   # Kernel .config
+patches_dir = "kernel/patches"         # Directory with patches
+```
+
 NEVER manually edit rootfs files. The setup script in `rootfs-config.toml` and `src/setup/rootfs.rs` control what gets installed.
 
 ### Memory Sharing (UFFD)

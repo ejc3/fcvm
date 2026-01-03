@@ -66,11 +66,13 @@ pub struct KernelProfile {
     #[serde(default)]
     pub build_inputs: Vec<String>,
 
-    /// Build script path (relative to repo root)
+    /// Base config URL for VM kernel (Firecracker's microvm config)
+    /// {arch} is replaced with aarch64 or x86_64 at build time
     #[serde(default)]
-    pub build_script: Option<String>,
+    pub base_config_url: Option<String>,
 
-    /// Kernel config file path (relative to repo root)
+    /// Kernel config fragment file path (relative to repo root)
+    /// Applied on top of base_config_url
     #[serde(default)]
     pub kernel_config: Option<String>,
 
@@ -102,6 +104,29 @@ pub struct KernelProfile {
     /// Override FUSE reader count
     #[serde(default)]
     pub fuse_readers: Option<u32>,
+
+    /// Host kernel configuration (for EC2 instances running fcvm)
+    #[serde(default)]
+    pub host_kernel: Option<HostKernelConfig>,
+}
+
+/// Host kernel build configuration.
+///
+/// Uses the running kernel's config as base (includes all EC2/AWS modules),
+/// applies fcvm patches, and builds deb packages for installation.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct HostKernelConfig {
+    /// Kernel version (e.g., "6.18.3")
+    #[serde(default)]
+    pub kernel_version: String,
+
+    /// Patches directory (relative to repo root)
+    #[serde(default)]
+    pub patches_dir: Option<String>,
+
+    /// Files to hash for kernel SHA (globs supported, *.vm.patch excluded)
+    #[serde(default)]
+    pub build_inputs: Vec<String>,
 }
 
 impl KernelProfile {
