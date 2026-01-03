@@ -172,6 +172,55 @@ async fn test_graceful_shutdown() -> Result<()> {
     }
 }
 
+/// Test Ftrace utility works for kernel tracing
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_ftrace_sanity() -> Result<()> {
+    println!("\nTest Ftrace utility");
+    println!("===================");
+
+    // Create tracer
+    let tracer = common::Ftrace::new().context("creating Ftrace")?;
+
+    // List KVM events
+    let events = tracer.list_kvm_events()?;
+    println!("  Available KVM events: {}", events.len());
+    assert!(!events.is_empty(), "Should have KVM events");
+    assert!(events.iter().any(|e| e.contains("kvm_exit")), "Should have kvm_exit event");
+
+    // Enable some events
+    tracer.enable_events(&["kvm:kvm_exit", "kvm:kvm_entry"])?;
+    println!("  Enabled kvm_exit and kvm_entry events");
+
+    // Start tracing
+    tracer.start()?;
+
+    // Run a quick VM to generate trace events
+    let (vm_name, _, _, _) = common::unique_names("ftrace-test");
+    let (mut child, _) = common::spawn_fcvm(&[
+        "podman", "run", "--name", &vm_name, "--network", "bridged",
+        "alpine:latest", "true",
+    ]).await?;
+
+    // Wait for exit
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        child.wait()
+    ).await??;
+
+    // Stop and read
+    tracer.stop()?;
+    let trace = tracer.read_grep("kvm_exit", 20)?;
+    println!("  Trace output (last 20 kvm_exit lines):");
+    for line in trace.lines().take(5) {
+        println!("    {}", line);
+    }
+
+    assert!(trace.contains("kvm_exit"), "Should have captured kvm_exit events");
+    println!("✅ FTRACE SANITY PASSED!");
+    Ok(())
+}
+
 /// Test trailing args syntax: fcvm podman run ... image cmd args
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
