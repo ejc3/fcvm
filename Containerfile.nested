@@ -17,7 +17,7 @@ FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 iptables podman python3 kmod procps fuse3 curl nginx \
-    fuse-overlayfs sudo \
+    fuse-overlayfs sudo iperf3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Configure podman to use fuse-overlayfs (required for nested containers)
