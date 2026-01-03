@@ -151,10 +151,10 @@ async fn test_extra_disk_ro_clone() -> Result<()> {
     Ok(())
 }
 
-/// Test --disk-dir: creates disk image from directory contents
+/// Test --disk-dir read-only: creates disk image from directory contents
 #[tokio::test]
-async fn test_disk_dir() -> Result<()> {
-    let (vm_name, _, _, _) = common::unique_names("disk-dir");
+async fn test_disk_dir_ro() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("diskdir-ro");
 
     // Create a temp directory with test files
     let source_dir = TempDir::new()?;
@@ -166,7 +166,7 @@ async fn test_disk_dir() -> Result<()> {
     )
     .await?;
 
-    // Start VM with --disk-dir
+    // Start VM with --disk-dir (read-only)
     let disk_dir_spec = format!("{}:/mydata:ro", source_dir.path().display());
     let (mut child, pid) = common::spawn_fcvm(&[
         "podman",
@@ -202,6 +202,65 @@ async fn test_disk_dir() -> Result<()> {
 
     // Verify disk image was created in VM's data directory (not /tmp)
     // and that it will be cleaned up on exit (which we test by just killing the VM)
+
+    child.kill().await.ok();
+    Ok(())
+}
+
+/// Test --disk-dir read-write: can write to ephemeral disk
+#[tokio::test]
+async fn test_disk_dir_rw() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("diskdir-rw");
+
+    // Create a temp directory with initial content
+    let source_dir = TempDir::new()?;
+    tokio::fs::write(source_dir.path().join("original.txt"), "original content\n").await?;
+
+    // Start VM with --disk-dir (read-write, no :ro suffix)
+    let disk_dir_spec = format!("{}:/mydata", source_dir.path().display());
+    let (mut child, pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        "--disk-dir",
+        &disk_dir_spec,
+        common::TEST_IMAGE,
+    ])
+    .await
+    .context("spawn")?;
+
+    common::poll_health_by_pid(pid, 120).await?;
+
+    // Read original file
+    let content = common::exec_in_container(pid, &["cat", "/mydata/original.txt"]).await?;
+    assert!(
+        content.contains("original content"),
+        "read original failed: {}",
+        content
+    );
+
+    // Write new file (ephemeral - only exists in VM's copy)
+    let content = common::exec_in_container(
+        pid,
+        &["echo 'written in vm' > /mydata/newfile.txt && cat /mydata/newfile.txt"],
+    )
+    .await?;
+    assert!(
+        content.contains("written in vm"),
+        "write failed: {}",
+        content
+    );
+
+    // Verify the write persists within the VM session
+    let content = common::exec_in_container(pid, &["cat", "/mydata/newfile.txt"]).await?;
+    assert!(
+        content.contains("written in vm"),
+        "re-read failed: {}",
+        content
+    );
 
     child.kill().await.ok();
     Ok(())
