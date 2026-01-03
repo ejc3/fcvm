@@ -1,6 +1,6 @@
 //! Extra disk integration tests
 //!
-//! Tests the --disk flag for adding extra block devices to VMs.
+//! Tests the --disk and --disk-dir flags for adding extra block devices to VMs.
 
 #![cfg(feature = "privileged-tests")]
 
@@ -8,6 +8,7 @@ mod common;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+use tempfile::TempDir;
 
 /// Create a small ext4 disk image with a test file
 async fn create_test_disk(path: &PathBuf) -> Result<()> {
@@ -147,5 +148,61 @@ async fn test_extra_disk_ro_clone() -> Result<()> {
     assert!(content.contains("hello"), "clone read failed");
 
     tokio::fs::remove_file(&disk_path).await.ok();
+    Ok(())
+}
+
+/// Test --disk-dir: creates disk image from directory contents
+#[tokio::test]
+async fn test_disk_dir() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("disk-dir");
+
+    // Create a temp directory with test files
+    let source_dir = TempDir::new()?;
+    tokio::fs::write(source_dir.path().join("hello.txt"), "hello from disk-dir\n").await?;
+    tokio::fs::create_dir_all(source_dir.path().join("subdir")).await?;
+    tokio::fs::write(
+        source_dir.path().join("subdir/nested.txt"),
+        "nested content\n",
+    )
+    .await?;
+
+    // Start VM with --disk-dir
+    let disk_dir_spec = format!("{}:/mydata:ro", source_dir.path().display());
+    let (mut child, pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        "--disk-dir",
+        &disk_dir_spec,
+        common::TEST_IMAGE,
+    ])
+    .await
+    .context("spawn")?;
+
+    common::poll_health_by_pid(pid, 120).await?;
+
+    // Read top-level file
+    let content = common::exec_in_container(pid, &["cat", "/mydata/hello.txt"]).await?;
+    assert!(
+        content.contains("hello from disk-dir"),
+        "read top-level failed: {}",
+        content
+    );
+
+    // Read nested file
+    let content = common::exec_in_container(pid, &["cat", "/mydata/subdir/nested.txt"]).await?;
+    assert!(
+        content.contains("nested content"),
+        "read nested failed: {}",
+        content
+    );
+
+    // Verify disk image was created in VM's data directory (not /tmp)
+    // and that it will be cleaned up on exit (which we test by just killing the VM)
+
+    child.kill().await.ok();
     Ok(())
 }

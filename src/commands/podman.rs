@@ -56,6 +56,107 @@ impl VolumeMapping {
 
 use super::common::{VSOCK_OUTPUT_PORT, VSOCK_STATUS_PORT, VSOCK_VOLUME_PORT_BASE};
 
+/// Create an ext4 disk image from a directory's contents.
+/// Returns the path to the created image.
+async fn create_disk_from_dir(
+    source_dir: &std::path::Path,
+    output_path: &std::path::Path,
+) -> Result<()> {
+    use std::process::Stdio;
+
+    // Calculate directory size (add 20% overhead for ext4 metadata, min 16MB)
+    let dir_size = tokio::process::Command::new("du")
+        .args(["-sb", source_dir.to_str().unwrap()])
+        .output()
+        .await
+        .context("calculating directory size")?;
+
+    let size_str = String::from_utf8_lossy(&dir_size.stdout);
+    let size_bytes: u64 = size_str
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16 * 1024 * 1024);
+
+    // Add 20% overhead, minimum 16MB
+    let image_size = std::cmp::max(size_bytes * 120 / 100, 16 * 1024 * 1024);
+
+    info!(
+        "Creating disk image from {}: {} bytes -> {} bytes",
+        source_dir.display(),
+        size_bytes,
+        image_size
+    );
+
+    // Create sparse file
+    tokio::process::Command::new("truncate")
+        .args(["-s", &image_size.to_string(), output_path.to_str().unwrap()])
+        .status()
+        .await
+        .context("creating sparse file")?;
+
+    // Format as ext4
+    let mkfs = tokio::process::Command::new("mkfs.ext4")
+        .args(["-q", "-F", output_path.to_str().unwrap()])
+        .output()
+        .await
+        .context("formatting as ext4")?;
+
+    if !mkfs.status.success() {
+        bail!(
+            "mkfs.ext4 failed: {}",
+            String::from_utf8_lossy(&mkfs.stderr)
+        );
+    }
+
+    // Mount and copy contents
+    let mount_dir = format!("/tmp/fcvm-disk-dir-{}", std::process::id());
+    tokio::fs::create_dir_all(&mount_dir).await?;
+
+    let mount = tokio::process::Command::new("mount")
+        .args([output_path.to_str().unwrap(), &mount_dir])
+        .output()
+        .await
+        .context("mounting image")?;
+
+    if !mount.status.success() {
+        tokio::fs::remove_dir(&mount_dir).await.ok();
+        bail!("mount failed: {}", String::from_utf8_lossy(&mount.stderr));
+    }
+
+    // Copy directory contents (use rsync for reliability)
+    let copy = tokio::process::Command::new("rsync")
+        .args(["-a", &format!("{}/", source_dir.display()), &format!("{}/", mount_dir)])
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("copying directory contents")?;
+
+    // Always unmount
+    let umount = tokio::process::Command::new("umount")
+        .arg(&mount_dir)
+        .output()
+        .await;
+
+    tokio::fs::remove_dir(&mount_dir).await.ok();
+
+    if !copy.status.success() {
+        bail!(
+            "rsync failed: {}",
+            String::from_utf8_lossy(&copy.stderr)
+        );
+    }
+
+    if let Ok(u) = umount {
+        if !u.status.success() {
+            warn!("umount warning: {}", String::from_utf8_lossy(&u.stderr));
+        }
+    }
+
+    info!("Created disk image: {}", output_path.display());
+    Ok(())
+}
+
 /// Main dispatcher for podman commands
 pub async fn cmd_podman(args: PodmanArgs) -> Result<()> {
     match args.cmd {
@@ -1395,6 +1496,81 @@ async fn run_vm_setup(
                 crate::firecracker::api::Drive {
                     drive_id: drive_id.clone(),
                     path_on_host: abs_path.display().to_string(),
+                    is_root_device: false,
+                    is_read_only: read_only,
+                    partuuid: None,
+                    rate_limiter: None,
+                },
+            )
+            .await?;
+    }
+
+    // Process --disk-dir: create disk images from directories
+    // Images are stored in VM's data directory (cleaned up on exit)
+    let disk_offset = args.disk.len();
+    for (i, dir_spec) in args.disk_dir.iter().enumerate() {
+        // Check for :ro suffix
+        let (spec_without_ro, read_only) = if dir_spec.ends_with(":ro") {
+            (&dir_spec[..dir_spec.len() - 3], true)
+        } else {
+            (dir_spec.as_str(), false)
+        };
+
+        // Split HOST_DIR:GUEST_MOUNT
+        let parts: Vec<&str> = spec_without_ro.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            anyhow::bail!(
+                "Invalid disk-dir spec '{}'. Expected format: HOST_DIR:GUEST_MOUNT[:ro]",
+                dir_spec
+            );
+        }
+        let source_dir = std::path::Path::new(parts[0]);
+        let mount_path = parts[1].to_string();
+
+        // Validate source directory exists
+        if !source_dir.is_dir() {
+            anyhow::bail!(
+                "Source directory does not exist or is not a directory: {}",
+                source_dir.display()
+            );
+        }
+
+        // Validate mount path is absolute
+        if !mount_path.starts_with('/') {
+            anyhow::bail!(
+                "Disk mount path must be absolute: {} (got '{}')",
+                dir_spec,
+                mount_path
+            );
+        }
+
+        // Create disk image in VM's data directory
+        let disk_idx = disk_offset + i;
+        let image_path = data_dir.join("disks").join(format!("disk-dir-{}.raw", disk_idx));
+        create_disk_from_dir(source_dir, &image_path).await?;
+
+        let drive_id = format!("disk{}", disk_idx);
+
+        extra_disks.push(crate::state::types::ExtraDisk {
+            path: image_path.display().to_string(),
+            mount_path: mount_path.clone(),
+            read_only,
+        });
+
+        info!(
+            "Adding disk from dir: {} -> {} -> /dev/vd{} -> {} ({})",
+            source_dir.display(),
+            image_path.display(),
+            (b'b' + disk_idx as u8) as char,
+            mount_path,
+            if read_only { "ro" } else { "rw" }
+        );
+        client
+            .add_drive(
+                &drive_id,
+                crate::firecracker::api::Drive {
+                    drive_id: drive_id.clone(),
+                    path_on_host: image_path.display().to_string(),
                     is_root_device: false,
                     is_read_only: read_only,
                     partuuid: None,
