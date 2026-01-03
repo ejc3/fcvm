@@ -153,29 +153,14 @@ Recursive nesting (Host → L1 → L2 → ...) is enabled via the `arm64.nv2` ke
 
 **CRITICAL**: Both host AND guest kernels need DSB patches for cache coherency under NV2.
 
-Guest kernels are built automatically by `fcvm setup --kernel-profile nested --build-kernels`.
-The HOST kernel must be rebuilt manually when DSB patches are added/modified.
-
-**Rebuild host kernel**:
-```bash
-# Build with all patches from kernel/patches/
-KERNEL_VERSION=6.18.3 BUILD_DIR=/tmp/kernel-build-host ./kernel/build.sh
-
-# Or use the host kernel script that includes module install:
-/tmp/build-host-kernel.sh
-
-# Install after build completes:
-cd /tmp/kernel-build-host/linux-6.18.3
-sudo make ARCH=arm64 modules_install
-sudo cp arch/arm64/boot/Image /boot/vmlinuz-6.18.3-nested-dsb
-sudo update-grub
-sudo reboot
-```
+**Install host kernel**: `make install-host-kernel` (builds kernel, installs to /boot, updates GRUB).
+Patches from `kernel/patches/` are applied automatically during the build.
 
 **Current patches** (all apply to both host and guest kernels):
 - `nv2-vsock-cache-sync.patch`: DSB SY in `kvm_nested_sync_hwstate()`
 - `nv2-vsock-rx-barrier.patch`: DSB SY in `virtio_transport_rx_work()`
 - `mmfr4-override.patch`: ID register override for recursive nesting
+- `wfx-stopped-exit.patch`: Exit to userspace on WFI when vCPU is stopped (fixes halt -f hang)
 
 ### How It Works
 
