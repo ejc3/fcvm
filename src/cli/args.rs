@@ -100,6 +100,11 @@ pub struct RunArgs {
     /// Container image (e.g., nginx:alpine or localhost/myimage)
     pub image: String,
 
+    /// Command and arguments to run in container (alternative to --cmd)
+    /// Example: fcvm podman run --name foo --network bridged alpine:latest sh -c "echo hello"
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub command_args: Vec<String>,
+
     /// VM name (required)
     #[arg(long)]
     pub name: String,

@@ -652,8 +652,12 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         );
     }
 
-    // Parse optional container command using shell-like semantics
-    let cmd_args = if let Some(cmd) = &args.cmd {
+    // Parse optional container command - either from trailing args or --cmd flag
+    let cmd_args = if !args.command_args.is_empty() {
+        // Trailing args take precedence (e.g., "alpine:latest sh -c 'echo hello'")
+        Some(args.command_args.clone())
+    } else if let Some(cmd) = &args.cmd {
+        // Fall back to --cmd flag with shell parsing
         Some(shell_words::split(cmd).with_context(|| format!("parsing --cmd argument: {}", cmd))?)
     } else {
         None
