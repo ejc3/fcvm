@@ -122,8 +122,11 @@ sudo fcvm podman run --name web1 --map /host/config:/config:ro public.ecr.aws/ng
 # Custom resources
 sudo fcvm podman run --name web1 --cpu 4 --mem 4096 public.ecr.aws/nginx/nginx:alpine
 
-# With environment variables and custom command
-sudo fcvm podman run --name web1 --env DEBUG=1 --cmd "nginx -g 'daemon off;'" public.ecr.aws/nginx/nginx:alpine
+# With custom command (docker-style trailing args)
+sudo fcvm podman run --name web1 alpine:latest echo "hello world"
+
+# Or using --cmd flag with shell parsing
+sudo fcvm podman run --name web1 --env DEBUG=1 --cmd "nginx -g 'daemon off;'" nginx:alpine
 
 # Rootless mode (no sudo required)
 fcvm podman run --name web1 --network rootless public.ecr.aws/nginx/nginx:alpine
