@@ -126,7 +126,11 @@ async fn create_disk_from_dir(
 
     // Copy directory contents (use rsync for reliability)
     let copy = tokio::process::Command::new("rsync")
-        .args(["-a", &format!("{}/", source_dir.display()), &format!("{}/", mount_dir)])
+        .args([
+            "-a",
+            &format!("{}/", source_dir.display()),
+            &format!("{}/", mount_dir),
+        ])
         .stderr(Stdio::piped())
         .output()
         .await
@@ -141,10 +145,7 @@ async fn create_disk_from_dir(
     tokio::fs::remove_dir(&mount_dir).await.ok();
 
     if !copy.status.success() {
-        bail!(
-            "rsync failed: {}",
-            String::from_utf8_lossy(&copy.stderr)
-        );
+        bail!("rsync failed: {}", String::from_utf8_lossy(&copy.stderr));
     }
 
     if let Ok(u) = umount {
@@ -200,10 +201,7 @@ async fn setup_nfs_exports(
         } else {
             "rw,sync,no_subtree_check,no_root_squash"
         };
-        exports.push_str(&format!(
-            "{} {}({})\n",
-            share.host_path, guest_ip, opts
-        ));
+        exports.push_str(&format!("{} {}({})\n", share.host_path, guest_ip, opts));
     }
 
     // Write exports file
@@ -1635,7 +1633,9 @@ async fn run_vm_setup(
 
         // Create disk image in VM's data directory
         let disk_idx = disk_offset + i;
-        let image_path = data_dir.join("disks").join(format!("disk-dir-{}.raw", disk_idx));
+        let image_path = data_dir
+            .join("disks")
+            .join(format!("disk-dir-{}.raw", disk_idx));
         create_disk_from_dir(source_dir, &image_path).await?;
 
         let drive_id = format!("disk{}", disk_idx);
@@ -1729,7 +1729,7 @@ async fn run_vm_setup(
 
     // Set up NFS exports if we have any shares
     if !nfs_shares.is_empty() {
-        setup_nfs_exports(&vm_id, &nfs_shares, &network_config).await?;
+        setup_nfs_exports(vm_id, &nfs_shares, network_config).await?;
     }
     vm_state.config.nfs_shares = nfs_shares;
 

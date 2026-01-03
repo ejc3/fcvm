@@ -107,7 +107,7 @@ async fn test_list_vms() {
                 network: NetworkConfig::default(),
                 volumes: vec![],
                 extra_disks: vec![],
-            nfs_shares: vec![],
+                nfs_shares: vec![],
                 env: vec![],
                 health_check_url: None,
                 snapshot_name: None,

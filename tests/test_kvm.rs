@@ -36,6 +36,35 @@ mod common;
 use anyhow::{bail, Context, Result};
 use std::process::Stdio;
 
+/// Mount method for sharing the image cache directory with L1 VM
+#[derive(Debug, Clone, Copy)]
+enum ImageCacheMount {
+    /// --map: FUSE-over-vsock (current default)
+    FuseMap,
+    /// --disk-dir: creates a raw disk image from directory contents
+    DiskDir,
+    /// --nfs: shares directory via NFS over network
+    Nfs,
+}
+
+impl ImageCacheMount {
+    fn flag(&self) -> &'static str {
+        match self {
+            ImageCacheMount::FuseMap => "--map",
+            ImageCacheMount::DiskDir => "--disk-dir",
+            ImageCacheMount::Nfs => "--nfs",
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            ImageCacheMount::FuseMap => "fuse",
+            ImageCacheMount::DiskDir => "diskdir",
+            ImageCacheMount::Nfs => "nfs",
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_kvm_available_in_vm() -> Result<()> {
     println!("\nNested KVM test");
@@ -721,13 +750,29 @@ except OSError as e:
     }
 }
 
-/// Test L1→L2 nesting: basic check without benchmarks
+/// Test L1→L2 nesting with image cache via FUSE (--map)
 ///
-/// Verifies that nested virtualization works by running a simple command chain.
-/// This is the fastest L2 test - no benchmarks, just basic functionality.
+/// The container OCI archive is loaded via FUSE-over-vsock.
+/// This is the original/default behavior.
 #[tokio::test]
-async fn test_nested_l2() -> Result<()> {
-    run_nested_n_levels(2, "NESTED_2_LEVELS_SUCCESS", BenchmarkMode::None).await
+async fn test_nested_l2_fuse() -> Result<()> {
+    run_nested_n_levels(2, "NESTED_2_LEVELS_FUSE_SUCCESS", BenchmarkMode::None, ImageCacheMount::FuseMap).await
+}
+
+/// Test L1→L2 nesting with image cache via disk-dir (--disk-dir)
+///
+/// The container OCI archive is loaded from a raw disk image created from a directory.
+#[tokio::test]
+async fn test_nested_l2_diskdir() -> Result<()> {
+    run_nested_n_levels(2, "NESTED_2_LEVELS_DISKDIR_SUCCESS", BenchmarkMode::None, ImageCacheMount::DiskDir).await
+}
+
+/// Test L1→L2 nesting with image cache via NFS (--nfs)
+///
+/// The container OCI archive is loaded from an NFS share.
+#[tokio::test]
+async fn test_nested_l2_nfs() -> Result<()> {
+    run_nested_n_levels(2, "NESTED_2_LEVELS_NFS_SUCCESS", BenchmarkMode::None, ImageCacheMount::Nfs).await
 }
 
 /// Test L1→L2 nesting with standard benchmarks
@@ -737,7 +782,7 @@ async fn test_nested_l2() -> Result<()> {
 #[tokio::test]
 #[ignore = "exceeds 10-minute timeout - use for manual benchmarking"]
 async fn test_nested_l2_with_benchmarks() -> Result<()> {
-    run_nested_n_levels(2, "NESTED_2_LEVELS_BENCH_SUCCESS", BenchmarkMode::Standard).await
+    run_nested_n_levels(2, "NESTED_2_LEVELS_BENCH_SUCCESS", BenchmarkMode::Standard, ImageCacheMount::FuseMap).await
 }
 
 /// Test L1→L2 nesting with large file benchmarks (100MB copies)
@@ -751,6 +796,7 @@ async fn test_nested_l2_with_large_files() -> Result<()> {
         2,
         "NESTED_2_LEVELS_LARGE_SUCCESS",
         BenchmarkMode::WithLargeFiles,
+        ImageCacheMount::FuseMap,
     )
     .await
 }
@@ -766,6 +812,7 @@ async fn test_nested_l2_with_network() -> Result<()> {
         2,
         "NESTED_2_LEVELS_NETWORK_SUCCESS",
         BenchmarkMode::WithNetwork,
+        ImageCacheMount::FuseMap,
     )
     .await
 }
@@ -782,6 +829,7 @@ async fn test_nested_l3_with_network() -> Result<()> {
         3,
         "NESTED_3_LEVELS_NETWORK_SUCCESS",
         BenchmarkMode::WithNetwork,
+        ImageCacheMount::FuseMap,
     )
     .await
 }
@@ -795,7 +843,7 @@ async fn test_nested_l3_with_network() -> Result<()> {
 #[tokio::test]
 #[ignore]
 async fn test_nested_l3() -> Result<()> {
-    run_nested_n_levels(3, "MARKER_L3_OK_12345", BenchmarkMode::None).await
+    run_nested_n_levels(3, "MARKER_L3_OK_12345", BenchmarkMode::None, ImageCacheMount::FuseMap).await
 }
 
 /// Test L1→L2→L3→L4: 4 levels of nesting
@@ -804,7 +852,7 @@ async fn test_nested_l3() -> Result<()> {
 #[tokio::test]
 #[ignore]
 async fn test_nested_l4() -> Result<()> {
-    run_nested_n_levels(4, "MARKER_L4_OK_12345", BenchmarkMode::None).await
+    run_nested_n_levels(4, "MARKER_L4_OK_12345", BenchmarkMode::None, ImageCacheMount::FuseMap).await
 }
 
 /// Benchmark mode for nested tests
@@ -1119,11 +1167,26 @@ fn print_benchmark_summary(log_content: &str, include_large_files: bool, include
     println!("=========================\n");
 }
 
-/// Run N levels of nesting with configurable benchmarks
+/// Run N levels of nesting with configurable benchmarks and image cache mount
 ///
 /// Uses streaming output for real-time visibility.
-async fn run_nested_n_levels(n: usize, marker: &str, mode: BenchmarkMode) -> Result<()> {
+/// The `image_cache_mount` parameter controls how the OCI archive is shared with L1:
+/// - FuseMap: Uses FUSE-over-vsock via --map (original behavior)
+/// - DiskDir: Creates a disk image from a temp directory with the OCI archive
+/// - Nfs: Shares the temp directory via NFS
+async fn run_nested_n_levels(
+    n: usize,
+    marker: &str,
+    mode: BenchmarkMode,
+    image_cache_mount: ImageCacheMount,
+) -> Result<()> {
     assert!(n >= 2, "Need at least 2 levels for nesting");
+
+    println!(
+        "Image cache mount method: {} ({})",
+        image_cache_mount.name(),
+        image_cache_mount.flag()
+    );
 
     common::ensure_nested_image().await?;
 
@@ -1151,6 +1214,41 @@ async fn run_nested_n_levels(n: usize, marker: &str, mode: BenchmarkMode) -> Res
     let digest_stripped = digest.trim_start_matches("sha256:");
     println!("Image digest: {}", digest);
     println!("Benchmark mode: {:?}", mode);
+
+    // Create a dedicated directory with just this image for mounting
+    // This avoids mounting the entire image-cache which could be large
+    let image_dir = format!("/mnt/fcvm-btrfs/nested-test/{}", digest_stripped);
+    let image_archive = format!("{}/{}.oci.tar", image_dir, digest_stripped);
+    let src_archive = format!("/mnt/fcvm-btrfs/image-cache/{}.oci.tar", digest_stripped);
+
+    // Create directory and reflink-copy the archive (fast CoW copy on btrfs)
+    tokio::fs::create_dir_all(&image_dir).await.ok();
+    if !tokio::fs::try_exists(&image_archive).await.unwrap_or(false) {
+        println!("Copying OCI archive to dedicated directory...");
+        tokio::process::Command::new("cp")
+            .args(["--reflink=auto", &src_archive, &image_archive])
+            .status()
+            .await
+            .context("copying OCI archive")?;
+    }
+
+    // All three methods mount the same directory, just via different mechanisms
+    // Guest always loads from /mnt/image-cache/{digest}.oci.tar
+    let image_cache_mount_args = match image_cache_mount {
+        ImageCacheMount::FuseMap => vec![
+            "--map".to_string(),
+            format!("{}:/mnt/image-cache:ro", image_dir),
+        ],
+        ImageCacheMount::DiskDir => vec![
+            "--disk-dir".to_string(),
+            format!("{}:/mnt/image-cache:ro", image_dir),
+        ],
+        ImageCacheMount::Nfs => vec![
+            "--nfs".to_string(),
+            format!("{}:/mnt/image-cache:ro", image_dir),
+        ],
+    };
+    let image_cache_guest_path = "/mnt/image-cache".to_string();
 
     // Memory allocation strategy:
     // - Each VM needs enough memory to run its child's Firecracker (~2GB) + OS overhead (~500MB)
@@ -1298,7 +1396,7 @@ set -ex
 {large_script_call} {level}
 
 echo "L{level}: Importing image from shared cache..."
-podman load -i /mnt/fcvm-btrfs/image-cache/{digest}.oci.tar
+podman load -i {image_cache}/{digest}.oci.tar
 podman tag sha256:{digest} localhost/nested-test 2>/dev/null || true
 
 echo "L{level}: Starting L{next_level} VM..."
@@ -1318,6 +1416,7 @@ FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
                 level = level,
                 next_level = level + 1,
                 digest = digest_stripped,
+                image_cache = image_cache_guest_path,
                 mem_arg = mem_arg,
                 kernel = nested_kernel_path,
                 next_script = next_script,
@@ -1332,7 +1431,7 @@ set -ex
 {net_script_call} {level}
 
 echo "L{level}: Importing image from shared cache..."
-podman load -i /mnt/fcvm-btrfs/image-cache/{digest}.oci.tar
+podman load -i {image_cache}/{digest}.oci.tar
 podman tag sha256:{digest} localhost/nested-test 2>/dev/null || true
 
 echo "L{level}: Starting L{next_level} VM..."
@@ -1352,6 +1451,7 @@ FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
                 level = level,
                 next_level = level + 1,
                 digest = digest_stripped,
+                image_cache = image_cache_guest_path,
                 mem_arg = mem_arg,
                 kernel = nested_kernel_path,
                 next_script = next_script,
@@ -1365,7 +1465,7 @@ set -ex
 {level_script} {level}
 
 echo "L{level}: Importing image from shared cache..."
-podman load -i /mnt/fcvm-btrfs/image-cache/{digest}.oci.tar
+podman load -i {image_cache}/{digest}.oci.tar
 podman tag sha256:{digest} localhost/nested-test 2>/dev/null || true
 
 echo "L{level}: Starting L{next_level} VM..."
@@ -1384,6 +1484,7 @@ FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
                 level = level,
                 next_level = level + 1,
                 digest = digest_stripped,
+                image_cache = image_cache_guest_path,
                 mem_arg = mem_arg,
                 kernel = nested_kernel_path,
                 next_script = next_script,
@@ -1416,18 +1517,31 @@ FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
         BenchmarkMode::WithLargeFiles => "large",
         BenchmarkMode::WithNetwork => "network",
     };
-    let log_file = format!("/tmp/nested-l{}-{}.log", n, mode_suffix);
+    let log_file = format!(
+        "/tmp/nested-l{}-{}-{}.log",
+        n,
+        mode_suffix,
+        image_cache_mount.name()
+    );
+    let image_cache_args = image_cache_mount_args.join(" ");
     let fcvm_cmd = format!(
         "sudo ./target/release/fcvm podman run \
-         --name l1-nested-{}-{} \
+         --name l1-nested-{}-{}-{} \
          --network bridged \
          --privileged \
          --mem {} \
          --kernel-profile nested \
          --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
+         {} \
          localhost/nested-test \
          --cmd {} 2>&1 | tee {}",
-        n, mode_suffix, intermediate_mem, l1_script, log_file
+        n,
+        mode_suffix,
+        image_cache_mount.name(),
+        intermediate_mem,
+        image_cache_args,
+        l1_script,
+        log_file
     );
 
     let status = tokio::process::Command::new("sh")
@@ -1672,3 +1786,4 @@ async fn test_nested_l2_unbounded_fuse_corrupts() -> Result<()> {
     //   count=61 total_bytes_read=7343452 last_len=1048645
     bail!("This test intentionally fails to document known corruption")
 }
+
