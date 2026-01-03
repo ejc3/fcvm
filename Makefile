@@ -12,8 +12,13 @@ CONTAINER_ARCH ?= aarch64
 ROOT_DATA_DIR := /mnt/fcvm-btrfs/root
 CONTAINER_DATA_DIR := /mnt/fcvm-btrfs/container
 
-# Test options: FILTER=pattern STREAM=1 LIST=1
+# Test options: FILTER=pattern STREAM=1 LIST=1 IGNORED=1
 FILTER ?=
+ifeq ($(IGNORED),1)
+NEXTEST_IGNORED := --run-ignored=all
+else
+NEXTEST_IGNORED :=
+endif
 
 # Default log level: fcvm debug, suppress FUSE spam
 # Override with: RUST_LOG=debug make test-root
@@ -122,7 +127,7 @@ check-disk:
 	BTRFS_FREE=$$(df -BG /mnt/fcvm-btrfs 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \
 	if [ -n "$$ROOT_FREE" ] && [ "$$ROOT_FREE" -lt 10 ]; then \
 		echo "ERROR: Need 10GB free on / (have $${ROOT_FREE}GB)"; \
-		echo "Try: make clean-target"; \
+		echo "Try: make clean"; \
 		exit 1; \
 	fi; \
 	if [ -n "$$BTRFS_FREE" ] && [ "$$BTRFS_FREE" -lt 15 ]; then \
@@ -182,7 +187,7 @@ _test-root:
 	FCVM_DATA_DIR=$(ROOT_DATA_DIR) \
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
-	$(NEXTEST) $(NEXTEST_CAPTURE) --retries 2 --features privileged-tests $(FILTER)
+	$(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_IGNORED) --retries 2 --features privileged-tests $(FILTER)
 
 # Host targets (with setup, check-disk first to fail fast if disk is full)
 test-unit: check-disk build _test-unit

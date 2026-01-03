@@ -11,6 +11,55 @@ main → PR#55, main → PR#56    (wrong - parallel branches)
 
 Only branch directly from main when explicitly starting independent work.
 
+## ALWAYS USE THE MAKEFILE
+
+**Never run raw cargo/podman commands. Use make targets.**
+
+```bash
+# CORRECT
+make test-root FILTER=sanity
+make setup-fcvm
+make build
+
+# WRONG - bypasses setup, env vars, correct flags
+cargo test ...
+sudo cargo test ...
+./target/release/fcvm setup
+```
+
+If the Makefile is missing a target or broken, **fix the Makefile** - don't work around it.
+
+## NEVER ROUTE AROUND BUILD PROCESSES
+
+**If a build fails, FIX THE BUILD. Never manually copy files.**
+
+When a kernel, rootfs, or binary doesn't build correctly:
+1. Fix the build script
+2. Fix the source code
+3. Fix the patches
+
+**NEVER:**
+- Manually copy files to work around naming issues
+- Run build scripts directly instead of through fcvm
+- Create symlinks to "fix" path mismatches
+
+If `fcvm setup` produces wrong output, the bug is in fcvm or build.sh. Fix it there.
+
+## Nested Test Architecture
+
+Tests use `localhost/nested-test` container image built from `Containerfile.nested`.
+
+**Key files:**
+- `Containerfile.nested`: Container with fcvm, fc-agent, firecracker-nested, rsync
+- `tests/common/mod.rs`: `ensure_nested_image()` auto-builds via podman
+- `rootfs-config.toml`: VM rootfs packages (copied into container at `/etc/fcvm/`)
+
+**Package installation locations:**
+- Container packages: `Containerfile.nested` apt-get install
+- VM rootfs packages: `rootfs-config.toml` [packages] section
+
+Both need rsync for `--disk-dir` to work.
+
 ## NO HACKS
 
 **Fix the root cause, not the symptom.** When something fails:
@@ -97,8 +146,36 @@ Recursive nesting (Host → L1 → L2 → ...) is enabled via the `arm64.nv2` ke
 ### Requirements
 
 - **Hardware**: ARM64 with FEAT_NV2 (Graviton3+, c7g.metal)
-- **Host kernel**: 6.18+ with `kvm-arm.mode=nested`
+- **Host kernel**: 6.18+ with `kvm-arm.mode=nested` AND DSB patches
 - **Nested kernel**: Custom kernel with CONFIG_KVM=y (use `--kernel-profile nested`)
+
+### Host Kernel with DSB Patches
+
+**CRITICAL**: Both host AND guest kernels need DSB patches for cache coherency under NV2.
+
+Guest kernels are built automatically by `fcvm setup --kernel-profile nested --build-kernels`.
+The HOST kernel must be rebuilt manually when DSB patches are added/modified.
+
+**Rebuild host kernel**:
+```bash
+# Build with all patches from kernel/patches/
+KERNEL_VERSION=6.18.3 BUILD_DIR=/tmp/kernel-build-host ./kernel/build.sh
+
+# Or use the host kernel script that includes module install:
+/tmp/build-host-kernel.sh
+
+# Install after build completes:
+cd /tmp/kernel-build-host/linux-6.18.3
+sudo make ARCH=arm64 modules_install
+sudo cp arch/arm64/boot/Image /boot/vmlinuz-6.18.3-nested-dsb
+sudo update-grub
+sudo reboot
+```
+
+**Current patches** (all apply to both host and guest kernels):
+- `nv2-vsock-cache-sync.patch`: DSB SY in `kvm_nested_sync_hwstate()`
+- `nv2-vsock-rx-barrier.patch`: DSB SY in `virtio_transport_rx_work()`
+- `mmfr4-override.patch`: ID register override for recursive nesting
 
 ### How It Works
 
@@ -789,6 +866,11 @@ assert!(localhost_works, "Localhost port forwarding should work (requires route_
 
 4. **State file cleanup**: State files are deleted when VMs exit
    - Prevents stale state from affecting IP allocation
+
+5. **Unique ports/directories**: Tests must not share ports or temp directories
+   - Use `std::process::id() % 1000` offset for ports
+   - Use test name suffix for directories (e.g., `/tmp/scripts-{test_name}/`)
+   - Test owns lifetime of any services it starts (kill at end)
 
 **If tests fail in parallel but pass alone:**
 - It's a resource isolation bug - FIX IT
