@@ -70,10 +70,11 @@ fi
 
 cd "linux-${KERNEL_VERSION}"
 
-# Apply patches
+# Apply patches (shared only, skip .vm.patch which are VM-only)
 echo "Applying patches..."
 for patch_file in "$PATCHES_DIR"/*.patch; do
     [[ ! -f "$patch_file" ]] && continue
+    [[ "$patch_file" == *.vm.patch ]] && continue  # Skip VM-only patches
     patch_name=$(basename "$patch_file")
 
     echo "  Checking $patch_name..."
