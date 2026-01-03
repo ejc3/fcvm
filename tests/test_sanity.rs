@@ -108,3 +108,66 @@ async fn sanity_test_impl(network: &str) -> Result<()> {
 
     result
 }
+
+/// Test that VM exits gracefully when container finishes (PSCI shutdown)
+/// This tests the full shutdown path: container exit → fc-agent halt -f → PSCI → KVM_EXIT_SHUTDOWN
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_graceful_shutdown() -> Result<()> {
+    use std::time::Duration;
+
+    println!("\nGraceful shutdown test");
+    println!("======================");
+    println!("Verifies VM exits cleanly when container finishes (no SIGTERM)");
+
+    let (vm_name, _, _, _) = common::unique_names("graceful");
+
+    // Start VM with alpine:latest which exits immediately
+    println!("Starting VM with container that exits immediately...");
+    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        "alpine:latest", // Exits immediately with code 0
+    ])
+    .await
+    .context("spawning fcvm")?;
+
+    println!("  fcvm PID: {}", fcvm_pid);
+    println!("  Waiting for VM to exit gracefully (max 60s)...");
+
+    // Wait for process to exit on its own (NO kill!)
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(60);
+
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                let elapsed = start.elapsed();
+                println!("  VM exited after {:.1}s with status: {}", elapsed.as_secs_f32(), status);
+
+                if status.success() {
+                    println!("✅ GRACEFUL SHUTDOWN PASSED!");
+                    println!("  PSCI shutdown worked correctly");
+                    return Ok(());
+                } else {
+                    anyhow::bail!("VM exited with non-zero status: {}", status);
+                }
+            }
+            None => {
+                if start.elapsed() > timeout {
+                    // Kill the stuck process before failing
+                    common::kill_process(fcvm_pid).await;
+                    anyhow::bail!(
+                        "VM did not exit within {}s - PSCI shutdown is broken!",
+                        timeout.as_secs()
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+}

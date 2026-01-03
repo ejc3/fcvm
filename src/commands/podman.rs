@@ -460,7 +460,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
         // Apply runtime config from profile
         // Use content-addressed firecracker path if profile has custom firecracker
-        if let Some(fc_path) = crate::setup::get_profile_firecracker_path(&profile, profile_name) {
+        if let Some(fc_path) = crate::setup::get_profile_firecracker_path(&profile, profile_name).await {
             if !fc_path.exists() {
                 bail!(
                     "Profile '{}' firecracker not found at {}.\nRun: fcvm setup --kernel-profile {}",
