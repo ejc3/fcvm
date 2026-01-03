@@ -756,7 +756,13 @@ except OSError as e:
 /// This is the original/default behavior.
 #[tokio::test]
 async fn test_nested_l2_fuse() -> Result<()> {
-    run_nested_n_levels(2, "NESTED_2_LEVELS_FUSE_SUCCESS", BenchmarkMode::None, ImageCacheMount::FuseMap).await
+    run_nested_n_levels(
+        2,
+        "NESTED_2_LEVELS_FUSE_SUCCESS",
+        BenchmarkMode::None,
+        ImageCacheMount::FuseMap,
+    )
+    .await
 }
 
 /// Test L1→L2 nesting with image cache via disk-dir (--disk-dir)
@@ -764,7 +770,13 @@ async fn test_nested_l2_fuse() -> Result<()> {
 /// The container OCI archive is loaded from a raw disk image created from a directory.
 #[tokio::test]
 async fn test_nested_l2_diskdir() -> Result<()> {
-    run_nested_n_levels(2, "NESTED_2_LEVELS_DISKDIR_SUCCESS", BenchmarkMode::None, ImageCacheMount::DiskDir).await
+    run_nested_n_levels(
+        2,
+        "NESTED_2_LEVELS_DISKDIR_SUCCESS",
+        BenchmarkMode::None,
+        ImageCacheMount::DiskDir,
+    )
+    .await
 }
 
 /// Test L1→L2 nesting with image cache via NFS (--nfs)
@@ -772,7 +784,13 @@ async fn test_nested_l2_diskdir() -> Result<()> {
 /// The container OCI archive is loaded from an NFS share.
 #[tokio::test]
 async fn test_nested_l2_nfs() -> Result<()> {
-    run_nested_n_levels(2, "NESTED_2_LEVELS_NFS_SUCCESS", BenchmarkMode::None, ImageCacheMount::Nfs).await
+    run_nested_n_levels(
+        2,
+        "NESTED_2_LEVELS_NFS_SUCCESS",
+        BenchmarkMode::None,
+        ImageCacheMount::Nfs,
+    )
+    .await
 }
 
 /// Test L1→L2 nesting with standard benchmarks
@@ -782,7 +800,13 @@ async fn test_nested_l2_nfs() -> Result<()> {
 #[tokio::test]
 #[ignore = "exceeds 10-minute timeout - use for manual benchmarking"]
 async fn test_nested_l2_with_benchmarks() -> Result<()> {
-    run_nested_n_levels(2, "NESTED_2_LEVELS_BENCH_SUCCESS", BenchmarkMode::Standard, ImageCacheMount::FuseMap).await
+    run_nested_n_levels(
+        2,
+        "NESTED_2_LEVELS_BENCH_SUCCESS",
+        BenchmarkMode::Standard,
+        ImageCacheMount::FuseMap,
+    )
+    .await
 }
 
 /// Test L1→L2 nesting with large file benchmarks (100MB copies)
@@ -805,14 +829,38 @@ async fn test_nested_l2_with_large_files() -> Result<()> {
 ///
 /// Measures egress/ingress throughput from VMs at each level to host using iperf3.
 /// Tests various block sizes (128K, 1M) and parallelism (1, 4, 8 streams).
-/// Network tests don't depend on FUSE, so they work even at L3+.
+/// Network tests don't depend on FUSE for data path, but need image cache mount.
 #[tokio::test]
-async fn test_nested_l2_with_network() -> Result<()> {
+async fn test_nested_l2_network_fuse() -> Result<()> {
     run_nested_n_levels(
         2,
-        "NESTED_2_LEVELS_NETWORK_SUCCESS",
+        "NESTED_2_LEVELS_NETWORK_FUSE_SUCCESS",
         BenchmarkMode::WithNetwork,
         ImageCacheMount::FuseMap,
+    )
+    .await
+}
+
+/// Test L2 network benchmarks with image cache via disk-dir
+#[tokio::test]
+async fn test_nested_l2_network_diskdir() -> Result<()> {
+    run_nested_n_levels(
+        2,
+        "NESTED_2_LEVELS_NETWORK_DISKDIR_SUCCESS",
+        BenchmarkMode::WithNetwork,
+        ImageCacheMount::DiskDir,
+    )
+    .await
+}
+
+/// Test L2 network benchmarks with image cache via NFS
+#[tokio::test]
+async fn test_nested_l2_network_nfs() -> Result<()> {
+    run_nested_n_levels(
+        2,
+        "NESTED_2_LEVELS_NETWORK_NFS_SUCCESS",
+        BenchmarkMode::WithNetwork,
+        ImageCacheMount::Nfs,
     )
     .await
 }
@@ -820,16 +868,43 @@ async fn test_nested_l2_with_network() -> Result<()> {
 /// Test L3 network: measures throughput degradation through triple NAT chain
 ///
 /// BLOCKED: Even though network uses NAT (not FUSE), container startup requires
-/// FUSE for rootfs access. At L3, FUSE latency is ~15ms per operation, causing
+/// image cache mount. At L3, FUSE latency is ~15ms per operation, causing
 /// container startup to exceed the 10-minute test timeout.
+/// disk-dir and NFS may work better at L3.
 #[tokio::test]
 #[ignore]
-async fn test_nested_l3_with_network() -> Result<()> {
+async fn test_nested_l3_network_fuse() -> Result<()> {
     run_nested_n_levels(
         3,
-        "NESTED_3_LEVELS_NETWORK_SUCCESS",
+        "NESTED_3_LEVELS_NETWORK_FUSE_SUCCESS",
         BenchmarkMode::WithNetwork,
         ImageCacheMount::FuseMap,
+    )
+    .await
+}
+
+/// Test L3 network with disk-dir (may be faster than FUSE)
+#[tokio::test]
+#[ignore]
+async fn test_nested_l3_network_diskdir() -> Result<()> {
+    run_nested_n_levels(
+        3,
+        "NESTED_3_LEVELS_NETWORK_DISKDIR_SUCCESS",
+        BenchmarkMode::WithNetwork,
+        ImageCacheMount::DiskDir,
+    )
+    .await
+}
+
+/// Test L3 network with NFS (may be faster than FUSE)
+#[tokio::test]
+#[ignore]
+async fn test_nested_l3_network_nfs() -> Result<()> {
+    run_nested_n_levels(
+        3,
+        "NESTED_3_LEVELS_NETWORK_NFS_SUCCESS",
+        BenchmarkMode::WithNetwork,
+        ImageCacheMount::Nfs,
     )
     .await
 }
@@ -843,7 +918,13 @@ async fn test_nested_l3_with_network() -> Result<()> {
 #[tokio::test]
 #[ignore]
 async fn test_nested_l3() -> Result<()> {
-    run_nested_n_levels(3, "MARKER_L3_OK_12345", BenchmarkMode::None, ImageCacheMount::FuseMap).await
+    run_nested_n_levels(
+        3,
+        "MARKER_L3_OK_12345",
+        BenchmarkMode::None,
+        ImageCacheMount::FuseMap,
+    )
+    .await
 }
 
 /// Test L1→L2→L3→L4: 4 levels of nesting
@@ -852,7 +933,13 @@ async fn test_nested_l3() -> Result<()> {
 #[tokio::test]
 #[ignore]
 async fn test_nested_l4() -> Result<()> {
-    run_nested_n_levels(4, "MARKER_L4_OK_12345", BenchmarkMode::None, ImageCacheMount::FuseMap).await
+    run_nested_n_levels(
+        4,
+        "MARKER_L4_OK_12345",
+        BenchmarkMode::None,
+        ImageCacheMount::FuseMap,
+    )
+    .await
 }
 
 /// Benchmark mode for nested tests
@@ -1786,4 +1873,3 @@ async fn test_nested_l2_unbounded_fuse_corrupts() -> Result<()> {
     //   count=61 total_bytes_read=7343452 last_len=1048645
     bail!("This test intentionally fails to document known corruption")
 }
-
