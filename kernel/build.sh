@@ -22,8 +22,8 @@ compute_sha() {
 
 # Set KERNEL_PATH if not provided
 KERNEL_VERSION="${KERNEL_VERSION:-6.18.3}"
+BUILD_SHA=$(compute_sha)
 if [[ -z "${KERNEL_PATH:-}" ]]; then
-    BUILD_SHA=$(compute_sha)
     KERNEL_PATH="/mnt/fcvm-btrfs/kernels/vmlinux-${KERNEL_VERSION}-${BUILD_SHA}.bin"
     echo "Computed KERNEL_PATH: $KERNEL_PATH"
 fi
@@ -31,6 +31,8 @@ fi
 KERNEL_MAJOR="${KERNEL_VERSION%%.*}"
 BUILD_DIR="${BUILD_DIR:-/tmp/kernel-build}"
 NPROC="${NPROC:-$(nproc)}"
+SOURCE_DIR="$BUILD_DIR/linux-${KERNEL_VERSION}"
+SHA_MARKER="$SOURCE_DIR/.fcvm-patches-sha"
 
 # Architecture detection
 ARCH=$(uname -m)
@@ -43,6 +45,7 @@ esac
 echo "=== fcvm Nested Kernel Build ==="
 echo "Kernel version: $KERNEL_VERSION"
 echo "Architecture: $KERNEL_ARCH"
+echo "Build SHA: $BUILD_SHA"
 echo "Output: $KERNEL_PATH"
 echo ""
 
@@ -66,42 +69,59 @@ if [[ ! -f "$KERNEL_TARBALL" ]]; then
     curl -fSL "$KERNEL_URL" -o "$KERNEL_TARBALL"
 fi
 
-if [[ ! -d "linux-${KERNEL_VERSION}" ]]; then
+# Check if source exists and has matching SHA
+if [[ -d "$SOURCE_DIR" ]]; then
+    if [[ -f "$SHA_MARKER" ]] && [[ "$(cat "$SHA_MARKER")" == "$BUILD_SHA" ]]; then
+        echo "Source already patched with current SHA, reusing..."
+    else
+        echo "Source exists but SHA mismatch (patches changed), re-extracting..."
+        rm -rf "$SOURCE_DIR"
+    fi
+fi
+
+if [[ ! -d "$SOURCE_DIR" ]]; then
     echo "Extracting kernel source..."
     tar xf "$KERNEL_TARBALL"
 fi
 
-cd "linux-${KERNEL_VERSION}"
+cd "$SOURCE_DIR"
 
 # Apply patches from patches directory
 # VM kernel applies: *.patch (shared) + *.vm.patch (VM-only)
-# Host kernel applies: *.patch (shared) only, skips *.vm.patch
 PATCHES_DIR="$SCRIPT_DIR/patches"
-echo "Applying patches..."
 
-# Track applied patches to avoid duplicates (*.patch glob also matches *.vm.patch)
-declare -A applied_patches
+# Skip patching if already done with this SHA
+if [[ -f "$SHA_MARKER" ]] && [[ "$(cat "$SHA_MARKER")" == "$BUILD_SHA" ]]; then
+    echo "Patches already applied (SHA: $BUILD_SHA)"
+else
+    echo "Applying patches..."
 
-for patch_file in "$PATCHES_DIR"/*.patch "$PATCHES_DIR"/*.vm.patch; do
-    [[ ! -f "$patch_file" ]] && continue
-    [[ -n "${applied_patches[$patch_file]:-}" ]] && continue
-    applied_patches[$patch_file]=1
-    patch_name=$(basename "$patch_file")
+    # Track applied patches to avoid duplicates (*.patch glob also matches *.vm.patch)
+    declare -A applied_patches
 
-    echo "  Checking $patch_name..."
-    if patch -p1 --forward --dry-run < "$patch_file" >/dev/null 2>&1; then
-        patch -p1 --forward < "$patch_file"
-        echo "    Applied successfully"
-    else
-        if patch -p1 --reverse --dry-run < "$patch_file" >/dev/null 2>&1; then
-            echo "    Already applied (skipping)"
+    for patch_file in "$PATCHES_DIR"/*.patch "$PATCHES_DIR"/*.vm.patch; do
+        [[ ! -f "$patch_file" ]] && continue
+        [[ -n "${applied_patches[$patch_file]:-}" ]] && continue
+        applied_patches[$patch_file]=1
+        patch_name=$(basename "$patch_file")
+
+        echo "  Applying $patch_name..."
+        if patch -p1 --forward --dry-run < "$patch_file" >/dev/null 2>&1; then
+            patch -p1 --forward < "$patch_file"
         else
-            echo "    ERROR: Patch does not apply cleanly: $patch_name"
-            patch -p1 --forward --dry-run < "$patch_file" || true
+            echo "    ERROR: Patch does not apply cleanly"
+            echo "    This usually means the source is corrupt. Deleting and retrying..."
+            cd "$BUILD_DIR"
+            rm -rf "$SOURCE_DIR"
+            echo "    Re-run this script to rebuild from fresh source."
             exit 1
         fi
-    fi
-done
+    done
+
+    # Mark source as patched with this SHA
+    echo "$BUILD_SHA" > "$SHA_MARKER"
+    echo "Patches applied successfully (SHA: $BUILD_SHA)"
+fi
 
 # Download Firecracker base config
 FC_CONFIG_URL="https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-${ARCH}-6.1.config"

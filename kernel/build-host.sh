@@ -6,7 +6,7 @@
 #
 # The output is content-addressed by SHA of build inputs:
 #   - This script
-#   - All patches in patches/
+#   - Shared patches (*.patch, excluding *.vm.patch)
 #
 # If the output deb already exists, the build is skipped.
 
@@ -18,12 +18,18 @@ BUILD_DIR="${BUILD_DIR:-/tmp/kernel-build-host}"
 KERNEL_VERSION="${KERNEL_VERSION:-6.18.3}"
 KERNEL_MAJOR="${KERNEL_VERSION%%.*}"
 NPROC="${NPROC:-$(nproc)}"
+SOURCE_DIR="$BUILD_DIR/linux-${KERNEL_VERSION}"
+SHA_MARKER="$SOURCE_DIR/.fcvm-patches-sha"
 
-# Compute SHA from build inputs
+# Compute SHA from build inputs (host kernel excludes .vm.patch files)
 compute_sha() {
     (
         cat "$SCRIPT_DIR/build-host.sh"
-        cat "$PATCHES_DIR"/*.patch 2>/dev/null || true
+        for f in "$PATCHES_DIR"/*.patch; do
+            [[ -f "$f" ]] || continue
+            [[ "$f" == *.vm.patch ]] && continue
+            cat "$f"
+        done
     ) | sha256sum | cut -c1-12
 }
 
@@ -38,7 +44,7 @@ echo "LOCALVERSION: $LOCALVERSION"
 echo ""
 
 # Check if already built (look for installed deb or deb file)
-if dpkg -l | grep -q "${DEB_NAME}"; then
+if dpkg -l 2>/dev/null | grep -q "${DEB_NAME}"; then
     echo "Kernel already installed: ${DEB_NAME}"
     echo "Skipping build."
     exit 0
@@ -63,34 +69,51 @@ if [[ ! -f "$KERNEL_TARBALL" ]]; then
     curl -fSL "$KERNEL_URL" -o "$KERNEL_TARBALL"
 fi
 
-if [[ ! -d "linux-${KERNEL_VERSION}" ]]; then
+# Check if source exists and has matching SHA
+if [[ -d "$SOURCE_DIR" ]]; then
+    if [[ -f "$SHA_MARKER" ]] && [[ "$(cat "$SHA_MARKER")" == "$BUILD_SHA" ]]; then
+        echo "Source already patched with current SHA, reusing..."
+    else
+        echo "Source exists but SHA mismatch (patches changed), re-extracting..."
+        rm -rf "$SOURCE_DIR"
+    fi
+fi
+
+if [[ ! -d "$SOURCE_DIR" ]]; then
     echo "Extracting kernel source..."
     tar xf "$KERNEL_TARBALL"
 fi
 
-cd "linux-${KERNEL_VERSION}"
+cd "$SOURCE_DIR"
 
 # Apply patches (shared only, skip .vm.patch which are VM-only)
-echo "Applying patches..."
-for patch_file in "$PATCHES_DIR"/*.patch; do
-    [[ ! -f "$patch_file" ]] && continue
-    [[ "$patch_file" == *.vm.patch ]] && continue  # Skip VM-only patches
-    patch_name=$(basename "$patch_file")
+# Skip patching if already done with this SHA
+if [[ -f "$SHA_MARKER" ]] && [[ "$(cat "$SHA_MARKER")" == "$BUILD_SHA" ]]; then
+    echo "Patches already applied (SHA: $BUILD_SHA)"
+else
+    echo "Applying patches..."
+    for patch_file in "$PATCHES_DIR"/*.patch; do
+        [[ ! -f "$patch_file" ]] && continue
+        [[ "$patch_file" == *.vm.patch ]] && continue  # Skip VM-only patches
+        patch_name=$(basename "$patch_file")
 
-    echo "  Checking $patch_name..."
-    if patch -p1 --forward --dry-run < "$patch_file" >/dev/null 2>&1; then
-        patch -p1 --forward < "$patch_file"
-        echo "    Applied successfully"
-    else
-        if patch -p1 --reverse --dry-run < "$patch_file" >/dev/null 2>&1; then
-            echo "    Already applied (skipping)"
+        echo "  Applying $patch_name..."
+        if patch -p1 --forward --dry-run < "$patch_file" >/dev/null 2>&1; then
+            patch -p1 --forward < "$patch_file"
         else
-            echo "    ERROR: Patch does not apply cleanly: $patch_name"
-            patch -p1 --forward --dry-run < "$patch_file" || true
+            echo "    ERROR: Patch does not apply cleanly"
+            echo "    This usually means the source is corrupt. Deleting and retrying..."
+            cd "$BUILD_DIR"
+            rm -rf "$SOURCE_DIR"
+            echo "    Re-run this script to rebuild from fresh source."
             exit 1
         fi
-    fi
-done
+    done
+
+    # Mark source as patched with this SHA
+    echo "$BUILD_SHA" > "$SHA_MARKER"
+    echo "Patches applied successfully (SHA: $BUILD_SHA)"
+fi
 
 # Copy current kernel config as base
 echo "Using current kernel config as base..."
