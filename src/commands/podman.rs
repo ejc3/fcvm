@@ -1335,6 +1335,76 @@ async fn run_vm_setup(
         )
         .await?;
 
+    // Extra disks (appear as /dev/vdb, /dev/vdc, etc.)
+    // Parse format: HOST_PATH:GUEST_MOUNT[:ro]
+    let mut extra_disks = Vec::new();
+    for (i, disk_spec) in args.disk.iter().enumerate() {
+        // Check for :ro suffix
+        let (spec_without_ro, read_only) = if disk_spec.ends_with(":ro") {
+            (&disk_spec[..disk_spec.len() - 3], true)
+        } else {
+            (disk_spec.as_str(), false)
+        };
+
+        // Split HOST_PATH:GUEST_MOUNT
+        let parts: Vec<&str> = spec_without_ro.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            anyhow::bail!(
+                "Invalid disk spec '{}'. Expected format: HOST_PATH:GUEST_MOUNT[:ro]",
+                disk_spec
+            );
+        }
+        let path_str = parts[0];
+        let mount_path = parts[1].to_string();
+
+        // Validate mount path is absolute
+        if !mount_path.starts_with('/') {
+            anyhow::bail!(
+                "Disk mount path must be absolute: {} (got '{}')",
+                disk_spec,
+                mount_path
+            );
+        }
+
+        let drive_id = format!("disk{}", i);
+        let disk_path = std::path::Path::new(path_str);
+        if !disk_path.exists() {
+            anyhow::bail!("Disk not found: {}", disk_path.display());
+        }
+        let abs_path = disk_path.canonicalize().context(format!(
+            "Failed to resolve disk path: {}",
+            disk_path.display()
+        ))?;
+
+        extra_disks.push(crate::state::types::ExtraDisk {
+            path: abs_path.display().to_string(),
+            mount_path: mount_path.clone(),
+            read_only,
+        });
+
+        info!(
+            "Adding extra disk: {} -> /dev/vd{} -> {} ({})",
+            abs_path.display(),
+            (b'b' + i as u8) as char,
+            mount_path,
+            if read_only { "ro" } else { "rw" }
+        );
+        client
+            .add_drive(
+                &drive_id,
+                crate::firecracker::api::Drive {
+                    drive_id: drive_id.clone(),
+                    path_on_host: abs_path.display().to_string(),
+                    is_root_device: false,
+                    is_read_only: read_only,
+                    partuuid: None,
+                    rate_limiter: None,
+                },
+            )
+            .await?;
+    }
+    vm_state.config.extra_disks = extra_disks;
+
     // For rootless mode with slirp4netns: post_start starts slirp4netns in the namespace
     // For bridged mode: post_start is a no-op (TAP already created by BridgedNetwork)
     // Use holder_pid for rootless (slirp4netns attaches to holder's namespace)
@@ -1396,6 +1466,23 @@ async fn run_vm_setup(
         })
         .collect();
 
+    // Build extra disk info for MMDS
+    // Format: { device, mount_path, read_only }
+    // Disks are added as /dev/vdb, /dev/vdc, etc.
+    let extra_disk_mounts: Vec<serde_json::Value> = vm_state
+        .config
+        .extra_disks
+        .iter()
+        .enumerate()
+        .map(|(idx, disk)| {
+            serde_json::json!({
+                "device": format!("/dev/vd{}", (b'b' + idx as u8) as char),
+                "mount_path": &disk.mount_path,
+                "read_only": disk.read_only,
+            })
+        })
+        .collect();
+
     // MMDS data (container plan) - nested under "latest" for V2 compatibility
     // Include host timestamp so guest can set clock immediately (avoiding slow NTP sync)
     // Format without subsecond precision for Alpine `date` compatibility
@@ -1409,6 +1496,7 @@ async fn run_vm_setup(
                 }).collect::<std::collections::HashMap<_, _>>(),
                 "cmd": cmd_args,
                 "volumes": volume_mounts,
+                "extra_disks": extra_disk_mounts,
                 "image_archive": image_archive_name.map(|name| format!("/tmp/fcvm-image/{}", name)),
                 "privileged": args.privileged,
             },

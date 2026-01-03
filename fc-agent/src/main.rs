@@ -23,6 +23,9 @@ struct Plan {
     /// Volume mounts from host (FUSE-over-vsock)
     #[serde(default)]
     volumes: Vec<VolumeMount>,
+    /// Extra block devices (mounted automatically)
+    #[serde(default)]
+    extra_disks: Vec<ExtraDiskMount>,
     /// Path to OCI archive for localhost/ images (run directly without import)
     #[serde(default)]
     image_archive: Option<String>,
@@ -38,6 +41,18 @@ struct VolumeMount {
     guest_path: String,
     /// Vsock port to connect to host VolumeServer
     vsock_port: u32,
+    /// Read-only flag
+    #[serde(default)]
+    read_only: bool,
+}
+
+/// Extra disk mount configuration from MMDS
+#[derive(Debug, Clone, Deserialize)]
+struct ExtraDiskMount {
+    /// Device path (e.g., /dev/vdb)
+    device: String,
+    /// Mount path inside guest (e.g., /mnt/extra-disk-0)
+    mount_path: String,
     /// Read-only flag
     #[serde(default)]
     read_only: bool,
@@ -1454,6 +1469,74 @@ fn mount_fuse_volumes(volumes: &[VolumeMount]) -> Result<Vec<String>> {
     Ok(mounted_paths)
 }
 
+/// Mount extra block devices at their specified mount paths.
+/// Returns list of mount points that need to be cleaned up on exit.
+fn mount_extra_disks(disks: &[ExtraDiskMount]) -> Result<Vec<String>> {
+    let mut mounted_paths = Vec::new();
+
+    for disk in disks {
+        eprintln!(
+            "[fc-agent] mounting extra disk {} at {} ({})",
+            disk.device,
+            disk.mount_path,
+            if disk.read_only { "ro" } else { "rw" }
+        );
+
+        // Create mount point directory
+        if let Err(e) = std::fs::create_dir_all(&disk.mount_path) {
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(e)
+                    .with_context(|| format!("creating mount point: {}", disk.mount_path));
+            }
+        }
+
+        // Wait for device to appear (may take a moment after VM boot)
+        let device_path = std::path::Path::new(&disk.device);
+        for attempt in 1..=10 {
+            if device_path.exists() {
+                break;
+            }
+            if attempt == 10 {
+                anyhow::bail!("Device {} not found after 10 attempts", disk.device);
+            }
+            eprintln!(
+                "[fc-agent] waiting for device {} (attempt {}/10)",
+                disk.device, attempt
+            );
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+
+        // Mount the block device
+        let mut mount_cmd = std::process::Command::new("mount");
+        if disk.read_only {
+            mount_cmd.arg("-o").arg("ro");
+        }
+        mount_cmd.arg(&disk.device).arg(&disk.mount_path);
+
+        let output = mount_cmd
+            .output()
+            .with_context(|| format!("mounting {} at {}", disk.device, disk.mount_path))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "Failed to mount {} at {}: {}",
+                disk.device,
+                disk.mount_path,
+                stderr
+            );
+        }
+
+        eprintln!(
+            "[fc-agent] ✓ extra disk {} mounted at {}",
+            disk.device, disk.mount_path
+        );
+        mounted_paths.push(disk.mount_path.clone());
+    }
+
+    Ok(mounted_paths)
+}
+
 /// Sync VM clock from host time provided via MMDS
 /// This avoids the need to wait for slow NTP synchronization
 async fn sync_clock_from_host() -> Result<()> {
@@ -1663,6 +1746,27 @@ async fn main() -> Result<()> {
     };
     let has_shared_volume = mounted_fuse_paths.iter().any(|p| p == "/mnt/shared");
 
+    // Mount extra block devices before launching container
+    let mounted_disk_paths: Vec<String> = if !plan.extra_disks.is_empty() {
+        eprintln!(
+            "[fc-agent] mounting {} extra disk(s)",
+            plan.extra_disks.len()
+        );
+        match mount_extra_disks(&plan.extra_disks) {
+            Ok(paths) => {
+                eprintln!("[fc-agent] ✓ extra disks mounted successfully");
+                paths
+            }
+            Err(e) => {
+                eprintln!("[fc-agent] ERROR: failed to mount extra disks: {:?}", e);
+                // Continue without extra disks - container can still run
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     // If we have a shared volume, start lock test watcher
     // This allows clones to run POSIX lock tests on demand
     if has_shared_volume {
@@ -1817,6 +1921,17 @@ async fn main() -> Result<()> {
             format!("{}:{}:ro", vol.guest_path, vol.guest_path)
         } else {
             format!("{}:{}", vol.guest_path, vol.guest_path)
+        };
+        cmd.arg("-v").arg(mount_spec);
+    }
+
+    // Add extra disk mounts as bind mounts to container
+    // Disks are already mounted at mount_path, so we bind to same path in container
+    for disk in &plan.extra_disks {
+        let mount_spec = if disk.read_only {
+            format!("{}:{}:ro", disk.mount_path, disk.mount_path)
+        } else {
+            format!("{}:{}", disk.mount_path, disk.mount_path)
         };
         cmd.arg("-v").arg(mount_spec);
     }
@@ -1993,6 +2108,33 @@ async fn main() -> Result<()> {
         }
         // Give FUSE threads time to notice the unmount and exit
         sleep(Duration::from_millis(100)).await;
+    }
+
+    // Unmount extra disks before shutting down
+    if !mounted_disk_paths.is_empty() {
+        eprintln!(
+            "[fc-agent] unmounting {} extra disk(s) before shutdown",
+            mounted_disk_paths.len()
+        );
+        for path in &mounted_disk_paths {
+            eprintln!("[fc-agent] unmounting extra disk at {}", path);
+            match std::process::Command::new("umount").arg(path).output() {
+                Ok(output) => {
+                    if output.status.success() {
+                        eprintln!("[fc-agent] ✓ unmounted {}", path);
+                    } else {
+                        eprintln!(
+                            "[fc-agent] umount {} failed: {}",
+                            path,
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[fc-agent] umount {} error: {}", path, e);
+                }
+            }
+        }
     }
 
     // Shut down the VM when the container exits (success or failure)
