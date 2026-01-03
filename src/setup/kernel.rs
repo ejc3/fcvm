@@ -426,9 +426,7 @@ pub fn compute_profile_kernel_sha(profile: &KernelProfile) -> String {
                 let mut paths: Vec<PathBuf> = entries
                     .filter_map(|e| e.ok())
                     // Filter out .disabled files (allows disabling patches without changing SHA)
-                    .filter(|p| {
-                        !p.to_string_lossy().ends_with(".disabled")
-                    })
+                    .filter(|p| !p.to_string_lossy().ends_with(".disabled"))
                     .collect();
                 paths.sort(); // Deterministic order
                 paths

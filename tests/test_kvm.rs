@@ -34,8 +34,6 @@
 mod common;
 
 use anyhow::{bail, Context, Result};
-use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 #[tokio::test]
@@ -1108,7 +1106,10 @@ async fn run_nested_n_levels(n: usize, marker: &str, mode: BenchmarkMode) -> Res
     // Get FCVM_FUSE_MAX_WRITE from environment, default to 0 (unbounded)
     // The DSB SY patch in nested.c fixes L2 cache coherency issues
     let fuse_max_write = std::env::var("FCVM_FUSE_MAX_WRITE").unwrap_or_else(|_| "0".into());
-    println!("Using FCVM_FUSE_MAX_WRITE={} for nested VMs", fuse_max_write);
+    println!(
+        "Using FCVM_FUSE_MAX_WRITE={} for nested VMs",
+        fuse_max_write
+    );
 
     // Build L(n-1) down to L1: each runs script, imports image, runs fcvm
     for level in (1..n).rev() {

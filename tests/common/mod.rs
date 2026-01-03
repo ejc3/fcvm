@@ -923,10 +923,7 @@ pub async fn ensure_nested_image() -> anyhow::Result<()> {
 /// # Arguments
 /// * `image_name` - Full image name (e.g., "localhost/vsock-integrity")
 /// * `containerfile` - Path to Containerfile (e.g., "Containerfile.vsock-integrity")
-pub async fn ensure_nested_container(
-    image_name: &str,
-    containerfile: &str,
-) -> anyhow::Result<()> {
+pub async fn ensure_nested_container(image_name: &str, containerfile: &str) -> anyhow::Result<()> {
     let fcvm_path = find_fcvm_binary()?;
     let fcvm_dir = fcvm_path.parent().unwrap();
 
@@ -984,7 +981,14 @@ pub async fn ensure_nested_container(
                 .await
                 .ok();
             let save_out = tokio::process::Command::new("podman")
-                .args(["save", "--format", "oci-archive", "-o", &archive_path, image_name])
+                .args([
+                    "save",
+                    "--format",
+                    "oci-archive",
+                    "-o",
+                    &archive_path,
+                    image_name,
+                ])
                 .output()
                 .await?;
             if !save_out.status.success() {
