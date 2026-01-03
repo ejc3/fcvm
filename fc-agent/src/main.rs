@@ -26,6 +26,9 @@ struct Plan {
     /// Extra block devices (mounted automatically)
     #[serde(default)]
     extra_disks: Vec<ExtraDiskMount>,
+    /// NFS shares from host (mounted automatically)
+    #[serde(default)]
+    nfs_mounts: Vec<NfsMount>,
     /// Path to OCI archive for localhost/ images (run directly without import)
     #[serde(default)]
     image_archive: Option<String>,
@@ -52,6 +55,20 @@ struct ExtraDiskMount {
     /// Device path (e.g., /dev/vdb)
     device: String,
     /// Mount path inside guest (e.g., /mnt/extra-disk-0)
+    mount_path: String,
+    /// Read-only flag
+    #[serde(default)]
+    read_only: bool,
+}
+
+/// NFS mount configuration from MMDS
+#[derive(Debug, Clone, Deserialize)]
+struct NfsMount {
+    /// Host IP address (NFS server)
+    host_ip: String,
+    /// Path on host being exported
+    host_path: String,
+    /// Mount path inside guest
     mount_path: String,
     /// Read-only flag
     #[serde(default)]
@@ -1537,6 +1554,65 @@ fn mount_extra_disks(disks: &[ExtraDiskMount]) -> Result<Vec<String>> {
     Ok(mounted_paths)
 }
 
+/// Mount NFS shares from host.
+/// Returns list of mount points that need to be cleaned up on exit.
+fn mount_nfs_shares(shares: &[NfsMount]) -> Result<Vec<String>> {
+    let mut mounted_paths = Vec::new();
+
+    for share in shares {
+        let nfs_source = format!("{}:{}", share.host_ip, share.host_path);
+        eprintln!(
+            "[fc-agent] mounting NFS {} at {} ({})",
+            nfs_source,
+            share.mount_path,
+            if share.read_only { "ro" } else { "rw" }
+        );
+
+        // Create mount point directory
+        if let Err(e) = std::fs::create_dir_all(&share.mount_path) {
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(e)
+                    .with_context(|| format!("creating NFS mount point: {}", share.mount_path));
+            }
+        }
+
+        // Mount the NFS share
+        // Use -o nfsvers=4 for NFS v4, which is more firewall-friendly
+        let mut mount_cmd = std::process::Command::new("mount");
+        mount_cmd.arg("-t").arg("nfs");
+
+        let opts = if share.read_only {
+            "ro,nfsvers=4,nolock"
+        } else {
+            "rw,nfsvers=4,nolock"
+        };
+        mount_cmd.arg("-o").arg(opts);
+        mount_cmd.arg(&nfs_source).arg(&share.mount_path);
+
+        let output = mount_cmd
+            .output()
+            .with_context(|| format!("mounting NFS {} at {}", nfs_source, share.mount_path))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "Failed to mount NFS {} at {}: {}",
+                nfs_source,
+                share.mount_path,
+                stderr
+            );
+        }
+
+        eprintln!(
+            "[fc-agent] ✓ NFS {} mounted at {}",
+            nfs_source, share.mount_path
+        );
+        mounted_paths.push(share.mount_path.clone());
+    }
+
+    Ok(mounted_paths)
+}
+
 /// Sync VM clock from host time provided via MMDS
 /// This avoids the need to wait for slow NTP synchronization
 async fn sync_clock_from_host() -> Result<()> {
@@ -1767,6 +1843,27 @@ async fn main() -> Result<()> {
         Vec::new()
     };
 
+    // Mount NFS shares from host before launching container
+    let _mounted_nfs_paths: Vec<String> = if !plan.nfs_mounts.is_empty() {
+        eprintln!(
+            "[fc-agent] mounting {} NFS share(s)",
+            plan.nfs_mounts.len()
+        );
+        match mount_nfs_shares(&plan.nfs_mounts) {
+            Ok(paths) => {
+                eprintln!("[fc-agent] ✓ NFS shares mounted successfully");
+                paths
+            }
+            Err(e) => {
+                eprintln!("[fc-agent] ERROR: failed to mount NFS shares: {:?}", e);
+                // Continue without NFS - container can still run
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     // If we have a shared volume, start lock test watcher
     // This allows clones to run POSIX lock tests on demand
     if has_shared_volume {
@@ -1932,6 +2029,17 @@ async fn main() -> Result<()> {
             format!("{}:{}:ro", disk.mount_path, disk.mount_path)
         } else {
             format!("{}:{}", disk.mount_path, disk.mount_path)
+        };
+        cmd.arg("-v").arg(mount_spec);
+    }
+
+    // Add NFS mounts as bind mounts to container
+    // NFS shares are already mounted at mount_path, so we bind to same path in container
+    for share in &plan.nfs_mounts {
+        let mount_spec = if share.read_only {
+            format!("{}:{}:ro", share.mount_path, share.mount_path)
+        } else {
+            format!("{}:{}", share.mount_path, share.mount_path)
         };
         cmd.arg("-v").arg(mount_spec);
     }

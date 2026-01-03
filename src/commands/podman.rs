@@ -157,6 +157,92 @@ async fn create_disk_from_dir(
     Ok(())
 }
 
+/// Set up NFS exports for VM.
+/// Creates /etc/exports.d/fcvm-{vm_id}.exports and refreshes exportfs.
+async fn setup_nfs_exports(
+    vm_id: &str,
+    shares: &[crate::state::types::NfsShare],
+    network_config: &crate::network::NetworkConfig,
+) -> Result<()> {
+    use std::io::Write;
+
+    // Ensure NFS server is running
+    let status = tokio::process::Command::new("systemctl")
+        .args(["is-active", "nfs-server"])
+        .output()
+        .await?;
+
+    if !status.status.success() {
+        info!("Starting NFS server...");
+        let start = tokio::process::Command::new("systemctl")
+            .args(["start", "nfs-server"])
+            .status()
+            .await?;
+        if !start.success() {
+            anyhow::bail!("Failed to start NFS server. Run: sudo apt install nfs-kernel-server");
+        }
+    }
+
+    // Create exports directory if needed
+    tokio::fs::create_dir_all("/etc/exports.d").await.ok();
+
+    // Guest IP for access control (use /30 subnet for the VM)
+    let guest_ip = network_config
+        .guest_ip
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No guest IP configured for NFS"))?;
+
+    // Build exports file content
+    let mut exports = String::new();
+    for share in shares {
+        let opts = if share.read_only {
+            "ro,sync,no_subtree_check,no_root_squash"
+        } else {
+            "rw,sync,no_subtree_check,no_root_squash"
+        };
+        exports.push_str(&format!(
+            "{} {}({})\n",
+            share.host_path, guest_ip, opts
+        ));
+    }
+
+    // Write exports file
+    let exports_path = format!("/etc/exports.d/fcvm-{}.exports", vm_id);
+    let mut file = std::fs::File::create(&exports_path)?;
+    file.write_all(exports.as_bytes())?;
+
+    info!("Created NFS exports: {}", exports_path);
+
+    // Refresh exports
+    let refresh = tokio::process::Command::new("exportfs")
+        .arg("-ra")
+        .status()
+        .await?;
+
+    if !refresh.success() {
+        warn!("exportfs -ra failed, NFS mounts may not work");
+    }
+
+    Ok(())
+}
+
+/// Clean up NFS exports for VM
+async fn cleanup_nfs_exports(vm_id: &str) {
+    let exports_path = format!("/etc/exports.d/fcvm-{}.exports", vm_id);
+    if std::path::Path::new(&exports_path).exists() {
+        if let Err(e) = tokio::fs::remove_file(&exports_path).await {
+            warn!("Failed to remove NFS exports file: {}", e);
+        } else {
+            // Refresh exports to unregister
+            let _ = tokio::process::Command::new("exportfs")
+                .arg("-ra")
+                .status()
+                .await;
+            debug!("Cleaned up NFS exports: {}", exports_path);
+        }
+    }
+}
+
 /// Main dispatcher for podman commands
 pub async fn cmd_podman(args: PodmanArgs) -> Result<()> {
     match args.cmd {
@@ -806,6 +892,9 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     // Cancel status listener (podman-specific)
     status_handle.abort();
+
+    // Cleanup NFS exports
+    cleanup_nfs_exports(&vm_id).await;
 
     // Cleanup common resources
     super::common::cleanup_vm(
@@ -1581,6 +1670,69 @@ async fn run_vm_setup(
     }
     vm_state.config.extra_disks = extra_disks;
 
+    // Process --nfs: export directories via NFS for guest to mount
+    let mut nfs_shares = Vec::new();
+    for nfs_spec in args.nfs.iter() {
+        // Check for :ro suffix
+        let (spec_without_ro, read_only) = if nfs_spec.ends_with(":ro") {
+            (&nfs_spec[..nfs_spec.len() - 3], true)
+        } else {
+            (nfs_spec.as_str(), false)
+        };
+
+        // Split HOST_DIR:GUEST_MOUNT
+        let parts: Vec<&str> = spec_without_ro.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            anyhow::bail!(
+                "Invalid NFS spec '{}'. Expected format: HOST_DIR:GUEST_MOUNT[:ro]",
+                nfs_spec
+            );
+        }
+        let host_dir = std::path::Path::new(parts[0]);
+        let mount_path = parts[1].to_string();
+
+        // Validate host directory exists
+        if !host_dir.is_dir() {
+            anyhow::bail!(
+                "NFS source directory does not exist or is not a directory: {}",
+                host_dir.display()
+            );
+        }
+
+        // Validate mount path is absolute
+        if !mount_path.starts_with('/') {
+            anyhow::bail!(
+                "NFS mount path must be absolute: {} (got '{}')",
+                nfs_spec,
+                mount_path
+            );
+        }
+
+        let abs_path = host_dir.canonicalize().context(format!(
+            "Failed to resolve NFS path: {}",
+            host_dir.display()
+        ))?;
+
+        nfs_shares.push(crate::state::types::NfsShare {
+            host_path: abs_path.display().to_string(),
+            mount_path: mount_path.clone(),
+            read_only,
+        });
+
+        info!(
+            "NFS share: {} -> {} ({})",
+            abs_path.display(),
+            mount_path,
+            if read_only { "ro" } else { "rw" }
+        );
+    }
+
+    // Set up NFS exports if we have any shares
+    if !nfs_shares.is_empty() {
+        setup_nfs_exports(&vm_id, &nfs_shares, &network_config).await?;
+    }
+    vm_state.config.nfs_shares = nfs_shares;
+
     // For rootless mode with slirp4netns: post_start starts slirp4netns in the namespace
     // For bridged mode: post_start is a no-op (TAP already created by BridgedNetwork)
     // Use holder_pid for rootless (slirp4netns attaches to holder's namespace)
@@ -1659,6 +1811,22 @@ async fn run_vm_setup(
         })
         .collect();
 
+    // NFS mounts for guest
+    // Format: { host_ip, host_path, mount_path, read_only }
+    let nfs_mounts: Vec<serde_json::Value> = vm_state
+        .config
+        .nfs_shares
+        .iter()
+        .map(|share| {
+            serde_json::json!({
+                "host_ip": network_config.host_ip.as_ref().unwrap_or(&"".to_string()),
+                "host_path": &share.host_path,
+                "mount_path": &share.mount_path,
+                "read_only": share.read_only,
+            })
+        })
+        .collect();
+
     // MMDS data (container plan) - nested under "latest" for V2 compatibility
     // Include host timestamp so guest can set clock immediately (avoiding slow NTP sync)
     // Format without subsecond precision for Alpine `date` compatibility
@@ -1673,6 +1841,7 @@ async fn run_vm_setup(
                 "cmd": cmd_args,
                 "volumes": volume_mounts,
                 "extra_disks": extra_disk_mounts,
+                "nfs_mounts": nfs_mounts,
                 "image_archive": image_archive_name.map(|name| format!("/tmp/fcvm-image/{}", name)),
                 "privileged": args.privileged,
             },

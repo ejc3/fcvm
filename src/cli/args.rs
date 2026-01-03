@@ -132,6 +132,13 @@ pub struct RunArgs {
     #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
     pub disk_dir: Vec<String>,
 
+    /// Share directory via NFS: HOST_DIR:GUEST_MOUNT[:ro]
+    /// Starts NFS server on host, VM mounts via network.
+    /// Requires NFS kernel support (use --kernel-profile nested or --build-kernels).
+    /// Example: --nfs /data:/mnt/data:ro
+    #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
+    pub nfs: Vec<String>,
+
     /// Environment vars KEY=VALUE (repeat or comma-separated)
     #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
     pub env: Vec<String>,
