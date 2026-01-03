@@ -33,11 +33,8 @@ async fn test_vsock_integrity_nested() -> Result<()> {
 
     // 2. Build localhost/vsock-integrity (extends nested-test)
     println!("2. Building localhost/vsock-integrity container...");
-    common::ensure_nested_container(
-        "localhost/vsock-integrity",
-        "Containerfile.vsock-integrity",
-    )
-    .await?;
+    common::ensure_nested_container("localhost/vsock-integrity", "Containerfile.vsock-integrity")
+        .await?;
 
     // 3. Start L1 VM with vsock-integrity container
     // The container's ENTRYPOINT runs the test automatically
