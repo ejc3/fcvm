@@ -171,3 +171,43 @@ async fn test_graceful_shutdown() -> Result<()> {
         }
     }
 }
+
+/// Test trailing args syntax: fcvm podman run ... image cmd args
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_trailing_args_command() -> Result<()> {
+    use std::time::Duration;
+
+    println!("\nTest trailing args command syntax");
+    println!("==================================");
+
+    let (vm_name, _, _, _) = common::unique_names("trailing-args");
+
+    // Use trailing args: alpine:latest echo "test-marker-12345"
+    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        "alpine:latest",
+        "echo",
+        "test-marker-12345",
+    ])
+    .await
+    .context("spawning fcvm with trailing args")?;
+
+    println!("  fcvm PID: {}", fcvm_pid);
+
+    // Wait for exit
+    let status = tokio::time::timeout(Duration::from_secs(60), child.wait())
+        .await
+        .context("timeout waiting for VM")?
+        .context("waiting for child")?;
+
+    println!("  Exit status: {}", status);
+    assert!(status.success(), "VM should exit successfully");
+    println!("✅ TRAILING ARGS TEST PASSED!");
+    Ok(())
+}
