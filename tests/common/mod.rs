@@ -1026,11 +1026,39 @@ use anyhow::Context as _;
 /// let output = tracer.read(100)?;  // last 100 lines
 /// println!("{}", output);
 /// ```
+///
+/// Predefined event sets (by noise level):
+/// - `Ftrace::EVENTS_PSCI` - Low noise, good for shutdown/PSCI debugging
+/// - `Ftrace::EVENTS_ALL_KVM` - Everything (very noisy!)
 pub struct Ftrace {
     tracing_path: std::path::PathBuf,
 }
 
 impl Ftrace {
+    /// Low-noise events for PSCI/shutdown debugging
+    pub const EVENTS_PSCI: &'static [&'static str] = &[
+        "kvm:kvm_userspace_exit",
+        "kvm:kvm_hvc_arm64",
+        "kvm:kvm_vcpu_wakeup",
+        "kvm:kvm_wfx_arm64",
+    ];
+
+    /// Medium-noise events including interrupts
+    pub const EVENTS_INTERRUPTS: &'static [&'static str] = &[
+        "kvm:kvm_userspace_exit",
+        "kvm:kvm_set_irq",
+        "kvm:kvm_irq_line",
+        "kvm:kvm_vcpu_wakeup",
+        "kvm:vgic_update_irq_pending",
+    ];
+
+    /// High-noise events for detailed VM tracing
+    pub const EVENTS_DETAILED: &'static [&'static str] = &[
+        "kvm:kvm_exit",
+        "kvm:kvm_entry",
+        "kvm:kvm_userspace_exit",
+    ];
+
     /// Create new Ftrace instance. Requires root.
     pub fn new() -> anyhow::Result<Self> {
         let tracing_path = std::path::PathBuf::from("/sys/kernel/debug/tracing");
