@@ -2305,13 +2305,16 @@ async fn main() -> Result<()> {
     }
 
     // Now halt
-    eprintln!("[fc-agent] calling halt -f...");
-    let _ = Command::new("halt").args(["-f"]).spawn();
-
-    // Wait for halt to take effect
-    sleep(Duration::from_secs(2)).await;
-    eprintln!("[fc-agent] halt didn't complete after 2s, trying reboot -f");
+    // On ARM64 Firecracker, halt triggers PSCI SYSTEM_OFF which hangs the vCPU.
+    // But reboot triggers PSCI SYSTEM_RESET which Firecracker handles via KVM_EXIT_SHUTDOWN.
+    // So we use reboot -f first (it actually shuts down, not reboots, with reboot=k in cmdline).
+    eprintln!("[fc-agent] calling reboot -f (PSCI SYSTEM_RESET)...");
     let _ = Command::new("reboot").args(["-f"]).spawn();
+
+    // Wait for reboot to take effect
+    sleep(Duration::from_secs(2)).await;
+    eprintln!("[fc-agent] reboot didn't complete after 2s, trying halt -f");
+    let _ = Command::new("halt").args(["-f"]).spawn();
 
     // Wait a bit more
     sleep(Duration::from_secs(2)).await;

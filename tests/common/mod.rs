@@ -932,6 +932,7 @@ pub async fn ensure_nested_container(image_name: &str, containerfile: &str) -> a
         let profile = fcvm::setup::get_kernel_profile("nested")?
             .ok_or_else(|| anyhow::anyhow!("nested kernel profile not found"))?;
         let src_firecracker = fcvm::setup::get_profile_firecracker_path(&profile, "nested")
+            .await
             .ok_or_else(|| anyhow::anyhow!("nested profile has no custom firecracker"))?;
         if !src_firecracker.exists() {
             anyhow::bail!(
