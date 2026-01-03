@@ -187,10 +187,15 @@ impl KernelConfig {
     }
 }
 
+/// Package groups for rootfs. Each field must be added to all_packages().
+/// Using deny_unknown_fields to catch config typos that would silently be ignored.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct PackagesConfig {
     pub runtime: Vec<String>,
     pub fuse: Vec<String>,
+    #[serde(default)]
+    pub nfs: Vec<String>,
     pub system: Vec<String>,
     #[serde(default)]
     pub debug: Vec<String>,
@@ -201,6 +206,7 @@ impl PackagesConfig {
         self.runtime
             .iter()
             .chain(&self.fuse)
+            .chain(&self.nfs)
             .chain(&self.system)
             .chain(&self.debug)
             .map(|s| s.as_str())

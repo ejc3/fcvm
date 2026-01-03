@@ -1,6 +1,6 @@
-//! Extra disk integration tests
+//! Extra disk and NFS integration tests
 //!
-//! Tests the --disk and --disk-dir flags for adding extra block devices to VMs.
+//! Tests the --disk, --disk-dir, and --nfs flags for adding extra storage to VMs.
 
 #![cfg(feature = "privileged-tests")]
 
@@ -9,6 +9,40 @@ mod common;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use tempfile::TempDir;
+
+/// Mount method for directory sharing tests
+#[derive(Debug, Clone, Copy)]
+enum MountMethod {
+    /// --disk-dir: creates a raw disk image from directory contents
+    DiskDir,
+    /// --nfs: shares directory via NFS over network
+    Nfs,
+}
+
+impl MountMethod {
+    fn flag(&self) -> &'static str {
+        match self {
+            MountMethod::DiskDir => "--disk-dir",
+            MountMethod::Nfs => "--nfs",
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            MountMethod::DiskDir => "diskdir",
+            MountMethod::Nfs => "nfs",
+        }
+    }
+
+    /// Extra VM arguments required for this mount method.
+    /// NFS requires the nested kernel profile which has CONFIG_NFS_FS=y.
+    fn extra_args(&self) -> Vec<&'static str> {
+        match self {
+            MountMethod::DiskDir => vec![],
+            MountMethod::Nfs => vec!["--kernel-profile", "nested"],
+        }
+    }
+}
 
 /// Create a small ext4 disk image with a test file
 async fn create_test_disk(path: &PathBuf) -> Result<()> {
@@ -151,14 +185,13 @@ async fn test_extra_disk_ro_clone() -> Result<()> {
     Ok(())
 }
 
-/// Test --disk-dir read-only: creates disk image from directory contents
-#[tokio::test]
-async fn test_disk_dir_ro() -> Result<()> {
-    let (vm_name, _, _, _) = common::unique_names("diskdir-ro");
+/// Shared test logic for read-only directory mounts (--disk-dir or --nfs)
+async fn test_dir_mount_ro(method: MountMethod) -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names(&format!("{}-ro", method.name()));
 
     // Create a temp directory with test files
     let source_dir = TempDir::new()?;
-    tokio::fs::write(source_dir.path().join("hello.txt"), "hello from disk-dir\n").await?;
+    tokio::fs::write(source_dir.path().join("hello.txt"), "hello from dir mount\n").await?;
     tokio::fs::create_dir_all(source_dir.path().join("subdir")).await?;
     tokio::fs::write(
         source_dir.path().join("subdir/nested.txt"),
@@ -166,29 +199,30 @@ async fn test_disk_dir_ro() -> Result<()> {
     )
     .await?;
 
-    // Start VM with --disk-dir (read-only)
-    let disk_dir_spec = format!("{}:/mydata:ro", source_dir.path().display());
-    let (mut child, pid) = common::spawn_fcvm(&[
+    // Start VM with directory mount (read-only)
+    let mount_spec = format!("{}:/mydata:ro", source_dir.path().display());
+    let mut args = vec![
         "podman",
         "run",
         "--name",
         &vm_name,
         "--network",
         "bridged",
-        "--disk-dir",
-        &disk_dir_spec,
-        common::TEST_IMAGE,
-    ])
-    .await
-    .context("spawn")?;
+        method.flag(),
+        &mount_spec,
+    ];
+    args.extend(method.extra_args());
+    args.push(common::TEST_IMAGE);
+    let (mut child, pid) = common::spawn_fcvm(&args).await.context("spawn")?;
 
     common::poll_health_by_pid(pid, 120).await?;
 
     // Read top-level file
     let content = common::exec_in_container(pid, &["cat", "/mydata/hello.txt"]).await?;
     assert!(
-        content.contains("hello from disk-dir"),
-        "read top-level failed: {}",
+        content.contains("hello from dir mount"),
+        "{:?} read top-level failed: {}",
+        method,
         content
     );
 
@@ -196,12 +230,83 @@ async fn test_disk_dir_ro() -> Result<()> {
     let content = common::exec_in_container(pid, &["cat", "/mydata/subdir/nested.txt"]).await?;
     assert!(
         content.contains("nested content"),
-        "read nested failed: {}",
+        "{:?} read nested failed: {}",
+        method,
         content
     );
 
-    // Verify disk image was created in VM's data directory (not /tmp)
-    // and that it will be cleaned up on exit (which we test by just killing the VM)
+    child.kill().await.ok();
+    Ok(())
+}
+
+/// Test --disk-dir read-only: creates disk image from directory contents
+#[tokio::test]
+async fn test_disk_dir_ro() -> Result<()> {
+    test_dir_mount_ro(MountMethod::DiskDir).await
+}
+
+/// Test --nfs read-only: shares directory via NFS
+#[tokio::test]
+async fn test_nfs_ro() -> Result<()> {
+    test_dir_mount_ro(MountMethod::Nfs).await
+}
+
+/// Shared test logic for read-write directory mounts (--disk-dir or --nfs)
+async fn test_dir_mount_rw(method: MountMethod) -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names(&format!("{}-rw", method.name()));
+
+    // Create a temp directory with initial content
+    let source_dir = TempDir::new()?;
+    tokio::fs::write(source_dir.path().join("original.txt"), "original content\n").await?;
+
+    // Start VM with directory mount (read-write, no :ro suffix)
+    let mount_spec = format!("{}:/mydata", source_dir.path().display());
+    let mut args = vec![
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        method.flag(),
+        &mount_spec,
+    ];
+    args.extend(method.extra_args());
+    args.push(common::TEST_IMAGE);
+    let (mut child, pid) = common::spawn_fcvm(&args).await.context("spawn")?;
+
+    common::poll_health_by_pid(pid, 120).await?;
+
+    // Read original file
+    let content = common::exec_in_container(pid, &["cat", "/mydata/original.txt"]).await?;
+    assert!(
+        content.contains("original content"),
+        "{:?} read original failed: {}",
+        method,
+        content
+    );
+
+    // Write new file
+    let content = common::exec_in_container(
+        pid,
+        &["echo 'written in vm' > /mydata/newfile.txt && cat /mydata/newfile.txt"],
+    )
+    .await?;
+    assert!(
+        content.contains("written in vm"),
+        "{:?} write failed: {}",
+        method,
+        content
+    );
+
+    // Verify the write persists within the VM session
+    let content = common::exec_in_container(pid, &["cat", "/mydata/newfile.txt"]).await?;
+    assert!(
+        content.contains("written in vm"),
+        "{:?} re-read failed: {}",
+        method,
+        content
+    );
 
     child.kill().await.ok();
     Ok(())
@@ -210,58 +315,11 @@ async fn test_disk_dir_ro() -> Result<()> {
 /// Test --disk-dir read-write: can write to ephemeral disk
 #[tokio::test]
 async fn test_disk_dir_rw() -> Result<()> {
-    let (vm_name, _, _, _) = common::unique_names("diskdir-rw");
+    test_dir_mount_rw(MountMethod::DiskDir).await
+}
 
-    // Create a temp directory with initial content
-    let source_dir = TempDir::new()?;
-    tokio::fs::write(source_dir.path().join("original.txt"), "original content\n").await?;
-
-    // Start VM with --disk-dir (read-write, no :ro suffix)
-    let disk_dir_spec = format!("{}:/mydata", source_dir.path().display());
-    let (mut child, pid) = common::spawn_fcvm(&[
-        "podman",
-        "run",
-        "--name",
-        &vm_name,
-        "--network",
-        "bridged",
-        "--disk-dir",
-        &disk_dir_spec,
-        common::TEST_IMAGE,
-    ])
-    .await
-    .context("spawn")?;
-
-    common::poll_health_by_pid(pid, 120).await?;
-
-    // Read original file
-    let content = common::exec_in_container(pid, &["cat", "/mydata/original.txt"]).await?;
-    assert!(
-        content.contains("original content"),
-        "read original failed: {}",
-        content
-    );
-
-    // Write new file (ephemeral - only exists in VM's copy)
-    let content = common::exec_in_container(
-        pid,
-        &["echo 'written in vm' > /mydata/newfile.txt && cat /mydata/newfile.txt"],
-    )
-    .await?;
-    assert!(
-        content.contains("written in vm"),
-        "write failed: {}",
-        content
-    );
-
-    // Verify the write persists within the VM session
-    let content = common::exec_in_container(pid, &["cat", "/mydata/newfile.txt"]).await?;
-    assert!(
-        content.contains("written in vm"),
-        "re-read failed: {}",
-        content
-    );
-
-    child.kill().await.ok();
-    Ok(())
+/// Test --nfs read-write: can write to NFS share
+#[tokio::test]
+async fn test_nfs_rw() -> Result<()> {
+    test_dir_mount_rw(MountMethod::Nfs).await
 }
