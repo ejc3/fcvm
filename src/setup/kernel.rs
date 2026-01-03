@@ -558,46 +558,118 @@ async fn build_kernel_locally(
 // Host Kernel Installation (for EC2 setup)
 // ============================================================================
 
-/// Install profile kernel as the host kernel and configure GRUB.
+/// Build and install host kernel with fcvm patches.
+///
+/// This builds a kernel using the host's current config (not the VM/Firecracker config)
+/// and installs it as a deb package. The host kernel applies shared patches but skips
+/// .vm.patch files which are only needed for nested VM kernels.
+///
+/// Uses content-addressed caching: SHA is computed from build-host.sh + patches.
+/// If a kernel with that SHA is already installed, the build is skipped.
 ///
 /// `boot_args` are the kernel boot parameters from the profile config
 /// (e.g., "kvm-arm.mode=nested numa=off"). These are added to GRUB_CMDLINE_LINUX_DEFAULT.
-pub async fn install_host_kernel(profile_kernel: &Path, boot_args: Option<&str>) -> Result<()> {
+pub async fn install_host_kernel(_profile_kernel: &Path, boot_args: Option<&str>) -> Result<()> {
     if !nix::unistd::geteuid().is_root() {
         bail!("Installing host kernel requires root privileges. Run with sudo.");
     }
 
-    let filename = profile_kernel
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("vmlinux");
+    let build_script = Path::new("kernel/build-host.sh");
+    let patches_dir = Path::new("kernel/patches");
 
-    let parts: Vec<&str> = filename
-        .strip_prefix("vmlinux-")
-        .unwrap_or(filename)
-        .strip_suffix(".bin")
-        .unwrap_or(filename)
-        .split('-')
+    if !build_script.exists() {
+        bail!(
+            "Build script '{}' not found.\n\n\
+             Host kernel builds require the fcvm git repository.",
+            build_script.display()
+        );
+    }
+
+    // Compute SHA from build inputs (same algorithm as build-host.sh)
+    // Host kernel only uses *.patch files, not *.vm.patch
+    let sha = compute_host_kernel_sha(build_script, patches_dir)?;
+    let kernel_version = "6.18.3"; // Should match build-host.sh
+    let localversion = format!("-fcvm-{}", sha);
+    let expected_pkg = format!("linux-image-{}{}", kernel_version, localversion);
+
+    info!(sha = %sha, package = %expected_pkg, "computed host kernel SHA");
+
+    // Check if already installed
+    let output = Command::new("dpkg")
+        .args(["-l", &expected_pkg])
+        .output()
+        .await
+        .context("checking installed packages")?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.contains("ii ") {
+            println!("  ✓ Host kernel already installed: {}", expected_pkg);
+            println!();
+
+            // Still update GRUB config in case boot_args changed
+            let kernel_name = format!("{}{}", kernel_version, localversion);
+            update_grub_config(&kernel_name, boot_args).await?;
+
+            println!("  ⚠️  Reboot if not already running this kernel: sudo reboot");
+            return Ok(());
+        }
+    }
+
+    // Build host kernel (creates deb packages)
+    println!("Building host kernel with fcvm patches...");
+    println!("  SHA: {}", sha);
+    println!("  This takes 15-30 minutes...");
+    println!();
+
+    let cmd = Command::new(build_script);
+    let status = run_streaming(cmd, "host_kernel_build")
+        .await
+        .context("running build-host.sh")?;
+
+    if !status.success() {
+        bail!("Host kernel build failed with exit code: {:?}", status.code());
+    }
+
+    // Find the linux-image deb (exclude dbg packages)
+    let build_dir = Path::new("/tmp/kernel-build-host");
+    let pattern = format!("{}/linux-image-*.deb", build_dir.display());
+    let debs: Vec<_> = glob::glob(&pattern)
+        .context("globbing for deb files")?
+        .filter_map(|r| r.ok())
+        .filter(|p| !p.to_string_lossy().contains("-dbg"))
         .collect();
 
-    let (profile_name, kernel_version) = if parts.len() >= 2 {
-        (parts[0], parts[1])
-    } else {
-        ("custom", "unknown")
-    };
+    if debs.is_empty() {
+        bail!("No linux-image deb found in {}", build_dir.display());
+    }
 
-    let kernel_name = format!("vmlinuz-{}-{}", kernel_version, profile_name);
-    let boot_path = Path::new("/boot").join(&kernel_name);
+    let deb_path = &debs[0];
+    println!("  → Installing {}", deb_path.display());
 
-    info!(src = %profile_kernel.display(), dest = %boot_path.display(), "installing kernel to /boot");
-
-    tokio::fs::copy(profile_kernel, &boot_path)
+    // Install deb package
+    let output = Command::new("dpkg")
+        .args(["-i"])
+        .arg(deb_path)
+        .output()
         .await
-        .context("copying kernel to /boot")?;
+        .context("running dpkg -i")?;
 
-    println!("  → Installed kernel to {}", boot_path.display());
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("dpkg -i failed: {}", stderr);
+    }
 
-    update_grub_config(&kernel_name, boot_args).await?;
+    // Extract kernel name from deb filename for GRUB config
+    // e.g., linux-image-6.18.3-fcvm-abc123_6.18.3-1_arm64.deb -> 6.18.3-fcvm-abc123
+    let deb_name = deb_path.file_name().unwrap().to_string_lossy();
+    let kernel_name = deb_name
+        .strip_prefix("linux-image-")
+        .and_then(|s| s.split('_').next())
+        .unwrap_or("unknown");
+
+    // Update GRUB with boot args
+    update_grub_config(kernel_name, boot_args).await?;
 
     println!("  → Running update-grub...");
     let output = Command::new("update-grub")
@@ -610,11 +682,43 @@ pub async fn install_host_kernel(profile_kernel: &Path, boot_args: Option<&str>)
         warn!(stderr = %stderr, "update-grub had warnings");
     }
 
-    println!("  ✓ Host kernel installed");
+    println!("  ✓ Host kernel installed: {}", expected_pkg);
     println!();
     println!("  ⚠️  Reboot required: sudo reboot");
 
     Ok(())
+}
+
+/// Compute SHA for host kernel build (matches build-host.sh algorithm).
+/// Only includes *.patch files, not *.vm.patch (those are VM-only).
+fn compute_host_kernel_sha(build_script: &Path, patches_dir: &Path) -> Result<String> {
+    let mut content = Vec::new();
+
+    // Read build script
+    content.extend(std::fs::read(build_script).context("reading build-host.sh")?);
+
+    // Read patches (*.patch only, skip *.vm.patch)
+    if patches_dir.exists() {
+        let mut patches: Vec<_> = std::fs::read_dir(patches_dir)
+            .context("reading patches directory")?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().map(|e| e == "patch").unwrap_or(false)
+                    && !p.to_string_lossy().ends_with(".vm.patch")
+            })
+            .collect();
+
+        patches.sort(); // Consistent ordering
+
+        for patch in patches {
+            content.extend(std::fs::read(&patch).with_context(|| {
+                format!("reading patch {}", patch.display())
+            })?);
+        }
+    }
+
+    Ok(compute_sha256_short(&content))
 }
 
 // ============================================================================
