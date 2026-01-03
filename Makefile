@@ -115,6 +115,7 @@ help:
 	@echo "  setup-btrfs        Create btrfs loopback at /mnt/fcvm-btrfs"
 	@echo "  setup-fcvm         Download kernel and create rootfs"
 	@echo "  setup-pjdfstest    Build pjdfstest"
+	@echo "  install-host-kernel  Build and install host kernel with patches (requires reboot)"
 	@echo ""
 	@echo "Other:"
 	@echo "  bench              Run fuse-pipe benchmarks"
@@ -268,6 +269,11 @@ setup-fcvm: build setup-btrfs
 	fi
 	@echo "==> Running fcvm setup..."
 	./target/release/fcvm setup
+
+# Build and install host kernel with all patches from kernel/patches/
+# Requires reboot to activate the new kernel
+install-host-kernel: build setup-btrfs
+	sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels --install-host-kernel
 
 # Run setup inside container (for CI - container has Firecracker)
 container-setup-fcvm: container-build setup-btrfs

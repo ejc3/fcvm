@@ -315,7 +315,7 @@ fcvm supports running VMs inside VMs using ARM64 FEAT_NV2 nested virtualization.
 |-------------|---------|
 | **Hardware** | ARM64 with FEAT_NV2 (Graviton3+: c7g.metal, c7gn.metal, r7g.metal) |
 | **Host kernel** | 6.18+ with `kvm-arm.mode=nested` boot parameter |
-| **Nested kernel** | Pre-built from releases or build with `kernel/build.sh` |
+| **Nested kernel** | Pre-built from releases or `fcvm setup --kernel-profile nested --build-kernels` |
 | **Firecracker** | Fork with NV2 support (configured via kernel profile) |
 
 ### Setting Up an EC2 Instance for Nested Virtualization
@@ -406,7 +406,6 @@ fcvm setup --kernel-profile nested
 Or build locally (takes 10-20 minutes):
 ```bash
 fcvm setup --kernel-profile nested --build-kernels
-# Or manually: ./kernel/build.sh
 ```
 
 The nested kernel (6.18) includes:
