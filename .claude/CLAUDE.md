@@ -1059,6 +1059,21 @@ When a FUSE operation fails unexpectedly, trace the full path from kernel to fus
 
 This pattern found the ftruncate bug: kernel sends `FATTR_FH` with file handle, but fuse-pipe's `VolumeRequest::Setattr` didn't have an `fh` field.
 
+### Kernel Tracing (Ftrace)
+
+Use `common::Ftrace` for KVM debugging:
+
+```rust
+let tracer = common::Ftrace::new()?;
+tracer.enable_events(common::Ftrace::EVENTS_PSCI)?;
+tracer.start()?;
+// ... run VM ...
+tracer.stop()?;
+println!("{}", tracer.read_grep("kvm_exit", 50)?);
+```
+
+**Event sets:** `EVENTS_PSCI` (low noise), `EVENTS_INTERRUPTS`, `EVENTS_DETAILED` (noisy)
+
 ### POSIX Compliance (pjdfstest)
 
 All 8789 pjdfstest tests pass via two parallel test matrices:
