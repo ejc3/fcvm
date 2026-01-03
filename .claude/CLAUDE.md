@@ -433,6 +433,12 @@ make setup-fcvm   # Download kernel and create rootfs
 # Run a VM (requires setup first, or use --setup flag)
 sudo fcvm podman run --name my-vm --network bridged nginx:alpine
 
+# With custom command (docker-style trailing args)
+sudo fcvm podman run --name my-vm --network bridged alpine:latest echo "hello"
+
+# Or using --cmd flag
+sudo fcvm podman run --name my-vm --network bridged --cmd "echo hello" alpine:latest
+
 # Or run with auto-setup (first run takes 5-10 minutes)
 sudo fcvm podman run --name my-vm --network bridged --setup nginx:alpine
 
