@@ -44,10 +44,10 @@ index xxxx..yyyy 100644
 +	 * writes packet data and the VMM reads it via mmap. Without this
 +	 * barrier, the VMM may see stale or zero data.
 +	 *
-+	 * DSB ISH ensures completion of all data accesses in the inner
-+	 * shareable domain before proceeding.
++	 * DSB SY ensures completion of all data accesses across all observers
++	 * in the system (full system barrier, stronger than ISH).
 +	 */
-+	dsb(ish);
++	dsb(sy);
 +
  	/*
  	 * We previously decided that an SError was deliverable to the guest.

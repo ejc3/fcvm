@@ -26,14 +26,14 @@ compute_sha() {
 
 # Set KERNEL_PATH if not provided
 if [[ -z "${KERNEL_PATH:-}" ]]; then
-    KERNEL_VERSION="${KERNEL_VERSION:-6.18}"
+    KERNEL_VERSION="${KERNEL_VERSION:-6.18.3}"
     BUILD_SHA=$(compute_sha)
     KERNEL_PATH="/mnt/fcvm-btrfs/kernels/vmlinux-${KERNEL_VERSION}-${BUILD_SHA}.bin"
     echo "Computed KERNEL_PATH: $KERNEL_PATH"
 fi
 
 # Configuration (may already be set above)
-KERNEL_VERSION="${KERNEL_VERSION:-6.18}"
+KERNEL_VERSION="${KERNEL_VERSION:-6.18.3}"
 KERNEL_MAJOR="${KERNEL_VERSION%%.*}"
 BUILD_DIR="${BUILD_DIR:-/tmp/kernel-build}"
 NPROC="${NPROC:-$(nproc)}"
@@ -245,6 +245,33 @@ if [[ -f "$MMFR4_PATCH" ]]; then
         echo "  MMFR4 override patch applied successfully"
     fi
 fi
+
+# Apply any additional patches (excluding specially-handled ones)
+echo "Checking for additional patches..."
+for patch_file in "$PATCHES_DIR"/*.patch; do
+    [[ ! -f "$patch_file" ]] && continue
+    patch_name=$(basename "$patch_file")
+
+    # Skip patches handled above
+    case "$patch_name" in
+        0001-fuse-add-remap_file_range-support.patch) continue ;;
+        mmfr4-override.patch) continue ;;
+    esac
+
+    echo "  Applying $patch_name..."
+    if patch -p1 --forward --dry-run < "$patch_file" >/dev/null 2>&1; then
+        patch -p1 --forward < "$patch_file"
+        echo "    Applied successfully"
+    else
+        # Check if already applied
+        if patch -p1 --reverse --dry-run < "$patch_file" >/dev/null 2>&1; then
+            echo "    Already applied (skipping)"
+        else
+            echo "    WARNING: Patch does not apply cleanly"
+            patch -p1 --forward --dry-run < "$patch_file" || true
+        fi
+    fi
+done
 
 # Download Firecracker base config
 FC_CONFIG_URL="https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-${ARCH}-6.1.config"

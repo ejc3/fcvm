@@ -1105,6 +1105,11 @@ async fn run_nested_n_levels(n: usize, marker: &str, mode: BenchmarkMode) -> Res
     };
     println!("L{}: {} + echo marker", n, mode_desc);
 
+    // Get FCVM_FUSE_MAX_WRITE from environment, default to 0 (unbounded)
+    // The DSB SY patch in nested.c fixes L2 cache coherency issues
+    let fuse_max_write = std::env::var("FCVM_FUSE_MAX_WRITE").unwrap_or_else(|_| "0".into());
+    println!("Using FCVM_FUSE_MAX_WRITE={} for nested VMs", fuse_max_write);
+
     // Build L(n-1) down to L1: each runs script, imports image, runs fcvm
     for level in (1..n).rev() {
         let next_script = format!("{}/l{}.sh", scripts_dir, level + 1);
@@ -1124,7 +1129,7 @@ podman load -i /mnt/fcvm-btrfs/image-cache/{digest}.oci.tar
 podman tag sha256:{digest} localhost/nested-test 2>/dev/null || true
 
 echo "L{level}: Starting L{next_level} VM..."
-FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE=32768 fcvm podman run \
+FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
     --name l{next_level} \
     --network bridged \
     --privileged \
@@ -1142,7 +1147,8 @@ FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE=32768 fcvm podman run \
                 digest = digest_stripped,
                 mem_arg = mem_arg,
                 kernel = nested_kernel_path,
-                next_script = next_script
+                next_script = next_script,
+                fuse_max_write = fuse_max_write
             )
         } else {
             format!(
@@ -1157,7 +1163,7 @@ podman load -i /mnt/fcvm-btrfs/image-cache/{digest}.oci.tar
 podman tag sha256:{digest} localhost/nested-test 2>/dev/null || true
 
 echo "L{level}: Starting L{next_level} VM..."
-FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE=32768 fcvm podman run \
+FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
     --name l{next_level} \
     --network bridged \
     --privileged \
@@ -1174,7 +1180,8 @@ FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE=32768 fcvm podman run \
                 digest = digest_stripped,
                 mem_arg = mem_arg,
                 kernel = nested_kernel_path,
-                next_script = next_script
+                next_script = next_script,
+                fuse_max_write = fuse_max_write
             )
         };
         let script_path = format!("{}/l{}.sh", scripts_dir, level);
