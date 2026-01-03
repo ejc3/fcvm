@@ -1,11 +1,12 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+use crate::utils::{spawn_streaming, strip_firecracker_prefix};
 
 use super::FirecrackerClient;
 
@@ -375,79 +376,24 @@ impl VmManager {
             }
         }
 
-        // Spawn process
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        let mut child = cmd.spawn().context("spawning Firecracker process")?;
-
-        // Helper function to strip Firecracker timestamp and instance prefix
-        // Firecracker format: "2025-11-15T17:18:55.027478889 [anonymous-instance:main] message"
-        // We want to keep only: "message"
-        fn strip_firecracker_prefix(line: &str) -> &str {
-            let mut result = line;
-
-            // First, strip the timestamp if present
-            if let Some(pos) = result.find(' ') {
-                // Check if this looks like a timestamp (starts with year)
-                if result.starts_with("20") && result.chars().nth(4) == Some('-') {
-                    result = &result[pos + 1..]; // Skip past timestamp
+        // Spawn process with streaming output
+        let child = spawn_streaming(cmd, |line, is_stderr| {
+            let clean = strip_firecracker_prefix(line);
+            // fc-agent and container output at INFO/WARN, everything else at DEBUG
+            let is_important = clean.contains("fc-agent") || clean.contains("[ctr:");
+            if is_stderr {
+                if is_important {
+                    warn!(target: "firecracker", "{}", clean);
+                } else {
+                    debug!(target: "firecracker", "{}", clean);
                 }
+            } else if is_important {
+                info!(target: "firecracker", "{}", clean);
+            } else {
+                debug!(target: "firecracker", "{}", clean);
             }
-
-            // Now strip the [anonymous-instance:xxx] prefix if present
-            if result.starts_with('[') {
-                if let Some(end_pos) = result.find("] ") {
-                    result = &result[end_pos + 2..]; // Skip past the bracketed prefix
-                }
-            }
-
-            result
-        }
-
-        // Stream stdout/stderr to tracing
-        // Only fc-agent and container output shown at INFO level; kernel/systemd at DEBUG
-        if let Some(stdout) = child.stdout.take() {
-            let vm_id = self.vm_id.clone();
-            let vm_name = self.vm_name.clone();
-            tokio::spawn(async move {
-                let reader = BufReader::new(stdout);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let clean_line = strip_firecracker_prefix(&line);
-                    // vm_name and vm_id are already in the hierarchical target, so don't duplicate
-                    let _ = (&vm_name, &vm_id); // suppress unused warning
-
-                    // Show fc-agent and container output at INFO, everything else at DEBUG
-                    if clean_line.contains("fc-agent") || clean_line.contains("[ctr:") {
-                        info!(target: "firecracker", "{}", clean_line);
-                    } else {
-                        debug!(target: "firecracker", "{}", clean_line);
-                    }
-                }
-            });
-        }
-
-        if let Some(stderr) = child.stderr.take() {
-            let vm_id = self.vm_id.clone();
-            let vm_name = self.vm_name.clone();
-            tokio::spawn(async move {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let clean_line = strip_firecracker_prefix(&line);
-                    // vm_name and vm_id are already in the hierarchical target, so don't duplicate
-                    let _ = (&vm_name, &vm_id); // suppress unused warning
-
-                    // Show fc-agent and container output at WARN, everything else at DEBUG
-                    if clean_line.contains("fc-agent") || clean_line.contains("[ctr:") {
-                        warn!(target: "firecracker", "{}", clean_line);
-                    } else {
-                        debug!(target: "firecracker", "{}", clean_line);
-                    }
-                }
-            });
-        }
+        })
+        .context("spawning Firecracker process")?;
 
         self.process = Some(child);
 

@@ -1,5 +1,13 @@
 SHELL := /bin/bash
 
+# Brief notes (see .claude/CLAUDE.md for details):
+#   FILTER=x STREAM=1 - filter tests, stream output
+#   Assets are content-addressed (kernel by URL SHA, rootfs by script SHA, initrd by binary SHA)
+#   Logs: /tmp/fcvm-test-logs/
+.PHONY: show-notes
+show-notes:
+	@echo "━━━ fcvm ━━━  FILTER=$(FILTER) STREAM=$(STREAM)  Assets=SHA-cached  (see .claude/CLAUDE.md)"
+
 # Paths (can be overridden via environment)
 FUSE_BACKEND_RS ?= /home/ubuntu/fuse-backend-rs
 FUSER ?= /home/ubuntu/fuser
@@ -190,10 +198,10 @@ _test-root:
 	$(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_IGNORED) --retries 2 --features privileged-tests $(FILTER)
 
 # Host targets (with setup, check-disk first to fail fast if disk is full)
-test-unit: check-disk build _test-unit
-test-fast: check-disk setup-fcvm _test-fast
-test-all: check-disk setup-fcvm _test-all
-test-root: check-disk setup-fcvm setup-pjdfstest _test-root
+test-unit: show-notes check-disk build _test-unit
+test-fast: show-notes check-disk setup-fcvm _test-fast
+test-all: show-notes check-disk setup-fcvm _test-all
+test-root: show-notes check-disk setup-fcvm setup-pjdfstest _test-root
 test: test-root
 
 # Container targets (setup on host where needed, run-only in container)

@@ -8,6 +8,7 @@ use tracing::{debug, info, warn};
 
 use crate::paths;
 use crate::setup::rootfs::{get_kernel_profile, load_plan, KernelProfile};
+use crate::utils::run_streaming;
 
 /// Compute SHA256 of bytes, return hex string (first 12 chars)
 fn compute_sha256_short(data: &[u8]) -> String {
@@ -538,11 +539,12 @@ async fn build_kernel_locally(
         cmd.env("PATCHES_DIR", patches);
     }
 
-    let output = cmd.output().await.context("running build script")?;
+    let status = run_streaming(cmd, "kernel_build")
+        .await
+        .context("running build script")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("Kernel build failed: {}", stderr);
+    if !status.success() {
+        bail!("Kernel build failed with exit code: {:?}", status.code());
     }
 
     if !dest.exists() {
@@ -619,28 +621,61 @@ pub async fn install_host_kernel(profile_kernel: &Path, boot_args: Option<&str>)
 // Profile Firecracker Setup
 // ============================================================================
 
-/// Compute SHA for profile firecracker binary (repo + branch)
-fn compute_profile_firecracker_sha(profile: &KernelProfile) -> String {
+/// Fetch the latest commit hash for a repo/branch via git ls-remote.
+async fn fetch_remote_commit_hash(repo: &str, branch: &str) -> Result<String> {
+    let url = format!("https://github.com/{}", repo);
+    let output = tokio::process::Command::new("git")
+        .args(["ls-remote", &url, branch])
+        .output()
+        .await
+        .context("running git ls-remote")?;
+
+    if !output.status.success() {
+        bail!(
+            "git ls-remote failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let commit = stdout
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no commit hash in ls-remote output"))?;
+
+    Ok(commit[..12].to_string()) // First 12 chars of commit hash
+}
+
+/// Compute SHA for profile firecracker binary (repo + branch + commit)
+fn compute_profile_firecracker_sha_with_commit(
+    profile: &KernelProfile,
+    commit_hash: &str,
+) -> String {
     let repo = profile.firecracker_repo.as_deref().unwrap_or("");
     let branch = profile.firecracker_branch.as_deref().unwrap_or("main");
 
     let mut hasher = Sha256::new();
     hasher.update(repo.as_bytes());
     hasher.update(branch.as_bytes());
+    hasher.update(commit_hash.as_bytes());
     let result = hasher.finalize();
     hex::encode(&result[..6]) // 12 hex chars
 }
 
 /// Get the content-addressed path for profile firecracker binary.
 /// Uses assets_dir/firecracker/ alongside kernels and other assets.
-pub fn get_profile_firecracker_path(
+/// Fetches latest commit hash to ensure we detect updates.
+pub async fn get_profile_firecracker_path(
     profile: &KernelProfile,
     profile_name: &str,
 ) -> Option<PathBuf> {
     // Only return path if profile has a custom firecracker configured
-    profile.firecracker_repo.as_ref()?;
+    let repo = profile.firecracker_repo.as_ref()?;
+    let branch = profile.firecracker_branch.as_deref().unwrap_or("main");
 
-    let sha = compute_profile_firecracker_sha(profile);
+    // Fetch latest commit hash to detect updates
+    let commit_hash = fetch_remote_commit_hash(repo, branch).await.ok()?;
+    let sha = compute_profile_firecracker_sha_with_commit(profile, &commit_hash);
     let filename = format!("firecracker-{}-{}.bin", profile_name, sha);
 
     Some(paths::assets_dir().join("firecracker").join(filename))
@@ -649,7 +684,8 @@ pub fn get_profile_firecracker_path(
 /// Ensure the firecracker binary for a kernel profile exists.
 ///
 /// Uses content-addressed naming: firecracker-{profile}-{sha}.bin
-/// where SHA is computed from firecracker_repo + firecracker_branch.
+/// where SHA is computed from firecracker_repo + firecracker_branch + commit_hash.
+/// Automatically detects and rebuilds when new commits are pushed.
 pub async fn ensure_profile_firecracker(
     profile: &KernelProfile,
     profile_name: &str,
@@ -661,7 +697,10 @@ pub async fn ensure_profile_firecracker(
     };
 
     let branch = profile.firecracker_branch.as_deref().unwrap_or("main");
-    let sha = compute_profile_firecracker_sha(profile);
+
+    // Fetch latest commit hash to detect updates
+    let commit_hash = fetch_remote_commit_hash(repo, branch).await?;
+    let sha = compute_profile_firecracker_sha_with_commit(profile, &commit_hash);
 
     // Content-addressed path in assets dir (alongside kernels)
     let firecracker_dir = paths::assets_dir().join("firecracker");
