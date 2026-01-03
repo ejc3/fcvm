@@ -125,6 +125,13 @@ pub struct RunArgs {
     #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
     pub disk: Vec<String>,
 
+    /// Create disk image from directory: HOST_DIR:GUEST_MOUNT[:ro]
+    /// Creates an ext4 image from HOST_DIR contents and mounts at GUEST_MOUNT.
+    /// Image is stored in VM's data directory and cleaned up on exit.
+    /// Example: --disk-dir ./mydata:/data:ro
+    #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
+    pub disk_dir: Vec<String>,
+
     /// Environment vars KEY=VALUE (repeat or comma-separated)
     #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
     pub env: Vec<String>,
