@@ -82,6 +82,16 @@ jobs:
           echo "Architecture: $ARCH"
           echo "Build SHA: $SHA"
 
+      - name: Install GitHub CLI
+        run: |
+          if ! command -v gh &> /dev/null; then
+            echo "Installing GitHub CLI..."
+            sudo apt-get update
+            sudo apt-get install -y gh
+          else
+            echo "GitHub CLI already installed: $(gh --version)"
+          fi
+
       - name: Check if release already exists
         id: check
         env:
