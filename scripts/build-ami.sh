@@ -60,6 +60,17 @@ trap 'tag_failed $LINENO' ERR
 
 aws ec2 create-tags --resources $INSTANCE_ID --tags Key=BuildStatus,Value=building --region us-west-1
 
+# Setup NVMe instance storage for fast builds
+NVME_DEV=$(lsblk -d -o NAME,SIZE | grep -E 'nvme.*1\.8T' | head -1 | awk '{print $1}')
+if [ -n "$NVME_DEV" ]; then
+  echo "Setting up NVMe: /dev/$NVME_DEV"
+  mkfs.ext4 -F /dev/$NVME_DEV
+  mount /dev/$NVME_DEV /tmp
+  chmod 1777 /tmp
+else
+  echo "WARNING: No NVMe found, using EBS for builds"
+fi
+
 # Install deps (xz-utils needed for kernel kheaders tarball)
 apt-get install -y build-essential bc bison flex libssl-dev \
   libelf-dev libncurses-dev libdw-dev debhelper-compat rsync kmod cpio curl jq wget git \
@@ -255,13 +266,13 @@ main() {
   instance_id=$(aws ec2 run-instances \
     --region "$REGION" \
     --image-id "$base_ami" \
-    --instance-type c7g.8xlarge \
+    --instance-type c7gd.8xlarge \
     --instance-market-options '{"MarketType":"spot"}' \
     --subnet-id subnet-05c215519b2150ecd \
     --security-group-ids sg-0ebf2d8c6a0acc1a3 \
     --iam-instance-profile Name=jumpbox-admin-profile \
     --associate-public-ip-address \
-    --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":100,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
+    --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":40,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
     --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=ami-builder-temp},{Key=BuildStatus,Value=starting}]' \
     --user-data "file://$user_data_file" \
     --query 'Instances[0].InstanceId' \
@@ -273,12 +284,12 @@ main() {
     instance_id=$(aws ec2 run-instances \
       --region "$REGION" \
       --image-id "$base_ami" \
-      --instance-type c7g.8xlarge \
+      --instance-type c7gd.8xlarge \
       --subnet-id subnet-05c215519b2150ecd \
       --security-group-ids sg-0ebf2d8c6a0acc1a3 \
       --iam-instance-profile Name=jumpbox-admin-profile \
       --associate-public-ip-address \
-      --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":100,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
+      --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":40,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
       --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=ami-builder-temp},{Key=BuildStatus,Value=starting}]' \
       --user-data "file://$user_data_file" \
       --query 'Instances[0].InstanceId' \
