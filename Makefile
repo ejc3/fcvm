@@ -311,7 +311,10 @@ _bench:
 	cargo bench -p fuse-pipe --bench protocol
 
 lint:
-	cargo test --test lint
+	cargo fmt -p fcvm -p fuse-pipe -p fc-agent --check
+	cargo clippy --all-targets -- -D warnings
+	cargo audit
+	cargo deny check
 
 fmt:
 	cargo fmt
