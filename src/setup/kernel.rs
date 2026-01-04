@@ -932,7 +932,7 @@ echo "LOCALVERSION=$LOCALVERSION"
 echo "This takes 15-30 minutes..."
 echo ""
 
-make -j"$NPROC" ARCH=arm64 LOCALVERSION="$LOCALVERSION" bindeb-pkg
+make -j4 ARCH=arm64 LOCALVERSION="$LOCALVERSION" bindeb-pkg
 
 echo ""
 echo "=== Build Complete ==="
