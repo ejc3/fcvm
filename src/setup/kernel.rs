@@ -924,6 +924,8 @@ make ARCH=arm64 olddefconfig
 
 # Disable IKHEADERS - causes parallel build failures and not needed
 scripts/config --disable CONFIG_IKHEADERS
+scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS ""
+scripts/config --set-str CONFIG_SYSTEM_REVOCATION_KEYS ""
 
 # Build deb packages
 echo ""
@@ -932,7 +934,7 @@ echo "LOCALVERSION=$LOCALVERSION"
 echo "This takes 15-30 minutes..."
 echo ""
 
-make -j4 ARCH=arm64 LOCALVERSION="$LOCALVERSION" bindeb-pkg
+make -j"$NPROC" ARCH=arm64 LOCALVERSION="$LOCALVERSION" bindeb-pkg
 
 echo ""
 echo "=== Build Complete ==="
