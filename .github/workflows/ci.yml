@@ -485,3 +485,23 @@ jobs:
           path: /tmp/fcvm-test-logs/
           if-no-files-found: ignore
           retention-days: 14
+
+  # Final summary job - runs after all test jobs
+  summary:
+    name: Summary
+    needs: [lint, packaging, host, host-root, container]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/ci-artifacts
+      - name: Generate full log
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run view ${{ github.run_id }} --log > /tmp/ci-artifacts/full.log 2>/dev/null || true
+      - name: Analyze CI run
+        run: python3 scripts/analyze_ci_vms.py /tmp/ci-artifacts
