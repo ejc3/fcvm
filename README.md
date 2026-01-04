@@ -70,6 +70,33 @@ sudo apt-get update && sudo apt-get install -y \
     uidmap
 ```
 
+**Complete prerequisites**: See [`Containerfile`](Containerfile) for the full list of dependencies used in CI. This includes additional packages for kernel builds, container runtime, and testing. Running fcvm inside a VM (nested virtualization) is experimental.
+
+**Host system configuration**:
+```bash
+# KVM access
+sudo chmod 666 /dev/kvm
+
+# Userfaultfd for snapshot cloning
+sudo mknod /dev/userfaultfd c 10 126 2>/dev/null || true
+sudo chmod 666 /dev/userfaultfd
+sudo sysctl -w vm.unprivileged_userfaultfd=1
+
+# FUSE allow_other
+echo "user_allow_other" | sudo tee -a /etc/fuse.conf
+
+# Ubuntu 24.04+: allow unprivileged user namespaces
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+# Bridged networking only (not needed for --network rootless):
+sudo mkdir -p /var/run/netns
+sudo iptables -P FORWARD ACCEPT
+# NAT rule is set up automatically by fcvm
+
+# If running fcvm inside a container, set NAT on the HOST (container iptables don't persist):
+# sudo iptables -t nat -A POSTROUTING -s 172.30.0.0/16 -o eth0 -j MASQUERADE
+```
+
 ---
 
 ## Quick Start
