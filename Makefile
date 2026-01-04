@@ -225,12 +225,14 @@ container-test-all: check-disk container-setup-fcvm
 container-test: container-test-all
 
 CONTAINER_CACHE_REPO ?= ghcr.io/ejc3/fcvm-cache
+# Only push cache if authenticated to ghcr.io (CI has login, local dev doesn't)
+CACHE_TO_FLAG := $(shell podman login --get-login ghcr.io >/dev/null 2>&1 && echo "--cache-to $(CONTAINER_CACHE_REPO)" || echo "")
 
 container-build:
 	@sudo mkdir -p /mnt/fcvm-btrfs 2>/dev/null || true
 	@mkdir -p /tmp/fcvm-container-target
 	podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) \
-		--layers --cache-from $(CONTAINER_CACHE_REPO) --cache-to $(CONTAINER_CACHE_REPO) .
+		--layers --cache-from $(CONTAINER_CACHE_REPO) $(CACHE_TO_FLAG) .
 
 container-shell: container-build
 	$(CONTAINER_RUN) -it $(CONTAINER_TAG) bash
