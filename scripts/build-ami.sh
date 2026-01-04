@@ -84,8 +84,9 @@ git clone --depth 1 https://github.com/ejc3/firepod.git /tmp/firepod
 cd /tmp/firepod
 cargo build --release
 
-# Generate default config (needed for kernel profile lookup)
-./target/release/fcvm setup --generate-config --force
+# Use repo's config which has nested profile defined
+mkdir -p /root/.config/fcvm
+cp rootfs-config.toml /root/.config/fcvm/
 
 # Build and install kernel using fcvm setup
 aws ec2 create-tags --resources $INSTANCE_ID --tags Key=KernelVersion,Value=nested --region us-west-1
