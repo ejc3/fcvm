@@ -164,8 +164,7 @@ kernel_config = "kernel/nested.conf"
 patches_dir = "kernel/patches"
 
 # Base config for VM kernel (Firecracker's microvm config)
-# {arch} is replaced with aarch64 or x86_64 at build time
-base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-{arch}-6.1.config"
+base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-aarch64-6.1.config"
 
 # Firecracker NV2 fork with --enable-nv2 support
 # Binary is content-addressed: assets_dir/firecracker/firecracker-nested-{sha}.bin
@@ -190,3 +189,25 @@ patches_dir = "kernel/patches"
 build_inputs = [
     "kernel/patches/*.patch",
 ]
+
+# x86_64 nested profile (Intel VT-x / AMD-V)
+# Builds custom kernel with CONFIG_KVM_INTEL and CONFIG_KVM_AMD for nested virtualization.
+# x86 nested virtualization is more mature and doesn't require special patches like ARM NV2.
+[kernel_profiles.nested.amd64]
+description = "Nested virtualization support for running VMs inside VMs (x86_64)"
+kernel_version = "6.18.3"
+kernel_repo = "ejc3/firepod"
+
+# Build configuration - these files determine when kernel needs rebuilding
+build_inputs = [
+    "kernel/nested-x86.conf",
+]
+
+# Build paths (relative to repo root)
+kernel_config = "kernel/nested-x86.conf"
+
+# Base config for VM kernel (Firecracker's microvm config)
+base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
+
+# No special firecracker fork needed for x86 (standard firecracker supports Intel VT-x/AMD-V)
+# No special boot_args needed for x86
