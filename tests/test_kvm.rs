@@ -1362,12 +1362,19 @@ async fn run_nested_n_levels(
         tokio::fs::write(&net_path, network_script(&host_ip, iperf_port)).await?;
     }
 
-    for path in [&bench_path, &basic_path, &large_path, &net_path] {
+    // Chmod only files that were actually created
+    for path in [&bench_path, &basic_path, &large_path] {
         tokio::process::Command::new("chmod")
             .args(["+x", path])
             .status()
-            .await
-            .ok(); // Ignore errors for net.sh if not created
+            .await?;
+    }
+    // net.sh only exists for WithNetwork mode
+    if mode == BenchmarkMode::WithNetwork {
+        tokio::process::Command::new("chmod")
+            .args(["+x", &net_path])
+            .status()
+            .await?;
     }
 
     // Determine which script to run at each level based on mode
@@ -1442,6 +1449,8 @@ async fn run_nested_n_levels(
     for level in (1..n).rev() {
         let next_script = format!("{}/l{}.sh", scripts_dir, level + 1);
         let mem_arg = format!("--mem {}", intermediate_mem);
+        // Use single vCPU for nested VMs to avoid NETDEV WATCHDOG timeout under NV2
+        let cpu_arg = "--cpu 1";
 
         let script = match mode {
             BenchmarkMode::WithLargeFiles => format!(
@@ -1457,11 +1466,14 @@ podman load -i {image_cache}/{digest}.oci.tar
 podman tag sha256:{digest} localhost/nested-test 2>/dev/null || true
 
 echo "L{level}: Starting L{next_level} VM..."
-FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
+# Use local data_dir for nested VMs (FUSE doesn't support Unix sockets)
+mkdir -p /root/fcvm-data/state /root/fcvm-data/vm-disks
+FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
     --name l{next_level} \
     --network bridged \
     --privileged \
     {mem_arg} \
+    {cpu_arg} \
     --kernel-profile nested \
     --kernel {kernel} \
     --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
@@ -1475,6 +1487,7 @@ FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
                 digest = digest_stripped,
                 image_cache = image_cache_guest_path,
                 mem_arg = mem_arg,
+                cpu_arg = cpu_arg,
                 kernel = nested_kernel_path,
                 next_script = next_script,
                 fuse_max_write = fuse_max_write
@@ -1492,11 +1505,14 @@ podman load -i {image_cache}/{digest}.oci.tar
 podman tag sha256:{digest} localhost/nested-test 2>/dev/null || true
 
 echo "L{level}: Starting L{next_level} VM..."
-FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
+# Use local data_dir for nested VMs (FUSE doesn't support Unix sockets)
+mkdir -p /root/fcvm-data/state /root/fcvm-data/vm-disks
+FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
     --name l{next_level} \
     --network bridged \
     --privileged \
     {mem_arg} \
+    {cpu_arg} \
     --kernel-profile nested \
     --kernel {kernel} \
     --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
@@ -1510,6 +1526,7 @@ FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
                 digest = digest_stripped,
                 image_cache = image_cache_guest_path,
                 mem_arg = mem_arg,
+                cpu_arg = cpu_arg,
                 kernel = nested_kernel_path,
                 next_script = next_script,
                 fuse_max_write = fuse_max_write
@@ -1526,11 +1543,14 @@ podman load -i {image_cache}/{digest}.oci.tar
 podman tag sha256:{digest} localhost/nested-test 2>/dev/null || true
 
 echo "L{level}: Starting L{next_level} VM..."
-FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
+# Use local data_dir for nested VMs (FUSE doesn't support Unix sockets)
+mkdir -p /root/fcvm-data/state /root/fcvm-data/vm-disks
+FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
     --name l{next_level} \
     --network bridged \
     --privileged \
     {mem_arg} \
+    {cpu_arg} \
     --kernel-profile nested \
     --kernel {kernel} \
     --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
@@ -1543,6 +1563,7 @@ FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
                 digest = digest_stripped,
                 image_cache = image_cache_guest_path,
                 mem_arg = mem_arg,
+                cpu_arg = cpu_arg,
                 kernel = nested_kernel_path,
                 next_script = next_script,
                 fuse_max_write = fuse_max_write
