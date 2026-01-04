@@ -55,9 +55,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libclang-dev clang musl-tools
 
-      - name: Build fcvm
+      - name: Build fcvm and fc-agent
         working-directory: fcvm
-        run: cargo build --release -p fcvm
+        run: cargo build --release -p fcvm -p fc-agent
 
       - name: Compute kernel version and SHA
         id: kernel
