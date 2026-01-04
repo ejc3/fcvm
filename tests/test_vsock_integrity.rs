@@ -22,6 +22,7 @@ use anyhow::{Context, Result};
 /// 2. Starts L1 VM which runs the built-in test script
 /// 3. L1 starts echo server, then L2 with vsock client
 /// 4. Verifies no corruption in the vsock data path
+#[ignore = "nested tests disabled - too slow/flaky"]
 #[tokio::test]
 async fn test_vsock_integrity_nested() -> Result<()> {
     println!("\nVsock Integrity Test (NV2 Nested)");

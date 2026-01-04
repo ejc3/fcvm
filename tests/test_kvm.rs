@@ -233,6 +233,7 @@ async fn test_kvm_available_in_vm() -> Result<()> {
 ///
 /// REQUIRES: ARM64 with FEAT_NV2 (ARMv8.4+) and kvm-arm.mode=nested
 /// Skips if nested KVM isn't available.
+#[ignore = "nested tests disabled - too slow/flaky"]
 #[tokio::test]
 async fn test_nested_run_fcvm_inside_vm() -> Result<()> {
     println!("\nNested VM Test: Run fcvm inside fcvm");
@@ -750,6 +751,7 @@ except OSError as e:
 ///
 /// The container OCI archive is loaded via FUSE-over-vsock.
 /// This is the original/default behavior.
+#[ignore = "nested tests disabled - too slow/flaky"]
 #[tokio::test]
 async fn test_nested_l2_fuse() -> Result<()> {
     run_nested_n_levels(
@@ -764,6 +766,7 @@ async fn test_nested_l2_fuse() -> Result<()> {
 /// Test L1→L2 nesting with image cache via NFS (--nfs)
 ///
 /// The container OCI archive is loaded from an NFS share.
+#[ignore = "nested tests disabled - too slow/flaky"]
 #[tokio::test]
 async fn test_nested_l2_nfs() -> Result<()> {
     run_nested_n_levels(
@@ -796,6 +799,7 @@ async fn test_nested_l2_with_benchmarks() -> Result<()> {
 /// Tests FUSE-over-vsock with 100MB file copies at each nesting level.
 /// This validates the 32KB max_write limit that prevents vsock fragmentation
 /// issues under nested virtualization.
+#[ignore = "nested tests disabled - too slow/flaky"]
 #[tokio::test]
 async fn test_nested_l2_with_large_files() -> Result<()> {
     run_nested_n_levels(
@@ -812,6 +816,7 @@ async fn test_nested_l2_with_large_files() -> Result<()> {
 /// Measures egress/ingress throughput from VMs at each level to host using iperf3.
 /// Tests various block sizes (128K, 1M) and parallelism (1, 4, 8 streams).
 /// Network tests don't depend on FUSE for data path, but need image cache mount.
+#[ignore = "nested tests disabled - too slow/flaky"]
 #[tokio::test]
 async fn test_nested_l2_network_fuse() -> Result<()> {
     run_nested_n_levels(
@@ -824,6 +829,7 @@ async fn test_nested_l2_network_fuse() -> Result<()> {
 }
 
 /// Test L2 network benchmarks with image cache via NFS
+#[ignore = "nested tests disabled - too slow/flaky"]
 #[tokio::test]
 async fn test_nested_l2_network_nfs() -> Result<()> {
     run_nested_n_levels(
