@@ -65,6 +65,16 @@ trap 'tag_failed $LINENO' ERR
 
 aws ec2 create-tags --resources $INSTANCE_ID --tags Key=BuildStatus,Value=building --region us-west-1
 
+# SSH keys: fcvm-ec2 + dev servers can SSH in for debugging
+mkdir -p /home/ubuntu/.ssh
+chmod 700 /home/ubuntu/.ssh
+# Static key (fcvm-ec2)
+echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINwtXjjTCVgT9OR3qrnz3zDkV2GveuCBlWFXSOBG2joe fcvm-ec2" >> /home/ubuntu/.ssh/authorized_keys
+# Dev server key from SSM
+aws ssm get-parameter --name /dev-servers/runner-ssh-key-pub --region us-west-1 --query Parameter.Value --output text >> /home/ubuntu/.ssh/authorized_keys || true
+chmod 600 /home/ubuntu/.ssh/authorized_keys
+chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+
 # Setup NVMe instance storage (find NVMe that isn't the root disk)
 ROOT_DEV=$(lsblk -no PKNAME $(findmnt -no SOURCE /) | head -1)
 NVME_DEV=$(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && /^nvme/ {print $1}' | grep -v "^$ROOT_DEV$" | head -1)
