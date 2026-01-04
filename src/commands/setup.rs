@@ -18,6 +18,39 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         return Ok(());
     }
 
+    // For host kernel install only, use temp paths (no btrfs needed)
+    if args.install_host_kernel {
+        if args.kernel_profile.is_none() {
+            anyhow::bail!("--install-host-kernel requires --kernel-profile");
+        }
+        let profile_name = args.kernel_profile.as_ref().unwrap();
+        
+        // Use /tmp for kernel build (no btrfs required)
+        paths::init_with_paths("/tmp/fcvm-kernel", "/tmp/fcvm-kernel");
+        std::fs::create_dir_all("/tmp/fcvm-kernel/kernels")?;
+        
+        let profile = get_kernel_profile(profile_name)?.ok_or_else(|| {
+            anyhow::anyhow!("kernel profile '{}' not found in config", profile_name)
+        })?;
+
+        println!("Building and installing host kernel with profile '{}'...", profile_name);
+
+        // Build the profile kernel
+        let profile_kernel_path =
+            crate::setup::ensure_kernel(Some(profile_name), true, args.build_kernels)
+                .await
+                .context("building profile kernel")?;
+        println!("  ✓ Kernel built: {}", profile_kernel_path.display());
+
+        // Install as host kernel
+        println!("\nInstalling host kernel with fcvm patches...");
+        crate::setup::install_host_kernel(&profile, profile.boot_args.as_deref())
+            .await
+            .context("installing host kernel")?;
+        
+        return Ok(());
+    }
+
     // Load config and initialize paths (with helpful error if config missing)
     let (config, _, _) = load_config(None)?;
     paths::init_with_paths(&config.paths.data_dir, &config.paths.assets_dir);
@@ -67,15 +100,6 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         crate::setup::ensure_profile_firecracker(&profile, profile_name)
             .await
             .context("setting up profile firecracker")?;
-
-        // Install as host kernel if requested
-        if args.install_host_kernel {
-            println!("\nInstalling host kernel with fcvm patches...");
-            crate::setup::install_host_kernel(&profile, profile.boot_args.as_deref())
-                .await
-                .context("installing host kernel")?;
-            return Ok(());
-        }
 
         println!("\nFor '{}' profile, use:", profile_name);
         println!(
