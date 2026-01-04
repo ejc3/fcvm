@@ -931,15 +931,10 @@ pub async fn ensure_nested_container(image_name: &str, containerfile: &str) -> a
     if image_name == "localhost/nested-test" {
         let profile = fcvm::setup::get_kernel_profile("nested")?
             .ok_or_else(|| anyhow::anyhow!("nested kernel profile not found"))?;
-        let src_firecracker = fcvm::setup::get_profile_firecracker_path(&profile, "nested")
-            .await
-            .ok_or_else(|| anyhow::anyhow!("nested profile has no custom firecracker"))?;
-        if !src_firecracker.exists() {
-            anyhow::bail!(
-                "NV2 firecracker fork not found at {}. Run: fcvm setup --kernel-profile nested",
-                src_firecracker.display()
-            );
-        }
+
+        // Get firecracker path from profile (custom or system fallback)
+        let src_firecracker =
+            fcvm::setup::get_firecracker_for_profile(&profile, "nested").await?;
 
         tokio::fs::create_dir_all("artifacts").await.ok();
         std::fs::copy(fcvm_dir.join("fcvm"), "artifacts/fcvm")

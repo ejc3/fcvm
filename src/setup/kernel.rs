@@ -884,9 +884,25 @@ else
     exit 1
 fi
 
+# Detect kernel architecture from running system
+case "$(uname -m)" in
+    x86_64)  KERNEL_ARCH="x86" ;;
+    aarch64) KERNEL_ARCH="arm64" ;;
+    *)       echo "Unsupported architecture: $(uname -m)"; exit 1 ;;
+esac
+echo "Detected architecture: $KERNEL_ARCH"
+
 # Update config for new kernel version
 echo "Updating config for kernel ${{KERNEL_VERSION}}..."
-make ARCH=arm64 olddefconfig
+make ARCH="$KERNEL_ARCH" olddefconfig
+
+# Disable module signing (we don't have AWS signing keys)
+echo "Disabling module signing..."
+scripts/config --disable MODULE_SIG
+scripts/config --disable MODULE_SIG_ALL
+scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
+scripts/config --set-str SYSTEM_REVOCATION_KEYS ""
+make ARCH="$KERNEL_ARCH" olddefconfig
 
 # Build deb packages
 echo ""
@@ -895,7 +911,7 @@ echo "LOCALVERSION=$LOCALVERSION"
 echo "This takes 15-30 minutes..."
 echo ""
 
-make -j"$NPROC" ARCH=arm64 LOCALVERSION="$LOCALVERSION" bindeb-pkg
+make -j"$NPROC" ARCH="$KERNEL_ARCH" LOCALVERSION="$LOCALVERSION" bindeb-pkg
 
 echo ""
 echo "=== Build Complete ==="
@@ -1213,6 +1229,32 @@ pub async fn get_profile_firecracker_path(
     let filename = format!("firecracker-{}-{}.bin", profile_name, sha);
 
     Some(paths::assets_dir().join("firecracker").join(filename))
+}
+
+/// Get the firecracker binary path for a kernel profile.
+///
+/// Returns the custom firecracker from the profile if configured (firecracker_repo),
+/// otherwise falls back to the system firecracker via which.
+///
+/// This is the canonical way to get the firecracker path for a profile.
+pub async fn get_firecracker_for_profile(
+    profile: &KernelProfile,
+    profile_name: &str,
+) -> Result<PathBuf> {
+    // Check for custom firecracker from profile
+    if let Some(custom_fc) = get_profile_firecracker_path(profile, profile_name).await {
+        if !custom_fc.exists() {
+            bail!(
+                "Custom firecracker not found at {}. Run: fcvm setup --kernel-profile {}",
+                custom_fc.display(),
+                profile_name
+            );
+        }
+        return Ok(custom_fc);
+    }
+
+    // Fall back to system firecracker
+    which::which("firecracker").context("firecracker not found in PATH")
 }
 
 /// Ensure the firecracker binary for a kernel profile exists.
