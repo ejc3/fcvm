@@ -60,7 +60,7 @@ trap 'tag_failed $LINENO' ERR
 
 aws ec2 create-tags --resources $INSTANCE_ID --tags Key=BuildStatus,Value=building --region us-west-1
 
-# Install build deps (apt-get update already done above)
+# Install deps
 apt-get install -y build-essential bc bison flex libssl-dev \
   libelf-dev libncurses-dev libdw-dev debhelper-compat rsync kmod cpio curl jq wget git \
   dwarves \
@@ -70,55 +70,24 @@ apt-get install -y build-essential bc bison flex libssl-dev \
   skopeo busybox-static cpio zstd autoconf automake libtool \
   nfs-kernel-server libseccomp-dev
 
-# Clone firepod repo to get kernel config and patches
-git clone --depth 1 https://github.com/ejc3/firepod.git /tmp/firepod
-
-# Kernel version
-KERNEL_VERSION="6.18.3"
-echo "Building kernel version: $KERNEL_VERSION"
-aws ec2 create-tags --resources $INSTANCE_ID --tags Key=KernelVersion,Value=$KERNEL_VERSION --region us-west-1
-
-# Build host kernel
-cd /tmp
-BUILD_SHA=$(cat /tmp/firepod/kernel/nested.conf /tmp/firepod/kernel/patches/*.patch 2>/dev/null | sha256sum | cut -c1-12)
-LOCALVERSION="-fcvm-${BUILD_SHA}"
-
-# Download and extract kernel source
-curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.xz" | tar -xJ
-cd "linux-${KERNEL_VERSION}"
-
-# Use running kernel config as base, merge with nested.conf
-cp /boot/config-$(uname -r) .config 2>/dev/null || zcat /proc/config.gz > .config 2>/dev/null || true
-scripts/kconfig/merge_config.sh -m .config /tmp/firepod/kernel/nested.conf
-echo "CONFIG_LOCALVERSION=\"${LOCALVERSION}\"" >> .config
-echo "CONFIG_LOCALVERSION_AUTO=n" >> .config
-make olddefconfig
-
-# Apply all patches from repo
-for patch in /tmp/firepod/kernel/patches/*.patch; do
-  [ -f "$patch" ] && patch -p1 < "$patch"
-done
-
-# Build deb package
-make -j$(nproc) bindeb-pkg LOCALVERSION=""
-dpkg -i ../linux-image-*.deb
-
-# Configure GRUB with kvm-arm.mode=nested for NV2 support
-if ! grep -q "kvm-arm.mode=nested" /etc/default/grub; then
-  sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 kvm-arm.mode=nested"/' /etc/default/grub
-  echo "Added kvm-arm.mode=nested to GRUB"
-fi
-
-# Set new kernel as default
-GRUB_ENTRY="Advanced options for Ubuntu>Ubuntu, with Linux ${KERNEL_VERSION}${LOCALVERSION}"
-sed -i "s|^GRUB_DEFAULT=.*|GRUB_DEFAULT=\"${GRUB_ENTRY}\"|" /etc/default/grub
-update-grub
-
 # Node.js 22.x
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
 apt-get install -y nodejs
 
-# Rust for ubuntu user
+# Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+
+# Clone and build firepod
+git clone --depth 1 https://github.com/ejc3/firepod.git /tmp/firepod
+cd /tmp/firepod
+cargo build --release
+
+# Build and install kernel using fcvm setup
+aws ec2 create-tags --resources $INSTANCE_ID --tags Key=KernelVersion,Value=nested --region us-west-1
+./target/release/fcvm setup --kernel-profile nested --build-kernels --install-host-kernel
+
+# Rust for ubuntu user (separate from root's rust used for build)
 sudo -u ubuntu bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
 
 # Firecracker
