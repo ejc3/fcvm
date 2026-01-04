@@ -289,7 +289,7 @@ _setup-fcvm:
 		exit 1; \
 	fi
 	./target/release/fcvm setup
-	./target/release/fcvm setup --kernel-profile nested
+	./target/release/fcvm setup --kernel-profile nested --build-kernels
 
 bench: build
 	@echo "==> Running benchmarks..."

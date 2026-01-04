@@ -355,11 +355,11 @@ jobs:
       - name: setup-fcvm
         working-directory: fcvm
         run: make setup-fcvm
-      - name: Get nested kernel
+      - name: Build nested kernel
         working-directory: fcvm
         run: |
-          # Downloads from GitHub release if available, builds locally if not
-          sudo ./target/release/fcvm setup --kernel-profile nested
+          # Build nested kernel locally (don't rely on GitHub releases)
+          sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels
       - name: test-root
         working-directory: fcvm
         run: make test-root
