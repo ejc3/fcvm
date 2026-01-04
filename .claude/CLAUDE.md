@@ -11,6 +11,16 @@ main → PR#55, main → PR#56    (wrong - parallel branches)
 
 Only branch directly from main when explicitly starting independent work.
 
+## UNDERSTAND BRANCH CHAINS
+
+**Run before starting work, committing, or opening PRs:**
+
+```bash
+git log --oneline --graph --all --decorate | head -120
+```
+
+Shows which branch you're on and what it's based on.
+
 ## ALWAYS USE THE MAKEFILE
 
 **Never run raw cargo/podman commands. Use make targets.**
