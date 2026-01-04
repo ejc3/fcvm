@@ -24,16 +24,19 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
             anyhow::bail!("--install-host-kernel requires --kernel-profile");
         }
         let profile_name = args.kernel_profile.as_ref().unwrap();
-        
+
         // Use /tmp for kernel build (no btrfs required)
         paths::init_with_paths("/tmp/fcvm-kernel", "/tmp/fcvm-kernel");
         std::fs::create_dir_all("/tmp/fcvm-kernel/kernels")?;
-        
+
         let profile = get_kernel_profile(profile_name)?.ok_or_else(|| {
             anyhow::anyhow!("kernel profile '{}' not found in config", profile_name)
         })?;
 
-        println!("Building and installing host kernel with profile '{}'...", profile_name);
+        println!(
+            "Building and installing host kernel with profile '{}'...",
+            profile_name
+        );
 
         // Build the profile kernel
         let profile_kernel_path =
@@ -47,7 +50,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         crate::setup::install_host_kernel(&profile, profile.boot_args.as_deref())
             .await
             .context("installing host kernel")?;
-        
+
         return Ok(());
     }
 
