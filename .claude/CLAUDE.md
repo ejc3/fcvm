@@ -160,7 +160,12 @@ Patches from `kernel/patches/` are applied automatically during the build.
 - `nv2-vsock-cache-sync.patch`: DSB SY in `kvm_nested_sync_hwstate()`
 - `nv2-vsock-rx-barrier.patch`: DSB SY in `virtio_transport_rx_work()`
 - `mmfr4-override.patch`: ID register override for recursive nesting
-- `wfx-stopped-exit.patch`: Exit to userspace on WFI when vCPU is stopped (fixes halt -f hang)
+- `wfx-stopped-exit.patch`: Exit to userspace on WFI when vCPU is stopped (for nested VM shutdown)
+
+**VM Graceful Shutdown (PSCI)**:
+- fc-agent uses `poweroff -f` to trigger PSCI SYSTEM_OFF (function ID 0x84000008)
+- KVM forwards this to Firecracker via KVM_EXIT_SYSTEM_EVENT
+- NOTE: `halt -f` does NOT trigger PSCI - it just enters a WFI loop without calling PSCI
 
 ### How It Works
 

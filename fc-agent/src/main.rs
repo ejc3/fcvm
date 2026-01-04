@@ -2305,16 +2305,16 @@ async fn main() -> Result<()> {
     }
 
     // Now shutdown
-    // reboot -f triggers PSCI SYSTEM_RESET which Firecracker handles correctly.
-    // halt -f triggers PSCI SYSTEM_OFF which requires the wfx-stopped-exit kernel patch.
-    // We use reboot -f first since it works on all kernels, then fall back to halt -f.
-    eprintln!("[fc-agent] calling reboot -f (PSCI SYSTEM_RESET)...");
-    let _ = Command::new("reboot").args(["-f"]).spawn();
+    // poweroff -f triggers PSCI SYSTEM_OFF via pm_power_off callback.
+    // This requires the wfx-stopped-exit kernel patch to exit KVM_RUN.
+    // NOTE: halt -f does NOT work - it just enters a WFI loop without calling PSCI.
+    eprintln!("[fc-agent] calling poweroff -f (PSCI SYSTEM_OFF)...");
+    let _ = Command::new("poweroff").args(["-f"]).spawn();
 
-    // Wait for reboot to take effect
+    // Wait for poweroff to take effect
     sleep(Duration::from_secs(2)).await;
-    eprintln!("[fc-agent] reboot didn't complete after 2s, trying halt -f");
-    let _ = Command::new("halt").args(["-f"]).spawn();
+    eprintln!("[fc-agent] poweroff didn't complete after 2s, trying reboot -f");
+    let _ = Command::new("reboot").args(["-f"]).spawn();
 
     // Wait a bit more
     sleep(Duration::from_secs(2)).await;
