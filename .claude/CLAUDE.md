@@ -199,8 +199,52 @@ From [`arch/arm64/kvm/arch_timer.c`](https://github.com/torvalds/linux/blob/mast
 issues due to double Stage 2 translation (L2 GPA → L1 S2 → L1 HPA → L0 S2 → physical). Large writes
 that fragment into multiple vsock packets may see stale/zero data instead of actual content.
 
-**Fix**: FUSE max_write limited to 32KB in `fuse-pipe/src/client/fuse.rs`. This ensures each
-FUSE write fits in a single vsock packet (kernel's limit is 64KB), avoiding fragmentation.
+**Fix**: The DSB SY kernel patch in `kernel/patches/nv2-vsock-cache-sync.patch` fixes this issue.
+The patch adds a full system data synchronization barrier in `kvm_nested_sync_hwstate()` to ensure
+L2's writes are visible to L1's reads before returning from the nested guest exit handler.
+
+With the patch applied, FUSE max_write can be unbounded (default). Without the patch, set
+`FCVM_FUSE_MAX_WRITE=32768` to limit writes to 32KB as a workaround.
+
+### L2 Cache Coherency Fix (2026-01)
+
+**Problem**: L2 FUSE-over-FUSE corrupted with unbounded max_write (~1MB). After ~3-10MB
+transferred, L1 reads all zeros where L2's data should be.
+
+**Error pattern**:
+```
+STREAM CORRUPTION: zero-length message at count=67 after 10489619 bytes
+peek_bytes=128 hex=00 00 00 00 00 00 00 ... (128 bytes of zeros)
+```
+
+**Data path**:
+1. L2 app writes to FUSE → L2 fc-agent multiplexer → L2 vsock → virtio ring
+2. L2 kicks virtio (trap to L1 KVM)
+3. L1 Firecracker reads from virtio ring (mmap of guest memory)
+4. L1 VolumeServer writes to L1 FUSE → Host FS
+
+**Investigation**:
+- Raw vsock works fine (2MB packets, 4480/4480 tests pass)
+- Only FUSE-over-FUSE path triggers corruption (many small requests/responses)
+- Corruption happens when L1 reads virtio ring and sees stale/zero data
+
+**Root cause**: Under double Stage 2 translation, L2's writes to the virtio ring weren't
+visible to L1's mmap reads due to missing cache synchronization at nested guest exit.
+
+**Solution**: Add `dsb(sy)` in `kvm_nested_sync_hwstate()` - a full system data synchronization
+barrier that ensures all L2 writes complete and are visible before returning to L1.
+
+```c
+// In arch/arm64/kvm/nested.c
+dsb(sy);  // Full system barrier - ensures L2 writes visible to L1
+```
+
+**Why it works**: The DSB SY barrier forces cache coherency across the entire system, including
+the mmap'd guest memory that Firecracker reads. ISH (inner-shareable) barriers weren't sufficient
+because the double S2 translation creates a cross-domain cache coherency issue.
+
+**Test results**: With the DSB SY patch, 100MB file copies through FUSE-over-FUSE complete
+successfully with unbounded max_write (~1MB packets). Test: `make test-root FILTER=nested_l2_with_large`
 
 ## FUSE Performance Tracing
 

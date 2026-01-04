@@ -1,0 +1,36 @@
+# Vsock integrity test container
+#
+# Builds on localhost/nested-test (which has fcvm) and adds vsock-integrity binary.
+#
+# Build:
+#   # First build nested-test if not exists
+#   podman build -t localhost/nested-test -f Containerfile.nested .
+#   # Then build this
+#   podman build -t localhost/vsock-integrity -f Containerfile.vsock-integrity .
+#
+# Test flow:
+#   1. Host starts L1 with this container
+#   2. L1 runs echo server + starts L2
+#   3. L2 runs vsock client, tests data integrity
+
+FROM docker.io/library/rust:1.83-slim AS builder
+
+# Install musl target for static linking (L2 runs alpine)
+RUN rustup target add aarch64-unknown-linux-musl && \
+    apt-get update && apt-get install -y musl-tools && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY tests/vsock-integrity/ .
+RUN cargo build --release --target aarch64-unknown-linux-musl
+
+FROM localhost/nested-test
+
+# Add vsock-integrity binary (musl-linked for alpine)
+COPY --from=builder /build/target/aarch64-unknown-linux-musl/release/vsock-integrity /usr/local/bin/
+
+# Add test script
+COPY tests/vsock-integrity/run-test.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/run-test.sh
+
+# Default: run the vsock integrity test
+ENTRYPOINT ["/usr/local/bin/run-test.sh"]
