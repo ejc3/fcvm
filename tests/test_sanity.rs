@@ -111,7 +111,6 @@ async fn sanity_test_impl(network: &str) -> Result<()> {
 
 /// Test that VM exits gracefully when container finishes (PSCI shutdown)
 /// This tests the full shutdown path: container exit → fc-agent poweroff -f → PSCI SYSTEM_OFF → KVM exit
-#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_graceful_shutdown() -> Result<()> {
     use std::time::Duration;
@@ -122,15 +121,13 @@ async fn test_graceful_shutdown() -> Result<()> {
 
     let (vm_name, _, _, _) = common::unique_names("graceful");
 
-    // Start VM with alpine:latest which exits immediately
+    // Start VM with alpine:latest which exits immediately (rootless mode)
     println!("Starting VM with container that exits immediately...");
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
         "podman",
         "run",
         "--name",
         &vm_name,
-        "--network",
-        "bridged",
         "alpine:latest", // Exits immediately with code 0
     ])
     .await
@@ -236,7 +233,6 @@ async fn test_ftrace_sanity() -> Result<()> {
 }
 
 /// Test trailing args syntax: fcvm podman run ... image cmd args
-#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_trailing_args_command() -> Result<()> {
     use std::time::Duration;
@@ -246,14 +242,12 @@ async fn test_trailing_args_command() -> Result<()> {
 
     let (vm_name, _, _, _) = common::unique_names("trailing-args");
 
-    // Use trailing args: alpine:latest echo "test-marker-12345"
+    // Use trailing args: alpine:latest echo "test-marker-12345" (rootless mode)
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
         "podman",
         "run",
         "--name",
         &vm_name,
-        "--network",
-        "bridged",
         "alpine:latest",
         "echo",
         "test-marker-12345",

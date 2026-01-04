@@ -372,24 +372,35 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
     Ok(())
 }
 
-/// Test cloning while baseline VM is still running
+/// Test cloning while baseline VM is still running (rootless)
+#[tokio::test]
+async fn test_clone_while_baseline_running_rootless() -> Result<()> {
+    clone_while_baseline_running_impl("rootless").await
+}
+
+/// Test cloning while baseline VM is still running (bridged)
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_clone_while_baseline_running_bridged() -> Result<()> {
+    clone_while_baseline_running_impl("bridged").await
+}
+
+/// Implementation for clone-while-baseline-running test
 ///
 /// This tests for vsock socket path conflicts: when cloning from a running baseline,
 /// both the baseline and clone need separate vsock sockets. Without mount namespace
 /// isolation, Firecracker would try to bind to the same socket path stored in vmstate.bin.
-#[cfg(feature = "privileged-tests")]
-#[tokio::test]
-async fn test_clone_while_baseline_running() -> Result<()> {
+async fn clone_while_baseline_running_impl(network_mode: &str) -> Result<()> {
     let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("running");
 
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
-    println!("║     Clone While Baseline Running Test                         ║");
+    println!("║     Clone While Baseline Running Test ({})            ║", network_mode);
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
     let fcvm_path = common::find_fcvm_binary()?;
 
-    // Step 1: Start baseline VM (bridged mode for faster startup)
-    println!("Step 1: Starting baseline VM...");
+    // Step 1: Start baseline VM
+    println!("Step 1: Starting baseline VM ({})...", network_mode);
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
         &[
             "podman",
@@ -397,7 +408,7 @@ async fn test_clone_while_baseline_running() -> Result<()> {
             "--name",
             &baseline_name,
             "--network",
-            "bridged",
+            network_mode,
             common::TEST_IMAGE,
         ],
         &baseline_name,
@@ -460,7 +471,7 @@ async fn test_clone_while_baseline_running() -> Result<()> {
             "--name",
             &clone_name,
             "--network",
-            "bridged",
+            network_mode,
         ],
         &clone_name,
     )
