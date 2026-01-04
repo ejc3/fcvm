@@ -1015,6 +1015,7 @@ async fn run_vm_setup(
             // setns() fails with EINVAL until this sequence completes, so we just retry.
             let ready_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
             let mut wait_iterations = 0u32;
+            let mut namespace_ready = false;
             loop {
                 wait_iterations += 1;
                 let probe = tokio::process::Command::new("nsenter")
@@ -1036,6 +1037,7 @@ async fn run_vm_setup(
                             iterations = wait_iterations,
                             "namespace ready (nsenter probe succeeded)"
                         );
+                        namespace_ready = true;
                         break;
                     }
                     Ok(output) => {
@@ -1061,6 +1063,31 @@ async fn run_vm_setup(
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+
+            // If namespace didn't become ready, kill holder and retry
+            if !namespace_ready {
+                let _ = child.kill().await;
+                _last_error = Some(format!(
+                    "namespace not ready after 500ms ({} iterations)",
+                    wait_iterations
+                ));
+
+                if std::time::Instant::now() < retry_deadline {
+                    warn!(
+                        holder_pid = holder_pid,
+                        attempt = attempt,
+                        "namespace not ready, retrying holder creation..."
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                } else {
+                    bail!(
+                        "namespace not ready after {} attempts (holder PID {})",
+                        attempt,
+                        holder_pid
+                    );
+                }
             }
 
             // Take stderr pipe - we'll use it for diagnostics if holder dies later

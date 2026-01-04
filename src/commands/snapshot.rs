@@ -952,62 +952,102 @@ async fn run_clone_setup(
         // OPTIMIZATION: Parallelize disk creation with network setup
 
         // Step 1: Spawn holder process (keeps namespace alive)
+        // Retry for up to 2 seconds if namespace doesn't become ready (race condition)
         let holder_cmd = slirp_net.build_holder_command();
         info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
 
-        let mut child = tokio::process::Command::new(&holder_cmd[0])
-            .args(&holder_cmd[1..])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .context("spawning namespace holder process")?;
+        let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut attempt = 0u32;
 
-        let holder_pid = child.id().context("getting holder process PID")?;
-        info!(holder_pid = holder_pid, "namespace holder started");
+        let (mut child, holder_pid) = loop {
+            attempt += 1;
 
-        // Wait for namespace to be ready by testing nsenter directly
-        // The holder runs: unshare -> write uid_map/gid_map -> exec sleep -> sleep syscall
-        // setns() fails with EINVAL until this sequence completes, so we just retry.
-        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-        loop {
-            let probe = tokio::process::Command::new("nsenter")
-                .args([
-                    "-t",
-                    &holder_pid.to_string(),
-                    "-U",
-                    "-n",
-                    "--preserve-credentials",
-                    "--",
-                    "true",
-                ])
-                .output()
-                .await;
-            match probe {
-                Ok(output) if output.status.success() => {
-                    debug!(
-                        holder_pid = holder_pid,
-                        "namespace ready (nsenter probe succeeded)"
-                    );
-                    break;
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    if !stderr.contains("Invalid argument") {
-                        warn!(holder_pid = holder_pid, stderr = %stderr.trim(), "nsenter probe failed with unexpected error");
+            let mut child = tokio::process::Command::new(&holder_cmd[0])
+                .args(&holder_cmd[1..])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .context("spawning namespace holder process")?;
+
+            let holder_pid = child.id().context("getting holder process PID")?;
+            if attempt > 1 {
+                info!(
+                    holder_pid = holder_pid,
+                    attempt = attempt,
+                    "namespace holder started (retry)"
+                );
+            } else {
+                info!(holder_pid = holder_pid, "namespace holder started");
+            }
+
+            // Wait for namespace to be ready by testing nsenter directly
+            // The holder runs: unshare -> write uid_map/gid_map -> exec sleep -> sleep syscall
+            // setns() fails with EINVAL until this sequence completes, so we just retry.
+            let ready_deadline_inner =
+                std::time::Instant::now() + std::time::Duration::from_millis(500);
+            let mut namespace_ready = false;
+            loop {
+                let probe = tokio::process::Command::new("nsenter")
+                    .args([
+                        "-t",
+                        &holder_pid.to_string(),
+                        "-U",
+                        "-n",
+                        "--preserve-credentials",
+                        "--",
+                        "true",
+                    ])
+                    .output()
+                    .await;
+                match probe {
+                    Ok(output) if output.status.success() => {
+                        debug!(
+                            holder_pid = holder_pid,
+                            "namespace ready (nsenter probe succeeded)"
+                        );
+                        namespace_ready = true;
+                        break;
+                    }
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        if !stderr.contains("Invalid argument") {
+                            warn!(holder_pid = holder_pid, stderr = %stderr.trim(), "nsenter probe failed with unexpected error");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(holder_pid = holder_pid, error = %e, "nsenter probe spawn failed");
                         break;
                     }
                 }
-                Err(e) => {
-                    warn!(holder_pid = holder_pid, error = %e, "nsenter probe spawn failed");
+                if std::time::Instant::now() >= ready_deadline_inner {
+                    warn!(holder_pid = holder_pid, "namespace not ready after 500ms");
                     break;
                 }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
-            if std::time::Instant::now() >= ready_deadline {
-                warn!(holder_pid = holder_pid, "namespace not ready after 500ms");
-                break;
+
+            if namespace_ready {
+                break (child, holder_pid);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
+
+            // Namespace not ready, kill holder and retry
+            let _ = child.kill().await;
+            if std::time::Instant::now() < retry_deadline {
+                warn!(
+                    holder_pid = holder_pid,
+                    attempt = attempt,
+                    "namespace not ready, retrying holder creation..."
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            } else {
+                bail!(
+                    "namespace not ready after {} attempts (holder PID {})",
+                    attempt,
+                    holder_pid
+                );
+            }
+        };
 
         // Step 2: Run disk creation and network setup IN PARALLEL
         // This saves ~16ms by overlapping these independent operations
