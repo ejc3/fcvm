@@ -193,6 +193,8 @@ async fn request_reader<H: FilesystemHandler + 'static>(
     let mut max_len: usize = 0;
     let mut total_bytes_read: u64 = 0; // Track cumulative bytes for corruption debugging
     let mut last_unique: u64 = 0; // Track last successful unique ID
+    let mut expected_unique: u64 = 1; // Track expected sequence number
+    let mut zero_byte_runs: u64 = 0; // Track consecutive zero bytes seen (for corruption detection)
 
     loop {
         // Read request length
@@ -217,6 +219,14 @@ async fn request_reader<H: FilesystemHandler + 'static>(
         min_len = min_len.min(len);
         max_len = max_len.max(len);
 
+        // Track zero bytes for corruption pattern analysis
+        let all_zeros = len_buf.iter().all(|&b| b == 0);
+        if all_zeros {
+            zero_byte_runs += 1;
+        } else {
+            zero_byte_runs = 0;
+        }
+
         // CRITICAL: Detect zero-length messages - this is the corruption pattern we're seeing
         if len == 0 {
             error!(
@@ -225,41 +235,67 @@ async fn request_reader<H: FilesystemHandler + 'static>(
                 total_bytes_read,
                 last_len,
                 last_unique,
+                expected_unique,
+                zero_byte_runs,
                 len_hex = format!("{:02x} {:02x} {:02x} {:02x}", len_buf[0], len_buf[1], len_buf[2], len_buf[3]),
-                "STREAM CORRUPTION: zero-length message (vsock data loss?)"
+                "STREAM CORRUPTION: zero-length message detected"
             );
 
-            // Try to read ahead and dump what's in the buffer to diagnose misalignment
-            let mut peek_buf = [0u8; 128];
-            if let Ok(n) = read_half.read(&mut peek_buf).await {
-                let hex_dump: String = peek_buf[..n]
-                    .iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let ascii_dump: String = peek_buf[..n]
-                    .iter()
-                    .map(|b| {
-                        if *b >= 0x20 && *b < 0x7f {
-                            *b as char
-                        } else {
-                            '.'
+            // Try to scan ahead for a non-zero byte to understand corruption extent
+            let mut scan_buf = [0u8; 4096];
+            let mut zeros_scanned = 0u64;
+            let mut found_nonzero = false;
+
+            loop {
+                match read_half.read(&mut scan_buf).await {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        // Count leading zeros and find first non-zero
+                        for (i, &b) in scan_buf[..n].iter().enumerate() {
+                            if b != 0 {
+                                // Found non-zero byte - dump context
+                                let context_start = i.saturating_sub(16);
+                                let context_end = (i + 48).min(n);
+                                let hex_dump: String = scan_buf[context_start..context_end]
+                                    .iter()
+                                    .map(|x| format!("{:02x}", x))
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
+                                error!(
+                                    target: "fuse-pipe::server",
+                                    zeros_scanned = zeros_scanned + i as u64,
+                                    first_nonzero_byte = format!("{:02x}", b),
+                                    context_offset = i - context_start,
+                                    hex = %hex_dump,
+                                    "CORRUPTION EXTENT: found non-zero after zeros"
+                                );
+                                found_nonzero = true;
+                                break;
+                            }
                         }
-                    })
-                    .collect();
-                error!(
-                    target: "fuse-pipe::server",
-                    peek_bytes = n,
-                    hex = %hex_dump,
-                    ascii = %ascii_dump,
-                    "STREAM CORRUPTION: peeked ahead after zero-length"
-                );
+                        if found_nonzero {
+                            break;
+                        }
+                        zeros_scanned += n as u64;
+                        // Stop scanning after 1MB of zeros
+                        if zeros_scanned > 1024 * 1024 {
+                            error!(
+                                target: "fuse-pipe::server",
+                                zeros_scanned,
+                                "CORRUPTION EXTENT: >1MB of zeros, stopping scan"
+                            );
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
             }
 
             return Err(anyhow::anyhow!(
-                "Stream corruption: zero-length message at count={} after {} bytes",
+                "Stream corruption: zero-length message at count={} after {} bytes, {} zeros scanned",
                 count,
-                total_bytes_read
+                total_bytes_read,
+                zeros_scanned
             ));
         }
 
@@ -350,21 +386,35 @@ async fn request_reader<H: FilesystemHandler + 'static>(
         let unique = wire_req.unique;
         last_unique = unique; // Track for corruption debugging
 
-        // Detect gaps in unique IDs (could indicate missed/dropped messages)
-        static LAST_UNIQUE_GLOBAL: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
-        let prev = LAST_UNIQUE_GLOBAL.swap(unique, std::sync::atomic::Ordering::Relaxed);
-        if prev != 0 && unique > prev + 10 {
-            warn!(
-                target: "fuse-pipe::server",
-                count,
-                prev_unique = prev,
-                curr_unique = unique,
-                gap = unique - prev,
-                total_bytes_read,
-                "Large gap in unique IDs - possible dropped messages"
-            );
+        // Validate sequence: unique IDs should be monotonically increasing
+        // This helps detect both dropped messages and stream corruption
+        if unique != expected_unique {
+            if unique > expected_unique {
+                // Gap - messages might have been dropped
+                warn!(
+                    target: "fuse-pipe::server",
+                    count,
+                    expected = expected_unique,
+                    actual = unique,
+                    gap = unique - expected_unique,
+                    total_bytes_read,
+                    "SEQUENCE GAP: missing {} message(s)",
+                    unique - expected_unique
+                );
+            } else {
+                // Out of order or duplicate - could indicate corruption
+                error!(
+                    target: "fuse-pipe::server",
+                    count,
+                    expected = expected_unique,
+                    actual = unique,
+                    last_unique,
+                    total_bytes_read,
+                    "SEQUENCE ERROR: out-of-order or duplicate unique ID"
+                );
+            }
         }
+        expected_unique = unique + 1;
         let reader_id = wire_req.reader_id;
         let request = wire_req.request;
         let supplementary_groups = wire_req.supplementary_groups;

@@ -74,6 +74,31 @@ fn get_trace_rate() -> u64 {
     0
 }
 
+/// Set FCVM_FUSE_MAX_WRITE from kernel boot param if not already set.
+/// This propagates the max_write limit to the fuse-pipe client which reads from env.
+/// Used to limit write sizes in nested VMs to avoid vsock data corruption.
+fn propagate_max_write_from_cmdline() {
+    // Skip if already set in environment
+    if std::env::var("FCVM_FUSE_MAX_WRITE").is_ok() {
+        return;
+    }
+
+    // Check kernel command line for fuse_max_write=N
+    if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
+        for part in cmdline.split_whitespace() {
+            if let Some(value) = part.strip_prefix("fuse_max_write=") {
+                // Set as environment variable for fuse-pipe to pick up
+                std::env::set_var("FCVM_FUSE_MAX_WRITE", value);
+                eprintln!(
+                    "[fc-agent] set FCVM_FUSE_MAX_WRITE={} from kernel cmdline",
+                    value
+                );
+                return;
+            }
+        }
+    }
+}
+
 /// Mount a FUSE filesystem from host via vsock.
 ///
 /// This connects to the host VolumeServer at the given port and mounts
@@ -85,6 +110,9 @@ fn get_trace_rate() -> u64 {
 /// * `port` - The vsock port where the host VolumeServer is listening
 /// * `mount_point` - The path where the filesystem will be mounted
 pub fn mount_vsock(port: u32, mount_point: &str) -> anyhow::Result<()> {
+    // Propagate max_write limit from kernel cmdline to env var for fuse-pipe
+    propagate_max_write_from_cmdline();
+
     let num_readers = get_num_readers();
     let trace_rate = get_trace_rate();
     eprintln!(

@@ -459,21 +459,10 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         info!(profile = %profile_name, "using kernel profile");
 
         // Apply runtime config from profile
-        // Use content-addressed firecracker path if profile has custom firecracker
-        if let Some(fc_path) =
-            crate::setup::get_profile_firecracker_path(&profile, profile_name).await
-        {
-            if !fc_path.exists() {
-                bail!(
-                    "Profile '{}' firecracker not found at {}.\nRun: fcvm setup --kernel-profile {}",
-                    profile_name,
-                    fc_path.display(),
-                    profile_name
-                );
-            }
-            info!(firecracker_bin = %fc_path.display(), "from profile");
-            std::env::set_var("FCVM_FIRECRACKER_BIN", fc_path.to_string_lossy().as_ref());
-        }
+        // Get firecracker path (custom from profile or system fallback)
+        let fc_path = crate::setup::get_firecracker_for_profile(&profile, profile_name).await?;
+        info!(firecracker_bin = %fc_path.display(), "from profile");
+        std::env::set_var("FCVM_FIRECRACKER_BIN", fc_path.to_string_lossy().as_ref());
         if let Some(ref fc_args) = profile.firecracker_args {
             info!(firecracker_args = %fc_args, "from profile");
             std::env::set_var("FCVM_FIRECRACKER_ARGS", fc_args);
@@ -1462,13 +1451,27 @@ async fn run_vm_setup(
 
         // Format: ip=<client>:<server>:<gw>:<netmask>:<hostname>:<device>:<autoconf>[:<dns0>]
         // root=/dev/vda - the disk IS the ext4 filesystem (no partition table)
+        //
+        // reboot= method is architecture-specific:
+        // - ARM64: reboot=k works (keyboard controller / PSCI)
+        // - x86: reboot=t required (triple-fault) because Firecracker doesn't emulate ACPI
+        let reboot_method = if cfg!(target_arch = "x86_64") {
+            "t" // Triple-fault - only reliable method on x86 Firecracker
+        } else {
+            "k" // Keyboard controller - works on ARM64 via PSCI
+        };
         format!(
-            "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=1 systemd.log_color=no root=/dev/vda rw ip={}::{}:255.255.255.252::eth0:off{}",
-            guest_ip_clean, host_ip_clean, dns_suffix
+            "console=ttyS0 reboot={} panic=1 pci=off random.trust_cpu=1 systemd.log_color=no root=/dev/vda rw ip={}::{}:255.255.255.252::eth0:off{}",
+            reboot_method, guest_ip_clean, host_ip_clean, dns_suffix
         )
     } else {
         // No network config - used for basic boot (e.g., during setup)
-        "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=1 systemd.log_color=no root=/dev/vda rw".to_string()
+        let reboot_method = if cfg!(target_arch = "x86_64") {
+            "t"
+        } else {
+            "k"
+        };
+        format!("console=ttyS0 reboot={} panic=1 pci=off random.trust_cpu=1 systemd.log_color=no root=/dev/vda rw", reboot_method)
     };
 
     // Enable fc-agent strace debugging if requested
@@ -1493,6 +1496,13 @@ async fn run_vm_setup(
     // Used for debugging FUSE latency. Rate N means trace every Nth request.
     if let Ok(rate) = std::env::var("FCVM_FUSE_TRACE_RATE") {
         boot_args.push_str(&format!(" fuse_trace_rate={}", rate));
+    }
+
+    // Pass FUSE max_write to fc-agent via kernel command line.
+    // Used to limit write sizes in nested VMs to avoid vsock data corruption.
+    // Set FCVM_FUSE_MAX_WRITE=32768 for stable L2 operation on x86.
+    if let Ok(max_write) = std::env::var("FCVM_FUSE_MAX_WRITE") {
+        boot_args.push_str(&format!(" fuse_max_write={}", max_write));
     }
 
     client
