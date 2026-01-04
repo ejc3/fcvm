@@ -153,10 +153,14 @@ def analyze_full_log(log_path: Path) -> dict | None:
     if 'test_kvm_available_in_vm' in content and 'PASS' in content:
         results['nested_kvm'] = True
 
-    # Performance metrics
+    # Performance metrics (multiple patterns for different log formats)
     results['snapshot_times'] = [float(m.group(1)) for m in re.finditer(r'Snapshot created \(took ([\d.]+)s\)', content)]
     results['clone_health_times'] = [float(m.group(1)) for m in re.finditer(r'health=([\d.]+)s', content)]
-    results['boot_times'] = [float(m.group(1)) for m in re.finditer(r'VM healthy.*took ([\d.]+)s', content)]
+    results['boot_times'] = [float(m.group(1)) for m in re.finditer(r'took ([\d.]+)s\)?$', content, re.MULTILINE)]
+
+    # pjdfstest individual test counts (from prove output: "Files=X, Tests=Y")
+    pjdf_tests = [int(m.group(1)) for m in re.finditer(r'Tests=(\d+),', content)]
+    results['pjdfstest_count'] = sum(pjdf_tests)
 
     return results
 
@@ -179,8 +183,13 @@ def print_report(run_id: str, vm_results: dict, log_results: dict | None) -> Non
         total_tests = sum(j['total'] for j in log_results['jobs'].values())
         total_passed = sum(j['passed'] for j in log_results['jobs'].values())
         total_duration = sum(j['duration'] for j in log_results['jobs'].values())
+        pjdf_count = log_results.get('pjdfstest_count', 0)
 
-        print(f"  TESTS:     {total_passed}/{total_tests} passed")
+        print(f"  TESTS:     {total_passed}/{total_tests} passed", end="")
+        if pjdf_count:
+            print(f" (+ {pjdf_count} pjdfstest)")
+        else:
+            print()
         print(f"  VMs:       {total_vms} spawned ({total_base} base + {total_clone} clones)")
         print(f"  UFFD:      {total_uffd} memory servers")
         print(f"  DURATION:  {total_duration:.0f}s total test time")
@@ -232,7 +241,8 @@ def print_report(run_id: str, vm_results: dict, log_results: dict | None) -> Non
     features = []
     if log_results:
         if log_results.get('pjdfstest'):
-            features.append(f"pjdfstest: {len(log_results['pjdfstest'])} categories")
+            pjdf_count = log_results.get('pjdfstest_count', 0)
+            features.append(f"pjdfstest: {pjdf_count} tests in {len(log_results['pjdfstest'])} categories")
         if log_results.get('nested_kvm'):
             features.append("nested KVM: ✓")
     if features:
