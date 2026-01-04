@@ -7,9 +7,9 @@ REGION="${AWS_REGION:-us-west-1}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 KERNEL_DIR="$(dirname "$SCRIPT_DIR")/kernel"
 
-# Compute build hash
+# Compute build hash (from kernel config + patches, matches fcvm's kernel SHA)
 compute_hash() {
-  cat "$KERNEL_DIR/build-host.sh" "$KERNEL_DIR/nested.conf" "$KERNEL_DIR/patches/"*.patch 2>/dev/null | sha256sum | cut -c1-12
+  cat "$KERNEL_DIR/nested.conf" "$KERNEL_DIR/patches/"*.patch 2>/dev/null | sha256sum | cut -c1-12
 }
 
 # Check for existing AMI with matching hash
@@ -58,11 +58,11 @@ apt-get install -y build-essential bc bison flex libssl-dev \
   podman uidmap slirp4netns fuse-overlayfs containernetworking-plugins \
   fuse3 libfuse3-dev libclang-dev clang musl-tools \
   iproute2 iptables dnsmasq qemu-utils e2fsprogs parted \
-  skopeo busybox-static cpio zstd autoconf automake libtool
+  skopeo busybox-static cpio zstd autoconf automake libtool \
+  nfs-kernel-server libseccomp-dev
 
-# Download kernel build files
+# Download kernel config and patches
 mkdir -p /tmp/kernel/patches
-curl -fsSL https://raw.githubusercontent.com/ejc3/firepod/main/kernel/build-host.sh -o /tmp/kernel/build-host.sh
 curl -fsSL https://raw.githubusercontent.com/ejc3/firepod/main/kernel/nested.conf -o /tmp/kernel/nested.conf
 
 # Download all kernel patches (DSB patches required for NV2 cache coherency)
@@ -70,17 +70,47 @@ for patch in mmfr4-override nv2-vsock-cache-sync nv2-vsock-rx-barrier; do
   curl -fsSL "https://raw.githubusercontent.com/ejc3/firepod/main/kernel/patches/${patch}.patch" \
     -o "/tmp/kernel/patches/${patch}.patch" 2>/dev/null || true
 done
-chmod +x /tmp/kernel/build-host.sh
 
-# Get kernel version
-KERNEL_VERSION=$(grep -oP 'KERNEL_VERSION:-\K[0-9.]+' /tmp/kernel/build-host.sh | head -1)
+# Kernel version from nested.conf (CONFIG_LOCALVERSION or derive from source)
+KERNEL_VERSION="6.18.3"
 echo "Building kernel version: $KERNEL_VERSION"
 aws ec2 create-tags --resources $INSTANCE_ID --tags Key=KernelVersion,Value=$KERNEL_VERSION --region us-west-1
 
-# Build and install kernel
+# Build host kernel
 cd /tmp/kernel
-KERNEL_VERSION="$KERNEL_VERSION" ./build-host.sh /tmp/kernel-out
-dpkg -i /tmp/kernel-out/linux-image-*.deb
+BUILD_SHA=$(cat nested.conf patches/*.patch 2>/dev/null | sha256sum | cut -c1-12)
+LOCALVERSION="-fcvm-${BUILD_SHA}"
+
+# Download and extract kernel source
+curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.xz" | tar -xJ
+cd "linux-${KERNEL_VERSION}"
+
+# Use running kernel config as base, merge with nested.conf
+cp /boot/config-$(uname -r) .config 2>/dev/null || zcat /proc/config.gz > .config 2>/dev/null || true
+scripts/kconfig/merge_config.sh -m .config /tmp/kernel/nested.conf
+echo "CONFIG_LOCALVERSION=\"${LOCALVERSION}\"" >> .config
+echo "CONFIG_LOCALVERSION_AUTO=n" >> .config
+make olddefconfig
+
+# Apply patches
+for patch in /tmp/kernel/patches/*.patch; do
+  [ -f "$patch" ] && patch -p1 < "$patch"
+done
+
+# Build deb package
+make -j$(nproc) bindeb-pkg LOCALVERSION=""
+dpkg -i ../linux-image-*.deb
+
+# Configure GRUB with kvm-arm.mode=nested for NV2 support
+if ! grep -q "kvm-arm.mode=nested" /etc/default/grub; then
+  sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 kvm-arm.mode=nested"/' /etc/default/grub
+  echo "Added kvm-arm.mode=nested to GRUB"
+fi
+
+# Set new kernel as default
+GRUB_ENTRY="Advanced options for Ubuntu>Ubuntu, with Linux ${KERNEL_VERSION}${LOCALVERSION}"
+sed -i "s|^GRUB_DEFAULT=.*|GRUB_DEFAULT=\"${GRUB_ENTRY}\"|" /etc/default/grub
+update-grub
 
 # Node.js 22.x
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
