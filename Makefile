@@ -257,10 +257,12 @@ setup-btrfs:
 		fi && \
 		sudo mkdir -p /mnt/fcvm-btrfs && \
 		sudo mount -o loop /var/fcvm-btrfs.img /mnt/fcvm-btrfs && \
-		sudo mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,initrd,state,snapshots,vm-disks,cache} && \
+		sudo mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,initrd,state,snapshots,vm-disks,cache,image-cache} && \
 		sudo chown -R $$(id -un):$$(id -gn) /mnt/fcvm-btrfs && \
 		echo '==> btrfs ready at /mnt/fcvm-btrfs'; \
 	fi
+	@# Ensure image-cache exists with correct permissions (may be missing on older setups)
+	@sudo mkdir -p /mnt/fcvm-btrfs/image-cache && sudo chown $$(id -un):$$(id -gn) /mnt/fcvm-btrfs/image-cache
 	@# Create per-mode data directories with world-writable permissions
 	@sudo mkdir -p $(ROOT_DATA_DIR)/{state,snapshots,vm-disks} && sudo chmod -R 777 $(ROOT_DATA_DIR)
 	@sudo mkdir -p $(CONTAINER_DATA_DIR)/{state,snapshots,vm-disks} && sudo chmod -R 777 $(CONTAINER_DATA_DIR)
