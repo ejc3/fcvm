@@ -1031,40 +1031,6 @@ On serve process exit (SIGTERM/SIGINT):
 
 No master state file - `list_vms()` globs all `.json` files.
 
-### Test Integration
-
-Tests spawn processes and track PIDs directly (no stdout parsing needed):
-
-```rust
-// 1. Start baseline VM
-let baseline_proc = Command::new("sudo")
-    .args(["fcvm", "podman", "run", ...])
-    .spawn()?;
-let baseline_pid = baseline_proc.id();  // fcvm process PID
-
-// 2. Wait for healthy
-poll_health_by_pid(baseline_pid).await?;
-
-// 3. Create snapshot
-Command::new("sudo")
-    .args(["fcvm", "snapshot", "create", "--pid", &baseline_pid.to_string()])
-    .status()?;
-
-// 4. Start serve
-let serve_proc = Command::new("sudo")
-    .args(["fcvm", "snapshot", "serve", "my-snap"])
-    .spawn()?;
-let serve_pid = serve_proc.id();
-
-// 5. Clone
-let clone_proc = Command::new("sudo")
-    .args(["fcvm", "snapshot", "run", "--pid", &serve_pid.to_string()])
-    .spawn()?;
-
-// 6. Wait for clone healthy
-poll_health_by_pid(clone_proc.id()).await?;
-```
-
 ## Architecture
 
 ### Project Structure
@@ -1219,24 +1185,6 @@ After the setup VM exits, fcvm mounts the rootfs and verifies this marker exists
 If missing, setup fails with a clear error.
 
 The initrd contains a statically-linked busybox and fc-agent binary, injected at boot before systemd.
-
-```rust
-// src/storage/disk.rs - create_cow_disk()
-tokio::process::Command::new("cp")
-    .arg("--reflink=always")
-    .arg(&self.base_rootfs)
-    .arg(&overlay_path)
-```
-
-```rust
-// src/paths.rs - paths loaded from rootfs-config.toml [paths] section
-pub fn assets_dir() -> PathBuf  // Content-addressed: kernels, rootfs, initrd, image-cache
-pub fn data_dir() -> PathBuf    // Mutable: vm-disks, state, snapshots
-
-pub fn vm_runtime_dir(vm_id: &str) -> PathBuf {
-    data_dir().join("vm-disks").join(vm_id)
-}
-```
 
 **Setup**: Run `make setup-fcvm` before tests (called automatically by `make test-root` or `make container-test-root`).
 
