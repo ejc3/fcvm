@@ -530,11 +530,12 @@ fn generate_vm_kernel_build_script(
     };
 
     // Get config from profile
-    let patches_dir = profile
-        .patches_dir
-        .as_deref()
-        .map(|p| repo_root.join(p))
-        .unwrap_or_else(|| repo_root.join("kernel/patches"));
+    // Empty string means no patches, None means use default
+    let patches_dir = match profile.patches_dir.as_deref() {
+        Some("") => None, // Explicitly disabled
+        Some(p) => Some(repo_root.join(p)),
+        None => Some(repo_root.join("kernel/patches")), // Default
+    };
 
     let kernel_config = profile.kernel_config.as_deref().map(|p| repo_root.join(p));
 
@@ -561,7 +562,7 @@ SOURCE_DIR="$BUILD_DIR/linux-${{KERNEL_VERSION}}"
 SHA_MARKER="$SOURCE_DIR/.fcvm-patches-sha"
 BUILD_SHA="{sha}"
 KERNEL_PATH="{kernel_path}"
-PATCHES_DIR="{patches_dir}"
+{patches_dir_line}
 KERNEL_ARCH="{kernel_arch}"
 KERNEL_IMAGE="{kernel_image}"
 BASE_CONFIG_URL="{base_config_url}"
@@ -611,43 +612,7 @@ fi
 
 cd "$SOURCE_DIR"
 
-# Apply patches (VM kernel applies all: *.patch + *.vm.patch)
-if [[ -f "$SHA_MARKER" ]] && [[ "$(cat "$SHA_MARKER")" == "$BUILD_SHA" ]]; then
-    echo "Patches already applied (SHA: $BUILD_SHA)"
-else
-    echo "Applying patches..."
-
-    # Track applied patches to avoid duplicates (*.patch glob also matches *.vm.patch)
-    declare -A applied_patches
-
-    for patch_file in "$PATCHES_DIR"/*.patch "$PATCHES_DIR"/*.vm.patch; do
-        [[ ! -f "$patch_file" ]] && continue
-        [[ -n "${{applied_patches[$patch_file]:-}}" ]] && continue
-        applied_patches[$patch_file]=1
-        patch_name=$(basename "$patch_file")
-
-        echo "  Checking $patch_name..."
-        if patch -p1 --forward --dry-run < "$patch_file" >/dev/null 2>&1; then
-            echo "  Applying $patch_name..."
-            patch -p1 --forward < "$patch_file"
-        else
-            # Check if already applied (reversed)
-            if patch -p1 --reverse --dry-run < "$patch_file" >/dev/null 2>&1; then
-                echo "    Already applied: $patch_name"
-            else
-                echo "    ERROR: Patch does not apply cleanly: $patch_name"
-                patch -p1 --forward --dry-run < "$patch_file" || true
-                cd "$BUILD_DIR"
-                rm -rf "$SOURCE_DIR"
-                echo "    Re-run this script to rebuild from fresh source."
-                exit 1
-            fi
-        fi
-    done
-
-    echo "$BUILD_SHA" > "$SHA_MARKER"
-    echo "Patches applied successfully (SHA: $BUILD_SHA)"
-fi
+{apply_patches_block}
 
 # Download Firecracker base config
 echo "Downloading Firecracker base config..."
@@ -688,7 +653,51 @@ echo "Size: $(du -h "$KERNEL_PATH" | cut -f1)"
         kernel_major = kernel_major,
         sha = sha,
         kernel_path = dest.display(),
-        patches_dir = patches_dir.display(),
+        patches_dir_line = patches_dir
+            .as_ref()
+            .map(|p| format!("PATCHES_DIR=\"{}\"", p.display()))
+            .unwrap_or_else(|| "# No patches directory".to_string()),
+        apply_patches_block = if patches_dir.is_some() {
+            r#"# Apply patches (VM kernel applies all: *.patch + *.vm.patch)
+if [[ -f "$SHA_MARKER" ]] && [[ "$(cat "$SHA_MARKER")" == "$BUILD_SHA" ]]; then
+    echo "Patches already applied (SHA: $BUILD_SHA)"
+else
+    echo "Applying patches..."
+
+    # Track applied patches to avoid duplicates (*.patch glob also matches *.vm.patch)
+    declare -A applied_patches
+
+    for patch_file in "$PATCHES_DIR"/*.patch "$PATCHES_DIR"/*.vm.patch; do
+        [[ ! -f "$patch_file" ]] && continue
+        [[ -n "${applied_patches[$patch_file]:-}" ]] && continue
+        applied_patches[$patch_file]=1
+        patch_name=$(basename "$patch_file")
+
+        echo "  Checking $patch_name..."
+        if patch -p1 --forward --dry-run < "$patch_file" >/dev/null 2>&1; then
+            echo "  Applying $patch_name..."
+            patch -p1 --forward < "$patch_file"
+        else
+            # Check if already applied (reversed)
+            if patch -p1 --reverse --dry-run < "$patch_file" >/dev/null 2>&1; then
+                echo "    Already applied: $patch_name"
+            else
+                echo "    ERROR: Patch does not apply cleanly: $patch_name"
+                patch -p1 --forward --dry-run < "$patch_file" || true
+                cd "$BUILD_DIR"
+                rm -rf "$SOURCE_DIR"
+                echo "    Re-run this script to rebuild from fresh source."
+                exit 1
+            fi
+        fi
+    done
+
+    echo "$BUILD_SHA" > "$SHA_MARKER"
+    echo "Patches applied successfully (SHA: $BUILD_SHA)"
+fi"#
+        } else {
+            "# No patches to apply"
+        },
         kernel_arch = kernel_arch,
         kernel_image = kernel_image,
         base_config_url = base_config_url,
@@ -783,11 +792,12 @@ fn generate_host_kernel_build_script(
     let kernel_version = &config.kernel_version;
     let kernel_major = kernel_version.split('.').next().unwrap_or(kernel_version);
 
-    let patches_dir = config
-        .patches_dir
-        .as_deref()
-        .map(|p| repo_root.join(p))
-        .unwrap_or_else(|| repo_root.join("kernel/patches"));
+    // Empty string means no patches, None means use default
+    let patches_dir = match config.patches_dir.as_deref() {
+        Some("") => None, // Explicitly disabled
+        Some(p) => Some(repo_root.join(p)),
+        None => Some(repo_root.join("kernel/patches")), // Default
+    };
 
     let script = format!(
         r##"#!/bin/bash
@@ -805,7 +815,7 @@ NPROC="${{NPROC:-$(nproc)}}"
 SOURCE_DIR="$BUILD_DIR/linux-${{KERNEL_VERSION}}"
 SHA_MARKER="$SOURCE_DIR/.fcvm-patches-sha"
 BUILD_SHA="{sha}"
-PATCHES_DIR="{patches_dir}"
+{patches_dir_line}
 LOCALVERSION="-fcvm-${{BUILD_SHA}}"
 DEB_NAME="linux-image-${{KERNEL_VERSION}}${{LOCALVERSION}}"
 
@@ -858,39 +868,7 @@ fi
 
 cd "$SOURCE_DIR"
 
-# Apply patches (host kernel: *.patch only, skip *.vm.patch)
-if [[ -f "$SHA_MARKER" ]] && [[ "$(cat "$SHA_MARKER")" == "$BUILD_SHA" ]]; then
-    echo "Patches already applied (SHA: $BUILD_SHA)"
-else
-    echo "Applying patches..."
-    for patch_file in "$PATCHES_DIR"/*.patch; do
-        [[ ! -f "$patch_file" ]] && continue
-        [[ "$patch_file" == *.vm.patch ]] && continue  # Skip VM-only patches
-        patch_name=$(basename "$patch_file")
-
-        echo "  Checking $patch_name..."
-        if patch -p1 --forward --dry-run < "$patch_file" >/dev/null 2>&1; then
-            echo "  Applying $patch_name..."
-            patch -p1 --forward < "$patch_file"
-        else
-            # Check if already applied (reversed)
-            if patch -p1 --reverse --dry-run < "$patch_file" >/dev/null 2>&1; then
-                echo "    Already applied: $patch_name"
-            else
-                echo "    ERROR: Patch does not apply cleanly: $patch_name"
-                patch -p1 --forward --dry-run < "$patch_file" || true
-                cd "$BUILD_DIR"
-                rm -rf "$SOURCE_DIR"
-                echo "    Re-run this script to rebuild from fresh source."
-                exit 1
-            fi
-        fi
-    done
-
-    # Mark source as patched with this SHA
-    echo "$BUILD_SHA" > "$SHA_MARKER"
-    echo "Patches applied successfully (SHA: $BUILD_SHA)"
-fi
+{apply_patches_block}
 
 # Copy current kernel config as base (includes all EC2/AWS modules)
 echo "Using current kernel config as base..."
@@ -932,7 +910,47 @@ echo "  sudo reboot"
         kernel_version = kernel_version,
         kernel_major = kernel_major,
         sha = sha,
-        patches_dir = patches_dir.display(),
+        patches_dir_line = patches_dir
+            .as_ref()
+            .map(|p| format!("PATCHES_DIR=\"{}\"", p.display()))
+            .unwrap_or_else(|| "# No patches directory".to_string()),
+        apply_patches_block = if patches_dir.is_some() {
+            r#"# Apply patches (host kernel: *.patch only, skip *.vm.patch)
+if [[ -f "$SHA_MARKER" ]] && [[ "$(cat "$SHA_MARKER")" == "$BUILD_SHA" ]]; then
+    echo "Patches already applied (SHA: $BUILD_SHA)"
+else
+    echo "Applying patches..."
+    for patch_file in "$PATCHES_DIR"/*.patch; do
+        [[ ! -f "$patch_file" ]] && continue
+        [[ "$patch_file" == *.vm.patch ]] && continue  # Skip VM-only patches
+        patch_name=$(basename "$patch_file")
+
+        echo "  Checking $patch_name..."
+        if patch -p1 --forward --dry-run < "$patch_file" >/dev/null 2>&1; then
+            echo "  Applying $patch_name..."
+            patch -p1 --forward < "$patch_file"
+        else
+            # Check if already applied (reversed)
+            if patch -p1 --reverse --dry-run < "$patch_file" >/dev/null 2>&1; then
+                echo "    Already applied: $patch_name"
+            else
+                echo "    ERROR: Patch does not apply cleanly: $patch_name"
+                patch -p1 --forward --dry-run < "$patch_file" || true
+                cd "$BUILD_DIR"
+                rm -rf "$SOURCE_DIR"
+                echo "    Re-run this script to rebuild from fresh source."
+                exit 1
+            fi
+        fi
+    done
+
+    # Mark source as patched with this SHA
+    echo "$BUILD_SHA" > "$SHA_MARKER"
+    echo "Patches applied successfully (SHA: $BUILD_SHA)"
+fi"#
+        } else {
+            "# No patches to apply"
+        },
     );
 
     Ok(script)
