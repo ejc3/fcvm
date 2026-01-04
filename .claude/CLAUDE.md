@@ -94,19 +94,12 @@ Examples of hacks to avoid:
 **Always use `jq` to parse JSON.** Never use grep, sed, awk, or string matching on JSON.
 
 ```bash
-# WRONG - will break on whitespace/formatting differences
+# WRONG
 grep '"health_status":"healthy"' output.json
-echo "$JSON" | grep -o '"pid":[0-9]*' | cut -d: -f2
 
-# CORRECT - use jq
+# CORRECT
 jq -r '.[] | select(.health_status == "healthy")' output.json
-echo "$JSON" | jq -r '.pid'
 ```
-
-**Why this matters:**
-- JSON formatting varies (spaces after colons, newlines, field order)
-- Regex patterns break silently when format changes
-- jq is robust, self-documenting, and handles edge cases
 
 ## Test Failure Investigation
 
@@ -576,17 +569,6 @@ git checkout main && git pull
 | Merge PR | `gh pr merge <pr-number> --merge --delete-branch` |
 | List my PRs | `gh pr list --author @me` |
 
-**Why test locally first:**
-- CI is slow and flaky - local tests give immediate feedback
-- Catches issues before wasting CI cycles
-- Shows actual test output for debugging
-
-**Why PRs are required:**
-- CI validates all changes before merge
-- Clear history of what changed and why
-- Easy to revert individual changes
-- Prevents accidental pushes to main
-
 **Stacking PRs:** When work builds on unmerged PRs, create a chain:
 ```bash
 # PR #1 is on main
@@ -701,12 +683,6 @@ actual output proving it works
 - Workarounds for architectural limitations
 - Changes that might seem "wrong" without context
 - Multi-commit PRs with complex interactions
-- Anything where a reviewer might ask "why not just...?"
-
-**Why evidence matters:**
-- Proves the fix works, not just "looks right"
-- Local testing is sufficient - don't need CI green first
-- Helps future debugging if issues recur
 
 ### Commit Messages
 
@@ -758,8 +734,6 @@ struct VmState { health_status: String }
 let vms: Vec<VmState> = serde_json::from_str(&stdout)?;
 if vms.first().map(|v| v.health_status == "healthy").unwrap_or(false) { ... }
 ```
-
-Why: String matching breaks when JSON formatting changes (spaces, newlines, field order). Proper deserialization is robust and self-documenting.
 
 ### Test Failure Philosophy
 
@@ -1002,14 +976,6 @@ cp /tmp/test-${BRANCH}-root.log /tmp/fcvm-failed-${BRANCH}-root-test_exec_rootle
 # Then continue with other tests using a fresh log file
 make test-root 2>&1 | tee /tmp/test-${BRANCH}-root-run2.log
 ```
-
-**Why this matters:**
-- Branch names prevent confusion when working across multiple worktrees
-- Target names (root, fast, unit) identify which test tier was run
-- Filter names (exec, sanity) identify which subset was tested
-- Test logs get overwritten when running the suite again
-- Failed test output is essential for root cause analysis
-- Timestamps prevent filename collisions across sessions
 
 **Automated approach:**
 ```bash
