@@ -627,13 +627,91 @@ See [DESIGN.md](DESIGN.md#guest-agent) for details.
 
 ## Testing
 
+### CI Summary
+
+Every CI run exercises the full stack:
+
+| Metric | Count |
+|--------|-------|
+| **Total Tests** | 9,290 |
+| **Nextest Functions** | 501 |
+| **POSIX Compliance (pjdfstest)** | 8,789 |
+| **VMs Spawned** | 331 (92 base + 239 clones) |
+| **UFFD Memory Servers** | 28 |
+| **pjdfstest Categories** | 17 |
+
+Performance (on c7g.metal ARM64):
+- **Clone to healthy**: 0.67s average
+- **Snapshot creation**: 40.7s average
+- **Total test time**: ~13 minutes (parallel jobs)
+
+### Test Categories
+
+| Category | Description | VMs | Tests |
+|----------|-------------|-----|-------|
+| **Unit Tests** | CLI parsing, state manager, protocol serialization | 0 | ~50 |
+| **FUSE Tests** | fuse-pipe passthrough, permissions, mount/unmount | 0 | ~80 |
+| **VM Sanity** | Basic VM lifecycle, networking, exec | ~20 | ~30 |
+| **Snapshot/Clone** | UFFD memory sharing, btrfs reflinks, 100-clone scaling | ~230 | ~20 |
+| **pjdfstest** | POSIX filesystem compliance in VMs | 17 | 8,789 |
+| **Egress/Port Forward** | Network connectivity, port mapping | ~30 | ~40 |
+| **Disk Mounts** | RO/RW disks, directory mapping, NFS | ~10 | ~15 |
+| **Nested KVM** | L1→L2 virtualization (ARM64 NV2) | 2 | ~5 |
+
+### Test Tiers
+
+Tests are organized into tiers by privilege requirements:
+
 ```bash
-make build       # Build fcvm + fc-agent
-make test-root   # Run all tests (requires sudo + KVM)
-make test-root FILTER=exec STREAM=1  # Filter by name, live output
+make test-unit   # Unit tests only (no VMs, no sudo)
+make test-fast   # + quick VM tests (rootless, no sudo)
+make test-all    # + slow VM tests (rootless, no sudo)
+make test-root   # + privileged tests (bridged, pjdfstest, sudo)
+make test        # Alias for test-root
 ```
 
-See [CLAUDE.md](.claude/CLAUDE.md#makefile-targets) for all Makefile targets.
+Container equivalents:
+```bash
+make container-test-unit   # Unit tests in container
+make container-test        # All tests in container (recommended)
+```
+
+### Running Tests
+
+```bash
+# Build first
+make build
+
+# Run all tests (requires sudo + KVM)
+make test-root
+
+# Filter by name pattern
+make test-root FILTER=exec
+
+# Live output (stream as tests run)
+make test-root FILTER=sanity STREAM=1
+
+# Single test with debug logging
+RUST_LOG=debug make test-root FILTER=test_exec_basic STREAM=1
+```
+
+### CI Workflow
+
+Tests run automatically on PRs and pushes to main. Three parallel jobs:
+
+| Job | Runner | Tests |
+|-----|--------|-------|
+| **Host** | Self-hosted ARM64 | Unit tests, quick VM tests (rootless) |
+| **Host-Root** | Self-hosted ARM64 | Privileged tests, pjdfstest, nested KVM |
+| **Container** | Self-hosted ARM64 | All tests in container |
+
+Latest results: [CI Workflow](.github/workflows/ci.yml) → Actions tab
+
+Analyze any CI run locally:
+```bash
+python3 scripts/analyze_ci_vms.py              # Latest run
+python3 scripts/analyze_ci_vms.py <run_id>     # Specific run
+```
 
 ### Debugging Tests
 
