@@ -1845,10 +1845,7 @@ async fn main() -> Result<()> {
 
     // Mount NFS shares from host before launching container
     let _mounted_nfs_paths: Vec<String> = if !plan.nfs_mounts.is_empty() {
-        eprintln!(
-            "[fc-agent] mounting {} NFS share(s)",
-            plan.nfs_mounts.len()
-        );
+        eprintln!("[fc-agent] mounting {} NFS share(s)", plan.nfs_mounts.len());
         match mount_nfs_shares(&plan.nfs_mounts) {
             Ok(paths) => {
                 eprintln!("[fc-agent] ✓ NFS shares mounted successfully");
@@ -2247,10 +2244,83 @@ async fn main() -> Result<()> {
 
     // Shut down the VM when the container exits (success or failure)
     // This is the expected behavior - the VM exists to run one container
-    eprintln!("[fc-agent] shutting down VM");
-    let _ = Command::new("poweroff").spawn();
+    eprintln!("[fc-agent] shutting down VM (exit_code={})", exit_code);
 
-    // Give poweroff a moment to execute, then exit with container's exit code
-    sleep(Duration::from_millis(100)).await;
+    // Check what filesystems are mounted and might need syncing
+    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+        let fuse_mounts: Vec<&str> = mounts.lines().filter(|l| l.contains("fuse")).collect();
+        eprintln!("[fc-agent] FUSE mounts before shutdown: {:?}", fuse_mounts);
+    }
+
+    // Check dirty pages before sync
+    if let Ok(dirty) = std::fs::read_to_string("/proc/meminfo") {
+        for line in dirty.lines() {
+            if line.starts_with("Dirty:") || line.starts_with("Writeback:") {
+                eprintln!("[fc-agent] {}", line.trim());
+            }
+        }
+    }
+
+    // Try sync with timeout - spawn it and wait max 2 seconds
+    eprintln!("[fc-agent] starting sync...");
+    let sync_start = std::time::Instant::now();
+    let mut sync_child = match Command::new("sync").spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("[fc-agent] failed to spawn sync: {}", e);
+            // Continue to halt anyway
+            let _ = Command::new("halt").args(["-f"]).spawn();
+            sleep(Duration::from_secs(2)).await;
+            std::process::exit(exit_code);
+        }
+    };
+
+    // Wait for sync with 2 second timeout
+    for _ in 0..20 {
+        match sync_child.try_wait() {
+            Ok(Some(status)) => {
+                eprintln!(
+                    "[fc-agent] sync completed in {:?} with status: {:?}",
+                    sync_start.elapsed(),
+                    status
+                );
+                break;
+            }
+            Ok(None) => {
+                sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                eprintln!("[fc-agent] sync wait error: {}", e);
+                break;
+            }
+        }
+    }
+
+    if sync_start.elapsed().as_secs() >= 2 {
+        eprintln!("[fc-agent] sync timed out after 2s, killing it");
+        drop(sync_child.kill());
+    }
+
+    // Now shutdown
+    // poweroff -f triggers PSCI SYSTEM_OFF via pm_power_off callback.
+    // This requires the wfx-stopped-exit kernel patch to exit KVM_RUN.
+    // NOTE: halt -f does NOT work - it just enters a WFI loop without calling PSCI.
+    eprintln!("[fc-agent] calling poweroff -f (PSCI SYSTEM_OFF)...");
+    let _ = Command::new("poweroff").args(["-f"]).spawn();
+
+    // Wait for poweroff to take effect
+    sleep(Duration::from_secs(2)).await;
+    eprintln!("[fc-agent] poweroff didn't complete after 2s, trying reboot -f");
+    let _ = Command::new("reboot").args(["-f"]).spawn();
+
+    // Wait a bit more
+    sleep(Duration::from_secs(2)).await;
+    eprintln!("[fc-agent] reboot didn't complete, trying sysrq reboot");
+
+    // Last resort: use the reboot syscall directly via sysrq
+    let _ = std::fs::write("/proc/sysrq-trigger", "b");
+
+    sleep(Duration::from_secs(1)).await;
+    eprintln!("[fc-agent] VM shutdown completely failed!");
     std::process::exit(exit_code)
 }

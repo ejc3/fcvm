@@ -64,7 +64,12 @@ apt-get install -y build-essential bc bison flex libssl-dev \
 mkdir -p /tmp/kernel/patches
 curl -fsSL https://raw.githubusercontent.com/ejc3/firepod/main/kernel/build-host.sh -o /tmp/kernel/build-host.sh
 curl -fsSL https://raw.githubusercontent.com/ejc3/firepod/main/kernel/nested.conf -o /tmp/kernel/nested.conf
-curl -fsSL https://raw.githubusercontent.com/ejc3/firepod/main/kernel/patches/mmfr4-override.patch -o /tmp/kernel/patches/mmfr4-override.patch 2>/dev/null || true
+
+# Download all kernel patches (DSB patches required for NV2 cache coherency)
+for patch in mmfr4-override nv2-vsock-cache-sync nv2-vsock-rx-barrier; do
+  curl -fsSL "https://raw.githubusercontent.com/ejc3/firepod/main/kernel/patches/${patch}.patch" \
+    -o "/tmp/kernel/patches/${patch}.patch" 2>/dev/null || true
+done
 chmod +x /tmp/kernel/build-host.sh
 
 # Get kernel version

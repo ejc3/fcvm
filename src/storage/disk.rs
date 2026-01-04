@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use tokio::fs;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Configuration for a VM disk
 #[derive(Debug, Clone)]
@@ -66,11 +66,35 @@ impl DiskManager {
 
             if !reflink_output.status.success() {
                 let stderr = String::from_utf8_lossy(&reflink_output.stderr);
-                anyhow::bail!(
-                    "Reflink copy failed (required for CoW disk). Error: {}. \
-                    Ensure the kernel has FUSE_REMAP_FILE_RANGE support (requires a kernel profile with this patch).",
-                    stderr
-                );
+
+                // Check if this is a cross-device error (common in nested VMs where
+                // source is on FUSE mount but destination is local filesystem)
+                if stderr.contains("cross-device") || stderr.contains("Invalid cross-device link") {
+                    warn!(
+                        base = %self.base_rootfs.display(),
+                        disk = %disk_path.display(),
+                        "reflink failed (cross-device), falling back to regular copy (slower)"
+                    );
+
+                    // Fall back to regular copy
+                    let copy_output = tokio::process::Command::new("cp")
+                        .arg(&self.base_rootfs)
+                        .arg(&disk_path)
+                        .output()
+                        .await
+                        .context("executing cp (fallback)")?;
+
+                    if !copy_output.status.success() {
+                        let copy_stderr = String::from_utf8_lossy(&copy_output.stderr);
+                        anyhow::bail!("Disk copy failed. Error: {}", copy_stderr);
+                    }
+                } else {
+                    anyhow::bail!(
+                        "Reflink copy failed (required for CoW disk). Error: {}. \
+                        Ensure the kernel has FUSE_REMAP_FILE_RANGE support (requires a kernel profile with this patch).",
+                        stderr
+                    );
+                }
             }
         }
 

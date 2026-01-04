@@ -932,6 +932,7 @@ pub async fn ensure_nested_container(image_name: &str, containerfile: &str) -> a
         let profile = fcvm::setup::get_kernel_profile("nested")?
             .ok_or_else(|| anyhow::anyhow!("nested kernel profile not found"))?;
         let src_firecracker = fcvm::setup::get_profile_firecracker_path(&profile, "nested")
+            .await
             .ok_or_else(|| anyhow::anyhow!("nested profile has no custom firecracker"))?;
         if !src_firecracker.exists() {
             anyhow::bail!(
@@ -1012,3 +1013,143 @@ pub async fn ensure_nested_container(image_name: &str, containerfile: &str) -> a
 }
 
 use anyhow::Context as _;
+
+/// Ftrace utility for kernel tracing during tests
+///
+/// Usage:
+/// ```ignore
+/// let tracer = Ftrace::new()?;
+/// tracer.enable_events(&["kvm:kvm_exit", "kvm:kvm_entry"])?;
+/// tracer.start()?;
+/// // ... run test ...
+/// tracer.stop()?;
+/// let output = tracer.read(100)?;  // last 100 lines
+/// println!("{}", output);
+/// ```
+///
+/// Predefined event sets (by noise level):
+/// - `Ftrace::EVENTS_PSCI` - Low noise, good for shutdown/PSCI debugging
+/// - `Ftrace::EVENTS_ALL_KVM` - Everything (very noisy!)
+pub struct Ftrace {
+    tracing_path: std::path::PathBuf,
+}
+
+impl Ftrace {
+    /// Low-noise events for PSCI/shutdown debugging
+    pub const EVENTS_PSCI: &'static [&'static str] = &[
+        "kvm:kvm_userspace_exit",
+        "kvm:kvm_hvc_arm64",
+        "kvm:kvm_vcpu_wakeup",
+        "kvm:kvm_wfx_arm64",
+    ];
+
+    /// Medium-noise events including interrupts
+    pub const EVENTS_INTERRUPTS: &'static [&'static str] = &[
+        "kvm:kvm_userspace_exit",
+        "kvm:kvm_set_irq",
+        "kvm:kvm_irq_line",
+        "kvm:kvm_vcpu_wakeup",
+        "kvm:vgic_update_irq_pending",
+    ];
+
+    /// High-noise events for detailed VM tracing
+    pub const EVENTS_DETAILED: &'static [&'static str] =
+        &["kvm:kvm_exit", "kvm:kvm_entry", "kvm:kvm_userspace_exit"];
+
+    /// Create new Ftrace instance. Requires root.
+    pub fn new() -> anyhow::Result<Self> {
+        let tracing_path = std::path::PathBuf::from("/sys/kernel/debug/tracing");
+
+        // Mount debugfs if needed
+        if !tracing_path.exists() {
+            std::process::Command::new("mount")
+                .args(["-t", "debugfs", "none", "/sys/kernel/debug"])
+                .status()
+                .context("mounting debugfs")?;
+        }
+
+        if !tracing_path.exists() {
+            anyhow::bail!("ftrace not available at {:?}", tracing_path);
+        }
+
+        Ok(Self { tracing_path })
+    }
+
+    /// Enable specific trace events (e.g., "kvm:kvm_exit")
+    pub fn enable_events(&self, events: &[&str]) -> anyhow::Result<()> {
+        // Disable all first
+        std::fs::write(self.tracing_path.join("events/enable"), "0")?;
+
+        for event in events {
+            let path = self
+                .tracing_path
+                .join(format!("events/{}/enable", event.replace(':', "/")));
+            std::fs::write(&path, "1")
+                .with_context(|| format!("enabling event {} at {:?}", event, path))?;
+        }
+        Ok(())
+    }
+
+    /// Clear trace buffer
+    pub fn clear(&self) -> anyhow::Result<()> {
+        std::fs::write(self.tracing_path.join("trace"), "")?;
+        Ok(())
+    }
+
+    /// Start tracing
+    pub fn start(&self) -> anyhow::Result<()> {
+        self.clear()?;
+        std::fs::write(self.tracing_path.join("tracing_on"), "1")?;
+        Ok(())
+    }
+
+    /// Stop tracing
+    pub fn stop(&self) -> anyhow::Result<()> {
+        std::fs::write(self.tracing_path.join("tracing_on"), "0")?;
+        Ok(())
+    }
+
+    /// Read last N lines of trace
+    pub fn read(&self, last_n: usize) -> anyhow::Result<String> {
+        let content = std::fs::read_to_string(self.tracing_path.join("trace"))?;
+        let lines: Vec<&str> = content.lines().collect();
+        let start = if lines.len() > last_n {
+            lines.len() - last_n
+        } else {
+            0
+        };
+        Ok(lines[start..].join("\n"))
+    }
+
+    /// Read trace, filtering for pattern
+    pub fn read_grep(&self, pattern: &str, last_n: usize) -> anyhow::Result<String> {
+        let content = std::fs::read_to_string(self.tracing_path.join("trace"))?;
+        let lines: Vec<&str> = content
+            .lines()
+            .filter(|l| l.contains(pattern) || l.starts_with('#'))
+            .collect();
+        let start = if lines.len() > last_n {
+            lines.len() - last_n
+        } else {
+            0
+        };
+        Ok(lines[start..].join("\n"))
+    }
+
+    /// List available KVM events
+    pub fn list_kvm_events(&self) -> anyhow::Result<Vec<String>> {
+        let events_file = std::fs::read_to_string(self.tracing_path.join("available_events"))?;
+        Ok(events_file
+            .lines()
+            .filter(|l| l.starts_with("kvm:"))
+            .map(|s| s.to_string())
+            .collect())
+    }
+}
+
+impl Drop for Ftrace {
+    fn drop(&mut self) {
+        // Stop tracing on drop
+        let _ = self.stop();
+    }
+}

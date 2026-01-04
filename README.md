@@ -122,8 +122,11 @@ sudo fcvm podman run --name web1 --map /host/config:/config:ro public.ecr.aws/ng
 # Custom resources
 sudo fcvm podman run --name web1 --cpu 4 --mem 4096 public.ecr.aws/nginx/nginx:alpine
 
-# With environment variables and custom command
-sudo fcvm podman run --name web1 --env DEBUG=1 --cmd "nginx -g 'daemon off;'" public.ecr.aws/nginx/nginx:alpine
+# With custom command (docker-style trailing args)
+sudo fcvm podman run --name web1 alpine:latest echo "hello world"
+
+# Or using --cmd flag with shell parsing
+sudo fcvm podman run --name web1 --env DEBUG=1 --cmd "nginx -g 'daemon off;'" nginx:alpine
 
 # Rootless mode (no sudo required)
 fcvm podman run --name web1 --network rootless public.ecr.aws/nginx/nginx:alpine
@@ -312,7 +315,7 @@ fcvm supports running VMs inside VMs using ARM64 FEAT_NV2 nested virtualization.
 |-------------|---------|
 | **Hardware** | ARM64 with FEAT_NV2 (Graviton3+: c7g.metal, c7gn.metal, r7g.metal) |
 | **Host kernel** | 6.18+ with `kvm-arm.mode=nested` boot parameter |
-| **Nested kernel** | Pre-built from releases or build with `kernel/build.sh` |
+| **Nested kernel** | Pre-built from releases or `fcvm setup --kernel-profile nested --build-kernels` |
 | **Firecracker** | Fork with NV2 support (configured via kernel profile) |
 
 ### Setting Up an EC2 Instance for Nested Virtualization
@@ -403,7 +406,6 @@ fcvm setup --kernel-profile nested
 Or build locally (takes 10-20 minutes):
 ```bash
 fcvm setup --kernel-profile nested --build-kernels
-# Or manually: ./kernel/build.sh
 ```
 
 The nested kernel (6.18) includes:
@@ -736,13 +738,13 @@ kernel_repo = "your-org/your-kernel-repo"
 # Files that determine kernel SHA (supports globs)
 # When any of these change, kernel is rebuilt
 build_inputs = [
-    "kernel/build-minimal.sh",
     "kernel/minimal.conf",
+    "kernel/patches/*.patch",
 ]
 
 # Build paths (relative to repo root)
-build_script = "kernel/build-minimal.sh"
 kernel_config = "kernel/minimal.conf"
+patches_dir = "kernel/patches"
 
 # Optional: Custom Firecracker binary
 # firecracker_bin = "/usr/local/bin/firecracker-custom"
@@ -755,21 +757,22 @@ boot_args = "quiet"
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `kernel_version` | Yes | Kernel version (e.g., "6.18") |
+| `kernel_version` | Yes | Kernel version (e.g., "6.18.3") |
 | `kernel_repo` | Yes | GitHub repo for releases (e.g., "ejc3/firepod") |
 | `build_inputs` | Yes | Files to hash for kernel SHA (supports globs) |
-| `build_script` | No | Local build script path |
 | `kernel_config` | No | Kernel .config file path |
+| `patches_dir` | No | Directory containing kernel patches |
 | `firecracker_bin` | No | Custom Firecracker binary path |
 | `firecracker_args` | No | Extra Firecracker CLI args |
 | `boot_args` | No | Extra kernel boot parameters |
 
 **How it works:**
 
-1. **SHA computation**: fcvm hashes all files matching `build_inputs` patterns
-2. **Download first**: Tries to download from `kernel_repo` releases with tag `kernel-{profile}-{version}-{arch}-{sha}`
-3. **Local build fallback**: If download fails and `--build-kernels` is set, runs `build_script`
-4. **No recompilation needed**: Changing config only requires updating the TOML file
+1. **Config is source of truth**: All kernel versions and build configuration flow from `rootfs-config.toml`
+2. **SHA computation**: fcvm hashes all files matching `build_inputs` patterns
+3. **Download first**: Tries to download from `kernel_repo` releases with tag `kernel-{profile}-{version}-{arch}-{sha}`
+4. **Dynamic build scripts**: If download fails and `--build-kernels` is set, Rust generates build scripts on-the-fly (no shell scripts in source control)
+5. **Config sync**: `make build` automatically syncs embedded config to `~/.config/fcvm/` so runtime matches compile-time config
 
 ### Customizing the Base Image
 

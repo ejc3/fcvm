@@ -1,5 +1,13 @@
 SHELL := /bin/bash
 
+# Brief notes (see .claude/CLAUDE.md for details):
+#   FILTER=x STREAM=1 - filter tests, stream output
+#   Assets are content-addressed (kernel by URL SHA, rootfs by script SHA, initrd by binary SHA)
+#   Logs: /tmp/fcvm-test-logs/
+.PHONY: show-notes
+show-notes:
+	@echo "━━━ fcvm ━━━  FILTER=$(FILTER) STREAM=$(STREAM)  Assets=SHA-cached  (see .claude/CLAUDE.md)"
+
 # Paths (can be overridden via environment)
 FUSE_BACKEND_RS ?= /home/ubuntu/fuse-backend-rs
 FUSER ?= /home/ubuntu/fuser
@@ -12,8 +20,13 @@ CONTAINER_ARCH ?= aarch64
 ROOT_DATA_DIR := /mnt/fcvm-btrfs/root
 CONTAINER_DATA_DIR := /mnt/fcvm-btrfs/container
 
-# Test options: FILTER=pattern STREAM=1 LIST=1
+# Test options: FILTER=pattern STREAM=1 LIST=1 IGNORED=1
 FILTER ?=
+ifeq ($(IGNORED),1)
+NEXTEST_IGNORED := --run-ignored=all
+else
+NEXTEST_IGNORED :=
+endif
 
 # Default log level: fcvm debug, suppress FUSE spam
 # Override with: RUST_LOG=debug make test-root
@@ -102,6 +115,7 @@ help:
 	@echo "  setup-btrfs        Create btrfs loopback at /mnt/fcvm-btrfs"
 	@echo "  setup-fcvm         Download kernel and create rootfs"
 	@echo "  setup-pjdfstest    Build pjdfstest"
+	@echo "  install-host-kernel  Build and install host kernel with patches (requires reboot)"
 	@echo ""
 	@echo "Other:"
 	@echo "  bench              Run fuse-pipe benchmarks"
@@ -122,7 +136,7 @@ check-disk:
 	BTRFS_FREE=$$(df -BG /mnt/fcvm-btrfs 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \
 	if [ -n "$$ROOT_FREE" ] && [ "$$ROOT_FREE" -lt 10 ]; then \
 		echo "ERROR: Need 10GB free on / (have $${ROOT_FREE}GB)"; \
-		echo "Try: make clean-target"; \
+		echo "Try: make clean"; \
 		exit 1; \
 	fi; \
 	if [ -n "$$BTRFS_FREE" ] && [ "$$BTRFS_FREE" -lt 15 ]; then \
@@ -156,6 +170,8 @@ build:
 	CARGO_TARGET_DIR=target cargo build --release -p fcvm
 	CARGO_TARGET_DIR=target cargo build --release -p fc-agent --target $(MUSL_TARGET)
 	@mkdir -p target/release && cp target/$(MUSL_TARGET)/release/fc-agent target/release/fc-agent
+	@# Sync embedded config to user config dir (config is embedded at compile time)
+	@./target/release/fcvm setup --generate-config --force 2>/dev/null || true
 
 # Test that the release binary works without source tree (simulates cargo install)
 test-packaging: build
@@ -182,13 +198,13 @@ _test-root:
 	FCVM_DATA_DIR=$(ROOT_DATA_DIR) \
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
-	$(NEXTEST) $(NEXTEST_CAPTURE) --retries 2 --features privileged-tests $(FILTER)
+	$(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_IGNORED) --retries 2 --features privileged-tests $(FILTER)
 
 # Host targets (with setup, check-disk first to fail fast if disk is full)
-test-unit: check-disk build _test-unit
-test-fast: check-disk setup-fcvm _test-fast
-test-all: check-disk setup-fcvm _test-all
-test-root: check-disk setup-fcvm setup-pjdfstest _test-root
+test-unit: show-notes check-disk build _test-unit
+test-fast: show-notes check-disk setup-fcvm _test-fast
+test-all: show-notes check-disk setup-fcvm _test-all
+test-root: show-notes check-disk setup-fcvm setup-pjdfstest _test-root
 test: test-root
 
 # Container targets (setup on host where needed, run-only in container)
@@ -255,6 +271,11 @@ setup-fcvm: build setup-btrfs
 	fi
 	@echo "==> Running fcvm setup..."
 	./target/release/fcvm setup
+
+# Build and install host kernel with all patches from kernel/patches/
+# Requires reboot to activate the new kernel
+install-host-kernel: build setup-btrfs
+	sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels --install-host-kernel
 
 # Run setup inside container (for CI - container has Firecracker)
 container-setup-fcvm: container-build setup-btrfs
