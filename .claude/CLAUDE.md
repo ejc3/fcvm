@@ -598,126 +598,48 @@ git cherry-pick <pr2-commit>
 git push origin feature-b --force
 ```
 
-**One PR per concern:** Unrelated changes get separate PRs. If you're fixing a bug and notice a typo in docs, that's two PRs. This keeps reviews focused and makes reverts clean.
+**One PR per concern:** Unrelated changes get separate PRs.
 
 ### PR Descriptions: Show, Don't Tell
 
-**PRs should include evidence that changes work.** Actual output, not vague claims.
+**Include test evidence.** Actual output, not "tested and works."
 
-#### What to Include
-
-- **Summary** - Brief description of what and why
-- **Test evidence** - Local test output is fine! Don't need to wait for CI.
-
-Be reasonable about detail level. Simple changes need simple evidence.
-
-#### Good Examples
-
+Simple PR:
 ```markdown
 ## Fix cargo fmt scope
-Changed to only check workspace packages (not external deps).
+Changed to only check workspace packages.
 
-Tested:
-  cargo fmt -p fcvm -p fuse-pipe --check  # passes
+Tested: cargo fmt -p fcvm -p fuse-pipe --check  # passes
 ```
 
+Complex PR (kernel patches, workarounds, architectural changes):
 ```markdown
-## Add timeout parameter
-Tested locally:
-  make test-root FILTER=sanity  # passed in 45s
-```
-
-#### Bad Example
-
-```markdown
-Fixed CI. Tested and it works.
-```
-
-#### Complex/Advanced PRs
-
-**For non-trivial changes (architectural, workarounds, kernel patches), include:**
-
-1. **The Problem** - What was failing and why. Include root cause analysis.
-2. **The Solution** - How you fixed it. Explain the approach, not just "what" but "why this way".
-3. **Why It's Safe** - For workarounds or unusual approaches, explain why it won't break things.
-4. **Alternatives Considered** - What else you tried and why it didn't work.
-5. **Test Results** - Actual command output proving it works.
-
-**Example structure for complex PRs:**
-
-```markdown
-## Summary
 One-line description of what this enables.
 
 ## The Problem
 - What was broken
-- Root cause analysis (be specific)
-- Why existing approaches didn't work
+- Root cause analysis
 
 ## The Solution
-1. First key change and why
-2. Second key change and why
-3. Why this approach over alternatives
-
-### Why This Is Safe
-- Explain non-obvious safety guarantees
-- Address potential concerns upfront
-
-### Alternatives Considered
-1. Alternative A - why it didn't work
-2. Alternative B - why it was more invasive
+What changed and why this approach over alternatives.
 
 ## Test Results
-\`\`\`
 $ actual-command-run
-actual output proving it works
-\`\`\`
-
-## Test Plan
-- [x] Test case 1
-- [x] Test case 2
+actual output
 ```
-
-**When to use this format:**
-- Kernel patches or low-level system changes
-- Workarounds for architectural limitations
-- Changes that might seem "wrong" without context
-- Multi-commit PRs with complex interactions
 
 ### Commit Messages
 
-**Detailed messages with context and testing.** Commit messages should capture the nuance from the session that created them.
+**Include what changed, why, and test evidence.**
 
-**What to include:**
-- **What changed** - specific files, functions, behaviors modified
-- **Why it changed** - the problem being solved or feature being added
-- **How it was tested** - "show don't tell" with actual commands/output
-
-**Good example:**
 ```
 Remove obsolete require_non_root guard function
 
 The function was a no-op kept for "API compatibility" - exactly what
-our NO LEGACY policy prohibits. Rootless tests work fine under sudo.
-
-Removed function and all 12 call sites across test files.
+our NO LEGACY policy prohibits. Removed function and all 12 call sites.
 
 Tested: make test-root FILTER=sanity (both rootless and bridged pass)
 ```
-
-**Bad example:**
-```
-Fix tests
-```
-
-**Testing section format** - show actual commands:
-```
-Tested:
-  make test-root FILTER=sanity            # passed
-  make container-test-root FILTER=sanity  # passed
-```
-
-Not vague claims like "tested and works" or "verified manually".
 
 ### JSON Parsing
 
