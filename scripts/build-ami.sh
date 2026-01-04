@@ -50,6 +50,14 @@ curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "/tmp/awscli
 unzip -q /tmp/awscliv2.zip -d /tmp
 /tmp/aws/install
 
+# Error handler - tag instance as failed on any error
+tag_failed() {
+  echo "BUILD FAILED at line $1"
+  aws ec2 create-tags --resources $INSTANCE_ID --tags Key=BuildStatus,Value=failed --region us-west-1 || true
+  exit 1
+}
+trap 'tag_failed $LINENO' ERR
+
 aws ec2 create-tags --resources $INSTANCE_ID --tags Key=BuildStatus,Value=building --region us-west-1
 
 # Install build deps (apt-get update already done above)
@@ -166,29 +174,49 @@ wait_for_build() {
       --filters "Name=resource-id,Values=$instance_id" "Name=key,Values=BuildStatus" \
       --query 'Tags[0].Value' --output text)
 
-    # Get last log line via SSM for progress visibility
-    log_line=""
+    # Check for failure immediately
+    if [ "$status" = "failed" ]; then
+      echo "Build failed! Fetching last 50 lines of log..."
+      # Try to get error context via SSM
+      cmd_id=$(aws ssm send-command \
+        --region "$REGION" \
+        --instance-ids "$instance_id" \
+        --document-name "AWS-RunShellScript" \
+        --parameters 'commands=["tail -50 /var/log/ami-build.log 2>/dev/null || echo No log available"]' \
+        --query 'Command.CommandId' --output text 2>/dev/null) || true
+      if [ -n "$cmd_id" ]; then
+        sleep 3
+        aws ssm get-command-invocation \
+          --region "$REGION" \
+          --command-id "$cmd_id" \
+          --instance-id "$instance_id" \
+          --query 'StandardOutputContent' --output text 2>/dev/null || true
+      fi
+      return 1
+    fi
+
+    # Get last 3 log lines via SSM for progress visibility
+    log_lines=""
     if [ "$status" = "building" ]; then
       cmd_id=$(aws ssm send-command \
         --region "$REGION" \
         --instance-ids "$instance_id" \
         --document-name "AWS-RunShellScript" \
-        --parameters 'commands=["tail -1 /var/log/ami-build.log 2>/dev/null || echo waiting..."]' \
+        --parameters 'commands=["tail -3 /var/log/ami-build.log 2>/dev/null || echo waiting..."]' \
         --query 'Command.CommandId' --output text 2>/dev/null) || true
       if [ -n "$cmd_id" ]; then
         sleep 2
-        log_line=$(aws ssm get-command-invocation \
+        log_lines=$(aws ssm get-command-invocation \
           --region "$REGION" \
           --command-id "$cmd_id" \
           --instance-id "$instance_id" \
-          --query 'StandardOutputContent' --output text 2>/dev/null | tr -d '\n' | cut -c1-80) || true
+          --query 'StandardOutputContent' --output text 2>/dev/null | head -3) || true
       fi
     fi
 
-    if [ -n "$log_line" ]; then
-      echo "[$i/$timeout] $status: $log_line"
-    else
-      echo "[$i/$timeout] Build status: $status"
+    echo "[$i/$timeout] Build status: $status"
+    if [ -n "$log_lines" ]; then
+      echo "$log_lines" | sed 's/^/  > /'
     fi
 
     if [ "$status" = "complete" ]; then
