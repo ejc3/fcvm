@@ -611,6 +611,181 @@ pub async fn install_host_kernel(profile_kernel: &Path, boot_args: Option<&str>)
     Ok(())
 }
 
+// ============================================================================
+// Profile Firecracker Setup
+// ============================================================================
+
+/// Compute SHA for profile firecracker binary (repo + branch)
+fn compute_profile_firecracker_sha(profile: &KernelProfile) -> String {
+    let repo = profile.firecracker_repo.as_deref().unwrap_or("");
+    let branch = profile.firecracker_branch.as_deref().unwrap_or("main");
+
+    let mut hasher = Sha256::new();
+    hasher.update(repo.as_bytes());
+    hasher.update(branch.as_bytes());
+    let result = hasher.finalize();
+    hex::encode(&result[..6]) // 12 hex chars
+}
+
+/// Get the content-addressed path for profile firecracker binary.
+/// Uses assets_dir/firecracker/ alongside kernels and other assets.
+pub fn get_profile_firecracker_path(
+    profile: &KernelProfile,
+    profile_name: &str,
+) -> Option<PathBuf> {
+    // Only return path if profile has a custom firecracker configured
+    profile.firecracker_repo.as_ref()?;
+
+    let sha = compute_profile_firecracker_sha(profile);
+    let filename = format!("firecracker-{}-{}.bin", profile_name, sha);
+
+    Some(paths::assets_dir().join("firecracker").join(filename))
+}
+
+/// Ensure the firecracker binary for a kernel profile exists.
+///
+/// Uses content-addressed naming: firecracker-{profile}-{sha}.bin
+/// where SHA is computed from firecracker_repo + firecracker_branch.
+pub async fn ensure_profile_firecracker(
+    profile: &KernelProfile,
+    profile_name: &str,
+) -> Result<Option<PathBuf>> {
+    // Check if profile needs custom firecracker
+    let repo = match &profile.firecracker_repo {
+        Some(r) => r,
+        None => return Ok(None), // No custom firecracker needed
+    };
+
+    let branch = profile.firecracker_branch.as_deref().unwrap_or("main");
+    let sha = compute_profile_firecracker_sha(profile);
+
+    // Content-addressed path in assets dir (alongside kernels)
+    let firecracker_dir = paths::assets_dir().join("firecracker");
+    let filename = format!("firecracker-{}-{}.bin", profile_name, sha);
+    let bin_path = firecracker_dir.join(&filename);
+
+    // Already exists
+    if bin_path.exists() {
+        info!(
+            path = %bin_path.display(),
+            profile = %profile_name,
+            sha = %sha,
+            "firecracker binary exists"
+        );
+        return Ok(Some(bin_path));
+    }
+
+    // Create directory
+    tokio::fs::create_dir_all(&firecracker_dir)
+        .await
+        .context("creating firecracker directory")?;
+
+    // Acquire lock
+    let lock_file = firecracker_dir.join(format!("{}.lock", filename));
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock_fd = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&lock_file)
+        .context("opening firecracker lock file")?;
+
+    let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
+        .map_err(|(_, err)| err)
+        .context("acquiring exclusive lock for firecracker build")?;
+
+    // Double-check after lock
+    if bin_path.exists() {
+        debug!(path = %bin_path.display(), "firecracker exists (built by another process)");
+        flock.unlock().map_err(|(_, err)| err)?;
+        return Ok(Some(bin_path));
+    }
+
+    println!(
+        "  → Building firecracker from {} (branch: {}, sha: {})...",
+        repo, branch, sha
+    );
+    println!("    This may take 5-10 minutes...");
+
+    // Build in temp directory
+    let build_dir = PathBuf::from("/tmp/firecracker-profile-build");
+
+    // Clean up old build
+    if build_dir.exists() {
+        tokio::fs::remove_dir_all(&build_dir)
+            .await
+            .context("removing old firecracker build directory")?;
+    }
+
+    // Clone repo
+    let clone_url = format!("https://github.com/{}", repo);
+    let status = Command::new("git")
+        .args([
+            "clone",
+            "--depth=1",
+            "-b",
+            branch,
+            &clone_url,
+            build_dir.to_str().unwrap(),
+        ])
+        .status()
+        .await
+        .context("cloning firecracker repo")?;
+
+    if !status.success() {
+        flock.unlock().map_err(|(_, err)| err)?;
+        bail!("Failed to clone firecracker repo from {}", clone_url);
+    }
+
+    // Build firecracker
+    let status = Command::new("cargo")
+        .args(["build", "--release", "-p", "firecracker"])
+        .current_dir(&build_dir)
+        .status()
+        .await
+        .context("building firecracker")?;
+
+    if !status.success() {
+        flock.unlock().map_err(|(_, err)| err)?;
+        bail!("Firecracker build failed");
+    }
+
+    // Find the built binary
+    let mut binary = build_dir.join("target/release/firecracker");
+    if !binary.exists() {
+        // Try alternative path (Firecracker's custom build system)
+        let alt_binary = build_dir.join("build/cargo_target/release/firecracker");
+        if alt_binary.exists() {
+            binary = alt_binary;
+        } else {
+            flock.unlock().map_err(|(_, err)| err)?;
+            bail!(
+                "Firecracker binary not found at {} or {}",
+                binary.display(),
+                alt_binary.display()
+            );
+        }
+    }
+
+    // Copy to content-addressed path
+    tokio::fs::copy(&binary, &bin_path)
+        .await
+        .context("installing firecracker binary")?;
+
+    flock.unlock().map_err(|(_, err)| err)?;
+
+    info!(
+        path = %bin_path.display(),
+        profile = %profile_name,
+        sha = %sha,
+        "firecracker binary installed"
+    );
+    println!("  ✓ Firecracker ready: {}", bin_path.display());
+
+    Ok(Some(bin_path))
+}
+
 async fn update_grub_config(kernel_name: &str, boot_args: Option<&str>) -> Result<()> {
     let grub_default = Path::new("/etc/default/grub");
 

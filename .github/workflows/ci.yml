@@ -140,6 +140,9 @@ jobs:
     if: ${{ github.event.inputs.job != 'container' }}
     runs-on: [self-hosted, Linux, ARM64]
     steps:
+      # Clean up root-owned files from previous test runs before checkout
+      - name: Clean workspace (pre-checkout)
+        run: sudo rm -rf ${{ github.workspace }}/fcvm/target ${{ github.workspace }}/fcvm/artifacts || true
       - uses: actions/checkout@v6
         with:
           path: fcvm
@@ -271,6 +274,9 @@ jobs:
     if: ${{ github.event.inputs.job != 'container' }}
     runs-on: [self-hosted, Linux, ARM64]
     steps:
+      # Clean up root-owned files from previous test runs before checkout
+      - name: Clean workspace (pre-checkout)
+        run: sudo rm -rf ${{ github.workspace }}/fcvm/target ${{ github.workspace }}/fcvm/artifacts || true
       - uses: actions/checkout@v6
         with:
           path: fcvm
@@ -384,6 +390,9 @@ jobs:
     permissions:
       packages: write
     steps:
+      # Clean up root-owned files from previous test runs before checkout
+      - name: Clean workspace (pre-checkout)
+        run: sudo rm -rf ${{ github.workspace }}/fcvm/target ${{ github.workspace }}/fcvm/artifacts || true
       - uses: actions/checkout@v6
         with:
           path: fcvm

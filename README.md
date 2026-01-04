@@ -284,6 +284,8 @@ sudo fcvm podman run --name full \
 
 ## Nested Virtualization
 
+> ⚠️ **Experimental Feature**: Nested virtualization (L2+) is experimental. While basic functionality works, there are known stability issues under high I/O load. See [Known Issues](#known-issues-nested) below.
+
 fcvm supports running VMs inside VMs using ARM64 FEAT_NV2 nested virtualization. Currently **one level of nesting works**: Host → L1 VM with full KVM support.
 
 ```
@@ -463,13 +465,62 @@ make test-root FILTER=kvm
 # Tests:
 # - test_kvm_available_in_vm: Verifies /dev/kvm works in guest with nested profile
 # - test_nested_run_fcvm_inside_vm: Full test of running fcvm inside fcvm
+# - test_nested_l2: Full L1→L2 nesting with benchmarks at each level
 ```
+
+### Nested Performance Benchmarks
+
+Performance at each nesting level (measured on c7g.metal, ARM64 Graviton3):
+
+| Metric | L1 (Host→VM) | L2 (VM→VM) | Overhead |
+|--------|-------------|------------|----------|
+| **Egress (curl)** | ✓ | ✓ | — |
+| **Local Write** (10MB sync) | 4ms | 16ms | 4x |
+| **Local Read** (10MB) | 2ms | 14ms | 7x |
+| **FUSE Write** (10MB sync) | 83ms | 295ms | 3.6x |
+| **FUSE Read** (10MB) | 45ms | 226ms | 5x |
+| **FUSE Stat** (per-op) | 1.1ms | 5.3ms | 4.8x |
+| **Copy TO FUSE** (100MB) | 1078ms (92 MB/s) | 7789ms (12 MB/s) | **7.2x** |
+| **Copy FROM FUSE** (100MB) | 398ms (250 MB/s) | 2227ms (44 MB/s) | **5.6x** |
+| **Memory Used** | 399MB | 341MB | — |
+
+**Key observations:**
+- **~5-7x FUSE overhead** at L2 due to FUSE-over-FUSE chaining (L2 → L1 → Host)
+- **Large copies** show sustained throughput: 92 MB/s at L1, 12 MB/s at L2 (write) / 44 MB/s (read)
+- **Local disk** overhead is lower (~4-7x) since it only traverses the virtio block device
+- **Egress networking** works at all levels (NAT chains properly)
+- **Memory** is similar at each level (~350-400MB for the nested container image)
+
+**Why L3+ is blocked:** Each additional nesting level adds another FUSE hop. At L3, a single stat() would take ~25ms (5x × 5x = 25x overhead), making container startup take 10+ minutes.
 
 ### Limitations
 
 - ARM64 only (x86_64 nested virt uses different mechanism)
 - Requires bare-metal instance (c7g.metal) or host with nested virt enabled
-- Recursive nesting (L2+) blocked - see `.claude/CLAUDE.md` for details
+- L3+ nesting blocked by FUSE-over-FUSE latency (~5x per level)
+
+### Known Issues (Nested) {#known-issues-nested}
+
+**FUSE Stream Corruption Under High Load**
+
+Under sustained high I/O load in L2 VMs (100K+ FUSE requests/second), the FUSE-over-vsock protocol can experience stream corruption. Symptoms:
+
+```
+WARN fuse-pipe::server: deserialize error error=invalid value: integer 1275068416, expected variant index 0 <= i < 35
+WARN fuse-pipe::server: deserialize error error=io error: unexpected end of file
+```
+
+This appears to be a race condition in the vsock transport layer when L2's FUSE traffic saturates the L1→Host vsock connection. The issue is intermittent and typically occurs during:
+- Large file copies through FUSE (e.g., `cp -r` of 100MB+ files)
+- Parallel I/O from multiple processes in L2
+- Benchmark workloads with continuous writes
+
+**Workarounds:**
+- Reduce concurrent I/O in L2 VMs
+- Use local disk (`/tmp`) for high-throughput operations instead of FUSE-mounted volumes
+- Limit FUSE readers in L2: set `FCVM_FUSE_READERS=8` (default is 64)
+
+**Status:** Under investigation. The corruption pattern (`0x4C000000` = ASCII 'L') suggests data from different vsock streams may be mixing under pressure.
 
 ---
 
