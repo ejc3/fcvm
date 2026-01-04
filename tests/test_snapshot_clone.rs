@@ -408,7 +408,10 @@ async fn clone_while_baseline_running_impl(network_mode: &str) -> Result<()> {
     let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("running");
 
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
-    println!("║     Clone While Baseline Running Test ({})            ║", network_mode);
+    println!(
+        "║     Clone While Baseline Running Test ({})            ║",
+        network_mode
+    );
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
     let fcvm_path = common::find_fcvm_binary()?;

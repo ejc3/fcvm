@@ -31,13 +31,7 @@ async fn test_localhost_hello_world() -> Result<()> {
     // Step 2: Start VM with localhost image (rootless mode)
     println!("Step 2: Starting VM with localhost/test-hello image...");
     let mut child = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "podman",
-            "run",
-            "--name",
-            &vm_name,
-            "localhost/test-hello",
-        ])
+        .args(["podman", "run", "--name", &vm_name, "localhost/test-hello"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
