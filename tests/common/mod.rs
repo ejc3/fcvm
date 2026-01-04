@@ -933,8 +933,7 @@ pub async fn ensure_nested_container(image_name: &str, containerfile: &str) -> a
             .ok_or_else(|| anyhow::anyhow!("nested kernel profile not found"))?;
 
         // Get firecracker path from profile (custom or system fallback)
-        let src_firecracker =
-            fcvm::setup::get_firecracker_for_profile(&profile, "nested").await?;
+        let src_firecracker = fcvm::setup::get_firecracker_for_profile(&profile, "nested").await?;
 
         tokio::fs::create_dir_all("artifacts").await.ok();
         std::fs::copy(fcvm_dir.join("fcvm"), "artifacts/fcvm")

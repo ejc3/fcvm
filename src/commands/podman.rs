@@ -1484,6 +1484,13 @@ async fn run_vm_setup(
         boot_args.push_str(&format!(" fuse_trace_rate={}", rate));
     }
 
+    // Pass FUSE max_write to fc-agent via kernel command line.
+    // Used to limit write sizes in nested VMs to avoid vsock data corruption.
+    // Set FCVM_FUSE_MAX_WRITE=32768 for stable L2 operation on x86.
+    if let Ok(max_write) = std::env::var("FCVM_FUSE_MAX_WRITE") {
+        boot_args.push_str(&format!(" fuse_max_write={}", max_write));
+    }
+
     client
         .set_boot_source(crate::firecracker::api::BootSource {
             kernel_image_path: kernel_path.display().to_string(),

@@ -202,11 +202,12 @@ kernel_repo = "ejc3/firepod"
 # Build configuration - these files determine when kernel needs rebuilding
 build_inputs = [
     "kernel/nested-x86.conf",
+    "kernel/patches-x86/*.patch",
 ]
 
 # Build paths (relative to repo root)
 kernel_config = "kernel/nested-x86.conf"
-patches_dir = ""  # No patches for x86 (ARM patches don't apply)
+patches_dir = "kernel/patches-x86"  # FUSE remap_file_range patch for reflink support
 
 # Base config for VM kernel (Firecracker's microvm config)
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
