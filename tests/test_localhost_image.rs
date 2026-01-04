@@ -4,7 +4,7 @@
 //! The image is exported from the host using `podman save`, mounted into the VM via FUSE,
 //! and then imported by fc-agent using `podman load` before running with podman.
 
-#![cfg(feature = "integration-fast")]
+#![cfg(all(feature = "integration-fast", feature = "privileged-tests"))]
 
 mod common;
 
