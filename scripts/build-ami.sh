@@ -60,8 +60,8 @@ trap 'tag_failed $LINENO' ERR
 
 aws ec2 create-tags --resources $INSTANCE_ID --tags Key=BuildStatus,Value=building --region us-west-1
 
-# Setup NVMe instance storage for fast builds
-NVME_DEV=$(lsblk -d -o NAME,SIZE | grep -E 'nvme.*1\.8T' | head -1 | awk '{print $1}')
+# Setup NVMe instance storage for fast builds (shows as 1.7T or 1.8T)
+NVME_DEV=$(lsblk -d -o NAME,SIZE | grep -E 'nvme.*1\.[78]T' | head -1 | awk '{print $1}')
 if [ -n "$NVME_DEV" ]; then
   echo "Setting up NVMe: /dev/$NVME_DEV"
   mkfs.ext4 -F /dev/$NVME_DEV
