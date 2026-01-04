@@ -1,0 +1,22 @@
+From: fcvm <fcvm@local>
+Subject: [PATCH 2/3] Add PSCI debug logging to psci.c
+
+--- a/arch/arm64/kvm/psci.c
++++ b/arch/arm64/kvm/psci.c
+@@ -191,6 +191,8 @@
+ 
+ static void kvm_psci_system_off(struct kvm_vcpu *vcpu)
+ {
++	pr_info("[KVM PSCI DEBUG] kvm_psci_system_off called!\n");
++	pr_info("[KVM PSCI DEBUG] Setting KVM_EXIT_SYSTEM_EVENT (SHUTDOWN)\n");
+ 	kvm_prepare_system_event(vcpu, KVM_SYSTEM_EVENT_SHUTDOWN, 0);
+ }
+ 
+@@ -286,6 +288,7 @@
+ 		val = PSCI_0_2_TOS_MP;
+ 		break;
+ 	case PSCI_0_2_FN_SYSTEM_OFF:
++		pr_info("[KVM PSCI DEBUG] PSCI_0_2_FN_SYSTEM_OFF received!\n");
+ 		kvm_psci_system_off(vcpu);
+ 		/*
+ 		 * We shouldn't be going back to guest VCPU after

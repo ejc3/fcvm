@@ -7,7 +7,7 @@
 mod common;
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 /// Mount method for directory sharing tests
@@ -45,7 +45,7 @@ impl MountMethod {
 }
 
 /// Create a small ext4 disk image with a test file
-async fn create_test_disk(path: &PathBuf) -> Result<()> {
+async fn create_test_disk(path: &Path) -> Result<()> {
     // Create 64MB sparse file and format as ext4
     tokio::process::Command::new("truncate")
         .args(["-s", "64M", path.to_str().unwrap()])
