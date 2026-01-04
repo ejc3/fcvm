@@ -159,8 +159,7 @@ Patches from `kernel/patches/` are applied automatically during the build.
 **Current patches** (all apply to both host and guest kernels):
 - `nv2-vsock-cache-sync.patch`: DSB SY in `kvm_nested_sync_hwstate()`
 - `nv2-vsock-rx-barrier.patch`: DSB SY in `virtio_transport_rx_work()`
-- `mmfr4-override.patch`: ID register override for recursive nesting
-- `wfx-stopped-exit.patch`: Exit to userspace on WFI when vCPU is stopped (for nested VM shutdown)
+- `mmfr4-override.vm.patch`: ID register override for recursive nesting (guest only)
 
 **VM Graceful Shutdown (PSCI)**:
 - fc-agent uses `poweroff -f` to trigger PSCI SYSTEM_OFF (function ID 0x84000008)
