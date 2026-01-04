@@ -74,9 +74,10 @@ apt-get install -y build-essential bc bison flex libssl-dev \
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
 apt-get install -y nodejs
 
-# Rust
+# Rust (set HOME for cloud-init context)
+export HOME=/root
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
+source /root/.cargo/env
 
 # Clone and build firepod
 git clone --depth 1 https://github.com/ejc3/firepod.git /tmp/firepod
