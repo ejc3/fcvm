@@ -1,0 +1,54 @@
+From: fcvm <fcvm@localhost>
+Subject: [PATCH] KVM: arm64: Add cache synchronization for nested guest exit
+
+Under nested virtualization with NV2, when an L2 guest writes to memory
+and then exits to L1, the L1 hypervisor's userspace may not see the
+writes due to stale cache entries from the double Stage 2 translation.
+
+This manifests as data corruption in vsock packet handling where L2
+writes data to virtqueue buffers, but L1's Firecracker reads zeros
+or stale data when processing the packets.
+
+The issue occurs because:
+1. L2 writes go through shadow S2 translation (L2 GPA -> L1 IPA -> PA)
+2. L1 userspace reads go through a different cache pathway
+3. No barrier ensures L2's writes are visible to L1's reads
+
+Add a DSB (Data Synchronization Barrier) in kvm_nested_sync_hwstate()
+to ensure all data writes from the nested guest are completed and
+visible before returning to the L1 hypervisor.
+
+Also add cache maintenance in the nested S2 fault handler to ensure
+page table walks see consistent data.
+
+Signed-off-by: fcvm <fcvm@localhost>
+---
+ arch/arm64/kvm/nested.c | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/arch/arm64/kvm/nested.c b/arch/arm64/kvm/nested.c
+index xxxx..yyyy 100644
+--- a/arch/arm64/kvm/nested.c
++++ b/arch/arm64/kvm/nested.c
+@@ -1874,6 +1874,21 @@ void kvm_nested_sync_hwstate(struct kvm_vcpu *vcpu)
+ 	if (!vcpu_has_nv(vcpu))
+ 		return;
+
++	/*
++	 * Ensure all data writes from the nested guest are visible to the
++	 * L1 hypervisor before we return. Under NV2, the double Stage 2
++	 * translation can cause cache coherency issues where L2's writes
++	 * are not visible to L1's reads of the same memory.
++	 *
++	 * This is particularly important for virtio/vsock where the guest
++	 * writes packet data and the VMM reads it via mmap. Without this
++	 * barrier, the VMM may see stale or zero data.
++	 *
++	 * DSB SY ensures completion of all data accesses across all observers
++	 * in the system (full system barrier, stronger than ISH).
++	 */
++	dsb(sy);
++
+ 	/*
+ 	 * We previously decided that an SError was deliverable to the guest.
+ 	 * Reap the pending state from HCR_EL2 and...

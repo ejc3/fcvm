@@ -33,10 +33,10 @@ RUN mkdir -p /etc/containers /var/lib/containers/storage && \
         > /etc/containers/storage.conf
 
 # Copy pre-built binaries (host glibc 2.39 matches ubuntu:24.04)
-# The firecracker binary is copied as firecracker-nested (fcvm uses FCVM_FIRECRACKER_BIN env var)
 COPY artifacts/fcvm artifacts/fc-agent /usr/local/bin/
 COPY artifacts/firecracker-nested /usr/local/bin/firecracker-nested
-RUN chmod +x /usr/local/bin/fcvm /usr/local/bin/fc-agent /usr/local/bin/firecracker-nested
+RUN chmod +x /usr/local/bin/fcvm /usr/local/bin/fc-agent /usr/local/bin/firecracker-nested && \
+    ln -s firecracker-nested /usr/local/bin/firecracker
 
 # Copy config file for nested fcvm (uses same paths as host via FUSE mount)
 RUN mkdir -p /etc/fcvm

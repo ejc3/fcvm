@@ -499,28 +499,22 @@ Performance at each nesting level (measured on c7g.metal, ARM64 Graviton3):
 - Requires bare-metal instance (c7g.metal) or host with nested virt enabled
 - L3+ nesting blocked by FUSE-over-FUSE latency (~5x per level)
 
+### L2 Cache Coherency Fix
+
+**Background**: Under NV2 nested virtualization, L2 FUSE writes could corrupt when using large packet sizes (~1MB). The root cause was missing cache synchronization at nested guest exit - L2's writes to the virtio ring weren't visible to L1's mmap reads.
+
+**Solution**: A kernel patch adds a DSB SY (Data Synchronization Barrier) in `kvm_nested_sync_hwstate()` to ensure L2's writes are visible to L1 before returning from the nested guest exit handler.
+
+The patch is at `kernel/patches/nv2-vsock-cache-sync.patch` and is automatically applied when building the nested kernel.
+
+**Test**: 100MB file copies through FUSE-over-FUSE complete successfully with unbounded max_write:
+```bash
+make test-root FILTER=nested_l2_with_large
+```
+
 ### Known Issues (Nested) {#known-issues-nested}
 
-**FUSE Stream Corruption Under High Load**
-
-Under sustained high I/O load in L2 VMs (100K+ FUSE requests/second), the FUSE-over-vsock protocol can experience stream corruption. Symptoms:
-
-```
-WARN fuse-pipe::server: deserialize error error=invalid value: integer 1275068416, expected variant index 0 <= i < 35
-WARN fuse-pipe::server: deserialize error error=io error: unexpected end of file
-```
-
-This appears to be a race condition in the vsock transport layer when L2's FUSE traffic saturates the L1→Host vsock connection. The issue is intermittent and typically occurs during:
-- Large file copies through FUSE (e.g., `cp -r` of 100MB+ files)
-- Parallel I/O from multiple processes in L2
-- Benchmark workloads with continuous writes
-
-**Workarounds:**
-- Reduce concurrent I/O in L2 VMs
-- Use local disk (`/tmp`) for high-throughput operations instead of FUSE-mounted volumes
-- Limit FUSE readers in L2: set `FCVM_FUSE_READERS=8` (default is 64)
-
-**Status:** Under investigation. The corruption pattern (`0x4C000000` = ASCII 'L') suggests data from different vsock streams may be mixing under pressure.
+- **L3+ nesting**: Blocked by FUSE-over-FUSE latency (~5x per level). Each additional nesting level adds 3-5 seconds per filesystem request.
 
 ---
 
