@@ -142,7 +142,11 @@ jobs:
     steps:
       # Clean up root-owned files from previous test runs before checkout
       - name: Clean workspace (pre-checkout)
-        run: sudo rm -rf ${{ github.workspace }}/fcvm/target ${{ github.workspace }}/fcvm/artifacts || true
+        run: |
+          sudo rm -rf ${{ github.workspace }}/fcvm/target ${{ github.workspace }}/fcvm/artifacts || true
+          # Fix cargo advisory-db permissions (can become read-only from previous runs)
+          sudo chmod -R u+w ~/.cargo/advisory-db* 2>/dev/null || true
+          sudo chown -R $USER:$USER ~/.cargo/advisory-db* 2>/dev/null || true
       - uses: actions/checkout@v6
         with:
           path: fcvm
@@ -276,7 +280,11 @@ jobs:
     steps:
       # Clean up root-owned files from previous test runs before checkout
       - name: Clean workspace (pre-checkout)
-        run: sudo rm -rf ${{ github.workspace }}/fcvm/target ${{ github.workspace }}/fcvm/artifacts || true
+        run: |
+          sudo rm -rf ${{ github.workspace }}/fcvm/target ${{ github.workspace }}/fcvm/artifacts || true
+          # Fix cargo advisory-db permissions (can become read-only from previous runs)
+          sudo chmod -R u+w ~/.cargo/advisory-db* 2>/dev/null || true
+          sudo chown -R $USER:$USER ~/.cargo/advisory-db* 2>/dev/null || true
       - uses: actions/checkout@v6
         with:
           path: fcvm
@@ -394,7 +402,11 @@ jobs:
     steps:
       # Clean up root-owned files from previous test runs before checkout
       - name: Clean workspace (pre-checkout)
-        run: sudo rm -rf ${{ github.workspace }}/fcvm/target ${{ github.workspace }}/fcvm/artifacts || true
+        run: |
+          sudo rm -rf ${{ github.workspace }}/fcvm/target ${{ github.workspace }}/fcvm/artifacts || true
+          # Fix cargo advisory-db permissions (can become read-only from previous runs)
+          sudo chmod -R u+w ~/.cargo/advisory-db* 2>/dev/null || true
+          sudo chown -R $USER:$USER ~/.cargo/advisory-db* 2>/dev/null || true
       - uses: actions/checkout@v6
         with:
           path: fcvm
