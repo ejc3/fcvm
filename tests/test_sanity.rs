@@ -110,7 +110,7 @@ async fn sanity_test_impl(network: &str) -> Result<()> {
 }
 
 /// Test that VM exits gracefully when container finishes (PSCI shutdown)
-/// This tests the full shutdown path: container exit → fc-agent halt -f → PSCI → KVM_EXIT_SHUTDOWN
+/// This tests the full shutdown path: container exit → fc-agent poweroff -f → PSCI SYSTEM_OFF → KVM exit
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_graceful_shutdown() -> Result<()> {
