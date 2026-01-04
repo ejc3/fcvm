@@ -948,7 +948,7 @@ fcvm podman run --name <NAME> [OPTIONS] <IMAGE>
 --name <NAME>              VM name (required)
 --cpu <COUNT>              vCPU count (default: 2)
 --mem <MB>                 Memory in MiB (default: 2048)
---network <MODE>           Network mode: bridged|rootless (default: bridged)
+--network <MODE>           Network mode: rootless|bridged (default: rootless)
 --map <HOST:GUEST[:ro]>    Volume mount via FUSE (can specify multiple)
 --env <KEY=VALUE>          Environment variable (can specify multiple)
 --cmd <COMMAND>            Container command override
@@ -1502,7 +1502,7 @@ curl http://localhost:9090  # Should return nginx page in <2s
 kill $CLONE_PID $SERVE_PID $BASELINE_PID
 ```
 
-**Note**: `--network rootless` uses slirp4netns (no root required). `--network bridged` (default) uses iptables/TAP devices (requires sudo).
+**Note**: `--network rootless` (default) uses slirp4netns (no root required). `--network bridged` uses iptables/TAP devices (requires sudo).
 
 ### POSIX Compliance (pjdfstest)
 

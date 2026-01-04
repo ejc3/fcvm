@@ -529,34 +529,9 @@ Exception: For **forked libraries** (like fuse-backend-rs), we maintain compatib
 
 **Main branch is protected. All changes MUST go through pull requests.**
 
-#### Creating a PR (Required for ALL Changes)
+#### Creating a PR
 
-**CRITICAL: TEST LOCALLY BEFORE PUSHING.** CI is for validation, not discovery. Run `make lint` and relevant tests locally first.
-
-```bash
-# 1. Create feature branch
-git checkout -b fix-something
-
-# 2. Make changes and commit
-git add -A && git commit -m "Fix something"
-
-# 3. TEST LOCALLY FIRST (required!)
-make lint                    # Must pass
-make test-root FILTER=<relevant>  # Run relevant tests
-
-# 4. Push and create PR (only after local tests pass)
-git push -u origin fix-something
-gh pr create --fill
-
-# 5. Wait for CI to pass
-gh pr checks <pr-number>
-
-# 6. Merge when green
-gh pr merge <pr-number> --merge --delete-branch
-
-# 7. Update local main
-git checkout main && git pull
-```
+**TEST LOCALLY BEFORE PUSHING.** CI is for validation, not discovery.
 
 #### Quick Reference
 
@@ -708,25 +683,7 @@ When a POSIX test fails:
 
 2. **ALWAYS find the smoking gun in logs** - compare failing vs passing timestamps
 
-3. **Real example - Firecracker crash during parallel tests:**
-
-   ```
-   # FAILING (truncate):
-   05:01:26 Exporting image with skopeo
-   05:03:34 Image exported (122s later - lock contention!)
-   05:03:34.835 Firecracker spawned
-   05:03:34.859 VM setup failed (24ms - crashed immediately)
-
-   # PASSING (chmod):
-   05:01:27 Exporting image with skopeo
-   05:03:10 Image exported (103s - finished earlier)
-   05:03:11.258 Firecracker spawned
-   05:03:11.258 API server received request (success)
-   ```
-
-   **Root cause from logs:** All 17 tests serialize on podman storage lock, then thundering herd of VMs start at once.
-
-   **Fix:** Content-addressable image cache - first test exports, others hit cache.
+3. **Real example**: Firecracker crashed in parallel tests. Logs showed: failing test took 122s to export image (lock contention), then VM crashed 24ms after spawn. Passing test took 103s. **Root cause:** thundering herd after podman lock. **Fix:** content-addressable image cache.
 
 4. **The mantra:** What do timestamps show? What's different between failing and passing? The logs ALWAYS have the answer.
 
@@ -839,30 +796,7 @@ This ensures changes to fuse-backend-rs are immediately available without git co
 
 ### Monitoring Long-Running Tests
 
-When waiting for test results, use **max 30 second sleeps**:
-```bash
-# Good - 20-30 second waits
-sleep 20 && tail -50 /tmp/test.log
-sleep 30 && grep -E "PASS|FAIL" /tmp/test.log
-
-# Bad - too long (wastes time, user gets impatient)
-sleep 60 && ...
-sleep 90 && ...
-sleep 120 && ...
-
-# Bad - too frequent (wastes API calls)
-sleep 5 && ...
-```
-
-**NEVER sleep longer than 30 seconds** when waiting for results. If a command needs more time, use shorter sleeps with multiple checks.
-
-**Provide play-by-play updates** as tests run. Don't wait silently - report progress as it happens:
-```
-"Tests starting, 238 total..."
-"30s in, 50 passed so far..."
-"Found 2 failures: test_foo, test_bar"
-"Still running, 180/238 complete..."
-```
+**Max 30 second sleeps** when waiting for results. Provide play-by-play updates as tests run.
 
 ### Preserving Logs from Failed Tests
 
@@ -1031,40 +965,6 @@ On serve process exit (SIGTERM/SIGINT):
 
 No master state file - `list_vms()` globs all `.json` files.
 
-### Test Integration
-
-Tests spawn processes and track PIDs directly (no stdout parsing needed):
-
-```rust
-// 1. Start baseline VM
-let baseline_proc = Command::new("sudo")
-    .args(["fcvm", "podman", "run", ...])
-    .spawn()?;
-let baseline_pid = baseline_proc.id();  // fcvm process PID
-
-// 2. Wait for healthy
-poll_health_by_pid(baseline_pid).await?;
-
-// 3. Create snapshot
-Command::new("sudo")
-    .args(["fcvm", "snapshot", "create", "--pid", &baseline_pid.to_string()])
-    .status()?;
-
-// 4. Start serve
-let serve_proc = Command::new("sudo")
-    .args(["fcvm", "snapshot", "serve", "my-snap"])
-    .spawn()?;
-let serve_pid = serve_proc.id();
-
-// 5. Clone
-let clone_proc = Command::new("sudo")
-    .args(["fcvm", "snapshot", "run", "--pid", &serve_pid.to_string()])
-    .spawn()?;
-
-// 6. Wait for clone healthy
-poll_health_by_pid(clone_proc.id()).await?;
-```
-
 ## Architecture
 
 ### Project Structure
@@ -1219,24 +1119,6 @@ After the setup VM exits, fcvm mounts the rootfs and verifies this marker exists
 If missing, setup fails with a clear error.
 
 The initrd contains a statically-linked busybox and fc-agent binary, injected at boot before systemd.
-
-```rust
-// src/storage/disk.rs - create_cow_disk()
-tokio::process::Command::new("cp")
-    .arg("--reflink=always")
-    .arg(&self.base_rootfs)
-    .arg(&overlay_path)
-```
-
-```rust
-// src/paths.rs - paths loaded from rootfs-config.toml [paths] section
-pub fn assets_dir() -> PathBuf  // Content-addressed: kernels, rootfs, initrd, image-cache
-pub fn data_dir() -> PathBuf    // Mutable: vm-disks, state, snapshots
-
-pub fn vm_runtime_dir(vm_id: &str) -> PathBuf {
-    data_dir().join("vm-disks").join(vm_id)
-}
-```
 
 **Setup**: Run `make setup-fcvm` before tests (called automatically by `make test-root` or `make container-test-root`).
 

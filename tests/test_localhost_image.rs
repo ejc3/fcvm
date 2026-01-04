@@ -4,7 +4,7 @@
 //! The image is exported from the host using `podman save`, mounted into the VM via FUSE,
 //! and then imported by fc-agent using `podman load` before running with podman.
 
-#![cfg(all(feature = "integration-fast", feature = "privileged-tests"))]
+#![cfg(feature = "integration-fast")]
 
 mod common;
 
@@ -13,9 +13,9 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-/// Test that a localhost/ container image can be built and run in a VM
+/// Test that a localhost/ container image can be built and run in a VM (rootless)
 #[tokio::test]
-async fn test_localhost_hello_world_bridged() -> Result<()> {
+async fn test_localhost_hello_world() -> Result<()> {
     println!("\nLocalhost Image Test");
     println!("====================");
     println!("Testing that localhost/ container images work via podman save/load");
@@ -28,7 +28,7 @@ async fn test_localhost_hello_world_bridged() -> Result<()> {
     println!("Step 1: Building test container image localhost/test-hello...");
     build_test_image().await?;
 
-    // Step 2: Start VM with localhost image
+    // Step 2: Start VM with localhost image (rootless mode)
     println!("Step 2: Starting VM with localhost/test-hello image...");
     let mut child = tokio::process::Command::new(&fcvm_path)
         .args([
@@ -36,8 +36,6 @@ async fn test_localhost_hello_world_bridged() -> Result<()> {
             "run",
             "--name",
             &vm_name,
-            "--network",
-            "bridged",
             "localhost/test-hello",
         ])
         .stdout(Stdio::piped())
