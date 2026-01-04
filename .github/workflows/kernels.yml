@@ -145,6 +145,7 @@ jobs:
 
       - name: Create GitHub Release
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        working-directory: fcvm
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
