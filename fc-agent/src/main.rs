@@ -2304,10 +2304,10 @@ async fn main() -> Result<()> {
         let _ = sync_child.kill();
     }
 
-    // Now halt
-    // On ARM64 Firecracker, halt triggers PSCI SYSTEM_OFF which hangs the vCPU.
-    // But reboot triggers PSCI SYSTEM_RESET which Firecracker handles via KVM_EXIT_SHUTDOWN.
-    // So we use reboot -f first (it actually shuts down, not reboots, with reboot=k in cmdline).
+    // Now shutdown
+    // reboot -f triggers PSCI SYSTEM_RESET which Firecracker handles correctly.
+    // halt -f triggers PSCI SYSTEM_OFF which requires the wfx-stopped-exit kernel patch.
+    // We use reboot -f first since it works on all kernels, then fall back to halt -f.
     eprintln!("[fc-agent] calling reboot -f (PSCI SYSTEM_RESET)...");
     let _ = Command::new("reboot").args(["-f"]).spawn();
 
