@@ -134,29 +134,23 @@ The `--setup` flag triggers setup if kernel/rootfs are missing. Only works with 
 
 ### Run a Container
 ```bash
-# Run nginx in a Firecracker VM (using AWS ECR public registry to avoid Docker Hub rate limits)
-sudo fcvm podman run --name web1 public.ecr.aws/nginx/nginx:alpine
+# Run nginx in a Firecracker VM (uses rootless mode by default, no sudo needed)
+fcvm podman run --name web1 public.ecr.aws/nginx/nginx:alpine
 
 # With port forwarding (8080 on host -> 80 in guest)
-sudo fcvm podman run --name web1 --publish 8080:80 public.ecr.aws/nginx/nginx:alpine
+fcvm podman run --name web1 --publish 8080:80 public.ecr.aws/nginx/nginx:alpine
 
 # With host directory mapping (via fuse-pipe)
-sudo fcvm podman run --name web1 --map /host/data:/data public.ecr.aws/nginx/nginx:alpine
-
-# Read-only volume mapping
-sudo fcvm podman run --name web1 --map /host/config:/config:ro public.ecr.aws/nginx/nginx:alpine
+fcvm podman run --name web1 --map /host/data:/data public.ecr.aws/nginx/nginx:alpine
 
 # Custom resources
-sudo fcvm podman run --name web1 --cpu 4 --mem 4096 public.ecr.aws/nginx/nginx:alpine
+fcvm podman run --name web1 --cpu 4 --mem 4096 public.ecr.aws/nginx/nginx:alpine
 
 # With custom command (docker-style trailing args)
-sudo fcvm podman run --name web1 alpine:latest echo "hello world"
+fcvm podman run --name web1 alpine:latest echo "hello world"
 
-# Or using --cmd flag with shell parsing
-sudo fcvm podman run --name web1 --env DEBUG=1 --cmd "nginx -g 'daemon off;'" nginx:alpine
-
-# Rootless mode (no sudo required)
-fcvm podman run --name web1 --network rootless public.ecr.aws/nginx/nginx:alpine
+# Bridged mode (requires sudo, uses iptables)
+sudo fcvm podman run --name web1 --network bridged public.ecr.aws/nginx/nginx:alpine
 
 # List running VMs (sudo needed to read VM state files)
 sudo fcvm ls
@@ -172,36 +166,27 @@ sudo fcvm exec web1 -it -- sh                      # Explicit interactive TTY
 
 ### Snapshot & Clone Workflow
 ```bash
-# 1. Start baseline VM
-sudo fcvm podman run --name baseline public.ecr.aws/nginx/nginx:alpine
+# 1. Start baseline VM (using bridged, or omit --network for rootless)
+sudo fcvm podman run --name baseline --network bridged public.ecr.aws/nginx/nginx:alpine
 
 # 2. Create snapshot (pauses VM briefly)
 sudo fcvm snapshot create baseline --tag nginx-warm
-# Or by PID:
-sudo fcvm snapshot create --pid <vm_pid> --tag nginx-warm
 
-# 3. List available snapshots
-sudo fcvm snapshots
-
-# 4. Start UFFD memory server (serves pages on-demand)
+# 3. Start UFFD memory server (serves pages on-demand)
 sudo fcvm snapshot serve nginx-warm
 
-# 5. List running snapshot servers (sudo needed to read state files)
-sudo fcvm snapshot ls
+# 4. Clone from snapshot (~3ms startup)
+sudo fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
+sudo fcvm snapshot run --pid <serve_pid> --name clone2 --network bridged
 
-# 6. Clone from snapshot (~3ms startup)
-sudo fcvm snapshot run --pid <serve_pid> --name clone1
-sudo fcvm snapshot run --pid <serve_pid> --name clone2
-
-# 7. Clone with port forwarding (each clone can have unique ports)
-sudo fcvm snapshot run --pid <serve_pid> --name web1 --publish 8081:80
-sudo fcvm snapshot run --pid <serve_pid> --name web2 --publish 8082:80
+# 5. Clone with port forwarding (each clone can have unique ports)
+sudo fcvm snapshot run --pid <serve_pid> --name web1 --network bridged --publish 8081:80
+sudo fcvm snapshot run --pid <serve_pid> --name web2 --network bridged --publish 8082:80
 curl localhost:8081  # Reaches clone web1
 curl localhost:8082  # Reaches clone web2
 
-# 8. Clone and execute command (auto-cleans up after)
-sudo fcvm snapshot run --pid <serve_pid> --exec "curl localhost"
-# Clone starts → execs command in container → returns result → cleans up
+# 6. Clone and execute command (auto-cleans up after)
+sudo fcvm snapshot run --pid <serve_pid> --network bridged --exec "curl localhost"
 ```
 
 ---
@@ -606,7 +591,7 @@ See [DESIGN.md](DESIGN.md#commands) for full option reference.
 **`fcvm podman run`** - Essential options:
 ```
 --name <NAME>       VM name (required)
---network <MODE>    bridged (default, needs sudo) or rootless
+--network <MODE>    rootless (default) or bridged (needs sudo)
 --publish <H:G>     Port forward host:guest (e.g., 8080:80)
 --map <H:G[:ro]>    Volume mount host:guest (optional :ro for read-only)
 --env <K=V>         Environment variable
@@ -626,8 +611,8 @@ sudo fcvm exec my-vm -- bash                     # Interactive shell
 
 | Mode | Flag | Root | Notes |
 |------|------|------|-------|
-| Bridged | `--network bridged` | Yes | iptables NAT, better performance |
-| Rootless | `--network rootless` | No | slirp4netns, works without root |
+| Rootless | `--network rootless` (default) | No | slirp4netns, no root needed |
+| Bridged | `--network bridged` | Yes | iptables NAT |
 
 See [DESIGN.md](DESIGN.md#networking) for architecture details.
 
