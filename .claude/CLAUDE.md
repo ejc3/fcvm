@@ -312,6 +312,29 @@ because the double S2 translation creates a cross-domain cache coherency issue.
 **Test results**: With the DSB SY patch, 100MB file copies through FUSE-over-FUSE complete
 successfully with unbounded max_write (~1MB packets). Test: `make test-root FILTER=nested_l2_with_large`
 
+### L2 Single vCPU Requirement (2026-01)
+
+**Problem**: L2 VMs with 2+ vCPUs hit `NETDEV WATCHDOG: CPU: 1: transmit queue 0 timed out`
+around 23-29 seconds after boot. The virtio-net TX queue stops being serviced.
+
+**Symptoms**:
+- fc-agent reaches "configuring DNS from kernel cmdline" then hangs
+- NETDEV WATCHDOG fires with 5600ms timeout
+- L2 network becomes unresponsive
+
+**Root cause**: Multi-vCPU nested VMs under NV2 have interrupt delivery issues between vCPUs.
+The virtio-net driver on one vCPU puts packets on the TX queue, but the notification/interrupt
+path to L1's Firecracker isn't processed correctly with multiple vCPUs.
+
+**Solution**: Use single vCPU for L2+ VMs (`--cpu 1`). The test framework automatically
+applies this for nested VM launches.
+
+**Why it works**: With a single vCPU, there's no cross-vCPU interrupt path to go wrong.
+All virtio notifications go through the same vCPU, avoiding the NV2 multi-vCPU issues.
+
+**Impact**: L2 VMs are limited to 1 vCPU. This is a performance tradeoff but enables
+reliable L2 operation until ARM/kernel developers fix the underlying NV2 issues.
+
 ## FUSE Performance Tracing
 
 Enable per-operation tracing to diagnose FUSE latency issues (especially in nested VMs).
