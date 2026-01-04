@@ -250,7 +250,8 @@ main() {
   user_data_file=$(mktemp)
   create_user_data > "$user_data_file"
 
-  # Launch instance (AWS CLI base64-encodes file:// automatically)
+  # Launch instance - try spot first, fall back to on-demand
+  echo "Trying spot instance..."
   instance_id=$(aws ec2 run-instances \
     --region "$REGION" \
     --image-id "$base_ami" \
@@ -264,7 +265,25 @@ main() {
     --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=ami-builder-temp},{Key=BuildStatus,Value=starting}]' \
     --user-data "file://$user_data_file" \
     --query 'Instances[0].InstanceId' \
-    --output text)
+    --output text 2>&1) || true
+
+  # Fall back to on-demand if spot fails
+  if [[ -z "$instance_id" ]] || [[ "$instance_id" == *"error"* ]] || [[ "$instance_id" == *"Error"* ]]; then
+    echo "Spot failed, using on-demand..."
+    instance_id=$(aws ec2 run-instances \
+      --region "$REGION" \
+      --image-id "$base_ami" \
+      --instance-type c7g.8xlarge \
+      --subnet-id subnet-05c215519b2150ecd \
+      --security-group-ids sg-0ebf2d8c6a0acc1a3 \
+      --iam-instance-profile Name=jumpbox-admin-profile \
+      --associate-public-ip-address \
+      --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":100,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
+      --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=ami-builder-temp},{Key=BuildStatus,Value=starting}]' \
+      --user-data "file://$user_data_file" \
+      --query 'Instances[0].InstanceId' \
+      --output text)
+  fi
   echo "Launched instance: $instance_id"
 
   # Cleanup function
