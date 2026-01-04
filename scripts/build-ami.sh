@@ -63,30 +63,24 @@ aws ec2 create-tags --resources $INSTANCE_ID --tags Key=BuildStatus,Value=buildi
 # Install build deps (apt-get update already done above)
 apt-get install -y build-essential bc bison flex libssl-dev \
   libelf-dev libncurses-dev libdw-dev debhelper-compat rsync kmod cpio curl jq wget git \
+  dwarves \
   podman uidmap slirp4netns fuse-overlayfs containernetworking-plugins \
   fuse3 libfuse3-dev libclang-dev clang musl-tools \
   iproute2 iptables dnsmasq qemu-utils e2fsprogs parted \
   skopeo busybox-static cpio zstd autoconf automake libtool \
   nfs-kernel-server libseccomp-dev
 
-# Download kernel config and patches
-mkdir -p /tmp/kernel/patches
-curl -fsSL https://raw.githubusercontent.com/ejc3/firepod/main/kernel/nested.conf -o /tmp/kernel/nested.conf
+# Clone firepod repo to get kernel config and patches
+git clone --depth 1 https://github.com/ejc3/firepod.git /tmp/firepod
 
-# Download all kernel patches (DSB patches required for NV2 cache coherency)
-for patch in mmfr4-override nv2-vsock-cache-sync nv2-vsock-rx-barrier; do
-  curl -fsSL "https://raw.githubusercontent.com/ejc3/firepod/main/kernel/patches/${patch}.patch" \
-    -o "/tmp/kernel/patches/${patch}.patch" 2>/dev/null || true
-done
-
-# Kernel version from nested.conf (CONFIG_LOCALVERSION or derive from source)
+# Kernel version
 KERNEL_VERSION="6.18.3"
 echo "Building kernel version: $KERNEL_VERSION"
 aws ec2 create-tags --resources $INSTANCE_ID --tags Key=KernelVersion,Value=$KERNEL_VERSION --region us-west-1
 
 # Build host kernel
-cd /tmp/kernel
-BUILD_SHA=$(cat nested.conf patches/*.patch 2>/dev/null | sha256sum | cut -c1-12)
+cd /tmp
+BUILD_SHA=$(cat /tmp/firepod/kernel/nested.conf /tmp/firepod/kernel/patches/*.patch 2>/dev/null | sha256sum | cut -c1-12)
 LOCALVERSION="-fcvm-${BUILD_SHA}"
 
 # Download and extract kernel source
@@ -95,13 +89,13 @@ cd "linux-${KERNEL_VERSION}"
 
 # Use running kernel config as base, merge with nested.conf
 cp /boot/config-$(uname -r) .config 2>/dev/null || zcat /proc/config.gz > .config 2>/dev/null || true
-scripts/kconfig/merge_config.sh -m .config /tmp/kernel/nested.conf
+scripts/kconfig/merge_config.sh -m .config /tmp/firepod/kernel/nested.conf
 echo "CONFIG_LOCALVERSION=\"${LOCALVERSION}\"" >> .config
 echo "CONFIG_LOCALVERSION_AUTO=n" >> .config
 make olddefconfig
 
-# Apply patches
-for patch in /tmp/kernel/patches/*.patch; do
+# Apply all patches from repo
+for patch in /tmp/firepod/kernel/patches/*.patch; do
   [ -f "$patch" ] && patch -p1 < "$patch"
 done
 
