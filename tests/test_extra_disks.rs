@@ -102,11 +102,9 @@ async fn test_extra_disk_rw() -> Result<()> {
     assert!(content.contains("hello"), "read failed: {}", content);
 
     // Write new file in container
-    let content = common::exec_in_container(
-        pid,
-        &["echo world > /data/new.txt && cat /data/new.txt"],
-    )
-    .await?;
+    let content =
+        common::exec_in_container(pid, &["echo world > /data/new.txt && cat /data/new.txt"])
+            .await?;
     assert!(content.contains("world"), "write failed: {}", content);
 
     // Snapshot should be blocked for RW disk
@@ -191,7 +189,11 @@ async fn test_dir_mount_ro(method: MountMethod) -> Result<()> {
 
     // Create a temp directory with test files
     let source_dir = TempDir::new()?;
-    tokio::fs::write(source_dir.path().join("hello.txt"), "hello from dir mount\n").await?;
+    tokio::fs::write(
+        source_dir.path().join("hello.txt"),
+        "hello from dir mount\n",
+    )
+    .await?;
     tokio::fs::create_dir_all(source_dir.path().join("subdir")).await?;
     tokio::fs::write(
         source_dir.path().join("subdir/nested.txt"),
