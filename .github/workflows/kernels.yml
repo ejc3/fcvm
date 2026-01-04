@@ -19,6 +19,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  FUSE_BACKEND_RS: ${{ github.workspace }}/fuse-backend-rs
+  FUSER: ${{ github.workspace }}/fuser
 
 jobs:
   build-nested-kernel:
@@ -28,33 +30,47 @@ jobs:
       contents: write  # Required for creating releases
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: fcvm
 
-      - name: Install GitHub CLI
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+
+      - name: Install Rust
         run: |
-          if ! command -v gh &> /dev/null; then
-            echo "Installing GitHub CLI..."
-            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-            sudo apt-get update
-            sudo apt-get install -y gh
-          else
-            echo "GitHub CLI already installed: $(gh --version)"
-          fi
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libclang-dev clang musl-tools
+
+      - name: Build fcvm
+        working-directory: fcvm
+        run: cargo build --release -p fcvm
 
       - name: Compute kernel version and SHA
         id: kernel
+        working-directory: fcvm
         run: |
-          # Extract version from build.sh
-          VERSION=$(grep '^KERNEL_VERSION=' kernel/build.sh | head -1 | cut -d'"' -f2 || echo "6.18")
-          if [ -z "$VERSION" ]; then
-            VERSION=$(grep 'KERNEL_VERSION:-' kernel/build.sh | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "6.18")
-          fi
+          # Get kernel info from fcvm (reads from rootfs-config.toml)
+          # SHA is computed from build_inputs: kernel/nested.conf + kernel/patches/*.patch
+          SHA=$(cat kernel/nested.conf kernel/patches/*.patch 2>/dev/null | sha256sum | cut -c1-12)
 
-          # Get architecture
+          # Version from config
+          VERSION=$(grep 'kernel_version' ~/.config/fcvm/rootfs-config.toml | grep -oE '"[0-9]+\.[0-9]+\.[0-9]+"' | head -1 | tr -d '"' || echo "6.18.3")
+
           ARCH=$(uname -m)
-
-          # Compute SHA from build inputs
-          SHA=$(cat kernel/build.sh kernel/nested.conf kernel/patches/*.patch 2>/dev/null | sha256sum | cut -c1-12)
 
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "arch=$ARCH" >> $GITHUB_OUTPUT
@@ -80,27 +96,40 @@ jobs:
             echo "exists=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Install build dependencies
+      - name: Setup btrfs for fcvm
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true
         run: |
-          sudo apt-get update
-          sudo apt-get install -y flex bison bc libelf-dev libssl-dev
+          # Create btrfs filesystem if needed
+          if [ ! -d /mnt/fcvm-btrfs ]; then
+            sudo mkdir -p /mnt/fcvm-btrfs
+            sudo truncate -s 50G /var/fcvm-btrfs.img
+            sudo mkfs.btrfs /var/fcvm-btrfs.img
+            sudo mount /var/fcvm-btrfs.img /mnt/fcvm-btrfs
+          fi
+          sudo chmod 777 /mnt/fcvm-btrfs
 
-      - name: Build kernel
+      - name: Build kernel using fcvm
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        working-directory: fcvm
         run: |
+          # Build the nested kernel using fcvm
+          sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels
+
+          # Find the built kernel and copy to expected location
           KERNEL_PATH="/tmp/${{ steps.kernel.outputs.filename }}"
-          echo "Building kernel to: $KERNEL_PATH"
+          SHA="${{ steps.kernel.outputs.sha }}"
+          VERSION="${{ steps.kernel.outputs.version }}"
 
-          # Run build script
-          KERNEL_PATH="$KERNEL_PATH" ./kernel/build.sh
+          # The kernel is at /mnt/fcvm-btrfs/kernels/vmlinux-nested-{version}-{arch}-{sha}.bin
+          BUILT_KERNEL=$(find /mnt/fcvm-btrfs/kernels -name "vmlinux-nested-*-${SHA}.bin" | head -1)
 
-          # Verify output
-          if [ ! -f "$KERNEL_PATH" ]; then
-            echo "ERROR: Kernel not found at $KERNEL_PATH"
+          if [ -z "$BUILT_KERNEL" ] || [ ! -f "$BUILT_KERNEL" ]; then
+            echo "ERROR: Built kernel not found"
+            ls -la /mnt/fcvm-btrfs/kernels/ || true
             exit 1
           fi
 
+          cp "$BUILT_KERNEL" "$KERNEL_PATH"
           ls -lh "$KERNEL_PATH"
           file "$KERNEL_PATH"
 
@@ -113,6 +142,7 @@ jobs:
           FILENAME="${{ steps.kernel.outputs.filename }}"
           VERSION="${{ steps.kernel.outputs.version }}"
           SHA="${{ steps.kernel.outputs.sha }}"
+          ARCH="${{ steps.kernel.outputs.arch }}"
 
           # Delete existing release if force rebuilding
           if [ "${{ inputs.force_build }}" == "true" ]; then
@@ -120,7 +150,6 @@ jobs:
           fi
 
           # Create release with kernel binary
-          ARCH="${{ steps.kernel.outputs.arch }}"
           gh release create "$TAG" \
             --title "Nested Kernel ${VERSION} (${ARCH}) - ${SHA}" \
             --notes "Nested kernel for running fcvm inside fcvm (nested virtualization).
