@@ -146,47 +146,63 @@ wait_for_build() {
 
     # Check for failure immediately
     if [ "$status" = "failed" ]; then
-      echo "Build failed! Fetching last 50 lines of log..."
-      # Try to get error context via SSM
+      echo "================================================"
+      echo "BUILD FAILED - Fetching error log..."
+      echo "================================================"
+      # Try to get error context via SSM (wait longer for command)
       cmd_id=$(aws ssm send-command \
         --region "$REGION" \
         --instance-ids "$instance_id" \
         --document-name "AWS-RunShellScript" \
-        --parameters 'commands=["tail -50 /var/log/ami-build.log 2>/dev/null || echo No log available"]' \
-        --query 'Command.CommandId' --output text 2>/dev/null) || true
+        --parameters 'commands=["tail -100 /var/log/ami-build.log"]' \
+        --query 'Command.CommandId' --output text) || true
       if [ -n "$cmd_id" ]; then
-        sleep 3
+        # Wait for command to complete
+        for j in $(seq 1 10); do
+          sleep 2
+          cmd_status=$(aws ssm get-command-invocation \
+            --region "$REGION" \
+            --command-id "$cmd_id" \
+            --instance-id "$instance_id" \
+            --query 'Status' --output text 2>/dev/null) || true
+          if [ "$cmd_status" = "Success" ] || [ "$cmd_status" = "Failed" ]; then
+            break
+          fi
+        done
+        # Print the log output
+        echo "--- Build Log (last 100 lines) ---"
         aws ssm get-command-invocation \
           --region "$REGION" \
           --command-id "$cmd_id" \
           --instance-id "$instance_id" \
-          --query 'StandardOutputContent' --output text 2>/dev/null || true
+          --query 'StandardOutputContent' --output text || echo "Could not fetch log"
+        echo "--- End Log ---"
+      else
+        echo "Could not send SSM command"
       fi
       return 1
     fi
 
-    # Get last 3 log lines via SSM for progress visibility
-    log_lines=""
+    # Get last 10 log lines via SSM for progress visibility
+    echo "[$i/$timeout] Build status: $status"
     if [ "$status" = "building" ]; then
       cmd_id=$(aws ssm send-command \
         --region "$REGION" \
         --instance-ids "$instance_id" \
         --document-name "AWS-RunShellScript" \
-        --parameters 'commands=["tail -3 /var/log/ami-build.log 2>/dev/null || echo waiting..."]' \
+        --parameters 'commands=["tail -10 /var/log/ami-build.log 2>/dev/null || echo waiting..."]' \
         --query 'Command.CommandId' --output text 2>/dev/null) || true
       if [ -n "$cmd_id" ]; then
-        sleep 2
+        sleep 3
         log_lines=$(aws ssm get-command-invocation \
           --region "$REGION" \
           --command-id "$cmd_id" \
           --instance-id "$instance_id" \
-          --query 'StandardOutputContent' --output text 2>/dev/null | head -3) || true
+          --query 'StandardOutputContent' --output text 2>/dev/null) || true
+        if [ -n "$log_lines" ]; then
+          echo "$log_lines" | sed 's/^/  > /'
+        fi
       fi
-    fi
-
-    echo "[$i/$timeout] Build status: $status"
-    if [ -n "$log_lines" ]; then
-      echo "$log_lines" | sed 's/^/  > /'
     fi
 
     if [ "$status" = "complete" ]; then
