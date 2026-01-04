@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 """
-Analyze CI test run from log artifacts.
+Analyze CI test run.
 
 Usage:
-    # Download artifacts first:
-    gh run download <run_id> --dir /tmp/ci-artifacts
-    
-    # Also download full log:
-    gh run view <run_id> --log > /tmp/ci-artifacts/full.log
-    
-    # Then analyze:
-    python3 scripts/analyze_ci_vms.py /tmp/ci-artifacts
+    # Analyze latest run
+    python3 scripts/analyze_ci_vms.py
+
+    # Analyze specific run
+    python3 scripts/analyze_ci_vms.py 20699186509
 """
+import json
 import re
+import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from pathlib import Path
+
+
+def run_cmd(cmd: list[str], check: bool = True) -> str:
+    """Run command and return stdout."""
+    result = subprocess.run(cmd, capture_output=True, text=True, check=check)
+    return result.stdout
 
 
 def strip_ansi(text: str) -> str:
@@ -23,7 +29,43 @@ def strip_ansi(text: str) -> str:
     return re.sub(r'\x1b\[[0-9;]*m', '', text)
 
 
-def analyze_logs(artifacts_dir: str):
+def get_run_id(arg: str | None) -> str:
+    """Get run ID from argument or fetch latest."""
+    if arg:
+        return arg
+    # Get latest run
+    result = run_cmd(["gh", "run", "list", "--limit", "1", "--json", "databaseId"])
+    runs = json.loads(result)
+    if not runs:
+        print("No runs found")
+        sys.exit(1)
+    return str(runs[0]["databaseId"])
+
+
+def download_artifacts(run_id: str, dest: Path) -> None:
+    """Download test-logs artifacts for a run."""
+    # List artifacts for this run
+    result = run_cmd(["gh", "api", f"repos/{{owner}}/{{repo}}/actions/runs/{run_id}/artifacts"])
+    data = json.loads(result)
+
+    # Download only test-logs artifacts
+    for artifact in data.get("artifacts", []):
+        name = artifact["name"]
+        if name.startswith("test-logs-"):
+            artifact_dir = dest / name
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            run_cmd(["gh", "run", "download", run_id, "--name", name, "--dir", str(artifact_dir)])
+
+
+def get_full_log(run_id: str, dest: Path) -> Path:
+    """Download full log for a run."""
+    log_path = dest / "full.log"
+    result = run_cmd(["gh", "run", "view", run_id, "--log"], check=False)
+    log_path.write_text(result)
+    return log_path
+
+
+def analyze_logs(artifacts_dir: Path) -> dict:
     """Parse log files and count VMs by type."""
     results = {
         'base_vms': [],
@@ -32,21 +74,21 @@ def analyze_logs(artifacts_dir: str):
         'by_job': defaultdict(lambda: {'base': 0, 'clone': 0, 'uffd': 0}),
         'by_test': defaultdict(lambda: {'base': 0, 'clone': 0}),
     }
-    
-    for job_dir in Path(artifacts_dir).iterdir():
-        if not job_dir.is_dir():
+
+    for job_dir in artifacts_dir.iterdir():
+        if not job_dir.is_dir() or not job_dir.name.startswith("test-logs-"):
             continue
         job_name = job_dir.name
-        
+
         for log_file in job_dir.glob("*.log"):
             name = log_file.name
-            
+
             if '-base-' in name:
                 results['base_vms'].append(name)
                 results['by_job'][job_name]['base'] += 1
                 test = name.split('-base-')[0]
                 results['by_test'][test]['base'] += 1
-                
+
             elif '-clone-' in name:
                 results['clone_vms'].append(name)
                 results['by_job'][job_name]['clone'] += 1
@@ -54,7 +96,7 @@ def analyze_logs(artifacts_dir: str):
                     parts = name.split('-clone-')
                     test = parts[0].rsplit('-', 2)[0] if parts[0].count('-') > 2 else parts[0]
                     results['by_test'][test]['clone'] += 1
-                    
+
             elif 'uffd-server' in name:
                 results['uffd_servers'].append(name)
                 results['by_job'][job_name]['uffd'] += 1
@@ -62,215 +104,164 @@ def analyze_logs(artifacts_dir: str):
     return results
 
 
-def analyze_full_log(log_path: Path):
+def analyze_full_log(log_path: Path) -> dict | None:
     """Parse the full CI log for test results and timing."""
     if not log_path.exists():
         return None
-    
+
     content = strip_ansi(log_path.read_text())
-    
+
     results = {
         'jobs': {},
         'tests': {'passed': 0, 'failed': 0, 'skipped': 0, 'flaky': 0},
-        'timings': [],
         'pjdfstest': [],
         'nested_kvm': False,
     }
-    
-    # Parse job summaries - handle both container format and host format
-    # Container: Summary [ 239.109s] 136 tests run: 136 passed, 0 skipped
-    # Host-Root: Summary [ 475.100s] 241 tests run: 241 passed (3 flaky), 13 skipped
+
+    # Parse job summaries
     for line in content.split('\n'):
         if 'Summary' in line and 'tests run' in line:
-            # Extract job name from line start
             parts = line.split('\t')
             if len(parts) >= 1:
                 job = parts[0].strip()
             else:
                 continue
-            
-            # Extract duration
+
             dur_match = re.search(r'\[\s*([\d.]+)s\]', line)
             if not dur_match:
                 continue
             duration = float(dur_match.group(1))
-            
-            # Extract test counts
+
             tests_match = re.search(r'(\d+)\s*tests run:\s*(\d+)\s*passed', line)
             if not tests_match:
                 continue
             total = int(tests_match.group(1))
             passed = int(tests_match.group(2))
-            
-            # Only keep the highest test count per job (final summary)
+
             if job not in results['jobs'] or total > results['jobs'][job]['total']:
                 results['jobs'][job] = {'duration': duration, 'total': total, 'passed': passed}
-    
-    # Check for flaky tests
+
+    # Flaky tests
     flaky_matches = re.findall(r'(\d+)\s*flaky', content)
     results['tests']['flaky'] = sum(int(m) for m in flaky_matches)
-    
+
     # pjdfstest categories
     pjdf_cats = set(re.findall(r'pjdfs-vm-(\w+)', content))
     results['pjdfstest'] = sorted(pjdf_cats)
-    
-    # Nested KVM test
+
+    # Nested KVM
     if 'test_kvm_available_in_vm' in content and 'PASS' in content:
         results['nested_kvm'] = True
-    
-    # Snapshot timings
-    results['snapshot_times'] = []
-    for match in re.finditer(r'Snapshot created \(took ([\d.]+)s\)', content):
-        results['snapshot_times'].append(float(match.group(1)))
-    
-    # Clone health times
-    results['clone_health_times'] = []
-    for match in re.finditer(r'health=([\d.]+)s', content):
-        results['clone_health_times'].append(float(match.group(1)))
-    
-    # VM boot times
-    results['boot_times'] = []
-    for match in re.finditer(r'VM healthy.*took ([\d.]+)s', content):
-        results['boot_times'].append(float(match.group(1)))
-    
+
+    # Performance metrics
+    results['snapshot_times'] = [float(m.group(1)) for m in re.finditer(r'Snapshot created \(took ([\d.]+)s\)', content)]
+    results['clone_health_times'] = [float(m.group(1)) for m in re.finditer(r'health=([\d.]+)s', content)]
+    results['boot_times'] = [float(m.group(1)) for m in re.finditer(r'VM healthy.*took ([\d.]+)s', content)]
+
     return results
 
 
-def print_report(vm_results, log_results=None):
-    """Print formatted report of VM counts and test results."""
+def print_report(run_id: str, vm_results: dict, log_results: dict | None) -> None:
+    """Print formatted report."""
     total_base = len(vm_results['base_vms'])
     total_clone = len(vm_results['clone_vms'])
     total_uffd = len(vm_results['uffd_servers'])
     total_vms = total_base + total_clone
-    
-    print("=" * 70)
-    print("                    FCVM CI FULL ANALYSIS REPORT")
-    print("=" * 70)
+
     print()
-    
-    # Test Results Summary
+    print("=" * 60)
+    print(f"           FCVM CI RUN {run_id}")
+    print("=" * 60)
+    print()
+
+    # Big numbers summary
     if log_results and log_results.get('jobs'):
-        print("## TEST RESULTS SUMMARY")
-        print(f"┌{'─'*20}┬{'─'*12}┬{'─'*10}┬{'─'*12}┐")
-        print(f"│ {'Job':<18} │ {'Duration':>10} │ {'Tests':>8} │ {'Passed':>10} │")
-        print(f"├{'─'*20}┼{'─'*12}┼{'─'*10}┼{'─'*12}┤")
-        total_tests = 0
-        total_passed = 0
-        total_duration = 0
-        for job, data in sorted(log_results['jobs'].items()):
-            dur_str = f"{data['duration']:.1f}s"
-            print(f"│ {job:<18} │ {dur_str:>10} │ {data['total']:>8} │ {data['passed']:>10} │")
-            total_tests += data['total']
-            total_passed += data['passed']
-            total_duration += data['duration']
-        print(f"├{'─'*20}┼{'─'*12}┼{'─'*10}┼{'─'*12}┤")
-        print(f"│ {'TOTAL':<18} │ {total_duration:.1f}s{' '*4} │ {total_tests:>8} │ {total_passed:>10} │")
-        print(f"└{'─'*20}┴{'─'*12}┴{'─'*10}┴{'─'*12}┘")
-        
+        total_tests = sum(j['total'] for j in log_results['jobs'].values())
+        total_passed = sum(j['passed'] for j in log_results['jobs'].values())
+        total_duration = sum(j['duration'] for j in log_results['jobs'].values())
+
+        print(f"  TESTS:     {total_passed}/{total_tests} passed")
+        print(f"  VMs:       {total_vms} spawned ({total_base} base + {total_clone} clones)")
+        print(f"  UFFD:      {total_uffd} memory servers")
+        print(f"  DURATION:  {total_duration:.0f}s total test time")
         if log_results['tests']['flaky'] > 0:
-            print(f"  ⚠️  Flaky tests: {log_results['tests']['flaky']}")
+            print(f"  FLAKY:     {log_results['tests']['flaky']} tests")
         print()
-    
-    # VM Count
-    print("## VM SPAWN COUNT")
-    print(f"┌{'─'*30}┬{'─'*10}┐")
-    print(f"│ {'Category':<28} │ {'Count':>8} │")
-    print(f"├{'─'*30}┼{'─'*10}┤")
-    print(f"│ {'Base VMs':<28} │ {total_base:>8} │")
-    print(f"│ {'Clone VMs':<28} │ {total_clone:>8} │")
-    print(f"│ {'UFFD Servers':<28} │ {total_uffd:>8} │")
-    print(f"├{'─'*30}┼{'─'*10}┤")
-    print(f"│ {'TOTAL VMs SPAWNED':<28} │ {total_vms:>8} │")
-    print(f"└{'─'*30}┴{'─'*10}┘")
-    print()
-    
-    # By Job
-    print("## VMs BY CI JOB")
-    print(f"┌{'─'*25}┬{'─'*8}┬{'─'*8}┬{'─'*8}┐")
-    print(f"│ {'Job':<23} │ {'Base':>6} │ {'Clone':>6} │ {'UFFD':>6} │")
-    print(f"├{'─'*25}┼{'─'*8}┼{'─'*8}┼{'─'*8}┤")
+
+    # Jobs breakdown
+    if log_results and log_results.get('jobs'):
+        print("JOBS:")
+        for job, data in sorted(log_results['jobs'].items()):
+            status = "✓" if data['passed'] == data['total'] else "✗"
+            print(f"  {status} {job}: {data['passed']}/{data['total']} in {data['duration']:.0f}s")
+        print()
+
+    # VMs by job
+    print("VMs BY JOB:")
     for job, counts in sorted(vm_results['by_job'].items()):
         job_short = job.replace('test-logs-', '')
-        print(f"│ {job_short:<23} │ {counts['base']:>6} │ {counts['clone']:>6} │ {counts['uffd']:>6} │")
-    print(f"└{'─'*25}┴{'─'*8}┴{'─'*8}┴{'─'*8}┘")
+        total = counts['base'] + counts['clone']
+        if total > 0:
+            print(f"  {job_short}: {counts['base']} base + {counts['clone']} clones")
     print()
-    
-    # Clone Scaling
-    print("## CLONE SCALING TESTS")
-    clone_tests = [(t, c) for t, c in vm_results['by_test'].items() if c['clone'] > 0]
-    print(f"┌{'─'*30}┬{'─'*8}┬{'─'*8}┬{'─'*10}┐")
-    print(f"│ {'Test':<28} │ {'Base':>6} │ {'Clone':>6} │ {'Ratio':>8} │")
-    print(f"├{'─'*30}┼{'─'*8}┼{'─'*8}┼{'─'*10}┤")
-    for test, counts in sorted(clone_tests, key=lambda x: x[1]['clone'], reverse=True):
-        ratio = counts['clone'] / counts['base'] if counts['base'] > 0 else counts['clone']
-        ratio_str = f"{ratio:.0f}x"
-        print(f"│ {test[:28]:<28} │ {counts['base']:>6} │ {counts['clone']:>6} │ {ratio_str:>8} │")
-    print(f"└{'─'*30}┴{'─'*8}┴{'─'*8}┴{'─'*10}┘")
-    print()
-    
+
     # Performance
     if log_results:
-        print("## PERFORMANCE METRICS")
+        print("PERFORMANCE:")
         if log_results.get('boot_times'):
-            avg_boot = sum(log_results['boot_times']) / len(log_results['boot_times'])
-            print(f"  VM boot to healthy: avg {avg_boot:.1f}s (n={len(log_results['boot_times'])})")
+            avg = sum(log_results['boot_times']) / len(log_results['boot_times'])
+            print(f"  Boot to healthy:    {avg:.1f}s avg (n={len(log_results['boot_times'])})")
         if log_results.get('snapshot_times'):
-            avg_snap = sum(log_results['snapshot_times']) / len(log_results['snapshot_times'])
-            print(f"  Snapshot creation:  avg {avg_snap:.1f}s (n={len(log_results['snapshot_times'])})")
+            avg = sum(log_results['snapshot_times']) / len(log_results['snapshot_times'])
+            print(f"  Snapshot creation:  {avg:.1f}s avg (n={len(log_results['snapshot_times'])})")
         if log_results.get('clone_health_times'):
-            avg_health = sum(log_results['clone_health_times']) / len(log_results['clone_health_times'])
-            print(f"  Clone to healthy:   avg {avg_health:.2f}s (n={len(log_results['clone_health_times'])})")
+            avg = sum(log_results['clone_health_times']) / len(log_results['clone_health_times'])
+            print(f"  Clone to healthy:   {avg:.2f}s avg (n={len(log_results['clone_health_times'])})")
         print()
-    
-    # pjdfstest
-    if log_results and log_results.get('pjdfstest'):
-        print("## POSIX COMPLIANCE (pjdfstest)")
-        print(f"  Categories tested: {len(log_results['pjdfstest'])}")
-        for cat in log_results['pjdfstest']:
-            print(f"    - {cat}")
+
+    # Clone scaling (top 5)
+    clone_tests = [(t, c) for t, c in vm_results['by_test'].items() if c['clone'] > 0]
+    if clone_tests:
+        print("CLONE SCALING (top 5):")
+        for test, counts in sorted(clone_tests, key=lambda x: x[1]['clone'], reverse=True)[:5]:
+            ratio = counts['clone'] / counts['base'] if counts['base'] > 0 else counts['clone']
+            print(f"  {test}: {counts['base']} → {counts['clone']} ({ratio:.0f}x)")
         print()
-    
-    # Nested KVM
-    if log_results and log_results.get('nested_kvm'):
-        print("## NESTED VIRTUALIZATION")
-        print("  ✅ test_kvm_available_in_vm PASSED")
-        print("     /dev/kvm works inside VMs (kvm-arm.mode=nested)")
+
+    # Features
+    features = []
+    if log_results:
+        if log_results.get('pjdfstest'):
+            features.append(f"pjdfstest: {len(log_results['pjdfstest'])} categories")
+        if log_results.get('nested_kvm'):
+            features.append("nested KVM: ✓")
+    if features:
+        print("FEATURES: " + ", ".join(features))
         print()
-    
-    # All tests by category
-    print("## ALL TESTS BY CATEGORY")
-    by_base = sorted(vm_results['by_test'].items(), key=lambda x: x[0])
-    for test, counts in by_base:
-        clone_info = f" + {counts['clone']} clones" if counts['clone'] > 0 else ""
-        print(f"  {test}: {counts['base']} base{clone_info}")
 
 
 def main():
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <artifacts_dir>")
-        print()
-        print("Download artifacts first:")
-        print("  gh run download <run_id> --dir /tmp/ci-artifacts")
-        print("  gh run view <run_id> --log > /tmp/ci-artifacts/full.log")
-        sys.exit(1)
-    
-    artifacts_dir = Path(sys.argv[1])
-    if not artifacts_dir.exists():
-        print(f"Error: {artifacts_dir} does not exist")
-        sys.exit(1)
-    
-    vm_results = analyze_logs(str(artifacts_dir))
-    
-    # Try to find full.log
-    full_log = artifacts_dir / "full.log"
-    if not full_log.exists():
-        full_log = artifacts_dir.parent / "full.log"
-    
-    log_results = None
-    if full_log.exists():
-        log_results = analyze_full_log(full_log)
-    
-    print_report(vm_results, log_results)
+    run_id = get_run_id(sys.argv[1] if len(sys.argv) > 1 else None)
+
+    print(f"Analyzing run {run_id}...")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dest = Path(tmpdir)
+
+        # Download artifacts
+        print("Downloading artifacts...")
+        download_artifacts(run_id, dest)
+
+        # Get full log
+        print("Downloading full log...")
+        log_path = get_full_log(run_id, dest)
+
+        # Analyze
+        vm_results = analyze_logs(dest)
+        log_results = analyze_full_log(log_path)
+
+        # Report
+        print_report(run_id, vm_results, log_results)
 
 
 if __name__ == '__main__':
