@@ -60,10 +60,22 @@ trap 'tag_failed $LINENO' ERR
 
 aws ec2 create-tags --resources $INSTANCE_ID --tags Key=BuildStatus,Value=building --region us-west-1
 
-# Install deps
+# Setup NVMe instance storage (find NVMe that isn't the root disk)
+ROOT_DEV=$(lsblk -no PKNAME $(findmnt -no SOURCE /) | head -1)
+NVME_DEV=$(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && /^nvme/ {print $1}' | grep -v "^$ROOT_DEV$" | head -1)
+if [ -n "$NVME_DEV" ]; then
+  echo "Setting up NVMe: /dev/$NVME_DEV"
+  mkfs.ext4 -F /dev/$NVME_DEV
+  mount /dev/$NVME_DEV /tmp
+  chmod 1777 /tmp
+else
+  echo "WARNING: No NVMe found, using EBS for builds"
+fi
+
+# Install deps (xz-utils needed for kernel kheaders tarball)
 apt-get install -y build-essential bc bison flex libssl-dev \
   libelf-dev libncurses-dev libdw-dev debhelper-compat rsync kmod cpio curl jq wget git \
-  dwarves \
+  dwarves xz-utils \
   podman uidmap slirp4netns fuse-overlayfs containernetworking-plugins \
   fuse3 libfuse3-dev libclang-dev clang musl-tools \
   iproute2 iptables dnsmasq qemu-utils e2fsprogs parted \
@@ -250,20 +262,40 @@ main() {
   user_data_file=$(mktemp)
   create_user_data > "$user_data_file"
 
-  # Launch instance (AWS CLI base64-encodes file:// automatically)
+  # Launch instance - try spot first, fall back to on-demand
+  echo "Trying spot instance..."
   instance_id=$(aws ec2 run-instances \
     --region "$REGION" \
     --image-id "$base_ami" \
-    --instance-type c7g.2xlarge \
+    --instance-type c7gd.8xlarge \
+    --instance-market-options '{"MarketType":"spot"}' \
     --subnet-id subnet-05c215519b2150ecd \
     --security-group-ids sg-0ebf2d8c6a0acc1a3 \
     --iam-instance-profile Name=jumpbox-admin-profile \
     --associate-public-ip-address \
-    --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":100,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
+    --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":40,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
     --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=ami-builder-temp},{Key=BuildStatus,Value=starting}]' \
     --user-data "file://$user_data_file" \
     --query 'Instances[0].InstanceId' \
-    --output text)
+    --output text 2>&1) || true
+
+  # Fall back to on-demand if spot fails
+  if [[ -z "$instance_id" ]] || [[ "$instance_id" == *"error"* ]] || [[ "$instance_id" == *"Error"* ]]; then
+    echo "Spot failed, using on-demand..."
+    instance_id=$(aws ec2 run-instances \
+      --region "$REGION" \
+      --image-id "$base_ami" \
+      --instance-type c7gd.8xlarge \
+      --subnet-id subnet-05c215519b2150ecd \
+      --security-group-ids sg-0ebf2d8c6a0acc1a3 \
+      --iam-instance-profile Name=jumpbox-admin-profile \
+      --associate-public-ip-address \
+      --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":40,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
+      --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=ami-builder-temp},{Key=BuildStatus,Value=starting}]' \
+      --user-data "file://$user_data_file" \
+      --query 'Instances[0].InstanceId' \
+      --output text)
+  fi
   echo "Launched instance: $instance_id"
 
   # Cleanup function
