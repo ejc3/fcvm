@@ -1485,8 +1485,8 @@ FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse
     --kernel-profile nested \
     --kernel {kernel} \
     --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
-    localhost/nested-test \
-    --cmd {next_script}
+    --cmd {next_script} \
+    localhost/nested-test
 "#,
                 level_script = level_script,
                 large_script_call = large_script_call,
@@ -1523,8 +1523,8 @@ FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse
     --kernel-profile nested \
     --kernel {kernel} \
     --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
-    localhost/nested-test \
-    --cmd {next_script}
+    --cmd {next_script} \
+    localhost/nested-test
 "#,
                 level_script = level_script,
                 net_script_call = net_script_call,
@@ -1560,8 +1560,8 @@ FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse
     --kernel-profile nested \
     --kernel {kernel} \
     --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
-    localhost/nested-test \
-    --cmd {next_script}
+    --cmd {next_script} \
+    localhost/nested-test
 "#,
                 level_script = level_script,
                 level = level,
@@ -1617,8 +1617,8 @@ FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse
          --kernel-profile nested \
          --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
          {} \
-         localhost/nested-test \
-         --cmd {} 2>&1 | tee {}",
+         --cmd {} \
+         localhost/nested-test 2>&1 | tee {}",
         n,
         mode_suffix,
         image_cache_mount.name(),

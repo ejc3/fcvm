@@ -212,13 +212,11 @@ fn get_profile_kernel_path(profile_name: &str) -> Result<PathBuf> {
     let profile = get_kernel_profile(profile_name)?
         .ok_or_else(|| anyhow::anyhow!("kernel profile '{}' not found in config", profile_name))?;
 
+    // If profile doesn't specify custom kernel, use the default kernel
+    // This allows runtime-only profiles (boot_args, firecracker_args, etc.)
     if !profile.is_custom() {
-        bail!(
-            "kernel profile '{}' has no kernel source configured.\n\
-             Add kernel_version + kernel_repo to [kernel_profiles.{}]",
-            profile_name,
-            profile_name
-        );
+        debug!(profile = %profile_name, "profile uses default kernel (no custom kernel configured)");
+        return get_default_kernel_path();
     }
 
     let sha = compute_profile_kernel_sha(&profile);
@@ -240,13 +238,11 @@ async fn ensure_profile_kernel(
         )
     })?;
 
+    // If profile doesn't specify custom kernel, use the default kernel
+    // This allows runtime-only profiles (boot_args, firecracker_args, etc.)
     if !profile.is_custom() {
-        bail!(
-            "kernel profile '{}' has no kernel source configured.\n\
-             Add kernel_version + kernel_repo to [kernel_profiles.{}]",
-            profile_name,
-            profile_name
-        );
+        info!(profile = %profile_name, "profile uses default kernel");
+        return ensure_default_kernel(allow_create).await;
     }
 
     let sha = compute_profile_kernel_sha(&profile);
@@ -533,31 +529,24 @@ fn generate_vm_kernel_build_script(
         arch => bail!("Unsupported architecture: {}", arch),
     };
 
-    let arch_for_url = match std::env::consts::ARCH {
-        "aarch64" => "aarch64",
-        "x86_64" => "x86_64",
-        arch => bail!("Unsupported architecture: {}", arch),
-    };
-
     // Get config from profile
-    let patches_dir = profile
-        .patches_dir
-        .as_deref()
-        .map(|p| repo_root.join(p))
-        .unwrap_or_else(|| repo_root.join("kernel/patches"));
+    // Empty string means no patches, None means use default
+    let patches_dir = match profile.patches_dir.as_deref() {
+        Some("") => None, // Explicitly disabled
+        Some(p) => Some(repo_root.join(p)),
+        None => Some(repo_root.join("kernel/patches")), // Default
+    };
 
     let kernel_config = profile.kernel_config.as_deref().map(|p| repo_root.join(p));
 
     let base_config_url = profile
         .base_config_url
         .as_deref()
-        .map(|url| url.replace("{arch}", arch_for_url))
-        .unwrap_or_else(|| {
-            format!(
-                "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-{}-6.1.config",
-                arch_for_url
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "kernel profile must specify base_config_url (e.g., firecracker microvm-kernel-ci config)"
             )
-        });
+        })?;
 
     let script = format!(
         r##"#!/bin/bash
@@ -573,7 +562,7 @@ SOURCE_DIR="$BUILD_DIR/linux-${{KERNEL_VERSION}}"
 SHA_MARKER="$SOURCE_DIR/.fcvm-patches-sha"
 BUILD_SHA="{sha}"
 KERNEL_PATH="{kernel_path}"
-PATCHES_DIR="{patches_dir}"
+{patches_dir_line}
 KERNEL_ARCH="{kernel_arch}"
 KERNEL_IMAGE="{kernel_image}"
 BASE_CONFIG_URL="{base_config_url}"
@@ -623,43 +612,7 @@ fi
 
 cd "$SOURCE_DIR"
 
-# Apply patches (VM kernel applies all: *.patch + *.vm.patch)
-if [[ -f "$SHA_MARKER" ]] && [[ "$(cat "$SHA_MARKER")" == "$BUILD_SHA" ]]; then
-    echo "Patches already applied (SHA: $BUILD_SHA)"
-else
-    echo "Applying patches..."
-
-    # Track applied patches to avoid duplicates (*.patch glob also matches *.vm.patch)
-    declare -A applied_patches
-
-    for patch_file in "$PATCHES_DIR"/*.patch "$PATCHES_DIR"/*.vm.patch; do
-        [[ ! -f "$patch_file" ]] && continue
-        [[ -n "${{applied_patches[$patch_file]:-}}" ]] && continue
-        applied_patches[$patch_file]=1
-        patch_name=$(basename "$patch_file")
-
-        echo "  Checking $patch_name..."
-        if patch -p1 --forward --dry-run < "$patch_file" >/dev/null 2>&1; then
-            echo "  Applying $patch_name..."
-            patch -p1 --forward < "$patch_file"
-        else
-            # Check if already applied (reversed)
-            if patch -p1 --reverse --dry-run < "$patch_file" >/dev/null 2>&1; then
-                echo "    Already applied: $patch_name"
-            else
-                echo "    ERROR: Patch does not apply cleanly: $patch_name"
-                patch -p1 --forward --dry-run < "$patch_file" || true
-                cd "$BUILD_DIR"
-                rm -rf "$SOURCE_DIR"
-                echo "    Re-run this script to rebuild from fresh source."
-                exit 1
-            fi
-        fi
-    done
-
-    echo "$BUILD_SHA" > "$SHA_MARKER"
-    echo "Patches applied successfully (SHA: $BUILD_SHA)"
-fi
+{apply_patches_block}
 
 # Download Firecracker base config
 echo "Downloading Firecracker base config..."
@@ -684,11 +637,11 @@ echo ""
 echo "Building kernel with $NPROC parallel jobs..."
 make ARCH="$KERNEL_ARCH" -j"$NPROC" "$KERNEL_IMAGE"
 
-# Copy output
+# Copy output (Firecracker needs uncompressed ELF vmlinux, not bzImage)
 echo "Copying kernel to $KERNEL_PATH..."
 case "$KERNEL_ARCH" in
     arm64)  cp "arch/arm64/boot/Image" "$KERNEL_PATH" ;;
-    x86_64) cp "arch/x86/boot/bzImage" "$KERNEL_PATH" ;;
+    x86_64) cp "vmlinux" "$KERNEL_PATH" ;;
 esac
 
 echo ""
@@ -700,7 +653,51 @@ echo "Size: $(du -h "$KERNEL_PATH" | cut -f1)"
         kernel_major = kernel_major,
         sha = sha,
         kernel_path = dest.display(),
-        patches_dir = patches_dir.display(),
+        patches_dir_line = patches_dir
+            .as_ref()
+            .map(|p| format!("PATCHES_DIR=\"{}\"", p.display()))
+            .unwrap_or_else(|| "# No patches directory".to_string()),
+        apply_patches_block = if patches_dir.is_some() {
+            r#"# Apply patches (VM kernel applies all: *.patch + *.vm.patch)
+if [[ -f "$SHA_MARKER" ]] && [[ "$(cat "$SHA_MARKER")" == "$BUILD_SHA" ]]; then
+    echo "Patches already applied (SHA: $BUILD_SHA)"
+else
+    echo "Applying patches..."
+
+    # Track applied patches to avoid duplicates (*.patch glob also matches *.vm.patch)
+    declare -A applied_patches
+
+    for patch_file in "$PATCHES_DIR"/*.patch "$PATCHES_DIR"/*.vm.patch; do
+        [[ ! -f "$patch_file" ]] && continue
+        [[ -n "${applied_patches[$patch_file]:-}" ]] && continue
+        applied_patches[$patch_file]=1
+        patch_name=$(basename "$patch_file")
+
+        echo "  Checking $patch_name..."
+        if patch -p1 --forward --dry-run < "$patch_file" >/dev/null 2>&1; then
+            echo "  Applying $patch_name..."
+            patch -p1 --forward < "$patch_file"
+        else
+            # Check if already applied (reversed)
+            if patch -p1 --reverse --dry-run < "$patch_file" >/dev/null 2>&1; then
+                echo "    Already applied: $patch_name"
+            else
+                echo "    ERROR: Patch does not apply cleanly: $patch_name"
+                patch -p1 --forward --dry-run < "$patch_file" || true
+                cd "$BUILD_DIR"
+                rm -rf "$SOURCE_DIR"
+                echo "    Re-run this script to rebuild from fresh source."
+                exit 1
+            fi
+        fi
+    done
+
+    echo "$BUILD_SHA" > "$SHA_MARKER"
+    echo "Patches applied successfully (SHA: $BUILD_SHA)"
+fi"#
+        } else {
+            "# No patches to apply"
+        },
         kernel_arch = kernel_arch,
         kernel_image = kernel_image,
         base_config_url = base_config_url,
@@ -795,11 +792,12 @@ fn generate_host_kernel_build_script(
     let kernel_version = &config.kernel_version;
     let kernel_major = kernel_version.split('.').next().unwrap_or(kernel_version);
 
-    let patches_dir = config
-        .patches_dir
-        .as_deref()
-        .map(|p| repo_root.join(p))
-        .unwrap_or_else(|| repo_root.join("kernel/patches"));
+    // Empty string means no patches, None means use default
+    let patches_dir = match config.patches_dir.as_deref() {
+        Some("") => None, // Explicitly disabled
+        Some(p) => Some(repo_root.join(p)),
+        None => Some(repo_root.join("kernel/patches")), // Default
+    };
 
     let script = format!(
         r##"#!/bin/bash
@@ -817,7 +815,7 @@ NPROC="${{NPROC:-$(nproc)}}"
 SOURCE_DIR="$BUILD_DIR/linux-${{KERNEL_VERSION}}"
 SHA_MARKER="$SOURCE_DIR/.fcvm-patches-sha"
 BUILD_SHA="{sha}"
-PATCHES_DIR="{patches_dir}"
+{patches_dir_line}
 LOCALVERSION="-fcvm-${{BUILD_SHA}}"
 DEB_NAME="linux-image-${{KERNEL_VERSION}}${{LOCALVERSION}}"
 
@@ -870,7 +868,70 @@ fi
 
 cd "$SOURCE_DIR"
 
-# Apply patches (host kernel: *.patch only, skip *.vm.patch)
+{apply_patches_block}
+
+# Copy current kernel config as base (includes all EC2/AWS modules)
+echo "Using current kernel config as base..."
+CURRENT_VERSION=$(uname -r)
+if [[ -f "/boot/config-${{CURRENT_VERSION}}" ]]; then
+    cp "/boot/config-${{CURRENT_VERSION}}" .config
+    echo "  Copied /boot/config-${{CURRENT_VERSION}}"
+elif [[ -f /proc/config.gz ]]; then
+    zcat /proc/config.gz > .config
+    echo "  Extracted from /proc/config.gz"
+else
+    echo "ERROR: Cannot find current kernel config"
+    exit 1
+fi
+
+# Detect kernel architecture from running system
+case "$(uname -m)" in
+    x86_64)  KERNEL_ARCH="x86" ;;
+    aarch64) KERNEL_ARCH="arm64" ;;
+    *)       echo "Unsupported architecture: $(uname -m)"; exit 1 ;;
+esac
+echo "Detected architecture: $KERNEL_ARCH"
+
+# Update config for new kernel version
+echo "Updating config for kernel ${{KERNEL_VERSION}}..."
+make ARCH="$KERNEL_ARCH" olddefconfig
+
+# Disable module signing (we don't have AWS signing keys)
+echo "Disabling module signing..."
+scripts/config --disable MODULE_SIG
+scripts/config --disable MODULE_SIG_ALL
+scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
+scripts/config --set-str SYSTEM_REVOCATION_KEYS ""
+make ARCH="$KERNEL_ARCH" olddefconfig
+
+# Build deb packages
+echo ""
+echo "Building kernel deb packages with $NPROC parallel jobs..."
+echo "LOCALVERSION=$LOCALVERSION"
+echo "This takes 15-30 minutes..."
+echo ""
+
+make -j"$NPROC" ARCH="$KERNEL_ARCH" LOCALVERSION="$LOCALVERSION" bindeb-pkg
+
+echo ""
+echo "=== Build Complete ==="
+echo "Deb packages:"
+ls -la "$BUILD_DIR"/*.deb | grep -v dbg || true
+echo ""
+echo "To install:"
+echo "  sudo dpkg -i $BUILD_DIR/linux-image-${{KERNEL_VERSION}}${{LOCALVERSION}}*.deb"
+echo "  sudo update-grub"
+echo "  sudo reboot"
+"##,
+        kernel_version = kernel_version,
+        kernel_major = kernel_major,
+        sha = sha,
+        patches_dir_line = patches_dir
+            .as_ref()
+            .map(|p| format!("PATCHES_DIR=\"{}\"", p.display()))
+            .unwrap_or_else(|| "# No patches directory".to_string()),
+        apply_patches_block = if patches_dir.is_some() {
+            r#"# Apply patches (host kernel: *.patch only, skip *.vm.patch)
 if [[ -f "$SHA_MARKER" ]] && [[ "$(cat "$SHA_MARKER")" == "$BUILD_SHA" ]]; then
     echo "Patches already applied (SHA: $BUILD_SHA)"
 else
@@ -902,54 +963,10 @@ else
     # Mark source as patched with this SHA
     echo "$BUILD_SHA" > "$SHA_MARKER"
     echo "Patches applied successfully (SHA: $BUILD_SHA)"
-fi
-
-# Copy current kernel config as base (includes all EC2/AWS modules)
-echo "Using current kernel config as base..."
-CURRENT_VERSION=$(uname -r)
-if [[ -f "/boot/config-${{CURRENT_VERSION}}" ]]; then
-    cp "/boot/config-${{CURRENT_VERSION}}" .config
-    echo "  Copied /boot/config-${{CURRENT_VERSION}}"
-elif [[ -f /proc/config.gz ]]; then
-    zcat /proc/config.gz > .config
-    echo "  Extracted from /proc/config.gz"
-else
-    echo "ERROR: Cannot find current kernel config"
-    exit 1
-fi
-
-# Update config for new kernel version
-echo "Updating config for kernel ${{KERNEL_VERSION}}..."
-make ARCH=arm64 olddefconfig
-
-# Disable IKHEADERS - causes parallel build failures and not needed
-scripts/config --disable CONFIG_IKHEADERS
-scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS ""
-scripts/config --set-str CONFIG_SYSTEM_REVOCATION_KEYS ""
-
-# Build deb packages
-echo ""
-echo "Building kernel deb packages with $NPROC parallel jobs..."
-echo "LOCALVERSION=$LOCALVERSION"
-echo "This takes 15-30 minutes..."
-echo ""
-
-make -j"$NPROC" ARCH=arm64 LOCALVERSION="$LOCALVERSION" bindeb-pkg
-
-echo ""
-echo "=== Build Complete ==="
-echo "Deb packages:"
-ls -la "$BUILD_DIR"/*.deb | grep -v dbg || true
-echo ""
-echo "To install:"
-echo "  sudo dpkg -i $BUILD_DIR/linux-image-${{KERNEL_VERSION}}${{LOCALVERSION}}*.deb"
-echo "  sudo update-grub"
-echo "  sudo reboot"
-"##,
-        kernel_version = kernel_version,
-        kernel_major = kernel_major,
-        sha = sha,
-        patches_dir = patches_dir.display(),
+fi"#
+        } else {
+            "# No patches to apply"
+        },
     );
 
     Ok(script)
@@ -1212,6 +1229,32 @@ pub async fn get_profile_firecracker_path(
     let filename = format!("firecracker-{}-{}.bin", profile_name, sha);
 
     Some(paths::assets_dir().join("firecracker").join(filename))
+}
+
+/// Get the firecracker binary path for a kernel profile.
+///
+/// Returns the custom firecracker from the profile if configured (firecracker_repo),
+/// otherwise falls back to the system firecracker via which.
+///
+/// This is the canonical way to get the firecracker path for a profile.
+pub async fn get_firecracker_for_profile(
+    profile: &KernelProfile,
+    profile_name: &str,
+) -> Result<PathBuf> {
+    // Check for custom firecracker from profile
+    if let Some(custom_fc) = get_profile_firecracker_path(profile, profile_name).await {
+        if !custom_fc.exists() {
+            bail!(
+                "Custom firecracker not found at {}. Run: fcvm setup --kernel-profile {}",
+                custom_fc.display(),
+                profile_name
+            );
+        }
+        return Ok(custom_fc);
+    }
+
+    // Fall back to system firecracker
+    which::which("firecracker").context("firecracker not found in PATH")
 }
 
 /// Ensure the firecracker binary for a kernel profile exists.
