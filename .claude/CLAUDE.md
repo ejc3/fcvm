@@ -913,34 +913,11 @@ assert!(localhost_works, "Localhost port forwarding should work (requires route_
 
 ### Build and Test Rules
 
-**CRITICAL: NEVER use `sudo cargo` or `sudo cargo test`. ALWAYS use Makefile targets.**
+**NEVER use `sudo cargo`. ALWAYS use Makefile targets.**
 
-The Makefile uses `CARGO_TARGET_*_RUNNER='sudo -E'` to run test **binaries** with sudo, not cargo itself. Using `sudo cargo` creates root-owned files in `target/` that break subsequent non-sudo builds.
+The Makefile uses `CARGO_TARGET_*_RUNNER='sudo -E'` to run test binaries with sudo, not cargo itself. Using `sudo cargo` creates root-owned files in `target/` that break subsequent builds.
 
-```bash
-# CORRECT - always use make
-make build       # Build fcvm + fc-agent (no sudo)
-make test-unit   # Unit tests only, no sudo
-make test-fast   # + quick VM tests, no sudo (rootless only)
-make test-all    # + slow VM tests, no sudo (rootless only)
-make test-root   # + privileged tests (bridged, pjdfstest), uses sudo runner
-make test        # Alias for test-root
-
-# WRONG - never do this
-sudo cargo build ...        # Creates root-owned target/, breaks everything
-sudo cargo test ...         # Same problem
-cargo test -p fcvm ...      # Missing feature flags, setup
-```
-
-**Test tiers (additive):**
-| Target | Features | Sudo | Tests |
-|--------|----------|------|-------|
-| test-unit | none | no | lint, cli, state manager |
-| test-fast | integration-fast | no | + quick VM (rootless) |
-| test-all | + integration-slow | no | + slow VM (rootless) |
-| test-root | + privileged-tests | yes | + bridged, pjdfstest |
-
-**Feature flags**: `privileged-tests` gates bridged networking tests and pjdfstest. Rootless tests compile without it. Use `FILTER=` to filter by name pattern.
+See README.md for test tiers and Makefile targets.
 
 ### Container Build Rules
 
@@ -1102,74 +1079,15 @@ println!("{}", tracer.read_grep("kvm_exit", 50)?);
 
 **Event sets:** `EVENTS_PSCI` (low noise), `EVENTS_INTERRUPTS`, `EVENTS_DETAILED` (noisy)
 
-### POSIX Compliance (pjdfstest)
+## CI and Testing
 
-All 8789 pjdfstest tests pass via two parallel test matrices:
+**See README.md for test categories, CI summary, and Makefile targets.** Run `make help` for full list.
 
-| Matrix | Location | What it tests |
-|--------|----------|---------------|
-| Host-side | `fuse-pipe/tests/pjdfstest_matrix_root.rs` | fuse-pipe FUSE directly (no VM) |
-| In-VM | `tests/test_fuse_in_vm_matrix.rs` | Full stack: host VolumeServer → vsock → guest FUSE |
-
-Both matrices run 17 categories in parallel via nextest. Each category is a separate test, so all 34 tests (17 × 2) can run concurrently. Total time is ~2-3 minutes (limited by slowest category: chown ~82s).
-
-## CI and Testing Philosophy
-
-**Use the Makefile.** All test commands are defined there. Never reimplement `podman run` commands - use the existing targets.
-
-### Key Makefile Targets
-
-| Target | What |
-|--------|------|
-| `make test-unit` | Unit tests only (no VMs, no sudo) |
-| `make test-fast` | + quick VM tests (rootless, no sudo) |
-| `make test-all` | + slow VM tests (rootless, no sudo) |
-| `make test-root` | + privileged tests (bridged, pjdfstest, sudo) |
-| `make test` | Alias for test-root |
-| `make container-test` | All tests in container |
-
-### Path Overrides for CI
-
-Makefile paths can be overridden via environment:
-```bash
-export FUSE_BACKEND_RS=/path/to/fuse-backend-rs
-export FUSER=/path/to/fuser
-make container-test
-```
-
-### CI Structure
-
-**PR/Push (2 parallel jobs):**
-- Host: Runs on bare metal with KVM
-- Container: Runs in privileged container
-
-**Nightly (scheduled):**
-- Full benchmarks with artifact upload
-
-### Manual CI Trigger
-
-CI only auto-runs on PRs to `main`. To test other branches:
-```bash
-gh workflow run ci.yml --ref <branch-name>
-```
-
-### Getting Logs from In-Progress CI Runs
-
-**`gh run view --log` only works after ALL jobs complete.** To get logs from a completed job while other jobs are still running:
-
-```bash
-# Get job ID for the completed job
-gh api repos/OWNER/REPO/actions/runs/RUN_ID/jobs --jq '.jobs[] | select(.name=="Host") | .id'
-
-# Fetch logs for that specific job
-gh api repos/OWNER/REPO/actions/runs/RUN_ID/jobs --jq '.jobs[] | select(.name=="Host") | .id' \
-  | xargs -I{} gh api repos/OWNER/REPO/actions/jobs/{}/logs 2>&1 \
-  | grep -E "pattern"
-```
-
-### linkat AT_EMPTY_PATH Limitation
-
-fuse-backend-rs hardlinks use `linkat(..., AT_EMPTY_PATH)`. Older kernels require `CAP_DAC_READ_SEARCH` capability; newer kernels (≥5.12ish) relaxed this. BuildJet runs older kernel → ENOENT. Localhost (kernel 6.14) works fine. Hardlink tests detect and skip. See [linkat(2)](https://man7.org/linux/man-pages/man2/linkat.2.html), [kernel patch](https://lwn.net/Articles/565122/).
+Key points for development:
+- Always use `make test-root FILTER=<pattern>` - never raw cargo commands
+- CI runs on every PR: Host (bare metal) + Container (privileged)
+- Manual trigger: `gh workflow run ci.yml --ref <branch>`
+- Get in-progress logs: `gh api repos/OWNER/REPO/actions/runs/RUN_ID/jobs`
 
 ## PID-Based Process Management
 
@@ -1537,44 +1455,7 @@ fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
 
 ## Build Instructions
 
-### Makefile Targets
-
-Run `make help` for full list. Key targets:
-
-#### Development
-| Target | Description |
-|--------|-------------|
-| `make build` | Build fcvm + fc-agent |
-| `make clean` | Clean build artifacts |
-
-#### Testing
-| Target | Description |
-|--------|-------------|
-| `make test-unit` | Unit tests only (no VMs, no sudo) |
-| `make test-fast` | + quick VM tests (rootless, no sudo) |
-| `make test-all` | + slow VM tests (rootless, no sudo) |
-| `make test-root` | + privileged tests (bridged, pjdfstest, sudo) |
-| `make test` | Alias for test-root |
-| `make container-test` | All tests in container |
-| `make container-shell` | Interactive shell |
-
-#### Linting
-| Target | Description |
-|--------|-------------|
-| `make lint` | Run lint tests (fmt, clippy, audit, deny) |
-| `make fmt` | Format code |
-
-#### Benchmarks
-| Target | Description |
-|--------|-------------|
-| `make bench` | All benchmarks (throughput + operations + protocol) |
-| `make container-bench` | Run benchmarks in container (used by nightly CI) |
-
-#### Setup (idempotent, run automatically by tests)
-| Target | Description |
-|--------|-------------|
-| `make setup-btrfs` | Create btrfs loopback |
-| `make setup-fcvm` | Download kernel and create rootfs (runs `fcvm setup`) |
+Run `make help` for all targets. See README.md for details.
 
 ### How Setup Works
 
@@ -1724,38 +1605,15 @@ let (mut child, pid) = common::spawn_fcvm(&["podman", "run", "--name", &vm_name,
 - No deadlock because parent's stdout/stderr handle the data
 - Consistent error handling and PID extraction
 
-## fuse-pipe Testing
+## fuse-pipe Debugging
 
-**Quick reference**: See `make help` for all targets.
-
-### Quick Reference
-
-| Command | Description |
-|---------|-------------|
-| `make container-test-unit` | Unit tests in container |
-| `make container-test-fast` | + quick VM tests (rootless) |
-| `make container-test-all` | + slow VM tests (rootless) |
-| `make container-test-root` | + privileged tests |
-| `make container-test` | Alias for container-test-root |
-| `make container-shell` | Interactive shell |
-
-### Tracing Targets
-
-| Target | Component |
-|--------|-----------|
-| `fuse_pipe::fixture` | Test fixture setup/teardown |
-| `fuse-pipe::server` | Async server |
-| `fuse-pipe::client` | FUSE client, multiplexer |
-| `passthrough` | PassthroughFs operations |
-
-### Running Tests with Tracing
+**Tracing targets** for debugging FUSE issues:
+- `passthrough` - PassthroughFs operations (most useful)
+- `fuse_pipe` - fuse-pipe client/server
+- `fuse_backend_rs` - fuse-backend-rs internals
 
 ```bash
-# All components at info level, passthrough at debug
-RUST_LOG="fuse_pipe=info,fuse-pipe=info,passthrough=debug" sudo -E cargo test --release -p fuse-pipe --test integration -- --nocapture
-
-# Just passthrough operations
-RUST_LOG="passthrough=debug" sudo -E cargo test --release -p fuse-pipe --test integration test_list_directory -- --nocapture
+RUST_LOG="passthrough=debug" make test-root FILTER=permission -- --nocapture
 ```
 
 ## Exec Command Flags
