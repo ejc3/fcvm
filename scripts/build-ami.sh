@@ -68,10 +68,11 @@ aws ec2 create-tags --resources $INSTANCE_ID --tags Key=BuildStatus,Value=buildi
 # SSH keys: fcvm-ec2 + dev servers can SSH in for debugging
 mkdir -p /home/ubuntu/.ssh
 chmod 700 /home/ubuntu/.ssh
-# Static key (fcvm-ec2)
-echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINwtXjjTCVgT9OR3qrnz3zDkV2GveuCBlWFXSOBG2joe fcvm-ec2" >> /home/ubuntu/.ssh/authorized_keys
-# Dev server key from SSM
-aws ssm get-parameter --name /dev-servers/runner-ssh-key-pub --region us-west-1 --query Parameter.Value --output text >> /home/ubuntu/.ssh/authorized_keys || true
+# Static keys (fcvm-ec2 for jumpbox, dev-to-runner for dev servers)
+cat >> /home/ubuntu/.ssh/authorized_keys << 'SSHKEYS'
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINwtXjjTCVgT9OR3qrnz3zDkV2GveuCBlWFXSOBG2joe fcvm-ec2
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPEnsYFangbzY7I0yUxa1sr0MNWN9fMiAKIcUpV6KaLn dev-to-runner
+SSHKEYS
 chmod 600 /home/ubuntu/.ssh/authorized_keys
 chown -R ubuntu:ubuntu /home/ubuntu/.ssh
 
