@@ -176,7 +176,7 @@ jobs:
           sudo apt-get install -y fuse3 libfuse3-dev libclang-dev clang musl-tools \
             iproute2 iptables slirp4netns dnsmasq qemu-utils e2fsprogs parted \
             podman skopeo busybox-static cpio zstd autoconf automake libtool cmake \
-            libseccomp-dev
+            libseccomp-dev nfs-kernel-server
       - name: Install Firecracker
         run: |
           curl -L -o /tmp/firecracker.tgz \
@@ -310,7 +310,7 @@ jobs:
           sudo apt-get install -y fuse3 libfuse3-dev libclang-dev clang musl-tools \
             iproute2 iptables slirp4netns dnsmasq qemu-utils e2fsprogs parted \
             podman skopeo busybox-static cpio zstd autoconf automake libtool cmake \
-            libseccomp-dev
+            libseccomp-dev nfs-kernel-server
       - name: Install Firecracker
         run: |
           curl -L -o /tmp/firecracker.tgz \
@@ -345,6 +345,8 @@ jobs:
           sudo sysctl -w vm.unprivileged_userfaultfd=1
           echo "user_allow_other" | sudo tee /etc/fuse.conf
           podman system migrate || true
+          # Install iperf3 for network benchmarks
+          sudo apt-get update && sudo apt-get install -y iperf3 || true
       - name: Create test log directory
         run: mkdir -p /tmp/fcvm-test-logs
       - name: Clean test data

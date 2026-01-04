@@ -49,6 +49,21 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         anyhow::bail!("Either --name or --pid must be specified");
     };
 
+    // Block snapshots when VM has read-write extra disks
+    let rw_disks: Vec<_> = vm_state
+        .config
+        .extra_disks
+        .iter()
+        .filter(|d| !d.read_only)
+        .collect();
+    if !rw_disks.is_empty() {
+        anyhow::bail!(
+            "Cannot create snapshot: VM has {} read-write extra disk(s). \
+             Use :ro suffix for disks that should be included in snapshots.",
+            rw_disks.len()
+        );
+    }
+
     let snapshot_name = args.tag.unwrap_or_else(|| {
         vm_state
             .name

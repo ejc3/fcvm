@@ -67,6 +67,25 @@ pub enum ProcessType {
     Clone,
 }
 
+/// Extra disk configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtraDisk {
+    pub path: String,
+    pub mount_path: String,
+    pub read_only: bool,
+}
+
+/// NFS share configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NfsShare {
+    /// Host directory being exported
+    pub host_path: String,
+    /// Mount path inside guest/container
+    pub mount_path: String,
+    /// Read-only mount
+    pub read_only: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmConfig {
     pub image: String,
@@ -75,6 +94,12 @@ pub struct VmConfig {
     pub network: NetworkConfig,
     pub volumes: Vec<String>,
     pub env: Vec<String>,
+    /// Extra block devices (paths to raw disk images)
+    #[serde(default)]
+    pub extra_disks: Vec<ExtraDisk>,
+    /// NFS shares to mount in guest
+    #[serde(default)]
+    pub nfs_shares: Vec<NfsShare>,
     /// HTTP health check URL. None means check container running status via fc-agent.
     pub health_check_url: Option<String>,
     /// Which snapshot this process is serving or was cloned from
@@ -106,6 +131,8 @@ impl VmState {
                 network: NetworkConfig::default(),
                 volumes: Vec::new(),
                 env: Vec::new(),
+                extra_disks: Vec::new(),
+                nfs_shares: Vec::new(),
                 health_check_url: None,
                 snapshot_name: None,
                 process_type: Some(ProcessType::Vm),
