@@ -922,6 +922,9 @@ fi
 echo "Updating config for kernel ${{KERNEL_VERSION}}..."
 make ARCH=arm64 olddefconfig
 
+# Disable IKHEADERS - causes parallel build failures and not needed
+scripts/config --disable CONFIG_IKHEADERS
+
 # Build deb packages
 echo ""
 echo "Building kernel deb packages with $NPROC parallel jobs..."
