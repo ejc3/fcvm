@@ -254,7 +254,8 @@ main() {
   instance_id=$(aws ec2 run-instances \
     --region "$REGION" \
     --image-id "$base_ami" \
-    --instance-type c7g.2xlarge \
+    --instance-type c7g.8xlarge \
+    --instance-market-options '{"MarketType":"spot"}' \
     --subnet-id subnet-05c215519b2150ecd \
     --security-group-ids sg-0ebf2d8c6a0acc1a3 \
     --iam-instance-profile Name=jumpbox-admin-profile \
