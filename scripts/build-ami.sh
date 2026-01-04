@@ -7,9 +7,14 @@ REGION="${AWS_REGION:-us-west-1}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 KERNEL_DIR="$(dirname "$SCRIPT_DIR")/kernel"
 
-# Compute build hash (from kernel config + patches, matches fcvm's kernel SHA)
+# Compute build hash (from kernel config + patches + boot_args)
 compute_hash() {
-  cat "$KERNEL_DIR/nested.conf" "$KERNEL_DIR/patches/"*.patch 2>/dev/null | sha256sum | cut -c1-12
+  local repo_root="$(dirname "$KERNEL_DIR")"
+  {
+    cat "$KERNEL_DIR/nested.conf" "$KERNEL_DIR/patches/"*.patch 2>/dev/null
+    # Include boot_args from config to invalidate cache when they change
+    grep -E '^boot_args\s*=' "$repo_root/rootfs-config.toml" 2>/dev/null || true
+  } | sha256sum | cut -c1-12
 }
 
 # Check for existing AMI with matching hash

@@ -1407,11 +1407,31 @@ pub async fn ensure_profile_firecracker(
 
 async fn update_grub_config(kernel_name: &str, boot_args: Option<&str>) -> Result<()> {
     let grub_default = Path::new("/etc/default/grub");
+    let grub_d = Path::new("/etc/default/grub.d");
 
     if !grub_default.exists() {
         bail!("/etc/default/grub not found");
     }
 
+    // Cloud images have /etc/default/grub.d/50-cloudimg-settings.cfg that overrides
+    // GRUB_CMDLINE_LINUX_DEFAULT. We need to use a higher-numbered file to override it.
+    if grub_d.exists() {
+        if let Some(args) = boot_args {
+            let fcvm_cfg = grub_d.join("99-fcvm.cfg");
+            let content = format!(
+                "# fcvm kernel boot parameters\n\
+                 # Overrides cloud-image defaults for nested virtualization\n\
+                 GRUB_CMDLINE_LINUX_DEFAULT=\"$GRUB_CMDLINE_LINUX_DEFAULT {}\"\n",
+                args
+            );
+            tokio::fs::write(&fcvm_cfg, &content)
+                .await
+                .context("writing /etc/default/grub.d/99-fcvm.cfg")?;
+            println!("  → Created {} with boot args", fcvm_cfg.display());
+        }
+    }
+
+    // Also update /etc/default/grub for GRUB_DEFAULT (kernel selection)
     let content = tokio::fs::read_to_string(grub_default)
         .await
         .context("reading /etc/default/grub")?;
@@ -1420,32 +1440,7 @@ async fn update_grub_config(kernel_name: &str, boot_args: Option<&str>) -> Resul
     let mut new_lines = Vec::new();
 
     for line in content.lines() {
-        if line.starts_with("GRUB_CMDLINE_LINUX_DEFAULT=") {
-            // Add boot_args from profile if provided
-            if let Some(args) = boot_args {
-                // Check if any of the args are already present
-                let args_to_add: Vec<&str> = args
-                    .split_whitespace()
-                    .filter(|arg| !line.contains(arg))
-                    .collect();
-
-                if !args_to_add.is_empty() {
-                    let args_str = args_to_add.join(" ");
-                    let new_line = if line.contains("=\"\"") {
-                        line.replace("=\"\"", &format!("=\"{}\"", args_str))
-                    } else {
-                        line.replacen("=\"", &format!("=\"{} ", args_str), 1)
-                    };
-                    new_lines.push(new_line);
-                    modified = true;
-                    println!("  → Added boot args: {}", args_str);
-                } else {
-                    new_lines.push(line.to_string());
-                }
-            } else {
-                new_lines.push(line.to_string());
-            }
-        } else if line.starts_with("GRUB_DEFAULT=") {
+        if line.starts_with("GRUB_DEFAULT=") {
             let new_default = format!(
                 "GRUB_DEFAULT=\"Advanced options for Ubuntu>Ubuntu, with Linux {}\"",
                 kernel_name
