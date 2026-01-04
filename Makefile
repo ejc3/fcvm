@@ -14,7 +14,7 @@ FUSER ?= /home/ubuntu/fuser
 
 # Container settings
 CONTAINER_TAG := fcvm-test:latest
-CONTAINER_ARCH ?= aarch64
+CONTAINER_ARCH ?= $(shell uname -m)
 
 # Per-mode data directories (prevents UID conflicts between test modes)
 ROOT_DATA_DIR := /mnt/fcvm-btrfs/root
@@ -74,7 +74,7 @@ CONTAINER_RUN := podman run --rm --privileged \
 	-v .:/workspace/fcvm \
 	$(TARGET_MOUNT) \
 	-v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs -v $(FUSER):/workspace/fuser \
-	--device /dev/fuse -v /dev/kvm:/dev/kvm \
+	--device /dev/fuse -v /dev/kvm:/dev/kvm -v /dev/userfaultfd:/dev/userfaultfd \
 	--ulimit nofile=65536:65536 --pids-limit=65536 -v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	-v $(TEST_LOG_DIR):$(TEST_LOG_DIR) $(CARGO_CACHE_MOUNT) \
 	-e FCVM_DATA_DIR=$(CONTAINER_DATA_DIR)
