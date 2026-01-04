@@ -183,33 +183,26 @@ wait_for_build() {
       return 1
     fi
 
-    # Get last 15 log lines via SSM for progress visibility
-    echo "[$i/$timeout] Build status: $status"
+    # Show progress
+    echo "[$i/$timeout] Build status: $status (instance: $instance_id)"
     if [ "$status" = "building" ]; then
+      # Try SSM first
+      echo "  Fetching logs via SSM..."
       cmd_id=$(aws ssm send-command \
         --region "$REGION" \
         --instance-ids "$instance_id" \
         --document-name "AWS-RunShellScript" \
         --parameters 'commands=["tail -15 /var/log/ami-build.log"]' \
-        --query 'Command.CommandId' --output text 2>&1) || true
-      if [ -n "$cmd_id" ] && [ "$cmd_id" != "None" ]; then
-        # Wait for SSM command to complete
-        for wait in 1 2 3 4 5; do
-          sleep 2
-          cmd_status=$(aws ssm get-command-invocation \
-            --region "$REGION" \
-            --command-id "$cmd_id" \
-            --instance-id "$instance_id" \
-            --query 'Status' --output text 2>/dev/null) || true
-          if [ "$cmd_status" = "Success" ]; then
-            aws ssm get-command-invocation \
-              --region "$REGION" \
-              --command-id "$cmd_id" \
-              --instance-id "$instance_id" \
-              --query 'StandardOutputContent' --output text 2>/dev/null | sed 's/^/  > /'
-            break
-          fi
-        done
+        --query 'Command.CommandId' --output text 2>&1)
+      echo "  SSM command: $cmd_id"
+      if [ -n "$cmd_id" ] && [[ ! "$cmd_id" =~ "error" ]]; then
+        sleep 5
+        echo "  Getting SSM output..."
+        aws ssm get-command-invocation \
+          --region "$REGION" \
+          --command-id "$cmd_id" \
+          --instance-id "$instance_id" \
+          --output text 2>&1 | head -20
       fi
     fi
 
