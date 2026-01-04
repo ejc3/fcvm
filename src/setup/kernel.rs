@@ -524,10 +524,7 @@ fn generate_vm_kernel_build_script(
     repo_root: &Path,
 ) -> Result<String> {
     let kernel_version = &profile.kernel_version;
-    let kernel_major = kernel_version
-        .split('.')
-        .next()
-        .unwrap_or(kernel_version);
+    let kernel_major = kernel_version.split('.').next().unwrap_or(kernel_version);
 
     // Get architecture-specific values
     let (kernel_arch, kernel_image) = match std::env::consts::ARCH {
@@ -549,10 +546,7 @@ fn generate_vm_kernel_build_script(
         .map(|p| repo_root.join(p))
         .unwrap_or_else(|| repo_root.join("kernel/patches"));
 
-    let kernel_config = profile
-        .kernel_config
-        .as_deref()
-        .map(|p| repo_root.join(p));
+    let kernel_config = profile.kernel_config.as_deref().map(|p| repo_root.join(p));
 
     let base_config_url = profile
         .base_config_url
@@ -799,10 +793,7 @@ fn generate_host_kernel_build_script(
     repo_root: &Path,
 ) -> Result<String> {
     let kernel_version = &config.kernel_version;
-    let kernel_major = kernel_version
-        .split('.')
-        .next()
-        .unwrap_or(kernel_version);
+    let kernel_major = kernel_version.split('.').next().unwrap_or(kernel_version);
 
     let patches_dir = config
         .patches_dir
@@ -1090,7 +1081,10 @@ pub async fn install_host_kernel(profile: &KernelProfile, boot_args: Option<&str
     let _ = std::fs::remove_file(&script_path);
 
     if !status.success() {
-        bail!("Host kernel build failed with exit code: {:?}", status.code());
+        bail!(
+            "Host kernel build failed with exit code: {:?}",
+            status.code()
+        );
     }
 
     // Find the linux-image deb (exclude dbg packages)

@@ -1053,11 +1053,8 @@ impl Ftrace {
     ];
 
     /// High-noise events for detailed VM tracing
-    pub const EVENTS_DETAILED: &'static [&'static str] = &[
-        "kvm:kvm_exit",
-        "kvm:kvm_entry",
-        "kvm:kvm_userspace_exit",
-    ];
+    pub const EVENTS_DETAILED: &'static [&'static str] =
+        &["kvm:kvm_exit", "kvm:kvm_entry", "kvm:kvm_userspace_exit"];
 
     /// Create new Ftrace instance. Requires root.
     pub fn new() -> anyhow::Result<Self> {
@@ -1084,7 +1081,9 @@ impl Ftrace {
         std::fs::write(self.tracing_path.join("events/enable"), "0")?;
 
         for event in events {
-            let path = self.tracing_path.join(format!("events/{}/enable", event.replace(':', "/")));
+            let path = self
+                .tracing_path
+                .join(format!("events/{}/enable", event.replace(':', "/")));
             std::fs::write(&path, "1")
                 .with_context(|| format!("enabling event {} at {:?}", event, path))?;
         }
@@ -1114,7 +1113,11 @@ impl Ftrace {
     pub fn read(&self, last_n: usize) -> anyhow::Result<String> {
         let content = std::fs::read_to_string(self.tracing_path.join("trace"))?;
         let lines: Vec<&str> = content.lines().collect();
-        let start = if lines.len() > last_n { lines.len() - last_n } else { 0 };
+        let start = if lines.len() > last_n {
+            lines.len() - last_n
+        } else {
+            0
+        };
         Ok(lines[start..].join("\n"))
     }
 
@@ -1125,7 +1128,11 @@ impl Ftrace {
             .lines()
             .filter(|l| l.contains(pattern) || l.starts_with('#'))
             .collect();
-        let start = if lines.len() > last_n { lines.len() - last_n } else { 0 };
+        let start = if lines.len() > last_n {
+            lines.len() - last_n
+        } else {
+            0
+        };
         Ok(lines[start..].join("\n"))
     }
 

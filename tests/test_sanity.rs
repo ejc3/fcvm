@@ -147,7 +147,11 @@ async fn test_graceful_shutdown() -> Result<()> {
         match child.try_wait()? {
             Some(status) => {
                 let elapsed = start.elapsed();
-                println!("  VM exited after {:.1}s with status: {}", elapsed.as_secs_f32(), status);
+                println!(
+                    "  VM exited after {:.1}s with status: {}",
+                    elapsed.as_secs_f32(),
+                    status
+                );
 
                 if status.success() {
                     println!("✅ GRACEFUL SHUTDOWN PASSED!");
@@ -186,7 +190,10 @@ async fn test_ftrace_sanity() -> Result<()> {
     let events = tracer.list_kvm_events()?;
     println!("  Available KVM events: {}", events.len());
     assert!(!events.is_empty(), "Should have KVM events");
-    assert!(events.iter().any(|e| e.contains("kvm_exit")), "Should have kvm_exit event");
+    assert!(
+        events.iter().any(|e| e.contains("kvm_exit")),
+        "Should have kvm_exit event"
+    );
 
     // Enable some events
     tracer.enable_events(&["kvm:kvm_exit", "kvm:kvm_entry"])?;
@@ -198,15 +205,19 @@ async fn test_ftrace_sanity() -> Result<()> {
     // Run a quick VM to generate trace events
     let (vm_name, _, _, _) = common::unique_names("ftrace-test");
     let (mut child, _) = common::spawn_fcvm(&[
-        "podman", "run", "--name", &vm_name, "--network", "bridged",
-        "alpine:latest", "true",
-    ]).await?;
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        "alpine:latest",
+        "true",
+    ])
+    .await?;
 
     // Wait for exit
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        child.wait()
-    ).await??;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await??;
 
     // Stop and read
     tracer.stop()?;
@@ -216,7 +227,10 @@ async fn test_ftrace_sanity() -> Result<()> {
         println!("    {}", line);
     }
 
-    assert!(trace.contains("kvm_exit"), "Should have captured kvm_exit events");
+    assert!(
+        trace.contains("kvm_exit"),
+        "Should have captured kvm_exit events"
+    );
     println!("✅ FTRACE SANITY PASSED!");
     Ok(())
 }

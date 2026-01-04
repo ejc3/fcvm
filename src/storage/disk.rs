@@ -86,10 +86,7 @@ impl DiskManager {
 
                     if !copy_output.status.success() {
                         let copy_stderr = String::from_utf8_lossy(&copy_output.stderr);
-                        anyhow::bail!(
-                            "Disk copy failed. Error: {}",
-                            copy_stderr
-                        );
+                        anyhow::bail!("Disk copy failed. Error: {}", copy_stderr);
                     }
                 } else {
                     anyhow::bail!(
