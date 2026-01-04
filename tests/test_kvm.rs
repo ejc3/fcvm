@@ -1330,10 +1330,7 @@ async fn run_nested_n_levels(
     let iperf_port: u16 = if mode == BenchmarkMode::WithNetwork {
         // Generate unique port based on process ID to avoid conflicts in parallel tests
         let port = 5201 + (std::process::id() % 1000) as u16;
-        println!(
-            "Starting iperf3 server on host ({}:{})...",
-            host_ip, port
-        );
+        println!("Starting iperf3 server on host ({}:{})...", host_ip, port);
         iperf_server = Some(
             tokio::process::Command::new("iperf3")
                 .args(["-s", "-p", &port.to_string()])

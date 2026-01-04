@@ -1845,10 +1845,7 @@ async fn main() -> Result<()> {
 
     // Mount NFS shares from host before launching container
     let _mounted_nfs_paths: Vec<String> = if !plan.nfs_mounts.is_empty() {
-        eprintln!(
-            "[fc-agent] mounting {} NFS share(s)",
-            plan.nfs_mounts.len()
-        );
+        eprintln!("[fc-agent] mounting {} NFS share(s)", plan.nfs_mounts.len());
         match mount_nfs_shares(&plan.nfs_mounts) {
             Ok(paths) => {
                 eprintln!("[fc-agent] ✓ NFS shares mounted successfully");
@@ -2251,10 +2248,7 @@ async fn main() -> Result<()> {
 
     // Check what filesystems are mounted and might need syncing
     if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
-        let fuse_mounts: Vec<&str> = mounts
-            .lines()
-            .filter(|l| l.contains("fuse"))
-            .collect();
+        let fuse_mounts: Vec<&str> = mounts.lines().filter(|l| l.contains("fuse")).collect();
         eprintln!("[fc-agent] FUSE mounts before shutdown: {:?}", fuse_mounts);
     }
 
@@ -2285,8 +2279,11 @@ async fn main() -> Result<()> {
     for _ in 0..20 {
         match sync_child.try_wait() {
             Ok(Some(status)) => {
-                eprintln!("[fc-agent] sync completed in {:?} with status: {:?}",
-                         sync_start.elapsed(), status);
+                eprintln!(
+                    "[fc-agent] sync completed in {:?} with status: {:?}",
+                    sync_start.elapsed(),
+                    status
+                );
                 break;
             }
             Ok(None) => {
@@ -2301,7 +2298,7 @@ async fn main() -> Result<()> {
 
     if sync_start.elapsed().as_secs() >= 2 {
         eprintln!("[fc-agent] sync timed out after 2s, killing it");
-        let _ = sync_child.kill();
+        drop(sync_child.kill());
     }
 
     // Now shutdown
