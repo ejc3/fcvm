@@ -11,11 +11,12 @@ RUN RUST_VERSION=$(grep 'channel' /tmp/rust-toolchain.toml | cut -d'"' -f2) && \
 # Install cargo tools
 RUN cargo install cargo-nextest cargo-audit cargo-deny --locked
 
-# Install system dependencies
+# Install system dependencies (including kernel build tools: flex, bison, bc, libelf-dev, libssl-dev)
 RUN apt-get update && apt-get install -y \
     fuse3 libfuse3-dev autoconf automake libtool perl libclang-dev clang cmake \
     musl-tools iproute2 iptables slirp4netns dnsmasq qemu-utils e2fsprogs \
     parted fdisk podman skopeo git curl sudo procps zstd busybox-static cpio uidmap \
+    flex bison bc libelf-dev libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Firecracker
