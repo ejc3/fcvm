@@ -537,6 +537,7 @@ make test-root FILTER=nested_l2_with_large
 ### Known Issues (Nested) {#known-issues-nested}
 
 - **L3+ nesting**: Blocked by FUSE-over-FUSE latency (~5x per level). Each additional nesting level adds 3-5 seconds per filesystem request.
+- **Nested tests disabled**: L2/L3 nested tests are currently disabled in CI due to timing sensitivity and flakiness under NV2. The tests pass individually but are slow (~5 min each) and occasionally timeout. Run manually with `make test-root FILTER=nested` if needed.
 
 ---
 
