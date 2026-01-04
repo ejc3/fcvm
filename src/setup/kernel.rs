@@ -967,41 +967,10 @@ fn compute_host_kernel_sha(config: &HostKernelConfig, repo_root: &Path) -> Resul
     // Include kernel version in SHA
     content.extend(config.kernel_version.as_bytes());
 
-    // Include current host kernel config (determines EC2/AWS modules)
-    let current_version = std::process::Command::new("uname")
-        .arg("-r")
-        .output()
-        .context("running uname -r")?;
-    let kernel_release = String::from_utf8_lossy(&current_version.stdout)
-        .trim()
-        .to_string();
-
-    let config_path = PathBuf::from(format!("/boot/config-{}", kernel_release));
-    if config_path.exists() {
-        let config_data = std::fs::read(&config_path)
-            .with_context(|| format!("reading {}", config_path.display()))?;
-        debug!(
-            path = %config_path.display(),
-            bytes = config_data.len(),
-            "hashing host kernel config"
-        );
-        content.extend(config_data);
-    } else {
-        // Try /proc/config.gz
-        let proc_config = Path::new("/proc/config.gz");
-        if proc_config.exists() {
-            let output = std::process::Command::new("zcat")
-                .arg(proc_config)
-                .output()
-                .context("running zcat /proc/config.gz")?;
-            if output.status.success() {
-                debug!(bytes = output.stdout.len(), "hashing /proc/config.gz");
-                content.extend(output.stdout);
-            }
-        } else {
-            warn!("No kernel config found at {} or /proc/config.gz", config_path.display());
-        }
-    }
+    // NOTE: We intentionally do NOT include the running kernel's config in the SHA.
+    // The host kernel uses the running kernel's config as a base, but the SHA should
+    // only reflect what WE control (version + patches). This makes builds reproducible
+    // across reboots and different base kernels.
 
     // Read patches from build_inputs (with *.vm.patch filter)
     for pattern in &config.build_inputs {
