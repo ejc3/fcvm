@@ -211,12 +211,30 @@ fn protocol_file_type_to_fuser(ft: u8) -> FileType {
     }
 }
 
+/// Maximum write size for FUSE operations (32KB).
+///
+/// This limits FUSE writes to ensure they fit in a single vsock packet.
+/// Under nested virtualization (NV2), vsock packet fragmentation can trigger
+/// memory visibility issues due to double Stage 2 translation. By keeping
+/// writes under the kernel's 64KB vsock packet limit, we avoid fragmentation.
+const FUSE_MAX_WRITE: u32 = 32 * 1024;
+
 impl Filesystem for FuseClient {
     fn init(
         &mut self,
         _req: &Request<'_>,
-        _config: &mut fuser::KernelConfig,
+        config: &mut fuser::KernelConfig,
     ) -> Result<(), libc::c_int> {
+        // Limit max_write to avoid vsock packet fragmentation under nested virtualization.
+        if let Err(max) = config.set_max_write(FUSE_MAX_WRITE) {
+            tracing::warn!(
+                target: "fuse-pipe::client",
+                requested = FUSE_MAX_WRITE,
+                max,
+                "Failed to set max_write, using kernel max"
+            );
+        }
+
         // Spawn additional readers now that INIT is done
         if let Some(callback) = self.init_callback.take() {
             callback();

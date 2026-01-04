@@ -188,41 +188,158 @@ async fn request_reader<H: FilesystemHandler + 'static>(
 ) -> anyhow::Result<()> {
     let mut len_buf = [0u8; 4];
     let mut count = 0u64;
+    let mut last_len: usize = 0;
+    let mut min_len: usize = usize::MAX;
+    let mut max_len: usize = 0;
+    let mut total_bytes_read: u64 = 0; // Track cumulative bytes for corruption debugging
+    let mut last_unique: u64 = 0; // Track last successful unique ID
 
     loop {
         // Read request length
         match read_half.read_exact(&mut len_buf).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                tracing::debug!(target: "fuse-pipe::server", count, "client disconnected");
+                tracing::debug!(target: "fuse-pipe::server", count, total_bytes_read, "client disconnected");
                 break;
             }
             Err(e) => return Err(e.into()),
         }
 
+        total_bytes_read += 4;
         count += 1;
-        if count <= 10 || count.is_multiple_of(100) {
-            tracing::info!(target: "fuse-pipe::server", count, "server: received requests");
-        }
 
         // Mark server_recv as soon as we have the length header
         let t_recv = now_nanos();
 
         let len = u32::from_be_bytes(len_buf) as usize;
+
+        // Track length statistics for debugging
+        min_len = min_len.min(len);
+        max_len = max_len.max(len);
+
+        // CRITICAL: Detect zero-length messages - this is the corruption pattern we're seeing
+        if len == 0 {
+            error!(
+                target: "fuse-pipe::server",
+                count,
+                total_bytes_read,
+                last_len,
+                last_unique,
+                len_hex = format!("{:02x} {:02x} {:02x} {:02x}", len_buf[0], len_buf[1], len_buf[2], len_buf[3]),
+                "STREAM CORRUPTION: zero-length message (vsock data loss?)"
+            );
+
+            // Try to read ahead and dump what's in the buffer to diagnose misalignment
+            let mut peek_buf = [0u8; 128];
+            if let Ok(n) = read_half.read(&mut peek_buf).await {
+                let hex_dump: String = peek_buf[..n]
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let ascii_dump: String = peek_buf[..n]
+                    .iter()
+                    .map(|b| {
+                        if *b >= 0x20 && *b < 0x7f {
+                            *b as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+                error!(
+                    target: "fuse-pipe::server",
+                    peek_bytes = n,
+                    hex = %hex_dump,
+                    ascii = %ascii_dump,
+                    "STREAM CORRUPTION: peeked ahead after zero-length"
+                );
+            }
+
+            return Err(anyhow::anyhow!(
+                "Stream corruption: zero-length message at count={} after {} bytes",
+                count,
+                total_bytes_read
+            ));
+        }
+
+        if count <= 10 || count.is_multiple_of(100) {
+            tracing::info!(target: "fuse-pipe::server", count, len, min_len, max_len, total_bytes_read, "server: received requests");
+        }
+
         if len > MAX_MESSAGE_SIZE {
-            warn!(target: "fuse-pipe::server", len, max = MAX_MESSAGE_SIZE, "message too large");
+            warn!(target: "fuse-pipe::server", len, max = MAX_MESSAGE_SIZE, total_bytes_read, "message too large");
             return Err(anyhow::anyhow!("message too large: {}", len));
         }
+
+        // Sanity check: typical FUSE requests should be < 1MB
+        // Log anomalies that might indicate corruption
+        if len < 12 {
+            // WireRequest minimum size: unique(8) + reader_id(4) = 12 bytes
+            error!(
+                target: "fuse-pipe::server",
+                count,
+                len,
+                total_bytes_read,
+                len_hex = format!("{:02x} {:02x} {:02x} {:02x}", len_buf[0], len_buf[1], len_buf[2], len_buf[3]),
+                last_len,
+                last_unique,
+                "SUSPICIOUS: message too small (min expected 12 bytes)"
+            );
+        }
+
+        last_len = len;
 
         // Read request body
         let mut req_buf = vec![0u8; len];
         read_half.read_exact(&mut req_buf).await?;
+        total_bytes_read += len as u64;
 
         // Deserialize
         let wire_req: WireRequest = match bincode::deserialize(&req_buf) {
             Ok(r) => r,
             Err(e) => {
-                warn!(target: "fuse-pipe::server", error = %e, "deserialize error");
+                // Log detailed diagnostics for stream corruption debugging
+                let first_64: Vec<u8> = req_buf.iter().take(64).copied().collect();
+                let hex_dump: String = first_64
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let ascii_dump: String = first_64
+                    .iter()
+                    .map(|b| {
+                        if *b >= 0x20 && *b < 0x7f {
+                            *b as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+
+                // Try to extract what looks like a unique ID from the corrupted data
+                let maybe_unique = if req_buf.len() >= 8 {
+                    u64::from_le_bytes([
+                        req_buf[0], req_buf[1], req_buf[2], req_buf[3], req_buf[4], req_buf[5],
+                        req_buf[6], req_buf[7],
+                    ])
+                } else {
+                    0
+                };
+
+                error!(
+                    target: "fuse-pipe::server",
+                    count,
+                    len,
+                    total_bytes_read,
+                    last_len,
+                    last_unique,
+                    maybe_unique,
+                    error = %e,
+                    hex = %hex_dump,
+                    ascii = %ascii_dump,
+                    "DESERIALIZE FAILED - raw bytes dumped"
+                );
                 continue;
             }
         };
@@ -231,6 +348,23 @@ async fn request_reader<H: FilesystemHandler + 'static>(
         let t_deser = now_nanos();
 
         let unique = wire_req.unique;
+        last_unique = unique; // Track for corruption debugging
+
+        // Detect gaps in unique IDs (could indicate missed/dropped messages)
+        static LAST_UNIQUE_GLOBAL: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let prev = LAST_UNIQUE_GLOBAL.swap(unique, std::sync::atomic::Ordering::Relaxed);
+        if prev != 0 && unique > prev + 10 {
+            warn!(
+                target: "fuse-pipe::server",
+                count,
+                prev_unique = prev,
+                curr_unique = unique,
+                gap = unique - prev,
+                total_bytes_read,
+                "Large gap in unique IDs - possible dropped messages"
+            );
+        }
         let reader_id = wire_req.reader_id;
         let request = wire_req.request;
         let supplementary_groups = wire_req.supplementary_groups;

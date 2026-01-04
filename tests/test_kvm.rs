@@ -34,245 +34,9 @@
 mod common;
 
 use anyhow::{bail, Context, Result};
-use nix::fcntl::{Flock, FlockArg};
 use sha2::{Digest, Sha256};
-use std::fs::OpenOptions;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-
-const FIRECRACKER_NV2_REPO: &str = "https://github.com/ejc3/firecracker.git";
-const FIRECRACKER_NV2_BRANCH: &str = "nv2-nested";
-
-/// Path where NV2 firecracker fork is installed (separate from system firecracker)
-const FIRECRACKER_NV2_PATH: &str = "/usr/local/bin/firecracker-nv2";
-/// SHA file to track which commit the binary was built from
-const FIRECRACKER_NV2_SHA_PATH: &str = "/usr/local/bin/firecracker-nv2.sha";
-
-/// Get the HEAD SHA of the remote branch (without cloning)
-async fn get_remote_branch_sha() -> Result<String> {
-    let output = tokio::process::Command::new("git")
-        .args(["ls-remote", FIRECRACKER_NV2_REPO, FIRECRACKER_NV2_BRANCH])
-        .output()
-        .await
-        .context("running git ls-remote")?;
-
-    if !output.status.success() {
-        bail!("git ls-remote failed");
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Format: "<sha>\trefs/heads/<branch>"
-    let sha = stdout
-        .split_whitespace()
-        .next()
-        .context("parsing SHA from git ls-remote")?;
-
-    Ok(sha.to_string())
-}
-
-/// Check if NV2 Firecracker binary exists, supports --enable-nv2, AND matches remote SHA
-async fn firecracker_nv2_exists() -> bool {
-    let path = std::path::Path::new(FIRECRACKER_NV2_PATH);
-    if !path.exists() {
-        return false;
-    }
-
-    // Check if binary has --enable-nv2 support
-    let output = tokio::process::Command::new(FIRECRACKER_NV2_PATH)
-        .arg("--help")
-        .output()
-        .await;
-
-    let has_nv2_flag = match output {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).contains("enable-nv2"),
-        Err(_) => false,
-    };
-
-    if !has_nv2_flag {
-        return false;
-    }
-
-    // Check if SHA matches remote (content-addressed caching)
-    let sha_path = std::path::Path::new(FIRECRACKER_NV2_SHA_PATH);
-    if !sha_path.exists() {
-        println!("  No SHA file found, will rebuild to ensure correct version");
-        return false;
-    }
-
-    let cached_sha = match std::fs::read_to_string(sha_path) {
-        Ok(s) => s.trim().to_string(),
-        Err(_) => return false,
-    };
-
-    let remote_sha = match get_remote_branch_sha().await {
-        Ok(s) => s,
-        Err(e) => {
-            println!("  Warning: couldn't check remote SHA: {}", e);
-            // If we can't check remote, assume cached version is fine
-            return true;
-        }
-    };
-
-    if cached_sha != remote_sha {
-        println!(
-            "  Cached SHA {} != remote SHA {}, will rebuild",
-            &cached_sha[..8],
-            &remote_sha[..8]
-        );
-        return false;
-    }
-
-    true
-}
-
-/// Ensure Firecracker with NV2 support is installed at FIRECRACKER_NV2_PATH
-/// Also sets FCVM_FIRECRACKER_BIN env var so fcvm uses it
-async fn ensure_firecracker_nv2() -> Result<()> {
-    if firecracker_nv2_exists().await {
-        println!(
-            "✓ Firecracker with NV2 support found at {}",
-            FIRECRACKER_NV2_PATH
-        );
-        std::env::set_var("FCVM_FIRECRACKER_BIN", FIRECRACKER_NV2_PATH);
-        return Ok(());
-    }
-
-    // Acquire exclusive lock to prevent parallel builds
-    let lock_file = PathBuf::from("/tmp/firecracker-nv2-build.lock");
-    let lock_fd = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&lock_file)
-        .context("opening firecracker build lock file")?;
-
-    let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
-        .map_err(|(_, err)| err)
-        .context("acquiring exclusive lock for firecracker build")?;
-
-    // Double-check after acquiring lock - another process may have built it
-    if firecracker_nv2_exists().await {
-        println!("✓ Firecracker with NV2 support found (built by another process)");
-        let _ = flock.unlock();
-        return Ok(());
-    }
-
-    println!("Building Firecracker with NV2 support...");
-    println!("  This may take 5-10 minutes on first run...");
-
-    let build_dir = PathBuf::from("/tmp/firecracker-nv2-build");
-
-    // Always remove old build dir to ensure fresh clone with correct SHA
-    // (shallow clones don't update properly with fetch)
-    if build_dir.exists() {
-        println!("  Removing stale build directory...");
-        tokio::fs::remove_dir_all(&build_dir).await?;
-    }
-
-    println!("  Cloning {}...", FIRECRACKER_NV2_REPO);
-    let status = tokio::process::Command::new("git")
-        .args([
-            "clone",
-            "--depth=1",
-            "-b",
-            FIRECRACKER_NV2_BRANCH,
-            FIRECRACKER_NV2_REPO,
-            build_dir.to_str().unwrap(),
-        ])
-        .status()
-        .await
-        .context("cloning Firecracker repo")?;
-
-    if !status.success() {
-        bail!("Failed to clone Firecracker repo");
-    }
-
-    // Checkout the correct branch (redundant after clone -b, but ensures clean state)
-    let status = tokio::process::Command::new("git")
-        .args(["checkout", FIRECRACKER_NV2_BRANCH])
-        .current_dir(&build_dir)
-        .status()
-        .await?;
-
-    if !status.success() {
-        bail!("Failed to checkout branch {}", FIRECRACKER_NV2_BRANCH);
-    }
-
-    // Build Firecracker
-    println!("  Building Firecracker (release)...");
-    let status = tokio::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "firecracker"])
-        .current_dir(&build_dir)
-        .status()
-        .await
-        .context("building Firecracker")?;
-
-    if !status.success() {
-        bail!("Firecracker build failed");
-    }
-
-    // Install to /usr/local/bin (requires sudo)
-    // Firecracker uses target/release when built with cargo directly
-    let mut binary = build_dir.join("target/release/firecracker");
-    if !binary.exists() {
-        // Try alternative path (Firecracker's custom build system)
-        let alt_binary = build_dir.join("build/cargo_target/release/firecracker");
-        if alt_binary.exists() {
-            binary = alt_binary;
-        } else {
-            bail!(
-                "Firecracker binary not found at {} or {}",
-                binary.display(),
-                alt_binary.display()
-            );
-        }
-    }
-
-    println!("  Installing Firecracker to {}...", FIRECRACKER_NV2_PATH);
-    let status = tokio::process::Command::new("cp")
-        .args([binary.to_str().unwrap(), FIRECRACKER_NV2_PATH])
-        .status()
-        .await
-        .context("installing Firecracker")?;
-
-    if !status.success() {
-        bail!("Failed to install Firecracker to {}", FIRECRACKER_NV2_PATH);
-    }
-
-    // Get the SHA of what we just built
-    let built_sha = tokio::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(&build_dir)
-        .output()
-        .await
-        .context("getting built commit SHA")?;
-
-    let sha = String::from_utf8_lossy(&built_sha.stdout)
-        .trim()
-        .to_string();
-
-    // Write SHA file (content-addressed cache marker)
-    std::fs::write(FIRECRACKER_NV2_SHA_PATH, &sha).context("writing SHA file")?;
-
-    println!("  Built from commit {}", &sha[..12]);
-
-    // Verify installation (skip SHA check since we just wrote it)
-    let path = std::path::Path::new(FIRECRACKER_NV2_PATH);
-    if !path.exists() {
-        let _ = flock.unlock();
-        bail!("Firecracker binary not found after install");
-    }
-
-    let _ = flock.unlock();
-    std::env::set_var("FCVM_FIRECRACKER_BIN", FIRECRACKER_NV2_PATH);
-    println!(
-        "✓ Firecracker with NV2 support installed at {}",
-        FIRECRACKER_NV2_PATH
-    );
-    Ok(())
-}
 
 #[tokio::test]
 async fn test_kvm_available_in_vm() -> Result<()> {
@@ -280,16 +44,13 @@ async fn test_kvm_available_in_vm() -> Result<()> {
     println!("==================");
     println!("Verifying /dev/kvm works with nested kernel profile");
 
-    // Ensure NV2 firecracker is installed (profile config references it)
-    ensure_firecracker_nv2().await?;
-
     let fcvm_path = common::find_fcvm_binary()?;
     let (vm_name, _, _, _) = common::unique_names("nested-kvm");
 
     // Start the VM with nested kernel profile
     // Use --privileged so the container can access /dev/kvm
     println!("\nStarting VM with nested kernel profile (privileged mode)...");
-    let (mut _child, fcvm_pid) = common::spawn_fcvm(&[
+    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
         "podman",
         "run",
         "--name",
@@ -307,8 +68,8 @@ async fn test_kvm_available_in_vm() -> Result<()> {
 
     // Wait for VM to become healthy
     println!("  Waiting for VM to become healthy...");
-    if let Err(e) = common::poll_health_by_pid(fcvm_pid, 180).await {
-        common::kill_process(fcvm_pid).await;
+    if let Err(e) = common::poll_health(&mut child, 180).await {
+        let _ = child.kill().await;
         return Err(e.context("VM failed to become healthy"));
     }
     println!("  ✓ VM is healthy!");
@@ -453,9 +214,6 @@ async fn test_kvm_available_in_vm() -> Result<()> {
 async fn test_nested_run_fcvm_inside_vm() -> Result<()> {
     println!("\nNested VM Test: Run fcvm inside fcvm");
     println!("=====================================");
-
-    // Ensure NV2 firecracker is installed (profile config references it)
-    ensure_firecracker_nv2().await?;
 
     let fcvm_path = common::find_fcvm_binary()?;
     let fcvm_dir = fcvm_path.parent().unwrap();
@@ -717,11 +475,14 @@ async fn ensure_nested_image() -> Result<()> {
     // All inputs that affect the container image
     let src_fcvm = fcvm_dir.join("fcvm");
     let src_agent = fcvm_dir.join("fc-agent");
-    // NV2 firecracker fork - installed by ensure_firecracker_nv2()
-    let src_firecracker = PathBuf::from(FIRECRACKER_NV2_PATH);
+    // NV2 firecracker fork - installed by fcvm setup --kernel-profile nested
+    let profile = fcvm::setup::get_kernel_profile("nested")?
+        .ok_or_else(|| anyhow::anyhow!("nested kernel profile not found"))?;
+    let src_firecracker = fcvm::setup::get_profile_firecracker_path(&profile, "nested")
+        .ok_or_else(|| anyhow::anyhow!("nested profile has no custom firecracker"))?;
     if !src_firecracker.exists() {
         bail!(
-            "NV2 firecracker fork not found at {}. ensure_firecracker_nv2() should have installed it.",
+            "NV2 firecracker fork not found at {}. Run: fcvm setup --kernel-profile nested",
             src_firecracker.display()
         );
     }
@@ -765,7 +526,7 @@ async fn ensure_nested_image() -> Result<()> {
         std::fs::copy(&src_fcvm, "artifacts/fcvm").context("copying fcvm to artifacts/")?;
         std::fs::copy(&src_agent, "artifacts/fc-agent")
             .context("copying fc-agent to artifacts/")?;
-        std::fs::copy(&src_firecracker, "artifacts/firecracker-nv2").ok();
+        std::fs::copy(&src_firecracker, "artifacts/firecracker-nested").ok();
 
         // Force rebuild by removing old image
         tokio::process::Command::new("podman")
@@ -880,7 +641,6 @@ async fn run_nested_chain(total_levels: usize) -> Result<()> {
     println!("{}", "=".repeat(50));
 
     // Ensure prerequisites
-    ensure_firecracker_nv2().await?;
     ensure_nested_image().await?;
 
     let fcvm_path = common::find_fcvm_binary()?;
@@ -1124,35 +884,91 @@ except OSError as e:
     }
 }
 
-/// Test L1→L2 nesting: run fcvm inside L1 to start L2
+/// Test L1→L2 nesting: basic check without benchmarks
 ///
-/// L1: Host starts VM with localhost/nested-test + nested kernel profile
-/// L2: L1 container imports image from shared cache, then runs fcvm
+/// Verifies that nested virtualization works by running a simple command chain.
+/// This is the fastest L2 test - no benchmarks, just basic functionality.
 #[tokio::test]
 async fn test_nested_l2() -> Result<()> {
-    ensure_nested_image().await?;
+    run_nested_n_levels(2, "NESTED_2_LEVELS_SUCCESS", BenchmarkMode::None).await
+}
 
-    // Get the digest of localhost/nested-test so L2 can import from shared cache
-    let digest_out = tokio::process::Command::new("podman")
-        .args([
-            "inspect",
-            "localhost/nested-test",
-            "--format",
-            "{{.Digest}}",
-        ])
-        .output()
-        .await?;
-    let digest = String::from_utf8_lossy(&digest_out.stdout)
-        .trim()
-        .to_string();
-    println!("Image digest: {}", digest);
+/// Test L1→L2 nesting with standard benchmarks
+///
+/// IGNORED: This test runs extensive benchmarks at both L1 and L2 levels,
+/// which exceeds the 10-minute test timeout. Use for manual performance analysis.
+#[tokio::test]
+#[ignore = "exceeds 10-minute timeout - use for manual benchmarking"]
+async fn test_nested_l2_with_benchmarks() -> Result<()> {
+    run_nested_n_levels(2, "NESTED_2_LEVELS_BENCH_SUCCESS", BenchmarkMode::Standard).await
+}
 
-    // Create nested-scripts directory
-    tokio::fs::create_dir_all("/mnt/fcvm-btrfs/nested-scripts").await?;
+/// Test L1→L2 nesting with large file benchmarks (100MB copies)
+///
+/// Tests FUSE-over-vsock with 100MB file copies at each nesting level.
+/// This validates the 32KB max_write limit that prevents vsock fragmentation
+/// issues under nested virtualization.
+#[tokio::test]
+async fn test_nested_l2_with_large_files() -> Result<()> {
+    run_nested_n_levels(
+        2,
+        "NESTED_2_LEVELS_LARGE_SUCCESS",
+        BenchmarkMode::WithLargeFiles,
+    )
+    .await
+}
 
-    // Benchmark script that runs at each level
-    // Tests: egress, local disk, FUSE disk
-    let bench_script = r#"#!/bin/bash
+/// Test L1→L2→L3: 3 levels of nesting
+///
+/// BLOCKED: 3-hop FUSE chain (L3→L2→L1→HOST) causes ~3-5 second latency per
+/// request due to PassthroughFs + spawn_blocking serialization. FUSE mount
+/// initialization alone takes 10+ minutes. Need to implement request pipelining
+/// or async PassthroughFs before this test can complete in reasonable time.
+#[tokio::test]
+#[ignore]
+async fn test_nested_l3() -> Result<()> {
+    run_nested_n_levels(3, "MARKER_L3_OK_12345", BenchmarkMode::None).await
+}
+
+/// Test L1→L2→L3→L4: 4 levels of nesting
+///
+/// BLOCKED: Same issue as L3, but worse. 4-hop FUSE chain would be even slower.
+#[tokio::test]
+#[ignore]
+async fn test_nested_l4() -> Result<()> {
+    run_nested_n_levels(4, "MARKER_L4_OK_12345", BenchmarkMode::None).await
+}
+
+/// Benchmark mode for nested tests
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BenchmarkMode {
+    /// No benchmarks - just verify nesting works
+    None,
+    /// Standard benchmarks (egress, disk I/O, FUSE latency, memory)
+    Standard,
+    /// Standard + large file tests (100MB copies)
+    WithLargeFiles,
+}
+
+/// Basic script that just echoes the success marker (no benchmarks)
+fn basic_script() -> &'static str {
+    r#"#!/bin/bash
+set -e
+LEVEL=${1:-unknown}
+echo "=== L${LEVEL} BASIC CHECK ==="
+echo "Kernel: $(uname -r)"
+echo "Memory: $(grep MemAvailable /proc/meminfo | awk '{print $2/1024 " MB"}')"
+echo "=== END L${LEVEL} ==="
+echo "MARKER_L${LEVEL}_OK"
+"#
+}
+
+/// Benchmark script that runs at each nesting level
+///
+/// Measures: egress connectivity, local disk I/O, FUSE disk I/O, FUSE latency, memory usage.
+/// Outputs MARKER_L{level}_OK on success.
+fn benchmark_script() -> &'static str {
+    r#"#!/bin/bash
 set -e
 LEVEL=${1:-unknown}
 
@@ -1236,13 +1052,35 @@ if mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then
     START=$(date +%s%N)
     for i in $(seq 1 100); do cat "${FUSE_DIR}/lat.txt" > /dev/null; done
     END=$(date +%s%N)
-    READ_US=$(( (END - START) / 100000 ))
+    READ_US=$(( (END - START) / 1000 ))
     echo "FUSE_SMALLREAD_L${LEVEL}=${READ_US}us/op (100 ops)"
 
     rm -rf "$FUSE_DIR"
 fi
 
-# Test 5: Memory usage (RSS)
+# Test 5: Large FUSE copy - DISABLED (too slow at L2 with FUSE-over-FUSE)
+# if mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then
+#     echo "--- Large Copy Test ---"
+#     FUSE_DIR="/mnt/fcvm-btrfs/bench-copy-${LEVEL}-$$"
+#     mkdir -p "$FUSE_DIR"
+#     dd if=/dev/urandom of=/tmp/large.dat bs=1M count=100 2>/dev/null
+#     START=$(date +%s%N)
+#     cp /tmp/large.dat "${FUSE_DIR}/large.dat"
+#     sync
+#     END=$(date +%s%N)
+#     COPY_TO_MS=$(( (END - START) / 1000000 ))
+#     COPY_TO_MBS=$(( 100 * 1000 / (COPY_TO_MS + 1) ))
+#     echo "FUSE_COPY_TO_L${LEVEL}=${COPY_TO_MS}ms (100MB, ${COPY_TO_MBS}MB/s)"
+#     START=$(date +%s%N)
+#     cp "${FUSE_DIR}/large.dat" /tmp/large2.dat
+#     END=$(date +%s%N)
+#     COPY_FROM_MS=$(( (END - START) / 1000000 ))
+#     COPY_FROM_MBS=$(( 100 * 1000 / (COPY_FROM_MS + 1) ))
+#     echo "FUSE_COPY_FROM_L${LEVEL}=${COPY_FROM_MS}ms (100MB, ${COPY_FROM_MBS}MB/s)"
+#     rm -rf "$FUSE_DIR" /tmp/large.dat /tmp/large2.dat
+# fi
+
+# Test 6: Memory usage (RSS)
 echo "--- Memory Test ---"
 MEM_TOTAL=$(grep MemTotal /proc/meminfo | awk '{print $2}')
 MEM_AVAIL=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
@@ -1253,99 +1091,59 @@ echo "MEM_L${LEVEL}=${MEM_USED_MB}MB/${MEM_TOTAL_MB}MB"
 
 echo "=== END BENCHMARK L${LEVEL} ==="
 echo "MARKER_L${LEVEL}_OK"
-"#;
+"#
+}
 
-    let bench_path = "/mnt/fcvm-btrfs/nested-scripts/bench.sh";
-    tokio::fs::write(bench_path, bench_script).await?;
-    tokio::process::Command::new("chmod")
-        .args(["+x", bench_path])
-        .status()
-        .await?;
+/// Large file benchmark script - tests 100MB copies over FUSE
+///
+/// WARNING: This can trigger FUSE stream corruption under high load (~8K requests).
+/// See README.md "Known Issues (Nested)" for details.
+fn large_file_script() -> &'static str {
+    r#"#!/bin/bash
+set -e
+LEVEL=${1:-unknown}
 
-    // L2 script: just run benchmark
-    let l2_script = r#"#!/bin/bash
-set -ex
-/mnt/fcvm-btrfs/nested-scripts/bench.sh 2
-"#;
-    let l2_path = "/mnt/fcvm-btrfs/nested-scripts/l2.sh";
-    tokio::fs::write(l2_path, l2_script).await?;
-    tokio::process::Command::new("chmod")
-        .args(["+x", l2_path])
-        .status()
-        .await?;
+echo "=== LARGE FILE BENCHMARK L${LEVEL} ==="
 
-    // L1 script: run L1 benchmark, import image, start L2 with benchmark
-    // Use stripped digest (without sha256: prefix) to match fcvm's cache format
-    let digest_stripped = digest.trim_start_matches("sha256:");
-    let l1_script = format!(
-        r#"#!/bin/bash
-set -ex
+if mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then
+    FUSE_DIR="/mnt/fcvm-btrfs/bench-large-${LEVEL}-$$"
+    mkdir -p "$FUSE_DIR"
 
-# Run L1 benchmark first
-/mnt/fcvm-btrfs/nested-scripts/bench.sh 1
+    echo "--- Generating 100MB random data ---"
+    dd if=/dev/urandom of=/tmp/large.dat bs=1M count=100 2>/dev/null
 
-echo "L1: Importing image from shared cache..."
-podman load -i /mnt/fcvm-btrfs/image-cache/{digest}.oci.tar
+    echo "--- Copy TO FUSE (100MB) ---"
+    START=$(date +%s%N)
+    cp /tmp/large.dat "${FUSE_DIR}/large.dat"
+    sync
+    END=$(date +%s%N)
+    COPY_TO_MS=$(( (END - START) / 1000000 ))
+    COPY_TO_MBS=$(( 100 * 1000 / (COPY_TO_MS + 1) ))
+    echo "FUSE_COPY_TO_L${LEVEL}=${COPY_TO_MS}ms (100MB, ${COPY_TO_MBS}MB/s)"
 
-echo "L1: Starting L2 VM with benchmarks (tracing enabled)..."
-FCVM_FUSE_TRACE_RATE=100 fcvm podman run --name l2 --network bridged --privileged \
-    --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
-    localhost/nested-test \
-    --cmd /mnt/fcvm-btrfs/nested-scripts/l2.sh
-"#,
-        digest = digest_stripped
-    );
+    echo "--- Copy FROM FUSE (100MB) ---"
+    START=$(date +%s%N)
+    cp "${FUSE_DIR}/large.dat" /tmp/large2.dat
+    END=$(date +%s%N)
+    COPY_FROM_MS=$(( (END - START) / 1000000 ))
+    COPY_FROM_MBS=$(( 100 * 1000 / (COPY_FROM_MS + 1) ))
+    echo "FUSE_COPY_FROM_L${LEVEL}=${COPY_FROM_MS}ms (100MB, ${COPY_FROM_MBS}MB/s)"
 
-    let l1_path = "/mnt/fcvm-btrfs/nested-scripts/l1.sh";
-    tokio::fs::write(l1_path, &l1_script).await?;
-    tokio::process::Command::new("chmod")
-        .args(["+x", l1_path])
-        .status()
-        .await?;
-    println!("Wrote nesting scripts to /mnt/fcvm-btrfs/nested-scripts/");
+    rm -rf "$FUSE_DIR" /tmp/large.dat /tmp/large2.dat
+else
+    echo "FUSE_LARGE_L${LEVEL}=NOT_MOUNTED"
+fi
 
-    // Run L1 with --cmd that executes the script
-    let output = tokio::process::Command::new("./target/release/fcvm")
-        .args([
-            "podman",
-            "run",
-            "--name",
-            "l1-nested",
-            "--network",
-            "bridged",
-            "--privileged",
-            "--mem",
-            "4096",
-            "--kernel-profile",
-            "nested",
-            "--map",
-            "/mnt/fcvm-btrfs:/mnt/fcvm-btrfs",
-            "localhost/nested-test",
-            "--cmd",
-            "/mnt/fcvm-btrfs/nested-scripts/l1.sh",
-        ])
-        .output()
-        .await?;
+echo "=== END LARGE FILE L${LEVEL} ==="
+echo "MARKER_LARGE_L${LEVEL}_OK"
+"#
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    println!("stdout: {}", stdout);
-    println!("stderr: {}", stderr);
-
-    // Check for L1 and L2 markers
-    assert!(
-        stderr.contains("MARKER_L1_OK"),
-        "L1 benchmark should complete. Check stderr above."
-    );
-    assert!(
-        stderr.contains("MARKER_L2_OK"),
-        "L2 benchmark should complete. Check stderr above."
-    );
-
-    // Extract and display benchmark results
+/// Print a summary of benchmark results from log content
+fn print_benchmark_summary(log_content: &str, include_large_files: bool) {
     println!("\n=== BENCHMARK SUMMARY ===");
-    for line in stderr.lines() {
-        if line.contains("EGRESS_L")
+    for line in log_content.lines() {
+        let is_standard = line.contains("EGRESS_L")
             || line.contains("LOCAL_WRITE_L")
             || line.contains("LOCAL_READ_L")
             || line.contains("FUSE_WRITE_L")
@@ -1353,44 +1151,32 @@ FCVM_FUSE_TRACE_RATE=100 fcvm podman run --name l2 --network bridged --privilege
             || line.contains("FUSE_READ_L")
             || line.contains("FUSE_STAT_L")
             || line.contains("FUSE_SMALLREAD_L")
-            || line.contains("MEM_L")
-        {
+            || line.contains("MEM_L");
+        let is_large_file = line.contains("FUSE_COPY_TO_L") || line.contains("FUSE_COPY_FROM_L");
+
+        if is_standard || (include_large_files && is_large_file) {
             // Strip ANSI codes and prefixes
             let clean = line.split("stdout]").last().unwrap_or(line).trim();
             println!("{}", clean);
         }
     }
     println!("=========================\n");
-
-    Ok(())
 }
 
-/// Test L1→L2→L3: 3 levels of nesting
+/// Run N levels of nesting with configurable benchmarks
 ///
-/// BLOCKED: 3-hop FUSE chain (L3→L2→L1→HOST) causes ~3-5 second latency per
-/// request due to PassthroughFs + spawn_blocking serialization. FUSE mount
-/// initialization alone takes 10+ minutes. Need to implement request pipelining
-/// or async PassthroughFs before this test can complete in reasonable time.
-#[tokio::test]
-#[ignore]
-async fn test_nested_l3() -> Result<()> {
-    run_nested_n_levels(3, "MARKER_L3_OK_12345").await
-}
-
-/// Test L1→L2→L3→L4: 4 levels of nesting
-///
-/// BLOCKED: Same issue as L3, but worse. 4-hop FUSE chain would be even slower.
-#[tokio::test]
-#[ignore]
-async fn test_nested_l4() -> Result<()> {
-    run_nested_n_levels(4, "MARKER_L4_OK_12345").await
-}
-
-/// Run N levels of nesting, building scripts from deepest level upward
-async fn run_nested_n_levels(n: usize, marker: &str) -> Result<()> {
+/// Uses streaming output for real-time visibility.
+async fn run_nested_n_levels(n: usize, marker: &str, mode: BenchmarkMode) -> Result<()> {
     assert!(n >= 2, "Need at least 2 levels for nesting");
 
     ensure_nested_image().await?;
+
+    // Get the nested kernel path (with correct SHA computed on host)
+    // This is needed because inside L1, the kernel build inputs don't exist
+    // so the SHA computation would fail
+    let nested_kernel =
+        fcvm::setup::get_kernel_path(Some("nested")).context("getting nested kernel path")?;
+    let nested_kernel_path = nested_kernel.to_string_lossy();
 
     // Get the digest of localhost/nested-test
     let digest_out = tokio::process::Command::new("podman")
@@ -1405,7 +1191,10 @@ async fn run_nested_n_levels(n: usize, marker: &str) -> Result<()> {
     let digest = String::from_utf8_lossy(&digest_out.stdout)
         .trim()
         .to_string();
+    // Strip sha256: prefix for cache path (cache files don't have prefix)
+    let digest_stripped = digest.trim_start_matches("sha256:");
     println!("Image digest: {}", digest);
+    println!("Benchmark mode: {:?}", mode);
 
     // Memory allocation strategy:
     // - Each VM needs enough memory to run its child's Firecracker (~2GB) + OS overhead (~500MB)
@@ -1413,60 +1202,142 @@ async fn run_nested_n_levels(n: usize, marker: &str) -> Result<()> {
     // - Deepest level (Ln): 2GB (default) since it just runs echo
     let intermediate_mem = "4096"; // 4GB for VMs that spawn children
 
-    // Build scripts from deepest level (Ln) upward to L1
-    // Ln (deepest): just echo the marker
-    // L1..L(n-1): import image + run fcvm with next level's script
-
     let scripts_dir = "/mnt/fcvm-btrfs/nested-scripts";
     tokio::fs::create_dir_all(scripts_dir).await.ok();
 
-    // Deepest level (Ln): just echo the marker
-    let ln_script = format!("#!/bin/bash\necho {}\n", marker);
+    // Write scripts based on benchmark mode
+    let bench_path = format!("{}/bench.sh", scripts_dir);
+    let basic_path = format!("{}/basic.sh", scripts_dir);
+    let large_path = format!("{}/large.sh", scripts_dir);
+
+    tokio::fs::write(&bench_path, benchmark_script()).await?;
+    tokio::fs::write(&basic_path, basic_script()).await?;
+    tokio::fs::write(&large_path, large_file_script()).await?;
+
+    for path in [&bench_path, &basic_path, &large_path] {
+        tokio::process::Command::new("chmod")
+            .args(["+x", path])
+            .status()
+            .await?;
+    }
+
+    // Determine which script to run at each level based on mode
+    let level_script = match mode {
+        BenchmarkMode::None => format!("{}/basic.sh", scripts_dir),
+        BenchmarkMode::Standard => format!("{}/bench.sh", scripts_dir),
+        BenchmarkMode::WithLargeFiles => format!("{}/bench.sh", scripts_dir),
+    };
+
+    // For WithLargeFiles, also run the large file script
+    let large_script_call = if mode == BenchmarkMode::WithLargeFiles {
+        format!("{}/large.sh", scripts_dir)
+    } else {
+        String::new()
+    };
+
+    // Deepest level (Ln): run script(s) + echo marker
+    let ln_script = if mode == BenchmarkMode::WithLargeFiles {
+        format!(
+            "#!/bin/bash\nset -ex\n{level_script} {n}\n{large_script_call} {n}\necho {marker}\n",
+            level_script = level_script,
+            large_script_call = large_script_call,
+            n = n,
+            marker = marker
+        )
+    } else {
+        format!(
+            "#!/bin/bash\nset -ex\n{level_script} {n}\necho {marker}\n",
+            level_script = level_script,
+            n = n,
+            marker = marker
+        )
+    };
     let ln_path = format!("{}/l{}.sh", scripts_dir, n);
     tokio::fs::write(&ln_path, &ln_script).await?;
     tokio::process::Command::new("chmod")
         .args(["+x", &ln_path])
         .status()
         .await?;
-    println!("L{}: echo marker", n);
 
-    // Build L(n-1) down to L1: each imports image and runs fcvm with next script
-    // Each level needs:
-    // - --map to access shared storage
-    // - --mem for intermediate levels to fit child VM
-    // - --kernel-profile for nested virtualization
+    let mode_desc = match mode {
+        BenchmarkMode::None => "basic check",
+        BenchmarkMode::Standard => "standard benchmarks",
+        BenchmarkMode::WithLargeFiles => "benchmarks + large files",
+    };
+    println!("L{}: {} + echo marker", n, mode_desc);
 
+    // Build L(n-1) down to L1: each runs script, imports image, runs fcvm
     for level in (1..n).rev() {
         let next_script = format!("{}/l{}.sh", scripts_dir, level + 1);
-
-        // Every level in this loop runs `fcvm podman run`, spawning a child VM.
-        // Each spawned VM runs Firecracker which needs ~2GB. So every level that
-        // spawns a VM needs extra memory (4GB) to fit:
-        // - Firecracker process for child VM (~2GB)
-        // - OS overhead and containers (~1-2GB)
-        //
-        // L(n) (deepest, created outside this loop) just runs echo, no child VMs.
-        // All other levels (1 to n-1) spawn VMs and need 4GB.
         let mem_arg = format!("--mem {}", intermediate_mem);
 
-        let script = format!(
-            r#"#!/bin/bash
+        let script = if mode == BenchmarkMode::WithLargeFiles {
+            format!(
+                r#"#!/bin/bash
 set -ex
-echo "L{}: Importing image from shared cache..."
-podman load -i /mnt/fcvm-btrfs/image-cache/{}.oci.tar
-podman tag sha256:{} localhost/nested-test 2>/dev/null || true
-echo "L{}: Starting L{} VM..."
-fcvm podman run --name l{} --network bridged --privileged {} --kernel-profile nested --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs localhost/nested-test --cmd {}
+
+# Run benchmarks for this level
+{level_script} {level}
+{large_script_call} {level}
+
+echo "L{level}: Importing image from shared cache..."
+podman load -i /mnt/fcvm-btrfs/image-cache/{digest}.oci.tar
+podman tag sha256:{digest} localhost/nested-test 2>/dev/null || true
+
+echo "L{level}: Starting L{next_level} VM..."
+FCVM_FUSE_TRACE_RATE=100 fcvm podman run \
+    --name l{next_level} \
+    --network bridged \
+    --privileged \
+    {mem_arg} \
+    --kernel-profile nested \
+    --kernel {kernel} \
+    --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
+    localhost/nested-test \
+    --cmd {next_script}
 "#,
-            level,
-            digest,
-            digest,
-            level,
-            level + 1,
-            level + 1,
-            mem_arg,
-            next_script
-        );
+                level_script = level_script,
+                large_script_call = large_script_call,
+                level = level,
+                next_level = level + 1,
+                digest = digest_stripped,
+                mem_arg = mem_arg,
+                kernel = nested_kernel_path,
+                next_script = next_script
+            )
+        } else {
+            format!(
+                r#"#!/bin/bash
+set -ex
+
+# Run script for this level
+{level_script} {level}
+
+echo "L{level}: Importing image from shared cache..."
+podman load -i /mnt/fcvm-btrfs/image-cache/{digest}.oci.tar
+podman tag sha256:{digest} localhost/nested-test 2>/dev/null || true
+
+echo "L{level}: Starting L{next_level} VM..."
+FCVM_FUSE_TRACE_RATE=100 fcvm podman run \
+    --name l{next_level} \
+    --network bridged \
+    --privileged \
+    {mem_arg} \
+    --kernel-profile nested \
+    --kernel {kernel} \
+    --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
+    localhost/nested-test \
+    --cmd {next_script}
+"#,
+                level_script = level_script,
+                level = level,
+                next_level = level + 1,
+                digest = digest_stripped,
+                mem_arg = mem_arg,
+                kernel = nested_kernel_path,
+                next_script = next_script
+            )
+        };
         let script_path = format!("{}/l{}.sh", scripts_dir, level);
         tokio::fs::write(&script_path, &script).await?;
         tokio::process::Command::new("chmod")
@@ -1474,13 +1345,12 @@ fcvm podman run --name l{} --network bridged --privileged {} --kernel-profile ne
             .status()
             .await?;
         println!(
-            "L{}: import + fcvm {} --kernel-profile nested --map + --cmd {}",
-            level, mem_arg, next_script
+            "L{}: {} + import + fcvm {} --cmd {}",
+            level, mode_desc, mem_arg, next_script
         );
     }
 
     // Run L1 from host with nested kernel profile
-    // L1 needs extra memory since it spawns L2
     let l1_script = format!("{}/l1.sh", scripts_dir);
     println!(
         "\nStarting {} levels of nesting with 4GB per intermediate VM...",
@@ -1488,10 +1358,15 @@ fcvm podman run --name l{} --network bridged --privileged {} --kernel-profile ne
     );
 
     // Use sh -c with tee to stream output in real-time AND capture for marker check
-    let log_file = format!("/tmp/nested-l{}.log", n);
+    let mode_suffix = match mode {
+        BenchmarkMode::None => "basic",
+        BenchmarkMode::Standard => "bench",
+        BenchmarkMode::WithLargeFiles => "large",
+    };
+    let log_file = format!("/tmp/nested-l{}-{}.log", n, mode_suffix);
     let fcvm_cmd = format!(
         "sudo ./target/release/fcvm podman run \
-         --name l1-nested-{} \
+         --name l1-nested-{}-{} \
          --network bridged \
          --privileged \
          --mem {} \
@@ -1499,7 +1374,7 @@ fcvm podman run --name l{} --network bridged --privileged {} --kernel-profile ne
          --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
          localhost/nested-test \
          --cmd {} 2>&1 | tee {}",
-        n, intermediate_mem, l1_script, log_file
+        n, mode_suffix, intermediate_mem, l1_script, log_file
     );
 
     let status = tokio::process::Command::new("sh")
@@ -1514,14 +1389,45 @@ fcvm podman run --name l{} --network bridged --privileged {} --kernel-profile ne
         .await
         .unwrap_or_default();
 
-    // Look for the marker in output
+    // Verify all level markers present
+    for level in 1..=n {
+        let level_marker = format!("MARKER_L{}_OK", level);
+        assert!(
+            log_content.contains(&level_marker),
+            "L{} should complete (missing {}). Exit status: {:?}. Check output above.",
+            level,
+            level_marker,
+            status
+        );
+    }
+
+    // For large file mode, also verify large file markers
+    if mode == BenchmarkMode::WithLargeFiles {
+        for level in 1..=n {
+            let large_marker = format!("MARKER_LARGE_L{}_OK", level);
+            assert!(
+                log_content.contains(&large_marker),
+                "L{} large file benchmark should complete (missing {}). Exit status: {:?}.",
+                level,
+                large_marker,
+                status
+            );
+        }
+    }
+
+    // Also verify the final marker
     assert!(
         log_content.contains(marker),
-        "L{} VM should echo marker '{}'. Exit status: {:?}. Check output above.",
-        n,
+        "Final marker '{}' not found. Exit status: {:?}. Check output above.",
         marker,
         status
     );
+
+    // Extract and display benchmark summary
+    if mode != BenchmarkMode::None {
+        print_benchmark_summary(&log_content, mode == BenchmarkMode::WithLargeFiles);
+    }
+
     Ok(())
 }
 

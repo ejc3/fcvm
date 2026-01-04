@@ -230,10 +230,22 @@ fn writer_loop(
     pending: Arc<DashMap<u64, Sender<ResponsePayload>>>,
 ) {
     let mut count = 0u64;
+    let mut total_bytes_written: u64 = 0; // Track for corruption debugging
+
     while let Ok(req) = request_rx.recv() {
         count += 1;
+        let msg_len = req.data.len();
+
         if count <= 10 || count.is_multiple_of(100) {
-            tracing::info!(target: "fuse-pipe::mux", count, pending_count = pending.len(), "writer: sent requests");
+            tracing::info!(
+                target: "fuse-pipe::mux",
+                count,
+                unique = req.unique,
+                msg_len,
+                total_bytes_written,
+                pending_count = pending.len(),
+                "writer: sending request"
+            );
         }
 
         // Register the response channel BEFORE writing (to avoid race)
@@ -247,16 +259,26 @@ fn writer_loop(
             Ok(())
         };
         if let Err(e) = write_result.as_ref().and(flush_result.as_ref()) {
-            tracing::warn!(target: "fuse-pipe::mux", unique = req.unique, error = %e, error_kind = ?e.kind(), "writer: socket write failed");
+            tracing::warn!(
+                target: "fuse-pipe::mux",
+                unique = req.unique,
+                msg_len,
+                total_bytes_written,
+                error = %e,
+                error_kind = ?e.kind(),
+                "writer: socket write failed"
+            );
             // Remove from pending and signal error
             if let Some((_, tx)) = pending.remove(&req.unique) {
                 let _ = tx.send((VolumeResponse::error(libc::EIO), None));
             }
+        } else {
+            total_bytes_written += msg_len as u64;
         }
         // Note: client_socket_write is marked by server_recv on the server side
         // since we can't update the span after serialization
     }
-    tracing::info!(target: "fuse-pipe::mux", count, "writer: exiting");
+    tracing::info!(target: "fuse-pipe::mux", count, total_bytes_written, "writer: exiting");
 }
 
 /// Reader thread: reads responses from socket, routes to waiting readers.

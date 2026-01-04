@@ -4,7 +4,7 @@
 #
 # Build:
 #   cp target/release/fcvm target/release/fc-agent artifacts/
-#   cp /usr/local/bin/firecracker artifacts/firecracker-nv2
+#   cp /mnt/fcvm-btrfs/firecracker/firecracker-nested-*.bin artifacts/firecracker-nested
 #   sudo podman build -t localhost/nested-test -f Containerfile.nested .
 #
 # The nested test is driven by test_nested_chain tests which:
@@ -33,9 +33,10 @@ RUN mkdir -p /etc/containers /var/lib/containers/storage && \
         > /etc/containers/storage.conf
 
 # Copy pre-built binaries (host glibc 2.39 matches ubuntu:24.04)
+# The firecracker binary is copied as firecracker-nested (fcvm uses FCVM_FIRECRACKER_BIN env var)
 COPY artifacts/fcvm artifacts/fc-agent /usr/local/bin/
-COPY artifacts/firecracker-nv2 /usr/local/bin/firecracker
-RUN chmod +x /usr/local/bin/fcvm /usr/local/bin/fc-agent /usr/local/bin/firecracker
+COPY artifacts/firecracker-nested /usr/local/bin/firecracker-nested
+RUN chmod +x /usr/local/bin/fcvm /usr/local/bin/fc-agent /usr/local/bin/firecracker-nested
 
 # Copy config file for nested fcvm (uses same paths as host via FUSE mount)
 RUN mkdir -p /etc/fcvm

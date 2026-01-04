@@ -260,10 +260,9 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         bail!("--setup is not allowed when running as root. Run 'fcvm setup' first.");
     }
 
-    // Get kernel path and apply profile config
-    // Priority: --kernel-profile > --kernel > default kernel
-    let kernel_path = if let Some(ref profile_name) = args.kernel_profile {
-        // Load profile for runtime config
+    // Apply kernel profile runtime config (firecracker_args, boot_args, etc.)
+    // This is done regardless of whether --kernel is also specified
+    if let Some(ref profile_name) = args.kernel_profile {
         let profile = crate::setup::get_kernel_profile(profile_name)?.ok_or_else(|| {
             anyhow::anyhow!(
                 "kernel profile '{}' not found for {} in config",
@@ -275,9 +274,18 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         info!(profile = %profile_name, "using kernel profile");
 
         // Apply runtime config from profile
-        if let Some(ref bin) = profile.firecracker_bin {
-            info!(firecracker_bin = %bin, "from profile");
-            std::env::set_var("FCVM_FIRECRACKER_BIN", bin);
+        // Use content-addressed firecracker path if profile has custom firecracker
+        if let Some(fc_path) = crate::setup::get_profile_firecracker_path(&profile, profile_name) {
+            if !fc_path.exists() {
+                bail!(
+                    "Profile '{}' firecracker not found at {}.\nRun: fcvm setup --kernel-profile {}",
+                    profile_name,
+                    fc_path.display(),
+                    profile_name
+                );
+            }
+            info!(firecracker_bin = %fc_path.display(), "from profile");
+            std::env::set_var("FCVM_FIRECRACKER_BIN", fc_path.to_string_lossy().as_ref());
         }
         if let Some(ref fc_args) = profile.firecracker_args {
             info!(firecracker_args = %fc_args, "from profile");
@@ -291,8 +299,20 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
             info!(fuse_readers = %readers, "from profile");
             std::env::set_var("FCVM_FUSE_READERS", readers.to_string());
         }
+    }
 
-        // Get kernel path (must already exist)
+    // Get kernel path
+    // Priority: --kernel (explicit) > --kernel-profile (computed) > default
+    let kernel_path = if let Some(custom_kernel) = &args.kernel {
+        // Explicit kernel path - use directly
+        let path = PathBuf::from(custom_kernel);
+        if !path.exists() {
+            bail!("Custom kernel not found: {}", path.display());
+        }
+        info!(kernel = %path.display(), "using custom kernel");
+        path
+    } else if let Some(ref profile_name) = args.kernel_profile {
+        // Compute kernel path from profile
         let kernel = crate::setup::get_kernel_path(Some(profile_name))?;
         if !kernel.exists() {
             bail!(
@@ -303,13 +323,6 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
             );
         }
         kernel
-    } else if let Some(custom_kernel) = &args.kernel {
-        let path = PathBuf::from(custom_kernel);
-        if !path.exists() {
-            bail!("Custom kernel not found: {}", path.display());
-        }
-        info!(kernel = %path.display(), "using custom kernel");
-        path
     } else {
         // Default kernel (downloads if --setup is set)
         crate::setup::ensure_kernel(None, args.setup, false)

@@ -178,6 +178,30 @@ KVM_CAP_ARM_EL2 (cap 240) = 1
   -> Nested virtualization IS supported by KVM (VHE mode)
 ```
 
+### Known NV2 Architectural Limitations
+
+ARM's FEAT_NV2 has fundamental architectural issues acknowledged by Linux kernel maintainers.
+These affect memory visibility, register access, and timer emulation under nested virtualization.
+
+**Kernel source citations** (from `torvalds/linux` master branch):
+
+From [`arch/arm64/kvm/nested.c`](https://github.com/torvalds/linux/blob/master/arch/arm64/kvm/nested.c):
+> "In yet another example where FEAT_NV2 is fscking broken, accesses to MDSCR_EL1 are redirected to the VNCR despite having an effect at EL2."
+
+> "One of the many architectural bugs in FEAT_NV2 is that the guest hypervisor can write to HCR_EL2 behind our back"
+
+From [`arch/arm64/kvm/arch_timer.c`](https://github.com/torvalds/linux/blob/master/arch/arm64/kvm/arch_timer.c):
+> "Paper over NV2 brokenness by publishing the interrupt status bit. This still results in a poor quality of emulation"
+
+> "NV2 badly breaks the timer semantics by redirecting accesses to the EL1 timer state to memory"
+
+**Impact on fcvm**: Under L2 (nested) VMs, vsock packet fragmentation can trigger memory visibility
+issues due to double Stage 2 translation (L2 GPA → L1 S2 → L1 HPA → L0 S2 → physical). Large writes
+that fragment into multiple vsock packets may see stale/zero data instead of actual content.
+
+**Fix**: FUSE max_write limited to 32KB in `fuse-pipe/src/client/fuse.rs`. This ensures each
+FUSE write fits in a single vsock packet (kernel's limit is 64KB), avoiding fragmentation.
+
 ## FUSE Performance Tracing
 
 Enable per-operation tracing to diagnose FUSE latency issues (especially in nested VMs).

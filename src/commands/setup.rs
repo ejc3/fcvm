@@ -63,6 +63,11 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
             profile_kernel_path.display()
         );
 
+        // Build profile firecracker if needed
+        crate::setup::ensure_profile_firecracker(&profile, profile_name)
+            .await
+            .context("setting up profile firecracker")?;
+
         // Install as host kernel if requested
         if args.install_host_kernel {
             println!("\nInstalling profile kernel as host kernel...");
