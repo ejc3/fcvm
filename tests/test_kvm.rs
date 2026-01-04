@@ -1442,12 +1442,18 @@ async fn run_nested_n_levels(
         fuse_max_write
     );
 
+    // ARM64 NV2 has NETDEV WATCHDOG issues with multiple vCPUs in L2+ VMs
+    // Limit to 1 vCPU to avoid virtio-net TX queue timeout
+    let cpu_arg = if std::env::consts::ARCH == "aarch64" {
+        "--cpu 1 \\\n    "
+    } else {
+        ""
+    };
+
     // Build L(n-1) down to L1: each runs script, imports image, runs fcvm
     for level in (1..n).rev() {
         let next_script = format!("{}/l{}.sh", scripts_dir, level + 1);
         let mem_arg = format!("--mem {}", intermediate_mem);
-        // Use single vCPU for nested VMs to avoid NETDEV WATCHDOG timeout under NV2
-        let cpu_arg = "--cpu 1";
 
         let script = match mode {
             BenchmarkMode::WithLargeFiles => format!(
@@ -1469,8 +1475,7 @@ FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse
     --name l{next_level} \
     --network bridged \
     --privileged \
-    {mem_arg} \
-    {cpu_arg} \
+    {cpu_arg}{mem_arg} \
     --kernel-profile nested \
     --kernel {kernel} \
     --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
@@ -1483,8 +1488,8 @@ FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse
                 next_level = level + 1,
                 digest = digest_stripped,
                 image_cache = image_cache_guest_path,
-                mem_arg = mem_arg,
                 cpu_arg = cpu_arg,
+                mem_arg = mem_arg,
                 kernel = nested_kernel_path,
                 next_script = next_script,
                 fuse_max_write = fuse_max_write
@@ -1508,8 +1513,7 @@ FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse
     --name l{next_level} \
     --network bridged \
     --privileged \
-    {mem_arg} \
-    {cpu_arg} \
+    {cpu_arg}{mem_arg} \
     --kernel-profile nested \
     --kernel {kernel} \
     --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
@@ -1522,8 +1526,8 @@ FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse
                 next_level = level + 1,
                 digest = digest_stripped,
                 image_cache = image_cache_guest_path,
-                mem_arg = mem_arg,
                 cpu_arg = cpu_arg,
+                mem_arg = mem_arg,
                 kernel = nested_kernel_path,
                 next_script = next_script,
                 fuse_max_write = fuse_max_write
@@ -1546,8 +1550,7 @@ FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse
     --name l{next_level} \
     --network bridged \
     --privileged \
-    {mem_arg} \
-    {cpu_arg} \
+    {cpu_arg}{mem_arg} \
     --kernel-profile nested \
     --kernel {kernel} \
     --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
@@ -1559,8 +1562,8 @@ FCVM_DATA_DIR=/root/fcvm-data FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse
                 next_level = level + 1,
                 digest = digest_stripped,
                 image_cache = image_cache_guest_path,
-                mem_arg = mem_arg,
                 cpu_arg = cpu_arg,
+                mem_arg = mem_arg,
                 kernel = nested_kernel_path,
                 next_script = next_script,
                 fuse_max_write = fuse_max_write
