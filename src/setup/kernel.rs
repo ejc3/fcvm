@@ -212,13 +212,11 @@ fn get_profile_kernel_path(profile_name: &str) -> Result<PathBuf> {
     let profile = get_kernel_profile(profile_name)?
         .ok_or_else(|| anyhow::anyhow!("kernel profile '{}' not found in config", profile_name))?;
 
+    // If profile doesn't specify custom kernel, use the default kernel
+    // This allows runtime-only profiles (boot_args, firecracker_args, etc.)
     if !profile.is_custom() {
-        bail!(
-            "kernel profile '{}' has no kernel source configured.\n\
-             Add kernel_version + kernel_repo to [kernel_profiles.{}]",
-            profile_name,
-            profile_name
-        );
+        debug!(profile = %profile_name, "profile uses default kernel (no custom kernel configured)");
+        return get_default_kernel_path();
     }
 
     let sha = compute_profile_kernel_sha(&profile);
@@ -240,13 +238,11 @@ async fn ensure_profile_kernel(
         )
     })?;
 
+    // If profile doesn't specify custom kernel, use the default kernel
+    // This allows runtime-only profiles (boot_args, firecracker_args, etc.)
     if !profile.is_custom() {
-        bail!(
-            "kernel profile '{}' has no kernel source configured.\n\
-             Add kernel_version + kernel_repo to [kernel_profiles.{}]",
-            profile_name,
-            profile_name
-        );
+        info!(profile = %profile_name, "profile uses default kernel");
+        return ensure_default_kernel(allow_create).await;
     }
 
     let sha = compute_profile_kernel_sha(&profile);
@@ -533,12 +529,6 @@ fn generate_vm_kernel_build_script(
         arch => bail!("Unsupported architecture: {}", arch),
     };
 
-    let arch_for_url = match std::env::consts::ARCH {
-        "aarch64" => "aarch64",
-        "x86_64" => "x86_64",
-        arch => bail!("Unsupported architecture: {}", arch),
-    };
-
     // Get config from profile
     let patches_dir = profile
         .patches_dir
@@ -551,13 +541,11 @@ fn generate_vm_kernel_build_script(
     let base_config_url = profile
         .base_config_url
         .as_deref()
-        .map(|url| url.replace("{arch}", arch_for_url))
-        .unwrap_or_else(|| {
-            format!(
-                "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-{}-6.1.config",
-                arch_for_url
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "kernel profile must specify base_config_url (e.g., firecracker microvm-kernel-ci config)"
             )
-        });
+        })?;
 
     let script = format!(
         r##"#!/bin/bash
@@ -684,11 +672,11 @@ echo ""
 echo "Building kernel with $NPROC parallel jobs..."
 make ARCH="$KERNEL_ARCH" -j"$NPROC" "$KERNEL_IMAGE"
 
-# Copy output
+# Copy output (Firecracker needs uncompressed ELF vmlinux, not bzImage)
 echo "Copying kernel to $KERNEL_PATH..."
 case "$KERNEL_ARCH" in
     arm64)  cp "arch/arm64/boot/Image" "$KERNEL_PATH" ;;
-    x86_64) cp "arch/x86/boot/bzImage" "$KERNEL_PATH" ;;
+    x86_64) cp "vmlinux" "$KERNEL_PATH" ;;
 esac
 
 echo ""

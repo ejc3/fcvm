@@ -2298,7 +2298,7 @@ async fn main() -> Result<()> {
 
     if sync_start.elapsed().as_secs() >= 2 {
         eprintln!("[fc-agent] sync timed out after 2s, killing it");
-        drop(sync_child.kill());
+        let _ = sync_child.kill().await;
     }
 
     // Now shutdown
