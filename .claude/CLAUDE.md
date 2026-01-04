@@ -11,6 +11,10 @@ main → PR#55, main → PR#56    (wrong - parallel branches)
 
 Only branch directly from main when explicitly starting independent work.
 
+**When base PR merges:** Your branch's merge-base with main shifts automatically. The delta shown in your PR will only be your commits (base PR's commits are now in main). Merge conflicts can arise if main got other commits touching the same files.
+
+**PR description:** Always note `**Stacked on:** <base-branch> (PR #N)` so reviewers understand the dependency.
+
 ## UNDERSTAND BRANCH CHAINS
 
 **Run before starting work, committing, or opening PRs:**
@@ -20,6 +24,8 @@ git log --oneline --graph --all --decorate | head -120
 ```
 
 Shows which branch you're on and what it's based on.
+
+**Don't confuse local vs remote:** After rebasing locally, `origin/<branch>` shows the old history until you force-push. They're the same branch at different points in time.
 
 ## ALWAYS USE THE MAKEFILE
 
