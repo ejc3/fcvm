@@ -248,6 +248,35 @@ fn writer_loop(
             );
         }
 
+        // Validate the message structure before sending
+        if req.data.len() < 4 {
+            tracing::error!(
+                target: "fuse-pipe::mux",
+                unique = req.unique,
+                data_len = req.data.len(),
+                "writer: message too short (missing length prefix?)"
+            );
+            continue;
+        }
+        let len_prefix = u32::from_be_bytes([req.data[0], req.data[1], req.data[2], req.data[3]]);
+        if len_prefix == 0 {
+            tracing::error!(
+                target: "fuse-pipe::mux",
+                unique = req.unique,
+                "writer: ZERO LENGTH PREFIX - corruption before send!"
+            );
+            continue;
+        }
+        if len_prefix as usize != req.data.len() - 4 {
+            tracing::error!(
+                target: "fuse-pipe::mux",
+                unique = req.unique,
+                len_prefix,
+                actual_body_len = req.data.len() - 4,
+                "writer: length prefix mismatch!"
+            );
+        }
+
         // Register the response channel BEFORE writing (to avoid race)
         pending.insert(req.unique, req.response_tx);
 
