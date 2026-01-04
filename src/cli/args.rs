@@ -21,7 +21,7 @@ pub enum Commands {
     /// List running VMs
     Ls(LsArgs),
     /// Podman-compatible container operations
-    Podman(PodmanArgs),
+    Podman(Box<PodmanArgs>),
     /// Snapshot operations (create, serve, run)
     Snapshot(SnapshotArgs),
     /// List available snapshots
@@ -115,6 +115,29 @@ pub struct RunArgs {
     /// Volume mapping(s): HOST:GUEST[:ro] (repeat or comma-separated)
     #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
     pub map: Vec<String>,
+
+    /// Extra disk(s): HOST_PATH:GUEST_MOUNT[:ro] (repeat or comma-separated)
+    /// Disks appear as /dev/vdb, /dev/vdc, etc. in order specified.
+    /// Mounted at GUEST_MOUNT in both VM and container.
+    /// Read-only disks (:ro) can be used with snapshots/clones.
+    /// Read-write disks block snapshot/clone operations.
+    /// Example: --disk /data.raw:/data --disk /scratch.raw:/scratch:ro
+    #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
+    pub disk: Vec<String>,
+
+    /// Create disk image from directory: HOST_DIR:GUEST_MOUNT[:ro]
+    /// Creates an ext4 image from HOST_DIR contents and mounts at GUEST_MOUNT.
+    /// Image is stored in VM's data directory and cleaned up on exit.
+    /// Example: --disk-dir ./mydata:/data:ro
+    #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
+    pub disk_dir: Vec<String>,
+
+    /// Share directory via NFS: HOST_DIR:GUEST_MOUNT[:ro]
+    /// Starts NFS server on host, VM mounts via network.
+    /// Requires NFS kernel support (use --kernel-profile nested or --build-kernels).
+    /// Example: --nfs /data:/mnt/data:ro
+    #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
+    pub nfs: Vec<String>,
 
     /// Environment vars KEY=VALUE (repeat or comma-separated)
     #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]

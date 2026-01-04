@@ -488,10 +488,30 @@ Performance at each nesting level (measured on c7g.metal, ARM64 Graviton3):
 - **~5-7x FUSE overhead** at L2 due to FUSE-over-FUSE chaining (L2 → L1 → Host)
 - **Large copies** show sustained throughput: 92 MB/s at L1, 12 MB/s at L2 (write) / 44 MB/s (read)
 - **Local disk** overhead is lower (~4-7x) since it only traverses the virtio block device
-- **Egress networking** works at all levels (NAT chains properly)
 - **Memory** is similar at each level (~350-400MB for the nested container image)
 
 **Why L3+ is blocked:** Each additional nesting level adds another FUSE hop. At L3, a single stat() would take ~25ms (5x × 5x = 25x overhead), making container startup take 10+ minutes.
+
+#### Network Performance (iperf3)
+
+Egress/ingress throughput measured with iperf3 (3-second tests, various block sizes and parallelism):
+
+| Direction | Block Size | Streams | L1 | L2 | Overhead |
+|-----------|------------|---------|----|----|----------|
+| **Egress** (VM→Host) | 128K | 1 | 42.4 Gbps | 11.0 Gbps | 3.9x |
+| | 128K | 4 | 38.0 Gbps | 12.8 Gbps | 3.0x |
+| | 1M | 1 | 43.1 Gbps | 9.0 Gbps | 4.8x |
+| | 1M | 8 | 33.1 Gbps | 12.3 Gbps | 2.7x |
+| **Ingress** (Host→VM) | 128K | 1 | 48.7 Gbps | 8.4 Gbps | 5.8x |
+| | 128K | 4 | 44.3 Gbps | 8.6 Gbps | 5.2x |
+| | 1M | 1 | 53.4 Gbps | 11.7 Gbps | 4.6x |
+| | 1M | 8 | 43.0 Gbps | 10.4 Gbps | 4.1x |
+
+**Network observations:**
+- **L1 achieves 40-53 Gbps** - excellent virtio-net performance
+- **L2 achieves 8-13 Gbps** - ~4-5x overhead from double NAT chain
+- **Single stream often outperforms parallel** - likely virtio queue contention
+- **Egress slightly faster than ingress at L2** - asymmetric NAT path
 
 ### Limitations
 

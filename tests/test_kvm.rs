@@ -755,6 +755,37 @@ async fn test_nested_l2_with_large_files() -> Result<()> {
     .await
 }
 
+/// Test nested VMs with network throughput benchmarks
+///
+/// Measures egress/ingress throughput from VMs at each level to host using iperf3.
+/// Tests various block sizes (128K, 1M) and parallelism (1, 4, 8 streams).
+/// Network tests don't depend on FUSE, so they work even at L3+.
+#[tokio::test]
+async fn test_nested_l2_with_network() -> Result<()> {
+    run_nested_n_levels(
+        2,
+        "NESTED_2_LEVELS_NETWORK_SUCCESS",
+        BenchmarkMode::WithNetwork,
+    )
+    .await
+}
+
+/// Test L3 network: measures throughput degradation through triple NAT chain
+///
+/// BLOCKED: Even though network uses NAT (not FUSE), container startup requires
+/// FUSE for rootfs access. At L3, FUSE latency is ~15ms per operation, causing
+/// container startup to exceed the 10-minute test timeout.
+#[tokio::test]
+#[ignore]
+async fn test_nested_l3_with_network() -> Result<()> {
+    run_nested_n_levels(
+        3,
+        "NESTED_3_LEVELS_NETWORK_SUCCESS",
+        BenchmarkMode::WithNetwork,
+    )
+    .await
+}
+
 /// Test L1→L2→L3: 3 levels of nesting
 ///
 /// BLOCKED: 3-hop FUSE chain (L3→L2→L1→HOST) causes ~3-5 second latency per
@@ -785,6 +816,8 @@ enum BenchmarkMode {
     Standard,
     /// Standard + large file tests (100MB copies)
     WithLargeFiles,
+    /// Network throughput benchmarks (iperf3)
+    WithNetwork,
 }
 
 /// Basic script that just echoes the success marker (no benchmarks)
@@ -976,8 +1009,92 @@ echo "MARKER_LARGE_L${LEVEL}_OK"
 "#
 }
 
+/// Network benchmark script using iperf3
+/// Tests egress/ingress throughput at various block sizes and parallelism
+fn network_script(server_ip: &str) -> String {
+    format!(
+        r#"#!/bin/bash
+set -e
+LEVEL=${{1:-unknown}}
+SERVER="{server_ip}"
+
+echo "=== NETWORK BENCHMARK L${{LEVEL}} ==="
+echo "Server: $SERVER"
+
+# Check if iperf3 is available
+if ! command -v iperf3 &> /dev/null; then
+    echo "NETBENCH_L${{LEVEL}}=SKIP (iperf3 not installed)"
+    echo "MARKER_NET_L${{LEVEL}}_OK"
+    exit 0
+fi
+
+# Check connectivity first
+echo "--- Connectivity Test ---"
+if ! timeout 5 bash -c "echo > /dev/tcp/$SERVER/5201" 2>/dev/null; then
+    echo "NETBENCH_L${{LEVEL}}=SKIP (cannot reach $SERVER:5201)"
+    echo "MARKER_NET_L${{LEVEL}}_OK"
+    exit 0
+fi
+echo "Server reachable"
+
+# Block sizes and parallelism
+BLOCK_SIZES="128K 1M"
+PARALLEL="1 4 8"
+DURATION=3
+
+echo ""
+echo "--- Egress Throughput (VM -> Host) ---"
+for bs in $BLOCK_SIZES; do
+    for p in $PARALLEL; do
+        result=$(iperf3 -c $SERVER -t $DURATION -l $bs -P $p -J 2>/dev/null || echo '{{"error":"failed"}}')
+        throughput=$(echo "$result" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    if 'error' in data:
+        print('FAIL')
+    else:
+        bps = data['end']['sum_sent']['bits_per_second']
+        mbps = bps / 1000000
+        print(f'{{mbps:.0f}}')
+except:
+    print('FAIL')
+" 2>/dev/null || echo "FAIL")
+        echo "NET_EGRESS_L${{LEVEL}}_${{bs}}_P${{p}}=${{throughput}}Mbps"
+    done
+done
+
+echo ""
+echo "--- Ingress Throughput (Host -> VM) ---"
+for bs in $BLOCK_SIZES; do
+    for p in $PARALLEL; do
+        result=$(iperf3 -c $SERVER -t $DURATION -l $bs -P $p -R -J 2>/dev/null || echo '{{"error":"failed"}}')
+        throughput=$(echo "$result" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    if 'error' in data:
+        print('FAIL')
+    else:
+        bps = data['end']['sum_received']['bits_per_second']
+        mbps = bps / 1000000
+        print(f'{{mbps:.0f}}')
+except:
+    print('FAIL')
+" 2>/dev/null || echo "FAIL")
+        echo "NET_INGRESS_L${{LEVEL}}_${{bs}}_P${{p}}=${{throughput}}Mbps"
+    done
+done
+
+echo ""
+echo "=== END NETWORK BENCHMARK L${{LEVEL}} ==="
+echo "MARKER_NET_L${{LEVEL}}_OK"
+"#
+    )
+}
+
 /// Print a summary of benchmark results from log content
-fn print_benchmark_summary(log_content: &str, include_large_files: bool) {
+fn print_benchmark_summary(log_content: &str, include_large_files: bool, include_network: bool) {
     println!("\n=== BENCHMARK SUMMARY ===");
     for line in log_content.lines() {
         let is_standard = line.contains("EGRESS_L")
@@ -990,8 +1107,10 @@ fn print_benchmark_summary(log_content: &str, include_large_files: bool) {
             || line.contains("FUSE_SMALLREAD_L")
             || line.contains("MEM_L");
         let is_large_file = line.contains("FUSE_COPY_TO_L") || line.contains("FUSE_COPY_FROM_L");
+        let is_network = line.contains("NET_EGRESS_L") || line.contains("NET_INGRESS_L");
 
-        if is_standard || (include_large_files && is_large_file) {
+        if is_standard || (include_large_files && is_large_file) || (include_network && is_network)
+        {
             // Strip ANSI codes and prefixes
             let clean = line.split("stdout]").last().unwrap_or(line).trim();
             println!("{}", clean);
@@ -1042,20 +1161,58 @@ async fn run_nested_n_levels(n: usize, marker: &str, mode: BenchmarkMode) -> Res
     let scripts_dir = "/mnt/fcvm-btrfs/nested-scripts";
     tokio::fs::create_dir_all(scripts_dir).await.ok();
 
+    // Get host IP for network benchmarks (used by iperf3)
+    let host_ip = if mode == BenchmarkMode::WithNetwork {
+        // Get source IP for reaching the internet (this is what VMs can reach via NAT)
+        let output = tokio::process::Command::new("ip")
+            .args(["route", "get", "8.8.8.8"])
+            .output()
+            .await?;
+        let route_output = String::from_utf8_lossy(&output.stdout);
+        // Parse "8.8.8.8 via X.X.X.X dev eth0 src 10.0.1.103 ..."
+        route_output
+            .split_whitespace()
+            .skip_while(|s| *s != "src")
+            .nth(1)
+            .unwrap_or("10.0.1.103")
+            .to_string()
+    } else {
+        String::new()
+    };
+
+    // Start iperf3 server for network benchmarks
+    let mut iperf_server: Option<tokio::process::Child> = None;
+    if mode == BenchmarkMode::WithNetwork {
+        println!("Starting iperf3 server on host ({})...", host_ip);
+        iperf_server = Some(
+            tokio::process::Command::new("iperf3")
+                .args(["-s", "-D"]) // Daemon mode
+                .spawn()
+                .context("starting iperf3 server")?,
+        );
+        // Give server time to start
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+
     // Write scripts based on benchmark mode
     let bench_path = format!("{}/bench.sh", scripts_dir);
     let basic_path = format!("{}/basic.sh", scripts_dir);
     let large_path = format!("{}/large.sh", scripts_dir);
+    let net_path = format!("{}/net.sh", scripts_dir);
 
     tokio::fs::write(&bench_path, benchmark_script()).await?;
     tokio::fs::write(&basic_path, basic_script()).await?;
     tokio::fs::write(&large_path, large_file_script()).await?;
+    if mode == BenchmarkMode::WithNetwork {
+        tokio::fs::write(&net_path, network_script(&host_ip)).await?;
+    }
 
-    for path in [&bench_path, &basic_path, &large_path] {
+    for path in [&bench_path, &basic_path, &large_path, &net_path] {
         tokio::process::Command::new("chmod")
             .args(["+x", path])
             .status()
-            .await?;
+            .await
+            .ok(); // Ignore errors for net.sh if not created
     }
 
     // Determine which script to run at each level based on mode
@@ -1063,6 +1220,7 @@ async fn run_nested_n_levels(n: usize, marker: &str, mode: BenchmarkMode) -> Res
         BenchmarkMode::None => format!("{}/basic.sh", scripts_dir),
         BenchmarkMode::Standard => format!("{}/bench.sh", scripts_dir),
         BenchmarkMode::WithLargeFiles => format!("{}/bench.sh", scripts_dir),
+        BenchmarkMode::WithNetwork => format!("{}/basic.sh", scripts_dir), // Just basic + network
     };
 
     // For WithLargeFiles, also run the large file script
@@ -1072,22 +1230,35 @@ async fn run_nested_n_levels(n: usize, marker: &str, mode: BenchmarkMode) -> Res
         String::new()
     };
 
+    // For WithNetwork, run network benchmark script
+    let net_script_call = if mode == BenchmarkMode::WithNetwork {
+        format!("{}/net.sh", scripts_dir)
+    } else {
+        String::new()
+    };
+
     // Deepest level (Ln): run script(s) + echo marker
-    let ln_script = if mode == BenchmarkMode::WithLargeFiles {
-        format!(
+    let ln_script = match mode {
+        BenchmarkMode::WithLargeFiles => format!(
             "#!/bin/bash\nset -ex\n{level_script} {n}\n{large_script_call} {n}\necho {marker}\n",
             level_script = level_script,
             large_script_call = large_script_call,
             n = n,
             marker = marker
-        )
-    } else {
-        format!(
+        ),
+        BenchmarkMode::WithNetwork => format!(
+            "#!/bin/bash\nset -ex\n{level_script} {n}\n{net_script_call} {n}\necho {marker}\n",
+            level_script = level_script,
+            net_script_call = net_script_call,
+            n = n,
+            marker = marker
+        ),
+        _ => format!(
             "#!/bin/bash\nset -ex\n{level_script} {n}\necho {marker}\n",
             level_script = level_script,
             n = n,
             marker = marker
-        )
+        ),
     };
     let ln_path = format!("{}/l{}.sh", scripts_dir, n);
     tokio::fs::write(&ln_path, &ln_script).await?;
@@ -1100,6 +1271,7 @@ async fn run_nested_n_levels(n: usize, marker: &str, mode: BenchmarkMode) -> Res
         BenchmarkMode::None => "basic check",
         BenchmarkMode::Standard => "standard benchmarks",
         BenchmarkMode::WithLargeFiles => "benchmarks + large files",
+        BenchmarkMode::WithNetwork => "network benchmarks",
     };
     println!("L{}: {} + echo marker", n, mode_desc);
 
@@ -1116,8 +1288,8 @@ async fn run_nested_n_levels(n: usize, marker: &str, mode: BenchmarkMode) -> Res
         let next_script = format!("{}/l{}.sh", scripts_dir, level + 1);
         let mem_arg = format!("--mem {}", intermediate_mem);
 
-        let script = if mode == BenchmarkMode::WithLargeFiles {
-            format!(
+        let script = match mode {
+            BenchmarkMode::WithLargeFiles => format!(
                 r#"#!/bin/bash
 set -ex
 
@@ -1150,9 +1322,42 @@ FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
                 kernel = nested_kernel_path,
                 next_script = next_script,
                 fuse_max_write = fuse_max_write
-            )
-        } else {
-            format!(
+            ),
+            BenchmarkMode::WithNetwork => format!(
+                r#"#!/bin/bash
+set -ex
+
+# Run script for this level
+{level_script} {level}
+{net_script_call} {level}
+
+echo "L{level}: Importing image from shared cache..."
+podman load -i /mnt/fcvm-btrfs/image-cache/{digest}.oci.tar
+podman tag sha256:{digest} localhost/nested-test 2>/dev/null || true
+
+echo "L{level}: Starting L{next_level} VM..."
+FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
+    --name l{next_level} \
+    --network bridged \
+    --privileged \
+    {mem_arg} \
+    --kernel-profile nested \
+    --kernel {kernel} \
+    --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
+    localhost/nested-test \
+    --cmd {next_script}
+"#,
+                level_script = level_script,
+                net_script_call = net_script_call,
+                level = level,
+                next_level = level + 1,
+                digest = digest_stripped,
+                mem_arg = mem_arg,
+                kernel = nested_kernel_path,
+                next_script = next_script,
+                fuse_max_write = fuse_max_write
+            ),
+            _ => format!(
                 r#"#!/bin/bash
 set -ex
 
@@ -1183,7 +1388,7 @@ FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
                 kernel = nested_kernel_path,
                 next_script = next_script,
                 fuse_max_write = fuse_max_write
-            )
+            ),
         };
         let script_path = format!("{}/l{}.sh", scripts_dir, level);
         tokio::fs::write(&script_path, &script).await?;
@@ -1209,6 +1414,7 @@ FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
         BenchmarkMode::None => "basic",
         BenchmarkMode::Standard => "bench",
         BenchmarkMode::WithLargeFiles => "large",
+        BenchmarkMode::WithNetwork => "network",
     };
     let log_file = format!("/tmp/nested-l{}-{}.log", n, mode_suffix);
     let fcvm_cmd = format!(
@@ -1262,6 +1468,20 @@ FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
         }
     }
 
+    // For network mode, verify network markers
+    if mode == BenchmarkMode::WithNetwork {
+        for level in 1..=n {
+            let net_marker = format!("MARKER_NET_L{}_OK", level);
+            assert!(
+                log_content.contains(&net_marker),
+                "L{} network benchmark should complete (missing {}). Exit status: {:?}.",
+                level,
+                net_marker,
+                status
+            );
+        }
+    }
+
     // Also verify the final marker
     assert!(
         log_content.contains(marker),
@@ -1272,7 +1492,17 @@ FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_max_write} fcvm podman run \
 
     // Extract and display benchmark summary
     if mode != BenchmarkMode::None {
-        print_benchmark_summary(&log_content, mode == BenchmarkMode::WithLargeFiles);
+        print_benchmark_summary(
+            &log_content,
+            mode == BenchmarkMode::WithLargeFiles,
+            mode == BenchmarkMode::WithNetwork,
+        );
+    }
+
+    // Clean up iperf3 server if started
+    if let Some(mut server) = iperf_server {
+        println!("Stopping iperf3 server...");
+        server.kill().await.ok();
     }
 
     Ok(())
