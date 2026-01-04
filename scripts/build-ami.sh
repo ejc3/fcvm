@@ -60,10 +60,10 @@ trap 'tag_failed $LINENO' ERR
 
 aws ec2 create-tags --resources $INSTANCE_ID --tags Key=BuildStatus,Value=building --region us-west-1
 
-# Install deps
+# Install deps (xz-utils needed for kernel kheaders tarball)
 apt-get install -y build-essential bc bison flex libssl-dev \
   libelf-dev libncurses-dev libdw-dev debhelper-compat rsync kmod cpio curl jq wget git \
-  dwarves \
+  dwarves xz-utils \
   podman uidmap slirp4netns fuse-overlayfs containernetworking-plugins \
   fuse3 libfuse3-dev libclang-dev clang musl-tools \
   iproute2 iptables dnsmasq qemu-utils e2fsprogs parted \
