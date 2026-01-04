@@ -1451,13 +1451,27 @@ async fn run_vm_setup(
 
         // Format: ip=<client>:<server>:<gw>:<netmask>:<hostname>:<device>:<autoconf>[:<dns0>]
         // root=/dev/vda - the disk IS the ext4 filesystem (no partition table)
+        //
+        // reboot= method is architecture-specific:
+        // - ARM64: reboot=k works (keyboard controller / PSCI)
+        // - x86: reboot=t required (triple-fault) because Firecracker doesn't emulate ACPI
+        let reboot_method = if cfg!(target_arch = "x86_64") {
+            "t" // Triple-fault - only reliable method on x86 Firecracker
+        } else {
+            "k" // Keyboard controller - works on ARM64 via PSCI
+        };
         format!(
-            "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=1 systemd.log_color=no root=/dev/vda rw ip={}::{}:255.255.255.252::eth0:off{}",
-            guest_ip_clean, host_ip_clean, dns_suffix
+            "console=ttyS0 reboot={} panic=1 pci=off random.trust_cpu=1 systemd.log_color=no root=/dev/vda rw ip={}::{}:255.255.255.252::eth0:off{}",
+            reboot_method, guest_ip_clean, host_ip_clean, dns_suffix
         )
     } else {
         // No network config - used for basic boot (e.g., during setup)
-        "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=1 systemd.log_color=no root=/dev/vda rw".to_string()
+        let reboot_method = if cfg!(target_arch = "x86_64") {
+            "t"
+        } else {
+            "k"
+        };
+        format!("console=ttyS0 reboot={} panic=1 pci=off random.trust_cpu=1 systemd.log_color=no root=/dev/vda rw", reboot_method)
     };
 
     // Enable fc-agent strace debugging if requested
