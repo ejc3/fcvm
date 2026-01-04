@@ -22,10 +22,24 @@ async fn test_snapshot_clone_rootless_10() -> Result<()> {
     snapshot_clone_test_impl("rootless", 10).await
 }
 
+/// Full snapshot/clone workflow test with bridged networking (10 clones)
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_snapshot_clone_bridged_10() -> Result<()> {
+    snapshot_clone_test_impl("bridged", 10).await
+}
+
 /// Stress test with 100 clones using rootless networking
 #[tokio::test]
-async fn test_snapshot_clone_stress_100() -> Result<()> {
+async fn test_snapshot_clone_stress_100_rootless() -> Result<()> {
     snapshot_clone_test_impl("rootless", 100).await
+}
+
+/// Stress test with 100 clones using bridged networking
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_snapshot_clone_stress_100_bridged() -> Result<()> {
+    snapshot_clone_test_impl("bridged", 100).await
 }
 
 /// Result of spawning and health-checking a single clone
