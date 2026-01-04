@@ -290,6 +290,7 @@ _setup-fcvm:
 		echo "ERROR: Need 15GB on /mnt/fcvm-btrfs (have $${FREE_GB}GB)"; \
 		exit 1; \
 	fi
+	sudo ./target/release/fcvm setup --generate-config --force
 	sudo ./target/release/fcvm setup
 	sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels
 

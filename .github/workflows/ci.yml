@@ -374,6 +374,8 @@ jobs:
       - name: Build nested kernel
         working-directory: fcvm
         run: |
+          # Regenerate config for root (setup-fcvm wrote to CI user's config dir)
+          sudo ./target/release/fcvm setup --generate-config --force
           # Build nested kernel locally (don't rely on GitHub releases)
           sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels
       - name: test-root
