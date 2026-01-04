@@ -164,7 +164,7 @@ pub struct RunArgs {
     pub balloon: Option<u32>,
 
     /// Network mode: bridged (requires sudo) or rootless (no sudo)
-    #[arg(long, value_enum, default_value_t = NetworkMode::Bridged)]
+    #[arg(long, value_enum, default_value_t = NetworkMode::Rootless)]
     pub network: NetworkMode,
 
     /// HTTP health check URL. If not specified, health is based on container running status.
@@ -260,7 +260,7 @@ pub struct SnapshotRunArgs {
     pub publish: Vec<String>,
 
     /// Network mode: bridged (requires sudo) or rootless (no sudo)
-    #[arg(long, value_enum, default_value_t = NetworkMode::Bridged)]
+    #[arg(long, value_enum, default_value_t = NetworkMode::Rootless)]
     pub network: NetworkMode,
 
     /// Execute command in container after clone is healthy (like fcvm exec -c)
