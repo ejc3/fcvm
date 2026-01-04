@@ -193,6 +193,7 @@ build_inputs = [
 # x86_64 nested profile (Intel VT-x / AMD-V)
 # Builds custom kernel with CONFIG_KVM_INTEL and CONFIG_KVM_AMD for nested virtualization.
 # x86 nested virtualization is more mature and doesn't require special patches like ARM NV2.
+# Requires CONFIG_PCI=y for GENERIC_MSI_IRQ (virtio-mmio IRQ infrastructure).
 [kernel_profiles.nested.amd64]
 description = "Nested virtualization support for running VMs inside VMs (x86_64)"
 kernel_version = "6.18.3"
@@ -205,6 +206,7 @@ build_inputs = [
 
 # Build paths (relative to repo root)
 kernel_config = "kernel/nested-x86.conf"
+patches_dir = ""  # No patches for x86 (ARM patches don't apply)
 
 # Base config for VM kernel (Firecracker's microvm config)
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
