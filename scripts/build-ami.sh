@@ -79,8 +79,10 @@ export HOME=/root
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source /root/.cargo/env
 
-# Clone and build firepod
+# Clone firepod and its dependencies
 git clone --depth 1 https://github.com/ejc3/firepod.git /tmp/firepod
+git clone --depth 1 https://github.com/ejc3/fuse-backend-rs.git /tmp/fuse-backend-rs
+git clone --depth 1 https://github.com/ejc3/fuser.git /tmp/fuser
 cd /tmp/firepod
 cargo build --release
 
