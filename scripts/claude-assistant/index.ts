@@ -122,7 +122,7 @@ function setupFixBranch(ctx: Context): void {
   }
 
   // Fetch latest to ensure we have the PR branch
-  git("fetch", "origin", ctx.headBranch);
+  gitOrFail("fetch", "origin", ctx.headBranch);
 
   // Check if branch already exists
   if (branchExists(ctx.fixBranch)) {
