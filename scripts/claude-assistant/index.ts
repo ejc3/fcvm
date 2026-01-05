@@ -198,19 +198,27 @@ All GitHub operations target **PR #${ctx.prNumber}** in **${ctx.repository}**.
 
 ---
 
-## STEP 1: UNDERSTAND THE FULL CHANGE
+## STEP 1: UNDERSTAND THE FULL SCOPE
 
-### 1a. Get the commit history
+### 1a. Get PR context (title, description, comments)
+\`\`\`bash
+gh pr view ${ctx.prNumber} --repo ${ctx.repository}
+gh pr view ${ctx.prNumber} --repo ${ctx.repository} --comments
+\`\`\`
+
+### 1b. Get the commit history
 \`\`\`bash
 git log origin/${ctx.baseBranch}..origin/${ctx.headBranch} --oneline
 \`\`\`
 
-### 1b. Get the complete diff
+Review each commit message to understand the progression of changes.
+
+### 1d. Get the complete diff
 \`\`\`bash
 git diff origin/${ctx.baseBranch}...origin/${ctx.headBranch}
 \`\`\`
 
-### 1c. If diff output is large or appears truncated
+### 1e. If diff output is large or appears truncated
 The diff output may be truncated for large changes. If the diff ends mid-line or seems incomplete:
 - Use \`git diff --stat\` to see which files changed
 - Read individual files directly with the Read tool to verify their actual content
