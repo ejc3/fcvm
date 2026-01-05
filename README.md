@@ -13,6 +13,24 @@ A Rust implementation that launches Firecracker microVMs to run Podman container
 
 ---
 
+## Why fcvm?
+
+[Firecracker](https://github.com/firecracker-microvm/firecracker) is the VMM that powers AWS Lambda and Fargate. It provides secure, multi-tenant microVMs with minimal overhead. However, using Firecracker directly requires significant setup:
+
+| Raw Firecracker | fcvm |
+|-----------------|------|
+| Download kernel + rootfs from S3, patch SSH keys | `fcvm setup` - one command |
+| Configure VM via curl to Unix socket API | `fcvm podman run` - familiar Docker/Podman syntax |
+| Manual TAP device, iptables, NAT setup | Automatic networking (bridged or rootless) |
+| SSH into guest for access | `fcvm exec` via vsock (no SSH needed) |
+| No container runtime integration | Native OCI container support via Podman |
+| Manual snapshot/restore orchestration | Instant cloning with UFFD + btrfs CoW |
+| ~100 lines of bash per VM | Single command |
+
+**fcvm builds on Firecracker** to provide a container-native experience while preserving the security isolation of hardware virtualization.
+
+---
+
 ## Prerequisites
 
 **Hardware**
