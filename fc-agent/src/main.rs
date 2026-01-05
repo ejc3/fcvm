@@ -858,9 +858,8 @@ fn handle_exec_connection_blocking(fd: i32) {
         // Use unified TTY handler
         // NOTE: Don't call std::process::exit() here - that would kill the entire fc-agent!
         // run_with_pty_fd already sends the exit code via exec_proto and closes the fd.
-        // We just return and let the spawn_blocking task end naturally.
+        // We just let the spawn_blocking task end naturally.
         let _exit_code = tty::run_with_pty_fd(fd, &command, request.tty, request.interactive);
-        return;
     } else {
         handle_exec_pipe(fd, &request);
     }

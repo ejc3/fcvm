@@ -496,8 +496,12 @@ async fn exec_test_impl(network: &str) -> Result<()> {
     let (exit_code, _, output) = run_exec_with_pty_interrupt(
         &fcvm_path,
         fcvm_pid,
-        true,  // in_vm
-        &["sh", "-c", "trap 'echo CAUGHT_SIGINT; exit 130' INT; echo READY; sleep 999"],
+        true, // in_vm
+        &[
+            "sh",
+            "-c",
+            "trap 'echo CAUGHT_SIGINT; exit 130' INT; echo READY; sleep 999",
+        ],
         "READY",
         0x03, // Ctrl-C
     )
@@ -523,7 +527,11 @@ async fn exec_test_impl(network: &str) -> Result<()> {
         &fcvm_path,
         fcvm_pid,
         false, // container
-        &["sh", "-c", "trap 'echo CAUGHT_SIGINT; exit 130' INT; echo READY; sleep 999"],
+        &[
+            "sh",
+            "-c",
+            "trap 'echo CAUGHT_SIGINT; exit 130' INT; echo READY; sleep 999",
+        ],
         "READY",
         0x03, // Ctrl-C
     )

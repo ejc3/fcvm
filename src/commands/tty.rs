@@ -164,7 +164,11 @@ fn reader_loop(mut stream: std::os::unix::net::UnixStream, done: Arc<AtomicBool>
         match exec_proto::Message::read_from(&mut stream) {
             Ok(exec_proto::Message::Data(data)) => {
                 total_read += data.len();
-                debug!("reader_loop: received {} bytes (total {})", data.len(), total_read);
+                debug!(
+                    "reader_loop: received {} bytes (total {})",
+                    data.len(),
+                    total_read
+                );
                 let _ = stdout.write_all(&data);
                 let _ = stdout.flush();
             }
@@ -273,5 +277,8 @@ fn writer_loop(stream: &mut std::os::unix::net::UnixStream, done: Arc<AtomicBool
             }
         }
     }
-    debug!("writer_loop: exiting, total written: {} bytes", total_written);
+    debug!(
+        "writer_loop: exiting, total written: {} bytes",
+        total_written
+    );
 }
