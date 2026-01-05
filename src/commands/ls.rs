@@ -64,15 +64,7 @@ pub async fn cmd_ls(args: LsArgs) -> Result<()> {
         // Table output
         println!(
             "{:<20} {:<10} {:<12} {:<12} {:<15} {:<15} {:<12} {:<8} {:<6}",
-            "NAME",
-            "PID",
-            "STATUS",
-            "HEALTH",
-            "HOST_ADDR",
-            "GUEST_IP",
-            "IMAGE",
-            "MEM(MB)",
-            "STALE"
+            "NAME", "PID", "STATUS", "HEALTH", "HOST_ADDR", "GUEST_IP", "IMAGE", "MEM(MB)", "STALE"
         );
         println!("{}", "-".repeat(120));
 
