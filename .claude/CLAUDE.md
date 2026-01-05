@@ -27,6 +27,12 @@ gh pr view 2 --json baseRefName
 
 ## UNDERSTAND BRANCH CHAINS
 
+**ALWAYS fetch before investigating branches:**
+```bash
+git fetch origin
+```
+Branches may already be merged on remote. Don't waste time on stale local state.
+
 **Run before starting work, committing, or opening PRs:**
 
 ```bash
