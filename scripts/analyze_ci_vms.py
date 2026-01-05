@@ -8,6 +8,9 @@ Usage:
 
     # Analyze specific run
     python3 scripts/analyze_ci_vms.py 20699186509
+
+    # Analyze pre-downloaded artifacts directory
+    python3 scripts/analyze_ci_vms.py /tmp/ci-artifacts
 """
 import json
 import re
@@ -251,27 +254,43 @@ def print_report(run_id: str, vm_results: dict, log_results: dict | None) -> Non
 
 
 def main():
-    run_id = get_run_id(sys.argv[1] if len(sys.argv) > 1 else None)
+    arg = sys.argv[1] if len(sys.argv) > 1 else None
 
-    print(f"Analyzing run {run_id}...")
+    # Check if argument is a directory path (pre-downloaded artifacts)
+    if arg and Path(arg).is_dir():
+        dest = Path(arg)
+        run_id = "local"
+        print(f"Analyzing run {dest}...")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        dest = Path(tmpdir)
-
-        # Download artifacts
-        print("Downloading artifacts...")
-        download_artifacts(run_id, dest)
-
-        # Get full log
-        print("Downloading full log...")
-        log_path = get_full_log(run_id, dest)
-
-        # Analyze
+        # Analyze pre-downloaded artifacts
         vm_results = analyze_logs(dest)
+        log_path = dest / "full.log"
         log_results = analyze_full_log(log_path)
 
         # Report
         print_report(run_id, vm_results, log_results)
+    else:
+        # Download artifacts for run ID
+        run_id = get_run_id(arg)
+        print(f"Analyzing run {run_id}...")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dest = Path(tmpdir)
+
+            # Download artifacts
+            print("Downloading artifacts...")
+            download_artifacts(run_id, dest)
+
+            # Get full log
+            print("Downloading full log...")
+            log_path = get_full_log(run_id, dest)
+
+            # Analyze
+            vm_results = analyze_logs(dest)
+            log_results = analyze_full_log(log_path)
+
+            # Report
+            print_report(run_id, vm_results, log_results)
 
 
 if __name__ == '__main__':
