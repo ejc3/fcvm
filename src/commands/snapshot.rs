@@ -557,15 +557,6 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         .await
         .context("creating VM data directory")?;
 
-    // For rootless mode, make directory world-writable so processes inside the user
-    // namespace can create sockets. User namespace UID 0 maps to subordinate UID
-    // (typically 100000+), which doesn't match the directory owner (UID 1000).
-    if matches!(args.network, NetworkMode::Rootless) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o777))
-            .context("setting directory permissions for rootless mode")?;
-    }
-
     let socket_path = data_dir.join("firecracker.sock");
 
     // Build UFFD socket path for memory server
@@ -1067,13 +1058,6 @@ async fn run_clone_setup(
                 .create_cow_disk()
                 .await
                 .context("creating CoW disk from snapshot")?;
-
-            // For rootless mode, make disk directory and file world-accessible
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&vm_dir, std::fs::Permissions::from_mode(0o777))
-                .context("setting disk directory permissions for rootless mode")?;
-            std::fs::set_permissions(&rootfs_path, std::fs::Permissions::from_mode(0o666))
-                .context("setting disk file permissions for rootless mode")?;
 
             info!(
                 rootfs = %rootfs_path.display(),

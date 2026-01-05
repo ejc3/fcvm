@@ -116,7 +116,7 @@ jobs:
             sudo mkfs.btrfs /var/fcvm-btrfs.img
             sudo mount /var/fcvm-btrfs.img /mnt/fcvm-btrfs
           fi
-          sudo chmod 777 /mnt/fcvm-btrfs
+          sudo chown $USER:$USER /mnt/fcvm-btrfs
 
       - name: Build kernel using fcvm
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true
