@@ -126,8 +126,9 @@ function setupFixBranch(ctx: Context): void {
 
   // Check if branch already exists
   if (branchExists(ctx.fixBranch)) {
-    log(`Branch ${ctx.fixBranch} already exists, checking out`);
+    log(`Branch ${ctx.fixBranch} already exists, checking out and updating`);
     gitOrFail("checkout", ctx.fixBranch);
+    gitOrFail("reset", "--hard", `origin/${ctx.headBranch}`);
   } else {
     // Create fix branch FROM the PR branch, not from main
     // This ensures Claude can read PR files locally with the Read tool
