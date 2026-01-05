@@ -25,6 +25,9 @@ import { tmpdir } from "os";
 const MAX_LOG_SIZE = parseInt(process.env.CLAUDE_MAX_LOG_SIZE ?? "100000", 10);
 const MAX_TURNS = parseInt(process.env.CLAUDE_MAX_TURNS ?? "50", 10);
 
+// Branch naming convention for Claude-generated fix branches
+const FIX_BRANCH_PREFIX = "claude/fix-";
+
 type Mode = "review" | "ci-fix" | "respond";
 
 interface Context {
@@ -627,7 +630,7 @@ async function main(): Promise<void> {
     baseBranch: process.env.BASE_BRANCH ?? "main",
     runId,
     runUrl: process.env.RUN_URL ?? "",
-    fixBranch: `claude/fix-${runId}`,
+    fixBranch: `${FIX_BRANCH_PREFIX}${runId}`,
     logsDir,
     failedRunId: process.env.FAILED_RUN_ID,
     failedRunUrl: process.env.FAILED_RUN_URL,

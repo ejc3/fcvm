@@ -47,14 +47,14 @@ echo ""
 
 # Run L2 VM
 # Note: L2 just needs to run the vsock client - no nested virtualization needed
-# Use alpine:latest with vsock-integrity from FUSE mount
+# Use ECR image to avoid Docker Hub rate limits
 # FCVM_FUSE_MAX_WRITE=32768 prevents vsock data loss in L2 FUSE-over-FUSE
 FCVM_FUSE_MAX_WRITE=32768 fcvm podman run \
     --name l2-vsock-test \
     --network bridged \
     --vsock-dir "$VSOCK_DIR" \
     --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
-    alpine:latest \
+    public.ecr.aws/nginx/nginx:alpine \
     --cmd "/mnt/fcvm-btrfs/bin/vsock-integrity client-vsock 2 $VSOCK_PORT && echo $MARKER" 2>&1 | tee /tmp/l2-output.log
 
 # Kill echo server

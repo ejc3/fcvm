@@ -121,7 +121,7 @@ echo "SUCCESS: copy_file_range works through FUSE!"
         &map_arg,
         "--cmd",
         test_script,
-        "alpine:latest",
+        common::TEST_IMAGE, // Use ECR to avoid Docker Hub rate limits
     ])
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());

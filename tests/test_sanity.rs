@@ -121,14 +121,16 @@ async fn test_graceful_shutdown() -> Result<()> {
 
     let (vm_name, _, _, _) = common::unique_names("graceful");
 
-    // Start VM with alpine:latest which exits immediately (rootless mode)
+    // Start VM with container that exits immediately (rootless mode)
+    // Use public ECR image to avoid Docker Hub rate limits
     println!("Starting VM with container that exits immediately...");
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
         "podman",
         "run",
         "--name",
         &vm_name,
-        "alpine:latest", // Exits immediately with code 0
+        common::TEST_IMAGE, // nginx:alpine from ECR
+        "true",             // Exit immediately with code 0
     ])
     .await
     .context("spawning fcvm")?;
@@ -208,7 +210,7 @@ async fn test_ftrace_sanity() -> Result<()> {
         &vm_name,
         "--network",
         "bridged",
-        "alpine:latest",
+        common::TEST_IMAGE, // Use ECR to avoid Docker Hub rate limits
         "true",
     ])
     .await?;
@@ -242,13 +244,14 @@ async fn test_trailing_args_command() -> Result<()> {
 
     let (vm_name, _, _, _) = common::unique_names("trailing-args");
 
-    // Use trailing args: alpine:latest echo "test-marker-12345" (rootless mode)
+    // Use trailing args: image echo "test-marker-12345" (rootless mode)
+    // Use ECR image to avoid Docker Hub rate limits
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
         "podman",
         "run",
         "--name",
         &vm_name,
-        "alpine:latest",
+        common::TEST_IMAGE,
         "echo",
         "test-marker-12345",
     ])

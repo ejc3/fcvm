@@ -419,11 +419,12 @@ except OSError as e:
         chmod 666 /dev/net/tun
         cd /mnt/fcvm-btrfs
         # Use bridged networking (outer VM is privileged so iptables works)
+        # Use ECR image to avoid Docker Hub rate limits
         fcvm podman run \
             --name inner-test \
             --network bridged \
             --cmd "echo NESTED_SUCCESS_INNER_VM_WORKS" \
-            alpine:latest
+            public.ecr.aws/nginx/nginx:alpine
     "#;
 
     let output = tokio::process::Command::new(&fcvm_path)

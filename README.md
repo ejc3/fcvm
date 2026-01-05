@@ -32,44 +32,6 @@ A Rust implementation that launches Firecracker microVMs to run Podman container
 
 ---
 
-## Test Requirements
-
-**Container Testing (Recommended)** - All dependencies bundled:
-```bash
-make container-test  # All tests in container (just needs podman + /dev/kvm)
-```
-
-See [CLAUDE.md](.claude/CLAUDE.md#makefile-targets) for all Makefile targets.
-
-**Native Testing** - Additional dependencies required:
-
-| Category | Packages |
-|----------|----------|
-| FUSE | fuse3, libfuse3-dev |
-| pjdfstest build | autoconf, automake, libtool |
-| pjdfstest runtime | perl |
-| bindgen (userfaultfd-sys) | libclang-dev, clang |
-| VM tests | iproute2, iptables, slirp4netns |
-| Rootfs build | qemu-utils, e2fsprogs |
-| User namespaces | uidmap (for newuidmap/newgidmap) |
-
-**pjdfstest Setup** (for POSIX compliance tests):
-```bash
-git clone --depth 1 https://github.com/pjd/pjdfstest /tmp/pjdfstest-check
-cd /tmp/pjdfstest-check && autoreconf -ifs && ./configure && make
-```
-
-**Ubuntu/Debian Install**:
-```bash
-sudo apt-get update && sudo apt-get install -y \
-    fuse3 libfuse3-dev \
-    autoconf automake libtool perl \
-    libclang-dev clang \
-    iproute2 iptables slirp4netns \
-    qemu-utils e2fsprogs \
-    uidmap
-```
-
 **Complete prerequisites**: See [`Containerfile`](Containerfile) for the full list of dependencies used in CI. This includes additional packages for kernel builds, container runtime, and testing. Running fcvm inside a VM (nested virtualization) is experimental.
 
 **Host system configuration**:
@@ -299,6 +261,47 @@ sudo fcvm podman run --name full \
 ```
 
 ---
+
+## Test Requirements
+
+**Container Testing (Recommended)** - All dependencies bundled:
+```bash
+make container-test  # All tests in container (just needs podman + /dev/kvm)
+```
+
+See [CLAUDE.md](.claude/CLAUDE.md#makefile-targets) for all Makefile targets.
+
+**Native Testing** - Additional dependencies required:
+
+| Category | Packages |
+|----------|----------|
+| FUSE | fuse3, libfuse3-dev |
+| pjdfstest build | autoconf, automake, libtool |
+| pjdfstest runtime | perl |
+| bindgen (userfaultfd-sys) | libclang-dev, clang |
+| VM tests | iproute2, iptables, slirp4netns |
+| Rootfs build | qemu-utils, e2fsprogs |
+| User namespaces | uidmap (for newuidmap/newgidmap) |
+
+**pjdfstest Setup** (for POSIX compliance tests):
+```bash
+git clone --depth 1 https://github.com/pjd/pjdfstest /tmp/pjdfstest-check
+cd /tmp/pjdfstest-check && autoreconf -ifs && ./configure && make
+```
+
+**Ubuntu/Debian Install**:
+```bash
+sudo apt-get update && sudo apt-get install -y \
+    fuse3 libfuse3-dev \
+    autoconf automake libtool perl \
+    libclang-dev clang \
+    iproute2 iptables slirp4netns \
+    qemu-utils e2fsprogs \
+    uidmap
+```
+
+----
+
 
 ## Nested Virtualization
 
