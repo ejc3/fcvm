@@ -978,11 +978,11 @@ async fn run_vm_setup(
         // This is fully rootless - no sudo required!
 
         // Step 1: Spawn holder process (keeps namespace alive)
-        // Retry for up to 2 seconds if holder dies (transient failures under load)
+        // Retry for up to 5 seconds if holder dies (transient failures under load)
         let holder_cmd = slirp_net.build_holder_command();
         info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
 
-        let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut attempt = 0;
         #[allow(unused_assignments)]
         let mut _last_error: Option<String> = None;
