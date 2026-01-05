@@ -64,15 +64,7 @@ pub async fn cmd_ls(args: LsArgs) -> Result<()> {
         // Table output
         println!(
             "{:<20} {:<10} {:<12} {:<12} {:<15} {:<15} {:<12} {:<8} {:<6}",
-            "NAME",
-            "PID",
-            "STATUS",
-            "HEALTH",
-            "GUEST_IP",
-            "TAP_DEVICE",
-            "IMAGE",
-            "MEM(MB)",
-            "STALE"
+            "NAME", "PID", "STATUS", "HEALTH", "HOST_ADDR", "GUEST_IP", "IMAGE", "MEM(MB)", "STALE"
         );
         println!("{}", "-".repeat(120));
 
@@ -84,12 +76,15 @@ pub async fn cmd_ls(args: LsArgs) -> Result<()> {
                 .name
                 .as_deref()
                 .unwrap_or_else(|| truncate_id(&vm.vm_id, 8));
+            // HOST_ADDR: loopback_ip for rootless, host_ip for bridged
+            let host_addr = vm
+                .config
+                .network
+                .loopback_ip
+                .as_deref()
+                .or(vm.config.network.host_ip.as_deref())
+                .unwrap_or("-");
             let guest_ip = vm.config.network.guest_ip.as_deref().unwrap_or("-");
-            let tap_device = if vm.config.network.tap_device.is_empty() {
-                "-"
-            } else {
-                &vm.config.network.tap_device
-            };
             let image = vm
                 .config
                 .image
@@ -105,8 +100,8 @@ pub async fn cmd_ls(args: LsArgs) -> Result<()> {
                 pid_str,
                 status,
                 health,
+                host_addr,
                 guest_ip,
-                tap_device,
                 image,
                 vm.config.memory_mib,
                 stale_marker

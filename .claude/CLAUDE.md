@@ -1045,8 +1045,8 @@ fuse-pipe/benches/
    - **Performance**: Original VM + 2 clones = ~512MB RAM total (not 1.5GB!)
 
 3. **True Rootless Networking** (2025-11-25)
-   - `--network bridged` (default): Network namespace + iptables, requires root
-   - `--network rootless`: slirp4netns, no root required
+   - `--network rootless` (default): slirp4netns, no root required
+   - `--network bridged`: Network namespace + iptables, requires root
    - User namespace via `unshare --user --map-root-user --net`
    - Health checks use unique loopback IPs (127.x.y.z) per VM
 
@@ -1083,8 +1083,8 @@ fuse-pipe/benches/
 
 | Mode | Flag | Requires Root | Performance | Port Forwarding |
 |------|------|---------------|-------------|-----------------|
+| Rootless (default) | `--network rootless` | No | Good | slirp4netns API |
 | Bridged | `--network bridged` | Yes | Better | iptables DNAT |
-| Rootless | `--network rootless` | No | Good | slirp4netns API |
 
 **Rootless Architecture:**
 - Firecracker starts with `unshare --user --map-root-user --net`
