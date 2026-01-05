@@ -455,8 +455,8 @@ async function runClaude(prompt: string): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  if (!process.env.ANTHROPIC_API_KEY) {
-    console.error("ANTHROPIC_API_KEY is required");
+  if (!process.env.ANTHROPIC_API_KEY && !process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+    console.error("ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN is required");
     process.exit(1);
   }
 
