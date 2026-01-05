@@ -414,7 +414,7 @@ impl VmManager {
                 .context("running chmod via nsenter")?;
             if !chmod_output.status.success() {
                 let stderr = String::from_utf8_lossy(&chmod_output.stderr);
-                warn!(target: "vm", vm_id = %self.vm_id, stderr = %stderr, "chmod via nsenter failed (non-fatal)");
+                debug!(target: "vm", vm_id = %self.vm_id, stderr = %stderr, "chmod via nsenter failed (non-fatal)");
             }
         }
 
