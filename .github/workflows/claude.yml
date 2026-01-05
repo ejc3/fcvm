@@ -183,7 +183,13 @@ jobs:
           BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
           RUN_ID: ${{ github.run_id }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: cd scripts/claude-assistant && pnpm exec tsx index.ts
+        run: |
+          cd scripts/claude-assistant && pnpm exec tsx index.ts 2>&1 | tee /tmp/claude-output.log
+          # Verify completion marker exists (detects if process was killed mid-execution)
+          if ! grep -q "CLAUDE_ASSISTANT_COMPLETE" /tmp/claude-output.log; then
+            echo "ERROR: Claude assistant did not complete - process may have been killed"
+            exit 1
+          fi
 
   # Manual review via /claude-review comment
   manual-review:
@@ -247,7 +253,12 @@ jobs:
           BASE_BRANCH: ${{ steps.pr.outputs.base_branch }}
           RUN_ID: ${{ github.run_id }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: cd scripts/claude-assistant && pnpm exec tsx index.ts
+        run: |
+          cd scripts/claude-assistant && pnpm exec tsx index.ts 2>&1 | tee /tmp/claude-output.log
+          if ! grep -q "CLAUDE_ASSISTANT_COMPLETE" /tmp/claude-output.log; then
+            echo "ERROR: Claude assistant did not complete - process may have been killed"
+            exit 1
+          fi
 
   # Respond to @claude mentions
   respond:
@@ -318,7 +329,12 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           COMMENT_BODY: ${{ github.event.comment.body }}
-        run: cd scripts/claude-assistant && pnpm exec tsx index.ts
+        run: |
+          cd scripts/claude-assistant && pnpm exec tsx index.ts 2>&1 | tee /tmp/claude-output.log
+          if ! grep -q "CLAUDE_ASSISTANT_COMPLETE" /tmp/claude-output.log; then
+            echo "ERROR: Claude assistant did not complete - process may have been killed"
+            exit 1
+          fi
 
   # Auto-fix CI failures
   ci-fix:
@@ -376,4 +392,9 @@ jobs:
           FAILED_RUN_ID: ${{ github.event.workflow_run.id }}
           FAILED_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}
           WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
-        run: cd scripts/claude-assistant && pnpm exec tsx index.ts
+        run: |
+          cd scripts/claude-assistant && pnpm exec tsx index.ts 2>&1 | tee /tmp/claude-output.log
+          if ! grep -q "CLAUDE_ASSISTANT_COMPLETE" /tmp/claude-output.log; then
+            echo "ERROR: Claude assistant did not complete - process may have been killed"
+            exit 1
+          fi

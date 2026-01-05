@@ -697,6 +697,9 @@ async function main(): Promise<void> {
   }
 
   await runClaude(prompt);
+
+  // Print completion marker - if this doesn't appear in logs, the job was truncated/killed
+  console.log("\n=== CLAUDE_ASSISTANT_COMPLETE ===\n");
 }
 
 main().catch((e) => {
