@@ -19,6 +19,11 @@ const REQUIRED_DIRS: &[&str] = &[
     "image-cache",
 ];
 
+/// Unmount a path, ignoring errors
+fn cleanup_mount(path: &Path) {
+    let _ = Command::new("umount").arg(path).status();
+}
+
 /// Check if a path is a btrfs filesystem
 fn is_btrfs_mount(path: &Path) -> bool {
     // Check if it's a mountpoint first
@@ -65,17 +70,13 @@ pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
 
     // Already set up?
     if is_btrfs_mount(&mount_point) {
-        // Check required directories exist
-        let mut all_dirs_exist = true;
+        // Create any missing directories (idempotent)
         for dir in REQUIRED_DIRS {
-            if !mount_point.join(dir).exists() {
-                all_dirs_exist = false;
-                break;
-            }
+            let path = mount_point.join(dir);
+            std::fs::create_dir_all(&path)
+                .with_context(|| format!("creating directory {}", path.display()))?;
         }
-        if all_dirs_exist {
-            return Ok(());
-        }
+        return Ok(());
     }
 
     // Check if we're root (required for mount operations)
@@ -162,11 +163,14 @@ pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
         );
     }
 
-    // Create required subdirectories
+    // Create required subdirectories (cleanup mount on failure)
     for dir in REQUIRED_DIRS {
         let path = mount_point.join(dir);
-        std::fs::create_dir_all(&path)
-            .with_context(|| format!("creating directory {}", path.display()))?;
+        if let Err(e) = std::fs::create_dir_all(&path) {
+            // Clean up the mount before returning error
+            cleanup_mount(&mount_point);
+            return Err(e).with_context(|| format!("creating directory {}", path.display()));
+        }
     }
 
     // Set ownership to the user who invoked sudo (if SUDO_USER is set)
