@@ -27,7 +27,6 @@ A Rust implementation that launches Firecracker microVMs to run Podman container
 | No container runtime integration | Native OCI container support via Podman |
 | No host filesystem access | FUSE (`--map`), NFS (`--nfs`), block devices (`--disk`) |
 | No port forwarding | `--publish` with automatic NAT rules |
-| No health monitoring | Built-in health checks (`--health-check`) |
 | ~100 lines of bash per VM | Single command |
 
 **fcvm builds on Firecracker** to provide a container-native experience while preserving the security isolation of hardware virtualization.
@@ -88,17 +87,19 @@ sudo iptables -P FORWARD ACCEPT
 git clone https://github.com/ejc3/fcvm
 cd fcvm
 make build
-export PATH="$PWD/target/release:$PATH"
 
 # First-time setup (downloads kernel + builds rootfs, ~5 min)
 # Use sudo if btrfs storage needs to be created; skip sudo if already mounted
 sudo ./target/release/fcvm setup
 
 # Run a container (rootless - no sudo needed)
-fcvm podman run --name test nginx:alpine
+./target/release/fcvm podman run --name test nginx:alpine
 
-# Exec into the container
-fcvm exec --name test -- cat /etc/os-release
+# Exec into that container
+./target/release/fcvm exec --name test -- cat /etc/os-release
+
+# One-shot run a command in the container
+./target/release/fcvm podman run --name test nginx:alpine -- cat /etc/os-release
 
 # Or with bridged networking (requires sudo)
 sudo ./target/release/fcvm podman run --name test --network bridged nginx:alpine
@@ -112,49 +113,52 @@ That's it! See [Examples](#examples) for port forwarding, volumes, and more.
 
 ```bash
 # Run a service (rootless mode, no sudo)
-fcvm podman run --name web1 public.ecr.aws/nginx/nginx:alpine
+./target/release/fcvm podman run --name web1 public.ecr.aws/nginx/nginx:alpine
 
 # Port forwarding (8080 on host -> 80 in container)
-fcvm podman run --name web1 --publish 8080:80 public.ecr.aws/nginx/nginx:alpine
+./target/release/fcvm podman run --name web1 --publish 8080:80 public.ecr.aws/nginx/nginx:alpine
 
-# Host directory mapping
-fcvm podman run --name web1 --map /host/data:/data public.ecr.aws/nginx/nginx:alpine
+# Use this to find the IP it's bound to:
+./target/release/fcvm ls # --json to view as json
+
+# Host directory mapping (using fuse)
+./target/release/fcvm podman run --name web1 --map /host/data:/data public.ecr.aws/nginx/nginx:alpine
 
 # Custom resources
-fcvm podman run --name web1 --cpu 4 --mem 4096 public.ecr.aws/nginx/nginx:alpine
+./target/release/fcvm podman run --name web1 --cpu 4 --mem 4096 public.ecr.aws/nginx/nginx:alpine
 
 # Bridged mode (requires sudo)
-sudo fcvm podman run --name web1 --network bridged public.ecr.aws/nginx/nginx:alpine
+sudo ./target/release/fcvm podman run --name web1 --network bridged public.ecr.aws/nginx/nginx:alpine
 
 # List VMs and execute commands
-sudo fcvm ls
-sudo fcvm exec web1 -- cat /etc/os-release
-sudo fcvm exec web1 -- bash                        # Interactive shell
+sudo ./target/release/fcvm ls
+sudo ./target/release/fcvm exec web1 -- cat /etc/os-release
+sudo ./target/release/fcvm exec web1 -- bash                        # Interactive shell
 ```
 
 ### Snapshot & Clone Workflow
 ```bash
 # 1. Start baseline VM (using bridged, or omit --network for rootless)
-sudo fcvm podman run --name baseline --network bridged public.ecr.aws/nginx/nginx:alpine
+sudo ./target/release/fcvm podman run --name baseline --network bridged public.ecr.aws/nginx/nginx:alpine
 
 # 2. Create snapshot (pauses VM briefly)
-sudo fcvm snapshot create baseline --tag nginx-warm
+sudo ./target/release/fcvm snapshot create baseline --tag nginx-warm
 
 # 3. Start UFFD memory server (serves pages on-demand)
-sudo fcvm snapshot serve nginx-warm
+sudo ./target/release/fcvm snapshot serve nginx-warm
 
 # 4. Clone from snapshot (~3ms startup)
-sudo fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
-sudo fcvm snapshot run --pid <serve_pid> --name clone2 --network bridged
+sudo ./target/release/fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
+sudo ./target/release/fcvm snapshot run --pid <serve_pid> --name clone2 --network bridged
 
 # 5. Clone with port forwarding (each clone can have unique ports)
-sudo fcvm snapshot run --pid <serve_pid> --name web1 --network bridged --publish 8081:80
-sudo fcvm snapshot run --pid <serve_pid> --name web2 --network bridged --publish 8082:80
+sudo ./target/release/fcvm snapshot run --pid <serve_pid> --name web1 --network bridged --publish 8081:80
+sudo ./target/release/fcvm snapshot run --pid <serve_pid> --name web2 --network bridged --publish 8082:80
 # Get the host IP from fcvm ls --json, then curl it:
-#   curl $(sudo fcvm ls --json | jq -r '.[] | select(.name=="web1") | .config.network.host_ip'):8081
+curl $(sudo ./target/release/fcvm ls --json | jq -r '.[] | select(.name=="web1") | .config.network.host_ip'):8081
 
 # 6. Clone and execute command (auto-cleans up after)
-sudo fcvm snapshot run --pid <serve_pid> --network bridged --exec "curl localhost"
+sudo ./target/release/fcvm snapshot run --pid <serve_pid> --network bridged --exec "curl localhost"
 ```
 
 ---
