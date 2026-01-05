@@ -1010,68 +1010,17 @@ async fn run_vm_setup(
                 info!(holder_pid = holder_pid, "namespace holder started");
             }
 
-            // Wait for namespace to be ready by testing nsenter directly
-            // The holder runs: unshare -> write uid_map/gid_map -> exec sleep -> sleep syscall
-            // setns() fails with EINVAL until this sequence completes, so we just retry.
-            let ready_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-            let mut wait_iterations = 0u32;
-            let mut namespace_ready = false;
-            loop {
-                wait_iterations += 1;
-                let probe = tokio::process::Command::new("nsenter")
-                    .args([
-                        "-t",
-                        &holder_pid.to_string(),
-                        "-U",
-                        "-n",
-                        "--preserve-credentials",
-                        "--",
-                        "true",
-                    ])
-                    .output()
-                    .await;
-                match probe {
-                    Ok(output) if output.status.success() => {
-                        debug!(
-                            holder_pid = holder_pid,
-                            iterations = wait_iterations,
-                            "namespace ready (nsenter probe succeeded)"
-                        );
-                        namespace_ready = true;
-                        break;
-                    }
-                    Ok(output) => {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        if !stderr.contains("Invalid argument") {
-                            // Some other error - don't retry
-                            warn!(holder_pid = holder_pid, stderr = %stderr.trim(), "nsenter probe failed with unexpected error");
-                            break;
-                        }
-                        // EINVAL means namespace not ready yet, retry
-                    }
-                    Err(e) => {
-                        warn!(holder_pid = holder_pid, error = %e, "nsenter probe spawn failed");
-                        break;
-                    }
-                }
-                if std::time::Instant::now() >= ready_deadline {
-                    warn!(
-                        holder_pid = holder_pid,
-                        iterations = wait_iterations,
-                        "namespace not ready after 500ms"
-                    );
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
+            // Wait for namespace to be ready by checking uid_map
+            let namespace_ready = crate::utils::wait_for_namespace_ready(
+                holder_pid,
+                std::time::Duration::from_millis(500),
+            )
+            .await;
 
             // If namespace didn't become ready, kill holder and retry
             if !namespace_ready {
                 let _ = child.kill().await;
-                _last_error = Some(format!(
-                    "namespace not ready after 500ms ({} iterations)",
-                    wait_iterations
-                ));
+                _last_error = Some("namespace not ready after 500ms".to_string());
 
                 if std::time::Instant::now() < retry_deadline {
                     warn!(
