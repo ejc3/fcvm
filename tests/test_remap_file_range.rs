@@ -68,7 +68,7 @@ async fn run_remap_test_in_vm(test_name: &str, test_script: &str) -> Result<()> 
         &map_arg,
         "--cmd",
         test_script,
-        "alpine:latest",
+        common::TEST_IMAGE, // Use ECR to avoid Docker Hub rate limits
     ];
     cmd.args(&args)
         .stdout(Stdio::piped())
