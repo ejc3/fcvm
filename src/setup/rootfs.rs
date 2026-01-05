@@ -647,12 +647,10 @@ pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
     // 2. SUDO_USER's config (when running with sudo)
     if let Ok(sudo_user) = std::env::var("SUDO_USER") {
         // Get the invoking user's home directory
-        if let Ok(passwd) = nix::unistd::User::from_name(&sudo_user) {
-            if let Some(user) = passwd {
-                let p = user.dir.join(".config/fcvm").join(CONFIG_FILE);
-                if p.exists() {
-                    return Ok(p);
-                }
+        if let Some(user) = nix::unistd::User::from_name(&sudo_user).ok().flatten() {
+            let p = user.dir.join(".config/fcvm").join(CONFIG_FILE);
+            if p.exists() {
+                return Ok(p);
             }
         }
     }
