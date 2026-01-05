@@ -50,27 +50,23 @@ fn is_btrfs_mount(path: &Path) -> bool {
 fn get_storage_paths(config_path: Option<&str>) -> Result<(PathBuf, PathBuf)> {
     let (config, _, _) = load_config(config_path)?;
     let mount_point = PathBuf::from(&config.paths.assets_dir);
-    // Loopback image goes in /var with same basename
-    let loopback_name = mount_point
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "fcvm-btrfs".to_string());
-    let loopback_image = PathBuf::from(format!("/var/{}.img", loopback_name));
+    // Loopback image is a sibling of mount point (e.g., /mnt/fcvm-btrfs -> /mnt/fcvm-btrfs.img)
+    let loopback_image = mount_point.with_extension("img");
     Ok((mount_point, loopback_image))
 }
 
 /// Ensure btrfs storage is set up at the configured assets_dir.
 ///
 /// If the mount point doesn't exist or isn't btrfs, creates a loopback image
-/// in /var, formats it as btrfs, and mounts it.
+/// as a sibling file (e.g., /mnt/fcvm-btrfs.img for /mnt/fcvm-btrfs),
+/// formats it as btrfs, and mounts it.
 ///
-/// This operation requires root privileges.
+/// Creating the loopback and mounting requires root privileges.
 pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
     let (mount_point, loopback_image) = get_storage_paths(config_path)?;
 
-    // Already set up?
+    // Already btrfs? Just ensure directories exist (no root needed)
     if is_btrfs_mount(&mount_point) {
-        // Create any missing directories (idempotent)
         for dir in REQUIRED_DIRS {
             let path = mount_point.join(dir);
             std::fs::create_dir_all(&path)
@@ -79,7 +75,7 @@ pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-    // Check if we're root (required for mount operations)
+    // Need to create/mount btrfs - requires root
     if !nix::unistd::Uid::effective().is_root() {
         anyhow::bail!(
             "Storage not initialized. Run with sudo:\n\n  \
