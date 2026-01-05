@@ -229,6 +229,57 @@ All GitHub operations target **PR #${ctx.prNumber}** in **${ctx.repository}**.
 
 ---
 
+## STEP 0: WAIT FOR CI TO PASS
+
+**Before doing anything else**, wait for CI checks to pass.
+
+### 0a. Check Lint status first (fast check)
+\`\`\`bash
+gh api repos/${ctx.repository}/commits/${ctx.headSha}/check-runs --jq '.check_runs[] | select(.name == "Lint") | {name: .name, status: .status, conclusion: .conclusion}'
+\`\`\`
+
+### 0b. If Lint passes, check overall PR status
+\`\`\`bash
+gh pr checks ${ctx.prNumber} --repo ${ctx.repository}
+\`\`\`
+
+**Rules:**
+- If **Lint failed**: Stop immediately. Post comment: "Lint failed - please fix before I can review."
+- If **any check failed**: Stop. Post comment noting which check failed.
+- If **checks are still running**: Wait 30 seconds, then check again. Repeat until all pass/fail or 15 minutes elapsed.
+- If **all checks pass**: Proceed to Step 1.
+
+**Do NOT proceed with the review until CI passes.** Reviewing code that doesn't pass CI is a waste of time.
+
+---
+
+## CRITICAL: IF YOU MAKE CHANGES
+
+When you edit files and create a fix PR:
+
+### 1. Run lint locally BEFORE committing
+\`\`\`bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+\`\`\`
+
+If lint fails, fix the issues before committing. **NEVER push code that doesn't pass lint.**
+
+### 2. After pushing, verify your PR passes CI
+\`\`\`bash
+gh pr checks <your-pr-number> --repo ${ctx.repository} --watch
+\`\`\`
+
+If CI fails on your PR:
+- Read the failure logs
+- Fix the issue
+- Commit and push again
+- Repeat until CI passes
+
+**Your fix PR must pass CI before you're done.** Do not leave broken PRs.
+
+---
+
 ## STEP 1: UNDERSTAND THE FULL SCOPE
 
 ### 1a. Get PR context (title, description, comments)
@@ -302,6 +353,13 @@ _Review by Claude | [Run](${ctx.runUrl})_"
 
 ### 5a. Edit files
 Make the minimum changes needed to fix the issues.
+
+**IMPORTANT: Edit files directly in the repo. NEVER:**
+- Copy files to /tmp and edit there
+- Create temp files and copy back
+- Use intermediate files
+
+Just use the Edit tool directly on the source files.
 
 ### 5b. Commit
 \`\`\`bash
