@@ -141,7 +141,8 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 anyhow::bail!(
-                    "Failed to create reflink copy. Ensure /mnt/fcvm-btrfs is a btrfs filesystem. Error: {}",
+                    "Failed to create reflink copy. Ensure {} is a btrfs filesystem. Error: {}",
+                    crate::paths::assets_dir().display(),
                     stderr
                 );
             }
@@ -159,7 +160,9 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
 
         // Parse volume configs from VM state (format: HOST:GUEST[:ro])
         use super::common::VSOCK_VOLUME_PORT_BASE;
-        let volume_configs: Vec<SnapshotVolumeConfig> = vm_state.config.volumes
+        let volume_configs: Vec<SnapshotVolumeConfig> = vm_state
+            .config
+            .volumes
             .iter()
             .enumerate()
             .filter_map(|(idx, spec)| {
@@ -214,7 +217,10 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             "snapshot created successfully"
         );
 
-        let vm_name = vm_state.name.as_deref().unwrap_or(truncate_id(&vm_state.vm_id, 8));
+        let vm_name = vm_state
+            .name
+            .as_deref()
+            .unwrap_or(truncate_id(&vm_state.vm_id, 8));
         println!(
             "✓ Snapshot '{}' created from VM '{}'",
             snapshot_name, vm_name
