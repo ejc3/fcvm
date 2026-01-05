@@ -67,10 +67,14 @@ sudo iptables -P FORWARD ACCEPT
 # 1. Build
 cargo build --release --workspace
 
-# 2. First-time setup (5-10 min, creates btrfs + downloads kernel + builds rootfs)
+# 2. Generate config (customize ~/.config/fcvm/rootfs-config.toml if needed)
+fcvm setup --generate-config
+
+# 3. First-time setup (5-10 min, downloads kernel + builds rootfs)
+#    Use sudo if btrfs needs to be created; skip sudo if path is already btrfs
 sudo fcvm setup
 
-# 3. Run a container
+# 4. Run a container
 fcvm podman run --name test alpine:latest echo "hello world"
 ```
 
@@ -246,6 +250,21 @@ sudo fcvm podman run --name full \
 5. **Creates fc-agent initrd** for guest agent injection
 
 Everything is cached by content hash - subsequent runs are instant.
+
+**Alternative: Manual btrfs setup (no sudo for fcvm)**
+
+If you prefer to create the loopback yourself:
+```bash
+truncate -s 60G /mnt/fcvm-btrfs.img
+sudo mkfs.btrfs /mnt/fcvm-btrfs.img
+sudo mount -o loop /mnt/fcvm-btrfs.img /mnt/fcvm-btrfs
+sudo chown $USER:$USER /mnt/fcvm-btrfs
+
+# Then setup without sudo (btrfs already exists)
+fcvm setup
+```
+
+Or just point `assets_dir` in your config to any existing btrfs path.
 
 **Alternative: Auto-setup on first run (rootless only)**
 ```bash

@@ -14,7 +14,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         let config_path = generate_config(args.force)?;
         println!("Generated config at: {}", config_path.display());
         println!("\nCustomize the config file, then run:");
-        println!("  fcvm setup");
+        println!("  sudo fcvm setup");
         return Ok(());
     }
 
