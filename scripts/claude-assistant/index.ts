@@ -21,8 +21,9 @@ import { mkdirSync, writeFileSync, existsSync } from "fs";
 import { join, resolve } from "path";
 import { tmpdir } from "os";
 
-const MAX_LOG_SIZE = 100_000;
-const MAX_TURNS = 50;
+// Configurable limits with sensible defaults
+const MAX_LOG_SIZE = parseInt(process.env.CLAUDE_MAX_LOG_SIZE ?? "100000", 10);
+const MAX_TURNS = parseInt(process.env.CLAUDE_MAX_TURNS ?? "50", 10);
 
 type Mode = "review" | "ci-fix" | "respond";
 
@@ -112,7 +113,10 @@ function setupFixBranch(ctx: Context): void {
 
 function downloadLogs(ctx: Context): void {
   mkdirSync(ctx.logsDir, { recursive: true });
-  if (!ctx.failedRunId) return;
+  if (!ctx.failedRunId) {
+    logError("No failed run ID provided - cannot download logs");
+    return;
+  }
 
   log(`Downloading logs to ${ctx.logsDir}`);
 
@@ -121,7 +125,14 @@ function downloadLogs(ctx: Context): void {
     "--jq", '.jobs[] | select(.conclusion == "failure") | {id: .id, name: .name}'
   );
 
-  if (result.ok && result.stdout) {
+  if (!result.ok) {
+    logError(`Failed to fetch job list for run ${ctx.failedRunId}`);
+    writeFileSync(join(ctx.logsDir, "error.log"), `Failed to fetch job list: ${result.stdout}`);
+    return;
+  }
+
+  let jobsDownloaded = 0;
+  if (result.stdout) {
     for (const line of result.stdout.split("\n")) {
       if (!line.trim()) continue;
       try {
@@ -132,8 +143,14 @@ function downloadLogs(ctx: Context): void {
           let content = logResult.stdout;
           if (content.length > MAX_LOG_SIZE) content = content.slice(0, MAX_LOG_SIZE) + "\n...truncated";
           writeFileSync(join(ctx.logsDir, `job-${job.id}.log`), content);
+          jobsDownloaded++;
+        } else {
+          logError(`Failed to download logs for job ${job.id}`);
         }
-      } catch { continue; }
+      } catch (e) {
+        logError(`Failed to parse job data: ${e}`);
+        continue;
+      }
     }
   }
 
@@ -142,9 +159,16 @@ function downloadLogs(ctx: Context): void {
     let content = summary.stdout;
     if (content.length > MAX_LOG_SIZE) content = content.slice(0, MAX_LOG_SIZE) + "\n...truncated";
     writeFileSync(join(ctx.logsDir, "run-summary.log"), content);
+  } else {
+    logError(`Failed to download run summary for run ${ctx.failedRunId}`);
   }
 
-  log(`Logs saved to ${ctx.logsDir}`);
+  if (jobsDownloaded === 0 && !existsSync(join(ctx.logsDir, "run-summary.log"))) {
+    logError("CRITICAL: No logs were successfully downloaded. Claude may not have sufficient context to fix the issue.");
+    writeFileSync(join(ctx.logsDir, "error.log"), "Failed to download any logs. This may prevent accurate diagnosis.");
+  }
+
+  log(`Logs saved to ${ctx.logsDir} (${jobsDownloaded} job logs downloaded)`);
 }
 
 function reviewPrompt(ctx: Context): string {
@@ -504,14 +528,27 @@ function validateEnvironment(): void {
   if (!process.env.ANTHROPIC_API_KEY && !process.env.CLAUDE_CODE_OAUTH_TOKEN) {
     throw new Error("ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN is required");
   }
-  if (!process.env.GITHUB_REPOSITORY) {
+
+  const repo = process.env.GITHUB_REPOSITORY;
+  if (!repo) {
     throw new Error("GITHUB_REPOSITORY is required");
   }
+  // Validate owner/repo format
+  if (!/^[a-zA-Z0-9_-]+\/[a-zA-Z0-9_.-]+$/.test(repo)) {
+    throw new Error(`GITHUB_REPOSITORY has invalid format: ${repo}. Expected owner/repo`);
+  }
+
   if (!process.env.HEAD_BRANCH) {
     throw new Error("HEAD_BRANCH is required");
   }
-  if (!process.env.RUN_ID) {
+
+  const runId = process.env.RUN_ID;
+  if (!runId) {
     throw new Error("RUN_ID is required");
+  }
+  // Validate RUN_ID is numeric
+  if (!/^\d+$/.test(runId)) {
+    throw new Error(`RUN_ID has invalid format: ${runId}. Expected numeric value`);
   }
 }
 
@@ -529,7 +566,12 @@ function sanitizeCommentBody(body: string | undefined): string | undefined {
   // Limit size to prevent prompt injection attacks
   const MAX_COMMENT_SIZE = 10000;
   if (body.length > MAX_COMMENT_SIZE) {
-    return body.slice(0, MAX_COMMENT_SIZE) + "\n...[truncated]";
+    // Keep first 60% and last 30% to preserve both context and recent content
+    const keepStart = Math.floor(MAX_COMMENT_SIZE * 0.6);
+    const keepEnd = Math.floor(MAX_COMMENT_SIZE * 0.3);
+    const start = body.slice(0, keepStart);
+    const end = body.slice(-keepEnd);
+    return `${start}\n\n...[truncated ${body.length - MAX_COMMENT_SIZE} chars]...\n\n${end}`;
   }
   return body;
 }
