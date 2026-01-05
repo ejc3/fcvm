@@ -980,52 +980,12 @@ async fn run_clone_setup(
                 info!(holder_pid = holder_pid, "namespace holder started");
             }
 
-            // Wait for namespace to be ready by testing nsenter directly
-            // The holder runs: unshare -> write uid_map/gid_map -> exec sleep -> sleep syscall
-            // setns() fails with EINVAL until this sequence completes, so we just retry.
-            let ready_deadline_inner =
-                std::time::Instant::now() + std::time::Duration::from_millis(500);
-            let mut namespace_ready = false;
-            loop {
-                let probe = tokio::process::Command::new("nsenter")
-                    .args([
-                        "-t",
-                        &holder_pid.to_string(),
-                        "-U",
-                        "-n",
-                        "--preserve-credentials",
-                        "--",
-                        "true",
-                    ])
-                    .output()
-                    .await;
-                match probe {
-                    Ok(output) if output.status.success() => {
-                        debug!(
-                            holder_pid = holder_pid,
-                            "namespace ready (nsenter probe succeeded)"
-                        );
-                        namespace_ready = true;
-                        break;
-                    }
-                    Ok(output) => {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        if !stderr.contains("Invalid argument") {
-                            warn!(holder_pid = holder_pid, stderr = %stderr.trim(), "nsenter probe failed with unexpected error");
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(holder_pid = holder_pid, error = %e, "nsenter probe spawn failed");
-                        break;
-                    }
-                }
-                if std::time::Instant::now() >= ready_deadline_inner {
-                    warn!(holder_pid = holder_pid, "namespace not ready after 500ms");
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
+            // Wait for namespace to be ready by checking uid_map
+            let namespace_ready = crate::utils::wait_for_namespace_ready(
+                holder_pid,
+                std::time::Duration::from_millis(500),
+            )
+            .await;
 
             if namespace_ready {
                 break (child, holder_pid);

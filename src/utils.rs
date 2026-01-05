@@ -169,6 +169,135 @@ pub async fn run_streaming(
     Ok(child.wait().await?)
 }
 
+/// Wait for a user namespace to be ready by checking uid_map.
+///
+/// When `unshare --map-root-user` creates a namespace, the uid_map initially has
+/// an identity mapping "0 0 4294967295" before the actual mapping is written.
+/// setns() fails with EINVAL until the real mapping (e.g., "0 1000 1") is written.
+///
+/// This function polls uid_map until it no longer contains the identity mapping,
+/// which is more efficient than repeatedly spawning nsenter processes.
+///
+/// # Arguments
+/// * `holder_pid` - PID of the namespace holder process
+/// * `timeout` - Maximum time to wait for namespace readiness
+///
+/// # Returns
+/// `true` if namespace became ready, `false` on timeout or error
+pub async fn wait_for_namespace_ready(holder_pid: u32, timeout: Duration) -> bool {
+    use tracing::{debug, info, warn};
+
+    let deadline = std::time::Instant::now() + timeout;
+    let uid_map_path = format!("/proc/{}/uid_map", holder_pid);
+    let mut iterations = 0u32;
+
+    loop {
+        iterations += 1;
+
+        // Check if uid_map exists and has been properly written
+        match tokio::fs::read_to_string(&uid_map_path).await {
+            Ok(content) => {
+                let trimmed = content.trim();
+                // Namespace is ready when:
+                // 1. uid_map is not empty (has been written)
+                // 2. Does not contain identity mapping (4294967295)
+                //
+                // On host: initial mapping is "0 0 4294967295", replaced with "0 1000 1"
+                // In container: initial mapping is empty, replaced with "0 0 1"
+                //
+                // ALSO check gid_map - both must be written for setns() to succeed
+                let gid_map_path = format!("/proc/{}/gid_map", holder_pid);
+                let gid_map = tokio::fs::read_to_string(&gid_map_path)
+                    .await
+                    .unwrap_or_default();
+                let gid_trimmed = gid_map.trim();
+
+                if !trimmed.is_empty() && !gid_trimmed.is_empty() && !content.contains("4294967295")
+                {
+                    // Maps are written - now verify nsenter actually works
+                    // Some kernel states require additional settling time
+                    let probe = tokio::process::Command::new("nsenter")
+                        .args([
+                            "-t",
+                            &holder_pid.to_string(),
+                            "-U",
+                            "-n",
+                            "--preserve-credentials",
+                            "--",
+                            "true",
+                        ])
+                        .output()
+                        .await;
+
+                    match probe {
+                        Ok(output) if output.status.success() => {
+                            info!(
+                                holder_pid = holder_pid,
+                                iterations = iterations,
+                                uid_map = %trimmed,
+                                gid_map = %gid_trimmed,
+                                "namespace ready (nsenter probe succeeded)"
+                            );
+                            return true;
+                        }
+                        Ok(output) => {
+                            // nsenter failed even though maps are written - continue waiting
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            debug!(
+                                holder_pid = holder_pid,
+                                iterations = iterations,
+                                stderr = %stderr.trim(),
+                                "nsenter probe failed, continuing to wait"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(holder_pid = holder_pid, error = %e, "nsenter probe spawn failed");
+                            return false;
+                        }
+                    }
+                }
+
+                // Log what we're waiting for
+                if iterations == 1 || iterations % 50 == 0 {
+                    debug!(
+                        holder_pid = holder_pid,
+                        iterations = iterations,
+                        uid_map_empty = trimmed.is_empty(),
+                        gid_map_empty = gid_trimmed.is_empty(),
+                        has_identity = content.contains("4294967295"),
+                        "waiting for namespace to be ready"
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Process might have died, check if still alive
+                if !is_process_alive(holder_pid) {
+                    debug!(
+                        holder_pid = holder_pid,
+                        "holder process died while waiting for uid_map"
+                    );
+                    return false;
+                }
+            }
+            Err(e) => {
+                warn!(holder_pid = holder_pid, error = %e, "failed to read uid_map");
+                return false;
+            }
+        }
+
+        if std::time::Instant::now() >= deadline {
+            warn!(
+                holder_pid = holder_pid,
+                iterations = iterations,
+                "namespace not ready after {:?}",
+                timeout
+            );
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
