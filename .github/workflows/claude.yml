@@ -21,9 +21,63 @@ env:
 # Required: CLAUDE_APP_ID (variable), CLAUDE_APP_PRIVATE_KEY (secret)
 
 jobs:
+  # Check for non-member comments before running any Claude job
+  safety-check:
+    runs-on: ubuntu-latest
+    outputs:
+      safe: ${{ steps.check.outputs.safe }}
+      pr_number: ${{ steps.get-pr.outputs.number }}
+    steps:
+      - name: Generate token
+        id: token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.CLAUDE_APP_ID }}
+          private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
+
+      - name: Get PR number
+        id: get-pr
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "issue_comment" ]; then
+            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "pull_request_review_comment" ]; then
+            echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "workflow_run" ]; then
+            PR_NUM=$(gh pr list --repo ${{ github.repository }} --head ${{ github.event.workflow_run.head_branch }} --json number --jq '.[0].number // 0')
+            echo "number=$PR_NUM" >> $GITHUB_OUTPUT
+          else
+            echo "number=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check for non-member comments
+        id: check
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          PR_NUM="${{ steps.get-pr.outputs.number }}"
+          if [ -z "$PR_NUM" ] || [ "$PR_NUM" = "0" ]; then
+            echo "safe=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          ISSUE=$(gh api repos/${{ github.repository }}/issues/$PR_NUM/comments --jq "$NONMEMBER_FILTER" 2>/dev/null || echo 0)
+          REVIEW=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM/comments --jq "$NONMEMBER_FILTER" 2>/dev/null || echo 0)
+          TOTAL=$((ISSUE + REVIEW))
+          if [ "$TOTAL" -gt 0 ]; then
+            echo "::warning::Blocking Claude - $TOTAL non-member comment(s) detected"
+            echo "safe=false" >> $GITHUB_OUTPUT
+          else
+            echo "safe=true" >> $GITHUB_OUTPUT
+          fi
+
   # Review PRs from org members, auto-fix medium/critical issues
   review:
+    needs: safety-check
     if: |
+      needs.safety-check.outputs.safe == 'true' &&
       github.event_name == 'pull_request' &&
       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association) &&
       !startsWith(github.event.pull_request.head.ref, 'claude/fix-')
@@ -40,51 +94,23 @@ jobs:
           app-id: ${{ vars.CLAUDE_APP_ID }}
           private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
 
-      - name: Validate token
-        run: |
-          if [ -z "${{ steps.claude-token.outputs.token }}" ]; then
-            echo "Error: Failed to generate GitHub App token"
-            exit 1
-          fi
-
-      - name: Check for non-member comments
-        id: check-comments
-        env:
-          GH_TOKEN: ${{ steps.claude-token.outputs.token }}
-        run: |
-          PR_NUM="${{ github.event.pull_request.number }}"
-          ISSUE=$(gh api repos/${{ github.repository }}/issues/$PR_NUM/comments --jq "$NONMEMBER_FILTER")
-          REVIEW=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM/comments --jq "$NONMEMBER_FILTER")
-          TOTAL=$((ISSUE + REVIEW))
-          if [ "$TOTAL" -gt 0 ]; then
-            echo "::warning::Skipping - $TOTAL non-member comment(s) detected"
-            echo "safe=false" >> $GITHUB_OUTPUT
-          else
-            echo "safe=true" >> $GITHUB_OUTPUT
-          fi
-
       - uses: actions/checkout@v4
-        if: steps.check-comments.outputs.safe == 'true'
         with:
           fetch-depth: 0
           token: ${{ steps.claude-token.outputs.token }}
 
       - uses: actions/setup-node@v4
-        if: steps.check-comments.outputs.safe == 'true'
         with:
           node-version: '20'
 
       - uses: pnpm/action-setup@v4
-        if: steps.check-comments.outputs.safe == 'true'
         with:
           version: 9
 
       - name: Install dependencies
-        if: steps.check-comments.outputs.safe == 'true'
         run: cd scripts/claude-assistant && pnpm install
 
       - name: Run Claude review
-        if: steps.check-comments.outputs.safe == 'true'
         env:
           GH_TOKEN: ${{ steps.claude-token.outputs.token }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -100,7 +126,9 @@ jobs:
 
   # Manual review via /claude-review comment
   manual-review:
+    needs: safety-check
     if: |
+      needs.safety-check.outputs.safe == 'true' &&
       github.event_name == 'issue_comment' &&
       github.event.issue.pull_request &&
       contains(github.event.comment.body, '/claude-review') &&
@@ -118,52 +146,24 @@ jobs:
           app-id: ${{ vars.CLAUDE_APP_ID }}
           private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
 
-      - name: Validate token
-        run: |
-          if [ -z "${{ steps.claude-token.outputs.token }}" ]; then
-            echo "Error: Failed to generate GitHub App token"
-            exit 1
-          fi
-
-      - name: Check for non-member comments
-        id: check-comments
-        env:
-          GH_TOKEN: ${{ steps.claude-token.outputs.token }}
-        run: |
-          PR_NUM="${{ github.event.issue.number }}"
-          ISSUE=$(gh api repos/${{ github.repository }}/issues/$PR_NUM/comments --jq "$NONMEMBER_FILTER")
-          REVIEW=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM/comments --jq "$NONMEMBER_FILTER")
-          TOTAL=$((ISSUE + REVIEW))
-          if [ "$TOTAL" -gt 0 ]; then
-            echo "::warning::Skipping - $TOTAL non-member comment(s) detected"
-            echo "safe=false" >> $GITHUB_OUTPUT
-          else
-            echo "safe=true" >> $GITHUB_OUTPUT
-          fi
-
       - uses: actions/checkout@v4
-        if: steps.check-comments.outputs.safe == 'true'
         with:
           fetch-depth: 0
           ref: refs/pull/${{ github.event.issue.number }}/head
           token: ${{ steps.claude-token.outputs.token }}
 
       - uses: actions/setup-node@v4
-        if: steps.check-comments.outputs.safe == 'true'
         with:
           node-version: '20'
 
       - uses: pnpm/action-setup@v4
-        if: steps.check-comments.outputs.safe == 'true'
         with:
           version: 9
 
       - name: Install dependencies
-        if: steps.check-comments.outputs.safe == 'true'
         run: cd scripts/claude-assistant && pnpm install
 
       - name: Get PR info
-        if: steps.check-comments.outputs.safe == 'true'
         id: pr
         run: |
           PR_DATA=$(gh pr view ${{ github.event.issue.number }} --json headRefName,headRefOid,baseRefName)
@@ -174,7 +174,6 @@ jobs:
           GH_TOKEN: ${{ steps.claude-token.outputs.token }}
 
       - name: Run Claude review
-        if: steps.check-comments.outputs.safe == 'true'
         env:
           GH_TOKEN: ${{ steps.claude-token.outputs.token }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -190,7 +189,9 @@ jobs:
 
   # Respond to @claude mentions
   respond:
+    needs: safety-check
     if: |
+      needs.safety-check.outputs.safe == 'true' &&
       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
       !contains(github.event.comment.body, '/claude-review') &&
       ((github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
@@ -208,71 +209,29 @@ jobs:
           app-id: ${{ vars.CLAUDE_APP_ID }}
           private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
 
-      - name: Validate token
-        run: |
-          if [ -z "${{ steps.claude-token.outputs.token }}" ]; then
-            echo "Error: Failed to generate GitHub App token"
-            exit 1
-          fi
-
-      - name: Get PR number
-        id: pr
-        run: |
-          # issue_comment on a PR: github.event.issue.number
-          # pull_request_review_comment: github.event.pull_request.number
-          if [ "${{ github.event_name }}" = "issue_comment" ]; then
-            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event_name }}" = "pull_request_review_comment" ]; then
-            echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
-          else
-            echo "::error::Unknown event type for respond job"
-            exit 1
-          fi
-
-      - name: Check for non-member comments
-        id: check-comments
-        env:
-          GH_TOKEN: ${{ steps.claude-token.outputs.token }}
-        run: |
-          PR_NUM="${{ steps.pr.outputs.number }}"
-          ISSUE=$(gh api repos/${{ github.repository }}/issues/$PR_NUM/comments --jq "$NONMEMBER_FILTER")
-          REVIEW=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM/comments --jq "$NONMEMBER_FILTER")
-          TOTAL=$((ISSUE + REVIEW))
-          if [ "$TOTAL" -gt 0 ]; then
-            echo "::warning::Skipping - $TOTAL non-member comment(s) detected"
-            echo "safe=false" >> $GITHUB_OUTPUT
-          else
-            echo "safe=true" >> $GITHUB_OUTPUT
-          fi
-
       - uses: actions/checkout@v4
-        if: steps.check-comments.outputs.safe == 'true'
         with:
           fetch-depth: 0
           token: ${{ steps.claude-token.outputs.token }}
 
       - uses: actions/setup-node@v4
-        if: steps.check-comments.outputs.safe == 'true'
         with:
           node-version: '20'
 
       - uses: pnpm/action-setup@v4
-        if: steps.check-comments.outputs.safe == 'true'
         with:
           version: 9
 
       - name: Install dependencies
-        if: steps.check-comments.outputs.safe == 'true'
         run: cd scripts/claude-assistant && pnpm install
 
       - name: Run Claude respond
-        if: steps.check-comments.outputs.safe == 'true'
         env:
           GH_TOKEN: ${{ steps.claude-token.outputs.token }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           MODE: respond
           GITHUB_REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_NUMBER: ${{ needs.safety-check.outputs.pr_number }}
           HEAD_BRANCH: ${{ github.head_ref }}
           HEAD_SHA: ${{ github.sha }}
           BASE_BRANCH: ${{ github.base_ref }}
@@ -283,7 +242,9 @@ jobs:
 
   # Auto-fix CI failures
   ci-fix:
+    needs: safety-check
     if: |
+      needs.safety-check.outputs.safe == 'true' &&
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.conclusion == 'failure' &&
       !startsWith(github.event.workflow_run.head_branch, 'claude/fix-') &&
@@ -300,13 +261,6 @@ jobs:
         with:
           app-id: ${{ vars.CLAUDE_APP_ID }}
           private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
-
-      - name: Validate token
-        run: |
-          if [ -z "${{ steps.claude-token.outputs.token }}" ]; then
-            echo "Error: Failed to generate GitHub App token"
-            exit 1
-          fi
 
       - uses: actions/checkout@v4
         with:
@@ -325,53 +279,31 @@ jobs:
       - name: Install dependencies
         run: cd scripts/claude-assistant && pnpm install
 
-      - name: Get PR number
-        id: pr
-        run: |
-          PR_NUM=$(gh pr list --repo ${{ github.repository }} --head ${{ github.event.workflow_run.head_branch }} --json number --jq '.[0].number')
-          echo "number=${PR_NUM:-0}" >> $GITHUB_OUTPUT
-
-          if [ -n "$PR_NUM" ]; then
-            ASSOC=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM --jq '.author_association')
-            echo "association=$ASSOC" >> $GITHUB_OUTPUT
-          fi
-        env:
-          GH_TOKEN: ${{ steps.claude-token.outputs.token }}
-
-      - name: Check if should run
+      - name: Check PR author association
         id: check
         env:
           GH_TOKEN: ${{ steps.claude-token.outputs.token }}
         run: |
           BRANCH="${{ github.event.workflow_run.head_branch }}"
-          ASSOC="${{ steps.pr.outputs.association }}"
-          PR_NUM="${{ steps.pr.outputs.number }}"
+          PR_NUM="${{ needs.safety-check.outputs.pr_number }}"
 
-          # Always run for main/master (no PR comments to worry about)
+          # Always run for main/master
           if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
             echo "should_run=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # For PRs, only run for org members
-          if [ "$ASSOC" != "OWNER" ] && [ "$ASSOC" != "MEMBER" ] && [ "$ASSOC" != "COLLABORATOR" ]; then
-            echo "should_run=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # Check for non-member comments (prompt injection risk)
+          # For PRs, check author is org member
           if [ -n "$PR_NUM" ] && [ "$PR_NUM" != "0" ]; then
-            ISSUE=$(gh api repos/${{ github.repository }}/issues/$PR_NUM/comments --jq "$NONMEMBER_FILTER")
-            REVIEW=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM/comments --jq "$NONMEMBER_FILTER")
-            TOTAL=$((ISSUE + REVIEW))
-            if [ "$TOTAL" -gt 0 ]; then
-              echo "::warning::Skipping - $TOTAL non-member comment(s) detected"
+            ASSOC=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM --jq '.author_association')
+            if [ "$ASSOC" = "OWNER" ] || [ "$ASSOC" = "MEMBER" ] || [ "$ASSOC" = "COLLABORATOR" ]; then
+              echo "should_run=true" >> $GITHUB_OUTPUT
+            else
               echo "should_run=false" >> $GITHUB_OUTPUT
-              exit 0
             fi
+          else
+            echo "should_run=false" >> $GITHUB_OUTPUT
           fi
-
-          echo "should_run=true" >> $GITHUB_OUTPUT
 
       - name: Run Claude CI fix
         if: steps.check.outputs.should_run == 'true'
@@ -380,7 +312,7 @@ jobs:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           MODE: ci-fix
           GITHUB_REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_NUMBER: ${{ needs.safety-check.outputs.pr_number }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           BASE_BRANCH: main
