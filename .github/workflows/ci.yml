@@ -13,10 +13,16 @@ on:
           - container
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'kernel/**'
+      - 'scripts/claude-assistant/**'
+      - '.github/workflows/claude*.yml'
   push:
     branches: [main]
     paths-ignore:
       - 'kernel/**'  # When kernel changes, wait for Build Kernels workflow
+      - 'scripts/claude-assistant/**'
+      - '.github/workflows/claude*.yml'
   workflow_run:
     workflows: ["Build Kernels"]
     types: [completed]
