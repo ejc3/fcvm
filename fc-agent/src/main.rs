@@ -1382,6 +1382,95 @@ fn notify_container_exit(exit_code: i32) {
     }
 }
 
+/// Shutdown the VM with the given exit code.
+///
+/// This function handles the shutdown sequence:
+/// 1. Sync filesystems
+/// 2. Call poweroff/reboot based on architecture
+/// 3. Fallback to sysrq if needed
+///
+/// This function never returns.
+async fn shutdown_vm(exit_code: i32) -> ! {
+    eprintln!("[fc-agent] shutting down VM (exit_code={})", exit_code);
+
+    // Check what filesystems are mounted and might need syncing
+    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+        let fuse_mounts: Vec<&str> = mounts.lines().filter(|l| l.contains("fuse")).collect();
+        if !fuse_mounts.is_empty() {
+            eprintln!("[fc-agent] FUSE mounts before shutdown: {:?}", fuse_mounts);
+        }
+    }
+
+    // Try sync with timeout - spawn it and wait max 2 seconds
+    eprintln!("[fc-agent] starting sync...");
+    let sync_start = std::time::Instant::now();
+    if let Ok(mut sync_child) = Command::new("sync").spawn() {
+        // Wait for sync with 2 second timeout
+        for _ in 0..20 {
+            match sync_child.try_wait() {
+                Ok(Some(status)) => {
+                    eprintln!(
+                        "[fc-agent] sync completed in {:?} with status: {:?}",
+                        sync_start.elapsed(),
+                        status
+                    );
+                    break;
+                }
+                Ok(None) => {
+                    sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => {
+                    eprintln!("[fc-agent] sync wait error: {}", e);
+                    break;
+                }
+            }
+        }
+        if sync_start.elapsed().as_secs() >= 2 {
+            eprintln!("[fc-agent] sync timed out after 2s, killing it");
+            let _ = sync_child.kill().await;
+        }
+    }
+
+    // Now shutdown - method depends on architecture:
+    // - ARM64: poweroff -f triggers PSCI SYSTEM_OFF via pm_power_off callback
+    // - x86: reboot -f with reboot=t boot param triggers triple-fault (Firecracker has no ACPI)
+    #[cfg(target_arch = "aarch64")]
+    {
+        eprintln!("[fc-agent] calling poweroff -f (PSCI SYSTEM_OFF)...");
+        let _ = Command::new("poweroff").args(["-f"]).spawn();
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        eprintln!("[fc-agent] calling reboot -f (triple-fault via reboot=t)...");
+        let _ = Command::new("reboot").args(["-f"]).spawn();
+    }
+
+    // Wait for shutdown to take effect
+    sleep(Duration::from_secs(2)).await;
+
+    // Fallback: try the other command
+    #[cfg(target_arch = "aarch64")]
+    {
+        eprintln!("[fc-agent] poweroff didn't complete after 2s, trying reboot -f");
+        let _ = Command::new("reboot").args(["-f"]).spawn();
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        eprintln!("[fc-agent] reboot didn't complete after 2s, trying sysrq");
+    }
+
+    // Wait a bit more
+    sleep(Duration::from_secs(2)).await;
+    eprintln!("[fc-agent] shutdown didn't complete, trying sysrq reboot");
+
+    // Last resort: use the reboot syscall directly via sysrq
+    let _ = std::fs::write("/proc/sysrq-trigger", "b");
+
+    sleep(Duration::from_secs(1)).await;
+    eprintln!("[fc-agent] VM shutdown completely failed!");
+    std::process::exit(exit_code)
+}
+
 /// Notify host that container has started via vsock.
 ///
 /// Sends "ready\n" message to the host on the status vsock port.
@@ -1738,7 +1827,7 @@ fn configure_dns_from_cmdline() {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     // Initialize tracing (fuse-pipe uses tracing for logging)
     // Disable ANSI codes since output goes through serial console/vsock
     tracing_subscriber::fmt()
@@ -1752,6 +1841,23 @@ async fn main() -> Result<()> {
         .init();
 
     eprintln!("[fc-agent] starting");
+
+    // Run the agent and handle any errors by shutting down the VM
+    if let Err(e) = run_agent().await {
+        eprintln!("[fc-agent] ==========================================");
+        eprintln!("[fc-agent] FATAL ERROR: Container failed to start");
+        eprintln!("[fc-agent] Error: {:?}", e);
+        eprintln!("[fc-agent] ==========================================");
+        // Notify host of failure (exit code 1)
+        notify_container_exit(1);
+        // Shutdown the VM so it doesn't hang indefinitely
+        shutdown_vm(1).await;
+    }
+}
+
+/// Main agent logic - fetches plan, runs container, and triggers shutdown.
+async fn run_agent() -> Result<()> {
+    eprintln!("[fc-agent] run_agent starting");
 
     // Raise resource limits early to support high parallelism workloads
     raise_resource_limits();
@@ -2244,102 +2350,5 @@ async fn main() -> Result<()> {
 
     // Shut down the VM when the container exits (success or failure)
     // This is the expected behavior - the VM exists to run one container
-    eprintln!("[fc-agent] shutting down VM (exit_code={})", exit_code);
-
-    // Check what filesystems are mounted and might need syncing
-    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
-        let fuse_mounts: Vec<&str> = mounts.lines().filter(|l| l.contains("fuse")).collect();
-        eprintln!("[fc-agent] FUSE mounts before shutdown: {:?}", fuse_mounts);
-    }
-
-    // Check dirty pages before sync
-    if let Ok(dirty) = std::fs::read_to_string("/proc/meminfo") {
-        for line in dirty.lines() {
-            if line.starts_with("Dirty:") || line.starts_with("Writeback:") {
-                eprintln!("[fc-agent] {}", line.trim());
-            }
-        }
-    }
-
-    // Try sync with timeout - spawn it and wait max 2 seconds
-    eprintln!("[fc-agent] starting sync...");
-    let sync_start = std::time::Instant::now();
-    let mut sync_child = match Command::new("sync").spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            eprintln!("[fc-agent] failed to spawn sync: {}", e);
-            // Continue to halt anyway
-            let _ = Command::new("halt").args(["-f"]).spawn();
-            sleep(Duration::from_secs(2)).await;
-            std::process::exit(exit_code);
-        }
-    };
-
-    // Wait for sync with 2 second timeout
-    for _ in 0..20 {
-        match sync_child.try_wait() {
-            Ok(Some(status)) => {
-                eprintln!(
-                    "[fc-agent] sync completed in {:?} with status: {:?}",
-                    sync_start.elapsed(),
-                    status
-                );
-                break;
-            }
-            Ok(None) => {
-                sleep(Duration::from_millis(100)).await;
-            }
-            Err(e) => {
-                eprintln!("[fc-agent] sync wait error: {}", e);
-                break;
-            }
-        }
-    }
-
-    if sync_start.elapsed().as_secs() >= 2 {
-        eprintln!("[fc-agent] sync timed out after 2s, killing it");
-        let _ = sync_child.kill().await;
-    }
-
-    // Now shutdown - method depends on architecture:
-    // - ARM64: poweroff -f triggers PSCI SYSTEM_OFF via pm_power_off callback
-    // - x86: reboot -f with reboot=t boot param triggers triple-fault (Firecracker has no ACPI)
-    #[cfg(target_arch = "aarch64")]
-    {
-        eprintln!("[fc-agent] calling poweroff -f (PSCI SYSTEM_OFF)...");
-        let _ = Command::new("poweroff").args(["-f"]).spawn();
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        // On x86, Firecracker doesn't emulate ACPI so poweroff doesn't work.
-        // With reboot=t kernel param, reboot -f triggers a triple-fault which
-        // causes KVM_EXIT_SHUTDOWN that Firecracker handles properly.
-        eprintln!("[fc-agent] calling reboot -f (triple-fault via reboot=t)...");
-        let _ = Command::new("reboot").args(["-f"]).spawn();
-    }
-
-    // Wait for shutdown to take effect
-    sleep(Duration::from_secs(2)).await;
-
-    // Fallback: try the other command
-    #[cfg(target_arch = "aarch64")]
-    {
-        eprintln!("[fc-agent] poweroff didn't complete after 2s, trying reboot -f");
-        let _ = Command::new("reboot").args(["-f"]).spawn();
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        eprintln!("[fc-agent] reboot didn't complete after 2s, trying sysrq");
-    }
-
-    // Wait a bit more
-    sleep(Duration::from_secs(2)).await;
-    eprintln!("[fc-agent] shutdown didn't complete, trying sysrq reboot");
-
-    // Last resort: use the reboot syscall directly via sysrq
-    let _ = std::fs::write("/proc/sysrq-trigger", "b");
-
-    sleep(Duration::from_secs(1)).await;
-    eprintln!("[fc-agent] VM shutdown completely failed!");
-    std::process::exit(exit_code)
+    shutdown_vm(exit_code).await
 }

@@ -271,3 +271,71 @@ async fn test_trailing_args_command() -> Result<()> {
     println!("✅ TRAILING ARGS TEST PASSED!");
     Ok(())
 }
+
+/// Test that VM shuts down when container fails to start (e.g., invalid image)
+///
+/// This is critical: if the container can't start (image pull fails, etc.),
+/// the VM should exit instead of hanging indefinitely.
+#[tokio::test]
+async fn test_container_startup_failure_triggers_shutdown() -> Result<()> {
+    use std::time::Duration;
+
+    println!("\nContainer startup failure test");
+    println!("===============================");
+    println!("Verifies VM exits when container fails to start (no hang)");
+
+    let (vm_name, _, _, _) = common::unique_names("startup-fail");
+
+    // Use a nonexistent image that will definitely fail to pull
+    // This tests that fc-agent properly triggers VM shutdown on error
+    println!("Starting VM with nonexistent image...");
+    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "nonexistent.invalid/this-image-does-not-exist:v999",
+    ])
+    .await
+    .context("spawning fcvm")?;
+
+    println!("  fcvm PID: {}", fcvm_pid);
+    println!("  Waiting for VM to exit (max 120s)...");
+
+    // Wait for process to exit - should NOT hang
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(120);
+
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                let elapsed = start.elapsed();
+                println!(
+                    "  VM exited after {:.1}s with status: {}",
+                    elapsed.as_secs_f32(),
+                    status
+                );
+
+                // VM should exit with non-zero status (container failed to start)
+                assert!(
+                    !status.success(),
+                    "VM should exit with error status when container fails to start"
+                );
+                println!("✅ STARTUP FAILURE SHUTDOWN PASSED!");
+                println!("  fc-agent correctly triggered VM shutdown on error");
+                return Ok(());
+            }
+            None => {
+                if start.elapsed() > timeout {
+                    // Kill the stuck process before failing
+                    common::kill_process(fcvm_pid).await;
+                    anyhow::bail!(
+                        "VM did not exit within {}s - fc-agent is NOT shutting down on startup failure!",
+                        timeout.as_secs()
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+}
