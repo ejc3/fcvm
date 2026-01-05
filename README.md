@@ -134,7 +134,11 @@ The `--setup` flag triggers setup if kernel/rootfs are missing. Only works with 
 
 ### Run a Container
 ```bash
-# Run nginx in a Firecracker VM (uses rootless mode by default, no sudo needed)
+# Run a one-shot command (clean output, just like docker run)
+fcvm podman run --name test alpine:latest echo "hello world"
+# Output: hello world
+
+# Run a service (uses rootless mode by default, no sudo needed)
 fcvm podman run --name web1 public.ecr.aws/nginx/nginx:alpine
 
 # With port forwarding (8080 on host -> 80 in guest)
@@ -147,9 +151,6 @@ fcvm podman run --name web1 --map /host/data:/data public.ecr.aws/nginx/nginx:al
 
 # Custom resources
 fcvm podman run --name web1 --cpu 4 --mem 4096 public.ecr.aws/nginx/nginx:alpine
-
-# With custom command (docker-style trailing args)
-fcvm podman run --name web1 alpine:latest echo "hello world"
 
 # Bridged mode (requires sudo, uses iptables)
 sudo fcvm podman run --name web1 --network bridged public.ecr.aws/nginx/nginx:alpine
@@ -623,7 +624,7 @@ See [DESIGN.md](DESIGN.md#networking) for architecture details.
 ## Container Behavior
 
 - **Exit codes**: Container exit code forwarded to host via vsock
-- **Logs**: Container stdout/stderr prefixed with `[ctr:out]`/`[ctr:err]`
+- **Logs**: Container stdout goes to host stdout, stderr to host stderr (clean output for scripting)
 - **Health**: Default uses vsock ready signal; optional `--health-check` for HTTP
 
 See [DESIGN.md](DESIGN.md#guest-agent) for details.
@@ -635,7 +636,7 @@ See [DESIGN.md](DESIGN.md#guest-agent) for details.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FCVM_BASE_DIR` | `/mnt/fcvm-btrfs` | Base directory for all data |
-| `RUST_LOG` | `info` | Logging level (e.g., `debug`, `firecracker=debug`) |
+| `RUST_LOG` | `warn` | Logging level (quiet by default; use `info` or `debug` for verbose) |
 
 ---
 
