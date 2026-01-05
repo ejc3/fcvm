@@ -288,6 +288,23 @@ jobs:
       - name: Install dependencies
         run: cd scripts/claude-assistant && pnpm install
 
+      - name: Get PR info
+        id: pr
+        env:
+          GH_TOKEN: ${{ steps.claude-token.outputs.token }}
+        run: |
+          PR_NUM="${{ needs.safety-check.outputs.pr_number }}"
+          if [ -n "$PR_NUM" ] && [ "$PR_NUM" != "0" ]; then
+            PR_DATA=$(gh pr view $PR_NUM --json headRefName,headRefOid,baseRefName)
+            echo "head_branch=$(echo $PR_DATA | jq -r .headRefName)" >> $GITHUB_OUTPUT
+            echo "head_sha=$(echo $PR_DATA | jq -r .headRefOid)" >> $GITHUB_OUTPUT
+            echo "base_branch=$(echo $PR_DATA | jq -r .baseRefName)" >> $GITHUB_OUTPUT
+          else
+            echo "head_branch=" >> $GITHUB_OUTPUT
+            echo "head_sha=" >> $GITHUB_OUTPUT
+            echo "base_branch=" >> $GITHUB_OUTPUT
+          fi
+
       - name: Run Claude respond
         env:
           GH_TOKEN: ${{ steps.claude-token.outputs.token }}
@@ -295,9 +312,9 @@ jobs:
           MODE: respond
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ needs.safety-check.outputs.pr_number }}
-          HEAD_BRANCH: ${{ github.head_ref }}
-          HEAD_SHA: ${{ github.sha }}
-          BASE_BRANCH: ${{ github.base_ref }}
+          HEAD_BRANCH: ${{ steps.pr.outputs.head_branch }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          BASE_BRANCH: ${{ steps.pr.outputs.base_branch }}
           RUN_ID: ${{ github.run_id }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           COMMENT_BODY: ${{ github.event.comment.body }}
