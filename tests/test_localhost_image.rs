@@ -42,33 +42,33 @@ async fn test_localhost_hello_world() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("failed to get child PID"))?;
     println!("  fcvm process started (PID: {})", fcvm_pid);
 
-    // Spawn task to collect stdout
+    // Monitor stdout for container output (goes directly to stdout without prefix)
     let stdout = child.stdout.take();
     let stdout_task = tokio::spawn(async move {
+        let mut found_hello = false;
         if let Some(stdout) = stdout {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 eprintln!("[VM stdout] {}", line);
+                // Check for container output (no prefix in clean output mode)
+                if line.contains("Hello from localhost container!") {
+                    found_hello = true;
+                }
             }
         }
+        found_hello
     });
 
-    // Monitor stderr for container output and exit status
-    // Output comes via bidirectional vsock channel as [ctr:stdout] or [ctr:stderr]
+    // Monitor stderr for exit status (logs still go to stderr)
     let stderr = child.stderr.take();
     let stderr_task = tokio::spawn(async move {
-        let mut found_hello = false;
         let mut exited_zero = false;
         if let Some(stderr) = stderr {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 eprintln!("[VM stderr] {}", line);
-                // Check for container output via bidirectional vsock channel
-                if line.contains("[ctr:stdout] Hello from localhost container!") {
-                    found_hello = true;
-                }
                 // Check for container exit with code 0
                 if line.contains("Container exit notification received")
                     && line.contains("exit_code=0")
@@ -77,7 +77,7 @@ async fn test_localhost_hello_world() -> Result<()> {
                 }
             }
         }
-        (found_hello, exited_zero)
+        exited_zero
     });
 
     // Wait for the process to exit (with timeout)
@@ -102,8 +102,8 @@ async fn test_localhost_hello_world() -> Result<()> {
     }
 
     // Wait for output tasks
-    let _ = stdout_task.await;
-    let (found_hello, container_exited_zero) = stderr_task.await.unwrap_or((false, false));
+    let found_hello = stdout_task.await.unwrap_or(false);
+    let container_exited_zero = stderr_task.await.unwrap_or(false);
 
     // Check results - verify we got the container output
     if found_hello {
@@ -117,9 +117,7 @@ async fn test_localhost_hello_world() -> Result<()> {
         Ok(())
     } else {
         println!("\n❌ LOCALHOST IMAGE TEST FAILED!");
-        println!(
-            "  - Did not find expected output: '[ctr:stdout] Hello from localhost container!'"
-        );
+        println!("  - Did not find expected output: 'Hello from localhost container!'");
         println!("  - Check logs above for error details");
         anyhow::bail!("Localhost image test failed")
     }

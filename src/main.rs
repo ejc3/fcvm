@@ -50,8 +50,8 @@ async fn main() -> Result<()> {
     }
 
     // Initialize logging
-    // Use RUST_LOG if set, otherwise default to INFO
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // Use RUST_LOG if set, otherwise default to WARN (quiet by default, use RUST_LOG=info for verbose)
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
 
     // If --sub-process flag is set, disable timestamps AND level (subprocess mode)
     // Parent process already shows timestamp and level, so subprocess just shows the message
