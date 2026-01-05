@@ -502,6 +502,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh run view ${{ github.run_id }} --log > /tmp/ci-artifacts/full.log 2>/dev/null || true
+          # Wait briefly for logs to be available
+          sleep 5
+          gh run view ${{ github.run_id }} --log > /tmp/ci-artifacts/full.log || echo "Log fetch failed"
+          echo "Log size: $(wc -l < /tmp/ci-artifacts/full.log) lines"
       - name: Analyze CI run
         run: python3 scripts/analyze_ci_vms.py /tmp/ci-artifacts
