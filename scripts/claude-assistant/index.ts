@@ -23,7 +23,7 @@ import { tmpdir } from "os";
 
 // Configurable limits with sensible defaults
 const MAX_LOG_SIZE = parseInt(process.env.CLAUDE_MAX_LOG_SIZE ?? "100000", 10);
-const MAX_TURNS = parseInt(process.env.CLAUDE_MAX_TURNS ?? "50", 10);
+const MAX_TURNS = parseInt(process.env.CLAUDE_MAX_TURNS ?? "75", 10);
 
 // Branch naming convention for Claude-generated fix branches
 const FIX_BRANCH_PREFIX = "claude/fix-";
