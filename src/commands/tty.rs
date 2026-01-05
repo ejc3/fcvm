@@ -4,20 +4,22 @@
 //! used by both `podman run -it` and `exec -it` paths.
 
 use std::io::Write;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, BorrowedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+use nix::sys::termios::{self, SetArg, Termios};
 use tracing::{debug, info, warn};
 
 /// Global storage for terminal restoration on signal (async-signal-safe)
-/// Using static mut with atomic flag instead of Mutex to be signal-safe.
-/// SAFETY: Only written while TERMIOS_SAVED is false, only read in signal handler
-/// after TERMIOS_SAVED is true. The main code path ensures proper synchronization.
-static mut ORIG_FD: i32 = -1;
-static mut ORIG_TERMIOS_STORAGE: libc::termios = unsafe { std::mem::zeroed() };
+/// Using atomics and static mut with careful synchronization to be signal-safe.
+/// SAFETY: ORIG_TERMIOS is only written while TERMIOS_SAVED is false,
+/// only read in signal handler after TERMIOS_SAVED is true.
+static ORIG_FD: AtomicI32 = AtomicI32::new(-1);
+static mut ORIG_TERMIOS: Option<Termios> = None;
 static TERMIOS_SAVED: AtomicBool = AtomicBool::new(false);
 
 /// Global flag to track if signal handlers are installed
@@ -30,35 +32,39 @@ fn install_signal_handlers() {
     }
 
     // Handler that restores terminal - must be async-signal-safe
-    // Only calls tcsetattr (async-signal-safe per POSIX)
     extern "C" fn signal_handler(_sig: libc::c_int) {
-        // Restore terminal if we have saved state
-        // Using Relaxed is fine - we just need to see a consistent value
-        if TERMIOS_SAVED.load(Ordering::Relaxed) {
-            unsafe {
-                // Use raw pointer to avoid creating a reference to mutable static
-                libc::tcsetattr(
-                    ORIG_FD,
-                    libc::TCSANOW,
-                    std::ptr::addr_of!(ORIG_TERMIOS_STORAGE),
-                );
+        if TERMIOS_SAVED.load(Ordering::Acquire) {
+            let fd = ORIG_FD.load(Ordering::Acquire);
+            if fd >= 0 {
+                // SAFETY: We only read ORIG_TERMIOS after TERMIOS_SAVED is true,
+                // and it's only written before TERMIOS_SAVED becomes true.
+                unsafe {
+                    if let Some(ref termios) = ORIG_TERMIOS {
+                        // tcsetattr is async-signal-safe per POSIX
+                        let _ = termios::tcsetattr(
+                            BorrowedFd::borrow_raw(fd),
+                            SetArg::TCSANOW,
+                            termios,
+                        );
+                    }
+                }
             }
         }
         // SA_RESETHAND auto-resets handler to SIG_DFL, so signal will terminate process
     }
 
-    unsafe {
-        // Use sigaction() instead of signal() for well-defined behavior
-        // SA_RESETHAND: auto-reset to SIG_DFL after first invocation (no need to re-raise)
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = signal_handler as usize;
-        sa.sa_flags = libc::SA_RESETHAND;
+    // Use sigaction with SA_RESETHAND for well-defined behavior
+    let handler = SigHandler::Handler(signal_handler);
+    let action = SigAction::new(handler, SaFlags::SA_RESETHAND, SigSet::empty());
 
-        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
-        libc::sigaction(libc::SIGQUIT, &sa, std::ptr::null_mut());
-        libc::sigaction(libc::SIGHUP, &sa, std::ptr::null_mut());
-        // Note: SIGINT (Ctrl+C) is passed through to guest in raw mode
+    // Install handlers for termination signals
+    // SAFETY: signal_handler is async-signal-safe
+    unsafe {
+        let _ = sigaction(Signal::SIGTERM, &action);
+        let _ = sigaction(Signal::SIGQUIT, &action);
+        let _ = sigaction(Signal::SIGHUP, &action);
     }
+    // Note: SIGINT (Ctrl+C) is passed through to guest in raw mode
 }
 
 /// Run a TTY session by listening on a Unix socket.
@@ -161,9 +167,11 @@ pub fn run_tty_session_connected(stream: UnixStream, tty: bool, interactive: boo
 }
 
 /// Set up raw terminal mode
-fn setup_raw_terminal(stdin_fd: i32) -> Result<Option<libc::termios>> {
-    let is_tty = unsafe { libc::isatty(stdin_fd) == 1 };
-    if !is_tty {
+fn setup_raw_terminal(stdin_fd: i32) -> Result<Option<Termios>> {
+    // SAFETY: stdin_fd is valid for the duration of this call
+    let fd = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
+
+    if !nix::unistd::isatty(stdin_fd).unwrap_or(false) {
         bail!("TTY mode requires a terminal. Use without -t for non-interactive mode.");
     }
 
@@ -171,54 +179,50 @@ fn setup_raw_terminal(stdin_fd: i32) -> Result<Option<libc::termios>> {
     install_signal_handlers();
 
     // Ensure stdin is in blocking mode (tokio may have set it non-blocking)
-    unsafe {
-        let flags = libc::fcntl(stdin_fd, libc::F_GETFL);
-        if flags != -1 && (flags & libc::O_NONBLOCK) != 0 {
-            libc::fcntl(stdin_fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+    if let Ok(flags) = nix::fcntl::fcntl(stdin_fd, nix::fcntl::FcntlArg::F_GETFL) {
+        let oflags = nix::fcntl::OFlag::from_bits_truncate(flags);
+        if oflags.contains(nix::fcntl::OFlag::O_NONBLOCK) {
+            let new_flags = oflags & !nix::fcntl::OFlag::O_NONBLOCK;
+            let _ = nix::fcntl::fcntl(stdin_fd, nix::fcntl::FcntlArg::F_SETFL(new_flags));
             debug!("setup_raw_terminal: cleared O_NONBLOCK from stdin");
         }
     }
 
     // Save original terminal settings
-    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
-    if unsafe { libc::tcgetattr(stdin_fd, &mut termios) } != 0 {
-        bail!("Failed to get terminal attributes");
-    }
-    let orig = termios;
+    let orig = termios::tcgetattr(fd).context("Failed to get terminal attributes")?;
 
     // Store in global for signal handler access (async-signal-safe approach)
     // SAFETY: We only write while TERMIOS_SAVED is false, ensuring no concurrent read
+    ORIG_FD.store(stdin_fd, Ordering::Release);
     unsafe {
-        ORIG_FD = stdin_fd;
-        ORIG_TERMIOS_STORAGE = orig;
+        ORIG_TERMIOS = Some(orig.clone());
     }
     // Memory barrier: ensure writes above are visible before setting flag
     TERMIOS_SAVED.store(true, Ordering::Release);
 
     // Set raw mode
-    unsafe {
-        libc::cfmakeraw(&mut termios);
-    }
-    if unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &termios) } != 0 {
+    let mut raw = orig.clone();
+    termios::cfmakeraw(&mut raw);
+
+    if let Err(e) = termios::tcsetattr(fd, SetArg::TCSANOW, &raw) {
         // Clear global on failure
         TERMIOS_SAVED.store(false, Ordering::Release);
-        bail!("Failed to set raw terminal mode");
+        bail!("Failed to set raw terminal mode: {}", e);
     }
 
     Ok(Some(orig))
 }
 
 /// Restore terminal to original settings
-fn restore_terminal(stdin_fd: i32, termios: libc::termios) {
+fn restore_terminal(stdin_fd: i32, orig_termios: Termios) {
     // Clear global first (signal handler won't need to restore anymore)
     TERMIOS_SAVED.store(false, Ordering::Release);
 
-    let ret = unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &termios) };
-    if ret != 0 {
-        warn!(
-            "Failed to restore terminal settings: {}",
-            std::io::Error::last_os_error()
-        );
+    // SAFETY: stdin_fd is valid for the duration of this call
+    let fd = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
+
+    if let Err(e) = termios::tcsetattr(fd, SetArg::TCSANOW, &orig_termios) {
+        warn!("Failed to restore terminal settings: {}", e);
     }
 }
 
