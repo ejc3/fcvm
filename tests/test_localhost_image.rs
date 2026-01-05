@@ -132,11 +132,11 @@ async fn build_test_image() -> Result<()> {
     let temp_dir = TempDir::new().context("creating temp dir")?;
     let containerfile_path = temp_dir.path().join("Containerfile");
 
-    // Write a simple Containerfile
+    // Write a simple Containerfile (use ECR to avoid Docker Hub rate limits)
     let mut file = std::fs::File::create(&containerfile_path)?;
     writeln!(
         file,
-        r#"FROM alpine:latest
+        r#"FROM public.ecr.aws/nginx/nginx:alpine
 CMD ["echo", "Hello from localhost container!"]"#
     )?;
 
