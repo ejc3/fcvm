@@ -21,13 +21,14 @@ env:
 # Required: CLAUDE_APP_ID (variable), CLAUDE_APP_PRIVATE_KEY (secret)
 
 jobs:
-  # Gatekeeper: Check for non-member comments and author association
+  # Gatekeeper: Check for non-member commits, comments, and author association
   safety-check:
     runs-on: ubuntu-latest
     outputs:
       safe: ${{ steps.check.outputs.safe }}
       pr_number: ${{ steps.get-pr.outputs.number }}
       author_ok: ${{ steps.author.outputs.ok }}
+      commits_ok: ${{ steps.commits.outputs.ok }}
     steps:
       - name: Generate token
         id: token
@@ -84,6 +85,33 @@ jobs:
             echo "ok=false" >> $GITHUB_OUTPUT
           fi
 
+      - name: Check for non-member commits
+        id: commits
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          PR_NUM="${{ steps.get-pr.outputs.number }}"
+          if [ -z "$PR_NUM" ] || [ "$PR_NUM" = "0" ]; then
+            echo "ok=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          # Check each commit author's association
+          NON_MEMBER=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM/commits --jq \
+            '[.[] | select(.author.type != "Bot" and .author.login != null) | .author.login] | unique | .[]' | while read -r LOGIN; do
+            if [ -n "$LOGIN" ]; then
+              ASSOC=$(gh api repos/${{ github.repository }}/collaborators/$LOGIN/permission --jq '.permission' 2>/dev/null || echo "none")
+              if [ "$ASSOC" != "admin" ] && [ "$ASSOC" != "write" ] && [ "$ASSOC" != "maintain" ]; then
+                echo "$LOGIN"
+              fi
+            fi
+          done | head -1)
+          if [ -n "$NON_MEMBER" ]; then
+            echo "::warning::Blocking Claude - non-member commit author: $NON_MEMBER"
+            echo "ok=false" >> $GITHUB_OUTPUT
+          else
+            echo "ok=true" >> $GITHUB_OUTPUT
+          fi
+
       - name: Check for non-member comments
         id: check
         env:
@@ -110,6 +138,7 @@ jobs:
     if: |
       needs.safety-check.outputs.safe == 'true' &&
       needs.safety-check.outputs.author_ok == 'true' &&
+      needs.safety-check.outputs.commits_ok == 'true' &&
       github.event_name == 'pull_request' &&
       !startsWith(github.event.pull_request.head.ref, 'claude/fix-')
     runs-on: ubuntu-latest
@@ -161,6 +190,7 @@ jobs:
     if: |
       needs.safety-check.outputs.safe == 'true' &&
       needs.safety-check.outputs.author_ok == 'true' &&
+      needs.safety-check.outputs.commits_ok == 'true' &&
       github.event_name == 'issue_comment' &&
       github.event.issue.pull_request &&
       contains(github.event.comment.body, '/claude-review')
@@ -224,6 +254,7 @@ jobs:
     if: |
       needs.safety-check.outputs.safe == 'true' &&
       needs.safety-check.outputs.author_ok == 'true' &&
+      needs.safety-check.outputs.commits_ok == 'true' &&
       !contains(github.event.comment.body, '/claude-review') &&
       ((github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')))
@@ -277,6 +308,7 @@ jobs:
     if: |
       needs.safety-check.outputs.safe == 'true' &&
       needs.safety-check.outputs.author_ok == 'true' &&
+      needs.safety-check.outputs.commits_ok == 'true' &&
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.conclusion == 'failure' &&
       !startsWith(github.event.workflow_run.head_branch, 'claude/fix-') &&
