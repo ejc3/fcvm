@@ -13,6 +13,16 @@ Only branch directly from main when explicitly starting independent work.
 
 **When base PR merges:** Your branch's merge-base with main shifts automatically. The delta shown in your PR will only be your commits (base PR's commits are now in main). Merge conflicts can arise if main got other commits touching the same files.
 
+**CRITICAL: Verify base update before merging dependent PRs:**
+```bash
+# After PR #1 merges, WAIT and verify PR #2's base changed to main
+gh pr view 2 --json baseRefName
+# Must show: {"baseRefName":"main"}
+# If it still shows the old branch name, DO NOT MERGE - wait or manually update
+```
+
+**Why this matters:** If you merge PR #2 while its base is still the old branch (not main), the commits go into the orphaned branch and never reach main. You'll lose your changes.
+
 **PR description:** Always note `**Stacked on:** <base-branch> (PR #N)` so reviewers understand the dependency.
 
 ## UNDERSTAND BRANCH CHAINS
