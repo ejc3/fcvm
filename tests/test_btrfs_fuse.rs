@@ -275,7 +275,7 @@ async fn test_btrfs_in_container() -> Result<()> {
             "--",
             "sh",
             "-c",
-            "cp /btrfs/reflink-src.bin /btrfs/reflink-dst.bin && echo 'copy done'",
+            "cp /btrfs/reflink-src.bin /btrfs/reflink-dst.bin && sync /btrfs && echo 'copy done'",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -323,6 +323,13 @@ async fn test_btrfs_in_container() -> Result<()> {
     // Both files should share physical blocks due to CoW reflink
     let src_file = format!("{}/reflink-src.bin", mount_path);
     let dst_file = format!("{}/reflink-dst.bin", mount_path);
+
+    // Sync the btrfs mount to ensure FUSE writes are flushed before filefrag
+    // This is essential under parallel test load where I/O can be delayed
+    let _ = tokio::process::Command::new("sync")
+        .arg(&mount_path)
+        .output()
+        .await;
 
     let output = tokio::process::Command::new("filefrag")
         .args(["-v", &src_file])

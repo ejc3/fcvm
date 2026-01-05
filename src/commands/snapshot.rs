@@ -952,11 +952,11 @@ async fn run_clone_setup(
         // OPTIMIZATION: Parallelize disk creation with network setup
 
         // Step 1: Spawn holder process (keeps namespace alive)
-        // Retry for up to 2 seconds if namespace doesn't become ready (race condition)
+        // Retry for up to 5 seconds if namespace doesn't become ready (race condition)
         let holder_cmd = slirp_net.build_holder_command();
         info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
 
-        let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut attempt = 0u32;
 
         let (mut child, holder_pid) = loop {
