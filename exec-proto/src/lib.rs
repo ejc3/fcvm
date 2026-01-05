@@ -100,17 +100,31 @@ impl Message {
         reader.read_exact(&mut len_buf)?;
         let len = u32::from_be_bytes(len_buf) as usize;
 
-        // Sanity check: limit message size to 16MB
-        if len > 16 * 1024 * 1024 {
+        // Sanity check: limit message size to 1MB (plenty for TTY data)
+        // This prevents DoS via large length values
+        const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
+        if len > MAX_MESSAGE_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("message too large: {} bytes", len),
+                format!(
+                    "message too large: {} bytes (max {})",
+                    len, MAX_MESSAGE_SIZE
+                ),
             ));
         }
 
-        // Read payload
-        let mut payload = vec![0u8; len];
-        reader.read_exact(&mut payload)?;
+        // Read payload progressively to avoid allocating large buffers upfront
+        // This prevents memory exhaustion if sender disconnects mid-transfer
+        let mut payload = Vec::with_capacity(len.min(64 * 1024)); // Start with at most 64KB
+        let mut remaining = len;
+        let mut chunk = [0u8; 8192]; // Read in 8KB chunks
+
+        while remaining > 0 {
+            let to_read = remaining.min(chunk.len());
+            reader.read_exact(&mut chunk[..to_read])?;
+            payload.extend_from_slice(&chunk[..to_read]);
+            remaining -= to_read;
+        }
 
         // Parse based on type
         match msg_type {

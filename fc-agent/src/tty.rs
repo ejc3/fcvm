@@ -113,6 +113,15 @@ pub fn run_with_pty_fd(vsock_fd: i32, command: &[String], tty: bool, interactive
             Ok(f) => f,
             Err(e) => {
                 eprintln!("[fc-agent] tty: failed to clone vsock: {}", e);
+                // Clean up FDs before returning
+                if tty {
+                    unsafe { libc::close(master_fd) };
+                } else {
+                    unsafe {
+                        libc::close(stdout_read);
+                        libc::close(stdin_write);
+                    }
+                }
                 unsafe {
                     libc::kill(pid, libc::SIGKILL);
                     libc::waitpid(pid, std::ptr::null_mut(), 0);
@@ -127,6 +136,8 @@ pub fn run_with_pty_fd(vsock_fd: i32, command: &[String], tty: bool, interactive
             let dup_fd = unsafe { libc::dup(master_fd) };
             if dup_fd < 0 {
                 eprintln!("[fc-agent] tty: failed to dup master fd");
+                // Clean up master_fd before returning
+                unsafe { libc::close(master_fd) };
                 unsafe {
                     libc::kill(pid, libc::SIGKILL);
                     libc::waitpid(pid, std::ptr::null_mut(), 0);
@@ -395,8 +406,14 @@ fn reader_loop(mut source: std::fs::File, vsock: &mut std::fs::File, child_pid: 
 
     // Wait for child and get exit code
     let mut status: libc::c_int = 0;
-    unsafe {
-        libc::waitpid(child_pid, &mut status, 0);
+    let ret = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+
+    if ret < 0 {
+        eprintln!(
+            "[fc-agent] tty: waitpid failed: {}",
+            std::io::Error::last_os_error()
+        );
+        return 1;
     }
 
     if libc::WIFEXITED(status) {
