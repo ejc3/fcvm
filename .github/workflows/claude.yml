@@ -11,6 +11,10 @@ on:
     workflows: ["CI"]
     types: [completed]
 
+# Filter to find non-member, non-bot comments (for prompt injection prevention)
+env:
+  NONMEMBER_FILTER: '[.[] | select(.user.type != "Bot" and .author_association != "OWNER" and .author_association != "MEMBER" and .author_association != "COLLABORATOR")] | length'
+
 # Note: We use a GitHub App token instead of GITHUB_TOKEN so that:
 # 1. All actions appear as "Claude" bot
 # 2. PRs created by Claude can trigger CI workflows
@@ -49,18 +53,11 @@ jobs:
           GH_TOKEN: ${{ steps.claude-token.outputs.token }}
         run: |
           PR_NUM="${{ github.event.pull_request.number }}"
-
-          # Check issue comments (general PR comments) - allow members and bots
-          ISSUE_COMMENTS=$(gh api repos/${{ github.repository }}/issues/$PR_NUM/comments \
-            --jq '[.[] | select(.user.type != "Bot" and .author_association != "OWNER" and .author_association != "MEMBER" and .author_association != "COLLABORATOR")] | length')
-
-          # Check review comments (inline code comments) - allow members and bots
-          REVIEW_COMMENTS=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM/comments \
-            --jq '[.[] | select(.user.type != "Bot" and .author_association != "OWNER" and .author_association != "MEMBER" and .author_association != "COLLABORATOR")] | length')
-
-          TOTAL=$((ISSUE_COMMENTS + REVIEW_COMMENTS))
+          ISSUE=$(gh api repos/${{ github.repository }}/issues/$PR_NUM/comments --jq "$NONMEMBER_FILTER")
+          REVIEW=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM/comments --jq "$NONMEMBER_FILTER")
+          TOTAL=$((ISSUE + REVIEW))
           if [ "$TOTAL" -gt 0 ]; then
-            echo "::warning::Skipping Claude - $TOTAL comment(s) from non-members detected (issue: $ISSUE_COMMENTS, review: $REVIEW_COMMENTS)"
+            echo "::warning::Skipping - $TOTAL non-member comment(s) detected"
             echo "safe=false" >> $GITHUB_OUTPUT
           else
             echo "safe=true" >> $GITHUB_OUTPUT
@@ -134,18 +131,11 @@ jobs:
           GH_TOKEN: ${{ steps.claude-token.outputs.token }}
         run: |
           PR_NUM="${{ github.event.issue.number }}"
-
-          # Check issue comments (general PR comments) - allow members and bots
-          ISSUE_COMMENTS=$(gh api repos/${{ github.repository }}/issues/$PR_NUM/comments \
-            --jq '[.[] | select(.user.type != "Bot" and .author_association != "OWNER" and .author_association != "MEMBER" and .author_association != "COLLABORATOR")] | length')
-
-          # Check review comments (inline code comments) - allow members and bots
-          REVIEW_COMMENTS=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM/comments \
-            --jq '[.[] | select(.user.type != "Bot" and .author_association != "OWNER" and .author_association != "MEMBER" and .author_association != "COLLABORATOR")] | length')
-
-          TOTAL=$((ISSUE_COMMENTS + REVIEW_COMMENTS))
+          ISSUE=$(gh api repos/${{ github.repository }}/issues/$PR_NUM/comments --jq "$NONMEMBER_FILTER")
+          REVIEW=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM/comments --jq "$NONMEMBER_FILTER")
+          TOTAL=$((ISSUE + REVIEW))
           if [ "$TOTAL" -gt 0 ]; then
-            echo "::warning::Skipping Claude - $TOTAL comment(s) from non-members detected (issue: $ISSUE_COMMENTS, review: $REVIEW_COMMENTS)"
+            echo "::warning::Skipping - $TOTAL non-member comment(s) detected"
             echo "safe=false" >> $GITHUB_OUTPUT
           else
             echo "safe=true" >> $GITHUB_OUTPUT
@@ -245,18 +235,11 @@ jobs:
           GH_TOKEN: ${{ steps.claude-token.outputs.token }}
         run: |
           PR_NUM="${{ steps.pr.outputs.number }}"
-
-          # Check issue comments (general PR comments) - allow members and bots
-          ISSUE_COMMENTS=$(gh api repos/${{ github.repository }}/issues/$PR_NUM/comments \
-            --jq '[.[] | select(.user.type != "Bot" and .author_association != "OWNER" and .author_association != "MEMBER" and .author_association != "COLLABORATOR")] | length')
-
-          # Check review comments (inline code comments) - allow members and bots
-          REVIEW_COMMENTS=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM/comments \
-            --jq '[.[] | select(.user.type != "Bot" and .author_association != "OWNER" and .author_association != "MEMBER" and .author_association != "COLLABORATOR")] | length')
-
-          TOTAL=$((ISSUE_COMMENTS + REVIEW_COMMENTS))
+          ISSUE=$(gh api repos/${{ github.repository }}/issues/$PR_NUM/comments --jq "$NONMEMBER_FILTER")
+          REVIEW=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM/comments --jq "$NONMEMBER_FILTER")
+          TOTAL=$((ISSUE + REVIEW))
           if [ "$TOTAL" -gt 0 ]; then
-            echo "::warning::Skipping Claude - $TOTAL comment(s) from non-members detected (issue: $ISSUE_COMMENTS, review: $REVIEW_COMMENTS)"
+            echo "::warning::Skipping - $TOTAL non-member comment(s) detected"
             echo "safe=false" >> $GITHUB_OUTPUT
           else
             echo "safe=true" >> $GITHUB_OUTPUT
@@ -378,17 +361,11 @@ jobs:
 
           # Check for non-member comments (prompt injection risk)
           if [ -n "$PR_NUM" ] && [ "$PR_NUM" != "0" ]; then
-            # Check issue comments (general PR comments) - allow members and bots
-            ISSUE_COMMENTS=$(gh api repos/${{ github.repository }}/issues/$PR_NUM/comments \
-              --jq '[.[] | select(.user.type != "Bot" and .author_association != "OWNER" and .author_association != "MEMBER" and .author_association != "COLLABORATOR")] | length')
-
-            # Check review comments (inline code comments) - allow members and bots
-            REVIEW_COMMENTS=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM/comments \
-              --jq '[.[] | select(.user.type != "Bot" and .author_association != "OWNER" and .author_association != "MEMBER" and .author_association != "COLLABORATOR")] | length')
-
-            TOTAL=$((ISSUE_COMMENTS + REVIEW_COMMENTS))
+            ISSUE=$(gh api repos/${{ github.repository }}/issues/$PR_NUM/comments --jq "$NONMEMBER_FILTER")
+            REVIEW=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM/comments --jq "$NONMEMBER_FILTER")
+            TOTAL=$((ISSUE + REVIEW))
             if [ "$TOTAL" -gt 0 ]; then
-              echo "::warning::Skipping Claude - $TOTAL comment(s) from non-members detected (issue: $ISSUE_COMMENTS, review: $REVIEW_COMMENTS)"
+              echo "::warning::Skipping - $TOTAL non-member comment(s) detected"
               echo "should_run=false" >> $GITHUB_OUTPUT
               exit 0
             fi
