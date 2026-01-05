@@ -12,7 +12,6 @@ use crate::cli::ExecArgs;
 use crate::paths;
 use crate::state::StateManager;
 use anyhow::{bail, Context, Result};
-use exec_proto;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -231,7 +230,11 @@ pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
     // Use binary framing for any mode needing TTY or stdin forwarding
     // JSON line mode only for plain non-interactive commands
     if tty || interactive {
-        run_framed_mode(stream, tty, interactive)
+        let exit_code = super::tty::run_tty_session_connected(stream, tty, interactive)?;
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+        Ok(())
     } else {
         run_line_mode(stream)
     }
@@ -275,155 +278,6 @@ fn run_line_mode(stream: UnixStream) -> Result<()> {
     let exit_code = run_line_mode_with_exit_code(stream)?;
 
     // Exit with the command's exit code
-    if exit_code != 0 {
-        std::process::exit(exit_code);
-    }
-
-    Ok(())
-}
-
-/// Run with binary framing protocol (for TTY and/or interactive modes)
-///
-/// Uses the binary framing protocol (exec_proto) to cleanly separate
-/// control messages (exit code) from raw terminal data.
-///
-/// - `tty`: If true, set terminal to raw mode for proper TTY handling
-/// - `interactive`: If true, forward stdin to the remote command
-fn run_framed_mode(stream: UnixStream, tty: bool, interactive: bool) -> Result<()> {
-    use std::io::{stdin, stdout};
-    use std::os::unix::io::AsRawFd;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-
-    let stdin_fd = stdin().as_raw_fd();
-    let mut orig_termios: Option<libc::termios> = None;
-
-    // Only set up raw terminal mode if TTY requested
-    if tty {
-        let is_tty = unsafe { libc::isatty(stdin_fd) == 1 };
-        if !is_tty {
-            bail!("TTY mode requires a terminal. Use without -t for non-interactive mode.");
-        }
-
-        // Save original terminal settings
-        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
-        if unsafe { libc::tcgetattr(stdin_fd, &mut termios) } != 0 {
-            bail!("Failed to get terminal attributes");
-        }
-        orig_termios = Some(termios);
-
-        // Set raw mode
-        let mut raw_termios = termios;
-        unsafe {
-            libc::cfmakeraw(&mut raw_termios);
-        }
-        if unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &raw_termios) } != 0 {
-            bail!("Failed to set raw terminal mode");
-        }
-    }
-
-    // Flag to track completion
-    let done = Arc::new(AtomicBool::new(false));
-    let done_clone = done.clone();
-
-    // Clone stream for reader/writer
-    let read_stream = stream.try_clone().context("cloning stream for reader")?;
-    let mut write_stream = stream;
-
-    // Spawn thread to read framed messages from socket and write to stdout
-    let reader_done = done.clone();
-    let reader_thread = std::thread::spawn(move || {
-        let mut stdout = stdout().lock();
-        let mut read_stream = read_stream;
-
-        loop {
-            if reader_done.load(Ordering::Relaxed) {
-                break;
-            }
-
-            // Read framed message using binary protocol
-            match exec_proto::Message::read_from(&mut read_stream) {
-                Ok(exec_proto::Message::Data(data)) => {
-                    // Write raw PTY data to stdout
-                    let _ = stdout.write_all(&data);
-                    let _ = stdout.flush();
-                }
-                Ok(exec_proto::Message::Exit(code)) => {
-                    // Process exited, return the exit code
-                    reader_done.store(true, Ordering::Relaxed);
-                    return Some(code);
-                }
-                Ok(exec_proto::Message::Error(msg)) => {
-                    // Error from guest
-                    let _ = writeln!(stdout, "\r\nError: {}\r", msg);
-                    let _ = stdout.flush();
-                    reader_done.store(true, Ordering::Relaxed);
-                    return Some(1);
-                }
-                Ok(exec_proto::Message::Stdin(_)) => {
-                    // Should not receive STDIN from guest, ignore
-                }
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                        // Connection closed
-                        break;
-                    }
-                    // Other error, log and exit
-                    eprintln!("\r\nProtocol error: {}\r", e);
-                    break;
-                }
-            }
-        }
-        None
-    });
-
-    // Only spawn writer thread if interactive mode (stdin forwarding)
-    let writer_thread = if interactive {
-        let writer_done = done.clone();
-        Some(std::thread::spawn(move || {
-            let stdin = stdin();
-            let mut stdin = stdin.lock();
-            let mut buf = [0u8; 1024];
-
-            loop {
-                if writer_done.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                match stdin.read(&mut buf) {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        // Send stdin data as framed STDIN message
-                        if exec_proto::write_stdin(&mut write_stream, &buf[..n]).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        }))
-    } else {
-        // Not interactive - just drop the write_stream
-        drop(write_stream);
-        None
-    };
-
-    // Wait for reader to finish (it detects exit)
-    let exit_code = reader_thread.join().ok().flatten().unwrap_or(0);
-
-    // Signal writer to stop
-    done_clone.store(true, Ordering::Relaxed);
-
-    // Restore terminal if we set raw mode
-    if let Some(termios) = orig_termios {
-        unsafe {
-            libc::tcsetattr(stdin_fd, libc::TCSANOW, &termios);
-        }
-    }
-
-    // Don't wait for writer - it may be blocked on stdin
-    drop(writer_thread);
-
     if exit_code != 0 {
         std::process::exit(exit_code);
     }

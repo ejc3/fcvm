@@ -119,6 +119,8 @@ pub fn spawn_streaming<F>(
 where
     F: Fn(&str, bool) + Send + Sync + Clone + 'static,
 {
+    // Stdin is null to prevent child from competing with parent for terminal input
+    cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 

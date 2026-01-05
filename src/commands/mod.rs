@@ -6,6 +6,7 @@ pub mod podman;
 pub mod setup;
 pub mod snapshot;
 pub mod snapshots;
+pub mod tty;
 
 // Re-export command functions
 pub use completions::cmd_completions;

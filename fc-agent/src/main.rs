@@ -1,4 +1,5 @@
 mod fuse;
+mod tty;
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
@@ -35,6 +36,12 @@ struct Plan {
     /// Run container in privileged mode (allows mknod, device access, etc.)
     #[serde(default)]
     privileged: bool,
+    /// Keep STDIN open even if not attached
+    #[serde(default)]
+    interactive: bool,
+    /// Allocate a pseudo-TTY
+    #[serde(default)]
+    tty: bool,
 }
 
 /// Volume mount configuration from MMDS
@@ -617,7 +624,7 @@ const STATUS_VSOCK_PORT: u32 = 4999;
 /// Exec server port for running commands from host
 const EXEC_VSOCK_PORT: u32 = 4998;
 
-/// Container output streaming port
+/// Container output streaming port (line-based protocol)
 const OUTPUT_VSOCK_PORT: u32 = 4997;
 
 /// Host CID for vsock (always 2)
@@ -831,285 +838,32 @@ fn handle_exec_connection_blocking(fd: i32) {
     // Use framed protocol for TTY or interactive modes
     // JSON line protocol only for plain non-interactive
     if request.tty || request.interactive {
-        handle_exec_framed(fd, &request);
+        // Build command for exec
+        let command = if request.in_container {
+            let mut cmd = vec!["podman".to_string(), "exec".to_string()];
+            // Pass -i and -t to podman exec
+            if request.interactive {
+                cmd.push("-i".to_string());
+            }
+            if request.tty {
+                cmd.push("-t".to_string());
+            }
+            cmd.push("--latest".to_string());
+            cmd.extend(request.command.iter().cloned());
+            cmd
+        } else {
+            request.command.clone()
+        };
+
+        // Use unified TTY handler
+        // NOTE: Don't call std::process::exit() here - that would kill the entire fc-agent!
+        // run_with_pty_fd already sends the exit code via exec_proto and closes the fd.
+        // We just return and let the spawn_blocking task end naturally.
+        let _exit_code = tty::run_with_pty_fd(fd, &command, request.tty, request.interactive);
+        return;
     } else {
         handle_exec_pipe(fd, &request);
     }
-}
-
-/// Handle exec with binary framing protocol
-///
-/// Uses the binary framing protocol (exec_proto) to cleanly separate
-/// control messages (exit code) from raw terminal/pipe data.
-///
-/// - If `tty=true`: allocates PTY for terminal emulation
-/// - If `tty=false`: uses pipes for stdin/stdout/stderr
-fn handle_exec_framed(fd: i32, request: &ExecRequest) {
-    use std::io::Read;
-    use std::os::unix::io::FromRawFd;
-
-    // Wrap vsock fd in File for clean I/O
-    let mut vsock = unsafe { std::fs::File::from_raw_fd(fd) };
-
-    // For TTY mode, allocate a PTY
-    // For non-TTY, we'll use pipes (set up after fork)
-    let (master_fd, slave_fd) = if request.tty {
-        let mut master: libc::c_int = 0;
-        let mut slave: libc::c_int = 0;
-
-        let result = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-
-        if result != 0 {
-            let _ = exec_proto::write_error(&mut vsock, "Failed to allocate PTY");
-            return;
-        }
-        (master, slave)
-    } else {
-        (-1, -1) // Will use pipes instead
-    };
-
-    // For non-TTY mode, create pipes
-    let (stdin_read, stdin_write, stdout_read, stdout_write) = if !request.tty {
-        let mut stdin_pipe = [0i32; 2];
-        let mut stdout_pipe = [0i32; 2];
-        unsafe {
-            if libc::pipe(stdin_pipe.as_mut_ptr()) != 0 {
-                let _ = exec_proto::write_error(&mut vsock, "Failed to create stdin pipe");
-                return;
-            }
-            if libc::pipe(stdout_pipe.as_mut_ptr()) != 0 {
-                libc::close(stdin_pipe[0]);
-                libc::close(stdin_pipe[1]);
-                let _ = exec_proto::write_error(&mut vsock, "Failed to create stdout pipe");
-                return;
-            }
-        }
-        (stdin_pipe[0], stdin_pipe[1], stdout_pipe[0], stdout_pipe[1])
-    } else {
-        (-1, -1, -1, -1)
-    };
-
-    // Fork
-    let pid = unsafe { libc::fork() };
-
-    if pid < 0 {
-        let _ = exec_proto::write_error(&mut vsock, "Failed to fork");
-        if request.tty {
-            unsafe {
-                libc::close(master_fd);
-                libc::close(slave_fd);
-            }
-        } else {
-            unsafe {
-                libc::close(stdin_read);
-                libc::close(stdin_write);
-                libc::close(stdout_read);
-                libc::close(stdout_write);
-            }
-        }
-        return;
-    }
-
-    if pid == 0 {
-        // Child process - don't let File destructor close fd
-        std::mem::forget(vsock);
-
-        if request.tty {
-            unsafe {
-                // Create new session and set controlling terminal
-                libc::setsid();
-                libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
-
-                // Redirect stdin/stdout/stderr to PTY slave
-                libc::dup2(slave_fd, 0);
-                libc::dup2(slave_fd, 1);
-                libc::dup2(slave_fd, 2);
-
-                // Close fds we don't need
-                if slave_fd > 2 {
-                    libc::close(slave_fd);
-                }
-                libc::close(master_fd);
-            }
-        } else {
-            unsafe {
-                // Redirect stdin/stdout/stderr to pipes
-                libc::dup2(stdin_read, 0);
-                libc::dup2(stdout_write, 1);
-                libc::dup2(stdout_write, 2); // stderr also to stdout pipe
-
-                // Close unused pipe ends
-                libc::close(stdin_read);
-                libc::close(stdin_write);
-                libc::close(stdout_read);
-                libc::close(stdout_write);
-            }
-        }
-
-        unsafe { libc::close(fd) };
-
-        // Build and exec command
-        if request.in_container {
-            let mut args: Vec<std::ffi::CString> = vec![
-                std::ffi::CString::new("podman").unwrap(),
-                std::ffi::CString::new("exec").unwrap(),
-            ];
-            // Pass -i and -t separately, matching podman's semantics
-            if request.interactive {
-                args.push(std::ffi::CString::new("-i").unwrap());
-            }
-            if request.tty {
-                args.push(std::ffi::CString::new("-t").unwrap());
-            }
-            args.push(std::ffi::CString::new("--latest").unwrap());
-            for arg in &request.command {
-                args.push(std::ffi::CString::new(arg.as_str()).unwrap());
-            }
-            let arg_ptrs: Vec<*const libc::c_char> = args
-                .iter()
-                .map(|s| s.as_ptr())
-                .chain(std::iter::once(std::ptr::null()))
-                .collect();
-            unsafe {
-                libc::execvp(args[0].as_ptr(), arg_ptrs.as_ptr());
-            }
-        } else {
-            let prog = std::ffi::CString::new(request.command[0].as_str()).unwrap();
-            let args: Vec<std::ffi::CString> = request
-                .command
-                .iter()
-                .map(|s| std::ffi::CString::new(s.as_str()).unwrap())
-                .collect();
-            let arg_ptrs: Vec<*const libc::c_char> = args
-                .iter()
-                .map(|s| s.as_ptr())
-                .chain(std::iter::once(std::ptr::null()))
-                .collect();
-            unsafe {
-                libc::execvp(prog.as_ptr(), arg_ptrs.as_ptr());
-            }
-        }
-
-        unsafe { libc::_exit(127) };
-    }
-
-    // Parent process - close child ends of pipes/pty
-    if request.tty {
-        unsafe { libc::close(slave_fd) };
-    } else {
-        unsafe {
-            libc::close(stdin_read);
-            libc::close(stdout_write);
-        }
-    }
-
-    // Wrap master fd or stdout pipe in File for reading output
-    let output_reader = if request.tty {
-        unsafe { std::fs::File::from_raw_fd(master_fd) }
-    } else {
-        unsafe { std::fs::File::from_raw_fd(stdout_read) }
-    };
-
-    // For non-TTY, wrap stdin pipe for writing
-    let stdin_writer = if !request.tty {
-        Some(unsafe { std::fs::File::from_raw_fd(stdin_write) })
-    } else {
-        None
-    };
-
-    // Use output_reader as the "pty_master" equivalent
-    let pty_master = output_reader;
-
-    // Only forward stdin if interactive mode is enabled
-    let writer_thread = if request.interactive {
-        let vsock_for_writer = vsock.try_clone().expect("clone vsock");
-        // For TTY mode, write to PTY; for non-TTY, write to stdin pipe
-        let stdin_target: std::fs::File = if request.tty {
-            pty_master.try_clone().expect("clone pty")
-        } else {
-            stdin_writer.expect("stdin_writer should exist for interactive non-TTY")
-        };
-
-        // Thread: read STDIN messages from vsock, write to PTY/stdin pipe
-        Some(std::thread::spawn(move || {
-            use std::io::Write;
-            let mut vsock = vsock_for_writer;
-            let mut target = stdin_target;
-
-            loop {
-                match exec_proto::Message::read_from(&mut vsock) {
-                    Ok(exec_proto::Message::Stdin(data)) => {
-                        if target.write_all(&data).is_err() {
-                            break;
-                        }
-                        if target.flush().is_err() {
-                            break;
-                        }
-                    }
-                    Ok(exec_proto::Message::Exit(_)) | Ok(exec_proto::Message::Error(_)) => break,
-                    Ok(_) => {} // Ignore unexpected message types
-                    Err(_) => break,
-                }
-            }
-            // Drop target to close stdin pipe, signaling EOF to child
-            drop(target);
-        }))
-    } else {
-        // Drop stdin_writer if not interactive (closes pipe)
-        drop(stdin_writer);
-        None
-    };
-
-    // Thread: read from PTY, write DATA messages to vsock
-    let reader_thread = std::thread::spawn(move || {
-        let mut vsock = vsock;
-        let mut pty = pty_master;
-        let mut buf = [0u8; 4096];
-
-        loop {
-            match pty.read(&mut buf) {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    if exec_proto::write_data(&mut vsock, &buf[..n]).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-
-        // Return vsock for exit message
-        vsock
-    });
-
-    // Wait for child to exit
-    let mut status: libc::c_int = 0;
-    unsafe {
-        libc::waitpid(pid, &mut status, 0);
-    }
-
-    let exit_code = if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else {
-        1
-    };
-
-    // Wait for reader (it will get EOF when PTY closes)
-    let mut vsock = reader_thread.join().expect("reader thread");
-
-    // Writer may be blocked on read - abort it by dropping
-    drop(writer_thread);
-
-    // Send exit code
-    let _ = exec_proto::write_exit(&mut vsock, exit_code);
 }
 
 /// Handle exec in pipe mode (non-TTY)
@@ -2092,68 +1846,118 @@ async fn run_agent() -> Result<()> {
 
     eprintln!("[fc-agent] launching container: {}", image_ref);
 
-    // Build Podman command
-    let mut cmd = Command::new("podman");
-    cmd.arg("run")
-        .arg("--rm")
-        .arg("--network=host")
-        // Raise ulimit for containers running parallel tests
-        .arg("--ulimit")
-        .arg("nofile=65536:65536");
+    // Build Podman args (used for both TTY and non-TTY modes)
+    let mut podman_args = vec![
+        "podman".to_string(),
+        "run".to_string(),
+        "--rm".to_string(),
+        "--network=host".to_string(),
+        "--ulimit".to_string(),
+        "nofile=65536:65536".to_string(),
+    ];
 
     // Privileged mode: allows mknod, device access, etc. for POSIX compliance tests
     if plan.privileged {
         eprintln!("[fc-agent] privileged mode enabled");
-        cmd.arg("--device-cgroup-rule=b *:* rwm") // Allow block device nodes
-            .arg("--device-cgroup-rule=c *:* rwm") // Allow char device nodes
-            .arg("--privileged");
+        podman_args.push("--device-cgroup-rule=b *:* rwm".to_string());
+        podman_args.push("--device-cgroup-rule=c *:* rwm".to_string());
+        podman_args.push("--privileged".to_string());
+    }
+
+    // Interactive/TTY modes
+    if plan.interactive {
+        podman_args.push("-i".to_string());
+    }
+    if plan.tty {
+        podman_args.push("-t".to_string());
     }
 
     // Add environment variables
     for (key, val) in &plan.env {
-        cmd.arg("-e").arg(format!("{}={}", key, val));
+        podman_args.push("-e".to_string());
+        podman_args.push(format!("{}={}", key, val));
     }
 
     // Add FUSE-mounted volumes as bind mounts to container
-    // The FUSE mount is already at guest_path, so we bind it to same path in container
     for vol in &plan.volumes {
         let mount_spec = if vol.read_only {
             format!("{}:{}:ro", vol.guest_path, vol.guest_path)
         } else {
             format!("{}:{}", vol.guest_path, vol.guest_path)
         };
-        cmd.arg("-v").arg(mount_spec);
+        podman_args.push("-v".to_string());
+        podman_args.push(mount_spec);
     }
 
     // Add extra disk mounts as bind mounts to container
-    // Disks are already mounted at mount_path, so we bind to same path in container
     for disk in &plan.extra_disks {
         let mount_spec = if disk.read_only {
             format!("{}:{}:ro", disk.mount_path, disk.mount_path)
         } else {
             format!("{}:{}", disk.mount_path, disk.mount_path)
         };
-        cmd.arg("-v").arg(mount_spec);
+        podman_args.push("-v".to_string());
+        podman_args.push(mount_spec);
     }
 
     // Add NFS mounts as bind mounts to container
-    // NFS shares are already mounted at mount_path, so we bind to same path in container
     for share in &plan.nfs_mounts {
         let mount_spec = if share.read_only {
             format!("{}:{}:ro", share.mount_path, share.mount_path)
         } else {
             format!("{}:{}", share.mount_path, share.mount_path)
         };
-        cmd.arg("-v").arg(mount_spec);
+        podman_args.push("-v".to_string());
+        podman_args.push(mount_spec);
     }
 
     // Image (either oci-archive:/path or image name from registry)
-    cmd.arg(&image_ref);
+    podman_args.push(image_ref.clone());
 
     // Command override
     if let Some(cmd_args) = &plan.cmd {
-        cmd.args(cmd_args);
+        podman_args.extend(cmd_args.iter().cloned());
     }
+
+    // TTY mode: use PTY and binary protocol (blocking, not async)
+    if plan.tty {
+        eprintln!("[fc-agent] TTY mode enabled, using PTY");
+
+        // Notify host that container is starting
+        notify_container_started();
+
+        // Run container with TTY (blocks until container exits)
+        let exit_code = tty::run_with_pty(&podman_args, plan.tty, plan.interactive);
+
+        // Notify host of container exit
+        notify_container_exit(exit_code);
+
+        // Unmount FUSE volumes before shutdown
+        if !mounted_fuse_paths.is_empty() {
+            eprintln!(
+                "[fc-agent] unmounting {} FUSE volume(s) before shutdown",
+                mounted_fuse_paths.len()
+            );
+            for path in &mounted_fuse_paths {
+                eprintln!("[fc-agent] unmounting FUSE volume at {}", path);
+                let _ = std::process::Command::new("umount")
+                    .arg("-l")
+                    .arg(path)
+                    .output();
+            }
+        }
+
+        // Power off the VM
+        eprintln!("[fc-agent] powering off VM");
+        let _ = std::process::Command::new("poweroff").arg("-f").spawn();
+
+        // Exit with container's exit code
+        std::process::exit(exit_code);
+    }
+
+    // Non-TTY mode: use async I/O with line-based protocol
+    let mut cmd = Command::new(&podman_args[0]);
+    cmd.args(&podman_args[1..]);
 
     // Spawn container with piped stdin/stdout/stderr for bidirectional I/O
     cmd.stdin(Stdio::piped());

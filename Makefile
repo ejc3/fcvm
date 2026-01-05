@@ -28,6 +28,13 @@ else
 NEXTEST_IGNORED :=
 endif
 
+# Disable retries when FILTER is set (debugging specific tests)
+ifdef FILTER
+NEXTEST_RETRIES :=
+else
+NEXTEST_RETRIES := --retries 2
+endif
+
 # Default log level: fcvm debug, suppress FUSE spam
 # Override with: RUST_LOG=debug make test-root
 TEST_LOG ?= fcvm=debug,health-monitor=info,fuser=warn,fuse_backend_rs=warn,passthrough=warn
@@ -199,7 +206,7 @@ _test-root:
 	FCVM_DATA_DIR=$(ROOT_DATA_DIR) \
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
-	$(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_IGNORED) --retries 2 --features privileged-tests $(FILTER)
+	$(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_IGNORED) $(NEXTEST_RETRIES) --features privileged-tests $(FILTER)
 
 # Host targets (with setup, check-disk first to fail fast if disk is full)
 test-unit: show-notes check-disk build _test-unit
