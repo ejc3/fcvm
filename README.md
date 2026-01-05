@@ -138,6 +138,8 @@ The `--setup` flag triggers setup if kernel/rootfs are missing. Only works with 
 fcvm podman run --name web1 public.ecr.aws/nginx/nginx:alpine
 
 # With port forwarding (8080 on host -> 80 in guest)
+# Note: In rootless mode, use the assigned loopback IP (e.g., curl 127.0.0.2:8080)
+# In bridged mode, use the veth host IP (see fcvm ls --json for the IP)
 fcvm podman run --name web1 --publish 8080:80 public.ecr.aws/nginx/nginx:alpine
 
 # With host directory mapping (via fuse-pipe)
@@ -182,8 +184,8 @@ sudo fcvm snapshot run --pid <serve_pid> --name clone2 --network bridged
 # 5. Clone with port forwarding (each clone can have unique ports)
 sudo fcvm snapshot run --pid <serve_pid> --name web1 --network bridged --publish 8081:80
 sudo fcvm snapshot run --pid <serve_pid> --name web2 --network bridged --publish 8082:80
-curl localhost:8081  # Reaches clone web1
-curl localhost:8082  # Reaches clone web2
+# Get the host IP from fcvm ls --json, then curl it:
+#   curl $(sudo fcvm ls --json | jq -r '.[] | select(.name=="web1") | .config.network.host_ip'):8081
 
 # 6. Clone and execute command (auto-cleans up after)
 sudo fcvm snapshot run --pid <serve_pid> --network bridged --exec "curl localhost"
@@ -284,7 +286,7 @@ sudo fcvm podman run --name multi-port \
 
 # Multiple volume mappings (comma-separated, with read-only)
 sudo fcvm podman run --name multi-vol \
-  --map /tmp/logs:/var/log,/tmp/data:/data:ro \
+  --map /tmp/logs:/logs,/tmp/data:/data:ro \
   public.ecr.aws/nginx/nginx:alpine
 
 # Combined
