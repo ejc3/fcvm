@@ -51,7 +51,7 @@ fn get_storage_paths(config_path: Option<&str>) -> Result<(PathBuf, PathBuf)> {
     let (config, _, _) = load_config(config_path)?;
     let mount_point = PathBuf::from(&config.paths.assets_dir);
     // Loopback image is a sibling of mount point (e.g., /mnt/fcvm-btrfs -> /mnt/fcvm-btrfs.img)
-    let loopback_image = mount_point.with_extension("img");
+    let loopback_image = PathBuf::from(format!("{}.img", mount_point.display()));
     Ok((mount_point, loopback_image))
 }
 
