@@ -54,8 +54,12 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         return Ok(());
     }
 
+    // Ensure btrfs storage is ready (creates loopback if needed)
+    // This must be done before accessing any paths under the configured assets_dir
+    crate::setup::ensure_storage(args.config.as_deref()).context("initializing storage")?;
+
     // Load config and initialize paths (with helpful error if config missing)
-    let (config, _, _) = load_config(None)?;
+    let (config, _, _) = load_config(args.config.as_deref())?;
     paths::init_with_paths(&config.paths.data_dir, &config.paths.assets_dir);
 
     println!("Setting up fcvm (this may take 5-10 minutes on first run)...");

@@ -36,8 +36,8 @@ async fn main() -> Result<()> {
     // Initialize paths - some commands don't need config
     match &cli.cmd {
         Commands::Setup(_) => {
-            // Setup handles its own config loading with proper error messages
-            paths::init_with_defaults();
+            // Setup handles its own path initialization after loading config
+            // Don't pre-initialize here since setup may create storage first
         }
         Commands::Completions(_) => {
             // Shell completions don't need config
