@@ -264,9 +264,12 @@ setup-btrfs:
 	fi
 	@# Ensure image-cache exists with correct permissions (may be missing on older setups)
 	@sudo mkdir -p /mnt/fcvm-btrfs/image-cache && sudo chown $$(id -un):$$(id -gn) /mnt/fcvm-btrfs/image-cache
-	@# Create per-mode data directories (owned by root for root tests, by user for rootless)
+	@# Create per-mode data directories
+	@# ROOT_DATA_DIR: owned by root (tests run with sudo)
+	@# CONTAINER_DATA_DIR: owned by user (podman rootless maps to subordinate UIDs)
 	@sudo mkdir -p $(ROOT_DATA_DIR)/{state,snapshots,vm-disks}
 	@sudo mkdir -p $(CONTAINER_DATA_DIR)/{state,snapshots,vm-disks}
+	@sudo chown -R $$(id -un):$$(id -gn) $(CONTAINER_DATA_DIR)
 
 setup-fcvm: build setup-btrfs
 	@FREE_GB=$$(df -BG /mnt/fcvm-btrfs 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \

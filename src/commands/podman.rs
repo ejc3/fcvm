@@ -655,7 +655,6 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .await
         .context("creating VM data directory")?;
 
-
     let socket_path = data_dir.join("firecracker.sock");
 
     // Create VM state
@@ -930,7 +929,6 @@ async fn run_vm_setup(
         .create_cow_disk()
         .await
         .context("creating CoW disk")?;
-
 
     info!(rootfs = %rootfs_path.display(), "disk prepared (fc-agent baked into Layer 2)");
 
