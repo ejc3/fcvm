@@ -100,7 +100,8 @@ jobs:
             '[.[] | select(.author.type != "Bot" and .author.login != null) | .author.login] | unique | .[]' | while read -r LOGIN; do
             if [ -n "$LOGIN" ]; then
               ASSOC=$(gh api repos/${{ github.repository }}/collaborators/$LOGIN/permission --jq '.permission' 2>/dev/null || echo "none")
-              if [ "$ASSOC" != "admin" ] && [ "$ASSOC" != "write" ] && [ "$ASSOC" != "maintain" ]; then
+              # Block if not a collaborator (permission = none)
+              if [ "$ASSOC" = "none" ]; then
                 echo "$LOGIN"
               fi
             fi
