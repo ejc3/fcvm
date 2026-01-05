@@ -951,6 +951,25 @@ PRs are automatically reviewed by Claude. Reviews are blocking if critical issue
 
 Reviews check for security issues, bugs, and breaking changes. Issues prefixed with `BLOCKING:` will fail the status check.
 
+### Auto-Fix CI Failures
+
+When CI fails, Claude automatically attempts to diagnose and fix the issue.
+
+| Scenario | Behavior |
+|----------|----------|
+| **PR from org member** | Creates fix PR on top of the failing branch |
+| **Main branch failure** | Creates fix PR targeting main |
+| **External contributor PR** | Skipped (no auto-fix) |
+
+The auto-fix workflow:
+1. Downloads failed job logs
+2. Runs Claude Code to diagnose and fix
+3. Creates a stacked fix PR
+4. Monitors CI on the fix PR (30 min timeout)
+5. Updates the original PR with status and links
+
+Fix branches use the naming convention `claude/fix-{runId}` and are excluded from auto-fix to prevent infinite loops.
+
 ---
 
 ## License
