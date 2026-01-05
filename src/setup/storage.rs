@@ -50,9 +50,36 @@ fn is_btrfs_mount(path: &Path) -> bool {
 fn get_storage_paths(config_path: Option<&str>) -> Result<(PathBuf, PathBuf)> {
     let (config, _, _) = load_config(config_path)?;
     let mount_point = PathBuf::from(&config.paths.assets_dir);
+
+    // Canonicalize the mount point to resolve .., ., and symlinks
+    // If it doesn't exist yet, canonicalize as much as possible
+    let canonical_mount = if mount_point.exists() {
+        mount_point.canonicalize()
+            .context("canonicalizing mount point path")?
+    } else {
+        // For non-existent paths, try to canonicalize the parent
+        if let Some(parent) = mount_point.parent() {
+            let canonical_parent = if parent.exists() {
+                parent.canonicalize()
+                    .context("canonicalizing mount point parent")?
+            } else {
+                parent.to_path_buf()
+            };
+            canonical_parent.join(mount_point.file_name().unwrap_or_default())
+        } else {
+            mount_point.clone()
+        }
+    };
+
     // Loopback image is a sibling of mount point (e.g., /mnt/fcvm-btrfs -> /mnt/fcvm-btrfs.img)
-    let loopback_image = PathBuf::from(format!("{}.img", mount_point.display()));
-    Ok((mount_point, loopback_image))
+    // Use the canonical path and proper PathBuf API to construct the loopback path
+    let mut loopback_image = canonical_mount.clone();
+    let current_name = loopback_image.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("fcvm-btrfs");
+    loopback_image.set_file_name(format!("{}.img", current_name));
+
+    Ok((canonical_mount, loopback_image))
 }
 
 /// Ensure btrfs storage is set up at the configured assets_dir.
@@ -70,7 +97,12 @@ pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
         for dir in REQUIRED_DIRS {
             let path = mount_point.join(dir);
             std::fs::create_dir_all(&path)
-                .with_context(|| format!("creating directory {}", path.display()))?;
+                .with_context(|| {
+                    format!(
+                        "creating directory {} (if mount was unmounted, run 'sudo fcvm setup' again)",
+                        path.display()
+                    )
+                })?;
         }
         return Ok(());
     }
@@ -178,8 +210,8 @@ pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
     // Set ownership to the user who invoked sudo (if SUDO_USER is set)
     if let Ok(sudo_user) = std::env::var("SUDO_USER") {
         info!("Setting ownership to {}", sudo_user);
+        // Chown the mount point itself (non-recursive since we just created it)
         let status = Command::new("chown")
-            .arg("-R")
             .arg(format!("{}:{}", sudo_user, sudo_user))
             .arg(&mount_point)
             .status()
