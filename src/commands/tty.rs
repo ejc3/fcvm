@@ -7,14 +7,18 @@ use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use tracing::{debug, info, warn};
 
-/// Global storage for terminal restoration on signal
-/// Stores (stdin_fd, original_termios) when raw mode is active
-static ORIG_TERMIOS: Mutex<Option<(i32, libc::termios)>> = Mutex::new(None);
+/// Global storage for terminal restoration on signal (async-signal-safe)
+/// Using static mut with atomic flag instead of Mutex to be signal-safe.
+/// SAFETY: Only written while TERMIOS_SAVED is false, only read in signal handler
+/// after TERMIOS_SAVED is true. The main code path ensures proper synchronization.
+static mut ORIG_FD: i32 = -1;
+static mut ORIG_TERMIOS_STORAGE: libc::termios = unsafe { std::mem::zeroed() };
+static TERMIOS_SAVED: AtomicBool = AtomicBool::new(false);
 
 /// Global flag to track if signal handlers are installed
 static SIGNAL_HANDLERS_INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -25,28 +29,34 @@ fn install_signal_handlers() {
         return; // Already installed
     }
 
-    // Handler that restores terminal and re-raises the signal
-    extern "C" fn signal_handler(sig: libc::c_int) {
+    // Handler that restores terminal - must be async-signal-safe
+    // Only calls tcsetattr (async-signal-safe per POSIX)
+    extern "C" fn signal_handler(_sig: libc::c_int) {
         // Restore terminal if we have saved state
-        if let Ok(guard) = ORIG_TERMIOS.lock() {
-            if let Some((fd, termios)) = *guard {
-                unsafe {
-                    libc::tcsetattr(fd, libc::TCSANOW, &termios);
-                }
+        // Using Relaxed is fine - we just need to see a consistent value
+        if TERMIOS_SAVED.load(Ordering::Relaxed) {
+            unsafe {
+                // Use raw pointer to avoid creating a reference to mutable static
+                libc::tcsetattr(
+                    ORIG_FD,
+                    libc::TCSANOW,
+                    std::ptr::addr_of!(ORIG_TERMIOS_STORAGE),
+                );
             }
         }
-        // Re-raise the signal with default handler
-        unsafe {
-            libc::signal(sig, libc::SIG_DFL);
-            libc::raise(sig);
-        }
+        // SA_RESETHAND auto-resets handler to SIG_DFL, so signal will terminate process
     }
 
     unsafe {
-        // Install handlers for common termination signals
-        libc::signal(libc::SIGTERM, signal_handler as libc::sighandler_t);
-        libc::signal(libc::SIGQUIT, signal_handler as libc::sighandler_t);
-        libc::signal(libc::SIGHUP, signal_handler as libc::sighandler_t);
+        // Use sigaction() instead of signal() for well-defined behavior
+        // SA_RESETHAND: auto-reset to SIG_DFL after first invocation (no need to re-raise)
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = signal_handler as usize;
+        sa.sa_flags = libc::SA_RESETHAND;
+
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGQUIT, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGHUP, &sa, std::ptr::null_mut());
         // Note: SIGINT (Ctrl+C) is passed through to guest in raw mode
     }
 }
@@ -176,10 +186,14 @@ fn setup_raw_terminal(stdin_fd: i32) -> Result<Option<libc::termios>> {
     }
     let orig = termios;
 
-    // Store in global for signal handler access
-    if let Ok(mut guard) = ORIG_TERMIOS.lock() {
-        *guard = Some((stdin_fd, orig));
+    // Store in global for signal handler access (async-signal-safe approach)
+    // SAFETY: We only write while TERMIOS_SAVED is false, ensuring no concurrent read
+    unsafe {
+        ORIG_FD = stdin_fd;
+        ORIG_TERMIOS_STORAGE = orig;
     }
+    // Memory barrier: ensure writes above are visible before setting flag
+    TERMIOS_SAVED.store(true, Ordering::Release);
 
     // Set raw mode
     unsafe {
@@ -187,9 +201,7 @@ fn setup_raw_terminal(stdin_fd: i32) -> Result<Option<libc::termios>> {
     }
     if unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &termios) } != 0 {
         // Clear global on failure
-        if let Ok(mut guard) = ORIG_TERMIOS.lock() {
-            *guard = None;
-        }
+        TERMIOS_SAVED.store(false, Ordering::Release);
         bail!("Failed to set raw terminal mode");
     }
 
@@ -199,9 +211,7 @@ fn setup_raw_terminal(stdin_fd: i32) -> Result<Option<libc::termios>> {
 /// Restore terminal to original settings
 fn restore_terminal(stdin_fd: i32, termios: libc::termios) {
     // Clear global first (signal handler won't need to restore anymore)
-    if let Ok(mut guard) = ORIG_TERMIOS.lock() {
-        *guard = None;
-    }
+    TERMIOS_SAVED.store(false, Ordering::Release);
 
     let ret = unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &termios) };
     if ret != 0 {
@@ -263,7 +273,8 @@ fn reader_loop(mut stream: std::os::unix::net::UnixStream, done: Arc<AtomicBool>
             }
         }
     }
-    // Should not reach here normally - return error if we do
+    // Reached when done flag set externally (e.g., writer thread error) without Exit message
+    debug!("reader_loop: exiting due to done flag without Exit message");
     Some(1)
 }
 
