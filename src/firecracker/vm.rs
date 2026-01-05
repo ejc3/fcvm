@@ -77,10 +77,12 @@ impl VmManager {
     /// Set namespace holder PID for rootless networking
     ///
     /// When set, Firecracker will be launched inside an existing user+net namespace
-    /// via nsenter. The holder process (created by `unshare --user --map-auto --net -- cat`)
+    /// via nsenter. The holder process (created by `unshare --user --map-root-user --net -- cat`)
     /// keeps the namespace alive while Firecracker runs.
     ///
-    /// This approach is fully rootless - no sudo required!
+    /// With `--map-root-user`, the current user (UID 1000) is mapped to UID 0 inside the
+    /// namespace. Combined with `--preserve-credentials` when using nsenter, no chmod
+    /// is needed on sockets or files - the user has access both inside and outside.
     pub fn set_holder_pid(&mut self, pid: u32) {
         self.holder_pid = Some(pid);
     }
@@ -399,24 +401,6 @@ impl VmManager {
 
         // Wait for socket to be ready
         self.wait_for_socket().await?;
-
-        // In rootless mode, the socket is created by Firecracker (UID 0 inside namespace = UID 100000+ outside)
-        // We need to chmod it so the host process (UID 1000) can connect
-        if let Some(holder_pid) = self.holder_pid {
-            info!(target: "vm", vm_id = %self.vm_id, "making API socket accessible from outside namespace");
-            let chmod_output = tokio::process::Command::new("nsenter")
-                .args(["-t", &holder_pid.to_string(), "-U", "-n", "--"])
-                .arg("chmod")
-                .arg("777")
-                .arg(&self.socket_path)
-                .output()
-                .await
-                .context("running chmod via nsenter")?;
-            if !chmod_output.status.success() {
-                let stderr = String::from_utf8_lossy(&chmod_output.stderr);
-                debug!(target: "vm", vm_id = %self.vm_id, stderr = %stderr, "chmod via nsenter failed (non-fatal)");
-            }
-        }
 
         // Create API client
         self.client = Some(FirecrackerClient::new(self.socket_path.clone())?);

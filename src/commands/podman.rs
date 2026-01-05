@@ -270,11 +270,6 @@ async fn run_status_listener(
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("binding status listener to {}", socket_path))?;
 
-    // Make socket accessible by Firecracker running in user namespace (UID 100000)
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o777))
-        .with_context(|| format!("chmod status socket {}", socket_path))?;
-
     info!(socket = %socket_path, "Status listener started");
 
     let ready_file = runtime_dir.join("container-ready");
@@ -350,11 +345,6 @@ async fn run_output_listener(socket_path: &str, vm_id: &str) -> Result<Vec<(Stri
 
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("binding output listener to {}", socket_path))?;
-
-    // Make socket accessible by Firecracker
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o777))
-        .with_context(|| format!("chmod output socket {}", socket_path))?;
 
     info!(socket = %socket_path, "Output listener started");
 
@@ -665,15 +655,6 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .await
         .context("creating VM data directory")?;
 
-    // For rootless mode, make directory world-writable so processes inside the user
-    // namespace can create sockets. User namespace UID 0 maps to subordinate UID
-    // (typically 100000+), which doesn't match the directory owner (UID 1000).
-    if matches!(args.network, NetworkMode::Rootless) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o777))
-            .context("setting directory permissions for rootless mode")?;
-    }
-
     let socket_path = data_dir.join("firecracker.sock");
 
     // Create VM state
@@ -948,16 +929,6 @@ async fn run_vm_setup(
         .create_cow_disk()
         .await
         .context("creating CoW disk")?;
-
-    // For rootless mode, make disk directory and file world-accessible
-    // Firecracker runs as UID 100000+ inside namespace, can't access UID 1000 files
-    if network.as_any().downcast_ref::<SlirpNetwork>().is_some() {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&vm_dir, std::fs::Permissions::from_mode(0o777))
-            .context("setting disk directory permissions for rootless mode")?;
-        std::fs::set_permissions(&rootfs_path, std::fs::Permissions::from_mode(0o666))
-            .context("setting disk file permissions for rootless mode")?;
-    }
 
     info!(rootfs = %rootfs_path.display(), "disk prepared (fc-agent baked into Layer 2)");
 

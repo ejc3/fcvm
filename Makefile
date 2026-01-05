@@ -49,7 +49,8 @@ MUSL_TARGET := x86_64-unknown-linux-musl
 endif
 
 # Base test command
-NEXTEST := CARGO_TARGET_DIR=target cargo nextest $(NEXTEST_CMD) --release
+export CARGO_TARGET_DIR := target
+NEXTEST := cargo nextest $(NEXTEST_CMD) --release
 
 # Optional cargo cache directory (for CI caching)
 CARGO_CACHE_DIR ?=
@@ -187,11 +188,11 @@ _test-unit:
 
 _test-fast:
 	RUST_LOG="$(TEST_LOG)" \
-	$(NEXTEST) $(NEXTEST_CAPTURE) --no-default-features --features integration-fast $(FILTER)
+	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) --no-default-features --features integration-fast $(FILTER)
 
 _test-all:
 	RUST_LOG="$(TEST_LOG)" \
-	$(NEXTEST) $(NEXTEST_CAPTURE) $(FILTER)
+	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) $(FILTER)
 
 _test-root:
 	RUST_LOG="$(TEST_LOG)" \
@@ -263,9 +264,12 @@ setup-btrfs:
 	fi
 	@# Ensure image-cache exists with correct permissions (may be missing on older setups)
 	@sudo mkdir -p /mnt/fcvm-btrfs/image-cache && sudo chown $$(id -un):$$(id -gn) /mnt/fcvm-btrfs/image-cache
-	@# Create per-mode data directories with world-writable permissions
-	@sudo mkdir -p $(ROOT_DATA_DIR)/{state,snapshots,vm-disks} && sudo chmod -R 777 $(ROOT_DATA_DIR)
-	@sudo mkdir -p $(CONTAINER_DATA_DIR)/{state,snapshots,vm-disks} && sudo chmod -R 777 $(CONTAINER_DATA_DIR)
+	@# Create per-mode data directories
+	@# ROOT_DATA_DIR: owned by root (tests run with sudo)
+	@# CONTAINER_DATA_DIR: owned by user (podman rootless maps to subordinate UIDs)
+	@sudo mkdir -p $(ROOT_DATA_DIR)/{state,snapshots,vm-disks}
+	@sudo mkdir -p $(CONTAINER_DATA_DIR)/{state,snapshots,vm-disks}
+	@sudo chown -R $$(id -un):$$(id -gn) $(CONTAINER_DATA_DIR)
 
 setup-fcvm: build setup-btrfs
 	@FREE_GB=$$(df -BG /mnt/fcvm-btrfs 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \

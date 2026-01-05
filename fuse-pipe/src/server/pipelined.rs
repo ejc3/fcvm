@@ -73,10 +73,6 @@ impl<H: FilesystemHandler + 'static> AsyncServer<H> {
 
         let listener = UnixListener::bind(socket_path)?;
 
-        // Make socket accessible by Firecracker running in user namespace (UID 100000)
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o777))?;
-
         // Signal ready BEFORE entering accept loop
         if let Some(tx) = ready {
             let _ = tx.send(());
