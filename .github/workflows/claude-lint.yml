@@ -1,0 +1,29 @@
+name: Lint Claude Assistant
+
+on:
+  push:
+    paths:
+      - 'scripts/claude-assistant/**'
+  pull_request:
+    paths:
+      - 'scripts/claude-assistant/**'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install dependencies
+        run: cd scripts/claude-assistant && pnpm install
+
+      - name: Type check
+        run: cd scripts/claude-assistant && pnpm run check 2>&1 | head -1
