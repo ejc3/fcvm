@@ -10,3 +10,4 @@ sync-test/
 *.local
 cargo-home/
 .local/
+scripts/claude-assistant/node_modules/

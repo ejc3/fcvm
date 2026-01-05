@@ -1,4 +1,4 @@
-name: Claude Code
+name: Claude Assistant
 
 on:
   pull_request:
@@ -7,44 +7,73 @@ on:
     types: [created]
   pull_request_review_comment:
     types: [created]
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+# Note: We use a GitHub App token instead of GITHUB_TOKEN so that:
+# 1. All actions appear as "Claude" bot
+# 2. PRs created by Claude can trigger CI workflows
+# Required: CLAUDE_APP_ID (variable), CLAUDE_APP_PRIVATE_KEY (secret)
 
 jobs:
-  # Auto-review PRs from org members (OWNER, MEMBER, COLLABORATOR)
+  # Review PRs from org members, auto-fix medium/critical issues
   review:
     if: |
       github.event_name == 'pull_request' &&
-      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      !startsWith(github.event.pull_request.head.ref, 'claude/fix-')
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
+    timeout-minutes: 45
+    concurrency:
+      group: claude-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     steps:
+      - name: Generate Claude token
+        id: claude-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.CLAUDE_APP_ID }}
+          private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
+
+      - name: Validate token
+        run: |
+          if [ -z "${{ steps.claude-token.outputs.token }}" ]; then
+            echo "Error: Failed to generate GitHub App token"
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ steps.claude-token.outputs.token }}
 
-      - uses: anthropics/claude-code-action@v1
-        id: review
+      - uses: actions/setup-node@v4
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          direct_prompt: |
-            Review this PR and post comments.
+          node-version: '20'
 
-            For critical issues (security, bugs, breaking changes), prefix with "BLOCKING:"
-            For suggestions and style issues, just comment normally.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
 
-            Always provide feedback, even if everything looks good.
+      - name: Install dependencies
+        run: cd scripts/claude-assistant && pnpm install
 
-      - name: Check for blocking issues
-        run: |
-          if echo "${{ steps.review.outputs.response }}" | grep -q "BLOCKING:"; then
-            echo "❌ Claude found blocking issues"
-            exit 1
-          else
-            echo "✅ No blocking issues found"
-          fi
+      - name: Run Claude review
+        env:
+          GH_TOKEN: ${{ steps.claude-token.outputs.token }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          MODE: review
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: cd scripts/claude-assistant && pnpm exec tsx index.ts
 
-  # Manual review via /claude-review comment (org members only)
+  # Manual review via /claude-review comment
   manual-review:
     if: |
       github.event_name == 'issue_comment' &&
@@ -52,37 +81,67 @@ jobs:
       contains(github.event.comment.body, '/claude-review') &&
       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
+    timeout-minutes: 45
+    concurrency:
+      group: claude-manual-${{ github.event.issue.number }}
+      cancel-in-progress: true
     steps:
+      - name: Generate Claude token
+        id: claude-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.CLAUDE_APP_ID }}
+          private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
+
+      - name: Validate token
+        run: |
+          if [ -z "${{ steps.claude-token.outputs.token }}" ]; then
+            echo "Error: Failed to generate GitHub App token"
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event.issue.pull_request.url && format('refs/pull/{0}/head', github.event.issue.number) }}
+          ref: refs/pull/${{ github.event.issue.number }}/head
+          token: ${{ steps.claude-token.outputs.token }}
 
-      - uses: anthropics/claude-code-action@v1
-        id: review
+      - uses: actions/setup-node@v4
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          direct_prompt: |
-            Review this PR and post comments.
+          node-version: '20'
 
-            For critical issues (security, bugs, breaking changes), prefix with "BLOCKING:"
-            For suggestions and style issues, just comment normally.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
 
-            Always provide feedback, even if everything looks good.
+      - name: Install dependencies
+        run: cd scripts/claude-assistant && pnpm install
 
-      - name: Check for blocking issues
+      - name: Get PR info
+        id: pr
         run: |
-          if echo "${{ steps.review.outputs.response }}" | grep -q "BLOCKING:"; then
-            echo "❌ Claude found blocking issues"
-            exit 1
-          else
-            echo "✅ No blocking issues found"
-          fi
+          PR_DATA=$(gh pr view ${{ github.event.issue.number }} --json headRefName,headRefOid,baseRefName)
+          echo "head_branch=$(echo $PR_DATA | jq -r .headRefName)" >> $GITHUB_OUTPUT
+          echo "head_sha=$(echo $PR_DATA | jq -r .headRefOid)" >> $GITHUB_OUTPUT
+          echo "base_branch=$(echo $PR_DATA | jq -r .baseRefName)" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ steps.claude-token.outputs.token }}
 
-  # Respond to @claude mentions in comments (org members only)
+      - name: Run Claude review
+        env:
+          GH_TOKEN: ${{ steps.claude-token.outputs.token }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          MODE: review
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          HEAD_BRANCH: ${{ steps.pr.outputs.head_branch }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          BASE_BRANCH: ${{ steps.pr.outputs.base_branch }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: cd scripts/claude-assistant && pnpm exec tsx index.ts
+
+  # Respond to @claude mentions
   respond:
     if: |
       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
@@ -90,15 +149,155 @@ jobs:
       ((github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')))
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: write
+    timeout-minutes: 15
+    concurrency:
+      group: claude-respond-${{ github.event.comment.id }}
+      cancel-in-progress: false
     steps:
+      - name: Generate Claude token
+        id: claude-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.CLAUDE_APP_ID }}
+          private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
+
+      - name: Validate token
+        run: |
+          if [ -z "${{ steps.claude-token.outputs.token }}" ]; then
+            echo "Error: Failed to generate GitHub App token"
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ steps.claude-token.outputs.token }}
 
-      - uses: anthropics/claude-code-action@v1
+      - uses: actions/setup-node@v4
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          node-version: '20'
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install dependencies
+        run: cd scripts/claude-assistant && pnpm install
+
+      - name: Get PR number
+        id: pr
+        run: |
+          if [ "${{ github.event.issue.pull_request }}" != "" ]; then
+            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          else
+            echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Claude respond
+        env:
+          GH_TOKEN: ${{ steps.claude-token.outputs.token }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          MODE: respond
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_BRANCH: ${{ github.head_ref }}
+          HEAD_SHA: ${{ github.sha }}
+          BASE_BRANCH: ${{ github.base_ref }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: cd scripts/claude-assistant && pnpm exec tsx index.ts
+
+  # Auto-fix CI failures
+  ci-fix:
+    if: |
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      !startsWith(github.event.workflow_run.head_branch, 'claude/fix-') &&
+      github.event.workflow_run.name != 'Claude Assistant'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: claude-cifix-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: true
+    steps:
+      - name: Generate Claude token
+        id: claude-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.CLAUDE_APP_ID }}
+          private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
+
+      - name: Validate token
+        run: |
+          if [ -z "${{ steps.claude-token.outputs.token }}" ]; then
+            echo "Error: Failed to generate GitHub App token"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          token: ${{ steps.claude-token.outputs.token }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install dependencies
+        run: cd scripts/claude-assistant && pnpm install
+
+      - name: Get PR number
+        id: pr
+        run: |
+          PR_NUM=$(gh pr list --repo ${{ github.repository }} --head ${{ github.event.workflow_run.head_branch }} --json number --jq '.[0].number')
+          echo "number=${PR_NUM:-0}" >> $GITHUB_OUTPUT
+
+          if [ -n "$PR_NUM" ]; then
+            ASSOC=$(gh api repos/${{ github.repository }}/pulls/$PR_NUM --jq '.author_association')
+            echo "association=$ASSOC" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ steps.claude-token.outputs.token }}
+
+      - name: Check if should run
+        id: check
+        run: |
+          BRANCH="${{ github.event.workflow_run.head_branch }}"
+          ASSOC="${{ steps.pr.outputs.association }}"
+
+          # Always run for main/master
+          if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # For PRs, only run for org members
+          if [ "$ASSOC" = "OWNER" ] || [ "$ASSOC" = "MEMBER" ] || [ "$ASSOC" = "COLLABORATOR" ]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_run=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Claude CI fix
+        if: steps.check.outputs.should_run == 'true'
+        env:
+          GH_TOKEN: ${{ steps.claude-token.outputs.token }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          MODE: ci-fix
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          BASE_BRANCH: main
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FAILED_RUN_ID: ${{ github.event.workflow_run.id }}
+          FAILED_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+        run: cd scripts/claude-assistant && pnpm exec tsx index.ts
