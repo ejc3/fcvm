@@ -102,36 +102,28 @@ sudo iptables -P FORWARD ACCEPT
 
 ## Quick Start
 
-### Build
 ```bash
-# Build host CLI and guest agent
-cargo build --release --workspace
+git clone https://github.com/ejc3/fcvm
+cd fcvm
+make build
+
+# Create a short repo-local entrypoint
+ln -sf target/release/fcvm ./fcvm
+
+# First-time setup (downloads kernel + builds rootfs, ~5 min)
+# Use sudo if fcvm needs to create/mount /mnt/fcvm-btrfs
+sudo ./fcvm setup
+
+# Rootless (default network, no sudo)
+./fcvm podman run --name test-rootless nginx:alpine
+./fcvm exec test-rootless -- cat /etc/os-release
+
+# One-shot command (runs command then exits)
+./fcvm podman run --name oneshot alpine:latest -- echo "Hello from microVM"
+
+# Bridged networking (requires sudo)
+sudo ./fcvm podman run --name test-bridged --network bridged nginx:alpine
 ```
-
-### Setup (First Time)
-```bash
-# Create btrfs filesystem
-make setup-btrfs
-
-# Download kernel and create rootfs (takes 5-10 minutes first time)
-fcvm setup
-```
-
-**What `fcvm setup` does:**
-1. Downloads Kata kernel (~15MB, cached by URL hash)
-2. Downloads packages via `podman run ubuntu:noble` (ensures correct Ubuntu 24.04 versions)
-3. Creates Layer 2 rootfs (~10GB): boots VM, installs packages, writes config files
-4. Verifies setup completed successfully (checks marker file)
-5. Creates fc-agent initrd
-
-Subsequent runs are instant - everything is cached by content hash.
-
-**Alternative: Auto-setup on first run (rootless only)**
-```bash
-# Skip explicit setup - does it automatically on first run
-fcvm podman run --name web1 --network rootless --setup nginx:alpine
-```
-The `--setup` flag triggers setup if kernel/rootfs are missing. Only works with `--network rootless` to avoid file ownership issues when running as root.
 
 ### Run a Container
 ```bash
