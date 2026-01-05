@@ -17,11 +17,12 @@
 
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { spawnSync } from "child_process";
-import { mkdirSync, writeFileSync } from "fs";
-import { join } from "path";
+import { mkdirSync, writeFileSync, existsSync } from "fs";
+import { join, resolve } from "path";
+import { tmpdir } from "os";
 
 const MAX_LOG_SIZE = 100_000;
-const LOGS_DIR = "/tmp/ci-logs";
+const MAX_TURNS = 50;
 
 type Mode = "review" | "ci-fix" | "respond";
 
@@ -35,6 +36,7 @@ interface Context {
   runId: string;
   runUrl: string;
   fixBranch: string;
+  logsDir: string;
   failedRunId?: string;
   failedRunUrl?: string;
   workflowName?: string;
@@ -45,30 +47,74 @@ function log(msg: string): void {
   console.log(`[driver] ${msg}`);
 }
 
-function run(cmd: string, args: string[]): { stdout: string; ok: boolean } {
+function logError(msg: string): void {
+  console.error(`[driver] ERROR: ${msg}`);
+}
+
+function run(cmd: string, args: string[]): { stdout: string; stderr: string; ok: boolean } {
   log(`$ ${cmd} ${args.join(" ")}`);
   const result = spawnSync(cmd, args, { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
-  return { stdout: result.stdout?.trim() ?? "", ok: result.status === 0 };
+  if (result.status !== 0 && result.stderr) {
+    logError(`Command failed: ${result.stderr.trim()}`);
+  }
+  return {
+    stdout: result.stdout?.trim() ?? "",
+    stderr: result.stderr?.trim() ?? "",
+    ok: result.status === 0,
+  };
 }
 
 function git(...args: string[]): boolean {
-  return run("git", args).ok;
+  const result = run("git", args);
+  return result.ok;
+}
+
+function gitOrFail(...args: string[]): void {
+  const result = run("git", args);
+  if (!result.ok) {
+    throw new Error(`git ${args[0]} failed: ${result.stderr}`);
+  }
 }
 
 function gh(...args: string[]): { stdout: string; ok: boolean } {
-  return run("gh", args);
+  const result = run("gh", args);
+  return { stdout: result.stdout, ok: result.ok };
+}
+
+function branchExists(branchName: string): boolean {
+  const result = run("git", ["rev-parse", "--verify", branchName]);
+  return result.ok;
 }
 
 function setupFixBranch(ctx: Context): void {
-  log(`Creating fix branch: ${ctx.fixBranch}`);
-  git("config", "user.name", "claude[bot]");
-  git("config", "user.email", "claude[bot]@users.noreply.github.com");
-  git("checkout", "-b", ctx.fixBranch);
+  log(`Setting up fix branch: ${ctx.fixBranch}`);
+
+  // Configure git user (only if not already set)
+  const nameResult = run("git", ["config", "user.name"]);
+  if (!nameResult.ok || !nameResult.stdout) {
+    gitOrFail("config", "user.name", "claude[bot]");
+  }
+
+  const emailResult = run("git", ["config", "user.email"]);
+  if (!emailResult.ok || !emailResult.stdout) {
+    gitOrFail("config", "user.email", "claude[bot]@users.noreply.github.com");
+  }
+
+  // Check if branch already exists
+  if (branchExists(ctx.fixBranch)) {
+    log(`Branch ${ctx.fixBranch} already exists, checking out`);
+    gitOrFail("checkout", ctx.fixBranch);
+  } else {
+    log(`Creating new branch ${ctx.fixBranch}`);
+    gitOrFail("checkout", "-b", ctx.fixBranch);
+  }
 }
 
-function downloadLogs(ctx: Context): string {
-  mkdirSync(LOGS_DIR, { recursive: true });
-  if (!ctx.failedRunId) return LOGS_DIR;
+function downloadLogs(ctx: Context): void {
+  mkdirSync(ctx.logsDir, { recursive: true });
+  if (!ctx.failedRunId) return;
+
+  log(`Downloading logs to ${ctx.logsDir}`);
 
   const result = gh(
     "api", `repos/${ctx.repository}/actions/runs/${ctx.failedRunId}/jobs`,
@@ -85,7 +131,7 @@ function downloadLogs(ctx: Context): string {
         if (logResult.ok) {
           let content = logResult.stdout;
           if (content.length > MAX_LOG_SIZE) content = content.slice(0, MAX_LOG_SIZE) + "\n...truncated";
-          writeFileSync(join(LOGS_DIR, `job-${job.id}.log`), content);
+          writeFileSync(join(ctx.logsDir, `job-${job.id}.log`), content);
         }
       } catch { continue; }
     }
@@ -95,11 +141,10 @@ function downloadLogs(ctx: Context): string {
   if (summary.ok) {
     let content = summary.stdout;
     if (content.length > MAX_LOG_SIZE) content = content.slice(0, MAX_LOG_SIZE) + "\n...truncated";
-    writeFileSync(join(LOGS_DIR, "run-summary.log"), content);
+    writeFileSync(join(ctx.logsDir, "run-summary.log"), content);
   }
 
-  log(`Logs saved to ${LOGS_DIR}`);
-  return LOGS_DIR;
+  log(`Logs saved to ${ctx.logsDir}`);
 }
 
 function reviewPrompt(ctx: Context): string {
@@ -227,7 +272,7 @@ Please review and merge the fix PR first, then this PR.
 **BEGIN**: Run the diff command.`;
 }
 
-function ciFixPrompt(ctx: Context, logsDir: string): string {
+function ciFixPrompt(ctx: Context): string {
   return `# Claude CI Fix Task
 
 ## CONTEXT - READ CAREFULLY
@@ -255,12 +300,12 @@ Your current branch is \`${ctx.fixBranch}\`, branched from \`${ctx.headBranch}\`
 
 ## STEP 1: READ LOGS
 
-Logs are in \`${logsDir}/\`:
+Logs are in \`${ctx.logsDir}/\`:
 - \`run-summary.log\` - Failed run overview
 - \`job-*.log\` - Individual failed job logs
 
 \`\`\`bash
-cat ${logsDir}/run-summary.log
+cat ${ctx.logsDir}/run-summary.log
 \`\`\`
 
 Then read specific job logs as needed.
@@ -435,12 +480,13 @@ gh pr comment ${ctx.prNumber} --repo ${ctx.repository} --body "Done! Created PR:
 }
 
 async function runClaude(prompt: string): Promise<void> {
+  log(`Starting Claude Code with maxTurns=${MAX_TURNS}`);
   for await (const message of query({
     prompt,
     options: {
       allowedTools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
       permissionMode: "acceptEdits",
-      maxTurns: 30,
+      maxTurns: MAX_TURNS,
     },
   })) {
     if (message.type === "assistant" && "message" in message && message.message?.content) {
@@ -454,29 +500,77 @@ async function runClaude(prompt: string): Promise<void> {
   }
 }
 
-async function main(): Promise<void> {
+function validateEnvironment(): void {
   if (!process.env.ANTHROPIC_API_KEY && !process.env.CLAUDE_CODE_OAUTH_TOKEN) {
-    console.error("ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN is required");
+    throw new Error("ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN is required");
+  }
+  if (!process.env.GITHUB_REPOSITORY) {
+    throw new Error("GITHUB_REPOSITORY is required");
+  }
+  if (!process.env.HEAD_BRANCH) {
+    throw new Error("HEAD_BRANCH is required");
+  }
+  if (!process.env.RUN_ID) {
+    throw new Error("RUN_ID is required");
+  }
+}
+
+function validatePrNumber(prNumber: number, mode: Mode): void {
+  if (mode === "review" || mode === "respond") {
+    if (!prNumber || prNumber <= 0 || !Number.isInteger(prNumber)) {
+      throw new Error(`Invalid PR number: ${prNumber}. Expected positive integer.`);
+    }
+  }
+  // ci-fix mode allows prNumber=0 for main branch failures
+}
+
+function sanitizeCommentBody(body: string | undefined): string | undefined {
+  if (!body) return undefined;
+  // Limit size to prevent prompt injection attacks
+  const MAX_COMMENT_SIZE = 10000;
+  if (body.length > MAX_COMMENT_SIZE) {
+    return body.slice(0, MAX_COMMENT_SIZE) + "\n...[truncated]";
+  }
+  return body;
+}
+
+async function main(): Promise<void> {
+  try {
+    validateEnvironment();
+  } catch (e) {
+    console.error((e as Error).message);
     process.exit(1);
   }
 
   const mode = (process.env.MODE ?? "review") as Mode;
   const runId = process.env.RUN_ID!;
+  const prNumber = parseInt(process.env.PR_NUMBER ?? "0", 10);
+
+  try {
+    validatePrNumber(prNumber, mode);
+  } catch (e) {
+    console.error((e as Error).message);
+    process.exit(1);
+  }
+
+  // Use system temp dir instead of hardcoded path
+  const logsDir = join(tmpdir(), `claude-ci-logs-${runId}`);
 
   const ctx: Context = {
     mode,
     repository: process.env.GITHUB_REPOSITORY!,
-    prNumber: parseInt(process.env.PR_NUMBER ?? "0", 10),
+    prNumber,
     headBranch: process.env.HEAD_BRANCH!,
-    headSha: process.env.HEAD_SHA!,
+    headSha: process.env.HEAD_SHA ?? "",
     baseBranch: process.env.BASE_BRANCH ?? "main",
     runId,
     runUrl: process.env.RUN_URL ?? "",
     fixBranch: `claude/fix-${runId}`,
+    logsDir,
     failedRunId: process.env.FAILED_RUN_ID,
     failedRunUrl: process.env.FAILED_RUN_URL,
     workflowName: process.env.WORKFLOW_NAME,
-    commentBody: process.env.COMMENT_BODY,
+    commentBody: sanitizeCommentBody(process.env.COMMENT_BODY),
   };
 
   log(`Mode: ${mode}, Repo: ${ctx.repository}, PR: #${ctx.prNumber}`);
@@ -489,7 +583,8 @@ async function main(): Promise<void> {
       prompt = reviewPrompt(ctx);
       break;
     case "ci-fix":
-      prompt = ciFixPrompt(ctx, downloadLogs(ctx));
+      downloadLogs(ctx);
+      prompt = ciFixPrompt(ctx);
       break;
     case "respond":
       prompt = respondPrompt(ctx);

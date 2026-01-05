@@ -26,4 +26,4 @@ jobs:
         run: cd scripts/claude-assistant && pnpm install
 
       - name: Type check
-        run: cd scripts/claude-assistant && pnpm run check 2>&1 | head -1
+        run: cd scripts/claude-assistant && pnpm run check
