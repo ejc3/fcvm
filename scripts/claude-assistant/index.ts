@@ -252,10 +252,17 @@ The diff output may be truncated for large changes. If the diff ends mid-line or
 ## STEP 2: CHECK PREVIOUS REVIEWS
 
 Look at the comments from step 1a. If there are previous Claude reviews:
-- **[LOW] issues**: Do NOT repeat if already mentioned. These add no value.
-- **[MEDIUM]/[CRITICAL] issues**: Can reference if still present (e.g., "Previously noted X is still unfixed")
+- **[LOW] issues**: Do NOT mention again. Skip entirely.
+- **[MEDIUM]/[CRITICAL] issues that are STILL UNFIXED**: Reference with a link, do NOT repeat the analysis.
 
-Only report NEW findings or still-present MEDIUM/CRITICAL issues.
+When referencing a previous comment, get the comment URL:
+\`\`\`bash
+gh api repos/${ctx.repository}/issues/${ctx.prNumber}/comments --jq '.[] | select(.user.login == "claude[bot]") | {id: .id, url: .html_url}'
+\`\`\`
+
+Then link to it: "As noted in [previous review](URL), the PATH inconsistency remains unfixed."
+
+**CRITICAL**: If an issue was already reported, do NOT repeat the full analysis. One-line summary with link only.
 
 ## STEP 3: ANALYZE
 
