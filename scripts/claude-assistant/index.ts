@@ -45,6 +45,7 @@ interface Context {
   failedRunUrl?: string;
   workflowName?: string;
   commentBody?: string;
+  memberPRs?: string;  // Open PRs from org members
 }
 
 function log(msg: string): void {
@@ -88,6 +89,22 @@ function gh(...args: string[]): { stdout: string; ok: boolean } {
 function branchExists(branchName: string): boolean {
   const result = run("git", ["rev-parse", "--verify", branchName]);
   return result.ok;
+}
+
+/**
+ * Fetch open PRs from org members or bots only.
+ * Filters out PRs from external contributors to avoid prompt injection.
+ */
+function fetchMemberPRs(repository: string): string {
+  log("Fetching open PRs from members/bots");
+  const result = gh(
+    "api", `repos/${repository}/pulls`,
+    "--jq", `.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR" or .user.type == "Bot") | "#\(.number) \(.title) (@\(.user.login))"`
+  );
+  if (!result.ok || !result.stdout) {
+    return "Failed to fetch PRs";
+  }
+  return result.stdout || "No open PRs from members";
 }
 
 function setupFixBranch(ctx: Context): void {
@@ -190,6 +207,11 @@ function reviewPrompt(ctx: Context): string {
 
 You are reviewing **PR #${ctx.prNumber}** in **${ctx.repository}**.
 Your current branch is \`${ctx.fixBranch}\`, branched from \`${ctx.headBranch}\`.
+
+### Open PRs (from members/bots only)
+\`\`\`
+${ctx.memberPRs}
+\`\`\`
 
 ## DESIGN
 
@@ -630,9 +652,10 @@ async function main(): Promise<void> {
   // Use system temp dir instead of hardcoded path
   const logsDir = join(tmpdir(), `claude-ci-logs-${runId}`);
 
+  const repository = process.env.GITHUB_REPOSITORY!;
   const ctx: Context = {
     mode,
-    repository: process.env.GITHUB_REPOSITORY!,
+    repository,
     prNumber,
     headBranch: process.env.HEAD_BRANCH!,
     headSha: process.env.HEAD_SHA ?? "",
@@ -645,6 +668,7 @@ async function main(): Promise<void> {
     failedRunUrl: process.env.FAILED_RUN_URL,
     workflowName: process.env.WORKFLOW_NAME,
     commentBody: sanitizeCommentBody(process.env.COMMENT_BODY),
+    memberPRs: fetchMemberPRs(repository),
   };
 
   log(`Mode: ${mode}, Repo: ${ctx.repository}, PR: #${ctx.prNumber}`);
