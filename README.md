@@ -63,70 +63,43 @@ sudo iptables -P FORWARD ACCEPT
 
 ## Quick Start
 
-### Build
 ```bash
-# Build host CLI and guest agent
+# 1. Build
 cargo build --release --workspace
-```
 
-### Setup (First Time)
-```bash
-# Create btrfs filesystem
-make setup-btrfs
+# 2. First-time setup (5-10 min, creates btrfs + downloads kernel + builds rootfs)
+sudo fcvm setup
 
-# Download kernel and create rootfs (takes 5-10 minutes first time)
-fcvm setup
-```
-
-**What `fcvm setup` does:**
-1. Downloads Kata kernel (~15MB, cached by URL hash)
-2. Downloads packages via `podman run ubuntu:noble` (ensures correct Ubuntu 24.04 versions)
-3. Creates Layer 2 rootfs (~10GB): boots VM, installs packages, writes config files
-4. Verifies setup completed successfully (checks marker file)
-5. Creates fc-agent initrd
-
-Subsequent runs are instant - everything is cached by content hash.
-
-**Alternative: Auto-setup on first run (rootless only)**
-```bash
-# Skip explicit setup - does it automatically on first run
-fcvm podman run --name web1 --network rootless --setup nginx:alpine
-```
-The `--setup` flag triggers setup if kernel/rootfs are missing. Only works with `--network rootless` to avoid file ownership issues when running as root.
-
-### Run a Container
-```bash
-# Run a one-shot command (clean output, just like docker run)
+# 3. Run a container
 fcvm podman run --name test alpine:latest echo "hello world"
-# Output: hello world
+```
 
-# Run a service (uses rootless mode by default, no sudo needed)
+That's it! See [Examples](#examples) for port forwarding, volumes, and more.
+
+---
+
+## Examples
+
+```bash
+# Run a service (rootless mode, no sudo)
 fcvm podman run --name web1 public.ecr.aws/nginx/nginx:alpine
 
-# With port forwarding (8080 on host -> 80 in guest)
-# Note: In rootless mode, use the assigned loopback IP (e.g., curl 127.0.0.2:8080)
-# In bridged mode, use the veth host IP (see fcvm ls --json for the IP)
+# Port forwarding (8080 on host -> 80 in container)
 fcvm podman run --name web1 --publish 8080:80 public.ecr.aws/nginx/nginx:alpine
 
-# With host directory mapping (via fuse-pipe)
+# Host directory mapping
 fcvm podman run --name web1 --map /host/data:/data public.ecr.aws/nginx/nginx:alpine
 
 # Custom resources
 fcvm podman run --name web1 --cpu 4 --mem 4096 public.ecr.aws/nginx/nginx:alpine
 
-# Bridged mode (requires sudo, uses iptables)
+# Bridged mode (requires sudo)
 sudo fcvm podman run --name web1 --network bridged public.ecr.aws/nginx/nginx:alpine
 
-# List running VMs (sudo needed to read VM state files)
+# List VMs and execute commands
 sudo fcvm ls
-sudo fcvm ls --json          # JSON output
-sudo fcvm ls --pid 12345     # Filter by PID
-
-# Execute commands (mirrors podman exec, sudo needed)
-sudo fcvm exec web1 -- cat /etc/os-release         # Run in container (default)
-sudo fcvm exec web1 --vm -- hostname               # Run in VM
-sudo fcvm exec web1 -- bash                        # Interactive shell (auto -it)
-sudo fcvm exec web1 -it -- sh                      # Explicit interactive TTY
+sudo fcvm exec web1 -- cat /etc/os-release
+sudo fcvm exec web1 -- bash                        # Interactive shell
 ```
 
 ### Snapshot & Clone Workflow
@@ -262,6 +235,34 @@ sudo fcvm podman run --name full \
 
 ---
 
+## How It Works
+
+### What `fcvm setup` does
+
+1. **Creates btrfs storage** at configured path (60GB loopback, auto-mounted)
+2. **Downloads Kata kernel** (~15MB, cached by URL hash)
+3. **Downloads packages** via `podman run ubuntu:noble` (ensures correct versions)
+4. **Creates Layer 2 rootfs** (~10GB): boots VM, installs packages, configures services
+5. **Creates fc-agent initrd** for guest agent injection
+
+Everything is cached by content hash - subsequent runs are instant.
+
+**Alternative: Auto-setup on first run (rootless only)**
+```bash
+fcvm podman run --name web1 --network rootless --setup nginx:alpine
+```
+
+### Networking Modes
+
+| Mode | Flag | Requires sudo | Port forwarding |
+|------|------|---------------|-----------------|
+| Rootless | `--network rootless` (default) | No | Unique loopback IP per VM |
+| Bridged | `--network bridged` | Yes | iptables DNAT |
+
+In rootless mode, each VM gets a unique loopback IP (127.0.0.2, 127.0.0.3, ...). Use `fcvm ls --json` to find a VM's IP.
+
+---
+
 ## Test Requirements
 
 **Container Testing (Recommended)** - All dependencies bundled:
@@ -300,8 +301,419 @@ sudo apt-get update && sudo apt-get install -y \
     uidmap
 ```
 
-----
+---
 
+## Project Structure
+
+```
+fcvm/
+├── src/           # Host CLI (fcvm binary)
+├── fc-agent/      # Guest agent (runs inside VM)
+├── fuse-pipe/     # FUSE passthrough library
+└── tests/         # Integration tests (16 files)
+```
+
+See [DESIGN.md](DESIGN.md#directory-structure) for detailed structure.
+
+---
+
+## CLI Reference
+
+Run `fcvm --help` or `fcvm <command> --help` for full options.
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `fcvm setup` | Download kernel (~15MB) and create rootfs (~10GB). Takes 5-10 min first run |
+| `fcvm podman run` | Run container in Firecracker VM |
+| `fcvm exec` | Execute command in running VM/container |
+| `fcvm ls` | List running VMs (`--json` for JSON output) |
+| `fcvm snapshot create` | Create snapshot from running VM |
+| `fcvm snapshot serve` | Start UFFD memory server for cloning |
+| `fcvm snapshot run` | Spawn clone from memory server |
+| `fcvm snapshots` | List available snapshots |
+
+See [DESIGN.md](DESIGN.md#commands) for full option reference.
+
+### Key Options
+
+**`fcvm podman run`** - Essential options:
+```
+--name <NAME>       VM name (required)
+--network <MODE>    rootless (default) or bridged (needs sudo)
+--publish <H:G>     Port forward host:guest (e.g., 8080:80)
+--map <H:G[:ro]>    Volume mount host:guest (optional :ro for read-only)
+--env <K=V>         Environment variable
+--setup             Auto-setup if kernel/rootfs missing (rootless only)
+```
+
+**`fcvm exec`** - Execute in VM/container:
+```bash
+sudo fcvm exec my-vm -- cat /etc/os-release     # In container
+sudo fcvm exec my-vm --vm -- curl -s ifconfig.me # In guest OS
+sudo fcvm exec my-vm -- bash                     # Interactive shell
+```
+
+---
+
+## Network Modes
+
+| Mode | Flag | Root | Notes |
+|------|------|------|-------|
+| Rootless | `--network rootless` (default) | No | slirp4netns, no root needed |
+| Bridged | `--network bridged` | Yes | iptables NAT |
+
+See [DESIGN.md](DESIGN.md#networking) for architecture details.
+
+---
+
+## Container Behavior
+
+- **Exit codes**: Container exit code forwarded to host via vsock
+- **Logs**: Container stdout goes to host stdout, stderr to host stderr (clean output for scripting)
+- **Health**: Default uses vsock ready signal; optional `--health-check` for HTTP
+
+See [DESIGN.md](DESIGN.md#guest-agent) for details.
+
+---
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FCVM_BASE_DIR` | `/mnt/fcvm-btrfs` | Base directory for all data |
+| `RUST_LOG` | `warn` | Logging level (quiet by default; use `info` or `debug` for verbose) |
+
+---
+
+## Testing
+
+### CI Summary
+
+Every CI run exercises the full stack:
+
+| Metric | Count |
+|--------|-------|
+| **Total Tests** | 9,290 |
+| **Nextest Functions** | 501 |
+| **POSIX Compliance (pjdfstest)** | 8,789 |
+| **VMs Spawned** | 331 (92 base + 239 clones) |
+| **UFFD Memory Servers** | 28 |
+| **pjdfstest Categories** | 17 |
+
+Performance (on c7g.metal ARM64):
+- **Clone to healthy**: 0.67s average
+- **Snapshot creation**: 40.7s average
+- **Total test time**: ~13 minutes (parallel jobs)
+
+### Test Categories
+
+| Category | Description | VMs | Tests |
+|----------|-------------|-----|-------|
+| **Unit Tests** | CLI parsing, state manager, protocol serialization | 0 | ~50 |
+| **FUSE Tests** | fuse-pipe passthrough, permissions, mount/unmount | 0 | ~80 |
+| **VM Sanity** | Basic VM lifecycle, networking, exec | ~20 | ~30 |
+| **Snapshot/Clone** | UFFD memory sharing, btrfs reflinks, 100-clone scaling | ~230 | ~20 |
+| **pjdfstest** | POSIX filesystem compliance in VMs | 17 | 8,789 |
+| **Egress/Port Forward** | Network connectivity, port mapping | ~30 | ~40 |
+| **Disk Mounts** | RO/RW disks, directory mapping, NFS | ~10 | ~15 |
+| **Nested KVM** | L1→L2 virtualization (ARM64 NV2) | 2 | ~5 |
+
+### Test Tiers
+
+Tests are organized into tiers by privilege requirements:
+
+```bash
+make test-unit   # Unit tests only (no VMs, no sudo)
+make test-fast   # + quick VM tests (rootless, no sudo)
+make test-all    # + slow VM tests (rootless, no sudo)
+make test-root   # + privileged tests (bridged, pjdfstest, sudo)
+make test        # Alias for test-root
+```
+
+Container equivalents:
+```bash
+make container-test-unit   # Unit tests in container
+make container-test        # All tests in container (recommended)
+```
+
+### Running Tests
+
+```bash
+# Build first
+make build
+
+# Run all tests (requires sudo + KVM)
+make test-root
+
+# Filter by name pattern
+make test-root FILTER=exec
+
+# Live output (stream as tests run)
+make test-root FILTER=sanity STREAM=1
+
+# Single test with debug logging
+RUST_LOG=debug make test-root FILTER=test_exec_basic STREAM=1
+```
+
+### CI Workflow
+
+Tests run automatically on PRs and pushes to main. Three parallel jobs:
+
+| Job | Runner | Tests |
+|-----|--------|-------|
+| **Host** | Self-hosted ARM64 | Unit tests, quick VM tests (rootless) |
+| **Host-Root** | Self-hosted ARM64 | Privileged tests, pjdfstest, nested KVM |
+| **Container** | Self-hosted ARM64 | All tests in container |
+
+Latest results: [CI Workflow](.github/workflows/ci.yml) → Actions tab
+
+Analyze any CI run locally:
+```bash
+python3 scripts/analyze_ci_vms.py              # Latest run
+python3 scripts/analyze_ci_vms.py <run_id>     # Specific run
+```
+
+### Debugging Tests
+
+Enable tracing:
+```bash
+RUST_LOG="passthrough=debug,fuse_pipe=info" sudo -E cargo test ...
+```
+
+Check running VMs:
+```bash
+sudo fcvm ls
+```
+
+Manual cleanup:
+```bash
+# Kill test VMs
+ps aux | grep fcvm | grep test | awk '{print $2}' | xargs sudo kill 2>/dev/null
+
+# Remove test directories
+rm -rf /tmp/fcvm-test-*
+
+# Force unmount stale FUSE mounts
+sudo fusermount3 -u /tmp/fuse-*-mount*
+```
+
+---
+
+## Data Layout
+
+All data stored under the configured `assets_dir` (default `/mnt/fcvm-btrfs/`) which requires btrfs for CoW reflinks. See [DESIGN.md](DESIGN.md#data-directory) for details.
+
+```bash
+# Setup storage, kernel, and rootfs (creates btrfs automatically if needed)
+sudo fcvm setup
+```
+
+---
+
+## Kernels and Base Images
+
+fcvm uses a config-driven approach for kernels and base images. All configuration is in `rootfs-config.toml`.
+
+### Default Kernel
+
+The default kernel is from [Kata Containers](https://github.com/kata-containers/kata-containers):
+
+| Property | Value |
+|----------|-------|
+| **Version** | 6.12.47 |
+| **Source** | Kata 3.24.0 release |
+| **Key Config** | `CONFIG_FUSE_FS=y` (required for volume mounts) |
+| **Architectures** | arm64, amd64 |
+
+The kernel is downloaded automatically during `fcvm setup` and cached by URL hash. Changing the URL in config triggers a re-download.
+
+### Base Image
+
+The guest OS is Ubuntu 24.04 LTS (Noble Numbat):
+
+| Property | Value |
+|----------|-------|
+| **Version** | 24.04 LTS |
+| **Source** | Ubuntu cloud images |
+| **Packages** | podman, crun, fuse-overlayfs, skopeo, fuse3, haveged, chrony |
+
+The rootfs is built automatically during `fcvm setup` and cached by script SHA. Changing packages, services, or files in config triggers a rebuild.
+
+### Kernel Profiles
+
+For advanced use cases (like nested virtualization), fcvm supports **kernel profiles**. Profiles define:
+
+- Custom kernel with specific configuration
+- Optional custom Firecracker binary
+- Boot arguments and runtime settings
+
+**Current profiles:**
+
+| Profile | Architecture | Description |
+|---------|--------------|-------------|
+| `nested` | arm64 | Nested virtualization (NV2) with CONFIG_KVM=y |
+
+Usage:
+```bash
+# Download/build kernel for profile
+fcvm setup --kernel-profile nested
+
+# Run VM with profile
+sudo fcvm podman run --name vm1 --kernel-profile nested --privileged nginx:alpine
+```
+
+### Adding a New Kernel Profile
+
+To add a custom kernel profile, edit `rootfs-config.toml`:
+
+```toml
+# Example: Add a minimal kernel profile for amd64
+[kernel_profiles.minimal.amd64]
+description = "Minimal kernel for fast boot"
+kernel_version = "6.12"
+kernel_repo = "your-org/your-kernel-repo"
+
+# Files that determine kernel SHA (supports globs)
+# When any of these change, kernel is rebuilt
+build_inputs = [
+    "kernel/minimal.conf",
+    "kernel/patches/*.patch",
+]
+
+# Build paths (relative to repo root)
+kernel_config = "kernel/minimal.conf"
+patches_dir = "kernel/patches"
+
+# Optional: Custom Firecracker binary
+# firecracker_bin = "/usr/local/bin/firecracker-custom"
+
+# Optional: Extra boot arguments
+boot_args = "quiet"
+```
+
+**Key fields:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `kernel_version` | Yes | Kernel version (e.g., "6.18.3") |
+| `kernel_repo` | Yes | GitHub repo for releases (e.g., "ejc3/firepod") |
+| `build_inputs` | Yes | Files to hash for kernel SHA (supports globs) |
+| `kernel_config` | No | Kernel .config file path |
+| `patches_dir` | No | Directory containing kernel patches |
+| `firecracker_bin` | No | Custom Firecracker binary path |
+| `firecracker_args` | No | Extra Firecracker CLI args |
+| `boot_args` | No | Extra kernel boot parameters |
+
+**How it works:**
+
+1. **Config is source of truth**: All kernel versions and build configuration flow from `rootfs-config.toml`
+2. **SHA computation**: fcvm hashes all files matching `build_inputs` patterns
+3. **Download first**: Tries to download from `kernel_repo` releases with tag `kernel-{profile}-{version}-{arch}-{sha}`
+4. **Dynamic build scripts**: If download fails and `--build-kernels` is set, Rust generates build scripts on-the-fly (no shell scripts in source control)
+5. **Config sync**: `make build` automatically syncs embedded config to `~/.config/fcvm/` so runtime matches compile-time config
+
+### Customizing the Base Image
+
+The rootfs is built from `rootfs-config.toml` sections:
+
+```toml
+[base]
+version = "24.04"
+codename = "noble"
+
+[packages]
+runtime = ["podman", "crun", "fuse-overlayfs", "skopeo"]
+fuse = ["fuse3"]
+system = ["haveged", "chrony"]
+debug = ["strace"]
+
+[services]
+enable = ["haveged", "chrony", "systemd-networkd"]
+disable = ["snapd", "cloud-init"]
+
+[files."/etc/myconfig"]
+content = """
+my custom config
+"""
+```
+
+After changing the config, run `fcvm setup` to rebuild the rootfs with the new SHA.
+
+---
+
+## Troubleshooting
+
+### "fcvm binary not found"
+- Build fcvm first: `make build`
+- Or set PATH: `export PATH=$PATH:./target/release`
+
+### "timeout waiting for VM to become healthy"
+- Check VM logs: `sudo fcvm ls --json`
+- Verify kernel and rootfs exist: `ls -la /mnt/fcvm-btrfs/`
+- Check networking: VMs use host DNS servers directly (no dnsmasq needed)
+
+### Tests hang indefinitely
+- VMs may not be cleaning up properly
+- Manual cleanup: `ps aux | grep fcvm | grep test | awk '{print $2}' | xargs sudo kill`
+
+### KVM not available
+- Firecracker requires `/dev/kvm`
+- On AWS: use c6g.metal or c5.metal (NOT c5.large or other regular instances)
+- On other clouds: use bare-metal instances or hosts with nested virtualization
+
+---
+
+## Documentation
+
+- `DESIGN.md` - Comprehensive design specification and architecture
+- `PERFORMANCE.md` - Performance benchmarks, tuning guide, and tracing
+- `.claude/CLAUDE.md` - Development notes, debugging tips, implementation details
+- `LICENSE` - MIT License
+
+---
+
+## CI Infrastructure
+
+CI runs on self-hosted ARM64 runners (c7g.metal spot instances) managed by [ejc3/aws-setup](https://github.com/ejc3/aws-setup).
+
+- **Auto-scaling**: Runners launch on demand, stop after 30 mins idle
+- **Hardware**: c7g.metal with /dev/kvm for VM tests
+- **Cost**: ~$0.50/hr spot pricing, $0 when idle
+
+### Claude Code Review
+
+PRs are automatically reviewed by Claude. Reviews are blocking if critical issues are found.
+
+| Trigger | Description |
+|---------|-------------|
+| **Auto** | PRs from org members are reviewed automatically |
+| `/claude-review` | Comment on any PR to trigger manual review |
+| `@claude ...` | Ask Claude questions in PR comments |
+
+Reviews check for security issues, bugs, and breaking changes. Issues prefixed with `BLOCKING:` will fail the status check.
+
+### Auto-Fix CI Failures
+
+When CI fails, Claude automatically attempts to diagnose and fix the issue.
+
+| Scenario | Behavior |
+|----------|----------|
+| **PR from org member** | Creates fix PR on top of the failing branch |
+| **Main branch failure** | Creates fix PR targeting main |
+| **External contributor PR** | Skipped (no auto-fix) |
+
+The auto-fix workflow:
+1. Downloads failed job logs
+2. Runs Claude Code to diagnose and fix
+3. Creates a stacked fix PR
+4. Monitors CI on the fix PR (30 min timeout)
+5. Updates the original PR with status and links
+
+Fix branches use the naming convention `claude/fix-{runId}` and are excluded from auto-fix to prevent infinite loops.
+
+---
 
 ## Nested Virtualization
 
@@ -556,419 +968,6 @@ make test-root FILTER=nested_l2_with_large
 
 - **L3+ nesting**: Blocked by FUSE-over-FUSE latency (~5x per level). Each additional nesting level adds 3-5 seconds per filesystem request.
 - **Nested tests disabled**: L2/L3 nested tests are currently disabled in CI due to timing sensitivity and flakiness under NV2. The tests pass individually but are slow (~5 min each) and occasionally timeout. Run manually with `make test-root FILTER=nested` if needed.
-
----
-
-## Project Structure
-
-```
-fcvm/
-├── src/           # Host CLI (fcvm binary)
-├── fc-agent/      # Guest agent (runs inside VM)
-├── fuse-pipe/     # FUSE passthrough library
-└── tests/         # Integration tests (16 files)
-```
-
-See [DESIGN.md](DESIGN.md#directory-structure) for detailed structure.
-
----
-
-## CLI Reference
-
-Run `fcvm --help` or `fcvm <command> --help` for full options.
-
-### Commands
-
-| Command | Description |
-|---------|-------------|
-| `fcvm setup` | Download kernel (~15MB) and create rootfs (~10GB). Takes 5-10 min first run |
-| `fcvm podman run` | Run container in Firecracker VM |
-| `fcvm exec` | Execute command in running VM/container |
-| `fcvm ls` | List running VMs (`--json` for JSON output) |
-| `fcvm snapshot create` | Create snapshot from running VM |
-| `fcvm snapshot serve` | Start UFFD memory server for cloning |
-| `fcvm snapshot run` | Spawn clone from memory server |
-| `fcvm snapshots` | List available snapshots |
-
-See [DESIGN.md](DESIGN.md#commands) for full option reference.
-
-### Key Options
-
-**`fcvm podman run`** - Essential options:
-```
---name <NAME>       VM name (required)
---network <MODE>    rootless (default) or bridged (needs sudo)
---publish <H:G>     Port forward host:guest (e.g., 8080:80)
---map <H:G[:ro]>    Volume mount host:guest (optional :ro for read-only)
---env <K=V>         Environment variable
---setup             Auto-setup if kernel/rootfs missing (rootless only)
-```
-
-**`fcvm exec`** - Execute in VM/container:
-```bash
-sudo fcvm exec my-vm -- cat /etc/os-release     # In container
-sudo fcvm exec my-vm --vm -- curl -s ifconfig.me # In guest OS
-sudo fcvm exec my-vm -- bash                     # Interactive shell
-```
-
----
-
-## Network Modes
-
-| Mode | Flag | Root | Notes |
-|------|------|------|-------|
-| Rootless | `--network rootless` (default) | No | slirp4netns, no root needed |
-| Bridged | `--network bridged` | Yes | iptables NAT |
-
-See [DESIGN.md](DESIGN.md#networking) for architecture details.
-
----
-
-## Container Behavior
-
-- **Exit codes**: Container exit code forwarded to host via vsock
-- **Logs**: Container stdout goes to host stdout, stderr to host stderr (clean output for scripting)
-- **Health**: Default uses vsock ready signal; optional `--health-check` for HTTP
-
-See [DESIGN.md](DESIGN.md#guest-agent) for details.
-
----
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `FCVM_BASE_DIR` | `/mnt/fcvm-btrfs` | Base directory for all data |
-| `RUST_LOG` | `warn` | Logging level (quiet by default; use `info` or `debug` for verbose) |
-
----
-
-## Testing
-
-### CI Summary
-
-Every CI run exercises the full stack:
-
-| Metric | Count |
-|--------|-------|
-| **Total Tests** | 9,290 |
-| **Nextest Functions** | 501 |
-| **POSIX Compliance (pjdfstest)** | 8,789 |
-| **VMs Spawned** | 331 (92 base + 239 clones) |
-| **UFFD Memory Servers** | 28 |
-| **pjdfstest Categories** | 17 |
-
-Performance (on c7g.metal ARM64):
-- **Clone to healthy**: 0.67s average
-- **Snapshot creation**: 40.7s average
-- **Total test time**: ~13 minutes (parallel jobs)
-
-### Test Categories
-
-| Category | Description | VMs | Tests |
-|----------|-------------|-----|-------|
-| **Unit Tests** | CLI parsing, state manager, protocol serialization | 0 | ~50 |
-| **FUSE Tests** | fuse-pipe passthrough, permissions, mount/unmount | 0 | ~80 |
-| **VM Sanity** | Basic VM lifecycle, networking, exec | ~20 | ~30 |
-| **Snapshot/Clone** | UFFD memory sharing, btrfs reflinks, 100-clone scaling | ~230 | ~20 |
-| **pjdfstest** | POSIX filesystem compliance in VMs | 17 | 8,789 |
-| **Egress/Port Forward** | Network connectivity, port mapping | ~30 | ~40 |
-| **Disk Mounts** | RO/RW disks, directory mapping, NFS | ~10 | ~15 |
-| **Nested KVM** | L1→L2 virtualization (ARM64 NV2) | 2 | ~5 |
-
-### Test Tiers
-
-Tests are organized into tiers by privilege requirements:
-
-```bash
-make test-unit   # Unit tests only (no VMs, no sudo)
-make test-fast   # + quick VM tests (rootless, no sudo)
-make test-all    # + slow VM tests (rootless, no sudo)
-make test-root   # + privileged tests (bridged, pjdfstest, sudo)
-make test        # Alias for test-root
-```
-
-Container equivalents:
-```bash
-make container-test-unit   # Unit tests in container
-make container-test        # All tests in container (recommended)
-```
-
-### Running Tests
-
-```bash
-# Build first
-make build
-
-# Run all tests (requires sudo + KVM)
-make test-root
-
-# Filter by name pattern
-make test-root FILTER=exec
-
-# Live output (stream as tests run)
-make test-root FILTER=sanity STREAM=1
-
-# Single test with debug logging
-RUST_LOG=debug make test-root FILTER=test_exec_basic STREAM=1
-```
-
-### CI Workflow
-
-Tests run automatically on PRs and pushes to main. Three parallel jobs:
-
-| Job | Runner | Tests |
-|-----|--------|-------|
-| **Host** | Self-hosted ARM64 | Unit tests, quick VM tests (rootless) |
-| **Host-Root** | Self-hosted ARM64 | Privileged tests, pjdfstest, nested KVM |
-| **Container** | Self-hosted ARM64 | All tests in container |
-
-Latest results: [CI Workflow](.github/workflows/ci.yml) → Actions tab
-
-Analyze any CI run locally:
-```bash
-python3 scripts/analyze_ci_vms.py              # Latest run
-python3 scripts/analyze_ci_vms.py <run_id>     # Specific run
-```
-
-### Debugging Tests
-
-Enable tracing:
-```bash
-RUST_LOG="passthrough=debug,fuse_pipe=info" sudo -E cargo test ...
-```
-
-Check running VMs:
-```bash
-sudo fcvm ls
-```
-
-Manual cleanup:
-```bash
-# Kill test VMs
-ps aux | grep fcvm | grep test | awk '{print $2}' | xargs sudo kill 2>/dev/null
-
-# Remove test directories
-rm -rf /tmp/fcvm-test-*
-
-# Force unmount stale FUSE mounts
-sudo fusermount3 -u /tmp/fuse-*-mount*
-```
-
----
-
-## Data Layout
-
-All data stored under `/mnt/fcvm-btrfs/` (btrfs for CoW reflinks). See [DESIGN.md](DESIGN.md#data-directory) for details.
-
-```bash
-# Setup btrfs (done automatically by make setup-btrfs)
-make setup-btrfs
-make setup-fcvm   # Download kernel, create rootfs
-```
-
----
-
-## Kernels and Base Images
-
-fcvm uses a config-driven approach for kernels and base images. All configuration is in `rootfs-config.toml`.
-
-### Default Kernel
-
-The default kernel is from [Kata Containers](https://github.com/kata-containers/kata-containers):
-
-| Property | Value |
-|----------|-------|
-| **Version** | 6.12.47 |
-| **Source** | Kata 3.24.0 release |
-| **Key Config** | `CONFIG_FUSE_FS=y` (required for volume mounts) |
-| **Architectures** | arm64, amd64 |
-
-The kernel is downloaded automatically during `fcvm setup` and cached by URL hash. Changing the URL in config triggers a re-download.
-
-### Base Image
-
-The guest OS is Ubuntu 24.04 LTS (Noble Numbat):
-
-| Property | Value |
-|----------|-------|
-| **Version** | 24.04 LTS |
-| **Source** | Ubuntu cloud images |
-| **Packages** | podman, crun, fuse-overlayfs, skopeo, fuse3, haveged, chrony |
-
-The rootfs is built automatically during `fcvm setup` and cached by script SHA. Changing packages, services, or files in config triggers a rebuild.
-
-### Kernel Profiles
-
-For advanced use cases (like nested virtualization), fcvm supports **kernel profiles**. Profiles define:
-
-- Custom kernel with specific configuration
-- Optional custom Firecracker binary
-- Boot arguments and runtime settings
-
-**Current profiles:**
-
-| Profile | Architecture | Description |
-|---------|--------------|-------------|
-| `nested` | arm64 | Nested virtualization (NV2) with CONFIG_KVM=y |
-
-Usage:
-```bash
-# Download/build kernel for profile
-fcvm setup --kernel-profile nested
-
-# Run VM with profile
-sudo fcvm podman run --name vm1 --kernel-profile nested --privileged nginx:alpine
-```
-
-### Adding a New Kernel Profile
-
-To add a custom kernel profile, edit `rootfs-config.toml`:
-
-```toml
-# Example: Add a minimal kernel profile for amd64
-[kernel_profiles.minimal.amd64]
-description = "Minimal kernel for fast boot"
-kernel_version = "6.12"
-kernel_repo = "your-org/your-kernel-repo"
-
-# Files that determine kernel SHA (supports globs)
-# When any of these change, kernel is rebuilt
-build_inputs = [
-    "kernel/minimal.conf",
-    "kernel/patches/*.patch",
-]
-
-# Build paths (relative to repo root)
-kernel_config = "kernel/minimal.conf"
-patches_dir = "kernel/patches"
-
-# Optional: Custom Firecracker binary
-# firecracker_bin = "/usr/local/bin/firecracker-custom"
-
-# Optional: Extra boot arguments
-boot_args = "quiet"
-```
-
-**Key fields:**
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `kernel_version` | Yes | Kernel version (e.g., "6.18.3") |
-| `kernel_repo` | Yes | GitHub repo for releases (e.g., "ejc3/firepod") |
-| `build_inputs` | Yes | Files to hash for kernel SHA (supports globs) |
-| `kernel_config` | No | Kernel .config file path |
-| `patches_dir` | No | Directory containing kernel patches |
-| `firecracker_bin` | No | Custom Firecracker binary path |
-| `firecracker_args` | No | Extra Firecracker CLI args |
-| `boot_args` | No | Extra kernel boot parameters |
-
-**How it works:**
-
-1. **Config is source of truth**: All kernel versions and build configuration flow from `rootfs-config.toml`
-2. **SHA computation**: fcvm hashes all files matching `build_inputs` patterns
-3. **Download first**: Tries to download from `kernel_repo` releases with tag `kernel-{profile}-{version}-{arch}-{sha}`
-4. **Dynamic build scripts**: If download fails and `--build-kernels` is set, Rust generates build scripts on-the-fly (no shell scripts in source control)
-5. **Config sync**: `make build` automatically syncs embedded config to `~/.config/fcvm/` so runtime matches compile-time config
-
-### Customizing the Base Image
-
-The rootfs is built from `rootfs-config.toml` sections:
-
-```toml
-[base]
-version = "24.04"
-codename = "noble"
-
-[packages]
-runtime = ["podman", "crun", "fuse-overlayfs", "skopeo"]
-fuse = ["fuse3"]
-system = ["haveged", "chrony"]
-debug = ["strace"]
-
-[services]
-enable = ["haveged", "chrony", "systemd-networkd"]
-disable = ["snapd", "cloud-init"]
-
-[files."/etc/myconfig"]
-content = """
-my custom config
-"""
-```
-
-After changing the config, run `fcvm setup` to rebuild the rootfs with the new SHA.
-
----
-
-## Troubleshooting
-
-### "fcvm binary not found"
-- Build fcvm first: `make build`
-- Or set PATH: `export PATH=$PATH:./target/release`
-
-### "timeout waiting for VM to become healthy"
-- Check VM logs: `sudo fcvm ls --json`
-- Verify kernel and rootfs exist: `ls -la /mnt/fcvm-btrfs/`
-- Check networking: VMs use host DNS servers directly (no dnsmasq needed)
-
-### Tests hang indefinitely
-- VMs may not be cleaning up properly
-- Manual cleanup: `ps aux | grep fcvm | grep test | awk '{print $2}' | xargs sudo kill`
-
-### KVM not available
-- Firecracker requires `/dev/kvm`
-- On AWS: use c6g.metal or c5.metal (NOT c5.large or other regular instances)
-- On other clouds: use bare-metal instances or hosts with nested virtualization
-
----
-
-## Documentation
-
-- `DESIGN.md` - Comprehensive design specification and architecture
-- `PERFORMANCE.md` - Performance benchmarks, tuning guide, and tracing
-- `.claude/CLAUDE.md` - Development notes, debugging tips, implementation details
-- `LICENSE` - MIT License
-
----
-
-## CI Infrastructure
-
-CI runs on self-hosted ARM64 runners (c7g.metal spot instances) managed by [ejc3/aws-setup](https://github.com/ejc3/aws-setup).
-
-- **Auto-scaling**: Runners launch on demand, stop after 30 mins idle
-- **Hardware**: c7g.metal with /dev/kvm for VM tests
-- **Cost**: ~$0.50/hr spot pricing, $0 when idle
-
-### Claude Code Review
-
-PRs are automatically reviewed by Claude. Reviews are blocking if critical issues are found.
-
-| Trigger | Description |
-|---------|-------------|
-| **Auto** | PRs from org members are reviewed automatically |
-| `/claude-review` | Comment on any PR to trigger manual review |
-| `@claude ...` | Ask Claude questions in PR comments |
-
-Reviews check for security issues, bugs, and breaking changes. Issues prefixed with `BLOCKING:` will fail the status check.
-
-### Auto-Fix CI Failures
-
-When CI fails, Claude automatically attempts to diagnose and fix the issue.
-
-| Scenario | Behavior |
-|----------|----------|
-| **PR from org member** | Creates fix PR on top of the failing branch |
-| **Main branch failure** | Creates fix PR targeting main |
-| **External contributor PR** | Skipped (no auto-fix) |
-
-The auto-fix workflow:
-1. Downloads failed job logs
-2. Runs Claude Code to diagnose and fix
-3. Creates a stacked fix PR
-4. Monitors CI on the fix PR (30 min timeout)
-5. Updates the original PR with status and links
-
-Fix branches use the naming convention `claude/fix-{runId}` and are excluded from auto-fix to prevent infinite loops.
 
 ---
 
