@@ -107,6 +107,12 @@ pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
 
     // Create loopback image if it doesn't exist
     if !loopback_image.exists() {
+        // Ensure parent directory exists
+        if let Some(parent) = loopback_image.parent() {
+            std::fs::create_dir_all(parent)
+                .context("creating loopback image parent directory")?;
+        }
+
         info!(
             "Creating {}GB loopback image at {}",
             DEFAULT_SIZE_GB,
