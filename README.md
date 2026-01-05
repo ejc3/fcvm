@@ -20,11 +20,14 @@ A Rust implementation that launches Firecracker microVMs to run Podman container
 | Raw Firecracker | fcvm |
 |-----------------|------|
 | Download kernel + rootfs from S3, patch SSH keys | `fcvm setup` - one command |
-| Configure VM via curl to Unix socket API | `fcvm podman run` - familiar Docker/Podman syntax |
+| Configure VM via curl to Unix socket API | `fcvm podman run` - Docker/Podman syntax |
+| Manual snapshot/restore orchestration | Instant cloning with UFFD + btrfs CoW (`fcvm snapshot`) |
 | Manual TAP device, iptables, NAT setup | Automatic networking (bridged or rootless) |
 | SSH into guest for access | `fcvm exec` via vsock (no SSH needed) |
 | No container runtime integration | Native OCI container support via Podman |
-| Manual snapshot/restore orchestration | Instant cloning with UFFD + btrfs CoW |
+| No host filesystem access | FUSE (`--map`), NFS (`--nfs`), block devices (`--disk`) |
+| No port forwarding | `--publish` with automatic NAT rules |
+| No health monitoring | Built-in health checks (`--health-check`) |
 | ~100 lines of bash per VM | Single command |
 
 **fcvm builds on Firecracker** to provide a container-native experience while preserving the security isolation of hardware virtualization.
@@ -82,18 +85,23 @@ sudo iptables -P FORWARD ACCEPT
 ## Quick Start
 
 ```bash
-# 1. Build
-cargo build --release --workspace
+git clone https://github.com/ejc3/fcvm
+cd fcvm
+make build
+export PATH="$PWD/target/release:$PATH"
 
-# 2. Generate config (customize ~/.config/fcvm/rootfs-config.toml if needed)
-fcvm setup --generate-config
+# First-time setup (downloads kernel + builds rootfs, ~5 min)
+# Use sudo if btrfs storage needs to be created; skip sudo if already mounted
+sudo ./target/release/fcvm setup
 
-# 3. First-time setup (5-10 min, downloads kernel + builds rootfs)
-#    Use sudo if btrfs needs to be created; skip sudo if path is already btrfs
-sudo fcvm setup
+# Run a container (rootless - no sudo needed)
+fcvm podman run --name test nginx:alpine
 
-# 4. Run a container
-fcvm podman run --name test alpine:latest echo "hello world"
+# Exec into the container
+fcvm exec --name test -- cat /etc/os-release
+
+# Or with bridged networking (requires sudo)
+sudo ./target/release/fcvm podman run --name test --network bridged nginx:alpine
 ```
 
 That's it! See [Examples](#examples) for port forwarding, volumes, and more.
