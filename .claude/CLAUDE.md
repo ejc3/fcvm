@@ -1162,7 +1162,7 @@ sudo fcvm podman run --name my-vm --network bridged \
 Key config fields in `[kernel_profiles.nested.arm64]`:
 ```toml
 kernel_version = "6.18.3"              # Version to download/build
-kernel_repo = "ejc3/firepod"           # GitHub repo for releases
+kernel_repo = "ejc3/fcvm"           # GitHub repo for releases
 build_inputs = ["kernel/nested.conf", "kernel/patches/*.patch"]  # Files for SHA
 kernel_config = "kernel/nested.conf"   # Kernel .config
 patches_dir = "kernel/patches"         # Directory with patches

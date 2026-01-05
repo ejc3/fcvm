@@ -14,13 +14,13 @@ if [ ! -f "$MARKER" ]; then
   apt-get install -y curl jq
 
   # Find the latest host kernel release
-  RELEASE_TAG=$(curl -s https://api.github.com/repos/ejc3/firepod/releases | \
+  RELEASE_TAG=$(curl -s https://api.github.com/repos/ejc3/fcvm/releases | \
     jq -r '.[] | select(.tag_name | startswith("host-kernel-")) | .tag_name' | head -1)
 
   if [ -n "$RELEASE_TAG" ]; then
     echo "Found kernel release: $RELEASE_TAG"
 
-    KERNEL_URL=$(curl -s "https://api.github.com/repos/ejc3/firepod/releases/tags/$RELEASE_TAG" | \
+    KERNEL_URL=$(curl -s "https://api.github.com/repos/ejc3/fcvm/releases/tags/$RELEASE_TAG" | \
       jq -r '.assets[] | select(.name | startswith("linux-image-")) | .browser_download_url')
 
     if [ -n "$KERNEL_URL" ]; then
@@ -39,7 +39,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'curl -fsSL https://raw.githubusercontent.com/ejc3/firepod/main/scripts/setup-runner.sh | bash'
+ExecStart=/bin/bash -c 'curl -fsSL https://raw.githubusercontent.com/ejc3/fcvm/main/scripts/setup-runner.sh | bash'
 RemainAfterExit=yes
 StandardOutput=journal+console
 StandardError=journal+console
@@ -122,8 +122,8 @@ chown -R ubuntu:ubuntu /opt/actions-runner
 PAT=$(aws ssm get-parameter --name /github-runner/pat --with-decryption --query 'Parameter.Value' --output text --region us-west-1 2>/dev/null || echo "")
 if [ -n "$PAT" ] && [ "$PAT" != "placeholder" ]; then
   TOKEN=$(curl -s -X POST -H "Authorization: token $PAT" \
-    https://api.github.com/repos/ejc3/firepod/actions/runners/registration-token | jq -r '.token')
-  sudo -u ubuntu ./config.sh --url https://github.com/ejc3/firepod --token "$TOKEN" \
+    https://api.github.com/repos/ejc3/fcvm/actions/runners/registration-token | jq -r '.token')
+  sudo -u ubuntu ./config.sh --url https://github.com/ejc3/fcvm --token "$TOKEN" \
     --name "runner-$INSTANCE_ID" --labels self-hosted,Linux,ARM64 --unattended
   ./svc.sh install ubuntu
   ./svc.sh start

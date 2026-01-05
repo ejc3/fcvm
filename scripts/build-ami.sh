@@ -107,11 +107,11 @@ export HOME=/root
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source /root/.cargo/env
 
-# Clone firepod and its dependencies
-git clone --depth 1 https://github.com/ejc3/firepod.git /tmp/firepod
+# Clone fcvm and its dependencies
+git clone --depth 1 https://github.com/ejc3/fcvm.git /tmp/fcvm
 git clone --depth 1 https://github.com/ejc3/fuse-backend-rs.git /tmp/fuse-backend-rs
 git clone --depth 1 https://github.com/ejc3/fuser.git /tmp/fuser
-cd /tmp/firepod
+cd /tmp/fcvm
 cargo build --release
 
 # Use repo's config which has nested profile defined
@@ -340,13 +340,13 @@ main() {
 
   # Create AMI
   timestamp=$(date +%Y%m%d-%H%M)
-  ami_name="firepod-runner-${kernel_version}-${timestamp}"
+  ami_name="fcvm-runner-${kernel_version}-${timestamp}"
 
   ami_id=$(aws ec2 create-image \
     --region "$REGION" \
     --instance-id "$instance_id" \
     --name "$ami_name" \
-    --description "Firepod CI runner with kernel ${kernel_version}-nested" \
+    --description "fcvm CI runner with kernel ${kernel_version}-nested" \
     --query 'ImageId' --output text)
   echo "Created AMI: $ami_id ($ami_name)"
 

@@ -149,7 +149,7 @@ remove_dirs = [
 [kernel_profiles.nested.arm64]
 description = "Nested virtualization support for running VMs inside VMs"
 kernel_version = "6.18.3"
-kernel_repo = "ejc3/firepod"
+kernel_repo = "ejc3/fcvm"
 
 # Build configuration - these files determine when kernel needs rebuilding
 # SHA is computed from contents of all files matching these patterns
@@ -197,7 +197,7 @@ build_inputs = [
 [kernel_profiles.nested.amd64]
 description = "Nested virtualization support for running VMs inside VMs (x86_64)"
 kernel_version = "6.18.3"
-kernel_repo = "ejc3/firepod"
+kernel_repo = "ejc3/fcvm"
 
 # Build configuration - these files determine when kernel needs rebuilding
 build_inputs = [

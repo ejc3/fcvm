@@ -617,7 +617,7 @@ boot_args = "quiet"
 | Field | Required | Description |
 |-------|----------|-------------|
 | `kernel_version` | Yes | Kernel version (e.g., "6.18.3") |
-| `kernel_repo` | Yes | GitHub repo for releases (e.g., "ejc3/firepod") |
+| `kernel_repo` | Yes | GitHub repo for releases (e.g., "ejc3/fcvm") |
 | `build_inputs` | Yes | Files to hash for kernel SHA (supports globs) |
 | `kernel_config` | No | Kernel .config file path |
 | `patches_dir` | No | Directory containing kernel patches |
