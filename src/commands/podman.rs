@@ -406,8 +406,13 @@ async fn run_output_listener(socket_path: &str, vm_id: &str) -> Result<Vec<(Stri
                 // Parse raw line format: stream:content
                 let line = line_buf.trim_end();
                 if let Some((stream, content)) = line.split_once(':') {
-                    // Print to host's stderr with prefix (using tracing)
-                    eprintln!("[ctr:{}] {}", stream, content);
+                    // Print container output directly (stdout to stdout, stderr to stderr)
+                    // No prefix - clean output for scripting
+                    if stream == "stdout" {
+                        println!("{}", content);
+                    } else {
+                        eprintln!("{}", content);
+                    }
                     output_lines.push((stream.to_string(), content.to_string()));
 
                     // Send ack back (bidirectional)
