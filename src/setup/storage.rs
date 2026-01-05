@@ -54,13 +54,15 @@ fn get_storage_paths(config_path: Option<&str>) -> Result<(PathBuf, PathBuf)> {
     // Canonicalize the mount point to resolve .., ., and symlinks
     // If it doesn't exist yet, canonicalize as much as possible
     let canonical_mount = if mount_point.exists() {
-        mount_point.canonicalize()
+        mount_point
+            .canonicalize()
             .context("canonicalizing mount point path")?
     } else {
         // For non-existent paths, try to canonicalize the parent
         if let Some(parent) = mount_point.parent() {
             let canonical_parent = if parent.exists() {
-                parent.canonicalize()
+                parent
+                    .canonicalize()
                     .context("canonicalizing mount point parent")?
             } else {
                 parent.to_path_buf()
@@ -74,7 +76,8 @@ fn get_storage_paths(config_path: Option<&str>) -> Result<(PathBuf, PathBuf)> {
     // Loopback image is a sibling of mount point (e.g., /mnt/fcvm-btrfs -> /mnt/fcvm-btrfs.img)
     // Use the canonical path and proper PathBuf API to construct the loopback path
     let mut loopback_image = canonical_mount.clone();
-    let current_name = loopback_image.file_name()
+    let current_name = loopback_image
+        .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("fcvm-btrfs");
     loopback_image.set_file_name(format!("{}.img", current_name));
@@ -96,13 +99,12 @@ pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
     if is_btrfs_mount(&mount_point) {
         for dir in REQUIRED_DIRS {
             let path = mount_point.join(dir);
-            std::fs::create_dir_all(&path)
-                .with_context(|| {
-                    format!(
-                        "creating directory {} (if mount was unmounted, run 'sudo fcvm setup' again)",
-                        path.display()
-                    )
-                })?;
+            std::fs::create_dir_all(&path).with_context(|| {
+                format!(
+                    "creating directory {} (if mount was unmounted, run 'sudo fcvm setup' again)",
+                    path.display()
+                )
+            })?;
         }
         return Ok(());
     }
@@ -141,8 +143,7 @@ pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
     if !loopback_image.exists() {
         // Ensure parent directory exists
         if let Some(parent) = loopback_image.parent() {
-            std::fs::create_dir_all(parent)
-                .context("creating loopback image parent directory")?;
+            std::fs::create_dir_all(parent).context("creating loopback image parent directory")?;
         }
 
         info!(
