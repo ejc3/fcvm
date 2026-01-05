@@ -78,7 +78,7 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev libclang-dev clang
       - name: Cache cargo tools
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/bin
           key: ${{ env.CACHE_KEY_LINT }}-${{ runner.os }}-${{ runner.arch }}
@@ -200,7 +200,7 @@ jobs:
           sudo mv "/usr/local/bin/jailer-v${FC_VERSION}-${ARCH}" /usr/local/bin/jailer
       - name: Restore cargo tools cache
         id: cache-cargo-tools
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ~/.cargo/bin
           key: ${{ env.CACHE_KEY_HOST }}-${{ runner.os }}-${{ runner.arch }}
@@ -275,7 +275,7 @@ jobs:
           retention-days: 14
       - name: Save cargo tools cache
         if: always() && steps.cache-cargo-tools.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: ~/.cargo/bin
           key: ${{ env.CACHE_KEY_HOST }}-${{ runner.os }}-${{ runner.arch }}
@@ -342,7 +342,7 @@ jobs:
           sudo mv "/usr/local/bin/jailer-v${FC_VERSION}-${ARCH}" /usr/local/bin/jailer
       - name: Restore cargo tools cache
         id: cache-cargo-tools
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ~/.cargo/bin
           key: ${{ env.CACHE_KEY_HOST }}-${{ runner.os }}-${{ runner.arch }}
@@ -401,7 +401,7 @@ jobs:
           retention-days: 14
       - name: Save cargo tools cache
         if: always() && steps.cache-cargo-tools.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: ~/.cargo/bin
           key: ${{ env.CACHE_KEY_HOST }}-${{ runner.os }}-${{ runner.arch }}
