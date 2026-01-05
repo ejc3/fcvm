@@ -965,7 +965,7 @@ The auto-fix workflow:
 4. Monitors CI on the fix PR (30 min timeout)
 5. Updates the original PR with status and links
 
-Fix branches use the naming convention `claude/fix-ci-{run_id}` and are excluded from auto-fix to prevent infinite loops.
+Fix branches use the naming convention `claude/fix-{runId}` and are excluded from auto-fix to prevent infinite loops.
 
 ---
 

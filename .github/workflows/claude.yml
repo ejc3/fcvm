@@ -36,6 +36,13 @@ jobs:
           app-id: ${{ vars.CLAUDE_APP_ID }}
           private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
 
+      - name: Validate token
+        run: |
+          if [ -z "${{ steps.claude-token.outputs.token }}" ]; then
+            echo "Error: Failed to generate GitHub App token"
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -85,6 +92,13 @@ jobs:
         with:
           app-id: ${{ vars.CLAUDE_APP_ID }}
           private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
+
+      - name: Validate token
+        run: |
+          if [ -z "${{ steps.claude-token.outputs.token }}" ]; then
+            echo "Error: Failed to generate GitHub App token"
+            exit 1
+          fi
 
       - uses: actions/checkout@v4
         with:
@@ -147,6 +161,13 @@ jobs:
           app-id: ${{ vars.CLAUDE_APP_ID }}
           private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
 
+      - name: Validate token
+        run: |
+          if [ -z "${{ steps.claude-token.outputs.token }}" ]; then
+            echo "Error: Failed to generate GitHub App token"
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -192,7 +213,8 @@ jobs:
     if: |
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.conclusion == 'failure' &&
-      !startsWith(github.event.workflow_run.head_branch, 'claude/fix-')
+      !startsWith(github.event.workflow_run.head_branch, 'claude/fix-') &&
+      github.event.workflow_run.name != 'Claude Assistant'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     concurrency:
@@ -205,6 +227,13 @@ jobs:
         with:
           app-id: ${{ vars.CLAUDE_APP_ID }}
           private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
+
+      - name: Validate token
+        run: |
+          if [ -z "${{ steps.claude-token.outputs.token }}" ]; then
+            echo "Error: Failed to generate GitHub App token"
+            exit 1
+          fi
 
       - uses: actions/checkout@v4
         with:
