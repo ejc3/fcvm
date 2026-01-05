@@ -629,10 +629,11 @@ pub fn generate_config(force: bool) -> Result<PathBuf> {
 ///
 /// Lookup order:
 /// 1. Explicit path (--config flag)
-/// 2. XDG user config (~/.config/fcvm/rootfs-config.toml)
-/// 3. System config (/etc/fcvm/rootfs-config.toml)
-/// 4. Next to binary (development)
-/// 5. ERROR (no embedded fallback)
+/// 2. SUDO_USER's config (when running with sudo, use invoking user's config)
+/// 3. XDG user config (~/.config/fcvm/rootfs-config.toml)
+/// 4. System config (/etc/fcvm/rootfs-config.toml)
+/// 5. Next to binary (development)
+/// 6. ERROR (no embedded fallback)
 pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
     // 1. Explicit --config
     if let Some(path) = explicit_path {
@@ -643,7 +644,26 @@ pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
         return Ok(p);
     }
 
-    // 2. XDG user config
+    // 2. SUDO_USER's config (when running with sudo)
+    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        // Get the invoking user's home directory
+        match nix::unistd::User::from_name(&sudo_user) {
+            Ok(Some(user)) => {
+                let p = user.dir.join(".config/fcvm").join(CONFIG_FILE);
+                if p.exists() {
+                    return Ok(p);
+                }
+            }
+            Ok(None) => {
+                tracing::debug!("SUDO_USER '{}' not found in passwd database", sudo_user);
+            }
+            Err(e) => {
+                tracing::debug!("Failed to lookup SUDO_USER '{}': {}", sudo_user, e);
+            }
+        }
+    }
+
+    // 3. XDG user config
     if let Some(proj_dirs) = ProjectDirs::from("", "", "fcvm") {
         let p = proj_dirs.config_dir().join(CONFIG_FILE);
         if p.exists() {
@@ -651,13 +671,13 @@ pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
         }
     }
 
-    // 3. System config
+    // 4. System config
     let system = Path::new("/etc/fcvm").join(CONFIG_FILE);
     if system.exists() {
         return Ok(system);
     }
 
-    // 4. Next to binary (development)
+    // 5. Next to binary (development)
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
             // Check next to binary

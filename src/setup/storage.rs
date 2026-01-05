@@ -50,36 +50,64 @@ fn is_btrfs_mount(path: &Path) -> bool {
 fn get_storage_paths(config_path: Option<&str>) -> Result<(PathBuf, PathBuf)> {
     let (config, _, _) = load_config(config_path)?;
     let mount_point = PathBuf::from(&config.paths.assets_dir);
-    // Loopback image goes in /var with same basename
-    let loopback_name = mount_point
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "fcvm-btrfs".to_string());
-    let loopback_image = PathBuf::from(format!("/var/{}.img", loopback_name));
-    Ok((mount_point, loopback_image))
+
+    // Canonicalize the mount point to resolve .., ., and symlinks
+    // If it doesn't exist yet, canonicalize as much as possible
+    let canonical_mount = if mount_point.exists() {
+        mount_point.canonicalize()
+            .context("canonicalizing mount point path")?
+    } else {
+        // For non-existent paths, try to canonicalize the parent
+        if let Some(parent) = mount_point.parent() {
+            let canonical_parent = if parent.exists() {
+                parent.canonicalize()
+                    .context("canonicalizing mount point parent")?
+            } else {
+                parent.to_path_buf()
+            };
+            canonical_parent.join(mount_point.file_name().unwrap_or_default())
+        } else {
+            mount_point.clone()
+        }
+    };
+
+    // Loopback image is a sibling of mount point (e.g., /mnt/fcvm-btrfs -> /mnt/fcvm-btrfs.img)
+    // Use the canonical path and proper PathBuf API to construct the loopback path
+    let mut loopback_image = canonical_mount.clone();
+    let current_name = loopback_image.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("fcvm-btrfs");
+    loopback_image.set_file_name(format!("{}.img", current_name));
+
+    Ok((canonical_mount, loopback_image))
 }
 
 /// Ensure btrfs storage is set up at the configured assets_dir.
 ///
 /// If the mount point doesn't exist or isn't btrfs, creates a loopback image
-/// in /var, formats it as btrfs, and mounts it.
+/// as a sibling file (e.g., /mnt/fcvm-btrfs.img for /mnt/fcvm-btrfs),
+/// formats it as btrfs, and mounts it.
 ///
-/// This operation requires root privileges.
+/// Creating the loopback and mounting requires root privileges.
 pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
     let (mount_point, loopback_image) = get_storage_paths(config_path)?;
 
-    // Already set up?
+    // Already btrfs? Just ensure directories exist (no root needed)
     if is_btrfs_mount(&mount_point) {
-        // Create any missing directories (idempotent)
         for dir in REQUIRED_DIRS {
             let path = mount_point.join(dir);
             std::fs::create_dir_all(&path)
-                .with_context(|| format!("creating directory {}", path.display()))?;
+                .with_context(|| {
+                    format!(
+                        "creating directory {} (if mount was unmounted, run 'sudo fcvm setup' again)",
+                        path.display()
+                    )
+                })?;
         }
         return Ok(());
     }
 
-    // Check if we're root (required for mount operations)
+    // Need to create/mount btrfs - requires root
     if !nix::unistd::Uid::effective().is_root() {
         anyhow::bail!(
             "Storage not initialized. Run with sudo:\n\n  \
@@ -111,6 +139,12 @@ pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
 
     // Create loopback image if it doesn't exist
     if !loopback_image.exists() {
+        // Ensure parent directory exists
+        if let Some(parent) = loopback_image.parent() {
+            std::fs::create_dir_all(parent)
+                .context("creating loopback image parent directory")?;
+        }
+
         info!(
             "Creating {}GB loopback image at {}",
             DEFAULT_SIZE_GB,
@@ -176,8 +210,8 @@ pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
     // Set ownership to the user who invoked sudo (if SUDO_USER is set)
     if let Ok(sudo_user) = std::env::var("SUDO_USER") {
         info!("Setting ownership to {}", sudo_user);
+        // Chown the mount point itself (non-recursive since we just created it)
         let status = Command::new("chown")
-            .arg("-R")
             .arg(format!("{}:{}", sudo_user, sudo_user))
             .arg(&mount_point)
             .status()
