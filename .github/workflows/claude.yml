@@ -278,6 +278,7 @@ jobs:
 
       - name: Get PR info
         id: pr
+        working-directory: fcvm
         run: |
           PR_DATA=$(gh pr view ${{ github.event.issue.number }} --json headRefName,headRefOid,baseRefName)
           echo "head_branch=$(echo $PR_DATA | jq -r .headRefName)" >> $GITHUB_OUTPUT
@@ -370,6 +371,7 @@ jobs:
 
       - name: Get PR info
         id: pr
+        working-directory: fcvm
         env:
           GH_TOKEN: ${{ steps.claude-token.outputs.token }}
         run: |
