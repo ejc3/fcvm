@@ -111,6 +111,10 @@ You → fcvm → Firecracker VM → Podman → Container
 Each `podman run` boots a VM (~50ms), pulls the image, and starts the container with full VM isolation.
 
 ```bash
+# Install Rust (if not already installed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+
 # Install musl toolchain (for static linking fc-agent binary)
 sudo apt install musl-tools
 rustup target add $(uname -m)-unknown-linux-musl
