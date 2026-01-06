@@ -159,6 +159,27 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ steps.claude-token.outputs.token }}
+          path: fcvm
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev libclang-dev clang
 
       - uses: actions/setup-node@v4
         with:
@@ -169,9 +190,10 @@ jobs:
           version: 9
 
       - name: Install dependencies
-        run: cd scripts/claude-assistant && pnpm install
+        run: cd fcvm/scripts/claude-assistant && pnpm install
 
       - name: Run Claude review
+        working-directory: fcvm
         env:
           GH_TOKEN: ${{ steps.claude-token.outputs.token }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -183,6 +205,8 @@ jobs:
           BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
           RUN_ID: ${{ github.run_id }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FUSE_BACKEND_RS: ${{ github.workspace }}/fuse-backend-rs
+          FUSER: ${{ github.workspace }}/fuser
         run: |
           cd scripts/claude-assistant && pnpm exec tsx index.ts 2>&1 | tee /tmp/claude-output.log
           # Verify completion marker exists (detects if process was killed mid-execution)
@@ -219,6 +243,27 @@ jobs:
           fetch-depth: 0
           ref: refs/pull/${{ github.event.issue.number }}/head
           token: ${{ steps.claude-token.outputs.token }}
+          path: fcvm
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev libclang-dev clang
 
       - uses: actions/setup-node@v4
         with:
@@ -229,7 +274,7 @@ jobs:
           version: 9
 
       - name: Install dependencies
-        run: cd scripts/claude-assistant && pnpm install
+        run: cd fcvm/scripts/claude-assistant && pnpm install
 
       - name: Get PR info
         id: pr
@@ -242,6 +287,7 @@ jobs:
           GH_TOKEN: ${{ steps.claude-token.outputs.token }}
 
       - name: Run Claude review
+        working-directory: fcvm
         env:
           GH_TOKEN: ${{ steps.claude-token.outputs.token }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -253,6 +299,8 @@ jobs:
           BASE_BRANCH: ${{ steps.pr.outputs.base_branch }}
           RUN_ID: ${{ github.run_id }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FUSE_BACKEND_RS: ${{ github.workspace }}/fuse-backend-rs
+          FUSER: ${{ github.workspace }}/fuser
         run: |
           cd scripts/claude-assistant && pnpm exec tsx index.ts 2>&1 | tee /tmp/claude-output.log
           if ! grep -q "CLAUDE_ASSISTANT_COMPLETE" /tmp/claude-output.log; then
@@ -287,6 +335,27 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ steps.claude-token.outputs.token }}
+          path: fcvm
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev libclang-dev clang
 
       - uses: actions/setup-node@v4
         with:
@@ -297,7 +366,7 @@ jobs:
           version: 9
 
       - name: Install dependencies
-        run: cd scripts/claude-assistant && pnpm install
+        run: cd fcvm/scripts/claude-assistant && pnpm install
 
       - name: Get PR info
         id: pr
@@ -317,6 +386,7 @@ jobs:
           fi
 
       - name: Run Claude respond
+        working-directory: fcvm
         env:
           GH_TOKEN: ${{ steps.claude-token.outputs.token }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -329,6 +399,8 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           COMMENT_BODY: ${{ github.event.comment.body }}
+          FUSE_BACKEND_RS: ${{ github.workspace }}/fuse-backend-rs
+          FUSER: ${{ github.workspace }}/fuser
         run: |
           cd scripts/claude-assistant && pnpm exec tsx index.ts 2>&1 | tee /tmp/claude-output.log
           if ! grep -q "CLAUDE_ASSISTANT_COMPLETE" /tmp/claude-output.log; then
@@ -365,6 +437,27 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
           token: ${{ steps.claude-token.outputs.token }}
+          path: fcvm
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuse-backend-rs
+          ref: master
+          path: fuse-backend-rs
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ejc3/fuser
+          ref: master
+          path: fuser
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev libclang-dev clang
 
       - uses: actions/setup-node@v4
         with:
@@ -375,9 +468,10 @@ jobs:
           version: 9
 
       - name: Install dependencies
-        run: cd scripts/claude-assistant && pnpm install
+        run: cd fcvm/scripts/claude-assistant && pnpm install
 
       - name: Run Claude CI fix
+        working-directory: fcvm
         env:
           GH_TOKEN: ${{ steps.claude-token.outputs.token }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -392,6 +486,8 @@ jobs:
           FAILED_RUN_ID: ${{ github.event.workflow_run.id }}
           FAILED_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}
           WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          FUSE_BACKEND_RS: ${{ github.workspace }}/fuse-backend-rs
+          FUSER: ${{ github.workspace }}/fuser
         run: |
           cd scripts/claude-assistant && pnpm exec tsx index.ts 2>&1 | tee /tmp/claude-output.log
           if ! grep -q "CLAUDE_ASSISTANT_COMPLETE" /tmp/claude-output.log; then
