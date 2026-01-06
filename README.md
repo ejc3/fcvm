@@ -254,8 +254,6 @@ Validated with 10 sequential clones from the same memory server:
 
 Individual clone times: 631, 599, 611, 611, 615, 618, 618, 622, 587, 599ms
 
-**Key findings**: Very low variance across clones. UFFD memory serving is consistent and reliable.
-
 #### 10-Clone Parallel Test Results
 
 All 10 clones launched simultaneously:
@@ -266,7 +264,11 @@ All 10 clones launched simultaneously:
 | **Snapshot load (UFFD)** | 9-11ms (consistent under load) |
 | **Individual clone times** | 743-1024ms |
 
-The core VM restore (~10ms) stays consistent even under parallel load. Total wall clock time is only slightly longer than a single clone because all 10 VMs share the same UFFD memory server.
+**Key findings**:
+- **Core restore is fast**: ~10ms regardless of sequential or parallel execution
+- **UFFD scales well**: Single memory server handles 10 concurrent clones with minimal overhead
+- **Parallelism works**: 10 VMs in 1.03s (not 10× sequential time)
+- **Bottleneck is cleanup**: Network teardown and state deletion add latency under contention
 
 **Demo: Time a clone cycle**
 
