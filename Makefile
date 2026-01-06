@@ -1,5 +1,14 @@
 SHELL := /bin/bash
 
+# Find Rust toolchain bin directory and set PATH
+# Prefer stable (has musl target), fall back to any toolchain
+RUST_BIN := $(shell command -v cargo >/dev/null 2>&1 && dirname $$(command -v cargo) || \
+	(test -x $(HOME)/.cargo/bin/cargo && echo $(HOME)/.cargo/bin) || \
+	(ls -d $(HOME)/.rustup/toolchains/stable-*/bin 2>/dev/null | head -1) || \
+	(ls -d $(HOME)/.rustup/toolchains/*/bin 2>/dev/null | head -1))
+export PATH := $(RUST_BIN):$(PATH)
+CARGO := cargo
+
 # Brief notes (see .claude/CLAUDE.md for details):
 #   FILTER=x STREAM=1 - filter tests, stream output
 #   Assets are content-addressed (kernel by URL SHA, rootfs by script SHA, initrd by binary SHA)
@@ -57,7 +66,7 @@ endif
 
 # Base test command
 export CARGO_TARGET_DIR := target
-NEXTEST := cargo nextest $(NEXTEST_CMD) --release
+NEXTEST := $(CARGO) nextest $(NEXTEST_CMD) --release
 
 # Optional cargo cache directory (for CI caching)
 CARGO_CACHE_DIR ?=
@@ -175,8 +184,8 @@ clean-test-data:
 
 build:
 	@echo "==> Building..."
-	CARGO_TARGET_DIR=target cargo build --release -p fcvm
-	CARGO_TARGET_DIR=target cargo build --release -p fc-agent --target $(MUSL_TARGET)
+	CARGO_TARGET_DIR=target $(CARGO) build --release -p fcvm
+	CARGO_TARGET_DIR=target $(CARGO) build --release -p fc-agent --target $(MUSL_TARGET)
 	@mkdir -p target/release && cp target/$(MUSL_TARGET)/release/fc-agent target/release/fc-agent
 	@# Sync embedded config to user config dir (config is embedded at compile time)
 	@./target/release/fcvm setup --generate-config --force 2>/dev/null || true
@@ -309,9 +318,9 @@ _setup-fcvm:
 
 bench: build
 	@echo "==> Running benchmarks..."
-	sudo cargo bench -p fuse-pipe --bench throughput
-	sudo cargo bench -p fuse-pipe --bench operations
-	cargo bench -p fuse-pipe --bench protocol
+	sudo $(CARGO) bench -p fuse-pipe --bench throughput
+	sudo $(CARGO) bench -p fuse-pipe --bench operations
+	$(CARGO) bench -p fuse-pipe --bench protocol
 
 # Container benchmark target (used by nightly CI)
 container-bench: container-build
@@ -320,18 +329,18 @@ container-bench: container-build
 
 _bench:
 	@echo "==> Running benchmarks..."
-	cargo bench -p fuse-pipe --bench throughput
-	cargo bench -p fuse-pipe --bench operations
-	cargo bench -p fuse-pipe --bench protocol
+	$(CARGO) bench -p fuse-pipe --bench throughput
+	$(CARGO) bench -p fuse-pipe --bench operations
+	$(CARGO) bench -p fuse-pipe --bench protocol
 
 lint:
-	cargo fmt -p fcvm -p fuse-pipe -p fc-agent --check
-	cargo clippy --all-targets -- -D warnings
-	cargo audit
-	cargo deny check
+	$(CARGO) fmt -p fcvm -p fuse-pipe -p fc-agent --check
+	$(CARGO) clippy --all-targets -- -D warnings
+	$(CARGO) audit
+	$(CARGO) deny check
 
 fmt:
-	cargo fmt
+	$(CARGO) fmt
 
 # SSH to jumpbox (IP from terraform: cd ~/src/aws && terraform output jumpbox_ssh_command)
 JUMPBOX_IP := 54.193.62.221
