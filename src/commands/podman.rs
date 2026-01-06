@@ -701,9 +701,10 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     let socket_path = data_dir.join("firecracker.sock");
 
     // Create VM state
+    // Note: env vars are NOT stored in state (they may contain secrets and state is world-readable)
+    // Instead, env is passed directly to MMDS at VM start time
     let mut vm_state = VmState::new(vm_id.clone(), args.image.clone(), args.cpu, args.mem);
     vm_state.name = Some(vm_name.clone());
-    vm_state.config.env = args.env.clone();
     vm_state.config.volumes = args.map.clone();
     vm_state.config.health_check_url = args.health_check.clone();
 

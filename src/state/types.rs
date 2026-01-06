@@ -93,7 +93,8 @@ pub struct VmConfig {
     pub memory_mib: u32,
     pub network: NetworkConfig,
     pub volumes: Vec<String>,
-    pub env: Vec<String>,
+    // Note: env vars intentionally NOT stored here - they may contain secrets
+    // and state files are world-readable. Env is passed directly to MMDS.
     /// Extra block devices (paths to raw disk images)
     #[serde(default)]
     pub extra_disks: Vec<ExtraDisk>,
@@ -130,7 +131,6 @@ impl VmState {
                 memory_mib,
                 network: NetworkConfig::default(),
                 volumes: Vec::new(),
-                env: Vec::new(),
                 extra_disks: Vec::new(),
                 nfs_shares: Vec::new(),
                 health_check_url: None,
@@ -221,7 +221,6 @@ mod tests {
                     "host_veth": null
                 },
                 "volumes": [],
-                "env": [],
                 "health_check_url": null,
                 "snapshot_name": null,
                 "process_type": "serve",
