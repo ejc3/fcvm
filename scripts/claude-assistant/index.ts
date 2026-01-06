@@ -333,7 +333,37 @@ SEVERITY: <critical|medium|low|none>
 _Review by Claude | [Run](${ctx.runUrl})_"
 \`\`\`
 
-## STEP 5: FIX (only if [MEDIUM] or [CRITICAL] issues found)
+## STEP 5: DECIDE WHETHER TO FIX OR BLOCK
+
+When you find [MEDIUM] or [CRITICAL] issues, decide:
+
+### Option A: BLOCK (if fix would revert the PR's changes)
+
+If fixing the issue means undoing/reverting what the PR did, **do NOT create a fix PR**.
+Instead, comment that the PR should not be merged:
+
+\`\`\`bash
+gh pr comment ${ctx.prNumber} --repo ${ctx.repository} --body "## ⛔ Do Not Merge
+
+This PR has critical issues that require changes by the author before merging.
+
+### Issues Requiring Author Action
+<list the issues>
+
+### Why No Auto-Fix
+The fix would essentially revert this PR's changes. The author should address these issues directly.
+
+---
+_Review by Claude | [Run](${ctx.runUrl})_"
+\`\`\`
+
+Then **STOP** - do not create any fix PR.
+
+### Option B: FIX (if you're adding improvements on top)
+
+Only create a fix PR if you're **adding to** the PR's changes, not undoing them.
+Good examples: adding missing error handling, fixing a typo, adding a missing test.
+Bad examples: reverting a permission change, removing a feature the PR added.
 
 ### 5a. Edit files
 Make the minimum changes needed to fix the issues.
