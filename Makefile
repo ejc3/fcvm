@@ -146,6 +146,8 @@ help:
 # Disk space check - fails if either root or btrfs is too full
 # Requires 10GB free on root (for cargo target) and 15GB on btrfs (for VMs)
 check-disk:
+	@# Ensure test log directory exists for container mounts
+	@mkdir -p $(TEST_LOG_DIR)
 	@# Fix advisory-db ownership (sudo/non-sudo mixing corrupts it)
 	@sudo chown -R $$(id -u):$$(id -g) "$$HOME/.cargo/advisory-db" 2>/dev/null || true
 	@sudo chown -R $$(id -u):$$(id -g) "$$HOME/.cargo/advisory-dbs" 2>/dev/null || true
@@ -323,7 +325,7 @@ bench: build
 	$(CARGO) bench -p fuse-pipe --bench protocol
 
 # Container benchmark target (used by nightly CI)
-container-bench: container-build
+container-bench: check-disk container-build
 	@echo "==> Running benchmarks in container..."
 	$(CONTAINER_RUN) $(CONTAINER_TAG) make build _bench
 
