@@ -4,7 +4,7 @@ A Rust implementation that launches Firecracker microVMs to run Podman container
 
 > **Features**
 > - Run OCI containers in isolated Firecracker microVMs
-> - Instant VM cloning via UFFD memory server + btrfs reflinks (~3ms)
+> - Fast VM cloning via UFFD memory server + btrfs reflinks (~0.7s per clone)
 > - Multiple VMs share memory via kernel page cache (50 VMs = ~512MB, not 25GB!)
 > - Dual networking: bridged (iptables) or rootless (slirp4netns)
 > - Port forwarding for both regular VMs and clones
@@ -108,7 +108,7 @@ fcvm runs containers inside Firecracker microVMs:
 You → fcvm → Firecracker VM → Podman → Container
 ```
 
-Each `podman run` boots a VM (~50ms), pulls the image, and starts the container with full VM isolation.
+Each `podman run` boots a VM (~5s), pulls the image, and starts the container with full VM isolation.
 
 ```bash
 # Install Rust (if not already installed)
@@ -193,7 +193,7 @@ sudo ./fcvm snapshot create baseline --tag nginx-warm
 # 3. Start UFFD memory server (serves pages on-demand)
 sudo ./fcvm snapshot serve nginx-warm
 
-# 4. Clone from snapshot (~3ms startup)
+# 4. Clone from snapshot (~0.7s startup)
 sudo ./fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
 sudo ./fcvm snapshot run --pid <serve_pid> --name clone2 --network bridged
 
@@ -213,16 +213,16 @@ sudo ./fcvm snapshot run --pid <serve_pid> --network bridged --exec "curl localh
 
 | Demo | What it proves |
 |------|----------------|
-| **Clone Speed** | 3ms memory restore from snapshot |
+| **Clone Speed** | ~0.7s clone startup from snapshot |
 | **Memory Sharing** | 10 clones use ~1.5GB extra, not 20GB |
 | **Scale-Out** | 50+ VMs with ~7GB memory, not 100GB |
 | **Privileged Container** | mknod and device access work |
 | **Multiple Ports** | Comma-separated port mappings |
 | **Multiple Volumes** | Comma-separated volume mappings with :ro |
 
-### Clone Speed (~3ms startup)
+### Clone Speed (~0.7s startup)
 
-Demonstrate instant VM cloning from a warmed snapshot:
+Demonstrate fast VM cloning from a warmed snapshot:
 
 ```bash
 # Setup: Create baseline and snapshot (rootless mode)
@@ -232,7 +232,7 @@ Demonstrate instant VM cloning from a warmed snapshot:
 
 # Time a clone startup (includes exec and cleanup)
 time ./fcvm snapshot run --pid <serve_pid> --exec "echo ready"
-# real 0m0.003s  ← 3ms!
+# real 0m0.7s  ← ~700ms
 ```
 
 ### Memory Sharing Proof
@@ -253,9 +253,9 @@ wait
 free -m | grep Mem
 ```
 
-### Scale-Out Demo (50 VMs in ~150ms)
+### Scale-Out Demo (50 VMs in ~3s)
 
-Spin up a fleet of web servers instantly:
+Spin up a fleet of web servers quickly:
 
 ```bash
 # Create warm nginx snapshot (one-time, in another terminal)
@@ -269,7 +269,7 @@ time for i in {1..50}; do
   ./fcvm snapshot run --pid <serve_pid> --name web$i --publish $((8080+i)):80 &
 done
 wait
-# real 0m0.150s  ← 50 VMs in 150ms!
+# real 0m3.1s  ← 50 VMs in ~3 seconds
 
 # Verify all running
 ./fcvm ls | wc -l  # 51 (50 clones + 1 baseline)
