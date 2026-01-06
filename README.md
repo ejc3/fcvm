@@ -4,7 +4,7 @@ A Rust implementation that launches Firecracker microVMs to run Podman container
 
 > **Features**
 > - Run OCI containers in isolated Firecracker microVMs
-> - Instant VM cloning via UFFD memory server + btrfs reflinks (~3ms)
+> - Fast VM cloning via UFFD memory server + btrfs reflinks (~10ms restore, ~610ms with exec)
 > - Multiple VMs share memory via kernel page cache (50 VMs = ~512MB, not 25GB!)
 > - Dual networking: bridged (iptables) or rootless (slirp4netns)
 > - Port forwarding for both regular VMs and clones
@@ -108,7 +108,7 @@ fcvm runs containers inside Firecracker microVMs:
 You → fcvm → Firecracker VM → Podman → Container
 ```
 
-Each `podman run` boots a VM (~50ms), pulls the image, and starts the container with full VM isolation.
+Each `podman run` boots a VM (~5s), pulls the image, and starts the container with full VM isolation.
 
 ```bash
 # Install Rust (if not already installed)
@@ -193,7 +193,7 @@ sudo ./fcvm snapshot create baseline --tag nginx-warm
 # 3. Start UFFD memory server (serves pages on-demand)
 sudo ./fcvm snapshot serve nginx-warm
 
-# 4. Clone from snapshot (~3ms startup)
+# 4. Clone from snapshot (~10ms restore, ~610ms with exec)
 sudo ./fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
 sudo ./fcvm snapshot run --pid <serve_pid> --name clone2 --network bridged
 
@@ -213,16 +213,64 @@ sudo ./fcvm snapshot run --pid <serve_pid> --network bridged --exec "curl localh
 
 | Demo | What it proves |
 |------|----------------|
-| **Clone Speed** | 3ms memory restore from snapshot |
+| **Clone Speed** | ~10ms memory restore, ~610ms full cycle |
 | **Memory Sharing** | 10 clones use ~1.5GB extra, not 20GB |
 | **Scale-Out** | 50+ VMs with ~7GB memory, not 100GB |
 | **Privileged Container** | mknod and device access work |
 | **Multiple Ports** | Comma-separated port mappings |
 | **Multiple Volumes** | Comma-separated volume mappings with :ro |
 
-### Clone Speed (~3ms startup)
+### Clone Speed Breakdown
 
-Demonstrate instant VM cloning from a warmed snapshot:
+Clone timing measured on c7g.metal ARM64 with `RUST_LOG=debug`:
+
+| Step | Time | Description |
+|------|------|-------------|
+| State lookup | ~1ms | Find serve process |
+| Namespace spawn | ~6ms | `unshare --user --map-root-user --net` |
+| CoW disk reflink | ~31ms | btrfs instant copy |
+| Network setup | ~35ms | TAP device, iptables rules |
+| Firecracker spawn | ~6ms | Start VM process |
+| **Snapshot load (UFFD)** | **~9ms** | Load memory from server |
+| Disk patch | <1ms | Point to CoW disk |
+| **VM resume** | **<1ms** | Resume vCPUs |
+| fc-agent recovery | ~100ms | ARP flush, kill stale TCP |
+| Exec connect | ~20ms | Connect to guest vsock |
+| Command + cleanup | ~300ms | Run echo + shutdown |
+| **Total** | **~610ms** | Full clone cycle with exec |
+
+The **core VM restore** (snapshot load + resume) is just **~10ms**. The remaining time is network setup, guest agent recovery, and cleanup.
+
+#### 10-Clone Test Results
+
+Validated with 10 sequential clones from the same memory server:
+
+| Metric | Average | Range |
+|--------|---------|-------|
+| **Snapshot load (UFFD)** | 9.08ms | 8.76-9.56ms |
+| **VM resume** | 0.48ms | 0.44-0.56ms |
+| **Core VM restore** | ~9.5ms | — |
+| **Full clone cycle** | 611ms | 587-631ms |
+
+Individual clone times: 631, 599, 611, 611, 615, 618, 618, 622, 587, 599ms
+
+#### 10-Clone Parallel Test Results
+
+All 10 clones launched simultaneously:
+
+| Metric | Value |
+|--------|-------|
+| **Wall clock time** | **1.03s** |
+| **Snapshot load (UFFD)** | 9-11ms (consistent under load) |
+| **Individual clone times** | 743-1024ms |
+
+**Key findings**:
+- **Core restore is fast**: ~10ms regardless of sequential or parallel execution
+- **UFFD scales well**: Single memory server handles 10 concurrent clones with minimal overhead
+- **Parallelism works**: 10 VMs in 1.03s (not 10× sequential time)
+- **Bottleneck is cleanup**: Network teardown and state deletion add latency under contention
+
+**Demo: Time a clone cycle**
 
 ```bash
 # Setup: Create baseline and snapshot (rootless mode)
@@ -232,7 +280,7 @@ Demonstrate instant VM cloning from a warmed snapshot:
 
 # Time a clone startup (includes exec and cleanup)
 time ./fcvm snapshot run --pid <serve_pid> --exec "echo ready"
-# real 0m0.003s  ← 3ms!
+# real 0m0.610s  ← 610ms total, ~10ms for VM restore
 ```
 
 ### Memory Sharing Proof
@@ -253,9 +301,9 @@ wait
 free -m | grep Mem
 ```
 
-### Scale-Out Demo (50 VMs in ~150ms)
+### Scale-Out Demo (50 VMs in ~3s)
 
-Spin up a fleet of web servers instantly:
+Spin up a fleet of web servers quickly:
 
 ```bash
 # Create warm nginx snapshot (one-time, in another terminal)
@@ -269,7 +317,7 @@ time for i in {1..50}; do
   ./fcvm snapshot run --pid <serve_pid> --name web$i --publish $((8080+i)):80 &
 done
 wait
-# real 0m0.150s  ← 50 VMs in 150ms!
+# real 0m3.1s  ← 50 VMs in ~3 seconds
 
 # Verify all running
 ./fcvm ls | wc -l  # 51 (50 clones + 1 baseline)
@@ -716,7 +764,7 @@ Every CI run exercises the full stack:
 | **pjdfstest Categories** | 17 |
 
 Performance (on c7g.metal ARM64):
-- **Clone to healthy**: 0.67s average
+- **Clone to healthy**: 0.67s average (see [Clone Speed Breakdown](#clone-speed-breakdown))
 - **Snapshot creation**: 40.7s average
 - **Total test time**: ~13 minutes (parallel jobs)
 
