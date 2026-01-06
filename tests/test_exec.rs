@@ -360,7 +360,7 @@ async fn exec_test_impl(network: &str) -> Result<()> {
     {
         let pid_str = fcvm_pid.to_string();
         let mut child = tokio::process::Command::new(&fcvm_path)
-            .args(["exec", "--pid", &pid_str, "--vm", "-i", "--", "head", "-1"])
+            .args(["exec", "--pid", &pid_str, "--vm", "-i", "head", "-1"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -391,7 +391,7 @@ async fn exec_test_impl(network: &str) -> Result<()> {
     {
         let pid_str = fcvm_pid.to_string();
         let mut child = tokio::process::Command::new(&fcvm_path)
-            .args(["exec", "--pid", &pid_str, "-i", "--", "head", "-1"])
+            .args(["exec", "--pid", &pid_str, "-i", "head", "-1"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -482,6 +482,125 @@ async fn exec_test_impl(network: &str) -> Result<()> {
         output
     );
     println!("  ✓ -t without -i correctly ignores stdin (container)");
+
+    // ======================================================================
+    // Tests 25-28: Ctrl-C/Ctrl-D/Ctrl-Z via PTY (proper signal path)
+    // These tests send actual control characters through the PTY to verify
+    // the signal handling works correctly through the terminal layer.
+    // ======================================================================
+
+    // Test 25: Ctrl-C (0x03) via PTY interrupts sleep (VM)
+    // This tests the proper PTY signal path: we write 0x03 to PTY master,
+    // which gets interpreted by the PTY slave's line discipline as SIGINT
+    println!("\nTest 25: Ctrl-C (0x03) via PTY interrupts command (VM -it)");
+    let (exit_code, _, output) = run_exec_with_pty_interrupt(
+        &fcvm_path,
+        fcvm_pid,
+        true, // in_vm
+        &[
+            "sh",
+            "-c",
+            "trap 'echo CAUGHT_SIGINT; exit 130' INT; echo READY; sleep 999",
+        ],
+        "READY",
+        0x03, // Ctrl-C
+    )
+    .await?;
+    println!("  exit code: {}", exit_code);
+    println!("  output: {:?}", output);
+    assert!(
+        output.contains("READY"),
+        "should see READY before interrupt, got: {:?}",
+        output
+    );
+    assert!(
+        output.contains("CAUGHT_SIGINT"),
+        "trap should catch SIGINT, got: {:?}",
+        output
+    );
+    assert_eq!(exit_code, 130, "exit code should be 130 (128 + SIGINT)");
+    println!("  ✓ Ctrl-C via PTY works for VM exec");
+
+    // Test 26: Ctrl-C (0x03) via PTY interrupts command (container -it)
+    println!("\nTest 26: Ctrl-C (0x03) via PTY interrupts command (container -it)");
+    let (exit_code, _, output) = run_exec_with_pty_interrupt(
+        &fcvm_path,
+        fcvm_pid,
+        false, // container
+        &[
+            "sh",
+            "-c",
+            "trap 'echo CAUGHT_SIGINT; exit 130' INT; echo READY; sleep 999",
+        ],
+        "READY",
+        0x03, // Ctrl-C
+    )
+    .await?;
+    println!("  exit code: {}", exit_code);
+    println!("  output: {:?}", output);
+    assert!(
+        output.contains("READY"),
+        "should see READY before interrupt, got: {:?}",
+        output
+    );
+    assert!(
+        output.contains("CAUGHT_SIGINT"),
+        "trap should catch SIGINT, got: {:?}",
+        output
+    );
+    assert_eq!(exit_code, 130, "exit code should be 130 (128 + SIGINT)");
+    println!("  ✓ Ctrl-C via PTY works for container exec");
+
+    // Test 27: Ctrl-D (0x04) via PTY sends EOF (VM -it)
+    // Ctrl-D should close stdin, causing the process to see EOF
+    println!("\nTest 27: Ctrl-D (0x04) via PTY sends EOF (VM -it)");
+    let (exit_code, _, output) = run_exec_with_pty_interrupt(
+        &fcvm_path,
+        fcvm_pid,
+        true, // in_vm
+        &["sh", "-c", "echo READY; cat; echo GOT_EOF"],
+        "READY",
+        0x04, // Ctrl-D
+    )
+    .await?;
+    println!("  exit code: {}", exit_code);
+    println!("  output: {:?}", output);
+    assert!(
+        output.contains("READY"),
+        "should see READY before EOF, got: {:?}",
+        output
+    );
+    assert!(
+        output.contains("GOT_EOF"),
+        "cat should get EOF and script should continue, got: {:?}",
+        output
+    );
+    println!("  ✓ Ctrl-D via PTY works for VM exec");
+
+    // Test 28: Ctrl-D (0x04) via PTY sends EOF (container -it)
+    println!("\nTest 28: Ctrl-D (0x04) via PTY sends EOF (container -it)");
+    let (exit_code, _, output) = run_exec_with_pty_interrupt(
+        &fcvm_path,
+        fcvm_pid,
+        false, // container
+        &["sh", "-c", "echo READY; cat; echo GOT_EOF"],
+        "READY",
+        0x04, // Ctrl-D
+    )
+    .await?;
+    println!("  exit code: {}", exit_code);
+    println!("  output: {:?}", output);
+    assert!(
+        output.contains("READY"),
+        "should see READY before EOF, got: {:?}",
+        output
+    );
+    assert!(
+        output.contains("GOT_EOF"),
+        "cat should get EOF and script should continue, got: {:?}",
+        output
+    );
+    println!("  ✓ Ctrl-D via PTY works for container exec");
 
     // Cleanup
     println!("\nCleaning up...");
@@ -870,6 +989,158 @@ async fn run_exec_with_pty(
     }
 }
 
+/// Run fcvm exec with PTY and send a control character after seeing expected output
+///
+/// This tests the proper PTY signal path:
+/// - Ctrl-C (0x03) should be converted to SIGINT by PTY layer
+/// - Ctrl-D (0x04) should be converted to EOF
+/// - Ctrl-Z (0x1a) should be converted to SIGTSTP
+///
+/// Uses -it mode (interactive + tty) so stdin is forwarded.
+async fn run_exec_with_pty_interrupt(
+    fcvm_path: &std::path::Path,
+    pid: u32,
+    in_vm: bool,
+    cmd: &[&str],
+    wait_for: &str,
+    control_char: u8,
+) -> Result<(i32, Duration, String)> {
+    use nix::pty::openpty;
+    use nix::unistd::{close, dup2, fork, ForkResult};
+    use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+
+    let pid_str = pid.to_string();
+    let start = std::time::Instant::now();
+
+    // Allocate a PTY pair
+    let pty = openpty(None, None).context("opening PTY")?;
+
+    // Configure PTY slave before forking
+    unsafe {
+        let slave_fd = pty.slave.as_raw_fd();
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(slave_fd, &mut termios) == 0 {
+            // Disable echo but KEEP ISIG enabled so control characters work
+            termios.c_lflag &= !(libc::ECHO | libc::ICANON);
+            // ISIG must be enabled for Ctrl-C → SIGINT conversion in PTY layer
+            libc::tcsetattr(slave_fd, libc::TCSANOW, &termios);
+        }
+    }
+
+    let master_fd = pty.master.into_raw_fd();
+    let slave_fd = pty.slave.into_raw_fd();
+
+    match unsafe { fork() }.context("forking")? {
+        ForkResult::Child => {
+            // Child: set up PTY slave as stdin/stdout/stderr
+            unsafe {
+                libc::setsid();
+                libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
+                dup2(slave_fd, 0).ok();
+                dup2(slave_fd, 1).ok();
+                dup2(slave_fd, 2).ok();
+                if slave_fd > 2 {
+                    close(slave_fd).ok();
+                }
+                close(master_fd).ok();
+            }
+
+            // Build command
+            use std::ffi::CString;
+            let prog = CString::new(fcvm_path.to_str().unwrap()).unwrap();
+            let mut args: Vec<CString> = vec![
+                CString::new(fcvm_path.to_str().unwrap()).unwrap(),
+                CString::new("exec").unwrap(),
+                CString::new("--pid").unwrap(),
+                CString::new(pid_str.as_str()).unwrap(),
+                CString::new("-it").unwrap(), // Always use -it for control char tests
+            ];
+            if in_vm {
+                args.push(CString::new("--vm").unwrap());
+            }
+            args.push(CString::new("--").unwrap());
+            for c in cmd {
+                args.push(CString::new(*c).unwrap());
+            }
+
+            #[allow(unreachable_code)]
+            {
+                nix::unistd::execvp(&prog, &args).expect("execvp failed");
+                std::process::exit(1);
+            }
+        }
+        ForkResult::Parent { child } => {
+            close(slave_fd).ok();
+            let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+
+            // Set non-blocking
+            unsafe {
+                let flags = libc::fcntl(master_fd, libc::F_GETFL);
+                libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+
+            let mut output = Vec::new();
+            let mut buf = [0u8; 4096];
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut sent_control = false;
+
+            loop {
+                if std::time::Instant::now() > deadline {
+                    nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL).ok();
+                    anyhow::bail!("timeout waiting for command");
+                }
+
+                use std::io::Read;
+                match master.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        output.extend_from_slice(&buf[..n]);
+
+                        // Check if we should send the control character
+                        if !sent_control {
+                            let output_str = String::from_utf8_lossy(&output);
+                            if output_str.contains(wait_for) {
+                                // Small delay to ensure command is in expected state
+                                std::thread::sleep(Duration::from_millis(100));
+
+                                // Send the control character through PTY
+                                use std::io::Write;
+                                master.write_all(&[control_char]).ok();
+                                master.flush().ok();
+                                sent_control = true;
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Check if child exited
+                        match nix::sys::wait::waitpid(
+                            child,
+                            Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+                        ) {
+                            Ok(nix::sys::wait::WaitStatus::Exited(_, _)) => break,
+                            Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
+                            _ => std::thread::sleep(Duration::from_millis(50)),
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            // Wait for child
+            let status = nix::sys::wait::waitpid(child, None).context("waiting for child")?;
+            let exit_code = match status {
+                nix::sys::wait::WaitStatus::Exited(_, code) => code,
+                _ => -1,
+            };
+
+            let duration = start.elapsed();
+            let output_str = String::from_utf8_lossy(&output).to_string();
+
+            Ok((exit_code, duration, output_str))
+        }
+    }
+}
+
 /// Stress test: Run 100 parallel TTY execs to verify no race conditions
 ///
 /// This test verifies that the TTY stdin fix works under heavy parallel load.
@@ -1008,5 +1279,313 @@ async fn test_exec_parallel_tty_stress() -> Result<()> {
     );
 
     println!("✓ ALL {} PARALLEL TTY EXECS PASSED!", TOTAL_EXECS);
+    Ok(())
+}
+
+// ============================================================================
+// Tests for `fcvm podman run -it` (not exec, but container run with -i/-t)
+// ============================================================================
+
+/// Test `fcvm podman run -t` allocates TTY for container
+///
+/// Uses `tty` command to verify TTY is allocated when -t flag is used.
+#[tokio::test]
+async fn test_podman_run_tty() -> Result<()> {
+    use nix::pty::openpty;
+    use nix::unistd::{close, dup2, fork, ForkResult};
+    use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+    use std::time::Duration;
+
+    println!("\nTest: fcvm podman run -t (TTY allocation)");
+    println!("==========================================");
+
+    let fcvm_path = common::find_fcvm_binary()?;
+    let (vm_name, _, _, _) = common::unique_names("run-tty");
+
+    // Allocate PTY for test harness (since we don't have a real terminal)
+    let pty = openpty(None, None).context("opening PTY")?;
+
+    // Disable echo before forking
+    unsafe {
+        let slave_fd = pty.slave.as_raw_fd();
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(slave_fd, &mut termios) == 0 {
+            termios.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
+            libc::tcsetattr(slave_fd, libc::TCSANOW, &termios);
+        }
+    }
+
+    let master_fd = pty.master.into_raw_fd();
+    let slave_fd = pty.slave.into_raw_fd();
+
+    // Fork to run fcvm with PTY
+    match unsafe { fork() }.context("forking")? {
+        ForkResult::Child => {
+            // Child: set up PTY and exec fcvm
+            unsafe {
+                libc::setsid();
+                libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
+                dup2(slave_fd, 0).ok();
+                dup2(slave_fd, 1).ok();
+                dup2(slave_fd, 2).ok();
+                if slave_fd > 2 {
+                    close(slave_fd).ok();
+                }
+                close(master_fd).ok();
+            }
+
+            // Exec fcvm podman run -t ... tty
+            use std::ffi::CString;
+            let prog = CString::new(fcvm_path.to_str().unwrap()).unwrap();
+            let args = vec![
+                CString::new(fcvm_path.to_str().unwrap()).unwrap(),
+                CString::new("podman").unwrap(),
+                CString::new("run").unwrap(),
+                CString::new("--name").unwrap(),
+                CString::new(vm_name.as_str()).unwrap(),
+                CString::new("-t").unwrap(),
+                CString::new("alpine:latest").unwrap(),
+                CString::new("tty").unwrap(),
+            ];
+            #[allow(unreachable_code)]
+            {
+                nix::unistd::execvp(&prog, &args).expect("execvp failed");
+                std::process::exit(1);
+            }
+        }
+        ForkResult::Parent { child } => {
+            close(slave_fd).ok();
+
+            let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+
+            // Read output with timeout
+            let mut output = Vec::new();
+            let mut buf = [0u8; 4096];
+
+            // Set non-blocking
+            unsafe {
+                let flags = libc::fcntl(master_fd, libc::F_GETFL);
+                libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            loop {
+                if std::time::Instant::now() > deadline {
+                    nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL).ok();
+                    break;
+                }
+
+                use std::io::Read;
+                match master.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => output.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        match nix::sys::wait::waitpid(
+                            child,
+                            Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+                        ) {
+                            Ok(nix::sys::wait::WaitStatus::Exited(_, _)) => break,
+                            Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
+                            _ => std::thread::sleep(Duration::from_millis(50)),
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            // Wait for child
+            let _ = nix::sys::wait::waitpid(child, None);
+
+            let output_str = String::from_utf8_lossy(&output);
+            println!("  Output: {:?}", output_str);
+
+            // Should see /dev/pts/X
+            assert!(
+                output_str.contains("/dev/pts"),
+                "With -t flag, container should have TTY (/dev/pts), got: {:?}",
+                output_str
+            );
+            println!("✓ fcvm podman run -t correctly allocates TTY");
+        }
+    }
+
+    Ok(())
+}
+
+/// Test `fcvm podman run -it` for interactive container with TTY
+///
+/// Uses `head -1` to verify stdin is forwarded when -i flag is used.
+#[tokio::test]
+async fn test_podman_run_interactive_tty() -> Result<()> {
+    use nix::pty::openpty;
+    use nix::unistd::{close, dup2, fork, ForkResult};
+    use std::io::Write;
+    use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+    use std::time::Duration;
+
+    println!("\nTest: fcvm podman run -it (interactive + TTY)");
+    println!("==============================================");
+
+    let fcvm_path = common::find_fcvm_binary()?;
+    let (vm_name, _, _, _) = common::unique_names("run-it");
+
+    // Allocate PTY for test harness
+    let pty = openpty(None, None).context("opening PTY")?;
+
+    // Disable echo before forking
+    unsafe {
+        let slave_fd = pty.slave.as_raw_fd();
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(slave_fd, &mut termios) == 0 {
+            termios.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
+            libc::tcsetattr(slave_fd, libc::TCSANOW, &termios);
+        }
+    }
+
+    let master_fd = pty.master.into_raw_fd();
+    let slave_fd = pty.slave.into_raw_fd();
+
+    // Fork to run fcvm with PTY
+    match unsafe { fork() }.context("forking")? {
+        ForkResult::Child => {
+            // Child: set up PTY and exec fcvm
+            unsafe {
+                libc::setsid();
+                libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
+                dup2(slave_fd, 0).ok();
+                dup2(slave_fd, 1).ok();
+                dup2(slave_fd, 2).ok();
+                if slave_fd > 2 {
+                    close(slave_fd).ok();
+                }
+                close(master_fd).ok();
+            }
+
+            // Exec fcvm podman run -it ... head -1
+            use std::ffi::CString;
+            let prog = CString::new(fcvm_path.to_str().unwrap()).unwrap();
+            let args = vec![
+                CString::new(fcvm_path.to_str().unwrap()).unwrap(),
+                CString::new("podman").unwrap(),
+                CString::new("run").unwrap(),
+                CString::new("--name").unwrap(),
+                CString::new(vm_name.as_str()).unwrap(),
+                CString::new("-it").unwrap(),
+                CString::new("alpine:latest").unwrap(),
+                CString::new("head").unwrap(),
+                CString::new("-1").unwrap(),
+            ];
+            #[allow(unreachable_code)]
+            {
+                nix::unistd::execvp(&prog, &args).expect("execvp failed");
+                unreachable!();
+            }
+        }
+        ForkResult::Parent { child } => {
+            close(slave_fd).ok();
+
+            let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+
+            // Wait for container to be ready
+            std::thread::sleep(Duration::from_secs(10));
+
+            // Write input to container
+            master
+                .write_all(b"hello-from-stdin\n")
+                .context("writing stdin")?;
+            master.flush()?;
+
+            // Read output with timeout
+            let mut output = Vec::new();
+            let mut buf = [0u8; 4096];
+
+            // Set non-blocking
+            unsafe {
+                let flags = libc::fcntl(master_fd, libc::F_GETFL);
+                libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            loop {
+                if std::time::Instant::now() > deadline {
+                    nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL).ok();
+                    break;
+                }
+
+                use std::io::Read;
+                match master.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => output.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        match nix::sys::wait::waitpid(
+                            child,
+                            Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+                        ) {
+                            Ok(nix::sys::wait::WaitStatus::Exited(_, _)) => break,
+                            Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
+                            _ => std::thread::sleep(Duration::from_millis(50)),
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            // Wait for child
+            let _ = nix::sys::wait::waitpid(child, None);
+
+            let output_str = String::from_utf8_lossy(&output);
+            println!("  Output: {:?}", output_str);
+
+            // Should see our input echoed back
+            assert!(
+                output_str.contains("hello-from-stdin"),
+                "With -it flags, stdin should be forwarded, got: {:?}",
+                output_str
+            );
+            println!("✓ fcvm podman run -it correctly forwards stdin");
+        }
+    }
+
+    Ok(())
+}
+
+/// Test `fcvm podman run` without -t flag (no TTY)
+///
+/// Verifies that without -t, container does NOT have a TTY.
+#[tokio::test]
+async fn test_podman_run_no_tty() -> Result<()> {
+    use std::time::Duration;
+
+    println!("\nTest: fcvm podman run (no -t = no TTY)");
+    println!("======================================");
+
+    let fcvm_path = common::find_fcvm_binary()?;
+    let (vm_name, _, _, _) = common::unique_names("run-no-tty");
+
+    // Run without -t, check tty command output
+    let output = tokio::time::timeout(
+        Duration::from_secs(120),
+        tokio::process::Command::new(&fcvm_path)
+            .args(["podman", "run", "--name", &vm_name, "alpine:latest", "tty"])
+            .output(),
+    )
+    .await
+    .context("timeout")?
+    .context("running fcvm")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}{}", stdout, stderr);
+
+    println!("  Output: {:?}", combined.trim());
+
+    // Without -t, should say "not a tty"
+    assert!(
+        combined.contains("not a tty") || combined.contains("not a terminal"),
+        "Without -t flag, container should NOT have TTY, got: {:?}",
+        combined
+    );
+    println!("✓ fcvm podman run (no -t) correctly has no TTY");
+
     Ok(())
 }

@@ -54,7 +54,7 @@ impl VolumeMapping {
     }
 }
 
-use super::common::{VSOCK_OUTPUT_PORT, VSOCK_STATUS_PORT, VSOCK_VOLUME_PORT_BASE};
+use super::common::{VSOCK_OUTPUT_PORT, VSOCK_STATUS_PORT, VSOCK_TTY_PORT, VSOCK_VOLUME_PORT_BASE};
 
 /// Create an ext4 disk image from a directory's contents.
 /// Returns the path to the created image.
@@ -335,8 +335,14 @@ async fn run_status_listener(
 ///   Guest → Host: "stdout:content" or "stderr:content"
 ///   Host → Guest: "stdin:content" (written to container stdin)
 ///
+/// If `interactive` is true, forwards host stdin to container.
+///
 /// Returns collected output lines as Vec<(stream, line)>.
-async fn run_output_listener(socket_path: &str, vm_id: &str) -> Result<Vec<(String, String)>> {
+async fn run_output_listener(
+    socket_path: &str,
+    vm_id: &str,
+    interactive: bool,
+) -> Result<Vec<(String, String)>> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
@@ -374,9 +380,40 @@ async fn run_output_listener(socket_path: &str, vm_id: &str) -> Result<Vec<(Stri
 
     debug!(vm_id = %vm_id, "Output connection established");
 
-    let (reader, mut writer) = stream.into_split();
+    let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
+    let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
     let mut line_buf = String::new();
+
+    // Spawn stdin forwarder if interactive mode
+    let stdin_task = if interactive {
+        let writer = writer.clone();
+        Some(tokio::spawn(async move {
+            let stdin = tokio::io::stdin();
+            let mut stdin = BufReader::new(stdin);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match stdin.read_line(&mut line).await {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
+                        // Forward to container: "stdin:content\n"
+                        let msg = format!("stdin:{}", line.trim_end());
+                        let mut w = writer.lock().await;
+                        if w.write_all(msg.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        if w.write_all(b"\n").await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }))
+    } else {
+        None
+    };
 
     // Read lines until connection closes
     loop {
@@ -406,7 +443,8 @@ async fn run_output_listener(socket_path: &str, vm_id: &str) -> Result<Vec<(Stri
                     output_lines.push((stream.to_string(), content.to_string()));
 
                     // Send ack back (bidirectional)
-                    let _ = writer.write_all(b"ack\n").await;
+                    let mut w = writer.lock().await;
+                    let _ = w.write_all(b"ack\n").await;
                 }
             }
             Ok(Err(e)) => {
@@ -419,6 +457,11 @@ async fn run_output_listener(socket_path: &str, vm_id: &str) -> Result<Vec<(Stri
                 break;
             }
         }
+    }
+
+    // Abort stdin task if it's still running
+    if let Some(task) = stdin_task {
+        task.abort();
     }
 
     // Clean up
@@ -766,21 +809,40 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         })
     };
 
-    // Start bidirectional output listener for container stdout/stderr
-    // Port 4997 receives JSON lines: {"stream":"stdout|stderr","line":"..."}
+    // Start I/O listener for container stdin/stdout/stderr
+    // TTY mode: use binary exec_proto on port 4996 (blocking, raw terminal)
+    // Non-TTY mode: use line-based protocol on port 4997 (async)
+    let tty_mode = args.tty;
+    let interactive = args.interactive;
+    let tty_socket_path = format!("{}_{}", vsock_socket_path.display(), VSOCK_TTY_PORT);
     let output_socket_path = format!("{}_{}", vsock_socket_path.display(), VSOCK_OUTPUT_PORT);
-    let _output_handle = {
+
+    // For TTY mode, we spawn a blocking thread that handles the TTY I/O
+    // This must be set up BEFORE VM starts so we're ready to accept connection
+    let tty_handle = if tty_mode {
+        let socket_path = tty_socket_path.clone();
+        Some(std::thread::spawn(move || {
+            super::tty::run_tty_session(&socket_path, true, interactive)
+        }))
+    } else {
+        None
+    };
+
+    // For non-TTY mode, use async output listener
+    let _output_handle = if !tty_mode {
         let socket_path = output_socket_path.clone();
         let vm_id_clone = vm_id.clone();
-        tokio::spawn(async move {
-            match run_output_listener(&socket_path, &vm_id_clone).await {
+        Some(tokio::spawn(async move {
+            match run_output_listener(&socket_path, &vm_id_clone, interactive).await {
                 Ok(lines) => lines,
                 Err(e) => {
                     tracing::warn!("Output listener error: {}", e);
                     Vec::new()
                 }
             }
-        })
+        }))
+    } else {
+        None
     };
 
     // Run the main VM setup in a helper to ensure cleanup on error
@@ -848,6 +910,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt())?;
 
     // Wait for signal or VM exit
+    // For TTY mode, we get exit code from the TTY listener thread
+    // For non-TTY mode, we read it from the file written by status listener
     let container_exit_code: Option<i32>;
     tokio::select! {
         _ = sigterm.recv() => {
@@ -860,12 +924,21 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         }
         status = vm_manager.wait() => {
             info!(status = ?status, "VM exited");
-            // Read container exit code from file written by status listener
-            let exit_file = data_dir.join("container-exit");
-            container_exit_code = std::fs::read_to_string(&exit_file)
-                .ok()
-                .and_then(|s| s.trim().parse::<i32>().ok());
-            info!(container_exit_code = ?container_exit_code, "container exit code");
+            if let Some(handle) = tty_handle {
+                // TTY mode: get exit code from TTY listener
+                container_exit_code = handle
+                    .join()
+                    .ok()
+                    .and_then(|r| r.ok());
+                info!(container_exit_code = ?container_exit_code, "TTY container exit code");
+            } else {
+                // Non-TTY mode: read container exit code from file written by status listener
+                let exit_file = data_dir.join("container-exit");
+                container_exit_code = std::fs::read_to_string(&exit_file)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i32>().ok());
+                info!(container_exit_code = ?container_exit_code, "container exit code");
+            }
         }
     }
 
@@ -1812,6 +1885,8 @@ async fn run_vm_setup(
                 "nfs_mounts": nfs_mounts,
                 "image_archive": image_archive_name.map(|name| format!("/tmp/fcvm-image/{}", name)),
                 "privileged": args.privileged,
+                "interactive": args.interactive,
+                "tty": args.tty,
             },
             "host-time": chrono::Utc::now().timestamp().to_string(),
         }

@@ -745,7 +745,7 @@ pub async fn exec_in_container(pid: u32, cmd: &[&str]) -> anyhow::Result<String>
     let script = cmd.join(" ");
 
     let output = tokio::process::Command::new(&fcvm_path)
-        .args(["exec", "--pid", &pid.to_string(), "--", "sh", "-c", &script])
+        .args(["exec", "--pid", &pid.to_string(), "sh", "-c", &script])
         .output()
         .await?;
 

@@ -318,7 +318,7 @@ async fn test_nested_run_fcvm_inside_vm() -> Result<()> {
     // First, check kernel config and dmesg for KVM-related messages
     let debug_output = tokio::process::Command::new(&fcvm_path)
         .args([
-            "exec", "--pid", &outer_pid.to_string(), "--vm", "--",
+            "exec", "--pid", &outer_pid.to_string(), "--vm",
             "sh", "-c", r#"
 echo "=== Kernel config (KVM/VIRTUALIZATION) ==="
 zcat /proc/config.gz 2>/dev/null | grep -E "^CONFIG_(KVM|VIRTUALIZATION)" || echo "config.gz not available"

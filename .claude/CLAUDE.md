@@ -27,6 +27,12 @@ gh pr view 2 --json baseRefName
 
 ## UNDERSTAND BRANCH CHAINS
 
+**ALWAYS fetch before investigating branches:**
+```bash
+git fetch origin
+```
+Branches may already be merged on remote. Don't waste time on stale local state.
+
 **Run before starting work, committing, or opening PRs:**
 
 ```bash
@@ -499,13 +505,22 @@ See `Containerfile.libfuse-remap` and `Containerfile.pjdfstest` for examples.
 
 **CRITICAL: VM commands BLOCK the terminal.** You MUST use Claude's `run_in_background: true` feature.
 
-```bash
-# WRONG - This blocks forever, wastes context, and times out
-sudo fcvm podman run --name test nginx:alpine
+**PREFER NON-ROOT TESTING**: Run tests without sudo when possible. Rootless networking mode (`--network rootless`, the default) doesn't require sudo. Only use `sudo` for:
+- `--network bridged` tests
+- Operations that explicitly need root (iptables, privileged containers)
 
-# CORRECT - Run VM in background, then use exec to test
+The ubuntu user has KVM access (`kvm` group), so `fcvm podman run` works without sudo in rootless mode.
+
+```bash
+# PREFERRED - Rootless mode (no sudo needed, use run_in_background: true)
+./target/release/fcvm podman run --name test alpine:latest 2>&1 | tee /tmp/vm.log
+# Defaults to --network rootless
+# Get PID from state and use exec:
+ls -t /mnt/fcvm-btrfs/state/*.json | head -1 | xargs cat | jq -r '.pid'
+./target/release/fcvm exec --pid <PID> -- hostname
+
+# ONLY WHEN NEEDED - Bridged mode (requires sudo)
 sudo ./target/release/fcvm podman run --name test --network bridged nginx:alpine 2>&1 | tee /tmp/vm.log
-# Use run_in_background: true in Bash tool call
 # Then sleep and check logs:
 sleep 30
 grep healthy /tmp/vm.log

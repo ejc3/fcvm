@@ -43,6 +43,8 @@
 2. **`fcvm exec` Command**
    - Execute commands in running VMs
    - Supports running in guest OS or inside container (`-c` flag)
+   - Interactive mode with stdin forwarding (`-i` flag)
+   - TTY allocation for terminal apps (`-t` flag)
 
 3. **`fcvm snapshot` Commands**
    - `fcvm snapshot create`: Create snapshot from running VM
@@ -907,120 +909,168 @@ The guest is configured to support rootless Podman:
 
 ---
 
+## TTY & Interactive Mode
+
+fcvm provides full interactive terminal support for both `podman run -it` and `exec -it`, matching docker/podman semantics.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Host Process (fcvm)                                                     │
+│  ┌──────────────┐     ┌──────────────────┐     ┌──────────────────────┐│
+│  │ User Terminal│────►│ Raw Mode Handler │────►│ exec_proto Encoder   ││
+│  │ (stdin/out)  │◄────│ (tcsetattr)      │◄────│ (binary framing)     ││
+│  └──────────────┘     └──────────────────┘     └──────────┬───────────┘│
+│                                                           │            │
+└───────────────────────────────────────────────────────────┼────────────┘
+                                                            │ vsock
+                                                            ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│ Guest (fc-agent)                                          │           │
+│  ┌──────────────────┐     ┌──────────────┐     ┌──────────▼─────────┐ │
+│  │ exec_proto       │────►│ PTY Master   │────►│ Container Process  │ │
+│  │ Decoder          │◄────│ (openpty)    │◄────│ (sh, vim, etc.)    │ │
+│  └──────────────────┘     └──────────────┘     └────────────────────┘ │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+### Flags
+
+| Flag | Meaning | Implementation |
+|------|---------|----------------|
+| `-i` | Keep stdin open | Host reads stdin, sends via STDIN messages |
+| `-t` | Allocate PTY | Guest allocates PTY master/slave pair |
+| `-it` | Both | Interactive shell with full terminal support |
+| neither | Plain exec | Pipes for stdin/stdout, no PTY |
+
+### Wire Protocol (exec_proto)
+
+Binary framed protocol over vsock for efficient transport of terminal data:
+
+```
+┌─────────┬─────────┬──────────────────┐
+│ Type(1) │ Len(4)  │ Payload(N)       │
+└─────────┴─────────┴──────────────────┘
+```
+
+**Message Types**:
+- `DATA (0x00)`: Output from command (stdout/stderr)
+- `STDIN (0x01)`: Input from user terminal
+- `EXIT (0x02)`: Command exit code (4 bytes, big-endian i32)
+- `ERROR (0x03)`: Error message string
+
+**Why binary framing?**
+- Handles escape sequences (Ctrl+C = 0x03, Ctrl+D = 0x04)
+- Preserves all bytes without escaping
+- Efficient for high-throughput terminal output
+
+### Host-Side Implementation (`src/commands/tty.rs`)
+
+```rust
+// 1. Set terminal to raw mode
+let original = tcgetattr(stdin)?;
+let mut raw = original.clone();
+cfmakeraw(&mut raw);
+tcsetattr(stdin, TCSANOW, &raw)?;
+
+// 2. Spawn reader/writer tasks
+tokio::spawn(async move {
+    // Reader: terminal stdin → vsock
+    loop {
+        let n = stdin.read(&mut buf)?;
+        exec_proto::write_stdin(&mut vsock, &buf[..n])?;
+    }
+});
+
+tokio::spawn(async move {
+    // Writer: vsock → terminal stdout
+    loop {
+        match exec_proto::Message::read_from(&mut vsock)? {
+            Message::Data(data) => stdout.write_all(&data)?,
+            Message::Exit(code) => return code,
+            _ => {}
+        }
+    }
+});
+```
+
+### Guest-Side Implementation (`fc-agent/src/tty.rs`)
+
+```rust
+// 1. Allocate PTY
+let (master, slave) = openpty()?;
+
+// 2. Fork child process
+match fork() {
+    0 => {
+        // Child: setup PTY as controlling terminal
+        setsid();
+        ioctl(slave, TIOCSCTTY, 0);
+        dup2(slave, STDIN);
+        dup2(slave, STDOUT);
+        dup2(slave, STDERR);
+        execvp(command, args);
+    }
+    pid => {
+        // Parent: relay between vsock and PTY master
+        // Reader thread: PTY master → vsock (DATA messages)
+        // Writer thread: vsock (STDIN messages) → PTY master
+    }
+}
+```
+
+### Supported Features
+
+- **Escape sequences**: Colors (ANSI), cursor movement, screen clearing
+- **Control characters**: Ctrl+C (SIGINT), Ctrl+D (EOF), Ctrl+Z (SIGTSTP)
+- **Line editing**: Arrow keys, backspace, history (shell-dependent)
+- **Full-screen apps**: vim, htop, less, nano, tmux
+
+### Limitations
+
+- **Window resize (SIGWINCH)**: Not implemented. Terminal size is fixed at session start.
+- **Job control**: Background/foreground (`bg`, `fg`) work within the container, but signals are not forwarded to the host.
+
+---
+
 ## CLI Interface
 
-### Commands
+> **Full CLI documentation with examples**: See [README.md](README.md#cli-reference)
 
-#### `fcvm setup`
+### Command Summary
 
-**Purpose**: Download kernel and create rootfs (first-time setup).
+| Command | Purpose |
+|---------|---------|
+| `fcvm setup` | Download kernel, create rootfs (first-time setup, ~5-10 min) |
+| `fcvm podman run` | Launch container in Firecracker VM |
+| `fcvm exec` | Execute command in running VM/container |
+| `fcvm ls` | List running VMs |
+| `fcvm snapshot create` | Create snapshot from running VM |
+| `fcvm snapshot serve` | Start UFFD memory server for cloning |
+| `fcvm snapshot run` | Spawn clone from memory server |
+| `fcvm snapshots` | List available snapshots |
 
-**Usage**:
-```bash
-fcvm setup
-```
+### Key CLI Design Decisions
 
-**What it does:**
-1. Downloads Kata kernel (~15MB, cached by URL hash)
-2. Downloads packages via `podman run ubuntu:noble` with `apt-get install --download-only`
-3. Creates Layer 2 rootfs (~10GB): boots VM, installs packages, writes config
-4. Verifies setup by checking `/etc/fcvm-setup-complete` marker file
-5. Creates fc-agent initrd (embeds statically-linked fc-agent binary)
+1. **Trailing arguments**: Both `podman run` and `exec` support trailing args after `--`:
+   ```bash
+   fcvm podman run --name test alpine:latest echo "hello"
+   fcvm exec --name test -it -- sh -c "ls -la"
+   ```
 
-Takes 5-10 minutes on first run. Subsequent runs are instant (cached by content hash).
+2. **`--name` vs `--pid`**: VM identification uses named flags (not positional):
+   ```bash
+   fcvm exec --name my-vm -- hostname    # By name
+   fcvm exec --pid 12345 -- hostname     # By PID
+   ```
 
-**Note**: Must be run before `fcvm podman run` with bridged networking. For rootless mode, you can use `--setup` flag on `fcvm podman run` instead.
+3. **Interactive flags** (`-i`, `-t`): Match docker/podman semantics:
+   - `-i`: Keep stdin open
+   - `-t`: Allocate PTY
+   - `-it`: Both (interactive shell)
 
-#### `fcvm podman run`
-
-**Purpose**: Launch a container in a new Firecracker VM.
-
-**Usage**:
-```bash
-fcvm podman run --name <NAME> [OPTIONS] <IMAGE>
-```
-
-**Arguments**:
-- `IMAGE` - Container image (e.g., `nginx:alpine`, `ghcr.io/org/app:v1.0`)
-
-**Options**:
-```
---name <NAME>              VM name (required)
---cpu <COUNT>              vCPU count (default: 2)
---mem <MB>                 Memory in MiB (default: 2048)
---network <MODE>           Network mode: rootless|bridged (default: rootless)
---map <HOST:GUEST[:ro]>    Volume mount via FUSE (can specify multiple)
---env <KEY=VALUE>          Environment variable (can specify multiple)
---cmd <COMMAND>            Container command override
---publish <MAPPING>        Port publish (can specify multiple)
---balloon <MB>             Memory balloon target
---health-check <URL>       HTTP health check URL
---privileged               Run container in privileged mode
---setup                    Run setup if kernel/rootfs missing (rootless only)
-```
-
-**Examples**:
-```bash
-# Simple nginx (bridged networking, requires sudo)
-sudo fcvm podman run --name my-nginx nginx:alpine
-
-# Rootless mode (no sudo required)
-fcvm podman run --name my-nginx --network rootless nginx:alpine
-
-# With port forwarding
-sudo fcvm podman run --name web --publish 8080:80 nginx:alpine
-
-# With volumes and environment
-sudo fcvm podman run \
-  --name db \
-  --map /host/data:/data \
-  --env DB_HOST=localhost \
-  postgres:15
-
-# With health check
-sudo fcvm podman run \
-  --name web \
-  --health-check http://localhost/health \
-  nginx:alpine
-
-# High CPU/memory with balloon
-sudo fcvm podman run \
-  --name ml \
-  --cpu 8 \
-  --mem 8192 \
-  --balloon 4096 \
-  ml-training:latest
-```
-
-#### `fcvm exec`
-
-**Purpose**: Execute a command in a running VM.
-
-**Usage**:
-```bash
-fcvm exec --pid <PID> [OPTIONS] -- <COMMAND> [ARGS...]
-```
-
-**Options**:
-```
---pid <PID>        PID of the fcvm process managing the VM (required)
--c, --container    Run command inside the container (not just guest OS)
-```
-
-**Examples**:
-```bash
-# Run command in guest OS
-sudo fcvm exec --pid 12345 -- ls -la /
-
-# Run command inside container
-sudo fcvm exec --pid 12345 -c -- curl -s http://localhost/health
-
-# Check egress connectivity from guest
-sudo fcvm exec --pid 12345 -- curl -s ifconfig.me
-
-# Check egress connectivity from container
-sudo fcvm exec --pid 12345 -c -- wget -q -O - http://ifconfig.me
-```
+4. **Network modes**: `--network rootless` (default, no sudo) or `--network bridged` (sudo required)
 
 #### `fcvm snapshot create`
 

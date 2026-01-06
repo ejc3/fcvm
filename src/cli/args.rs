@@ -97,14 +97,6 @@ pub enum PodmanCommands {
 
 #[derive(Args, Debug)]
 pub struct RunArgs {
-    /// Container image (e.g., nginx:alpine or localhost/myimage)
-    pub image: String,
-
-    /// Command and arguments to run in container (alternative to --cmd)
-    /// Example: fcvm podman run --name foo --network bridged alpine:latest sh -c "echo hello"
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    pub command_args: Vec<String>,
-
     /// VM name (required)
     #[arg(long)]
     pub name: String,
@@ -177,6 +169,14 @@ pub struct RunArgs {
     #[arg(long)]
     pub privileged: bool,
 
+    /// Keep STDIN open even if not attached
+    #[arg(short, long)]
+    pub interactive: bool,
+
+    /// Allocate a pseudo-TTY
+    #[arg(short, long)]
+    pub tty: bool,
+
     /// Debug fc-agent with strace (output to /tmp/fc-agent.strace in guest)
     /// Useful for diagnosing fc-agent startup issues
     #[arg(long)]
@@ -201,6 +201,14 @@ pub struct RunArgs {
     /// Example: --vsock-dir /tmp/myvm creates /tmp/myvm/vsock.sock
     #[arg(long)]
     pub vsock_dir: Option<String>,
+
+    /// Container image (e.g., nginx:alpine or localhost/myimage)
+    pub image: String,
+
+    /// Command and arguments to run in container (alternative to --cmd)
+    /// Example: fcvm podman run --name foo --network bridged alpine:latest sh -c "echo hello"
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub command_args: Vec<String>,
 }
 
 // ============================================================================
@@ -305,10 +313,6 @@ pub struct LsArgs {
 
 #[derive(Args, Debug)]
 pub struct ExecArgs {
-    /// VM name to exec into (mutually exclusive with --pid)
-    #[arg(conflicts_with = "pid")]
-    pub name: Option<String>,
-
     /// VM PID to exec into (mutually exclusive with name)
     #[arg(long, conflicts_with = "name")]
     pub pid: Option<u32>,
@@ -316,6 +320,10 @@ pub struct ExecArgs {
     /// Execute in the VM instead of inside the container
     #[arg(long)]
     pub vm: bool,
+
+    /// Execute inside container (default, mutually exclusive with --vm)
+    #[arg(short, long)]
+    pub container: bool,
 
     /// Keep STDIN open even if not attached
     #[arg(short, long)]
@@ -329,7 +337,11 @@ pub struct ExecArgs {
     #[arg(short, long)]
     pub quiet: bool,
 
+    /// VM name to exec into (mutually exclusive with --pid)
+    #[arg(long, conflicts_with = "pid")]
+    pub name: Option<String>,
+
     /// Command and arguments to execute
-    #[arg(last = true, required = true)]
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
     pub command: Vec<String>,
 }
