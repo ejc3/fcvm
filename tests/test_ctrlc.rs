@@ -29,7 +29,7 @@ async fn test_ctrlc_via_terminal() -> Result<()> {
     let fcvm_path = common::find_fcvm_binary()?;
     let (vm_name, _, _, _) = common::unique_names("ctrlc-term");
 
-    // Build command args - use bridged mode for reliable testing
+    // Build command args - use rootless mode (no sudo required)
     let args = [
         fcvm_path.to_str().unwrap(),
         "podman",
@@ -37,7 +37,7 @@ async fn test_ctrlc_via_terminal() -> Result<()> {
         "--name",
         &vm_name,
         "--network",
-        "bridged",
+        "rootless",
         "alpine:latest",
         "sleep",
         "120", // Long sleep so we can interrupt it
@@ -96,8 +96,9 @@ async fn test_ctrlc_via_terminal() -> Result<()> {
             use std::ffi::CString;
             let prog = CString::new(args[0]).unwrap();
             let c_args: Vec<CString> = args.iter().map(|s| CString::new(*s).unwrap()).collect();
-            nix::unistd::execvp(&prog, &c_args).expect("execvp failed");
-            unreachable!()
+            // execvp replaces the process - this line is only reached on error
+            let _ = nix::unistd::execvp(&prog, &c_args);
+            std::process::exit(1);
         }
         ForkResult::Parent { child } => {
             // Close slave in parent
