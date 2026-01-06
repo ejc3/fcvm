@@ -121,13 +121,19 @@ function setupFixBranch(ctx: Context): void {
     gitOrFail("config", "user.email", "claude[bot]@users.noreply.github.com");
   }
 
+  // Fetch latest to ensure we have the PR branch
+  gitOrFail("fetch", "origin", ctx.headBranch);
+
   // Check if branch already exists
   if (branchExists(ctx.fixBranch)) {
-    log(`Branch ${ctx.fixBranch} already exists, checking out`);
+    log(`Branch ${ctx.fixBranch} already exists, checking out and updating`);
     gitOrFail("checkout", ctx.fixBranch);
+    gitOrFail("reset", "--hard", `origin/${ctx.headBranch}`);
   } else {
-    log(`Creating new branch ${ctx.fixBranch}`);
-    gitOrFail("checkout", "-b", ctx.fixBranch);
+    // Create fix branch FROM the PR branch, not from main
+    // This ensures Claude can read PR files locally with the Read tool
+    log(`Creating new branch ${ctx.fixBranch} from origin/${ctx.headBranch}`);
+    gitOrFail("checkout", "-b", ctx.fixBranch, `origin/${ctx.headBranch}`);
   }
 }
 
@@ -206,7 +212,8 @@ function reviewPrompt(ctx: Context): string {
 | **Run URL** | ${ctx.runUrl} |
 
 You are reviewing **PR #${ctx.prNumber}** in **${ctx.repository}**.
-Your current branch is \`${ctx.fixBranch}\`, branched from \`${ctx.headBranch}\`.
+Your current branch is \`${ctx.fixBranch}\`, branched from \`origin/${ctx.headBranch}\`.
+**The PR's code is already checked out locally** - you can use the Read tool directly on any file.
 
 ### Open PRs (from members/bots only)
 \`\`\`
@@ -246,7 +253,7 @@ git diff origin/${ctx.baseBranch}...origin/${ctx.headBranch}
 ### 1e. If diff output is large or appears truncated
 The diff output may be truncated for large changes. If the diff ends mid-line or seems incomplete:
 - Use \`git diff --stat\` to see which files changed
-- Read individual files directly with the Read tool to verify their actual content
+- Read individual files directly with the Read tool (PR code is checked out locally)
 - **NEVER assume a file is incomplete based on truncated diff output**
 
 ## STEP 2: CHECK PREVIOUS REVIEWS
@@ -697,6 +704,9 @@ async function main(): Promise<void> {
   }
 
   await runClaude(prompt);
+
+  // Print completion marker - if this doesn't appear in logs, the job was truncated/killed
+  console.log("\n=== CLAUDE_ASSISTANT_COMPLETE ===\n");
 }
 
 main().catch((e) => {
