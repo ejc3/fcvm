@@ -144,7 +144,7 @@ jobs:
   host:
     name: Host
     if: ${{ github.event.inputs.job != 'container' }}
-    runs-on: [self-hosted, Linux, metal]
+    runs-on: [self-hosted, Linux, ARM64]
     steps:
       # Clean up root-owned files from previous test runs before checkout
       - name: Clean workspace (pre-checkout)
@@ -286,7 +286,7 @@ jobs:
   host-root:
     name: Host-Root
     if: ${{ github.event.inputs.job != 'container' }}
-    runs-on: [self-hosted, Linux, metal]
+    runs-on: [self-hosted, Linux, ARM64]
     steps:
       # Clean up root-owned files from previous test runs before checkout
       - name: Clean workspace (pre-checkout)
@@ -412,7 +412,7 @@ jobs:
   container:
     name: Container
     if: ${{ github.event.inputs.job != 'host' }}
-    runs-on: [self-hosted, Linux, metal]
+    runs-on: [self-hosted, Linux, ARM64]
     permissions:
       packages: write
     steps:
