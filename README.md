@@ -21,7 +21,7 @@ A Rust implementation that launches Firecracker microVMs to run Podman container
 - For AWS: c6g.metal (ARM64) or c5.metal (x86_64) - NOT regular instances
 
 **Runtime Dependencies**
-- Rust 1.83+ with cargo (nightly for fuser crate)
+- Rust 1.83+ with cargo and musl target ([rustup.rs](https://rustup.rs), then `rustup target add $(uname -m)-unknown-linux-musl`)
 - Firecracker binary in PATH
 - For bridged networking: sudo, iptables, iproute2
 - For rootless networking: slirp4netns
@@ -102,95 +102,109 @@ sudo iptables -P FORWARD ACCEPT
 
 ## Quick Start
 
+fcvm runs containers inside Firecracker microVMs:
+
+```
+You → fcvm → Firecracker VM → Podman → Container
+```
+
+Each `podman run` boots a VM (~50ms), pulls the image, and starts the container with full VM isolation.
+
 ```bash
+# Install Rust (if not already installed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+
+# Install musl toolchain (for static linking fc-agent binary)
+sudo apt install musl-tools
+rustup target add $(uname -m)-unknown-linux-musl
+
+# Clone and build fcvm + fc-agent binaries (~2 min)
 git clone https://github.com/ejc3/fcvm
 cd fcvm
 make build
+# → "Finished release profile [optimized] target(s)"
 
-# Create a short repo-local entrypoint
+# Create symlink for convenience (works with sudo)
 ln -sf target/release/fcvm ./fcvm
 
-# First-time setup (downloads kernel + builds rootfs, ~5 min)
-# Use sudo if fcvm needs to create/mount /mnt/fcvm-btrfs
+# Download kernel + build rootfs (~5 min first time, then cached)
 sudo ./fcvm setup
+# → "Setup complete"
 
-# Rootless (default network, no sudo)
-./fcvm podman run --name test-rootless nginx:alpine
-./fcvm exec test-rootless -- cat /etc/os-release
+# One-shot command (runs, prints output, exits)
+./fcvm podman run --name hello alpine:latest -- echo "Hello from microVM"
+# → Hello from microVM
 
-# One-shot command (runs command then exits)
-./fcvm podman run --name oneshot alpine:latest -- echo "Hello from microVM"
+# Run a long-lived service (stays in foreground, or add & to background)
+./fcvm podman run --name web nginx:alpine
+# → Logs show VM booting, then "healthy" when nginx is ready
 
-# Bridged networking (requires sudo)
-sudo ./fcvm podman run --name test-bridged --network bridged nginx:alpine
+# In another terminal:
+./fcvm ls
+# → Shows "web" with PID, health status, network info
+
+./fcvm exec --name web -- cat /etc/os-release
+# → Shows Alpine Linux info
+
+# Bridged networking (for full network access, requires sudo)
+sudo ./fcvm podman run --name web-bridged --network bridged nginx:alpine
 ```
 
-### Run a Container
+### More Options
+
 ```bash
-# Run a one-shot command (clean output, just like docker run)
-fcvm podman run --name test alpine:latest echo "hello world"
-# Output: hello world
+# Port forwarding (8080 on host -> 80 in container)
+./fcvm podman run --name web --publish 8080:80 nginx:alpine
+# In rootless: curl the assigned loopback IP (e.g., curl 127.0.0.2:8080)
+# In bridged: curl the veth host IP (see ./fcvm ls --json)
 
-# Run a service (uses rootless mode by default, no sudo needed)
-fcvm podman run --name web1 public.ecr.aws/nginx/nginx:alpine
+# Mount host directory into container
+./fcvm podman run --name app --map /host/data:/data alpine:latest
 
-# With port forwarding (8080 on host -> 80 in guest)
-# Note: In rootless mode, use the assigned loopback IP (e.g., curl 127.0.0.2:8080)
-# In bridged mode, use the veth host IP (see fcvm ls --json for the IP)
-fcvm podman run --name web1 --publish 8080:80 public.ecr.aws/nginx/nginx:alpine
+# Custom CPU/memory
+./fcvm podman run --name big --cpu 4 --mem 4096 alpine:latest
 
-# With host directory mapping (via fuse-pipe)
-fcvm podman run --name web1 --map /host/data:/data public.ecr.aws/nginx/nginx:alpine
+# Interactive shell (-it like docker/podman)
+./fcvm podman run --name shell -it alpine:latest sh
 
-# Custom resources
-fcvm podman run --name web1 --cpu 4 --mem 4096 public.ecr.aws/nginx/nginx:alpine
+# JSON output for scripting
+./fcvm ls --json
+./fcvm ls --pid 12345    # Filter by PID
 
-# Bridged mode (requires sudo, uses iptables)
-sudo fcvm podman run --name web1 --network bridged public.ecr.aws/nginx/nginx:alpine
+# Execute in guest VM instead of container
+./fcvm exec --name web --vm -- hostname
 
-# Interactive container (-it like docker/podman)
-fcvm podman run --name shell -it alpine:latest sh      # Interactive shell
-fcvm podman run --name vim -it alpine:latest vi        # Run vim (full TTY support)
+# Interactive shell in container
+./fcvm exec --name web -it -- sh
 
-# List running VMs (sudo needed to read VM state files)
-sudo fcvm ls
-sudo fcvm ls --json          # JSON output
-sudo fcvm ls --pid 12345     # Filter by PID
-
-# Execute commands (mirrors podman exec, sudo needed)
-sudo fcvm exec --name web1 -- cat /etc/os-release       # Run in container (default)
-sudo fcvm exec --name web1 --vm -- hostname             # Run in VM
-sudo fcvm exec --pid 12345 -- hostname                  # By PID (from fcvm ls)
-
-# Interactive shell/TTY (like docker/podman -it)
-sudo fcvm exec --name web1 -it -- sh                    # Interactive shell in container
-sudo fcvm exec --name web1 -it --vm -- bash             # Interactive shell in VM
-sudo fcvm exec --name web1 -t -- ls -la --color=always  # TTY for colors, no stdin
+# TTY for colors (no stdin)
+./fcvm exec --name web -t -- ls -la --color=always
 ```
 
 ### Snapshot & Clone Workflow
 ```bash
 # 1. Start baseline VM (using bridged, or omit --network for rootless)
-sudo fcvm podman run --name baseline --network bridged public.ecr.aws/nginx/nginx:alpine
+sudo ./fcvm podman run --name baseline --network bridged public.ecr.aws/nginx/nginx:alpine
 
 # 2. Create snapshot (pauses VM briefly)
-sudo fcvm snapshot create baseline --tag nginx-warm
+sudo ./fcvm snapshot create baseline --tag nginx-warm
 
 # 3. Start UFFD memory server (serves pages on-demand)
-sudo fcvm snapshot serve nginx-warm
+sudo ./fcvm snapshot serve nginx-warm
 
 # 4. Clone from snapshot (~3ms startup)
-sudo fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
-sudo fcvm snapshot run --pid <serve_pid> --name clone2 --network bridged
+sudo ./fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
+sudo ./fcvm snapshot run --pid <serve_pid> --name clone2 --network bridged
 
 # 5. Clone with port forwarding (each clone can have unique ports)
-sudo fcvm snapshot run --pid <serve_pid> --name web1 --network bridged --publish 8081:80
-sudo fcvm snapshot run --pid <serve_pid> --name web2 --network bridged --publish 8082:80
+sudo ./fcvm snapshot run --pid <serve_pid> --name web1 --network bridged --publish 8081:80
+sudo ./fcvm snapshot run --pid <serve_pid> --name web2 --network bridged --publish 8082:80
 # Get the host IP from fcvm ls --json, then curl it:
-#   curl $(sudo fcvm ls --json | jq -r '.[] | select(.name=="web1") | .config.network.host_ip'):8081
+#   curl $(./fcvm ls --json | jq -r '.[] | select(.name=="web1") | .config.network.host_ip'):8081
 
 # 6. Clone and execute command (auto-cleans up after)
-sudo fcvm snapshot run --pid <serve_pid> --network bridged --exec "curl localhost"
+sudo ./fcvm snapshot run --pid <serve_pid> --network bridged --exec "curl localhost"
 ```
 
 ---
@@ -211,13 +225,13 @@ sudo fcvm snapshot run --pid <serve_pid> --network bridged --exec "curl localhos
 Demonstrate instant VM cloning from a warmed snapshot:
 
 ```bash
-# Setup: Create baseline and snapshot
-sudo fcvm podman run --name baseline public.ecr.aws/nginx/nginx:alpine
-sudo fcvm snapshot create baseline --tag nginx-warm
-sudo fcvm snapshot serve nginx-warm  # Note the serve PID
+# Setup: Create baseline and snapshot (rootless mode)
+./fcvm podman run --name baseline nginx:alpine
+./fcvm snapshot create baseline --tag nginx-warm
+./fcvm snapshot serve nginx-warm  # Note the serve PID
 
 # Time a clone startup (includes exec and cleanup)
-time sudo fcvm snapshot run --pid <serve_pid> --exec "echo ready"
+time ./fcvm snapshot run --pid <serve_pid> --exec "echo ready"
 # real 0m0.003s  ← 3ms!
 ```
 
@@ -231,7 +245,7 @@ free -m | grep Mem
 
 # Start 10 clones from same snapshot
 for i in {1..10}; do
-  sudo fcvm snapshot run --pid <serve_pid> --name clone$i &
+  ./fcvm snapshot run --pid <serve_pid> --name clone$i &
 done
 wait
 
@@ -244,24 +258,24 @@ free -m | grep Mem
 Spin up a fleet of web servers instantly:
 
 ```bash
-# Create warm nginx snapshot (one-time)
-sudo fcvm podman run --name baseline --publish 8080:80 public.ecr.aws/nginx/nginx:alpine
-# Wait for healthy, then snapshot
-sudo fcvm snapshot create baseline --tag nginx-warm
-sudo fcvm snapshot serve nginx-warm  # Note serve PID
+# Create warm nginx snapshot (one-time, in another terminal)
+./fcvm podman run --name baseline --publish 8080:80 nginx:alpine
+# Once healthy, in another terminal:
+./fcvm snapshot create baseline --tag nginx-warm
+./fcvm snapshot serve nginx-warm  # Note serve PID
 
 # Spin up 50 nginx instances in parallel
 time for i in {1..50}; do
-  sudo fcvm snapshot run --pid <serve_pid> --name web$i --publish $((8080+i)):80 &
+  ./fcvm snapshot run --pid <serve_pid> --name web$i --publish $((8080+i)):80 &
 done
 wait
 # real 0m0.150s  ← 50 VMs in 150ms!
 
 # Verify all running
-sudo fcvm ls | wc -l  # 51 (50 clones + 1 baseline)
+./fcvm ls | wc -l  # 51 (50 clones + 1 baseline)
 
-# Test a random clone
-curl -s localhost:8090 | head -5
+# Test a clone (use loopback IP from ./fcvm ls --json)
+curl -s 127.0.0.10:8090 | head -5
 ```
 
 ### Privileged Container (Device Access)
@@ -270,7 +284,7 @@ Run containers that need mknod or device access:
 
 ```bash
 # Privileged mode allows mknod, /dev access, etc.
-sudo fcvm podman run --name dev --privileged \
+sudo ./fcvm podman run --name dev --privileged \
   --cmd "sh -c 'mknod /dev/null2 c 1 3 && ls -la /dev/null2'" \
   public.ecr.aws/docker/library/alpine:latest
 # Output: crw-r--r-- 1 root root 1,3 /dev/null2
@@ -282,21 +296,21 @@ Expose multiple ports and mount multiple volumes in one command:
 
 ```bash
 # Multiple port mappings (comma-separated)
-sudo fcvm podman run --name multi-port \
+./fcvm podman run --name multi-port \
   --publish 8080:80,8443:443 \
-  public.ecr.aws/nginx/nginx:alpine
+  nginx:alpine
 
 # Multiple volume mappings (comma-separated, with read-only)
-sudo fcvm podman run --name multi-vol \
+./fcvm podman run --name multi-vol \
   --map /tmp/logs:/logs,/tmp/data:/data:ro \
-  public.ecr.aws/nginx/nginx:alpine
+  nginx:alpine
 
 # Combined
-sudo fcvm podman run --name full \
+./fcvm podman run --name full \
   --publish 8080:80,8443:443 \
   --map /tmp/html:/usr/share/nginx/html:ro \
   --env NGINX_HOST=localhost,NGINX_PORT=80 \
-  public.ecr.aws/nginx/nginx:alpine
+  nginx:alpine
 ```
 
 ---
@@ -315,16 +329,16 @@ fcvm supports full interactive terminal sessions, matching docker/podman's `-i` 
 
 ```bash
 # Run interactive shell in container
-fcvm podman run --name shell -it alpine:latest sh
+./fcvm podman run --name shell -it alpine:latest sh
 
 # Run vim (full TTY - arrow keys, escape sequences work)
-fcvm podman run --name editor -it alpine:latest vi /tmp/test.txt
+./fcvm podman run --name editor -it alpine:latest vi /tmp/test.txt
 
 # Run shell in existing VM
-sudo fcvm exec --name web1 -it -- sh
+./fcvm exec --name web1 -it -- sh
 
 # Pipe data (use -i without -t)
-echo "hello" | fcvm podman run --name pipe -i alpine:latest cat
+echo "hello" | ./fcvm podman run --name pipe -i alpine:latest cat
 ```
 
 ### How It Works
@@ -397,7 +411,7 @@ cargo install fcvm
 
 # Download nested kernel profile and install as host kernel
 # This also configures GRUB with kvm-arm.mode=nested
-sudo fcvm setup --kernel-profile nested --install-host-kernel
+sudo ./fcvm setup --kernel-profile nested --install-host-kernel
 
 # Reboot into the new kernel
 sudo reboot
@@ -457,14 +471,14 @@ sudo reboot
 
 ```bash
 # Download pre-built kernel from GitHub releases (~20MB)
-fcvm setup --kernel-profile nested
+./fcvm setup --kernel-profile nested
 
 # Kernel will be at /mnt/fcvm-btrfs/kernels/vmlinux-nested-6.18-aarch64-*.bin
 ```
 
 Or build locally (takes 10-20 minutes):
 ```bash
-fcvm setup --kernel-profile nested --build-kernels
+./fcvm setup --kernel-profile nested --build-kernels
 ```
 
 The nested kernel (6.18) includes:
@@ -479,7 +493,7 @@ The nested kernel (6.18) includes:
 **Step 1: Start outer VM with nested kernel profile**
 ```bash
 # Uses nested kernel profile from rootfs-config.toml
-sudo fcvm podman run \
+sudo ./fcvm podman run \
     --name outer-vm \
     --network bridged \
     --kernel-profile nested \
@@ -492,11 +506,11 @@ sudo fcvm podman run \
 **Step 2: Verify nested KVM works**
 ```bash
 # Check guest sees HYP mode
-fcvm exec --pid <outer_pid> --vm -- dmesg | grep -i kvm
+./fcvm exec --pid <outer_pid> --vm -- dmesg | grep -i kvm
 # Should show: "kvm [1]: VHE mode initialized successfully"
 
 # Verify /dev/kvm is accessible
-fcvm exec --pid <outer_pid> --vm -- ls -la /dev/kvm
+./fcvm exec --pid <outer_pid> --vm -- ls -la /dev/kvm
 ```
 
 **Step 3: Run inner VM**
@@ -649,9 +663,9 @@ See [DESIGN.md](DESIGN.md#cli-interface) for architecture and design decisions.
 
 **`fcvm exec`** - Execute in VM/container:
 ```bash
-sudo fcvm exec --name my-vm -- cat /etc/os-release     # In container
-sudo fcvm exec --name my-vm --vm -- curl -s ifconfig.me # In guest OS
-sudo fcvm exec --name my-vm -it -- bash                 # Interactive shell
+./fcvm exec --name my-vm -- cat /etc/os-release     # In container
+./fcvm exec --name my-vm --vm -- curl -s ifconfig.me # In guest OS
+./fcvm exec --name my-vm -it -- bash                 # Interactive shell
 ```
 
 ---
@@ -783,7 +797,7 @@ RUST_LOG="passthrough=debug,fuse_pipe=info" sudo -E cargo test ...
 
 Check running VMs:
 ```bash
-sudo fcvm ls
+./fcvm ls
 ```
 
 Manual cleanup:
@@ -858,10 +872,10 @@ For advanced use cases (like nested virtualization), fcvm supports **kernel prof
 Usage:
 ```bash
 # Download/build kernel for profile
-fcvm setup --kernel-profile nested
+./fcvm setup --kernel-profile nested
 
 # Run VM with profile
-sudo fcvm podman run --name vm1 --kernel-profile nested --privileged nginx:alpine
+sudo ./fcvm podman run --name vm1 --kernel-profile nested --privileged nginx:alpine
 ```
 
 ### Adding a New Kernel Profile
@@ -950,7 +964,7 @@ After changing the config, run `fcvm setup` to rebuild the rootfs with the new S
 - Or set PATH: `export PATH=$PATH:./target/release`
 
 ### "timeout waiting for VM to become healthy"
-- Check VM logs: `sudo fcvm ls --json`
+- Check VM logs: `./fcvm ls --json`
 - Verify kernel and rootfs exist: `ls -la /mnt/fcvm-btrfs/`
 - Check networking: VMs use host DNS servers directly (no dnsmasq needed)
 

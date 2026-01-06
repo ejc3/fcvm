@@ -43,7 +43,6 @@ async fn test_state_persistence() {
             volumes: vec![],
             extra_disks: vec![],
             nfs_shares: vec![],
-            env: vec![],
             health_check_url: None,
             snapshot_name: None,
             process_type: Some(ProcessType::Vm),
@@ -61,15 +60,16 @@ async fn test_state_persistence() {
     // Note: VmStatus doesn't derive PartialEq, so we can't compare directly
     assert!(matches!(loaded.status, VmStatus::Running));
 
-    // Verify file permissions are restrictive (Unix only)
+    // Verify file permissions are world-readable (Unix only)
+    // State files use 0o644 so non-root users can list VMs
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let state_file = temp_dir.path().join("test-vm-1.json");
         let metadata = std::fs::metadata(&state_file).unwrap();
         let permissions = metadata.permissions();
-        // Check that only owner can read/write (0o600)
-        assert_eq!(permissions.mode() & 0o777, 0o600);
+        // Check permissions are world-readable (0o644) so non-root can list VMs
+        assert_eq!(permissions.mode() & 0o777, 0o644);
     }
 
     // Delete state
@@ -108,7 +108,6 @@ async fn test_list_vms() {
                 volumes: vec![],
                 extra_disks: vec![],
                 nfs_shares: vec![],
-                env: vec![],
                 health_check_url: None,
                 snapshot_name: None,
                 process_type: Some(ProcessType::Vm),
