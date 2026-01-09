@@ -199,6 +199,7 @@ pjdfstest_vm_category!(test_pjdfstest_vm_rmdir, "rmdir");
 pjdfstest_vm_category!(test_pjdfstest_vm_symlink, "symlink");
 pjdfstest_vm_category!(test_pjdfstest_vm_truncate, "truncate");
 pjdfstest_vm_category!(test_pjdfstest_vm_unlink, "unlink");
-// DISABLED: utimensat test fails with FUSE_WRITEBACK_CACHE + default_permissions
-// See fuse-pipe/tests/pjdfstest_matrix_root.rs for detailed explanation.
+
+// NOTE: utimensat requires kernel patch 0002-fuse-fix-utimensat-with-default-permissions.patch
+// Tested in: tests/test_utimensat_fix.rs (runs with nested kernel that has the patch)
 // pjdfstest_vm_category!(test_pjdfstest_vm_utimensat, "utimensat");

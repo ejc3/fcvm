@@ -53,7 +53,8 @@ pjdfstest_category!(test_pjdfstest_symlink, "symlink");
 pjdfstest_category!(test_pjdfstest_truncate, "truncate");
 pjdfstest_category!(test_pjdfstest_unlink, "unlink");
 
-// NOTE: utimensat requires kernel patch 0002-fuse-fix-utimensat-with-default-permissions.patch
+// NOTE: utimensat disabled - requires kernel patch 0002-fuse-fix-utimensat-with-default-permissions.patch
 // Without the patch, 1/122 tests fail (non-owner with write permission calling utimensat(UTIME_NOW))
 // See: https://github.com/libfuse/libfuse/issues/15
-pjdfstest_category!(test_pjdfstest_utimensat, "utimensat");
+// Tested in: tests/test_utimensat_fix.rs (runs with nested kernel that has the patch)
+// pjdfstest_category!(test_pjdfstest_utimensat, "utimensat");
