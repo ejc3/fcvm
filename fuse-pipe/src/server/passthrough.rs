@@ -78,7 +78,7 @@ impl PassthroughFs {
         let cfg = Config {
             root_dir,
             do_import: true,
-            writeback: false,
+            writeback: true, // Server-side: handle open flags for writeback
             no_open: false,
             no_opendir: false,
             xattr: true,
