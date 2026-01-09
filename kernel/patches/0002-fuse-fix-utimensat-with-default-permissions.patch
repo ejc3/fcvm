@@ -1,0 +1,60 @@
+From 4ce85a66b9c034fb8bd4865c912b3a103b1f94ba Mon Sep 17 00:00:00 2001
+From: ejc3 <ejc3@users.noreply.github.com>
+Date: Fri, 9 Jan 2026 16:30:08 +0000
+Subject: [PATCH] fuse: fix utimensat permission check with default_permissions
+
+When FUSE is mounted with default_permissions and writeback cache enabled,
+utimensat(UTIME_NOW) incorrectly returns EPERM for non-owner users who have
+write permission on the file.
+
+POSIX specifies that setting timestamps to the current time (UTIME_NOW)
+should succeed if the caller has write permission on the file, even if
+they are not the owner. The kernel indicates this case by setting
+ATTR_TOUCH in ia_valid.
+
+The current code only adds ATTR_FORCE (which bypasses setattr_prepare()
+permission checks) when default_permissions is disabled. This means that
+with default_permissions enabled, setattr_prepare() enforces owner-only
+access for timestamp changes, violating POSIX.
+
+Fix this by adding ATTR_FORCE when ATTR_TOUCH is set and the user has
+write permission on the file. This allows the POSIX-compliant behavior
+where write permission is sufficient for utimensat(UTIME_NOW).
+
+This issue has been known since 2006:
+https://github.com/libfuse/libfuse/issues/15
+
+Signed-off-by: fcvm developers <fcvm@anthropic.com>
+---
+ fs/fuse/dir.c | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
+index ecaec0fea..f961fec58 100644
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -1949,8 +1949,20 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	bool fault_blocked = false;
+ 	u64 attr_version;
+ 
+-	if (!fc->default_permissions)
++	if (!fc->default_permissions) {
+ 		attr->ia_valid |= ATTR_FORCE;
++	} else if (attr->ia_valid & ATTR_TOUCH) {
++		/*
++		 * POSIX: utimensat(UTIME_NOW) should succeed if user has
++		 * write permission, even if not owner. The kernel sets
++		 * ATTR_TOUCH for this case. Check write permission and
++		 * add ATTR_FORCE to bypass setattr_prepare()'s owner check.
++		 */
++		int write_err = inode_permission(idmap, inode, MAY_WRITE);
++		if (!write_err)
++			attr->ia_valid |= ATTR_FORCE;
++		/* If no write permission, let setattr_prepare() reject it */
++	}
+ 
+ 	err = setattr_prepare(idmap, dentry, attr);
+ 	if (err)
+-- 
+2.43.0
+
