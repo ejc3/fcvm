@@ -24,6 +24,22 @@ where write permission is sufficient for utimensat(UTIME_NOW).
 This issue has been known since 2006:
 https://github.com/libfuse/libfuse/issues/15
 
+This can be verified with pjdfstest (POSIX filesystem test suite):
+  prove -v /path/to/pjdfstest/tests/utimensat/06.t
+Test 11 specifically checks non-owner with write permission.
+
+To reproduce manually:
+  # Mount FUSE with default_permissions and writeback cache
+  # Create file as root, give write permission to others
+  echo test > /mnt/fuse/testfile
+  chmod 666 /mnt/fuse/testfile
+
+  # As non-root user:
+  touch -m /mnt/fuse/testfile
+
+  Before: EPERM
+  After:  Success
+
 Signed-off-by: fcvm developers <fcvm@anthropic.com>
 ---
  fs/fuse/dir.c | 14 +++++++++++++-
