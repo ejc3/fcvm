@@ -177,6 +177,11 @@ fn run_ficlone_test_with_paths(data_dir: &std::path::Path, mount_dir: &std::path
 
     fs::write(&src_path, &test_data).expect("write source file");
 
+    // Flush writes to ensure data is on disk before cloning (important with writeback cache)
+    let src_for_sync = File::open(&src_path).expect("open for sync");
+    src_for_sync.sync_all().expect("sync source file");
+    drop(src_for_sync);
+
     // Open source for reading
     let src_file = File::open(&src_path).expect("open source");
 
@@ -280,6 +285,14 @@ fn run_ficlonerange_test_with_paths(data_dir: &std::path::Path, mount_dir: &std:
     // Pre-allocate destination with zeros
     let dst_zeros: Vec<u8> = vec![0u8; block_size * num_blocks];
     fs::write(&dst_path, &dst_zeros).expect("write dest zeros");
+
+    // Flush writes to ensure data is on disk before cloning (important with writeback cache)
+    let src_for_sync = File::open(&src_path).expect("open source for sync");
+    src_for_sync.sync_all().expect("sync source file");
+    drop(src_for_sync);
+    let dst_for_sync = File::open(&dst_path).expect("open dest for sync");
+    dst_for_sync.sync_all().expect("sync dest file");
+    drop(dst_for_sync);
 
     let src_file = File::open(&src_path).expect("open source");
     let dst_file = fs::OpenOptions::new()
@@ -394,6 +407,11 @@ fn run_cp_reflink_test_with_paths(data_dir: &std::path::Path, mount_dir: &std::p
     let dst_path = mount.join("cp_reflink_dest.bin");
 
     fs::write(&src_path, &test_data).expect("write source");
+
+    // Flush writes to ensure data is on disk before cloning (important with writeback cache)
+    let src_for_sync = File::open(&src_path).expect("open for sync");
+    src_for_sync.sync_all().expect("sync source file");
+    drop(src_for_sync);
 
     // Run cp --reflink=always
     let output = std::process::Command::new("cp")
