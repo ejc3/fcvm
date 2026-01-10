@@ -118,6 +118,14 @@ impl Multiplexer {
         let pending_for_writer = Arc::clone(&pending);
         let pending_for_reader = Arc::clone(&pending);
 
+        // Log that checksum feature is enabled (proves new code is deployed)
+        tracing::info!(
+            target: "fuse-pipe::mux",
+            num_readers,
+            trace_rate,
+            "CHECKSUM_ENABLED: client will add CRC32 checksums to requests"
+        );
+
         // Spawn writer thread - receives requests from channel, writes to socket
         std::thread::Builder::new()
             .name("fuse-mux-writer".to_string())
@@ -233,6 +241,7 @@ impl Multiplexer {
 
         // Build wire request - span goes inside the request so server gets it
         // reader_id is set to 0 since routing is done by unique ID, not reader_id
+        // Add checksum for corruption detection
         let wire = if should_trace {
             WireRequest::with_span_and_groups(
                 unique,
@@ -241,8 +250,9 @@ impl Multiplexer {
                 Span::new(),
                 supplementary_groups,
             )
+            .with_checksum()
         } else {
-            WireRequest::with_groups(unique, 0, request, supplementary_groups)
+            WireRequest::with_groups(unique, 0, request, supplementary_groups).with_checksum()
         };
 
         let body = match bincode::serialize(&wire) {
@@ -399,8 +409,13 @@ fn writer_loop(
             );
         }
 
-        // Write to socket
-        let write_result = socket.write_all(&req.data);
+        // Compute CRC32 of entire message (length prefix + body) for wire-level validation
+        let send_crc = crc32fast::hash(&req.data);
+
+        // Write CRC header first, then the message
+        // Wire format: [4 bytes: CRC][4 bytes: length][N bytes: body]
+        let crc_bytes = send_crc.to_be_bytes();
+        let write_result = socket.write_all(&crc_bytes).and_then(|_| socket.write_all(&req.data));
         let flush_result = if write_result.is_ok() {
             socket.flush()
         } else {
@@ -424,6 +439,17 @@ fn writer_loop(
             }
         } else {
             total_bytes_written += msg_len as u64;
+
+            // Log every sent request for detailed debugging (separate target for filtering)
+            tracing::debug!(
+                target: "fuse-pipe::mux::trace",
+                count,
+                unique = req.unique,
+                msg_len,
+                total_bytes_written,
+                send_crc = format!("{:08x}", send_crc),
+                "sent request"
+            );
         }
     }
     tracing::info!(target: "fuse-pipe::mux", count, total_bytes_written, "writer: exiting");
@@ -790,6 +816,32 @@ fn reader_loop(mut socket: UnixStream, pending: Arc<DashMap<u64, PendingEntry>>)
         // Deserialize and route to waiting reader (lock-free lookup + remove)
         match bincode::deserialize::<WireResponse>(&resp_buf) {
             Ok(wire) => {
+                // Validate checksum if present (for corruption detection)
+                if !wire.validate_checksum() {
+                    let expected = wire.checksum;
+                    let actual = wire.compute_checksum();
+                    tracing::error!(
+                        target: "fuse-pipe::mux",
+                        count,
+                        unique = wire.unique,
+                        ?expected,
+                        actual,
+                        "CHECKSUM MISMATCH - response corrupted in transit"
+                    );
+                    // Continue processing but log the corruption for diagnosis
+                }
+
+                // Log every response for detailed debugging (separate target for filtering)
+                tracing::debug!(
+                    target: "fuse-pipe::mux::trace",
+                    count,
+                    unique = wire.unique,
+                    reader_id = wire.reader_id,
+                    len,
+                    has_checksum = wire.checksum.is_some(),
+                    "received response"
+                );
+
                 // Mark client receive time on the span
                 let mut span = wire.span;
                 if let Some(ref mut s) = span {

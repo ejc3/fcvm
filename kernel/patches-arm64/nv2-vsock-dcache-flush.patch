@@ -1,0 +1,57 @@
+From: fcvm <fcvm@localhost>
+Subject: [PATCH] vsock/virtio: Add cache flush for NV2 with nonlinear SKB support
+
+Add cache flush in vsock TX path for ARM64 NV2 compatibility.
+Handle both linear and nonlinear (paged) SKBs.
+
+Signed-off-by: fcvm <fcvm@localhost>
+---
+ net/vmw_vsock/virtio_transport.c | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+--- a/net/vmw_vsock/virtio_transport.c
++++ b/net/vmw_vsock/virtio_transport.c
+@@ -21,6 +21,10 @@
+ #include <linux/mutex.h>
+ #include <net/af_vsock.h>
+
++#ifdef CONFIG_ARM64
++#include <asm/cacheflush.h>
++#endif
++
+ static struct workqueue_struct *virtio_vsock_workqueue;
+ static struct virtio_vsock __rcu *the_virtio_vsock;
+ static DEFINE_MUTEX(the_virtio_vsock_mutex); /* protects the_virtio_vsock */
+@@ -147,6 +151,32 @@ static int virtio_transport_send_skb(struct sk_buff *skb, struct virtqueue *vq,
+ 	if (ret < 0)
+ 		return ret;
+
++#ifdef CONFIG_ARM64
++	/* NV2: Flush all SKB data before virtqueue kick */
++	dsb(sy);
++	/* Flush vsock header */
++	dcache_clean_inval_poc((unsigned long)virtio_vsock_hdr(skb),
++		(unsigned long)virtio_vsock_hdr(skb) + sizeof(struct virtio_vsock_hdr));
++	if (!skb_is_nonlinear(skb)) {
++		/* Linear: flush data directly */
++		if (skb->len > 0)
++			dcache_clean_inval_poc((unsigned long)skb->data,
++				(unsigned long)skb->data + skb->len);
++	} else {
++		/* Nonlinear: flush each page fragment */
++		struct skb_shared_info *si = skb_shinfo(skb);
++		int i;
++		for (i = 0; i < si->nr_frags; i++) {
++			skb_frag_t *f = &si->frags[i];
++			void *addr = page_address(skb_frag_page(f)) + skb_frag_off(f);
++			dcache_clean_inval_poc((unsigned long)addr,
++				(unsigned long)addr + skb_frag_size(f));
++		}
++	}
++	dsb(sy);
++	isb();
++#endif
++
+ 	virtio_transport_deliver_tap_pkt(skb);
+ 	return 0;
+ }

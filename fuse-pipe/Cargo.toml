@@ -45,6 +45,9 @@ fuser = { git = "https://github.com/ejc3/fuser.git", branch = "remap-file-range-
 # Concurrent data structures
 dashmap = "5.5"
 
+# Checksum for corruption detection
+crc32fast = "1.3"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "process", "time"] }
 tempfile = "3"
