@@ -180,14 +180,17 @@ fuse_readers = 64
 # Uses the running kernel's config (/boot/config-$(uname -r)) as base,
 # which includes all EC2/AWS modules (ENA networking, NVMe, etc.)
 # Then applies fcvm patches for NV2 cache coherency (DSB barriers)
+#
+# NOTE: Host kernel uses kernel/patches/ NOT kernel/patches-arm64/
+# - kernel/patches/ has MMIO barrier (for L0 KVM handling L1's MMIO traps)
+# - kernel/patches-arm64/ has vsock flush (for L1 guest, uses non-exported symbols)
 [kernel_profiles.nested.arm64.host_kernel]
 kernel_version = "6.18.3"
-patches_dir = "kernel/patches-arm64"
+patches_dir = "kernel/patches"
 
-# Build inputs for SHA calculation (patches only, skip *.vm.patch for host)
-# .vm.patch files are only applied to the nested VM kernel, not host
+# Build inputs for SHA calculation
 build_inputs = [
-    "kernel/patches-arm64/*.patch",
+    "kernel/patches/*.patch",
 ]
 
 # x86_64 nested profile (Intel VT-x / AMD-V)

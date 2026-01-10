@@ -135,6 +135,8 @@ impl<H: FilesystemHandler + 'static> AsyncServer<H> {
     ) -> anyhow::Result<()> {
         let socket_path = format!("{}_{}", uds_base_path, port);
         info!(target: "fuse-pipe::server", uds_base_path, port, socket_path = %socket_path, "serving vsock-forwarded");
+        // Log that checksum validation is enabled (proves new code is deployed)
+        info!(target: "fuse-pipe::server", "CHECKSUM_ENABLED: server will validate CRC32 checksums on requests");
         self.serve_unix_with_ready_signal(&socket_path, ready).await
     }
 
@@ -191,12 +193,26 @@ async fn request_reader<H: FilesystemHandler + 'static>(
     let mut last_unique: u64 = 0; // Track last successful unique ID
     let mut zero_byte_runs: u64 = 0; // Track consecutive zero bytes seen (for corruption detection)
 
+    let mut crc_buf = [0u8; 4]; // For reading CRC header
+
     loop {
+        // Read CRC header first (new wire format)
+        match read_half.read_exact(&mut crc_buf).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                tracing::debug!(target: "fuse-pipe::server", count, total_bytes_read, "client disconnected");
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let expected_crc = u32::from_be_bytes(crc_buf);
+        total_bytes_read += 4;
+
         // Read request length
         match read_half.read_exact(&mut len_buf).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                tracing::debug!(target: "fuse-pipe::server", count, total_bytes_read, "client disconnected");
+                tracing::debug!(target: "fuse-pipe::server", count, total_bytes_read, "client disconnected (after CRC)");
                 break;
             }
             Err(e) => return Err(e.into()),
@@ -325,6 +341,26 @@ async fn request_reader<H: FilesystemHandler + 'static>(
         read_half.read_exact(&mut req_buf).await?;
         total_bytes_read += len as u64;
 
+        // Compute CRC of received data (length bytes + body) and validate against header
+        let mut crc_data = Vec::with_capacity(4 + len);
+        crc_data.extend_from_slice(&len_buf);
+        crc_data.extend_from_slice(&req_buf);
+        let recv_crc = crc32fast::hash(&crc_data);
+
+        if recv_crc != expected_crc {
+            error!(
+                target: "fuse-pipe::server",
+                count,
+                len,
+                total_bytes_read,
+                last_unique,
+                expected_crc = format!("{:08x}", expected_crc),
+                recv_crc = format!("{:08x}", recv_crc),
+                "WIRE CRC MISMATCH - data corrupted in transit!"
+            );
+            // Continue to deserialization to get more diagnostic info
+        }
+
         // Deserialize
         let wire_req: WireRequest = match bincode::deserialize(&req_buf) {
             Ok(r) => r,
@@ -357,6 +393,9 @@ async fn request_reader<H: FilesystemHandler + 'static>(
                     0
                 };
 
+                // Compute CRC32 of received buffer for comparison with sender
+                let recv_crc = crc32fast::hash(&req_buf);
+
                 error!(
                     target: "fuse-pipe::server",
                     count,
@@ -365,10 +404,11 @@ async fn request_reader<H: FilesystemHandler + 'static>(
                     last_len,
                     last_unique,
                     maybe_unique,
+                    recv_crc = format!("{:08x}", recv_crc),
                     error = %e,
                     hex = %hex_dump,
                     ascii = %ascii_dump,
-                    "DESERIALIZE FAILED - raw bytes dumped"
+                    "DESERIALIZE FAILED - raw bytes dumped with CRC"
                 );
                 continue;
             }
@@ -376,6 +416,35 @@ async fn request_reader<H: FilesystemHandler + 'static>(
 
         // Mark deserialize done on span if present
         let t_deser = now_nanos();
+
+        // Validate checksum if present (for corruption detection)
+        if !wire_req.validate_checksum() {
+            let expected = wire_req.checksum;
+            let actual = wire_req.compute_checksum();
+            error!(
+                target: "fuse-pipe::server",
+                count,
+                unique = wire_req.unique,
+                ?expected,
+                actual,
+                total_bytes_read,
+                "CHECKSUM MISMATCH - data corrupted in transit"
+            );
+            // Continue processing but log the corruption for diagnosis
+        }
+
+        // Log every message for detailed debugging (separate target for filtering)
+        tracing::debug!(
+            target: "fuse-pipe::server::trace",
+            count,
+            unique = wire_req.unique,
+            reader_id = wire_req.reader_id,
+            len,
+            total_bytes_read,
+            has_checksum = wire_req.checksum.is_some(),
+            request_type = %format!("{:?}", std::mem::discriminant(&wire_req.request)),
+            "received request"
+        );
 
         let unique = wire_req.unique;
         last_unique = unique; // Track for corruption debugging (used in deserialize error logs)
@@ -475,9 +544,10 @@ async fn response_writer(
         }
 
         // Build wire response with span (span is cloned/moved into response here)
+        // Add checksum for corruption detection
         let wire_resp = match span {
-            Some(s) => WireResponse::with_span(unique, reader_id, response, s),
-            None => WireResponse::new(unique, reader_id, response),
+            Some(s) => WireResponse::with_span(unique, reader_id, response, s).with_checksum(),
+            None => WireResponse::new(unique, reader_id, response).with_checksum(),
         };
 
         let resp_buf = match bincode::serialize(&wire_resp) {
@@ -487,6 +557,16 @@ async fn response_writer(
                 continue;
             }
         };
+
+        // Log every response for detailed debugging (separate target for filtering)
+        tracing::debug!(
+            target: "fuse-pipe::server::trace",
+            unique,
+            reader_id,
+            resp_len = resp_buf.len(),
+            checksum = wire_resp.checksum,
+            "sending response"
+        );
 
         let resp_len = (resp_buf.len() as u32).to_be_bytes();
 

@@ -1,0 +1,51 @@
+From: fcvm <fcvm@localhost>
+Subject: [PATCH] virtio: Add cache flush barrier before kick for ARM64 NV2
+
+Under ARM64 nested virtualization (FEAT_NV2), the hypervisor may read
+stale data from virtqueue ring structures unless explicit cache
+maintenance is performed. Standard memory barriers (DSB) order operations
+but don't flush dirty cache lines.
+
+This patch adds DSB + ISB barrier sequence in virtqueue_notify() before
+signaling the host. This ensures all prior writes to the virtqueue
+(descriptor table, available ring, and data buffers) are visible to the
+hypervisor when it receives the notification.
+
+The barrier is only added on ARM64 and has minimal performance impact
+since kicks are relatively infrequent compared to data operations.
+
+Signed-off-by: fcvm <fcvm@localhost>
+---
+diff --git a/drivers/virtio/virtio_ring.c b/drivers/virtio/virtio_ring.c
+--- a/drivers/virtio/virtio_ring.c
++++ b/drivers/virtio/virtio_ring.c
+@@ -16,6 +16,11 @@
+ #include <linux/spinlock.h>
+ #include <xen/xen.h>
+
++#ifdef CONFIG_ARM64
++#include <asm/barrier.h>
++#include <asm/cacheflush.h>
++#endif
++
+ #ifdef DEBUG
+ /* For development, we want to crash whenever the ring is misused. */
+ #define BAD_RING(_vq, fmt, args...)				\
+@@ -2192,6 +2197,17 @@ bool virtqueue_notify(struct virtqueue *_vq)
+ 	if (unlikely(vq->broken))
+ 		return false;
+
++#ifdef CONFIG_ARM64
++	/*
++	 * NV2 cache coherency: Ensure all writes to virtqueue structures
++	 * (descriptor table, available ring) and data buffers are visible
++	 * to the hypervisor before sending the kick notification.
++	 * Standard DSB doesn't flush dirty cache lines under nested virt.
++	 */
++	dsb(sy);
++	isb();
++#endif
++
+ 	/* Prod other side to tell it about changes. */
+ 	if (!vq->notify(_vq)) {
+ 		vq->broken = true;

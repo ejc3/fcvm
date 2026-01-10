@@ -1737,7 +1737,8 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,fuse_pipe=debug")),
+                // Note: targets use hyphens (fuse-pipe::*) not underscores
+                .unwrap_or_else(|_| EnvFilter::new("info,fuse-pipe=debug,fuse-pipe::mux::trace=debug")),
         )
         .with_target(true)
         .with_ansi(false)
