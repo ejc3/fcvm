@@ -246,6 +246,22 @@ impl Filesystem for FuseClient {
             );
         }
 
+        // Enable auto-invalidation: kernel checks mtime and invalidates cached pages
+        // when file is modified. Essential for FICLONE/reflink where content changes
+        // without going through normal write path.
+        if let Err(unsupported) = config.add_capabilities(fuser::consts::FUSE_AUTO_INVAL_DATA) {
+            tracing::warn!(
+                target: "fuse-pipe::client",
+                unsupported,
+                "Kernel doesn't support FUSE_AUTO_INVAL_DATA"
+            );
+        } else {
+            tracing::debug!(
+                target: "fuse-pipe::client",
+                "Enabled FUSE_AUTO_INVAL_DATA for cache coherency"
+            );
+        }
+
         // Limit max_write to avoid vsock data loss under nested virtualization.
         // Override with FCVM_FUSE_MAX_WRITE env var (0 = unbounded).
         let max_write = std::env::var("FCVM_FUSE_MAX_WRITE")

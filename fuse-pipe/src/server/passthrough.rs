@@ -90,11 +90,14 @@ impl PassthroughFs {
 
         let inner = FuseBackendPassthrough::new(cfg)?;
 
-        // Initialize the filesystem with writeback cache capability.
-        // This sets the internal writeback flag which enables O_WRONLY -> O_RDWR
-        // promotion. Without this, files opened with O_WRONLY will fail with EBADF
-        // when the kernel issues read requests for page cache operations.
-        inner.init(FsOptions::WRITEBACK_CACHE)?;
+        // Initialize the filesystem with writeback cache and auto-invalidation.
+        // - WRITEBACK_CACHE: sets the internal writeback flag which enables
+        //   O_WRONLY -> O_RDWR promotion. Without this, files opened with O_WRONLY
+        //   will fail with EBADF when the kernel issues read requests for page cache.
+        // - AUTO_INVAL_DATA: kernel checks mtime on reads and invalidates cached
+        //   pages if the file was modified. Essential for FICLONE/reflink where
+        //   file content changes without going through normal write path.
+        inner.init(FsOptions::WRITEBACK_CACHE | FsOptions::AUTO_INVAL_DATA)?;
 
         Ok(Self {
             inner: Arc::new(inner),
