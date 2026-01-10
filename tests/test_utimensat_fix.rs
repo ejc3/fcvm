@@ -104,7 +104,6 @@ async fn test_utimensat_pjdfstest_nested_kernel() -> Result<()> {
         }
     };
 
-    let elapsed = std::time::Instant::now();
     if exit_status.success() {
         println!("\n✅ PJDFSTEST UTIMENSAT PASSED!");
         println!("   All 122 utimensat tests passed with patched kernel.");
@@ -112,11 +111,10 @@ async fn test_utimensat_pjdfstest_nested_kernel() -> Result<()> {
         Ok(())
     } else {
         bail!(
-            "pjdfstest utimensat failed: exit={} ({:.1}s)\n\n\
+            "pjdfstest utimensat failed: exit={}\n\n\
             The kernel patch may not be applied correctly.\n\
             Check: fcvm setup --kernel-profile nested --build-kernels",
-            exit_status.code().unwrap_or(-1),
-            elapsed.elapsed().as_secs_f64()
+            exit_status.code().unwrap_or(-1)
         )
     }
 }
