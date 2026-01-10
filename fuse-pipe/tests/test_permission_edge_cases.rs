@@ -1242,8 +1242,13 @@ fn test_fallocate_punch_hole() {
         hole_offset
     );
     let mut hole_buf = vec![0xFFu8; hole_len as usize];
-    let read_bytes =
-        unsafe { libc::read(fd, hole_buf.as_mut_ptr() as *mut libc::c_void, hole_buf.len()) };
+    let read_bytes = unsafe {
+        libc::read(
+            fd,
+            hole_buf.as_mut_ptr() as *mut libc::c_void,
+            hole_buf.len(),
+        )
+    };
     assert_eq!(read_bytes as usize, hole_buf.len(), "read hole region");
 
     // Hole should be all zeros
@@ -1259,8 +1264,13 @@ fn test_fallocate_punch_hole() {
     // Verify data before hole is intact (first 256KB should be 0xAA)
     assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_SET) }, 0);
     let mut before_buf = vec![0u8; hole_offset as usize];
-    let read_bytes =
-        unsafe { libc::read(fd, before_buf.as_mut_ptr() as *mut libc::c_void, before_buf.len()) };
+    let read_bytes = unsafe {
+        libc::read(
+            fd,
+            before_buf.as_mut_ptr() as *mut libc::c_void,
+            before_buf.len(),
+        )
+    };
     assert_eq!(read_bytes as usize, before_buf.len());
     assert!(
         before_buf.iter().all(|&b| b == 0xAA),
@@ -1274,8 +1284,13 @@ fn test_fallocate_punch_hole() {
         after_offset
     );
     let mut after_buf = vec![0u8; (1024 * 1024 - after_offset) as usize];
-    let read_bytes =
-        unsafe { libc::read(fd, after_buf.as_mut_ptr() as *mut libc::c_void, after_buf.len()) };
+    let read_bytes = unsafe {
+        libc::read(
+            fd,
+            after_buf.as_mut_ptr() as *mut libc::c_void,
+            after_buf.len(),
+        )
+    };
     assert_eq!(read_bytes as usize, after_buf.len());
     assert!(
         after_buf.iter().all(|&b| b == 0xAA),

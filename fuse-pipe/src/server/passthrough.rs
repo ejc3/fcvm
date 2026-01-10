@@ -1604,8 +1604,12 @@ mod tests {
             VolumeResponse::Written { size } => {
                 eprintln!("remap_file_range succeeded, size={}", size);
 
-                // For whole-file clone (len=0), we return 0 on success
-                assert_eq!(size, 0, "FICLONE should return 0 for whole file");
+                // For whole-file clone (len=0), we return the file size on success
+                assert_eq!(
+                    size,
+                    test_data.len() as u32,
+                    "FICLONE should return file size for whole file (len=0)"
+                );
 
                 // Verify the data was cloned by reading destination
                 let resp = fs.read(dst_ino, dst_fh, 0, 100, uid, gid, 0);
