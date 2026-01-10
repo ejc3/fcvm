@@ -1198,9 +1198,18 @@ fn test_fallocate_punch_hole() {
         std::io::Error::last_os_error()
     );
 
-    // Get initial block count
-    let meta_before = fs::metadata(&file).expect("stat");
-    let blocks_before = meta_before.blocks();
+    // Get initial block count using fstat() on the open fd to get fresh metadata
+    // (fs::metadata() may return stale cached data with FUSE_WRITEBACK_CACHE)
+    use std::os::unix::fs::MetadataExt;
+    let mut stat_before: libc::stat = unsafe { std::mem::zeroed() };
+    let fstat_ret = unsafe { libc::fstat(fd, &mut stat_before) };
+    assert_eq!(
+        fstat_ret,
+        0,
+        "fstat failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let blocks_before = stat_before.st_blocks as u64;
 
     // Punch a 512KB hole in the middle
     const FALLOC_FL_PUNCH_HOLE: i32 = 0x02;
@@ -1214,10 +1223,9 @@ fn test_fallocate_punch_hole() {
         )
     };
 
-    unsafe { libc::close(fd) };
-
     if ret != 0 {
         let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
         let _ = fs::remove_file(&file);
         drop(fuse);
         cleanup(&data_dir, &mount_dir);
@@ -1230,9 +1238,19 @@ fn test_fallocate_punch_hole() {
         panic!("fallocate PUNCH_HOLE failed: {}", err);
     }
 
-    // Verify blocks decreased (hole was punched)
-    let meta_after = fs::metadata(&file).expect("stat");
-    let blocks_after = meta_after.blocks();
+    // Get block count after punch hole using fstat() on the open fd
+    let mut stat_after: libc::stat = unsafe { std::mem::zeroed() };
+    let fstat_ret = unsafe { libc::fstat(fd, &mut stat_after) };
+    assert_eq!(
+        fstat_ret,
+        0,
+        "fstat after punch_hole failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let blocks_after = stat_after.st_blocks as u64;
+    let file_size = stat_after.st_size as u64;
+
+    unsafe { libc::close(fd) };
 
     eprintln!(
         "PUNCH_HOLE: blocks before={}, after={} (saved {} blocks)",
@@ -1243,7 +1261,7 @@ fn test_fallocate_punch_hole() {
 
     // File size should remain 1MB
     assert_eq!(
-        meta_after.len(),
+        file_size,
         1024 * 1024,
         "file size should be unchanged"
     );
