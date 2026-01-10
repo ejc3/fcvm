@@ -214,11 +214,18 @@ _test-all:
 	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) $(FILTER)
 
 _test-root:
-	RUST_LOG="$(TEST_LOG)" \
+	@RUST_LOG="$(TEST_LOG)" \
 	FCVM_DATA_DIR=$(ROOT_DATA_DIR) \
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
-	$(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_IGNORED) $(NEXTEST_RETRIES) --features privileged-tests $(FILTER)
+	$(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_IGNORED) $(NEXTEST_RETRIES) --features privileged-tests $(FILTER) || \
+	{ echo ""; \
+	  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
+	  echo "TEST FAILED - Check debug logs for root cause:"; \
+	  echo "  📋 Debug logs: /tmp/fcvm-test-logs/*.log"; \
+	  echo "  💡 Re-run with STREAM=1 to see tracing output in real-time"; \
+	  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
+	  exit 1; }
 
 # Host targets (with setup, check-disk first to fail fast if disk is full)
 test-unit: show-notes check-disk build _test-unit
