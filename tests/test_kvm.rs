@@ -1871,3 +1871,51 @@ async fn test_nested_l2_unbounded_fuse_corrupts() -> Result<()> {
     //   count=61 total_bytes_read=7343452 last_len=1048645
     bail!("This test intentionally fails to document known corruption")
 }
+
+/// Known failure: L1 NV2-enabled kernel + high-throughput vsock + writeback cache.
+///
+/// This test documents corruption when using `--kernel-profile nested` (NV2-enabled
+/// kernel) with high-throughput FUSE writes and writeback cache enabled.
+///
+/// Root cause analysis (2026-01):
+/// - Default kernel + writeback cache: WORKS (~21MB transferred, 600+ messages)
+/// - Nested kernel + writeback cache: FAILS (~2.4MB transferred, ~32 messages)
+///
+/// Symptoms:
+/// - STREAM CORRUPTION: zero-length message detected after ~2.4MB
+/// - peek_bytes=128 shows 128 bytes of zeros
+/// - Pattern: count=32, total_bytes_read=2463475, last_len=1048645
+///
+/// This is distinct from the L2 corruption issue (double Stage 2 translation).
+/// This is an L1 issue where the NV2-enabled guest kernel + vsock under high
+/// throughput with writeback cache triggers ~32KB zero blocks in the stream.
+///
+/// The workaround is to use the default kernel for workloads that don't need
+/// nested virtualization (like btrfs reflink tests). The nested kernel profile
+/// should only be used when actually running VMs inside VMs.
+///
+/// To reproduce manually:
+///   # On fuse-writeback-perf branch (writeback cache enabled)
+///   make test-root FILTER=btrfs_in_container STREAM=1
+///   # With --kernel-profile nested in the test, it fails around 2.4MB
+///   # Without nested kernel, it passes with 21MB+ transferred
+#[ignore = "documents known NV2 kernel + writeback cache vsock corruption"]
+#[tokio::test]
+async fn test_nv2_kernel_writeback_cache_vsock_corruption() -> Result<()> {
+    // This test documents the corruption that occurs when combining:
+    // 1. NV2-enabled kernel (--kernel-profile nested)
+    // 2. High-throughput FUSE writes via vsock
+    // 3. Writeback cache enabled
+    //
+    // The combination triggers ~32KB zero blocks appearing in the vsock stream
+    // after approximately 2.4MB of data transferred.
+    //
+    // To investigate, use the btrfs test with nested kernel:
+    //   1. Edit test_btrfs_fuse.rs to add "--kernel-profile", "nested" to spawn_fcvm
+    //   2. Run: make test-root FILTER=btrfs_in_container STREAM=1
+    //   3. Observe: "STREAM CORRUPTION: zero-length message detected"
+    //
+    // The fix is to not use nested kernel when not needed (nested virtualization).
+    // Writeback cache works fine with the default kernel.
+    bail!("This test intentionally fails to document NV2 + writeback cache corruption")
+}
