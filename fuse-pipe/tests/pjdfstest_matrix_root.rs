@@ -53,12 +53,8 @@ pjdfstest_category!(test_pjdfstest_symlink, "symlink");
 pjdfstest_category!(test_pjdfstest_truncate, "truncate");
 pjdfstest_category!(test_pjdfstest_unlink, "unlink");
 
-// DISABLED: utimensat test fails 1/122 tests when FUSE_WRITEBACK_CACHE is enabled.
-// The failing test: non-owner user with write permission calling utimensat(UTIME_NOW).
-// Root cause: Linux kernel interaction between default_permissions + writeback cache.
-// With default_permissions, FUSE doesn't set ATTR_FORCE, so setattr_prepare() requires
-// owner or CAP_FOWNER for timestamp changes, ignoring write permission.
-// This is a known kernel limitation since 2006: https://github.com/libfuse/libfuse/issues/15
-// Trade-off: writeback cache gives 9x write performance improvement.
-// TODO: Re-enable if kernel is fixed or we find a workaround.
+// NOTE: utimensat disabled - requires kernel patch 0002-fuse-fix-utimensat-with-default-permissions.patch
+// Without the patch, 1/122 tests fail (non-owner with write permission calling utimensat(UTIME_NOW))
+// See: https://github.com/libfuse/libfuse/issues/15
+// Tested in: tests/test_utimensat_fix.rs (runs with nested kernel that has the patch)
 // pjdfstest_category!(test_pjdfstest_utimensat, "utimensat");

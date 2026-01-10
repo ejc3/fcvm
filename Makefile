@@ -135,6 +135,11 @@ help:
 	@echo "  setup-lint-tools   Install cargo-audit and cargo-deny"
 	@echo "  install-host-kernel  Build and install host kernel with patches (requires reboot)"
 	@echo ""
+	@echo "Kernel patches:"
+	@echo "  kernel-patch-create PROFILE=nested NAME=0004-fix FILE=fs/fuse/dir.c"
+	@echo "  kernel-patch-edit PROFILE=nested PATCH=0002"
+	@echo "  kernel-patch-validate PROFILE=nested"
+	@echo ""
 	@echo "Other:"
 	@echo "  bench              Run fuse-pipe benchmarks"
 	@echo "  lint               Run linting (auto-installs tools if needed)"
@@ -364,3 +369,22 @@ fmt:
 JUMPBOX_IP := 54.193.62.221
 ssh:
 	ssh -i ~/.ssh/fcvm-ec2 ubuntu@$(JUMPBOX_IP)
+
+# Kernel patch helpers - generates properly formatted patches
+# Usage: make kernel-patch-create PROFILE=nested NAME=0004-my-fix FILE=fs/fuse/dir.c
+PROFILE ?= nested
+NAME ?=
+PATCH ?=
+FILE ?=
+
+kernel-patch-create:
+	@test -n "$(NAME)" || (echo "ERROR: NAME required (e.g., NAME=0004-my-fix)"; exit 1)
+	@test -n "$(FILE)" || (echo "ERROR: FILE required (e.g., FILE=fs/fuse/dir.c)"; exit 1)
+	./scripts/kernel-patch.sh create $(PROFILE) $(NAME) $(FILE)
+
+kernel-patch-edit:
+	@test -n "$(PATCH)" || (echo "ERROR: PATCH required (e.g., PATCH=0002)"; exit 1)
+	./scripts/kernel-patch.sh edit $(PROFILE) $(PATCH)
+
+kernel-patch-validate:
+	./scripts/kernel-patch.sh validate $(PROFILE)

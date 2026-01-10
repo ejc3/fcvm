@@ -1,0 +1,89 @@
+From 4ce85a66b9c034fb8bd4865c912b3a103b1f94ba Mon Sep 17 00:00:00 2001
+From: ejc3 <ejc3@users.noreply.github.com>
+Date: Fri, 9 Jan 2026 16:30:08 +0000
+Subject: [PATCH] fuse: fix utimensat permission check with default_permissions
+
+When FUSE is mounted with default_permissions, utimensat(UTIME_NOW)
+incorrectly returns EPERM for non-owner users who have write permission
+on the file.
+
+POSIX specifies that setting timestamps to the current time (UTIME_NOW)
+should succeed if the caller has write permission on the file, even if
+they are not the owner. The kernel indicates this case by setting
+ATTR_TOUCH in ia_valid.
+
+This patch fixes two issues:
+
+1. fuse_do_setattr() only adds ATTR_FORCE (which bypasses setattr_prepare()
+   permission checks) when default_permissions is disabled. With
+   default_permissions enabled, setattr_prepare() enforces owner-only
+   access for timestamp changes, violating POSIX.
+
+   Fix: Add ATTR_FORCE when ATTR_TOUCH is set and the user has write
+   permission on the file.
+
+2. With writeback cache enabled (trust_local_cmtime=true), iattr_to_fattr()
+   sends FATTR_ATIME_NOW but NOT FATTR_MTIME_NOW. This asymmetry causes
+   the FUSE server to receive an explicit mtime timestamp instead of
+   "set to now" semantics. Since setting explicit timestamps requires
+   ownership, the server returns EPERM.
+
+   Fix: Also send FATTR_MTIME_NOW when ATTR_TOUCH is set, regardless of
+   writeback cache mode. This preserves the writeback cache optimization
+   for normal file operations while correctly handling explicit
+   utimensat(UTIME_NOW) calls.
+
+Signed-off-by: fcvm developers <fcvm@anthropic.com>
+---
+ fs/fuse/dir.c | 25 +++++++++++++++++++++++--
+ 1 file changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
+index ecaec0fea..a1b2c3d4e 100644
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -1824,8 +1824,17 @@ static void iattr_to_fattr(struct mnt_idmap *idmap, struct fuse_conn *fc,
+ 		arg->valid |= FATTR_MTIME;
+ 		arg->mtime = iattr->ia_mtime.tv_sec;
+ 		arg->mtimensec = iattr->ia_mtime.tv_nsec;
+-		if (!(ivalid & ATTR_MTIME_SET) && !trust_local_cmtime)
+-			arg->valid |= FATTR_MTIME_NOW;
++		if (!(ivalid & ATTR_MTIME_SET)) {
++			/*
++			 * Send MTIME_NOW if not explicit timestamp AND either:
++			 * - writeback cache disabled (!trust_local_cmtime), OR
++			 * - this is utimensat(UTIME_NOW) (ATTR_TOUCH set)
++			 * The second case ensures POSIX compliance for touch ops
++			 * even with writeback cache enabled.
++			 */
++			if (!trust_local_cmtime || (ivalid & ATTR_TOUCH))
++				arg->valid |= FATTR_MTIME_NOW;
++		}
+ 	}
+ 	if ((ivalid & ATTR_CTIME) && trust_local_cmtime) {
+ 		arg->valid |= FATTR_CTIME;
+@@ -1949,8 +1958,20 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	bool fault_blocked = false;
+ 	u64 attr_version;
+
+-	if (!fc->default_permissions)
++	if (!fc->default_permissions) {
+ 		attr->ia_valid |= ATTR_FORCE;
++	} else if (attr->ia_valid & ATTR_TOUCH) {
++		/*
++		 * POSIX: utimensat(UTIME_NOW) should succeed if user has
++		 * write permission, even if not owner. The kernel sets
++		 * ATTR_TOUCH for this case. Check write permission and
++		 * add ATTR_FORCE to bypass setattr_prepare()'s owner check.
++		 */
++		int write_err = inode_permission(idmap, inode, MAY_WRITE);
++
++		if (!write_err)
++			attr->ia_valid |= ATTR_FORCE;
++	}
+
+ 	err = setattr_prepare(idmap, dentry, attr);
+ 	if (err)
+-- 
+2.43.0
+
