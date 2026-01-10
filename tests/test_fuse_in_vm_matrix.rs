@@ -190,16 +190,11 @@ pjdfstest_vm_category!(test_pjdfstest_vm_link, "link");
 pjdfstest_vm_category!(test_pjdfstest_vm_mkdir, "mkdir");
 pjdfstest_vm_category!(test_pjdfstest_vm_mkfifo, "mkfifo");
 pjdfstest_vm_category!(test_pjdfstest_vm_mknod, "mknod");
-// DISABLED: open test fails with FUSE_WRITEBACK_CACHE (O_WRONLY → O_RDWR promotion)
-// See fuse-pipe/tests/pjdfstest_matrix_root.rs for detailed explanation.
-// pjdfstest_vm_category!(test_pjdfstest_vm_open, "open");
+pjdfstest_vm_category!(test_pjdfstest_vm_open, "open");
 pjdfstest_vm_category!(test_pjdfstest_vm_posix_fallocate, "posix_fallocate");
 pjdfstest_vm_category!(test_pjdfstest_vm_rename, "rename");
 pjdfstest_vm_category!(test_pjdfstest_vm_rmdir, "rmdir");
 pjdfstest_vm_category!(test_pjdfstest_vm_symlink, "symlink");
 pjdfstest_vm_category!(test_pjdfstest_vm_truncate, "truncate");
 pjdfstest_vm_category!(test_pjdfstest_vm_unlink, "unlink");
-
-// NOTE: utimensat requires kernel patch 0002-fuse-fix-utimensat-with-default-permissions.patch
-// Tested in: tests/test_utimensat_fix.rs (runs with nested kernel that has the patch)
-// pjdfstest_vm_category!(test_pjdfstest_vm_utimensat, "utimensat");
+pjdfstest_vm_category!(test_pjdfstest_vm_utimensat, "utimensat");
