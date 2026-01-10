@@ -6,54 +6,37 @@ writes data to a virtqueue and then kicks via MMIO, the L1 hypervisor
 may read stale data. This causes vsock stream corruption where ~32KB of
 zeros appear after several megabytes of data transfer.
 
-The race condition is:
-1. L2 writes data to virtqueue (via shadow S2 translation)
-2. L2 writes MMIO notification (triggers trap to L1)
-3. L1 KVM handles MMIO trap, calls kvm_io_bus_write()
-4. kvm_io_bus_write() -> ioeventfd_write() -> eventfd_signal()
-5. L1 Firecracker wakes up and reads from virtqueue
-6. L1 Firecracker may see stale/zero data if step 1 isn't visible
-
 Add DSB SY immediately before kvm_io_bus_write() in io_mem_abort()
-when running on hardware with FEAT_NV2 capability. This ensures L2's
-prior data writes are globally visible before we signal the eventfd
-that wakes up L1 userspace (Firecracker).
+when running a nested guest. This ensures L2's prior data writes are
+globally visible before we signal the eventfd that wakes userspace.
 
 Signed-off-by: fcvm <fcvm@localhost>
 ---
- arch/arm64/kvm/mmio.c | 17 +++++++++++++++++
- 1 file changed, 17 insertions(+), 0 deletions(-)
+ arch/arm64/kvm/mmio.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
 
 --- a/arch/arm64/kvm/mmio.c
 +++ b/arch/arm64/kvm/mmio.c
-@@ -7,6 +7,8 @@
+@@ -7,6 +7,7 @@
  #include <linux/kvm_host.h>
  #include <asm/kvm_emulate.h>
  #include <trace/events/kvm.h>
-+#include <asm/cpufeature.h>
 +#include <asm/barrier.h>
 
  #include "trace.h"
 
-@@ -201,6 +203,22 @@ int io_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa)
+@@ -201,6 +202,15 @@ int io_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa)
  		trace_kvm_mmio(KVM_TRACE_MMIO_WRITE, len, fault_ipa, &data);
  		kvm_mmio_write_buf(data_buf, len, data);
 
 +		/*
-+		 * NV2 cache coherency: When running on hardware with nested
-+		 * virtualization capability, ensure all prior guest writes
-+		 * are visible before signaling the eventfd. Without this,
-+		 * userspace (e.g., Firecracker) may read stale data from
-+		 * guest memory due to double S2 translation cache issues.
++		 * NV2 cache coherency: When running a nested guest,
++		 * ensure all prior guest writes are visible before
++		 * signaling the eventfd. Without this, userspace may
++		 * read stale data from guest memory.
 +		 */
-+		if (cpus_have_final_cap(ARM64_HAS_NESTED_VIRT)) {
-+			static atomic_t nv2_mmio_dsb_count = ATOMIC_INIT(0);
-+			int cnt = atomic_inc_return(&nv2_mmio_dsb_count);
-+			if (cnt <= 10 || (cnt % 10000) == 0)
-+				pr_info_ratelimited("nv2-mmio-dsb[%d]: ipa=%llx len=%d\n",
-+					cnt, fault_ipa, len);
++		if (vcpu_has_nv(vcpu))
 +			dsb(sy);
-+		}
 +
  		ret = kvm_io_bus_write(vcpu, KVM_MMIO_BUS, fault_ipa, len,
  				       data_buf);
