@@ -18,7 +18,7 @@ use super::handler::FilesystemHandler;
 use super::zerocopy::{SliceReader, VecWriter};
 use crate::protocol::{DirEntry, DirEntryPlus, FileAttr, VolumeRequest, VolumeResponse};
 
-use fuse_backend_rs::abi::fuse_abi::CreateIn;
+use fuse_backend_rs::abi::fuse_abi::{CreateIn, FsOptions};
 use fuse_backend_rs::api::filesystem::{Context, Entry, FileSystem, SetattrValid};
 use fuse_backend_rs::passthrough::{Config, PassthroughFs as FuseBackendPassthrough};
 
@@ -90,8 +90,11 @@ impl PassthroughFs {
 
         let inner = FuseBackendPassthrough::new(cfg)?;
 
-        // Initialize the filesystem
-        inner.import()?;
+        // Initialize the filesystem with writeback cache capability.
+        // This sets the internal writeback flag which enables O_WRONLY -> O_RDWR
+        // promotion. Without this, files opened with O_WRONLY will fail with EBADF
+        // when the kernel issues read requests for page cache operations.
+        inner.init(FsOptions::WRITEBACK_CACHE)?;
 
         Ok(Self {
             inner: Arc::new(inner),
