@@ -1,18 +1,19 @@
 From: fcvm <fcvm@localhost>
-Subject: [PATCH] virtio: Add cache flush barrier before kick for ARM64 NV2
+Subject: [PATCH] virtio: Flush vring cache before kick for ARM64 NV2
 
 Under ARM64 nested virtualization (FEAT_NV2), the hypervisor may read
 stale data from virtqueue ring structures unless explicit cache
-maintenance is performed. Standard memory barriers (DSB) order operations
-but don't flush dirty cache lines.
+maintenance is performed. DSB orders operations but doesn't flush
+dirty cache lines to the point of coherency.
 
-This patch adds DSB + ISB barrier sequence in virtqueue_notify() before
-signaling the host. This ensures all prior writes to the virtqueue
-(descriptor table, available ring, and data buffers) are visible to the
-hypervisor when it receives the notification.
+This patch adds DC CIVAC (clean and invalidate) on the entire vring
+region before sending the kick notification. This ensures the host
+sees updated descriptors and available ring entries.
 
-The barrier is only added on ARM64 and has minimal performance impact
-since kicks are relatively infrequent compared to data operations.
+The flush covers:
+- Descriptor table (16 bytes × num_descriptors)
+- Available ring header + entries
+- Used ring header + entries (for bidirectional coherency)
 
 Signed-off-by: fcvm <fcvm@localhost>
 ---
@@ -31,17 +32,36 @@ diff --git a/drivers/virtio/virtio_ring.c b/drivers/virtio/virtio_ring.c
  #ifdef DEBUG
  /* For development, we want to crash whenever the ring is misused. */
  #define BAD_RING(_vq, fmt, args...)				\
-@@ -2192,6 +2197,17 @@ bool virtqueue_notify(struct virtqueue *_vq)
+@@ -2192,6 +2197,36 @@ bool virtqueue_notify(struct virtqueue *_vq)
  	if (unlikely(vq->broken))
  		return false;
 
 +#ifdef CONFIG_ARM64
 +	/*
-+	 * NV2 cache coherency: Ensure all writes to virtqueue structures
-+	 * (descriptor table, available ring) and data buffers are visible
-+	 * to the hypervisor before sending the kick notification.
-+	 * Standard DSB doesn't flush dirty cache lines under nested virt.
++	 * NV2 cache coherency: Flush all vring structures to ensure
++	 * hypervisor sees updated descriptors and available ring.
++	 * DSB alone doesn't flush dirty cache lines under nested virt.
 +	 */
++	dsb(sy);
++	if (!vq->packed_ring) {
++		/* Split virtqueue: flush desc, avail, and used rings */
++		struct vring *vr = &vq->split.vring;
++		unsigned long desc_start = (unsigned long)vr->desc;
++		unsigned long desc_end = desc_start + (16 * vr->num);
++		unsigned long avail_start = (unsigned long)vr->avail;
++		unsigned long avail_end = avail_start +
++			sizeof(struct vring_avail) + (2 * vr->num);
++		unsigned long used_start = (unsigned long)vr->used;
++		unsigned long used_end = used_start +
++			sizeof(struct vring_used) + (8 * vr->num);
++
++		dcache_clean_inval_poc(desc_start, desc_end);
++		dcache_clean_inval_poc(avail_start, avail_end);
++		dcache_clean_inval_poc(used_start, used_end);
++	} else {
++		/* Packed virtqueue: TODO if needed */
++		dsb(sy);
++	}
 +	dsb(sy);
 +	isb();
 +#endif
