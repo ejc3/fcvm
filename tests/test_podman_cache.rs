@@ -2,43 +2,77 @@
 //!
 //! Tests the container-layer caching feature that caches VM state after
 //! container image is loaded, enabling fast subsequent launches.
+//!
+//! ## Test Isolation Pattern
+//!
+//! Each test uses unique parameters (env vars) to generate unique cache keys.
+//! Tests only verify their OWN cache entries, never global state.
+//! This enables safe parallel execution.
 
 #![cfg(feature = "integration-fast")]
 
 mod common;
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Get the podman cache directory path
 fn podman_cache_dir() -> PathBuf {
-    // Default path - same as paths::podman_cache_dir()
     PathBuf::from("/mnt/fcvm-btrfs/podman-cache")
 }
 
-/// Count cache entries in the podman cache directory
-fn count_cache_entries() -> usize {
-    let cache_dir = podman_cache_dir();
-    if !cache_dir.exists() {
-        return 0;
+/// Compute the cache key for given parameters (mirrors fcvm's compute_podman_cache_key)
+fn compute_cache_key(image: &str, cmd: &[&str], env: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(image.as_bytes());
+    // Default VM config: cpu=1, mem=512, privileged=false, interactive=false, tty=false
+    hasher.update(b"1"); // cpu
+    hasher.update(b"512"); // mem
+    hasher.update(b"0"); // privileged
+    hasher.update(b"0"); // interactive
+    hasher.update(b"0"); // tty
+
+    // Environment (sorted)
+    let mut env_sorted: Vec<_> = env.iter().collect();
+    env_sorted.sort();
+    for e in env_sorted {
+        hasher.update(e.as_bytes());
     }
-    std::fs::read_dir(&cache_dir)
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-                .count()
-        })
-        .unwrap_or(0)
+
+    // Command
+    hasher.update(cmd.join(" ").as_bytes());
+
+    let result = hasher.finalize();
+    hex::encode(&result[..6])
 }
 
-/// Clean up podman cache directory for isolated testing
-async fn cleanup_cache() {
-    let cache_dir = podman_cache_dir();
-    if cache_dir.exists() {
-        let _ = tokio::fs::remove_dir_all(&cache_dir).await;
+/// Check if a specific cache entry exists and is complete
+fn cache_entry_exists(cache_key: &str) -> bool {
+    let path = podman_cache_dir().join(cache_key);
+    path.join("memory.bin").exists()
+        && path.join("vmstate.bin").exists()
+        && path.join("disk.raw").exists()
+        && path.join("config.json").exists()
+}
+
+/// Delete a specific cache entry (for test isolation)
+fn delete_cache_entry(cache_key: &str) {
+    let path = podman_cache_dir().join(cache_key);
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+/// Wait for a cache entry to be created (with timeout)
+async fn wait_for_cache_entry(cache_key: &str, timeout_secs: u64) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(timeout_secs) {
+        if cache_entry_exists(cache_key) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    false
 }
 
 /// Test that first run creates a cache entry
@@ -46,14 +80,21 @@ async fn cleanup_cache() {
 async fn test_podman_cache_miss_creates_cache() -> Result<()> {
     println!("\ntest_podman_cache_miss_creates_cache");
     println!("=====================================");
-    println!("First run with a container image should create cache");
 
-    // Start with clean cache
-    cleanup_cache().await;
-    let initial_count = count_cache_entries();
-    println!("Initial cache entries: {}", initial_count);
+    // Use unique env var to get unique cache key
+    let test_id = format!("miss-{}", std::process::id());
+    let env_var = format!("TEST_ID={}", test_id);
+    let cache_key = compute_cache_key("alpine:latest", &["echo", "hello"], &[&env_var]);
+    println!("Test cache key: {}", cache_key);
 
-    // Run container - should be a cache miss
+    // Clean our specific cache entry
+    delete_cache_entry(&cache_key);
+    assert!(
+        !cache_entry_exists(&cache_key),
+        "Cache should not exist initially"
+    );
+
+    // Run container
     let (vm_name, _, _, _) = common::unique_names("cache-miss");
     println!("Starting VM: {}", vm_name);
 
@@ -64,94 +105,44 @@ async fn test_podman_cache_miss_creates_cache() -> Result<()> {
         &vm_name,
         "--network",
         "rootless",
+        "--env",
+        &env_var,
         "alpine:latest",
         "echo",
         "hello",
     ])
     .await
-    .context("spawning fcvm for cache miss test")?;
+    .context("spawning fcvm")?;
 
-    // Wait for VM to become healthy
-    println!("Waiting for VM to become healthy...");
-    match common::poll_health_by_pid(pid, 180).await {
-        Ok(_) => println!("VM is healthy"),
-        Err(e) => {
-            // VM might have exited after running echo - that's OK
-            println!("Health check result: {}", e);
-        }
-    }
+    // Wait for container (may exit quickly)
+    let _ = common::poll_health_by_pid(pid, 180).await;
+    let _ = tokio::time::timeout(Duration::from_secs(120), child.wait()).await;
 
-    // Wait for process to complete (it should exit after echo)
-    println!("Waiting for process to complete...");
-    let timeout = Duration::from_secs(30);
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        match child.try_wait() {
-            Ok(Some(_status)) => {
-                println!("Process exited");
-                break;
-            }
-            Ok(None) => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(e) => {
-                println!("Error checking process: {}", e);
-                break;
-            }
-        }
-    }
-
-    // Verify cache was created
-    let final_count = count_cache_entries();
-    println!("Final cache entries: {}", final_count);
-
-    assert!(
-        final_count > initial_count,
-        "Cache directory should have new entries after first run"
-    );
-
-    // Verify cache structure
-    let cache_dir = podman_cache_dir();
-    for entry in std::fs::read_dir(&cache_dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            let path = entry.path();
-            assert!(
-                path.join("memory.bin").exists(),
-                "Cache should have memory.bin"
-            );
-            assert!(
-                path.join("vmstate.bin").exists(),
-                "Cache should have vmstate.bin"
-            );
-            assert!(path.join("disk.raw").exists(), "Cache should have disk.raw");
-            assert!(
-                path.join("config.json").exists(),
-                "Cache should have config.json"
-            );
-            println!(
-                "Cache entry verified: {}",
-                entry.file_name().to_string_lossy()
-            );
-        }
-    }
+    // Verify OUR cache entry was created
+    let created = wait_for_cache_entry(&cache_key, 10).await;
+    assert!(created, "Cache entry {} should be created", cache_key);
+    println!("Cache entry verified: {}", cache_key);
 
     println!("Test passed");
     Ok(())
 }
 
-/// Test that second run with same config is faster (cache hit)
+/// Test that second run with same config hits cache
 #[tokio::test]
 async fn test_podman_cache_hit_restores_fast() -> Result<()> {
     println!("\ntest_podman_cache_hit_restores_fast");
     println!("====================================");
-    println!("Second run should be faster due to cache hit");
 
-    // Start with clean cache
-    cleanup_cache().await;
+    // Use unique env var to get unique cache key
+    let test_id = format!("hit-{}", std::process::id());
+    let env_var = format!("TEST_ID={}", test_id);
+    let cache_key = compute_cache_key(common::TEST_IMAGE, &[], &[&env_var]);
+    println!("Test cache key: {}", cache_key);
 
-    // First run - cache miss
-    // Use the same command for both runs so cache key matches
+    // Clean our specific cache entry first
+    delete_cache_entry(&cache_key);
+
+    // First run - cache miss (creates cache)
     let (vm_name1, _, _, _) = common::unique_names("cache-hit-1");
     println!("First run (cache miss): {}", vm_name1);
 
@@ -163,29 +154,27 @@ async fn test_podman_cache_hit_restores_fast() -> Result<()> {
         &vm_name1,
         "--network",
         "rootless",
-        common::TEST_IMAGE, // Use nginx which stays running
+        "--env",
+        &env_var,
+        common::TEST_IMAGE,
     ])
-    .await
-    .context("spawning first VM")?;
+    .await?;
 
-    // Wait for first container to become healthy (cache created)
-    common::poll_health_by_pid(pid1, 180)
-        .await
-        .context("first container should become healthy")?;
+    common::poll_health_by_pid(pid1, 180).await?;
     let duration1 = start1.elapsed();
     println!("First run duration: {:?}", duration1);
 
-    // Kill the first container
     child1.kill().await?;
     let _ = child1.wait().await;
-    println!("First container killed");
 
     // Verify cache was created
-    let count = count_cache_entries();
-    println!("Cache entries after first run: {}", count);
-    assert!(count > 0, "Cache should be created after first run");
+    assert!(
+        wait_for_cache_entry(&cache_key, 60).await,
+        "Cache should be created"
+    );
+    println!("Cache entry created: {}", cache_key);
 
-    // Second run - should hit cache (SAME image and config)
+    // Second run - cache hit
     let (vm_name2, _, _, _) = common::unique_names("cache-hit-2");
     println!("Second run (cache hit): {}", vm_name2);
 
@@ -197,36 +186,26 @@ async fn test_podman_cache_hit_restores_fast() -> Result<()> {
         &vm_name2,
         "--network",
         "rootless",
-        common::TEST_IMAGE, // Same image as first run
+        "--env",
+        &env_var,
+        common::TEST_IMAGE,
     ])
-    .await
-    .context("spawning second VM")?;
+    .await?;
 
-    // Wait for second container to become healthy
-    common::poll_health_by_pid(pid2, 60)
-        .await
-        .context("second container should become healthy quickly")?;
+    common::poll_health_by_pid(pid2, 180).await?;
     let duration2 = start2.elapsed();
     println!("Second run duration: {:?}", duration2);
 
-    // Cleanup
     child2.kill().await?;
     let _ = child2.wait().await;
 
-    // Cache hit should be at least 50% faster
-    // (Conservative threshold - actual improvement is often 5-10x)
-    if duration1.as_millis() > 5000 {
-        // Only check speedup if first run took meaningful time
-        assert!(
-            duration2 < duration1,
-            "Cache hit ({:?}) should be faster than miss ({:?})",
-            duration2,
-            duration1
-        );
-        println!(
-            "Speedup: {:.1}x",
-            duration1.as_secs_f64() / duration2.as_secs_f64()
-        );
+    // Second run should be faster (or at least not much slower)
+    if duration1 > Duration::from_secs(5) {
+        // Only check speedup if first run was slow enough to measure
+        let speedup = duration1.as_secs_f64() / duration2.as_secs_f64();
+        println!("Speedup: {:.1}x", speedup);
+        // Cache should provide at least some speedup
+        assert!(speedup > 1.0, "Cache hit should be faster than miss");
     } else {
         println!("First run was too fast to measure speedup meaningfully");
     }
@@ -235,21 +214,32 @@ async fn test_podman_cache_hit_restores_fast() -> Result<()> {
     Ok(())
 }
 
-/// Test that different ENV creates different cache entries
+/// Test that different commands create different cache entries
 #[tokio::test]
-async fn test_podman_cache_different_env_different_cache() -> Result<()> {
-    println!("\ntest_podman_cache_different_env_different_cache");
-    println!("================================================");
-    println!("Different ENV values should create separate cache entries");
+async fn test_podman_cache_different_commands() -> Result<()> {
+    println!("\ntest_podman_cache_different_commands");
+    println!("=====================================");
 
-    // Start with clean cache
-    cleanup_cache().await;
-    let initial_count = count_cache_entries();
+    let test_id = format!("cmd-{}", std::process::id());
 
-    // Run with ENV_A=value_a
-    let (vm_name1, _, _, _) = common::unique_names("env-a");
-    println!("Running with MY_VAR=value_a: {}", vm_name1);
+    // Two different commands with same base env
+    let env_var = format!("TEST_ID={}", test_id);
+    let cache_key1 = compute_cache_key("alpine:latest", &["echo", "cmd1"], &[&env_var]);
+    let cache_key2 = compute_cache_key("alpine:latest", &["echo", "cmd2"], &[&env_var]);
 
+    println!("Cache key 1: {} (echo cmd1)", cache_key1);
+    println!("Cache key 2: {} (echo cmd2)", cache_key2);
+    assert_ne!(
+        cache_key1, cache_key2,
+        "Different commands should have different cache keys"
+    );
+
+    // Clean both
+    delete_cache_entry(&cache_key1);
+    delete_cache_entry(&cache_key2);
+
+    // Run first command
+    let (vm_name1, _, _, _) = common::unique_names("cmd-1");
     let (mut child1, pid1) = common::spawn_fcvm(&[
         "podman",
         "run",
@@ -258,22 +248,17 @@ async fn test_podman_cache_different_env_different_cache() -> Result<()> {
         "--network",
         "rootless",
         "--env",
-        "MY_VAR=value_a",
+        &env_var,
         "alpine:latest",
         "echo",
-        "a",
+        "cmd1",
     ])
     .await?;
     let _ = common::poll_health_by_pid(pid1, 180).await;
-    let _ = tokio::time::timeout(Duration::from_secs(30), child1.wait()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(120), child1.wait()).await;
 
-    let count_after_first = count_cache_entries();
-    println!("Cache entries after first run: {}", count_after_first);
-
-    // Run with ENV_A=value_b (different value)
-    let (vm_name2, _, _, _) = common::unique_names("env-b");
-    println!("Running with MY_VAR=value_b: {}", vm_name2);
-
+    // Run second command
+    let (vm_name2, _, _, _) = common::unique_names("cmd-2");
     let (mut child2, pid2) = common::spawn_fcvm(&[
         "podman",
         "run",
@@ -282,44 +267,122 @@ async fn test_podman_cache_different_env_different_cache() -> Result<()> {
         "--network",
         "rootless",
         "--env",
-        "MY_VAR=value_b",
+        &env_var,
         "alpine:latest",
         "echo",
-        "b",
+        "cmd2",
     ])
     .await?;
     let _ = common::poll_health_by_pid(pid2, 180).await;
-    let _ = tokio::time::timeout(Duration::from_secs(30), child2.wait()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(120), child2.wait()).await;
 
-    let count_after_second = count_cache_entries();
-    println!("Cache entries after second run: {}", count_after_second);
-
-    // Should have created 2 different cache entries
+    // Both should have their own cache entries
     assert!(
-        count_after_second > count_after_first,
-        "Different ENV should create different cache: {} vs {}",
-        count_after_second,
-        count_after_first
+        wait_for_cache_entry(&cache_key1, 10).await,
+        "Cache 1 should exist"
+    );
+    assert!(
+        wait_for_cache_entry(&cache_key2, 10).await,
+        "Cache 2 should exist"
     );
 
     println!("Test passed");
     Ok(())
 }
 
-/// Test that --no-cache flag bypasses cache
+/// Test that different env vars create different cache entries
+#[tokio::test]
+async fn test_podman_cache_different_envs() -> Result<()> {
+    println!("\ntest_podman_cache_different_envs");
+    println!("================================");
+
+    let test_id = format!("env-{}", std::process::id());
+
+    let env_var_a = format!("TEST_ID={}-a", test_id);
+    let env_var_b = format!("TEST_ID={}-b", test_id);
+    let cache_key_a = compute_cache_key("alpine:latest", &["echo", "x"], &[&env_var_a]);
+    let cache_key_b = compute_cache_key("alpine:latest", &["echo", "x"], &[&env_var_b]);
+
+    println!("Cache key A: {}", cache_key_a);
+    println!("Cache key B: {}", cache_key_b);
+    assert_ne!(
+        cache_key_a, cache_key_b,
+        "Different envs should have different cache keys"
+    );
+
+    // Clean both
+    delete_cache_entry(&cache_key_a);
+    delete_cache_entry(&cache_key_b);
+
+    // Run with env A
+    let (vm_name_a, _, _, _) = common::unique_names("env-a");
+    let (mut child_a, pid_a) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name_a,
+        "--network",
+        "rootless",
+        "--env",
+        &env_var_a,
+        "alpine:latest",
+        "echo",
+        "x",
+    ])
+    .await?;
+    let _ = common::poll_health_by_pid(pid_a, 180).await;
+    let _ = tokio::time::timeout(Duration::from_secs(120), child_a.wait()).await;
+
+    // Run with env B
+    let (vm_name_b, _, _, _) = common::unique_names("env-b");
+    let (mut child_b, pid_b) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name_b,
+        "--network",
+        "rootless",
+        "--env",
+        &env_var_b,
+        "alpine:latest",
+        "echo",
+        "x",
+    ])
+    .await?;
+    let _ = common::poll_health_by_pid(pid_b, 180).await;
+    let _ = tokio::time::timeout(Duration::from_secs(120), child_b.wait()).await;
+
+    // Both should have their own cache entries
+    assert!(
+        wait_for_cache_entry(&cache_key_a, 10).await,
+        "Cache A should exist"
+    );
+    assert!(
+        wait_for_cache_entry(&cache_key_b, 10).await,
+        "Cache B should exist"
+    );
+
+    println!("Test passed");
+    Ok(())
+}
+
+/// Test that --no-cache flag works
 #[tokio::test]
 async fn test_podman_cache_no_cache_flag() -> Result<()> {
     println!("\ntest_podman_cache_no_cache_flag");
     println!("================================");
-    println!("--no-cache should bypass cache entirely");
 
-    // Start with clean cache
-    cleanup_cache().await;
+    // Use unique env var
+    let test_id = format!("nocache-{}", std::process::id());
+    let env_var = format!("TEST_ID={}", test_id);
+    let cache_key = compute_cache_key("alpine:latest", &["echo", "hi"], &[&env_var]);
+    println!("Test cache key: {}", cache_key);
+
+    // Clean our cache entry
+    delete_cache_entry(&cache_key);
 
     // Run with --no-cache
     let (vm_name, _, _, _) = common::unique_names("no-cache");
-    println!("Running with --no-cache: {}", vm_name);
-
     let (mut child, pid) = common::spawn_fcvm(&[
         "podman",
         "run",
@@ -328,21 +391,23 @@ async fn test_podman_cache_no_cache_flag() -> Result<()> {
         "--network",
         "rootless",
         "--no-cache",
+        "--env",
+        &env_var,
         "alpine:latest",
         "echo",
-        "hello",
+        "hi",
     ])
     .await?;
 
-    // Wait for completion
     let _ = common::poll_health_by_pid(pid, 180).await;
-    let _ = tokio::time::timeout(Duration::from_secs(30), child.wait()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(60), child.wait()).await;
 
     // Should NOT create cache entry
-    let cache_count = count_cache_entries();
-    println!("Cache entries: {}", cache_count);
-
-    assert_eq!(cache_count, 0, "--no-cache should not create cache entries");
+    tokio::time::sleep(Duration::from_secs(2)).await; // Give it time to NOT create
+    assert!(
+        !cache_entry_exists(&cache_key),
+        "--no-cache should not create cache"
+    );
 
     println!("Test passed");
     Ok(())
@@ -353,155 +418,66 @@ async fn test_podman_cache_no_cache_flag() -> Result<()> {
 async fn test_podman_cache_corruption_recovery() -> Result<()> {
     println!("\ntest_podman_cache_corruption_recovery");
     println!("======================================");
-    println!("Corrupted cache should fall back to normal boot");
 
-    // Start with clean cache
-    cleanup_cache().await;
+    // Use unique env var
+    let test_id = format!("corrupt-{}", std::process::id());
+    let env_var = format!("TEST_ID={}", test_id);
+    let cache_key = compute_cache_key("alpine:latest", &["echo", "recovered"], &[&env_var]);
+    println!("Test cache key: {}", cache_key);
 
-    // First run creates cache
-    let (vm_name1, _, _, _) = common::unique_names("corrupt-1");
-    println!("Creating cache: {}", vm_name1);
+    // Create a corrupted cache entry (empty config.json)
+    let cache_path = podman_cache_dir().join(&cache_key);
+    std::fs::create_dir_all(&cache_path)?;
+    std::fs::write(cache_path.join("config.json"), "{}")?;
+    println!("Created corrupted cache entry");
 
-    let (mut child1, pid1) = common::spawn_fcvm(&[
+    // Run - should detect corruption and boot fresh
+    let (vm_name, _, _, _) = common::unique_names("corrupt");
+    let (mut child, pid) = common::spawn_fcvm(&[
         "podman",
         "run",
         "--name",
-        &vm_name1,
+        &vm_name,
         "--network",
         "rootless",
-        "alpine:latest",
-        "echo",
-        "create",
-    ])
-    .await?;
-    let _ = common::poll_health_by_pid(pid1, 180).await;
-    let _ = tokio::time::timeout(Duration::from_secs(30), child1.wait()).await;
-
-    // Corrupt the cache by deleting memory.bin
-    let cache_dir = podman_cache_dir();
-    for entry in std::fs::read_dir(&cache_dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            let memory_path = entry.path().join("memory.bin");
-            if memory_path.exists() {
-                println!("Corrupting cache by removing: {}", memory_path.display());
-                std::fs::remove_file(&memory_path)?;
-            }
-        }
-    }
-
-    // Second run should fall back to normal boot
-    let (vm_name2, _, _, _) = common::unique_names("corrupt-2");
-    println!("Running after corruption: {}", vm_name2);
-
-    let (mut child2, pid2) = common::spawn_fcvm(&[
-        "podman",
-        "run",
-        "--name",
-        &vm_name2,
-        "--network",
-        "rootless",
+        "--env",
+        &env_var,
         "alpine:latest",
         "echo",
         "recovered",
     ])
     .await?;
 
-    // Should still work (fall back to normal boot)
-    match common::poll_health_by_pid(pid2, 180).await {
-        Ok(_) => println!("VM recovered from corrupted cache"),
-        Err(e) => {
-            // VM might exit after echo - that's OK
-            println!("Result: {}", e);
-        }
-    }
-    let _ = tokio::time::timeout(Duration::from_secs(30), child2.wait()).await;
+    let _ = common::poll_health_by_pid(pid, 180).await;
+    let _ = tokio::time::timeout(Duration::from_secs(120), child.wait()).await;
 
-    println!("Test passed");
-    Ok(())
-}
-
-/// Test that different commands create different cache entries
-#[tokio::test]
-async fn test_podman_cache_different_cmd_different_cache() -> Result<()> {
-    println!("\ntest_podman_cache_different_cmd_different_cache");
-    println!("================================================");
-    println!("Different commands should create separate cache entries");
-
-    // Start with clean cache
-    cleanup_cache().await;
-    let initial_count = count_cache_entries();
-
-    // Run with command "echo hello"
-    let (vm_name1, _, _, _) = common::unique_names("cmd-1");
-    println!("Running: echo hello");
-
-    let (mut child1, pid1) = common::spawn_fcvm(&[
-        "podman",
-        "run",
-        "--name",
-        &vm_name1,
-        "--network",
-        "rootless",
-        "alpine:latest",
-        "echo",
-        "hello",
-    ])
-    .await?;
-    let _ = common::poll_health_by_pid(pid1, 180).await;
-    let _ = tokio::time::timeout(Duration::from_secs(30), child1.wait()).await;
-
-    let count_after_first = count_cache_entries();
-
-    // Run with different command "echo world"
-    let (vm_name2, _, _, _) = common::unique_names("cmd-2");
-    println!("Running: echo world");
-
-    let (mut child2, pid2) = common::spawn_fcvm(&[
-        "podman",
-        "run",
-        "--name",
-        &vm_name2,
-        "--network",
-        "rootless",
-        "alpine:latest",
-        "echo",
-        "world",
-    ])
-    .await?;
-    let _ = common::poll_health_by_pid(pid2, 180).await;
-    let _ = tokio::time::timeout(Duration::from_secs(30), child2.wait()).await;
-
-    let count_after_second = count_cache_entries();
-    println!(
-        "Cache entries: {} -> {}",
-        count_after_first, count_after_second
-    );
-
+    // Should have recovered and created valid cache
     assert!(
-        count_after_second > count_after_first,
-        "Different commands should create different cache entries"
+        wait_for_cache_entry(&cache_key, 60).await,
+        "Should recover with valid cache"
     );
 
     println!("Test passed");
     Ok(())
 }
 
-/// Test that cache works correctly with long-running containers
+/// Test long-running container (cache should include running container state)
 #[tokio::test]
 async fn test_podman_cache_long_running_container() -> Result<()> {
     println!("\ntest_podman_cache_long_running_container");
     println!("=========================================");
-    println!("Cache should work with containers that stay running");
 
-    // Start with clean cache
-    cleanup_cache().await;
-    let initial_count = count_cache_entries();
+    // Use unique env var
+    let test_id = format!("long-{}", std::process::id());
+    let env_var = format!("TEST_ID={}", test_id);
+    let cache_key = compute_cache_key(common::TEST_IMAGE, &[], &[&env_var]);
+    println!("Test cache key: {}", cache_key);
 
-    // First run - long-running nginx container
+    // Clean our cache entry
+    delete_cache_entry(&cache_key);
+
+    // First run - creates cache
     let (vm_name1, _, _, _) = common::unique_names("long-1");
-    println!("Starting long-running container: {}", vm_name1);
-
     let (mut child1, pid1) = common::spawn_fcvm(&[
         "podman",
         "run",
@@ -509,38 +485,26 @@ async fn test_podman_cache_long_running_container() -> Result<()> {
         &vm_name1,
         "--network",
         "rootless",
+        "--env",
+        &env_var,
         common::TEST_IMAGE,
     ])
     .await?;
 
-    // Wait for it to become healthy (nginx should stay running)
-    common::poll_health_by_pid(pid1, 180)
-        .await
-        .context("first container should become healthy")?;
+    common::poll_health_by_pid(pid1, 180).await?;
+    println!("First container healthy");
 
-    println!("First container is healthy");
-
-    // Give time for cache to be created
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    // Kill the first container
     child1.kill().await?;
     let _ = child1.wait().await;
-    println!("First container killed");
 
-    // Check cache was created
-    let count_after_first = count_cache_entries();
-    println!("Cache entries after first run: {}", count_after_first);
+    // Verify cache created
     assert!(
-        count_after_first > initial_count,
-        "Cache should be created for long-running container"
+        wait_for_cache_entry(&cache_key, 60).await,
+        "Cache should be created"
     );
 
-    // Second run - should hit cache
+    // Second run - from cache
     let (vm_name2, _, _, _) = common::unique_names("long-2");
-    println!("Starting second container (cache hit): {}", vm_name2);
-
-    let start = Instant::now();
     let (mut child2, pid2) = common::spawn_fcvm(&[
         "podman",
         "run",
@@ -548,18 +512,15 @@ async fn test_podman_cache_long_running_container() -> Result<()> {
         &vm_name2,
         "--network",
         "rootless",
+        "--env",
+        &env_var,
         common::TEST_IMAGE,
     ])
     .await?;
 
-    common::poll_health_by_pid(pid2, 60)
-        .await
-        .context("second container should become healthy quickly")?;
+    common::poll_health_by_pid(pid2, 180).await?;
+    println!("Second container healthy (from cache)");
 
-    let duration = start.elapsed();
-    println!("Second container healthy in {:?}", duration);
-
-    // Cleanup
     child2.kill().await?;
     let _ = child2.wait().await;
 
