@@ -745,6 +745,24 @@ See [DESIGN.md](DESIGN.md#guest-agent) for details.
 |----------|---------|-------------|
 | `FCVM_BASE_DIR` | `/mnt/fcvm-btrfs` | Base directory for all data |
 | `RUST_LOG` | `warn` | Logging level (quiet by default; use `info` or `debug` for verbose) |
+| `FCVM_NO_WRITEBACK_CACHE` | unset | Set to `1` to disable FUSE writeback cache (see below) |
+| `FCVM_NO_XATTR_FASTPATH` | unset | Set to `1` to disable security.capability xattr fast path |
+
+### FUSE Writeback Cache
+
+FUSE writeback cache is **enabled by default** for ~9x write performance improvement. The kernel batches writes and flushes them asynchronously, dramatically improving throughput for workloads with many small writes.
+
+**Known POSIX edge cases** (disabled in pjdfstest):
+
+| Test | Issue | Workaround |
+|------|-------|------------|
+| `open` (3/144 fail) | O_WRONLY promoted to O_RDWR, requires read permission | Use `0644` instead of `0200` for write-only files |
+| `utimensat` (1/122 fail) | Needs kernel patch with `default_permissions` | Use nested kernel profile which has the patch |
+
+To disable writeback cache for debugging:
+```bash
+FCVM_NO_WRITEBACK_CACHE=1 ./fcvm podman run --name test alpine:latest
+```
 
 ---
 
