@@ -116,11 +116,23 @@ async fn test_podman_cache_miss_creates_cache() -> Result<()> {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
             let path = entry.path();
-            assert!(path.join("memory.bin").exists(), "Cache should have memory.bin");
-            assert!(path.join("vmstate.bin").exists(), "Cache should have vmstate.bin");
+            assert!(
+                path.join("memory.bin").exists(),
+                "Cache should have memory.bin"
+            );
+            assert!(
+                path.join("vmstate.bin").exists(),
+                "Cache should have vmstate.bin"
+            );
             assert!(path.join("disk.raw").exists(), "Cache should have disk.raw");
-            assert!(path.join("config.json").exists(), "Cache should have config.json");
-            println!("Cache entry verified: {}", entry.file_name().to_string_lossy());
+            assert!(
+                path.join("config.json").exists(),
+                "Cache should have config.json"
+            );
+            println!(
+                "Cache entry verified: {}",
+                entry.file_name().to_string_lossy()
+            );
         }
     }
 
@@ -330,10 +342,7 @@ async fn test_podman_cache_no_cache_flag() -> Result<()> {
     let cache_count = count_cache_entries();
     println!("Cache entries: {}", cache_count);
 
-    assert_eq!(
-        cache_count, 0,
-        "--no-cache should not create cache entries"
-    );
+    assert_eq!(cache_count, 0, "--no-cache should not create cache entries");
 
     println!("Test passed");
     Ok(())

@@ -1190,15 +1190,16 @@ fn notify_cache_ready_and_wait(digest: &str) -> bool {
     if result < 0 {
         let err = std::io::Error::last_os_error();
         unsafe { libc::close(fd) };
-        eprintln!("[fc-agent] WARNING: failed to connect vsock for cache: {}", err);
+        eprintln!(
+            "[fc-agent] WARNING: failed to connect vsock for cache: {}",
+            err
+        );
         return false;
     }
 
     // Send cache-ready message
     let msg = format!("cache-ready:{}\n", digest);
-    let written = unsafe {
-        libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len())
-    };
+    let written = unsafe { libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len()) };
 
     if written != msg.len() as isize {
         eprintln!("[fc-agent] WARNING: failed to send cache-ready message");
@@ -2025,7 +2026,9 @@ async fn run_agent() -> Result<()> {
                 if notify_cache_ready_and_wait(&digest) {
                     eprintln!("[fc-agent] ✓ cache ready notification acknowledged");
                 } else {
-                    eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing anyway");
+                    eprintln!(
+                        "[fc-agent] WARNING: cache-ready handshake failed, continuing anyway"
+                    );
                 }
             }
             Err(e) => {
