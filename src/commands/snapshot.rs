@@ -8,15 +8,16 @@ use crate::cli::{
     NetworkMode, SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs,
     SnapshotServeArgs,
 };
-use crate::firecracker::VmManager;
 use crate::network::{BridgedNetwork, NetworkManager, PortMapping, SlirpNetwork};
 use crate::paths;
 use crate::state::{
     generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState, VmStatus,
 };
-use crate::storage::{DiskManager, SnapshotManager};
+use crate::storage::SnapshotManager;
 use crate::uffd::UffdServer;
 use crate::volume::{spawn_volume_servers, VolumeConfig};
+
+use super::common::{MemoryBackend, SnapshotRestoreConfig};
 
 /// Main dispatcher for snapshot commands
 pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
@@ -696,14 +697,23 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         "network configured for clone"
     );
 
-    // Run clone setup in a helper to ensure cleanup on error
-    let setup_result = run_clone_setup(
+    // Build restore configuration
+    let restore_config = SnapshotRestoreConfig {
+        vmstate_path: snapshot_config.vmstate_path.clone(),
+        memory_backend: MemoryBackend::Uffd {
+            socket_path: uffd_socket.clone(),
+        },
+        source_disk_path: snapshot_config.disk_path.clone(),
+        original_vm_id: snapshot_config.vm_id.clone(),
+    };
+
+    // Run clone setup using shared restore function
+    let setup_result = super::common::restore_from_snapshot(
         &vm_id,
         &vm_name,
         &data_dir,
         &socket_path,
-        &uffd_socket,
-        &snapshot_config,
+        &restore_config,
         &network_config,
         network.as_mut(),
         &state_manager,
@@ -892,403 +902,4 @@ async fn cmd_snapshot_ls() -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Helper function that runs clone setup and returns VmManager on success.
-/// This allows the caller to cleanup network resources on error.
-/// For rootless mode, also returns the holder process that keeps the namespace alive.
-#[allow(clippy::too_many_arguments)]
-async fn run_clone_setup(
-    vm_id: &str,
-    vm_name: &str,
-    data_dir: &std::path::Path,
-    socket_path: &std::path::Path,
-    uffd_socket: &std::path::Path,
-    snapshot_config: &crate::storage::snapshot::SnapshotConfig,
-    network_config: &crate::network::NetworkConfig,
-    network: &mut dyn NetworkManager,
-    state_manager: &StateManager,
-    vm_state: &mut VmState,
-) -> Result<(VmManager, Option<tokio::process::Child>)> {
-    let vm_dir = data_dir.join("disks");
-
-    // Configure namespace isolation if network provides one
-    let mut holder_child: Option<tokio::process::Child> = None;
-    let mut holder_pid_for_post_start: Option<u32> = None;
-    let mut vm_manager = VmManager::new(vm_id.to_string(), socket_path.to_path_buf(), None);
-    vm_manager.set_vm_name(vm_name.to_string());
-
-    // rootfs_path is set by either the bridged or rootless branch
-    let rootfs_path: std::path::PathBuf;
-
-    if let Some(bridged_net) = network.as_any().downcast_ref::<BridgedNetwork>() {
-        if let Some(ns_id) = bridged_net.namespace_id() {
-            info!(namespace = %ns_id, "configuring VM to run in network namespace");
-            vm_manager.set_namespace(ns_id.to_string());
-        }
-
-        // For bridged mode, create disk sequentially (no parallelization benefit)
-        let disk_manager = DiskManager::new(
-            vm_id.to_string(),
-            snapshot_config.disk_path.clone(),
-            vm_dir.clone(),
-        );
-
-        rootfs_path = disk_manager
-            .create_cow_disk()
-            .await
-            .context("creating CoW disk from snapshot")?;
-
-        info!(
-            rootfs = %rootfs_path.display(),
-            snapshot_disk = %snapshot_config.disk_path.display(),
-            "CoW disk prepared from snapshot"
-        );
-    } else if let Some(slirp_net) = network.as_any().downcast_ref::<SlirpNetwork>() {
-        // Rootless mode: spawn holder process and set up namespace via nsenter
-        // OPTIMIZATION: Parallelize disk creation with network setup
-
-        // Step 1: Spawn holder process (keeps namespace alive)
-        // Retry for up to 5 seconds if namespace doesn't become ready (race condition)
-        let holder_cmd = slirp_net.build_holder_command();
-        info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
-
-        let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut attempt = 0u32;
-
-        let (mut child, holder_pid) = loop {
-            attempt += 1;
-
-            let mut child = tokio::process::Command::new(&holder_cmd[0])
-                .args(&holder_cmd[1..])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .context("spawning namespace holder process")?;
-
-            let holder_pid = child.id().context("getting holder process PID")?;
-            if attempt > 1 {
-                info!(
-                    holder_pid = holder_pid,
-                    attempt = attempt,
-                    "namespace holder started (retry)"
-                );
-            } else {
-                info!(holder_pid = holder_pid, "namespace holder started");
-            }
-
-            // Wait for namespace to be ready by checking uid_map
-            let namespace_ready = crate::utils::wait_for_namespace_ready(
-                holder_pid,
-                std::time::Duration::from_millis(500),
-            )
-            .await;
-
-            if namespace_ready {
-                break (child, holder_pid);
-            }
-
-            // Namespace not ready, kill holder and retry
-            let _ = child.kill().await;
-            if std::time::Instant::now() < retry_deadline {
-                warn!(
-                    holder_pid = holder_pid,
-                    attempt = attempt,
-                    "namespace not ready, retrying holder creation..."
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            } else {
-                bail!(
-                    "namespace not ready after {} attempts (holder PID {})",
-                    attempt,
-                    holder_pid
-                );
-            }
-        };
-
-        // Step 2: Run disk creation and network setup IN PARALLEL
-        // This saves ~16ms by overlapping these independent operations
-        let setup_script = slirp_net.build_setup_script();
-        let nsenter_prefix = slirp_net.build_nsenter_prefix(holder_pid);
-        let tap_device = network_config.tap_device.clone();
-
-        // Disk creation task
-        let disk_task = async {
-            let disk_manager = DiskManager::new(
-                vm_id.to_string(),
-                snapshot_config.disk_path.clone(),
-                vm_dir.clone(),
-            );
-
-            let rootfs_path = disk_manager
-                .create_cow_disk()
-                .await
-                .context("creating CoW disk from snapshot")?;
-
-            info!(
-                rootfs = %rootfs_path.display(),
-                snapshot_disk = %snapshot_config.disk_path.display(),
-                "CoW disk prepared from snapshot"
-            );
-
-            Ok::<_, anyhow::Error>(rootfs_path)
-        };
-
-        // Network setup task
-        let network_task = async {
-            const MAX_NS_WAIT: Duration = Duration::from_millis(1000);
-            const NS_POLL_INTERVAL: Duration = Duration::from_millis(5);
-            let ns_poll_start = std::time::Instant::now();
-
-            info!(holder_pid = holder_pid, "running network setup via nsenter");
-            loop {
-                // Verify holder is still alive before attempting nsenter
-                if !crate::utils::is_process_alive(holder_pid) {
-                    bail!(
-                        "holder process (PID {}) died before network setup could run",
-                        holder_pid
-                    );
-                }
-
-                let output = tokio::process::Command::new(&nsenter_prefix[0])
-                    .args(&nsenter_prefix[1..])
-                    .arg("bash")
-                    .arg("-c")
-                    .arg(&setup_script)
-                    .output()
-                    .await
-                    .context("running network setup via nsenter")?;
-
-                if output.status.success() {
-                    debug!("namespace ready after {:?}", ns_poll_start.elapsed());
-                    break;
-                }
-
-                // Check if it's a namespace-not-ready error (retry) vs permanent error (fail)
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if stderr.contains("Invalid argument") || stderr.contains("No such process") {
-                    if ns_poll_start.elapsed() > MAX_NS_WAIT {
-                        bail!(
-                            "namespace not ready after {:?}: {}",
-                            ns_poll_start.elapsed(),
-                            stderr
-                        );
-                    }
-                    tokio::time::sleep(NS_POLL_INTERVAL).await;
-                    continue;
-                }
-
-                // Permanent error
-                bail!("network setup failed: {}", stderr);
-            }
-
-            // Verify TAP device was created successfully
-            let verify_cmd = format!("ip link show {} >/dev/null 2>&1", tap_device);
-            let verify_output = tokio::process::Command::new(&nsenter_prefix[0])
-                .args(&nsenter_prefix[1..])
-                .arg("bash")
-                .arg("-c")
-                .arg(&verify_cmd)
-                .status()
-                .await
-                .context("verifying TAP device")?;
-
-            if !verify_output.success() {
-                bail!(
-                    "TAP device '{}' not found after network setup - setup may have failed silently",
-                    tap_device
-                );
-            }
-            debug!(tap_device = %tap_device, "TAP device verified");
-
-            Ok::<_, anyhow::Error>(())
-        };
-
-        // Run both tasks in parallel
-        let (disk_result, network_result) = tokio::join!(disk_task, network_task);
-
-        // Handle errors - kill holder child if either fails
-        if let Err(e) = &disk_result {
-            let _ = child.kill().await;
-            return Err(anyhow::anyhow!("disk creation failed: {}", e));
-        }
-        if let Err(e) = &network_result {
-            let _ = child.kill().await;
-            return Err(anyhow::anyhow!("network setup failed: {}", e));
-        }
-
-        rootfs_path = disk_result?;
-        network_result?;
-
-        info!(
-            holder_pid = holder_pid,
-            "parallel disk + network setup complete"
-        );
-
-        // Step 3: Set namespace paths for pre_exec setns (NOT nsenter wrapper)
-        // For clones, we need to enter namespaces in pre_exec because:
-        // - pre_exec runs BEFORE nsenter would enter the namespace
-        // - We need CAP_SYS_ADMIN (from user namespace) for mount operations
-        // - Entering user namespace first gives us CAP_SYS_ADMIN for unshare(CLONE_NEWNS)
-        vm_manager.set_user_namespace_path(std::path::PathBuf::from(format!(
-            "/proc/{}/ns/user",
-            holder_pid
-        )));
-        vm_manager.set_net_namespace_path(std::path::PathBuf::from(format!(
-            "/proc/{}/ns/net",
-            holder_pid
-        )));
-
-        // Store holder_pid in state for health checks
-        vm_state.holder_pid = Some(holder_pid);
-        holder_pid_for_post_start = Some(holder_pid);
-
-        holder_child = Some(child);
-    } else {
-        // Unknown network type - should not happen
-        bail!("Unknown network type - must be either BridgedNetwork or SlirpNetwork");
-    }
-
-    // Configure mount namespace isolation for vsock redirect
-    // This is ALWAYS needed for clones because vmstate.bin stores the baseline's vsock uds_path,
-    // and Firecracker cannot override it during snapshot restore. Without this isolation:
-    // - The baseline VM is using /baseline_dir/vsock.sock
-    // - All clones would try to bind() to the same path, causing "Address in use" errors
-    //
-    // Solution: Run each clone in a mount namespace where baseline_dir is bind-mounted
-    // over clone_dir. When Firecracker does bind("/baseline_dir/vsock.sock"),
-    // it actually binds to "/clone_dir/vsock.sock" due to the bind mount.
-    let baseline_dir = paths::vm_runtime_dir(&snapshot_config.vm_id);
-    info!(
-        baseline_dir = %baseline_dir.display(),
-        clone_dir = %data_dir.display(),
-        "enabling mount namespace for vsock socket isolation"
-    );
-    vm_manager.set_vsock_redirect(baseline_dir, data_dir.to_path_buf());
-
-    let firecracker_bin = super::common::find_firecracker()?;
-
-    vm_manager
-        .start(&firecracker_bin, None)
-        .await
-        .context("starting Firecracker")?;
-
-    // For rootless mode with slirp4netns: post_start starts slirp4netns in the namespace
-    // For bridged mode: post_start is a no-op (TAP already created)
-    let vm_pid = vm_manager.pid()?;
-    let post_start_pid = holder_pid_for_post_start.unwrap_or(vm_pid);
-    network
-        .post_start(post_start_pid)
-        .await
-        .context("post-start network setup")?;
-
-    let client = vm_manager.client()?;
-
-    // Load snapshot with UFFD backend and network override
-    use crate::firecracker::api::{
-        DrivePatch, MemBackend, NetworkOverride, SnapshotLoad, VmState as ApiVmState,
-    };
-
-    info!(
-        tap_device = %network_config.tap_device,
-        disk = %rootfs_path.display(),
-        "loading snapshot with uffd backend and network override"
-    );
-
-    // Timing instrumentation: measure snapshot load operation
-    let load_start = std::time::Instant::now();
-    client
-        .load_snapshot(SnapshotLoad {
-            snapshot_path: snapshot_config.vmstate_path.display().to_string(),
-            mem_backend: MemBackend {
-                backend_type: "Uffd".to_string(),
-                backend_path: uffd_socket.display().to_string(),
-            },
-            enable_diff_snapshots: Some(false),
-            resume_vm: Some(false), // Update devices before resume
-            network_overrides: Some(vec![NetworkOverride {
-                iface_id: "eth0".to_string(),
-                host_dev_name: network_config.tap_device.clone(),
-            }]),
-        })
-        .await
-        .context("loading snapshot with uffd backend")?;
-    let load_duration = load_start.elapsed();
-    info!(
-        duration_ms = load_duration.as_millis(),
-        "snapshot load completed"
-    );
-
-    // Timing instrumentation: measure disk patch operation
-    let patch_start = std::time::Instant::now();
-    client
-        .patch_drive(
-            "rootfs",
-            DrivePatch {
-                drive_id: "rootfs".to_string(),
-                path_on_host: Some(rootfs_path.display().to_string()),
-                rate_limiter: None,
-            },
-        )
-        .await
-        .context("retargeting rootfs drive for clone")?;
-    let patch_duration = patch_start.elapsed();
-    info!(
-        duration_ms = patch_duration.as_millis(),
-        "disk patch completed"
-    );
-
-    // Signal fc-agent to flush ARP cache via MMDS restore-epoch update
-    // fc-agent watches for this field change and immediately flushes stale ARP entries
-    //
-    // IMPORTANT: After snapshot load:
-    // - MMDS CONFIG is preserved from the snapshot (version, network interfaces, IP)
-    // - MMDS DATA is NOT persisted (empty data store) - we need to populate it
-    // - /mmds/config endpoint is PRE-BOOT ONLY - cannot be called after snapshot load
-    // - /mmds endpoint (PUT/PATCH) is allowed both pre-boot and post-boot
-    //
-    // So we just call put_mmds() - the config is already there from the snapshot.
-    let restore_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("system time before Unix epoch")?
-        .as_secs();
-
-    // Put the restore-epoch data directly (MMDS config is preserved from snapshot)
-    // fc-agent doesn't need container-plan after restore since container is already running
-    client
-        .put_mmds(serde_json::json!({
-            "latest": {
-                "host-time": chrono::Utc::now().timestamp().to_string(),
-                "restore-epoch": restore_epoch.to_string()
-            }
-        }))
-        .await
-        .context("updating MMDS with restore-epoch")?;
-    info!(
-        restore_epoch = restore_epoch,
-        "signaled fc-agent to flush ARP via MMDS"
-    );
-
-    // Timing instrumentation: measure VM resume operation
-    let resume_start = std::time::Instant::now();
-    client
-        .patch_vm_state(ApiVmState {
-            state: "Resumed".to_string(),
-        })
-        .await
-        .context("resuming VM after snapshot load")?;
-    let resume_duration = resume_start.elapsed();
-    info!(
-        duration_ms = resume_duration.as_millis(),
-        total_snapshot_ms = (load_duration + patch_duration + resume_duration).as_millis(),
-        "VM resume completed"
-    );
-
-    // Store fcvm process PID (not Firecracker PID)
-    vm_state.pid = Some(std::process::id());
-
-    // Save VM state with complete network configuration
-    super::common::save_vm_state_with_network(state_manager, vm_state, network_config).await?;
-
-    Ok((vm_manager, holder_child))
 }

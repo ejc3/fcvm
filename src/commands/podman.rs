@@ -1,16 +1,48 @@
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
-use std::path::PathBuf;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::cli::{NetworkMode, PodmanArgs, PodmanCommands, RunArgs};
 use crate::firecracker::VmManager;
-use crate::network::{BridgedNetwork, NetworkManager, PortMapping, SlirpNetwork};
+use crate::network::{BridgedNetwork, NetworkConfig, NetworkManager, PortMapping, SlirpNetwork};
 use crate::paths;
 use crate::state::{generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState};
 use crate::storage::DiskManager;
 use crate::volume::{spawn_volume_servers, VolumeConfig};
+
+/// Request to create a podman cache snapshot.
+/// Sent from status listener to main task when fc-agent signals cache-ready.
+struct CacheRequest {
+    /// Image digest from fc-agent
+    digest: String,
+    /// Oneshot channel to signal completion back to status listener
+    ack_tx: oneshot::Sender<()>,
+}
+
+/// Metadata stored in podman cache config.json
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PodmanCacheConfig {
+    /// Cache key (12-char hex)
+    cache_key: String,
+    /// Image name
+    image: String,
+    /// Image digest
+    image_digest: String,
+    /// vCPU count
+    vcpu: u8,
+    /// Memory MiB
+    memory_mib: u32,
+    /// Network config for restore
+    network_config: NetworkConfig,
+    /// Original VM ID (for vsock socket path redirect)
+    original_vm_id: String,
+    /// Creation timestamp
+    created_at: chrono::DateTime<chrono::Utc>,
+}
 
 /// Parsed volume mapping from --map HOST:GUEST[:ro]
 #[derive(Debug, Clone)]
@@ -52,6 +84,537 @@ impl VolumeMapping {
             read_only,
         })
     }
+}
+
+/// Compute a cache key for podman container snapshots.
+///
+/// For localhost/ images: uses SHA from podman (content-addressable)
+/// For remote images: uses image URL/name (tag-based)
+///
+/// The key also includes container configuration that affects behavior.
+fn compute_podman_cache_key(args: &RunArgs, image_identifier: &str) -> String {
+    let mut hasher = Sha256::new();
+
+    // Image identifier (SHA for localhost/, URL for remote)
+    hasher.update(image_identifier.as_bytes());
+
+    // VM configuration
+    hasher.update(args.cpu.to_string().as_bytes());
+    hasher.update(args.mem.to_string().as_bytes());
+
+    // Container flags
+    hasher.update(if args.privileged { b"1" } else { b"0" });
+    hasher.update(if args.interactive { b"1" } else { b"0" });
+    hasher.update(if args.tty { b"1" } else { b"0" });
+
+    // Environment variables (sorted for determinism)
+    let mut env_sorted: Vec<_> = args.env.iter().collect();
+    env_sorted.sort();
+    for env in env_sorted {
+        hasher.update(env.as_bytes());
+    }
+
+    // Container command
+    if let Some(cmd) = &args.cmd {
+        hasher.update(cmd.as_bytes());
+    }
+    hasher.update(args.command_args.join(" ").as_bytes());
+
+    // Volume mappings (sorted for determinism)
+    let mut vols: Vec<_> = args.map.iter().collect();
+    vols.sort();
+    for v in vols {
+        hasher.update(v.as_bytes());
+    }
+
+    let result = hasher.finalize();
+    hex::encode(&result[..6]) // 12 hex chars
+}
+
+/// Get the image identifier for cache key computation.
+///
+/// For localhost/ images: returns SHA256 digest from podman (requires podman)
+/// For remote images: returns the image URL/name as-is (no podman needed)
+async fn get_image_identifier(image: &str) -> Result<String> {
+    if image.starts_with("localhost/") {
+        // Use podman to get the digest for localhost images
+        let output = tokio::process::Command::new("podman")
+            .args(["image", "inspect", image, "--format", "{{.Digest}}"])
+            .output()
+            .await
+            .context("running podman inspect")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("Failed to get digest for image '{}': {}", image, stderr);
+        }
+
+        let digest = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .trim_start_matches("sha256:")
+            .to_string();
+
+        Ok(digest)
+    } else {
+        // For remote images, use the image name/URL as identifier
+        Ok(image.to_string())
+    }
+}
+
+/// Check if a podman cache exists for the given cache key.
+fn check_podman_cache(cache_key: &str) -> Option<PathBuf> {
+    let cache_dir = paths::podman_cache_dir().join(cache_key);
+    let config_path = cache_dir.join("config.json");
+
+    if config_path.exists() {
+        Some(cache_dir)
+    } else {
+        None
+    }
+}
+
+/// Create a podman cache snapshot from a running VM.
+///
+/// This pauses the VM, creates a Firecracker snapshot, copies the disk,
+/// saves metadata, and resumes the VM.
+async fn create_podman_cache(
+    vm_manager: &VmManager,
+    cache_key: &str,
+    vm_id: &str,
+    args: &RunArgs,
+    image_digest: &str,
+    disk_path: &Path,
+    network_config: &NetworkConfig,
+) -> Result<()> {
+    let cache_dir = paths::podman_cache_dir().join(cache_key);
+
+    // Lock to prevent concurrent cache creation
+    let lock_path = cache_dir.with_extension("lock");
+    tokio::fs::create_dir_all(paths::podman_cache_dir())
+        .await
+        .context("creating podman-cache directory")?;
+
+    let lock_file = std::fs::File::create(&lock_path).context("creating cache lock file")?;
+    lock_file
+        .lock_exclusive()
+        .context("acquiring cache lock")?;
+
+    // Double-check after lock (another process might have created it)
+    if cache_dir.join("config.json").exists() {
+        info!(cache_key = %cache_key, "Cache already exists (created by another process)");
+        return Ok(());
+    }
+
+    info!(cache_key = %cache_key, "Creating podman cache snapshot");
+
+    // Create cache directory
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .context("creating cache directory")?;
+
+    // Get Firecracker client
+    let client = vm_manager.client().context("VM not started")?;
+
+    // Pause VM before snapshotting (required by Firecracker)
+    use crate::firecracker::api::{SnapshotCreate, VmState as ApiVmState};
+
+    client
+        .patch_vm_state(ApiVmState {
+            state: "Paused".to_string(),
+        })
+        .await
+        .context("pausing VM for snapshot")?;
+
+    info!(cache_key = %cache_key, "VM paused for cache snapshot");
+
+    // Create snapshot files
+    let memory_path = cache_dir.join("memory.bin");
+    let vmstate_path = cache_dir.join("vmstate.bin");
+
+    let snapshot_result = client
+        .create_snapshot(SnapshotCreate {
+            snapshot_type: Some("Full".to_string()),
+            snapshot_path: vmstate_path.display().to_string(),
+            mem_file_path: memory_path.display().to_string(),
+        })
+        .await;
+
+    // Resume VM regardless of snapshot result
+    let resume_result = client
+        .patch_vm_state(ApiVmState {
+            state: "Resumed".to_string(),
+        })
+        .await;
+
+    if let Err(e) = &resume_result {
+        warn!(cache_key = %cache_key, error = %e, "Failed to resume VM after snapshot");
+    }
+
+    // Check if snapshot succeeded
+    snapshot_result.context("creating Firecracker snapshot")?;
+    resume_result.context("resuming VM after snapshot")?;
+
+    // Copy disk using btrfs reflink
+    let cache_disk_path = cache_dir.join("disk.raw");
+    let reflink_result = tokio::process::Command::new("cp")
+        .args([
+            "--reflink=always",
+            disk_path.to_str().unwrap(),
+            cache_disk_path.to_str().unwrap(),
+        ])
+        .status()
+        .await
+        .context("copying disk with reflink")?;
+
+    if !reflink_result.success() {
+        bail!("Reflink copy failed - btrfs filesystem required for podman cache");
+    }
+
+    // Save cache metadata
+    let config = PodmanCacheConfig {
+        cache_key: cache_key.to_string(),
+        image: args.image.clone(),
+        image_digest: image_digest.to_string(),
+        vcpu: args.cpu,
+        memory_mib: args.mem,
+        network_config: network_config.clone(),
+        original_vm_id: vm_id.to_string(),
+        created_at: chrono::Utc::now(),
+    };
+
+    let config_json = serde_json::to_string_pretty(&config)?;
+    tokio::fs::write(cache_dir.join("config.json"), config_json)
+        .await
+        .context("writing cache config")?;
+
+    info!(
+        cache_key = %cache_key,
+        memory = %memory_path.display(),
+        disk = %cache_disk_path.display(),
+        "Podman cache created successfully"
+    );
+
+    Ok(())
+}
+
+/// Restore a VM from podman cache using direct File-based memory loading.
+///
+/// This is similar to snapshot run but uses File backend instead of UFFD.
+/// The memory is loaded directly from the cache's memory.bin file.
+async fn restore_from_podman_cache(
+    args: &RunArgs,
+    cache_dir: &Path,
+    cache_key: &str,
+) -> Result<()> {
+    // Load cache configuration
+    let config_path = cache_dir.join("config.json");
+    let config_json = tokio::fs::read_to_string(&config_path)
+        .await
+        .context("reading cache config")?;
+    let cache_config: PodmanCacheConfig =
+        serde_json::from_str(&config_json).context("parsing cache config")?;
+
+    info!(
+        cache_key = %cache_key,
+        image = %cache_config.image,
+        "Restoring from podman cache"
+    );
+
+    // Generate VM ID and validate name
+    let vm_id = generate_vm_id();
+    let vm_name = args.name.clone();
+    validate_vm_name(&vm_name).context("invalid VM name")?;
+
+    // Setup paths
+    let data_dir = paths::vm_runtime_dir(&vm_id);
+    tokio::fs::create_dir_all(&data_dir)
+        .await
+        .context("creating VM data directory")?;
+
+    let socket_path = data_dir.join("firecracker.sock");
+    let vm_dir = data_dir.join("disks");
+    tokio::fs::create_dir_all(&vm_dir)
+        .await
+        .context("creating VM disks directory")?;
+
+    // Create CoW disk from cache
+    let disk_manager = DiskManager::new(
+        vm_id.clone(),
+        cache_dir.join("disk.raw"),
+        vm_dir.clone(),
+    );
+    let rootfs_path = disk_manager
+        .create_cow_disk()
+        .await
+        .context("creating CoW disk from cache")?;
+
+    info!(
+        rootfs = %rootfs_path.display(),
+        cache_disk = %cache_dir.join("disk.raw").display(),
+        "CoW disk prepared from cache"
+    );
+
+    // Create VM state
+    let mut vm_state = VmState::new(
+        vm_id.clone(),
+        cache_config.image.clone(),
+        cache_config.vcpu,
+        cache_config.memory_mib,
+    );
+    vm_state.name = Some(vm_name.clone());
+    vm_state.config.volumes = args.map.clone();
+    vm_state.config.health_check_url = args.health_check.clone();
+
+    // Initialize state manager
+    let state_manager = StateManager::new(paths::state_dir());
+    state_manager.init().await?;
+
+    // Parse port mappings for new VM
+    let port_mappings: Vec<PortMapping> = args
+        .publish
+        .iter()
+        .map(|s| PortMapping::parse(s))
+        .collect::<Result<Vec<_>>>()
+        .context("parsing port mappings")?;
+
+    // Setup networking based on mode
+    let tap_device = format!("tap-{}", truncate_id(&vm_id, 8));
+    let mut network: Box<dyn NetworkManager> = match args.network {
+        NetworkMode::Bridged => {
+            if !nix::unistd::geteuid().is_root() {
+                bail!(
+                    "Bridged networking requires root. Either:\n  \
+                     - Run with sudo: sudo fcvm podman run ...\n  \
+                     - Use rootless mode: fcvm podman run --network rootless ..."
+                );
+            }
+            Box::new(BridgedNetwork::new(
+                vm_id.clone(),
+                tap_device.clone(),
+                port_mappings.clone(),
+            ))
+        }
+        NetworkMode::Rootless => {
+            // Allocate loopback IP
+            let loopback_ip = state_manager
+                .allocate_loopback_ip(&mut vm_state)
+                .await
+                .context("allocating loopback IP")?;
+
+            Box::new(
+                SlirpNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
+                    .with_loopback_ip(loopback_ip),
+            )
+        }
+    };
+
+    let network_config = network.setup().await.context("setting up network")?;
+
+    // Use network-provided health check URL if user didn't specify one
+    if vm_state.config.health_check_url.is_none() {
+        vm_state.config.health_check_url = network_config.health_check_url.clone();
+    }
+    if let Some(port) = network_config.health_check_port {
+        vm_state.config.network.health_check_port = Some(port);
+    }
+
+    info!(
+        tap = %network_config.tap_device,
+        mac = %network_config.guest_mac,
+        "Network configured for cache restore"
+    );
+
+    // Setup vsock socket path
+    let vsock_socket_path = if let Some(ref vsock_dir) = args.vsock_dir {
+        let vsock_dir = PathBuf::from(vsock_dir);
+        tokio::fs::create_dir_all(&vsock_dir)
+            .await
+            .with_context(|| format!("creating vsock dir: {:?}", vsock_dir))?;
+        vsock_dir.join("vsock.sock")
+    } else {
+        data_dir.join("vsock.sock")
+    };
+
+    // Parse volume mappings
+    let volume_mappings: Vec<VolumeMapping> = args
+        .map
+        .iter()
+        .map(|s| VolumeMapping::parse(s))
+        .collect::<Result<Vec<_>>>()
+        .context("parsing volume mappings")?;
+
+    // Spawn VolumeServers for volumes
+    let volume_configs: Vec<VolumeConfig> = volume_mappings
+        .iter()
+        .enumerate()
+        .map(|(idx, vol)| VolumeConfig {
+            host_path: vol.host_path.clone(),
+            guest_path: vol.guest_path.clone().into(),
+            read_only: vol.read_only,
+            port: VSOCK_VOLUME_PORT_BASE + idx as u32,
+        })
+        .collect();
+
+    let volume_server_handles = spawn_volume_servers(&volume_configs, &vsock_socket_path)
+        .await
+        .context("spawning VolumeServers")?;
+
+    // Build restore configuration
+    let restore_config = super::common::SnapshotRestoreConfig {
+        vmstate_path: cache_dir.join("vmstate.bin"),
+        memory_backend: super::common::MemoryBackend::File {
+            memory_path: cache_dir.join("memory.bin"),
+        },
+        source_disk_path: cache_dir.join("disk.raw"),
+        original_vm_id: cache_config.original_vm_id.clone(),
+    };
+
+    // Run cache restore using shared snapshot restore function
+    let setup_result = super::common::restore_from_snapshot(
+        &vm_id,
+        &vm_name,
+        &data_dir,
+        &socket_path,
+        &restore_config,
+        &network_config,
+        network.as_mut(),
+        &state_manager,
+        &mut vm_state,
+    )
+    .await;
+
+    // If setup failed, cleanup all resources before propagating error
+    if let Err(e) = setup_result {
+        warn!("Cache restore setup failed, cleaning up resources");
+
+        for handle in volume_server_handles {
+            handle.abort();
+        }
+
+        if let Err(cleanup_err) = network.cleanup().await {
+            warn!("Failed to cleanup network after setup error: {}", cleanup_err);
+        }
+        return Err(e);
+    }
+
+    let (mut vm_manager, mut holder_child) = setup_result.unwrap();
+
+    info!(
+        vm_id = %vm_id,
+        cache_key = %cache_key,
+        "VM restored from cache successfully"
+    );
+
+    // Start status listener for this VM
+    let status_socket_path = format!("{}_{}", vsock_socket_path.display(), VSOCK_STATUS_PORT);
+    let status_handle = {
+        let runtime_dir = data_dir.clone();
+        let socket_path = status_socket_path.clone();
+        let vm_id_clone = vm_id.clone();
+        tokio::spawn(async move {
+            // No cache_tx for restored VMs - they don't need to create cache
+            if let Err(e) = run_status_listener(&socket_path, &runtime_dir, &vm_id_clone, None).await
+            {
+                tracing::warn!("Status listener error: {}", e);
+            }
+        })
+    };
+
+    // Setup TTY/output listeners based on mode
+    let tty_mode = args.tty;
+    let interactive = args.interactive;
+    let tty_socket_path = format!("{}_{}", vsock_socket_path.display(), VSOCK_TTY_PORT);
+    let output_socket_path = format!("{}_{}", vsock_socket_path.display(), VSOCK_OUTPUT_PORT);
+
+    let tty_handle = if tty_mode {
+        let socket_path = tty_socket_path.clone();
+        Some(std::thread::spawn(move || {
+            super::tty::run_tty_session(&socket_path, true, interactive)
+        }))
+    } else {
+        None
+    };
+
+    let _output_handle = if !tty_mode {
+        let socket_path = output_socket_path.clone();
+        let vm_id_clone = vm_id.clone();
+        Some(tokio::spawn(async move {
+            match run_output_listener(&socket_path, &vm_id_clone, interactive).await {
+                Ok(lines) => lines,
+                Err(e) => {
+                    tracing::warn!("Output listener error: {}", e);
+                    Vec::new()
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Create cancellation token for graceful health monitor shutdown
+    let health_cancel_token = tokio_util::sync::CancellationToken::new();
+
+    // Spawn health monitor
+    let health_monitor_handle = crate::health::spawn_health_monitor_with_cancel(
+        vm_id.clone(),
+        vm_state.pid,
+        paths::state_dir(),
+        Some(health_cancel_token.clone()),
+    );
+
+    // Setup signal handlers
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+
+    // Wait for signal or VM exit
+    let container_exit_code: Option<i32>;
+    tokio::select! {
+        _ = sigterm.recv() => {
+            info!("received SIGTERM, shutting down VM");
+            container_exit_code = None;
+        }
+        _ = sigint.recv() => {
+            info!("received SIGINT, shutting down VM");
+            container_exit_code = None;
+        }
+        status = vm_manager.wait() => {
+            info!(status = ?status, "VM exited");
+            if let Some(handle) = tty_handle {
+                container_exit_code = handle.join().ok().and_then(|r| r.ok());
+            } else {
+                let exit_file = data_dir.join("container-exit");
+                container_exit_code = std::fs::read_to_string(&exit_file)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i32>().ok());
+            }
+        }
+    }
+
+    // Cancel status listener
+    status_handle.abort();
+
+    // Cleanup resources
+    super::common::cleanup_vm(
+        &vm_id,
+        &mut vm_manager,
+        &mut holder_child,
+        volume_server_handles,
+        network.as_mut(),
+        &state_manager,
+        &data_dir,
+        Some(health_cancel_token),
+        Some(health_monitor_handle),
+    )
+    .await;
+
+    // Return error if container exited with non-zero exit code
+    if let Some(code) = container_exit_code {
+        if code != 0 {
+            bail!("container exited with code {}", code);
+        }
+    }
+
+    Ok(())
 }
 
 use super::common::{VSOCK_OUTPUT_PORT, VSOCK_STATUS_PORT, VSOCK_TTY_PORT, VSOCK_VOLUME_PORT_BASE};
@@ -256,12 +819,14 @@ pub async fn cmd_podman(args: PodmanArgs) -> Result<()> {
 /// Messages:
 /// - "ready\n" - Container started, create ready file for health check
 /// - "exit:{code}\n" - Container exited, write exit code to file
+/// - "cache-ready:{digest}\n" - Image loaded, ready for caching (sends cache-ack back)
 async fn run_status_listener(
     socket_path: &str,
     runtime_dir: &std::path::Path,
     vm_id: &str,
+    cache_tx: Option<mpsc::Sender<CacheRequest>>,
 ) -> Result<()> {
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
 
     // Remove stale socket if it exists
@@ -275,7 +840,7 @@ async fn run_status_listener(
     let ready_file = runtime_dir.join("container-ready");
     let exit_file = runtime_dir.join("container-exit");
 
-    // Accept connections in a loop (we get "ready" then "exit")
+    // Accept connections in a loop (we get "cache-ready" then "ready" then "exit")
     loop {
         let accept_result = tokio::time::timeout(
             std::time::Duration::from_secs(3600), // 1 hour timeout
@@ -296,7 +861,7 @@ async fn run_status_listener(
         };
 
         // Read the message
-        let mut buf = [0u8; 64];
+        let mut buf = [0u8; 128];
         let n = match stream.read(&mut buf).await {
             Ok(n) if n > 0 => n,
             _ => continue,
@@ -310,6 +875,9 @@ async fn run_status_listener(
             std::fs::write(&ready_file, "ready\n")
                 .with_context(|| format!("writing ready file: {:?}", ready_file))?;
             info!(vm_id = %vm_id, "Container ready notification received");
+        } else if let Some(debug_msg) = msg.strip_prefix("debug:") {
+            // Debug message from fc-agent (useful when serial console is broken after restore)
+            info!(vm_id = %vm_id, debug = %debug_msg, "fc-agent debug message");
         } else if let Some(code_str) = msg.strip_prefix("exit:") {
             // Write exit code to file
             std::fs::write(&exit_file, format!("{}\n", code_str))
@@ -317,6 +885,37 @@ async fn run_status_listener(
             info!(vm_id = %vm_id, exit_code = %code_str, "Container exit notification received");
             // Exit loop after receiving exit code
             break;
+        } else if let Some(digest) = msg.strip_prefix("cache-ready:") {
+            // fc-agent has loaded the image and is ready for caching
+            info!(vm_id = %vm_id, digest = %digest, "Cache-ready notification received");
+
+            if let Some(ref tx) = cache_tx {
+                // Create oneshot channel for ack
+                let (ack_tx, ack_rx) = oneshot::channel();
+
+                // Send cache request to main task
+                let request = CacheRequest {
+                    digest: digest.to_string(),
+                    ack_tx,
+                };
+
+                if tx.send(request).await.is_ok() {
+                    // Wait for main task to complete cache creation
+                    // No timeout - host is responsible for completing
+                    if ack_rx.await.is_ok() {
+                        info!(vm_id = %vm_id, "Cache created, sending ack to fc-agent");
+                    } else {
+                        warn!(vm_id = %vm_id, "Cache creation failed or was cancelled");
+                    }
+                } else {
+                    warn!(vm_id = %vm_id, "Failed to send cache request to main task");
+                }
+            }
+
+            // Send ack back to fc-agent (even if cache creation failed)
+            if let Err(e) = stream.write_all(b"cache-ack\n").await {
+                warn!(vm_id = %vm_id, error = %e, "Failed to send cache-ack to fc-agent");
+            }
         } else {
             warn!(vm_id = %vm_id, msg = %msg, "Unexpected status message");
         }
@@ -550,6 +1149,34 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     let initrd_path = crate::setup::ensure_fc_agent_initrd(args.setup)
         .await
         .context("setting up fc-agent initrd")?;
+
+    // Check for podman cache (unless --no-cache is set)
+    // Keep cache_key available for later cache creation on miss
+    let cache_key: Option<String> = if !args.no_cache {
+        // Get image identifier for cache key computation
+        let image_identifier = get_image_identifier(&args.image).await?;
+        let key = compute_podman_cache_key(&args, &image_identifier);
+
+        // Check if cache exists
+        if let Some(cache_dir) = check_podman_cache(&key) {
+            info!(
+                cache_key = %key,
+                image = %args.image,
+                "Cache hit! Restoring from snapshot"
+            );
+            return restore_from_podman_cache(&args, &cache_dir, &key).await;
+        }
+
+        info!(
+            cache_key = %key,
+            image = %args.image,
+            "Cache miss, will create cache after image load"
+        );
+        Some(key)
+    } else {
+        info!("Cache disabled via --no-cache flag");
+        None
+    };
 
     // Generate VM ID
     let vm_id = generate_vm_id();
@@ -795,16 +1422,26 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .await
         .context("spawning VolumeServers")?;
 
+    // Create cache channel for cache-ready notifications (unless --no-cache is set)
+    let (cache_tx, mut cache_rx): (Option<mpsc::Sender<CacheRequest>>, Option<mpsc::Receiver<CacheRequest>>) =
+        if !args.no_cache {
+            let (tx, rx) = mpsc::channel(1);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
     // Start status channel listener for fc-agent notifications
     // - "ready" on port 4999 -> creates container-ready file for health check
     // - "exit:{code}" on port 4999 -> creates container-exit file with exit code
+    // - "cache-ready:{digest}" on port 4999 -> trigger cache creation
     let status_socket_path = format!("{}_{}", vsock_socket_path.display(), VSOCK_STATUS_PORT);
     let status_handle = {
         let runtime_dir = data_dir.clone();
         let socket_path = status_socket_path.clone();
         let vm_id_clone = vm_id.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_status_listener(&socket_path, &runtime_dir, &vm_id_clone).await {
+            if let Err(e) = run_status_listener(&socket_path, &runtime_dir, &vm_id_clone, cache_tx).await {
                 tracing::warn!("Status listener error: {}", e);
             }
         })
@@ -910,35 +1547,74 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
 
-    // Wait for signal or VM exit
+    // Wait for signal, VM exit, or cache requests
     // For TTY mode, we get exit code from the TTY listener thread
     // For non-TTY mode, we read it from the file written by status listener
     let container_exit_code: Option<i32>;
-    tokio::select! {
-        _ = sigterm.recv() => {
-            info!("received SIGTERM, shutting down VM");
-            container_exit_code = None; // Signal-based shutdown, not container exit
-        }
-        _ = sigint.recv() => {
-            info!("received SIGINT, shutting down VM");
-            container_exit_code = None; // Signal-based shutdown, not container exit
-        }
-        status = vm_manager.wait() => {
-            info!(status = ?status, "VM exited");
-            if let Some(handle) = tty_handle {
-                // TTY mode: get exit code from TTY listener
-                container_exit_code = handle
-                    .join()
-                    .ok()
-                    .and_then(|r| r.ok());
-                info!(container_exit_code = ?container_exit_code, "TTY container exit code");
-            } else {
-                // Non-TTY mode: read container exit code from file written by status listener
-                let exit_file = data_dir.join("container-exit");
-                container_exit_code = std::fs::read_to_string(&exit_file)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<i32>().ok());
-                info!(container_exit_code = ?container_exit_code, "container exit code");
+    let disk_path = data_dir.join("disks/rootfs.raw");
+
+    loop {
+        tokio::select! {
+            _ = sigterm.recv() => {
+                info!("received SIGTERM, shutting down VM");
+                container_exit_code = None;
+                break;
+            }
+            _ = sigint.recv() => {
+                info!("received SIGINT, shutting down VM");
+                container_exit_code = None;
+                break;
+            }
+            status = vm_manager.wait() => {
+                info!(status = ?status, "VM exited");
+                if let Some(handle) = tty_handle {
+                    container_exit_code = handle.join().ok().and_then(|r| r.ok());
+                    info!(container_exit_code = ?container_exit_code, "TTY container exit code");
+                } else {
+                    let exit_file = data_dir.join("container-exit");
+                    container_exit_code = std::fs::read_to_string(&exit_file)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<i32>().ok());
+                    info!(container_exit_code = ?container_exit_code, "container exit code");
+                }
+                break;
+            }
+            // Handle cache creation requests from fc-agent
+            Some(cache_request) = async {
+                match cache_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(ref key) = cache_key {
+                    info!(cache_key = %key, digest = %cache_request.digest, "Creating cache snapshot");
+
+                    let create_result = create_podman_cache(
+                        &vm_manager,
+                        key,
+                        &vm_id,
+                        &args,
+                        &cache_request.digest,
+                        &disk_path,
+                        &network_config,
+                    ).await;
+
+                    match create_result {
+                        Ok(()) => {
+                            info!(cache_key = %key, "Cache created successfully");
+                        }
+                        Err(e) => {
+                            warn!(cache_key = %key, error = %e, "Failed to create cache");
+                        }
+                    }
+
+                    // Send ack back regardless of success (fc-agent should continue)
+                    let _ = cache_request.ack_tx.send(());
+                } else {
+                    // Should not happen if channel exists, but send ack anyway
+                    let _ = cache_request.ack_tx.send(());
+                }
+                // Continue waiting for VM exit or signals
             }
         }
     }
