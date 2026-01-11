@@ -1,5 +1,6 @@
-From: fcvm <fcvm@localhost>
 Subject: [PATCH] KVM: arm64: Add cache synchronization for nested guest exit
+
+From: fcvm <fcvm@localhost>
 
 Under nested virtualization with NV2, when an L2 guest writes to memory
 and then exits to L1, the L1 hypervisor's userspace may not see the
@@ -23,17 +24,17 @@ page table walks see consistent data.
 
 Signed-off-by: fcvm <fcvm@localhost>
 ---
- arch/arm64/kvm/nested.c | 15 +++++++++++++++
+ arch/arm64/kvm/nested.c |   15 +++++++++++++++
  1 file changed, 15 insertions(+)
 
 diff --git a/arch/arm64/kvm/nested.c b/arch/arm64/kvm/nested.c
-index xxxx..yyyy 100644
+index f04cda40545b..2c4d196a1ef3 100644
 --- a/arch/arm64/kvm/nested.c
 +++ b/arch/arm64/kvm/nested.c
-@@ -1874,6 +1874,21 @@ void kvm_nested_sync_hwstate(struct kvm_vcpu *vcpu)
+@@ -1824,6 +1824,21 @@ void kvm_nested_sync_hwstate(struct kvm_vcpu *vcpu)
  	if (!vcpu_has_nv(vcpu))
  		return;
-
+ 
 +	/*
 +	 * Ensure all data writes from the nested guest are visible to the
 +	 * L1 hypervisor before we return. Under NV2, the double Stage 2

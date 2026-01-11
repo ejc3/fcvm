@@ -1,20 +1,23 @@
-From: fcvm <fcvm@localhost>
 Subject: [PATCH] vsock/virtio: Add cache flush for NV2 with nonlinear SKB support
+
+From: fcvm <fcvm@localhost>
 
 Add cache flush in vsock TX path for ARM64 NV2 compatibility.
 Handle both linear and nonlinear (paged) SKBs.
 
 Signed-off-by: fcvm <fcvm@localhost>
 ---
- net/vmw_vsock/virtio_transport.c | 30 ++++++++++++++++++++++++++++++
+ net/vmw_vsock/virtio_transport.c |   30 ++++++++++++++++++++++++++++++
  1 file changed, 30 insertions(+)
 
+diff --git a/net/vmw_vsock/virtio_transport.c b/net/vmw_vsock/virtio_transport.c
+index 8c867023a2e5..f8771cb22c2b 100644
 --- a/net/vmw_vsock/virtio_transport.c
 +++ b/net/vmw_vsock/virtio_transport.c
 @@ -21,6 +21,10 @@
  #include <linux/mutex.h>
  #include <net/af_vsock.h>
-
+ 
 +#ifdef CONFIG_ARM64
 +#include <asm/cacheflush.h>
 +#endif
@@ -25,7 +28,7 @@ Signed-off-by: fcvm <fcvm@localhost>
 @@ -147,6 +151,32 @@ static int virtio_transport_send_skb(struct sk_buff *skb, struct virtqueue *vq,
  	if (ret < 0)
  		return ret;
-
+ 
 +#ifdef CONFIG_ARM64
 +	/* NV2: Flush all SKB data before virtqueue kick */
 +	dsb(sy);

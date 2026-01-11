@@ -1,28 +1,25 @@
-From 6f6ee8aeb45e73a6aa45538f1c663b9dd6e9d75e Mon Sep 17 00:00:00 2001
-From: ejc3 <ejc3@users.noreply.github.com>
-Date: Sat, 3 Jan 2026 23:05:43 +0000
-Subject: [PATCH] fuse: add remap_file_range support for FICLONE
+commit 936c13cb572373a6481e72d5ca3cfa77d8c87d8e
+Author: ejc3 <ejc3@users.noreply.github.com>
+Date:   Sat Jan 3 23:05:43 2026 +0000
 
-Add support for the remap_file_range file operation to FUSE, enabling
-FICLONE and FICLONERANGE ioctls to work on FUSE filesystems.
-
-This is useful for:
-- Container filesystems that need to support btrfs-style reflinks
-- Copy-on-write operations through FUSE passthrough filesystems
-- Deduplication operations (with REMAP_FILE_DEDUP flag)
-
-Signed-off-by: fcvm developers <fcvm@anthropic.com>
----
- fs/fuse/file.c            | 100 ++++++++++++++++++++++++++++++++++++++
- fs/fuse/fuse_i.h          |   3 ++
- include/uapi/linux/fuse.h |  17 +++++++
- 3 files changed, 120 insertions(+)
+    From 6f6ee8aeb45e73a6aa45538f1c663b9dd6e9d75e Mon Sep 17 00:00:00 2001
+    Subject: [PATCH] fuse: add remap_file_range support for FICLONE
+    
+    Add support for the remap_file_range file operation to FUSE, enabling
+    FICLONE and FICLONERANGE ioctls to work on FUSE filesystems.
+    
+    This is useful for:
+    - Container filesystems that need to support btrfs-style reflinks
+    - Copy-on-write operations through FUSE passthrough filesystems
+    - Deduplication operations (with REMAP_FILE_DEDUP flag)
+    
+    Signed-off-by: fcvm developers <fcvm@anthropic.com>
 
 diff --git a/fs/fuse/file.c b/fs/fuse/file.c
-index 6014d5888..3762cd1a0 100644
+index f1ef77a0be05..36d77b5af9bd 100644
 --- a/fs/fuse/file.c
 +++ b/fs/fuse/file.c
-@@ -3104,6 +3104,105 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
+@@ -3083,6 +3083,105 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
  	return ret;
  }
  
@@ -128,7 +125,7 @@ index 6014d5888..3762cd1a0 100644
  static const struct file_operations fuse_file_operations = {
  	.llseek		= fuse_file_llseek,
  	.read_iter	= fuse_file_read_iter,
-@@ -3123,6 +3222,7 @@ static const struct file_operations fuse_file_operations = {
+@@ -3102,6 +3201,7 @@ static const struct file_operations fuse_file_operations = {
  	.poll		= fuse_file_poll,
  	.fallocate	= fuse_file_fallocate,
  	.copy_file_range = fuse_copy_file_range,
@@ -137,7 +134,7 @@ index 6014d5888..3762cd1a0 100644
  
  static const struct address_space_operations fuse_file_aops  = {
 diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
-index c2f2a4815..825d92f4f 100644
+index c2f2a48156d6..825d92f4f10d 100644
 --- a/fs/fuse/fuse_i.h
 +++ b/fs/fuse/fuse_i.h
 @@ -859,6 +859,9 @@ struct fuse_conn {
@@ -151,7 +148,7 @@ index c2f2a4815..825d92f4f 100644
  	unsigned int destroy:1;
  
 diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
-index c13e1f9a2..4ad264aa6 100644
+index c13e1f9a2f12..4ad264aa6a99 100644
 --- a/include/uapi/linux/fuse.h
 +++ b/include/uapi/linux/fuse.h
 @@ -663,6 +663,7 @@ enum fuse_opcode {
@@ -183,6 +180,3 @@ index c13e1f9a2..4ad264aa6 100644
 +	uint32_t	padding;
 +};
  #endif /* _LINUX_FUSE_H */
--- 
-2.43.0
-
