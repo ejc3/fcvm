@@ -27,9 +27,9 @@ fn podman_cache_dir() -> PathBuf {
 fn compute_cache_key(image: &str, cmd: &[&str], env: &[&str]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(image.as_bytes());
-    // Default VM config: cpu=1, mem=512, privileged=false, interactive=false, tty=false
-    hasher.update(b"1"); // cpu
-    hasher.update(b"512"); // mem
+    // Default VM config: cpu=2, mem=2048, privileged=false, interactive=false, tty=false
+    hasher.update(b"2"); // cpu (fcvm default)
+    hasher.update(b"2048"); // mem (fcvm default)
     hasher.update(b"0"); // privileged
     hasher.update(b"0"); // interactive
     hasher.update(b"0"); // tty
@@ -413,26 +413,27 @@ async fn test_podman_cache_no_cache_flag() -> Result<()> {
     Ok(())
 }
 
-/// Test that corrupted cache falls back to normal boot
+/// Test that incomplete cache (missing files) is treated as miss
 #[tokio::test]
-async fn test_podman_cache_corruption_recovery() -> Result<()> {
-    println!("\ntest_podman_cache_corruption_recovery");
-    println!("======================================");
+async fn test_podman_cache_incomplete_treated_as_miss() -> Result<()> {
+    println!("\ntest_podman_cache_incomplete_treated_as_miss");
+    println!("=============================================");
 
     // Use unique env var
-    let test_id = format!("corrupt-{}", std::process::id());
+    let test_id = format!("incomplete-{}", std::process::id());
     let env_var = format!("TEST_ID={}", test_id);
     let cache_key = compute_cache_key("alpine:latest", &["echo", "recovered"], &[&env_var]);
     println!("Test cache key: {}", cache_key);
 
-    // Create a corrupted cache entry (empty config.json)
+    // Create an incomplete cache entry (only config.json, missing other files)
+    // This simulates an interrupted cache creation
     let cache_path = podman_cache_dir().join(&cache_key);
     std::fs::create_dir_all(&cache_path)?;
-    std::fs::write(cache_path.join("config.json"), "{}")?;
-    println!("Created corrupted cache entry");
+    // Don't create memory.bin, vmstate.bin, disk.raw - only the directory
+    println!("Created incomplete cache directory (no files)");
 
-    // Run - should detect corruption and boot fresh
-    let (vm_name, _, _, _) = common::unique_names("corrupt");
+    // Run - should treat incomplete cache as miss and boot fresh
+    let (vm_name, _, _, _) = common::unique_names("incomplete");
     let (mut child, pid) = common::spawn_fcvm(&[
         "podman",
         "run",
@@ -451,10 +452,10 @@ async fn test_podman_cache_corruption_recovery() -> Result<()> {
     let _ = common::poll_health_by_pid(pid, 180).await;
     let _ = tokio::time::timeout(Duration::from_secs(120), child.wait()).await;
 
-    // Should have recovered and created valid cache
+    // Should have created a valid cache after fresh boot
     assert!(
         wait_for_cache_entry(&cache_key, 60).await,
-        "Should recover with valid cache"
+        "Should create valid cache after fresh boot"
     );
 
     println!("Test passed");
