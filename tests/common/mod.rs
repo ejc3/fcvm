@@ -9,6 +9,9 @@ use std::sync::{Arc, Mutex};
 /// Default test image - use AWS ECR to avoid Docker Hub rate limits
 pub const TEST_IMAGE: &str = "public.ecr.aws/nginx/nginx:alpine";
 
+/// Alpine test image from ECR public gallery
+pub const TEST_IMAGE_ALPINE: &str = "public.ecr.aws/docker/library/alpine:latest";
+
 /// Standard log directory for test logs
 const TEST_LOG_DIR: &str = "/tmp/fcvm-test-logs";
 

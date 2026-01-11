@@ -23,7 +23,7 @@ fn test_publish_does_not_consume_image() {
             "test",
             "--publish",
             "8080:80",
-            "nginx:alpine",
+            common::TEST_IMAGE,
             "--help",
         ])
         .output()
@@ -50,7 +50,7 @@ fn test_map_does_not_consume_image() {
             "test",
             "--map",
             "/host:/guest",
-            "nginx:alpine",
+            common::TEST_IMAGE,
             "--help",
         ])
         .output()
@@ -76,7 +76,7 @@ fn test_env_does_not_consume_image() {
             "test",
             "--env",
             "FOO=bar",
-            "nginx:alpine",
+            common::TEST_IMAGE,
             "--help",
         ])
         .output()
@@ -107,7 +107,7 @@ fn test_multiple_options_do_not_consume_image() {
             "/host:/guest",
             "--env",
             "FOO=bar",
-            "nginx:alpine",
+            common::TEST_IMAGE,
             "--help",
         ])
         .output()
@@ -134,7 +134,7 @@ fn test_comma_separated_publish_works() {
             "test",
             "--publish",
             "8080:80,8443:443",
-            "nginx:alpine",
+            common::TEST_IMAGE,
             "--help",
         ])
         .output()
@@ -163,7 +163,7 @@ fn test_repeated_publish_works() {
             "8080:80",
             "--publish",
             "8443:443",
-            "nginx:alpine",
+            common::TEST_IMAGE,
             "--help",
         ])
         .output()
