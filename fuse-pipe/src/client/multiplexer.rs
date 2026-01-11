@@ -107,7 +107,7 @@ impl Multiplexer {
         // Spawn writer thread - receives requests from channel, writes to socket
         std::thread::Builder::new()
             .name("fuse-mux-writer".to_string())
-            .stack_size(128 * 1024) // 128KB - sufficient for socket I/O
+            .stack_size(512 * 1024) // 512KB - sufficient for socket I/O
             .spawn(move || {
                 writer_loop(socket_writer, request_rx, pending_for_writer);
             })
@@ -116,7 +116,7 @@ impl Multiplexer {
         // Spawn reader thread - reads responses from socket, routes to waiting readers
         std::thread::Builder::new()
             .name("fuse-mux-reader".to_string())
-            .stack_size(128 * 1024) // 128KB - sufficient for socket I/O
+            .stack_size(512 * 1024) // 512KB - sufficient for socket I/O
             .spawn(move || {
                 reader_loop(socket_reader, pending_for_reader);
             })

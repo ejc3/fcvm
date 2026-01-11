@@ -356,7 +356,7 @@ fn mount_internal<P: AsRef<Path>>(
                     let destroyed_check = Arc::clone(&destroyed);
                     let handle = thread::Builder::new()
                         .name(format!("fuse-reader-{}", reader_id))
-                        .stack_size(128 * 1024) // 128KB - sufficient for blocking read
+                        .stack_size(512 * 1024) // 512KB - sufficient for FUSE operations
                         .spawn(move || {
                         debug!(target: "fuse-pipe::client", reader_id, "secondary reader starting session.run()");
                         let run_result = reader_session.run();
@@ -599,7 +599,7 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
                     let destroyed_check = Arc::clone(&destroyed);
                     let handle = thread::Builder::new()
                         .name(format!("fuse-reader-{}", reader_id))
-                        .stack_size(128 * 1024) // 128KB - sufficient for blocking read
+                        .stack_size(512 * 1024) // 512KB - sufficient for FUSE operations
                         .spawn(move || {
                             if let Err(e) = reader_session.run() {
                                 if destroyed_check.load(Ordering::SeqCst) {
