@@ -195,9 +195,7 @@ async fn create_podman_cache(
         .context("creating podman-cache directory")?;
 
     let lock_file = std::fs::File::create(&lock_path).context("creating cache lock file")?;
-    lock_file
-        .lock_exclusive()
-        .context("acquiring cache lock")?;
+    lock_file.lock_exclusive().context("acquiring cache lock")?;
 
     // Double-check after lock (another process might have created it)
     if cache_dir.join("config.json").exists() {
@@ -338,11 +336,7 @@ async fn restore_from_podman_cache(
         .context("creating VM disks directory")?;
 
     // Create CoW disk from cache
-    let disk_manager = DiskManager::new(
-        vm_id.clone(),
-        cache_dir.join("disk.raw"),
-        vm_dir.clone(),
-    );
+    let disk_manager = DiskManager::new(vm_id.clone(), cache_dir.join("disk.raw"), vm_dir.clone());
     let rootfs_path = disk_manager
         .create_cow_disk()
         .await
@@ -467,7 +461,8 @@ async fn restore_from_podman_cache(
         let vm_id_clone = vm_id.clone();
         tokio::spawn(async move {
             // No cache_tx for restored VMs - they don't need to create cache
-            if let Err(e) = run_status_listener(&socket_path, &runtime_dir, &vm_id_clone, None).await
+            if let Err(e) =
+                run_status_listener(&socket_path, &runtime_dir, &vm_id_clone, None).await
             {
                 tracing::warn!("Status listener error: {}", e);
             }
@@ -539,7 +534,10 @@ async fn restore_from_podman_cache(
         status_handle.abort();
 
         if let Err(cleanup_err) = network.cleanup().await {
-            warn!("Failed to cleanup network after setup error: {}", cleanup_err);
+            warn!(
+                "Failed to cleanup network after setup error: {}",
+                cleanup_err
+            );
         }
         return Err(e);
     }
@@ -1424,13 +1422,15 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .context("spawning VolumeServers")?;
 
     // Create cache channel for cache-ready notifications (unless --no-cache is set)
-    let (cache_tx, mut cache_rx): (Option<mpsc::Sender<CacheRequest>>, Option<mpsc::Receiver<CacheRequest>>) =
-        if !args.no_cache {
-            let (tx, rx) = mpsc::channel(1);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
+    let (cache_tx, mut cache_rx): (
+        Option<mpsc::Sender<CacheRequest>>,
+        Option<mpsc::Receiver<CacheRequest>>,
+    ) = if !args.no_cache {
+        let (tx, rx) = mpsc::channel(1);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
 
     // Start status channel listener for fc-agent notifications
     // - "ready" on port 4999 -> creates container-ready file for health check
@@ -1442,7 +1442,9 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         let socket_path = status_socket_path.clone();
         let vm_id_clone = vm_id.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_status_listener(&socket_path, &runtime_dir, &vm_id_clone, cache_tx).await {
+            if let Err(e) =
+                run_status_listener(&socket_path, &runtime_dir, &vm_id_clone, cache_tx).await
+            {
                 tracing::warn!("Status listener error: {}", e);
             }
         })
