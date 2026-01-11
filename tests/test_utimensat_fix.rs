@@ -37,7 +37,14 @@ async fn test_utimensat_pjdfstest_nested_kernel() -> Result<()> {
     if !check.status.success() {
         println!("   Building pjdfstest container...");
         let build = tokio::process::Command::new("podman")
-            .args(["build", "-t", "pjdfstest", "-f", "Containerfile.pjdfstest", "."])
+            .args([
+                "build",
+                "-t",
+                "pjdfstest",
+                "-f",
+                "Containerfile.pjdfstest",
+                ".",
+            ])
             .output()
             .await
             .context("building pjdfstest container")?;
