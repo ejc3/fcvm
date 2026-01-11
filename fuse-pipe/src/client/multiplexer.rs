@@ -105,14 +105,22 @@ impl Multiplexer {
         let pending_for_reader = Arc::clone(&pending);
 
         // Spawn writer thread - receives requests from channel, writes to socket
-        std::thread::spawn(move || {
-            writer_loop(socket_writer, request_rx, pending_for_writer);
-        });
+        std::thread::Builder::new()
+            .name("fuse-mux-writer".to_string())
+            .stack_size(128 * 1024) // 128KB - sufficient for socket I/O
+            .spawn(move || {
+                writer_loop(socket_writer, request_rx, pending_for_writer);
+            })
+            .expect("failed to spawn fuse mux writer thread");
 
         // Spawn reader thread - reads responses from socket, routes to waiting readers
-        std::thread::spawn(move || {
-            reader_loop(socket_reader, pending_for_reader);
-        });
+        std::thread::Builder::new()
+            .name("fuse-mux-reader".to_string())
+            .stack_size(128 * 1024) // 128KB - sufficient for socket I/O
+            .spawn(move || {
+                reader_loop(socket_reader, pending_for_reader);
+            })
+            .expect("failed to spawn fuse mux reader thread");
 
         Ok(Arc::new(Self {
             request_tx,

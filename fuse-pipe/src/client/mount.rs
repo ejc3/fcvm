@@ -354,7 +354,10 @@ fn mount_internal<P: AsRef<Path>>(
                         fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::All);
 
                     let destroyed_check = Arc::clone(&destroyed);
-                    let handle = thread::spawn(move || {
+                    let handle = thread::Builder::new()
+                        .name(format!("fuse-reader-{}", reader_id))
+                        .stack_size(128 * 1024) // 128KB - sufficient for blocking read
+                        .spawn(move || {
                         debug!(target: "fuse-pipe::client", reader_id, "secondary reader starting session.run()");
                         let run_result = reader_session.run();
                         debug!(target: "fuse-pipe::client", reader_id, "secondary reader session.run() returned, dropping session");
@@ -372,7 +375,7 @@ fn mount_internal<P: AsRef<Path>>(
                             }
                         }
                         debug!(target: "fuse-pipe::client", reader_id, "secondary reader thread exiting");
-                    });
+                    }).expect("failed to spawn fuse reader thread");
                     reader_threads
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -594,15 +597,18 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
                         fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::All);
 
                     let destroyed_check = Arc::clone(&destroyed);
-                    let handle = thread::spawn(move || {
-                        if let Err(e) = reader_session.run() {
-                            if destroyed_check.load(Ordering::SeqCst) {
-                                debug!(target: "fuse-pipe::client", reader_id, "reader exited (clean shutdown)");
-                            } else {
-                                error!(target: "fuse-pipe::client", reader_id, error = %e, "reader error");
+                    let handle = thread::Builder::new()
+                        .name(format!("fuse-reader-{}", reader_id))
+                        .stack_size(128 * 1024) // 128KB - sufficient for blocking read
+                        .spawn(move || {
+                            if let Err(e) = reader_session.run() {
+                                if destroyed_check.load(Ordering::SeqCst) {
+                                    debug!(target: "fuse-pipe::client", reader_id, "reader exited (clean shutdown)");
+                                } else {
+                                    error!(target: "fuse-pipe::client", reader_id, error = %e, "reader error");
+                                }
                             }
-                        }
-                    });
+                        }).expect("failed to spawn fuse reader thread");
                     reader_threads
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
