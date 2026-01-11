@@ -1,6 +1,17 @@
 #!/bin/bash
-SIZE=$1
-ATTEMPTS=$2
+set -e
+
+SIZE=${1:-10M}
+ATTEMPTS=${2:-3}
+
+cd "$(dirname "$0")/.."
+
+# Ensure fcvm is built and kernel is set up
+echo "=== Setting up fcvm and nested kernel ==="
+make build
+sudo mkdir -p /root/.config/fcvm
+sudo cp rootfs-config.toml /root/.config/fcvm/
+sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels
 
 # First verify simple VM works
 echo "=== Verifying simple VM works ==="
