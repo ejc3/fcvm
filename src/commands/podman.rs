@@ -459,6 +459,52 @@ async fn restore_from_podman_cache(
         .await
         .context("spawning VolumeServers")?;
 
+    // Start status listener BEFORE restoring VM so we're ready when fc-agent connects
+    let status_socket_path = format!("{}_{}", vsock_socket_path.display(), VSOCK_STATUS_PORT);
+    let status_handle = {
+        let runtime_dir = data_dir.clone();
+        let socket_path = status_socket_path.clone();
+        let vm_id_clone = vm_id.clone();
+        tokio::spawn(async move {
+            // No cache_tx for restored VMs - they don't need to create cache
+            if let Err(e) = run_status_listener(&socket_path, &runtime_dir, &vm_id_clone, None).await
+            {
+                tracing::warn!("Status listener error: {}", e);
+            }
+        })
+    };
+
+    // Setup TTY/output listeners BEFORE VM restore so we're ready to accept connections
+    let tty_mode = args.tty;
+    let interactive = args.interactive;
+    let tty_socket_path = format!("{}_{}", vsock_socket_path.display(), VSOCK_TTY_PORT);
+    let output_socket_path = format!("{}_{}", vsock_socket_path.display(), VSOCK_OUTPUT_PORT);
+
+    let tty_handle = if tty_mode {
+        let socket_path = tty_socket_path.clone();
+        Some(std::thread::spawn(move || {
+            super::tty::run_tty_session(&socket_path, true, interactive)
+        }))
+    } else {
+        None
+    };
+
+    let _output_handle = if !tty_mode {
+        let socket_path = output_socket_path.clone();
+        let vm_id_clone = vm_id.clone();
+        Some(tokio::spawn(async move {
+            match run_output_listener(&socket_path, &vm_id_clone, interactive).await {
+                Ok(lines) => lines,
+                Err(e) => {
+                    tracing::warn!("Output listener error: {}", e);
+                    Vec::new()
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     // Build restore configuration
     let restore_config = super::common::SnapshotRestoreConfig {
         vmstate_path: cache_dir.join("vmstate.bin"),
@@ -490,6 +536,7 @@ async fn restore_from_podman_cache(
         for handle in volume_server_handles {
             handle.abort();
         }
+        status_handle.abort();
 
         if let Err(cleanup_err) = network.cleanup().await {
             warn!("Failed to cleanup network after setup error: {}", cleanup_err);
@@ -504,52 +551,6 @@ async fn restore_from_podman_cache(
         cache_key = %cache_key,
         "VM restored from cache successfully"
     );
-
-    // Start status listener for this VM
-    let status_socket_path = format!("{}_{}", vsock_socket_path.display(), VSOCK_STATUS_PORT);
-    let status_handle = {
-        let runtime_dir = data_dir.clone();
-        let socket_path = status_socket_path.clone();
-        let vm_id_clone = vm_id.clone();
-        tokio::spawn(async move {
-            // No cache_tx for restored VMs - they don't need to create cache
-            if let Err(e) = run_status_listener(&socket_path, &runtime_dir, &vm_id_clone, None).await
-            {
-                tracing::warn!("Status listener error: {}", e);
-            }
-        })
-    };
-
-    // Setup TTY/output listeners based on mode
-    let tty_mode = args.tty;
-    let interactive = args.interactive;
-    let tty_socket_path = format!("{}_{}", vsock_socket_path.display(), VSOCK_TTY_PORT);
-    let output_socket_path = format!("{}_{}", vsock_socket_path.display(), VSOCK_OUTPUT_PORT);
-
-    let tty_handle = if tty_mode {
-        let socket_path = tty_socket_path.clone();
-        Some(std::thread::spawn(move || {
-            super::tty::run_tty_session(&socket_path, true, interactive)
-        }))
-    } else {
-        None
-    };
-
-    let _output_handle = if !tty_mode {
-        let socket_path = output_socket_path.clone();
-        let vm_id_clone = vm_id.clone();
-        Some(tokio::spawn(async move {
-            match run_output_listener(&socket_path, &vm_id_clone, interactive).await {
-                Ok(lines) => lines,
-                Err(e) => {
-                    tracing::warn!("Output listener error: {}", e);
-                    Vec::new()
-                }
-            }
-        }))
-    } else {
-        None
-    };
 
     // Create cancellation token for graceful health monitor shutdown
     let health_cancel_token = tokio_util::sync::CancellationToken::new();
