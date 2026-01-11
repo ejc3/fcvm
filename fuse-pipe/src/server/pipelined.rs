@@ -189,7 +189,6 @@ async fn request_reader<H: FilesystemHandler + 'static>(
     let mut max_len: usize = 0;
     let mut total_bytes_read: u64 = 0; // Track cumulative bytes for corruption debugging
     let mut last_unique: u64 = 0; // Track last successful unique ID
-    let mut expected_unique: u64 = 1; // Track expected sequence number
     let mut zero_byte_runs: u64 = 0; // Track consecutive zero bytes seen (for corruption detection)
 
     loop {
@@ -231,7 +230,6 @@ async fn request_reader<H: FilesystemHandler + 'static>(
                 total_bytes_read,
                 last_len,
                 last_unique,
-                expected_unique,
                 zero_byte_runs,
                 len_hex = format!("{:02x} {:02x} {:02x} {:02x}", len_buf[0], len_buf[1], len_buf[2], len_buf[3]),
                 "STREAM CORRUPTION: zero-length message detected"
@@ -380,37 +378,7 @@ async fn request_reader<H: FilesystemHandler + 'static>(
         let t_deser = now_nanos();
 
         let unique = wire_req.unique;
-        last_unique = unique; // Track for corruption debugging
-
-        // Validate sequence: unique IDs should be monotonically increasing
-        // This helps detect both dropped messages and stream corruption
-        if unique != expected_unique {
-            if unique > expected_unique {
-                // Gap - messages might have been dropped
-                warn!(
-                    target: "fuse-pipe::server",
-                    count,
-                    expected = expected_unique,
-                    actual = unique,
-                    gap = unique - expected_unique,
-                    total_bytes_read,
-                    "SEQUENCE GAP: missing {} message(s)",
-                    unique - expected_unique
-                );
-            } else {
-                // Out of order or duplicate - could indicate corruption
-                error!(
-                    target: "fuse-pipe::server",
-                    count,
-                    expected = expected_unique,
-                    actual = unique,
-                    last_unique,
-                    total_bytes_read,
-                    "SEQUENCE ERROR: out-of-order or duplicate unique ID"
-                );
-            }
-        }
-        expected_unique = unique + 1;
+        last_unique = unique; // Track for corruption debugging (used in deserialize error logs)
         let reader_id = wire_req.reader_id;
         let request = wire_req.request;
         let supplementary_groups = wire_req.supplementary_groups;

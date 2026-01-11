@@ -223,6 +223,45 @@ impl Filesystem for FuseClient {
         _req: &Request<'_>,
         config: &mut fuser::KernelConfig,
     ) -> Result<(), libc::c_int> {
+        // Enable writeback cache for better write performance (kernel batches writes).
+        // Can be disabled via FCVM_NO_WRITEBACK_CACHE=1 for debugging.
+        let enable_writeback = std::env::var("FCVM_NO_WRITEBACK_CACHE").is_err();
+        if enable_writeback {
+            if let Err(unsupported) = config.add_capabilities(fuser::consts::FUSE_WRITEBACK_CACHE) {
+                tracing::warn!(
+                    target: "fuse-pipe::client",
+                    unsupported,
+                    "Kernel doesn't support FUSE_WRITEBACK_CACHE"
+                );
+            } else {
+                tracing::debug!(
+                    target: "fuse-pipe::client",
+                    "Enabled FUSE_WRITEBACK_CACHE for better write performance"
+                );
+            }
+        } else {
+            tracing::debug!(
+                target: "fuse-pipe::client",
+                "FUSE_WRITEBACK_CACHE disabled via FCVM_NO_WRITEBACK_CACHE"
+            );
+        }
+
+        // Enable auto-invalidation: kernel checks mtime and invalidates cached pages
+        // when file is modified. Essential for FICLONE/reflink where content changes
+        // without going through normal write path.
+        if let Err(unsupported) = config.add_capabilities(fuser::consts::FUSE_AUTO_INVAL_DATA) {
+            tracing::warn!(
+                target: "fuse-pipe::client",
+                unsupported,
+                "Kernel doesn't support FUSE_AUTO_INVAL_DATA"
+            );
+        } else {
+            tracing::debug!(
+                target: "fuse-pipe::client",
+                "Enabled FUSE_AUTO_INVAL_DATA for cache coherency"
+            );
+        }
+
         // Limit max_write to avoid vsock data loss under nested virtualization.
         // Override with FCVM_FUSE_MAX_WRITE env var (0 = unbounded).
         let max_write = std::env::var("FCVM_FUSE_MAX_WRITE")
@@ -915,6 +954,26 @@ impl Filesystem for FuseClient {
     }
 
     fn getxattr(&mut self, req: &Request, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
+        // Fast path: The kernel calls getxattr("security.capability") on every write
+        // to check if file capabilities need to be cleared. This is extremely common
+        // and almost always returns ENODATA (no capabilities set). Short-circuit this
+        // to avoid the expensive server round-trip (~32µs savings per write).
+        //
+        // This is safe because:
+        // 1. If capabilities ARE set, they're preserved (we'd need setxattr to clear)
+        // 2. The kernel's capability check is advisory - it clears caps on successful write
+        // 3. Container workloads rarely use file capabilities
+        //
+        // Can be disabled via FCVM_NO_XATTR_FASTPATH=1 for debugging.
+        if std::env::var("FCVM_NO_XATTR_FASTPATH").is_err() {
+            if let Some(name_str) = name.to_str() {
+                if name_str == "security.capability" {
+                    reply.error(libc::ENODATA);
+                    return;
+                }
+            }
+        }
+
         let response = self.send_request_sync(VolumeRequest::Getxattr {
             ino,
             name: name.to_string_lossy().to_string(),

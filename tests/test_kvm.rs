@@ -1871,3 +1871,54 @@ async fn test_nested_l2_unbounded_fuse_corrupts() -> Result<()> {
     //   count=61 total_bytes_read=7343452 last_len=1048645
     bail!("This test intentionally fails to document known corruption")
 }
+
+/// Minimal repro: NV2 kernel + high-throughput FUSE writes.
+///
+/// Expected: FAILS with stream corruption on fuse-writeback-perf branch.
+/// Expected: PASSES on main branch (no writeback cache).
+#[ignore = "repro for NV2 + writeback cache vsock corruption"]
+#[tokio::test]
+async fn test_nv2_kernel_writeback_cache_vsock_corruption() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("nv2-repro");
+    let test_dir = format!("/tmp/nv2-test-{}", std::process::id());
+    tokio::fs::create_dir_all(&test_dir).await?;
+
+    let (mut _child, pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "bridged",
+        "--kernel-profile",
+        "nested",
+        "--map",
+        &format!("{}:/mnt/test", test_dir),
+        "--privileged",
+        common::TEST_IMAGE,
+    ])
+    .await?;
+
+    common::poll_health_by_pid(pid, 180).await?;
+
+    // Write 10MB - this triggers corruption with NV2 + writeback cache
+    let output = tokio::process::Command::new(common::find_fcvm_binary()?)
+        .args([
+            "exec",
+            "--pid",
+            &pid.to_string(),
+            "--",
+            "sh",
+            "-c",
+            "dd if=/dev/zero of=/mnt/test/data bs=1M count=10 && sync && echo OK",
+        ])
+        .output()
+        .await?;
+
+    common::kill_process(pid).await;
+    let _ = tokio::fs::remove_dir_all(&test_dir).await;
+
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("OK"), "Write failed: {}", out);
+    Ok(())
+}

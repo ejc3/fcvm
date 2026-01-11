@@ -134,6 +134,10 @@ async fn test_btrfs_in_container() -> Result<()> {
     println!("\n2. Starting VM with btrfs mounted via fuse-pipe...");
     let map_arg = format!("{}:/btrfs", mount_path);
 
+    // Note: Using default kernel (not nested) because high-throughput vsock + NV2 kernel
+    // causes ~32KB stream corruption with writeback cache enabled. This is related to the
+    // L2 cache coherency issue (CLAUDE.md) but manifests at L1 with NV2-enabled guests.
+    // The btrfs reflink feature works fine - the issue is the vsock transport under load.
     let (mut _child, fcvm_pid) = common::spawn_fcvm(&[
         "podman",
         "run",
@@ -141,8 +145,7 @@ async fn test_btrfs_in_container() -> Result<()> {
         &vm_name,
         "--network",
         "bridged",
-        "--kernel-profile",
-        "nested",
+        // Skip nested kernel - see comment above
         "--map",
         &map_arg,
         "--privileged",

@@ -3,7 +3,11 @@
 
 [advisories]
 # Fail on security vulnerabilities
-ignore = []
+ignore = [
+    # bincode is unmaintained but v1.3.3 is considered complete
+    # Not a security issue - maintainers ceased development
+    "RUSTSEC-2025-0141",
+]
 
 [licenses]
 # Allowed open-source licenses

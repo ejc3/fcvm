@@ -602,6 +602,20 @@ git push origin feature-b --force
 
 ### PR Descriptions: Show, Don't Tell
 
+**CRITICAL: Review commits in THIS branch before writing PR description.**
+
+For stacked PRs (branches of branches), only describe commits in YOUR branch:
+```bash
+# First: identify your base branch
+gh pr view --json baseRefName   # Shows what branch this PR targets
+
+# Then: review only YOUR commits (not the whole stack)
+git log --oneline origin/<base-branch>..HEAD   # Commits in THIS branch only
+git log --oneline origin/main..HEAD            # Only if PR targets main directly
+```
+
+**Anti-pattern:** For a stacked PR, reviewing `main..HEAD` includes commits from parent branches. This causes incorrect claims like "X was never enabled on main" when X was enabled in THIS branch's commits.
+
 **Include test evidence.** Actual output, not "tested and works."
 
 Simple PR:
@@ -1192,6 +1206,40 @@ build_inputs = ["kernel/nested.conf", "kernel/patches/*.patch"]  # Files for SHA
 kernel_config = "kernel/nested.conf"   # Kernel .config
 patches_dir = "kernel/patches"         # Directory with patches
 ```
+
+**Creating/Editing Kernel Patches:**
+```bash
+make kernel-patch-create PROFILE=nested NAME=0004-my-fix FILE=fs/fuse/dir.c
+make kernel-patch-edit PROFILE=nested PATCH=0002
+make kernel-patch-validate PROFILE=nested
+```
+
+NEVER hand-write patches - the hunk counts will be wrong. Always use the helper script which generates proper `git format-patch` output.
+
+When a patch change doesn't fix the issue, the bug is incomplete root cause analysis - not "needs a workaround". Adding workarounds (env vars, flags) masks bugs. Find and fix ALL causes.
+
+### NEVER Assume - Always Investigate
+
+**Disabling tests is NEVER acceptable.** When a test fails:
+1. **Don't assume** the test is wrong or the limitation is fundamental
+2. **Don't assume** someone else's workaround (like #[ignore]) was correct
+3. **Investigate** the actual code path - read the library source
+4. **Find the root cause** - there's usually a missing initialization or config
+
+**Example anti-pattern (O_WRONLY + writeback cache):**
+```
+❌ WRONG: "O_WRONLY is fundamentally incompatible with writeback cache"
+   → Added #[ignore] to test
+   → Assumed the limitation was in FUSE kernel design
+
+✅ CORRECT: Read fuse-backend-rs source code
+   → Found get_writeback_open_flags() exists and promotes O_WRONLY → O_RDWR
+   → But init() wasn't being called to enable the writeback flag
+   → Fixed by calling inner.init(FsOptions::WRITEBACK_CACHE)
+   → Test passes, no workaround needed
+```
+
+**The fix is almost always in the code, not in disabling tests.**
 
 NEVER manually edit rootfs files. The setup script in `rootfs-config.toml` and `src/setup/rootfs.rs` control what gets installed.
 

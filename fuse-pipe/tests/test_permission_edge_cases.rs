@@ -1184,31 +1184,37 @@ fn test_fallocate_punch_hole() {
     let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o644) };
     assert!(fd >= 0, "open failed: {}", std::io::Error::last_os_error());
 
-    // Write 1MB of data
+    // Write 1MB of 0xAA bytes
     let data = vec![0xAAu8; 1024 * 1024];
     let written = unsafe { libc::write(fd, data.as_ptr() as *const libc::c_void, data.len()) };
     assert_eq!(written as usize, data.len(), "write failed");
 
-    // Get initial block count
-    let meta_before = fs::metadata(&file).expect("stat");
-    let blocks_before = meta_before.blocks();
+    // Flush writes to disk
+    let fsync_ret = unsafe { libc::fsync(fd) };
+    assert_eq!(
+        fsync_ret,
+        0,
+        "fsync failed: {}",
+        std::io::Error::last_os_error()
+    );
 
-    // Punch a 512KB hole in the middle
+    // Punch a 512KB hole in the middle (offset 256KB, length 512KB)
     const FALLOC_FL_PUNCH_HOLE: i32 = 0x02;
     const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
+    let hole_offset = 256 * 1024;
+    let hole_len = 512 * 1024;
     let ret = unsafe {
         libc::fallocate(
             fd,
             FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-            256 * 1024, // offset: 256KB
-            512 * 1024, // length: 512KB
+            hole_offset,
+            hole_len,
         )
     };
 
-    unsafe { libc::close(fd) };
-
     if ret != 0 {
         let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
         let _ = fs::remove_file(&file);
         drop(fuse);
         cleanup(&data_dir, &mount_dir);
@@ -1221,30 +1227,79 @@ fn test_fallocate_punch_hole() {
         panic!("fallocate PUNCH_HOLE failed: {}", err);
     }
 
-    // Verify blocks decreased (hole was punched)
-    let meta_after = fs::metadata(&file).expect("stat");
-    let blocks_after = meta_after.blocks();
-
-    eprintln!(
-        "PUNCH_HOLE: blocks before={}, after={} (saved {} blocks)",
-        blocks_before,
-        blocks_after,
-        blocks_before - blocks_after
-    );
-
-    // File size should remain 1MB
+    // Verify file size is unchanged
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
     assert_eq!(
-        meta_after.len(),
+        stat.st_size as u64,
         1024 * 1024,
-        "file size should be unchanged"
+        "file size should be unchanged after punch_hole"
     );
 
-    // Blocks should have decreased
+    // Verify the hole reads as zeros by reading the hole region
+    assert_eq!(
+        unsafe { libc::lseek(fd, hole_offset, libc::SEEK_SET) },
+        hole_offset
+    );
+    let mut hole_buf = vec![0xFFu8; hole_len as usize];
+    let read_bytes = unsafe {
+        libc::read(
+            fd,
+            hole_buf.as_mut_ptr() as *mut libc::c_void,
+            hole_buf.len(),
+        )
+    };
+    assert_eq!(read_bytes as usize, hole_buf.len(), "read hole region");
+
+    // Hole should be all zeros
+    let zeros = hole_buf.iter().filter(|&&b| b == 0).count();
+    assert_eq!(
+        zeros,
+        hole_buf.len(),
+        "hole region should be zeros, but {} of {} bytes are non-zero",
+        hole_buf.len() - zeros,
+        hole_buf.len()
+    );
+
+    // Verify data before hole is intact (first 256KB should be 0xAA)
+    assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_SET) }, 0);
+    let mut before_buf = vec![0u8; hole_offset as usize];
+    let read_bytes = unsafe {
+        libc::read(
+            fd,
+            before_buf.as_mut_ptr() as *mut libc::c_void,
+            before_buf.len(),
+        )
+    };
+    assert_eq!(read_bytes as usize, before_buf.len());
     assert!(
-        blocks_after < blocks_before,
-        "blocks should decrease after punching hole"
+        before_buf.iter().all(|&b| b == 0xAA),
+        "data before hole should be 0xAA"
     );
 
+    // Verify data after hole is intact (last 256KB should be 0xAA)
+    let after_offset = hole_offset + hole_len;
+    assert_eq!(
+        unsafe { libc::lseek(fd, after_offset, libc::SEEK_SET) },
+        after_offset
+    );
+    let mut after_buf = vec![0u8; (1024 * 1024 - after_offset) as usize];
+    let read_bytes = unsafe {
+        libc::read(
+            fd,
+            after_buf.as_mut_ptr() as *mut libc::c_void,
+            after_buf.len(),
+        )
+    };
+    assert_eq!(read_bytes as usize, after_buf.len());
+    assert!(
+        after_buf.iter().all(|&b| b == 0xAA),
+        "data after hole should be 0xAA"
+    );
+
+    eprintln!("PUNCH_HOLE: verified hole is zeros, surrounding data intact");
+
+    unsafe { libc::close(fd) };
     let _ = fs::remove_file(&file);
     drop(fuse);
     cleanup(&data_dir, &mount_dir);
