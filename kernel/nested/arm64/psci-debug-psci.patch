@@ -1,9 +1,17 @@
-From: fcvm <fcvm@local>
 Subject: [PATCH 2/3] Add PSCI debug logging to psci.c
 
+From: fcvm <fcvm@local>
+
+
+---
+ arch/arm64/kvm/psci.c |    3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/arch/arm64/kvm/psci.c b/arch/arm64/kvm/psci.c
+index 3b5dbe9a0a0e..e5defb91b956 100644
 --- a/arch/arm64/kvm/psci.c
 +++ b/arch/arm64/kvm/psci.c
-@@ -191,6 +191,8 @@
+@@ -191,6 +191,8 @@ static void kvm_prepare_system_event(struct kvm_vcpu *vcpu, u32 type, u64 flags)
  
  static void kvm_psci_system_off(struct kvm_vcpu *vcpu)
  {
@@ -12,7 +20,7 @@ Subject: [PATCH 2/3] Add PSCI debug logging to psci.c
  	kvm_prepare_system_event(vcpu, KVM_SYSTEM_EVENT_SHUTDOWN, 0);
  }
  
-@@ -286,6 +288,7 @@
+@@ -286,6 +288,7 @@ static int kvm_psci_0_2_call(struct kvm_vcpu *vcpu)
  		val = PSCI_0_2_TOS_MP;
  		break;
  	case PSCI_0_2_FN_SYSTEM_OFF:

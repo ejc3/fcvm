@@ -193,20 +193,65 @@ kernel/
 ├── host/
 │   └── arm64/
 │       ├── 0001-fuse-*.patch -> ../../           # symlink
-│       └── nv2-mmio-barrier.patch                # KVM MMIO DSB for L1 traps
+│       └── nv2-mmio-barrier.patch                # DSB before ioeventfd in io_mem_abort()
 ├── nested/
 │   └── arm64/
 │       ├── 0001-fuse-*.patch -> ../../           # symlink
-│       ├── nv2-vsock-dcache-flush.patch          # TX: DC CIVAC for SKB data
-│       ├── nv2-vsock-rx-barrier.patch            # RX: DSB before reading
-│       ├── nv2-vsock-cache-sync.patch            # DSB at nested exit
-│       ├── nv2-virtio-kick-barrier.patch         # DSB at virtqueue kick
-│       └── mmfr4-override.vm.patch               # ID register override
+│       ├── nv2-vsock-cache-sync.patch            # DSB at kvm_nested_sync_hwstate()
+│       ├── nv2-vsock-dcache-flush.patch          # Cache flush in vsock TX
+│       ├── nv2-vsock-rx-barrier.patch            # DSB before virtqueue read
+│       ├── nv2-virtio-kick-barrier.patch         # Flush vring before notify
+│       ├── mmfr4-override.vm.patch               # ID register override
+│       ├── psci-debug-handle-exit.patch          # PSCI debug logging
+│       └── psci-debug-psci.patch                 # PSCI debug logging
 ├── nested.conf
 └── nested-x86.conf
 ```
 
 **Principle**: Put patches at highest level where they apply, symlink down.
+
+### Kernel Patch Management (stgit)
+
+Patches are managed with **stgit** (Stacked Git) in `~/linux` for automatic line number updates.
+
+**Branches:**
+- `fcvm-host`: v6.18 + FUSE patch + host DSB barrier
+- `fcvm-nested`: v6.18 + all nested patches
+
+**Editing a patch:**
+```bash
+cd ~/linux
+git checkout fcvm-nested
+# Make changes to source files
+stg refresh                    # Updates current patch
+```
+
+**Adding a new patch:**
+```bash
+stg new my-fix -m "Fix something"
+# Make changes
+stg refresh
+```
+
+**Exporting to fcvm:**
+```bash
+stg export -d /home/ubuntu/fcvm/kernel/nested/arm64/
+# For host:
+git checkout fcvm-host
+stg export -d /home/ubuntu/fcvm/kernel/host/arm64/
+```
+
+**Rebasing when kernel version changes:**
+```bash
+git fetch origin tag v6.19
+stg rebase v6.19               # Auto-adjusts line numbers
+stg export -d /home/ubuntu/fcvm/kernel/nested/arm64/
+```
+
+**Sparse checkout:** The ~/linux repo uses sparse checkout. Add directories as needed:
+```bash
+git sparse-checkout add drivers/virtio net/vmw_vsock
+```
 
 ### Host Kernel with DSB Patches
 
@@ -214,14 +259,15 @@ kernel/
 Patches from `kernel/host/arm64/` are applied automatically.
 
 **Host patches** (L0 bare metal):
-- `nv2-mmio-barrier.patch`: DSB SY in KVM MMIO handler before eventfd signal
+- `nv2-mmio-barrier.patch`: DSB SY before ioeventfd signaling in io_mem_abort()
 
 **Nested patches** (L1 guest VM):
-- `nv2-vsock-dcache-flush.patch`: DC CIVAC flush in virtio_transport_send_skb()
-- `nv2-vsock-rx-barrier.patch`: DSB SY in virtio_transport_rx_work()
-- `nv2-vsock-cache-sync.patch`: DSB SY in kvm_nested_sync_hwstate()
-- `nv2-virtio-kick-barrier.patch`: DSB+ISB at virtqueue_notify()
+- `nv2-vsock-cache-sync.patch`: DSB SY in kvm_nested_sync_hwstate() after nested exit
+- `nv2-vsock-dcache-flush.patch`: Cache flush in vsock TX path for NV2
+- `nv2-vsock-rx-barrier.patch`: DSB SY before reading virtqueue in RX path
+- `nv2-virtio-kick-barrier.patch`: Flush vring cache + DSB+ISB before virtqueue_notify()
 - `mmfr4-override.vm.patch`: ID register override for recursive nesting
+- `psci-debug-*.patch`: Debug logging for PSCI shutdown (temporary)
 
 **VM Graceful Shutdown (PSCI)**:
 - fc-agent uses `poweroff -f` to trigger PSCI SYSTEM_OFF (function ID 0x84000008)

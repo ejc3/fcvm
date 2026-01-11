@@ -1,46 +1,40 @@
-From: fcvm <fcvm@localhost>
-Subject: [PATCH] virtio: Flush vring cache before kick for ARM64 NV2
+commit 9fd6e74a774660f1ef2dfdc32ebe7cc875c1ef86
+Author: ejc3 <ejc3@users.noreply.github.com>
+Date:   Sun Jan 11 00:21:18 2026 +0000
 
-Under ARM64 nested virtualization (FEAT_NV2), the hypervisor may read
-stale data from virtqueue ring structures unless explicit cache
-maintenance is performed. DSB orders operations but doesn't flush
-dirty cache lines to the point of coherency.
+    virtio: Flush vring cache before kick for ARM64 NV2
+    
+    Under ARM64 nested virtualization (FEAT_NV2), the hypervisor may read
+    stale data from virtqueue ring structures unless explicit cache
+    maintenance is performed.
+    
+    Signed-off-by: fcvm <fcvm@localhost>
 
-This patch adds DC CIVAC (clean and invalidate) on the entire vring
-region before sending the kick notification. This ensures the host
-sees updated descriptors and available ring entries.
-
-The flush covers:
-- Descriptor table (16 bytes × num_descriptors)
-- Available ring header + entries
-- Used ring header + entries (for bidirectional coherency)
-
-Signed-off-by: fcvm <fcvm@localhost>
----
 diff --git a/drivers/virtio/virtio_ring.c b/drivers/virtio/virtio_ring.c
+index 7b6205253b46..53b388ae9feb 100644
 --- a/drivers/virtio/virtio_ring.c
 +++ b/drivers/virtio/virtio_ring.c
-@@ -16,6 +16,11 @@
+@@ -15,6 +15,11 @@
  #include <linux/spinlock.h>
  #include <xen/xen.h>
-
+ 
 +#ifdef CONFIG_ARM64
 +#include <asm/barrier.h>
 +#include <asm/cacheflush.h>
 +#endif
 +
  #ifdef DEBUG
- /* For development, we want to crash whenever the ring is misused. */
+ /* For development, we want to crash whenever the ring is screwed. */
  #define BAD_RING(_vq, fmt, args...)				\
-@@ -2192,6 +2197,36 @@ bool virtqueue_notify(struct virtqueue *_vq)
+@@ -2489,6 +2494,36 @@ bool virtqueue_notify(struct virtqueue *_vq)
  	if (unlikely(vq->broken))
  		return false;
-
+ 
 +#ifdef CONFIG_ARM64
 +	/*
 +	 * NV2 cache coherency: Flush all vring structures to ensure
 +	 * hypervisor sees updated descriptors and available ring.
-+	 * DSB alone doesn't flush dirty cache lines under nested virt.
++	 * DSB alone does not flush dirty cache lines under nested virt.
 +	 */
 +	dsb(sy);
 +	if (!vq->packed_ring) {

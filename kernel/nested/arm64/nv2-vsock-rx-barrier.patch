@@ -1,5 +1,6 @@
-From: fcvm <fcvm@localhost>
 Subject: [PATCH] vsock/virtio: Add DSB barrier before reading virtqueue under NV2
+
+From: fcvm <fcvm@localhost>
 
 Under ARM64 nested virtualization (FEAT_NV2), there's a cache coherency
 race between L2 guest writes to the virtio ring and L1's reads. The
@@ -16,9 +17,11 @@ L2 tests when transferring >300MB through NFS mounts.
 
 Signed-off-by: fcvm <fcvm@localhost>
 ---
- net/vmw_vsock/virtio_transport.c | 10 ++++++++++
- 1 file changed, 10 insertions(+)
+ net/vmw_vsock/virtio_transport.c |   11 +++++++++++
+ 1 file changed, 11 insertions(+)
 
+diff --git a/net/vmw_vsock/virtio_transport.c b/net/vmw_vsock/virtio_transport.c
+index f8771cb22c2b..f8feec1fbda8 100644
 --- a/net/vmw_vsock/virtio_transport.c
 +++ b/net/vmw_vsock/virtio_transport.c
 @@ -17,6 +17,9 @@
@@ -31,10 +34,10 @@ Signed-off-by: fcvm <fcvm@localhost>
  #include <net/sock.h>
  #include <linux/mutex.h>
  #include <net/af_vsock.h>
-@@ -618,6 +621,14 @@
-
+@@ -648,6 +651,14 @@ static void virtio_transport_rx_work(struct work_struct *work)
+ 
  	mutex_lock(&vsock->rx_lock);
-
+ 
 +#ifdef CONFIG_ARM64
 +	/*
 +	 * Under nested virtualization (NV2), ensure L2's writes to the
@@ -45,3 +48,4 @@ Signed-off-by: fcvm <fcvm@localhost>
 +
  	if (!vsock->rx_run)
  		goto out;
+ 

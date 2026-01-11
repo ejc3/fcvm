@@ -1,6 +1,7 @@
 From eea0cef5cdd46b34d5074f1de9509cb1ad54461a Mon Sep 17 00:00:00 2001
+
 From: ejc3 <ejc3@users.noreply.github.com>
-Date: Sat, 3 Jan 2026 22:09:57 +0000
+
 Subject: [PATCH] arm64: Add MMFR4 override support for NV2 recursive nesting
 
 Add support for overriding ID_AA64MMFR4_EL1 via the arm64.nv2 boot parameter.
@@ -21,14 +22,14 @@ bypass TID3 trapping and see hardware values instead of emulated values.
 
 Signed-off-by: fcvm developers <fcvm@anthropic.com>
 ---
- arch/arm64/include/asm/cpufeature.h   |  1 +
- arch/arm64/kernel/cpufeature.c        |  9 ++++++---
- arch/arm64/kernel/image-vars.h        |  1 +
- arch/arm64/kernel/pi/idreg-override.c | 12 ++++++++++++
+ arch/arm64/include/asm/cpufeature.h   |    1 +
+ arch/arm64/kernel/cpufeature.c        |    9 ++++++---
+ arch/arm64/kernel/image-vars.h        |    1 +
+ arch/arm64/kernel/pi/idreg-override.c |   12 ++++++++++++
  4 files changed, 20 insertions(+), 3 deletions(-)
 
 diff --git a/arch/arm64/include/asm/cpufeature.h b/arch/arm64/include/asm/cpufeature.h
-index e223cbf35..26c368b40 100644
+index e223cbf350e4..26c368b404d4 100644
 --- a/arch/arm64/include/asm/cpufeature.h
 +++ b/arch/arm64/include/asm/cpufeature.h
 @@ -961,6 +961,7 @@ struct arm64_ftr_reg *get_arm64_ftr_reg(u32 sys_id);
@@ -40,7 +41,7 @@ index e223cbf35..26c368b40 100644
  extern struct arm64_ftr_override id_aa64pfr1_override;
  extern struct arm64_ftr_override id_aa64zfr0_override;
 diff --git a/arch/arm64/kernel/cpufeature.c b/arch/arm64/kernel/cpufeature.c
-index e25b0f84a..9a50ab1e9 100644
+index e25b0f84a22d..9a50ab1e9072 100644
 --- a/arch/arm64/kernel/cpufeature.c
 +++ b/arch/arm64/kernel/cpufeature.c
 @@ -511,9 +511,11 @@ static const struct arm64_ftr_bits ftr_id_aa64mmfr3[] = {
@@ -75,7 +76,7 @@ index e25b0f84a..9a50ab1e9 100644
  	/* Op1 = 0, CRn = 10, CRm = 4 */
  	ARM64_FTR_REG(SYS_MPAMIDR_EL1, ftr_mpamidr),
 diff --git a/arch/arm64/kernel/image-vars.h b/arch/arm64/kernel/image-vars.h
-index 536976360..e91a46556 100644
+index 5369763606e7..e91a46556e45 100644
 --- a/arch/arm64/kernel/image-vars.h
 +++ b/arch/arm64/kernel/image-vars.h
 @@ -51,6 +51,7 @@ PI_EXPORT_SYM(id_aa64isar2_override);
@@ -87,7 +88,7 @@ index 536976360..e91a46556 100644
  PI_EXPORT_SYM(id_aa64pfr1_override);
  PI_EXPORT_SYM(id_aa64smfr0_override);
 diff --git a/arch/arm64/kernel/pi/idreg-override.c b/arch/arm64/kernel/pi/idreg-override.c
-index bc57b290e..ef404ca57 100644
+index bc57b290e5e7..ef404ca57cb7 100644
 --- a/arch/arm64/kernel/pi/idreg-override.c
 +++ b/arch/arm64/kernel/pi/idreg-override.c
 @@ -106,6 +106,16 @@ static const struct ftr_set_desc mmfr2 __prel64_initconst = {
@@ -123,6 +124,3 @@ index bc57b290e..ef404ca57 100644
  };
  
  static int __init parse_hexdigit(const char *p, u64 *v)
--- 
-2.43.0
-
