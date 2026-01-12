@@ -109,6 +109,12 @@ fn build_firecracker_config(
     extra_disks.extend(args.disk_dir.iter().cloned());
     extra_disks.extend(args.nfs.iter().cloned());
 
+    // Collect env vars for cache key (affects container behavior)
+    let env_vars: Vec<String> = args.env.iter().cloned().collect();
+
+    // Collect volume mounts for cache key (affects MMDS plan)
+    let volume_mounts: Vec<String> = args.map.iter().cloned().collect();
+
     FirecrackerConfig::new(
         kernel_path.to_path_buf(),
         initrd_path.to_path_buf(),
@@ -119,6 +125,9 @@ fn build_firecracker_config(
         args.mem,
         network_mode,
         extra_disks,
+        env_vars,
+        volume_mounts,
+        args.privileged,
     )
 }
 
@@ -2154,6 +2163,9 @@ async fn run_vm_setup(
             extra_disks.extend(args.disk.iter().cloned());
             extra_disks.extend(args.disk_dir.iter().cloned());
             extra_disks.extend(args.nfs.iter().cloned());
+            // Collect env vars and volume mounts for cache key
+            let env_vars: Vec<String> = args.env.iter().cloned().collect();
+            let volume_mounts: Vec<String> = args.map.iter().cloned().collect();
 
             crate::firecracker::FirecrackerConfig::new(
                 kernel_path.to_path_buf(),
@@ -2165,6 +2177,9 @@ async fn run_vm_setup(
                 args.mem,
                 network_mode,
                 extra_disks,
+                env_vars,
+                volume_mounts,
+                args.privileged,
             )
         });
 

@@ -34,6 +34,18 @@ pub struct FirecrackerConfig {
     /// Format: "host_spec:guest_mount[:ro]" - host_spec included because content matters.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_disks: Vec<String>,
+    /// Environment variables passed to the container.
+    /// Format: "KEY=value" - affects container behavior so must be in cache key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_vars: Vec<String>,
+    /// Volume mount specifications.
+    /// Format: "host_path:guest_path[:ro]" - affects MMDS plan so must be in cache key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volume_mounts: Vec<String>,
+    /// Whether container runs in privileged mode.
+    /// Affects container capabilities and MMDS plan.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub privileged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +106,9 @@ impl FirecrackerConfig {
         mem: u32,
         network_mode: NetworkMode,
         extra_disks: Vec<String>,
+        env_vars: Vec<String>,
+        volume_mounts: Vec<String>,
+        privileged: bool,
     ) -> Self {
         Self {
             boot_source: BootSource {
@@ -115,6 +130,9 @@ impl FirecrackerConfig {
             container_cmd,
             network_mode,
             extra_disks,
+            env_vars,
+            volume_mounts,
+            privileged,
         }
     }
 
@@ -218,6 +236,9 @@ mod tests {
             2048,
             NetworkMode::Bridged,
             vec![],
+            vec![],
+            vec![],
+            false,
         );
 
         let config2 = FirecrackerConfig::new(
@@ -230,6 +251,9 @@ mod tests {
             2048,
             NetworkMode::Bridged,
             vec![],
+            vec![],
+            vec![],
+            false,
         );
 
         assert_eq!(config1.cache_key(), config2.cache_key());
@@ -247,6 +271,9 @@ mod tests {
             2048,
             NetworkMode::Bridged,
             vec![],
+            vec![],
+            vec![],
+            false,
         );
 
         // Different network mode
@@ -260,6 +287,9 @@ mod tests {
             2048,
             NetworkMode::Rootless,
             vec![],
+            vec![],
+            vec![],
+            false,
         );
 
         assert_ne!(config1.cache_key(), config2.cache_key());
@@ -278,6 +308,9 @@ mod tests {
             2048,
             NetworkMode::Bridged,
             vec![],
+            vec![],
+            vec![],
+            false,
         );
 
         // Same image, with command
@@ -291,6 +324,9 @@ mod tests {
             2048,
             NetworkMode::Bridged,
             vec![],
+            vec![],
+            vec![],
+            false,
         );
 
         // Different commands must produce different cache keys
@@ -310,6 +346,9 @@ mod tests {
             2048,
             NetworkMode::Bridged,
             vec![],
+            vec![],
+            vec![],
+            false,
         );
 
         // With disk-dir
@@ -323,9 +362,126 @@ mod tests {
             2048,
             NetworkMode::Bridged,
             vec!["/tmp/data:/mydata:ro".to_string()],
+            vec![],
+            vec![],
+            false,
         );
 
         // Different disk configs must produce different cache keys
+        assert_ne!(config1.cache_key(), config2.cache_key());
+    }
+
+    #[test]
+    fn test_cache_key_changes_with_env_vars() {
+        // No env vars
+        let config1 = FirecrackerConfig::new(
+            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
+            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
+            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
+            "nginx:alpine".to_string(),
+            None,
+            2,
+            2048,
+            NetworkMode::Bridged,
+            vec![],
+            vec![],
+            vec![],
+            false,
+        );
+
+        // With env var
+        let config2 = FirecrackerConfig::new(
+            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
+            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
+            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
+            "nginx:alpine".to_string(),
+            None,
+            2,
+            2048,
+            NetworkMode::Bridged,
+            vec![],
+            vec!["MY_VAR=test_value".to_string()],
+            vec![],
+            false,
+        );
+
+        // Different env vars must produce different cache keys
+        assert_ne!(config1.cache_key(), config2.cache_key());
+    }
+
+    #[test]
+    fn test_cache_key_changes_with_volumes() {
+        // No volumes
+        let config1 = FirecrackerConfig::new(
+            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
+            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
+            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
+            "nginx:alpine".to_string(),
+            None,
+            2,
+            2048,
+            NetworkMode::Bridged,
+            vec![],
+            vec![],
+            vec![],
+            false,
+        );
+
+        // With volume
+        let config2 = FirecrackerConfig::new(
+            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
+            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
+            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
+            "nginx:alpine".to_string(),
+            None,
+            2,
+            2048,
+            NetworkMode::Bridged,
+            vec![],
+            vec![],
+            vec!["/tmp/data:/data:ro".to_string()],
+            false,
+        );
+
+        // Different volume configs must produce different cache keys
+        assert_ne!(config1.cache_key(), config2.cache_key());
+    }
+
+    #[test]
+    fn test_cache_key_changes_with_privileged() {
+        // Not privileged
+        let config1 = FirecrackerConfig::new(
+            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
+            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
+            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
+            "nginx:alpine".to_string(),
+            None,
+            2,
+            2048,
+            NetworkMode::Bridged,
+            vec![],
+            vec![],
+            vec![],
+            false,
+        );
+
+        // Privileged
+        let config2 = FirecrackerConfig::new(
+            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
+            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
+            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
+            "nginx:alpine".to_string(),
+            None,
+            2,
+            2048,
+            NetworkMode::Bridged,
+            vec![],
+            vec![],
+            vec![],
+            true,
+        );
+
+        // Different privileged flags must produce different cache keys
         assert_ne!(config1.cache_key(), config2.cache_key());
     }
 }
