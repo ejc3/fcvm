@@ -598,6 +598,11 @@ pub async fn restore_from_snapshot(
     // Store fcvm process PID (not Firecracker PID)
     vm_state.pid = Some(std::process::id());
 
+    // Track original vsock vm_id for future snapshots
+    // When this VM is later snapshotted, clones need to use this original_vm_id
+    // for vsock redirect because vmstate.bin stores paths from this vm
+    vm_state.config.original_vsock_vm_id = Some(restore_config.original_vm_id.clone());
+
     // Save VM state with complete network configuration
     save_vm_state_with_network(state_manager, vm_state, network_config).await?;
 
