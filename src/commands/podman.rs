@@ -1,6 +1,5 @@
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, oneshot};
@@ -86,49 +85,31 @@ impl VolumeMapping {
     }
 }
 
-/// Compute a cache key for podman container snapshots.
-///
-/// For localhost/ images: uses SHA from podman (content-addressable)
-/// For remote images: uses image URL/name (tag-based)
-///
-/// The key also includes container configuration that affects behavior.
-fn compute_podman_cache_key(args: &RunArgs, image_identifier: &str) -> String {
-    let mut hasher = Sha256::new();
+/// Build FirecrackerConfig from run args.
+/// The config is the single source of truth for both cache key and VM launch.
+fn build_firecracker_config(
+    args: &RunArgs,
+    image_identifier: &str,
+    kernel_path: &Path,
+    rootfs_path: &Path,
+    initrd_path: &Path,
+) -> crate::firecracker::FirecrackerConfig {
+    use crate::firecracker::{FirecrackerConfig, FcNetworkMode};
 
-    // Image identifier (SHA for localhost/, URL for remote)
-    hasher.update(image_identifier.as_bytes());
+    let network_mode = match args.network {
+        crate::cli::args::NetworkMode::Bridged => FcNetworkMode::Bridged,
+        crate::cli::args::NetworkMode::Rootless => FcNetworkMode::Rootless,
+    };
 
-    // VM configuration
-    hasher.update(args.cpu.to_string().as_bytes());
-    hasher.update(args.mem.to_string().as_bytes());
-
-    // Container flags
-    hasher.update(if args.privileged { b"1" } else { b"0" });
-    hasher.update(if args.interactive { b"1" } else { b"0" });
-    hasher.update(if args.tty { b"1" } else { b"0" });
-
-    // Environment variables (sorted for determinism)
-    let mut env_sorted: Vec<_> = args.env.iter().collect();
-    env_sorted.sort();
-    for env in env_sorted {
-        hasher.update(env.as_bytes());
-    }
-
-    // Container command
-    if let Some(cmd) = &args.cmd {
-        hasher.update(cmd.as_bytes());
-    }
-    hasher.update(args.command_args.join(" ").as_bytes());
-
-    // Volume mappings (sorted for determinism)
-    let mut vols: Vec<_> = args.map.iter().collect();
-    vols.sort();
-    for v in vols {
-        hasher.update(v.as_bytes());
-    }
-
-    let result = hasher.finalize();
-    hex::encode(&result[..6]) // 12 hex chars
+    FirecrackerConfig::new(
+        kernel_path.to_path_buf(),
+        initrd_path.to_path_buf(),
+        rootfs_path.to_path_buf(),
+        image_identifier.to_string(),
+        args.cpu,
+        args.mem,
+        network_mode,
+    )
 }
 
 /// Get the image identifier for cache key computation.
@@ -1150,11 +1131,12 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .context("setting up fc-agent initrd")?;
 
     // Check for podman cache (unless --no-cache is set)
-    // Keep cache_key available for later cache creation on miss
-    let cache_key: Option<String> = if !args.no_cache {
+    // Keep fc_config and cache_key available for later cache creation on miss
+    let (fc_config, cache_key): (Option<crate::firecracker::FirecrackerConfig>, Option<String>) = if !args.no_cache {
         // Get image identifier for cache key computation
         let image_identifier = get_image_identifier(&args.image).await?;
-        let key = compute_podman_cache_key(&args, &image_identifier);
+        let config = build_firecracker_config(&args, &image_identifier, &kernel_path, &base_rootfs, &initrd_path);
+        let key = config.cache_key();
 
         // Check if cache exists
         if let Some(cache_dir) = check_podman_cache(&key) {
@@ -1171,10 +1153,10 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
             image = %args.image,
             "Cache miss, will create cache after image load"
         );
-        Some(key)
+        (Some(config), Some(key))
     } else {
         info!("Cache disabled via --no-cache flag");
-        None
+        (None, None)
     };
 
     // Generate VM ID
@@ -1503,6 +1485,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         &volume_mappings,
         &vsock_socket_path,
         image_archive_name.as_deref(),
+        fc_config,
     )
     .await;
 
@@ -1672,6 +1655,7 @@ async fn run_vm_setup(
     volume_mappings: &[VolumeMapping],
     vsock_socket_path: &std::path::Path,
     image_archive_name: Option<&str>,
+    fc_config: Option<crate::firecracker::FirecrackerConfig>,
 ) -> Result<(VmManager, Option<tokio::process::Child>)> {
     // Setup storage - just need CoW copy (fc-agent is injected via initrd at boot)
     let vm_dir = data_dir.join("disks");
@@ -2135,114 +2119,89 @@ async fn run_vm_setup(
     // Configure VM via API
     info!("configuring VM via Firecracker API");
 
-    // Boot source with network configuration via kernel cmdline
-    // The rootfs is a raw disk with partitions, root=/dev/vda1 specifies partition 1
+    // Build FirecrackerConfig for launch (single source of truth for VM config)
+    // Use fc_config from cache check if available, otherwise build fresh
+    let launch_config = fc_config.unwrap_or_else(|| {
+        use crate::firecracker::FcNetworkMode;
+        let network_mode = match args.network {
+            crate::cli::args::NetworkMode::Bridged => FcNetworkMode::Bridged,
+            crate::cli::args::NetworkMode::Rootless => FcNetworkMode::Rootless,
+        };
+        crate::firecracker::FirecrackerConfig::new(
+            kernel_path.to_path_buf(),
+            initrd_path.to_path_buf(),
+            rootfs_path.to_path_buf(),
+            args.image.clone(),
+            args.cpu,
+            args.mem,
+            network_mode,
+        )
+    });
+
+    // Build runtime boot args (per-instance values NOT in cache key)
+    // These are added to the static boot_args from FirecrackerConfig
+    let mut runtime_boot_args = String::new();
+
+    // Network configuration via kernel cmdline
     // Format: ip=<client-ip>:<server-ip>:<gw-ip>:<netmask>:<hostname>:<device>:<autoconf>:<dns0>
-    // Example: ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off:172.16.0.1
-    let mut boot_args = if let (Some(guest_ip), Some(host_ip)) =
-        (&network_config.guest_ip, &network_config.host_ip)
-    {
-        // Extract just the IP without CIDR notation if present
+    if let (Some(guest_ip), Some(host_ip)) = (&network_config.guest_ip, &network_config.host_ip) {
         let guest_ip_clean = guest_ip.split('/').next().unwrap_or(guest_ip);
         let host_ip_clean = host_ip.split('/').next().unwrap_or(host_ip);
-
-        // Always pass DNS in boot args - gateway IP where dnsmasq listens
-        // This avoids relying on NAT to reach external DNS (8.8.8.8)
         let dns_suffix = network_config
             .dns_server
             .as_ref()
             .map(|dns| format!(":{}", dns))
             .unwrap_or_default();
-
-        // Format: ip=<client>:<server>:<gw>:<netmask>:<hostname>:<device>:<autoconf>[:<dns0>]
-        // root=/dev/vda - the disk IS the ext4 filesystem (no partition table)
-        //
-        // reboot= method is architecture-specific:
-        // - ARM64: reboot=k works (keyboard controller / PSCI)
-        // - x86: reboot=t required (triple-fault) because Firecracker doesn't emulate ACPI
-        let reboot_method = if cfg!(target_arch = "x86_64") {
-            "t" // Triple-fault - only reliable method on x86 Firecracker
-        } else {
-            "k" // Keyboard controller - works on ARM64 via PSCI
-        };
-        format!(
-            "console=ttyS0 reboot={} panic=1 pci=off random.trust_cpu=1 systemd.log_color=no root=/dev/vda rw ip={}::{}:255.255.255.252::eth0:off{}",
-            reboot_method, guest_ip_clean, host_ip_clean, dns_suffix
-        )
-    } else {
-        // No network config - used for basic boot (e.g., during setup)
-        let reboot_method = if cfg!(target_arch = "x86_64") {
-            "t"
-        } else {
-            "k"
-        };
-        format!("console=ttyS0 reboot={} panic=1 pci=off random.trust_cpu=1 systemd.log_color=no root=/dev/vda rw", reboot_method)
-    };
+        runtime_boot_args.push_str(&format!(
+            "ip={}::{}:255.255.255.252::eth0:off{}",
+            guest_ip_clean, host_ip_clean, dns_suffix
+        ));
+    }
 
     // Enable fc-agent strace debugging if requested
     if args.strace_agent {
-        boot_args.push_str(" fc_agent_strace=1");
+        if !runtime_boot_args.is_empty() {
+            runtime_boot_args.push(' ');
+        }
+        runtime_boot_args.push_str("fc_agent_strace=1");
         info!("fc-agent strace debugging enabled - output will be in /tmp/fc-agent.strace");
     }
 
     // Additional boot args from environment (caller controls)
     if let Ok(extra) = std::env::var("FCVM_BOOT_ARGS") {
-        boot_args.push(' ');
-        boot_args.push_str(&extra);
+        if !runtime_boot_args.is_empty() {
+            runtime_boot_args.push(' ');
+        }
+        runtime_boot_args.push_str(&extra);
     }
 
     // Pass FUSE reader count to fc-agent via kernel command line.
-    // Used to reduce memory at deeper nesting levels (256 readers × 8MB = 2GB per mount).
     if let Ok(readers) = std::env::var("FCVM_FUSE_READERS") {
-        boot_args.push_str(&format!(" fuse_readers={}", readers));
+        if !runtime_boot_args.is_empty() {
+            runtime_boot_args.push(' ');
+        }
+        runtime_boot_args.push_str(&format!("fuse_readers={}", readers));
     }
 
     // Pass FUSE trace rate to fc-agent via kernel command line.
-    // Used for debugging FUSE latency. Rate N means trace every Nth request.
     if let Ok(rate) = std::env::var("FCVM_FUSE_TRACE_RATE") {
-        boot_args.push_str(&format!(" fuse_trace_rate={}", rate));
+        if !runtime_boot_args.is_empty() {
+            runtime_boot_args.push(' ');
+        }
+        runtime_boot_args.push_str(&format!("fuse_trace_rate={}", rate));
     }
 
     // Pass FUSE max_write to fc-agent via kernel command line.
-    // Used to limit write sizes in nested VMs to avoid vsock data corruption.
-    // Set FCVM_FUSE_MAX_WRITE=32768 for stable L2 operation on x86.
     if let Ok(max_write) = std::env::var("FCVM_FUSE_MAX_WRITE") {
-        boot_args.push_str(&format!(" fuse_max_write={}", max_write));
+        if !runtime_boot_args.is_empty() {
+            runtime_boot_args.push(' ');
+        }
+        runtime_boot_args.push_str(&format!("fuse_max_write={}", max_write));
     }
 
-    client
-        .set_boot_source(crate::firecracker::api::BootSource {
-            kernel_image_path: kernel_path.display().to_string(),
-            initrd_path: Some(initrd_path.display().to_string()),
-            boot_args: Some(boot_args),
-        })
-        .await?;
-
-    // Machine config
-    client
-        .set_machine_config(crate::firecracker::api::MachineConfig {
-            vcpu_count: args.cpu,
-            mem_size_mib: args.mem,
-            smt: Some(false),
-            cpu_template: None,
-            track_dirty_pages: Some(true), // Enable snapshot support
-        })
-        .await?;
-
-    // Root drive
-    client
-        .add_drive(
-            "rootfs",
-            crate::firecracker::api::Drive {
-                drive_id: "rootfs".to_string(),
-                path_on_host: rootfs_path.display().to_string(),
-                is_root_device: true,
-                is_read_only: false,
-                partuuid: None,
-                rate_limiter: None,
-            },
-        )
-        .await?;
+    // Apply FirecrackerConfig to client (boot_source, machine_config, rootfs drive)
+    // This ensures the same config used for cache key is used for launch
+    launch_config.apply(&client, &runtime_boot_args).await?;
 
     // Extra disks (appear as /dev/vdb, /dev/vdc, etc.)
     // Parse format: HOST_PATH:GUEST_MOUNT[:ro]
