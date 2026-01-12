@@ -128,6 +128,8 @@ fn build_firecracker_config(
         env_vars,
         volume_mounts,
         args.privileged,
+        args.tty,
+        args.interactive,
     )
 }
 
@@ -508,6 +510,8 @@ async fn restore_from_podman_cache(
     };
 
     // Build restore configuration
+    // For direct cache restore, snapshot_vm_id is None because vmstate.bin has
+    // the original_vm_id for both vsock and disk paths (no intervening snapshot/patch)
     let restore_config = super::common::SnapshotRestoreConfig {
         vmstate_path: cache_dir.join("vmstate.bin"),
         memory_backend: super::common::MemoryBackend::File {
@@ -515,6 +519,7 @@ async fn restore_from_podman_cache(
         },
         source_disk_path: cache_dir.join("disk.raw"),
         original_vm_id: cache_config.original_vm_id.clone(),
+        snapshot_vm_id: None,
     };
 
     // Run cache restore using shared snapshot restore function
@@ -1168,9 +1173,11 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         None
     };
 
-    // Check for podman cache (unless --no-cache is set)
+    // Check for podman cache (unless --no-cache is set or localhost image)
+    // Localhost images have tarball paths in MMDS that won't exist on restore
     // Keep fc_config and cache_key available for later cache creation on miss
-    let (fc_config, cache_key): (Option<crate::firecracker::FirecrackerConfig>, Option<String>) = if !args.no_cache {
+    let is_localhost_image = args.image.starts_with("localhost/");
+    let (fc_config, cache_key): (Option<crate::firecracker::FirecrackerConfig>, Option<String>) = if !args.no_cache && !is_localhost_image {
         // Get image identifier for cache key computation
         let image_identifier = get_image_identifier(&args.image).await?;
         let config = build_firecracker_config(&args, &image_identifier, &kernel_path, &base_rootfs, &initrd_path, cmd_args.clone());
@@ -1192,6 +1199,9 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
             "Cache miss, will create cache after image load"
         );
         (Some(config), Some(key))
+    } else if is_localhost_image {
+        info!("Cache disabled for localhost image (tarball path won't exist on restore)");
+        (None, None)
     } else {
         info!("Cache disabled via --no-cache flag");
         (None, None)
@@ -1434,7 +1444,9 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // Skip cache creation when:
     // - --no-cache flag is set
     // - Volumes are specified (FUSE-over-vsock breaks during snapshot pause)
-    let skip_cache_creation = args.no_cache || !args.map.is_empty();
+    // - Localhost images (tarball path in MMDS won't exist on restore)
+    // Note: is_localhost_image is already defined above
+    let skip_cache_creation = args.no_cache || !args.map.is_empty() || is_localhost_image;
     if !args.map.is_empty() && !args.no_cache {
         info!(
             "Skipping cache creation: volumes specified (FUSE doesn't survive snapshot pause)"
@@ -2189,6 +2201,8 @@ async fn run_vm_setup(
                 env_vars,
                 volume_mounts,
                 args.privileged,
+                args.tty,
+                args.interactive,
             )
         });
 

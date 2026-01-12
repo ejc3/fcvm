@@ -712,12 +712,25 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     );
 
     // Build restore configuration
-    // Use original_vsock_vm_id if available (for snapshots of VMs restored from cache),
-    // otherwise fall back to vm_id (for snapshots of fresh VMs)
+    // For snapshots of cache-restored VMs:
+    // - original_vsock_vm_id (vm-AAA) = vsock paths in vmstate.bin (unchanged from cache)
+    // - vm_id (vm-BBB) = disk paths in vmstate.bin (patched during cache restore)
+    // For snapshots of fresh VMs:
+    // - vm_id is used for both (no separate original_vsock_vm_id)
     let original_vm_id = snapshot_config
         .original_vsock_vm_id
         .clone()
         .unwrap_or_else(|| snapshot_config.vm_id.clone());
+
+    // snapshot_vm_id is the VM ID where disk paths point (snapshot_config.vm_id)
+    // Only set if different from original_vm_id (for cache-restored VMs)
+    let snapshot_vm_id = if snapshot_config.original_vsock_vm_id.is_some() {
+        // Snapshot of cache-restored VM: disk paths point to snapshot's vm_id
+        Some(snapshot_config.vm_id.clone())
+    } else {
+        // Snapshot of fresh VM: disk and vsock both use same vm_id
+        None
+    };
 
     let restore_config = SnapshotRestoreConfig {
         vmstate_path: snapshot_config.vmstate_path.clone(),
@@ -726,6 +739,7 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         },
         source_disk_path: snapshot_config.disk_path.clone(),
         original_vm_id,
+        snapshot_vm_id,
     };
 
     // Run clone setup using shared restore function

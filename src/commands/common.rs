@@ -216,8 +216,12 @@ pub struct SnapshotRestoreConfig {
     pub memory_backend: MemoryBackend,
     /// Source disk for CoW copy
     pub source_disk_path: PathBuf,
-    /// Original VM ID (for vsock socket path redirect)
+    /// Original VM ID for vsock socket path redirect (from original cache creation)
     pub original_vm_id: String,
+    /// Snapshot VM ID for disk path redirect (the VM that was snapshotted)
+    /// This is needed because disk paths are patched during cache restore,
+    /// so vmstate.bin has a different VM ID for disk than for vsock.
+    pub snapshot_vm_id: Option<String>,
 }
 
 /// Restore a VM from a snapshot
@@ -466,14 +470,22 @@ pub async fn restore_from_snapshot(
         anyhow::bail!("Unknown network type - must be either BridgedNetwork or SlirpNetwork");
     }
 
-    // Configure mount namespace isolation for vsock redirect
-    let baseline_dir = paths::vm_runtime_dir(&restore_config.original_vm_id);
+    // Configure mount namespace isolation for path redirects
+    // We need to redirect BOTH:
+    // 1. original_vm_id - for vsock paths in vmstate.bin (original cache VM)
+    // 2. snapshot_vm_id - for disk paths in vmstate.bin (snapshotted VM, if different)
+    let mut baseline_dirs = vec![paths::vm_runtime_dir(&restore_config.original_vm_id)];
+    if let Some(ref snapshot_vm_id) = restore_config.snapshot_vm_id {
+        if snapshot_vm_id != &restore_config.original_vm_id {
+            baseline_dirs.push(paths::vm_runtime_dir(snapshot_vm_id));
+        }
+    }
     info!(
-        baseline_dir = %baseline_dir.display(),
+        baseline_dirs = ?baseline_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
         clone_dir = %data_dir.display(),
-        "enabling mount namespace for vsock socket isolation"
+        "enabling mount namespace for path isolation"
     );
-    vm_manager.set_vsock_redirect(baseline_dir, data_dir.to_path_buf());
+    vm_manager.set_mount_redirects(baseline_dirs, data_dir.to_path_buf());
 
     let firecracker_bin = find_firecracker()?;
 
