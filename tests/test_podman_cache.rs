@@ -7,10 +7,10 @@
 //!
 //! Cache keys are computed from FirecrackerConfig JSON which includes:
 //! - kernel_path, initrd_path, rootfs_path (content-addressed with SHA)
-//! - container_image, cpu, mem, network_mode
+//! - container_image, container_cmd, cpu, mem, network_mode
 //!
-//! Cache keys do NOT include runtime-only values: env vars, cmd, ports, volumes.
-//! This means VMs with same image+cpu+mem+network_mode share the same cache.
+//! Cache keys do NOT include runtime-only values: env vars, ports, volumes.
+//! This means VMs with same image+cmd+cpu+mem+network_mode share the same cache.
 //!
 //! ## Test Isolation
 //!
@@ -95,9 +95,12 @@ async fn test_podman_cache_miss_creates_cache() -> Result<()> {
     let before = list_cache_entries();
     println!("Cache entries before: {}", before.len());
 
-    // Run container
+    // Run container with a UNIQUE command that won't be in any existing cache.
+    // Since container_cmd is now part of the cache key, using a timestamp ensures
+    // this test always creates a new cache entry (cache miss).
     let (vm_name, _, _, _) = common::unique_names("cache-miss");
-    println!("Starting VM: {}", vm_name);
+    let unique_msg = format!("cache-miss-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    println!("Starting VM: {} with unique message: {}", vm_name, unique_msg);
 
     let (mut child, pid) = common::spawn_fcvm(&[
         "podman",
@@ -108,7 +111,7 @@ async fn test_podman_cache_miss_creates_cache() -> Result<()> {
         "rootless",
         "alpine:latest",
         "echo",
-        "hello",
+        &unique_msg,
     ])
     .await
     .context("spawning fcvm")?;
