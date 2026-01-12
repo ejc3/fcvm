@@ -46,6 +46,14 @@ pub struct FirecrackerConfig {
     /// Affects container capabilities and MMDS plan.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub privileged: bool,
+    /// Whether to allocate a TTY for the container.
+    /// Affects MMDS plan and container PTY allocation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tty: bool,
+    /// Whether stdin is forwarded to the container.
+    /// Affects MMDS plan and container stdin handling.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interactive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +117,8 @@ impl FirecrackerConfig {
         env_vars: Vec<String>,
         volume_mounts: Vec<String>,
         privileged: bool,
+        tty: bool,
+        interactive: bool,
     ) -> Self {
         Self {
             boot_source: BootSource {
@@ -133,6 +143,8 @@ impl FirecrackerConfig {
             env_vars,
             volume_mounts,
             privileged,
+            tty,
+            interactive,
         }
     }
 
@@ -239,6 +251,8 @@ mod tests {
             vec![],
             vec![],
             false,
+            false,
+            false,
         );
 
         let config2 = FirecrackerConfig::new(
@@ -253,6 +267,8 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            false,
+            false,
             false,
         );
 
@@ -274,6 +290,8 @@ mod tests {
             vec![],
             vec![],
             false,
+            false,
+            false,
         );
 
         // Different network mode
@@ -289,6 +307,8 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            false,
+            false,
             false,
         );
 
@@ -311,6 +331,8 @@ mod tests {
             vec![],
             vec![],
             false,
+            false,
+            false,
         );
 
         // Same image, with command
@@ -326,6 +348,8 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            false,
+            false,
             false,
         );
 
@@ -349,6 +373,8 @@ mod tests {
             vec![],
             vec![],
             false,
+            false,
+            false,
         );
 
         // With disk-dir
@@ -364,6 +390,8 @@ mod tests {
             vec!["/tmp/data:/mydata:ro".to_string()],
             vec![],
             vec![],
+            false,
+            false,
             false,
         );
 
@@ -387,6 +415,8 @@ mod tests {
             vec![],
             vec![],
             false,
+            false,
+            false,
         );
 
         // With env var
@@ -402,6 +432,8 @@ mod tests {
             vec![],
             vec!["MY_VAR=test_value".to_string()],
             vec![],
+            false,
+            false,
             false,
         );
 
@@ -425,6 +457,8 @@ mod tests {
             vec![],
             vec![],
             false,
+            false,
+            false,
         );
 
         // With volume
@@ -440,6 +474,8 @@ mod tests {
             vec![],
             vec![],
             vec!["/tmp/data:/data:ro".to_string()],
+            false,
+            false,
             false,
         );
 
@@ -463,6 +499,8 @@ mod tests {
             vec![],
             vec![],
             false,
+            false,
+            false,
         );
 
         // Privileged
@@ -479,9 +517,95 @@ mod tests {
             vec![],
             vec![],
             true,
+            false,
+            false,
         );
 
         // Different privileged flags must produce different cache keys
+        assert_ne!(config1.cache_key(), config2.cache_key());
+    }
+
+    #[test]
+    fn test_cache_key_changes_with_tty() {
+        // No TTY
+        let config1 = FirecrackerConfig::new(
+            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
+            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
+            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
+            "nginx:alpine".to_string(),
+            None,
+            2,
+            2048,
+            NetworkMode::Bridged,
+            vec![],
+            vec![],
+            vec![],
+            false,
+            false,
+            false,
+        );
+
+        // With TTY
+        let config2 = FirecrackerConfig::new(
+            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
+            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
+            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
+            "nginx:alpine".to_string(),
+            None,
+            2,
+            2048,
+            NetworkMode::Bridged,
+            vec![],
+            vec![],
+            vec![],
+            false,
+            true,
+            false,
+        );
+
+        // Different TTY flags must produce different cache keys
+        assert_ne!(config1.cache_key(), config2.cache_key());
+    }
+
+    #[test]
+    fn test_cache_key_changes_with_interactive() {
+        // Not interactive
+        let config1 = FirecrackerConfig::new(
+            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
+            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
+            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
+            "nginx:alpine".to_string(),
+            None,
+            2,
+            2048,
+            NetworkMode::Bridged,
+            vec![],
+            vec![],
+            vec![],
+            false,
+            false,
+            false,
+        );
+
+        // Interactive
+        let config2 = FirecrackerConfig::new(
+            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
+            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
+            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
+            "nginx:alpine".to_string(),
+            None,
+            2,
+            2048,
+            NetworkMode::Bridged,
+            vec![],
+            vec![],
+            vec![],
+            false,
+            false,
+            true,
+        );
+
+        // Different interactive flags must produce different cache keys
         assert_ne!(config1.cache_key(), config2.cache_key());
     }
 }
