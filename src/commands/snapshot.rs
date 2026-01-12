@@ -190,9 +190,20 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             );
         }
 
+        // Determine the original vsock vm_id for clones
+        // If this VM was restored from cache/snapshot, it has original_vsock_vm_id set,
+        // meaning its vmstate.bin references that original vm's paths.
+        // If not set, this is a fresh VM and we use its own vm_id.
+        let original_vsock_vm_id = vm_state
+            .config
+            .original_vsock_vm_id
+            .clone()
+            .unwrap_or_else(|| vm_state.vm_id.clone());
+
         let snapshot_config = SnapshotConfig {
             name: snapshot_name.clone(),
             vm_id: vm_state.vm_id.clone(),
+            original_vsock_vm_id: Some(original_vsock_vm_id),
             memory_path: memory_path.clone(),
             vmstate_path: vmstate_path.clone(),
             disk_path: disk_path.clone(),
@@ -698,13 +709,20 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     );
 
     // Build restore configuration
+    // Use original_vsock_vm_id if available (for snapshots of VMs restored from cache),
+    // otherwise fall back to vm_id (for snapshots of fresh VMs)
+    let original_vm_id = snapshot_config
+        .original_vsock_vm_id
+        .clone()
+        .unwrap_or_else(|| snapshot_config.vm_id.clone());
+
     let restore_config = SnapshotRestoreConfig {
         vmstate_path: snapshot_config.vmstate_path.clone(),
         memory_backend: MemoryBackend::Uffd {
             socket_path: uffd_socket.clone(),
         },
         source_disk_path: snapshot_config.disk_path.clone(),
-        original_vm_id: snapshot_config.vm_id.clone(),
+        original_vm_id,
     };
 
     // Run clone setup using shared restore function
