@@ -353,6 +353,8 @@ async fn restore_from_podman_cache(
         .context("parsing port mappings")?;
 
     // Setup networking based on mode
+    // For cache restore, we need to use the original guest IP from the cached snapshot
+    // because the VM's IP is baked into the kernel command line and disk
     let tap_device = format!("tap-{}", truncate_id(&vm_id, 8));
     let mut network: Box<dyn NetworkManager> = match args.network {
         NetworkMode::Bridged => {
@@ -363,11 +365,16 @@ async fn restore_from_podman_cache(
                      - Use rootless mode: fcvm podman run --network rootless ..."
                 );
             }
-            Box::new(BridgedNetwork::new(
-                vm_id.clone(),
-                tap_device.clone(),
-                port_mappings.clone(),
-            ))
+            // Use clone approach: NAT to the original guest IP from the cached snapshot
+            let original_guest_ip = cache_config
+                .network_config
+                .guest_ip
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("cached config missing guest_ip for bridged mode"))?;
+            Box::new(
+                BridgedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
+                    .with_guest_ip(original_guest_ip),
+            )
         }
         NetworkMode::Rootless => {
             // Allocate loopback IP
@@ -2120,23 +2127,27 @@ async fn run_vm_setup(
     info!("configuring VM via Firecracker API");
 
     // Build FirecrackerConfig for launch (single source of truth for VM config)
-    // Use fc_config from cache check if available, otherwise build fresh
-    let launch_config = fc_config.unwrap_or_else(|| {
-        use crate::firecracker::FcNetworkMode;
-        let network_mode = match args.network {
-            crate::cli::args::NetworkMode::Bridged => FcNetworkMode::Bridged,
-            crate::cli::args::NetworkMode::Rootless => FcNetworkMode::Rootless,
-        };
-        crate::firecracker::FirecrackerConfig::new(
-            kernel_path.to_path_buf(),
-            initrd_path.to_path_buf(),
-            rootfs_path.to_path_buf(),
-            args.image.clone(),
-            args.cpu,
-            args.mem,
-            network_mode,
-        )
-    });
+    // Use fc_config from cache check if available, otherwise build fresh.
+    // IMPORTANT: fc_config uses content-addressed base_rootfs path for cache key,
+    // but launch must use per-instance CoW copy path (rootfs_path).
+    let launch_config = fc_config
+        .map(|config| config.with_rootfs_path(rootfs_path.to_path_buf()))
+        .unwrap_or_else(|| {
+            use crate::firecracker::FcNetworkMode;
+            let network_mode = match args.network {
+                crate::cli::args::NetworkMode::Bridged => FcNetworkMode::Bridged,
+                crate::cli::args::NetworkMode::Rootless => FcNetworkMode::Rootless,
+            };
+            crate::firecracker::FirecrackerConfig::new(
+                kernel_path.to_path_buf(),
+                initrd_path.to_path_buf(),
+                rootfs_path.to_path_buf(),
+                args.image.clone(),
+                args.cpu,
+                args.mem,
+                network_mode,
+            )
+        });
 
     // Build runtime boot args (per-instance values NOT in cache key)
     // These are added to the static boot_args from FirecrackerConfig

@@ -113,6 +113,21 @@ impl FirecrackerConfig {
         compute_sha256(json.as_bytes())[..12].to_string()
     }
 
+    /// Return a copy of this config with the rootfs path replaced.
+    ///
+    /// This is used when launching a VM: the cache key is computed using the
+    /// content-addressed base rootfs path, but the actual launch uses a
+    /// per-instance CoW copy path.
+    pub fn with_rootfs_path(&self, new_rootfs_path: PathBuf) -> Self {
+        let mut config = self.clone();
+        for drive in &mut config.drives {
+            if drive.is_root_device {
+                drive.path_on_host = new_rootfs_path.clone();
+            }
+        }
+        config
+    }
+
     /// Apply this config to a Firecracker client.
     ///
     /// `runtime_boot_args` contains per-instance values (IPs, strace, etc.)
