@@ -386,15 +386,11 @@ async fn restore_from_podman_cache(
                      - Use rootless mode: fcvm podman run --network rootless ..."
                 );
             }
-            // Use clone approach: NAT to the original guest IP from the cached snapshot
-            let original_guest_ip = cache_config
-                .network_config
-                .guest_ip
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("cached config missing guest_ip for bridged mode"))?;
+            // Use original VM ID for subnet calculation to get same IPs as cached snapshot
+            // This uses fresh VM networking (direct guest IP access) not clone networking (NAT)
             Box::new(
                 BridgedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
-                    .with_guest_ip(original_guest_ip),
+                    .with_network_vm_id(cache_config.original_vm_id.clone()),
             )
         }
         NetworkMode::Rootless => {
