@@ -1430,11 +1430,20 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .await
         .context("spawning VolumeServers")?;
 
-    // Create cache channel for cache-ready notifications (unless --no-cache is set)
+    // Create cache channel for cache-ready notifications
+    // Skip cache creation when:
+    // - --no-cache flag is set
+    // - Volumes are specified (FUSE-over-vsock breaks during snapshot pause)
+    let skip_cache_creation = args.no_cache || !args.map.is_empty();
+    if !args.map.is_empty() && !args.no_cache {
+        info!(
+            "Skipping cache creation: volumes specified (FUSE doesn't survive snapshot pause)"
+        );
+    }
     let (cache_tx, mut cache_rx): (
         Option<mpsc::Sender<CacheRequest>>,
         Option<mpsc::Receiver<CacheRequest>>,
-    ) = if !args.no_cache {
+    ) = if !skip_cache_creation {
         let (tx, rx) = mpsc::channel(1);
         (Some(tx), Some(rx))
     } else {
