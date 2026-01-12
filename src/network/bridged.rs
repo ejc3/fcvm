@@ -30,6 +30,8 @@ pub struct BridgedNetwork {
     tap_device: String,
     port_mappings: Vec<PortMapping>,
     guest_ip_override: Option<String>,
+    /// VM ID to use for subnet calculation (for cache restore with fresh networking)
+    network_vm_id: Option<String>,
 
     // Network state (populated during setup)
     namespace_id: Option<String>,
@@ -51,6 +53,7 @@ impl BridgedNetwork {
             tap_device,
             port_mappings,
             guest_ip_override: None,
+            network_vm_id: None,
             namespace_id: None,
             host_veth: None,
             guest_veth: None,
@@ -70,6 +73,15 @@ impl BridgedNetwork {
         self
     }
 
+    /// Use a specific VM ID for network subnet calculation (for cache restore).
+    /// This allows restored VMs to get the same subnet/IPs as the original
+    /// while keeping fresh VM networking (not clone networking with NAT).
+    /// The new vm_id is still used for namespace/TAP naming (isolation).
+    pub fn with_network_vm_id(mut self, network_vm_id: String) -> Self {
+        self.network_vm_id = Some(network_vm_id);
+        self
+    }
+
     /// Get the namespace ID for this network
     pub fn namespace_id(&self) -> Option<&str> {
         self.namespace_id.as_deref()
@@ -84,8 +96,11 @@ impl NetworkManager for BridgedNetwork {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
+        // Use network_vm_id for subnet calculation if set (for cache restore)
+        // This allows restored VMs to get the same IPs as the original VM
+        let id_for_subnet = self.network_vm_id.as_ref().unwrap_or(&self.vm_id);
         let mut hasher = DefaultHasher::new();
-        self.vm_id.hash(&mut hasher);
+        id_for_subnet.hash(&mut hasher);
         let subnet_id = (hasher.finish() % 16384) as u16;
 
         // For clones, use In-Namespace NAT with unique 10.x.y.0/30 for veth
