@@ -190,15 +190,11 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             );
         }
 
-        // Determine the original vsock vm_id for clones
-        // If this VM was restored from cache/snapshot, it has original_vsock_vm_id set,
-        // meaning its vmstate.bin references that original vm's paths.
-        // If not set, this is a fresh VM and we use its own vm_id.
-        let original_vsock_vm_id = vm_state
-            .config
-            .original_vsock_vm_id
-            .clone()
-            .unwrap_or_else(|| vm_state.vm_id.clone());
+        // The snapshot's original_vsock_vm_id should always be the CURRENT VM's ID.
+        // Even if this VM was restored from cache/snapshot, the patch_drive call during
+        // restore updated Firecracker's internal state to use the current VM's disk path.
+        // So the new vmstate.bin created by this snapshot will reference the current VM's paths.
+        let original_vsock_vm_id = vm_state.vm_id.clone();
 
         let snapshot_config = SnapshotConfig {
             name: snapshot_name.clone(),
