@@ -93,6 +93,7 @@ fn build_firecracker_config(
     kernel_path: &Path,
     rootfs_path: &Path,
     initrd_path: &Path,
+    cmd_args: Option<Vec<String>>,
 ) -> crate::firecracker::FirecrackerConfig {
     use crate::firecracker::{FirecrackerConfig, FcNetworkMode};
 
@@ -106,6 +107,7 @@ fn build_firecracker_config(
         initrd_path.to_path_buf(),
         rootfs_path.to_path_buf(),
         image_identifier.to_string(),
+        cmd_args,
         args.cpu,
         args.mem,
         network_mode,
@@ -1137,12 +1139,24 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .await
         .context("setting up fc-agent initrd")?;
 
+    // Parse optional container command EARLY - it's part of cache key
+    // Either from trailing args or --cmd flag
+    let cmd_args = if !args.command_args.is_empty() {
+        // Trailing args take precedence (e.g., "alpine:latest sh -c 'echo hello'")
+        Some(args.command_args.clone())
+    } else if let Some(cmd) = &args.cmd {
+        // Fall back to --cmd flag with shell parsing
+        Some(shell_words::split(cmd).with_context(|| format!("parsing --cmd argument: {}", cmd))?)
+    } else {
+        None
+    };
+
     // Check for podman cache (unless --no-cache is set)
     // Keep fc_config and cache_key available for later cache creation on miss
     let (fc_config, cache_key): (Option<crate::firecracker::FirecrackerConfig>, Option<String>) = if !args.no_cache {
         // Get image identifier for cache key computation
         let image_identifier = get_image_identifier(&args.image).await?;
-        let config = build_firecracker_config(&args, &image_identifier, &kernel_path, &base_rootfs, &initrd_path);
+        let config = build_firecracker_config(&args, &image_identifier, &kernel_path, &base_rootfs, &initrd_path, cmd_args.clone());
         let key = config.cache_key();
 
         // Check if cache exists
@@ -1295,17 +1309,6 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 .join(", ")
         );
     }
-
-    // Parse optional container command - either from trailing args or --cmd flag
-    let cmd_args = if !args.command_args.is_empty() {
-        // Trailing args take precedence (e.g., "alpine:latest sh -c 'echo hello'")
-        Some(args.command_args.clone())
-    } else if let Some(cmd) = &args.cmd {
-        // Fall back to --cmd flag with shell parsing
-        Some(shell_words::split(cmd).with_context(|| format!("parsing --cmd argument: {}", cmd))?)
-    } else {
-        None
-    };
 
     // Setup paths
     let data_dir = paths::vm_runtime_dir(&vm_id);
@@ -2143,6 +2146,7 @@ async fn run_vm_setup(
                 initrd_path.to_path_buf(),
                 rootfs_path.to_path_buf(),
                 args.image.clone(),
+                cmd_args.clone(),
                 args.cpu,
                 args.mem,
                 network_mode,

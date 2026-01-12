@@ -25,6 +25,8 @@ pub struct FirecrackerConfig {
     pub drives: Vec<Drive>,
     /// Container image to pull (for fc-agent)
     pub container_image: String,
+    /// Container command (affects what runs after container starts)
+    pub container_cmd: Option<Vec<String>>,
     /// Network mode (bridged or rootless)
     pub network_mode: NetworkMode,
 }
@@ -81,6 +83,7 @@ impl FirecrackerConfig {
         initrd_path: PathBuf,
         rootfs_path: PathBuf,
         container_image: String,
+        container_cmd: Option<Vec<String>>,
         cpu: u8,
         mem: u32,
         network_mode: NetworkMode,
@@ -102,6 +105,7 @@ impl FirecrackerConfig {
                 is_read_only: false,
             }],
             container_image,
+            container_cmd,
             network_mode,
         }
     }
@@ -201,6 +205,7 @@ mod tests {
             "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
             "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
             "nginx:alpine".to_string(),
+            None,
             2,
             2048,
             NetworkMode::Bridged,
@@ -211,6 +216,7 @@ mod tests {
             "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
             "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
             "nginx:alpine".to_string(),
+            None,
             2,
             2048,
             NetworkMode::Bridged,
@@ -226,6 +232,7 @@ mod tests {
             "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
             "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
             "nginx:alpine".to_string(),
+            None,
             2,
             2048,
             NetworkMode::Bridged,
@@ -237,11 +244,42 @@ mod tests {
             "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
             "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
             "nginx:alpine".to_string(),
+            None,
             2,
             2048,
             NetworkMode::Rootless,
         );
 
+        assert_ne!(config1.cache_key(), config2.cache_key());
+    }
+
+    #[test]
+    fn test_cache_key_changes_with_cmd() {
+        // Same image, no command
+        let config1 = FirecrackerConfig::new(
+            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
+            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
+            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
+            "nginx:alpine".to_string(),
+            None,
+            2,
+            2048,
+            NetworkMode::Bridged,
+        );
+
+        // Same image, with command
+        let config2 = FirecrackerConfig::new(
+            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
+            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
+            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
+            "nginx:alpine".to_string(),
+            Some(vec!["true".to_string()]),
+            2,
+            2048,
+            NetworkMode::Bridged,
+        );
+
+        // Different commands must produce different cache keys
         assert_ne!(config1.cache_key(), config2.cache_key());
     }
 }
