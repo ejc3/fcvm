@@ -102,6 +102,13 @@ fn build_firecracker_config(
         crate::cli::args::NetworkMode::Rootless => FcNetworkMode::Rootless,
     };
 
+    // Collect extra disk specifications for cache key.
+    // These are block devices that must match between cache create and restore.
+    let mut extra_disks: Vec<String> = Vec::new();
+    extra_disks.extend(args.disk.iter().cloned());
+    extra_disks.extend(args.disk_dir.iter().cloned());
+    extra_disks.extend(args.nfs.iter().cloned());
+
     FirecrackerConfig::new(
         kernel_path.to_path_buf(),
         initrd_path.to_path_buf(),
@@ -111,6 +118,7 @@ fn build_firecracker_config(
         args.cpu,
         args.mem,
         network_mode,
+        extra_disks,
     )
 }
 
@@ -2141,6 +2149,12 @@ async fn run_vm_setup(
                 crate::cli::args::NetworkMode::Bridged => FcNetworkMode::Bridged,
                 crate::cli::args::NetworkMode::Rootless => FcNetworkMode::Rootless,
             };
+            // Collect extra disk specifications
+            let mut extra_disks: Vec<String> = Vec::new();
+            extra_disks.extend(args.disk.iter().cloned());
+            extra_disks.extend(args.disk_dir.iter().cloned());
+            extra_disks.extend(args.nfs.iter().cloned());
+
             crate::firecracker::FirecrackerConfig::new(
                 kernel_path.to_path_buf(),
                 initrd_path.to_path_buf(),
@@ -2150,6 +2164,7 @@ async fn run_vm_setup(
                 args.cpu,
                 args.mem,
                 network_mode,
+                extra_disks,
             )
         });
 

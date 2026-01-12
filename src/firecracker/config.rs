@@ -29,6 +29,11 @@ pub struct FirecrackerConfig {
     pub container_cmd: Option<Vec<String>>,
     /// Network mode (bridged or rootless)
     pub network_mode: NetworkMode,
+    /// Extra disk specifications (--disk, --disk-dir, --nfs).
+    /// These add block devices that must match between cache create and restore.
+    /// Format: "host_spec:guest_mount[:ro]" - host_spec included because content matters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_disks: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +83,7 @@ pub fn static_boot_args() -> &'static str {
 
 impl FirecrackerConfig {
     /// Create a new Firecracker config for a podman VM.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         kernel_path: PathBuf,
         initrd_path: PathBuf,
@@ -87,6 +93,7 @@ impl FirecrackerConfig {
         cpu: u8,
         mem: u32,
         network_mode: NetworkMode,
+        extra_disks: Vec<String>,
     ) -> Self {
         Self {
             boot_source: BootSource {
@@ -107,6 +114,7 @@ impl FirecrackerConfig {
             container_image,
             container_cmd,
             network_mode,
+            extra_disks,
         }
     }
 
@@ -209,6 +217,7 @@ mod tests {
             2,
             2048,
             NetworkMode::Bridged,
+            vec![],
         );
 
         let config2 = FirecrackerConfig::new(
@@ -220,6 +229,7 @@ mod tests {
             2,
             2048,
             NetworkMode::Bridged,
+            vec![],
         );
 
         assert_eq!(config1.cache_key(), config2.cache_key());
@@ -236,6 +246,7 @@ mod tests {
             2,
             2048,
             NetworkMode::Bridged,
+            vec![],
         );
 
         // Different network mode
@@ -248,6 +259,7 @@ mod tests {
             2,
             2048,
             NetworkMode::Rootless,
+            vec![],
         );
 
         assert_ne!(config1.cache_key(), config2.cache_key());
@@ -265,6 +277,7 @@ mod tests {
             2,
             2048,
             NetworkMode::Bridged,
+            vec![],
         );
 
         // Same image, with command
@@ -277,9 +290,42 @@ mod tests {
             2,
             2048,
             NetworkMode::Bridged,
+            vec![],
         );
 
         // Different commands must produce different cache keys
+        assert_ne!(config1.cache_key(), config2.cache_key());
+    }
+
+    #[test]
+    fn test_cache_key_changes_with_extra_disks() {
+        // No extra disks
+        let config1 = FirecrackerConfig::new(
+            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
+            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
+            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
+            "nginx:alpine".to_string(),
+            None,
+            2,
+            2048,
+            NetworkMode::Bridged,
+            vec![],
+        );
+
+        // With disk-dir
+        let config2 = FirecrackerConfig::new(
+            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
+            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
+            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
+            "nginx:alpine".to_string(),
+            None,
+            2,
+            2048,
+            NetworkMode::Bridged,
+            vec!["/tmp/data:/mydata:ro".to_string()],
+        );
+
+        // Different disk configs must produce different cache keys
         assert_ne!(config1.cache_key(), config2.cache_key());
     }
 }
