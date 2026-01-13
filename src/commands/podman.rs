@@ -95,7 +95,7 @@ fn build_firecracker_config(
     initrd_path: &Path,
     cmd_args: Option<Vec<String>>,
 ) -> crate::firecracker::FirecrackerConfig {
-    use crate::firecracker::{FirecrackerConfig, FcNetworkMode};
+    use crate::firecracker::{FcNetworkMode, FirecrackerConfig};
 
     let network_mode = match args.network {
         crate::cli::args::NetworkMode::Bridged => FcNetworkMode::Bridged,
@@ -1173,10 +1173,20 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // Localhost images have tarball paths in MMDS that won't exist on restore
     // Keep fc_config and cache_key available for later cache creation on miss
     let is_localhost_image = args.image.starts_with("localhost/");
-    let (fc_config, cache_key): (Option<crate::firecracker::FirecrackerConfig>, Option<String>) = if !args.no_cache && !is_localhost_image {
+    let (fc_config, cache_key): (
+        Option<crate::firecracker::FirecrackerConfig>,
+        Option<String>,
+    ) = if !args.no_cache && !is_localhost_image {
         // Get image identifier for cache key computation
         let image_identifier = get_image_identifier(&args.image).await?;
-        let config = build_firecracker_config(&args, &image_identifier, &kernel_path, &base_rootfs, &initrd_path, cmd_args.clone());
+        let config = build_firecracker_config(
+            &args,
+            &image_identifier,
+            &kernel_path,
+            &base_rootfs,
+            &initrd_path,
+            cmd_args.clone(),
+        );
         let key = config.cache_key();
 
         // Check if cache exists
@@ -1444,9 +1454,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // Note: is_localhost_image is already defined above
     let skip_cache_creation = args.no_cache || !args.map.is_empty() || is_localhost_image;
     if !args.map.is_empty() && !args.no_cache {
-        info!(
-            "Skipping cache creation: volumes specified (FUSE doesn't survive snapshot pause)"
-        );
+        info!("Skipping cache creation: volumes specified (FUSE doesn't survive snapshot pause)");
     }
     let (cache_tx, mut cache_rx): (
         Option<mpsc::Sender<CacheRequest>>,
