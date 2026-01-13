@@ -261,7 +261,8 @@ impl VmManager {
                 None
             };
 
-            let mount_paths = if let Some((ref baseline_dirs, ref clone_dir)) = mount_redirects_clone
+            let mount_paths = if let Some((ref baseline_dirs, ref clone_dir)) =
+                mount_redirects_clone
             {
                 info!(target: "vm", vm_id = %self.vm_id,
                     baseline_dirs = ?baseline_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),

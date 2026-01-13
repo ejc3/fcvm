@@ -53,10 +53,7 @@ fn list_cache_entries() -> HashSet<String> {
 }
 
 /// Wait for a new cache entry to appear (returns the new key)
-async fn wait_for_new_cache_entry(
-    before: &HashSet<String>,
-    timeout_secs: u64,
-) -> Option<String> {
+async fn wait_for_new_cache_entry(before: &HashSet<String>, timeout_secs: u64) -> Option<String> {
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(timeout_secs) {
         let current = list_cache_entries();
@@ -99,8 +96,17 @@ async fn test_podman_cache_miss_creates_cache() -> Result<()> {
     // Since container_cmd is now part of the cache key, using a timestamp ensures
     // this test always creates a new cache entry (cache miss).
     let (vm_name, _, _, _) = common::unique_names("cache-miss");
-    let unique_msg = format!("cache-miss-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-    println!("Starting VM: {} with unique message: {}", vm_name, unique_msg);
+    let unique_msg = format!(
+        "cache-miss-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    println!(
+        "Starting VM: {} with unique message: {}",
+        vm_name, unique_msg
+    );
 
     let (mut child, pid) = common::spawn_fcvm(&[
         "podman",
@@ -326,7 +332,10 @@ async fn test_podman_cache_incomplete_treated_as_miss() -> Result<()> {
 
     // Verify it's incomplete (exists but missing required files)
     assert!(cache_path.exists(), "Directory should exist");
-    assert!(!cache_entry_exists(incomplete_key), "Should be incomplete (missing files)");
+    assert!(
+        !cache_entry_exists(incomplete_key),
+        "Should be incomplete (missing files)"
+    );
 
     // Clean up
     let _ = std::fs::remove_dir_all(&cache_path);
