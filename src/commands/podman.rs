@@ -110,10 +110,10 @@ fn build_firecracker_config(
     extra_disks.extend(args.nfs.iter().cloned());
 
     // Collect env vars for cache key (affects container behavior)
-    let env_vars: Vec<String> = args.env.iter().cloned().collect();
+    let env_vars: Vec<String> = args.env.to_vec();
 
     // Collect volume mounts for cache key (affects MMDS plan)
-    let volume_mounts: Vec<String> = args.map.iter().cloned().collect();
+    let volume_mounts: Vec<String> = args.map.to_vec();
 
     FirecrackerConfig::new(
         kernel_path.to_path_buf(),
@@ -2189,8 +2189,8 @@ async fn run_vm_setup(
             extra_disks.extend(args.disk_dir.iter().cloned());
             extra_disks.extend(args.nfs.iter().cloned());
             // Collect env vars and volume mounts for cache key
-            let env_vars: Vec<String> = args.env.iter().cloned().collect();
-            let volume_mounts: Vec<String> = args.map.iter().cloned().collect();
+            let env_vars: Vec<String> = args.env.to_vec();
+            let volume_mounts: Vec<String> = args.map.to_vec();
 
             crate::firecracker::FirecrackerConfig::new(
                 kernel_path.to_path_buf(),
@@ -2273,7 +2273,7 @@ async fn run_vm_setup(
 
     // Apply FirecrackerConfig to client (boot_source, machine_config, rootfs drive)
     // This ensures the same config used for cache key is used for launch
-    launch_config.apply(&client, &runtime_boot_args).await?;
+    launch_config.apply(client, &runtime_boot_args).await?;
 
     // Extra disks (appear as /dev/vdb, /dev/vdc, etc.)
     // Parse format: HOST_PATH:GUEST_MOUNT[:ro]

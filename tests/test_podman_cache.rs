@@ -75,12 +75,6 @@ fn cache_entry_exists(cache_key: &str) -> bool {
         && path.join("config.json").exists()
 }
 
-/// Delete a specific cache entry (for test cleanup)
-fn delete_cache_entry(cache_key: &str) {
-    let path = podman_cache_dir().join(cache_key);
-    let _ = std::fs::remove_dir_all(&path);
-}
-
 /// Test that first run creates a cache entry
 /// Uses rootless network mode for this test
 #[tokio::test]
