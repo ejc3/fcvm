@@ -312,7 +312,10 @@ async fn test_podman_cache_no_cache_flag() -> Result<()> {
 /// Test that incomplete cache (missing files) is treated as miss
 /// This test requires root because it writes to /mnt/fcvm-btrfs/podman-cache/
 #[tokio::test]
-#[cfg_attr(not(feature = "privileged-tests"), ignore = "requires root to write to cache dir")]
+#[cfg_attr(
+    not(feature = "privileged-tests"),
+    ignore = "requires root to write to cache dir"
+)]
 async fn test_podman_cache_incomplete_treated_as_miss() -> Result<()> {
     println!("\ntest_podman_cache_incomplete_treated_as_miss");
     println!("=============================================");
