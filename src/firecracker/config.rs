@@ -29,6 +29,10 @@ pub struct FirecrackerConfig {
     pub container_cmd: Option<Vec<String>>,
     /// Network mode (bridged or rootless)
     pub network_mode: NetworkMode,
+    /// Data directory for mutable VM data (vm-disks, state).
+    /// Included in cache key because Firecracker snapshots store absolute paths.
+    /// Different data_dirs (e.g., root vs non-root) must use separate caches.
+    pub data_dir: PathBuf,
     /// Extra disk specifications (--disk, --disk-dir, --nfs).
     /// These add block devices that must match between cache create and restore.
     /// Format: "host_spec:guest_mount[:ro]" - host_spec included because content matters.
@@ -113,6 +117,7 @@ impl FirecrackerConfig {
         cpu: u8,
         mem: u32,
         network_mode: NetworkMode,
+        data_dir: PathBuf,
         extra_disks: Vec<String>,
         env_vars: Vec<String>,
         volume_mounts: Vec<String>,
@@ -139,6 +144,7 @@ impl FirecrackerConfig {
             container_image,
             container_cmd,
             network_mode,
+            data_dir,
             extra_disks,
             env_vars,
             volume_mounts,
@@ -236,376 +242,105 @@ impl FirecrackerConfig {
 mod tests {
     use super::*;
 
+    /// Helper to create a default test config with optional overrides
+    fn test_config() -> FirecrackerConfig {
+        FirecrackerConfig::new(
+            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
+            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
+            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
+            "nginx:alpine".to_string(),
+            None,
+            2,
+            2048,
+            NetworkMode::Bridged,
+            "/mnt/fcvm-btrfs".into(),
+            vec![],
+            vec![],
+            vec![],
+            false,
+            false,
+            false,
+        )
+    }
+
     #[test]
     fn test_cache_key_deterministic() {
-        let config1 = FirecrackerConfig::new(
-            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
-            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
-            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
-            "nginx:alpine".to_string(),
-            None,
-            2,
-            2048,
-            NetworkMode::Bridged,
-            vec![],
-            vec![],
-            vec![],
-            false,
-            false,
-            false,
-        );
-
-        let config2 = FirecrackerConfig::new(
-            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
-            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
-            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
-            "nginx:alpine".to_string(),
-            None,
-            2,
-            2048,
-            NetworkMode::Bridged,
-            vec![],
-            vec![],
-            vec![],
-            false,
-            false,
-            false,
-        );
-
+        let config1 = test_config();
+        let config2 = test_config();
         assert_eq!(config1.cache_key(), config2.cache_key());
     }
 
     #[test]
     fn test_cache_key_changes_with_config() {
-        let config1 = FirecrackerConfig::new(
-            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
-            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
-            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
-            "nginx:alpine".to_string(),
-            None,
-            2,
-            2048,
-            NetworkMode::Bridged,
-            vec![],
-            vec![],
-            vec![],
-            false,
-            false,
-            false,
-        );
-
-        // Different network mode
-        let config2 = FirecrackerConfig::new(
-            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
-            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
-            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
-            "nginx:alpine".to_string(),
-            None,
-            2,
-            2048,
-            NetworkMode::Rootless,
-            vec![],
-            vec![],
-            vec![],
-            false,
-            false,
-            false,
-        );
-
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.network_mode = NetworkMode::Rootless;
         assert_ne!(config1.cache_key(), config2.cache_key());
     }
 
     #[test]
     fn test_cache_key_changes_with_cmd() {
-        // Same image, no command
-        let config1 = FirecrackerConfig::new(
-            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
-            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
-            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
-            "nginx:alpine".to_string(),
-            None,
-            2,
-            2048,
-            NetworkMode::Bridged,
-            vec![],
-            vec![],
-            vec![],
-            false,
-            false,
-            false,
-        );
-
-        // Same image, with command
-        let config2 = FirecrackerConfig::new(
-            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
-            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
-            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
-            "nginx:alpine".to_string(),
-            Some(vec!["true".to_string()]),
-            2,
-            2048,
-            NetworkMode::Bridged,
-            vec![],
-            vec![],
-            vec![],
-            false,
-            false,
-            false,
-        );
-
-        // Different commands must produce different cache keys
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.container_cmd = Some(vec!["true".to_string()]);
         assert_ne!(config1.cache_key(), config2.cache_key());
     }
 
     #[test]
     fn test_cache_key_changes_with_extra_disks() {
-        // No extra disks
-        let config1 = FirecrackerConfig::new(
-            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
-            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
-            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
-            "nginx:alpine".to_string(),
-            None,
-            2,
-            2048,
-            NetworkMode::Bridged,
-            vec![],
-            vec![],
-            vec![],
-            false,
-            false,
-            false,
-        );
-
-        // With disk-dir
-        let config2 = FirecrackerConfig::new(
-            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
-            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
-            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
-            "nginx:alpine".to_string(),
-            None,
-            2,
-            2048,
-            NetworkMode::Bridged,
-            vec!["/tmp/data:/mydata:ro".to_string()],
-            vec![],
-            vec![],
-            false,
-            false,
-            false,
-        );
-
-        // Different disk configs must produce different cache keys
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.extra_disks = vec!["/tmp/data:/mydata:ro".to_string()];
         assert_ne!(config1.cache_key(), config2.cache_key());
     }
 
     #[test]
     fn test_cache_key_changes_with_env_vars() {
-        // No env vars
-        let config1 = FirecrackerConfig::new(
-            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
-            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
-            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
-            "nginx:alpine".to_string(),
-            None,
-            2,
-            2048,
-            NetworkMode::Bridged,
-            vec![],
-            vec![],
-            vec![],
-            false,
-            false,
-            false,
-        );
-
-        // With env var
-        let config2 = FirecrackerConfig::new(
-            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
-            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
-            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
-            "nginx:alpine".to_string(),
-            None,
-            2,
-            2048,
-            NetworkMode::Bridged,
-            vec![],
-            vec!["MY_VAR=test_value".to_string()],
-            vec![],
-            false,
-            false,
-            false,
-        );
-
-        // Different env vars must produce different cache keys
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.env_vars = vec!["MY_VAR=test_value".to_string()];
         assert_ne!(config1.cache_key(), config2.cache_key());
     }
 
     #[test]
     fn test_cache_key_changes_with_volumes() {
-        // No volumes
-        let config1 = FirecrackerConfig::new(
-            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
-            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
-            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
-            "nginx:alpine".to_string(),
-            None,
-            2,
-            2048,
-            NetworkMode::Bridged,
-            vec![],
-            vec![],
-            vec![],
-            false,
-            false,
-            false,
-        );
-
-        // With volume
-        let config2 = FirecrackerConfig::new(
-            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
-            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
-            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
-            "nginx:alpine".to_string(),
-            None,
-            2,
-            2048,
-            NetworkMode::Bridged,
-            vec![],
-            vec![],
-            vec!["/tmp/data:/data:ro".to_string()],
-            false,
-            false,
-            false,
-        );
-
-        // Different volume configs must produce different cache keys
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.volume_mounts = vec!["/tmp/data:/data:ro".to_string()];
         assert_ne!(config1.cache_key(), config2.cache_key());
     }
 
     #[test]
     fn test_cache_key_changes_with_privileged() {
-        // Not privileged
-        let config1 = FirecrackerConfig::new(
-            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
-            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
-            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
-            "nginx:alpine".to_string(),
-            None,
-            2,
-            2048,
-            NetworkMode::Bridged,
-            vec![],
-            vec![],
-            vec![],
-            false,
-            false,
-            false,
-        );
-
-        // Privileged
-        let config2 = FirecrackerConfig::new(
-            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
-            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
-            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
-            "nginx:alpine".to_string(),
-            None,
-            2,
-            2048,
-            NetworkMode::Bridged,
-            vec![],
-            vec![],
-            vec![],
-            true,
-            false,
-            false,
-        );
-
-        // Different privileged flags must produce different cache keys
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.privileged = true;
         assert_ne!(config1.cache_key(), config2.cache_key());
     }
 
     #[test]
     fn test_cache_key_changes_with_tty() {
-        // No TTY
-        let config1 = FirecrackerConfig::new(
-            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
-            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
-            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
-            "nginx:alpine".to_string(),
-            None,
-            2,
-            2048,
-            NetworkMode::Bridged,
-            vec![],
-            vec![],
-            vec![],
-            false,
-            false,
-            false,
-        );
-
-        // With TTY
-        let config2 = FirecrackerConfig::new(
-            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
-            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
-            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
-            "nginx:alpine".to_string(),
-            None,
-            2,
-            2048,
-            NetworkMode::Bridged,
-            vec![],
-            vec![],
-            vec![],
-            false,
-            true,
-            false,
-        );
-
-        // Different TTY flags must produce different cache keys
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.tty = true;
         assert_ne!(config1.cache_key(), config2.cache_key());
     }
 
     #[test]
     fn test_cache_key_changes_with_interactive() {
-        // Not interactive
-        let config1 = FirecrackerConfig::new(
-            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
-            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
-            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
-            "nginx:alpine".to_string(),
-            None,
-            2,
-            2048,
-            NetworkMode::Bridged,
-            vec![],
-            vec![],
-            vec![],
-            false,
-            false,
-            false,
-        );
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.interactive = true;
+        assert_ne!(config1.cache_key(), config2.cache_key());
+    }
 
-        // Interactive
-        let config2 = FirecrackerConfig::new(
-            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
-            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
-            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
-            "nginx:alpine".to_string(),
-            None,
-            2,
-            2048,
-            NetworkMode::Bridged,
-            vec![],
-            vec![],
-            vec![],
-            false,
-            false,
-            true,
-        );
-
-        // Different interactive flags must produce different cache keys
+    #[test]
+    fn test_cache_key_changes_with_data_dir() {
+        // Different data_dirs must produce different cache keys
+        // This ensures root and non-root caches don't collide
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.data_dir = "/mnt/fcvm-btrfs/root".into();
         assert_ne!(config1.cache_key(), config2.cache_key());
     }
 }
