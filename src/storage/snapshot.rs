@@ -11,6 +11,14 @@ use crate::network::NetworkConfig;
 pub struct SnapshotConfig {
     pub name: String,
     pub vm_id: String,
+    /// Original VM ID for vsock socket path redirect.
+    /// This is the VM ID whose path is stored in vmstate.bin.
+    /// When a VM is restored from cache/snapshot, its vmstate still references
+    /// the original VM's paths. When snapshotting such a VM, we preserve this
+    /// original_vm_id so clones use the correct redirect path.
+    /// Defaults to vm_id if not set (for snapshots of fresh VMs).
+    #[serde(default)]
+    pub original_vsock_vm_id: Option<String>,
     pub memory_path: PathBuf,
     pub vmstate_path: PathBuf,
     pub disk_path: PathBuf,
@@ -151,6 +159,7 @@ mod tests {
         let config = SnapshotConfig {
             name: "test-snapshot".to_string(),
             vm_id: "abc123".to_string(),
+            original_vsock_vm_id: None,
             memory_path: PathBuf::from("/path/to/memory.bin"),
             vmstate_path: PathBuf::from("/path/to/vmstate.bin"),
             disk_path: PathBuf::from("/path/to/disk.raw"),
@@ -258,6 +267,7 @@ mod tests {
         let config = SnapshotConfig {
             name: "test-snap".to_string(),
             vm_id: "test123".to_string(),
+            original_vsock_vm_id: None,
             memory_path: PathBuf::from("/memory.bin"),
             vmstate_path: PathBuf::from("/vmstate.bin"),
             disk_path: PathBuf::from("/disk.raw"),
@@ -309,6 +319,7 @@ mod tests {
             let config = SnapshotConfig {
                 name: name.to_string(),
                 vm_id: format!("vm-{}", name),
+                original_vsock_vm_id: None,
                 memory_path: PathBuf::from("/memory.bin"),
                 vmstate_path: PathBuf::from("/vmstate.bin"),
                 disk_path: PathBuf::from("/disk.raw"),
@@ -348,6 +359,7 @@ mod tests {
         let config = SnapshotConfig {
             name: "to-delete".to_string(),
             vm_id: "vm123".to_string(),
+            original_vsock_vm_id: None,
             memory_path: PathBuf::from("/memory.bin"),
             vmstate_path: PathBuf::from("/vmstate.bin"),
             disk_path: PathBuf::from("/disk.raw"),

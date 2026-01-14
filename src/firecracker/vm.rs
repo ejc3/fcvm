@@ -39,7 +39,7 @@ pub struct VmManager {
     holder_pid: Option<u32>, // namespace holder PID for rootless mode (use nsenter to run FC)
     user_namespace_path: Option<PathBuf>, // User namespace path for rootless clones (enter via setns in pre_exec)
     net_namespace_path: Option<PathBuf>, // Net namespace path for rootless clones (enter via setns in pre_exec)
-    vsock_redirect: Option<(PathBuf, PathBuf)>, // (baseline_dir, clone_dir) for mount namespace isolation
+    mount_redirects: Option<(Vec<PathBuf>, PathBuf)>, // (baseline_dirs, clone_dir) for mount namespace isolation
     process: Option<Child>,
     client: Option<FirecrackerClient>,
 }
@@ -55,7 +55,7 @@ impl VmManager {
             holder_pid: None,
             user_namespace_path: None,
             net_namespace_path: None,
-            vsock_redirect: None,
+            mount_redirects: None,
             process: None,
             client: None,
         }
@@ -89,7 +89,7 @@ impl VmManager {
 
     /// Set user namespace path for rootless clones
     ///
-    /// When set along with vsock_redirect, pre_exec will enter this user namespace
+    /// When set along with mount_redirects, pre_exec will enter this user namespace
     /// first (via setns) before doing mount operations. This gives CAP_SYS_ADMIN
     /// inside the user namespace, allowing unshare(CLONE_NEWNS) to succeed.
     ///
@@ -108,17 +108,21 @@ impl VmManager {
         self.net_namespace_path = Some(path);
     }
 
-    /// Set vsock redirect for mount namespace isolation
+    /// Set mount redirects for mount namespace isolation
     ///
     /// When set, Firecracker will be launched in a new mount namespace with
-    /// clone_dir bind-mounted over baseline_dir. This allows multiple clones
-    /// from the same snapshot to each have their own vsock socket binding,
-    /// even though vmstate.bin stores the baseline's uds_path.
+    /// clone_dir bind-mounted over each baseline_dir. This allows multiple clones
+    /// from the same snapshot to each have their own vsock socket and disk file bindings,
+    /// even though vmstate.bin stores the baseline's paths.
+    ///
+    /// Multiple baseline_dirs are needed because:
+    /// - Vsock paths in vmstate.bin reference the original cache VM's directory
+    /// - Disk paths in vmstate.bin reference the snapshotted VM's directory (after patch_drive)
     ///
     /// The bind mount makes Firecracker see clone's directory contents when
-    /// accessing baseline's path, so each clone binds to its own socket file.
-    pub fn set_vsock_redirect(&mut self, baseline_dir: PathBuf, clone_dir: PathBuf) {
-        self.vsock_redirect = Some((baseline_dir, clone_dir));
+    /// accessing any baseline's path, so each clone binds to its own socket files.
+    pub fn set_mount_redirects(&mut self, baseline_dirs: Vec<PathBuf>, clone_dir: PathBuf) {
+        self.mount_redirects = Some((baseline_dirs, clone_dir));
     }
 
     /// Start the Firecracker process
@@ -141,7 +145,7 @@ impl VmManager {
         // 2. holder_pid set (no user_namespace_path): use nsenter to enter existing namespace (rootless baseline)
         // 3. neither: direct Firecracker (privileged/bridged mode)
         //
-        // For rootless clones with vsock_redirect, we MUST use pre_exec setns instead of nsenter,
+        // For rootless clones with mount_redirects, we MUST use pre_exec setns instead of nsenter,
         // because pre_exec runs BEFORE nsenter would enter the namespace, and we need CAP_SYS_ADMIN
         // from the user namespace to do mount operations.
         let mut cmd = if self.user_namespace_path.is_some() {
@@ -202,21 +206,23 @@ impl VmManager {
         // Setup namespace isolation if specified (network namespace and/or mount namespace)
         // We need to handle these in a single pre_exec because it can only be called once
         let ns_id_clone = self.namespace_id.clone();
-        let vsock_redirect_clone = self.vsock_redirect.clone();
+        let mount_redirects_clone = self.mount_redirects.clone();
         let user_ns_path_clone = self.user_namespace_path.clone();
         let net_ns_path_clone = self.net_namespace_path.clone();
 
-        // Ensure baseline directory exists for bind mount target
-        // The baseline VM may have been cleaned up, but we need the directory for mount
-        if let Some((ref baseline_dir, _)) = vsock_redirect_clone {
-            if !baseline_dir.exists() {
-                std::fs::create_dir_all(baseline_dir)
-                    .context("creating baseline directory for vsock mount redirect")?;
+        // Ensure baseline directories exist for bind mount targets
+        // The baseline VMs may have been cleaned up, but we need the directories for mount
+        if let Some((ref baseline_dirs, _)) = mount_redirects_clone {
+            for baseline_dir in baseline_dirs {
+                if !baseline_dir.exists() {
+                    std::fs::create_dir_all(baseline_dir)
+                        .context("creating baseline directory for mount redirect")?;
+                }
             }
         }
 
         if ns_id_clone.is_some()
-            || vsock_redirect_clone.is_some()
+            || mount_redirects_clone.is_some()
             || user_ns_path_clone.is_some()
             || net_ns_path_clone.is_some()
         {
@@ -255,18 +261,23 @@ impl VmManager {
                 None
             };
 
-            let vsock_paths = if let Some((ref baseline_dir, ref clone_dir)) = vsock_redirect_clone
+            let mount_paths = if let Some((ref baseline_dirs, ref clone_dir)) =
+                mount_redirects_clone
             {
                 info!(target: "vm", vm_id = %self.vm_id,
-                    baseline = %baseline_dir.display(),
+                    baseline_dirs = ?baseline_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                     clone = %clone_dir.display(),
-                    "setting up mount namespace for vsock redirect");
-                Some((
-                    CString::new(baseline_dir.to_string_lossy().as_bytes())
-                        .context("baseline path contains invalid characters")?,
-                    CString::new(clone_dir.to_string_lossy().as_bytes())
-                        .context("clone path contains invalid characters")?,
-                ))
+                    "setting up mount namespace for mount redirects");
+                let clone_cstr = CString::new(clone_dir.to_string_lossy().as_bytes())
+                    .context("clone path contains invalid characters")?;
+                let baseline_cstrs: Vec<CString> = baseline_dirs
+                    .iter()
+                    .map(|p| {
+                        CString::new(p.to_string_lossy().as_bytes())
+                            .context("baseline path contains invalid characters")
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Some((baseline_cstrs, clone_cstr))
             } else {
                 None
             };
@@ -308,11 +319,11 @@ impl VmManager {
                         // Now we have CAP_SYS_ADMIN inside the user namespace!
                     }
 
-                    // Step 1: Set up mount namespace for vsock redirect if needed
+                    // Step 1: Set up mount namespace for path redirects if needed
                     // This must be done BEFORE entering network namespace
                     // Note: This now succeeds because we entered user namespace first (if needed)
-                    if let Some((ref baseline_cstr, ref clone_cstr)) = vsock_paths {
-                        // Create a new mount namespace so our bind mount is isolated
+                    if let Some((ref baseline_cstrs, ref clone_cstr)) = mount_paths {
+                        // Create a new mount namespace so our bind mounts are isolated
                         unshare(CloneFlags::CLONE_NEWNS).map_err(|e| {
                             std::io::Error::other(format!(
                                 "failed to unshare mount namespace: {}",
@@ -333,21 +344,23 @@ impl VmManager {
                             std::io::Error::other(format!("failed to make mount private: {}", e))
                         })?;
 
-                        // Bind mount clone_dir over baseline_dir
-                        // This makes Firecracker see clone's files when accessing baseline's path
-                        mount(
-                            Some(clone_cstr.as_c_str()),
-                            baseline_cstr.as_c_str(),
-                            None::<&str>,
-                            MsFlags::MS_BIND,
-                            None::<&str>,
-                        )
-                        .map_err(|e| {
-                            std::io::Error::other(format!(
-                                "failed to bind mount {:?} over {:?}: {}",
-                                clone_cstr, baseline_cstr, e
-                            ))
-                        })?;
+                        // Bind mount clone_dir over each baseline_dir
+                        // This makes Firecracker see clone's files when accessing any baseline's path
+                        for baseline_cstr in baseline_cstrs {
+                            mount(
+                                Some(clone_cstr.as_c_str()),
+                                baseline_cstr.as_c_str(),
+                                None::<&str>,
+                                MsFlags::MS_BIND,
+                                None::<&str>,
+                            )
+                            .map_err(|e| {
+                                std::io::Error::other(format!(
+                                    "failed to bind mount {:?} over {:?}: {}",
+                                    clone_cstr, baseline_cstr, e
+                                ))
+                            })?;
+                        }
                     }
 
                     // Step 2: Enter network namespace if specified
