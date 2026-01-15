@@ -504,33 +504,55 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
 }
 
 /// Run clone from snapshot
+///
+/// Two modes:
+/// - `--pid <serve_pid>`: Clone via UFFD memory sharing (for multiple concurrent clones)
+/// - `--snapshot <name>`: Clone directly from snapshot files (simpler, no serve process needed)
 async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
-    // Verify the serve process is actually alive before attempting any work
-    // This prevents wasted setup if the serve process died between state file creation and now
-    if !crate::utils::is_process_alive(args.pid) {
-        anyhow::bail!(
-            "serve process (PID {}) is not running - start with 'fcvm snapshot serve'",
-            args.pid
-        );
-    }
+    // Determine mode and get snapshot name
+    let (snapshot_name, serve_pid, use_uffd) = match (&args.pid, &args.snapshot) {
+        (Some(pid), None) => {
+            // UFFD mode: verify serve process is alive
+            if !crate::utils::is_process_alive(*pid) {
+                anyhow::bail!(
+                    "serve process (PID {}) is not running - start with 'fcvm snapshot serve'",
+                    pid
+                );
+            }
 
-    // Load serve state by PID to get snapshot name
+            // Load serve state by PID to get snapshot name
+            let state_manager = StateManager::new(paths::state_dir());
+            let serve_state = state_manager
+                .load_state_by_pid(*pid)
+                .await
+                .context("loading serve process state - is serve running?")?;
+
+            let name = serve_state
+                .config
+                .snapshot_name
+                .ok_or_else(|| anyhow::anyhow!("serve process has no snapshot_name"))?;
+
+            info!(
+                "Cloning VM from serve PID {} (snapshot: {})",
+                pid, name
+            );
+            (name, Some(*pid), true)
+        }
+        (None, Some(name)) => {
+            // Direct file mode: no serve process needed
+            info!("Cloning VM directly from snapshot: {}", name);
+            (name.clone(), None, false)
+        }
+        (None, None) => {
+            anyhow::bail!("Either --pid or --snapshot must be specified");
+        }
+        (Some(_), Some(_)) => {
+            // clap's conflicts_with should prevent this, but just in case
+            anyhow::bail!("Cannot specify both --pid and --snapshot");
+        }
+    };
+
     let state_manager = StateManager::new(paths::state_dir());
-    let serve_state = state_manager
-        .load_state_by_pid(args.pid)
-        .await
-        .context("loading serve process state - is serve running?")?;
-
-    // Get snapshot name from serve state
-    let snapshot_name = serve_state
-        .config
-        .snapshot_name
-        .ok_or_else(|| anyhow::anyhow!("serve process has no snapshot_name"))?;
-
-    info!(
-        "Cloning VM from serve PID {} (snapshot: {})",
-        args.pid, snapshot_name
-    );
 
     // Load snapshot configuration
     let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
@@ -570,7 +592,7 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Save snapshot tracking info in clone state
     vm_state.config.snapshot_name = Some(snapshot_name.clone());
     vm_state.config.process_type = Some(crate::state::ProcessType::Clone);
-    vm_state.config.serve_pid = Some(args.pid); // Track which serve spawned us!
+    vm_state.config.serve_pid = serve_pid; // Track which serve spawned us (None for direct mode)
 
     // Setup paths
     let data_dir = paths::vm_runtime_dir(&vm_id);
@@ -580,17 +602,23 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     let socket_path = data_dir.join("firecracker.sock");
 
-    // Build UFFD socket path for memory server
-    // Note: We already verified the serve process is alive above.
-    // We do NOT check socket existence here (TOCTOU race) - let the actual
-    // connection attempt fail with a meaningful error instead.
-    let uffd_socket = paths::data_dir().join(format!("uffd-{}-{}.sock", snapshot_name, args.pid));
-
-    info!(
-        uffd_socket = %uffd_socket.display(),
-        serve_pid = args.pid,
-        "connecting to memory server"
-    );
+    // Build UFFD socket path for memory server (only for UFFD mode)
+    let uffd_socket = if use_uffd {
+        let pid = serve_pid.expect("serve_pid must be set for UFFD mode");
+        let socket = paths::data_dir().join(format!("uffd-{}-{}.sock", snapshot_name, pid));
+        info!(
+            uffd_socket = %socket.display(),
+            serve_pid = pid,
+            "connecting to memory server"
+        );
+        Some(socket)
+    } else {
+        info!(
+            memory_file = %snapshot_config.memory_path.display(),
+            "loading memory directly from file"
+        );
+        None
+    };
 
     // Setup VolumeServers for clones if snapshot has volumes
     //
@@ -732,11 +760,20 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         None
     };
 
+    // Choose memory backend based on mode
+    let memory_backend = if let Some(ref uffd_socket_path) = uffd_socket {
+        MemoryBackend::Uffd {
+            socket_path: uffd_socket_path.clone(),
+        }
+    } else {
+        MemoryBackend::File {
+            memory_path: snapshot_config.memory_path.clone(),
+        }
+    };
+
     let restore_config = SnapshotRestoreConfig {
         vmstate_path: snapshot_config.vmstate_path.clone(),
-        memory_backend: MemoryBackend::Uffd {
-            socket_path: uffd_socket.clone(),
-        },
+        memory_backend,
         source_disk_path: snapshot_config.disk_path.clone(),
         original_vm_id,
         snapshot_vm_id,
@@ -777,16 +814,29 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     let (mut vm_manager, mut holder_child) = setup_result.unwrap();
 
-    info!(
-        vm_id = %vm_id,
-        vm_name = %vm_name,
-        "VM cloned successfully with UFFD memory sharing!"
-    );
-    println!(
-        "✓ VM '{}' cloned from snapshot '{}'",
-        vm_name, snapshot_name
-    );
-    println!("  Memory pages shared via UFFD");
+    if use_uffd {
+        info!(
+            vm_id = %vm_id,
+            vm_name = %vm_name,
+            "VM cloned successfully with UFFD memory sharing!"
+        );
+        println!(
+            "✓ VM '{}' cloned from snapshot '{}' (UFFD mode)",
+            vm_name, snapshot_name
+        );
+        println!("  Memory pages shared via UFFD server");
+    } else {
+        info!(
+            vm_id = %vm_id,
+            vm_name = %vm_name,
+            "VM cloned successfully from snapshot files!"
+        );
+        println!(
+            "✓ VM '{}' cloned from snapshot '{}' (direct mode)",
+            vm_name, snapshot_name
+        );
+        println!("  Memory loaded from file");
+    }
     println!("  Disk uses CoW overlay");
 
     // Handle --exec: run command in container then cleanup and exit

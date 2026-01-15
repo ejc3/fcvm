@@ -261,9 +261,13 @@ pub struct SnapshotServeArgs {
 
 #[derive(Args, Debug)]
 pub struct SnapshotRunArgs {
-    /// Serve process PID to clone from
-    #[arg(long)]
-    pub pid: u32,
+    /// Serve process PID to clone from (UFFD mode - memory sharing)
+    #[arg(long, conflicts_with = "snapshot")]
+    pub pid: Option<u32>,
+
+    /// Snapshot name to clone from (direct file mode - no UFFD server needed)
+    #[arg(long, conflicts_with = "pid")]
+    pub snapshot: Option<String>,
 
     /// Optional: custom name for cloned VM (auto-generated if not provided)
     #[arg(long)]
