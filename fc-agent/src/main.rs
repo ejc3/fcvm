@@ -1159,152 +1159,131 @@ async fn get_image_digest(image: &str) -> Result<String> {
 /// The host will pause the VM, create a snapshot, resume, then send ack.
 /// This blocks indefinitely until ack is received (no timeout).
 fn notify_cache_ready_and_wait(digest: &str) -> bool {
-    // Create vsock socket
-    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        eprintln!(
-            "[fc-agent] WARNING: failed to create vsock socket for cache: {}",
-            std::io::Error::last_os_error()
-        );
-        return false;
-    }
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, VsockAddr};
+    use nix::unistd::{read, write};
+    use std::os::fd::{AsFd, AsRawFd};
 
-    // Build sockaddr_vm structure
-    let addr = libc::sockaddr_vm {
-        svm_family: libc::AF_VSOCK as u16,
-        svm_reserved1: 0,
-        svm_port: STATUS_VSOCK_PORT,
-        svm_cid: HOST_CID,
-        svm_zero: [0u8; 4],
+    // Create vsock socket
+    let sock = match socket(
+        AddressFamily::Vsock,
+        SockType::Stream,
+        SockFlag::empty(),
+        None,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "[fc-agent] WARNING: failed to create vsock socket for cache: {}",
+                e
+            );
+            return false;
+        }
     };
 
     // Connect to host
-    let result = unsafe {
-        libc::connect(
-            fd,
-            &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_vm>() as u32,
-        )
-    };
-
-    if result < 0 {
-        let err = std::io::Error::last_os_error();
-        unsafe { libc::close(fd) };
+    let addr = VsockAddr::new(HOST_CID, STATUS_VSOCK_PORT);
+    if let Err(e) = connect(sock.as_raw_fd(), &addr) {
         eprintln!(
             "[fc-agent] WARNING: failed to connect vsock for cache: {}",
-            err
+            e
         );
         return false;
     }
 
     // Send cache-ready message
     let msg = format!("cache-ready:{}\n", digest);
-    let written = unsafe { libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len()) };
-
-    if written != msg.len() as isize {
-        eprintln!("[fc-agent] WARNING: failed to send cache-ready message");
-        unsafe { libc::close(fd) };
-        return false;
+    match write(&sock, msg.as_bytes()) {
+        Ok(n) if n == msg.len() => {}
+        Ok(_) => {
+            eprintln!("[fc-agent] WARNING: failed to send complete cache-ready message");
+            return false;
+        }
+        Err(e) => {
+            eprintln!(
+                "[fc-agent] WARNING: failed to send cache-ready message: {}",
+                e
+            );
+            return false;
+        }
     }
 
     eprintln!("[fc-agent] sent cache-ready:{}, waiting for ack...", digest);
+
+    // Set socket to non-blocking to prevent read() from blocking after restore
+    // After snapshot restore, the kernel might think data is available but read() would block
+    if let Ok(flags) = fcntl(sock.as_raw_fd(), FcntlArg::F_GETFL) {
+        let new_flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
+        let _ = fcntl(sock.as_raw_fd(), FcntlArg::F_SETFL(new_flags));
+    }
 
     // Wait for cache-ack response with timeout (handles snapshot restore case)
     // After restore, the vsock connection is dead and poll will timeout
     let mut buf = [0u8; 64];
     let mut total_read = 0;
-    const POLL_TIMEOUT_MS: i32 = 100; // 100ms timeout
-
-    // Set socket to non-blocking to prevent read() from blocking after restore
-    // After snapshot restore, the kernel might think data is available but read() would block
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags >= 0 {
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-    }
 
     loop {
         // Use poll() to check if data is available with timeout
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
+        let mut poll_fds = [PollFd::new(sock.as_fd(), PollFlags::POLLIN)];
 
-        let poll_result = unsafe { libc::poll(&mut pfd, 1, POLL_TIMEOUT_MS) };
-
-        if poll_result < 0 {
-            // poll error
-            eprintln!(
-                "[fc-agent] cache-ack poll error: {}",
-                std::io::Error::last_os_error()
-            );
-            unsafe { libc::close(fd) };
-            return false;
-        }
-
-        if poll_result == 0 {
-            // Timeout - likely restored from snapshot with dead connection
-            eprintln!("[fc-agent] cache-ack poll timeout (restored from snapshot?)");
-            unsafe { libc::close(fd) };
-            return false;
+        match poll(&mut poll_fds, PollTimeout::from(100u16)) {
+            Err(e) => {
+                eprintln!("[fc-agent] cache-ack poll error: {}", e);
+                return false;
+            }
+            Ok(0) => {
+                // Timeout - likely restored from snapshot with dead connection
+                eprintln!("[fc-agent] cache-ack poll timeout (restored from snapshot?)");
+                return false;
+            }
+            Ok(_) => {}
         }
 
         // Check for hangup/error
-        if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-            eprintln!("[fc-agent] cache-ack connection closed or error");
-            unsafe { libc::close(fd) };
-            return false;
+        if let Some(revents) = poll_fds[0].revents() {
+            if revents.contains(PollFlags::POLLHUP) || revents.contains(PollFlags::POLLERR) {
+                eprintln!("[fc-agent] cache-ack connection closed or error");
+                return false;
+            }
         }
 
         // Data available (POLLIN set), do non-blocking read
-        let n = unsafe {
-            libc::read(
-                fd,
-                buf[total_read..].as_mut_ptr() as *mut libc::c_void,
-                buf.len() - total_read,
-            )
-        };
-
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
+        match read(sock.as_raw_fd(), &mut buf[total_read..]) as Result<usize, nix::errno::Errno> {
+            Err(nix::errno::Errno::EAGAIN) => {
                 // Non-blocking read returned EAGAIN/EWOULDBLOCK - no data actually available
                 // This can happen after snapshot restore when poll returns but data isn't really there
                 eprintln!("[fc-agent] cache-ack read would block (likely restored from snapshot)");
-                unsafe { libc::close(fd) };
                 return false;
             }
-            eprintln!("[fc-agent] cache-ack read error: {}", err);
-            unsafe { libc::close(fd) };
-            return false;
+            Err(e) => {
+                eprintln!("[fc-agent] cache-ack read error: {}", e);
+                return false;
+            }
+            Ok(0) => {
+                // Connection closed
+                eprintln!("[fc-agent] cache-ack connection closed");
+                return false;
+            }
+            Ok(n) => {
+                total_read += n;
+            }
         }
-
-        if n == 0 {
-            // Connection closed
-            eprintln!("[fc-agent] cache-ack connection closed");
-            unsafe { libc::close(fd) };
-            return false;
-        }
-
-        total_read += n as usize;
 
         // Check if we received "cache-ack\n"
         let received = std::str::from_utf8(&buf[..total_read]).unwrap_or("");
         if received.contains("cache-ack") {
             eprintln!("[fc-agent] ✓ received cache-ack from host");
-            unsafe { libc::close(fd) };
             return true;
         }
 
         // Prevent buffer overflow
         if total_read >= buf.len() {
             eprintln!("[fc-agent] cache-ack buffer overflow, giving up");
-            unsafe { libc::close(fd) };
             return false;
         }
     }
+    // sock is automatically closed when dropped
 }
 
 /// Shutdown the VM with the given exit code.
