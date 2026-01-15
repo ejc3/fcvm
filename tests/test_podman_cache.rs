@@ -3,6 +3,11 @@
 //! Tests the container-layer caching feature that caches VM state after
 //! container image is loaded, enabling fast subsequent launches.
 //!
+//! ## Cache Storage
+//!
+//! Cache entries are stored via SnapshotManager in the snapshots directory
+//! (`paths::snapshot_dir()`). The cache key becomes the snapshot name.
+//!
 //! ## Cache Key Model
 //!
 //! Cache keys are computed from FirecrackerConfig JSON which includes:
@@ -19,7 +24,7 @@
 //!
 //! ## Root Required
 //!
-//! All tests in this file require root to write to /mnt/fcvm-btrfs/podman-cache/.
+//! All tests in this file require root for privileged networking tests.
 
 #![cfg(all(feature = "integration-fast", feature = "privileged-tests"))]
 
@@ -30,10 +35,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-/// Get the snapshot directory path (where podman cache is now stored via SnapshotManager)
-fn snapshot_dir() -> PathBuf {
-    // Cache is stored with SnapshotManager, which uses paths::snapshot_dir()
-    // The data_dir is /mnt/fcvm-btrfs/root by default (from FCVM_DATA_DIR or default)
+/// Get the cache directory path (cache entries are stored as snapshots via SnapshotManager)
+fn cache_dir() -> PathBuf {
     let data_dir = std::env::var("FCVM_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/mnt/fcvm-btrfs/root"));
@@ -43,7 +46,7 @@ fn snapshot_dir() -> PathBuf {
 /// List all cache entries (directory names that contain complete cache files)
 fn list_cache_entries() -> HashSet<String> {
     let mut entries = HashSet::new();
-    if let Ok(dir) = std::fs::read_dir(snapshot_dir()) {
+    if let Ok(dir) = std::fs::read_dir(cache_dir()) {
         for entry in dir.flatten() {
             if let Ok(name) = entry.file_name().into_string() {
                 let path = entry.path();
@@ -77,7 +80,7 @@ async fn wait_for_new_cache_entry(before: &HashSet<String>, timeout_secs: u64) -
 
 /// Check if a specific cache entry exists and is complete
 fn cache_entry_exists(cache_key: &str) -> bool {
-    let path = snapshot_dir().join(cache_key);
+    let path = cache_dir().join(cache_key);
     path.join("memory.bin").exists()
         && path.join("vmstate.bin").exists()
         && path.join("disk.raw").exists()
@@ -326,7 +329,7 @@ async fn test_podman_cache_incomplete_treated_as_miss() -> Result<()> {
 
     // Create an incomplete cache entry with a known key
     let incomplete_key = "incomplete-test-entry";
-    let cache_path = snapshot_dir().join(incomplete_key);
+    let cache_path = cache_dir().join(incomplete_key);
 
     // Clean and create empty directory (incomplete cache)
     let _ = std::fs::remove_dir_all(&cache_path);
