@@ -208,14 +208,24 @@ The snapshot captures VM state **after image pull but before container start**. 
 ```
 
 ### Snapshot & Clone Workflow
+
+Two modes for restoring from snapshots:
+- **UFFD mode** (`--pid`): Memory served on-demand via UFFD server. Best for many concurrent clones sharing memory.
+- **Direct mode** (`--snapshot`): Memory loaded directly from file. Simpler, no server needed.
+
 ```bash
 # 1. Start baseline VM (using bridged, or omit --network for rootless)
 sudo ./fcvm podman run --name baseline --network bridged public.ecr.aws/nginx/nginx:alpine
 
-# 2. Create snapshot (pauses VM briefly)
+# 2. Create snapshot (pauses VM briefly, then resumes)
 sudo ./fcvm snapshot create baseline --tag nginx-warm
 
-# 3. Start UFFD memory server (serves pages on-demand)
+# === Direct Mode (simpler, for single clones) ===
+# Clone directly from snapshot files - no server needed
+sudo ./fcvm snapshot run --snapshot nginx-warm --name clone1 --network bridged
+
+# === UFFD Mode (for multiple concurrent clones) ===
+# 3. Start UFFD memory server (serves pages on-demand, memory shared via page cache)
 sudo ./fcvm snapshot serve nginx-warm
 
 # 4. Clone from snapshot (~10ms restore, ~610ms with exec)
@@ -230,6 +240,8 @@ sudo ./fcvm snapshot run --pid <serve_pid> --name web2 --network bridged --publi
 
 # 6. Clone and execute command (auto-cleans up after)
 sudo ./fcvm snapshot run --pid <serve_pid> --network bridged --exec "curl localhost"
+# Or in direct mode:
+sudo ./fcvm snapshot run --snapshot nginx-warm --network bridged --exec "curl localhost"
 ```
 
 ---
@@ -715,7 +727,7 @@ Run `fcvm --help` or `fcvm <command> --help` for full options.
 | `fcvm ls` | List running VMs (`--json` for JSON output) |
 | `fcvm snapshot create` | Create snapshot from running VM |
 | `fcvm snapshot serve` | Start UFFD memory server for cloning |
-| `fcvm snapshot run` | Spawn clone from memory server |
+| `fcvm snapshot run` | Clone from snapshot (`--pid` for UFFD, `--snapshot` for direct) |
 | `fcvm snapshots` | List available snapshots |
 
 See [DESIGN.md](DESIGN.md#cli-interface) for architecture and design decisions.
