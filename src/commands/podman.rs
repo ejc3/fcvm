@@ -1431,10 +1431,8 @@ async fn run_vm_setup(
         let holder_cmd = slirp_net.build_holder_command();
         info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
 
-        let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let retry_deadline = std::time::Instant::now() + super::common::HOLDER_RETRY_TIMEOUT;
         let mut attempt = 0;
-        #[allow(unused_assignments)]
-        let mut _last_error: Option<String> = None;
 
         let (mut child, holder_pid, mut holder_stderr) = loop {
             attempt += 1;
@@ -1462,14 +1460,13 @@ async fn run_vm_setup(
             // Wait for namespace to be ready by checking uid_map
             let namespace_ready = crate::utils::wait_for_namespace_ready(
                 holder_pid,
-                std::time::Duration::from_millis(500),
+                super::common::NAMESPACE_READY_TIMEOUT,
             )
             .await;
 
             // If namespace didn't become ready, kill holder and retry
             if !namespace_ready {
                 let _ = child.kill().await;
-                _last_error = Some("namespace not ready after 500ms".to_string());
 
                 if std::time::Instant::now() < retry_deadline {
                     warn!(
@@ -1477,7 +1474,7 @@ async fn run_vm_setup(
                         attempt = attempt,
                         "namespace not ready, retrying holder creation..."
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    tokio::time::sleep(super::common::HOLDER_RETRY_INTERVAL).await;
                     continue;
                 } else {
                     bail!(
@@ -1503,12 +1500,6 @@ async fn run_vm_setup(
                         String::new()
                     };
 
-                    _last_error = Some(format!(
-                        "holder exited immediately: status={}, stderr='{}'",
-                        status,
-                        stderr.trim()
-                    ));
-
                     if std::time::Instant::now() < retry_deadline {
                         warn!(
                             holder_pid = holder_pid,
@@ -1517,7 +1508,7 @@ async fn run_vm_setup(
                             stderr = %stderr.trim(),
                             "holder died, retrying..."
                         );
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        tokio::time::sleep(super::common::HOLDER_RETRY_INTERVAL).await;
                         continue;
                     } else {
                         bail!(
@@ -1558,11 +1549,6 @@ async fn run_vm_setup(
 
                 let _ = child.kill().await;
 
-                _last_error = Some(format!(
-                    "holder died after 100ms: stderr='{}'",
-                    holder_stderr_content.trim()
-                ));
-
                 if std::time::Instant::now() < retry_deadline {
                     warn!(
                         holder_pid = holder_pid,
@@ -1570,7 +1556,7 @@ async fn run_vm_setup(
                         holder_stderr = %holder_stderr_content.trim(),
                         "holder died after initial check, retrying..."
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    tokio::time::sleep(super::common::HOLDER_RETRY_INTERVAL).await;
                     continue;
                 } else {
                     let max_user_ns = std::fs::read_to_string("/proc/sys/user/max_user_namespaces")

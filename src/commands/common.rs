@@ -34,6 +34,21 @@ pub const VSOCK_TTY_PORT: u32 = 4996;
 /// Minimum required Firecracker version for network_overrides support
 const MIN_FIRECRACKER_VERSION: (u32, u32, u32) = (1, 13, 1);
 
+/// Timeout for namespace holder creation retries
+pub const HOLDER_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Timeout for waiting for namespace to be ready
+pub const NAMESPACE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Maximum wait time for namespace setup via nsenter
+pub const NSENTER_MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Poll interval for namespace setup retries
+pub const NSENTER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Retry interval between holder creation attempts
+pub const HOLDER_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Find and validate Firecracker binary
 ///
 /// Returns the path to the Firecracker binary if it exists and meets minimum version requirements.
@@ -287,7 +302,7 @@ pub async fn restore_from_snapshot(
         let holder_cmd = slirp_net.build_holder_command();
         info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
 
-        let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let retry_deadline = std::time::Instant::now() + HOLDER_RETRY_TIMEOUT;
         let mut attempt = 0u32;
 
         let (mut child, holder_pid) = loop {
@@ -314,7 +329,7 @@ pub async fn restore_from_snapshot(
             // Wait for namespace to be ready by checking uid_map
             let namespace_ready = crate::utils::wait_for_namespace_ready(
                 holder_pid,
-                std::time::Duration::from_millis(500),
+                NAMESPACE_READY_TIMEOUT,
             )
             .await;
 
@@ -330,7 +345,7 @@ pub async fn restore_from_snapshot(
                     attempt = attempt,
                     "namespace not ready, retrying holder creation..."
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tokio::time::sleep(HOLDER_RETRY_INTERVAL).await;
             } else {
                 anyhow::bail!(
                     "namespace not ready after {} attempts (holder PID {})",
@@ -367,8 +382,6 @@ pub async fn restore_from_snapshot(
 
         // Network setup task
         let network_task = async {
-            const MAX_NS_WAIT: std::time::Duration = std::time::Duration::from_millis(1000);
-            const NS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
             let ns_poll_start = std::time::Instant::now();
 
             info!(holder_pid = holder_pid, "running network setup via nsenter");
@@ -398,14 +411,14 @@ pub async fn restore_from_snapshot(
                 // Check if it's a namespace-not-ready error (retry) vs permanent error (fail)
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if stderr.contains("Invalid argument") || stderr.contains("No such process") {
-                    if ns_poll_start.elapsed() > MAX_NS_WAIT {
+                    if ns_poll_start.elapsed() > NSENTER_MAX_WAIT {
                         anyhow::bail!(
                             "namespace not ready after {:?}: {}",
                             ns_poll_start.elapsed(),
                             stderr
                         );
                     }
-                    tokio::time::sleep(NS_POLL_INTERVAL).await;
+                    tokio::time::sleep(NSENTER_POLL_INTERVAL).await;
                     continue;
                 }
 
