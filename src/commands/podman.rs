@@ -619,7 +619,7 @@ async fn run_status_listener(
 /// If `interactive` is true, forwards host stdin to container.
 ///
 /// Returns collected output lines as Vec<(stream, line)>.
-async fn run_output_listener(
+pub(crate) async fn run_output_listener(
     socket_path: &str,
     vm_id: &str,
     interactive: bool,
@@ -879,6 +879,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 publish: args.publish.clone(),
                 network: args.network,
                 exec: None,
+                tty: args.tty,
+                interactive: args.interactive,
             };
             return super::snapshot::cmd_snapshot_run(snapshot_args).await;
         }

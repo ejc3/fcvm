@@ -283,6 +283,14 @@ pub struct SnapshotRunArgs {
     /// Execute command in container after clone is healthy (like fcvm exec -c)
     #[arg(long)]
     pub exec: Option<String>,
+
+    /// Allocate a pseudo-TTY for the container
+    #[arg(short, long)]
+    pub tty: bool,
+
+    /// Keep STDIN open for interactive mode
+    #[arg(short, long)]
+    pub interactive: bool,
 }
 
 // ============================================================================

@@ -248,6 +248,14 @@ impl NetworkManager for BridgedNetwork {
                 let _ = self.cleanup().await;
                 return Err(e).context("setting up in-namespace NAT");
             }
+
+            // Add host route to guest IP for direct access
+            // This allows curling the guest IP directly from the host
+            // Traffic: host → veth0 → veth1 (namespace) → br0 → TAP → guest
+            if let Err(e) = veth::add_host_route_to_guest(&host_veth, &guest_ip, &veth_inner_ip).await {
+                let _ = self.cleanup().await;
+                return Err(e).context("adding host route to guest IP");
+            }
         } else {
             // Baseline VM: Configure guest side of veth and connect via L2 bridge
             if let Err(e) = veth::setup_guest_veth_in_ns(&namespace_id, &guest_veth).await {

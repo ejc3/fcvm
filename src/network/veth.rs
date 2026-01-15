@@ -524,6 +524,10 @@ pub async fn setup_in_namespace_nat(
 
     // Step 7: Add MASQUERADE rule for NAT on veth outgoing
     // This changes source IP from guest IP (172.30.90.2) to veth IP (10.x.y.2)
+    // IMPORTANT: Only MASQUERADE traffic going to the INTERNET, not to the local host.
+    // Traffic to host_ip (10.x.y.1) is direct access responses - don't masquerade those.
+    // Without this exclusion, direct guest IP access wouldn't work because the response
+    // would have src=veth_ip instead of src=guest_ip.
     let output = exec_in_namespace(
         ns_name,
         &[
@@ -532,6 +536,11 @@ pub async fn setup_in_namespace_nat(
             "nat",
             "-A",
             "POSTROUTING",
+            "-s",
+            &config.guest_ip,
+            "!",
+            "-d",
+            host_ip,
             "-o",
             veth_name,
             "-j",
@@ -584,6 +593,54 @@ pub async fn setup_in_namespace_nat(
         veth = %veth_name,
         veth_ip = %config.veth_ip_cidr,
         "in-namespace NAT configured successfully"
+    );
+
+    Ok(())
+}
+
+/// Adds a host route to reach the guest IP via the namespace's veth IP
+///
+/// For clones using in-namespace NAT, the guest IP (e.g., 172.30.90.2) is not
+/// directly reachable from the host because it's behind the namespace's bridge.
+/// We add a route that uses the namespace veth IP as the nexthop:
+///   ip route add 172.30.90.2/32 via 10.x.y.2
+///
+/// This works because:
+/// - Host ARPs for 10.x.y.2 (namespace veth IP) which IS on the same L2 segment
+/// - Packet is delivered to namespace with dst=172.30.90.2
+/// - Namespace routes it to br0 → TAP → guest
+///
+/// Using just "dev veth0" doesn't work because the host would ARP for 172.30.90.2
+/// directly, but only devices on the veth L2 segment can respond, and the guest
+/// is on a different L2 segment (br0/TAP).
+pub async fn add_host_route_to_guest(host_veth: &str, guest_ip: &str, veth_inner_ip: &str) -> Result<()> {
+    debug!(
+        veth = %host_veth,
+        guest_ip = %guest_ip,
+        via = %veth_inner_ip,
+        "adding host route to guest IP via namespace veth"
+    );
+
+    let route = format!("{}/32", guest_ip);
+    let output = Command::new("ip")
+        .args(["route", "add", &route, "via", veth_inner_ip])
+        .output()
+        .await
+        .context("adding host route to guest IP")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Ignore "File exists" - route already added
+        if !stderr.contains("File exists") {
+            anyhow::bail!("failed to add host route to {}: {}", guest_ip, stderr);
+        }
+    }
+
+    info!(
+        veth = %host_veth,
+        guest_ip = %guest_ip,
+        via = %veth_inner_ip,
+        "host can now reach guest IP directly"
     );
 
     Ok(())

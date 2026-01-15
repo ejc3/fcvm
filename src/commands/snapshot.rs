@@ -17,7 +17,8 @@ use crate::storage::SnapshotManager;
 use crate::uffd::UffdServer;
 use crate::volume::{spawn_volume_servers, VolumeConfig};
 
-use super::common::{MemoryBackend, SnapshotRestoreConfig};
+use super::common::{MemoryBackend, SnapshotRestoreConfig, VSOCK_OUTPUT_PORT, VSOCK_TTY_PORT};
+use super::podman::run_output_listener;
 
 /// Main dispatcher for snapshot commands
 pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
@@ -657,6 +658,40 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         .await
         .context("spawning VolumeServers for clone")?;
 
+    // Setup TTY/output socket paths
+    let tty_mode = args.tty;
+    let interactive = args.interactive;
+    let tty_socket_path = format!("{}_{}", clone_vsock_base.display(), VSOCK_TTY_PORT);
+    let output_socket_path = format!("{}_{}", clone_vsock_base.display(), VSOCK_OUTPUT_PORT);
+
+    // For TTY mode, we spawn a blocking thread that handles the TTY I/O
+    // This must be set up BEFORE VM starts so we're ready to accept connection
+    let tty_handle = if tty_mode {
+        let socket_path = tty_socket_path.clone();
+        Some(std::thread::spawn(move || {
+            super::tty::run_tty_session(&socket_path, true, interactive)
+        }))
+    } else {
+        None
+    };
+
+    // For non-TTY mode, use async output listener
+    let _output_handle = if !tty_mode {
+        let socket_path = output_socket_path.clone();
+        let vm_id_clone = vm_id.clone();
+        Some(tokio::spawn(async move {
+            match run_output_listener(&socket_path, &vm_id_clone, interactive).await {
+                Ok(lines) => lines,
+                Err(e) => {
+                    tracing::warn!("Output listener error: {}", e);
+                    Vec::new()
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     // Setup networking - use saved network config from snapshot
     let tap_device = format!("tap-{}", truncate_id(&vm_id, 8));
     let port_mappings: Vec<PortMapping> = args
@@ -916,6 +951,9 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
 
+    // Track container exit code (from TTY mode)
+    let mut container_exit_code: Option<i32> = None;
+
     // Wait for signal or VM exit
     tokio::select! {
         _ = sigterm.recv() => {
@@ -926,6 +964,11 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         }
         status = vm_manager.wait() => {
             info!(status = ?status, "VM exited");
+            // If in TTY mode, get exit code from TTY handle
+            if let Some(handle) = tty_handle {
+                container_exit_code = handle.join().ok().and_then(|r| r.ok());
+                info!(container_exit_code = ?container_exit_code, "TTY container exit code");
+            }
         }
     }
 
@@ -942,6 +985,13 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         Some(health_monitor_handle),
     )
     .await;
+
+    // Return error if container exited with non-zero code
+    if let Some(code) = container_exit_code {
+        if code != 0 {
+            std::process::exit(code);
+        }
+    }
 
     Ok(())
 }
