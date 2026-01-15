@@ -51,7 +51,7 @@ fn test_sigint_kills_firecracker_bridged() -> Result<()> {
             &vm_name,
             "--network",
             "bridged",
-            common::TEST_IMAGE,
+            "nginx:alpine",
         ])
         .spawn()
         .context("spawning fcvm")?;
@@ -184,7 +184,7 @@ fn test_sigterm_kills_firecracker_bridged() -> Result<()> {
             &vm_name,
             "--network",
             "bridged",
-            common::TEST_IMAGE,
+            "nginx:alpine",
         ])
         .spawn()
         .context("spawning fcvm")?;
