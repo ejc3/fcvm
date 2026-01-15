@@ -30,15 +30,20 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-/// Get the podman cache directory path
-fn podman_cache_dir() -> PathBuf {
-    PathBuf::from("/mnt/fcvm-btrfs/podman-cache")
+/// Get the snapshot directory path (where podman cache is now stored via SnapshotManager)
+fn snapshot_dir() -> PathBuf {
+    // Cache is stored with SnapshotManager, which uses paths::snapshot_dir()
+    // The data_dir is /mnt/fcvm-btrfs/root by default (from FCVM_DATA_DIR or default)
+    let data_dir = std::env::var("FCVM_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/mnt/fcvm-btrfs/root"));
+    data_dir.join("snapshots")
 }
 
 /// List all cache entries (directory names that contain complete cache files)
 fn list_cache_entries() -> HashSet<String> {
     let mut entries = HashSet::new();
-    if let Ok(dir) = std::fs::read_dir(podman_cache_dir()) {
+    if let Ok(dir) = std::fs::read_dir(snapshot_dir()) {
         for entry in dir.flatten() {
             if let Ok(name) = entry.file_name().into_string() {
                 let path = entry.path();
@@ -72,7 +77,7 @@ async fn wait_for_new_cache_entry(before: &HashSet<String>, timeout_secs: u64) -
 
 /// Check if a specific cache entry exists and is complete
 fn cache_entry_exists(cache_key: &str) -> bool {
-    let path = podman_cache_dir().join(cache_key);
+    let path = snapshot_dir().join(cache_key);
     path.join("memory.bin").exists()
         && path.join("vmstate.bin").exists()
         && path.join("disk.raw").exists()
@@ -321,7 +326,7 @@ async fn test_podman_cache_incomplete_treated_as_miss() -> Result<()> {
 
     // Create an incomplete cache entry with a known key
     let incomplete_key = "incomplete-test-entry";
-    let cache_path = podman_cache_dir().join(incomplete_key);
+    let cache_path = snapshot_dir().join(incomplete_key);
 
     // Clean and create empty directory (incomplete cache)
     let _ = std::fs::remove_dir_all(&cache_path);
