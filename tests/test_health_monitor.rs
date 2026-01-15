@@ -74,7 +74,6 @@ async fn test_health_monitor_behaviors() {
             snapshot_name: None,
             process_type: Some(ProcessType::Vm),
             serve_pid: None,
-            original_vsock_vm_id: None,
         },
     };
 

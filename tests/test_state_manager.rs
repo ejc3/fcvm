@@ -47,7 +47,6 @@ async fn test_state_persistence() {
             snapshot_name: None,
             process_type: Some(ProcessType::Vm),
             serve_pid: None,
-            original_vsock_vm_id: None,
         },
     };
 
@@ -113,7 +112,6 @@ async fn test_list_vms() {
                 snapshot_name: None,
                 process_type: Some(ProcessType::Vm),
                 serve_pid: None,
-                original_vsock_vm_id: None,
             },
         };
         manager.save_state(&state).await.unwrap();

@@ -71,36 +71,12 @@ pub async fn create_veth_pair(host_veth: &str, guest_veth: &str, ns_name: &str) 
     Ok(())
 }
 
-/// Check if a network namespace has any running processes
-async fn namespace_has_processes(ns_name: &str) -> bool {
-    // Use ip netns pids to check for processes in the namespace
-    let output = Command::new("ip")
-        .args(["netns", "pids", ns_name])
-        .output()
-        .await;
-
-    match output {
-        Ok(result) if result.status.success() => {
-            // If there are any PIDs output, the namespace is active
-            let stdout = String::from_utf8_lossy(&result.stdout);
-            !stdout.trim().is_empty()
-        }
-        _ => {
-            // Namespace doesn't exist or command failed - consider it inactive
-            false
-        }
-    }
-}
-
 /// Cleans up any stale veth interface with the same IP address
 ///
 /// This is a proactive cleanup for cases where a previous fcvm process was killed
 /// with SIGKILL and didn't get a chance to clean up its network resources.
 /// Without this, the stale veth's IP would conflict with the new one, causing
 /// routing issues (return traffic goes to wrong interface).
-///
-/// IMPORTANT: Only cleans up veths whose associated namespace has no running processes.
-/// This prevents race conditions when multiple VMs from the same cache entry run in parallel.
 async fn cleanup_stale_veth_with_ip(ip_with_cidr: &str, exclude_veth: &str) -> Result<()> {
     // Extract just the IP (without CIDR)
     let ip = ip_with_cidr.split('/').next().unwrap_or(ip_with_cidr);
@@ -133,26 +109,6 @@ async fn cleanup_stale_veth_with_ip(ip_with_cidr: &str, exclude_veth: &str) -> R
 
                 // Don't delete the veth we're about to configure
                 if iface_name == exclude_veth {
-                    continue;
-                }
-
-                // Extract vm_id suffix from veth name (veth0-vm-XXXXX -> vm-XXXXX)
-                // and construct the namespace name (fcvm-vm-XXXXX)
-                let ns_name = if let Some(suffix) = iface_name.strip_prefix("veth0-") {
-                    format!("fcvm-{}", suffix)
-                } else {
-                    continue; // Not a veth we manage
-                };
-
-                // Check if the namespace still has running processes
-                // If so, this veth belongs to an active VM - DON'T delete it!
-                if namespace_has_processes(&ns_name).await {
-                    debug!(
-                        veth = %iface_name,
-                        namespace = %ns_name,
-                        ip = %ip,
-                        "skipping veth cleanup - namespace has running processes (concurrent VM)"
-                    );
                     continue;
                 }
 

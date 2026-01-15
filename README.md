@@ -4,7 +4,6 @@ A Rust implementation that launches Firecracker microVMs to run Podman container
 
 > **Features**
 > - Run OCI containers in isolated Firecracker microVMs
-> - **~6x faster startup** with container image cache (540ms vs 3100ms)
 > - Fast VM cloning via UFFD memory server + btrfs reflinks (~10ms restore, ~610ms with exec)
 > - Multiple VMs share memory via kernel page cache (50 VMs = ~512MB, not 25GB!)
 > - Dual networking: bridged (iptables) or rootless (slirp4netns)
@@ -109,7 +108,7 @@ fcvm runs containers inside Firecracker microVMs:
 You → fcvm → Firecracker VM → Podman → Container
 ```
 
-Each `podman run` boots a VM, pulls the image, and starts the container with full VM isolation. First run takes ~3s; subsequent runs with the same image take ~540ms (cached).
+Each `podman run` boots a VM (~5s), pulls the image, and starts the container with full VM isolation.
 
 ```bash
 # Install Rust (if not already installed)
@@ -151,30 +150,6 @@ sudo ./fcvm setup
 # Bridged networking (for full network access, requires sudo)
 sudo ./fcvm podman run --name web-bridged --network bridged nginx:alpine
 ```
-
-### Container Image Cache (~6x Faster Startup)
-
-fcvm automatically caches container images after the first pull. On subsequent runs with the same image, startup is **~6x faster** (540ms vs 3100ms).
-
-```bash
-# First run: pulls image, creates cache (~3s)
-./fcvm podman run --name web1 nginx:alpine
-# → Cache created for nginx:alpine
-
-# Second run: restores from cache (~540ms)
-./fcvm podman run --name web2 nginx:alpine
-# → Restored from cache
-
-# Disable cache for testing
-./fcvm podman run --name web3 --no-cache nginx:alpine
-```
-
-**How it works:**
-1. First run: fc-agent pulls image, host takes Firecracker snapshot
-2. Cache key: SHA256 of (image, tag, cmd, env, config)
-3. Subsequent runs: Restore snapshot, fc-agent starts container (image already pulled)
-
-The snapshot captures VM state **after image pull but before container start**. On restore, fc-agent runs `podman run` with the already-pulled image, skipping the slow pull/export step.
 
 ### More Options
 
@@ -732,7 +707,6 @@ See [DESIGN.md](DESIGN.md#cli-interface) for architecture and design decisions.
 -i, --interactive   Keep stdin open (for piping input)
 -t, --tty           Allocate pseudo-TTY (for vim, colors, etc.)
 --setup             Auto-setup if kernel/rootfs missing (rootless only)
---no-cache          Disable container image cache (for testing)
 ```
 
 **`fcvm exec`** - Execute in VM/container:

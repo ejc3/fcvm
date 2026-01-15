@@ -109,12 +109,6 @@ pub struct VmConfig {
     pub process_type: Option<ProcessType>,
     /// For clones: which serve process PID spawned this clone
     pub serve_pid: Option<u32>,
-    /// Original VM ID for vsock socket path redirect.
-    /// Set when VM is restored from cache or snapshot. The vmstate.bin stores
-    /// paths from the original VM, so when this VM is later snapshotted, we need
-    /// to preserve this original_vm_id for clones to use the correct redirect.
-    #[serde(default)]
-    pub original_vsock_vm_id: Option<String>,
 }
 
 impl VmState {
@@ -143,7 +137,6 @@ impl VmState {
                 snapshot_name: None,
                 process_type: Some(ProcessType::Vm),
                 serve_pid: None,
-                original_vsock_vm_id: None,
             },
         }
     }

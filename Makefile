@@ -310,8 +310,6 @@ setup-fcvm: build setup-btrfs
 	fi
 	@echo "==> Running fcvm setup..."
 	./target/release/fcvm setup
-	@echo "==> Running fcvm setup --kernel-profile nested..."
-	./target/release/fcvm setup --kernel-profile nested --build-kernels
 
 # Build and install host kernel with all patches from kernel/patches/
 # Requires reboot to activate the new kernel
