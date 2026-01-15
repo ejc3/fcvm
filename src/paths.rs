@@ -99,11 +99,8 @@ pub fn image_cache_dir() -> PathBuf {
     assets_dir().join("image-cache")
 }
 
-/// Directory for podman container cache snapshots.
-/// Caches "container-loaded" VM state keyed by image digest + config hash.
-pub fn podman_cache_dir() -> PathBuf {
-    assets_dir().join("podman-cache")
-}
+// NOTE: Podman cache snapshots now use snapshot_dir() with cache_key as name.
+// This unifies snapshot storage - cached snapshots are regular snapshots.
 
 /// Directory for downloaded files (ubuntu cloud image, etc).
 pub fn cache_dir() -> PathBuf {

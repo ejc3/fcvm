@@ -508,7 +508,9 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
 /// Two modes:
 /// - `--pid <serve_pid>`: Clone via UFFD memory sharing (for multiple concurrent clones)
 /// - `--snapshot <name>`: Clone directly from snapshot files (simpler, no serve process needed)
-async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
+///
+/// This is public so podman.rs can call it directly for cache hits.
+pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Determine mode and get snapshot name
     let (snapshot_name, serve_pid, use_uffd) = match (&args.pid, &args.snapshot) {
         (Some(pid), None) => {
