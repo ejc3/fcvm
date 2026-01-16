@@ -70,7 +70,10 @@ fn list_snapshot_entries() -> HashSet<String> {
 }
 
 /// Wait for a new snapshot entry to appear (returns the new key)
-async fn wait_for_new_snapshot_entry(before: &HashSet<String>, timeout_secs: u64) -> Option<String> {
+async fn wait_for_new_snapshot_entry(
+    before: &HashSet<String>,
+    timeout_secs: u64,
+) -> Option<String> {
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(timeout_secs) {
         let current = list_snapshot_entries();

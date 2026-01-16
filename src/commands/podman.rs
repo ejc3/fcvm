@@ -1178,7 +1178,9 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // Note: no_snapshot and is_localhost_image are already defined above
     let skip_snapshot_creation = no_snapshot || !args.map.is_empty() || is_localhost_image;
     if !args.map.is_empty() && !no_snapshot {
-        info!("Skipping snapshot creation: volumes specified (FUSE doesn't survive snapshot pause)");
+        info!(
+            "Skipping snapshot creation: volumes specified (FUSE doesn't survive snapshot pause)"
+        );
     }
     let (cache_tx, mut cache_rx): (
         Option<mpsc::Sender<CacheRequest>>,
