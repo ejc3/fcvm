@@ -1313,7 +1313,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 if let Some(ref key) = cache_key {
                     info!(cache_key = %key, digest = %cache_request.digest, "Creating cache snapshot");
 
-                    let create_result = create_podman_cache(
+                    // Use nested select! so signals can interrupt cache creation
+                    let cache_fut = create_podman_cache(
                         &vm_manager,
                         key,
                         &vm_id,
@@ -1321,19 +1322,33 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                         &disk_path,
                         &network_config,
                         &volume_configs,
-                    ).await;
+                    );
 
-                    match create_result {
-                        Ok(()) => {
-                            info!(cache_key = %key, "Cache created successfully");
+                    tokio::select! {
+                        biased;  // Check signals first
+                        _ = sigterm.recv() => {
+                            info!("received SIGTERM during cache creation, shutting down VM");
+                            container_exit_code = None;
+                            break;  // Break outer loop to cleanup
                         }
-                        Err(e) => {
-                            warn!(cache_key = %key, error = %e, "Failed to create cache");
+                        _ = sigint.recv() => {
+                            info!("received SIGINT during cache creation, shutting down VM");
+                            container_exit_code = None;
+                            break;  // Break outer loop to cleanup
+                        }
+                        result = cache_fut => {
+                            match result {
+                                Ok(()) => {
+                                    info!(cache_key = %key, "Cache created successfully");
+                                }
+                                Err(e) => {
+                                    warn!(cache_key = %key, error = %e, "Failed to create cache");
+                                }
+                            }
+                            // Send ack back regardless of success (fc-agent should continue)
+                            let _ = cache_request.ack_tx.send(());
                         }
                     }
-
-                    // Send ack back regardless of success (fc-agent should continue)
-                    let _ = cache_request.ack_tx.send(());
                 } else {
                     // Should not happen if channel exists, but send ack anyway
                     let _ = cache_request.ack_tx.send(());
