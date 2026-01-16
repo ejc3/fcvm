@@ -856,14 +856,15 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         None
     };
 
-    // Check for podman cache (unless --no-cache is set or localhost image)
+    // Check for podman cache (unless --no-cache is set, FCVM_NO_CACHE env var, or localhost image)
     // Localhost images have tarball paths in MMDS that won't exist on restore
     // Keep fc_config and cache_key available for later cache creation on miss
+    let no_cache = args.no_cache || std::env::var("FCVM_NO_CACHE").is_ok();
     let is_localhost_image = args.image.starts_with("localhost/");
     let (fc_config, cache_key): (
         Option<crate::firecracker::FirecrackerConfig>,
         Option<String>,
-    ) = if !args.no_cache && !is_localhost_image {
+    ) = if !no_cache && !is_localhost_image {
         // Get image identifier for cache key computation
         let image_identifier = get_image_identifier(&args.image).await?;
         let config = build_firecracker_config(
@@ -907,7 +908,11 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         info!("Cache disabled for localhost image (tarball path won't exist on restore)");
         (None, None)
     } else {
-        info!("Cache disabled via --no-cache flag");
+        if std::env::var("FCVM_NO_CACHE").is_ok() {
+            info!("Cache disabled via FCVM_NO_CACHE environment variable");
+        } else {
+            info!("Cache disabled via --no-cache flag");
+        }
         (None, None)
     };
 
@@ -1146,12 +1151,12 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     // Create cache channel for cache-ready notifications
     // Skip cache creation when:
-    // - --no-cache flag is set
+    // - --no-cache flag or FCVM_NO_CACHE env var is set
     // - Volumes are specified (FUSE-over-vsock breaks during snapshot pause)
     // - Localhost images (tarball path in MMDS won't exist on restore)
-    // Note: is_localhost_image is already defined above
-    let skip_cache_creation = args.no_cache || !args.map.is_empty() || is_localhost_image;
-    if !args.map.is_empty() && !args.no_cache {
+    // Note: no_cache and is_localhost_image are already defined above
+    let skip_cache_creation = no_cache || !args.map.is_empty() || is_localhost_image;
+    if !args.map.is_empty() && !no_cache {
         info!("Skipping cache creation: volumes specified (FUSE doesn't survive snapshot pause)");
     }
     let (cache_tx, mut cache_rx): (

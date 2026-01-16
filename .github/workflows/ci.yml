@@ -281,12 +281,25 @@ jobs:
           key: ${{ env.CACHE_KEY_HOST }}-${{ runner.os }}-${{ runner.arch }}
 
   # Runner 1b: Host-Root (bare metal with KVM)
-  # Runs: test-root (privileged tests with nested kernel)
-  # Parallel with Host job for faster CI
+  # Runs: test-root with matrix for cache testing modes
+  # - NoCache: FCVM_NO_CACHE=1, runs once (tests bypass path)
+  # - Cache: no env var, runs twice (cache miss then cache hit)
   host-root:
-    name: Host-Root
+    name: Host-Root-${{ matrix.mode }}
     if: ${{ github.event.inputs.job != 'container' }}
     runs-on: [self-hosted, Linux, ARM64]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: NoCache
+            fcvm_no_cache: "1"
+            test_runs: "1"
+          - mode: Cache
+            fcvm_no_cache: ""
+            test_runs: "2"
+    env:
+      FCVM_NO_CACHE: ${{ matrix.fcvm_no_cache }}
     steps:
       # Clean up root-owned files from previous test runs before checkout
       - name: Clean workspace (pre-checkout)
@@ -386,7 +399,11 @@ jobs:
           sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels
       - name: test-root
         working-directory: fcvm
-        run: make test-root
+        run: |
+          for i in $(seq 1 ${{ matrix.test_runs }}); do
+            echo "=== Test run $i of ${{ matrix.test_runs }} ==="
+            make test-root
+          done
       - name: Capture kernel logs
         if: always()
         run: |
@@ -395,7 +412,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: test-logs-host-root
+          name: test-logs-host-root-${{ matrix.mode }}
           path: /tmp/fcvm-test-logs/
           if-no-files-found: ignore
           retention-days: 14
