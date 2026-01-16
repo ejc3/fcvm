@@ -88,15 +88,20 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     use crate::firecracker::FirecrackerClient;
     let client = FirecrackerClient::new(socket_path)?;
 
-    // Create snapshot paths
+    // Create snapshot paths - use temp directory for atomic creation
     let snapshot_dir = paths::snapshot_dir().join(&snapshot_name);
-    tokio::fs::create_dir_all(&snapshot_dir)
-        .await
-        .context("creating snapshot directory")?;
+    let temp_snapshot_dir = paths::snapshot_dir().join(format!("{}.creating", &snapshot_name));
 
-    let memory_path = snapshot_dir.join("memory.bin");
-    let vmstate_path = snapshot_dir.join("vmstate.bin");
-    let disk_path = snapshot_dir.join("disk.raw");
+    // Clean up any leftover temp directory from previous failed attempt
+    let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+
+    tokio::fs::create_dir_all(&temp_snapshot_dir)
+        .await
+        .context("creating temp snapshot directory")?;
+
+    let memory_path = temp_snapshot_dir.join("memory.bin");
+    let vmstate_path = temp_snapshot_dir.join("vmstate.bin");
+    let disk_path = temp_snapshot_dir.join("disk.raw");
 
     // Pause VM before snapshotting (required by Firecracker)
     info!("Pausing VM before snapshot");
@@ -204,13 +209,18 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             .clone()
             .unwrap_or_else(|| vm_state.vm_id.clone());
 
+        // Build config with FINAL paths (not temp paths) so config.json is correct after rename
+        let final_memory_path = snapshot_dir.join("memory.bin");
+        let final_vmstate_path = snapshot_dir.join("vmstate.bin");
+        let final_disk_path = snapshot_dir.join("disk.raw");
+
         let snapshot_config = SnapshotConfig {
             name: snapshot_name.clone(),
             vm_id: vm_state.vm_id.clone(),
             original_vsock_vm_id: Some(original_vsock_vm_id),
-            memory_path: memory_path.clone(),
-            vmstate_path: vmstate_path.clone(),
-            disk_path: disk_path.clone(),
+            memory_path: final_memory_path.clone(),
+            vmstate_path: final_vmstate_path.clone(),
+            disk_path: final_disk_path.clone(),
             created_at: chrono::Utc::now(),
             metadata: SnapshotMetadata {
                 image: vm_state.config.image.clone(),
@@ -221,11 +231,23 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             },
         };
 
-        let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
-        snapshot_manager
-            .save_snapshot(snapshot_config.clone())
+        // Write config.json directly to temp directory (don't use save_snapshot which creates another dir)
+        let temp_config_path = temp_snapshot_dir.join("config.json");
+        let config_json = serde_json::to_string_pretty(&snapshot_config)?;
+        tokio::fs::write(&temp_config_path, &config_json)
             .await
-            .context("saving snapshot metadata")?;
+            .context("writing snapshot config.json")?;
+
+        // Atomic rename from temp to final location
+        // If final exists (e.g., from previous snapshot with same name), remove it first
+        if snapshot_dir.exists() {
+            tokio::fs::remove_dir_all(&snapshot_dir)
+                .await
+                .context("removing existing snapshot directory")?;
+        }
+        tokio::fs::rename(&temp_snapshot_dir, &snapshot_dir)
+            .await
+            .context("renaming temp snapshot to final location")?;
 
         info!(
             snapshot = %snapshot_name,
@@ -253,6 +275,11 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     }
     .await;
+
+    // Clean up temp directory on failure (on success, it was renamed to final)
+    if snapshot_result.is_err() {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+    }
 
     // Resume the original VM after snapshotting regardless of snapshot result
     info!("Resuming original VM");

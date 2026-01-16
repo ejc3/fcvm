@@ -203,10 +203,13 @@ async fn create_podman_cache(
 
     info!(cache_key = %cache_key, "Creating podman cache snapshot");
 
-    // Create snapshot directory
-    tokio::fs::create_dir_all(&snapshot_dir)
+    // Use temp directory for atomic snapshot creation
+    // Only rename to final location after all files are written successfully
+    let temp_snapshot_dir = snapshot_dir.with_extension("creating");
+    let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+    tokio::fs::create_dir_all(&temp_snapshot_dir)
         .await
-        .context("creating snapshot directory")?;
+        .context("creating temp snapshot directory")?;
 
     // Get Firecracker client
     let client = vm_manager.client().context("VM not started")?;
@@ -223,9 +226,9 @@ async fn create_podman_cache(
 
     info!(cache_key = %cache_key, "VM paused for cache snapshot");
 
-    // Create snapshot files
-    let memory_path = snapshot_dir.join("memory.bin");
-    let vmstate_path = snapshot_dir.join("vmstate.bin");
+    // Create snapshot files in temp directory
+    let memory_path = temp_snapshot_dir.join("memory.bin");
+    let vmstate_path = temp_snapshot_dir.join("vmstate.bin");
 
     let snapshot_result = client
         .create_snapshot(SnapshotCreate {
@@ -246,12 +249,18 @@ async fn create_podman_cache(
         warn!(cache_key = %cache_key, error = %e, "Failed to resume VM after snapshot");
     }
 
-    // Check if snapshot succeeded
-    snapshot_result.context("creating Firecracker snapshot")?;
-    resume_result.context("resuming VM after snapshot")?;
+    // Check if snapshot succeeded - clean up temp dir on failure
+    if let Err(e) = snapshot_result {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        return Err(e).context("creating Firecracker snapshot");
+    }
+    if let Err(e) = resume_result {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        return Err(e).context("resuming VM after snapshot");
+    }
 
     // Copy disk using btrfs reflink
-    let disk_path_in_snapshot = snapshot_dir.join("disk.raw");
+    let disk_path_in_snapshot = temp_snapshot_dir.join("disk.raw");
     let reflink_result = tokio::process::Command::new("cp")
         .args([
             "--reflink=always",
@@ -263,6 +272,7 @@ async fn create_podman_cache(
         .context("copying disk with reflink")?;
 
     if !reflink_result.success() {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
         bail!("Reflink copy failed - btrfs filesystem required for podman cache");
     }
 
@@ -278,13 +288,18 @@ async fn create_podman_cache(
         .collect();
 
     // Save snapshot metadata using SnapshotConfig format
+    // Update paths to point to final location (after rename)
+    let final_memory_path = snapshot_dir.join("memory.bin");
+    let final_vmstate_path = snapshot_dir.join("vmstate.bin");
+    let final_disk_path = snapshot_dir.join("disk.raw");
+
     let snapshot_config = SnapshotConfig {
         name: cache_key.to_string(),
         vm_id: vm_id.to_string(),
         original_vsock_vm_id: None, // Fresh VM, no redirect needed
-        memory_path,
-        vmstate_path,
-        disk_path: disk_path_in_snapshot.clone(),
+        memory_path: final_memory_path,
+        vmstate_path: final_vmstate_path,
+        disk_path: final_disk_path.clone(),
         created_at: chrono::Utc::now(),
         metadata: SnapshotMetadata {
             image: args.image.clone(),
@@ -295,16 +310,22 @@ async fn create_podman_cache(
         },
     };
 
-    // Use SnapshotManager to save the config
-    let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
-    snapshot_manager
-        .save_snapshot(snapshot_config)
+    // Write config to temp directory
+    let config_path = temp_snapshot_dir.join("config.json");
+    let config_json =
+        serde_json::to_string_pretty(&snapshot_config).context("serializing snapshot config")?;
+    tokio::fs::write(&config_path, &config_json)
         .await
-        .context("saving snapshot config")?;
+        .context("writing snapshot config")?;
+
+    // Atomic rename from temp to final location
+    tokio::fs::rename(&temp_snapshot_dir, &snapshot_dir)
+        .await
+        .context("renaming snapshot directory to final location")?;
 
     info!(
         cache_key = %cache_key,
-        disk = %disk_path_in_snapshot.display(),
+        disk = %final_disk_path.display(),
         "Podman cache created successfully"
     );
 
