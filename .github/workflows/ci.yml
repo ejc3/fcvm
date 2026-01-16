@@ -281,9 +281,19 @@ jobs:
           key: ${{ env.CACHE_KEY_HOST }}-${{ runner.os }}-${{ runner.arch }}
 
   # Runner 1b: Host-Root (bare metal with KVM)
-  # Runs: test-root with matrix for snapshot testing modes
-  # - NoSnapshot: FCVM_NO_SNAPSHOT=1, runs once (tests bypass path)
-  # - Snapshot: no env var, runs twice (snapshot miss then snapshot hit)
+  # Runs test-root with matrix for snapshot testing modes.
+  # IMPORTANT: Both matrix entries run on the SAME self-hosted runner to test
+  # snapshot persistence across runs.
+  #
+  # Matrix modes:
+  # - SnapshotDisabled: FCVM_NO_SNAPSHOT=1, runs once
+  #   Tests the code path where snapshot feature is explicitly disabled.
+  #   Verifies --no-snapshot flag and FCVM_NO_SNAPSHOT env var work correctly.
+  #
+  # - SnapshotEnabled: No env var, runs TWICE on same runner
+  #   Run 1: Snapshot miss - creates snapshots for container images
+  #   Run 2: Snapshot hit - reuses snapshots from Run 1 (should be faster)
+  #   This validates the full snapshot lifecycle: create -> persist -> restore
   host-root:
     name: Host-Root-${{ matrix.mode }}
     if: ${{ github.event.inputs.job != 'container' }}
@@ -292,10 +302,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - mode: NoSnapshot
+          - mode: SnapshotDisabled
             fcvm_no_snapshot: "1"
             test_runs: "1"
-          - mode: Snapshot
+          - mode: SnapshotEnabled
             fcvm_no_snapshot: ""
             test_runs: "2"
     env:
@@ -400,9 +410,23 @@ jobs:
       - name: test-root
         working-directory: fcvm
         run: |
+          SNAPSHOT_DIR="${FCVM_DATA_DIR:-/mnt/fcvm-btrfs/root}/snapshots"
           for i in $(seq 1 ${{ matrix.test_runs }}); do
-            echo "=== Test run $i of ${{ matrix.test_runs }} ==="
+            echo ""
+            echo "╔══════════════════════════════════════════════════════════════════╗"
+            echo "║ Test Run $i of ${{ matrix.test_runs }} (${{ matrix.mode }} mode)"
+            echo "╚══════════════════════════════════════════════════════════════════╝"
+            echo ""
+            BEFORE=$(sudo find "$SNAPSHOT_DIR" -maxdepth 1 -type d 2>/dev/null | wc -l)
+            echo "📦 Snapshot entries before run $i: $((BEFORE - 1))"
+            echo ""
             make test-root
+            AFTER=$(sudo find "$SNAPSHOT_DIR" -maxdepth 1 -type d 2>/dev/null | wc -l)
+            echo ""
+            echo "📦 Snapshot entries after run $i: $((AFTER - 1))"
+            if [ "$i" -eq 2 ] && [ "${{ matrix.mode }}" = "SnapshotEnabled" ]; then
+              echo "✓ Run 2 complete - snapshot hit paths tested"
+            fi
           done
       - name: Capture kernel logs
         if: always()
