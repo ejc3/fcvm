@@ -8,15 +8,17 @@ use crate::cli::{
     NetworkMode, SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs,
     SnapshotServeArgs,
 };
-use crate::firecracker::VmManager;
 use crate::network::{BridgedNetwork, NetworkManager, PortMapping, SlirpNetwork};
 use crate::paths;
 use crate::state::{
     generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState, VmStatus,
 };
-use crate::storage::{DiskManager, SnapshotManager};
+use crate::storage::SnapshotManager;
 use crate::uffd::UffdServer;
 use crate::volume::{spawn_volume_servers, VolumeConfig};
+
+use super::common::{MemoryBackend, SnapshotRestoreConfig, VSOCK_OUTPUT_PORT, VSOCK_TTY_PORT};
+use super::podman::run_output_listener;
 
 /// Main dispatcher for snapshot commands
 pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
@@ -189,9 +191,23 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             );
         }
 
+        // Use original_vsock_vm_id from the VM state if available.
+        // When a VM is restored from cache, its vmstate.bin references vsock paths from the
+        // ORIGINAL (cached) VM. Taking a snapshot of this restored VM creates a NEW vmstate.bin,
+        // but Firecracker doesn't update vsock paths - they still reference the original VM ID.
+        // So we must preserve the original_vsock_vm_id through the chain:
+        // Cache(vm-AAA) → Restore(vm-BBB) → Snapshot → Clone(vm-CCC)
+        // The clone needs to redirect from vm-AAA's path, not vm-BBB's.
+        let original_vsock_vm_id = vm_state
+            .config
+            .original_vsock_vm_id
+            .clone()
+            .unwrap_or_else(|| vm_state.vm_id.clone());
+
         let snapshot_config = SnapshotConfig {
             name: snapshot_name.clone(),
             vm_id: vm_state.vm_id.clone(),
+            original_vsock_vm_id: Some(original_vsock_vm_id),
             memory_path: memory_path.clone(),
             vmstate_path: vmstate_path.clone(),
             disk_path: disk_path.clone(),
@@ -489,33 +505,54 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
 }
 
 /// Run clone from snapshot
-async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
-    // Verify the serve process is actually alive before attempting any work
-    // This prevents wasted setup if the serve process died between state file creation and now
-    if !crate::utils::is_process_alive(args.pid) {
-        anyhow::bail!(
-            "serve process (PID {}) is not running - start with 'fcvm snapshot serve'",
-            args.pid
-        );
-    }
+///
+/// Two modes:
+/// - `--pid <serve_pid>`: Clone via UFFD memory sharing (for multiple concurrent clones)
+/// - `--snapshot <name>`: Clone directly from snapshot files (simpler, no serve process needed)
+///
+/// This is public so podman.rs can call it directly for cache hits.
+pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
+    // Determine mode and get snapshot name
+    let (snapshot_name, serve_pid, use_uffd) = match (&args.pid, &args.snapshot) {
+        (Some(pid), None) => {
+            // UFFD mode: verify serve process is alive
+            if !crate::utils::is_process_alive(*pid) {
+                anyhow::bail!(
+                    "serve process (PID {}) is not running - start with 'fcvm snapshot serve'",
+                    pid
+                );
+            }
 
-    // Load serve state by PID to get snapshot name
+            // Load serve state by PID to get snapshot name
+            let state_manager = StateManager::new(paths::state_dir());
+            let serve_state = state_manager
+                .load_state_by_pid(*pid)
+                .await
+                .context("loading serve process state - is serve running?")?;
+
+            let name = serve_state
+                .config
+                .snapshot_name
+                .ok_or_else(|| anyhow::anyhow!("serve process has no snapshot_name"))?;
+
+            info!("Cloning VM from serve PID {} (snapshot: {})", pid, name);
+            (name, Some(*pid), true)
+        }
+        (None, Some(name)) => {
+            // Direct file mode: no serve process needed
+            info!("Cloning VM directly from snapshot: {}", name);
+            (name.clone(), None, false)
+        }
+        (None, None) => {
+            anyhow::bail!("Either --pid or --snapshot must be specified");
+        }
+        (Some(_), Some(_)) => {
+            // clap's conflicts_with should prevent this, but just in case
+            anyhow::bail!("Cannot specify both --pid and --snapshot");
+        }
+    };
+
     let state_manager = StateManager::new(paths::state_dir());
-    let serve_state = state_manager
-        .load_state_by_pid(args.pid)
-        .await
-        .context("loading serve process state - is serve running?")?;
-
-    // Get snapshot name from serve state
-    let snapshot_name = serve_state
-        .config
-        .snapshot_name
-        .ok_or_else(|| anyhow::anyhow!("serve process has no snapshot_name"))?;
-
-    info!(
-        "Cloning VM from serve PID {} (snapshot: {})",
-        args.pid, snapshot_name
-    );
 
     // Load snapshot configuration
     let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
@@ -555,7 +592,7 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Save snapshot tracking info in clone state
     vm_state.config.snapshot_name = Some(snapshot_name.clone());
     vm_state.config.process_type = Some(crate::state::ProcessType::Clone);
-    vm_state.config.serve_pid = Some(args.pid); // Track which serve spawned us!
+    vm_state.config.serve_pid = serve_pid; // Track which serve spawned us (None for direct mode)
 
     // Setup paths
     let data_dir = paths::vm_runtime_dir(&vm_id);
@@ -565,17 +602,23 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     let socket_path = data_dir.join("firecracker.sock");
 
-    // Build UFFD socket path for memory server
-    // Note: We already verified the serve process is alive above.
-    // We do NOT check socket existence here (TOCTOU race) - let the actual
-    // connection attempt fail with a meaningful error instead.
-    let uffd_socket = paths::data_dir().join(format!("uffd-{}-{}.sock", snapshot_name, args.pid));
-
-    info!(
-        uffd_socket = %uffd_socket.display(),
-        serve_pid = args.pid,
-        "connecting to memory server"
-    );
+    // Build UFFD socket path for memory server (only for UFFD mode)
+    let uffd_socket = if use_uffd {
+        let pid = serve_pid.expect("serve_pid must be set for UFFD mode");
+        let socket = paths::data_dir().join(format!("uffd-{}-{}.sock", snapshot_name, pid));
+        info!(
+            uffd_socket = %socket.display(),
+            serve_pid = pid,
+            "connecting to memory server"
+        );
+        Some(socket)
+    } else {
+        info!(
+            memory_file = %snapshot_config.memory_path.display(),
+            "loading memory directly from file"
+        );
+        None
+    };
 
     // Setup VolumeServers for clones if snapshot has volumes
     //
@@ -611,6 +654,40 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     let volume_server_handles = spawn_volume_servers(&volume_configs, &clone_vsock_base)
         .await
         .context("spawning VolumeServers for clone")?;
+
+    // Setup TTY/output socket paths
+    let tty_mode = args.tty;
+    let interactive = args.interactive;
+    let tty_socket_path = format!("{}_{}", clone_vsock_base.display(), VSOCK_TTY_PORT);
+    let output_socket_path = format!("{}_{}", clone_vsock_base.display(), VSOCK_OUTPUT_PORT);
+
+    // For TTY mode, we spawn a blocking thread that handles the TTY I/O
+    // This must be set up BEFORE VM starts so we're ready to accept connection
+    let tty_handle = if tty_mode {
+        let socket_path = tty_socket_path.clone();
+        Some(std::thread::spawn(move || {
+            super::tty::run_tty_session(&socket_path, true, interactive)
+        }))
+    } else {
+        None
+    };
+
+    // For non-TTY mode, use async output listener
+    let _output_handle = if !tty_mode {
+        let socket_path = output_socket_path.clone();
+        let vm_id_clone = vm_id.clone();
+        Some(tokio::spawn(async move {
+            match run_output_listener(&socket_path, &vm_id_clone, interactive).await {
+                Ok(lines) => lines,
+                Err(e) => {
+                    tracing::warn!("Output listener error: {}", e);
+                    Vec::new()
+                }
+            }
+        }))
+    } else {
+        None
+    };
 
     // Setup networking - use saved network config from snapshot
     let tap_device = format!("tap-{}", truncate_id(&vm_id, 8));
@@ -696,14 +773,53 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         "network configured for clone"
     );
 
-    // Run clone setup in a helper to ensure cleanup on error
-    let setup_result = run_clone_setup(
+    // Build restore configuration
+    // For snapshots of cache-restored VMs:
+    // - original_vsock_vm_id (vm-AAA) = vsock paths in vmstate.bin (unchanged from cache)
+    // - vm_id (vm-BBB) = disk paths in vmstate.bin (patched during cache restore)
+    // For snapshots of fresh VMs:
+    // - vm_id is used for both (no separate original_vsock_vm_id)
+    let original_vm_id = snapshot_config
+        .original_vsock_vm_id
+        .clone()
+        .unwrap_or_else(|| snapshot_config.vm_id.clone());
+
+    // snapshot_vm_id is the VM ID where disk paths point (snapshot_config.vm_id)
+    // Only set if different from original_vm_id (for cache-restored VMs)
+    let snapshot_vm_id = if snapshot_config.original_vsock_vm_id.is_some() {
+        // Snapshot of cache-restored VM: disk paths point to snapshot's vm_id
+        Some(snapshot_config.vm_id.clone())
+    } else {
+        // Snapshot of fresh VM: disk and vsock both use same vm_id
+        None
+    };
+
+    // Choose memory backend based on mode
+    let memory_backend = if let Some(ref uffd_socket_path) = uffd_socket {
+        MemoryBackend::Uffd {
+            socket_path: uffd_socket_path.clone(),
+        }
+    } else {
+        MemoryBackend::File {
+            memory_path: snapshot_config.memory_path.clone(),
+        }
+    };
+
+    let restore_config = SnapshotRestoreConfig {
+        vmstate_path: snapshot_config.vmstate_path.clone(),
+        memory_backend,
+        source_disk_path: snapshot_config.disk_path.clone(),
+        original_vm_id,
+        snapshot_vm_id,
+    };
+
+    // Run clone setup using shared restore function
+    let setup_result = super::common::restore_from_snapshot(
         &vm_id,
         &vm_name,
         &data_dir,
         &socket_path,
-        &uffd_socket,
-        &snapshot_config,
+        &restore_config,
         &network_config,
         network.as_mut(),
         &state_manager,
@@ -732,16 +848,29 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     let (mut vm_manager, mut holder_child) = setup_result.unwrap();
 
-    info!(
-        vm_id = %vm_id,
-        vm_name = %vm_name,
-        "VM cloned successfully with UFFD memory sharing!"
-    );
-    println!(
-        "✓ VM '{}' cloned from snapshot '{}'",
-        vm_name, snapshot_name
-    );
-    println!("  Memory pages shared via UFFD");
+    if use_uffd {
+        info!(
+            vm_id = %vm_id,
+            vm_name = %vm_name,
+            "VM cloned successfully with UFFD memory sharing!"
+        );
+        println!(
+            "✓ VM '{}' cloned from snapshot '{}' (UFFD mode)",
+            vm_name, snapshot_name
+        );
+        println!("  Memory pages shared via UFFD server");
+    } else {
+        info!(
+            vm_id = %vm_id,
+            vm_name = %vm_name,
+            "VM cloned successfully from snapshot files!"
+        );
+        println!(
+            "✓ VM '{}' cloned from snapshot '{}' (direct mode)",
+            vm_name, snapshot_name
+        );
+        println!("  Memory loaded from file");
+    }
     println!("  Disk uses CoW overlay");
 
     // Handle --exec: run command in container then cleanup and exit
@@ -819,6 +948,9 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
 
+    // Track container exit code (from TTY mode)
+    let mut container_exit_code: Option<i32> = None;
+
     // Wait for signal or VM exit
     tokio::select! {
         _ = sigterm.recv() => {
@@ -829,6 +961,11 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         }
         status = vm_manager.wait() => {
             info!(status = ?status, "VM exited");
+            // If in TTY mode, get exit code from TTY handle
+            if let Some(handle) = tty_handle {
+                container_exit_code = handle.join().ok().and_then(|r| r.ok());
+                info!(container_exit_code = ?container_exit_code, "TTY container exit code");
+            }
         }
     }
 
@@ -845,6 +982,13 @@ async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         Some(health_monitor_handle),
     )
     .await;
+
+    // Return error if container exited with non-zero code
+    if let Some(code) = container_exit_code {
+        if code != 0 {
+            std::process::exit(code);
+        }
+    }
 
     Ok(())
 }
@@ -892,403 +1036,4 @@ async fn cmd_snapshot_ls() -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Helper function that runs clone setup and returns VmManager on success.
-/// This allows the caller to cleanup network resources on error.
-/// For rootless mode, also returns the holder process that keeps the namespace alive.
-#[allow(clippy::too_many_arguments)]
-async fn run_clone_setup(
-    vm_id: &str,
-    vm_name: &str,
-    data_dir: &std::path::Path,
-    socket_path: &std::path::Path,
-    uffd_socket: &std::path::Path,
-    snapshot_config: &crate::storage::snapshot::SnapshotConfig,
-    network_config: &crate::network::NetworkConfig,
-    network: &mut dyn NetworkManager,
-    state_manager: &StateManager,
-    vm_state: &mut VmState,
-) -> Result<(VmManager, Option<tokio::process::Child>)> {
-    let vm_dir = data_dir.join("disks");
-
-    // Configure namespace isolation if network provides one
-    let mut holder_child: Option<tokio::process::Child> = None;
-    let mut holder_pid_for_post_start: Option<u32> = None;
-    let mut vm_manager = VmManager::new(vm_id.to_string(), socket_path.to_path_buf(), None);
-    vm_manager.set_vm_name(vm_name.to_string());
-
-    // rootfs_path is set by either the bridged or rootless branch
-    let rootfs_path: std::path::PathBuf;
-
-    if let Some(bridged_net) = network.as_any().downcast_ref::<BridgedNetwork>() {
-        if let Some(ns_id) = bridged_net.namespace_id() {
-            info!(namespace = %ns_id, "configuring VM to run in network namespace");
-            vm_manager.set_namespace(ns_id.to_string());
-        }
-
-        // For bridged mode, create disk sequentially (no parallelization benefit)
-        let disk_manager = DiskManager::new(
-            vm_id.to_string(),
-            snapshot_config.disk_path.clone(),
-            vm_dir.clone(),
-        );
-
-        rootfs_path = disk_manager
-            .create_cow_disk()
-            .await
-            .context("creating CoW disk from snapshot")?;
-
-        info!(
-            rootfs = %rootfs_path.display(),
-            snapshot_disk = %snapshot_config.disk_path.display(),
-            "CoW disk prepared from snapshot"
-        );
-    } else if let Some(slirp_net) = network.as_any().downcast_ref::<SlirpNetwork>() {
-        // Rootless mode: spawn holder process and set up namespace via nsenter
-        // OPTIMIZATION: Parallelize disk creation with network setup
-
-        // Step 1: Spawn holder process (keeps namespace alive)
-        // Retry for up to 5 seconds if namespace doesn't become ready (race condition)
-        let holder_cmd = slirp_net.build_holder_command();
-        info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
-
-        let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut attempt = 0u32;
-
-        let (mut child, holder_pid) = loop {
-            attempt += 1;
-
-            let mut child = tokio::process::Command::new(&holder_cmd[0])
-                .args(&holder_cmd[1..])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .context("spawning namespace holder process")?;
-
-            let holder_pid = child.id().context("getting holder process PID")?;
-            if attempt > 1 {
-                info!(
-                    holder_pid = holder_pid,
-                    attempt = attempt,
-                    "namespace holder started (retry)"
-                );
-            } else {
-                info!(holder_pid = holder_pid, "namespace holder started");
-            }
-
-            // Wait for namespace to be ready by checking uid_map
-            let namespace_ready = crate::utils::wait_for_namespace_ready(
-                holder_pid,
-                std::time::Duration::from_millis(500),
-            )
-            .await;
-
-            if namespace_ready {
-                break (child, holder_pid);
-            }
-
-            // Namespace not ready, kill holder and retry
-            let _ = child.kill().await;
-            if std::time::Instant::now() < retry_deadline {
-                warn!(
-                    holder_pid = holder_pid,
-                    attempt = attempt,
-                    "namespace not ready, retrying holder creation..."
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            } else {
-                bail!(
-                    "namespace not ready after {} attempts (holder PID {})",
-                    attempt,
-                    holder_pid
-                );
-            }
-        };
-
-        // Step 2: Run disk creation and network setup IN PARALLEL
-        // This saves ~16ms by overlapping these independent operations
-        let setup_script = slirp_net.build_setup_script();
-        let nsenter_prefix = slirp_net.build_nsenter_prefix(holder_pid);
-        let tap_device = network_config.tap_device.clone();
-
-        // Disk creation task
-        let disk_task = async {
-            let disk_manager = DiskManager::new(
-                vm_id.to_string(),
-                snapshot_config.disk_path.clone(),
-                vm_dir.clone(),
-            );
-
-            let rootfs_path = disk_manager
-                .create_cow_disk()
-                .await
-                .context("creating CoW disk from snapshot")?;
-
-            info!(
-                rootfs = %rootfs_path.display(),
-                snapshot_disk = %snapshot_config.disk_path.display(),
-                "CoW disk prepared from snapshot"
-            );
-
-            Ok::<_, anyhow::Error>(rootfs_path)
-        };
-
-        // Network setup task
-        let network_task = async {
-            const MAX_NS_WAIT: Duration = Duration::from_millis(1000);
-            const NS_POLL_INTERVAL: Duration = Duration::from_millis(5);
-            let ns_poll_start = std::time::Instant::now();
-
-            info!(holder_pid = holder_pid, "running network setup via nsenter");
-            loop {
-                // Verify holder is still alive before attempting nsenter
-                if !crate::utils::is_process_alive(holder_pid) {
-                    bail!(
-                        "holder process (PID {}) died before network setup could run",
-                        holder_pid
-                    );
-                }
-
-                let output = tokio::process::Command::new(&nsenter_prefix[0])
-                    .args(&nsenter_prefix[1..])
-                    .arg("bash")
-                    .arg("-c")
-                    .arg(&setup_script)
-                    .output()
-                    .await
-                    .context("running network setup via nsenter")?;
-
-                if output.status.success() {
-                    debug!("namespace ready after {:?}", ns_poll_start.elapsed());
-                    break;
-                }
-
-                // Check if it's a namespace-not-ready error (retry) vs permanent error (fail)
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if stderr.contains("Invalid argument") || stderr.contains("No such process") {
-                    if ns_poll_start.elapsed() > MAX_NS_WAIT {
-                        bail!(
-                            "namespace not ready after {:?}: {}",
-                            ns_poll_start.elapsed(),
-                            stderr
-                        );
-                    }
-                    tokio::time::sleep(NS_POLL_INTERVAL).await;
-                    continue;
-                }
-
-                // Permanent error
-                bail!("network setup failed: {}", stderr);
-            }
-
-            // Verify TAP device was created successfully
-            let verify_cmd = format!("ip link show {} >/dev/null 2>&1", tap_device);
-            let verify_output = tokio::process::Command::new(&nsenter_prefix[0])
-                .args(&nsenter_prefix[1..])
-                .arg("bash")
-                .arg("-c")
-                .arg(&verify_cmd)
-                .status()
-                .await
-                .context("verifying TAP device")?;
-
-            if !verify_output.success() {
-                bail!(
-                    "TAP device '{}' not found after network setup - setup may have failed silently",
-                    tap_device
-                );
-            }
-            debug!(tap_device = %tap_device, "TAP device verified");
-
-            Ok::<_, anyhow::Error>(())
-        };
-
-        // Run both tasks in parallel
-        let (disk_result, network_result) = tokio::join!(disk_task, network_task);
-
-        // Handle errors - kill holder child if either fails
-        if let Err(e) = &disk_result {
-            let _ = child.kill().await;
-            return Err(anyhow::anyhow!("disk creation failed: {}", e));
-        }
-        if let Err(e) = &network_result {
-            let _ = child.kill().await;
-            return Err(anyhow::anyhow!("network setup failed: {}", e));
-        }
-
-        rootfs_path = disk_result?;
-        network_result?;
-
-        info!(
-            holder_pid = holder_pid,
-            "parallel disk + network setup complete"
-        );
-
-        // Step 3: Set namespace paths for pre_exec setns (NOT nsenter wrapper)
-        // For clones, we need to enter namespaces in pre_exec because:
-        // - pre_exec runs BEFORE nsenter would enter the namespace
-        // - We need CAP_SYS_ADMIN (from user namespace) for mount operations
-        // - Entering user namespace first gives us CAP_SYS_ADMIN for unshare(CLONE_NEWNS)
-        vm_manager.set_user_namespace_path(std::path::PathBuf::from(format!(
-            "/proc/{}/ns/user",
-            holder_pid
-        )));
-        vm_manager.set_net_namespace_path(std::path::PathBuf::from(format!(
-            "/proc/{}/ns/net",
-            holder_pid
-        )));
-
-        // Store holder_pid in state for health checks
-        vm_state.holder_pid = Some(holder_pid);
-        holder_pid_for_post_start = Some(holder_pid);
-
-        holder_child = Some(child);
-    } else {
-        // Unknown network type - should not happen
-        bail!("Unknown network type - must be either BridgedNetwork or SlirpNetwork");
-    }
-
-    // Configure mount namespace isolation for vsock redirect
-    // This is ALWAYS needed for clones because vmstate.bin stores the baseline's vsock uds_path,
-    // and Firecracker cannot override it during snapshot restore. Without this isolation:
-    // - The baseline VM is using /baseline_dir/vsock.sock
-    // - All clones would try to bind() to the same path, causing "Address in use" errors
-    //
-    // Solution: Run each clone in a mount namespace where baseline_dir is bind-mounted
-    // over clone_dir. When Firecracker does bind("/baseline_dir/vsock.sock"),
-    // it actually binds to "/clone_dir/vsock.sock" due to the bind mount.
-    let baseline_dir = paths::vm_runtime_dir(&snapshot_config.vm_id);
-    info!(
-        baseline_dir = %baseline_dir.display(),
-        clone_dir = %data_dir.display(),
-        "enabling mount namespace for vsock socket isolation"
-    );
-    vm_manager.set_vsock_redirect(baseline_dir, data_dir.to_path_buf());
-
-    let firecracker_bin = super::common::find_firecracker()?;
-
-    vm_manager
-        .start(&firecracker_bin, None)
-        .await
-        .context("starting Firecracker")?;
-
-    // For rootless mode with slirp4netns: post_start starts slirp4netns in the namespace
-    // For bridged mode: post_start is a no-op (TAP already created)
-    let vm_pid = vm_manager.pid()?;
-    let post_start_pid = holder_pid_for_post_start.unwrap_or(vm_pid);
-    network
-        .post_start(post_start_pid)
-        .await
-        .context("post-start network setup")?;
-
-    let client = vm_manager.client()?;
-
-    // Load snapshot with UFFD backend and network override
-    use crate::firecracker::api::{
-        DrivePatch, MemBackend, NetworkOverride, SnapshotLoad, VmState as ApiVmState,
-    };
-
-    info!(
-        tap_device = %network_config.tap_device,
-        disk = %rootfs_path.display(),
-        "loading snapshot with uffd backend and network override"
-    );
-
-    // Timing instrumentation: measure snapshot load operation
-    let load_start = std::time::Instant::now();
-    client
-        .load_snapshot(SnapshotLoad {
-            snapshot_path: snapshot_config.vmstate_path.display().to_string(),
-            mem_backend: MemBackend {
-                backend_type: "Uffd".to_string(),
-                backend_path: uffd_socket.display().to_string(),
-            },
-            enable_diff_snapshots: Some(false),
-            resume_vm: Some(false), // Update devices before resume
-            network_overrides: Some(vec![NetworkOverride {
-                iface_id: "eth0".to_string(),
-                host_dev_name: network_config.tap_device.clone(),
-            }]),
-        })
-        .await
-        .context("loading snapshot with uffd backend")?;
-    let load_duration = load_start.elapsed();
-    info!(
-        duration_ms = load_duration.as_millis(),
-        "snapshot load completed"
-    );
-
-    // Timing instrumentation: measure disk patch operation
-    let patch_start = std::time::Instant::now();
-    client
-        .patch_drive(
-            "rootfs",
-            DrivePatch {
-                drive_id: "rootfs".to_string(),
-                path_on_host: Some(rootfs_path.display().to_string()),
-                rate_limiter: None,
-            },
-        )
-        .await
-        .context("retargeting rootfs drive for clone")?;
-    let patch_duration = patch_start.elapsed();
-    info!(
-        duration_ms = patch_duration.as_millis(),
-        "disk patch completed"
-    );
-
-    // Signal fc-agent to flush ARP cache via MMDS restore-epoch update
-    // fc-agent watches for this field change and immediately flushes stale ARP entries
-    //
-    // IMPORTANT: After snapshot load:
-    // - MMDS CONFIG is preserved from the snapshot (version, network interfaces, IP)
-    // - MMDS DATA is NOT persisted (empty data store) - we need to populate it
-    // - /mmds/config endpoint is PRE-BOOT ONLY - cannot be called after snapshot load
-    // - /mmds endpoint (PUT/PATCH) is allowed both pre-boot and post-boot
-    //
-    // So we just call put_mmds() - the config is already there from the snapshot.
-    let restore_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("system time before Unix epoch")?
-        .as_secs();
-
-    // Put the restore-epoch data directly (MMDS config is preserved from snapshot)
-    // fc-agent doesn't need container-plan after restore since container is already running
-    client
-        .put_mmds(serde_json::json!({
-            "latest": {
-                "host-time": chrono::Utc::now().timestamp().to_string(),
-                "restore-epoch": restore_epoch.to_string()
-            }
-        }))
-        .await
-        .context("updating MMDS with restore-epoch")?;
-    info!(
-        restore_epoch = restore_epoch,
-        "signaled fc-agent to flush ARP via MMDS"
-    );
-
-    // Timing instrumentation: measure VM resume operation
-    let resume_start = std::time::Instant::now();
-    client
-        .patch_vm_state(ApiVmState {
-            state: "Resumed".to_string(),
-        })
-        .await
-        .context("resuming VM after snapshot load")?;
-    let resume_duration = resume_start.elapsed();
-    info!(
-        duration_ms = resume_duration.as_millis(),
-        total_snapshot_ms = (load_duration + patch_duration + resume_duration).as_millis(),
-        "VM resume completed"
-    );
-
-    // Store fcvm process PID (not Firecracker PID)
-    vm_state.pid = Some(std::process::id());
-
-    // Save VM state with complete network configuration
-    super::common::save_vm_state_with_network(state_manager, vm_state, network_config).await?;
-
-    Ok((vm_manager, holder_child))
 }

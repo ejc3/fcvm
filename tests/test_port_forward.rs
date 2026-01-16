@@ -44,7 +44,7 @@ fn test_port_forward_bridged() -> Result<()> {
             "bridged",
             "--publish",
             "8080:80",
-            "nginx:alpine",
+            common::TEST_IMAGE,
         ])
         .spawn()
         .context("spawning fcvm")?;
@@ -189,7 +189,7 @@ fn test_port_forward_rootless() -> Result<()> {
             "rootless",
             "--publish",
             "8080:80",
-            "nginx:alpine",
+            common::TEST_IMAGE,
         ])
         .spawn()
         .context("spawning fcvm")?;

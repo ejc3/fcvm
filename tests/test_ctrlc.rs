@@ -145,10 +145,13 @@ async fn test_ctrlc_via_terminal() -> Result<()> {
             Ok(n) => {
                 output.extend_from_slice(&buf[..n]);
                 let output_str = String::from_utf8_lossy(&output);
-                // "Container ready notification received" appears when container is up
-                if output_str.contains("Container ready") {
+                // "Container ready notification received" appears when container starts fresh
+                // "cloned from snapshot" appears when container is restored from cache
+                if output_str.contains("Container ready")
+                    || output_str.contains("cloned from snapshot")
+                {
                     vm_started = true;
-                    println!("  Container ready!");
+                    println!("  Container ready (or cloned)!");
                     break;
                 }
             }

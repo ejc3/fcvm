@@ -202,6 +202,11 @@ pub struct RunArgs {
     #[arg(long)]
     pub vsock_dir: Option<String>,
 
+    /// Disable automatic podman cache (bypass cache lookup and creation).
+    /// By default, fcvm caches "container-loaded" VM snapshots for fast subsequent launches.
+    #[arg(long)]
+    pub no_cache: bool,
+
     /// Container image (e.g., nginx:alpine or localhost/myimage)
     pub image: String,
 
@@ -256,9 +261,13 @@ pub struct SnapshotServeArgs {
 
 #[derive(Args, Debug)]
 pub struct SnapshotRunArgs {
-    /// Serve process PID to clone from
-    #[arg(long)]
-    pub pid: u32,
+    /// Serve process PID to clone from (UFFD mode - memory sharing)
+    #[arg(long, conflicts_with = "snapshot")]
+    pub pid: Option<u32>,
+
+    /// Snapshot name to clone from (direct file mode - no UFFD server needed)
+    #[arg(long, conflicts_with = "pid")]
+    pub snapshot: Option<String>,
 
     /// Optional: custom name for cloned VM (auto-generated if not provided)
     #[arg(long)]
@@ -274,6 +283,14 @@ pub struct SnapshotRunArgs {
     /// Execute command in container after clone is healthy (like fcvm exec -c)
     #[arg(long)]
     pub exec: Option<String>,
+
+    /// Allocate a pseudo-TTY for the container
+    #[arg(short, long)]
+    pub tty: bool,
+
+    /// Keep STDIN open for interactive mode
+    #[arg(short, long)]
+    pub interactive: bool,
 }
 
 // ============================================================================

@@ -1,5 +1,16 @@
 # fcvm Development Log
 
+## ALWAYS FIX FAILING TESTS. PERIOD.
+
+**If ANY test fails, FIX THE ROOT CAUSE.** No exceptions. No workarounds. No weakening assertions.
+
+- Never add flags like `--no-cache` to avoid failures
+- Never weaken assertions to accept broken behavior
+- Never skip, ignore, or comment out failing tests
+- Always fix the actual bug in the code
+
+This is non-negotiable. A test failure means the CODE is broken - fix the code, not the test.
+
 ## STACKED PRs BY DEFAULT
 
 **All work goes in stacked PRs.** Each new PR should be based on the previous one, not main.

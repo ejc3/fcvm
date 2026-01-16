@@ -1135,6 +1135,157 @@ fn notify_container_exit(exit_code: i32) {
     }
 }
 
+/// Get the digest of a pulled image using podman inspect.
+/// Returns the digest string (e.g., "sha256:abc123...")
+async fn get_image_digest(image: &str) -> Result<String> {
+    let output = Command::new("podman")
+        .args(["image", "inspect", "--format", "{{.Digest}}", image])
+        .output()
+        .await
+        .context("running podman image inspect")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("podman image inspect failed: {}", stderr);
+    }
+
+    let digest = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(digest)
+}
+
+/// Notify host that image is loaded and wait for cache creation acknowledgment.
+///
+/// Sends "cache-ready:{digest}\n" to host and waits for "cache-ack\n" response.
+/// The host will pause the VM, create a snapshot, resume, then send ack.
+/// This blocks indefinitely until ack is received (no timeout).
+fn notify_cache_ready_and_wait(digest: &str) -> bool {
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, VsockAddr};
+    use nix::unistd::{read, write};
+    use std::os::fd::{AsFd, AsRawFd};
+
+    // Create vsock socket
+    let sock = match socket(
+        AddressFamily::Vsock,
+        SockType::Stream,
+        SockFlag::empty(),
+        None,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "[fc-agent] WARNING: failed to create vsock socket for cache: {}",
+                e
+            );
+            return false;
+        }
+    };
+
+    // Connect to host
+    let addr = VsockAddr::new(HOST_CID, STATUS_VSOCK_PORT);
+    if let Err(e) = connect(sock.as_raw_fd(), &addr) {
+        eprintln!(
+            "[fc-agent] WARNING: failed to connect vsock for cache: {}",
+            e
+        );
+        return false;
+    }
+
+    // Send cache-ready message
+    let msg = format!("cache-ready:{}\n", digest);
+    match write(&sock, msg.as_bytes()) {
+        Ok(n) if n == msg.len() => {}
+        Ok(_) => {
+            eprintln!("[fc-agent] WARNING: failed to send complete cache-ready message");
+            return false;
+        }
+        Err(e) => {
+            eprintln!(
+                "[fc-agent] WARNING: failed to send cache-ready message: {}",
+                e
+            );
+            return false;
+        }
+    }
+
+    eprintln!("[fc-agent] sent cache-ready:{}, waiting for ack...", digest);
+
+    // Set socket to non-blocking to prevent read() from blocking after restore
+    // After snapshot restore, the kernel might think data is available but read() would block
+    if let Ok(flags) = fcntl(sock.as_raw_fd(), FcntlArg::F_GETFL) {
+        let new_flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
+        let _ = fcntl(sock.as_raw_fd(), FcntlArg::F_SETFL(new_flags));
+    }
+
+    // Wait for cache-ack response with timeout (handles snapshot restore case)
+    // After restore, the vsock connection is dead and poll will timeout
+    let mut buf = [0u8; 64];
+    let mut total_read = 0;
+
+    loop {
+        // Use poll() to check if data is available with timeout
+        let mut poll_fds = [PollFd::new(sock.as_fd(), PollFlags::POLLIN)];
+
+        match poll(&mut poll_fds, PollTimeout::from(100u16)) {
+            Err(e) => {
+                eprintln!("[fc-agent] cache-ack poll error: {}", e);
+                return false;
+            }
+            Ok(0) => {
+                // Timeout - likely restored from snapshot with dead connection
+                eprintln!("[fc-agent] cache-ack poll timeout (restored from snapshot?)");
+                return false;
+            }
+            Ok(_) => {}
+        }
+
+        // Check for hangup/error
+        if let Some(revents) = poll_fds[0].revents() {
+            if revents.contains(PollFlags::POLLHUP) || revents.contains(PollFlags::POLLERR) {
+                eprintln!("[fc-agent] cache-ack connection closed or error");
+                return false;
+            }
+        }
+
+        // Data available (POLLIN set), do non-blocking read
+        match read(sock.as_raw_fd(), &mut buf[total_read..]) as Result<usize, nix::errno::Errno> {
+            Err(nix::errno::Errno::EAGAIN) => {
+                // Non-blocking read returned EAGAIN/EWOULDBLOCK - no data actually available
+                // This can happen after snapshot restore when poll returns but data isn't really there
+                eprintln!("[fc-agent] cache-ack read would block (likely restored from snapshot)");
+                return false;
+            }
+            Err(e) => {
+                eprintln!("[fc-agent] cache-ack read error: {}", e);
+                return false;
+            }
+            Ok(0) => {
+                // Connection closed
+                eprintln!("[fc-agent] cache-ack connection closed");
+                return false;
+            }
+            Ok(n) => {
+                total_read += n;
+            }
+        }
+
+        // Check if we received "cache-ack\n"
+        let received = std::str::from_utf8(&buf[..total_read]).unwrap_or("");
+        if received.contains("cache-ack") {
+            eprintln!("[fc-agent] ✓ received cache-ack from host");
+            return true;
+        }
+
+        // Prevent buffer overflow
+        if total_read >= buf.len() {
+            eprintln!("[fc-agent] cache-ack buffer overflow, giving up");
+            return false;
+        }
+    }
+    // sock is automatically closed when dropped
+}
+
 /// Shutdown the VM with the given exit code.
 ///
 /// This function handles the shutdown sequence:
@@ -1843,14 +1994,64 @@ async fn run_agent() -> Result<()> {
         plan.image.clone()
     };
 
+    // Notify host that image is ready for caching
+    // For registry images, get the digest from podman
+    // For OCI archives, use the image name as identifier
+    if !image_ref.starts_with("oci-archive:") {
+        // Registry image - get digest from podman
+        match get_image_digest(&plan.image).await {
+            Ok(digest) => {
+                eprintln!("[fc-agent] image digest: {}", digest);
+                if notify_cache_ready_and_wait(&digest) {
+                    eprintln!("[fc-agent] ✓ cache ready notification acknowledged");
+                } else {
+                    eprintln!(
+                        "[fc-agent] WARNING: cache-ready handshake failed, continuing anyway"
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("[fc-agent] WARNING: failed to get image digest: {:?}", e);
+                eprintln!("[fc-agent] continuing without cache notification");
+            }
+        }
+    } else {
+        // OCI archive - notify with image name as identifier
+        eprintln!("[fc-agent] using OCI archive, notifying cache-ready with image name");
+        if notify_cache_ready_and_wait(&plan.image) {
+            eprintln!("[fc-agent] ✓ cache ready notification acknowledged");
+        } else {
+            eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing anyway");
+        }
+    }
+
     eprintln!("[fc-agent] launching container: {}", image_ref);
 
     // Build Podman args (used for both TTY and non-TTY modes)
+    //
+    // CRITICAL: --cgroups=split is REQUIRED for snapshot restore.
+    //
+    // Root cause: After Firecracker snapshot restore, systemd's timer/event loop
+    // gets confused because the VM clock jumps from snapshot-time to current-time.
+    // This is a known class of issues (see systemd/systemd#23032) where:
+    //   1. systemd's CLOCK_REALTIME-based timers break on clock discontinuity
+    //   2. epoll_wait() and timerfd handling in the event loop become confused
+    //   3. The watchdog/keepalive pings don't get sent correctly
+    //   4. D-Bus calls to systemd time out waiting for responses
+    //
+    // When crun tries to create cgroups via sd-bus, systemd never responds:
+    //   "OCI runtime error: crun: sd-bus call: Connection timed out"
+    //
+    // Solution: --cgroups=split uses cgroups v2 directly via cgroupfs, bypassing
+    // the broken D-Bus/systemd communication. This gives us:
+    // - Full cgroup v2 functionality (resource limits, isolation)
+    // - No dependency on systemd's event loop
     let mut podman_args = vec![
         "podman".to_string(),
         "run".to_string(),
         "--rm".to_string(),
         "--network=host".to_string(),
+        "--cgroups=split".to_string(),
         "--ulimit".to_string(),
         "nofile=65536:65536".to_string(),
     ];

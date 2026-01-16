@@ -1162,6 +1162,151 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
     }
 }
 
+/// Test direct file-based snapshot run (--snapshot flag) with rootless networking
+///
+/// This tests the new --snapshot flag which restores directly from disk
+/// without needing a UFFD memory server. Simpler for single clones.
+#[tokio::test]
+async fn test_snapshot_run_direct_rootless() -> Result<()> {
+    snapshot_run_direct_test_impl("rootless").await
+}
+
+/// Test direct file-based snapshot run (--snapshot flag) with bridged networking
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_snapshot_run_direct_bridged() -> Result<()> {
+    snapshot_run_direct_test_impl("bridged").await
+}
+
+/// Implementation of direct file-based snapshot run test
+async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) =
+        common::unique_names(&format!("direct-{}", network));
+
+    println!("\n╔═══════════════════════════════════════════════════════════════╗");
+    println!(
+        "║     Direct Snapshot Run Test ({:8})                       ║",
+        network
+    );
+    println!("║     (--snapshot flag, no UFFD server needed)                  ║");
+    println!("╚═══════════════════════════════════════════════════════════════╝\n");
+
+    let fcvm_path = common::find_fcvm_binary()?;
+
+    // Step 1: Start baseline VM
+    println!("Step 1: Starting baseline VM...");
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            network,
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
+
+    println!("  Waiting for baseline VM to become healthy...");
+    common::poll_health_by_pid(baseline_pid, 120).await?;
+    println!("  ✓ Baseline VM healthy (PID: {})", baseline_pid);
+
+    // Step 2: Create snapshot
+    println!("\nStep 2: Creating snapshot...");
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
+        ])
+        .output()
+        .await
+        .context("running snapshot create")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Snapshot creation failed: {}", stderr);
+    }
+    println!("  ✓ Snapshot created");
+
+    // Kill baseline - we only need the snapshot files
+    common::kill_process(baseline_pid).await;
+    println!("  Killed baseline VM (only need snapshot files)");
+
+    // Step 3: Run clone directly from snapshot files (NO UFFD server!)
+    println!(
+        "\nStep 3: Running clone with --snapshot {} (direct file mode)...",
+        snapshot_name
+    );
+    let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--snapshot", // Direct file mode, not --pid
+            &snapshot_name,
+            "--name",
+            &clone_name,
+            "--network",
+            network,
+        ],
+        &clone_name,
+    )
+    .await
+    .context("spawning clone from snapshot (direct mode)")?;
+
+    // Step 4: Wait for clone to become healthy
+    println!("\nStep 4: Waiting for clone to become healthy...");
+    common::poll_health_by_pid(clone_pid, 120).await?;
+    println!("  ✓ Clone is healthy (PID: {})", clone_pid);
+
+    // Step 5: Verify clone works by executing a command
+    println!("\nStep 5: Verifying clone works with exec...");
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "exec",
+            "--pid",
+            &clone_pid.to_string(),
+            "--",
+            "echo",
+            "DIRECT_SNAPSHOT_SUCCESS",
+        ])
+        .output()
+        .await
+        .context("running exec in clone")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let exec_ok = stdout.contains("DIRECT_SNAPSHOT_SUCCESS");
+    println!("  Exec result: {}", if exec_ok { "✓ OK" } else { "✗ FAIL" });
+
+    // Cleanup
+    println!("\nCleaning up...");
+    common::kill_process(clone_pid).await;
+    println!("  Killed clone");
+
+    // Results
+    println!("\n╔═══════════════════════════════════════════════════════════════╗");
+    println!("║                         RESULTS                               ║");
+    println!("╠═══════════════════════════════════════════════════════════════╣");
+    println!(
+        "║  Direct snapshot restore: {}                                  ║",
+        if exec_ok { "✓ PASSED" } else { "✗ FAILED" }
+    );
+    println!("╚═══════════════════════════════════════════════════════════════╝");
+
+    if exec_ok {
+        println!("\n✅ DIRECT SNAPSHOT RUN TEST PASSED!");
+        Ok(())
+    } else {
+        anyhow::bail!("Direct snapshot run test failed: exec_ok={}", exec_ok)
+    }
+}
+
 /// Test snapshot run --exec with bridged networking
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]

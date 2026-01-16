@@ -71,12 +71,36 @@ pub async fn create_veth_pair(host_veth: &str, guest_veth: &str, ns_name: &str) 
     Ok(())
 }
 
+/// Check if a network namespace has any running processes
+async fn namespace_has_processes(ns_name: &str) -> bool {
+    // Use ip netns pids to check for processes in the namespace
+    let output = Command::new("ip")
+        .args(["netns", "pids", ns_name])
+        .output()
+        .await;
+
+    match output {
+        Ok(result) if result.status.success() => {
+            // If there are any PIDs output, the namespace is active
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            !stdout.trim().is_empty()
+        }
+        _ => {
+            // Namespace doesn't exist or command failed - consider it inactive
+            false
+        }
+    }
+}
+
 /// Cleans up any stale veth interface with the same IP address
 ///
 /// This is a proactive cleanup for cases where a previous fcvm process was killed
 /// with SIGKILL and didn't get a chance to clean up its network resources.
 /// Without this, the stale veth's IP would conflict with the new one, causing
 /// routing issues (return traffic goes to wrong interface).
+///
+/// IMPORTANT: Only cleans up veths whose associated namespace has no running processes.
+/// This prevents race conditions when multiple VMs from the same cache entry run in parallel.
 async fn cleanup_stale_veth_with_ip(ip_with_cidr: &str, exclude_veth: &str) -> Result<()> {
     // Extract just the IP (without CIDR)
     let ip = ip_with_cidr.split('/').next().unwrap_or(ip_with_cidr);
@@ -109,6 +133,26 @@ async fn cleanup_stale_veth_with_ip(ip_with_cidr: &str, exclude_veth: &str) -> R
 
                 // Don't delete the veth we're about to configure
                 if iface_name == exclude_veth {
+                    continue;
+                }
+
+                // Extract vm_id suffix from veth name (veth0-vm-XXXXX -> vm-XXXXX)
+                // and construct the namespace name (fcvm-vm-XXXXX)
+                let ns_name = if let Some(suffix) = iface_name.strip_prefix("veth0-") {
+                    format!("fcvm-{}", suffix)
+                } else {
+                    continue; // Not a veth we manage
+                };
+
+                // Check if the namespace still has running processes
+                // If so, this veth belongs to an active VM - DON'T delete it!
+                if namespace_has_processes(&ns_name).await {
+                    debug!(
+                        veth = %iface_name,
+                        namespace = %ns_name,
+                        ip = %ip,
+                        "skipping veth cleanup - namespace has running processes (concurrent VM)"
+                    );
                     continue;
                 }
 
@@ -480,6 +524,10 @@ pub async fn setup_in_namespace_nat(
 
     // Step 7: Add MASQUERADE rule for NAT on veth outgoing
     // This changes source IP from guest IP (172.30.90.2) to veth IP (10.x.y.2)
+    // IMPORTANT: Only MASQUERADE traffic going to the INTERNET, not to the local host.
+    // Traffic to host_ip (10.x.y.1) is direct access responses - don't masquerade those.
+    // Without this exclusion, direct guest IP access wouldn't work because the response
+    // would have src=veth_ip instead of src=guest_ip.
     let output = exec_in_namespace(
         ns_name,
         &[
@@ -488,6 +536,11 @@ pub async fn setup_in_namespace_nat(
             "nat",
             "-A",
             "POSTROUTING",
+            "-s",
+            &config.guest_ip,
+            "!",
+            "-d",
+            host_ip,
             "-o",
             veth_name,
             "-j",
@@ -540,6 +593,58 @@ pub async fn setup_in_namespace_nat(
         veth = %veth_name,
         veth_ip = %config.veth_ip_cidr,
         "in-namespace NAT configured successfully"
+    );
+
+    Ok(())
+}
+
+/// Adds a host route to reach the guest IP via the namespace's veth IP
+///
+/// For clones using in-namespace NAT, the guest IP (e.g., 172.30.90.2) is not
+/// directly reachable from the host because it's behind the namespace's bridge.
+/// We add a route that uses the namespace veth IP as the nexthop:
+///   ip route add 172.30.90.2/32 via 10.x.y.2
+///
+/// This works because:
+/// - Host ARPs for 10.x.y.2 (namespace veth IP) which IS on the same L2 segment
+/// - Packet is delivered to namespace with dst=172.30.90.2
+/// - Namespace routes it to br0 → TAP → guest
+///
+/// Using just "dev veth0" doesn't work because the host would ARP for 172.30.90.2
+/// directly, but only devices on the veth L2 segment can respond, and the guest
+/// is on a different L2 segment (br0/TAP).
+pub async fn add_host_route_to_guest(
+    host_veth: &str,
+    guest_ip: &str,
+    veth_inner_ip: &str,
+) -> Result<()> {
+    debug!(
+        veth = %host_veth,
+        guest_ip = %guest_ip,
+        via = %veth_inner_ip,
+        "adding host route to guest IP via namespace veth"
+    );
+
+    let route = format!("{}/32", guest_ip);
+    let output = Command::new("ip")
+        .args(["route", "add", &route, "via", veth_inner_ip])
+        .output()
+        .await
+        .context("adding host route to guest IP")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Ignore "File exists" - route already added
+        if !stderr.contains("File exists") {
+            anyhow::bail!("failed to add host route to {}: {}", guest_ip, stderr);
+        }
+    }
+
+    info!(
+        veth = %host_veth,
+        guest_ip = %guest_ip,
+        via = %veth_inner_ip,
+        "host can now reach guest IP directly"
     );
 
     Ok(())

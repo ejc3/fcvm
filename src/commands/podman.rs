@@ -1,16 +1,31 @@
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::cli::{NetworkMode, PodmanArgs, PodmanCommands, RunArgs};
 use crate::firecracker::VmManager;
-use crate::network::{BridgedNetwork, NetworkManager, PortMapping, SlirpNetwork};
+use crate::network::{BridgedNetwork, NetworkConfig, NetworkManager, PortMapping, SlirpNetwork};
 use crate::paths;
 use crate::state::{generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState};
-use crate::storage::DiskManager;
+use crate::storage::{
+    DiskManager, SnapshotConfig, SnapshotManager, SnapshotMetadata, SnapshotVolumeConfig,
+};
 use crate::volume::{spawn_volume_servers, VolumeConfig};
+
+/// Request to create a podman cache snapshot.
+/// Sent from status listener to main task when fc-agent signals cache-ready.
+struct CacheRequest {
+    /// Image digest from fc-agent
+    digest: String,
+    /// Oneshot channel to signal completion back to status listener
+    ack_tx: oneshot::Sender<()>,
+}
+
+// Podman cache now uses SnapshotConfig from storage module.
+// Cache key becomes the snapshot name, stored in paths::snapshot_dir().
 
 /// Parsed volume mapping from --map HOST:GUEST[:ro]
 #[derive(Debug, Clone)]
@@ -52,6 +67,248 @@ impl VolumeMapping {
             read_only,
         })
     }
+}
+
+/// Build FirecrackerConfig from run args.
+/// The config is the single source of truth for both cache key and VM launch.
+fn build_firecracker_config(
+    args: &RunArgs,
+    image_identifier: &str,
+    kernel_path: &Path,
+    rootfs_path: &Path,
+    initrd_path: &Path,
+    cmd_args: Option<Vec<String>>,
+) -> crate::firecracker::FirecrackerConfig {
+    use crate::firecracker::{FcNetworkMode, FirecrackerConfig};
+
+    let network_mode = match args.network {
+        crate::cli::args::NetworkMode::Bridged => FcNetworkMode::Bridged,
+        crate::cli::args::NetworkMode::Rootless => FcNetworkMode::Rootless,
+    };
+
+    // Collect extra disk specifications for cache key.
+    // These are block devices that must match between cache create and restore.
+    let mut extra_disks: Vec<String> = Vec::new();
+    extra_disks.extend(args.disk.iter().cloned());
+    extra_disks.extend(args.disk_dir.iter().cloned());
+    extra_disks.extend(args.nfs.iter().cloned());
+
+    // Collect env vars for cache key (affects container behavior)
+    let env_vars: Vec<String> = args.env.to_vec();
+
+    // Collect volume mounts for cache key (affects MMDS plan)
+    let volume_mounts: Vec<String> = args.map.to_vec();
+
+    FirecrackerConfig::new(
+        kernel_path.to_path_buf(),
+        initrd_path.to_path_buf(),
+        rootfs_path.to_path_buf(),
+        image_identifier.to_string(),
+        cmd_args,
+        args.cpu,
+        args.mem,
+        network_mode,
+        crate::paths::data_dir(),
+        extra_disks,
+        env_vars,
+        volume_mounts,
+        args.privileged,
+        args.tty,
+        args.interactive,
+    )
+}
+
+/// Get the image identifier for cache key computation.
+///
+/// For localhost/ images: returns SHA256 digest from podman (requires podman)
+/// For remote images: returns the image URL/name as-is (no podman needed)
+async fn get_image_identifier(image: &str) -> Result<String> {
+    if image.starts_with("localhost/") {
+        // Use podman to get the digest for localhost images
+        let output = tokio::process::Command::new("podman")
+            .args(["image", "inspect", image, "--format", "{{.Digest}}"])
+            .output()
+            .await
+            .context("running podman inspect")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("Failed to get digest for image '{}': {}", image, stderr);
+        }
+
+        let digest = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .trim_start_matches("sha256:")
+            .to_string();
+
+        Ok(digest)
+    } else {
+        // For remote images, use the image name/URL as identifier
+        Ok(image.to_string())
+    }
+}
+
+/// Check if a podman cache snapshot exists.
+/// Uses SnapshotManager to check for the snapshot with cache_key as name.
+async fn check_podman_cache(cache_key: &str) -> Option<SnapshotConfig> {
+    let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
+    snapshot_manager.load_snapshot(cache_key).await.ok()
+}
+
+/// Create a podman cache snapshot from a running VM.
+///
+/// This pauses the VM, creates a Firecracker snapshot, copies the disk,
+/// saves metadata using SnapshotManager, and resumes the VM.
+///
+/// The snapshot is stored in snapshot_dir with cache_key as the name,
+/// making it accessible via `fcvm snapshot run --snapshot <cache_key>`.
+async fn create_podman_cache(
+    vm_manager: &VmManager,
+    cache_key: &str,
+    vm_id: &str,
+    args: &RunArgs,
+    disk_path: &Path,
+    network_config: &NetworkConfig,
+    volume_configs: &[VolumeConfig],
+) -> Result<()> {
+    // Cache snapshots stored in snapshot_dir with cache_key as name
+    let snapshot_dir = paths::snapshot_dir().join(cache_key);
+
+    // Lock to prevent concurrent cache creation
+    let lock_path = snapshot_dir.with_extension("lock");
+    tokio::fs::create_dir_all(paths::snapshot_dir())
+        .await
+        .context("creating snapshot directory")?;
+
+    let lock_file = std::fs::File::create(&lock_path).context("creating cache lock file")?;
+
+    // Use try_lock in a loop so we yield to the async runtime and can be interrupted
+    use fs2::FileExt;
+    loop {
+        match lock_file.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Lock is held by another process, yield and retry
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(e) => return Err(anyhow::anyhow!("acquiring cache lock: {}", e)),
+        }
+    }
+
+    // Double-check after lock (another process might have created it)
+    if snapshot_dir.join("config.json").exists() {
+        info!(cache_key = %cache_key, "Cache already exists (created by another process)");
+        return Ok(());
+    }
+
+    info!(cache_key = %cache_key, "Creating podman cache snapshot");
+
+    // Create snapshot directory
+    tokio::fs::create_dir_all(&snapshot_dir)
+        .await
+        .context("creating snapshot directory")?;
+
+    // Get Firecracker client
+    let client = vm_manager.client().context("VM not started")?;
+
+    // Pause VM before snapshotting (required by Firecracker)
+    use crate::firecracker::api::{SnapshotCreate, VmState as ApiVmState};
+
+    client
+        .patch_vm_state(ApiVmState {
+            state: "Paused".to_string(),
+        })
+        .await
+        .context("pausing VM for snapshot")?;
+
+    info!(cache_key = %cache_key, "VM paused for cache snapshot");
+
+    // Create snapshot files
+    let memory_path = snapshot_dir.join("memory.bin");
+    let vmstate_path = snapshot_dir.join("vmstate.bin");
+
+    let snapshot_result = client
+        .create_snapshot(SnapshotCreate {
+            snapshot_type: Some("Full".to_string()),
+            snapshot_path: vmstate_path.display().to_string(),
+            mem_file_path: memory_path.display().to_string(),
+        })
+        .await;
+
+    // Resume VM regardless of snapshot result
+    let resume_result = client
+        .patch_vm_state(ApiVmState {
+            state: "Resumed".to_string(),
+        })
+        .await;
+
+    if let Err(e) = &resume_result {
+        warn!(cache_key = %cache_key, error = %e, "Failed to resume VM after snapshot");
+    }
+
+    // Check if snapshot succeeded
+    snapshot_result.context("creating Firecracker snapshot")?;
+    resume_result.context("resuming VM after snapshot")?;
+
+    // Copy disk using btrfs reflink
+    let disk_path_in_snapshot = snapshot_dir.join("disk.raw");
+    let reflink_result = tokio::process::Command::new("cp")
+        .args([
+            "--reflink=always",
+            disk_path.to_str().unwrap(),
+            disk_path_in_snapshot.to_str().unwrap(),
+        ])
+        .status()
+        .await
+        .context("copying disk with reflink")?;
+
+    if !reflink_result.success() {
+        bail!("Reflink copy failed - btrfs filesystem required for podman cache");
+    }
+
+    // Convert VolumeConfig to SnapshotVolumeConfig for metadata
+    let snapshot_volumes: Vec<SnapshotVolumeConfig> = volume_configs
+        .iter()
+        .map(|v| SnapshotVolumeConfig {
+            host_path: v.host_path.clone(),
+            guest_path: v.guest_path.to_string_lossy().to_string(),
+            read_only: v.read_only,
+            vsock_port: v.port,
+        })
+        .collect();
+
+    // Save snapshot metadata using SnapshotConfig format
+    let snapshot_config = SnapshotConfig {
+        name: cache_key.to_string(),
+        vm_id: vm_id.to_string(),
+        original_vsock_vm_id: None, // Fresh VM, no redirect needed
+        memory_path,
+        vmstate_path,
+        disk_path: disk_path_in_snapshot.clone(),
+        created_at: chrono::Utc::now(),
+        metadata: SnapshotMetadata {
+            image: args.image.clone(),
+            vcpu: args.cpu,
+            memory_mib: args.mem,
+            network_config: network_config.clone(),
+            volumes: snapshot_volumes,
+        },
+    };
+
+    // Use SnapshotManager to save the config
+    let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
+    snapshot_manager
+        .save_snapshot(snapshot_config)
+        .await
+        .context("saving snapshot config")?;
+
+    info!(
+        cache_key = %cache_key,
+        disk = %disk_path_in_snapshot.display(),
+        "Podman cache created successfully"
+    );
+
+    Ok(())
 }
 
 use super::common::{VSOCK_OUTPUT_PORT, VSOCK_STATUS_PORT, VSOCK_TTY_PORT, VSOCK_VOLUME_PORT_BASE};
@@ -256,12 +513,14 @@ pub async fn cmd_podman(args: PodmanArgs) -> Result<()> {
 /// Messages:
 /// - "ready\n" - Container started, create ready file for health check
 /// - "exit:{code}\n" - Container exited, write exit code to file
+/// - "cache-ready:{digest}\n" - Image loaded, ready for caching (sends cache-ack back)
 async fn run_status_listener(
     socket_path: &str,
     runtime_dir: &std::path::Path,
     vm_id: &str,
+    cache_tx: Option<mpsc::Sender<CacheRequest>>,
 ) -> Result<()> {
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
 
     // Remove stale socket if it exists
@@ -275,7 +534,7 @@ async fn run_status_listener(
     let ready_file = runtime_dir.join("container-ready");
     let exit_file = runtime_dir.join("container-exit");
 
-    // Accept connections in a loop (we get "ready" then "exit")
+    // Accept connections in a loop (we get "cache-ready" then "ready" then "exit")
     loop {
         let accept_result = tokio::time::timeout(
             std::time::Duration::from_secs(3600), // 1 hour timeout
@@ -296,7 +555,7 @@ async fn run_status_listener(
         };
 
         // Read the message
-        let mut buf = [0u8; 64];
+        let mut buf = [0u8; 128];
         let n = match stream.read(&mut buf).await {
             Ok(n) if n > 0 => n,
             _ => continue,
@@ -310,6 +569,9 @@ async fn run_status_listener(
             std::fs::write(&ready_file, "ready\n")
                 .with_context(|| format!("writing ready file: {:?}", ready_file))?;
             info!(vm_id = %vm_id, "Container ready notification received");
+        } else if let Some(debug_msg) = msg.strip_prefix("debug:") {
+            // Debug message from fc-agent (useful when serial console is broken after restore)
+            info!(vm_id = %vm_id, debug = %debug_msg, "fc-agent debug message");
         } else if let Some(code_str) = msg.strip_prefix("exit:") {
             // Write exit code to file
             std::fs::write(&exit_file, format!("{}\n", code_str))
@@ -317,6 +579,37 @@ async fn run_status_listener(
             info!(vm_id = %vm_id, exit_code = %code_str, "Container exit notification received");
             // Exit loop after receiving exit code
             break;
+        } else if let Some(digest) = msg.strip_prefix("cache-ready:") {
+            // fc-agent has loaded the image and is ready for caching
+            info!(vm_id = %vm_id, digest = %digest, "Cache-ready notification received");
+
+            if let Some(ref tx) = cache_tx {
+                // Create oneshot channel for ack
+                let (ack_tx, ack_rx) = oneshot::channel();
+
+                // Send cache request to main task
+                let request = CacheRequest {
+                    digest: digest.to_string(),
+                    ack_tx,
+                };
+
+                if tx.send(request).await.is_ok() {
+                    // Wait for main task to complete cache creation
+                    // No timeout - host is responsible for completing
+                    if ack_rx.await.is_ok() {
+                        info!(vm_id = %vm_id, "Cache created, sending ack to fc-agent");
+                    } else {
+                        warn!(vm_id = %vm_id, "Cache creation failed or was cancelled");
+                    }
+                } else {
+                    warn!(vm_id = %vm_id, "Failed to send cache request to main task");
+                }
+            }
+
+            // Send ack back to fc-agent (even if cache creation failed)
+            if let Err(e) = stream.write_all(b"cache-ack\n").await {
+                warn!(vm_id = %vm_id, error = %e, "Failed to send cache-ack to fc-agent");
+            }
         } else {
             warn!(vm_id = %vm_id, msg = %msg, "Unexpected status message");
         }
@@ -338,7 +631,7 @@ async fn run_status_listener(
 /// If `interactive` is true, forwards host stdin to container.
 ///
 /// Returns collected output lines as Vec<(stream, line)>.
-async fn run_output_listener(
+pub(crate) async fn run_output_listener(
     socket_path: &str,
     vm_id: &str,
     interactive: bool,
@@ -551,6 +844,73 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .await
         .context("setting up fc-agent initrd")?;
 
+    // Parse optional container command EARLY - it's part of cache key
+    // Either from trailing args or --cmd flag
+    let cmd_args = if !args.command_args.is_empty() {
+        // Trailing args take precedence (e.g., "alpine:latest sh -c 'echo hello'")
+        Some(args.command_args.clone())
+    } else if let Some(cmd) = &args.cmd {
+        // Fall back to --cmd flag with shell parsing
+        Some(shell_words::split(cmd).with_context(|| format!("parsing --cmd argument: {}", cmd))?)
+    } else {
+        None
+    };
+
+    // Check for podman cache (unless --no-cache is set or localhost image)
+    // Localhost images have tarball paths in MMDS that won't exist on restore
+    // Keep fc_config and cache_key available for later cache creation on miss
+    let is_localhost_image = args.image.starts_with("localhost/");
+    let (fc_config, cache_key): (
+        Option<crate::firecracker::FirecrackerConfig>,
+        Option<String>,
+    ) = if !args.no_cache && !is_localhost_image {
+        // Get image identifier for cache key computation
+        let image_identifier = get_image_identifier(&args.image).await?;
+        let config = build_firecracker_config(
+            &args,
+            &image_identifier,
+            &kernel_path,
+            &base_rootfs,
+            &initrd_path,
+            cmd_args.clone(),
+        );
+        let key = config.cache_key();
+
+        // Check if cache snapshot exists
+        if check_podman_cache(&key).await.is_some() {
+            info!(
+                cache_key = %key,
+                image = %args.image,
+                "Cache hit! Cloning from snapshot"
+            );
+            // Call snapshot run directly with cache key as snapshot name
+            let snapshot_args = crate::cli::SnapshotRunArgs {
+                pid: None,
+                snapshot: Some(key.clone()),
+                name: Some(args.name.clone()),
+                publish: args.publish.clone(),
+                network: args.network,
+                exec: None,
+                tty: args.tty,
+                interactive: args.interactive,
+            };
+            return super::snapshot::cmd_snapshot_run(snapshot_args).await;
+        }
+
+        info!(
+            cache_key = %key,
+            image = %args.image,
+            "Cache miss, will create cache after image load"
+        );
+        (Some(config), Some(key))
+    } else if is_localhost_image {
+        info!("Cache disabled for localhost image (tarball path won't exist on restore)");
+        (None, None)
+    } else {
+        info!("Cache disabled via --no-cache flag");
+        (None, None)
+    };
+
     // Generate VM ID
     let vm_id = generate_vm_id();
     let vm_name = args.name.clone();
@@ -681,17 +1041,6 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         );
     }
 
-    // Parse optional container command - either from trailing args or --cmd flag
-    let cmd_args = if !args.command_args.is_empty() {
-        // Trailing args take precedence (e.g., "alpine:latest sh -c 'echo hello'")
-        Some(args.command_args.clone())
-    } else if let Some(cmd) = &args.cmd {
-        // Fall back to --cmd flag with shell parsing
-        Some(shell_words::split(cmd).with_context(|| format!("parsing --cmd argument: {}", cmd))?)
-    } else {
-        None
-    };
-
     // Setup paths
     let data_dir = paths::vm_runtime_dir(&vm_id);
     tokio::fs::create_dir_all(&data_dir)
@@ -795,16 +1144,39 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .await
         .context("spawning VolumeServers")?;
 
+    // Create cache channel for cache-ready notifications
+    // Skip cache creation when:
+    // - --no-cache flag is set
+    // - Volumes are specified (FUSE-over-vsock breaks during snapshot pause)
+    // - Localhost images (tarball path in MMDS won't exist on restore)
+    // Note: is_localhost_image is already defined above
+    let skip_cache_creation = args.no_cache || !args.map.is_empty() || is_localhost_image;
+    if !args.map.is_empty() && !args.no_cache {
+        info!("Skipping cache creation: volumes specified (FUSE doesn't survive snapshot pause)");
+    }
+    let (cache_tx, mut cache_rx): (
+        Option<mpsc::Sender<CacheRequest>>,
+        Option<mpsc::Receiver<CacheRequest>>,
+    ) = if !skip_cache_creation {
+        let (tx, rx) = mpsc::channel(1);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
     // Start status channel listener for fc-agent notifications
     // - "ready" on port 4999 -> creates container-ready file for health check
     // - "exit:{code}" on port 4999 -> creates container-exit file with exit code
+    // - "cache-ready:{digest}" on port 4999 -> trigger cache creation
     let status_socket_path = format!("{}_{}", vsock_socket_path.display(), VSOCK_STATUS_PORT);
     let status_handle = {
         let runtime_dir = data_dir.clone();
         let socket_path = status_socket_path.clone();
         let vm_id_clone = vm_id.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_status_listener(&socket_path, &runtime_dir, &vm_id_clone).await {
+            if let Err(e) =
+                run_status_listener(&socket_path, &runtime_dir, &vm_id_clone, cache_tx).await
+            {
                 tracing::warn!("Status listener error: {}", e);
             }
         })
@@ -863,6 +1235,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         &volume_mappings,
         &vsock_socket_path,
         image_archive_name.as_deref(),
+        fc_config,
     )
     .await;
 
@@ -910,35 +1283,89 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
 
-    // Wait for signal or VM exit
+    // Wait for signal, VM exit, or cache requests
     // For TTY mode, we get exit code from the TTY listener thread
     // For non-TTY mode, we read it from the file written by status listener
     let container_exit_code: Option<i32>;
-    tokio::select! {
-        _ = sigterm.recv() => {
-            info!("received SIGTERM, shutting down VM");
-            container_exit_code = None; // Signal-based shutdown, not container exit
-        }
-        _ = sigint.recv() => {
-            info!("received SIGINT, shutting down VM");
-            container_exit_code = None; // Signal-based shutdown, not container exit
-        }
-        status = vm_manager.wait() => {
-            info!(status = ?status, "VM exited");
-            if let Some(handle) = tty_handle {
-                // TTY mode: get exit code from TTY listener
-                container_exit_code = handle
-                    .join()
-                    .ok()
-                    .and_then(|r| r.ok());
-                info!(container_exit_code = ?container_exit_code, "TTY container exit code");
-            } else {
-                // Non-TTY mode: read container exit code from file written by status listener
-                let exit_file = data_dir.join("container-exit");
-                container_exit_code = std::fs::read_to_string(&exit_file)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<i32>().ok());
-                info!(container_exit_code = ?container_exit_code, "container exit code");
+    let disk_path = data_dir.join("disks/rootfs.raw");
+
+    loop {
+        tokio::select! {
+            _ = sigterm.recv() => {
+                info!("received SIGTERM, shutting down VM");
+                container_exit_code = None;
+                break;
+            }
+            _ = sigint.recv() => {
+                info!("received SIGINT, shutting down VM");
+                container_exit_code = None;
+                break;
+            }
+            status = vm_manager.wait() => {
+                info!(status = ?status, "VM exited");
+                if let Some(handle) = tty_handle {
+                    container_exit_code = handle.join().ok().and_then(|r| r.ok());
+                    info!(container_exit_code = ?container_exit_code, "TTY container exit code");
+                } else {
+                    let exit_file = data_dir.join("container-exit");
+                    container_exit_code = std::fs::read_to_string(&exit_file)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<i32>().ok());
+                    info!(container_exit_code = ?container_exit_code, "container exit code");
+                }
+                break;
+            }
+            // Handle cache creation requests from fc-agent
+            Some(cache_request) = async {
+                match cache_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(ref key) = cache_key {
+                    info!(cache_key = %key, digest = %cache_request.digest, "Creating cache snapshot");
+
+                    // Use nested select! so signals can interrupt cache creation
+                    let cache_fut = create_podman_cache(
+                        &vm_manager,
+                        key,
+                        &vm_id,
+                        &args,
+                        &disk_path,
+                        &network_config,
+                        &volume_configs,
+                    );
+
+                    tokio::select! {
+                        biased;  // Check signals first
+                        _ = sigterm.recv() => {
+                            info!("received SIGTERM during cache creation, shutting down VM");
+                            container_exit_code = None;
+                            break;  // Break outer loop to cleanup
+                        }
+                        _ = sigint.recv() => {
+                            info!("received SIGINT during cache creation, shutting down VM");
+                            container_exit_code = None;
+                            break;  // Break outer loop to cleanup
+                        }
+                        result = cache_fut => {
+                            match result {
+                                Ok(()) => {
+                                    info!(cache_key = %key, "Cache created successfully");
+                                }
+                                Err(e) => {
+                                    warn!(cache_key = %key, error = %e, "Failed to create cache");
+                                }
+                            }
+                            // Send ack back regardless of success (fc-agent should continue)
+                            let _ = cache_request.ack_tx.send(());
+                        }
+                    }
+                } else {
+                    // Should not happen if channel exists, but send ack anyway
+                    let _ = cache_request.ack_tx.send(());
+                }
+                // Continue waiting for VM exit or signals
             }
         }
     }
@@ -993,6 +1420,7 @@ async fn run_vm_setup(
     volume_mappings: &[VolumeMapping],
     vsock_socket_path: &std::path::Path,
     image_archive_name: Option<&str>,
+    fc_config: Option<crate::firecracker::FirecrackerConfig>,
 ) -> Result<(VmManager, Option<tokio::process::Child>)> {
     // Setup storage - just need CoW copy (fc-agent is injected via initrd at boot)
     let vm_dir = data_dir.join("disks");
@@ -1032,10 +1460,8 @@ async fn run_vm_setup(
         let holder_cmd = slirp_net.build_holder_command();
         info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
 
-        let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let retry_deadline = std::time::Instant::now() + super::common::HOLDER_RETRY_TIMEOUT;
         let mut attempt = 0;
-        #[allow(unused_assignments)]
-        let mut _last_error: Option<String> = None;
 
         let (mut child, holder_pid, mut holder_stderr) = loop {
             attempt += 1;
@@ -1063,14 +1489,13 @@ async fn run_vm_setup(
             // Wait for namespace to be ready by checking uid_map
             let namespace_ready = crate::utils::wait_for_namespace_ready(
                 holder_pid,
-                std::time::Duration::from_millis(500),
+                super::common::NAMESPACE_READY_TIMEOUT,
             )
             .await;
 
             // If namespace didn't become ready, kill holder and retry
             if !namespace_ready {
                 let _ = child.kill().await;
-                _last_error = Some("namespace not ready after 500ms".to_string());
 
                 if std::time::Instant::now() < retry_deadline {
                     warn!(
@@ -1078,7 +1503,7 @@ async fn run_vm_setup(
                         attempt = attempt,
                         "namespace not ready, retrying holder creation..."
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    tokio::time::sleep(super::common::HOLDER_RETRY_INTERVAL).await;
                     continue;
                 } else {
                     bail!(
@@ -1104,12 +1529,6 @@ async fn run_vm_setup(
                         String::new()
                     };
 
-                    _last_error = Some(format!(
-                        "holder exited immediately: status={}, stderr='{}'",
-                        status,
-                        stderr.trim()
-                    ));
-
                     if std::time::Instant::now() < retry_deadline {
                         warn!(
                             holder_pid = holder_pid,
@@ -1118,7 +1537,7 @@ async fn run_vm_setup(
                             stderr = %stderr.trim(),
                             "holder died, retrying..."
                         );
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        tokio::time::sleep(super::common::HOLDER_RETRY_INTERVAL).await;
                         continue;
                     } else {
                         bail!(
@@ -1159,11 +1578,6 @@ async fn run_vm_setup(
 
                 let _ = child.kill().await;
 
-                _last_error = Some(format!(
-                    "holder died after 100ms: stderr='{}'",
-                    holder_stderr_content.trim()
-                ));
-
                 if std::time::Instant::now() < retry_deadline {
                     warn!(
                         holder_pid = holder_pid,
@@ -1171,7 +1585,7 @@ async fn run_vm_setup(
                         holder_stderr = %holder_stderr_content.trim(),
                         "holder died after initial check, retrying..."
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    tokio::time::sleep(super::common::HOLDER_RETRY_INTERVAL).await;
                     continue;
                 } else {
                     let max_user_ns = std::fs::read_to_string("/proc/sys/user/max_user_namespaces")
@@ -1456,114 +1870,110 @@ async fn run_vm_setup(
     // Configure VM via API
     info!("configuring VM via Firecracker API");
 
-    // Boot source with network configuration via kernel cmdline
-    // The rootfs is a raw disk with partitions, root=/dev/vda1 specifies partition 1
+    // Build FirecrackerConfig for launch (single source of truth for VM config)
+    // Use fc_config from cache check if available, otherwise build fresh.
+    // IMPORTANT: fc_config uses content-addressed base_rootfs path for cache key,
+    // but launch must use per-instance CoW copy path (rootfs_path).
+    let launch_config = fc_config
+        .map(|config| config.with_rootfs_path(rootfs_path.to_path_buf()))
+        .unwrap_or_else(|| {
+            use crate::firecracker::FcNetworkMode;
+            let network_mode = match args.network {
+                crate::cli::args::NetworkMode::Bridged => FcNetworkMode::Bridged,
+                crate::cli::args::NetworkMode::Rootless => FcNetworkMode::Rootless,
+            };
+            // Collect extra disk specifications
+            let mut extra_disks: Vec<String> = Vec::new();
+            extra_disks.extend(args.disk.iter().cloned());
+            extra_disks.extend(args.disk_dir.iter().cloned());
+            extra_disks.extend(args.nfs.iter().cloned());
+            // Collect env vars and volume mounts for cache key
+            let env_vars: Vec<String> = args.env.to_vec();
+            let volume_mounts: Vec<String> = args.map.to_vec();
+
+            crate::firecracker::FirecrackerConfig::new(
+                kernel_path.to_path_buf(),
+                initrd_path.to_path_buf(),
+                rootfs_path.to_path_buf(),
+                args.image.clone(),
+                cmd_args.clone(),
+                args.cpu,
+                args.mem,
+                network_mode,
+                crate::paths::data_dir(),
+                extra_disks,
+                env_vars,
+                volume_mounts,
+                args.privileged,
+                args.tty,
+                args.interactive,
+            )
+        });
+
+    // Build runtime boot args (per-instance values NOT in cache key)
+    // These are added to the static boot_args from FirecrackerConfig
+    let mut runtime_boot_args = String::new();
+
+    // Network configuration via kernel cmdline
     // Format: ip=<client-ip>:<server-ip>:<gw-ip>:<netmask>:<hostname>:<device>:<autoconf>:<dns0>
-    // Example: ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off:172.16.0.1
-    let mut boot_args = if let (Some(guest_ip), Some(host_ip)) =
-        (&network_config.guest_ip, &network_config.host_ip)
-    {
-        // Extract just the IP without CIDR notation if present
+    if let (Some(guest_ip), Some(host_ip)) = (&network_config.guest_ip, &network_config.host_ip) {
         let guest_ip_clean = guest_ip.split('/').next().unwrap_or(guest_ip);
         let host_ip_clean = host_ip.split('/').next().unwrap_or(host_ip);
-
-        // Always pass DNS in boot args - gateway IP where dnsmasq listens
-        // This avoids relying on NAT to reach external DNS (8.8.8.8)
         let dns_suffix = network_config
             .dns_server
             .as_ref()
             .map(|dns| format!(":{}", dns))
             .unwrap_or_default();
-
-        // Format: ip=<client>:<server>:<gw>:<netmask>:<hostname>:<device>:<autoconf>[:<dns0>]
-        // root=/dev/vda - the disk IS the ext4 filesystem (no partition table)
-        //
-        // reboot= method is architecture-specific:
-        // - ARM64: reboot=k works (keyboard controller / PSCI)
-        // - x86: reboot=t required (triple-fault) because Firecracker doesn't emulate ACPI
-        let reboot_method = if cfg!(target_arch = "x86_64") {
-            "t" // Triple-fault - only reliable method on x86 Firecracker
-        } else {
-            "k" // Keyboard controller - works on ARM64 via PSCI
-        };
-        format!(
-            "console=ttyS0 reboot={} panic=1 pci=off random.trust_cpu=1 systemd.log_color=no root=/dev/vda rw ip={}::{}:255.255.255.252::eth0:off{}",
-            reboot_method, guest_ip_clean, host_ip_clean, dns_suffix
-        )
-    } else {
-        // No network config - used for basic boot (e.g., during setup)
-        let reboot_method = if cfg!(target_arch = "x86_64") {
-            "t"
-        } else {
-            "k"
-        };
-        format!("console=ttyS0 reboot={} panic=1 pci=off random.trust_cpu=1 systemd.log_color=no root=/dev/vda rw", reboot_method)
-    };
+        runtime_boot_args.push_str(&format!(
+            "ip={}::{}:255.255.255.252::eth0:off{}",
+            guest_ip_clean, host_ip_clean, dns_suffix
+        ));
+    }
 
     // Enable fc-agent strace debugging if requested
     if args.strace_agent {
-        boot_args.push_str(" fc_agent_strace=1");
+        if !runtime_boot_args.is_empty() {
+            runtime_boot_args.push(' ');
+        }
+        runtime_boot_args.push_str("fc_agent_strace=1");
         info!("fc-agent strace debugging enabled - output will be in /tmp/fc-agent.strace");
     }
 
     // Additional boot args from environment (caller controls)
     if let Ok(extra) = std::env::var("FCVM_BOOT_ARGS") {
-        boot_args.push(' ');
-        boot_args.push_str(&extra);
+        if !runtime_boot_args.is_empty() {
+            runtime_boot_args.push(' ');
+        }
+        runtime_boot_args.push_str(&extra);
     }
 
     // Pass FUSE reader count to fc-agent via kernel command line.
-    // Used to reduce memory at deeper nesting levels (256 readers × 8MB = 2GB per mount).
     if let Ok(readers) = std::env::var("FCVM_FUSE_READERS") {
-        boot_args.push_str(&format!(" fuse_readers={}", readers));
+        if !runtime_boot_args.is_empty() {
+            runtime_boot_args.push(' ');
+        }
+        runtime_boot_args.push_str(&format!("fuse_readers={}", readers));
     }
 
     // Pass FUSE trace rate to fc-agent via kernel command line.
-    // Used for debugging FUSE latency. Rate N means trace every Nth request.
     if let Ok(rate) = std::env::var("FCVM_FUSE_TRACE_RATE") {
-        boot_args.push_str(&format!(" fuse_trace_rate={}", rate));
+        if !runtime_boot_args.is_empty() {
+            runtime_boot_args.push(' ');
+        }
+        runtime_boot_args.push_str(&format!("fuse_trace_rate={}", rate));
     }
 
     // Pass FUSE max_write to fc-agent via kernel command line.
-    // Used to limit write sizes in nested VMs to avoid vsock data corruption.
-    // Set FCVM_FUSE_MAX_WRITE=32768 for stable L2 operation on x86.
     if let Ok(max_write) = std::env::var("FCVM_FUSE_MAX_WRITE") {
-        boot_args.push_str(&format!(" fuse_max_write={}", max_write));
+        if !runtime_boot_args.is_empty() {
+            runtime_boot_args.push(' ');
+        }
+        runtime_boot_args.push_str(&format!("fuse_max_write={}", max_write));
     }
 
-    client
-        .set_boot_source(crate::firecracker::api::BootSource {
-            kernel_image_path: kernel_path.display().to_string(),
-            initrd_path: Some(initrd_path.display().to_string()),
-            boot_args: Some(boot_args),
-        })
-        .await?;
-
-    // Machine config
-    client
-        .set_machine_config(crate::firecracker::api::MachineConfig {
-            vcpu_count: args.cpu,
-            mem_size_mib: args.mem,
-            smt: Some(false),
-            cpu_template: None,
-            track_dirty_pages: Some(true), // Enable snapshot support
-        })
-        .await?;
-
-    // Root drive
-    client
-        .add_drive(
-            "rootfs",
-            crate::firecracker::api::Drive {
-                drive_id: "rootfs".to_string(),
-                path_on_host: rootfs_path.display().to_string(),
-                is_root_device: true,
-                is_read_only: false,
-                partuuid: None,
-                rate_limiter: None,
-            },
-        )
-        .await?;
+    // Apply FirecrackerConfig to client (boot_source, machine_config, rootfs drive)
+    // This ensures the same config used for cache key is used for launch
+    launch_config.apply(client, &runtime_boot_args).await?;
 
     // Extra disks (appear as /dev/vdb, /dev/vdc, etc.)
     // Parse format: HOST_PATH:GUEST_MOUNT[:ro]

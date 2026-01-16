@@ -10,6 +10,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "signal"] }
 reqwest = { version = "0.11", default-features = false, features = ["json"] }
 libc = "0.2"
+nix = { version = "0.29", features = ["socket", "poll", "fs"] }
 fs2 = "0.4"
 fuse-pipe = { path = "../fuse-pipe", default-features = false }
 exec-proto = { path = "../exec-proto" }
