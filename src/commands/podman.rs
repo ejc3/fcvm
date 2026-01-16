@@ -181,7 +181,19 @@ async fn create_podman_cache(
         .context("creating snapshot directory")?;
 
     let lock_file = std::fs::File::create(&lock_path).context("creating cache lock file")?;
-    lock_file.lock_exclusive().context("acquiring cache lock")?;
+
+    // Use try_lock in a loop so we yield to the async runtime and can be interrupted
+    use fs2::FileExt;
+    loop {
+        match lock_file.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Lock is held by another process, yield and retry
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(e) => return Err(anyhow::anyhow!("acquiring cache lock: {}", e)),
+        }
+    }
 
     // Double-check after lock (another process might have created it)
     if snapshot_dir.join("config.json").exists() {
