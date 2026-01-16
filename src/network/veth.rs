@@ -613,7 +613,11 @@ pub async fn setup_in_namespace_nat(
 /// Using just "dev veth0" doesn't work because the host would ARP for 172.30.90.2
 /// directly, but only devices on the veth L2 segment can respond, and the guest
 /// is on a different L2 segment (br0/TAP).
-pub async fn add_host_route_to_guest(host_veth: &str, guest_ip: &str, veth_inner_ip: &str) -> Result<()> {
+pub async fn add_host_route_to_guest(
+    host_veth: &str,
+    guest_ip: &str,
+    veth_inner_ip: &str,
+) -> Result<()> {
     debug!(
         veth = %host_veth,
         guest_ip = %guest_ip,

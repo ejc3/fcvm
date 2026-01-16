@@ -535,10 +535,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 .snapshot_name
                 .ok_or_else(|| anyhow::anyhow!("serve process has no snapshot_name"))?;
 
-            info!(
-                "Cloning VM from serve PID {} (snapshot: {})",
-                pid, name
-            );
+            info!("Cloning VM from serve PID {} (snapshot: {})", pid, name);
             (name, Some(*pid), true)
         }
         (None, Some(name)) => {

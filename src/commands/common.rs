@@ -327,11 +327,8 @@ pub async fn restore_from_snapshot(
             }
 
             // Wait for namespace to be ready by checking uid_map
-            let namespace_ready = crate::utils::wait_for_namespace_ready(
-                holder_pid,
-                NAMESPACE_READY_TIMEOUT,
-            )
-            .await;
+            let namespace_ready =
+                crate::utils::wait_for_namespace_ready(holder_pid, NAMESPACE_READY_TIMEOUT).await;
 
             if namespace_ready {
                 break (child, holder_pid);

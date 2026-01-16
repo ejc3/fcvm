@@ -147,7 +147,9 @@ async fn test_ctrlc_via_terminal() -> Result<()> {
                 let output_str = String::from_utf8_lossy(&output);
                 // "Container ready notification received" appears when container starts fresh
                 // "cloned from snapshot" appears when container is restored from cache
-                if output_str.contains("Container ready") || output_str.contains("cloned from snapshot") {
+                if output_str.contains("Container ready")
+                    || output_str.contains("cloned from snapshot")
+                {
                     vm_started = true;
                     println!("  Container ready (or cloned)!");
                     break;

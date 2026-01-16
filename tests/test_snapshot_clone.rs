@@ -1240,12 +1240,15 @@ async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
     println!("  Killed baseline VM (only need snapshot files)");
 
     // Step 3: Run clone directly from snapshot files (NO UFFD server!)
-    println!("\nStep 3: Running clone with --snapshot {} (direct file mode)...", snapshot_name);
+    println!(
+        "\nStep 3: Running clone with --snapshot {} (direct file mode)...",
+        snapshot_name
+    );
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
         &[
             "snapshot",
             "run",
-            "--snapshot",  // Direct file mode, not --pid
+            "--snapshot", // Direct file mode, not --pid
             &snapshot_name,
             "--name",
             &clone_name,
@@ -1279,10 +1282,7 @@ async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let exec_ok = stdout.contains("DIRECT_SNAPSHOT_SUCCESS");
-    println!(
-        "  Exec result: {}",
-        if exec_ok { "✓ OK" } else { "✗ FAIL" }
-    );
+    println!("  Exec result: {}", if exec_ok { "✓ OK" } else { "✗ FAIL" });
 
     // Cleanup
     println!("\nCleaning up...");
