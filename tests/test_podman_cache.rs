@@ -281,11 +281,21 @@ async fn test_podman_cache_different_network_modes() -> Result<()> {
     Ok(())
 }
 
-/// Test that --no-cache flag works
+/// Test that --no-cache flag prevents cache creation
 #[tokio::test]
 async fn test_podman_cache_no_cache_flag() -> Result<()> {
     println!("\ntest_podman_cache_no_cache_flag");
     println!("================================");
+
+    // Use a unique command so we can verify OUR cache wasn't created
+    let unique_msg = format!(
+        "no-cache-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    println!("Using unique message: {}", unique_msg);
 
     // Record cache entries before
     let before = list_cache_entries();
@@ -303,21 +313,38 @@ async fn test_podman_cache_no_cache_flag() -> Result<()> {
         "--no-cache",
         "alpine:latest",
         "echo",
-        "no-cache",
+        &unique_msg,
     ])
     .await?;
 
     let _ = common::poll_health_by_pid(pid, 180).await;
     let _ = tokio::time::timeout(Duration::from_secs(60), child.wait()).await;
 
-    // Should NOT create a new cache entry
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let after = list_cache_entries();
+    // Wait extra time for cache creation (if it were to happen)
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // Note: Other parallel tests might create entries, so we can't strictly assert
-    // that count didn't change. Instead verify the flag doesn't crash.
-    println!("Cache entries after: {}", after.len());
-    println!("Test passed (--no-cache flag accepted)");
+    // Check for new cache entries
+    let after = list_cache_entries();
+    let new_entries: Vec<_> = after.difference(&before).cloned().collect();
+    println!(
+        "Cache entries after: {} (new: {})",
+        after.len(),
+        new_entries.len()
+    );
+
+    // Verify no new entry contains our unique message in its config
+    for entry in &new_entries {
+        let config_path = cache_dir().join(entry).join("config.json");
+        if let Ok(config) = std::fs::read_to_string(&config_path) {
+            assert!(
+                !config.contains(&unique_msg),
+                "--no-cache flag failed: cache entry {} was created for our command",
+                entry
+            );
+        }
+    }
+
+    println!("Test passed (--no-cache prevented cache creation)");
     Ok(())
 }
 
