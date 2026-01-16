@@ -35,6 +35,11 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+/// Check if caching is disabled via FCVM_NO_CACHE environment variable
+fn cache_disabled_by_env() -> bool {
+    std::env::var("FCVM_NO_CACHE").is_ok()
+}
+
 /// Get the cache directory path (cache entries are stored as snapshots via SnapshotManager)
 fn cache_dir() -> PathBuf {
     let data_dir = std::env::var("FCVM_DATA_DIR")
@@ -91,6 +96,10 @@ fn cache_entry_exists(cache_key: &str) -> bool {
 /// Uses rootless network mode for this test
 #[tokio::test]
 async fn test_podman_cache_miss_creates_cache() -> Result<()> {
+    if cache_disabled_by_env() {
+        println!("Skipping test: FCVM_NO_CACHE is set");
+        return Ok(());
+    }
     println!("\ntest_podman_cache_miss_creates_cache");
     println!("=====================================");
 
@@ -145,6 +154,10 @@ async fn test_podman_cache_miss_creates_cache() -> Result<()> {
 /// Uses rootless network mode - tests may share cache, that's OK
 #[tokio::test]
 async fn test_podman_cache_hit_restores_fast() -> Result<()> {
+    if cache_disabled_by_env() {
+        println!("Skipping test: FCVM_NO_CACHE is set");
+        return Ok(());
+    }
     println!("\ntest_podman_cache_hit_restores_fast");
     println!("====================================");
 
@@ -215,6 +228,10 @@ async fn test_podman_cache_hit_restores_fast() -> Result<()> {
 /// Test that different network modes create different cache entries
 #[tokio::test]
 async fn test_podman_cache_different_network_modes() -> Result<()> {
+    if cache_disabled_by_env() {
+        println!("Skipping test: FCVM_NO_CACHE is set");
+        return Ok(());
+    }
     println!("\ntest_podman_cache_different_network_modes");
     println!("==========================================");
 
@@ -351,6 +368,10 @@ async fn test_podman_cache_no_cache_flag() -> Result<()> {
 /// Test that incomplete cache (missing files) is treated as miss
 #[tokio::test]
 async fn test_podman_cache_incomplete_treated_as_miss() -> Result<()> {
+    if cache_disabled_by_env() {
+        println!("Skipping test: FCVM_NO_CACHE is set");
+        return Ok(());
+    }
     println!("\ntest_podman_cache_incomplete_treated_as_miss");
     println!("=============================================");
 
@@ -380,6 +401,10 @@ async fn test_podman_cache_incomplete_treated_as_miss() -> Result<()> {
 /// Test long-running container works with cache
 #[tokio::test]
 async fn test_podman_cache_long_running_container() -> Result<()> {
+    if cache_disabled_by_env() {
+        println!("Skipping test: FCVM_NO_CACHE is set");
+        return Ok(());
+    }
     println!("\ntest_podman_cache_long_running_container");
     println!("=========================================");
 

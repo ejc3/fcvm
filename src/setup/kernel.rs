@@ -137,35 +137,48 @@ async fn ensure_default_kernel(allow_create: bool) -> Result<PathBuf> {
     tokio::fs::create_dir_all(&cache_dir).await?;
 
     let tarball_path = cache_dir.join(format!("kernel-{}.tar.zst", url_hash));
+    let tarball_temp = cache_dir.join(format!("kernel-{}.tar.zst.downloading", url_hash));
 
-    // Download tarball if not cached
+    // Download tarball if not cached (atomic: download to temp, then rename)
     if !tarball_path.exists() {
         println!("  → Downloading tarball...");
+        // Clean up any leftover temp file from previous failed attempt
+        let _ = tokio::fs::remove_file(&tarball_temp).await;
+
         let output = Command::new("curl")
             .args(["-fSL", &kernel_config.url, "-o"])
-            .arg(&tarball_path)
+            .arg(&tarball_temp)
             .output()
             .await
             .context("running curl")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            let _ = tokio::fs::remove_file(&tarball_temp).await;
             let _ = flock.unlock();
             bail!("Failed to download kernel: {}", stderr);
         }
+
+        // Atomic rename on success
+        tokio::fs::rename(&tarball_temp, &tarball_path)
+            .await
+            .context("renaming downloaded tarball")?;
     } else {
         info!(path = %tarball_path.display(), "using cached tarball");
     }
 
-    // Extract kernel from tarball
+    // Extract kernel from tarball (atomic: extract to temp, then move)
     println!("  → Extracting kernel...");
-    let extract_path = format!("./{}", kernel_config.path);
+    let extract_temp = cache_dir.join(format!("kernel-{}-extract", url_hash));
+    let _ = tokio::fs::remove_dir_all(&extract_temp).await;
+    tokio::fs::create_dir_all(&extract_temp).await?;
 
+    let extract_path = format!("./{}", kernel_config.path);
     let output = Command::new("tar")
         .args(["--use-compress-program=zstd", "-xf"])
         .arg(&tarball_path)
         .arg("-C")
-        .arg(&cache_dir)
+        .arg(&extract_temp)
         .arg(&extract_path)
         .output()
         .await
@@ -173,13 +186,17 @@ async fn ensure_default_kernel(allow_create: bool) -> Result<PathBuf> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // Delete corrupted tarball and temp dir so next run re-downloads
+        let _ = tokio::fs::remove_file(&tarball_path).await;
+        let _ = tokio::fs::remove_dir_all(&extract_temp).await;
         let _ = flock.unlock();
         bail!("Failed to extract kernel: {}", stderr);
     }
 
     // Move to final location
-    let extracted_path = cache_dir.join(&kernel_config.path);
+    let extracted_path = extract_temp.join(&kernel_config.path);
     if !extracted_path.exists() {
+        let _ = tokio::fs::remove_dir_all(&extract_temp).await;
         let _ = flock.unlock();
         bail!(
             "Kernel not found after extraction at {}",
@@ -191,11 +208,8 @@ async fn ensure_default_kernel(allow_create: bool) -> Result<PathBuf> {
         .await
         .context("copying kernel to final location")?;
 
-    // Clean up extracted files
-    let opt_dir = cache_dir.join("opt");
-    if opt_dir.exists() {
-        tokio::fs::remove_dir_all(&opt_dir).await.ok();
-    }
+    // Clean up temp extraction dir
+    let _ = tokio::fs::remove_dir_all(&extract_temp).await;
 
     println!("  ✓ Kernel ready");
     info!(path = %kernel_path.display(), url_hash = %url_hash, "kernel ready");

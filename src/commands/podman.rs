@@ -203,10 +203,13 @@ async fn create_podman_cache(
 
     info!(cache_key = %cache_key, "Creating podman cache snapshot");
 
-    // Create snapshot directory
-    tokio::fs::create_dir_all(&snapshot_dir)
+    // Use temp directory for atomic snapshot creation
+    // Only rename to final location after all files are written successfully
+    let temp_snapshot_dir = snapshot_dir.with_extension("creating");
+    let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+    tokio::fs::create_dir_all(&temp_snapshot_dir)
         .await
-        .context("creating snapshot directory")?;
+        .context("creating temp snapshot directory")?;
 
     // Get Firecracker client
     let client = vm_manager.client().context("VM not started")?;
@@ -223,9 +226,9 @@ async fn create_podman_cache(
 
     info!(cache_key = %cache_key, "VM paused for cache snapshot");
 
-    // Create snapshot files
-    let memory_path = snapshot_dir.join("memory.bin");
-    let vmstate_path = snapshot_dir.join("vmstate.bin");
+    // Create snapshot files in temp directory
+    let memory_path = temp_snapshot_dir.join("memory.bin");
+    let vmstate_path = temp_snapshot_dir.join("vmstate.bin");
 
     let snapshot_result = client
         .create_snapshot(SnapshotCreate {
@@ -246,12 +249,18 @@ async fn create_podman_cache(
         warn!(cache_key = %cache_key, error = %e, "Failed to resume VM after snapshot");
     }
 
-    // Check if snapshot succeeded
-    snapshot_result.context("creating Firecracker snapshot")?;
-    resume_result.context("resuming VM after snapshot")?;
+    // Check if snapshot succeeded - clean up temp dir on failure
+    if let Err(e) = snapshot_result {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        return Err(e).context("creating Firecracker snapshot");
+    }
+    if let Err(e) = resume_result {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        return Err(e).context("resuming VM after snapshot");
+    }
 
     // Copy disk using btrfs reflink
-    let disk_path_in_snapshot = snapshot_dir.join("disk.raw");
+    let disk_path_in_snapshot = temp_snapshot_dir.join("disk.raw");
     let reflink_result = tokio::process::Command::new("cp")
         .args([
             "--reflink=always",
@@ -263,6 +272,7 @@ async fn create_podman_cache(
         .context("copying disk with reflink")?;
 
     if !reflink_result.success() {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
         bail!("Reflink copy failed - btrfs filesystem required for podman cache");
     }
 
@@ -278,13 +288,18 @@ async fn create_podman_cache(
         .collect();
 
     // Save snapshot metadata using SnapshotConfig format
+    // Update paths to point to final location (after rename)
+    let final_memory_path = snapshot_dir.join("memory.bin");
+    let final_vmstate_path = snapshot_dir.join("vmstate.bin");
+    let final_disk_path = snapshot_dir.join("disk.raw");
+
     let snapshot_config = SnapshotConfig {
         name: cache_key.to_string(),
         vm_id: vm_id.to_string(),
         original_vsock_vm_id: None, // Fresh VM, no redirect needed
-        memory_path,
-        vmstate_path,
-        disk_path: disk_path_in_snapshot.clone(),
+        memory_path: final_memory_path,
+        vmstate_path: final_vmstate_path,
+        disk_path: final_disk_path.clone(),
         created_at: chrono::Utc::now(),
         metadata: SnapshotMetadata {
             image: args.image.clone(),
@@ -295,16 +310,22 @@ async fn create_podman_cache(
         },
     };
 
-    // Use SnapshotManager to save the config
-    let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
-    snapshot_manager
-        .save_snapshot(snapshot_config)
+    // Write config to temp directory
+    let config_path = temp_snapshot_dir.join("config.json");
+    let config_json =
+        serde_json::to_string_pretty(&snapshot_config).context("serializing snapshot config")?;
+    tokio::fs::write(&config_path, &config_json)
         .await
-        .context("saving snapshot config")?;
+        .context("writing snapshot config")?;
+
+    // Atomic rename from temp to final location
+    tokio::fs::rename(&temp_snapshot_dir, &snapshot_dir)
+        .await
+        .context("renaming snapshot directory to final location")?;
 
     info!(
         cache_key = %cache_key,
-        disk = %disk_path_in_snapshot.display(),
+        disk = %final_disk_path.display(),
         "Podman cache created successfully"
     );
 
@@ -856,14 +877,15 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         None
     };
 
-    // Check for podman cache (unless --no-cache is set or localhost image)
+    // Check for podman cache (unless --no-cache is set, FCVM_NO_CACHE env var, or localhost image)
     // Localhost images have tarball paths in MMDS that won't exist on restore
     // Keep fc_config and cache_key available for later cache creation on miss
+    let no_cache = args.no_cache || std::env::var("FCVM_NO_CACHE").is_ok();
     let is_localhost_image = args.image.starts_with("localhost/");
     let (fc_config, cache_key): (
         Option<crate::firecracker::FirecrackerConfig>,
         Option<String>,
-    ) = if !args.no_cache && !is_localhost_image {
+    ) = if !no_cache && !is_localhost_image {
         // Get image identifier for cache key computation
         let image_identifier = get_image_identifier(&args.image).await?;
         let config = build_firecracker_config(
@@ -907,7 +929,11 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         info!("Cache disabled for localhost image (tarball path won't exist on restore)");
         (None, None)
     } else {
-        info!("Cache disabled via --no-cache flag");
+        if std::env::var("FCVM_NO_CACHE").is_ok() {
+            info!("Cache disabled via FCVM_NO_CACHE environment variable");
+        } else {
+            info!("Cache disabled via --no-cache flag");
+        }
         (None, None)
     };
 
@@ -1146,12 +1172,12 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     // Create cache channel for cache-ready notifications
     // Skip cache creation when:
-    // - --no-cache flag is set
+    // - --no-cache flag or FCVM_NO_CACHE env var is set
     // - Volumes are specified (FUSE-over-vsock breaks during snapshot pause)
     // - Localhost images (tarball path in MMDS won't exist on restore)
-    // Note: is_localhost_image is already defined above
-    let skip_cache_creation = args.no_cache || !args.map.is_empty() || is_localhost_image;
-    if !args.map.is_empty() && !args.no_cache {
+    // Note: no_cache and is_localhost_image are already defined above
+    let skip_cache_creation = no_cache || !args.map.is_empty() || is_localhost_image;
+    if !args.map.is_empty() && !no_cache {
         info!("Skipping cache creation: volumes specified (FUSE doesn't survive snapshot pause)");
     }
     let (cache_tx, mut cache_rx): (
