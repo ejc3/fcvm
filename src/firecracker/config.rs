@@ -154,8 +154,8 @@ impl FirecrackerConfig {
         }
     }
 
-    /// Compute cache key by hashing the JSON representation.
-    pub fn cache_key(&self) -> String {
+    /// Compute snapshot key by hashing the JSON representation.
+    pub fn snapshot_key(&self) -> String {
         use crate::setup::rootfs::compute_sha256;
         let json = serde_json::to_string(self).expect("FirecrackerConfig serialization failed");
         compute_sha256(json.as_bytes())[..12].to_string()
@@ -163,7 +163,7 @@ impl FirecrackerConfig {
 
     /// Return a copy of this config with the rootfs path replaced.
     ///
-    /// This is used when launching a VM: the cache key is computed using the
+    /// This is used when launching a VM: the snapshot key is computed using the
     /// content-addressed base rootfs path, but the actual launch uses a
     /// per-instance CoW copy path.
     pub fn with_rootfs_path(&self, new_rootfs_path: PathBuf) -> Self {

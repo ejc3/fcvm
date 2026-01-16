@@ -148,39 +148,39 @@ async fn get_image_identifier(image: &str) -> Result<String> {
     }
 }
 
-/// Check if a podman cache snapshot exists.
-/// Uses SnapshotManager to check for the snapshot with cache_key as name.
-async fn check_podman_cache(cache_key: &str) -> Option<SnapshotConfig> {
+/// Check if a podman snapshot exists.
+/// Uses SnapshotManager to check for the snapshot with snapshot_key as name.
+async fn check_podman_snapshot(snapshot_key: &str) -> Option<SnapshotConfig> {
     let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
-    snapshot_manager.load_snapshot(cache_key).await.ok()
+    snapshot_manager.load_snapshot(snapshot_key).await.ok()
 }
 
-/// Create a podman cache snapshot from a running VM.
+/// Create a podman snapshot from a running VM.
 ///
 /// This pauses the VM, creates a Firecracker snapshot, copies the disk,
 /// saves metadata using SnapshotManager, and resumes the VM.
 ///
-/// The snapshot is stored in snapshot_dir with cache_key as the name,
-/// making it accessible via `fcvm snapshot run --snapshot <cache_key>`.
-async fn create_podman_cache(
+/// The snapshot is stored in snapshot_dir with snapshot_key as the name,
+/// making it accessible via `fcvm snapshot run --snapshot <snapshot_key>`.
+async fn create_podman_snapshot(
     vm_manager: &VmManager,
-    cache_key: &str,
+    snapshot_key: &str,
     vm_id: &str,
     args: &RunArgs,
     disk_path: &Path,
     network_config: &NetworkConfig,
     volume_configs: &[VolumeConfig],
 ) -> Result<()> {
-    // Cache snapshots stored in snapshot_dir with cache_key as name
-    let snapshot_dir = paths::snapshot_dir().join(cache_key);
+    // Snapshots stored in snapshot_dir with snapshot_key as name
+    let snapshot_dir = paths::snapshot_dir().join(snapshot_key);
 
-    // Lock to prevent concurrent cache creation
+    // Lock to prevent concurrent snapshot creation
     let lock_path = snapshot_dir.with_extension("lock");
     tokio::fs::create_dir_all(paths::snapshot_dir())
         .await
         .context("creating snapshot directory")?;
 
-    let lock_file = std::fs::File::create(&lock_path).context("creating cache lock file")?;
+    let lock_file = std::fs::File::create(&lock_path).context("creating snapshot lock file")?;
 
     // Use try_lock in a loop so we yield to the async runtime and can be interrupted
     use fs2::FileExt;
@@ -191,17 +191,17 @@ async fn create_podman_cache(
                 // Lock is held by another process, yield and retry
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            Err(e) => return Err(anyhow::anyhow!("acquiring cache lock: {}", e)),
+            Err(e) => return Err(anyhow::anyhow!("acquiring snapshot lock: {}", e)),
         }
     }
 
     // Double-check after lock (another process might have created it)
     if snapshot_dir.join("config.json").exists() {
-        info!(cache_key = %cache_key, "Cache already exists (created by another process)");
+        info!(snapshot_key = %snapshot_key, "Snapshot already exists (created by another process)");
         return Ok(());
     }
 
-    info!(cache_key = %cache_key, "Creating podman cache snapshot");
+    info!(snapshot_key = %snapshot_key, "Creating podman snapshot");
 
     // Use temp directory for atomic snapshot creation
     // Only rename to final location after all files are written successfully
@@ -224,7 +224,7 @@ async fn create_podman_cache(
         .await
         .context("pausing VM for snapshot")?;
 
-    info!(cache_key = %cache_key, "VM paused for cache snapshot");
+    info!(snapshot_key = %snapshot_key, "VM paused for snapshot");
 
     // Create snapshot files in temp directory
     let memory_path = temp_snapshot_dir.join("memory.bin");
@@ -246,7 +246,7 @@ async fn create_podman_cache(
         .await;
 
     if let Err(e) = &resume_result {
-        warn!(cache_key = %cache_key, error = %e, "Failed to resume VM after snapshot");
+        warn!(snapshot_key = %snapshot_key, error = %e, "Failed to resume VM after snapshot");
     }
 
     // Check if snapshot succeeded - clean up temp dir on failure
@@ -273,7 +273,7 @@ async fn create_podman_cache(
 
     if !reflink_result.success() {
         let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-        bail!("Reflink copy failed - btrfs filesystem required for podman cache");
+        bail!("Reflink copy failed - btrfs filesystem required for podman snapshot");
     }
 
     // Convert VolumeConfig to SnapshotVolumeConfig for metadata
@@ -294,7 +294,7 @@ async fn create_podman_cache(
     let final_disk_path = snapshot_dir.join("disk.raw");
 
     let snapshot_config = SnapshotConfig {
-        name: cache_key.to_string(),
+        name: snapshot_key.to_string(),
         vm_id: vm_id.to_string(),
         original_vsock_vm_id: None, // Fresh VM, no redirect needed
         memory_path: final_memory_path,
@@ -324,9 +324,9 @@ async fn create_podman_cache(
         .context("renaming snapshot directory to final location")?;
 
     info!(
-        cache_key = %cache_key,
+        snapshot_key = %snapshot_key,
         disk = %final_disk_path.display(),
-        "Podman cache created successfully"
+        "Podman snapshot created successfully"
     );
 
     Ok(())
@@ -877,15 +877,15 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         None
     };
 
-    // Check for podman cache (unless --no-cache is set, FCVM_NO_CACHE env var, or localhost image)
+    // Check for snapshot cache (unless --no-snapshot is set, FCVM_NO_SNAPSHOT env var, or localhost image)
     // Localhost images have tarball paths in MMDS that won't exist on restore
-    // Keep fc_config and cache_key available for later cache creation on miss
-    let no_cache = args.no_cache || std::env::var("FCVM_NO_CACHE").is_ok();
+    // Keep fc_config and snapshot_key available for later snapshot creation on miss
+    let no_snapshot = args.no_snapshot || std::env::var("FCVM_NO_SNAPSHOT").is_ok();
     let is_localhost_image = args.image.starts_with("localhost/");
-    let (fc_config, cache_key): (
+    let (fc_config, snapshot_key): (
         Option<crate::firecracker::FirecrackerConfig>,
         Option<String>,
-    ) = if !no_cache && !is_localhost_image {
+    ) = if !no_snapshot && !is_localhost_image {
         // Get image identifier for cache key computation
         let image_identifier = get_image_identifier(&args.image).await?;
         let config = build_firecracker_config(
@@ -896,16 +896,16 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
             &initrd_path,
             cmd_args.clone(),
         );
-        let key = config.cache_key();
+        let key = config.snapshot_key();
 
-        // Check if cache snapshot exists
-        if check_podman_cache(&key).await.is_some() {
+        // Check if cached snapshot exists
+        if check_podman_snapshot(&key).await.is_some() {
             info!(
-                cache_key = %key,
+                snapshot_key = %key,
                 image = %args.image,
-                "Cache hit! Cloning from snapshot"
+                "Snapshot hit! Restoring from cached snapshot"
             );
-            // Call snapshot run directly with cache key as snapshot name
+            // Call snapshot run directly with snapshot key as snapshot name
             let snapshot_args = crate::cli::SnapshotRunArgs {
                 pid: None,
                 snapshot: Some(key.clone()),
@@ -920,19 +920,19 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         }
 
         info!(
-            cache_key = %key,
+            snapshot_key = %key,
             image = %args.image,
-            "Cache miss, will create cache after image load"
+            "Snapshot miss, will create snapshot after image load"
         );
         (Some(config), Some(key))
     } else if is_localhost_image {
-        info!("Cache disabled for localhost image (tarball path won't exist on restore)");
+        info!("Snapshot disabled for localhost image (tarball path won't exist on restore)");
         (None, None)
     } else {
-        if std::env::var("FCVM_NO_CACHE").is_ok() {
-            info!("Cache disabled via FCVM_NO_CACHE environment variable");
+        if std::env::var("FCVM_NO_SNAPSHOT").is_ok() {
+            info!("Snapshot disabled via FCVM_NO_SNAPSHOT environment variable");
         } else {
-            info!("Cache disabled via --no-cache flag");
+            info!("Snapshot disabled via --no-snapshot flag");
         }
         (None, None)
     };
@@ -1170,20 +1170,20 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .await
         .context("spawning VolumeServers")?;
 
-    // Create cache channel for cache-ready notifications
-    // Skip cache creation when:
-    // - --no-cache flag or FCVM_NO_CACHE env var is set
+    // Create snapshot channel for snapshot-ready notifications
+    // Skip snapshot creation when:
+    // - --no-snapshot flag or FCVM_NO_SNAPSHOT env var is set
     // - Volumes are specified (FUSE-over-vsock breaks during snapshot pause)
     // - Localhost images (tarball path in MMDS won't exist on restore)
-    // Note: no_cache and is_localhost_image are already defined above
-    let skip_cache_creation = no_cache || !args.map.is_empty() || is_localhost_image;
-    if !args.map.is_empty() && !no_cache {
-        info!("Skipping cache creation: volumes specified (FUSE doesn't survive snapshot pause)");
+    // Note: no_snapshot and is_localhost_image are already defined above
+    let skip_snapshot_creation = no_snapshot || !args.map.is_empty() || is_localhost_image;
+    if !args.map.is_empty() && !no_snapshot {
+        info!("Skipping snapshot creation: volumes specified (FUSE doesn't survive snapshot pause)");
     }
     let (cache_tx, mut cache_rx): (
         Option<mpsc::Sender<CacheRequest>>,
         Option<mpsc::Receiver<CacheRequest>>,
-    ) = if !skip_cache_creation {
+    ) = if !skip_snapshot_creation {
         let (tx, rx) = mpsc::channel(1);
         (Some(tx), Some(rx))
     } else {
@@ -1348,11 +1348,11 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                     None => std::future::pending().await,
                 }
             } => {
-                if let Some(ref key) = cache_key {
-                    info!(cache_key = %key, digest = %cache_request.digest, "Creating cache snapshot");
+                if let Some(ref key) = snapshot_key {
+                    info!(snapshot_key = %key, digest = %cache_request.digest, "Creating snapshot");
 
-                    // Use nested select! so signals can interrupt cache creation
-                    let cache_fut = create_podman_cache(
+                    // Use nested select! so signals can interrupt snapshot creation
+                    let snapshot_fut = create_podman_snapshot(
                         &vm_manager,
                         key,
                         &vm_id,
@@ -1365,22 +1365,22 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                     tokio::select! {
                         biased;  // Check signals first
                         _ = sigterm.recv() => {
-                            info!("received SIGTERM during cache creation, shutting down VM");
+                            info!("received SIGTERM during snapshot creation, shutting down VM");
                             container_exit_code = None;
                             break;  // Break outer loop to cleanup
                         }
                         _ = sigint.recv() => {
-                            info!("received SIGINT during cache creation, shutting down VM");
+                            info!("received SIGINT during snapshot creation, shutting down VM");
                             container_exit_code = None;
                             break;  // Break outer loop to cleanup
                         }
-                        result = cache_fut => {
+                        result = snapshot_fut => {
                             match result {
                                 Ok(()) => {
-                                    info!(cache_key = %key, "Cache created successfully");
+                                    info!(snapshot_key = %key, "Snapshot created successfully");
                                 }
                                 Err(e) => {
-                                    warn!(cache_key = %key, error = %e, "Failed to create cache");
+                                    warn!(snapshot_key = %key, error = %e, "Failed to create snapshot");
                                 }
                             }
                             // Send ack back regardless of success (fc-agent should continue)

@@ -163,10 +163,10 @@ fcvm automatically caches container images after the first pull. On subsequent r
 
 # Second run: restores from cache (~540ms)
 ./fcvm podman run --name web2 nginx:alpine
-# → Restored from cache
+# → Restored from snapshot
 
-# Disable cache for testing
-./fcvm podman run --name web3 --no-cache nginx:alpine
+# Disable snapshot for testing
+./fcvm podman run --name web3 --no-snapshot nginx:alpine
 ```
 
 **How it works:**
@@ -744,7 +744,7 @@ See [DESIGN.md](DESIGN.md#cli-interface) for architecture and design decisions.
 -i, --interactive   Keep stdin open (for piping input)
 -t, --tty           Allocate pseudo-TTY (for vim, colors, etc.)
 --setup             Auto-setup if kernel/rootfs missing (rootless only)
---no-cache          Disable container image cache (for testing)
+--no-snapshot       Disable automatic snapshot creation (for testing)
 ```
 
 **`fcvm exec`** - Execute in VM/container:
@@ -783,7 +783,7 @@ See [DESIGN.md](DESIGN.md#guest-agent) for details.
 |----------|---------|-------------|
 | `FCVM_BASE_DIR` | `/mnt/fcvm-btrfs` | Base directory for all data |
 | `RUST_LOG` | `warn` | Logging level (quiet by default; use `info` or `debug` for verbose) |
-| `FCVM_NO_CACHE` | unset | Set to `1` to disable container image cache (same as `--no-cache` flag) |
+| `FCVM_NO_SNAPSHOT` | unset | Set to `1` to disable automatic snapshot creation (same as `--no-snapshot` flag) |
 | `FCVM_NO_WRITEBACK_CACHE` | unset | Set to `1` to disable FUSE writeback cache (see below) |
 | `FCVM_NO_XATTR_FASTPATH` | unset | Set to `1` to disable security.capability xattr fast path |
 

@@ -281,9 +281,9 @@ jobs:
           key: ${{ env.CACHE_KEY_HOST }}-${{ runner.os }}-${{ runner.arch }}
 
   # Runner 1b: Host-Root (bare metal with KVM)
-  # Runs: test-root with matrix for cache testing modes
-  # - NoCache: FCVM_NO_CACHE=1, runs once (tests bypass path)
-  # - Cache: no env var, runs twice (cache miss then cache hit)
+  # Runs: test-root with matrix for snapshot testing modes
+  # - NoSnapshot: FCVM_NO_SNAPSHOT=1, runs once (tests bypass path)
+  # - Snapshot: no env var, runs twice (snapshot miss then snapshot hit)
   host-root:
     name: Host-Root-${{ matrix.mode }}
     if: ${{ github.event.inputs.job != 'container' }}
@@ -292,14 +292,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - mode: NoCache
-            fcvm_no_cache: "1"
+          - mode: NoSnapshot
+            fcvm_no_snapshot: "1"
             test_runs: "1"
-          - mode: Cache
-            fcvm_no_cache: ""
+          - mode: Snapshot
+            fcvm_no_snapshot: ""
             test_runs: "2"
     env:
-      FCVM_NO_CACHE: ${{ matrix.fcvm_no_cache }}
+      FCVM_NO_SNAPSHOT: ${{ matrix.fcvm_no_snapshot }}
     steps:
       # Clean up root-owned files from previous test runs before checkout
       - name: Clean workspace (pre-checkout)

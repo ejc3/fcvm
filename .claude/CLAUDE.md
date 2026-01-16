@@ -561,6 +561,18 @@ fcvm exec --pid <PID> -c -- wget -q -O - --timeout=10 http://ifconfig.me
 
 Exception: For **forked libraries** (like fuse-backend-rs), we maintain compatibility with upstream to enable merging upstream changes.
 
+### File Operations
+
+**Always use `git mv` when renaming files.** This preserves git history.
+
+```bash
+# CORRECT - preserves history
+git mv old_name.rs new_name.rs
+
+# WRONG - loses history
+mv old_name.rs new_name.rs
+```
+
 ### Development Workflow (PR-Based)
 
 **Main branch is protected. All changes MUST go through pull requests.**

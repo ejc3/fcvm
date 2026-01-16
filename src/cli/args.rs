@@ -202,10 +202,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub vsock_dir: Option<String>,
 
-    /// Disable automatic podman cache (bypass cache lookup and creation).
-    /// By default, fcvm caches "container-loaded" VM snapshots for fast subsequent launches.
+    /// Disable automatic snapshot cache (bypass snapshot lookup and creation).
+    /// By default, fcvm creates snapshots after container image pull for fast subsequent launches.
     #[arg(long)]
-    pub no_cache: bool,
+    pub no_snapshot: bool,
 
     /// Container image (e.g., nginx:alpine or localhost/myimage)
     pub image: String,
