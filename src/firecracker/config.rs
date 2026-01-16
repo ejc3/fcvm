@@ -154,8 +154,8 @@ impl FirecrackerConfig {
         }
     }
 
-    /// Compute cache key by hashing the JSON representation.
-    pub fn cache_key(&self) -> String {
+    /// Compute snapshot key by hashing the JSON representation.
+    pub fn snapshot_key(&self) -> String {
         use crate::setup::rootfs::compute_sha256;
         let json = serde_json::to_string(self).expect("FirecrackerConfig serialization failed");
         compute_sha256(json.as_bytes())[..12].to_string()
@@ -163,7 +163,7 @@ impl FirecrackerConfig {
 
     /// Return a copy of this config with the rootfs path replaced.
     ///
-    /// This is used when launching a VM: the cache key is computed using the
+    /// This is used when launching a VM: the snapshot key is computed using the
     /// content-addressed base rootfs path, but the actual launch uses a
     /// per-instance CoW copy path.
     pub fn with_rootfs_path(&self, new_rootfs_path: PathBuf) -> Self {
@@ -264,83 +264,83 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_key_deterministic() {
+    fn test_snapshot_key_deterministic() {
         let config1 = test_config();
         let config2 = test_config();
-        assert_eq!(config1.cache_key(), config2.cache_key());
+        assert_eq!(config1.snapshot_key(), config2.snapshot_key());
     }
 
     #[test]
-    fn test_cache_key_changes_with_config() {
+    fn test_snapshot_key_changes_with_config() {
         let config1 = test_config();
         let mut config2 = test_config();
         config2.network_mode = NetworkMode::Rootless;
-        assert_ne!(config1.cache_key(), config2.cache_key());
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 
     #[test]
-    fn test_cache_key_changes_with_cmd() {
+    fn test_snapshot_key_changes_with_cmd() {
         let config1 = test_config();
         let mut config2 = test_config();
         config2.container_cmd = Some(vec!["true".to_string()]);
-        assert_ne!(config1.cache_key(), config2.cache_key());
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 
     #[test]
-    fn test_cache_key_changes_with_extra_disks() {
+    fn test_snapshot_key_changes_with_extra_disks() {
         let config1 = test_config();
         let mut config2 = test_config();
         config2.extra_disks = vec!["/tmp/data:/mydata:ro".to_string()];
-        assert_ne!(config1.cache_key(), config2.cache_key());
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 
     #[test]
-    fn test_cache_key_changes_with_env_vars() {
+    fn test_snapshot_key_changes_with_env_vars() {
         let config1 = test_config();
         let mut config2 = test_config();
         config2.env_vars = vec!["MY_VAR=test_value".to_string()];
-        assert_ne!(config1.cache_key(), config2.cache_key());
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 
     #[test]
-    fn test_cache_key_changes_with_volumes() {
+    fn test_snapshot_key_changes_with_volumes() {
         let config1 = test_config();
         let mut config2 = test_config();
         config2.volume_mounts = vec!["/tmp/data:/data:ro".to_string()];
-        assert_ne!(config1.cache_key(), config2.cache_key());
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 
     #[test]
-    fn test_cache_key_changes_with_privileged() {
+    fn test_snapshot_key_changes_with_privileged() {
         let config1 = test_config();
         let mut config2 = test_config();
         config2.privileged = true;
-        assert_ne!(config1.cache_key(), config2.cache_key());
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 
     #[test]
-    fn test_cache_key_changes_with_tty() {
+    fn test_snapshot_key_changes_with_tty() {
         let config1 = test_config();
         let mut config2 = test_config();
         config2.tty = true;
-        assert_ne!(config1.cache_key(), config2.cache_key());
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 
     #[test]
-    fn test_cache_key_changes_with_interactive() {
+    fn test_snapshot_key_changes_with_interactive() {
         let config1 = test_config();
         let mut config2 = test_config();
         config2.interactive = true;
-        assert_ne!(config1.cache_key(), config2.cache_key());
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 
     #[test]
-    fn test_cache_key_changes_with_data_dir() {
-        // Different data_dirs must produce different cache keys
-        // This ensures root and non-root caches don't collide
+    fn test_snapshot_key_changes_with_data_dir() {
+        // Different data_dirs must produce different snapshot keys
+        // This ensures root and non-root snapshots don't collide
         let config1 = test_config();
         let mut config2 = test_config();
         config2.data_dir = "/mnt/fcvm-btrfs/root".into();
-        assert_ne!(config1.cache_key(), config2.cache_key());
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 }
