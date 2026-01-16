@@ -607,7 +607,7 @@ cd /mnt/fcvm-btrfs
 
 ### How It Works
 
-1. **FCVM_NV2=1** environment variable (auto-set when `--kernel` is used) triggers fcvm to pass `--enable-nv2` to Firecracker
+1. **FCVM_NV2=1** environment variable (auto-set when `--kernel-profile nested` is used) triggers fcvm to pass `--enable-nv2` to Firecracker
 2. **HAS_EL2 + HAS_EL2_E2H0** vCPU features are enabled
    - HAS_EL2 (bit 7): Enables virtual EL2 for guest
    - HAS_EL2_E2H0 (bit 8): Forces nVHE mode (avoids timer trap storm)
@@ -783,6 +783,7 @@ See [DESIGN.md](DESIGN.md#guest-agent) for details.
 |----------|---------|-------------|
 | `FCVM_BASE_DIR` | `/mnt/fcvm-btrfs` | Base directory for all data |
 | `RUST_LOG` | `warn` | Logging level (quiet by default; use `info` or `debug` for verbose) |
+| `FCVM_NO_CACHE` | unset | Set to `1` to disable container image cache (same as `--no-cache` flag) |
 | `FCVM_NO_WRITEBACK_CACHE` | unset | Set to `1` to disable FUSE writeback cache (see below) |
 | `FCVM_NO_XATTR_FASTPATH` | unset | Set to `1` to disable security.capability xattr fast path |
 
