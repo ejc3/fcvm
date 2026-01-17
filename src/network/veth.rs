@@ -650,9 +650,7 @@ pub async fn add_host_route_to_guest(
                         .output()
                         .await;
 
-                    let device_exists = dev_check
-                        .map(|o| o.status.success())
-                        .unwrap_or(false);
+                    let device_exists = dev_check.map(|o| o.status.success()).unwrap_or(false);
 
                     if !device_exists {
                         // Stale route pointing to dead device - delete it

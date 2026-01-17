@@ -120,7 +120,11 @@ async fn cmd_snapshots_ls(args: SnapshotsLsArgs) -> Result<()> {
 }
 
 /// Build snapshot info from config
-async fn build_snapshot_info(name: &str, config: &SnapshotConfig, use_btrfs_shared: bool) -> SnapshotInfo {
+async fn build_snapshot_info(
+    name: &str,
+    config: &SnapshotConfig,
+    use_btrfs_shared: bool,
+) -> SnapshotInfo {
     // Calculate age
     let now = chrono::Utc::now();
     let duration = now.signed_duration_since(config.created_at);
