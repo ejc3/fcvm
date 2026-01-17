@@ -455,3 +455,79 @@ async fn test_podman_snapshot_long_running_container() -> Result<()> {
     println!("Test passed");
     Ok(())
 }
+
+/// Test that snapshots created by podman run have type "System"
+#[tokio::test]
+async fn test_podman_snapshot_type_is_system() -> Result<()> {
+    if snapshot_disabled_by_env() {
+        println!("Skipping test: FCVM_NO_SNAPSHOT is set");
+        return Ok(());
+    }
+    println!("\ntest_podman_snapshot_type_is_system");
+    println!("====================================");
+
+    // Record snapshot entries before test
+    let before = list_snapshot_entries();
+
+    // Run container with unique command to ensure fresh snapshot
+    let (vm_name, _, _, _) = common::unique_names("type-check");
+    let unique_msg = format!(
+        "type-check-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    println!(
+        "Starting VM: {} with unique message: {}",
+        vm_name, unique_msg
+    );
+
+    let (mut child, pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "rootless",
+        "alpine:latest",
+        "echo",
+        &unique_msg,
+    ])
+    .await
+    .context("spawning fcvm")?;
+
+    // Wait for container
+    let _ = common::poll_health_by_pid(pid, 180).await;
+    let _ = tokio::time::timeout(Duration::from_secs(120), child.wait()).await;
+
+    // Wait for snapshot to be created
+    let new_key = wait_for_new_snapshot_entry(&before, 10).await;
+    assert!(new_key.is_some(), "A snapshot entry should be created");
+    let snapshot_key = new_key.unwrap();
+    println!("New snapshot entry: {}", snapshot_key);
+
+    // Read the snapshot config and verify type is System
+    let config_path = snapshot_dir().join(&snapshot_key).join("config.json");
+    let config_json =
+        std::fs::read_to_string(&config_path).context("reading snapshot config.json")?;
+
+    // Parse and verify snapshot_type is "System"
+    let config: serde_json::Value =
+        serde_json::from_str(&config_json).context("parsing snapshot config.json")?;
+
+    let snapshot_type = config
+        .get("snapshot_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("System"); // Default to System for backward compatibility
+
+    assert_eq!(
+        snapshot_type, "System",
+        "Snapshots created by 'podman run' should have type 'System', got '{}'",
+        snapshot_type
+    );
+    println!("Verified snapshot_type = {}", snapshot_type);
+
+    println!("Test passed");
+    Ok(())
+}

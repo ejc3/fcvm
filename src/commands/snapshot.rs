@@ -163,7 +163,9 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         }
 
         // Save snapshot metadata
-        use crate::storage::snapshot::{SnapshotConfig, SnapshotMetadata, SnapshotVolumeConfig};
+        use crate::storage::snapshot::{
+            SnapshotConfig, SnapshotMetadata, SnapshotType, SnapshotVolumeConfig,
+        };
 
         // Parse volume configs from VM state (format: HOST:GUEST[:ro])
         use super::common::VSOCK_VOLUME_PORT_BASE;
@@ -222,6 +224,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             vmstate_path: final_vmstate_path.clone(),
             disk_path: final_disk_path.clone(),
             created_at: chrono::Utc::now(),
+            snapshot_type: SnapshotType::User, // Explicit user-created snapshot
             metadata: SnapshotMetadata {
                 image: vm_state.config.image.clone(),
                 vcpu: vm_state.config.vcpu,
