@@ -339,6 +339,10 @@ pub struct SnapshotsPruneArgs {
     /// Force deletion without confirmation
     #[arg(short, long)]
     pub force: bool,
+
+    /// Delete ALL snapshots (including user-created ones)
+    #[arg(long)]
+    pub all: bool,
 }
 
 /// Filter for snapshot type in list command

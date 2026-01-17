@@ -240,32 +240,35 @@ async fn cmd_snapshots_delete(args: SnapshotsDeleteArgs) -> Result<()> {
     Ok(())
 }
 
-/// Delete all system (auto-generated) snapshots
+/// Delete snapshots (system-only by default, or all with --all)
 async fn cmd_snapshots_prune(args: SnapshotsPruneArgs) -> Result<()> {
-    info!("Pruning system snapshots");
+    let prune_all = args.all;
+    let type_desc = if prune_all { "all" } else { "system" };
+
+    info!("Pruning {} snapshots", type_desc);
 
     let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
     let snapshot_names = snapshot_manager.list_snapshots().await?;
 
-    // Find all system snapshots
-    let mut system_snapshots: Vec<(String, SnapshotConfig)> = Vec::new();
+    // Find snapshots to delete (all or just system)
+    let mut snapshots_to_delete: Vec<(String, SnapshotConfig)> = Vec::new();
 
     for name in snapshot_names {
         if let Ok(config) = snapshot_manager.load_snapshot(&name).await {
-            if config.snapshot_type == SnapshotType::System {
-                system_snapshots.push((name, config));
+            if prune_all || config.snapshot_type == SnapshotType::System {
+                snapshots_to_delete.push((name, config));
             }
         }
     }
 
-    if system_snapshots.is_empty() {
-        println!("No system snapshots to prune.");
+    if snapshots_to_delete.is_empty() {
+        println!("No {} snapshots to prune.", type_desc);
         return Ok(());
     }
 
     // Calculate total size
     let mut total_size = 0u64;
-    for (name, _) in &system_snapshots {
+    for (name, _) in &snapshots_to_delete {
         let dir = paths::snapshot_dir().join(name);
         total_size += calculate_dir_size(&dir).await.unwrap_or(0);
     }
@@ -273,12 +276,16 @@ async fn cmd_snapshots_prune(args: SnapshotsPruneArgs) -> Result<()> {
     // Confirm deletion unless --force
     if !args.force {
         println!(
-            "Found {} system snapshot(s) totaling {}:",
-            system_snapshots.len(),
+            "Found {} {} snapshot(s) totaling {}:",
+            snapshots_to_delete.len(),
+            type_desc,
             format_size(total_size)
         );
-        for (name, config) in &system_snapshots {
-            println!("  {} ({})", name, config.metadata.image);
+        for (name, config) in &snapshots_to_delete {
+            println!(
+                "  {} ({}, {})",
+                name, config.snapshot_type, config.metadata.image
+            );
         }
         print!("\nDelete all? [y/N] ");
         io::stdout().flush()?;
@@ -292,11 +299,11 @@ async fn cmd_snapshots_prune(args: SnapshotsPruneArgs) -> Result<()> {
         }
     }
 
-    // Delete all system snapshots
+    // Delete snapshots
     let mut deleted = 0;
     let mut failed = 0;
 
-    for (name, _) in system_snapshots {
+    for (name, _) in snapshots_to_delete {
         match snapshot_manager.delete_snapshot(&name).await {
             Ok(()) => {
                 deleted += 1;
@@ -310,8 +317,9 @@ async fn cmd_snapshots_prune(args: SnapshotsPruneArgs) -> Result<()> {
     }
 
     println!(
-        "Pruned {} system snapshot(s), freed ~{}",
+        "Pruned {} {} snapshot(s), freed ~{}",
         deleted,
+        type_desc,
         format_size(total_size)
     );
 
