@@ -877,13 +877,20 @@ RUST_LOG=debug make test-root FILTER=test_exec_basic STREAM=1
 
 ### CI Workflow
 
-Tests run automatically on PRs and pushes to main. Three parallel jobs:
+Tests run automatically on PRs and pushes to main:
 
 | Job | Runner | Tests |
 |-----|--------|-------|
 | **Host** | Self-hosted ARM64 | Unit tests, quick VM tests (rootless) |
-| **Host-Root** | Self-hosted ARM64 | Privileged tests, pjdfstest, nested KVM |
+| **Host-Root-SnapshotDisabled** | Self-hosted ARM64 | Privileged tests with `FCVM_NO_SNAPSHOT=1` |
+| **Host-Root-SnapshotEnabled** | Self-hosted ARM64 | Privileged tests run **twice** to verify snapshot hit |
 | **Container** | Self-hosted ARM64 | All tests in container |
+
+The **SnapshotEnabled** job runs the full test suite twice on the same runner:
+- **Run 1**: Creates snapshots (cache miss path)
+- **Run 2**: Uses existing snapshots (cache hit path - should be faster)
+
+This validates the complete snapshot lifecycle: creation, persistence, and restoration.
 
 Latest results: [CI Workflow](.github/workflows/ci.yml) → Actions tab
 
