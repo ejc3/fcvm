@@ -625,7 +625,65 @@ pub async fn add_host_route_to_guest(
         "adding host route to guest IP via namespace veth"
     );
 
+    // Check for existing route and clean up if it's stale (points to dead veth)
     let route = format!("{}/32", guest_ip);
+    let check_output = Command::new("ip")
+        .args(["route", "show", &route])
+        .output()
+        .await
+        .context("checking existing route")?;
+
+    if check_output.status.success() {
+        let existing_route = String::from_utf8_lossy(&check_output.stdout);
+        if !existing_route.trim().is_empty() {
+            // Route exists - check if it points to our veth or a different one
+            if !existing_route.contains(veth_inner_ip) {
+                // Route points to a different gateway - likely stale from crashed VM
+                // Check if the device in the route still exists
+                if let Some(dev_start) = existing_route.find("dev ") {
+                    let dev_part = &existing_route[dev_start + 4..];
+                    let old_dev = dev_part.split_whitespace().next().unwrap_or("");
+
+                    // Check if the old device exists
+                    let dev_check = Command::new("ip")
+                        .args(["link", "show", old_dev])
+                        .output()
+                        .await;
+
+                    let device_exists = dev_check
+                        .map(|o| o.status.success())
+                        .unwrap_or(false);
+
+                    if !device_exists {
+                        // Stale route pointing to dead device - delete it
+                        warn!(
+                            guest_ip = %guest_ip,
+                            old_route = %existing_route.trim(),
+                            "removing stale route to dead device"
+                        );
+                        let _ = Command::new("ip")
+                            .args(["route", "del", &route])
+                            .output()
+                            .await;
+                    } else {
+                        // Route exists and device is alive - another VM is using this guest IP
+                        // This shouldn't happen in normal operation but let's not break it
+                        warn!(
+                            guest_ip = %guest_ip,
+                            existing_route = %existing_route.trim(),
+                            "route already exists to live device, skipping"
+                        );
+                        return Ok(());
+                    }
+                }
+            } else {
+                // Route already points to the correct gateway
+                debug!(guest_ip = %guest_ip, "route already exists with correct gateway");
+                return Ok(());
+            }
+        }
+    }
+
     let output = Command::new("ip")
         .args(["route", "add", &route, "via", veth_inner_ip])
         .output()
@@ -634,7 +692,7 @@ pub async fn add_host_route_to_guest(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Ignore "File exists" - route already added
+        // Ignore "File exists" - race condition, route was added between check and add
         if !stderr.contains("File exists") {
             anyhow::bail!("failed to add host route to {}: {}", guest_ip, stderr);
         }
@@ -646,6 +704,31 @@ pub async fn add_host_route_to_guest(
         via = %veth_inner_ip,
         "host can now reach guest IP directly"
     );
+
+    Ok(())
+}
+
+/// Deletes the host route to a guest IP
+///
+/// This removes the route added by `add_host_route_to_guest`. Must be called during
+/// cleanup to prevent stale routes from interfering with future VMs using the same guest IP.
+pub async fn delete_host_route_to_guest(guest_ip: &str) -> Result<()> {
+    debug!(guest_ip = %guest_ip, "deleting host route to guest IP");
+
+    let route = format!("{}/32", guest_ip);
+    let output = Command::new("ip")
+        .args(["route", "del", &route])
+        .output()
+        .await
+        .context("deleting host route to guest IP")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Ignore "No such process" - route already deleted or never existed
+        if !stderr.contains("No such process") {
+            warn!(guest_ip = %guest_ip, error = %stderr, "failed to delete host route (non-fatal)");
+        }
+    }
 
     Ok(())
 }

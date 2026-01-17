@@ -366,7 +366,16 @@ impl NetworkManager for BridgedNetwork {
             portmap::cleanup_port_mappings(&self.port_mapping_rules).await?;
         }
 
-        // Step 2: Delete FORWARD rule and veth pair
+        // Step 2: Delete host route to guest IP (for clones)
+        // This route was added to allow direct access to the guest IP from the host.
+        // Must be deleted before the veth to prevent stale routes.
+        if self.is_clone {
+            if let Some(ref guest_ip) = self.guest_ip {
+                veth::delete_host_route_to_guest(guest_ip).await?;
+            }
+        }
+
+        // Step 3: Delete FORWARD rule and veth pair
         // Note: With In-Namespace NAT, all clone-specific rules are inside the namespace
         // and get cleaned up automatically when the namespace is deleted.
         if let Some(ref host_veth) = self.host_veth {
@@ -376,7 +385,7 @@ impl NetworkManager for BridgedNetwork {
             veth::delete_veth_pair(host_veth).await?;
         }
 
-        // Step 3: Delete network namespace (this cleans up everything inside it)
+        // Step 4: Delete network namespace (this cleans up everything inside it)
         // Including all NAT rules, bridge, and veth peer
         if let Some(ref namespace_id) = self.namespace_id {
             namespace::delete_namespace(namespace_id).await?;
