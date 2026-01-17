@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
         Commands::Ls(args) => commands::cmd_ls(args).await,
         Commands::Podman(args) => commands::cmd_podman(*args).await,
         Commands::Snapshot(args) => commands::cmd_snapshot(args).await,
-        Commands::Snapshots => commands::cmd_snapshots().await,
+        Commands::Snapshots(args) => commands::cmd_snapshots(args).await,
         Commands::Exec(args) => commands::cmd_exec(args).await,
         Commands::Setup(args) => commands::cmd_setup(args).await,
         Commands::Completions(args) => {

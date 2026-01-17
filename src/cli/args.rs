@@ -24,8 +24,8 @@ pub enum Commands {
     Podman(Box<PodmanArgs>),
     /// Snapshot operations (create, serve, run)
     Snapshot(SnapshotArgs),
-    /// List available snapshots
-    Snapshots,
+    /// Manage stored snapshots (list, delete, prune)
+    Snapshots(SnapshotsArgs),
     /// Execute a command in a running VM
     Exec(ExecArgs),
     /// Setup kernel and rootfs (kernel ~15MB download, rootfs ~10GB creation, takes 5-10 minutes)
@@ -291,6 +291,63 @@ pub struct SnapshotRunArgs {
     /// Keep STDIN open for interactive mode
     #[arg(short, long)]
     pub interactive: bool,
+}
+
+// ============================================================================
+// Snapshots Management Commands (list, delete, prune stored snapshots)
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct SnapshotsArgs {
+    #[command(subcommand)]
+    pub cmd: SnapshotsCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SnapshotsCommands {
+    /// List all stored snapshots
+    Ls(SnapshotsLsArgs),
+    /// Delete a specific snapshot
+    Delete(SnapshotsDeleteArgs),
+    /// Delete all system (auto-generated) snapshots
+    Prune(SnapshotsPruneArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SnapshotsLsArgs {
+    /// Output in JSON format
+    #[arg(long)]
+    pub json: bool,
+
+    /// Filter by type: user or system
+    #[arg(long, value_enum)]
+    pub filter: Option<SnapshotTypeFilter>,
+}
+
+#[derive(Args, Debug)]
+pub struct SnapshotsDeleteArgs {
+    /// Name of the snapshot to delete
+    pub name: String,
+
+    /// Force deletion without confirmation
+    #[arg(short, long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct SnapshotsPruneArgs {
+    /// Force deletion without confirmation
+    #[arg(short, long)]
+    pub force: bool,
+}
+
+/// Filter for snapshot type in list command
+#[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
+pub enum SnapshotTypeFilter {
+    /// User-created snapshots (via fcvm snapshot create)
+    User,
+    /// System-generated snapshots (auto-created cache)
+    System,
 }
 
 // ============================================================================

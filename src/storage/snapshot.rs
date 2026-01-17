@@ -6,6 +6,25 @@ use tracing::info;
 
 use crate::network::NetworkConfig;
 
+/// Type of snapshot - distinguishes user-created from system-generated
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum SnapshotType {
+    /// Created by user via `fcvm snapshot create`
+    User,
+    /// Auto-created by podman snapshot feature (cache)
+    #[default]
+    System,
+}
+
+impl std::fmt::Display for SnapshotType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnapshotType::User => write!(f, "user"),
+            SnapshotType::System => write!(f, "system"),
+        }
+    }
+}
+
 /// Snapshot configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotConfig {
@@ -23,6 +42,10 @@ pub struct SnapshotConfig {
     pub vmstate_path: PathBuf,
     pub disk_path: PathBuf,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Type of snapshot: User (explicit) or System (auto-generated cache)
+    /// Defaults to System for backward compatibility with existing snapshots
+    #[serde(default)]
+    pub snapshot_type: SnapshotType,
     pub metadata: SnapshotMetadata,
 }
 
@@ -164,6 +187,7 @@ mod tests {
             vmstate_path: PathBuf::from("/path/to/vmstate.bin"),
             disk_path: PathBuf::from("/path/to/disk.raw"),
             created_at: chrono::Utc::now(),
+            snapshot_type: SnapshotType::User,
             metadata: SnapshotMetadata {
                 image: "nginx:alpine".to_string(),
                 vcpu: 2,
@@ -191,6 +215,7 @@ mod tests {
 
         assert_eq!(parsed.name, "test-snapshot");
         assert_eq!(parsed.vm_id, "abc123");
+        assert_eq!(parsed.snapshot_type, SnapshotType::User);
         assert_eq!(parsed.metadata.image, "nginx:alpine");
         assert_eq!(parsed.metadata.vcpu, 2);
         assert_eq!(parsed.metadata.memory_mib, 512);
@@ -272,6 +297,7 @@ mod tests {
             vmstate_path: PathBuf::from("/vmstate.bin"),
             disk_path: PathBuf::from("/disk.raw"),
             created_at: chrono::Utc::now(),
+            snapshot_type: SnapshotType::User,
             metadata: SnapshotMetadata {
                 image: "alpine:latest".to_string(),
                 vcpu: 2,
@@ -302,6 +328,7 @@ mod tests {
         let loaded = manager.load_snapshot("test-snap").await.unwrap();
         assert_eq!(loaded.name, "test-snap");
         assert_eq!(loaded.vm_id, "test123");
+        assert_eq!(loaded.snapshot_type, SnapshotType::User);
         assert_eq!(loaded.metadata.image, "alpine:latest");
     }
 
@@ -324,6 +351,7 @@ mod tests {
                 vmstate_path: PathBuf::from("/vmstate.bin"),
                 disk_path: PathBuf::from("/disk.raw"),
                 created_at: chrono::Utc::now(),
+                snapshot_type: SnapshotType::System,
                 metadata: SnapshotMetadata {
                     image: "alpine".to_string(),
                     vcpu: 1,
@@ -364,6 +392,7 @@ mod tests {
             vmstate_path: PathBuf::from("/vmstate.bin"),
             disk_path: PathBuf::from("/disk.raw"),
             created_at: chrono::Utc::now(),
+            snapshot_type: SnapshotType::System,
             metadata: SnapshotMetadata {
                 image: "alpine".to_string(),
                 vcpu: 1,
@@ -402,5 +431,91 @@ mod tests {
         let result = manager.load_snapshot("does-not-exist").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_snapshot_type_default_is_system() {
+        // Verify that SnapshotType::default() is System (for backward compatibility)
+        assert_eq!(SnapshotType::default(), SnapshotType::System);
+    }
+
+    #[test]
+    fn test_snapshot_type_display() {
+        assert_eq!(format!("{}", SnapshotType::User), "user");
+        assert_eq!(format!("{}", SnapshotType::System), "system");
+    }
+
+    #[test]
+    fn test_snapshot_config_backward_compatibility() {
+        // Test that JSON without snapshot_type field defaults to System
+        // This ensures existing snapshots (created before this feature) load correctly
+        let json = r#"{
+            "name": "old-snapshot",
+            "vm_id": "abc123",
+            "memory_path": "/path/to/memory.bin",
+            "vmstate_path": "/path/to/vmstate.bin",
+            "disk_path": "/path/to/disk.raw",
+            "created_at": "2024-01-15T10:30:00Z",
+            "metadata": {
+                "image": "nginx:alpine",
+                "vcpu": 2,
+                "memory_mib": 512,
+                "network_config": {
+                    "tap_device": "tap-test",
+                    "guest_mac": "AA:BB:CC:DD:EE:FF"
+                }
+            }
+        }"#;
+
+        let config: SnapshotConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.name, "old-snapshot");
+        // Missing snapshot_type should default to System
+        assert_eq!(config.snapshot_type, SnapshotType::System);
+    }
+
+    #[test]
+    fn test_snapshot_type_json_roundtrip() {
+        // Test User type serializes and deserializes correctly
+        let user_config = SnapshotConfig {
+            name: "user-snapshot".to_string(),
+            vm_id: "user123".to_string(),
+            original_vsock_vm_id: None,
+            memory_path: PathBuf::from("/memory.bin"),
+            vmstate_path: PathBuf::from("/vmstate.bin"),
+            disk_path: PathBuf::from("/disk.raw"),
+            created_at: chrono::Utc::now(),
+            snapshot_type: SnapshotType::User,
+            metadata: SnapshotMetadata {
+                image: "alpine".to_string(),
+                vcpu: 1,
+                memory_mib: 256,
+                network_config: NetworkConfig {
+                    tap_device: "tap".to_string(),
+                    guest_mac: "00:00:00:00:00:00".to_string(),
+                    guest_ip: None,
+                    host_ip: None,
+                    host_veth: None,
+                    loopback_ip: None,
+                    health_check_port: None,
+                    health_check_url: None,
+                    dns_server: None,
+                },
+                volumes: vec![],
+            },
+        };
+
+        let json = serde_json::to_string(&user_config).unwrap();
+        let parsed: SnapshotConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.snapshot_type, SnapshotType::User);
+
+        // Test System type
+        let system_config = SnapshotConfig {
+            snapshot_type: SnapshotType::System,
+            ..user_config
+        };
+
+        let json = serde_json::to_string(&system_config).unwrap();
+        let parsed: SnapshotConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.snapshot_type, SnapshotType::System);
     }
 }

@@ -11,7 +11,8 @@ use crate::network::{BridgedNetwork, NetworkConfig, NetworkManager, PortMapping,
 use crate::paths;
 use crate::state::{generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState};
 use crate::storage::{
-    DiskManager, SnapshotConfig, SnapshotManager, SnapshotMetadata, SnapshotVolumeConfig,
+    DiskManager, SnapshotConfig, SnapshotManager, SnapshotMetadata, SnapshotType,
+    SnapshotVolumeConfig,
 };
 use crate::volume::{spawn_volume_servers, VolumeConfig};
 
@@ -301,6 +302,7 @@ async fn create_podman_snapshot(
         vmstate_path: final_vmstate_path,
         disk_path: final_disk_path.clone(),
         created_at: chrono::Utc::now(),
+        snapshot_type: SnapshotType::System, // Auto-generated cache snapshot
         metadata: SnapshotMetadata {
             image: args.image.clone(),
             vcpu: args.cpu,
