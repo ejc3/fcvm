@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::io::{self, Write};
+use std::os::unix::fs::MetadataExt;
 use tracing::info;
 
 use crate::cli::{
@@ -179,7 +180,8 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Calculate total size of directory (recursively)
+/// Calculate actual disk usage of directory (recursively)
+/// Uses st_blocks to get real disk usage, accounting for btrfs CoW/reflinks
 fn calculate_dir_size(
     dir: &std::path::Path,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>> {
@@ -194,7 +196,9 @@ fn calculate_dir_size(
         while let Some(entry) = entries.next_entry().await? {
             let metadata = entry.metadata().await?;
             if metadata.is_file() {
-                total += metadata.len();
+                // Use blocks * 512 for actual disk usage (like du)
+                // This accounts for sparse files and btrfs reflinks
+                total += metadata.blocks() * 512;
             } else if metadata.is_dir() {
                 // Recurse into subdirectories
                 total += calculate_dir_size(&entry.path()).await.unwrap_or(0);
