@@ -169,6 +169,12 @@ impl SnapshotManager {
             info!(snapshot = name, "snapshot deleted");
         }
 
+        // Also remove the lock file if it exists
+        let lock_file = self.snapshots_dir.join(format!("{}.lock", name));
+        if lock_file.exists() {
+            let _ = fs::remove_file(&lock_file).await;
+        }
+
         Ok(())
     }
 }
