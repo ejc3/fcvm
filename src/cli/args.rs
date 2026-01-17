@@ -322,6 +322,10 @@ pub struct SnapshotsLsArgs {
     /// Filter by type: user or system
     #[arg(long, value_enum)]
     pub filter: Option<SnapshotTypeFilter>,
+
+    /// Show accurate disk usage accounting for btrfs shared extents (slower)
+    #[arg(long)]
+    pub shared: bool,
 }
 
 #[derive(Args, Debug)]

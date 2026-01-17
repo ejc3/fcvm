@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
+use tokio::process::Command;
 use tracing::info;
 
 use crate::cli::{
@@ -65,7 +66,7 @@ async fn cmd_snapshots_ls(args: SnapshotsLsArgs) -> Result<()> {
                     }
                 }
 
-                let info = build_snapshot_info(&name, &config).await;
+                let info = build_snapshot_info(&name, &config, args.shared).await;
                 snapshots.push(info);
             }
             Err(e) => {
@@ -119,7 +120,7 @@ async fn cmd_snapshots_ls(args: SnapshotsLsArgs) -> Result<()> {
 }
 
 /// Build snapshot info from config
-async fn build_snapshot_info(name: &str, config: &SnapshotConfig) -> SnapshotInfo {
+async fn build_snapshot_info(name: &str, config: &SnapshotConfig, use_btrfs_shared: bool) -> SnapshotInfo {
     // Calculate age
     let now = chrono::Utc::now();
     let duration = now.signed_duration_since(config.created_at);
@@ -127,8 +128,20 @@ async fn build_snapshot_info(name: &str, config: &SnapshotConfig) -> SnapshotInf
 
     // Calculate size (sum of memory.bin, disk.raw, vmstate.bin)
     let snapshot_dir = paths::snapshot_dir().join(name);
-    let size_bytes = calculate_dir_size(&snapshot_dir).await.unwrap_or(0);
-    let size_human = format_size(size_bytes);
+    let (size_bytes, size_human) = if use_btrfs_shared {
+        // Use btrfs fi du to get accurate exclusive (non-shared) size
+        match calculate_btrfs_exclusive_size(&snapshot_dir).await {
+            Ok(exclusive) => (exclusive, format_size_exclusive(exclusive)),
+            Err(_) => {
+                // Fall back to st_blocks if btrfs fi du fails
+                let size = calculate_dir_size(&snapshot_dir).await.unwrap_or(0);
+                (size, format_size(size))
+            }
+        }
+    } else {
+        let size = calculate_dir_size(&snapshot_dir).await.unwrap_or(0);
+        (size, format_size(size))
+    };
 
     SnapshotInfo {
         name: name.to_string(),
@@ -163,8 +176,28 @@ fn format_duration(duration: chrono::Duration) -> String {
     }
 }
 
-/// Format size as human-readable
+/// Format size as human-readable with (shared) indicator for btrfs reflinks
 fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    let size = if bytes >= GB {
+        format!("{:.1}G", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1}M", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1}K", bytes as f64 / KB as f64)
+    } else {
+        format!("{}B", bytes)
+    };
+
+    // Indicate size may be shared via btrfs reflinks
+    format!("{} (shared)", size)
+}
+
+/// Format size for exclusive (non-shared) bytes
+fn format_size_exclusive(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;
@@ -178,6 +211,34 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{}B", bytes)
     }
+}
+
+/// Calculate exclusive (non-shared) disk usage using btrfs fi du
+async fn calculate_btrfs_exclusive_size(dir: &std::path::Path) -> Result<u64> {
+    let output = Command::new("btrfs")
+        .args(["filesystem", "du", "-s", "--raw"])
+        .arg(dir)
+        .output()
+        .await
+        .context("running btrfs fi du")?;
+
+    if !output.status.success() {
+        bail!("btrfs fi du failed");
+    }
+
+    // Parse output: "Total   Exclusive  Set shared  Filename"
+    // Second line: "12345   6789       ..."
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 {
+            if let Ok(exclusive) = parts[1].parse::<u64>() {
+                return Ok(exclusive);
+            }
+        }
+    }
+
+    bail!("failed to parse btrfs fi du output")
 }
 
 /// Calculate actual disk usage of directory (recursively)
