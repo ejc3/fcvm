@@ -143,6 +143,12 @@ async fn build_snapshot_info(name: &str, config: &SnapshotConfig) -> SnapshotInf
 /// Format duration as human-readable age
 fn format_duration(duration: chrono::Duration) -> String {
     let seconds = duration.num_seconds();
+
+    // Handle negative durations (clock skew, future timestamps)
+    if seconds < 0 {
+        return "0s".to_string();
+    }
+
     if seconds < 60 {
         format!("{}s", seconds)
     } else if seconds < 3600 {
@@ -173,23 +179,30 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Calculate total size of directory
-async fn calculate_dir_size(dir: &std::path::Path) -> Result<u64> {
-    let mut total = 0u64;
+/// Calculate total size of directory (recursively)
+fn calculate_dir_size(
+    dir: &std::path::Path,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + '_>> {
+    Box::pin(async move {
+        let mut total = 0u64;
 
-    if !dir.exists() {
-        return Ok(0);
-    }
-
-    let mut entries = tokio::fs::read_dir(dir).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let metadata = entry.metadata().await?;
-        if metadata.is_file() {
-            total += metadata.len();
+        if !dir.exists() {
+            return Ok(0);
         }
-    }
 
-    Ok(total)
+        let mut entries = tokio::fs::read_dir(dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let metadata = entry.metadata().await?;
+            if metadata.is_file() {
+                total += metadata.len();
+            } else if metadata.is_dir() {
+                // Recurse into subdirectories
+                total += calculate_dir_size(&entry.path()).await.unwrap_or(0);
+            }
+        }
+
+        Ok(total)
+    })
 }
 
 /// Delete a specific snapshot
