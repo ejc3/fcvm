@@ -204,17 +204,10 @@ async fn test_ctrlc_via_terminal() -> Result<()> {
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(30);
     let mut exit_status = None;
+    let mut pty_closed = false;
 
     loop {
-        // Continue reading output
-        match master.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => output.extend_from_slice(&buf[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => break,
-        }
-
-        // Check if child exited
+        // Check if child exited FIRST (before reading, so we don't miss it after EOF)
         match waitpid(child_pid, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::Exited(_, code)) => {
                 println!("  fcvm exited with code {}", code);
@@ -227,6 +220,22 @@ async fn test_ctrlc_via_terminal() -> Result<()> {
                 break;
             }
             _ => {}
+        }
+
+        // Continue reading output (if PTY still open)
+        if !pty_closed {
+            match master.read(&mut buf) {
+                Ok(0) => {
+                    println!("  PTY closed (EOF), waiting for process exit...");
+                    pty_closed = true;
+                }
+                Ok(n) => output.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => {
+                    println!("  PTY read error: {}, waiting for process exit...", e);
+                    pty_closed = true;
+                }
+            }
         }
 
         if start.elapsed() > timeout {
