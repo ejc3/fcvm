@@ -203,6 +203,7 @@ async fn test_ctrlc_via_terminal() -> Result<()> {
     println!("Waiting for fcvm to handle signal and exit...");
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(30);
+    #[allow(unused_assignments)]
     let mut exit_status = None;
     let mut pty_closed = false;
 
