@@ -1029,7 +1029,8 @@ pub struct Ftrace {
 }
 
 impl Ftrace {
-    /// Low-noise events for PSCI/shutdown debugging
+    /// Low-noise events for PSCI/shutdown debugging (ARM64)
+    #[cfg(target_arch = "aarch64")]
     pub const EVENTS_PSCI: &'static [&'static str] = &[
         "kvm:kvm_userspace_exit",
         "kvm:kvm_hvc_arm64",
@@ -1037,7 +1038,17 @@ impl Ftrace {
         "kvm:kvm_wfx_arm64",
     ];
 
-    /// Medium-noise events including interrupts
+    /// Low-noise events for shutdown debugging (x86)
+    #[cfg(target_arch = "x86_64")]
+    pub const EVENTS_PSCI: &'static [&'static str] = &[
+        "kvm:kvm_userspace_exit",
+        "kvm:kvm_hypercall",
+        "kvm:kvm_vcpu_wakeup",
+        "kvm:kvm_hlt",
+    ];
+
+    /// Medium-noise events including interrupts (ARM64)
+    #[cfg(target_arch = "aarch64")]
     pub const EVENTS_INTERRUPTS: &'static [&'static str] = &[
         "kvm:kvm_userspace_exit",
         "kvm:kvm_set_irq",
@@ -1046,7 +1057,17 @@ impl Ftrace {
         "kvm:vgic_update_irq_pending",
     ];
 
-    /// High-noise events for detailed VM tracing
+    /// Medium-noise events including interrupts (x86)
+    #[cfg(target_arch = "x86_64")]
+    pub const EVENTS_INTERRUPTS: &'static [&'static str] = &[
+        "kvm:kvm_userspace_exit",
+        "kvm:kvm_set_irq",
+        "kvm:kvm_vcpu_wakeup",
+        "kvm:kvm_apic",
+        "kvm:kvm_inj_virq",
+    ];
+
+    /// High-noise events for detailed VM tracing (arch-independent)
     pub const EVENTS_DETAILED: &'static [&'static str] =
         &["kvm:kvm_exit", "kvm:kvm_entry", "kvm:kvm_userspace_exit"];
 

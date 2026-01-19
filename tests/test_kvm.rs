@@ -1,6 +1,10 @@
-//! Integration tests for nested virtualization - nested VMs using ARM64 FEAT_NV2.
+//! Integration tests for nested virtualization.
 //!
-//! # Nested Virtualization Status (2025-12-30)
+//! # Nested Virtualization Support
+//!
+//! Supports both architectures:
+//! - **ARM64**: FEAT_NV2 (Graviton3+, c7g.metal) with `kvm-arm.mode=nested`
+//! - **x86_64**: Intel VT-x / AMD-V with nested=1 (c5.metal or similar)
 //!
 //! ## L1→L2 Working!
 //! - Host runs L1 with nested kernel (6.18) and `--privileged --map /mnt/fcvm-btrfs`
@@ -8,9 +12,10 @@
 //! - L2 executes commands successfully
 //!
 //! ## Key Components
-//! - **Host kernel**: 6.18.2-nested with `kvm-arm.mode=nested`
+//! - **ARM64 host kernel**: 6.18 with `kvm-arm.mode=nested`
+//! - **x86 host kernel**: Intel VT-x/AMD-V with `nested=1`
 //! - **Nested kernel**: 6.18 with `CONFIG_KVM=y`, FUSE_REMAP_FILE_RANGE support
-//! - **Firecracker**: Fork with NV2 support (`--enable-nv2` flag)
+//! - **Firecracker**: NV2 fork with `--enable-nv2` (ARM64 only)
 //! - **Shared storage**: `/mnt/fcvm-btrfs` mounted via FUSE-over-vsock
 //!
 //! ## How L2 Works
@@ -19,15 +24,9 @@
 //! 3. L1's script: imports image from shared cache, runs `fcvm podman run --cmd "echo MARKER"`
 //! 4. L2 echoes marker, exits
 //!
-//! ## For Deeper Nesting (L3+)
-//! Build scripts from deepest level upward:
-//! - L3 script: `echo MARKER`
-//! - L2 script: import + `fcvm ... --cmd /mnt/fcvm-btrfs/l3.sh`
-//! - L1 script: import + `fcvm ... --cmd /mnt/fcvm-btrfs/l2.sh`
-//!
-//! ## Hardware
-//! - c7g.metal (Graviton3 / Neoverse-V1) with FEAT_NV2
-//! - MIDR: 0x411fd401 (ARM Neoverse-V1)
+//! ## Hardware Requirements
+//! - **ARM64**: c7g.metal (Graviton3 / Neoverse-V1) with FEAT_NV2
+//! - **x86_64**: c5.metal or bare metal with Intel VT-x / AMD-V nested support
 
 #![cfg(feature = "privileged-tests")]
 
@@ -231,7 +230,7 @@ async fn test_kvm_available_in_vm() -> Result<()> {
 /// 4. Tests if nested KVM actually works (KVM_CREATE_VM ioctl)
 /// 5. If nested KVM works, runs fcvm inside the outer VM
 ///
-/// REQUIRES: ARM64 with FEAT_NV2 (ARMv8.4+) and kvm-arm.mode=nested
+/// REQUIRES: ARM64 with FEAT_NV2 and kvm-arm.mode=nested, or x86 with Intel VT-x/AMD-V nested=1
 /// Skips if nested KVM isn't available.
 #[ignore = "nested tests disabled - too slow/flaky"]
 #[tokio::test]
@@ -393,7 +392,7 @@ except OSError as e:
         // Nested KVM not available - skip the test
         common::kill_process(outer_pid).await;
         println!("SKIPPED: Nested KVM not available (KVM_CREATE_VM failed)");
-        println!("         This requires: ARM64 with FEAT_NV2 + kvm-arm.mode=nested");
+        println!("         This requires: ARM64 with FEAT_NV2 + kvm-arm.mode=nested, or x86 with nested=1");
         if stdout.contains("NESTED_KVM_FAILED") {
             println!("         Error: {}", stdout.trim());
         }
@@ -496,7 +495,7 @@ except OSError as e:
 ///
 /// Each nested level uses localhost/nested-test which has fcvm baked in.
 ///
-/// REQUIRES: ARM64 with FEAT_NV2 (ARMv8.4+) and kvm-arm.mode=nested
+/// REQUIRES: ARM64 with FEAT_NV2 + kvm-arm.mode=nested, or x86 with nested=1
 #[allow(dead_code)] // Helper for future L3+ tests (currently L3 is too slow)
 async fn run_nested_chain(total_levels: usize) -> Result<()> {
     let success_marker = format!("NESTED_CHAIN_{}_LEVELS_SUCCESS", total_levels);
@@ -592,7 +591,9 @@ except OSError as e:
     if !stdout.contains("NESTED_KVM_OK") {
         cleanup_vms(level_pids.clone()).await;
         println!("SKIPPED: Nested KVM not available");
-        println!("         Requires ARM64 with FEAT_NV2 + kvm-arm.mode=nested");
+        println!(
+            "         Requires ARM64 with FEAT_NV2 + kvm-arm.mode=nested, or x86 with nested=1"
+        );
         return Ok(());
     }
     println!("[Level 1] ✓ Nested KVM works!");
