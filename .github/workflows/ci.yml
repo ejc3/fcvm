@@ -48,15 +48,15 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           path: fcvm
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ejc3/fuse-backend-rs
           ref: master
           path: fuse-backend-rs
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ejc3/fuser
           ref: master
@@ -104,15 +104,15 @@ jobs:
     name: Packaging
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           path: fcvm
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ejc3/fuse-backend-rs
           ref: master
           path: fuse-backend-rs
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ejc3/fuser
           ref: master
@@ -156,15 +156,15 @@ jobs:
           # Fix cargo advisory-db permissions (can become read-only from previous runs)
           sudo chmod -R u+w ~/.cargo/advisory-db* 2>/dev/null || true
           sudo chown -R $USER:$USER ~/.cargo/advisory-db* 2>/dev/null || true
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           path: fcvm
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ejc3/fuse-backend-rs
           ref: master
           path: fuse-backend-rs
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ejc3/fuser
           ref: master
@@ -283,7 +283,7 @@ jobs:
         run: make test-fast
       - name: Upload test logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: test-logs-host-${{ matrix.arch }}
           path: /tmp/fcvm-test-logs/
@@ -336,15 +336,15 @@ jobs:
           # Fix cargo advisory-db permissions (can become read-only from previous runs)
           sudo chmod -R u+w ~/.cargo/advisory-db* 2>/dev/null || true
           sudo chown -R $USER:$USER ~/.cargo/advisory-db* 2>/dev/null || true
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           path: fcvm
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ejc3/fuse-backend-rs
           ref: master
           path: fuse-backend-rs
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ejc3/fuser
           ref: master
@@ -452,7 +452,7 @@ jobs:
           sudo dmesg | grep -iE 'userfault|uffd|kvm|firecracker|oom|killed|segfault|page.fault' > /tmp/fcvm-test-logs/dmesg-filtered.log || true
       - name: Upload test logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: test-logs-host-root-${{ matrix.arch }}-${{ matrix.mode }}
           path: /tmp/fcvm-test-logs/
@@ -488,15 +488,15 @@ jobs:
           # Fix cargo advisory-db permissions (can become read-only from previous runs)
           sudo chmod -R u+w ~/.cargo/advisory-db* 2>/dev/null || true
           sudo chown -R $USER:$USER ~/.cargo/advisory-db* 2>/dev/null || true
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           path: fcvm
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ejc3/fuse-backend-rs
           ref: master
           path: fuse-backend-rs
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ejc3/fuser
           ref: master
@@ -550,7 +550,7 @@ jobs:
           sudo dmesg | grep -iE 'userfault|uffd|kvm|firecracker|oom|killed|segfault|page.fault' > /tmp/fcvm-test-logs/dmesg-filtered.log || true
       - name: Upload test logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: test-logs-container-${{ matrix.arch }}
           path: /tmp/fcvm-test-logs/
@@ -564,9 +564,9 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: /tmp/ci-artifacts
       - name: Analyze CI run
