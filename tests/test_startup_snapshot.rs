@@ -142,9 +142,11 @@ async fn test_startup_snapshot_priority() -> Result<()> {
     .context("spawning fcvm for first boot")?;
 
     // Wait for healthy (startup snapshot created)
-    let health_result1 =
-        tokio::time::timeout(Duration::from_secs(300), common::poll_health_by_pid(fcvm_pid1, 300))
-            .await;
+    let health_result1 = tokio::time::timeout(
+        Duration::from_secs(300),
+        common::poll_health_by_pid(fcvm_pid1, 300),
+    )
+    .await;
 
     // Wait for snapshot creation to complete
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -176,9 +178,11 @@ async fn test_startup_snapshot_priority() -> Result<()> {
 
     // Wait for healthy - should be faster if using startup snapshot
     let start = std::time::Instant::now();
-    let health_result2 =
-        tokio::time::timeout(Duration::from_secs(120), common::poll_health_by_pid(fcvm_pid2, 120))
-            .await;
+    let health_result2 = tokio::time::timeout(
+        Duration::from_secs(120),
+        common::poll_health_by_pid(fcvm_pid2, 120),
+    )
+    .await;
     let elapsed = start.elapsed();
 
     // Cleanup
@@ -188,7 +192,10 @@ async fn test_startup_snapshot_priority() -> Result<()> {
 
     match health_result2 {
         Ok(Ok(_)) => {
-            println!("  Second VM became healthy in {:.2}s", elapsed.as_secs_f32());
+            println!(
+                "  Second VM became healthy in {:.2}s",
+                elapsed.as_secs_f32()
+            );
             // Startup snapshot should make second boot significantly faster
             // (skips container initialization time)
             println!("✅ STARTUP SNAPSHOT PRIORITY TEST PASSED!");
@@ -220,11 +227,7 @@ async fn test_no_startup_snapshot_without_health_check_url() -> Result<()> {
     // Start VM WITHOUT --health-check-url (uses container-ready file only)
     println!("Starting VM without --health-check-url...");
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
-        "podman",
-        "run",
-        "--name",
-        &vm_name,
-        // Note: no --health-check flag
+        "podman", "run", "--name", &vm_name, // Note: no --health-check flag
         TEST_IMAGE,
     ])
     .await
@@ -234,9 +237,11 @@ async fn test_no_startup_snapshot_without_health_check_url() -> Result<()> {
     println!("  Waiting for VM to become healthy (via container-ready file)...");
 
     // Wait for healthy status
-    let health_result =
-        tokio::time::timeout(Duration::from_secs(300), common::poll_health_by_pid(fcvm_pid, 300))
-            .await;
+    let health_result = tokio::time::timeout(
+        Duration::from_secs(300),
+        common::poll_health_by_pid(fcvm_pid, 300),
+    )
+    .await;
 
     // Wait a bit to ensure startup snapshot would have been created if it were going to be
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -292,9 +297,11 @@ async fn test_startup_snapshot_on_restored_vm() -> Result<()> {
     .await
     .context("spawning fcvm for first boot")?;
 
-    let health_result1 =
-        tokio::time::timeout(Duration::from_secs(300), common::poll_health_by_pid(fcvm_pid1, 300))
-            .await;
+    let health_result1 = tokio::time::timeout(
+        Duration::from_secs(300),
+        common::poll_health_by_pid(fcvm_pid1, 300),
+    )
+    .await;
 
     // Give time for both snapshots to be created
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -328,9 +335,11 @@ async fn test_startup_snapshot_on_restored_vm() -> Result<()> {
     .await
     .context("spawning fcvm for second boot")?;
 
-    let health_result2 =
-        tokio::time::timeout(Duration::from_secs(120), common::poll_health_by_pid(fcvm_pid2, 120))
-            .await;
+    let health_result2 = tokio::time::timeout(
+        Duration::from_secs(120),
+        common::poll_health_by_pid(fcvm_pid2, 120),
+    )
+    .await;
     let elapsed = start.elapsed();
 
     // Cleanup
@@ -387,9 +396,11 @@ async fn test_startup_snapshot_bridged() -> Result<()> {
     println!("  Waiting for VM to become healthy...");
 
     // Wait for healthy status
-    let health_result =
-        tokio::time::timeout(Duration::from_secs(300), common::poll_health_by_pid(fcvm_pid, 300))
-            .await;
+    let health_result = tokio::time::timeout(
+        Duration::from_secs(300),
+        common::poll_health_by_pid(fcvm_pid, 300),
+    )
+    .await;
 
     // Wait for snapshot creation
     tokio::time::sleep(Duration::from_secs(5)).await;

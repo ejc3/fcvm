@@ -295,7 +295,6 @@ pub struct SnapshotRunArgs {
     // ========================================================================
     // Internal fields - not exposed via CLI, used for startup snapshot support
     // ========================================================================
-
     /// Base snapshot key for startup snapshot creation (internal use only).
     /// When set, a startup snapshot will be created after the VM becomes healthy.
     #[arg(skip)]

@@ -4,13 +4,13 @@ use std::time::Duration;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{debug, info, warn};
 
-use crate::cli::{
-    NetworkMode, SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs,
-    SnapshotServeArgs,
-};
 use super::podman::{
     check_podman_snapshot, create_snapshot_interruptible, startup_snapshot_key,
     SnapshotCreationParams, SnapshotOutcome,
+};
+use crate::cli::{
+    NetworkMode, SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs,
+    SnapshotServeArgs,
 };
 use crate::network::{BridgedNetwork, NetworkManager, PortMapping, SlirpNetwork};
 use crate::paths;
