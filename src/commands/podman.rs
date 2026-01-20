@@ -74,6 +74,7 @@ pub enum SnapshotOutcome {
 ///
 /// Returns `SnapshotOutcome::Interrupted` if a signal is received - caller
 /// should break their event loop and proceed to cleanup.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_snapshot_interruptible(
     vm_manager: &VmManager,
     snapshot_key: &str,

@@ -19,33 +19,6 @@ const TEST_IMAGE: &str = common::TEST_IMAGE;
 /// Health check URL for nginx
 const HEALTH_CHECK_URL: &str = "http://localhost/";
 
-/// Check if a snapshot exists by key
-fn snapshot_exists(snapshot_key: &str) -> bool {
-    let snapshot_path = fcvm::paths::snapshot_dir().join(snapshot_key);
-    snapshot_path.join("config.json").exists()
-}
-
-/// Delete a snapshot by key (for test cleanup)
-async fn delete_snapshot(snapshot_key: &str) -> Result<()> {
-    let snapshot_path = fcvm::paths::snapshot_dir().join(snapshot_key);
-    if snapshot_path.exists() {
-        tokio::fs::remove_dir_all(&snapshot_path).await?;
-    }
-    // Also delete lock file
-    let lock_path = snapshot_path.with_extension("lock");
-    let _ = tokio::fs::remove_file(&lock_path).await;
-    Ok(())
-}
-
-/// Get the snapshot keys for a test (base and startup)
-fn get_test_snapshot_keys(test_suffix: &str) -> (String, String) {
-    // For testing, we use a deterministic key based on test name
-    // In real usage, the key is derived from FirecrackerConfig hash
-    let base_key = format!("test-startup-{}", test_suffix);
-    let startup_key = fcvm::commands::podman::startup_snapshot_key(&base_key);
-    (base_key, startup_key)
-}
-
 /// Test that fresh boot creates startup snapshot when health check URL is provided
 ///
 /// This test:
