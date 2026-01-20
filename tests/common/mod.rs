@@ -1168,3 +1168,36 @@ impl Drop for Ftrace {
         let _ = self.stop();
     }
 }
+
+// ============================================================================
+// Snapshot helpers
+// ============================================================================
+
+/// Check if a snapshot exists by key
+///
+/// A snapshot exists if it has a config.json file in its directory.
+pub fn snapshot_exists(snapshot_key: &str) -> bool {
+    let snapshot_path = fcvm::paths::snapshot_dir().join(snapshot_key);
+    snapshot_path.join("config.json").exists()
+}
+
+/// Delete a snapshot by key (for test cleanup)
+///
+/// Removes both the snapshot directory and its lock file.
+pub async fn delete_snapshot(snapshot_key: &str) -> anyhow::Result<()> {
+    let snapshot_path = fcvm::paths::snapshot_dir().join(snapshot_key);
+    if snapshot_path.exists() {
+        tokio::fs::remove_dir_all(&snapshot_path).await?;
+    }
+    // Also delete lock file
+    let lock_path = snapshot_path.with_extension("lock");
+    let _ = tokio::fs::remove_file(&lock_path).await;
+    Ok(())
+}
+
+/// Get the startup snapshot key for a base key
+///
+/// Uses the same format as the production code: `{base_key}-startup`
+pub fn startup_snapshot_key(base_key: &str) -> String {
+    fcvm::commands::podman::startup_snapshot_key(base_key)
+}

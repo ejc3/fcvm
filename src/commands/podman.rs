@@ -25,6 +25,96 @@ struct CacheRequest {
     ack_tx: oneshot::Sender<()>,
 }
 
+/// Parameters for creating a snapshot, used by both podman run and snapshot run.
+/// This allows snapshot creation from both fresh VMs (using RunArgs) and
+/// restored VMs (using existing snapshot metadata).
+pub struct SnapshotCreationParams {
+    /// Container image name
+    pub image: String,
+    /// Number of vCPUs
+    pub vcpu: u8,
+    /// Memory in MiB
+    pub memory_mib: u32,
+}
+
+impl SnapshotCreationParams {
+    /// Create from RunArgs (for fresh VMs)
+    pub fn from_run_args(args: &RunArgs) -> Self {
+        Self {
+            image: args.image.clone(),
+            vcpu: args.cpu,
+            memory_mib: args.mem,
+        }
+    }
+
+    /// Create from SnapshotMetadata (for restored VMs)
+    pub fn from_metadata(metadata: &SnapshotMetadata) -> Self {
+        Self {
+            image: metadata.image.clone(),
+            vcpu: metadata.vcpu,
+            memory_mib: metadata.memory_mib,
+        }
+    }
+}
+
+/// Result of a snapshot creation attempt that can be interrupted by signals.
+pub enum SnapshotOutcome {
+    /// Snapshot created successfully
+    Created,
+    /// Snapshot creation failed
+    Failed(anyhow::Error),
+    /// Signal received during creation (caller should break and shutdown)
+    Interrupted,
+}
+
+/// Create a snapshot with signal interruption support.
+///
+/// This wraps `create_podman_snapshot` in a `tokio::select!` that checks for
+/// SIGTERM/SIGINT, allowing graceful shutdown during snapshot creation.
+///
+/// Returns `SnapshotOutcome::Interrupted` if a signal is received - caller
+/// should break their event loop and proceed to cleanup.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_snapshot_interruptible(
+    vm_manager: &VmManager,
+    snapshot_key: &str,
+    vm_id: &str,
+    params: &SnapshotCreationParams,
+    disk_path: &Path,
+    network_config: &NetworkConfig,
+    volume_configs: &[VolumeConfig],
+    sigterm: &mut tokio::signal::unix::Signal,
+    sigint: &mut tokio::signal::unix::Signal,
+) -> SnapshotOutcome {
+    let snapshot_fut = create_podman_snapshot(
+        vm_manager,
+        snapshot_key,
+        vm_id,
+        params,
+        disk_path,
+        network_config,
+        volume_configs,
+    );
+
+    tokio::select! {
+        biased; // Check signals first
+        _ = sigterm.recv() => {
+            info!("received SIGTERM during snapshot creation, shutting down VM");
+            SnapshotOutcome::Interrupted
+        }
+        _ = sigint.recv() => {
+            info!("received SIGINT during snapshot creation, shutting down VM");
+            SnapshotOutcome::Interrupted
+        }
+        result = snapshot_fut => {
+            match result {
+                Ok(()) => SnapshotOutcome::Created,
+                Err(e) => SnapshotOutcome::Failed(e),
+            }
+        }
+    }
+}
+
 // Podman cache now uses SnapshotConfig from storage module.
 // Cache key becomes the snapshot name, stored in paths::snapshot_dir().
 
@@ -151,9 +241,17 @@ async fn get_image_identifier(image: &str) -> Result<String> {
 
 /// Check if a podman snapshot exists.
 /// Uses SnapshotManager to check for the snapshot with snapshot_key as name.
-async fn check_podman_snapshot(snapshot_key: &str) -> Option<SnapshotConfig> {
+pub async fn check_podman_snapshot(snapshot_key: &str) -> Option<SnapshotConfig> {
     let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
     snapshot_manager.load_snapshot(snapshot_key).await.ok()
+}
+
+/// Generate the startup snapshot key from a base snapshot key.
+///
+/// Startup snapshots capture VM state after the container reports healthy,
+/// enabling subsequent runs to skip application initialization time.
+pub fn startup_snapshot_key(base_key: &str) -> String {
+    format!("{}-startup", base_key)
 }
 
 /// Create a podman snapshot from a running VM.
@@ -163,11 +261,11 @@ async fn check_podman_snapshot(snapshot_key: &str) -> Option<SnapshotConfig> {
 ///
 /// The snapshot is stored in snapshot_dir with snapshot_key as the name,
 /// making it accessible via `fcvm snapshot run --snapshot <snapshot_key>`.
-async fn create_podman_snapshot(
+pub async fn create_podman_snapshot(
     vm_manager: &VmManager,
     snapshot_key: &str,
     vm_id: &str,
-    args: &RunArgs,
+    params: &SnapshotCreationParams,
     disk_path: &Path,
     network_config: &NetworkConfig,
     volume_configs: &[VolumeConfig],
@@ -304,9 +402,9 @@ async fn create_podman_snapshot(
         created_at: chrono::Utc::now(),
         snapshot_type: SnapshotType::System, // Auto-generated cache snapshot
         metadata: SnapshotMetadata {
-            image: args.image.clone(),
-            vcpu: args.cpu,
-            memory_mib: args.mem,
+            image: params.image.clone(),
+            vcpu: params.vcpu,
+            memory_mib: params.memory_mib,
             network_config: network_config.clone(),
             volumes: snapshot_volumes,
         },
@@ -900,14 +998,42 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         );
         let key = config.snapshot_key();
 
-        // Check if cached snapshot exists
+        // Check if cached snapshot exists - prefer startup snapshot over pre-start snapshot
+        let startup_key = startup_snapshot_key(&key);
+
+        // Check for startup snapshot first (fully initialized application)
+        if check_podman_snapshot(&startup_key).await.is_some() {
+            info!(
+                snapshot_key = %startup_key,
+                image = %args.image,
+                "Startup snapshot hit! Restoring from fully-initialized snapshot"
+            );
+            // Call snapshot run directly with startup snapshot
+            // No need to create startup snapshot again since we're restoring from one
+            let snapshot_args = crate::cli::SnapshotRunArgs {
+                pid: None,
+                snapshot: Some(startup_key.clone()),
+                name: Some(args.name.clone()),
+                publish: args.publish.clone(),
+                network: args.network,
+                exec: None,
+                tty: args.tty,
+                interactive: args.interactive,
+                startup_snapshot_base_key: None, // Already using startup snapshot
+                health_check_for_startup: None,
+            };
+            return super::snapshot::cmd_snapshot_run(snapshot_args).await;
+        }
+
+        // Check for pre-start snapshot (container loaded but not initialized)
         if check_podman_snapshot(&key).await.is_some() {
             info!(
                 snapshot_key = %key,
                 image = %args.image,
-                "Snapshot hit! Restoring from cached snapshot"
+                "Pre-start snapshot hit! Restoring from cached snapshot"
             );
-            // Call snapshot run directly with snapshot key as snapshot name
+            // Call snapshot run with startup snapshot creation enabled
+            // (if health_check_url is set)
             let snapshot_args = crate::cli::SnapshotRunArgs {
                 pid: None,
                 snapshot: Some(key.clone()),
@@ -917,6 +1043,9 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 exec: None,
                 tty: args.tty,
                 interactive: args.interactive,
+                // Pass startup snapshot context if health check URL is set
+                startup_snapshot_base_key: args.health_check.as_ref().map(|_| key.clone()),
+                health_check_for_startup: args.health_check.clone(),
             };
             return super::snapshot::cmd_snapshot_run(snapshot_args).await;
         }
@@ -1194,6 +1323,21 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         (None, None)
     };
 
+    // Create startup snapshot channel for health-triggered snapshot creation
+    // Only create startup snapshots if:
+    // - Not skipping snapshots (no --no-snapshot, no volumes, not localhost image)
+    // - Have a snapshot key
+    // - Have a health_check URL configured (HTTP health check, not just container-ready)
+    let (startup_tx, mut startup_rx): (
+        Option<tokio::sync::oneshot::Sender<()>>,
+        Option<tokio::sync::oneshot::Receiver<()>>,
+    ) = if !skip_snapshot_creation && snapshot_key.is_some() && args.health_check.is_some() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
     // Start status channel listener for fc-agent notifications
     // - "ready" on port 4999 -> creates container-ready file for health check
     // - "exit:{code}" on port 4999 -> creates container-exit file with exit code
@@ -1298,12 +1442,14 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // Create cancellation token for graceful health monitor shutdown
     let health_cancel_token = tokio_util::sync::CancellationToken::new();
 
-    // Spawn health monitor task with cancellation support
-    let health_monitor_handle = crate::health::spawn_health_monitor_with_cancel(
+    // Spawn health monitor task with startup snapshot trigger support
+    // Pass startup_tx to signal when health first becomes Healthy
+    let health_monitor_handle = crate::health::spawn_health_monitor_full(
         vm_id.clone(),
         vm_state.pid,
         paths::state_dir(),
         Some(health_cancel_token.clone()),
+        startup_tx,
     );
 
     // Note: For rootless mode, slirp4netns wraps Firecracker and configures TAP automatically
@@ -1353,47 +1499,68 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 }
             } => {
                 if let Some(ref key) = snapshot_key {
-                    info!(snapshot_key = %key, digest = %cache_request.digest, "Creating snapshot");
+                    info!(snapshot_key = %key, digest = %cache_request.digest, "Creating pre-start snapshot");
 
-                    // Use nested select! so signals can interrupt snapshot creation
-                    let snapshot_fut = create_podman_snapshot(
-                        &vm_manager,
-                        key,
-                        &vm_id,
-                        &args,
-                        &disk_path,
-                        &network_config,
-                        &volume_configs,
-                    );
-
-                    tokio::select! {
-                        biased;  // Check signals first
-                        _ = sigterm.recv() => {
-                            info!("received SIGTERM during snapshot creation, shutting down VM");
+                    let params = SnapshotCreationParams::from_run_args(&args);
+                    match create_snapshot_interruptible(
+                        &vm_manager, key, &vm_id, &params, &disk_path,
+                        &network_config, &volume_configs, &mut sigterm, &mut sigint,
+                    ).await {
+                        SnapshotOutcome::Interrupted => {
                             container_exit_code = None;
-                            break;  // Break outer loop to cleanup
+                            break;
                         }
-                        _ = sigint.recv() => {
-                            info!("received SIGINT during snapshot creation, shutting down VM");
-                            container_exit_code = None;
-                            break;  // Break outer loop to cleanup
+                        SnapshotOutcome::Created => {
+                            info!(snapshot_key = %key, "Pre-start snapshot created successfully");
                         }
-                        result = snapshot_fut => {
-                            match result {
-                                Ok(()) => {
-                                    info!(snapshot_key = %key, "Snapshot created successfully");
-                                }
-                                Err(e) => {
-                                    warn!(snapshot_key = %key, error = %e, "Failed to create snapshot");
-                                }
-                            }
-                            // Send ack back regardless of success (fc-agent should continue)
-                            let _ = cache_request.ack_tx.send(());
+                        SnapshotOutcome::Failed(e) => {
+                            warn!(snapshot_key = %key, error = %e, "Failed to create pre-start snapshot");
                         }
                     }
+                    // Send ack back regardless of success (fc-agent should continue)
+                    let _ = cache_request.ack_tx.send(());
                 } else {
                     // Should not happen if channel exists, but send ack anyway
                     let _ = cache_request.ack_tx.send(());
+                }
+                // Continue waiting for VM exit or signals
+            }
+            // Handle startup snapshot creation when health becomes healthy
+            Ok(()) = async {
+                match startup_rx.as_mut() {
+                    Some(rx) => rx.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // Oneshot channel - prevent further attempts
+                startup_rx = None;
+
+                if let Some(ref key) = snapshot_key {
+                    let startup_key = startup_snapshot_key(key);
+
+                    // Skip if startup snapshot already exists
+                    if check_podman_snapshot(&startup_key).await.is_some() {
+                        info!(snapshot_key = %startup_key, "Startup snapshot already exists, skipping");
+                    } else {
+                        info!(snapshot_key = %startup_key, "Creating startup snapshot (VM healthy)");
+
+                        let params = SnapshotCreationParams::from_run_args(&args);
+                        match create_snapshot_interruptible(
+                            &vm_manager, &startup_key, &vm_id, &params, &disk_path,
+                            &network_config, &volume_configs, &mut sigterm, &mut sigint,
+                        ).await {
+                            SnapshotOutcome::Interrupted => {
+                                container_exit_code = None;
+                                break;
+                            }
+                            SnapshotOutcome::Created => {
+                                info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
+                            }
+                            SnapshotOutcome::Failed(e) => {
+                                warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");
+                            }
+                        }
+                    }
                 }
                 // Continue waiting for VM exit or signals
             }

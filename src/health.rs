@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::time::Instant;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -37,6 +38,26 @@ pub fn spawn_health_monitor_with_cancel(
     state_dir: PathBuf,
     cancel_token: Option<CancellationToken>,
 ) -> JoinHandle<()> {
+    spawn_health_monitor_full(vm_id, pid, state_dir, cancel_token, None)
+}
+
+/// Spawn a health monitor with full configuration options.
+///
+/// Parameters:
+/// - `vm_id`: The VM identifier
+/// - `pid`: Optional process ID for the VM
+/// - `state_dir`: Directory for state files
+/// - `cancel_token`: Optional token for graceful shutdown
+/// - `startup_healthy_tx`: Optional oneshot channel to signal when health first becomes Healthy.
+///   This is used to trigger startup snapshot creation. Only fires once, when transitioning
+///   from non-healthy to healthy state.
+pub fn spawn_health_monitor_full(
+    vm_id: String,
+    pid: Option<u32>,
+    state_dir: PathBuf,
+    cancel_token: Option<CancellationToken>,
+    startup_healthy_tx: Option<oneshot::Sender<()>>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let state_manager = StateManager::new(state_dir);
 
@@ -57,6 +78,9 @@ pub fn spawn_health_monitor_with_cancel(
         // Adaptive polling: fast during startup, slow after healthy
         let mut poll_interval = HEALTH_POLL_STARTUP_INTERVAL;
         let mut is_healthy = false;
+
+        // Oneshot channel for startup snapshot notification (can only fire once)
+        let mut startup_tx = startup_healthy_tx;
 
         // Throttle health check failure logs to once per second (simple local variable)
         let mut last_failure_log: Option<Instant> = None;
@@ -110,6 +134,12 @@ pub fn spawn_health_monitor_with_cancel(
                 is_healthy = true;
                 poll_interval = HEALTH_POLL_HEALTHY_INTERVAL;
                 info!(target: "health-monitor", "VM healthy, switching to {:?} polling", HEALTH_POLL_HEALTHY_INTERVAL);
+
+                // Signal startup snapshot trigger (fires only once)
+                if let Some(tx) = startup_tx.take() {
+                    info!(target: "health-monitor", "signaling startup snapshot trigger");
+                    let _ = tx.send(()); // Ignore error if receiver dropped
+                }
             }
 
             // Stop monitoring if container has stopped
@@ -224,12 +254,29 @@ async fn update_health_status_once(
                             }
                         }
                     } else {
-                        // Bridged mode: use health_check_url directly (may differ from guest_ip for clones)
+                        // Bridged mode: transform URL to use guest IP if localhost is specified
+                        // "localhost" from the host doesn't reach the VM - we need the guest's IP
                         let veth_device = net.host_veth.as_deref();
 
-                        debug!(target: "health-monitor", url = %url_str, veth = ?veth_device, "HTTP health check via veth");
+                        // Transform URL: if host is localhost/127.0.0.1, use guest IP instead
+                        let effective_url = if url.host_str() == Some("localhost")
+                            || url.host_str() == Some("127.0.0.1")
+                        {
+                            if let Some(guest_ip) = net.guest_ip.as_ref() {
+                                // Strip CIDR suffix if present
+                                let guest_ip = guest_ip.split('/').next().unwrap_or(guest_ip);
+                                let port = url.port().unwrap_or(80);
+                                format!("http://{}:{}{}", guest_ip, port, health_path)
+                            } else {
+                                url_str.to_string()
+                            }
+                        } else {
+                            url_str.to_string()
+                        };
 
-                        match check_http_health_bridged(url_str, veth_device).await {
+                        debug!(target: "health-monitor", original_url = %url_str, effective_url = %effective_url, veth = ?veth_device, "HTTP health check via veth");
+
+                        match check_http_health_bridged(&effective_url, veth_device).await {
                             Ok(true) => {
                                 debug!(target: "health-monitor", "health check passed");
                                 *last_failure_log = None;
