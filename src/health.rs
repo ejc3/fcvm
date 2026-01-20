@@ -254,12 +254,29 @@ async fn update_health_status_once(
                             }
                         }
                     } else {
-                        // Bridged mode: use health_check_url directly (may differ from guest_ip for clones)
+                        // Bridged mode: transform URL to use guest IP if localhost is specified
+                        // "localhost" from the host doesn't reach the VM - we need the guest's IP
                         let veth_device = net.host_veth.as_deref();
 
-                        debug!(target: "health-monitor", url = %url_str, veth = ?veth_device, "HTTP health check via veth");
+                        // Transform URL: if host is localhost/127.0.0.1, use guest IP instead
+                        let effective_url = if url.host_str() == Some("localhost")
+                            || url.host_str() == Some("127.0.0.1")
+                        {
+                            if let Some(guest_ip) = net.guest_ip.as_ref() {
+                                // Strip CIDR suffix if present
+                                let guest_ip = guest_ip.split('/').next().unwrap_or(guest_ip);
+                                let port = url.port().unwrap_or(80);
+                                format!("http://{}:{}{}", guest_ip, port, health_path)
+                            } else {
+                                url_str.to_string()
+                            }
+                        } else {
+                            url_str.to_string()
+                        };
 
-                        match check_http_health_bridged(url_str, veth_device).await {
+                        debug!(target: "health-monitor", original_url = %url_str, effective_url = %effective_url, veth = ?veth_device, "HTTP health check via veth");
+
+                        match check_http_health_bridged(&effective_url, veth_device).await {
                             Ok(true) => {
                                 debug!(target: "health-monitor", "health check passed");
                                 *last_failure_log = None;
