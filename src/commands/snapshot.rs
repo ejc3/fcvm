@@ -8,6 +8,9 @@ use crate::cli::{
     NetworkMode, SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs,
     SnapshotServeArgs,
 };
+use super::podman::{
+    check_podman_snapshot, create_podman_snapshot, startup_snapshot_key, SnapshotCreationParams,
+};
 use crate::network::{BridgedNetwork, NetworkManager, PortMapping, SlirpNetwork};
 use crate::paths;
 use crate::state::{
@@ -966,12 +969,26 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Create cancellation token for graceful health monitor shutdown
     let health_cancel_token = tokio_util::sync::CancellationToken::new();
 
-    // Spawn health monitor task with cancellation support
-    let health_monitor_handle = crate::health::spawn_health_monitor_with_cancel(
+    // Create startup snapshot channel if:
+    // - startup_snapshot_base_key is set (passed from podman run on cache hit)
+    // - health_check_for_startup is set (HTTP health check URL)
+    let (startup_tx, mut startup_rx): (
+        Option<tokio::sync::oneshot::Sender<()>>,
+        Option<tokio::sync::oneshot::Receiver<()>>,
+    ) = if args.startup_snapshot_base_key.is_some() && args.health_check_for_startup.is_some() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    // Spawn health monitor task with startup snapshot trigger support
+    let health_monitor_handle = crate::health::spawn_health_monitor_full(
         vm_id.clone(),
         vm_state.pid,
         paths::state_dir(),
         Some(health_cancel_token.clone()),
+        startup_tx,
     );
 
     // Setup signal handlers
@@ -979,22 +996,94 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt())?;
 
     // Track container exit code (from TTY mode)
-    let mut container_exit_code: Option<i32> = None;
+    let container_exit_code: Option<i32>;
 
-    // Wait for signal or VM exit
-    tokio::select! {
-        _ = sigterm.recv() => {
-            info!("received SIGTERM, shutting down VM");
-        }
-        _ = sigint.recv() => {
-            info!("received SIGINT, shutting down VM");
-        }
-        status = vm_manager.wait() => {
-            info!(status = ?status, "VM exited");
-            // If in TTY mode, get exit code from TTY handle
-            if let Some(handle) = tty_handle {
-                container_exit_code = handle.join().ok().and_then(|r| r.ok());
-                info!(container_exit_code = ?container_exit_code, "TTY container exit code");
+    // Get disk path for startup snapshot creation
+    let disk_path = data_dir.join("disks/rootfs.raw");
+
+    // Wait for signal, VM exit, or startup snapshot trigger
+    loop {
+        tokio::select! {
+            _ = sigterm.recv() => {
+                info!("received SIGTERM, shutting down VM");
+                container_exit_code = None;
+                break;
+            }
+            _ = sigint.recv() => {
+                info!("received SIGINT, shutting down VM");
+                container_exit_code = None;
+                break;
+            }
+            status = vm_manager.wait() => {
+                info!(status = ?status, "VM exited");
+                // If in TTY mode, get exit code from TTY handle
+                if let Some(handle) = tty_handle {
+                    container_exit_code = handle.join().ok().and_then(|r| r.ok());
+                    info!(container_exit_code = ?container_exit_code, "TTY container exit code");
+                } else {
+                    container_exit_code = None;
+                }
+                break;
+            }
+            // Handle startup snapshot creation when health becomes healthy
+            Ok(()) = async {
+                match startup_rx.as_mut() {
+                    Some(rx) => rx.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // Oneshot channel - prevent further attempts
+                startup_rx = None;
+
+                if let Some(ref base_key) = args.startup_snapshot_base_key {
+                    let startup_key = startup_snapshot_key(base_key);
+
+                    // Skip if startup snapshot already exists
+                    if check_podman_snapshot(&startup_key).await.is_some() {
+                        info!(snapshot_key = %startup_key, "Startup snapshot already exists, skipping");
+                    } else {
+                        info!(snapshot_key = %startup_key, "Creating startup snapshot (VM healthy)");
+
+                        // Create params from original snapshot metadata
+                        let params = SnapshotCreationParams::from_metadata(&snapshot_config.metadata);
+
+                        // Use nested select! so signals can interrupt snapshot creation
+                        let snapshot_fut = create_podman_snapshot(
+                            &vm_manager,
+                            &startup_key,
+                            &vm_id,
+                            &params,
+                            &disk_path,
+                            &network_config,
+                            &volume_configs,
+                        );
+
+                        tokio::select! {
+                            biased;  // Check signals first
+                            _ = sigterm.recv() => {
+                                info!("received SIGTERM during startup snapshot creation, shutting down VM");
+                                container_exit_code = None;
+                                break;  // Break outer loop to cleanup
+                            }
+                            _ = sigint.recv() => {
+                                info!("received SIGINT during startup snapshot creation, shutting down VM");
+                                container_exit_code = None;
+                                break;  // Break outer loop to cleanup
+                            }
+                            result = snapshot_fut => {
+                                match result {
+                                    Ok(()) => {
+                                        info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
+                                    }
+                                    Err(e) => {
+                                        warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Continue waiting for VM exit or signals
             }
         }
     }

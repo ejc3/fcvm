@@ -291,6 +291,20 @@ pub struct SnapshotRunArgs {
     /// Keep STDIN open for interactive mode
     #[arg(short, long)]
     pub interactive: bool,
+
+    // ========================================================================
+    // Internal fields - not exposed via CLI, used for startup snapshot support
+    // ========================================================================
+
+    /// Base snapshot key for startup snapshot creation (internal use only).
+    /// When set, a startup snapshot will be created after the VM becomes healthy.
+    #[arg(skip)]
+    pub startup_snapshot_base_key: Option<String>,
+
+    /// Health check URL for triggering startup snapshot (internal use only).
+    /// Only used when startup_snapshot_base_key is set.
+    #[arg(skip)]
+    pub health_check_for_startup: Option<String>,
 }
 
 // ============================================================================
