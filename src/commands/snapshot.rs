@@ -9,7 +9,8 @@ use crate::cli::{
     SnapshotServeArgs,
 };
 use super::podman::{
-    check_podman_snapshot, create_podman_snapshot, startup_snapshot_key, SnapshotCreationParams,
+    check_podman_snapshot, create_snapshot_interruptible, startup_snapshot_key,
+    SnapshotCreationParams, SnapshotOutcome,
 };
 use crate::network::{BridgedNetwork, NetworkManager, PortMapping, SlirpNetwork};
 use crate::paths;
@@ -1044,41 +1045,20 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                     } else {
                         info!(snapshot_key = %startup_key, "Creating startup snapshot (VM healthy)");
 
-                        // Create params from original snapshot metadata
                         let params = SnapshotCreationParams::from_metadata(&snapshot_config.metadata);
-
-                        // Use nested select! so signals can interrupt snapshot creation
-                        let snapshot_fut = create_podman_snapshot(
-                            &vm_manager,
-                            &startup_key,
-                            &vm_id,
-                            &params,
-                            &disk_path,
-                            &network_config,
-                            &volume_configs,
-                        );
-
-                        tokio::select! {
-                            biased;  // Check signals first
-                            _ = sigterm.recv() => {
-                                info!("received SIGTERM during startup snapshot creation, shutting down VM");
+                        match create_snapshot_interruptible(
+                            &vm_manager, &startup_key, &vm_id, &params, &disk_path,
+                            &network_config, &volume_configs, &mut sigterm, &mut sigint,
+                        ).await {
+                            SnapshotOutcome::Interrupted => {
                                 container_exit_code = None;
-                                break;  // Break outer loop to cleanup
+                                break;
                             }
-                            _ = sigint.recv() => {
-                                info!("received SIGINT during startup snapshot creation, shutting down VM");
-                                container_exit_code = None;
-                                break;  // Break outer loop to cleanup
+                            SnapshotOutcome::Created => {
+                                info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
                             }
-                            result = snapshot_fut => {
-                                match result {
-                                    Ok(()) => {
-                                        info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
-                                    }
-                                    Err(e) => {
-                                        warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");
-                                    }
-                                }
+                            SnapshotOutcome::Failed(e) => {
+                                warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");
                             }
                         }
                     }

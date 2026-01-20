@@ -57,6 +57,63 @@ impl SnapshotCreationParams {
     }
 }
 
+/// Result of a snapshot creation attempt that can be interrupted by signals.
+pub enum SnapshotOutcome {
+    /// Snapshot created successfully
+    Created,
+    /// Snapshot creation failed
+    Failed(anyhow::Error),
+    /// Signal received during creation (caller should break and shutdown)
+    Interrupted,
+}
+
+/// Create a snapshot with signal interruption support.
+///
+/// This wraps `create_podman_snapshot` in a `tokio::select!` that checks for
+/// SIGTERM/SIGINT, allowing graceful shutdown during snapshot creation.
+///
+/// Returns `SnapshotOutcome::Interrupted` if a signal is received - caller
+/// should break their event loop and proceed to cleanup.
+pub async fn create_snapshot_interruptible(
+    vm_manager: &VmManager,
+    snapshot_key: &str,
+    vm_id: &str,
+    params: &SnapshotCreationParams,
+    disk_path: &Path,
+    network_config: &NetworkConfig,
+    volume_configs: &[VolumeConfig],
+    sigterm: &mut tokio::signal::unix::Signal,
+    sigint: &mut tokio::signal::unix::Signal,
+) -> SnapshotOutcome {
+    let snapshot_fut = create_podman_snapshot(
+        vm_manager,
+        snapshot_key,
+        vm_id,
+        params,
+        disk_path,
+        network_config,
+        volume_configs,
+    );
+
+    tokio::select! {
+        biased; // Check signals first
+        _ = sigterm.recv() => {
+            info!("received SIGTERM during snapshot creation, shutting down VM");
+            SnapshotOutcome::Interrupted
+        }
+        _ = sigint.recv() => {
+            info!("received SIGINT during snapshot creation, shutting down VM");
+            SnapshotOutcome::Interrupted
+        }
+        result = snapshot_fut => {
+            match result {
+                Ok(()) => SnapshotOutcome::Created,
+                Err(e) => SnapshotOutcome::Failed(e),
+            }
+        }
+    }
+}
+
 // Podman cache now uses SnapshotConfig from storage module.
 // Cache key becomes the snapshot name, stored in paths::snapshot_dir().
 
@@ -1441,45 +1498,26 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 }
             } => {
                 if let Some(ref key) = snapshot_key {
-                    info!(snapshot_key = %key, digest = %cache_request.digest, "Creating snapshot");
+                    info!(snapshot_key = %key, digest = %cache_request.digest, "Creating pre-start snapshot");
 
-                    // Use nested select! so signals can interrupt snapshot creation
                     let params = SnapshotCreationParams::from_run_args(&args);
-                    let snapshot_fut = create_podman_snapshot(
-                        &vm_manager,
-                        key,
-                        &vm_id,
-                        &params,
-                        &disk_path,
-                        &network_config,
-                        &volume_configs,
-                    );
-
-                    tokio::select! {
-                        biased;  // Check signals first
-                        _ = sigterm.recv() => {
-                            info!("received SIGTERM during snapshot creation, shutting down VM");
+                    match create_snapshot_interruptible(
+                        &vm_manager, key, &vm_id, &params, &disk_path,
+                        &network_config, &volume_configs, &mut sigterm, &mut sigint,
+                    ).await {
+                        SnapshotOutcome::Interrupted => {
                             container_exit_code = None;
-                            break;  // Break outer loop to cleanup
+                            break;
                         }
-                        _ = sigint.recv() => {
-                            info!("received SIGINT during snapshot creation, shutting down VM");
-                            container_exit_code = None;
-                            break;  // Break outer loop to cleanup
+                        SnapshotOutcome::Created => {
+                            info!(snapshot_key = %key, "Pre-start snapshot created successfully");
                         }
-                        result = snapshot_fut => {
-                            match result {
-                                Ok(()) => {
-                                    info!(snapshot_key = %key, "Snapshot created successfully");
-                                }
-                                Err(e) => {
-                                    warn!(snapshot_key = %key, error = %e, "Failed to create snapshot");
-                                }
-                            }
-                            // Send ack back regardless of success (fc-agent should continue)
-                            let _ = cache_request.ack_tx.send(());
+                        SnapshotOutcome::Failed(e) => {
+                            warn!(snapshot_key = %key, error = %e, "Failed to create pre-start snapshot");
                         }
                     }
+                    // Send ack back regardless of success (fc-agent should continue)
+                    let _ = cache_request.ack_tx.send(());
                 } else {
                     // Should not happen if channel exists, but send ack anyway
                     let _ = cache_request.ack_tx.send(());
@@ -1505,39 +1543,20 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                     } else {
                         info!(snapshot_key = %startup_key, "Creating startup snapshot (VM healthy)");
 
-                        // Use nested select! so signals can interrupt snapshot creation
                         let params = SnapshotCreationParams::from_run_args(&args);
-                        let snapshot_fut = create_podman_snapshot(
-                            &vm_manager,
-                            &startup_key,
-                            &vm_id,
-                            &params,
-                            &disk_path,
-                            &network_config,
-                            &volume_configs,
-                        );
-
-                        tokio::select! {
-                            biased;  // Check signals first
-                            _ = sigterm.recv() => {
-                                info!("received SIGTERM during startup snapshot creation, shutting down VM");
+                        match create_snapshot_interruptible(
+                            &vm_manager, &startup_key, &vm_id, &params, &disk_path,
+                            &network_config, &volume_configs, &mut sigterm, &mut sigint,
+                        ).await {
+                            SnapshotOutcome::Interrupted => {
                                 container_exit_code = None;
-                                break;  // Break outer loop to cleanup
+                                break;
                             }
-                            _ = sigint.recv() => {
-                                info!("received SIGINT during startup snapshot creation, shutting down VM");
-                                container_exit_code = None;
-                                break;  // Break outer loop to cleanup
+                            SnapshotOutcome::Created => {
+                                info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
                             }
-                            result = snapshot_fut => {
-                                match result {
-                                    Ok(()) => {
-                                        info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
-                                    }
-                                    Err(e) => {
-                                        warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");
-                                    }
-                                }
+                            SnapshotOutcome::Failed(e) => {
+                                warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");
                             }
                         }
                     }
