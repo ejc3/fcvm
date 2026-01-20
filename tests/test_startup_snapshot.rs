@@ -33,6 +33,9 @@ async fn test_startup_snapshot_created_on_fresh_boot() -> Result<()> {
 
     let (vm_name, _, _, _) = common::unique_names("startup-fresh");
 
+    // Use unique env var to get unique snapshot key (prevents parallel test interference)
+    let test_id = format!("TEST_ID=fresh-{}", std::process::id());
+
     // Start VM with health check URL (rootless mode for unprivileged testing)
     println!("Starting VM with --health-check-url...");
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
@@ -40,6 +43,8 @@ async fn test_startup_snapshot_created_on_fresh_boot() -> Result<()> {
         "run",
         "--name",
         &vm_name,
+        "--env",
+        &test_id,
         "--health-check",
         HEALTH_CHECK_URL,
         TEST_IMAGE,
@@ -98,6 +103,9 @@ async fn test_startup_snapshot_priority() -> Result<()> {
     println!("==============================");
     println!("Verifies startup snapshot is preferred over pre-start snapshot");
 
+    // Use unique env var to get unique snapshot key (prevents parallel test interference)
+    let test_id = format!("TEST_ID=priority-{}", std::process::id());
+
     // First boot: create both snapshots
     let (vm_name1, _, _, _) = common::unique_names("startup-priority-1");
 
@@ -107,6 +115,8 @@ async fn test_startup_snapshot_priority() -> Result<()> {
         "run",
         "--name",
         &vm_name1,
+        "--env",
+        &test_id,
         "--health-check",
         HEALTH_CHECK_URL,
         TEST_IMAGE,
@@ -142,6 +152,8 @@ async fn test_startup_snapshot_priority() -> Result<()> {
         "run",
         "--name",
         &vm_name2,
+        "--env",
+        &test_id,
         "--health-check",
         HEALTH_CHECK_URL,
         TEST_IMAGE,
@@ -197,10 +209,14 @@ async fn test_no_startup_snapshot_without_health_check_url() -> Result<()> {
 
     let (vm_name, _, _, _) = common::unique_names("startup-no-url");
 
+    // Use unique env var to get unique snapshot key (prevents parallel test interference)
+    let test_id = format!("TEST_ID=no-url-{}", std::process::id());
+
     // Start VM WITHOUT --health-check-url (uses container-ready file only)
     println!("Starting VM without --health-check-url...");
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
-        "podman", "run", "--name", &vm_name, // Note: no --health-check flag
+        "podman", "run", "--name", &vm_name, "--env",
+        &test_id, // Note: no --health-check flag
         TEST_IMAGE,
     ])
     .await
@@ -254,6 +270,9 @@ async fn test_startup_snapshot_on_restored_vm() -> Result<()> {
     println!("====================================");
     println!("Verifies startup snapshot is created even when restoring from pre-start");
 
+    // Use unique env var to get unique snapshot key (prevents parallel test interference)
+    let test_id = format!("TEST_ID=restored-{}", std::process::id());
+
     // First boot: creates pre-start snapshot, then startup snapshot
     let (vm_name1, _, _, _) = common::unique_names("startup-restore-1");
 
@@ -263,6 +282,8 @@ async fn test_startup_snapshot_on_restored_vm() -> Result<()> {
         "run",
         "--name",
         &vm_name1,
+        "--env",
+        &test_id,
         "--health-check",
         HEALTH_CHECK_URL,
         TEST_IMAGE,
@@ -301,6 +322,8 @@ async fn test_startup_snapshot_on_restored_vm() -> Result<()> {
         "run",
         "--name",
         &vm_name2,
+        "--env",
+        &test_id,
         "--health-check",
         HEALTH_CHECK_URL,
         TEST_IMAGE,
@@ -349,6 +372,9 @@ async fn test_startup_snapshot_bridged() -> Result<()> {
 
     let (vm_name, _, _, _) = common::unique_names("startup-bridged");
 
+    // Use unique env var to get unique snapshot key (prevents parallel test interference)
+    let test_id = format!("TEST_ID=bridged-{}", std::process::id());
+
     // Start VM with bridged networking and health check URL
     println!("Starting VM with --network bridged and --health-check-url...");
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
@@ -356,6 +382,8 @@ async fn test_startup_snapshot_bridged() -> Result<()> {
         "run",
         "--name",
         &vm_name,
+        "--env",
+        &test_id,
         "--network",
         "bridged",
         "--health-check",
