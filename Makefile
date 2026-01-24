@@ -313,10 +313,29 @@ setup-fcvm: build setup-btrfs
 	@echo "==> Running fcvm setup --kernel-profile nested..."
 	./target/release/fcvm setup --kernel-profile nested --build-kernels
 
+# Setup nested profile (kernel + firecracker for running VMs inside VMs)
+setup-nested: build setup-btrfs
+	sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels
+
 # Build and install host kernel with all patches from kernel/patches/
 # Requires reboot to activate the new kernel
 install-host-kernel: build setup-btrfs
 	sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels --install-host-kernel
+	@$(MAKE) verify-grub
+
+# Verify grub.cfg matches /etc/default/grub (catches manual edits)
+verify-grub:
+	@EXPECTED=$$(grep '^GRUB_DEFAULT=' /etc/default/grub 2>/dev/null | cut -d'"' -f2); \
+	ACTUAL=$$(sudo grep 'set default=' /boot/grub/grub.cfg 2>/dev/null | grep -v next_entry | head -1 | cut -d'"' -f2); \
+	if [ "$$EXPECTED" != "$$ACTUAL" ]; then \
+		echo "ERROR: grub.cfg out of sync with /etc/default/grub"; \
+		echo "  Expected: $$EXPECTED"; \
+		echo "  Actual:   $$ACTUAL"; \
+		echo "  Fix with: sudo update-grub"; \
+		exit 1; \
+	else \
+		echo "✓ GRUB configured for: $$EXPECTED"; \
+	fi
 
 # Run setup inside container (for CI - container has Firecracker)
 container-setup-fcvm: container-build setup-btrfs
