@@ -277,8 +277,13 @@ async fn test_nested_run_fcvm_inside_vm() -> Result<()> {
     println!("   Outer VM started (PID: {})", outer_pid);
 
     // Wait for outer VM
-    println!("   Waiting for outer VM to be healthy...");
-    if let Err(e) = common::poll_health_by_pid(outer_pid, 120).await {
+    // Nested profile VMs take longer to start due to:
+    // 1. FUSE mount initialization (3 volumes)
+    // 2. Serial console buffering delays
+    // 3. Container image pull/start over FUSE
+    // Allow 300s instead of default 120s
+    println!("   Waiting for outer VM to be healthy (up to 300s for nested profile)...");
+    if let Err(e) = common::poll_health_by_pid(outer_pid, 300).await {
         common::kill_process(outer_pid).await;
         return Err(e.context("outer VM failed to become healthy"));
     }
@@ -408,23 +413,48 @@ except OSError as e:
     // The outer VM has --privileged so iptables/namespaces work
     // Use --cmd for the container command (fcvm doesn't support trailing args after IMAGE)
     // Set HOME explicitly to ensure config file is found
-    let inner_cmd = r#"
+    //
+    // Write logs to shared FUSE mount so we can debug each level
+    let log_dir = "/mnt/fcvm-btrfs/nested-debug";
+    let l1_log = format!("{}/l1-fcvm.log", log_dir);
+    let l2_log = format!("{}/l2-fcvm.log", log_dir);
+    let marker_file = format!("{}/marker.txt", log_dir);
+
+    let inner_cmd = format!(r#"
         export PATH=/opt/fcvm:/mnt/fcvm-btrfs/bin:$PATH
         export HOME=/root
+
+        # Create debug log directory
+        mkdir -p {log_dir}
+        rm -f {l1_log} {l2_log} {marker_file}
+
+        echo "=== L1 START ===" >> {l1_log}
+        echo "L1: Setting up tun device..." >> {l1_log}
+
         # Load tun kernel module (needed for TAP device creation)
         modprobe tun 2>/dev/null || true
         mkdir -p /dev/net
         mknod /dev/net/tun c 10 200 2>/dev/null || true
         chmod 666 /dev/net/tun
+
+        echo "L1: tun ready, starting L2..." >> {l1_log}
+
         cd /mnt/fcvm-btrfs
-        # Use bridged networking (outer VM is privileged so iptables works)
-        # Use ECR image to avoid Docker Hub rate limits
-        fcvm podman run \
+
+        # Use local data dir (FUSE doesn't support Unix sockets for vsock backend)
+        mkdir -p /root/fcvm-data
+
+        # Run L2 with logs redirected to shared mount
+        echo "L1: Running fcvm for L2..." >> {l1_log}
+        FCVM_DATA_DIR=/root/fcvm-data RUST_LOG=debug fcvm podman run \
             --name inner-test \
             --network bridged \
-            --cmd "echo NESTED_SUCCESS_INNER_VM_WORKS" \
-            public.ecr.aws/nginx/nginx:alpine
-    "#;
+            --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
+            --cmd "echo L2_STARTED >> {l2_log} && echo NESTED_SUCCESS_INNER_VM_WORKS > {marker_file} && echo L2_DONE >> {l2_log}" \
+            public.ecr.aws/nginx/nginx:alpine 2>&1 | tee -a {l1_log}
+
+        echo "=== L1 END (exit code: $?) ===" >> {l1_log}
+    "#, log_dir = log_dir, l1_log = l1_log, l2_log = l2_log, marker_file = marker_file);
 
     let output = tokio::process::Command::new(&fcvm_path)
         .args([
@@ -435,7 +465,7 @@ except OSError as e:
             "--",
             "sh",
             "-c",
-            inner_cmd,
+            &inner_cmd,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -464,26 +494,53 @@ except OSError as e:
         }
     }
 
-    // 5. Cleanup
-    println!("\n5. Cleaning up outer VM...");
+    // 5. Read logs from shared mount
+    println!("\n5. Reading logs from shared mount...");
+
+    let log_dir = "/mnt/fcvm-btrfs/nested-debug";
+    let l1_log_path = format!("{}/l1-fcvm.log", log_dir);
+    let l2_log_path = format!("{}/l2-fcvm.log", log_dir);
+    let marker_path = format!("{}/marker.txt", log_dir);
+
+    // Give a moment for FUSE to sync
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let l1_log = tokio::fs::read_to_string(&l1_log_path).await.unwrap_or_else(|_| "L1 LOG NOT FOUND".to_string());
+    let l2_log = tokio::fs::read_to_string(&l2_log_path).await.unwrap_or_else(|_| "L2 LOG NOT FOUND".to_string());
+    let marker = tokio::fs::read_to_string(&marker_path).await.unwrap_or_default();
+
+    println!("\n=== L1 LOG ===");
+    for line in l1_log.lines().take(50) {
+        println!("  {}", line);
+    }
+
+    println!("\n=== L2 LOG ===");
+    for line in l2_log.lines() {
+        println!("  {}", line);
+    }
+
+    println!("\n=== MARKER FILE ===");
+    println!("  {}", marker.trim());
+
+    // 6. Cleanup
+    println!("\n6. Cleaning up outer VM...");
     common::kill_process(outer_pid).await;
 
-    // 6. Verify success
-    // Check both stdout and stderr since fcvm logs container output to its own stderr
-    // with [ctr:stdout] prefix, so when running via exec, the output appears in stderr
-    let combined = format!("{}\n{}", stdout, stderr);
-    if combined.contains("NESTED_SUCCESS_INNER_VM_WORKS") {
+    // 7. Verify success
+    if marker.contains("NESTED_SUCCESS_INNER_VM_WORKS") {
         println!("\n✅ NESTED TEST PASSED!");
         println!("   Successfully ran fcvm inside fcvm (nested virtualization)");
         Ok(())
     } else {
         bail!(
-            "Nested virtualization failed - inner VM did not produce expected output\n\
+            "Nested virtualization failed - marker file missing or wrong\n\
              Expected: NESTED_SUCCESS_INNER_VM_WORKS\n\
-             Got stdout: {}\n\
-             Got stderr: {}",
-            stdout,
-            stderr
+             Marker: '{}'\n\
+             L1 log: {}\n\
+             L2 log: {}",
+            marker.trim(),
+            l1_log,
+            l2_log
         );
     }
 }

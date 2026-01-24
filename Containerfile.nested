@@ -5,6 +5,9 @@
 # Build:
 #   cp target/release/fcvm target/release/fc-agent artifacts/
 #   cp /mnt/fcvm-btrfs/firecracker/firecracker-nested-*.bin artifacts/firecracker-nested
+#   # Pre-pull nginx image for faster nested tests:
+#   podman pull public.ecr.aws/nginx/nginx:alpine
+#   podman save -o artifacts/nginx-alpine.tar public.ecr.aws/nginx/nginx:alpine
 #   sudo podman build -t localhost/nested-test -f Containerfile.nested .
 #
 # The nested test is driven by test_nested_chain tests which:
@@ -48,7 +51,22 @@ COPY rootfs-config.toml /etc/fcvm/rootfs-config.toml
 COPY nested.sh /usr/local/bin/nested
 RUN chmod +x /usr/local/bin/nested
 
-# Default command - create runtime dirs, start nginx (for health checks), and sleep
-# /run/netns is needed for ip netns (bridged networking)
-# /run/containers/storage is needed for podman
-CMD ["sh", "-c", "mkdir -p /run/netns /run/containers/storage && nginx && sleep infinity"]
+# Pre-pulled container images for faster nested tests (avoids FUSE pull overhead)
+# These get loaded into podman storage at container startup
+COPY artifacts/nginx-alpine.tar /var/lib/fcvm-images/nginx-alpine.tar
+
+# Startup script that loads pre-pulled images and starts services
+RUN printf '%s\n' \
+    '#!/bin/bash' \
+    'mkdir -p /run/netns /run/containers/storage' \
+    '# Load pre-pulled images if not already present' \
+    'if ! podman image exists public.ecr.aws/nginx/nginx:alpine 2>/dev/null; then' \
+    '    echo "Loading pre-pulled nginx image..."' \
+    '    podman load -i /var/lib/fcvm-images/nginx-alpine.tar 2>/dev/null || true' \
+    'fi' \
+    'nginx' \
+    'exec sleep infinity' \
+    > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
+
+# Default command - load images, start nginx (for health checks), and sleep
+CMD ["/usr/local/bin/entrypoint.sh"]
