@@ -63,7 +63,7 @@ slow-timeout = { period = "600s", terminate-after = 1 }
 
 # VM tests get 10 minute timeout (non-snapshot tests)
 [[profile.default.overrides]]
-filter = "package(fcvm) & test(/test_/) & !test(/stress_100/) & !test(/pjdfstest_vm/) & !test(/snapshot/) & !test(/clone/) & !test(/nested_l2/)"
+filter = "package(fcvm) & test(/test_/) & !test(/stress_100/) & !test(/pjdfstest_vm/) & !test(/snapshot/) & !test(/clone/) & !test(/nested/)"
 test-group = "vm-tests"
 slow-timeout = { period = "600s", terminate-after = 1 }
 
@@ -73,9 +73,9 @@ filter = "package(fcvm) & test(/pjdfstest_vm/)"
 test-group = "vm-tests"
 slow-timeout = { period = "900s", terminate-after = 1 }
 
-# Nested L2 tests need 30 minutes (VM inside VM + 100MB file copies)
+# Nested tests need 30 minutes (VM inside VM is very slow)
 [[profile.default.overrides]]
-filter = "package(fcvm) & test(/nested_l2/)"
+filter = "package(fcvm) & test(/nested/)"
 test-group = "vm-tests"
 slow-timeout = { period = "1800s", terminate-after = 1 }
 
