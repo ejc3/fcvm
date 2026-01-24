@@ -771,8 +771,9 @@ pub(crate) async fn run_output_listener(
     let mut output_lines: Vec<(String, String)> = Vec::new();
 
     // Accept connection from fc-agent
+    // Nested VMs with FUSE can take 5+ minutes to start container
     let accept_result = tokio::time::timeout(
-        std::time::Duration::from_secs(120), // Wait up to 2 min for connection
+        std::time::Duration::from_secs(600), // Wait up to 10 min for connection
         listener.accept(),
     )
     .await;
