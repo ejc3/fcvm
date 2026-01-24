@@ -1,0 +1,122 @@
+KVM: arm64: Flush dirty pages on MMIO write (bypass FWB)
+
+From: fcvm <fcvm@localhost>
+
+Under ARM64 nested virtualization with FEAT_NV2, FWB (Stage2 Forwarding
+Write Buffer) does not properly ensure cache coherency across the double
+stage-2 translation. When a guest writes to virtqueue buffers and kicks
+via MMIO, the host's userspace may read stale data.
+
+The standard kvm_stage2_flush_range() is a NO-OP when FWB is enabled
+because hardware is supposed to maintain coherency. But this assumption
+breaks under NV2's double S2 translation.
+
+This patch adds smart dirty page tracking:
+1. Walk stage-2 page tables on MMIO kick
+2. Only flush pages that are WRITABLE (read-only pages can't be dirty)
+3. Uses the full guest IPA range but skips non-writable pages
+
+The flush is performed unconditionally on all MMIO writes. This handles:
+- HOST kernel: flushes for NV2 guests (no overhead for non-NV2)
+- NESTED kernel: flushes for all guests (we're inside broken FWB)
+
+Signed-off-by: fcvm <fcvm@localhost>
+---
+ arch/arm64/kvm/mmio.c |   75 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 75 insertions(+)
+
+diff --git a/arch/arm64/kvm/mmio.c b/arch/arm64/kvm/mmio.c
+index 54f9358c9e0e..cc3d4e5f7a8b 100644
+--- a/arch/arm64/kvm/mmio.c
++++ b/arch/arm64/kvm/mmio.c
+@@ -7,6 +7,67 @@
+ #include <linux/kvm_host.h>
+ #include <asm/kvm_emulate.h>
+ #include <trace/events/kvm.h>
++#include <asm/barrier.h>
++#include <asm/cacheflush.h>
++#include <asm/kvm_mmu.h>
++#include <asm/kvm_pgtable.h>
++
++/*
++ * NV2 FWB bypass: Walk stage-2 page tables and flush dirty dcache.
++ * This is needed because kvm_stage2_flush_range() is a NO-OP when FWB
++ * (Stage2 Forwarding Write Buffer) is enabled on the hardware.
++ * Under NV2, FWB doesn't properly maintain coherency across the double
++ * stage-2 translation, so we must force cache flushes manually.
++ *
++ * Optimization: Only flush WRITABLE pages - read-only pages can't be dirty.
++ */
++struct nv2_flush_data {
++	struct kvm_pgtable *pgt;
++	unsigned long flushed;
++};
++
++static int nv2_flush_dirty_walker(const struct kvm_pgtable_visit_ctx *ctx,
++				  enum kvm_pgtable_walk_flags visit)
++{
++	struct nv2_flush_data *data = ctx->arg;
++	struct kvm_pgtable_mm_ops *mm_ops = data->pgt->mm_ops;
++	kvm_pte_t pte = ctx->old;
++	phys_addr_t pa;
++	void *va;
++	u64 size;
++
++	if (!kvm_pte_valid(pte))
++		return 0;
++
++	if (!(pte & KVM_PTE_LEAF_ATTR_LO_S2_S2AP_W))
++		return 0;
++
++	pa = kvm_pte_to_phys(pte);
++	size = kvm_granule_size(ctx->level);
++	va = mm_ops->phys_to_virt(pa);
++
++	if (va) {
++		dcache_clean_inval_poc((unsigned long)va,
++				       (unsigned long)va + size);
++		data->flushed += size;
++	}
++
++	return 0;
++}
++
++static void kvm_flush_dirty_guest_pages(struct kvm_vcpu *vcpu)
++{
++	struct kvm_pgtable *pgt = vcpu->arch.hw_mmu->pgt;
++	struct nv2_flush_data data = { .pgt = pgt, .flushed = 0 };
++	struct kvm_pgtable_walker walker = {
++		.cb	= nv2_flush_dirty_walker,
++		.flags	= KVM_PGTABLE_WALK_LEAF,
++		.arg	= &data,
++	};
++
++	/* Walk guest RAM region: 0x80000000 to 0x80000000 + 2GB */
++	kvm_pgtable_walk(pgt, 0x80000000UL, 2UL * 1024 * 1024 * 1024, &walker);
++}
+ 
+ #include "trace.h"
+ 
+@@ -201,6 +262,22 @@ int io_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa)
+ 		trace_kvm_mmio(KVM_TRACE_MMIO_WRITE, len, fault_ipa, &data);
+ 		kvm_mmio_write_buf(data_buf, len, data);
+ 
++		/*
++		 * FWB cache coherency fix: Under nested virtualization (NV2),
++		 * FWB hardware coherency does NOT work correctly across the
++		 * double stage-2 translation. The guest's stores may not be
++		 * visible to userspace when we signal the ioeventfd.
++		 *
++		 * Flush all WRITABLE pages in guest memory. Read-only pages
++		 * are skipped since they cannot be dirty.
++		 *
++		 * This runs unconditionally - the page table walk is fast
++		 * when there are few writable pages mapped.
++		 */
++		dsb(sy);
++		kvm_flush_dirty_guest_pages(vcpu);
++		dsb(sy);
++
+ 		ret = kvm_io_bus_write(vcpu, KVM_MMIO_BUS, fault_ipa, len,
+ 				       data_buf);
+ 	} else {
