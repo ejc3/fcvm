@@ -1,0 +1,21 @@
+name: Checkout Dependencies
+description: Checkout fuser and fuse-backend-rs dependencies
+
+# UPDATE BRANCHES HERE - this is the single source of truth
+# fuser: https://github.com/ejc3/fuser
+# fuse-backend-rs: https://github.com/ejc3/fuse-backend-rs
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v6
+      with:
+        repository: ejc3/fuse-backend-rs
+        ref: master
+        path: fuse-backend-rs
+
+    - uses: actions/checkout@v6
+      with:
+        repository: ejc3/fuser
+        ref: remap-file-range-on-clone-fd
+        path: fuser

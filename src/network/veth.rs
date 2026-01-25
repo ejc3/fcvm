@@ -240,6 +240,20 @@ pub async fn setup_host_veth(veth_name: &str, ip_with_cidr: &str) -> Result<()> 
         debug!(veth = %veth_name, "added FORWARD rule for outbound traffic");
     }
 
+    // Enable per-interface forwarding on this veth
+    // (required even when global ip_forward=1, as per-interface default may be 0)
+    let iface_forwarding = format!("net.ipv4.conf.{}.forwarding=1", veth_name);
+    let output = Command::new("sysctl")
+        .args(["-w", &iface_forwarding])
+        .output()
+        .await
+        .with_context(|| format!("enabling forwarding on {}", veth_name))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(veth = %veth_name, "failed to enable per-interface forwarding: {}", stderr);
+    }
+
     Ok(())
 }
 
