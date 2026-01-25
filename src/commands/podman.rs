@@ -83,6 +83,7 @@ pub async fn create_snapshot_interruptible(
     disk_path: &Path,
     network_config: &NetworkConfig,
     volume_configs: &[VolumeConfig],
+    parent_snapshot_key: Option<&str>,
     sigterm: &mut tokio::signal::unix::Signal,
     sigint: &mut tokio::signal::unix::Signal,
 ) -> SnapshotOutcome {
@@ -94,6 +95,7 @@ pub async fn create_snapshot_interruptible(
         disk_path,
         network_config,
         volume_configs,
+        parent_snapshot_key,
     );
 
     tokio::select! {
@@ -261,6 +263,10 @@ pub fn startup_snapshot_key(base_key: &str) -> String {
 ///
 /// The snapshot is stored in snapshot_dir with snapshot_key as the name,
 /// making it accessible via `fcvm snapshot run --snapshot <snapshot_key>`.
+///
+/// If `parent_snapshot_key` is provided, the parent's memory.bin will be copied
+/// (via reflink) as a base, enabling diff snapshots for new directories.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_podman_snapshot(
     vm_manager: &VmManager,
     snapshot_key: &str,
@@ -269,6 +275,7 @@ pub async fn create_podman_snapshot(
     disk_path: &Path,
     network_config: &NetworkConfig,
     volume_configs: &[VolumeConfig],
+    parent_snapshot_key: Option<&str>,
 ) -> Result<()> {
     // Snapshots stored in snapshot_dir with snapshot_key as name
     let snapshot_dir = paths::snapshot_dir().join(snapshot_key);
@@ -341,7 +348,15 @@ pub async fn create_podman_snapshot(
     };
 
     // Use shared core function for snapshot creation
-    super::common::create_snapshot_core(client, snapshot_config, disk_path).await
+    // If parent key provided, resolve to directory path
+    let parent_dir = parent_snapshot_key.map(|key| paths::snapshot_dir().join(key));
+    super::common::create_snapshot_core(
+        client,
+        snapshot_config,
+        disk_path,
+        parent_dir.as_deref(),
+    )
+    .await
 }
 
 use super::common::{VSOCK_OUTPUT_PORT, VSOCK_STATUS_PORT, VSOCK_TTY_PORT, VSOCK_VOLUME_PORT_BASE};
@@ -1416,7 +1431,9 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                     let params = SnapshotCreationParams::from_run_args(&args);
                     match create_snapshot_interruptible(
                         &vm_manager, key, &vm_id, &params, &disk_path,
-                        &network_config, &volume_configs, &mut sigterm, &mut sigint,
+                        &network_config, &volume_configs,
+                        None, // Pre-start is the first snapshot, no parent
+                        &mut sigterm, &mut sigint,
                     ).await {
                         SnapshotOutcome::Interrupted => {
                             container_exit_code = None;
@@ -1459,7 +1476,9 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                         let params = SnapshotCreationParams::from_run_args(&args);
                         match create_snapshot_interruptible(
                             &vm_manager, &startup_key, &vm_id, &params, &disk_path,
-                            &network_config, &volume_configs, &mut sigterm, &mut sigint,
+                            &network_config, &volume_configs,
+                            Some(key.as_str()), // Parent is pre-start snapshot
+                            &mut sigterm, &mut sigint,
                         ).await {
                             SnapshotOutcome::Interrupted => {
                                 container_exit_code = None;

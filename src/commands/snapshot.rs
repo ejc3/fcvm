@@ -172,7 +172,10 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     };
 
     // Use shared core function for snapshot creation
-    super::common::create_snapshot_core(&client, snapshot_config.clone(), &vm_disk_path).await?;
+    // If the VM was restored from a snapshot, use that as parent for diff support
+    let parent_dir = vm_state.config.snapshot_name.as_ref()
+        .map(|name| paths::snapshot_dir().join(name));
+    super::common::create_snapshot_core(&client, snapshot_config.clone(), &vm_disk_path, parent_dir.as_deref()).await?;
 
     // Print user-friendly output
     let vm_name = vm_state
@@ -927,7 +930,9 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                         let params = SnapshotCreationParams::from_metadata(&snapshot_config.metadata);
                         match create_snapshot_interruptible(
                             &vm_manager, &startup_key, &vm_id, &params, &disk_path,
-                            &network_config, &volume_configs, &mut sigterm, &mut sigint,
+                            &network_config, &volume_configs,
+                            Some(base_key.as_str()), // Parent is pre-start snapshot
+                            &mut sigterm, &mut sigint,
                         ).await {
                             SnapshotOutcome::Interrupted => {
                                 container_exit_code = None;

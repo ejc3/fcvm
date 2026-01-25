@@ -752,14 +752,16 @@ pub async fn restore_from_snapshot(
 /// - Lock handling (if needed)
 ///
 /// **Diff Snapshot Behavior:**
-/// - First snapshot: Creates a Full snapshot (baseline)
-/// - Subsequent snapshots: Creates a Diff snapshot (only dirty pages), then merges onto base
-/// - Transparent to callers: Final result is always a complete memory.bin
+/// - If no base exists and no parent provided: Full snapshot
+/// - If no base exists but parent provided: Copy parent's memory.bin (reflink), then Diff
+/// - If base exists: Diff snapshot, merge onto existing base
+/// - Result is always a complete memory.bin
 ///
 /// # Arguments
 /// * `client` - Firecracker API client for the running VM
 /// * `snapshot_config` - Pre-built config with FINAL paths (after atomic rename)
 /// * `disk_path` - Source disk to copy to snapshot
+/// * `parent_snapshot_dir` - Optional parent snapshot to copy memory.bin from (enables diff for new dirs)
 ///
 /// # Returns
 /// Ok(()) on success, Err on failure. VM is resumed regardless of success/failure.
@@ -767,6 +769,7 @@ pub async fn create_snapshot_core(
     client: &crate::firecracker::FirecrackerClient,
     snapshot_config: crate::storage::snapshot::SnapshotConfig,
     disk_path: &Path,
+    parent_snapshot_dir: Option<&Path>,
 ) -> Result<()> {
     use crate::firecracker::api::{SnapshotCreate, VmState as ApiVmState};
 
@@ -779,7 +782,40 @@ pub async fn create_snapshot_core(
 
     // Check if base snapshot exists (for diff support)
     let base_memory_path = snapshot_dir.join("memory.bin");
-    let has_base = base_memory_path.exists();
+    let mut has_base = base_memory_path.exists();
+
+    // If no base but parent provided, copy parent's memory.bin as base (reflink = instant)
+    if !has_base {
+        if let Some(parent_dir) = parent_snapshot_dir {
+            let parent_memory = parent_dir.join("memory.bin");
+            if parent_memory.exists() {
+                info!(
+                    snapshot = %snapshot_config.name,
+                    parent = %parent_dir.display(),
+                    "copying parent memory.bin as base (reflink)"
+                );
+                // Create snapshot dir if needed
+                tokio::fs::create_dir_all(snapshot_dir)
+                    .await
+                    .context("creating snapshot directory")?;
+                // Reflink copy parent's memory.bin
+                let reflink_result = tokio::process::Command::new("cp")
+                    .args([
+                        "--reflink=always",
+                        parent_memory.to_str().unwrap(),
+                        base_memory_path.to_str().unwrap(),
+                    ])
+                    .status()
+                    .await
+                    .context("copying parent memory.bin")?;
+                if !reflink_result.success() {
+                    anyhow::bail!("Failed to reflink copy parent memory.bin");
+                }
+                has_base = true;
+            }
+        }
+    }
+
     let snapshot_type = if has_base { "Diff" } else { "Full" };
 
     info!(
