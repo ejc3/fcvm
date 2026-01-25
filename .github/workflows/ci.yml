@@ -224,8 +224,6 @@ jobs:
           echo ""
           sudo chmod 666 /dev/kvm
           sudo mkdir -p /var/run/netns
-          sudo iptables -P FORWARD ACCEPT
-          sudo iptables -t nat -A POSTROUTING -s 172.30.0.0/16 -o eth0 -j MASQUERADE || true
           if [ ! -e /dev/userfaultfd ]; then
             sudo mknod /dev/userfaultfd c 10 126
           fi
@@ -361,8 +359,6 @@ jobs:
         run: |
           sudo chmod 666 /dev/kvm
           sudo mkdir -p /var/run/netns
-          sudo iptables -P FORWARD ACCEPT
-          sudo iptables -t nat -A POSTROUTING -s 172.30.0.0/16 -o eth0 -j MASQUERADE || true
           if [ ! -e /dev/userfaultfd ]; then
             sudo mknod /dev/userfaultfd c 10 126
           fi
