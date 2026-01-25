@@ -36,10 +36,10 @@ pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
 
 /// Create snapshot from running VM
 async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
+    use super::common::VSOCK_VOLUME_PORT_BASE;
     use crate::storage::snapshot::{
         SnapshotConfig, SnapshotMetadata, SnapshotType, SnapshotVolumeConfig,
     };
-    use super::common::VSOCK_VOLUME_PORT_BASE;
 
     // Determine which VM to snapshot
     let state_manager = StateManager::new(paths::state_dir());

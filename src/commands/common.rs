@@ -3,11 +3,11 @@
 //! This module contains shared functions used by both baseline VM creation (podman.rs)
 //! and clone VM creation (snapshot.rs) to ensure consistent behavior.
 
-use std::io::{Read, Seek, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use nix::sys::uio::{pread, pwrite};
 use nix::unistd::{lseek, Whence};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -71,7 +71,7 @@ pub fn merge_diff_snapshot(base_path: &Path, diff_path: &Path) -> Result<u64> {
 
     let diff_file = std::fs::File::open(diff_path)
         .with_context(|| format!("opening diff snapshot: {}", diff_path.display()))?;
-    let mut base_file = OpenOptions::new()
+    let base_file = OpenOptions::new()
         .write(true)
         .open(base_path)
         .with_context(|| format!("opening base snapshot for writing: {}", base_path.display()))?;
@@ -99,7 +99,11 @@ pub fn merge_diff_snapshot(base_path: &Path, diff_path: &Path) -> Result<u64> {
                 break;
             }
             Err(e) => {
-                return Err(anyhow::anyhow!("SEEK_DATA failed at offset {}: {}", offset, e));
+                return Err(anyhow::anyhow!(
+                    "SEEK_DATA failed at offset {}: {}",
+                    offset,
+                    e
+                ));
             }
         };
 
@@ -119,28 +123,40 @@ pub fn merge_diff_snapshot(base_path: &Path, diff_path: &Path) -> Result<u64> {
         );
 
         // Copy data block from diff to base at same offset
-        // We need to use pread/pwrite semantics - seek both files to the right position
-        let mut diff_reader = std::io::BufReader::new(&diff_file);
-        diff_reader
-            .seek(std::io::SeekFrom::Start(data_start as u64))
-            .context("seeking diff file to data region")?;
-        base_file
-            .seek(std::io::SeekFrom::Start(data_start as u64))
-            .context("seeking base file to data region")?;
-
+        // Use pread/pwrite for atomic position+read/write without affecting file cursor
+        let mut file_offset = data_start;
         let mut remaining = block_size;
         while remaining > 0 {
             let to_read = remaining.min(buffer.len());
-            let bytes_read = diff_reader
-                .read(&mut buffer[..to_read])
-                .context("reading from diff snapshot")?;
+            let bytes_read = pread(&diff_file, &mut buffer[..to_read], file_offset)
+                .with_context(|| format!("reading from diff at offset {}", file_offset))?;
+
             if bytes_read == 0 {
                 // EOF before expected - shouldn't happen with SEEK_DATA/SEEK_HOLE
-                break;
+                anyhow::bail!(
+                    "unexpected EOF in diff snapshot at offset {} (expected {} more bytes)",
+                    file_offset,
+                    remaining
+                );
             }
-            base_file
-                .write_all(&buffer[..bytes_read])
-                .context("writing to base snapshot")?;
+
+            let mut write_offset = 0;
+            while write_offset < bytes_read {
+                let bytes_written = pwrite(
+                    &base_file,
+                    &buffer[write_offset..bytes_read],
+                    file_offset + write_offset as i64,
+                )
+                .with_context(|| {
+                    format!(
+                        "writing to base at offset {}",
+                        file_offset + write_offset as i64
+                    )
+                })?;
+                write_offset += bytes_written;
+            }
+
+            file_offset += bytes_read as i64;
             remaining -= bytes_read;
             total_bytes_copied += bytes_read as u64;
         }
@@ -878,43 +894,42 @@ pub async fn create_snapshot_core(
     info!(snapshot = %snapshot_config.name, "VM resumed, processing snapshot");
 
     if has_base {
-        // Diff snapshot: merge onto base, update in place
+        // Diff snapshot: copy base to temp, merge diff, then atomic rename
         info!(
             snapshot = %snapshot_config.name,
             base = %base_memory_path.display(),
             diff = %temp_memory_path.display(),
-            "merging diff snapshot onto base"
+            "merging diff snapshot onto base copy"
         );
 
+        // Copy base memory to temp dir (will merge diff into this copy)
+        let temp_base_memory = temp_snapshot_dir.join("memory.bin");
+        tokio::fs::copy(&base_memory_path, &temp_base_memory)
+            .await
+            .context("copying base memory to temp for merge")?;
+
         // Run merge in blocking task since it's CPU/IO bound
-        let base_path = base_memory_path.clone();
+        let merged_base_path = temp_base_memory.clone();
         let diff_path = temp_memory_path.clone();
-        let bytes_merged = tokio::task::spawn_blocking(move || {
-            merge_diff_snapshot(&base_path, &diff_path)
-        })
-        .await
-        .context("diff merge task panicked")?
-        .context("merging diff snapshot")?;
+        let bytes_merged =
+            tokio::task::spawn_blocking(move || merge_diff_snapshot(&merged_base_path, &diff_path))
+                .await
+                .context("diff merge task panicked")?
+                .context("merging diff snapshot")?;
 
         info!(
             snapshot = %snapshot_config.name,
             bytes_merged = bytes_merged,
-            "diff merge complete"
+            "diff merge complete, building atomic update"
         );
 
-        // Update vmstate.bin (overwrite existing)
-        let final_vmstate_path = snapshot_dir.join("vmstate.bin");
-        tokio::fs::copy(&temp_vmstate_path, &final_vmstate_path)
-            .await
-            .context("updating vmstate.bin")?;
-
-        // Update disk using btrfs reflink
-        let final_disk_path = snapshot_dir.join("disk.raw");
+        // Copy disk using btrfs reflink to temp dir
+        let temp_disk_path = temp_snapshot_dir.join("disk.raw");
         let reflink_result = tokio::process::Command::new("cp")
             .args([
                 "--reflink=always",
                 disk_path.to_str().unwrap(),
-                final_disk_path.to_str().unwrap(),
+                temp_disk_path.to_str().unwrap(),
             ])
             .status()
             .await
@@ -928,16 +943,22 @@ pub async fn create_snapshot_core(
             );
         }
 
-        // Update config.json
-        let config_path = snapshot_dir.join("config.json");
+        // Write config.json to temp directory
+        let temp_config_path = temp_snapshot_dir.join("config.json");
         let config_json = serde_json::to_string_pretty(&snapshot_config)
             .context("serializing snapshot config")?;
-        tokio::fs::write(&config_path, &config_json)
+        tokio::fs::write(&temp_config_path, &config_json)
             .await
             .context("writing snapshot config")?;
 
-        // Clean up temp directory
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        // Atomic replace: remove old snapshot dir, rename temp to final
+        // This ensures all files (memory, vmstate, disk, config) are updated atomically
+        tokio::fs::remove_dir_all(snapshot_dir)
+            .await
+            .context("removing old snapshot directory")?;
+        tokio::fs::rename(&temp_snapshot_dir, snapshot_dir)
+            .await
+            .context("renaming temp snapshot to final location")?;
 
         info!(
             snapshot = %snapshot_config.name,
