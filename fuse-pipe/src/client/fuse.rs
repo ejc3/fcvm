@@ -3,14 +3,17 @@
 use super::multiplexer::Multiplexer;
 use crate::protocol::{file_type, FileAttr, VolumeRequest, VolumeResponse};
 use fuser::{
-    FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus,
-    ReplyEmpty, ReplyEntry, ReplyLock, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
-    Request, TimeOrNow,
+    AccessFlags, BsdFileFlags, CopyFileRangeFlags, Errno, FileHandle, FileType, Filesystem,
+    FopenFlags, Generation, INodeNo, InitFlags, LockOwner, OpenFlags, ReadFlags, RenameFlags,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry,
+    ReplyLock, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
+    WriteFlags,
 };
 use std::ffi::OsStr;
 use std::fs;
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 /// Parse supplementary groups from /proc/<pid>/status.
@@ -48,8 +51,9 @@ pub type InitCallback = Box<dyn FnOnce() + Send>;
 pub struct FuseClient {
     mux: Arc<Multiplexer>,
     reader_id: u32,
-    /// Optional callback to run when init() completes (spawns additional readers)
-    init_callback: Option<InitCallback>,
+    /// Optional callback to run when init() completes (spawns additional readers).
+    /// Wrapped in Mutex to satisfy Sync requirement for Filesystem trait.
+    init_callback: Mutex<Option<InitCallback>>,
     /// Shared flag set by destroy() to signal clean shutdown to reader threads
     destroyed: Arc<AtomicBool>,
 }
@@ -72,7 +76,7 @@ impl FuseClient {
         Self {
             mux,
             reader_id,
-            init_callback: None,
+            init_callback: Mutex::new(None),
             destroyed,
         }
     }
@@ -90,7 +94,7 @@ impl FuseClient {
         Self {
             mux,
             reader_id,
-            init_callback: Some(callback),
+            init_callback: Mutex::new(Some(callback)),
             destroyed,
         }
     }
@@ -179,7 +183,7 @@ fn to_fuser_attr(attr: &FileAttr) -> fuser::FileAttr {
     };
 
     fuser::FileAttr {
-        ino: attr.ino,
+        ino: INodeNo(attr.ino),
         size: attr.size,
         blocks: attr.blocks,
         atime: to_system_time(attr.atime_secs, attr.atime_nsecs),
@@ -220,17 +224,17 @@ const DEFAULT_FUSE_MAX_WRITE: u32 = 0;
 impl Filesystem for FuseClient {
     fn init(
         &mut self,
-        _req: &Request<'_>,
+        _req: &Request,
         config: &mut fuser::KernelConfig,
-    ) -> Result<(), libc::c_int> {
+    ) -> Result<(), io::Error> {
         // Enable writeback cache for better write performance (kernel batches writes).
         // Can be disabled via FCVM_NO_WRITEBACK_CACHE=1 for debugging.
         let enable_writeback = std::env::var("FCVM_NO_WRITEBACK_CACHE").is_err();
         if enable_writeback {
-            if let Err(unsupported) = config.add_capabilities(fuser::consts::FUSE_WRITEBACK_CACHE) {
+            if let Err(unsupported) = config.add_capabilities(InitFlags::FUSE_WRITEBACK_CACHE) {
                 tracing::warn!(
                     target: "fuse-pipe::client",
-                    unsupported,
+                    unsupported_flags = ?unsupported,
                     "Kernel doesn't support FUSE_WRITEBACK_CACHE"
                 );
             } else {
@@ -249,10 +253,10 @@ impl Filesystem for FuseClient {
         // Enable auto-invalidation: kernel checks mtime and invalidates cached pages
         // when file is modified. Essential for FICLONE/reflink where content changes
         // without going through normal write path.
-        if let Err(unsupported) = config.add_capabilities(fuser::consts::FUSE_AUTO_INVAL_DATA) {
+        if let Err(unsupported) = config.add_capabilities(InitFlags::FUSE_AUTO_INVAL_DATA) {
             tracing::warn!(
                 target: "fuse-pipe::client",
-                unsupported,
+                unsupported_flags = ?unsupported,
                 "Kernel doesn't support FUSE_AUTO_INVAL_DATA"
             );
         } else {
@@ -287,7 +291,7 @@ impl Filesystem for FuseClient {
         }
 
         // Spawn additional readers now that INIT is done
-        if let Some(callback) = self.init_callback.take() {
+        if let Some(callback) = self.init_callback.lock().unwrap().take() {
             callback();
         }
         Ok(())
@@ -301,9 +305,9 @@ impl Filesystem for FuseClient {
         tracing::debug!(target: "fuse-pipe::client", reader_id = self.reader_id, was_already_set = was, "destroy() called - signaling clean shutdown");
     }
 
-    fn lookup(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let response = self.send_request_sync(VolumeRequest::Lookup {
-            parent,
+            parent: parent.into(),
             name: name.to_string_lossy().to_string(),
             uid: req.uid(),
             gid: req.gid(),
@@ -319,30 +323,30 @@ impl Filesystem for FuseClient {
                 reply.entry(
                     &Duration::from_secs(ttl_secs),
                     &to_fuser_attr(&attr),
-                    generation,
+                    Generation(generation),
                 );
             }
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        let response = self.send_request_sync(VolumeRequest::Getattr { ino });
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let response = self.send_request_sync(VolumeRequest::Getattr { ino: ino.into() });
 
         match response {
             VolumeResponse::Attr { attr, ttl_secs } => {
                 reply.attr(&Duration::from_secs(ttl_secs), &to_fuser_attr(&attr));
             }
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
     fn setattr(
-        &mut self,
+        &self,
         req: &Request,
-        ino: u64,
+        ino: INodeNo,
         mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
@@ -350,11 +354,11 @@ impl Filesystem for FuseClient {
         atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
-        fh: Option<u64>,
+        fh: Option<FileHandle>,
         _crtime: Option<std::time::SystemTime>,
         _chgtime: Option<std::time::SystemTime>,
         _bkuptime: Option<std::time::SystemTime>,
-        _flags: Option<u32>,
+        _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
         // Handle atime: UTIME_NOW, specific time, or UTIME_OMIT
@@ -382,7 +386,7 @@ impl Filesystem for FuseClient {
         // a non-root user chowns to one of their supplementary groups.
         let response = self.send_request_with_groups(
             VolumeRequest::Setattr {
-                ino,
+                ino: ino.into(),
                 mode,
                 uid,
                 gid,
@@ -393,7 +397,7 @@ impl Filesystem for FuseClient {
                 mtime_secs,
                 mtime_nsecs,
                 mtime_now,
-                fh,
+                fh: fh.map(|h| h.into()),
                 caller_uid: req.uid(),
                 caller_gid: req.gid(),
                 caller_pid: req.pid(),
@@ -405,23 +409,23 @@ impl Filesystem for FuseClient {
             VolumeResponse::Attr { attr, ttl_secs } => {
                 reply.attr(&Duration::from_secs(ttl_secs), &to_fuser_attr(&attr));
             }
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
     fn mkdir(
-        &mut self,
+        &self,
         req: &Request,
-        parent: u64,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        tracing::debug!(target: "fuse-pipe::client", parent, ?name, mode, uid = req.uid(), gid = req.gid(), pid = req.pid(), "mkdir request");
+        tracing::debug!(target: "fuse-pipe::client", ?parent, ?name, mode, uid = req.uid(), gid = req.gid(), pid = req.pid(), "mkdir request");
         let response = self.send_request_sync(VolumeRequest::Mkdir {
-            parent,
+            parent: parent.into(),
             name: name.to_string_lossy().to_string(),
             mode,
             uid: req.uid(),
@@ -439,24 +443,24 @@ impl Filesystem for FuseClient {
                 reply.entry(
                     &Duration::from_secs(ttl_secs),
                     &to_fuser_attr(&attr),
-                    generation,
+                    Generation(generation),
                 );
             }
             VolumeResponse::Error { errno } => {
                 tracing::debug!(target: "fuse-pipe::client", errno, "mkdir error");
-                reply.error(errno);
+                reply.error(Errno::from_i32(errno));
             }
             _ => {
                 tracing::debug!(target: "fuse-pipe::client", "mkdir unexpected response");
-                reply.error(libc::EIO);
+                reply.error(Errno::EIO);
             }
         }
     }
 
     fn mknod(
-        &mut self,
+        &self,
         req: &Request,
-        parent: u64,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
@@ -464,7 +468,7 @@ impl Filesystem for FuseClient {
         reply: ReplyEntry,
     ) {
         let response = self.send_request_sync(VolumeRequest::Mknod {
-            parent,
+            parent: parent.into(),
             name: name.to_string_lossy().to_string(),
             mode,
             rdev,
@@ -482,17 +486,17 @@ impl Filesystem for FuseClient {
                 reply.entry(
                     &Duration::from_secs(ttl_secs),
                     &to_fuser_attr(&attr),
-                    generation,
+                    Generation(generation),
                 );
             }
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
-    fn rmdir(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let response = self.send_request_sync(VolumeRequest::Rmdir {
-            parent,
+            parent: parent.into(),
             name: name.to_string_lossy().to_string(),
             uid: req.uid(),
             gid: req.gid(),
@@ -501,15 +505,15 @@ impl Filesystem for FuseClient {
 
         match response {
             VolumeResponse::Ok => reply.ok(),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
     fn create(
-        &mut self,
+        &self,
         req: &Request,
-        parent: u64,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
@@ -517,7 +521,7 @@ impl Filesystem for FuseClient {
         reply: ReplyCreate,
     ) {
         let response = self.send_request_sync(VolumeRequest::Create {
-            parent,
+            parent: parent.into(),
             name: name.to_string_lossy().to_string(),
             mode,
             flags: flags as u32,
@@ -537,47 +541,47 @@ impl Filesystem for FuseClient {
                 reply.created(
                     &Duration::from_secs(ttl_secs),
                     &to_fuser_attr(&attr),
-                    generation,
-                    fh,
+                    Generation(generation),
+                    FileHandle(fh),
                     flags,
                 );
             }
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
-    fn open(&mut self, req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
+    fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let response = self.send_request_sync(VolumeRequest::Open {
-            ino,
-            flags: flags as u32,
+            ino: ino.into(),
+            flags: flags.0 as u32,
             uid: req.uid(),
             gid: req.gid(),
             pid: req.pid(),
         });
 
         match response {
-            VolumeResponse::Opened { fh, flags } => reply.opened(fh, flags),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Opened { fh, flags } => reply.opened(FileHandle(fh), FopenFlags::from_bits_truncate(flags)),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
     fn read(
-        &mut self,
+        &self,
         req: &Request,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: ReadFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
         let response = self.send_request_sync(VolumeRequest::Read {
-            ino,
-            fh,
-            offset: offset as u64,
+            ino: ino.into(),
+            fh: fh.into(),
+            offset,
             size,
             uid: req.uid(),
             gid: req.gid(),
@@ -586,26 +590,26 @@ impl Filesystem for FuseClient {
 
         match response {
             VolumeResponse::Data { data } => reply.data(&data),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
     fn write(
-        &mut self,
+        &self,
         req: &Request,
-        ino: u64,
-        fh: u64,
+        ino: INodeNo,
+        fh: FileHandle,
         offset: i64,
         data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
         let response = self.send_request_sync(VolumeRequest::Write {
-            ino,
-            fh,
+            ino: ino.into(),
+            fh: fh.into(),
             offset: offset as u64,
             data: data.to_vec(),
             uid: req.uid(),
@@ -615,53 +619,53 @@ impl Filesystem for FuseClient {
 
         match response {
             VolumeResponse::Written { size } => reply.written(size),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
     fn release(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let response = self.send_request_sync(VolumeRequest::Release { ino, fh });
+        let response = self.send_request_sync(VolumeRequest::Release { ino: ino.into(), fh: fh.into() });
 
         match response {
             VolumeResponse::Ok => reply.ok(),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
-    fn flush(&mut self, _req: &Request, ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
-        let response = self.send_request_sync(VolumeRequest::Flush { ino, fh });
+    fn flush(&self, _req: &Request, ino: INodeNo, fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
+        let response = self.send_request_sync(VolumeRequest::Flush { ino: ino.into(), fh: fh.into() });
 
         match response {
             VolumeResponse::Ok => reply.ok(),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
-    fn fsync(&mut self, _req: &Request, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
-        let response = self.send_request_sync(VolumeRequest::Fsync { ino, fh, datasync });
+    fn fsync(&self, _req: &Request, ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
+        let response = self.send_request_sync(VolumeRequest::Fsync { ino: ino.into(), fh: fh.into(), datasync });
 
         match response {
             VolumeResponse::Ok => reply.ok(),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
-    fn unlink(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let response = self.send_request_sync(VolumeRequest::Unlink {
-            parent,
+            parent: parent.into(),
             name: name.to_string_lossy().to_string(),
             uid: req.uid(),
             gid: req.gid(),
@@ -670,25 +674,25 @@ impl Filesystem for FuseClient {
 
         match response {
             VolumeResponse::Ok => reply.ok(),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
     fn rename(
-        &mut self,
+        &self,
         req: &Request,
-        parent: u64,
+        parent: INodeNo,
         name: &OsStr,
-        newparent: u64,
+        newparent: INodeNo,
         newname: &OsStr,
-        _flags: u32,
+        _flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
         let response = self.send_request_sync(VolumeRequest::Rename {
-            parent,
+            parent: parent.into(),
             name: name.to_string_lossy().to_string(),
-            newparent,
+            newparent: newparent.into(),
             newname: newname.to_string_lossy().to_string(),
             uid: req.uid(),
             gid: req.gid(),
@@ -697,21 +701,21 @@ impl Filesystem for FuseClient {
 
         match response {
             VolumeResponse::Ok => reply.ok(),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
     fn symlink(
-        &mut self,
+        &self,
         req: &Request,
-        parent: u64,
+        parent: INodeNo,
         link_name: &OsStr,
         target: &std::path::Path,
         reply: ReplyEntry,
     ) {
         let response = self.send_request_sync(VolumeRequest::Symlink {
-            parent,
+            parent: parent.into(),
             name: link_name.to_string_lossy().to_string(),
             target: target.to_string_lossy().to_string(),
             uid: req.uid(),
@@ -728,35 +732,35 @@ impl Filesystem for FuseClient {
                 reply.entry(
                     &Duration::from_secs(ttl_secs),
                     &to_fuser_attr(&attr),
-                    generation,
+                    Generation(generation),
                 );
             }
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
-    fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
-        let response = self.send_request_sync(VolumeRequest::Readlink { ino });
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let response = self.send_request_sync(VolumeRequest::Readlink { ino: ino.into() });
 
         match response {
             VolumeResponse::Symlink { target } => reply.data(target.as_bytes()),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
     fn link(
-        &mut self,
+        &self,
         req: &Request,
-        ino: u64,
-        newparent: u64,
+        ino: INodeNo,
+        newparent: INodeNo,
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
         let response = self.send_request_sync(VolumeRequest::Link {
-            ino,
-            newparent,
+            ino: ino.into(),
+            newparent: newparent.into(),
             newname: newname.to_string_lossy().to_string(),
             uid: req.uid(),
             gid: req.gid(),
@@ -772,18 +776,18 @@ impl Filesystem for FuseClient {
                 reply.entry(
                     &Duration::from_secs(ttl_secs),
                     &to_fuser_attr(&attr),
-                    generation,
+                    Generation(generation),
                 );
             }
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
-    fn access(&mut self, req: &Request, ino: u64, mask: i32, reply: ReplyEmpty) {
+    fn access(&self, req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
         let response = self.send_request_sync(VolumeRequest::Access {
-            ino,
-            mask: mask as u32,
+            ino: ino.into(),
+            mask: mask.bits() as u32,
             uid: req.uid(),
             gid: req.gid(),
             pid: req.pid(),
@@ -791,13 +795,13 @@ impl Filesystem for FuseClient {
 
         match response {
             VolumeResponse::Ok => reply.ok(),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
-    fn statfs(&mut self, _req: &Request, ino: u64, reply: ReplyStatfs) {
-        let response = self.send_request_sync(VolumeRequest::Statfs { ino });
+    fn statfs(&self, _req: &Request, ino: INodeNo, reply: ReplyStatfs) {
+        let response = self.send_request_sync(VolumeRequest::Statfs { ino: ino.into() });
 
         match response {
             VolumeResponse::Statfs {
@@ -812,22 +816,22 @@ impl Filesystem for FuseClient {
             } => {
                 reply.statfs(blocks, bfree, bavail, files, ffree, bsize, namelen, frsize);
             }
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
     fn readdir(
-        &mut self,
+        &self,
         req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
         let response = self.send_request_sync(VolumeRequest::Readdir {
-            ino,
-            offset: offset as u64,
+            ino: ino.into(),
+            offset,
             uid: req.uid(),
             gid: req.gid(),
             pid: req.pid(),
@@ -836,31 +840,31 @@ impl Filesystem for FuseClient {
         match response {
             VolumeResponse::DirEntries { entries } => {
                 for (i, entry) in entries.iter().enumerate() {
-                    let offset = (offset as usize + i + 1) as i64;
+                    let entry_offset = offset + i as u64 + 1;
                     let ft = protocol_file_type_to_fuser(entry.file_type);
-                    if reply.add(entry.ino, offset, ft, &entry.name) {
+                    if reply.add(INodeNo(entry.ino), entry_offset, ft, &entry.name) {
                         break;
                     }
                 }
                 reply.ok();
             }
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
     fn readdirplus(
-        &mut self,
+        &self,
         req: &Request,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectoryPlus,
     ) {
         let response = self.send_request_sync(VolumeRequest::Readdirplus {
-            ino,
-            fh,
-            offset: offset as u64,
+            ino: ino.into(),
+            fh: fh.into(),
+            offset,
             uid: req.uid(),
             gid: req.gid(),
             pid: req.pid(),
@@ -869,67 +873,67 @@ impl Filesystem for FuseClient {
         match response {
             VolumeResponse::DirEntriesPlus { entries } => {
                 for (i, entry) in entries.iter().enumerate() {
-                    let offset = (offset as usize + i + 1) as i64;
+                    let entry_offset = offset + i as u64 + 1;
                     let attr = to_fuser_attr(&entry.attr);
                     let ttl = Duration::from_secs(entry.attr_ttl_secs);
                     if reply.add(
                         entry.ino,
-                        offset,
+                        entry_offset,
                         &entry.name,
                         &ttl,
                         &attr,
-                        entry.generation,
+                        Generation(entry.generation),
                     ) {
                         break;
                     }
                 }
                 reply.ok();
             }
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
-    fn opendir(&mut self, req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
+    fn opendir(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let response = self.send_request_sync(VolumeRequest::Opendir {
-            ino,
-            flags: flags as u32,
+            ino: ino.into(),
+            flags: flags.0 as u32,
             uid: req.uid(),
             gid: req.gid(),
             pid: req.pid(),
         });
 
         match response {
-            VolumeResponse::Openeddir { fh } => reply.opened(fh, 0),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Openeddir { fh } => reply.opened(FileHandle(fh), FopenFlags::empty()),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
-    fn releasedir(&mut self, _req: &Request, ino: u64, fh: u64, _flags: i32, reply: ReplyEmpty) {
-        let response = self.send_request_sync(VolumeRequest::Releasedir { ino, fh });
+    fn releasedir(&self, _req: &Request, ino: INodeNo, fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
+        let response = self.send_request_sync(VolumeRequest::Releasedir { ino: ino.into(), fh: fh.into() });
 
         match response {
             VolumeResponse::Ok => reply.ok(),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
-    fn fsyncdir(&mut self, _req: &Request, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
-        let response = self.send_request_sync(VolumeRequest::Fsyncdir { ino, fh, datasync });
+    fn fsyncdir(&self, _req: &Request, ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
+        let response = self.send_request_sync(VolumeRequest::Fsyncdir { ino: ino.into(), fh: fh.into(), datasync });
 
         match response {
             VolumeResponse::Ok => reply.ok(),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
     fn setxattr(
-        &mut self,
+        &self,
         req: &Request,
-        ino: u64,
+        ino: INodeNo,
         name: &OsStr,
         value: &[u8],
         flags: i32,
@@ -937,7 +941,7 @@ impl Filesystem for FuseClient {
         reply: ReplyEmpty,
     ) {
         let response = self.send_request_sync(VolumeRequest::Setxattr {
-            ino,
+            ino: ino.into(),
             name: name.to_string_lossy().to_string(),
             value: value.to_vec(),
             flags: flags as u32,
@@ -948,12 +952,12 @@ impl Filesystem for FuseClient {
 
         match response {
             VolumeResponse::Ok => reply.ok(),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
-    fn getxattr(&mut self, req: &Request, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
+    fn getxattr(&self, req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         // Fast path: The kernel calls getxattr("security.capability") on every write
         // to check if file capabilities need to be cleared. This is extremely common
         // and almost always returns ENODATA (no capabilities set). Short-circuit this
@@ -968,14 +972,14 @@ impl Filesystem for FuseClient {
         if std::env::var("FCVM_NO_XATTR_FASTPATH").is_err() {
             if let Some(name_str) = name.to_str() {
                 if name_str == "security.capability" {
-                    reply.error(libc::ENODATA);
+                    reply.error(Errno::ENODATA);
                     return;
                 }
             }
         }
 
         let response = self.send_request_sync(VolumeRequest::Getxattr {
-            ino,
+            ino: ino.into(),
             name: name.to_string_lossy().to_string(),
             size,
             uid: req.uid(),
@@ -986,14 +990,14 @@ impl Filesystem for FuseClient {
         match response {
             VolumeResponse::Xattr { data } => reply.data(&data),
             VolumeResponse::XattrSize { size } => reply.size(size),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
-    fn listxattr(&mut self, req: &Request, ino: u64, size: u32, reply: ReplyXattr) {
+    fn listxattr(&self, req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
         let response = self.send_request_sync(VolumeRequest::Listxattr {
-            ino,
+            ino: ino.into(),
             size,
             uid: req.uid(),
             gid: req.gid(),
@@ -1003,14 +1007,14 @@ impl Filesystem for FuseClient {
         match response {
             VolumeResponse::Xattr { data } => reply.data(&data),
             VolumeResponse::XattrSize { size } => reply.size(size),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
-    fn removexattr(&mut self, req: &Request, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn removexattr(&self, req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let response = self.send_request_sync(VolumeRequest::Removexattr {
-            ino,
+            ino: ino.into(),
             name: name.to_string_lossy().to_string(),
             uid: req.uid(),
             gid: req.gid(),
@@ -1019,24 +1023,24 @@ impl Filesystem for FuseClient {
 
         match response {
             VolumeResponse::Ok => reply.ok(),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
     fn fallocate(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        fh: u64,
+        ino: INodeNo,
+        fh: FileHandle,
         offset: i64,
         length: i64,
         mode: i32,
         reply: ReplyEmpty,
     ) {
         let response = self.send_request_sync(VolumeRequest::Fallocate {
-            ino,
-            fh,
+            ino: ino.into(),
+            fh: fh.into(),
             offset: offset as u64,
             length: length as u64,
             mode: mode as u32,
@@ -1044,40 +1048,40 @@ impl Filesystem for FuseClient {
 
         match response {
             VolumeResponse::Ok => reply.ok(),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
     fn lseek(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        fh: u64,
+        ino: INodeNo,
+        fh: FileHandle,
         offset: i64,
         whence: i32,
         reply: ReplyLseek,
     ) {
         let response = self.send_request_sync(VolumeRequest::Lseek {
-            ino,
-            fh,
+            ino: ino.into(),
+            fh: fh.into(),
             offset,
             whence: whence as u32,
         });
 
         match response {
             VolumeResponse::Lseek { offset } => reply.offset(offset as i64),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
     fn getlk(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        fh: u64,
-        lock_owner: u64,
+        ino: INodeNo,
+        fh: FileHandle,
+        lock_owner: LockOwner,
         start: u64,
         end: u64,
         typ: i32,
@@ -1085,9 +1089,9 @@ impl Filesystem for FuseClient {
         reply: ReplyLock,
     ) {
         let response = self.send_request_sync(VolumeRequest::Getlk {
-            ino,
-            fh,
-            lock_owner,
+            ino: ino.into(),
+            fh: fh.into(),
+            lock_owner: lock_owner.0,
             start,
             end,
             typ,
@@ -1101,17 +1105,17 @@ impl Filesystem for FuseClient {
                 typ,
                 pid,
             } => reply.locked(start, end, typ, pid),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
     fn setlk(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        fh: u64,
-        lock_owner: u64,
+        ino: INodeNo,
+        fh: FileHandle,
+        lock_owner: LockOwner,
         start: u64,
         end: u64,
         typ: i32,
@@ -1120,9 +1124,9 @@ impl Filesystem for FuseClient {
         reply: ReplyEmpty,
     ) {
         let response = self.send_request_sync(VolumeRequest::Setlk {
-            ino,
-            fh,
-            lock_owner,
+            ino: ino.into(),
+            fh: fh.into(),
+            lock_owner: lock_owner.0,
             start,
             end,
             typ,
@@ -1132,39 +1136,39 @@ impl Filesystem for FuseClient {
 
         match response {
             VolumeResponse::Ok => reply.ok(),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
     fn copy_file_range(
-        &mut self,
+        &self,
         _req: &Request,
-        ino_in: u64,
-        fh_in: u64,
+        ino_in: INodeNo,
+        fh_in: FileHandle,
         offset_in: i64,
-        ino_out: u64,
-        fh_out: u64,
+        ino_out: INodeNo,
+        fh_out: FileHandle,
         offset_out: i64,
         len: u64,
-        flags: u32,
+        flags: CopyFileRangeFlags,
         reply: ReplyWrite,
     ) {
         let response = self.send_request_sync(VolumeRequest::CopyFileRange {
-            ino_in,
-            fh_in,
+            ino_in: ino_in.into(),
+            fh_in: fh_in.into(),
             offset_in: offset_in as u64,
-            ino_out,
-            fh_out,
+            ino_out: ino_out.into(),
+            fh_out: fh_out.into(),
             offset_out: offset_out as u64,
             len,
-            flags,
+            flags: flags.bits() as u32,
         });
 
         match response {
             VolumeResponse::Written { size } => reply.written(size),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 
@@ -1206,8 +1210,8 @@ impl Filesystem for FuseClient {
 
         match response {
             VolumeResponse::Written { size } => reply.written(size),
-            VolumeResponse::Error { errno } => reply.error(errno),
-            _ => reply.error(libc::EIO),
+            VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
+            _ => reply.error(Errno::EIO),
         }
     }
 }

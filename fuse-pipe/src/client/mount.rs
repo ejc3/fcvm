@@ -295,11 +295,8 @@ fn mount_internal<P: AsRef<Path>>(
             let _ = tx.send(session.unmount_callable());
         }
 
+        // run() consumes the session and drops it when done
         let run_result = session.run();
-        // Drop the session BEFORE checking destroyed flag. The Session's Drop impl
-        // calls destroy() if it wasn't already called during run(). This ensures
-        // we see the flag set even when FUSE_DESTROY wasn't delivered (programmatic unmount).
-        drop(session);
 
         if let Err(e) = run_result {
             if destroyed.load(Ordering::SeqCst) {
@@ -350,7 +347,7 @@ fn mount_internal<P: AsRef<Path>>(
                     );
                     // Each cloned fd handles its own request/response pairs
                     // Use SessionACL::All to allow any user to access the mount (AllowOther is set)
-                    let mut reader_session =
+                    let reader_session =
                         fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::All);
 
                     let destroyed_check = Arc::clone(&destroyed);
@@ -359,13 +356,8 @@ fn mount_internal<P: AsRef<Path>>(
                         .stack_size(512 * 1024) // 512KB - sufficient for FUSE operations
                         .spawn(move || {
                         debug!(target: "fuse-pipe::client", reader_id, "secondary reader starting session.run()");
+                        // run() consumes the session and drops it when done
                         let run_result = reader_session.run();
-                        debug!(target: "fuse-pipe::client", reader_id, "secondary reader session.run() returned, dropping session");
-                        // Drop the session BEFORE checking destroyed flag. The Session's Drop impl
-                        // calls destroy() if it wasn't already called. This ensures we see the flag
-                        // set even when FUSE_DESTROY wasn't delivered (programmatic unmount).
-                        drop(reader_session);
-                        debug!(target: "fuse-pipe::client", reader_id, "secondary reader session dropped");
 
                         if let Err(e) = run_result {
                             let destroyed = destroyed_check.load(Ordering::SeqCst);
@@ -420,13 +412,8 @@ fn mount_internal<P: AsRef<Path>>(
     }
 
     debug!(target: "fuse-pipe::client", "primary reader starting session.run()");
+    // run() consumes the session and drops it when done
     let run_result = session.run();
-    debug!(target: "fuse-pipe::client", "primary reader session.run() returned, dropping session");
-    // Drop the session BEFORE checking destroyed flag. The Session's Drop impl
-    // calls destroy() if it wasn't already called. This ensures we see the flag
-    // set even when FUSE_DESTROY wasn't delivered (programmatic unmount).
-    drop(session);
-    debug!(target: "fuse-pipe::client", "primary reader session dropped");
 
     if let Err(e) = run_result {
         let destroyed_flag = destroyed.load(Ordering::SeqCst);
@@ -554,7 +541,7 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
     if num_readers == 1 {
         let destroyed = Arc::new(AtomicBool::new(false));
         let fs = FuseClient::with_destroyed_flag(Arc::clone(&mux), 0, Arc::clone(&destroyed));
-        let mut session = fuser::Session::new(fs, mount_point.as_ref(), &options)?;
+        let session = fuser::Session::new(fs, mount_point.as_ref(), &options)?;
         info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), "mounted via vsock");
         if let Err(e) = session.run() {
             if destroyed.load(Ordering::SeqCst) {
@@ -593,7 +580,7 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
                     );
                     // Each cloned fd handles its own request/response pairs
                     // Use SessionACL::All to allow any user to access the mount (AllowOther is set)
-                    let mut reader_session =
+                    let reader_session =
                         fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::All);
 
                     let destroyed_check = Arc::clone(&destroyed);
@@ -623,7 +610,7 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
         make_init_callback(Arc::clone(&destroyed), Arc::clone(&reader_threads)),
         Arc::clone(&destroyed),
     );
-    let mut session = fuser::Session::new(fs, mount_point.as_ref(), &options)?;
+    let session = fuser::Session::new(fs, mount_point.as_ref(), &options)?;
     info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), "mounted via vsock");
 
     let mut clone_failures = 0;
