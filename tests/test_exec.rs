@@ -1566,7 +1566,14 @@ async fn test_podman_run_no_tty() -> Result<()> {
     let output = tokio::time::timeout(
         Duration::from_secs(120),
         tokio::process::Command::new(&fcvm_path)
-            .args(["podman", "run", "--name", &vm_name, common::TEST_IMAGE_ALPINE, "tty"])
+            .args([
+                "podman",
+                "run",
+                "--name",
+                &vm_name,
+                common::TEST_IMAGE_ALPINE,
+                "tty",
+            ])
             .output(),
     )
     .await
