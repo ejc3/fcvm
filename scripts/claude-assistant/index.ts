@@ -230,16 +230,11 @@ All GitHub operations target **PR #${ctx.prNumber}** in **${ctx.repository}**.
 
 ---
 
-## STEP 0: WAIT FOR CI TO PASS
+## STEP 0: CHECK FOR CI FAILURES (non-blocking)
 
-**Before doing anything else**, wait for CI checks to pass.
+**Check if CI has failed, but don't wait for pending checks.**
 
-### 0a. Check Lint status first (fast check)
-\`\`\`bash
-gh api repos/${ctx.repository}/commits/${ctx.headSha}/check-runs --jq '.check_runs[] | select(.name == "Lint") | {name: .name, status: .status, conclusion: .conclusion}'
-\`\`\`
-
-### 0b. If Lint passes, check overall PR status
+### 0a. Check current CI status
 \`\`\`bash
 gh pr checks ${ctx.prNumber} --repo ${ctx.repository}
 \`\`\`
@@ -247,10 +242,10 @@ gh pr checks ${ctx.prNumber} --repo ${ctx.repository}
 **Rules:**
 - If **Lint failed**: Stop immediately. Post comment: "Lint failed - please fix before I can review."
 - If **any check failed**: Stop. Post comment noting which check failed.
-- If **checks are still running**: Wait 30 seconds, then check again. Repeat until all pass/fail or 15 minutes elapsed.
+- If **checks are pending/running**: Proceed to Step 1 immediately. Do NOT wait for them to complete.
 - If **all checks pass**: Proceed to Step 1.
 
-**Do NOT proceed with the review until CI passes.** Reviewing code that doesn't pass CI is a waste of time.
+**Do NOT wait for pending checks.** If nothing has failed yet, proceed with the review.
 
 ---
 
@@ -445,6 +440,20 @@ Please review and merge the fix PR first, then this PR.
 
 [View Claude Run](${ctx.runUrl})"
 \`\`\`
+
+---
+
+## STEP 6: CHECK CI STATUS AGAIN
+
+After completing your review (and any fixes), check if CI has progressed:
+
+\`\`\`bash
+gh pr checks ${ctx.prNumber} --repo ${ctx.repository}
+\`\`\`
+
+- If **any check has now failed**: Post a follow-up comment noting the failure.
+- If **all checks passed**: No action needed.
+- If **checks still pending**: No action needed - you've done your job.
 
 ---
 
