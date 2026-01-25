@@ -302,78 +302,8 @@ pub async fn create_podman_snapshot(
 
     info!(snapshot_key = %snapshot_key, "Creating podman snapshot");
 
-    // Use temp directory for atomic snapshot creation
-    // Only rename to final location after all files are written successfully
-    let temp_snapshot_dir = snapshot_dir.with_extension("creating");
-    let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-    tokio::fs::create_dir_all(&temp_snapshot_dir)
-        .await
-        .context("creating temp snapshot directory")?;
-
     // Get Firecracker client
     let client = vm_manager.client().context("VM not started")?;
-
-    // Pause VM before snapshotting (required by Firecracker)
-    use crate::firecracker::api::{SnapshotCreate, VmState as ApiVmState};
-
-    client
-        .patch_vm_state(ApiVmState {
-            state: "Paused".to_string(),
-        })
-        .await
-        .context("pausing VM for snapshot")?;
-
-    info!(snapshot_key = %snapshot_key, "VM paused for snapshot");
-
-    // Create snapshot files in temp directory
-    let memory_path = temp_snapshot_dir.join("memory.bin");
-    let vmstate_path = temp_snapshot_dir.join("vmstate.bin");
-
-    let snapshot_result = client
-        .create_snapshot(SnapshotCreate {
-            snapshot_type: Some("Full".to_string()),
-            snapshot_path: vmstate_path.display().to_string(),
-            mem_file_path: memory_path.display().to_string(),
-        })
-        .await;
-
-    // Resume VM regardless of snapshot result
-    let resume_result = client
-        .patch_vm_state(ApiVmState {
-            state: "Resumed".to_string(),
-        })
-        .await;
-
-    if let Err(e) = &resume_result {
-        warn!(snapshot_key = %snapshot_key, error = %e, "Failed to resume VM after snapshot");
-    }
-
-    // Check if snapshot succeeded - clean up temp dir on failure
-    if let Err(e) = snapshot_result {
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-        return Err(e).context("creating Firecracker snapshot");
-    }
-    if let Err(e) = resume_result {
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-        return Err(e).context("resuming VM after snapshot");
-    }
-
-    // Copy disk using btrfs reflink
-    let disk_path_in_snapshot = temp_snapshot_dir.join("disk.raw");
-    let reflink_result = tokio::process::Command::new("cp")
-        .args([
-            "--reflink=always",
-            disk_path.to_str().unwrap(),
-            disk_path_in_snapshot.to_str().unwrap(),
-        ])
-        .status()
-        .await
-        .context("copying disk with reflink")?;
-
-    if !reflink_result.success() {
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-        bail!("Reflink copy failed - btrfs filesystem required for podman snapshot");
-    }
 
     // Convert VolumeConfig to SnapshotVolumeConfig for metadata
     let snapshot_volumes: Vec<SnapshotVolumeConfig> = volume_configs
@@ -386,19 +316,19 @@ pub async fn create_podman_snapshot(
         })
         .collect();
 
-    // Save snapshot metadata using SnapshotConfig format
-    // Update paths to point to final location (after rename)
+    // Build final paths (create_snapshot_core handles temp dir)
     let final_memory_path = snapshot_dir.join("memory.bin");
     let final_vmstate_path = snapshot_dir.join("vmstate.bin");
     let final_disk_path = snapshot_dir.join("disk.raw");
 
+    // Build snapshot config with final paths
     let snapshot_config = SnapshotConfig {
         name: snapshot_key.to_string(),
         vm_id: vm_id.to_string(),
         original_vsock_vm_id: None, // Fresh VM, no redirect needed
         memory_path: final_memory_path,
         vmstate_path: final_vmstate_path,
-        disk_path: final_disk_path.clone(),
+        disk_path: final_disk_path,
         created_at: chrono::Utc::now(),
         snapshot_type: SnapshotType::System, // Auto-generated cache snapshot
         metadata: SnapshotMetadata {
@@ -410,26 +340,8 @@ pub async fn create_podman_snapshot(
         },
     };
 
-    // Write config to temp directory
-    let config_path = temp_snapshot_dir.join("config.json");
-    let config_json =
-        serde_json::to_string_pretty(&snapshot_config).context("serializing snapshot config")?;
-    tokio::fs::write(&config_path, &config_json)
-        .await
-        .context("writing snapshot config")?;
-
-    // Atomic rename from temp to final location
-    tokio::fs::rename(&temp_snapshot_dir, &snapshot_dir)
-        .await
-        .context("renaming snapshot directory to final location")?;
-
-    info!(
-        snapshot_key = %snapshot_key,
-        disk = %final_disk_path.display(),
-        "Podman snapshot created successfully"
-    );
-
-    Ok(())
+    // Use shared core function for snapshot creation
+    super::common::create_snapshot_core(client, snapshot_config, disk_path).await
 }
 
 use super::common::{VSOCK_OUTPUT_PORT, VSOCK_STATUS_PORT, VSOCK_TTY_PORT, VSOCK_VOLUME_PORT_BASE};

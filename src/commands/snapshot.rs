@@ -36,6 +36,11 @@ pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
 
 /// Create snapshot from running VM
 async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
+    use crate::storage::snapshot::{
+        SnapshotConfig, SnapshotMetadata, SnapshotType, SnapshotVolumeConfig,
+    };
+    use super::common::VSOCK_VOLUME_PORT_BASE;
+
     // Determine which VM to snapshot
     let state_manager = StateManager::new(paths::state_dir());
 
@@ -88,232 +93,106 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         );
     }
 
+    // Check VM disk exists
+    let vm_disk_path = paths::vm_runtime_dir(&vm_state.vm_id).join("disks/rootfs.raw");
+    if !vm_disk_path.exists() {
+        anyhow::bail!("VM disk not found at {}", vm_disk_path.display());
+    }
+
     // Create client directly for existing VM
     use crate::firecracker::FirecrackerClient;
     let client = FirecrackerClient::new(socket_path)?;
 
-    // Create snapshot paths - use temp directory for atomic creation
+    // Build final snapshot paths (used in config.json)
     let snapshot_dir = paths::snapshot_dir().join(&snapshot_name);
-    let temp_snapshot_dir = paths::snapshot_dir().join(format!("{}.creating", &snapshot_name));
+    let final_memory_path = snapshot_dir.join("memory.bin");
+    let final_vmstate_path = snapshot_dir.join("vmstate.bin");
+    let final_disk_path = snapshot_dir.join("disk.raw");
 
-    // Clean up any leftover temp directory from previous failed attempt
-    let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-
-    tokio::fs::create_dir_all(&temp_snapshot_dir)
-        .await
-        .context("creating temp snapshot directory")?;
-
-    let memory_path = temp_snapshot_dir.join("memory.bin");
-    let vmstate_path = temp_snapshot_dir.join("vmstate.bin");
-    let disk_path = temp_snapshot_dir.join("disk.raw");
-
-    // Pause VM before snapshotting (required by Firecracker)
-    info!("Pausing VM before snapshot");
-
-    use crate::firecracker::api::VmState as ApiVmState;
-    client
-        .patch_vm_state(ApiVmState {
-            state: "Paused".to_string(),
-        })
-        .await
-        .context("pausing VM")?;
-
-    info!("VM paused successfully");
-
-    let snapshot_result = async {
-        // Create snapshot via Firecracker API
-        info!("Creating Firecracker snapshot");
-        use crate::firecracker::api::SnapshotCreate;
-
-        client
-            .create_snapshot(SnapshotCreate {
-                snapshot_type: Some("Full".to_string()),
-                snapshot_path: vmstate_path.display().to_string(),
-                mem_file_path: memory_path.display().to_string(),
-            })
-            .await
-            .context("creating Firecracker snapshot")?;
-
-        // Copy the VM's disk to snapshot directory using reflink (instant CoW copy)
-        // REQUIRES btrfs filesystem - no fallback to regular copy
-        info!("Copying VM disk to snapshot directory");
-        let vm_disk_path = paths::vm_runtime_dir(&vm_state.vm_id).join("disks/rootfs.raw");
-
-        if vm_disk_path.exists() {
-            // Use cp --reflink=always for instant CoW copy on btrfs
-            let output = tokio::process::Command::new("cp")
-                .arg("--reflink=always")
-                .arg(&vm_disk_path)
-                .arg(&disk_path)
-                .output()
-                .await
-                .context("executing cp command")?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                anyhow::bail!(
-                    "Failed to create reflink copy. Ensure {} is a btrfs filesystem. Error: {}",
-                    crate::paths::assets_dir().display(),
-                    stderr
-                );
+    // Parse volume configs from VM state (format: HOST:GUEST[:ro])
+    let volume_configs: Vec<SnapshotVolumeConfig> = vm_state
+        .config
+        .volumes
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, spec)| {
+            let parts: Vec<&str> = spec.split(':').collect();
+            if parts.len() >= 2 {
+                Some(SnapshotVolumeConfig {
+                    host_path: PathBuf::from(parts[0]),
+                    guest_path: parts[1].to_string(),
+                    read_only: parts.get(2).map(|s| *s == "ro").unwrap_or(false),
+                    vsock_port: VSOCK_VOLUME_PORT_BASE + idx as u32,
+                })
+            } else {
+                warn!("Invalid volume spec in VM state: {}", spec);
+                None
             }
-            info!(
-                source = %vm_disk_path.display(),
-                dest = %disk_path.display(),
-                "VM disk copied to snapshot using reflink"
-            );
-        } else {
-            anyhow::bail!("VM disk not found at {}", vm_disk_path.display());
-        }
-
-        // Save snapshot metadata
-        use crate::storage::snapshot::{
-            SnapshotConfig, SnapshotMetadata, SnapshotType, SnapshotVolumeConfig,
-        };
-
-        // Parse volume configs from VM state (format: HOST:GUEST[:ro])
-        use super::common::VSOCK_VOLUME_PORT_BASE;
-        let volume_configs: Vec<SnapshotVolumeConfig> = vm_state
-            .config
-            .volumes
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, spec)| {
-                let parts: Vec<&str> = spec.split(':').collect();
-                if parts.len() >= 2 {
-                    Some(SnapshotVolumeConfig {
-                        host_path: PathBuf::from(parts[0]),
-                        guest_path: parts[1].to_string(),
-                        read_only: parts.get(2).map(|s| *s == "ro").unwrap_or(false),
-                        vsock_port: VSOCK_VOLUME_PORT_BASE + idx as u32,
-                    })
-                } else {
-                    warn!("Invalid volume spec in VM state: {}", spec);
-                    None
-                }
-            })
-            .collect();
-
-        if !volume_configs.is_empty() {
-            info!(
-                num_volumes = volume_configs.len(),
-                "saving {} volume config(s) to snapshot metadata",
-                volume_configs.len()
-            );
-        }
-
-        // Use original_vsock_vm_id from the VM state if available.
-        // When a VM is restored from cache, its vmstate.bin references vsock paths from the
-        // ORIGINAL (cached) VM. Taking a snapshot of this restored VM creates a NEW vmstate.bin,
-        // but Firecracker doesn't update vsock paths - they still reference the original VM ID.
-        // So we must preserve the original_vsock_vm_id through the chain:
-        // Cache(vm-AAA) → Restore(vm-BBB) → Snapshot → Clone(vm-CCC)
-        // The clone needs to redirect from vm-AAA's path, not vm-BBB's.
-        let original_vsock_vm_id = vm_state
-            .config
-            .original_vsock_vm_id
-            .clone()
-            .unwrap_or_else(|| vm_state.vm_id.clone());
-
-        // Build config with FINAL paths (not temp paths) so config.json is correct after rename
-        let final_memory_path = snapshot_dir.join("memory.bin");
-        let final_vmstate_path = snapshot_dir.join("vmstate.bin");
-        let final_disk_path = snapshot_dir.join("disk.raw");
-
-        let snapshot_config = SnapshotConfig {
-            name: snapshot_name.clone(),
-            vm_id: vm_state.vm_id.clone(),
-            original_vsock_vm_id: Some(original_vsock_vm_id),
-            memory_path: final_memory_path.clone(),
-            vmstate_path: final_vmstate_path.clone(),
-            disk_path: final_disk_path.clone(),
-            created_at: chrono::Utc::now(),
-            snapshot_type: SnapshotType::User, // Explicit user-created snapshot
-            metadata: SnapshotMetadata {
-                image: vm_state.config.image.clone(),
-                vcpu: vm_state.config.vcpu,
-                memory_mib: vm_state.config.memory_mib,
-                network_config: vm_state.config.network.clone(),
-                volumes: volume_configs,
-            },
-        };
-
-        // Write config.json directly to temp directory (don't use save_snapshot which creates another dir)
-        let temp_config_path = temp_snapshot_dir.join("config.json");
-        let config_json = serde_json::to_string_pretty(&snapshot_config)?;
-        tokio::fs::write(&temp_config_path, &config_json)
-            .await
-            .context("writing snapshot config.json")?;
-
-        // Atomic rename from temp to final location
-        // If final exists (e.g., from previous snapshot with same name), remove it first
-        if snapshot_dir.exists() {
-            tokio::fs::remove_dir_all(&snapshot_dir)
-                .await
-                .context("removing existing snapshot directory")?;
-        }
-        tokio::fs::rename(&temp_snapshot_dir, &snapshot_dir)
-            .await
-            .context("renaming temp snapshot to final location")?;
-
-        info!(
-            snapshot = %snapshot_name,
-            mem_size = snapshot_config.metadata.memory_mib,
-            "snapshot created successfully"
-        );
-
-        let vm_name = vm_state
-            .name
-            .as_deref()
-            .unwrap_or(truncate_id(&vm_state.vm_id, 8));
-        println!(
-            "✓ Snapshot '{}' created from VM '{}'",
-            snapshot_name, vm_name
-        );
-        println!("  Memory: {} MB", snapshot_config.metadata.memory_mib);
-        println!("  Files:");
-        println!("    {}", snapshot_config.memory_path.display());
-        println!("    {}", snapshot_config.disk_path.display());
-        println!(
-            "\nOriginal VM '{}' has been resumed and is still running.",
-            vm_name
-        );
-
-        Ok::<_, anyhow::Error>(())
-    }
-    .await;
-
-    // Clean up temp directory on failure (on success, it was renamed to final)
-    if snapshot_result.is_err() {
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-    }
-
-    // Resume the original VM after snapshotting regardless of snapshot result
-    info!("Resuming original VM");
-    let resume_result = client
-        .patch_vm_state(ApiVmState {
-            state: "Resumed".to_string(),
         })
-        .await;
+        .collect();
 
-    if let Err(e) = resume_result {
-        let vm_name = vm_state
-            .name
-            .as_deref()
-            .unwrap_or(truncate_id(&vm_state.vm_id, 8));
-        warn!(
-            error = %e,
-            vm = %vm_name,
-            "failed to resume VM after snapshot"
+    if !volume_configs.is_empty() {
+        info!(
+            num_volumes = volume_configs.len(),
+            "saving {} volume config(s) to snapshot metadata",
+            volume_configs.len()
         );
-        if snapshot_result.is_ok() {
-            return Err(e);
-        }
-    } else {
-        info!("Original VM resumed successfully");
     }
 
-    snapshot_result
+    // Use original_vsock_vm_id from the VM state if available.
+    // When a VM is restored from cache, its vmstate.bin references vsock paths from the
+    // ORIGINAL (cached) VM. Taking a snapshot of this restored VM creates a NEW vmstate.bin,
+    // but Firecracker doesn't update vsock paths - they still reference the original VM ID.
+    // So we must preserve the original_vsock_vm_id through the chain:
+    // Cache(vm-AAA) → Restore(vm-BBB) → Snapshot → Clone(vm-CCC)
+    // The clone needs to redirect from vm-AAA's path, not vm-BBB's.
+    let original_vsock_vm_id = vm_state
+        .config
+        .original_vsock_vm_id
+        .clone()
+        .unwrap_or_else(|| vm_state.vm_id.clone());
+
+    // Build snapshot config with FINAL paths (create_snapshot_core handles temp dir)
+    let snapshot_config = SnapshotConfig {
+        name: snapshot_name.clone(),
+        vm_id: vm_state.vm_id.clone(),
+        original_vsock_vm_id: Some(original_vsock_vm_id),
+        memory_path: final_memory_path,
+        vmstate_path: final_vmstate_path,
+        disk_path: final_disk_path,
+        created_at: chrono::Utc::now(),
+        snapshot_type: SnapshotType::User, // Explicit user-created snapshot
+        metadata: SnapshotMetadata {
+            image: vm_state.config.image.clone(),
+            vcpu: vm_state.config.vcpu,
+            memory_mib: vm_state.config.memory_mib,
+            network_config: vm_state.config.network.clone(),
+            volumes: volume_configs,
+        },
+    };
+
+    // Use shared core function for snapshot creation
+    super::common::create_snapshot_core(&client, snapshot_config.clone(), &vm_disk_path).await?;
+
+    // Print user-friendly output
+    let vm_name = vm_state
+        .name
+        .as_deref()
+        .unwrap_or(truncate_id(&vm_state.vm_id, 8));
+    println!(
+        "✓ Snapshot '{}' created from VM '{}'",
+        snapshot_name, vm_name
+    );
+    println!("  Memory: {} MB", snapshot_config.metadata.memory_mib);
+    println!("  Files:");
+    println!("    {}", snapshot_config.memory_path.display());
+    println!("    {}", snapshot_config.disk_path.display());
+    println!(
+        "\nOriginal VM '{}' has been resumed and is still running.",
+        vm_name
+    );
+
+    Ok(())
 }
 
 /// Serve snapshot memory (foreground)

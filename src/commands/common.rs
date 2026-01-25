@@ -630,3 +630,130 @@ pub async fn restore_from_snapshot(
 
     Ok((vm_manager, holder_child))
 }
+
+/// Core snapshot creation logic.
+///
+/// This handles the common operations for both user snapshots (`fcvm snapshot create`)
+/// and system snapshots (podman cache). The caller is responsible for:
+/// - Getting the Firecracker client
+/// - Building the SnapshotConfig with correct metadata
+/// - Lock handling (if needed)
+///
+/// # Arguments
+/// * `client` - Firecracker API client for the running VM
+/// * `snapshot_config` - Pre-built config with FINAL paths (after atomic rename)
+/// * `disk_path` - Source disk to copy to snapshot
+///
+/// # Returns
+/// Ok(()) on success, Err on failure. VM is resumed regardless of success/failure.
+pub async fn create_snapshot_core(
+    client: &crate::firecracker::FirecrackerClient,
+    snapshot_config: crate::storage::snapshot::SnapshotConfig,
+    disk_path: &Path,
+) -> Result<()> {
+    use crate::firecracker::api::{SnapshotCreate, VmState as ApiVmState};
+
+    // Derive directories from snapshot config (memory_path's parent is the snapshot dir)
+    let snapshot_dir = snapshot_config
+        .memory_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid memory_path in snapshot config"))?;
+    let temp_snapshot_dir = snapshot_dir.with_extension("creating");
+
+    // Clean up any leftover temp directory from previous failed attempt
+    let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+    tokio::fs::create_dir_all(&temp_snapshot_dir)
+        .await
+        .context("creating temp snapshot directory")?;
+
+    let temp_memory_path = temp_snapshot_dir.join("memory.bin");
+    let temp_vmstate_path = temp_snapshot_dir.join("vmstate.bin");
+
+    // Pause VM before snapshotting (required by Firecracker)
+    info!(snapshot = %snapshot_config.name, "pausing VM for snapshot");
+    client
+        .patch_vm_state(ApiVmState {
+            state: "Paused".to_string(),
+        })
+        .await
+        .context("pausing VM for snapshot")?;
+
+    // Create Firecracker snapshot
+    let snapshot_result = client
+        .create_snapshot(SnapshotCreate {
+            snapshot_type: Some("Full".to_string()),
+            snapshot_path: temp_vmstate_path.display().to_string(),
+            mem_file_path: temp_memory_path.display().to_string(),
+        })
+        .await;
+
+    // Resume VM immediately (always, regardless of snapshot result)
+    let resume_result = client
+        .patch_vm_state(ApiVmState {
+            state: "Resumed".to_string(),
+        })
+        .await;
+
+    if let Err(e) = &resume_result {
+        warn!(snapshot = %snapshot_config.name, error = %e, "failed to resume VM after snapshot");
+    }
+
+    // Check if snapshot succeeded - clean up temp dir on failure
+    if let Err(e) = snapshot_result {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        return Err(e).context("creating Firecracker snapshot");
+    }
+    if let Err(e) = resume_result {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        return Err(e).context("resuming VM after snapshot");
+    }
+
+    info!(snapshot = %snapshot_config.name, "VM resumed, copying disk");
+
+    // Copy disk using btrfs reflink (instant CoW copy)
+    let temp_disk_path = temp_snapshot_dir.join("disk.raw");
+    let reflink_result = tokio::process::Command::new("cp")
+        .args([
+            "--reflink=always",
+            disk_path.to_str().unwrap(),
+            temp_disk_path.to_str().unwrap(),
+        ])
+        .status()
+        .await
+        .context("copying disk with reflink")?;
+
+    if !reflink_result.success() {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        anyhow::bail!(
+            "Reflink copy failed - btrfs filesystem required. Ensure {} is on btrfs.",
+            paths::assets_dir().display()
+        );
+    }
+
+    // Write config.json to temp directory
+    let config_path = temp_snapshot_dir.join("config.json");
+    let config_json =
+        serde_json::to_string_pretty(&snapshot_config).context("serializing snapshot config")?;
+    tokio::fs::write(&config_path, &config_json)
+        .await
+        .context("writing snapshot config")?;
+
+    // Atomic rename from temp to final location
+    // If final exists (e.g., from previous snapshot with same name), remove it first
+    if snapshot_dir.exists() {
+        tokio::fs::remove_dir_all(snapshot_dir)
+            .await
+            .context("removing existing snapshot directory")?;
+    }
+    tokio::fs::rename(&temp_snapshot_dir, snapshot_dir)
+        .await
+        .context("renaming temp snapshot to final location")?;
+
+    info!(
+        snapshot = %snapshot_config.name,
+        disk = %snapshot_config.disk_path.display(),
+        "snapshot created successfully"
+    );
+
+    Ok(())
+}
