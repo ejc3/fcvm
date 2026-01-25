@@ -222,11 +222,7 @@ fn protocol_file_type_to_fuser(ft: u8) -> FileType {
 const DEFAULT_FUSE_MAX_WRITE: u32 = 0;
 
 impl Filesystem for FuseClient {
-    fn init(
-        &mut self,
-        _req: &Request,
-        config: &mut fuser::KernelConfig,
-    ) -> Result<(), io::Error> {
+    fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> Result<(), io::Error> {
         // Enable writeback cache for better write performance (kernel batches writes).
         // Can be disabled via FCVM_NO_WRITEBACK_CACHE=1 for debugging.
         let enable_writeback = std::env::var("FCVM_NO_WRITEBACK_CACHE").is_err();
@@ -561,7 +557,9 @@ impl Filesystem for FuseClient {
         });
 
         match response {
-            VolumeResponse::Opened { fh, flags } => reply.opened(FileHandle(fh), FopenFlags::from_bits_truncate(flags)),
+            VolumeResponse::Opened { fh, flags } => {
+                reply.opened(FileHandle(fh), FopenFlags::from_bits_truncate(flags))
+            }
             VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
             _ => reply.error(Errno::EIO),
         }
@@ -634,7 +632,10 @@ impl Filesystem for FuseClient {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let response = self.send_request_sync(VolumeRequest::Release { ino: ino.into(), fh: fh.into() });
+        let response = self.send_request_sync(VolumeRequest::Release {
+            ino: ino.into(),
+            fh: fh.into(),
+        });
 
         match response {
             VolumeResponse::Ok => reply.ok(),
@@ -643,8 +644,18 @@ impl Filesystem for FuseClient {
         }
     }
 
-    fn flush(&self, _req: &Request, ino: INodeNo, fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
-        let response = self.send_request_sync(VolumeRequest::Flush { ino: ino.into(), fh: fh.into() });
+    fn flush(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        let response = self.send_request_sync(VolumeRequest::Flush {
+            ino: ino.into(),
+            fh: fh.into(),
+        });
 
         match response {
             VolumeResponse::Ok => reply.ok(),
@@ -653,8 +664,19 @@ impl Filesystem for FuseClient {
         }
     }
 
-    fn fsync(&self, _req: &Request, ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
-        let response = self.send_request_sync(VolumeRequest::Fsync { ino: ino.into(), fh: fh.into(), datasync });
+    fn fsync(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let response = self.send_request_sync(VolumeRequest::Fsync {
+            ino: ino.into(),
+            fh: fh.into(),
+            datasync,
+        });
 
         match response {
             VolumeResponse::Ok => reply.ok(),
@@ -910,8 +932,18 @@ impl Filesystem for FuseClient {
         }
     }
 
-    fn releasedir(&self, _req: &Request, ino: INodeNo, fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
-        let response = self.send_request_sync(VolumeRequest::Releasedir { ino: ino.into(), fh: fh.into() });
+    fn releasedir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        let response = self.send_request_sync(VolumeRequest::Releasedir {
+            ino: ino.into(),
+            fh: fh.into(),
+        });
 
         match response {
             VolumeResponse::Ok => reply.ok(),
@@ -920,8 +952,19 @@ impl Filesystem for FuseClient {
         }
     }
 
-    fn fsyncdir(&self, _req: &Request, ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
-        let response = self.send_request_sync(VolumeRequest::Fsyncdir { ino: ino.into(), fh: fh.into(), datasync });
+    fn fsyncdir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let response = self.send_request_sync(VolumeRequest::Fsyncdir {
+            ino: ino.into(),
+            fh: fh.into(),
+            datasync,
+        });
 
         match response {
             VolumeResponse::Ok => reply.ok(),

@@ -259,7 +259,10 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!("failed to enable forwarding on {}: {}", outbound_iface, stderr);
+        warn!(
+            "failed to enable forwarding on {}: {}",
+            outbound_iface, stderr
+        );
     }
 
     // Check if MASQUERADE rule already exists
