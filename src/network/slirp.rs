@@ -173,7 +173,13 @@ ip link set {fc_tap} up
 ip link set lo up
 
 # Enable IP forwarding (required for NAT to work)
+# Must enable both global and per-interface forwarding.
+# The host's net.ipv4.conf.default.forwarding=0 means new interfaces
+# inherit forwarding=0 even when ip_forward=1.
 sysctl -w net.ipv4.ip_forward=1
+sysctl -w net.ipv4.conf.all.forwarding=1
+sysctl -w net.ipv4.conf.{slirp_dev}.forwarding=1
+sysctl -w net.ipv4.conf.{fc_tap}.forwarding=1
 
 # Set default route via slirp gateway (10.0.2.2 is slirp4netns internal gateway)
 ip route add default via 10.0.2.2 dev {slirp_dev}
