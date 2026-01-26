@@ -240,6 +240,20 @@ pub async fn setup_host_veth(veth_name: &str, ip_with_cidr: &str) -> Result<()> 
         debug!(veth = %veth_name, "added FORWARD rule for outbound traffic");
     }
 
+    // Enable per-interface forwarding on this veth
+    // (required even when global ip_forward=1, as per-interface default may be 0)
+    let iface_forwarding = format!("net.ipv4.conf.{}.forwarding=1", veth_name);
+    let output = Command::new("sysctl")
+        .args(["-w", &iface_forwarding])
+        .output()
+        .await
+        .with_context(|| format!("enabling forwarding on {}", veth_name))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(veth = %veth_name, "failed to enable per-interface forwarding: {}", stderr);
+    }
+
     Ok(())
 }
 
@@ -516,10 +530,59 @@ pub async fn setup_in_namespace_nat(
     }
 
     // Step 6: Enable IP forwarding inside namespace
+    // Must enable both global and per-interface forwarding.
+    // The host's net.ipv4.conf.default.forwarding=0 means new interfaces
+    // inherit forwarding=0 even when ip_forward=1.
     let output = exec_in_namespace(ns_name, &["sysctl", "-w", "net.ipv4.ip_forward=1"]).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("failed to enable IP forwarding in namespace: {}", stderr);
+    }
+
+    // Enable forwarding on all interfaces (catches any we might miss)
+    let output =
+        exec_in_namespace(ns_name, &["sysctl", "-w", "net.ipv4.conf.all.forwarding=1"]).await?;
+    if !output.status.success() {
+        warn!(
+            "failed to enable conf.all.forwarding: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Enable forwarding on the bridge (where TAP is attached)
+    let output = exec_in_namespace(
+        ns_name,
+        &[
+            "sysctl",
+            "-w",
+            &format!("net.ipv4.conf.{}.forwarding=1", bridge_name),
+        ],
+    )
+    .await?;
+    if !output.status.success() {
+        warn!(
+            "failed to enable forwarding on {}: {}",
+            bridge_name,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Enable forwarding on the veth (egress interface)
+    let output = exec_in_namespace(
+        ns_name,
+        &[
+            "sysctl",
+            "-w",
+            &format!("net.ipv4.conf.{}.forwarding=1", veth_name),
+        ],
+    )
+    .await?;
+    if !output.status.success() {
+        warn!(
+            "failed to enable forwarding on {}: {}",
+            veth_name,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // Step 7: Add MASQUERADE rule for NAT on veth outgoing

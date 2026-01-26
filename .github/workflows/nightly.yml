@@ -16,16 +16,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           path: fcvm
-      - uses: actions/checkout@v6
-        with:
-          repository: ejc3/fuse-backend-rs
-          ref: master
-          path: fuse-backend-rs
-      - uses: actions/checkout@v6
-        with:
-          repository: ejc3/fuser
-          ref: master
-          path: fuser
+      - uses: ./fcvm/.github/actions/checkout-deps
       - name: Run benchmarks (container)
         working-directory: fcvm
         run: |

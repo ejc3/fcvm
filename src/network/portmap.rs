@@ -236,7 +236,7 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
         "ensuring global NAT configuration"
     );
 
-    // Enable IP forwarding
+    // Enable IP forwarding globally
     let output = Command::new("sysctl")
         .args(["-w", "net.ipv4.ip_forward=1"])
         .output()
@@ -246,6 +246,23 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         warn!("failed to enable IP forwarding: {}", stderr);
+    }
+
+    // Enable forwarding on the outbound interface specifically
+    // (per-interface forwarding may be disabled even when global ip_forward=1)
+    let iface_forwarding = format!("net.ipv4.conf.{}.forwarding=1", outbound_iface);
+    let output = Command::new("sysctl")
+        .args(["-w", &iface_forwarding])
+        .output()
+        .await
+        .with_context(|| format!("enabling forwarding on {}", outbound_iface))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(
+            "failed to enable forwarding on {}: {}",
+            outbound_iface, stderr
+        );
     }
 
     // Check if MASQUERADE rule already exists
