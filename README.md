@@ -90,6 +90,10 @@ echo "user_allow_other" | sudo tee -a /etc/fuse.conf
 # Ubuntu 24.04+: allow unprivileged user namespaces
 sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
+# IP forwarding for container networking (e.g., podman builds)
+sudo sysctl -w net.ipv4.conf.all.forwarding=1
+sudo sysctl -w net.ipv4.conf.default.forwarding=1
+
 # Bridged networking only (not needed for --network rootless):
 sudo mkdir -p /var/run/netns
 sudo iptables -P FORWARD ACCEPT
