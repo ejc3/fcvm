@@ -306,11 +306,11 @@ fn mount_internal<P: AsRef<Path>>(
                     break;
                 }
                 Err(e) => {
-                    last_error = Some(e);
                     if attempt < SESSION_NEW_MAX_RETRIES {
-                        debug!(target: "fuse-pipe::client", attempt, max_retries = SESSION_NEW_MAX_RETRIES, error = %last_error.as_ref().unwrap(), "Session::new failed, retrying");
+                        debug!(target: "fuse-pipe::client", attempt, max_retries = SESSION_NEW_MAX_RETRIES, error = %e, "Session::new failed, retrying");
                         thread::sleep(SESSION_NEW_RETRY_DELAY);
                     }
+                    last_error = Some(e);
                 }
             }
         }
@@ -588,8 +588,30 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
     // For single reader, just run directly
     if num_readers == 1 {
         let destroyed = Arc::new(AtomicBool::new(false));
-        let fs = FuseClient::with_destroyed_flag(Arc::clone(&mux), 0, Arc::clone(&destroyed));
-        let session = fuser::Session::new(fs, mount_point.as_ref(), &options)?;
+
+        // Retry Session::new if kernel hasn't released resources from previous mount
+        let mut session = None;
+        let mut last_error = None;
+        for attempt in 0..=SESSION_NEW_MAX_RETRIES {
+            let fs = FuseClient::with_destroyed_flag(Arc::clone(&mux), 0, Arc::clone(&destroyed));
+            match fuser::Session::new(fs, mount_point.as_ref(), &options) {
+                Ok(s) => {
+                    if attempt > 0 {
+                        info!(target: "fuse-pipe::client", attempt, "Session::new succeeded after retry");
+                    }
+                    session = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    if attempt < SESSION_NEW_MAX_RETRIES {
+                        debug!(target: "fuse-pipe::client", attempt, max_retries = SESSION_NEW_MAX_RETRIES, error = %e, "Session::new failed, retrying");
+                        thread::sleep(SESSION_NEW_RETRY_DELAY);
+                    }
+                    last_error = Some(e);
+                }
+            }
+        }
+        let session = session.ok_or_else(|| last_error.unwrap())?;
         info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), "mounted via vsock");
         if let Err(e) = session.run() {
             if destroyed.load(Ordering::SeqCst) {
@@ -652,13 +674,34 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
             })
         };
 
-    let fs = FuseClient::with_init_callback(
-        Arc::clone(&mux),
-        0,
-        make_init_callback(Arc::clone(&destroyed), Arc::clone(&reader_threads)),
-        Arc::clone(&destroyed),
-    );
-    let session = fuser::Session::new(fs, mount_point.as_ref(), &options)?;
+    // Retry Session::new if kernel hasn't released resources from previous mount
+    let mut session = None;
+    let mut last_error = None;
+    for attempt in 0..=SESSION_NEW_MAX_RETRIES {
+        let fs = FuseClient::with_init_callback(
+            Arc::clone(&mux),
+            0,
+            make_init_callback(Arc::clone(&destroyed), Arc::clone(&reader_threads)),
+            Arc::clone(&destroyed),
+        );
+        match fuser::Session::new(fs, mount_point.as_ref(), &options) {
+            Ok(s) => {
+                if attempt > 0 {
+                    info!(target: "fuse-pipe::client", attempt, "Session::new succeeded after retry");
+                }
+                session = Some(s);
+                break;
+            }
+            Err(e) => {
+                last_error = Some(e);
+                if attempt < SESSION_NEW_MAX_RETRIES {
+                    debug!(target: "fuse-pipe::client", attempt, max_retries = SESSION_NEW_MAX_RETRIES, error = %last_error.as_ref().unwrap(), "Session::new failed, retrying");
+                    thread::sleep(SESSION_NEW_RETRY_DELAY);
+                }
+            }
+        }
+    }
+    let session = session.ok_or_else(|| last_error.unwrap())?;
     info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), "mounted via vsock");
 
     let mut clone_failures = 0;
