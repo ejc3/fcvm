@@ -350,13 +350,8 @@ pub async fn create_podman_snapshot(
     // Use shared core function for snapshot creation
     // If parent key provided, resolve to directory path
     let parent_dir = parent_snapshot_key.map(|key| paths::snapshot_dir().join(key));
-    super::common::create_snapshot_core(
-        client,
-        snapshot_config,
-        disk_path,
-        parent_dir.as_deref(),
-    )
-    .await
+    super::common::create_snapshot_core(client, snapshot_config, disk_path, parent_dir.as_deref())
+        .await
 }
 
 use super::common::{VSOCK_OUTPUT_PORT, VSOCK_STATUS_PORT, VSOCK_TTY_PORT, VSOCK_VOLUME_PORT_BASE};

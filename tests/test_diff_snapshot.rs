@@ -31,7 +31,9 @@ fn snapshot_dir() -> std::path::PathBuf {
 
 /// Read log file and search for diff snapshot indicators
 async fn check_log_for_diff_snapshot(log_path: &str) -> (bool, bool, bool) {
-    let log_content = tokio::fs::read_to_string(log_path).await.unwrap_or_default();
+    let log_content = tokio::fs::read_to_string(log_path)
+        .await
+        .unwrap_or_default();
 
     let has_full = log_content.contains("creating full snapshot")
         || log_content.contains("snapshot_type=\"Full\"");
@@ -243,8 +245,14 @@ async fn test_diff_snapshot_cache_hit_fast() -> Result<()> {
         Ok(Ok(_)) => {
             let speedup = duration1.as_secs_f64() / duration2.as_secs_f64();
             println!("\n  Performance:");
-            println!("    First boot:  {:.1}s (creates Full + Diff)", duration1.as_secs_f32());
-            println!("    Second boot: {:.1}s (uses merged snapshot)", duration2.as_secs_f32());
+            println!(
+                "    First boot:  {:.1}s (creates Full + Diff)",
+                duration1.as_secs_f32()
+            );
+            println!(
+                "    Second boot: {:.1}s (uses merged snapshot)",
+                duration2.as_secs_f32()
+            );
             println!("    Speedup:     {:.1}x", speedup);
 
             println!("\n✅ DIFF SNAPSHOT CACHE HIT TEST PASSED!");
@@ -364,10 +372,10 @@ async fn test_user_snapshot_from_clone_uses_parent() -> Result<()> {
     println!("  ✓ User snapshot created: {}", snapshot2_name);
 
     // Check if the snapshot was created as Diff (check stderr for logs)
-    let created_diff = stderr.contains("creating diff snapshot")
-        || stderr.contains("snapshot_type=\"Diff\"");
-    let used_parent = stderr.contains("copying parent memory.bin as base")
-        || stderr.contains("parent=");
+    let created_diff =
+        stderr.contains("creating diff snapshot") || stderr.contains("snapshot_type=\"Diff\"");
+    let used_parent =
+        stderr.contains("copying parent memory.bin as base") || stderr.contains("parent=");
 
     println!("\n  Snapshot analysis:");
     println!("    Used parent lineage: {}", used_parent);

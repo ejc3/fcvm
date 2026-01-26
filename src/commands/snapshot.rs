@@ -173,9 +173,18 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
 
     // Use shared core function for snapshot creation
     // If the VM was restored from a snapshot, use that as parent for diff support
-    let parent_dir = vm_state.config.snapshot_name.as_ref()
+    let parent_dir = vm_state
+        .config
+        .snapshot_name
+        .as_ref()
         .map(|name| paths::snapshot_dir().join(name));
-    super::common::create_snapshot_core(&client, snapshot_config.clone(), &vm_disk_path, parent_dir.as_deref()).await?;
+    super::common::create_snapshot_core(
+        &client,
+        snapshot_config.clone(),
+        &vm_disk_path,
+        parent_dir.as_deref(),
+    )
+    .await?;
 
     // Print user-friendly output
     let vm_name = vm_state

@@ -644,6 +644,11 @@ git push
 gh pr close <fix-pr-number>  # Close the auto-generated PR
 ```
 
+**MANDATORY before merging any PR:** Read all review comments first:
+```bash
+gh pr view <pr-number> --json comments --jq '.comments[] | .body'
+```
+
 ### PR Descriptions: Show, Don't Tell
 
 **CRITICAL: Review commits in THIS branch before writing PR description.**
