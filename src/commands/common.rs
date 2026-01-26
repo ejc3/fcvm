@@ -853,7 +853,13 @@ pub async fn create_snapshot_core(
         .await
         .context("creating temp snapshot directory")?;
 
-    let temp_memory_path = temp_snapshot_dir.join("memory.bin");
+    // For diff snapshots, write to memory.diff so we can merge onto memory.bin
+    // For full snapshots, write directly to memory.bin
+    let temp_memory_path = if has_base {
+        temp_snapshot_dir.join("memory.diff")
+    } else {
+        temp_snapshot_dir.join("memory.bin")
+    };
     let temp_vmstate_path = temp_snapshot_dir.join("vmstate.bin");
 
     // Pause VM before snapshotting (required by Firecracker)
@@ -899,28 +905,37 @@ pub async fn create_snapshot_core(
     info!(snapshot = %snapshot_config.name, "VM resumed, processing snapshot");
 
     if has_base {
-        // Diff snapshot: copy base to temp, merge diff, then atomic rename
+        // Diff snapshot: copy base to temp, merge diff onto it, then atomic rename
+        // At this point:
+        //   - temp_memory_path = memory.diff (Firecracker wrote the sparse diff here)
+        //   - base_memory_path = existing memory.bin (copied from parent or previous snapshot)
+        let diff_file_path = temp_memory_path.clone(); // memory.diff
+        let final_memory_path = temp_snapshot_dir.join("memory.bin");
+
         info!(
             snapshot = %snapshot_config.name,
             base = %base_memory_path.display(),
-            diff = %temp_memory_path.display(),
+            diff = %diff_file_path.display(),
             "merging diff snapshot onto base copy"
         );
 
-        // Copy base memory to temp dir (will merge diff into this copy)
-        let temp_base_memory = temp_snapshot_dir.join("memory.bin");
-        tokio::fs::copy(&base_memory_path, &temp_base_memory)
+        // Copy base memory to temp dir as memory.bin (will merge diff into this copy)
+        tokio::fs::copy(&base_memory_path, &final_memory_path)
             .await
             .context("copying base memory to temp for merge")?;
 
         // Run merge in blocking task since it's CPU/IO bound
-        let merged_base_path = temp_base_memory.clone();
-        let diff_path = temp_memory_path.clone();
+        // Merge from memory.diff onto memory.bin
+        let merge_target = final_memory_path.clone();
+        let merge_source = diff_file_path.clone();
         let bytes_merged =
-            tokio::task::spawn_blocking(move || merge_diff_snapshot(&merged_base_path, &diff_path))
+            tokio::task::spawn_blocking(move || merge_diff_snapshot(&merge_target, &merge_source))
                 .await
                 .context("diff merge task panicked")?
                 .context("merging diff snapshot")?;
+
+        // Clean up the diff file - we only need the merged memory.bin
+        let _ = tokio::fs::remove_file(&diff_file_path).await;
 
         info!(
             snapshot = %snapshot_config.name,
