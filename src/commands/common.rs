@@ -3,9 +3,12 @@
 //! This module contains shared functions used by both baseline VM creation (podman.rs)
 //! and clone VM creation (snapshot.rs) to ensure consistent behavior.
 
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use nix::sys::uio::{pread, pwrite};
+use nix::unistd::{lseek, Whence};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -48,6 +51,131 @@ pub const NSENTER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from
 
 /// Retry interval between holder creation attempts
 pub const HOLDER_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Merge a diff snapshot onto a base memory file.
+///
+/// Diff snapshots are sparse files where:
+/// - Holes = unchanged memory (skip)
+/// - Data blocks = dirty pages (copy to base at same offset)
+///
+/// Uses SEEK_DATA/SEEK_HOLE to efficiently find data blocks without reading the entire file.
+///
+/// # Arguments
+/// * `base_path` - Path to the full memory snapshot (will be modified in place)
+/// * `diff_path` - Path to the diff snapshot (sparse file)
+///
+/// # Returns
+/// Number of bytes copied from diff to base
+pub fn merge_diff_snapshot(base_path: &Path, diff_path: &Path) -> Result<u64> {
+    use std::fs::OpenOptions;
+
+    let diff_file = std::fs::File::open(diff_path)
+        .with_context(|| format!("opening diff snapshot: {}", diff_path.display()))?;
+    let base_file = OpenOptions::new()
+        .write(true)
+        .open(base_path)
+        .with_context(|| format!("opening base snapshot for writing: {}", base_path.display()))?;
+
+    let diff_fd = diff_file.as_raw_fd();
+    let file_size = diff_file
+        .metadata()
+        .context("getting diff file metadata")?
+        .len() as i64;
+
+    let mut offset: i64 = 0;
+    let mut total_bytes_copied: u64 = 0;
+    let mut data_regions = 0u32;
+
+    // 1MB buffer for copying data blocks
+    const BUFFER_SIZE: usize = 1024 * 1024;
+    let mut buffer = vec![0u8; BUFFER_SIZE];
+
+    loop {
+        // Find next data block (skip holes)
+        let data_start = match lseek(diff_fd, offset, Whence::SeekData) {
+            Ok(pos) => pos,
+            Err(nix::errno::Errno::ENXIO) => {
+                // ENXIO means no more data after this offset - we're done
+                break;
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "SEEK_DATA failed at offset {}: {}",
+                    offset,
+                    e
+                ));
+            }
+        };
+
+        // Find end of this data block (start of next hole)
+        let data_end = match lseek(diff_fd, data_start, Whence::SeekHole) {
+            Ok(pos) => pos,
+            Err(_) => file_size, // Data extends to EOF
+        };
+
+        let block_size = (data_end - data_start) as usize;
+        data_regions += 1;
+        debug!(
+            data_start = data_start,
+            data_end = data_end,
+            block_size = block_size,
+            "merging diff data region"
+        );
+
+        // Copy data block from diff to base at same offset
+        // Use pread/pwrite for atomic position+read/write without affecting file cursor
+        let mut file_offset = data_start;
+        let mut remaining = block_size;
+        while remaining > 0 {
+            let to_read = remaining.min(buffer.len());
+            let bytes_read = pread(&diff_file, &mut buffer[..to_read], file_offset)
+                .with_context(|| format!("reading from diff at offset {}", file_offset))?;
+
+            if bytes_read == 0 {
+                // EOF before expected - shouldn't happen with SEEK_DATA/SEEK_HOLE
+                anyhow::bail!(
+                    "unexpected EOF in diff snapshot at offset {} (expected {} more bytes)",
+                    file_offset,
+                    remaining
+                );
+            }
+
+            let mut write_offset = 0;
+            while write_offset < bytes_read {
+                let bytes_written = pwrite(
+                    &base_file,
+                    &buffer[write_offset..bytes_read],
+                    file_offset + write_offset as i64,
+                )
+                .with_context(|| {
+                    format!(
+                        "writing to base at offset {}",
+                        file_offset + write_offset as i64
+                    )
+                })?;
+                write_offset += bytes_written;
+            }
+
+            file_offset += bytes_read as i64;
+            remaining -= bytes_read;
+            total_bytes_copied += bytes_read as u64;
+        }
+
+        offset = data_end;
+    }
+
+    // Ensure all data is flushed to disk
+    base_file.sync_all().context("syncing base snapshot")?;
+
+    info!(
+        total_bytes = total_bytes_copied,
+        data_regions = data_regions,
+        diff_size = file_size,
+        "merged diff snapshot onto base"
+    );
+
+    Ok(total_bytes_copied)
+}
 
 /// Find and validate Firecracker binary
 ///
@@ -548,6 +676,11 @@ pub async fn restore_from_snapshot(
         .load_snapshot(SnapshotLoad {
             snapshot_path: restore_config.vmstate_path.display().to_string(),
             mem_backend,
+            // NOTE: enable_diff_snapshots is DEPRECATED in Firecracker v1.13.0+
+            // It was for legacy KVM dirty page tracking. Firecracker now uses mincore(2)
+            // to find dirty pages automatically. Enabling this on restored VMs causes
+            // kernel stack corruption ("stack-protector: Kernel stack is corrupted in: do_idle").
+            // Diff snapshots still work via snapshot_type: "Diff" + mincore(2).
             enable_diff_snapshots: Some(false),
             resume_vm: Some(false), // Update devices before resume
             network_overrides: Some(vec![NetworkOverride {
@@ -629,4 +762,278 @@ pub async fn restore_from_snapshot(
     save_vm_state_with_network(state_manager, vm_state, network_config).await?;
 
     Ok((vm_manager, holder_child))
+}
+
+/// Core snapshot creation logic with automatic diff snapshot support.
+///
+/// This handles the common operations for both user snapshots (`fcvm snapshot create`)
+/// and system snapshots (podman cache). The caller is responsible for:
+/// - Getting the Firecracker client
+/// - Building the SnapshotConfig with correct metadata
+/// - Lock handling (if needed)
+///
+/// **Diff Snapshot Behavior:**
+/// - If no base exists and no parent provided: Full snapshot
+/// - If no base exists but parent provided: Copy parent's memory.bin (reflink), then Diff
+/// - If base exists: Diff snapshot, merge onto existing base
+/// - Result is always a complete memory.bin
+///
+/// # Arguments
+/// * `client` - Firecracker API client for the running VM
+/// * `snapshot_config` - Pre-built config with FINAL paths (after atomic rename)
+/// * `disk_path` - Source disk to copy to snapshot
+/// * `parent_snapshot_dir` - Optional parent snapshot to copy memory.bin from (enables diff for new dirs)
+///
+/// # Returns
+/// Ok(()) on success, Err on failure. VM is resumed regardless of success/failure.
+pub async fn create_snapshot_core(
+    client: &crate::firecracker::FirecrackerClient,
+    snapshot_config: crate::storage::snapshot::SnapshotConfig,
+    disk_path: &Path,
+    parent_snapshot_dir: Option<&Path>,
+) -> Result<()> {
+    use crate::firecracker::api::{SnapshotCreate, VmState as ApiVmState};
+
+    // Derive directories from snapshot config (memory_path's parent is the snapshot dir)
+    let snapshot_dir = snapshot_config
+        .memory_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid memory_path in snapshot config"))?;
+    let temp_snapshot_dir = snapshot_dir.with_extension("creating");
+
+    // Check if base snapshot exists (for diff support)
+    let base_memory_path = snapshot_dir.join("memory.bin");
+    let mut has_base = base_memory_path.exists();
+
+    // If no base but parent provided, copy parent's memory.bin as base (reflink = instant)
+    if !has_base {
+        if let Some(parent_dir) = parent_snapshot_dir {
+            let parent_memory = parent_dir.join("memory.bin");
+            if parent_memory.exists() {
+                info!(
+                    snapshot = %snapshot_config.name,
+                    parent = %parent_dir.display(),
+                    "copying parent memory.bin as base (reflink)"
+                );
+                // Create snapshot dir if needed
+                tokio::fs::create_dir_all(snapshot_dir)
+                    .await
+                    .context("creating snapshot directory")?;
+                // Reflink copy parent's memory.bin
+                let reflink_result = tokio::process::Command::new("cp")
+                    .args([
+                        "--reflink=always",
+                        parent_memory.to_str().unwrap(),
+                        base_memory_path.to_str().unwrap(),
+                    ])
+                    .status()
+                    .await
+                    .context("copying parent memory.bin")?;
+                if !reflink_result.success() {
+                    anyhow::bail!("Failed to reflink copy parent memory.bin");
+                }
+                has_base = true;
+            }
+        }
+    }
+
+    let snapshot_type = if has_base { "Diff" } else { "Full" };
+
+    info!(
+        snapshot = %snapshot_config.name,
+        snapshot_type = snapshot_type,
+        has_base = has_base,
+        "creating {} snapshot",
+        snapshot_type.to_lowercase()
+    );
+
+    // Clean up any leftover temp directory from previous failed attempt
+    let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+    tokio::fs::create_dir_all(&temp_snapshot_dir)
+        .await
+        .context("creating temp snapshot directory")?;
+
+    // For diff snapshots, write to memory.diff so we can merge onto memory.bin
+    // For full snapshots, write directly to memory.bin
+    let temp_memory_path = if has_base {
+        temp_snapshot_dir.join("memory.diff")
+    } else {
+        temp_snapshot_dir.join("memory.bin")
+    };
+    let temp_vmstate_path = temp_snapshot_dir.join("vmstate.bin");
+
+    // Pause VM before snapshotting (required by Firecracker)
+    info!(snapshot = %snapshot_config.name, "pausing VM for snapshot");
+    client
+        .patch_vm_state(ApiVmState {
+            state: "Paused".to_string(),
+        })
+        .await
+        .context("pausing VM for snapshot")?;
+
+    // Create Firecracker snapshot (Full or Diff based on whether base exists)
+    let snapshot_result = client
+        .create_snapshot(SnapshotCreate {
+            snapshot_type: Some(snapshot_type.to_string()),
+            snapshot_path: temp_vmstate_path.display().to_string(),
+            mem_file_path: temp_memory_path.display().to_string(),
+        })
+        .await;
+
+    // Resume VM immediately (always, regardless of snapshot result)
+    // This minimizes pause time - diff merge happens after resume
+    let resume_result = client
+        .patch_vm_state(ApiVmState {
+            state: "Resumed".to_string(),
+        })
+        .await;
+
+    if let Err(e) = &resume_result {
+        warn!(snapshot = %snapshot_config.name, error = %e, "failed to resume VM after snapshot");
+    }
+
+    // Check if snapshot succeeded - clean up temp dir on failure
+    if let Err(e) = snapshot_result {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        return Err(e).context("creating Firecracker snapshot");
+    }
+    if let Err(e) = resume_result {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        return Err(e).context("resuming VM after snapshot");
+    }
+
+    info!(snapshot = %snapshot_config.name, "VM resumed, processing snapshot");
+
+    if has_base {
+        // Diff snapshot: copy base to temp, merge diff onto it, then atomic rename
+        // At this point:
+        //   - temp_memory_path = memory.diff (Firecracker wrote the sparse diff here)
+        //   - base_memory_path = existing memory.bin (copied from parent or previous snapshot)
+        let diff_file_path = temp_memory_path.clone(); // memory.diff
+        let final_memory_path = temp_snapshot_dir.join("memory.bin");
+
+        info!(
+            snapshot = %snapshot_config.name,
+            base = %base_memory_path.display(),
+            diff = %diff_file_path.display(),
+            "merging diff snapshot onto base copy"
+        );
+
+        // Copy base memory to temp dir as memory.bin (will merge diff into this copy)
+        tokio::fs::copy(&base_memory_path, &final_memory_path)
+            .await
+            .context("copying base memory to temp for merge")?;
+
+        // Run merge in blocking task since it's CPU/IO bound
+        // Merge from memory.diff onto memory.bin
+        let merge_target = final_memory_path.clone();
+        let merge_source = diff_file_path.clone();
+        let bytes_merged =
+            tokio::task::spawn_blocking(move || merge_diff_snapshot(&merge_target, &merge_source))
+                .await
+                .context("diff merge task panicked")?
+                .context("merging diff snapshot")?;
+
+        // Clean up the diff file - we only need the merged memory.bin
+        let _ = tokio::fs::remove_file(&diff_file_path).await;
+
+        info!(
+            snapshot = %snapshot_config.name,
+            bytes_merged = bytes_merged,
+            "diff merge complete, building atomic update"
+        );
+
+        // Copy disk using btrfs reflink to temp dir
+        let temp_disk_path = temp_snapshot_dir.join("disk.raw");
+        let reflink_result = tokio::process::Command::new("cp")
+            .args([
+                "--reflink=always",
+                disk_path.to_str().unwrap(),
+                temp_disk_path.to_str().unwrap(),
+            ])
+            .status()
+            .await
+            .context("copying disk with reflink")?;
+
+        if !reflink_result.success() {
+            let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+            anyhow::bail!(
+                "Reflink copy failed - btrfs filesystem required. Ensure {} is on btrfs.",
+                paths::assets_dir().display()
+            );
+        }
+
+        // Write config.json to temp directory
+        let temp_config_path = temp_snapshot_dir.join("config.json");
+        let config_json = serde_json::to_string_pretty(&snapshot_config)
+            .context("serializing snapshot config")?;
+        tokio::fs::write(&temp_config_path, &config_json)
+            .await
+            .context("writing snapshot config")?;
+
+        // Atomic replace: remove old snapshot dir, rename temp to final
+        // This ensures all files (memory, vmstate, disk, config) are updated atomically
+        tokio::fs::remove_dir_all(snapshot_dir)
+            .await
+            .context("removing old snapshot directory")?;
+        tokio::fs::rename(&temp_snapshot_dir, snapshot_dir)
+            .await
+            .context("renaming temp snapshot to final location")?;
+
+        info!(
+            snapshot = %snapshot_config.name,
+            disk = %snapshot_config.disk_path.display(),
+            "diff snapshot merged successfully"
+        );
+    } else {
+        // Full snapshot: atomic rename to final location
+        info!(snapshot = %snapshot_config.name, "copying disk");
+
+        // Copy disk using btrfs reflink (instant CoW copy)
+        let temp_disk_path = temp_snapshot_dir.join("disk.raw");
+        let reflink_result = tokio::process::Command::new("cp")
+            .args([
+                "--reflink=always",
+                disk_path.to_str().unwrap(),
+                temp_disk_path.to_str().unwrap(),
+            ])
+            .status()
+            .await
+            .context("copying disk with reflink")?;
+
+        if !reflink_result.success() {
+            let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+            anyhow::bail!(
+                "Reflink copy failed - btrfs filesystem required. Ensure {} is on btrfs.",
+                paths::assets_dir().display()
+            );
+        }
+
+        // Write config.json to temp directory
+        let config_path = temp_snapshot_dir.join("config.json");
+        let config_json = serde_json::to_string_pretty(&snapshot_config)
+            .context("serializing snapshot config")?;
+        tokio::fs::write(&config_path, &config_json)
+            .await
+            .context("writing snapshot config")?;
+
+        // Atomic rename from temp to final location
+        // If final exists (e.g., from previous snapshot with same name), remove it first
+        if snapshot_dir.exists() {
+            tokio::fs::remove_dir_all(snapshot_dir)
+                .await
+                .context("removing existing snapshot directory")?;
+        }
+        tokio::fs::rename(&temp_snapshot_dir, snapshot_dir)
+            .await
+            .context("renaming temp snapshot to final location")?;
+
+        info!(
+            snapshot = %snapshot_config.name,
+            disk = %snapshot_config.disk_path.display(),
+            "full snapshot created successfully"
+        );
+    }
+
+    Ok(())
 }

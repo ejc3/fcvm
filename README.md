@@ -90,6 +90,10 @@ echo "user_allow_other" | sudo tee -a /etc/fuse.conf
 # Ubuntu 24.04+: allow unprivileged user namespaces
 sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
+# IP forwarding for container networking (e.g., podman builds)
+sudo sysctl -w net.ipv4.conf.all.forwarding=1
+sudo sysctl -w net.ipv4.conf.default.forwarding=1
+
 # Bridged networking only (not needed for --network rootless):
 sudo mkdir -p /var/run/netns
 sudo iptables -P FORWARD ACCEPT
@@ -175,6 +179,37 @@ fcvm automatically caches container images after the first pull. On subsequent r
 3. Subsequent runs: Restore snapshot, fc-agent starts container (image already pulled)
 
 The snapshot captures VM state **after image pull but before container start**. On restore, fc-agent runs `podman run` with the already-pulled image, skipping the slow pull/export step.
+
+### Two-Tier Snapshot System
+
+fcvm uses a two-tier snapshot system for optimal startup performance:
+
+| Snapshot | When Created | Content | Size |
+|----------|--------------|---------|------|
+| **Pre-start** | After image pull, before container runs | VM with image loaded | Full (~2GB) |
+| **Startup** | After HTTP health check passes | VM with container fully initialized | Diff (~50MB) |
+
+**How diff snapshots work:**
+1. **First snapshot (pre-start)**: Creates a full memory snapshot (~2GB)
+2. **Subsequent snapshots (startup)**: Copies parent's memory.bin via reflink (CoW, instant), creates diff with only changed pages, merges diff onto base
+3. **Result**: Each snapshot ends up with a **complete memory.bin** - equivalent to a full snapshot, but created much faster
+
+**Key insight**: We use reflink copy + diff merge, not persistent diff chains. The reflink copy is instant (btrfs CoW), and the diff contains only ~2% of pages (those changed during container startup). After merging, you have a complete memory.bin that can be restored without any dependency on parent snapshots.
+
+The startup snapshot is triggered by `--health-check <url>`. When the health check passes, fcvm creates a diff snapshot of the fully-initialized application. Second run restores from the startup snapshot, skipping container initialization entirely.
+
+```bash
+# First run: Creates pre-start (full) + startup (diff, merged)
+./fcvm podman run --name web --health-check http://localhost/ nginx:alpine
+# → Pre-start snapshot: 2048MB (full)
+# → Startup snapshot: ~50MB (diff) → merged onto base
+
+# Second run: Restores from startup snapshot (~100ms faster)
+./fcvm podman run --name web2 --health-check http://localhost/ nginx:alpine
+# → Restored from startup snapshot (application already running)
+```
+
+**Parent lineage**: User snapshots from clones automatically use their source snapshot as a parent, enabling diff-based optimization across the entire snapshot chain.
 
 ### More Options
 

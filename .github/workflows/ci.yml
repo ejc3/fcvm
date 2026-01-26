@@ -231,6 +231,10 @@ jobs:
           sudo sysctl -w vm.unprivileged_userfaultfd=1
           # Disable AppArmor restriction on unprivileged user namespaces (needed for rootless networking on newer Ubuntu)
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+          # Enable IP forwarding for all interfaces (including future ones like podman0)
+          # This fixes podman container networking - without this, containers can't reach the internet
+          sudo sysctl -w net.ipv4.conf.all.forwarding=1
+          sudo sysctl -w net.ipv4.conf.default.forwarding=1
           # Enable FUSE allow_other for tests
           echo "user_allow_other" | sudo tee /etc/fuse.conf
           # Reset podman state if corrupted from previous runs
@@ -366,6 +370,10 @@ jobs:
           sudo sysctl -w vm.unprivileged_userfaultfd=1
           # Disable AppArmor restriction on unprivileged user namespaces (needed for rootless networking on newer Ubuntu)
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+          # Enable IP forwarding for all interfaces (including future ones like podman0)
+          # This fixes podman container networking - without this, containers can't reach the internet
+          sudo sysctl -w net.ipv4.conf.all.forwarding=1
+          sudo sysctl -w net.ipv4.conf.default.forwarding=1
           echo "user_allow_other" | sudo tee /etc/fuse.conf
           podman system migrate || true
           # Install iperf3 for network benchmarks
@@ -459,6 +467,10 @@ jobs:
           sudo sysctl -w vm.unprivileged_userfaultfd=1
           # Disable AppArmor restriction on unprivileged user namespaces (needed for rootless networking on newer Ubuntu)
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+          # Enable IP forwarding for all interfaces (including future ones like podman0)
+          # This fixes podman container networking - without this, containers can't reach the internet
+          sudo sysctl -w net.ipv4.conf.all.forwarding=1
+          sudo sysctl -w net.ipv4.conf.default.forwarding=1
           # Configure rootless podman to use cgroupfs (no systemd session on CI)
           mkdir -p ~/.config/containers
           printf '[engine]\ncgroup_manager = "cgroupfs"\nevents_logger = "file"\n' > ~/.config/containers/containers.conf

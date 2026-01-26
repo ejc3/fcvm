@@ -623,6 +623,32 @@ git push origin feature-b --force
 
 **One PR per concern:** Unrelated changes get separate PRs.
 
+### Claude Review Workflow
+
+PRs trigger an automated Claude review via GitHub Actions. After pushing:
+
+```bash
+# Wait for review check to complete
+gh pr checks <pr-number>
+# Look for: review  pass  4m13s  ...
+
+# Read review comments
+gh pr view <pr-number> --json comments --jq '.comments[] | .body'
+```
+
+If review finds critical issues, it may auto-create a fix PR. Cherry-pick the fix:
+```bash
+git fetch origin
+git cherry-pick <fix-commit>
+git push
+gh pr close <fix-pr-number>  # Close the auto-generated PR
+```
+
+**MANDATORY before merging any PR:** Read all review comments first:
+```bash
+gh pr view <pr-number> --json comments --jq '.comments[] | .body'
+```
+
 ### PR Descriptions: Show, Don't Tell
 
 **CRITICAL: Review commits in THIS branch before writing PR description.**
