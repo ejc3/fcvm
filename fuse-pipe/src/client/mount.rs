@@ -32,6 +32,11 @@ fn join_with_timeout<T>(thread: JoinHandle<T>, timeout: Duration) -> bool {
     true
 }
 
+/// Maximum retries for Session::new when kernel resources not yet released.
+const SESSION_NEW_MAX_RETRIES: u32 = 5;
+/// Delay between Session::new retries.
+const SESSION_NEW_RETRY_DELAY: Duration = Duration::from_millis(50);
+
 /// Configuration for FUSE mount.
 #[derive(Clone, Default)]
 pub struct MountConfig {
@@ -286,8 +291,30 @@ fn mount_internal<P: AsRef<Path>>(
     // For single reader, just run directly
     if num_readers == 1 {
         let destroyed = Arc::new(AtomicBool::new(false));
-        let fs = FuseClient::with_destroyed_flag(Arc::clone(&mux), 0, Arc::clone(&destroyed));
-        let mut session = fuser::Session::new(fs, mount_point.as_ref(), &options)?;
+
+        // Retry Session::new if kernel hasn't released resources from previous mount
+        let mut session = None;
+        let mut last_error = None;
+        for attempt in 0..=SESSION_NEW_MAX_RETRIES {
+            let fs = FuseClient::with_destroyed_flag(Arc::clone(&mux), 0, Arc::clone(&destroyed));
+            match fuser::Session::new(fs, mount_point.as_ref(), &options) {
+                Ok(s) => {
+                    if attempt > 0 {
+                        info!(target: "fuse-pipe::client", attempt, "Session::new succeeded after retry");
+                    }
+                    session = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt < SESSION_NEW_MAX_RETRIES {
+                        debug!(target: "fuse-pipe::client", attempt, max_retries = SESSION_NEW_MAX_RETRIES, error = %last_error.as_ref().unwrap(), "Session::new failed, retrying");
+                        thread::sleep(SESSION_NEW_RETRY_DELAY);
+                    }
+                }
+            }
+        }
+        let mut session = session.ok_or_else(|| last_error.unwrap())?;
         info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), "mounted");
 
         // Send unmounter before blocking on run()
@@ -377,13 +404,34 @@ fn mount_internal<P: AsRef<Path>>(
         };
 
     // Create primary FuseClient with callback and shared destroyed flag
-    let fs = FuseClient::with_init_callback(
-        Arc::clone(&mux),
-        0,
-        make_init_callback(Arc::clone(&destroyed), Arc::clone(&reader_threads)),
-        Arc::clone(&destroyed),
-    );
-    let mut session = fuser::Session::new(fs, mount_point.as_ref(), &options)?;
+    // Retry Session::new if kernel hasn't released resources from previous mount
+    let mut session = None;
+    let mut last_error = None;
+    for attempt in 0..=SESSION_NEW_MAX_RETRIES {
+        let fs = FuseClient::with_init_callback(
+            Arc::clone(&mux),
+            0,
+            make_init_callback(Arc::clone(&destroyed), Arc::clone(&reader_threads)),
+            Arc::clone(&destroyed),
+        );
+        match fuser::Session::new(fs, mount_point.as_ref(), &options) {
+            Ok(s) => {
+                if attempt > 0 {
+                    info!(target: "fuse-pipe::client", attempt, "Session::new succeeded after retry");
+                }
+                session = Some(s);
+                break;
+            }
+            Err(e) => {
+                last_error = Some(e);
+                if attempt < SESSION_NEW_MAX_RETRIES {
+                    debug!(target: "fuse-pipe::client", attempt, max_retries = SESSION_NEW_MAX_RETRIES, error = %last_error.as_ref().unwrap(), "Session::new failed, retrying");
+                    thread::sleep(SESSION_NEW_RETRY_DELAY);
+                }
+            }
+        }
+    }
+    let mut session = session.ok_or_else(|| last_error.unwrap())?;
     info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), "mounted");
 
     // Clone fds AFTER session created but BEFORE run()
