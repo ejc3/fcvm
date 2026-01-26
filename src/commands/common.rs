@@ -676,7 +676,12 @@ pub async fn restore_from_snapshot(
         .load_snapshot(SnapshotLoad {
             snapshot_path: restore_config.vmstate_path.display().to_string(),
             mem_backend,
-            enable_diff_snapshots: Some(true),
+            // NOTE: enable_diff_snapshots is DEPRECATED in Firecracker v1.13.0+
+            // It was for legacy KVM dirty page tracking. Firecracker now uses mincore(2)
+            // to find dirty pages automatically. Enabling this on restored VMs causes
+            // kernel stack corruption ("stack-protector: Kernel stack is corrupted in: do_idle").
+            // Diff snapshots still work via snapshot_type: "Diff" + mincore(2).
+            enable_diff_snapshots: Some(false),
             resume_vm: Some(false), // Update devices before resume
             network_overrides: Some(vec![NetworkOverride {
                 iface_id: "eth0".to_string(),

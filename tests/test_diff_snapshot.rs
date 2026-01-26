@@ -25,7 +25,7 @@ const HEALTH_CHECK_URL: &str = "http://localhost/";
 fn snapshot_dir() -> std::path::PathBuf {
     let data_dir = std::env::var("FCVM_DATA_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/mnt/fcvm-btrfs/root"));
+        .unwrap_or_else(|_| std::path::PathBuf::from("/mnt/fcvm-btrfs"));
     data_dir.join("snapshots")
 }
 
