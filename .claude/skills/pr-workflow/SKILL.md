@@ -47,28 +47,48 @@ make test-root FILTER=sanity
    # All checks must show "pass" before proceeding
    ```
 
-## Before Merging ANY Pull Request
+## MANDATORY: Read PR Comments Before ANY PR Operation
 
-### CRITICAL: Read ALL Review Comments First
+**YOU MUST READ ALL PR COMMENTS** before:
+- Checking PR status
+- Pushing new commits
+- Merging
+- Closing
+- ANY interaction with the PR
+
+This is NOT optional. Comments contain critical information.
+
+### Step 1: ALWAYS Read Comments First
 
 ```bash
-# Get all review comments
-gh pr view <pr-number> --json comments --jq '.comments[] | .body'
-
-# Get review status
-gh pr view <pr-number> --json reviews --jq '.reviews[] | {author: .author.login, state: .state, body: .body}'
-
-# Check for auto-generated fix PRs
-gh pr list --search "base:<your-branch>"
+# MANDATORY - Run this FIRST before any other PR operation
+gh pr view <pr-number> --json comments --jq '.comments[] | "---\n" + .body'
 ```
 
-Review comments may contain:
-- Required changes from reviewers
-- Auto-fix PRs from CI (cherry-pick or close if outdated)
-- Suggestions for improvement
-- Security concerns
+### Step 2: Check for Auto-Fix PRs
 
-### Verify CI is Green
+CI may have created fix PRs targeting your branch. You MUST handle these:
+
+```bash
+# Check for fix PRs
+gh pr list --search "base:<your-branch>"
+
+# If fix PRs exist:
+# 1. Review the fix
+# 2. Cherry-pick: git cherry-pick <commit>
+# 3. Push to your branch
+# 4. Close the fix PR: gh pr close <fix-pr> --comment "Cherry-picked into PR #<your-pr>"
+```
+
+### Step 3: Address Review Findings
+
+Comments may contain:
+- **Code review findings** - Fix these before merging
+- **Auto-fix PRs** - Cherry-pick or close if outdated
+- **CI failure analysis** - Re-run if infra issue, fix if code issue
+- **Security concerns** - Must address before merge
+
+### Step 4: Verify CI is Green
 
 ```bash
 gh pr checks <pr-number>
