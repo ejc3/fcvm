@@ -1058,13 +1058,14 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         // Use OCI archive format (single tar file) for faster FUSE transfer
         let archive_path = cache_dir.with_extension("oci.tar");
         if !archive_path.exists() {
-            info!(image = %args.image, digest = %digest, "Exporting localhost image as OCI archive");
+            // Use docker-archive format to preserve HEALTHCHECK (OCI format doesn't support it)
+            info!(image = %args.image, digest = %digest, "Exporting localhost image as Docker archive");
 
             let output = tokio::process::Command::new("podman")
                 .args([
                     "save",
                     "--format",
-                    "oci-archive",
+                    "docker-archive",
                     "-o",
                     archive_path.to_str().unwrap(),
                     &args.image,
@@ -1085,9 +1086,9 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 );
             }
 
-            info!(path = %archive_path.display(), "Image exported as OCI archive");
+            info!(path = %archive_path.display(), "Image exported as Docker archive");
         } else {
-            info!(image = %args.image, digest = %digest, "Using cached OCI archive");
+            info!(image = %args.image, digest = %digest, "Using cached Docker archive");
         }
 
         // Lock released when lock_file is dropped

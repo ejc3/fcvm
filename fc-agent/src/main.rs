@@ -2012,12 +2012,13 @@ async fn run_agent() -> Result<()> {
     }
 
     // Determine the image reference for podman run
-    // If image_archive is set, we run directly from the OCI archive (no import needed)
+    // If image_archive is set, we run directly from the Docker archive (no import needed)
+    // Docker archive format is used to preserve HEALTHCHECK (OCI format doesn't support it)
     // Otherwise, pull from registry
     let image_ref = if let Some(archive_path) = &plan.image_archive {
-        eprintln!("[fc-agent] using OCI archive: {}", archive_path);
+        eprintln!("[fc-agent] using Docker archive: {}", archive_path);
 
-        format!("oci-archive:{}", archive_path)
+        format!("docker-archive:{}", archive_path)
     } else {
         // Pull image with retries to handle transient DNS/network errors
         const MAX_RETRIES: u32 = 3;
@@ -2123,8 +2124,8 @@ async fn run_agent() -> Result<()> {
 
     // Notify host that image is ready for caching
     // For registry images, get the digest from podman
-    // For OCI archives, use the image name as identifier
-    if !image_ref.starts_with("oci-archive:") {
+    // For Docker archives, use the image name as identifier
+    if !image_ref.starts_with("docker-archive:") {
         // Registry image - get digest from podman
         match get_image_digest(&plan.image).await {
             Ok(digest) => {
@@ -2243,7 +2244,7 @@ async fn run_agent() -> Result<()> {
         podman_args.push(mount_spec);
     }
 
-    // Image (either oci-archive:/path or image name from registry)
+    // Image (either docker-archive:/path or image name from registry)
     podman_args.push(image_ref.clone());
 
     // Command override

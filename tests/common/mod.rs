@@ -6,8 +6,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-/// Default test image - use AWS ECR to avoid Docker Hub rate limits
-pub const TEST_IMAGE: &str = "public.ecr.aws/nginx/nginx:alpine";
+/// Default test image - local image with proper HEALTHCHECK
+/// Built from Containerfile.test (nginx:alpine + curl + healthcheck)
+pub const TEST_IMAGE: &str = "localhost/fcvm-test:latest";
 
 /// Standard log directory for test logs
 const TEST_LOG_DIR: &str = "/tmp/fcvm-test-logs";

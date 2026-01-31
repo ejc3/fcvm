@@ -226,10 +226,11 @@ async fn update_health_status_once(
                     }
                 }
             } else if ready_file.exists() {
-                // Legacy: container started but no health updates yet
-                debug!(target: "health-monitor", "container-ready file exists, healthy");
-                *last_failure_log = None;
-                HealthStatus::Healthy
+                // Container started but health status not yet reported.
+                // Wait for fc-agent to report actual podman health status.
+                // Don't assume healthy - the container might have a failing healthcheck.
+                debug!(target: "health-monitor", "container-ready, waiting for health status");
+                HealthStatus::Unknown
             } else {
                 debug!(target: "health-monitor", "waiting for container health status");
                 HealthStatus::Unknown

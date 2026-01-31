@@ -274,6 +274,131 @@ async fn test_trailing_args_command() -> Result<()> {
     Ok(())
 }
 
+/// Test that container with failing healthcheck is detected as unhealthy
+///
+/// This verifies that our health monitoring correctly reports unhealthy status
+/// when the container's HEALTHCHECK command returns non-zero.
+#[tokio::test]
+async fn test_unhealthy_container_detected() -> Result<()> {
+    use std::time::Duration;
+
+    println!("\nUnhealthy container detection test");
+    println!("===================================");
+    println!("Verifies containers with failing HEALTHCHECK are detected as unhealthy");
+
+    // Build the unhealthy test image (must use --format=docker for HEALTHCHECK to work)
+    println!("Building unhealthy test image...");
+    let build_status = tokio::process::Command::new("sudo")
+        .args([
+            "podman",
+            "build",
+            "--format=docker",
+            "-t",
+            "localhost/fcvm-unhealthy:latest",
+            "-f",
+            "Containerfile.unhealthy",
+            ".",
+        ])
+        .status()
+        .await
+        .context("running podman build")?;
+    assert!(build_status.success(), "Failed to build unhealthy test image");
+
+    let (vm_name, _, _, _) = common::unique_names("unhealthy");
+
+    println!("Starting VM with unhealthy container...");
+    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "localhost/fcvm-unhealthy:latest",
+    ])
+    .await
+    .context("spawning fcvm")?;
+
+    println!("  fcvm PID: {}", fcvm_pid);
+    println!("  Waiting up to 30s for health status to be reported...");
+
+    // Wait for container to start and health checks to run
+    // The container should become unhealthy, never healthy
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(30);
+    let mut saw_unhealthy = false;
+
+    loop {
+        if start.elapsed() > timeout {
+            break;
+        }
+
+        // Check if process exited unexpectedly
+        if let Some(status) = child.try_wait()? {
+            println!("  VM exited with status: {}", status);
+            break;
+        }
+
+        // Query health status
+        let fcvm_path = common::find_fcvm_binary()?;
+        let output = tokio::process::Command::new(&fcvm_path)
+            .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
+            .output()
+            .await?;
+
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+
+            #[derive(serde::Deserialize)]
+            struct VmDisplay {
+                #[serde(flatten)]
+                vm: fcvm::state::VmState,
+                #[allow(dead_code)]
+                stale: bool,
+            }
+
+            if let Ok(vms) = serde_json::from_str::<Vec<VmDisplay>>(&stdout) {
+                for d in &vms {
+                    match d.vm.health_status {
+                        fcvm::state::HealthStatus::Unhealthy => {
+                            println!("  ✓ Container correctly detected as UNHEALTHY");
+                            saw_unhealthy = true;
+                        }
+                        fcvm::state::HealthStatus::Healthy => {
+                            // This should NEVER happen with a failing healthcheck
+                            common::kill_process(fcvm_pid).await;
+                            anyhow::bail!(
+                                "Container with failing healthcheck was detected as HEALTHY - this is a bug!"
+                            );
+                        }
+                        _ => {
+                            // Starting, Unknown - keep waiting
+                        }
+                    }
+                }
+            }
+        }
+
+        if saw_unhealthy {
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Cleanup
+    println!("  Stopping fcvm process...");
+    common::kill_process(fcvm_pid).await;
+
+    assert!(
+        saw_unhealthy,
+        "Container should have been detected as unhealthy within {}s",
+        timeout.as_secs()
+    );
+
+    println!("✅ UNHEALTHY DETECTION PASSED!");
+    println!("  Health monitoring correctly identifies failing healthchecks");
+    Ok(())
+}
+
 /// Test that VM shuts down when container fails to start (e.g., invalid image)
 ///
 /// This is critical: if the container can't start (image pull fails, etc.),

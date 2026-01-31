@@ -232,11 +232,19 @@ _test-root:
 	  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
 	  exit 1; }
 
+# Build test container images (must use --format=docker for HEALTHCHECK to work)
+.PHONY: build-test-images
+build-test-images:
+	@echo "==> Building test container images..."
+	@sudo podman build --format=docker -t localhost/fcvm-test:latest -f Containerfile.test . >/dev/null
+	@sudo podman build --format=docker -t localhost/fcvm-unhealthy:latest -f Containerfile.unhealthy . >/dev/null
+	@echo "    ✓ Test images built"
+
 # Host targets (with setup, check-disk first to fail fast if disk is full)
 test-unit: show-notes check-disk build _test-unit
 test-fast: show-notes check-disk setup-fcvm _test-fast
 test-all: show-notes check-disk setup-fcvm _test-all
-test-root: show-notes check-disk setup-fcvm setup-pjdfstest _test-root
+test-root: show-notes check-disk setup-fcvm setup-pjdfstest build-test-images _test-root
 test: test-root
 
 # Container targets (setup on host where needed, run-only in container)
