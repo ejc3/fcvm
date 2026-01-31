@@ -683,11 +683,6 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     let network_config = network.setup().await.context("setting up network")?;
 
-    // Use network-provided health check URL if user didn't specify one
-    // Each network type (bridged/rootless) generates its own appropriate URL
-    if vm_state.config.health_check_url.is_none() {
-        vm_state.config.health_check_url = network_config.health_check_url.clone();
-    }
     if let Some(port) = network_config.health_check_port {
         vm_state.config.network.health_check_port = Some(port);
     }
@@ -862,12 +857,13 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     let health_cancel_token = tokio_util::sync::CancellationToken::new();
 
     // Create startup snapshot channel if:
+    // Create startup snapshot when health becomes healthy
     // - startup_snapshot_base_key is set (passed from podman run on cache hit)
-    // - health_check_for_startup is set (HTTP health check URL)
+    // Health is determined by fc-agent reporting podman's container health status
     let (startup_tx, mut startup_rx): (
         Option<tokio::sync::oneshot::Sender<()>>,
         Option<tokio::sync::oneshot::Receiver<()>>,
-    ) = if args.startup_snapshot_base_key.is_some() && args.health_check_for_startup.is_some() {
+    ) = if args.startup_snapshot_base_key.is_some() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (Some(tx), Some(rx))
     } else {

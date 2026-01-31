@@ -1,9 +1,10 @@
-//! Startup snapshot tests - verifies snapshot creation after HTTP health check passes
+//! Startup snapshot tests - verifies snapshot creation after container health check passes
 //!
 //! Tests the two-tier snapshot system:
 //! 1. Pre-start snapshot: Created after image load, before container starts
-//! 2. Startup snapshot: Created after HTTP health check passes (requires --health-check-url)
+//! 2. Startup snapshot: Created after podman HEALTHCHECK passes
 //!
+//! Health is determined by podman's built-in HEALTHCHECK mechanism.
 //! Selection priority: startup snapshot > pre-start snapshot > fresh boot
 
 #![cfg(feature = "integration-fast")]
@@ -13,31 +14,29 @@ mod common;
 use anyhow::{Context, Result};
 use std::time::Duration;
 
-/// Image for startup snapshot tests - nginx provides /health endpoint
+/// Image for startup snapshot tests - must have HEALTHCHECK defined
 const TEST_IMAGE: &str = common::TEST_IMAGE;
 
-/// Health check URL for nginx
-const HEALTH_CHECK_URL: &str = "http://localhost/";
-
-/// Test that fresh boot creates startup snapshot when health check URL is provided
+/// Test that fresh boot creates startup snapshot when container becomes healthy
 ///
 /// This test:
-/// 1. Starts a VM with --health-check-url
-/// 2. Waits for it to become healthy
+/// 1. Starts a VM with an image that has HEALTHCHECK
+/// 2. Waits for it to become healthy (podman health check passes)
 /// 3. Verifies startup snapshot is created after health check passes
 #[tokio::test]
 async fn test_startup_snapshot_created_on_fresh_boot() -> Result<()> {
     println!("\nStartup snapshot creation test");
     println!("===============================");
-    println!("Verifies startup snapshot is created after health check passes");
+    println!("Verifies startup snapshot is created after podman health check passes");
 
     let (vm_name, _, _, _) = common::unique_names("startup-fresh");
 
     // Use unique env var to get unique snapshot key (prevents parallel test interference)
     let test_id = format!("TEST_ID=fresh-{}", std::process::id());
 
-    // Start VM with health check URL (rootless mode for unprivileged testing)
-    println!("Starting VM with --health-check-url...");
+    // Start VM (rootless mode for unprivileged testing)
+    // Health is determined by podman's built-in HEALTHCHECK
+    println!("Starting VM...");
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
         "podman",
         "run",
@@ -45,8 +44,6 @@ async fn test_startup_snapshot_created_on_fresh_boot() -> Result<()> {
         &vm_name,
         "--env",
         &test_id,
-        "--health-check",
-        HEALTH_CHECK_URL,
         TEST_IMAGE,
     ])
     .await
@@ -117,8 +114,6 @@ async fn test_startup_snapshot_priority() -> Result<()> {
         &vm_name1,
         "--env",
         &test_id,
-        "--health-check",
-        HEALTH_CHECK_URL,
         TEST_IMAGE,
     ])
     .await
@@ -154,8 +149,6 @@ async fn test_startup_snapshot_priority() -> Result<()> {
         &vm_name2,
         "--env",
         &test_id,
-        "--health-check",
-        HEALTH_CHECK_URL,
         TEST_IMAGE,
     ])
     .await
@@ -196,70 +189,6 @@ async fn test_startup_snapshot_priority() -> Result<()> {
     }
 }
 
-/// Test that no startup snapshot is created without --health-check-url
-///
-/// Startup snapshot requires HTTP health check because:
-/// - Container-ready file alone doesn't indicate application readiness
-/// - HTTP health check confirms the application is fully initialized
-#[tokio::test]
-async fn test_no_startup_snapshot_without_health_check_url() -> Result<()> {
-    println!("\nNo startup snapshot without health check URL test");
-    println!("=================================================");
-    println!("Verifies startup snapshot requires --health-check-url");
-
-    let (vm_name, _, _, _) = common::unique_names("startup-no-url");
-
-    // Use unique env var to get unique snapshot key (prevents parallel test interference)
-    let test_id = format!("TEST_ID=no-url-{}", std::process::id());
-
-    // Start VM WITHOUT --health-check-url (uses container-ready file only)
-    println!("Starting VM without --health-check-url...");
-    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
-        "podman", "run", "--name", &vm_name, "--env",
-        &test_id, // Note: no --health-check flag
-        TEST_IMAGE,
-    ])
-    .await
-    .context("spawning fcvm")?;
-
-    println!("  fcvm PID: {}", fcvm_pid);
-    println!("  Waiting for VM to become healthy (via container-ready file)...");
-
-    // Wait for healthy status
-    let health_result = tokio::time::timeout(
-        Duration::from_secs(300),
-        common::poll_health_by_pid(fcvm_pid, 300),
-    )
-    .await;
-
-    // Wait a bit to ensure startup snapshot would have been created if it were going to be
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // Cleanup
-    println!("  Stopping VM...");
-    common::kill_process(fcvm_pid).await;
-    let _ = child.wait().await;
-
-    match health_result {
-        Ok(Ok(_)) => {
-            println!("  VM became healthy via container-ready file");
-            // Note: We can't easily check that startup snapshot was NOT created
-            // because we don't know the exact snapshot key. The test validates
-            // that the health check path works without the HTTP URL.
-            println!("✅ NO STARTUP SNAPSHOT WITHOUT URL TEST PASSED!");
-            println!("  Container-ready health check worked (startup snapshot not triggered)");
-            Ok(())
-        }
-        Ok(Err(e)) => {
-            println!("❌ Health check failed: {}", e);
-            Err(e)
-        }
-        Err(_) => {
-            anyhow::bail!("Timeout waiting for VM to become healthy")
-        }
-    }
-}
-
 /// Test startup snapshot creation for restored VMs (from pre-start snapshot)
 ///
 /// When a VM is restored from pre-start snapshot, it should still create
@@ -284,8 +213,6 @@ async fn test_startup_snapshot_on_restored_vm() -> Result<()> {
         &vm_name1,
         "--env",
         &test_id,
-        "--health-check",
-        HEALTH_CHECK_URL,
         TEST_IMAGE,
     ])
     .await
@@ -324,8 +251,6 @@ async fn test_startup_snapshot_on_restored_vm() -> Result<()> {
         &vm_name2,
         "--env",
         &test_id,
-        "--health-check",
-        HEALTH_CHECK_URL,
         TEST_IMAGE,
     ])
     .await
@@ -375,8 +300,8 @@ async fn test_startup_snapshot_bridged() -> Result<()> {
     // Use unique env var to get unique snapshot key (prevents parallel test interference)
     let test_id = format!("TEST_ID=bridged-{}", std::process::id());
 
-    // Start VM with bridged networking and health check URL
-    println!("Starting VM with --network bridged and --health-check-url...");
+    // Start VM with bridged networking
+    println!("Starting VM with --network bridged...");
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
         "podman",
         "run",
@@ -386,8 +311,6 @@ async fn test_startup_snapshot_bridged() -> Result<()> {
         &test_id,
         "--network",
         "bridged",
-        "--health-check",
-        HEALTH_CHECK_URL,
         TEST_IMAGE,
     ])
     .await

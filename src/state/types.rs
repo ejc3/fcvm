@@ -101,8 +101,6 @@ pub struct VmConfig {
     /// NFS shares to mount in guest
     #[serde(default)]
     pub nfs_shares: Vec<NfsShare>,
-    /// HTTP health check URL. None means check container running status via fc-agent.
-    pub health_check_url: Option<String>,
     /// Which snapshot this process is serving or was cloned from
     pub snapshot_name: Option<String>,
     /// Process type: vm (podman run), serve (snapshot serve), clone (snapshot run)
@@ -139,7 +137,6 @@ impl VmState {
                 volumes: Vec::new(),
                 extra_disks: Vec::new(),
                 nfs_shares: Vec::new(),
-                health_check_url: None,
                 snapshot_name: None,
                 process_type: Some(ProcessType::Vm),
                 serve_pid: None,
@@ -228,7 +225,6 @@ mod tests {
                     "host_veth": null
                 },
                 "volumes": [],
-                "health_check_url": null,
                 "snapshot_name": null,
                 "process_type": "serve",
                 "serve_pid": null

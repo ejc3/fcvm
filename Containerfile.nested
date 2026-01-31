@@ -48,6 +48,10 @@ COPY rootfs-config.toml /etc/fcvm/rootfs-config.toml
 COPY nested.sh /usr/local/bin/nested
 RUN chmod +x /usr/local/bin/nested
 
+# Health check - verify nginx is responding
+HEALTHCHECK --interval=2s --timeout=1s --start-period=5s --retries=3 \
+    CMD curl -sf http://localhost/ || exit 1
+
 # Default command - create runtime dirs, start nginx (for health checks), and sleep
 # /run/netns is needed for ip netns (bridged networking)
 # /run/containers/storage is needed for podman

@@ -1135,6 +1135,67 @@ fn notify_container_exit(exit_code: i32) {
     }
 }
 
+/// Notify host of container health status via vsock.
+///
+/// Sends "health:{status}\n" message to the host on the status vsock port.
+/// Status values: "healthy", "unhealthy", "starting", "none" (no healthcheck defined)
+fn notify_container_health(status: &str) {
+    let msg = format!("health:{}\n", status);
+    if send_status_to_host(msg.as_bytes()) {
+        eprintln!("[fc-agent] health status: {}", status);
+    }
+}
+
+/// Get container health status using podman inspect.
+///
+/// Returns the health status string from podman, or "none" if no healthcheck is defined.
+async fn get_container_health(container_id: &str) -> String {
+    let output = Command::new("podman")
+        .args([
+            "inspect",
+            "--format",
+            "{{.State.Health.Status}}",
+            container_id,
+        ])
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let status = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if status.is_empty() {
+                "none".to_string() // No healthcheck defined
+            } else {
+                status
+            }
+        }
+        _ => "unknown".to_string(),
+    }
+}
+
+/// Monitor container health in a background task.
+///
+/// Polls podman every 2 seconds and reports health changes to the host.
+async fn monitor_container_health(container_id: String, mut stop_rx: tokio::sync::oneshot::Receiver<()>) {
+    let mut last_status = String::new();
+
+    loop {
+        tokio::select! {
+            _ = &mut stop_rx => {
+                eprintln!("[fc-agent] health monitor stopping");
+                break;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                let status = get_container_health(&container_id).await;
+                if status != last_status {
+                    notify_container_health(&status);
+                    last_status = status;
+                }
+            }
+        }
+    }
+}
+
 /// Get the digest of a pulled image using podman inspect.
 /// Returns the digest string (e.g., "sha256:abc123...")
 async fn get_image_digest(image: &str) -> Result<String> {
@@ -2046,10 +2107,15 @@ async fn run_agent() -> Result<()> {
     // the broken D-Bus/systemd communication. This gives us:
     // - Full cgroup v2 functionality (resource limits, isolation)
     // - No dependency on systemd's event loop
+    // Container name for health monitoring
+    let container_name = "fcvm-container".to_string();
+
     let mut podman_args = vec![
         "podman".to_string(),
         "run".to_string(),
         "--rm".to_string(),
+        "--name".to_string(),
+        container_name.clone(),
         "--network=host".to_string(),
         "--cgroups=split".to_string(),
         "--ulimit".to_string(),
@@ -2126,8 +2192,39 @@ async fn run_agent() -> Result<()> {
         // Notify host that container is starting
         notify_container_started();
 
+        // Spawn health monitor thread (TTY mode uses blocking PTY, so use std::thread)
+        let health_container = container_name.clone();
+        let (health_stop_tx, health_stop_rx) = std::sync::mpsc::channel::<()>();
+        let health_thread = std::thread::spawn(move || {
+            loop {
+                // Check for stop signal (non-blocking)
+                if health_stop_rx.try_recv().is_ok() {
+                    break;
+                }
+
+                // Query podman for health status
+                let output = std::process::Command::new("podman")
+                    .args(["inspect", "--format", "{{.State.Health.Status}}", &health_container])
+                    .output();
+
+                if let Ok(out) = output {
+                    if out.status.success() {
+                        let status = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        let status = if status.is_empty() { "none" } else { &status };
+                        notify_container_health(status);
+                    }
+                }
+
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        });
+
         // Run container with TTY (blocks until container exits)
         let exit_code = tty::run_with_pty(&podman_args, plan.tty, plan.interactive);
+
+        // Stop health monitor
+        let _ = health_stop_tx.send(());
+        let _ = health_thread.join();
 
         // Notify host of container exit
         notify_container_exit(exit_code);
@@ -2169,6 +2266,13 @@ async fn run_agent() -> Result<()> {
     // Notify host that container has started via vsock
     // The host listens on vsock.sock_4999 for status messages
     notify_container_started();
+
+    // Spawn health monitor task to report podman's container health
+    let (health_stop_tx, health_stop_rx) = tokio::sync::oneshot::channel();
+    let health_container_name = container_name.clone();
+    let health_task = tokio::spawn(async move {
+        monitor_container_health(health_container_name, health_stop_rx).await;
+    });
 
     // Create vsock connection for container output streaming
     // Port 4997 is dedicated for stdout/stderr
@@ -2257,6 +2361,10 @@ async fn run_agent() -> Result<()> {
     // Wait for container to exit
     let status = child.wait().await?;
     let exit_code = status.code().unwrap_or(1);
+
+    // Stop health monitor (container exited)
+    let _ = health_stop_tx.send(());
+    let _ = health_task.await;
 
     // Abort stdin task (container exited, no more input needed)
     if let Some(task) = stdin_task {

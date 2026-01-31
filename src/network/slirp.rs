@@ -382,12 +382,6 @@ impl NetworkManager for SlirpNetwork {
 
         let guest_mac = generate_mac();
 
-        // Generate health check URL from loopback IP if available
-        let health_check_url = self
-            .loopback_ip
-            .as_ref()
-            .map(|ip| format!("http://{}:8080/", ip));
-
         Ok(NetworkConfig {
             tap_device: self.tap_device.clone(),
             guest_mac,
@@ -396,7 +390,6 @@ impl NetworkManager for SlirpNetwork {
             host_veth: None,
             loopback_ip: self.loopback_ip.clone(), // For port forwarding (no ip addr add needed!)
             health_check_port: Some(8080),         // Unprivileged port, forwards to guest:80
-            health_check_url,
             dns_server: Some("10.0.2.3".to_string()), // slirp4netns built-in DNS forwarder
         })
     }

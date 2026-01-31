@@ -576,6 +576,7 @@ async fn run_status_listener(
 
     let ready_file = runtime_dir.join("container-ready");
     let exit_file = runtime_dir.join("container-exit");
+    let health_file = runtime_dir.join("container-health");
 
     // Accept connections in a loop (we get "cache-ready" then "ready" then "exit")
     loop {
@@ -615,6 +616,11 @@ async fn run_status_listener(
         } else if let Some(debug_msg) = msg.strip_prefix("debug:") {
             // Debug message from fc-agent (useful when serial console is broken after restore)
             info!(vm_id = %vm_id, debug = %debug_msg, "fc-agent debug message");
+        } else if let Some(health_status) = msg.strip_prefix("health:") {
+            // Health status from fc-agent (podman container health)
+            std::fs::write(&health_file, format!("{}\n", health_status))
+                .with_context(|| format!("writing health file: {:?}", health_file))?;
+            debug!(vm_id = %vm_id, health = %health_status, "Container health update received");
         } else if let Some(code_str) = msg.strip_prefix("exit:") {
             // Write exit code to file
             std::fs::write(&exit_file, format!("{}\n", code_str))
@@ -942,7 +948,6 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 tty: args.tty,
                 interactive: args.interactive,
                 startup_snapshot_base_key: None, // Already using startup snapshot
-                health_check_for_startup: None,
             };
             return super::snapshot::cmd_snapshot_run(snapshot_args).await;
         }
@@ -955,7 +960,6 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 "Pre-start snapshot hit! Restoring from cached snapshot"
             );
             // Call snapshot run with startup snapshot creation enabled
-            // (if health_check_url is set)
             let snapshot_args = crate::cli::SnapshotRunArgs {
                 pid: None,
                 snapshot: Some(key.clone()),
@@ -965,9 +969,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 exec: None,
                 tty: args.tty,
                 interactive: args.interactive,
-                // Pass startup snapshot context if health check URL is set
-                startup_snapshot_base_key: args.health_check.as_ref().map(|_| key.clone()),
-                health_check_for_startup: args.health_check.clone(),
+                // Pass startup snapshot context - health is determined by podman
+                startup_snapshot_base_key: Some(key.clone()),
             };
             return super::snapshot::cmd_snapshot_run(snapshot_args).await;
         }
@@ -1134,7 +1137,6 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     let mut vm_state = VmState::new(vm_id.clone(), args.image.clone(), args.cpu, args.mem);
     vm_state.name = Some(vm_name.clone());
     vm_state.config.volumes = args.map.clone();
-    vm_state.config.health_check_url = args.health_check.clone();
 
     // Initialize state manager
     let state_manager = StateManager::new(paths::state_dir());
@@ -1181,11 +1183,6 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     let network_config = network.setup().await.context("setting up network")?;
 
-    // Use network-provided health check URL if user didn't specify one
-    // Each network type (bridged/rootless) generates its own appropriate URL
-    if vm_state.config.health_check_url.is_none() {
-        vm_state.config.health_check_url = network_config.health_check_url.clone();
-    }
     if let Some(port) = network_config.health_check_port {
         vm_state.config.network.health_check_port = Some(port);
     }
@@ -1249,11 +1246,11 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // Only create startup snapshots if:
     // - Not skipping snapshots (no --no-snapshot, no volumes, not localhost image)
     // - Have a snapshot key
-    // - Have a health_check URL configured (HTTP health check, not just container-ready)
+    // Health is determined by fc-agent reporting podman's container health status
     let (startup_tx, mut startup_rx): (
         Option<tokio::sync::oneshot::Sender<()>>,
         Option<tokio::sync::oneshot::Receiver<()>>,
-    ) = if !skip_snapshot_creation && snapshot_key.is_some() && args.health_check.is_some() {
+    ) = if !skip_snapshot_creation && snapshot_key.is_some() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (Some(tx), Some(rx))
     } else {

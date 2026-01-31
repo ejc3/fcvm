@@ -159,11 +159,6 @@ pub struct RunArgs {
     #[arg(long, value_enum, default_value_t = NetworkMode::Rootless)]
     pub network: NetworkMode,
 
-    /// HTTP health check URL. If not specified, health is based on container running status.
-    /// Example: --health-check http://localhost/health
-    #[arg(long)]
-    pub health_check: Option<String>,
-
     /// Run container in privileged mode (allows mknod, device access, etc.)
     /// Use for POSIX compliance tests that need full filesystem capabilities
     #[arg(long)]
@@ -299,11 +294,6 @@ pub struct SnapshotRunArgs {
     /// When set, a startup snapshot will be created after the VM becomes healthy.
     #[arg(skip)]
     pub startup_snapshot_base_key: Option<String>,
-
-    /// Health check URL for triggering startup snapshot (internal use only).
-    /// Only used when startup_snapshot_base_key is set.
-    #[arg(skip)]
-    pub health_check_for_startup: Option<String>,
 }
 
 // ============================================================================

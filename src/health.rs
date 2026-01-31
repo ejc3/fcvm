@@ -16,11 +16,14 @@ const HEALTH_POLL_HEALTHY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Spawn a background health monitoring task for a VM
 ///
-/// The task polls the VM process health at adaptive intervals:
+/// The task polls the VM health at adaptive intervals:
 /// - 100ms during startup (until healthy)
 /// - 10s after VM is healthy
 ///
-/// Health check tests HTTP connectivity using reqwest to the guest IP.
+/// Health is determined by:
+/// 1. Firecracker process existence
+/// 2. container-health file (written by fc-agent reporting podman's health status)
+/// 3. container-ready file (fallback for containers without healthcheck)
 ///
 /// Returns a JoinHandle that can be used to cancel the task.
 /// The task runs until cancelled or until the tokio runtime shuts down.
@@ -185,123 +188,51 @@ async fn update_health_status_once(
                 (HealthStatus::Unreachable, None)
             }
         } else {
-            // Process exists, now check application health
-            let state = state_manager
-                .load_state(vm_id)
-                .await
-                .context("loading state for health check")?;
+            // Process exists, check container health status file (written by fc-agent via vsock)
+            // fc-agent monitors podman's container health and reports it
+            let health_file = paths::vm_runtime_dir(vm_id).join("container-health");
+            let ready_file = paths::vm_runtime_dir(vm_id).join("container-ready");
 
-            // Two modes:
-            // 1. health_check_url = Some(url) -> HTTP check (container running + HTTP responds)
-            // 2. health_check_url = None -> Check container-ready file (written by fc-agent via vsock)
-            let status = match &state.config.health_check_url {
-                None => {
-                    // No HTTP check - check if container-ready file exists
-                    // fc-agent creates this file via vsock when the container starts
-                    let ready_file = paths::vm_runtime_dir(vm_id).join("container-ready");
-                    if ready_file.exists() {
-                        debug!(target: "health-monitor", "container-ready file exists, healthy");
-                        *last_failure_log = None;
-                        HealthStatus::Healthy
-                    } else {
-                        debug!(target: "health-monitor", "waiting for container-ready file");
+            let status = if health_file.exists() {
+                // fc-agent is reporting podman health status
+                match std::fs::read_to_string(&health_file) {
+                    Ok(content) => {
+                        let health = content.trim();
+                        match health {
+                            "healthy" => {
+                                debug!(target: "health-monitor", "podman reports healthy");
+                                *last_failure_log = None;
+                                HealthStatus::Healthy
+                            }
+                            "unhealthy" => {
+                                debug!(target: "health-monitor", "podman reports unhealthy");
+                                HealthStatus::Unhealthy
+                            }
+                            "starting" => {
+                                debug!(target: "health-monitor", "podman health check starting");
+                                HealthStatus::Unknown
+                            }
+                            _ => {
+                                // No healthcheck defined, but container is running
+                                debug!(target: "health-monitor", status = health, "container running (no healthcheck)");
+                                *last_failure_log = None;
+                                HealthStatus::Healthy
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!(target: "health-monitor", error = %e, "failed to read health file");
                         HealthStatus::Unknown
                     }
                 }
-                Some(url_str) => {
-                    // HTTP health check
-                    let url = url::Url::parse(url_str)
-                        .with_context(|| format!("parsing health check URL: {}", url_str))?;
-                    let health_path = url.path();
-                    let net = &state.config.network;
-
-                    // Rootless mode with holder_pid: use nsenter to curl guest directly
-                    // This bypasses the complexity of slirp4netns port forwarding
-                    if let Some(holder_pid) = state.holder_pid {
-                        // Extract guest IP without CIDR suffix
-                        let guest_ip = net
-                            .guest_ip
-                            .as_ref()
-                            .map(|ip| ip.split('/').next().unwrap_or(ip))
-                            .unwrap_or("192.168.1.2");
-                        let port = 80; // Always use port 80 directly to guest
-                        debug!(target: "health-monitor", holder_pid = holder_pid, guest_ip = %guest_ip, port = port, "HTTP health check via nsenter");
-
-                        match check_http_health_nsenter(holder_pid, guest_ip, port, health_path)
-                            .await
-                        {
-                            Ok(true) => {
-                                debug!(target: "health-monitor", "health check passed");
-                                *last_failure_log = None;
-                                HealthStatus::Healthy
-                            }
-                            Ok(false) => {
-                                warn!(target: "health-monitor", "health check returned false");
-                                HealthStatus::Unhealthy
-                            }
-                            Err(e) => {
-                                let should_log = match last_failure_log {
-                                    None => true,
-                                    Some(last_time) => {
-                                        last_time.elapsed() >= Duration::from_secs(1)
-                                    }
-                                };
-                                if should_log {
-                                    debug!(target: "health-monitor", error = %e, "HTTP health check failed (nsenter)");
-                                    *last_failure_log = Some(Instant::now());
-                                }
-                                HealthStatus::Unhealthy
-                            }
-                        }
-                    } else {
-                        // Bridged mode: transform URL to use guest IP if localhost is specified
-                        // "localhost" from the host doesn't reach the VM - we need the guest's IP
-                        let veth_device = net.host_veth.as_deref();
-
-                        // Transform URL: if host is localhost/127.0.0.1, use guest IP instead
-                        let effective_url = if url.host_str() == Some("localhost")
-                            || url.host_str() == Some("127.0.0.1")
-                        {
-                            if let Some(guest_ip) = net.guest_ip.as_ref() {
-                                // Strip CIDR suffix if present
-                                let guest_ip = guest_ip.split('/').next().unwrap_or(guest_ip);
-                                let port = url.port().unwrap_or(80);
-                                format!("http://{}:{}{}", guest_ip, port, health_path)
-                            } else {
-                                url_str.to_string()
-                            }
-                        } else {
-                            url_str.to_string()
-                        };
-
-                        debug!(target: "health-monitor", original_url = %url_str, effective_url = %effective_url, veth = ?veth_device, "HTTP health check via veth");
-
-                        match check_http_health_bridged(&effective_url, veth_device).await {
-                            Ok(true) => {
-                                debug!(target: "health-monitor", "health check passed");
-                                *last_failure_log = None;
-                                HealthStatus::Healthy
-                            }
-                            Ok(false) => {
-                                debug!(target: "health-monitor", "health check returned false");
-                                HealthStatus::Unhealthy
-                            }
-                            Err(e) => {
-                                let should_log = match last_failure_log {
-                                    None => true,
-                                    Some(last_time) => {
-                                        last_time.elapsed() >= Duration::from_secs(1)
-                                    }
-                                };
-                                if should_log {
-                                    debug!(target: "health-monitor", error = %e, "HTTP health check failed");
-                                    *last_failure_log = Some(Instant::now());
-                                }
-                                HealthStatus::Unhealthy
-                            }
-                        }
-                    }
-                }
+            } else if ready_file.exists() {
+                // Legacy: container started but no health updates yet
+                debug!(target: "health-monitor", "container-ready file exists, healthy");
+                *last_failure_log = None;
+                HealthStatus::Healthy
+            } else {
+                debug!(target: "health-monitor", "waiting for container health status");
+                HealthStatus::Unknown
             };
             (status, None)
         }
@@ -331,147 +262,3 @@ pub async fn run_health_check_once(
     Ok(status)
 }
 
-/// Check if HTTP service is responding via nsenter into the network namespace (rootless mode)
-///
-/// For rootless VMs, we use nsenter to enter the network namespace and curl
-/// the guest directly. This bypasses the complexity of slirp4netns port forwarding.
-///
-/// The holder_pid is the PID of the namespace holder process (sleep infinity).
-async fn check_http_health_nsenter(
-    holder_pid: u32,
-    guest_ip: &str,
-    port: u16,
-    health_path: &str,
-) -> Result<bool> {
-    let url = format!("http://{}:{}{}", guest_ip, port, health_path);
-
-    let start = Instant::now();
-
-    // Use nsenter to enter the namespace and curl the guest directly
-    // --preserve-credentials keeps UID/GID mapping
-    let output = tokio::process::Command::new("nsenter")
-        .args([
-            "-t",
-            &holder_pid.to_string(),
-            "-U",
-            "-n",
-            "--preserve-credentials",
-            "--",
-            "curl",
-            "-s",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            "--max-time",
-            "1",
-            &url,
-        ])
-        .output()
-        .await
-        .context("failed to run nsenter curl")?;
-
-    let elapsed = start.elapsed();
-
-    if output.status.success() {
-        let status_code = String::from_utf8_lossy(&output.stdout);
-        let status_code = status_code.trim();
-
-        if status_code.starts_with('2') || status_code.starts_with('3') {
-            debug!(
-                target: "health-monitor",
-                holder_pid = holder_pid,
-                guest_ip = guest_ip,
-                port = port,
-                status = status_code,
-                elapsed_ms = elapsed.as_millis(),
-                "health check succeeded (nsenter)"
-            );
-            Ok(true)
-        } else {
-            anyhow::bail!(
-                "Health check failed with status {} via nsenter to {}:{} ({}ms)",
-                status_code,
-                guest_ip,
-                port,
-                elapsed.as_millis()
-            )
-        }
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("timed out") || stderr.contains("Connection timed out") {
-            anyhow::bail!(
-                "Health check timed out via nsenter to {}:{}",
-                guest_ip,
-                port
-            )
-        } else if stderr.contains("Connection refused") {
-            anyhow::bail!("Connection refused to {}:{} via nsenter", guest_ip, port)
-        } else {
-            anyhow::bail!(
-                "Failed to connect to {}:{} via nsenter: {}",
-                guest_ip,
-                port,
-                stderr.trim()
-            )
-        }
-    }
-}
-
-/// Check if HTTP service is responding using reqwest with optional interface binding (bridged mode)
-///
-/// For baseline VMs, we bind to the specific veth interface since the guest IP
-/// is reachable via that interface.
-///
-/// For clones with In-Namespace NAT, the health_check_url uses the veth inner IP
-/// (e.g., 10.x.y.2) which is routed directly by the kernel, so interface binding
-/// is optional (the kernel routes to the correct veth based on IP).
-///
-/// We use reqwest's .interface() method (which uses SO_BINDTODEVICE on Linux)
-/// when a veth device is provided, ensuring traffic goes through that interface.
-async fn check_http_health_bridged(url: &str, veth_device: Option<&str>) -> Result<bool> {
-    // Build a reqwest client, optionally bound to the veth device
-    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(1));
-
-    if let Some(veth) = veth_device {
-        builder = builder.interface(veth);
-    }
-
-    let client = builder.build().context("building reqwest client")?;
-
-    let start = Instant::now();
-    let iface_str = veth_device.unwrap_or("default");
-
-    match client.get(url).send().await {
-        Ok(response) => {
-            let elapsed = start.elapsed();
-            if response.status().is_success() {
-                debug!(
-                    target: "health-monitor",
-                    interface = iface_str,
-                    url = url,
-                    status = %response.status(),
-                    elapsed_ms = elapsed.as_millis(),
-                    "health check succeeded"
-                );
-                Ok(true)
-            } else {
-                anyhow::bail!(
-                    "Health check failed with status {} via {} ({}ms)",
-                    response.status(),
-                    iface_str,
-                    elapsed.as_millis()
-                )
-            }
-        }
-        Err(e) => {
-            if e.is_timeout() {
-                anyhow::bail!("Health check timed out after 1 second via {}", iface_str)
-            } else if e.is_connect() {
-                anyhow::bail!("Connection refused to {} via {}", url, iface_str)
-            } else {
-                anyhow::bail!("Failed to connect to {} via {}: {}", url, iface_str, e)
-            }
-        }
-    }
-}
