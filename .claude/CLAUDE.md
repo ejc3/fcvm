@@ -590,6 +590,12 @@ mv old_name.rs new_name.rs
 
 ### Development Workflow (PR-Based)
 
+**IMPORTANT: Use `/pr-workflow` skill for ALL PR operations.** This includes:
+- Creating, checking, or merging PRs (`gh pr create`, `gh pr checks`, `gh pr merge`)
+- Checking CI status
+- Fixing lint/clippy/format errors
+- Running `cargo fmt` or `cargo clippy`
+
 **Main branch is protected. All changes MUST go through pull requests.**
 
 #### Creating a PR
