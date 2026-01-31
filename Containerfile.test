@@ -1,0 +1,11 @@
+# Test container with proper HEALTHCHECK
+# Based on nginx:alpine but with health verification
+
+FROM public.ecr.aws/nginx/nginx:alpine
+
+# Install curl for healthcheck
+RUN apk add --no-cache curl
+
+# Add healthcheck that verifies nginx is actually responding
+HEALTHCHECK --interval=2s --timeout=5s --start-period=5s --retries=3 \
+    CMD curl -sf http://localhost/ || exit 1

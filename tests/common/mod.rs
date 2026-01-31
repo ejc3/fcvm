@@ -683,6 +683,73 @@ pub async fn poll_health_by_pid(pid: u32, timeout_secs: u64) -> anyhow::Result<(
     }
 }
 
+/// Poll VM health status by PID until it matches the expected status.
+/// Returns Ok(()) when the expected status is reached, or error on timeout.
+pub async fn poll_health_status_by_pid(
+    pid: u32,
+    expected: fcvm::state::HealthStatus,
+    timeout_secs: u64,
+) -> anyhow::Result<()> {
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(timeout_secs);
+    let mut last_status: Option<fcvm::state::HealthStatus> = None;
+
+    loop {
+        if start.elapsed() > timeout {
+            anyhow::bail!(
+                "timeout waiting for VM to become {:?} (last status: {:?})",
+                expected,
+                last_status
+            );
+        }
+
+        // Check if process exited (zombie or gone)
+        let is_gone = std::fs::read_to_string(format!("/proc/{}/stat", pid))
+            .map(|s| s.contains(") Z "))
+            .unwrap_or(true);
+
+        if is_gone {
+            anyhow::bail!("fcvm process (pid {}) exited. Check logs above.", pid);
+        }
+
+        let fcvm_path = find_fcvm_binary()?;
+        let output = tokio::process::Command::new(&fcvm_path)
+            .args(["ls", "--json", "--pid", &pid.to_string()])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+
+        #[derive(serde::Deserialize)]
+        struct VmDisplay {
+            #[serde(flatten)]
+            vm: fcvm::state::VmState,
+            #[allow(dead_code)]
+            stale: bool,
+        }
+
+        if let Ok(vms) =
+            serde_json::from_str::<Vec<VmDisplay>>(&String::from_utf8_lossy(&output.stdout))
+        {
+            for d in &vms {
+                let current = d.vm.health_status;
+                if current != last_status.unwrap_or(fcvm::state::HealthStatus::Unknown) {
+                    println!("  Health status: {:?}", current);
+                    last_status = Some(current);
+                }
+                if current == expected {
+                    return Ok(());
+                }
+            }
+        }
+
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
 /// Poll for serve process state to exist by PID (serve processes don't have health status)
 pub async fn poll_serve_state_by_pid(pid: u32, timeout_secs: u64) -> anyhow::Result<()> {
     let start = std::time::Instant::now();

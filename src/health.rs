@@ -85,6 +85,8 @@ pub fn spawn_health_monitor_full(
         // Throttle health check failure logs to once per second (simple local variable)
         let mut last_failure_log: Option<Instant> = None;
         let mut first_check = true;
+        // Track if container has no HEALTHCHECK - skip exec if so
+        let mut skip_podman_healthcheck = false;
 
         loop {
             // Check for cancellation before sleeping
@@ -119,6 +121,7 @@ pub fn spawn_health_monitor_full(
                 &vm_id,
                 pid,
                 &mut last_failure_log,
+                &mut skip_podman_healthcheck,
             )
             .await
             {
@@ -161,12 +164,95 @@ pub fn spawn_health_monitor_with_state_dir(
     spawn_health_monitor_with_cancel(vm_id, pid, state_dir, None)
 }
 
+/// Find the fcvm binary for exec commands.
+fn find_fcvm_binary() -> Option<std::path::PathBuf> {
+    // Try several possible locations
+    // ./target/release/fcvm first for development/tests where we run from repo root
+    let candidates = [
+        std::path::PathBuf::from("./target/release/fcvm"),
+        std::path::PathBuf::from("/usr/local/bin/fcvm"),
+        std::path::PathBuf::from("/usr/bin/fcvm"),
+    ];
+
+    for path in candidates {
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    // Fall back to current exe if it looks like fcvm
+    if let Ok(exe) = std::env::current_exe() {
+        if exe.file_name().map(|n| n == "fcvm").unwrap_or(false) {
+            return Some(exe);
+        }
+    }
+
+    None
+}
+
+/// Check podman healthcheck status by exec'ing into VM.
+///
+/// Returns:
+/// - `Some(true)` = healthcheck exists and is healthy
+/// - `Some(false)` = healthcheck exists and is unhealthy/starting
+/// - `None` = no healthcheck defined (caller should skip future calls)
+async fn check_podman_healthcheck(pid: u32) -> Option<bool> {
+    // Use fcvm exec to run podman inspect inside the VM
+    let exe = match find_fcvm_binary() {
+        Some(e) => e,
+        None => return Some(true), // Can't find fcvm binary, assume healthy
+    };
+
+    let output = match tokio::process::Command::new(&exe)
+        .args([
+            "exec",
+            "--pid",
+            &pid.to_string(),
+            "--vm", // Run in VM (not container) where podman is available
+            "--",
+            "podman",
+            "inspect",
+            "--format",
+            "{{.State.Health.Status}}",
+            "fcvm-container",
+        ])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            // Exec not available yet, assume healthy (don't block startup)
+            debug!(target: "health-monitor", error = %e, "podman healthcheck exec failed, assuming healthy");
+            return Some(true);
+        }
+    };
+
+    if !output.status.success() {
+        // Container may not be running yet, assume healthy
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        debug!(target: "health-monitor", stderr = %stderr, "podman inspect failed, assuming healthy");
+        return Some(true);
+    }
+
+    let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    debug!(target: "health-monitor", podman_health = %status, "podman healthcheck status");
+
+    match status.as_str() {
+        "healthy" => Some(true),
+        "" => None, // No healthcheck defined - skip future checks
+        "unhealthy" => Some(false),
+        "starting" => Some(false), // Still starting, keep polling
+        _ => Some(true),           // Unknown status, assume healthy
+    }
+}
+
 /// Perform a single health check iteration and persist the result.
 async fn update_health_status_once(
     state_manager: &StateManager,
     vm_id: &str,
     pid: Option<u32>,
     last_failure_log: &mut Option<Instant>,
+    skip_podman_healthcheck: &mut bool,
 ) -> Result<(HealthStatus, Option<i32>)> {
     let (health_status, exit_code) = if let Some(pid) = pid {
         // First check if Firecracker process is still running
@@ -303,7 +389,30 @@ async fn update_health_status_once(
                     }
                 }
             };
-            (status, None)
+
+            // If base health check passed, also check podman healthcheck (AND logic)
+            // Skip if we already know the container has no healthcheck
+            let final_status = if status == HealthStatus::Healthy && !*skip_podman_healthcheck {
+                match check_podman_healthcheck(pid).await {
+                    Some(true) => {
+                        debug!(target: "health-monitor", "all health checks passed");
+                        HealthStatus::Healthy
+                    }
+                    Some(false) => {
+                        debug!(target: "health-monitor", "podman healthcheck not healthy");
+                        HealthStatus::Unhealthy
+                    }
+                    None => {
+                        // No healthcheck defined - skip future checks
+                        debug!(target: "health-monitor", "no podman healthcheck defined, skipping future checks");
+                        *skip_podman_healthcheck = true;
+                        HealthStatus::Healthy
+                    }
+                }
+            } else {
+                status
+            };
+            (final_status, None)
         }
     } else {
         (HealthStatus::Unknown, None)
@@ -326,8 +435,15 @@ pub async fn run_health_check_once(
 ) -> Result<HealthStatus> {
     let state_manager = StateManager::new(state_dir);
     let mut last_failure_log = None;
-    let (status, _exit_code) =
-        update_health_status_once(&state_manager, vm_id, pid, &mut last_failure_log).await?;
+    let mut skip_podman_healthcheck = false;
+    let (status, _exit_code) = update_health_status_once(
+        &state_manager,
+        vm_id,
+        pid,
+        &mut last_failure_log,
+        &mut skip_podman_healthcheck,
+    )
+    .await?;
     Ok(status)
 }
 

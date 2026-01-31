@@ -1,0 +1,8 @@
+# Test container with HEALTHCHECK that always fails
+# Used to verify unhealthy containers are detected correctly
+
+FROM public.ecr.aws/nginx/nginx:alpine
+
+# Healthcheck that always fails
+HEALTHCHECK --interval=1s --timeout=1s --start-period=1s --retries=1 \
+    CMD exit 1

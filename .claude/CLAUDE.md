@@ -88,6 +88,21 @@ When a kernel, rootfs, or binary doesn't build correctly:
 
 If `fcvm setup` produces wrong output, the bug is in fcvm or build.sh. Fix it there.
 
+## Test Helper Functions (tests/common/mod.rs)
+
+| Function | Purpose |
+|----------|---------|
+| `spawn_fcvm(&args)` | Spawn fcvm process, returns `(child, pid)` |
+| `spawn_fcvm_with_logs(&args, name)` | Same + debug log file |
+| `poll_health_by_pid(pid, timeout)` | Wait for VM healthy status |
+| `poll_health_status_by_pid(pid, expected, timeout)` | Wait for specific health status |
+| `poll_health(&child, timeout)` | Wait healthy (checks process exit) |
+| `kill_process(pid)` | SIGTERM then SIGKILL if needed |
+| `unique_names(prefix)` | Generate unique `(name, clone, snap, serve)` |
+| `find_fcvm_binary()` | Locate `./target/release/fcvm` |
+| `exec_in_vm(pid, &cmd)` | Run command in VM via exec |
+| `exec_in_container(pid, &cmd)` | Run command in container via exec |
+
 ## Nested Test Architecture
 
 Tests use `localhost/nested-test` container image built from `Containerfile.nested`.
