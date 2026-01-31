@@ -2016,8 +2016,8 @@ async fn run_agent() -> Result<()> {
             }
         }
     } else {
-        // OCI archive - notify with image name as identifier
-        eprintln!("[fc-agent] using OCI archive, notifying cache-ready with image name");
+        // Docker archive - notify with image name as identifier
+        eprintln!("[fc-agent] using Docker archive, notifying cache-ready with image name");
         if notify_cache_ready_and_wait(&plan.image) {
             eprintln!("[fc-agent] ✓ cache ready notification acknowledged");
         } else {
