@@ -260,7 +260,7 @@ async fn watch_restore_epoch() {
     }
 }
 
-/// Handle clone restore: kill stale sockets, flush ARP, and remount volumes
+/// Handle clone restore: kill stale sockets, flush ARP, remount volumes, and restart health monitoring
 async fn handle_clone_restore(volumes: &[VolumeMount]) {
     // 1. KILL all established TCP connections immediately
     // After snapshot restore, existing TCP connections are DEAD (different network namespace).
@@ -282,6 +282,69 @@ async fn handle_clone_restore(volumes: &[VolumeMount]) {
         );
         remount_fuse_volumes(volumes).await;
     }
+
+    // 4. Restart health monitoring for the running container
+    // The original health monitor task doesn't survive snapshot/restore,
+    // so we need to find the running container and start a new monitor.
+    restart_health_monitoring().await;
+}
+
+/// Find the running container and restart health monitoring.
+/// Called after clone restore since the original health monitor task is dead.
+async fn restart_health_monitoring() {
+    // Find the running container (there should be exactly one)
+    let output = match Command::new("podman")
+        .args(["ps", "--format", "{{.Names}}", "--filter", "status=running"])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!(
+                "[fc-agent] failed to list containers for health restart: {}",
+                e
+            );
+            return;
+        }
+    };
+
+    if !output.status.success() {
+        eprintln!("[fc-agent] podman ps failed for health restart");
+        return;
+    }
+
+    let containers: Vec<&str> = std::str::from_utf8(&output.stdout)
+        .unwrap_or("")
+        .trim()
+        .lines()
+        .collect();
+
+    if containers.is_empty() {
+        eprintln!("[fc-agent] no running containers found for health monitoring");
+        return;
+    }
+
+    // Use the first running container (should be only one in fcvm)
+    let container_name = containers[0].to_string();
+    eprintln!(
+        "[fc-agent] restarting health monitor for container: {}",
+        container_name
+    );
+
+    // Spawn a new health monitor task (no stop channel since this runs until VM exits)
+    tokio::spawn(async move {
+        // Simple health monitoring loop without stop channel
+        // (the original monitor task had a stop channel, but for clones we just run until exit)
+        let mut last_status = String::new();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let status = get_container_health(&container_name).await;
+            if status != last_status {
+                notify_container_health(&status);
+                last_status = status;
+            }
+        }
+    });
 }
 
 /// Remount FUSE volumes after clone restore.
@@ -1176,7 +1239,10 @@ async fn get_container_health(container_id: &str) -> String {
 /// Monitor container health in a background task.
 ///
 /// Polls podman every 2 seconds and reports health changes to the host.
-async fn monitor_container_health(container_id: String, mut stop_rx: tokio::sync::oneshot::Receiver<()>) {
+async fn monitor_container_health(
+    container_id: String,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+) {
     let mut last_status = String::new();
 
     loop {
@@ -2204,7 +2270,12 @@ async fn run_agent() -> Result<()> {
 
                 // Query podman for health status
                 let output = std::process::Command::new("podman")
-                    .args(["inspect", "--format", "{{.State.Health.Status}}", &health_container])
+                    .args([
+                        "inspect",
+                        "--format",
+                        "{{.State.Health.Status}}",
+                        &health_container,
+                    ])
                     .output();
 
                 if let Ok(out) = output {

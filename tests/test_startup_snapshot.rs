@@ -38,13 +38,7 @@ async fn test_startup_snapshot_created_on_fresh_boot() -> Result<()> {
     // Health is determined by podman's built-in HEALTHCHECK
     println!("Starting VM...");
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
-        "podman",
-        "run",
-        "--name",
-        &vm_name,
-        "--env",
-        &test_id,
-        TEST_IMAGE,
+        "podman", "run", "--name", &vm_name, "--env", &test_id, TEST_IMAGE,
     ])
     .await
     .context("spawning fcvm")?;
@@ -108,13 +102,7 @@ async fn test_startup_snapshot_priority() -> Result<()> {
 
     println!("First boot: Creating snapshots...");
     let (mut child1, fcvm_pid1) = common::spawn_fcvm(&[
-        "podman",
-        "run",
-        "--name",
-        &vm_name1,
-        "--env",
-        &test_id,
-        TEST_IMAGE,
+        "podman", "run", "--name", &vm_name1, "--env", &test_id, TEST_IMAGE,
     ])
     .await
     .context("spawning fcvm for first boot")?;
@@ -143,13 +131,7 @@ async fn test_startup_snapshot_priority() -> Result<()> {
 
     println!("Second boot: Should use startup snapshot...");
     let (mut child2, fcvm_pid2) = common::spawn_fcvm(&[
-        "podman",
-        "run",
-        "--name",
-        &vm_name2,
-        "--env",
-        &test_id,
-        TEST_IMAGE,
+        "podman", "run", "--name", &vm_name2, "--env", &test_id, TEST_IMAGE,
     ])
     .await
     .context("spawning fcvm for second boot")?;
@@ -207,13 +189,7 @@ async fn test_startup_snapshot_on_restored_vm() -> Result<()> {
 
     println!("First boot: Full cold start...");
     let (mut child1, fcvm_pid1) = common::spawn_fcvm(&[
-        "podman",
-        "run",
-        "--name",
-        &vm_name1,
-        "--env",
-        &test_id,
-        TEST_IMAGE,
+        "podman", "run", "--name", &vm_name1, "--env", &test_id, TEST_IMAGE,
     ])
     .await
     .context("spawning fcvm for first boot")?;
@@ -245,13 +221,7 @@ async fn test_startup_snapshot_on_restored_vm() -> Result<()> {
     println!("Second boot: Restoring from snapshot...");
     let start = std::time::Instant::now();
     let (mut child2, fcvm_pid2) = common::spawn_fcvm(&[
-        "podman",
-        "run",
-        "--name",
-        &vm_name2,
-        "--env",
-        &test_id,
-        TEST_IMAGE,
+        "podman", "run", "--name", &vm_name2, "--env", &test_id, TEST_IMAGE,
     ])
     .await
     .context("spawning fcvm for second boot")?;

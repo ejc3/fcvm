@@ -216,7 +216,9 @@ async fn test_ftrace_sanity() -> Result<()> {
     .await?;
 
     // Wait for exit
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await??;
+    // Note: 120s timeout handles I/O contention when running parallel tests on loop-backed
+    // btrfs (snapshot creation writes ~500MB memory files, which is slow under contention)
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(120), child.wait()).await??;
 
     // Stop and read
     tracer.stop()?;

@@ -261,4 +261,3 @@ pub async fn run_health_check_once(
         update_health_status_once(&state_manager, vm_id, pid, &mut last_failure_log).await?;
     Ok(status)
 }
-
