@@ -7,6 +7,7 @@
 
 mod common;
 
+#[cfg(feature = "privileged-tests")]
 use anyhow::{Context, Result};
 
 /// Test that a container with a passing HEALTHCHECK becomes healthy
@@ -129,12 +130,8 @@ async fn test_podman_healthcheck_unhealthy() -> Result<()> {
     // The unhealthy container has: --interval=1s --retries=1
     // So it should fail within a few seconds of the healthcheck running
     println!("  Polling health status (looking for Unhealthy)...");
-    let result = common::poll_health_status_by_pid(
-        fcvm_pid,
-        fcvm::state::HealthStatus::Unhealthy,
-        60,
-    )
-    .await;
+    let result =
+        common::poll_health_status_by_pid(fcvm_pid, fcvm::state::HealthStatus::Unhealthy, 60).await;
 
     // Kill the VM
     println!("  Stopping VM...");
@@ -190,7 +187,10 @@ async fn test_podman_healthcheck_none() -> Result<()> {
             Ok(())
         }
         Err(e) => {
-            anyhow::bail!("Health check failed for container without HEALTHCHECK: {}", e);
+            anyhow::bail!(
+                "Health check failed for container without HEALTHCHECK: {}",
+                e
+            );
         }
     }
 }
