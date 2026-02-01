@@ -376,8 +376,12 @@ fn mount_internal<P: AsRef<Path>>(
                     );
                     // Each cloned fd handles its own request/response pairs
                     // Use SessionACL::All to allow any user to access the mount (AllowOther is set)
-                    let reader_session =
-                        fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::All);
+                    let reader_session = fuser::Session::from_fd_initialized(
+                        fs,
+                        cloned_fd,
+                        fuser::SessionACL::All,
+                        None, // Use default proto_version (max supported)
+                    );
 
                     let destroyed_check = Arc::clone(&destroyed);
                     let handle = thread::Builder::new()
@@ -654,8 +658,12 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
                     );
                     // Each cloned fd handles its own request/response pairs
                     // Use SessionACL::All to allow any user to access the mount (AllowOther is set)
-                    let reader_session =
-                        fuser::Session::from_fd_initialized(fs, cloned_fd, fuser::SessionACL::All);
+                    let reader_session = fuser::Session::from_fd_initialized(
+                        fs,
+                        cloned_fd,
+                        fuser::SessionACL::All,
+                        None, // Use default proto_version (max supported)
+                    );
 
                     let destroyed_check = Arc::clone(&destroyed);
                     let handle = thread::Builder::new()
