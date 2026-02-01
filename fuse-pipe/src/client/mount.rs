@@ -287,6 +287,8 @@ fn mount_internal<P: AsRef<Path>>(
         debug!(target: "fuse-pipe::client", "skipping AllowOther (not root and user_allow_other not in /etc/fuse.conf)");
     }
     info!(target: "fuse-pipe::client", ?options, "using mount options");
+    let mut config = fuser::Config::default();
+    config.mount_options = options;
 
     // For single reader, just run directly
     if num_readers == 1 {
@@ -297,7 +299,7 @@ fn mount_internal<P: AsRef<Path>>(
         let mut last_error = None;
         for attempt in 0..=SESSION_NEW_MAX_RETRIES {
             let fs = FuseClient::with_destroyed_flag(Arc::clone(&mux), 0, Arc::clone(&destroyed));
-            match fuser::Session::new(fs, mount_point.as_ref(), &options) {
+            match fuser::Session::new(fs, mount_point.as_ref(), &config) {
                 Ok(s) => {
                     if attempt > 0 {
                         info!(target: "fuse-pipe::client", attempt, "Session::new succeeded after retry");
@@ -414,7 +416,7 @@ fn mount_internal<P: AsRef<Path>>(
             make_init_callback(Arc::clone(&destroyed), Arc::clone(&reader_threads)),
             Arc::clone(&destroyed),
         );
-        match fuser::Session::new(fs, mount_point.as_ref(), &options) {
+        match fuser::Session::new(fs, mount_point.as_ref(), &config) {
             Ok(s) => {
                 if attempt > 0 {
                     info!(target: "fuse-pipe::client", attempt, "Session::new succeeded after retry");
@@ -584,6 +586,8 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
     } else {
         debug!(target: "fuse-pipe::client", "skipping AllowOther (not root and user_allow_other not in /etc/fuse.conf)");
     }
+    let mut config = fuser::Config::default();
+    config.mount_options = options;
 
     // For single reader, just run directly
     if num_readers == 1 {
@@ -594,7 +598,7 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
         let mut last_error = None;
         for attempt in 0..=SESSION_NEW_MAX_RETRIES {
             let fs = FuseClient::with_destroyed_flag(Arc::clone(&mux), 0, Arc::clone(&destroyed));
-            match fuser::Session::new(fs, mount_point.as_ref(), &options) {
+            match fuser::Session::new(fs, mount_point.as_ref(), &config) {
                 Ok(s) => {
                     if attempt > 0 {
                         info!(target: "fuse-pipe::client", attempt, "Session::new succeeded after retry");
@@ -684,7 +688,7 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
             make_init_callback(Arc::clone(&destroyed), Arc::clone(&reader_threads)),
             Arc::clone(&destroyed),
         );
-        match fuser::Session::new(fs, mount_point.as_ref(), &options) {
+        match fuser::Session::new(fs, mount_point.as_ref(), &config) {
             Ok(s) => {
                 if attempt > 0 {
                     info!(target: "fuse-pipe::client", attempt, "Session::new succeeded after retry");

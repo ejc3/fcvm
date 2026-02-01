@@ -4,7 +4,7 @@ use super::multiplexer::Multiplexer;
 use crate::protocol::{file_type, FileAttr, VolumeRequest, VolumeResponse};
 use fuser::{
     AccessFlags, BsdFileFlags, CopyFileRangeFlags, Errno, FileHandle, FileType, Filesystem,
-    FopenFlags, Generation, INodeNo, InitFlags, LockOwner, OpenFlags, ReadFlags, RenameFlags,
+    FopenFlags, Generation, INodeNo, InitFlags, LockOwner, OpenFlags, RenameFlags,
     ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry,
     ReplyLock, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
     WriteFlags,
@@ -539,7 +539,7 @@ impl Filesystem for FuseClient {
                     &to_fuser_attr(&attr),
                     Generation(generation),
                     FileHandle(fh),
-                    flags,
+                    FopenFlags::from_bits_retain(flags),
                 );
             }
             VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
@@ -572,7 +572,7 @@ impl Filesystem for FuseClient {
         fh: FileHandle,
         offset: u64,
         size: u32,
-        _flags: ReadFlags,
+        _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
@@ -899,7 +899,7 @@ impl Filesystem for FuseClient {
                     let attr = to_fuser_attr(&entry.attr);
                     let ttl = Duration::from_secs(entry.attr_ttl_secs);
                     if reply.add(
-                        entry.ino,
+                        INodeNo(entry.ino),
                         entry_offset,
                         &entry.name,
                         &ttl,
@@ -1076,16 +1076,16 @@ impl Filesystem for FuseClient {
         _req: &Request,
         ino: INodeNo,
         fh: FileHandle,
-        offset: i64,
-        length: i64,
+        offset: u64,
+        length: u64,
         mode: i32,
         reply: ReplyEmpty,
     ) {
         let response = self.send_request_sync(VolumeRequest::Fallocate {
             ino: ino.into(),
             fh: fh.into(),
-            offset: offset as u64,
-            length: length as u64,
+            offset,
+            length,
             mode: mode as u32,
         });
 
