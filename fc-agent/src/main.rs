@@ -42,6 +42,12 @@ struct Plan {
     /// Allocate a pseudo-TTY
     #[serde(default)]
     tty: bool,
+    /// HTTP proxy for container registry access
+    #[serde(default)]
+    http_proxy: Option<String>,
+    /// HTTPS proxy for container registry access
+    #[serde(default)]
+    https_proxy: Option<String>,
 }
 
 /// Volume mount configuration from MMDS
@@ -1908,9 +1914,18 @@ async fn run_agent() -> Result<()> {
             eprintln!("[fc-agent] ==========================================");
 
             // Spawn podman pull and stream output in real-time
-            let mut child = Command::new("podman")
-                .arg("pull")
-                .arg(&plan.image)
+            let mut cmd = Command::new("podman");
+            cmd.arg("pull").arg(&plan.image);
+            // Pass proxy environment variables if configured
+            if let Some(ref proxy) = plan.http_proxy {
+                cmd.env("http_proxy", proxy);
+                cmd.env("HTTP_PROXY", proxy);
+            }
+            if let Some(ref proxy) = plan.https_proxy {
+                cmd.env("https_proxy", proxy);
+                cmd.env("HTTPS_PROXY", proxy);
+            }
+            let mut child = cmd
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()

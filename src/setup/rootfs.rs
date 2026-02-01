@@ -273,6 +273,9 @@ pub fn generate_install_script() -> String {
     r#"#!/bin/bash
 set -euo pipefail
 
+# Set PATH - required when running in chroot environment
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 echo 'FCVM: Removing conflicting packages before install...'
 # Remove time-daemon provider that conflicts with chrony
 apt-get remove -y --purge systemd-timesyncd || true
@@ -321,6 +324,14 @@ pub fn generate_download_script(plan: &Plan) -> String {
     format!(
         r#"# Download packages for Ubuntu {codename}
 set -euo pipefail
+# Disable APT sandbox - required for proxy auth via BPF interception
+# The _apt user doesn't have credentials, so apt must run as root
+echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/10sandbox
+# Configure apt proxy if http_proxy is set
+if [ -n "${{http_proxy:-}}" ]; then
+    echo "Acquire::http::Proxy \"$http_proxy\";" > /etc/apt/apt.conf.d/99proxy
+    echo "Acquire::https::Proxy \"$http_proxy\";" >> /etc/apt/apt.conf.d/99proxy
+fi
 apt-get update -qq
 apt-get install --download-only --yes --no-install-recommends {packages}
 cp /var/cache/apt/archives/*.deb /packages/ 2>/dev/null || true
@@ -1826,18 +1837,33 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
     // Use the same script that's included in the hash
     let download_script = generate_download_script(plan);
 
+    // Build podman args, including proxy env vars if set
+    let mut podman_args = vec![
+        "run".to_string(),
+        "--rm".to_string(),
+        "--cgroups=disabled".to_string(),
+        "--network=host".to_string(),
+    ];
+
+    // Pass through proxy environment variables if set
+    for var in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
+        if let Ok(val) = std::env::var(var) {
+            podman_args.push("-e".to_string());
+            podman_args.push(format!("{}={}", var, val));
+        }
+    }
+
+    podman_args.extend([
+        "-v".to_string(),
+        format!("{}:/packages", packages_dir.display()),
+        container_image.clone(),
+        "bash".to_string(),
+        "-c".to_string(),
+        download_script.clone(),
+    ]);
+
     let output = Command::new("podman")
-        .args([
-            "run",
-            "--rm",
-            "--cgroups=disabled",
-            "-v",
-            &format!("{}:/packages", packages_dir.display()),
-            &container_image,
-            "bash",
-            "-c",
-            &download_script,
-        ])
+        .args(&podman_args)
         .output()
         .await
         .context("downloading packages with podman")?;

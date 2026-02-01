@@ -2421,6 +2421,8 @@ async fn run_vm_setup(
                 "privileged": args.privileged,
                 "interactive": args.interactive,
                 "tty": args.tty,
+                "http_proxy": std::env::var("http_proxy").or_else(|_| std::env::var("HTTP_PROXY")).ok(),
+                "https_proxy": std::env::var("https_proxy").or_else(|_| std::env::var("HTTPS_PROXY")).ok(),
             },
             "host-time": chrono::Utc::now().timestamp().to_string(),
         }
