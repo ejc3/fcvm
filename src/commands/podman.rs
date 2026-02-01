@@ -1052,16 +1052,16 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
             .context("acquiring image cache lock")?;
 
         // Check if already cached (inside lock to prevent race)
-        // Use OCI archive format (single tar file) for faster FUSE transfer
-        let archive_path = cache_dir.with_extension("oci.tar");
+        // Use Docker archive format (preserves HEALTHCHECK, single tar file) for FUSE transfer
+        let archive_path = cache_dir.with_extension("docker.tar");
         if !archive_path.exists() {
-            info!(image = %args.image, digest = %digest, "Exporting localhost image as OCI archive");
+            info!(image = %args.image, digest = %digest, "Exporting localhost image as Docker archive");
 
             let output = tokio::process::Command::new("podman")
                 .args([
                     "save",
                     "--format",
-                    "oci-archive",
+                    "docker-archive",
                     "-o",
                     archive_path.to_str().unwrap(),
                     &args.image,
@@ -1082,16 +1082,16 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 );
             }
 
-            info!(path = %archive_path.display(), "Image exported as OCI archive");
+            info!(path = %archive_path.display(), "Image exported as Docker archive");
         } else {
-            info!(image = %args.image, digest = %digest, "Using cached OCI archive");
+            info!(image = %args.image, digest = %digest, "Using cached Docker archive");
         }
 
         // Lock released when lock_file is dropped
         drop(lock_file);
 
         // Add the image-cache directory as a read-only volume mount
-        // Guest will access the archive at /tmp/fcvm-image/{digest}.oci.tar
+        // Guest will access the archive at /tmp/fcvm-image/{digest}.docker.tar
         volume_mappings.push(VolumeMapping {
             host_path: image_cache_dir.clone(),
             guest_path: "/tmp/fcvm-image".to_string(),
@@ -1099,7 +1099,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         });
 
         // Return the archive filename (relative to mount point)
-        Some(format!("{}.oci.tar", digest))
+        Some(format!("{}.docker.tar", digest))
     } else {
         None
     };
