@@ -36,6 +36,10 @@ gh pr view 2 --json baseRefName
 
 **PR description:** Always note `**Stacked on:** <base-branch> (PR #N)` so reviewers understand the dependency.
 
+## Sending Email
+
+Use `aws ses send-email --region us-east-1` (recipient must be verified in SES sandbox).
+
 ## UNDERSTAND BRANCH CHAINS
 
 **ALWAYS fetch before investigating branches:**
