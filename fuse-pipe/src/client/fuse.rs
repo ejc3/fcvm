@@ -1216,7 +1216,7 @@ impl Filesystem for FuseClient {
     }
 
     fn remap_file_range(
-        &mut self,
+        &self,
         _req: &Request,
         ino_in: u64,
         fh_in: u64,
