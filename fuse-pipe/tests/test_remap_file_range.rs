@@ -24,10 +24,7 @@ static BTRFS_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn unique_btrfs_path(prefix: &str) -> std::path::PathBuf {
     let id = BTRFS_TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let pid = std::process::id();
-    std::path::PathBuf::from(format!(
-        "/mnt/fcvm-btrfs/{}-{}-{}",
-        prefix, pid, id
-    ))
+    std::path::PathBuf::from(format!("/mnt/fcvm-btrfs/{}-{}-{}", prefix, pid, id))
 }
 
 /// FICLONE ioctl number: _IOW(0x94, 9, int) = 0x40049409
