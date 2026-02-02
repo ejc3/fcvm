@@ -83,6 +83,14 @@ pub fn unique_paths(prefix: &str) -> (PathBuf, PathBuf) {
         let _ = std::process::Command::new("fusermount3")
             .args(["-u", mount_dir.to_str().unwrap()])
             .status();
+        // Wait for kernel to fully release the mount point after unmount.
+        // With fuser's spawn() + multi-threading, cleanup can take longer.
+        for _ in 0..50 {
+            if !is_fuse_mount(&mount_dir) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
     let _ = fs::remove_dir_all(&mount_dir);
 
