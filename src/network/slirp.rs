@@ -7,7 +7,10 @@ use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tracing::{debug, info, warn};
 
-use super::{get_host_dns_search, get_host_dns_servers, types::generate_mac, NetworkConfig, NetworkManager, PortMapping};
+use super::{
+    get_host_dns_search, get_host_dns_servers, types::generate_mac, NetworkConfig, NetworkManager,
+    PortMapping,
+};
 
 /// Get the path to the slirp4netns binary.
 /// Prefer the deps version with newer libslirp (4.8.0) for better IPv6 support.

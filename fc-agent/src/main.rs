@@ -281,7 +281,10 @@ async fn handle_clone_restore(volumes: &[VolumeMount]) {
     // slirp4netns is a NEW process after restore - it doesn't know our MAC address.
     // We must re-announce ourselves so slirp can route IPv6 DNS responses back.
     if let Err(e) = send_gratuitous_ndp_na("eth0", "fd00::100") {
-        eprintln!("[fc-agent] WARNING: failed to send NDP NA on restore: {}", e);
+        eprintln!(
+            "[fc-agent] WARNING: failed to send NDP NA on restore: {}",
+            e
+        );
     } else {
         eprintln!("[fc-agent] ✓ sent gratuitous NDP NA on restore");
     }
@@ -1695,15 +1698,8 @@ async fn sync_clock_from_host() -> Result<()> {
     Ok(())
 }
 
-/// Configure IPv6 networking on eth0 if DNS servers are IPv6
-///
-/// When DNS servers are IPv6 (like on IPv6-only networks), we need IPv6 connectivity.
-/// This adds an IPv6 address to eth0 and sets up routing through slirp4netns.
-///
-/// IPv6 addressing (bridge mode with slirp4netns):
-/// - Guest eth0: fd00::100/64
-/// - Gateway: fd00::2 (slirp4netns virtual gateway, on-link via bridge)
 /// Save proxy settings from the plan to a file so exec commands can use them.
+///
 /// This is needed because exec commands run via vsock don't have access to the
 /// original plan.
 const PROXY_SETTINGS_FILE: &str = "/etc/fcvm-proxy.env";
@@ -1736,18 +1732,21 @@ fn save_proxy_settings(plan: &Plan) {
     for (key, value) in &env_vars {
         std::env::set_var(key, value);
     }
-    eprintln!("[fc-agent] ✓ set {} proxy environment variables", env_vars.len());
+    eprintln!(
+        "[fc-agent] ✓ set {} proxy environment variables",
+        env_vars.len()
+    );
 
     // Also save to file for exec handler to read
     match std::fs::File::create(PROXY_SETTINGS_FILE) {
         Ok(mut file) => {
             if let Err(e) = file.write_all(content.as_bytes()) {
-                eprintln!(
-                    "[fc-agent] WARNING: failed to write proxy settings: {}",
-                    e
-                );
+                eprintln!("[fc-agent] WARNING: failed to write proxy settings: {}", e);
             } else {
-                eprintln!("[fc-agent] ✓ saved proxy settings to {}", PROXY_SETTINGS_FILE);
+                eprintln!(
+                    "[fc-agent] ✓ saved proxy settings to {}",
+                    PROXY_SETTINGS_FILE
+                );
             }
         }
         Err(e) => {
@@ -1770,14 +1769,20 @@ fn read_proxy_settings() -> Vec<(String, String)> {
     content
         .lines()
         .filter_map(|line| {
-            let mut parts = line.splitn(2, '=');
-            let key = parts.next()?;
-            let value = parts.next()?;
+            let (key, value) = line.split_once('=')?;
             Some((key.to_string(), value.to_string()))
         })
         .collect()
 }
 
+/// Configure IPv6 networking on eth0 if DNS servers are IPv6.
+///
+/// When DNS servers are IPv6 (like on IPv6-only networks), we need IPv6 connectivity.
+/// This adds an IPv6 address to eth0 and sets up routing through slirp4netns.
+///
+/// IPv6 addressing (bridge mode with slirp4netns):
+/// - Guest eth0: fd00::100/64
+/// - Gateway: fd00::2 (slirp4netns virtual gateway, on-link via bridge)
 /// - DNS: fd00::3 (slirp4netns virtual DNS, on-link via bridge)
 ///
 /// CRITICAL: After configuring IPv6, we must send a gratuitous NDP Neighbor
@@ -1839,7 +1844,9 @@ fn configure_ipv6_if_needed() {
     // Add IPv6 default route via slirp's gateway (fd00::2)
     // With bridge mode, fd00::2 is on-link (same L2 segment)
     let output = std::process::Command::new("ip")
-        .args(["-6", "route", "add", "default", "via", "fd00::2", "dev", "eth0"])
+        .args([
+            "-6", "route", "add", "default", "via", "fd00::2", "dev", "eth0",
+        ])
         .output();
 
     match output {
@@ -1874,17 +1881,26 @@ fn configure_ipv6_if_needed() {
 fn send_gratuitous_ndp_na(iface: &str, ipv6_addr: &str) -> std::io::Result<()> {
     // Get interface MAC address
     let mac_path = format!("/sys/class/net/{}/address", iface);
-    let mac_str = std::fs::read_to_string(&mac_path)?
-        .trim()
-        .to_string();
+    let mac_str = std::fs::read_to_string(&mac_path)?.trim().to_string();
     let mac: Vec<u8> = mac_str
         .split(':')
-        .map(|s| u8::from_str_radix(s, 16).unwrap_or(0))
-        .collect();
+        .map(|s| {
+            u8::from_str_radix(s, 16).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid MAC byte '{}' in '{}'", s, mac_str),
+                )
+            })
+        })
+        .collect::<Result<Vec<u8>, _>>()?;
     if mac.len() != 6 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "invalid MAC address",
+            format!(
+                "invalid MAC address '{}': expected 6 bytes, got {}",
+                mac_str,
+                mac.len()
+            ),
         ));
     }
 
@@ -2108,10 +2124,7 @@ fn configure_dns_from_cmdline() {
 
     match std::fs::write("/etc/resolv.conf", &resolv_conf) {
         Ok(_) => {
-            eprintln!(
-                "[fc-agent] ✓ configured DNS: {}",
-                nameservers.join(", ")
-            );
+            eprintln!("[fc-agent] ✓ configured DNS: {}", nameservers.join(", "));
             if !search_domains.is_empty() {
                 eprintln!(
                     "[fc-agent] ✓ configured search domains: {}",

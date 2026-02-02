@@ -1057,7 +1057,10 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
     // Use dynamic port to avoid conflicts with system services
     let host_port = common::find_available_high_port().context("finding available port")?;
     let publish_arg = format!("{}:80", host_port);
-    println!("\nStep 4: Spawning clone with --publish {} (rootless)...", publish_arg);
+    println!(
+        "\nStep 4: Spawning clone with --publish {} (rootless)...",
+        publish_arg
+    );
     let serve_pid_str = serve_pid.to_string();
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
         &[
@@ -1108,7 +1111,10 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
     println!("  Clone loopback IP: {}", loopback_ip);
 
     // Test: Access via loopback IP and forwarded port
-    println!("  Testing access via loopback {}:{}...", loopback_ip, host_port);
+    println!(
+        "  Testing access via loopback {}:{}...",
+        loopback_ip, host_port
+    );
     let loopback_result = tokio::process::Command::new("curl")
         .args([
             "-s",

@@ -248,7 +248,10 @@ fn test_port_forward_rootless() -> Result<()> {
 
     // Test: Access via loopback IP and forwarded port
     // In rootless mode, each VM gets a unique 127.x.y.z IP
-    println!("Testing access via loopback IP {}:{}...", loopback_ip, host_port);
+    println!(
+        "Testing access via loopback IP {}:{}...",
+        loopback_ip, host_port
+    );
     let output = Command::new("curl")
         .args([
             "-s",

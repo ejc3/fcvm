@@ -1286,7 +1286,7 @@ pub fn startup_snapshot_key(base_key: &str) -> String {
 /// # Returns
 /// An available port number, or error if none found
 pub fn find_available_port(start_port: u16, range_size: u16) -> anyhow::Result<u16> {
-    use std::net::{TcpListener, SocketAddr};
+    use std::net::{SocketAddr, TcpListener};
 
     for i in 0..range_size {
         let port = start_port + i;
@@ -1299,7 +1299,11 @@ pub fn find_available_port(start_port: u16, range_size: u16) -> anyhow::Result<u
         }
     }
 
-    anyhow::bail!("No available port found in range {}..{}", start_port, start_port + range_size)
+    anyhow::bail!(
+        "No available port found in range {}..{}",
+        start_port,
+        start_port + range_size
+    )
 }
 
 /// Find an available port in the default high port range (10000-60000).

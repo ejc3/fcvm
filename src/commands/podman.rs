@@ -1950,7 +1950,10 @@ async fn run_vm_setup(
 
         // Verify TAP device was created successfully
         let tap_device = &network_config.tap_device;
-        let verify_cmd = format!("export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH; ip link show {} >/dev/null 2>&1", tap_device);
+        let verify_cmd = format!(
+            "export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH; ip link show {} >/dev/null 2>&1",
+            tap_device
+        );
         let verify_output = tokio::process::Command::new(&nsenter_prefix[0])
             .args(&nsenter_prefix[1..])
             .arg("bash")
