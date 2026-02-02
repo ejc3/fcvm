@@ -264,14 +264,14 @@ fn mount_internal<P: AsRef<Path>>(
     // calling FUSE. This handles parent directory permission checking correctly and
     // reduces round-trips to the FUSE server for operations that would fail anyway.
     // Build mount options.
-    let mut options = vec![
+    let options = vec![
         fuser::MountOption::FSName("fuse-pipe".to_string()),
         fuser::MountOption::Suid,
         fuser::MountOption::Dev,
         fuser::MountOption::DefaultPermissions,
     ];
 
-    // AllowOther lets other users access the mount. It's needed when:
+    // AllowOther (SessionACL::All) lets other users access the mount. It's needed when:
     // - Tests switch to different uids (pjdfstest)
     // - Multiple users need to access the filesystem
     // Root can always use it; non-root needs user_allow_other in /etc/fuse.conf
@@ -280,15 +280,17 @@ fn mount_internal<P: AsRef<Path>>(
         .map(|s| s.lines().any(|l| l.trim() == "user_allow_other"))
         .unwrap_or(false);
 
-    if is_root || fuse_conf_allows {
-        options.push(fuser::MountOption::AllowOther);
-        debug!(target: "fuse-pipe::client", is_root, fuse_conf_allows, "adding AllowOther mount option");
+    let acl = if is_root || fuse_conf_allows {
+        debug!(target: "fuse-pipe::client", is_root, fuse_conf_allows, "using SessionACL::All (allow_other)");
+        fuser::SessionACL::All
     } else {
-        debug!(target: "fuse-pipe::client", "skipping AllowOther (not root and user_allow_other not in /etc/fuse.conf)");
-    }
+        debug!(target: "fuse-pipe::client", "using SessionACL::Owner (not root and user_allow_other not in /etc/fuse.conf)");
+        fuser::SessionACL::Owner
+    };
     info!(target: "fuse-pipe::client", ?options, "using mount options");
     let mut config = fuser::Config::default();
     config.mount_options = options;
+    config.acl = acl;
 
     // For single reader, just run directly
     if num_readers == 1 {
@@ -568,14 +570,14 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
 
     // Mount options (same as Unix socket version - see comments there for details)
     // Build mount options.
-    let mut options = vec![
+    let options = vec![
         fuser::MountOption::FSName("fuse-pipe".to_string()),
         fuser::MountOption::Suid,
         fuser::MountOption::Dev,
         fuser::MountOption::DefaultPermissions,
     ];
 
-    // AllowOther lets other users access the mount. It's needed when:
+    // AllowOther (SessionACL::All) lets other users access the mount. It's needed when:
     // - Tests switch to different uids (pjdfstest)
     // - Multiple users need to access the filesystem
     // Root can always use it; non-root needs user_allow_other in /etc/fuse.conf
@@ -584,14 +586,16 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
         .map(|s| s.lines().any(|l| l.trim() == "user_allow_other"))
         .unwrap_or(false);
 
-    if is_root || fuse_conf_allows {
-        options.push(fuser::MountOption::AllowOther);
-        debug!(target: "fuse-pipe::client", is_root, fuse_conf_allows, "adding AllowOther mount option");
+    let acl = if is_root || fuse_conf_allows {
+        debug!(target: "fuse-pipe::client", is_root, fuse_conf_allows, "using SessionACL::All (allow_other)");
+        fuser::SessionACL::All
     } else {
-        debug!(target: "fuse-pipe::client", "skipping AllowOther (not root and user_allow_other not in /etc/fuse.conf)");
-    }
+        debug!(target: "fuse-pipe::client", "using SessionACL::Owner (not root and user_allow_other not in /etc/fuse.conf)");
+        fuser::SessionACL::Owner
+    };
     let mut config = fuser::Config::default();
     config.mount_options = options;
+    config.acl = acl;
 
     // For single reader, just run directly
     if num_readers == 1 {
