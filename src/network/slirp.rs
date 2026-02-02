@@ -78,6 +78,8 @@ use crate::state::truncate_id;
 const GUEST_SUBNET: &str = "10.0.2.0/24";
 const GUEST_IP: &str = "10.0.2.15";
 const NAMESPACE_IP: &str = "10.0.2.1";
+/// slirp4netns internal gateway - the guest sends traffic here for NAT
+const SLIRP_GATEWAY: &str = "10.0.2.2";
 
 /// Default TAP device name for slirp4netns
 const SLIRP_DEVICE_NAME: &str = "slirp0";
@@ -508,7 +510,10 @@ impl NetworkManager for SlirpNetwork {
             tap_device: self.tap_device.clone(),
             guest_mac,
             guest_ip: Some(format!("{}/24", self.guest_ip)),
-            host_ip: Some(self.namespace_ip.clone()),
+            // Use slirp's internal gateway (10.0.2.2) as the gateway for the guest.
+            // This is different from namespace_ip (10.0.2.1) which is on br0 for health checks.
+            // The guest sends traffic to 10.0.2.2, slirp4netns NATs it to the internet.
+            host_ip: Some(SLIRP_GATEWAY.to_string()),
             host_veth: None,
             loopback_ip: self.loopback_ip.clone(), // For port forwarding (no ip addr add needed!)
             health_check_port: Some(8080),         // Unprivileged port, forwards to guest:80
