@@ -135,8 +135,8 @@ impl Multiplexer {
     ///
     /// This is called by reader threads. Uses lock-free channel for submission
     /// and per-request oneshot channel for response.
-    pub fn send_request(&self, reader_id: u32, request: VolumeRequest) -> VolumeResponse {
-        self.send_request_with_groups(reader_id, request, Vec::new())
+    pub fn send_request(&self, request: VolumeRequest) -> VolumeResponse {
+        self.send_request_with_groups(request, Vec::new())
     }
 
     /// Send a request with supplementary groups and wait for response.
@@ -144,7 +144,6 @@ impl Multiplexer {
     /// The supplementary groups are forwarded to the server for proper permission checks.
     pub fn send_request_with_groups(
         &self,
-        reader_id: u32,
         request: VolumeRequest,
         supplementary_groups: Vec<u32>,
     ) -> VolumeResponse {
@@ -159,16 +158,17 @@ impl Multiplexer {
         };
 
         // Build wire request - span goes inside the request so server gets it
+        // reader_id is set to 0 since routing is done by unique ID, not reader_id
         let wire = if should_trace {
             WireRequest::with_span_and_groups(
                 unique,
-                reader_id,
+                0, // reader_id not used for routing
                 request,
                 Span::new(),
                 supplementary_groups,
             )
         } else {
-            WireRequest::with_groups(unique, reader_id, request, supplementary_groups)
+            WireRequest::with_groups(unique, 0, request, supplementary_groups)
         };
 
         let body = match bincode::serialize(&wire) {
@@ -395,7 +395,7 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel();
 
         std::thread::spawn(move || {
-            let resp = mux_clone.send_request(0, VolumeRequest::Getattr { ino: 1 });
+            let resp = mux_clone.send_request(VolumeRequest::Getattr { ino: 1 });
             let _ = done_tx.send(resp.errno());
         });
 
@@ -433,21 +433,18 @@ mod tests {
         let (tx1, rx1) = mpsc::channel();
 
         std::thread::spawn(move || {
-            let resp = mux0.send_request(0, VolumeRequest::Getattr { ino: 10 });
+            let resp = mux0.send_request(VolumeRequest::Getattr { ino: 10 });
             let _ = tx0.send(resp);
         });
 
         std::thread::spawn(move || {
-            let resp = mux1.send_request(
-                1,
-                VolumeRequest::Lookup {
-                    parent: 1,
-                    name: "file".into(),
-                    uid: 1000,
-                    gid: 1000,
-                    pid: 0,
-                },
-            );
+            let resp = mux1.send_request(VolumeRequest::Lookup {
+                parent: 1,
+                name: "file".into(),
+                uid: 1000,
+                gid: 1000,
+                pid: 0,
+            });
             let _ = tx1.send(resp);
         });
 
@@ -492,7 +489,7 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel();
 
         std::thread::spawn(move || {
-            let resp = mux_clone.send_request(0, VolumeRequest::Getattr { ino: 1 });
+            let resp = mux_clone.send_request(VolumeRequest::Getattr { ino: 1 });
             let _ = done_tx.send(resp.errno());
         });
 
