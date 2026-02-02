@@ -83,6 +83,14 @@ pub fn unique_paths(prefix: &str) -> (PathBuf, PathBuf) {
         let _ = std::process::Command::new("fusermount3")
             .args(["-u", mount_dir.to_str().unwrap()])
             .status();
+        // Wait for kernel to fully release the mount point after unmount.
+        // With fuser's spawn() + multi-threading, cleanup can take longer.
+        for _ in 0..50 {
+            if !is_fuse_mount(&mount_dir) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
     let _ = fs::remove_dir_all(&mount_dir);
 
@@ -182,6 +190,9 @@ impl FuseMount {
         // Cleanup any stale state
         let _ = fs::remove_file(&socket);
         fs::create_dir_all(data_path).expect("create data dir");
+        // Remove mount_path if it exists (could be file or dir from previous test)
+        let _ = fs::remove_file(mount_path);
+        let _ = fs::remove_dir(mount_path);
         fs::create_dir_all(mount_path).expect("create mount dir");
 
         let socket_path = socket.to_str().unwrap().to_string();
@@ -305,6 +316,10 @@ impl Drop for FuseMount {
 
         debug!(target: TARGET, "Dropping server_guard (shutting down server)");
         drop(self.server_guard.take());
+
+        // Clean up mount directory to prevent stale state for next test
+        debug!(target: TARGET, "Cleaning up mount directory");
+        let _ = fs::remove_dir(&self.mount_dir);
 
         info!(target: TARGET, "FuseMount::drop complete");
     }

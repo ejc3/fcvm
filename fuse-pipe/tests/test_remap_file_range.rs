@@ -15,6 +15,17 @@ use std::fs::{self, File};
 use std::os::unix::io::AsRawFd;
 
 use common::{cleanup, unique_paths, FuseMount};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Counter for unique btrfs test paths
+static BTRFS_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Generate a unique path on btrfs for parallel test execution.
+fn unique_btrfs_path(prefix: &str) -> std::path::PathBuf {
+    let id = BTRFS_TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    std::path::PathBuf::from(format!("/mnt/fcvm-btrfs/{}-{}-{}", prefix, pid, id))
+}
 
 /// FICLONE ioctl number: _IOW(0x94, 9, int) = 0x40049409
 const FICLONE: libc::c_ulong = 0x40049409;
@@ -120,14 +131,14 @@ fn test_ficlone_whole_file() {
     // Check if backing filesystem is btrfs
     if !is_btrfs(std::path::Path::new("/tmp")) {
         // Try to use /mnt/fcvm-btrfs if available
-        let btrfs_path = std::path::Path::new("/mnt/fcvm-btrfs/test-fuse-ficlone");
         if !is_btrfs(std::path::Path::new("/mnt/fcvm-btrfs")) {
             eprintln!("SKIP: test_ficlone_whole_file requires btrfs backing filesystem");
             eprintln!("      /tmp is not btrfs and /mnt/fcvm-btrfs is not available");
             return;
         }
-        // Use btrfs-backed paths
-        return run_ficlone_test(btrfs_path);
+        // Use unique btrfs-backed path for parallel test safety
+        let btrfs_path = unique_btrfs_path("test-fuse-ficlone");
+        return run_ficlone_test(&btrfs_path);
     }
 
     run_ficlone_test_with_paths(&data_dir, &mount_dir);
@@ -227,12 +238,12 @@ fn test_ficlonerange_partial() {
 
     // Check if backing filesystem is btrfs
     if !is_btrfs(std::path::Path::new("/tmp")) {
-        let btrfs_path = std::path::Path::new("/mnt/fcvm-btrfs/test-fuse-ficlonerange");
         if !is_btrfs(std::path::Path::new("/mnt/fcvm-btrfs")) {
             eprintln!("SKIP: test_ficlonerange_partial requires btrfs backing filesystem");
             return;
         }
-        return run_ficlonerange_test(btrfs_path);
+        let btrfs_path = unique_btrfs_path("test-fuse-ficlonerange");
+        return run_ficlonerange_test(&btrfs_path);
     }
 
     run_ficlonerange_test_with_paths(&data_dir, &mount_dir);
@@ -360,12 +371,12 @@ fn test_cp_reflink_always() {
 
     // Check if backing filesystem is btrfs
     if !is_btrfs(std::path::Path::new("/tmp")) {
-        let btrfs_path = std::path::Path::new("/mnt/fcvm-btrfs/test-fuse-cp-reflink");
         if !is_btrfs(std::path::Path::new("/mnt/fcvm-btrfs")) {
             eprintln!("SKIP: test_cp_reflink_always requires btrfs backing filesystem");
             return;
         }
-        return run_cp_reflink_test(btrfs_path);
+        let btrfs_path = unique_btrfs_path("test-fuse-cp-reflink");
+        return run_cp_reflink_test(&btrfs_path);
     }
 
     run_cp_reflink_test_with_paths(&data_dir, &mount_dir);

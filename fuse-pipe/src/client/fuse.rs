@@ -47,10 +47,12 @@ fn get_supplementary_groups(pid: u32) -> Vec<u32> {
 pub type InitCallback = Box<dyn FnOnce() + Send>;
 
 /// FUSE client that uses a shared multiplexer.
+///
+/// This can be shared across multiple fuser threads via Arc. Response routing
+/// is done by unique request ID, not by reader/thread ID.
 pub struct FuseClient {
     mux: Arc<Multiplexer>,
-    reader_id: u32,
-    /// Optional callback to run when init() completes (spawns additional readers).
+    /// Optional callback to run when init() completes.
     /// Wrapped in Mutex to satisfy Sync requirement for Filesystem trait.
     init_callback: Mutex<Option<InitCallback>>,
     /// Shared flag set by destroy() to signal clean shutdown to reader threads
@@ -58,41 +60,31 @@ pub struct FuseClient {
 }
 
 impl FuseClient {
-    /// Create a new client for a specific reader using shared multiplexer.
-    pub fn new(mux: Arc<Multiplexer>, reader_id: u32) -> Self {
-        Self::with_destroyed_flag(mux, reader_id, Arc::new(AtomicBool::new(false)))
+    /// Create a new client using shared multiplexer.
+    pub fn new(mux: Arc<Multiplexer>) -> Self {
+        Self::with_destroyed_flag(mux, Arc::new(AtomicBool::new(false)))
     }
 
     /// Create a new client with a shared destroyed flag.
     ///
     /// The destroyed flag is set by `destroy()` when the filesystem is unmounted.
     /// Reader threads can check this flag to distinguish clean shutdown from errors.
-    pub fn with_destroyed_flag(
-        mux: Arc<Multiplexer>,
-        reader_id: u32,
-        destroyed: Arc<AtomicBool>,
-    ) -> Self {
+    pub fn with_destroyed_flag(mux: Arc<Multiplexer>, destroyed: Arc<AtomicBool>) -> Self {
         Self {
             mux,
-            reader_id,
             init_callback: Mutex::new(None),
             destroyed,
         }
     }
 
     /// Create a new client with a callback to run after INIT completes.
-    ///
-    /// The callback should spawn additional reader threads. This is only
-    /// used for the primary reader (reader 0).
     pub fn with_init_callback(
         mux: Arc<Multiplexer>,
-        reader_id: u32,
         callback: InitCallback,
         destroyed: Arc<AtomicBool>,
     ) -> Self {
         Self {
             mux,
-            reader_id,
             init_callback: Mutex::new(Some(callback)),
             destroyed,
         }
@@ -108,10 +100,9 @@ impl FuseClient {
         let pid = Self::request_pid(&request);
         if let Some(pid) = pid {
             let groups = get_supplementary_groups(pid);
-            self.mux
-                .send_request_with_groups(self.reader_id, request, groups)
+            self.mux.send_request_with_groups(request, groups)
         } else {
-            self.mux.send_request(self.reader_id, request)
+            self.mux.send_request(request)
         }
     }
 
@@ -121,8 +112,7 @@ impl FuseClient {
     /// and forwards them to the server for proper permission checks.
     fn send_request_with_groups(&self, request: VolumeRequest, pid: u32) -> VolumeResponse {
         let groups = get_supplementary_groups(pid);
-        self.mux
-            .send_request_with_groups(self.reader_id, request, groups)
+        self.mux.send_request_with_groups(request, groups)
     }
 
     /// Extract the caller PID from a request (when available).
@@ -297,7 +287,7 @@ impl Filesystem for FuseClient {
         // The kernel calls destroy() before closing cloned fds, so reader
         // threads will see this flag when they get ECONNABORTED.
         let was = self.destroyed.swap(true, Ordering::SeqCst);
-        tracing::debug!(target: "fuse-pipe::client", reader_id = self.reader_id, was_already_set = was, "destroy() called - signaling clean shutdown");
+        tracing::debug!(target: "fuse-pipe::client", was_already_set = was, "destroy() called - signaling clean shutdown");
     }
 
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {

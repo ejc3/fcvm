@@ -38,9 +38,9 @@ tracing-log = "0.2"  # Bridge log crate to tracing
 # Using local path for development - synced to EC2 via `make sync`
 fuse-backend-rs = { path = "../../fuse-backend-rs", default-features = false, features = ["fusedev"] }
 
-# FUSE client (local fork with multi-reader support via FUSE_DEV_IOC_CLONE)
-# Using local path for development - synced to EC2 via `make sync`
-fuser = { path = "../../fuser", features = ["abi-7-28"] }
+# FUSE client (fork with clone_fd for true parallel readers + remap_file_range)
+# Based on upstream PR #627 (stepancheg's multi-threaded approach)
+fuser = { git = "https://github.com/ejc3/fuser.git", branch = "remap-on-627", features = ["abi-7-28"] }
 
 # Concurrent data structures
 dashmap = "5.5"
