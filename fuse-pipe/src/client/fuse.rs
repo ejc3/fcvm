@@ -4,10 +4,9 @@ use super::multiplexer::Multiplexer;
 use crate::protocol::{file_type, FileAttr, VolumeRequest, VolumeResponse};
 use fuser::{
     AccessFlags, BsdFileFlags, CopyFileRangeFlags, Errno, FileHandle, FileType, Filesystem,
-    FopenFlags, Generation, INodeNo, InitFlags, LockOwner, OpenFlags, RenameFlags,
-    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry,
-    ReplyLock, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
-    WriteFlags,
+    FopenFlags, Generation, INodeNo, InitFlags, LockOwner, OpenFlags, RenameFlags, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyLock,
+    ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 use std::ffi::OsStr;
 use std::fs;
