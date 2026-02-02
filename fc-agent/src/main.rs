@@ -1801,10 +1801,16 @@ fn configure_ipv6_if_needed() {
     };
 
     // Check if any DNS server is IPv6 (contains ::)
+    // Parse the dns= parameter value and check each IP individually
     let has_ipv6_dns = cmdline
         .split_whitespace()
         .find(|s| s.starts_with("dns="))
-        .map(|s| s.contains("::"))
+        .and_then(|s| s.strip_prefix("dns="))
+        .map(|dns_val| {
+            dns_val
+                .split(',')
+                .any(|ip| ip.parse::<std::net::Ipv6Addr>().is_ok())
+        })
         .unwrap_or(false);
 
     if !has_ipv6_dns {
