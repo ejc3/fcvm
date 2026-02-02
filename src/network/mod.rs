@@ -68,6 +68,28 @@ pub fn get_host_dns_servers() -> anyhow::Result<Vec<String>> {
     Ok(servers)
 }
 
+/// Get host DNS search domains from resolv.conf
+///
+/// Returns search domains that VMs should use. This is critical for
+/// resolving short hostnames in enterprise networks that require search
+/// domain suffixes.
+pub fn get_host_dns_search() -> Vec<String> {
+    // Try systemd-resolved upstream config first
+    let resolv_content = std::fs::read_to_string("/run/systemd/resolve/resolv.conf")
+        .or_else(|_| std::fs::read_to_string("/etc/resolv.conf"))
+        .unwrap_or_default();
+
+    // Extract search domains from "search domain1 domain2 domain3" line
+    resolv_content
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("search ")
+                .map(|s| s.split_whitespace().map(|d| d.to_string()).collect())
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

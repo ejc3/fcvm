@@ -1268,3 +1268,47 @@ pub async fn delete_snapshot(snapshot_key: &str) -> anyhow::Result<()> {
 pub fn startup_snapshot_key(base_key: &str) -> String {
     fcvm::commands::podman::startup_snapshot_key(base_key)
 }
+
+// ============================================================================
+// Port allocation helpers
+// ============================================================================
+
+/// Find a port not blocked by wildcard binds (0.0.0.0:port).
+///
+/// Each VM gets a unique loopback IP (127.x.y.z), so VMs don't conflict with
+/// each other. But wildcard binds on 0.0.0.0 block all interfaces including
+/// loopback. This function finds a port without a wildcard bind.
+///
+/// # Arguments
+/// * `start_port` - Beginning of port range to scan (typically 10000+)
+/// * `range_size` - Number of ports to try before giving up
+///
+/// # Returns
+/// An available port number, or error if none found
+pub fn find_available_port(start_port: u16, range_size: u16) -> anyhow::Result<u16> {
+    use std::net::{TcpListener, SocketAddr};
+
+    for i in 0..range_size {
+        let port = start_port + i;
+        // Check 0.0.0.0 to detect wildcard binds that block all interfaces
+        let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
+
+        // Try to bind - if successful, no wildcard bind exists on this port
+        if TcpListener::bind(addr).is_ok() {
+            return Ok(port);
+        }
+    }
+
+    anyhow::bail!("No available port found in range {}..{}", start_port, start_port + range_size)
+}
+
+/// Find an available port in the default high port range (10000-60000).
+///
+/// This range avoids conflicts with common system services.
+pub fn find_available_high_port() -> anyhow::Result<u16> {
+    find_available_port(10000, 50000)
+}
+
+// ============================================================================
+// Network compatibility checks
+// ============================================================================

@@ -683,11 +683,9 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     let network_config = network.setup().await.context("setting up network")?;
 
-    // Use network-provided health check URL if user didn't specify one
-    // Each network type (bridged/rootless) generates its own appropriate URL
-    if vm_state.config.health_check_url.is_none() {
-        vm_state.config.health_check_url = network_config.health_check_url.clone();
-    }
+    // Note: We intentionally don't set health_check_url from network config by default.
+    // HTTP health checks should only be used when explicitly requested.
+    // For clones, use the container-ready file mechanism by default.
     if let Some(port) = network_config.health_check_port {
         vm_state.config.network.health_check_port = Some(port);
     }
@@ -860,6 +858,15 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Create cancellation token for graceful health monitor shutdown
     let health_cancel_token = tokio_util::sync::CancellationToken::new();
+
+    // For snapshot clones, the container is already running (snapshot was taken after container started).
+    // Create the container-ready file so the health check can immediately detect healthy status.
+    let ready_file = data_dir.join("container-ready");
+    if let Err(e) = std::fs::write(&ready_file, "ready\n") {
+        warn!("failed to create container-ready file: {}", e);
+    } else {
+        debug!("created container-ready file for snapshot clone");
+    }
 
     // Create startup snapshot channel if:
     // - startup_snapshot_base_key is set (passed from podman run on cache hit)

@@ -115,30 +115,42 @@ async fn exec_test_impl(network: &str) -> Result<()> {
         http_code
     );
 
-    // Test 6: Container internet connectivity - wget AWS public ECR (default, no flag needed)
-    println!("\nTest 6: Container internet - wget public.ecr.aws");
-    // Use wget --spider for HEAD request (exits 0 on success, 1 on failure)
-    // Alpine's wget doesn't have the same options as curl, but --spider works
+    // Test 6: Container internet connectivity - curl AWS public ECR (default, no flag needed)
+    // Note: We use curl because busybox wget doesn't properly support HTTPS through HTTP proxy
+    println!("\nTest 6: Container internet - curl public.ecr.aws");
+
+    // First install curl in the container
+    let _ = run_exec(
+        &fcvm_path,
+        fcvm_pid,
+        false,
+        &["apk", "add", "--no-cache", "curl"],
+    )
+    .await?;
+
+    // Now test with curl
     let output = run_exec(
         &fcvm_path,
         fcvm_pid,
         false,
         &[
-            "wget",
-            "--spider",
-            "-q",
-            "--timeout=10",
+            "curl",
+            "-s",
+            "--max-time",
+            "10",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
             "https://public.ecr.aws/",
         ],
     )
     .await?;
-    // wget --spider -q outputs nothing on success, just exits 0
-    // If we got here without error, connectivity works
-    println!("  wget spider succeeded (exit 0)");
-    // The command succeeds if we reach here; wget returns non-zero on network failure
+    println!("  curl HTTP status: {}", output.trim());
+    // public.ecr.aws returns 308 redirect or 200
     assert!(
-        output.trim().is_empty() || output.contains("200"),
-        "wget should succeed silently, got: {}",
+        output.contains("200") || output.contains("308"),
+        "curl should get 200 or 308, got: {}",
         output
     );
 

@@ -29,6 +29,16 @@ pub struct NetworkConfig {
     /// Rootless: 10.0.2.3 (slirp4netns built-in DNS)
     #[serde(default)]
     pub dns_server: Option<String>,
+    /// DNS search domains for the guest
+    /// These are needed to resolve short hostnames in enterprise networks
+    /// Passed to VM via kernel cmdline dns_search=domain1,domain2,...
+    #[serde(default)]
+    pub dns_search: Option<String>,
+    /// HTTP proxy URL for the guest to use
+    /// On IPv6-only hosts with old libslirp, this points to a local socat
+    /// forwarder that routes to an upstream proxy over IPv6
+    #[serde(default)]
+    pub http_proxy: Option<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -1181,11 +1181,11 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     let network_config = network.setup().await.context("setting up network")?;
 
-    // Use network-provided health check URL if user didn't specify one
-    // Each network type (bridged/rootless) generates its own appropriate URL
-    if vm_state.config.health_check_url.is_none() {
-        vm_state.config.health_check_url = network_config.health_check_url.clone();
-    }
+    // Note: We intentionally don't set health_check_url from network config by default.
+    // HTTP health checks should only be used when explicitly requested via --health-check.
+    // Without --health-check, the health monitor uses the container-ready file mechanism,
+    // which works for all containers regardless of whether they have an HTTP server.
+    // We still save the health_check_port for use with port forwarding.
     if let Some(port) = network_config.health_check_port {
         vm_state.config.network.health_check_port = Some(port);
     }
@@ -1950,7 +1950,7 @@ async fn run_vm_setup(
 
         // Verify TAP device was created successfully
         let tap_device = &network_config.tap_device;
-        let verify_cmd = format!("ip link show {} >/dev/null 2>&1", tap_device);
+        let verify_cmd = format!("export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH; ip link show {} >/dev/null 2>&1", tap_device);
         let verify_output = tokio::process::Command::new(&nsenter_prefix[0])
             .args(&nsenter_prefix[1..])
             .arg("bash")
@@ -2038,19 +2038,25 @@ async fn run_vm_setup(
     let mut runtime_boot_args = String::new();
 
     // Network configuration via kernel cmdline
-    // Format: ip=<client-ip>:<server-ip>:<gw-ip>:<netmask>:<hostname>:<device>:<autoconf>:<dns0>
+    // Format: ip=<client-ip>:<server-ip>:<gw-ip>:<netmask>:<hostname>:<device>:<autoconf>
+    // DNS is passed separately because IPv6 addresses contain ':' which conflicts with ip= separator
     if let (Some(guest_ip), Some(host_ip)) = (&network_config.guest_ip, &network_config.host_ip) {
         let guest_ip_clean = guest_ip.split('/').next().unwrap_or(guest_ip);
         let host_ip_clean = host_ip.split('/').next().unwrap_or(host_ip);
-        let dns_suffix = network_config
-            .dns_server
-            .as_ref()
-            .map(|dns| format!(":{}", dns))
-            .unwrap_or_default();
         runtime_boot_args.push_str(&format!(
-            "ip={}::{}:255.255.255.252::eth0:off{}",
-            guest_ip_clean, host_ip_clean, dns_suffix
+            "ip={}::{}:255.255.255.0::eth0:off",
+            guest_ip_clean, host_ip_clean
         ));
+
+        // Add DNS as separate parameter (comma-separated list of servers)
+        if let Some(dns) = &network_config.dns_server {
+            runtime_boot_args.push_str(&format!(" dns={}", dns));
+        }
+
+        // Add DNS search domains (critical for resolving short hostnames in enterprise networks)
+        if let Some(search) = &network_config.dns_search {
+            runtime_boot_args.push_str(&format!(" dns_search={}", search));
+        }
     }
 
     // Enable fc-agent strace debugging if requested
@@ -2421,8 +2427,18 @@ async fn run_vm_setup(
                 "privileged": args.privileged,
                 "interactive": args.interactive,
                 "tty": args.tty,
-                "http_proxy": std::env::var("http_proxy").or_else(|_| std::env::var("HTTP_PROXY")).ok(),
-                "https_proxy": std::env::var("https_proxy").or_else(|_| std::env::var("HTTPS_PROXY")).ok(),
+                // Use network-provided proxy (auto-configured for IPv6-only hosts), or fall back to environment
+                // Check all proxy env vars and use whichever is available
+                "http_proxy": network_config.http_proxy.clone()
+                    .or_else(|| std::env::var("http_proxy").ok())
+                    .or_else(|| std::env::var("HTTP_PROXY").ok())
+                    .or_else(|| std::env::var("https_proxy").ok())
+                    .or_else(|| std::env::var("HTTPS_PROXY").ok()),
+                "https_proxy": network_config.http_proxy.clone()
+                    .or_else(|| std::env::var("https_proxy").ok())
+                    .or_else(|| std::env::var("HTTPS_PROXY").ok())
+                    .or_else(|| std::env::var("http_proxy").ok())
+                    .or_else(|| std::env::var("HTTP_PROXY").ok()),
             },
             "host-time": chrono::Utc::now().timestamp().to_string(),
         }

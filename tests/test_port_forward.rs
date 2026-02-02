@@ -177,8 +177,12 @@ fn test_port_forward_rootless() -> Result<()> {
     let fcvm_path = common::find_fcvm_binary()?;
     let vm_name = format!("port-rootless-{}", std::process::id());
 
+    // Use dynamic port to avoid conflicts with system services
+    let host_port = common::find_available_high_port().context("finding available port")?;
+    let publish_arg = format!("{}:80", host_port);
+
     // Start VM with rootless networking and port forwarding
-    // Rootless uses unique loopback IPs (127.x.y.z) per VM, so port 8080 is fine
+    // Rootless uses unique loopback IPs (127.x.y.z) per VM
     let mut fcvm = Command::new(&fcvm_path)
         .args([
             "podman",
@@ -188,7 +192,7 @@ fn test_port_forward_rootless() -> Result<()> {
             "--network",
             "rootless",
             "--publish",
-            "8080:80",
+            &publish_arg,
             common::TEST_IMAGE,
         ])
         .spawn()
@@ -244,13 +248,13 @@ fn test_port_forward_rootless() -> Result<()> {
 
     // Test: Access via loopback IP and forwarded port
     // In rootless mode, each VM gets a unique 127.x.y.z IP
-    println!("Testing access via loopback IP {}:8080...", loopback_ip);
+    println!("Testing access via loopback IP {}:{}...", loopback_ip, host_port);
     let output = Command::new("curl")
         .args([
             "-s",
             "--max-time",
             "5",
-            &format!("http://{}:8080", loopback_ip),
+            &format!("http://{}:{}", loopback_ip, host_port),
         ])
         .output()
         .context("curl to loopback")?;

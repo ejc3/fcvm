@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use tracing::{debug, info};
 
 use super::{
-    get_host_dns_servers, namespace, portmap, types::generate_mac, veth, NetworkConfig,
-    NetworkManager, PortMapping,
+    get_host_dns_search, get_host_dns_servers, namespace, portmap, types::generate_mac, veth,
+    NetworkConfig, NetworkManager, PortMapping,
 };
 use crate::state::truncate_id;
 
@@ -343,6 +343,14 @@ impl NetworkManager for BridgedNetwork {
             "network namespace configured successfully"
         );
 
+        // Get search domains for VM
+        let search_domains = get_host_dns_search();
+        let dns_search = if search_domains.is_empty() {
+            None
+        } else {
+            Some(search_domains.join(","))
+        };
+
         // Return network config with auto-generated health check URL
         // For clones, use the veth inner IP (which gets DNATed to guest)
         Ok(NetworkConfig {
@@ -355,6 +363,8 @@ impl NetworkManager for BridgedNetwork {
             health_check_port: Some(80),
             health_check_url: Some(format!("http://{}:80/", health_check_ip)),
             dns_server,
+            dns_search,
+            http_proxy: None, // Bridged mode has direct network access, no proxy needed
         })
     }
 

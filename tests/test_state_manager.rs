@@ -39,6 +39,8 @@ async fn test_state_persistence() {
                 health_check_port: None,
                 health_check_url: None,
                 dns_server: None,
+                dns_search: None,
+                http_proxy: None,
             },
             volumes: vec![],
             extra_disks: vec![],

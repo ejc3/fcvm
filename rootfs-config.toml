@@ -80,6 +80,7 @@ disable = [
     "cloud-init",
     "cloud-config",
     "cloud-final",
+    "systemd-resolved",  # Use fc-agent's /etc/resolv.conf instead
 ]
 
 [files]

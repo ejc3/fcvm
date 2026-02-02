@@ -552,7 +552,7 @@ pub async fn restore_from_snapshot(
             }
 
             // Verify TAP device was created successfully
-            let verify_cmd = format!("ip link show {} >/dev/null 2>&1", tap_device);
+            let verify_cmd = format!("export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH; ip link show {} >/dev/null 2>&1", tap_device);
             let verify_output = tokio::process::Command::new(&nsenter_prefix[0])
                 .args(&nsenter_prefix[1..])
                 .arg("bash")

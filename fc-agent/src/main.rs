@@ -266,7 +266,7 @@ async fn watch_restore_epoch() {
     }
 }
 
-/// Handle clone restore: kill stale sockets, flush ARP, and remount volumes
+/// Handle clone restore: kill stale sockets, flush ARP/NDP, and remount volumes
 async fn handle_clone_restore(volumes: &[VolumeMount]) {
     // 1. KILL all established TCP connections immediately
     // After snapshot restore, existing TCP connections are DEAD (different network namespace).
@@ -277,10 +277,19 @@ async fn handle_clone_restore(volumes: &[VolumeMount]) {
     // 2. Flush ARP cache (stale MAC entries from previous network)
     flush_arp_cache().await;
 
+    // 3. Re-send NDP Neighbor Advertisement for IPv6
+    // slirp4netns is a NEW process after restore - it doesn't know our MAC address.
+    // We must re-announce ourselves so slirp can route IPv6 DNS responses back.
+    if let Err(e) = send_gratuitous_ndp_na("eth0", "fd00::100") {
+        eprintln!("[fc-agent] WARNING: failed to send NDP NA on restore: {}", e);
+    } else {
+        eprintln!("[fc-agent] ✓ sent gratuitous NDP NA on restore");
+    }
+
     // Note: Interface bounce (ip link down/up) is NOT needed - ss -K handles socket cleanup
     // more effectively by directly destroying sockets rather than hoping they notice ENETDOWN.
 
-    // 3. Remount FUSE volumes if any
+    // 4. Remount FUSE volumes if any
     if !volumes.is_empty() {
         eprintln!(
             "[fc-agent] clone has {} volume(s) to remount",
@@ -854,6 +863,11 @@ fn handle_exec_connection_blocking(fd: i32) {
             if request.tty {
                 cmd.push("-t".to_string());
             }
+            // Pass proxy settings via -e flags for podman exec
+            for (key, value) in read_proxy_settings() {
+                cmd.push("-e".to_string());
+                cmd.push(format!("{}={}", key, value));
+            }
             cmd.push("--latest".to_string());
             cmd.extend(request.command.iter().cloned());
             cmd
@@ -875,6 +889,9 @@ fn handle_exec_connection_blocking(fd: i32) {
 fn handle_exec_pipe(fd: i32, request: &ExecRequest) {
     use std::io::{BufRead, BufReader};
 
+    // Read proxy settings for external network access
+    let proxy_settings = read_proxy_settings();
+
     // Build the command using std::process::Command (blocking)
     let mut cmd = if request.in_container {
         // Execute inside the container using podman exec
@@ -883,6 +900,10 @@ fn handle_exec_pipe(fd: i32, request: &ExecRequest) {
         // Pass -i flag if interactive mode requested
         if request.interactive {
             cmd.arg("-i");
+        }
+        // Pass proxy settings via -e flags for podman exec
+        for (key, value) in &proxy_settings {
+            cmd.arg("-e").arg(format!("{}={}", key, value));
         }
         // Use the first running container (there should only be one)
         cmd.arg("--latest");
@@ -893,6 +914,10 @@ fn handle_exec_pipe(fd: i32, request: &ExecRequest) {
         let mut cmd = std::process::Command::new(&request.command[0]);
         if request.command.len() > 1 {
             cmd.args(&request.command[1..]);
+        }
+        // Set proxy environment variables for VM-level commands
+        for (key, value) in &proxy_settings {
+            cmd.env(key, value);
         }
         cmd
     };
@@ -1670,8 +1695,335 @@ async fn sync_clock_from_host() -> Result<()> {
     Ok(())
 }
 
+/// Configure IPv6 networking on eth0 if DNS servers are IPv6
+///
+/// When DNS servers are IPv6 (like on IPv6-only networks), we need IPv6 connectivity.
+/// This adds an IPv6 address to eth0 and sets up routing through slirp4netns.
+///
+/// IPv6 addressing (bridge mode with slirp4netns):
+/// - Guest eth0: fd00::100/64
+/// - Gateway: fd00::2 (slirp4netns virtual gateway, on-link via bridge)
+/// Save proxy settings from the plan to a file so exec commands can use them.
+/// This is needed because exec commands run via vsock don't have access to the
+/// original plan.
+const PROXY_SETTINGS_FILE: &str = "/etc/fcvm-proxy.env";
+
+fn save_proxy_settings(plan: &Plan) {
+    use std::io::Write;
+
+    let mut content = String::new();
+    let mut env_vars = Vec::new();
+
+    if let Some(ref proxy) = plan.http_proxy {
+        content.push_str(&format!("http_proxy={}\n", proxy));
+        content.push_str(&format!("HTTP_PROXY={}\n", proxy));
+        env_vars.push(("http_proxy", proxy.clone()));
+        env_vars.push(("HTTP_PROXY", proxy.clone()));
+    }
+    if let Some(ref proxy) = plan.https_proxy {
+        content.push_str(&format!("https_proxy={}\n", proxy));
+        content.push_str(&format!("HTTPS_PROXY={}\n", proxy));
+        env_vars.push(("https_proxy", proxy.clone()));
+        env_vars.push(("HTTPS_PROXY", proxy.clone()));
+    }
+
+    if content.is_empty() {
+        eprintln!("[fc-agent] no proxy settings configured");
+        return;
+    }
+
+    // Set environment variables in current process so child processes (TTY mode) inherit them
+    for (key, value) in &env_vars {
+        std::env::set_var(key, value);
+    }
+    eprintln!("[fc-agent] ✓ set {} proxy environment variables", env_vars.len());
+
+    // Also save to file for exec handler to read
+    match std::fs::File::create(PROXY_SETTINGS_FILE) {
+        Ok(mut file) => {
+            if let Err(e) = file.write_all(content.as_bytes()) {
+                eprintln!(
+                    "[fc-agent] WARNING: failed to write proxy settings: {}",
+                    e
+                );
+            } else {
+                eprintln!("[fc-agent] ✓ saved proxy settings to {}", PROXY_SETTINGS_FILE);
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "[fc-agent] WARNING: failed to create proxy settings file: {}",
+                e
+            );
+        }
+    }
+}
+
+/// Read proxy settings from the saved file.
+/// Returns a Vec of (key, value) pairs.
+fn read_proxy_settings() -> Vec<(String, String)> {
+    let content = match std::fs::read_to_string(PROXY_SETTINGS_FILE) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    content
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, '=');
+            let key = parts.next()?;
+            let value = parts.next()?;
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+/// - DNS: fd00::3 (slirp4netns virtual DNS, on-link via bridge)
+///
+/// CRITICAL: After configuring IPv6, we must send a gratuitous NDP Neighbor
+/// Advertisement so slirp4netns learns our MAC address. slirp only learns MACs
+/// from NDP messages, not from regular traffic.
+fn configure_ipv6_if_needed() {
+    eprintln!("[fc-agent] checking if IPv6 networking is needed");
+
+    // Read kernel command line to check for IPv6 DNS servers
+    let cmdline = match std::fs::read_to_string("/proc/cmdline") {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: failed to read /proc/cmdline: {}", e);
+            return;
+        }
+    };
+
+    // Check if any DNS server is IPv6 (contains ::)
+    let has_ipv6_dns = cmdline
+        .split_whitespace()
+        .find(|s| s.starts_with("dns="))
+        .map(|s| s.contains("::"))
+        .unwrap_or(false);
+
+    if !has_ipv6_dns {
+        eprintln!("[fc-agent] no IPv6 DNS servers, skipping IPv6 config");
+        return;
+    }
+
+    eprintln!("[fc-agent] IPv6 DNS detected, configuring IPv6 on eth0");
+
+    // Disable DAD (Duplicate Address Detection) to avoid "tentative" state
+    // DAD causes delays and the address can't be used while tentative
+    let _ = std::process::Command::new("sysctl")
+        .args(["-w", "net.ipv6.conf.eth0.accept_dad=0"])
+        .output();
+
+    // Add IPv6 address to eth0 - fd00::100 for the guest
+    // Use "nodad" flag to skip DAD and make address usable immediately
+    let output = std::process::Command::new("ip")
+        .args(["-6", "addr", "add", "fd00::100/64", "dev", "eth0", "nodad"])
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            eprintln!("[fc-agent] ✓ added fd00::100/64 to eth0");
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            if !stderr.contains("File exists") {
+                eprintln!("[fc-agent] WARNING: failed to add fd00::100: {}", stderr);
+            }
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: ip command failed: {}", e);
+        }
+    }
+
+    // Add IPv6 default route via slirp's gateway (fd00::2)
+    // With bridge mode, fd00::2 is on-link (same L2 segment)
+    let output = std::process::Command::new("ip")
+        .args(["-6", "route", "add", "default", "via", "fd00::2", "dev", "eth0"])
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            eprintln!("[fc-agent] ✓ added IPv6 default route via fd00::2");
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            // Ignore "already exists" errors
+            if !stderr.contains("File exists") {
+                eprintln!("[fc-agent] WARNING: failed to add IPv6 route: {}", stderr);
+            }
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: ip command failed: {}", e);
+        }
+    }
+
+    // Send gratuitous NDP Neighbor Advertisement to teach slirp our MAC address
+    // slirp4netns only learns MAC addresses from NDP messages, not regular traffic
+    if let Err(e) = send_gratuitous_ndp_na("eth0", "fd00::100") {
+        eprintln!("[fc-agent] WARNING: failed to send NDP NA: {}", e);
+    } else {
+        eprintln!("[fc-agent] ✓ sent gratuitous NDP NA for fd00::100");
+    }
+}
+
+/// Send a gratuitous NDP Neighbor Advertisement
+///
+/// This tells the network "fd00::100 is at <our MAC>". slirp4netns uses this
+/// to populate its NDP table so it can send responses back to us.
+fn send_gratuitous_ndp_na(iface: &str, ipv6_addr: &str) -> std::io::Result<()> {
+    // Get interface MAC address
+    let mac_path = format!("/sys/class/net/{}/address", iface);
+    let mac_str = std::fs::read_to_string(&mac_path)?
+        .trim()
+        .to_string();
+    let mac: Vec<u8> = mac_str
+        .split(':')
+        .map(|s| u8::from_str_radix(s, 16).unwrap_or(0))
+        .collect();
+    if mac.len() != 6 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid MAC address",
+        ));
+    }
+
+    // Get interface index
+    let ifindex_path = format!("/sys/class/net/{}/ifindex", iface);
+    let ifindex: i32 = std::fs::read_to_string(&ifindex_path)?
+        .trim()
+        .parse()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid ifindex"))?;
+
+    // Parse IPv6 address
+    let ipv6: std::net::Ipv6Addr = ipv6_addr
+        .parse()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid IPv6"))?;
+    let ipv6_bytes = ipv6.octets();
+
+    // Build the packet
+    let mut packet = Vec::with_capacity(86);
+
+    // Ethernet header (14 bytes)
+    // Destination: 33:33:00:00:00:01 (IPv6 all-nodes multicast MAC)
+    packet.extend_from_slice(&[0x33, 0x33, 0x00, 0x00, 0x00, 0x01]);
+    // Source: our MAC
+    packet.extend_from_slice(&mac);
+    // EtherType: IPv6 (0x86dd)
+    packet.extend_from_slice(&[0x86, 0xdd]);
+
+    // IPv6 header (40 bytes)
+    // Version (4 bits) + Traffic Class (8 bits) + Flow Label (20 bits) = 0x60000000
+    packet.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+    // Payload length: ICMPv6 header (8) + target (16) + option (8) = 32 bytes
+    packet.extend_from_slice(&[0x00, 0x20]);
+    // Next header: ICMPv6 (58)
+    packet.push(58);
+    // Hop limit: 255 (required for NDP)
+    packet.push(255);
+    // Source: fd00::100
+    packet.extend_from_slice(&ipv6_bytes);
+    // Destination: ff02::1 (all-nodes multicast)
+    packet.extend_from_slice(&[0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]);
+
+    // ICMPv6 Neighbor Advertisement (32 bytes)
+    // Type: 136 (Neighbor Advertisement)
+    packet.push(136);
+    // Code: 0
+    packet.push(0);
+    // Checksum placeholder (will calculate)
+    let checksum_offset = packet.len();
+    packet.extend_from_slice(&[0x00, 0x00]);
+    // Flags: Override (0x20000000) - tells recipient to update their cache
+    packet.extend_from_slice(&[0x20, 0x00, 0x00, 0x00]);
+    // Target address: fd00::100
+    packet.extend_from_slice(&ipv6_bytes);
+    // Option: Target Link-Layer Address
+    // Type: 2 (target link-layer address)
+    packet.push(2);
+    // Length: 1 (in units of 8 bytes)
+    packet.push(1);
+    // Link-layer address: our MAC
+    packet.extend_from_slice(&mac);
+
+    // Calculate ICMPv6 checksum (RFC 4443)
+    // Pseudo-header: src IPv6 + dst IPv6 + upper-layer length + zeros + next header
+    let mut sum: u32 = 0;
+
+    // Source IPv6 (fd00::100)
+    for chunk in ipv6_bytes.chunks(2) {
+        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    }
+    // Destination IPv6 (ff02::1)
+    let dst_ipv6: [u8; 16] = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+    for chunk in dst_ipv6.chunks(2) {
+        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    }
+    // Upper-layer packet length (32 bytes)
+    sum += 32u32;
+    // Next header (58 = ICMPv6)
+    sum += 58u32;
+
+    // ICMPv6 message (with checksum field as zero)
+    let icmpv6_start = 14 + 40; // After Ethernet + IPv6 headers
+    for i in (icmpv6_start..packet.len()).step_by(2) {
+        if i + 1 < packet.len() {
+            sum += u32::from(u16::from_be_bytes([packet[i], packet[i + 1]]));
+        } else {
+            sum += u32::from(packet[i]) << 8;
+        }
+    }
+
+    // Fold 32-bit sum to 16-bit
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    let checksum = !sum as u16;
+    packet[checksum_offset] = (checksum >> 8) as u8;
+    packet[checksum_offset + 1] = (checksum & 0xff) as u8;
+
+    // Open raw socket
+    let sock = unsafe {
+        libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_RAW,
+            (libc::ETH_P_ALL as u16).to_be() as i32,
+        )
+    };
+    if sock < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Build sockaddr_ll
+    let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+    addr.sll_family = libc::AF_PACKET as u16;
+    addr.sll_ifindex = ifindex;
+    addr.sll_halen = 6;
+    addr.sll_addr[..6].copy_from_slice(&[0x33, 0x33, 0x00, 0x00, 0x00, 0x01]);
+
+    // Send packet
+    let ret = unsafe {
+        libc::sendto(
+            sock,
+            packet.as_ptr() as *const libc::c_void,
+            packet.len(),
+            0,
+            &addr as *const libc::sockaddr_ll as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+        )
+    };
+
+    unsafe { libc::close(sock) };
+
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
 /// Configure DNS from kernel boot parameters
-/// Parses ip= parameter to extract DNS server and writes to /etc/resolv.conf
+/// Parses dns= parameter for DNS servers, falls back to gateway from ip= parameter
 fn configure_dns_from_cmdline() {
     eprintln!("[fc-agent] configuring DNS from kernel cmdline");
 
@@ -1685,47 +2037,87 @@ fn configure_dns_from_cmdline() {
     };
     eprintln!("[fc-agent] cmdline: {}", cmdline.trim());
 
-    // Find ip= parameter by searching for "ip=" and extracting until whitespace
-    // Format: ip=<client>::<gateway>:<netmask>::eth0:off[:<dns>]
-    let ip_param = cmdline
+    // Collect DNS servers
+    let mut nameservers: Vec<String> = Vec::new();
+
+    // Look for dns= parameter (comma-separated list, supports IPv6 with ::)
+    // Format: dns=10.0.2.3,fd00::3
+    if let Some(dns_param) = cmdline
         .split_whitespace()
-        .find(|s| s.starts_with("ip="))
-        .map(|s| s.trim_start_matches("ip="));
-
-    let ip_param = match ip_param {
-        Some(p) => p,
-        None => {
-            eprintln!("[fc-agent] WARNING: no ip= parameter in cmdline, skipping DNS config");
-            return;
+        .find(|s| s.starts_with("dns="))
+        .map(|s| s.trim_start_matches("dns="))
+    {
+        eprintln!("[fc-agent] dns param: {}", dns_param);
+        for server in dns_param.split(',') {
+            if !server.is_empty() {
+                nameservers.push(server.to_string());
+            }
         }
-    };
-    eprintln!("[fc-agent] ip param: {}", ip_param);
+    }
 
-    // Split by colons
-    let fields: Vec<&str> = ip_param.split(':').collect();
-    eprintln!("[fc-agent] ip fields: {:?}", fields);
+    // Fallback: extract gateway from ip= parameter if no dns= found
+    if nameservers.is_empty() {
+        if let Some(ip_param) = cmdline
+            .split_whitespace()
+            .find(|s| s.starts_with("ip="))
+            .map(|s| s.trim_start_matches("ip="))
+        {
+            // Format: ip=<client>::<gateway>:<netmask>::eth0:off
+            let fields: Vec<&str> = ip_param.split(':').collect();
+            if let Some(gateway) = fields.get(2) {
+                if !gateway.is_empty() {
+                    eprintln!("[fc-agent] using gateway as DNS fallback: {}", gateway);
+                    nameservers.push(gateway.to_string());
+                }
+            }
+        }
+    }
 
-    // Field 3 is gateway (0-indexed field 2)
-    // Field 8 is DNS (0-indexed field 7)
-    let gateway = fields.get(2).copied().unwrap_or("");
-    let dns = fields.get(7).copied().unwrap_or("");
-
-    eprintln!("[fc-agent] gateway={}, dns={}", gateway, dns);
-
-    let nameserver = if !dns.is_empty() {
-        dns
-    } else if !gateway.is_empty() {
-        gateway
-    } else {
-        eprintln!("[fc-agent] WARNING: no DNS or gateway found, skipping DNS config");
+    if nameservers.is_empty() {
+        eprintln!("[fc-agent] WARNING: no DNS found, skipping DNS config");
         return;
-    };
+    }
 
-    // Write to /etc/resolv.conf
-    let resolv_conf = format!("nameserver {}\n", nameserver);
+    eprintln!("[fc-agent] DNS servers: {:?}", nameservers);
+
+    // Look for dns_search= parameter (comma-separated list of search domains)
+    // Format: dns_search=01.cco0.facebook.com,cco0.facebook.com,facebook.com
+    let search_domains: Vec<String> = cmdline
+        .split_whitespace()
+        .find(|s| s.starts_with("dns_search="))
+        .map(|s| s.trim_start_matches("dns_search="))
+        .map(|s| s.split(',').map(|d| d.to_string()).collect())
+        .unwrap_or_default();
+
+    if !search_domains.is_empty() {
+        eprintln!("[fc-agent] DNS search domains: {:?}", search_domains);
+    }
+
+    // Write to /etc/resolv.conf with search domains and nameservers
+    let mut resolv_conf = String::new();
+
+    // Add search domains first (if any)
+    if !search_domains.is_empty() {
+        resolv_conf.push_str(&format!("search {}\n", search_domains.join(" ")));
+    }
+
+    // Add nameservers
+    for ns in &nameservers {
+        resolv_conf.push_str(&format!("nameserver {}\n", ns));
+    }
+
     match std::fs::write("/etc/resolv.conf", &resolv_conf) {
         Ok(_) => {
-            eprintln!("[fc-agent] ✓ configured DNS: nameserver {}", nameserver);
+            eprintln!(
+                "[fc-agent] ✓ configured DNS: {}",
+                nameservers.join(", ")
+            );
+            if !search_domains.is_empty() {
+                eprintln!(
+                    "[fc-agent] ✓ configured search domains: {}",
+                    search_domains.join(", ")
+                );
+            }
         }
         Err(e) => {
             eprintln!(
@@ -1776,6 +2168,9 @@ async fn run_agent() -> Result<()> {
     // This is a no-op if kernel doesn't have CONFIG_KVM
     create_kvm_device();
 
+    // Configure IPv6 networking if needed (before DNS so DNS queries can use IPv6)
+    configure_ipv6_if_needed();
+
     // Configure DNS from kernel boot parameters before any network operations
     configure_dns_from_cmdline();
 
@@ -1794,6 +2189,9 @@ async fn run_agent() -> Result<()> {
             }
         }
     };
+
+    // Save proxy settings for exec commands to use
+    save_proxy_settings(&plan);
 
     // Sync VM clock from host before launching container
     // This ensures TLS certificate validation works immediately
