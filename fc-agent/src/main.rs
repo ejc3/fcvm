@@ -1730,6 +1730,96 @@ fn configure_dns_from_cmdline() {
     }
 }
 
+/// Configure IPv6 from kernel boot parameters
+/// Parses ipv6= parameter and configures eth0 with the address and route
+fn configure_ipv6_from_cmdline() {
+    eprintln!("[fc-agent] checking for IPv6 configuration");
+
+    // Read kernel command line
+    let cmdline = match std::fs::read_to_string("/proc/cmdline") {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: failed to read /proc/cmdline: {}", e);
+            return;
+        }
+    };
+
+    // Find ipv6= parameter
+    // Format: ipv6=<client>|<gateway> (using | as delimiter since : is in IPv6 addresses)
+    // Example: ipv6=fd00:1::2|fd00:1::1
+    let ipv6_param = cmdline
+        .split_whitespace()
+        .find(|s| s.starts_with("ipv6="))
+        .map(|s| s.trim_start_matches("ipv6="));
+
+    let ipv6_param = match ipv6_param {
+        Some(p) => p,
+        None => {
+            eprintln!("[fc-agent] no ipv6= parameter, IPv6 not configured");
+            return;
+        }
+    };
+    eprintln!("[fc-agent] ipv6 param: {}", ipv6_param);
+
+    // Parse client|gateway format (| delimiter to avoid conflict with : in IPv6 addresses)
+    let parts: Vec<&str> = ipv6_param.split('|').collect();
+    if parts.len() != 2 {
+        eprintln!("[fc-agent] WARNING: invalid ipv6= format, expected <client>|<gateway>");
+        return;
+    }
+    // Format is client|gateway
+    let client = parts[0];
+    let gateway = parts[1];
+
+    eprintln!("[fc-agent] IPv6: client={}, gateway={}", client, gateway);
+
+    // Add IPv6 address to eth0
+    let addr_output = std::process::Command::new("ip")
+        .args(["-6", "addr", "add", &format!("{}/64", client), "dev", "eth0"])
+        .output();
+
+    match addr_output {
+        Ok(output) if output.status.success() => {
+            eprintln!("[fc-agent] ✓ added IPv6 address {}/64 to eth0", client);
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // RTNETLINK: File exists means address is already configured
+            if stderr.contains("File exists") {
+                eprintln!("[fc-agent] IPv6 address already exists on eth0");
+            } else {
+                eprintln!("[fc-agent] WARNING: failed to add IPv6 address: {}", stderr);
+            }
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: failed to run ip -6 addr add: {}", e);
+        }
+    }
+
+    // Add IPv6 default route
+    let route_output = std::process::Command::new("ip")
+        .args(["-6", "route", "add", "default", "via", gateway, "dev", "eth0"])
+        .output();
+
+    match route_output {
+        Ok(output) if output.status.success() => {
+            eprintln!("[fc-agent] ✓ added IPv6 default route via {}", gateway);
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // RTNETLINK: File exists means route is already configured
+            if stderr.contains("File exists") {
+                eprintln!("[fc-agent] IPv6 default route already exists");
+            } else {
+                eprintln!("[fc-agent] WARNING: failed to add IPv6 route: {}", stderr);
+            }
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: failed to run ip -6 route add: {}", e);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Initialize tracing (fuse-pipe uses tracing for logging)
@@ -1772,6 +1862,9 @@ async fn run_agent() -> Result<()> {
 
     // Configure DNS from kernel boot parameters before any network operations
     configure_dns_from_cmdline();
+
+    // Configure IPv6 if specified in kernel parameters
+    configure_ipv6_from_cmdline();
 
     // Wait for MMDS to be ready
     let plan = loop {

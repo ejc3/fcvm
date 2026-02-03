@@ -2051,6 +2051,18 @@ async fn run_vm_setup(
         ));
     }
 
+    // IPv6 configuration via kernel cmdline (for rootless networking)
+    // Format: ipv6=<client>|<gateway> - parsed by fc-agent to configure eth0
+    // Uses | as delimiter since : is part of IPv6 addresses
+    if let (Some(guest_ipv6), Some(host_ipv6)) =
+        (&network_config.guest_ipv6, &network_config.host_ipv6)
+    {
+        if !runtime_boot_args.is_empty() {
+            runtime_boot_args.push(' ');
+        }
+        runtime_boot_args.push_str(&format!("ipv6={}|{}", guest_ipv6, host_ipv6));
+    }
+
     // Enable fc-agent strace debugging if requested
     if args.strace_agent {
         if !runtime_boot_args.is_empty() {

@@ -66,6 +66,8 @@ async fn test_health_monitor_behaviors() {
                 health_check_port: None,
                 health_check_url: Some("http://localhost/health".to_string()),
                 dns_server: None,
+                guest_ipv6: None,
+                host_ipv6: None,
             },
             volumes: vec![],
             extra_disks: vec![],

@@ -355,6 +355,8 @@ impl NetworkManager for BridgedNetwork {
             health_check_port: Some(80),
             health_check_url: Some(format!("http://{}:80/", health_check_ip)),
             dns_server,
+            guest_ipv6: None, // Bridged mode doesn't support IPv6 yet
+            host_ipv6: None,
         })
     }
 

@@ -29,6 +29,12 @@ pub struct NetworkConfig {
     /// Rootless: 10.0.2.3 (slirp4netns built-in DNS)
     #[serde(default)]
     pub dns_server: Option<String>,
+    /// Guest IPv6 address (for rootless networking with IPv6)
+    #[serde(default)]
+    pub guest_ipv6: Option<String>,
+    /// Gateway IPv6 address (for rootless networking with IPv6)
+    #[serde(default)]
+    pub host_ipv6: Option<String>,
 }
 
 #[derive(Debug, Clone)]
