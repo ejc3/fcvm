@@ -1387,8 +1387,10 @@ pub async fn wait_for_tcp(addr: &str, timeout_ms: u64) -> anyhow::Result<()> {
 ///
 /// Responds to GET requests with "TEST_SUCCESS\n".
 /// Supports both IPv4 and IPv6 binding.
+/// Uses pure Rust (tokio) - no external processes like Python.
 pub struct LocalTestServer {
-    child: tokio::process::Child,
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
     pub url: String,
     pub port: u16,
 }
@@ -1403,6 +1405,8 @@ impl LocalTestServer {
     /// # Returns
     /// A LocalTestServer instance. Drop it to stop the server.
     pub async fn start(bind_addr: &str, port: u16) -> anyhow::Result<Self> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         let is_ipv6 = bind_addr.contains(':');
         let url = if is_ipv6 {
             format!("http://[{}]:{}/", bind_addr, port)
@@ -1410,57 +1414,46 @@ impl LocalTestServer {
             format!("http://{}:{}/", bind_addr, port)
         };
 
-        let child = tokio::process::Command::new("python3")
-            .args([
-                "-c",
-                &format!(
-                    r#"
-import http.server
-import socketserver
-import socket
-import sys
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(b'TEST_SUCCESS\n')
-
-    def log_message(self, format, *args):
-        pass  # Quiet
-
-addr = '{bind_addr}'
-if ':' in addr:
-    class Server(socketserver.TCPServer):
-        address_family = socket.AF_INET6
-        allow_reuse_address = True
-else:
-    class Server(socketserver.TCPServer):
-        allow_reuse_address = True
-
-with Server((addr, {port}), Handler) as httpd:
-    httpd.serve_forever()
-"#,
-                    bind_addr = bind_addr,
-                    port = port
-                ),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("failed to start test server: {}", e))?;
-
-        // Wait for server to be ready
-        let connect_addr = if is_ipv6 {
-            format!("[{}]:{}", bind_addr, port)
+        // Parse address for binding
+        let socket_addr: std::net::SocketAddr = if is_ipv6 {
+            format!("[{}]:{}", bind_addr, port).parse()?
         } else {
-            format!("{}:{}", bind_addr, port)
+            format!("{}:{}", bind_addr, port).parse()?
         };
-        // 5s timeout for CI environments where Python startup may be slower
-        wait_for_tcp(&connect_addr, 5000).await?;
 
-        Ok(Self { child, url, port })
+        // Bind listener before spawning task to ensure port is available
+        let listener = tokio::net::TcpListener::bind(socket_addr).await?;
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    result = listener.accept() => {
+                        if let Ok((mut stream, _)) = result {
+                            // Spawn handler for each connection
+                            tokio::spawn(async move {
+                                // Read request (we don't care about content)
+                                let mut buf = [0u8; 1024];
+                                let _ = stream.read(&mut buf).await;
+
+                                // Send minimal HTTP response
+                                let response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: close\r\n\r\nTEST_SUCCESS\n";
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            });
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            shutdown_tx,
+            task,
+            url,
+            port,
+        })
     }
 
     /// Start on an automatically selected port.
@@ -1470,8 +1463,8 @@ with Server((addr, {port}), Handler) as httpd:
     }
 
     /// Stop the server.
-    pub async fn stop(mut self) {
-        self.child.kill().await.ok();
-        self.child.wait().await.ok();
+    pub async fn stop(self) {
+        let _ = self.shutdown_tx.send(());
+        let _ = self.task.await;
     }
 }
