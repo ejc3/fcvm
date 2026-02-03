@@ -1457,7 +1457,8 @@ with Server((addr, {port}), Handler) as httpd:
         } else {
             format!("{}:{}", bind_addr, port)
         };
-        wait_for_tcp(&connect_addr, 1000).await?;
+        // 5s timeout for CI environments where Python startup may be slower
+        wait_for_tcp(&connect_addr, 5000).await?;
 
         Ok(Self { child, url, port })
     }
