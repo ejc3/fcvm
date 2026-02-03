@@ -230,7 +230,7 @@ async fn test_ipv6_egress_to_host() -> Result<()> {
         .find(|l| l.contains("inet6") && l.contains("scope global"))
         .and_then(|l| {
             l.split_whitespace()
-                .nth(1)  // Get the address part
+                .nth(1) // Get the address part
                 .map(|addr| addr.split('/').next().unwrap_or(addr))
         })
         .map(|s| s.to_string());
@@ -319,11 +319,7 @@ with IPv6Server(('::', {}), handler) as httpd:
     let url = format!("http://[{}]:{}/", host_ipv6, server_port);
     println!("Attempting to connect to: {}", url);
 
-    let result = common::exec_in_vm(
-        pid,
-        &["wget", "-q", "-O", "-", "--timeout=5", &url],
-    )
-    .await;
+    let result = common::exec_in_vm(pid, &["wget", "-q", "-O", "-", "--timeout=5", &url]).await;
 
     // Clean up
     server.kill().await.ok();

@@ -1775,7 +1775,14 @@ fn configure_ipv6_from_cmdline() {
 
     // Add IPv6 address to eth0
     let addr_output = std::process::Command::new("ip")
-        .args(["-6", "addr", "add", &format!("{}/64", client), "dev", "eth0"])
+        .args([
+            "-6",
+            "addr",
+            "add",
+            &format!("{}/64", client),
+            "dev",
+            "eth0",
+        ])
         .output();
 
     match addr_output {
@@ -1798,7 +1805,9 @@ fn configure_ipv6_from_cmdline() {
 
     // Add IPv6 default route
     let route_output = std::process::Command::new("ip")
-        .args(["-6", "route", "add", "default", "via", gateway, "dev", "eth0"])
+        .args([
+            "-6", "route", "add", "default", "via", gateway, "dev", "eth0",
+        ])
         .output();
 
     match route_output {
