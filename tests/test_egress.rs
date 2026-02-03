@@ -289,27 +289,58 @@ async fn test_egress(fcvm_path: &std::path::Path, pid: u32) -> Result<()> {
     }
     println!("    ✓ VM egress succeeded (HTTP 200)");
 
-    // Test 2: Container-level egress using wget (available in alpine nginx)
+    // Test 2: Container-level egress using curl
+    // Note: We install curl because busybox wget doesn't properly support HTTPS through HTTP proxy
     println!(
-        "  Testing container-level egress (wget to {})...",
+        "  Testing container-level egress (curl to {})...",
         EGRESS_TEST_URL
     );
+
+    // First install curl (apk add is quick with cache)
+    let install_output = tokio::process::Command::new(fcvm_path)
+        .args([
+            "exec",
+            "--pid",
+            &pid.to_string(),
+            "--",
+            "apk",
+            "add",
+            "--no-cache",
+            "curl",
+        ])
+        .output()
+        .await
+        .context("installing curl in container")?;
+
+    if !install_output.status.success() {
+        let stderr = String::from_utf8_lossy(&install_output.stderr);
+        anyhow::bail!(
+            "Failed to install curl in container: exit={}, stderr='{}'",
+            install_output.status,
+            stderr.trim()
+        );
+    }
+
+    // Now test with curl
     let container_output = tokio::process::Command::new(fcvm_path)
         .args([
             "exec",
             "--pid",
             &pid.to_string(),
             "--",
-            "wget",
-            "-q",
-            "-O",
+            "curl",
+            "-s",
+            "--max-time",
+            "10",
+            "-o",
             "/dev/null",
-            "--timeout=5",
+            "-w",
+            "%{http_code}",
             EGRESS_TEST_URL,
         ])
         .output()
         .await
-        .context("running wget in container")?;
+        .context("running curl in container")?;
 
     if !container_output.status.success() {
         let stderr = String::from_utf8_lossy(&container_output.stderr);
@@ -319,7 +350,13 @@ async fn test_egress(fcvm_path: &std::path::Path, pid: u32) -> Result<()> {
             stderr.trim()
         );
     }
-    println!("    ✓ Container egress succeeded");
+
+    let status_code = String::from_utf8_lossy(&container_output.stdout);
+    let code = status_code.trim();
+    if code != "200" {
+        anyhow::bail!("Container egress got HTTP {}, expected 200", code);
+    }
+    println!("    ✓ Container egress succeeded (HTTP 200)");
 
     Ok(())
 }

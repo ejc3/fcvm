@@ -660,15 +660,14 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
     println!("  ✓ Clone is healthy (PID: {})", clone_pid);
 
     // Step 5: Test internet connectivity from inside the clone
-    // We'll use fcvm exec to run commands inside the VM
     println!("\nStep 5: Testing internet connectivity from clone...");
 
-    // Test 1: DNS resolution using nslookup/host (available in alpine)
+    // Test 1: DNS resolution using nslookup
     println!("  Testing DNS resolution...");
     let dns_result = test_clone_dns(&fcvm_path, clone_pid).await;
 
-    // Test 2: HTTP connectivity using wget (available in alpine)
-    println!("  Testing HTTP connectivity...");
+    // Test 2: HTTPS connectivity using curl (with proxy)
+    println!("  Testing HTTPS connectivity via proxy...");
     let http_result = test_clone_http(&fcvm_path, clone_pid).await;
 
     // Cleanup
@@ -696,9 +695,9 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
     }
 
     if http_ok {
-        println!("║  HTTP connectivity: ✓ PASSED                                 ║");
+        println!("║  HTTPS connectivity: ✓ PASSED                                ║");
     } else {
-        println!("║  HTTP connectivity: ✗ FAILED                                 ║");
+        println!("║  HTTPS connectivity: ✗ FAILED                                ║");
         if let Err(ref e) = http_result {
             eprintln!("    Error: {}", e);
         }
@@ -724,15 +723,15 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
 /// Test DNS resolution from inside the clone VM
 async fn test_clone_dns(fcvm_path: &std::path::Path, clone_pid: u32) -> Result<()> {
     // Use nslookup to test DNS - available in the VM
-    // We'll resolve a well-known domain
     let output = tokio::process::Command::new(fcvm_path)
         .args([
             "exec",
             "--pid",
             &clone_pid.to_string(),
+            "--vm",
             "--",
             "nslookup",
-            "google.com",
+            "facebook.com",
         ])
         .output()
         .await
@@ -742,7 +741,7 @@ async fn test_clone_dns(fcvm_path: &std::path::Path, clone_pid: u32) -> Result<(
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     if output.status.success() && (stdout.contains("Address") || stdout.contains("Name:")) {
-        println!("    nslookup google.com: OK");
+        println!("    nslookup facebook.com: OK");
         Ok(())
     } else {
         anyhow::bail!(
@@ -754,35 +753,41 @@ async fn test_clone_dns(fcvm_path: &std::path::Path, clone_pid: u32) -> Result<(
     }
 }
 
-/// Test HTTP connectivity from inside the clone VM
+/// Test HTTPS connectivity from inside the clone VM
 async fn test_clone_http(fcvm_path: &std::path::Path, clone_pid: u32) -> Result<()> {
-    // Use curl to test HTTP - available in the VM
-    // We'll fetch a small file from a reliable source
+    // Use curl to test HTTPS - curl properly respects HTTPS_PROXY
+    // Note: We use the VM (not container) because curl is available there
     let output = tokio::process::Command::new(fcvm_path)
         .args([
             "exec",
             "--pid",
             &clone_pid.to_string(),
+            "--vm",
             "--",
             "curl",
             "-s",
-            "--connect-timeout",
+            "--max-time",
             "10",
-            "http://httpbin.org/ip",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "https://checkip.amazonaws.com",
         ])
         .output()
         .await
-        .context("running curl in clone")?;
+        .context("running curl in clone VM")?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    if output.status.success() && stdout.contains("origin") {
-        println!("    curl httpbin.org/ip: OK (got response)");
+    // checkip.amazonaws.com returns 200
+    if output.status.success() && stdout.contains("200") {
+        println!("    curl https://checkip.amazonaws.com: OK (HTTP 200)");
         Ok(())
     } else {
         anyhow::bail!(
-            "HTTP connectivity failed: exit={}, stdout={}, stderr={}",
+            "HTTPS connectivity failed: exit={}, stdout={}, stderr={}",
             output.status,
             stdout.trim(),
             stderr.trim()
@@ -1049,8 +1054,13 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
     println!("  ✓ Memory server ready (PID: {})", serve_pid);
 
     // Step 4: Spawn clone WITH port forwarding (rootless)
-    // Use port 8080 (unprivileged) since rootless can't bind to 80
-    println!("\nStep 4: Spawning clone with --publish 8080:80 (rootless)...");
+    // Use dynamic port to avoid conflicts with system services
+    let host_port = common::find_available_high_port().context("finding available port")?;
+    let publish_arg = format!("{}:80", host_port);
+    println!(
+        "\nStep 4: Spawning clone with --publish {} (rootless)...",
+        publish_arg
+    );
     let serve_pid_str = serve_pid.to_string();
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
         &[
@@ -1063,7 +1073,7 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
             "--network",
             "rootless",
             "--publish",
-            "8080:80",
+            &publish_arg,
         ],
         &clone_name,
     )
@@ -1101,13 +1111,16 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
     println!("  Clone loopback IP: {}", loopback_ip);
 
     // Test: Access via loopback IP and forwarded port
-    println!("  Testing access via loopback {}:8080...", loopback_ip);
+    println!(
+        "  Testing access via loopback {}:{}...",
+        loopback_ip, host_port
+    );
     let loopback_result = tokio::process::Command::new("curl")
         .args([
             "-s",
             "--max-time",
             "10",
-            &format!("http://{}:8080", loopback_ip),
+            &format!("http://{}:{}", loopback_ip, host_port),
         ])
         .output()
         .await;

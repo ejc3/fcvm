@@ -1294,3 +1294,10 @@ pub fn find_available_port(start_port: u16, range_size: u16) -> anyhow::Result<u
         start_port + range_size
     )
 }
+
+/// Find an available port in the default high port range (10000-60000).
+///
+/// This range avoids conflicts with common system services.
+pub fn find_available_high_port() -> anyhow::Result<u16> {
+    find_available_port(10000, 50000)
+}
