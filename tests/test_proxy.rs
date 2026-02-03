@@ -8,7 +8,6 @@
 mod common;
 
 use anyhow::{Context, Result};
-use std::time::Duration;
 
 /// Get the host's global IPv6 address (if available)
 async fn get_host_ipv6() -> Option<String> {
@@ -31,10 +30,15 @@ async fn get_host_ipv6() -> Option<String> {
 
 /// Test that a VM can use an IPv6-only proxy for egress.
 ///
-/// This is the main IPv6 proxy test:
-/// 1. Starts an HTTP forward proxy on the host's global IPv6 address
-/// 2. Starts a VM configured to use this IPv6 proxy
-/// 3. Verifies the VM can pull images and make requests through the proxy
+/// This is the main IPv6 proxy test - fully self-contained with no external network access:
+/// 1. Starts a local HTTP server on the host's IPv6 address (the "target")
+/// 2. Starts an HTTP forward proxy on the host's IPv6 address
+/// 3. Starts a VM configured to use the IPv6 proxy
+/// 4. Verifies the VM can reach the local target server through the proxy
+///
+/// This proves the VM can:
+/// - Use an IPv6-only proxy (set via http_proxy env var)
+/// - Reach IPv6 services through slirp4netns
 #[tokio::test]
 async fn test_vm_uses_ipv6_proxy() -> Result<()> {
     // Get host's global IPv6 address
@@ -48,9 +52,19 @@ async fn test_vm_uses_ipv6_proxy() -> Result<()> {
 
     println!("Host IPv6 address: {}", host_ipv6);
 
-    // Find an available port for our proxy
-    let proxy_port = common::find_available_high_port().context("find proxy port")?;
-    println!("Starting IPv6 proxy on [{}]:{}", host_ipv6, proxy_port);
+    // Start a local test server as the target (uses common helper)
+    let target_server = common::LocalTestServer::start_on_available_port(&host_ipv6)
+        .await
+        .context("start target server")?;
+    let target_port = target_server.port;
+    let target_url = target_server.url.clone();
+
+    // Find a port for the proxy
+    let proxy_port = target_port + 1;
+    println!(
+        "Local target: {}, proxy on [{}]:{}",
+        target_url, host_ipv6, proxy_port
+    );
 
     // Start an HTTP forward proxy listening on the host's IPv6 address
     // This proxy forwards HTTP requests (used for container registry access)
@@ -158,35 +172,46 @@ except Exception as e:
         .spawn()
         .context("start IPv6 proxy server")?;
 
-    // Give proxy time to start
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    // Wait for proxy to be ready
+    let proxy_addr = format!("[{}]:{}", host_ipv6, proxy_port);
+    if let Err(e) = common::wait_for_tcp(&proxy_addr, 1000).await {
+        target_server.stop().await;
+        anyhow::bail!("proxy server failed to start: {}", e);
+    }
 
-    // Verify proxy is working from host
-    let proxy_url = format!("http://[{}]:{}", host_ipv6, proxy_port);
-    println!("Testing proxy from host: {}", proxy_url);
+    // Verify target server is working from host (direct access)
+    println!("Testing target server directly: {}", target_url);
 
-    let host_test = tokio::process::Command::new("curl")
-        .args([
-            "-s",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            "--max-time",
-            "10",
-            "-x",
-            &proxy_url,
-            "http://httpbin.org/ip",
-        ])
+    let direct_test = tokio::process::Command::new("curl")
+        .args(["-s", "--max-time", "5", &target_url])
         .output()
         .await?;
 
-    let status_code = String::from_utf8_lossy(&host_test.stdout);
-    println!("Host proxy test status: {}", status_code);
-
-    if status_code.trim() != "200" {
+    let direct_response = String::from_utf8_lossy(&direct_test.stdout);
+    if !direct_response.contains("TEST_SUCCESS") {
+        target_server.stop().await;
         proxy_server.kill().await.ok();
-        anyhow::bail!("Host proxy test failed: status={}", status_code);
+        anyhow::bail!(
+            "Target server not responding correctly: {}",
+            direct_response
+        );
+    }
+    println!("✓ Target server working");
+
+    // Verify proxy is working from host
+    let proxy_url = format!("http://[{}]:{}", host_ipv6, proxy_port);
+    println!("Testing proxy from host: {} -> {}", proxy_url, target_url);
+
+    let host_test = tokio::process::Command::new("curl")
+        .args(["-s", "--max-time", "10", "-x", &proxy_url, &target_url])
+        .output()
+        .await?;
+
+    let proxy_response = String::from_utf8_lossy(&host_test.stdout);
+    if !proxy_response.contains("TEST_SUCCESS") {
+        target_server.stop().await;
+        proxy_server.kill().await.ok();
+        anyhow::bail!("Proxy test failed: {}", proxy_response);
     }
     println!("✓ IPv6 proxy working on host");
 
@@ -216,6 +241,7 @@ except Exception as e:
     // Wait for VM to be healthy (image pull goes through the proxy!)
     println!("Waiting for VM to become healthy (image pull via IPv6 proxy)...");
     if let Err(e) = common::poll_health_by_pid(pid, 180).await {
+        target_server.stop().await;
         proxy_server.kill().await.ok();
         common::kill_process(pid).await;
         let _ = child.wait().await;
@@ -224,23 +250,19 @@ except Exception as e:
 
     println!("✓ VM healthy - image pull succeeded through IPv6 proxy!");
 
-    // Test egress from inside the container using the proxy
-    println!("Testing egress from container via IPv6 proxy...");
+    // Test egress from inside the container to our local target via the proxy
+    // The VM reaches host's IPv6 via slirp4netns NAT, then proxy forwards to target
+    println!(
+        "Testing egress from container via IPv6 proxy to local target: {}",
+        target_url
+    );
 
-    let egress_result = common::exec_in_container(
-        pid,
-        &[
-            "wget",
-            "-q",
-            "-O",
-            "-",
-            "--timeout=10",
-            "http://httpbin.org/ip",
-        ],
-    )
-    .await;
+    let egress_result =
+        common::exec_in_container(pid, &["wget", "-q", "-O", "-", "--timeout=10", &target_url])
+            .await;
 
     // Clean up
+    target_server.stop().await;
     proxy_server.kill().await.ok();
     common::kill_process(pid).await;
     let _ = child.wait().await;
@@ -249,15 +271,17 @@ except Exception as e:
         Ok(output) => {
             println!("Egress response: {}", output);
             assert!(
-                output.contains("origin"),
-                "Expected httpbin response with 'origin', got: {}",
+                output.contains("TEST_SUCCESS"),
+                "Expected 'TEST_SUCCESS' response, got: {}",
                 output
             );
-            println!("✓ Container egress works through IPv6 proxy");
+            println!("✓ Container egress works through IPv6 proxy to local target");
         }
         Err(e) => {
-            println!("NOTE: Container egress test failed: {}", e);
-            println!("      This may be expected if httpbin.org is unreachable");
+            anyhow::bail!(
+                "Container couldn't reach local target through IPv6 proxy: {}",
+                e
+            );
         }
     }
 
@@ -265,15 +289,33 @@ except Exception as e:
     Ok(())
 }
 
-/// Test that proxy settings are correctly saved and passed to exec commands.
-/// Uses a working proxy (the host's IPv4 gateway) to verify end-to-end.
-#[tokio::test]
-async fn test_proxy_passthrough_to_exec() -> Result<()> {
-    // For this test, we don't need a real proxy - just verify the plumbing
-    // Start VM without proxy, then verify exec can receive proxy env vars
-    let (vm_name, _, _, _) = common::unique_names("proxyexec");
+/// Helper to test VM egress to a specific bind address.
+///
+/// The test binds to `bind_addr` on the host, but the VM must use the
+/// appropriate slirp4netns gateway to reach it:
+/// - 127.0.0.1 → VM uses 10.0.2.2 (IPv4 host loopback)
+/// - ::1       → VM uses fd00::2 (IPv6 host loopback)
+/// - 0.0.0.0   → VM uses 10.0.2.2 (all interfaces, reached via IPv4 gateway)
+/// - IPv6 global → VM can reach directly via slirp IPv6 NAT
+async fn test_egress_to_addr(bind_addr: &str, vm_target_addr: &str, addr_type: &str) -> Result<()> {
+    let test_server = common::LocalTestServer::start_on_available_port(bind_addr)
+        .await
+        .context("start test server")?;
 
-    // Start VM without proxy
+    // Build the URL that the VM will use (may differ from server's bind address)
+    let vm_url = if vm_target_addr.contains(':') {
+        format!("http://[{}]:{}/", vm_target_addr, test_server.port)
+    } else {
+        format!("http://{}:{}/", vm_target_addr, test_server.port)
+    };
+
+    println!(
+        "[{}] Server binds to {}, VM connects to {}",
+        addr_type, test_server.url, vm_url
+    );
+
+    let (vm_name, _, _, _) = common::unique_names(&format!("egress-{}", addr_type));
+
     let (mut child, pid) = common::spawn_fcvm(&[
         "podman",
         "run",
@@ -289,120 +331,79 @@ async fn test_proxy_passthrough_to_exec() -> Result<()> {
     .await
     .context("spawn fcvm")?;
 
-    // Wait for VM to be healthy
     if let Err(e) = common::poll_health_by_pid(pid, 120).await {
+        test_server.stop().await;
         common::kill_process(pid).await;
         let _ = child.wait().await;
-        anyhow::bail!("VM never became healthy: {}", e);
+        anyhow::bail!("[{}] VM never became healthy: {}", addr_type, e);
     }
 
-    println!("VM is healthy, testing egress without proxy...");
+    let result =
+        common::exec_in_container(pid, &["wget", "-q", "-O", "-", "--timeout=10", &vm_url]).await;
 
-    // Verify container can reach the internet directly
-    let direct_result = common::exec_in_container(
-        pid,
-        &[
-            "wget",
-            "-q",
-            "-O",
-            "-",
-            "--timeout=10",
-            "http://httpbin.org/ip",
-        ],
-    )
-    .await;
-
-    match direct_result {
-        Ok(output) => {
-            println!("Direct egress response: {}", output.trim());
-            assert!(
-                output.contains("origin"),
-                "Expected httpbin response, got: {}",
-                output
-            );
-            println!("✓ Container can reach internet directly");
-        }
-        Err(e) => {
-            common::kill_process(pid).await;
-            let _ = child.wait().await;
-            anyhow::bail!("Container couldn't reach internet: {}", e);
-        }
-    }
-
-    // Clean up
+    test_server.stop().await;
     common::kill_process(pid).await;
     let _ = child.wait().await;
 
-    println!("✓ Proxy passthrough test completed");
-    Ok(())
+    match result {
+        Ok(output) => {
+            assert!(
+                output.contains("TEST_SUCCESS"),
+                "[{}] Expected TEST_SUCCESS, got: {}",
+                addr_type,
+                output
+            );
+            println!(
+                "[{}] ✓ VM reached {} (bound to {})",
+                addr_type, vm_target_addr, bind_addr
+            );
+            Ok(())
+        }
+        Err(e) => anyhow::bail!(
+            "[{}] Container couldn't reach {} (bound to {}): {}",
+            addr_type,
+            vm_target_addr,
+            bind_addr,
+            e
+        ),
+    }
 }
 
-/// Test image pull and container egress in a basic VM (no proxy).
-/// This is a sanity check that networking works.
+/// Test VM egress to IPv4 loopback (127.0.0.1)
+/// Server binds to 127.0.0.1, VM connects via 10.0.2.2 (slirp IPv4 gateway)
 #[tokio::test]
-async fn test_image_pull_and_egress() -> Result<()> {
-    let (vm_name, _, _, _) = common::unique_names("egresstest");
+async fn test_egress_ipv4_local() -> Result<()> {
+    // slirp4netns translates 10.0.2.2 → host's 127.0.0.1
+    test_egress_to_addr("127.0.0.1", "10.0.2.2", "ipv4-local").await
+}
 
-    let (mut child, pid) = common::spawn_fcvm(&[
-        "podman",
-        "run",
-        "--name",
-        &vm_name,
-        "--network",
-        "rootless",
-        "--no-snapshot",
-        "alpine:latest",
-        "sleep",
-        "infinity",
-    ])
-    .await
-    .context("spawn fcvm")?;
+/// Test VM egress to IPv4 all interfaces (0.0.0.0)
+/// Server binds to 0.0.0.0, VM connects via 10.0.2.2 (slirp IPv4 gateway)
+#[tokio::test]
+async fn test_egress_ipv4_global() -> Result<()> {
+    // 0.0.0.0 accepts from all interfaces including from slirp4netns
+    test_egress_to_addr("0.0.0.0", "10.0.2.2", "ipv4-global").await
+}
 
-    // Wait for VM to be healthy (this includes image pull)
-    println!("Waiting for VM to become healthy (includes image pull)...");
-    if let Err(e) = common::poll_health_by_pid(pid, 120).await {
-        common::kill_process(pid).await;
-        let _ = child.wait().await;
-        anyhow::bail!("VM never became healthy: {}", e);
-    }
+/// Test VM egress to IPv6 loopback (::1)
+/// Server binds to ::1, VM connects via fd00::2 (slirp IPv6 gateway)
+#[tokio::test]
+async fn test_egress_ipv6_local() -> Result<()> {
+    // slirp4netns translates fd00::2 → host's ::1
+    test_egress_to_addr("::1", "fd00::2", "ipv6-local").await
+}
 
-    println!("✓ VM healthy - image pull succeeded");
-
-    // Test egress from the container
-    println!("Testing egress from container...");
-
-    let egress_result = common::exec_in_container(
-        pid,
-        &[
-            "wget",
-            "-q",
-            "-O",
-            "-",
-            "--timeout=10",
-            "http://httpbin.org/ip",
-        ],
-    )
-    .await;
-
-    // Clean up
-    common::kill_process(pid).await;
-    let _ = child.wait().await;
-
-    match egress_result {
-        Ok(output) => {
-            println!("Egress response: {}", output.trim());
-            assert!(
-                output.contains("origin"),
-                "Expected httpbin response with 'origin', got: {}",
-                output
-            );
-            println!("✓ Container egress works");
+/// Test VM egress to IPv6 global (host's public IPv6 address)
+/// Server binds to host's global IPv6, VM connects directly via slirp IPv6 NAT
+#[tokio::test]
+async fn test_egress_ipv6_global() -> Result<()> {
+    let host_ipv6 = match get_host_ipv6().await {
+        Some(ip) => ip,
+        None => {
+            println!("SKIP: Host has no global IPv6 address");
+            return Ok(());
         }
-        Err(e) => {
-            anyhow::bail!("Container egress failed: {}", e);
-        }
-    }
-
-    println!("✓ Image pull and egress test completed");
-    Ok(())
+    };
+    // VM can reach host's global IPv6 directly through slirp4netns IPv6 NAT
+    test_egress_to_addr(&host_ipv6, &host_ipv6, "ipv6-global").await
 }

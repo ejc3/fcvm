@@ -407,6 +407,63 @@ fn maybe_add_test_flags(args: &[&str]) -> Vec<String> {
     result
 }
 
+/// Spawn fcvm with environment variables set.
+///
+/// # Arguments
+/// * `args` - Arguments to pass to fcvm
+/// * `env_vars` - Environment variables to set (key, value pairs)
+///
+/// # Returns
+/// Tuple of (Child process, PID)
+pub async fn spawn_fcvm_with_env(
+    args: &[&str],
+    env_vars: &[(&str, &str)],
+) -> anyhow::Result<(tokio::process::Child, u32)> {
+    // Ensure config exists (runs once per test process)
+    ensure_config_exists();
+
+    let fcvm_path = find_fcvm_binary()?;
+    let final_args = maybe_add_test_flags(args);
+
+    // Extract name from args for logging
+    let name = args
+        .windows(2)
+        .find(|w| w[0] == "--name")
+        .map(|w| w[1])
+        .unwrap_or("fcvm");
+
+    let logger = TestLogger::new(name);
+
+    let mut cmd = tokio::process::Command::new(&fcvm_path);
+    cmd.args(&final_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("RUST_LOG", "debug");
+
+    // Set additional environment variables
+    for (key, value) in env_vars {
+        cmd.env(key, value);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn fcvm: {}", e))?;
+
+    let pid = child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("failed to get fcvm PID"))?;
+
+    logger.info(&format!(
+        "Spawned fcvm PID={} args={:?} env={:?}",
+        pid, args, env_vars
+    ));
+
+    spawn_log_consumer_to_file(child.stdout.take(), name, Some(logger.clone()), false);
+    spawn_log_consumer_to_file(child.stderr.take(), name, Some(logger), true);
+
+    Ok((child, pid))
+}
+
 /// Spawn fcvm with piped IO and automatic log consumers.
 ///
 /// Output is prefixed with `[name]` for stdout and `[name ERR]` for stderr,
@@ -450,65 +507,6 @@ pub async fn spawn_fcvm_with_logs(
         .ok_or_else(|| anyhow::anyhow!("failed to get fcvm PID"))?;
 
     logger.info(&format!("Spawned fcvm PID={} args={:?}", pid, args));
-
-    // Spawn log consumers immediately to prevent pipe buffer deadlock
-    spawn_log_consumer_to_file(child.stdout.take(), name, Some(logger.clone()), false);
-    spawn_log_consumer_to_file(child.stderr.take(), name, Some(logger), true);
-
-    Ok((child, pid))
-}
-
-/// Spawn fcvm with additional environment variables.
-///
-/// Similar to `spawn_fcvm_with_logs` but allows passing custom env vars.
-/// Useful for testing proxy configurations, etc.
-///
-/// # Arguments
-/// * `args` - Arguments to pass to fcvm
-/// * `env_vars` - Additional environment variables as (key, value) pairs
-pub async fn spawn_fcvm_with_env(
-    args: &[&str],
-    env_vars: &[(&str, &str)],
-) -> anyhow::Result<(tokio::process::Child, u32)> {
-    // Ensure config exists (runs once per test process)
-    ensure_config_exists();
-
-    let fcvm_path = find_fcvm_binary()?;
-    let final_args = maybe_add_test_flags(args);
-
-    // Extract name from args (--name value) for log file naming
-    let name = args
-        .windows(2)
-        .find(|w| w[0] == "--name")
-        .map(|w| w[1])
-        .unwrap_or("fcvm");
-
-    // Always create logger for debug output to file
-    let logger = TestLogger::new(name);
-
-    let mut cmd = tokio::process::Command::new(&fcvm_path);
-    cmd.args(&final_args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("RUST_LOG", "debug");
-
-    // Add custom environment variables
-    for (key, value) in env_vars {
-        cmd.env(key, value);
-    }
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn fcvm: {}", e))?;
-
-    let pid = child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("failed to get fcvm PID"))?;
-
-    logger.info(&format!(
-        "Spawned fcvm PID={} args={:?} env={:?}",
-        pid, args, env_vars
-    ));
 
     // Spawn log consumers immediately to prevent pipe buffer deadlock
     spawn_log_consumer_to_file(child.stdout.take(), name, Some(logger.clone()), false);
@@ -1359,4 +1357,120 @@ pub fn find_available_port(start_port: u16, range_size: u16) -> anyhow::Result<u
 /// This range avoids conflicts with common system services.
 pub fn find_available_high_port() -> anyhow::Result<u16> {
     find_available_port(10000, 50000)
+}
+
+/// Wait for a TCP server to be ready by attempting to connect.
+///
+/// # Arguments
+/// * `addr` - Address to connect to (e.g., "127.0.0.1:8080" or "[::1]:8080")
+/// * `timeout_ms` - Maximum time to wait in milliseconds
+///
+/// # Returns
+/// Ok(()) if connection successful, Err if timeout reached
+pub async fn wait_for_tcp(addr: &str, timeout_ms: u64) -> anyhow::Result<()> {
+    let attempts = timeout_ms / 20;
+    for attempt in 0..attempts {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(_) => return Ok(()),
+            Err(_) if attempt < attempts - 1 => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(e) => {
+                anyhow::bail!("server at {} not ready after {}ms: {}", addr, timeout_ms, e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A simple local HTTP test server for integration tests.
+///
+/// Responds to GET requests with "TEST_SUCCESS\n".
+/// Supports both IPv4 and IPv6 binding.
+pub struct LocalTestServer {
+    child: tokio::process::Child,
+    pub url: String,
+    pub port: u16,
+}
+
+impl LocalTestServer {
+    /// Start a local test server on the specified address and port.
+    ///
+    /// # Arguments
+    /// * `bind_addr` - Address to bind (e.g., "127.0.0.1", "::1", or IPv6 global address)
+    /// * `port` - Port to listen on
+    ///
+    /// # Returns
+    /// A LocalTestServer instance. Drop it to stop the server.
+    pub async fn start(bind_addr: &str, port: u16) -> anyhow::Result<Self> {
+        let is_ipv6 = bind_addr.contains(':');
+        let url = if is_ipv6 {
+            format!("http://[{}]:{}/", bind_addr, port)
+        } else {
+            format!("http://{}:{}/", bind_addr, port)
+        };
+
+        let child = tokio::process::Command::new("python3")
+            .args([
+                "-c",
+                &format!(
+                    r#"
+import http.server
+import socketserver
+import socket
+import sys
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'TEST_SUCCESS\n')
+
+    def log_message(self, format, *args):
+        pass  # Quiet
+
+addr = '{bind_addr}'
+if ':' in addr:
+    class Server(socketserver.TCPServer):
+        address_family = socket.AF_INET6
+        allow_reuse_address = True
+else:
+    class Server(socketserver.TCPServer):
+        allow_reuse_address = True
+
+with Server((addr, {port}), Handler) as httpd:
+    httpd.serve_forever()
+"#,
+                    bind_addr = bind_addr,
+                    port = port
+                ),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to start test server: {}", e))?;
+
+        // Wait for server to be ready
+        let connect_addr = if is_ipv6 {
+            format!("[{}]:{}", bind_addr, port)
+        } else {
+            format!("{}:{}", bind_addr, port)
+        };
+        wait_for_tcp(&connect_addr, 1000).await?;
+
+        Ok(Self { child, url, port })
+    }
+
+    /// Start on an automatically selected port.
+    pub async fn start_on_available_port(bind_addr: &str) -> anyhow::Result<Self> {
+        let port = find_available_high_port()?;
+        Self::start(bind_addr, port).await
+    }
+
+    /// Stop the server.
+    pub async fn stop(mut self) {
+        self.child.kill().await.ok();
+        self.child.wait().await.ok();
+    }
 }
