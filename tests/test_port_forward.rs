@@ -108,26 +108,33 @@ fn test_port_forward_bridged() -> Result<()> {
     }
 
     // Test 1: Direct access to guest IP should work
+    // Retry loop: Container is marked healthy when it starts, but nginx needs a moment to bind to port 80
     println!("Testing direct access to guest...");
-    let output = Command::new("curl")
-        .args(["-s", "--max-time", "5", &format!("http://{}:80", guest_ip)])
-        .output()
-        .context("curl to guest")?;
+    let mut direct_works = false;
+    let retry_start = std::time::Instant::now();
+    while retry_start.elapsed() < Duration::from_secs(30) {
+        let output = Command::new("curl")
+            .args(["-s", "--max-time", "2", &format!("http://{}:80", guest_ip)])
+            .output()
+            .context("curl to guest")?;
 
-    let direct_works = output.status.success() && !output.stdout.is_empty();
-    println!(
-        "Direct access: {}",
-        if direct_works { "OK" } else { "FAIL" }
-    );
+        if output.status.success() && !output.stdout.is_empty() {
+            direct_works = true;
+            println!("Direct access: OK");
+            println!(
+                "Response: {}",
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+            );
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 
-    if direct_works {
-        println!(
-            "Response: {}",
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .next()
-                .unwrap_or("")
-        );
+    if !direct_works {
+        println!("Direct access: FAIL (timed out after 30s)");
     }
 
     // Test 2: Access via port forwarding (veth's host IP)
@@ -136,21 +143,30 @@ fn test_port_forward_bridged() -> Result<()> {
         "Testing port forwarding via veth IP {}:{}...",
         veth_host_ip, host_port
     );
-    let output = Command::new("curl")
-        .args([
-            "-s",
-            "--max-time",
-            "5",
-            &format!("http://{}:{}", veth_host_ip, host_port),
-        ])
-        .output()
-        .context("curl to forwarded port")?;
+    let mut forward_works = false;
+    let retry_start = std::time::Instant::now();
+    while retry_start.elapsed() < Duration::from_secs(30) {
+        let output = Command::new("curl")
+            .args([
+                "-s",
+                "--max-time",
+                "2",
+                &format!("http://{}:{}", veth_host_ip, host_port),
+            ])
+            .output()
+            .context("curl to forwarded port")?;
 
-    let forward_works = output.status.success() && !output.stdout.is_empty();
-    println!(
-        "Port forwarding (veth IP): {}",
-        if forward_works { "OK" } else { "FAIL" }
-    );
+        if output.status.success() && !output.stdout.is_empty() {
+            forward_works = true;
+            println!("Port forwarding (veth IP): OK");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    if !forward_works {
+        println!("Port forwarding (veth IP): FAIL (timed out after 30s)");
+    }
 
     // Cleanup
     println!("Cleaning up...");
@@ -254,34 +270,41 @@ fn test_port_forward_rootless() -> Result<()> {
 
     // Test: Access via loopback IP and forwarded port
     // In rootless mode, each VM gets a unique 127.x.y.z IP
+    // Retry loop: Container is marked healthy when it starts, but nginx needs a moment to bind to port 80
     println!(
         "Testing access via loopback IP {}:{}...",
         loopback_ip, host_port
     );
-    let output = Command::new("curl")
-        .args([
-            "-s",
-            "--max-time",
-            "5",
-            &format!("http://{}:{}", loopback_ip, host_port),
-        ])
-        .output()
-        .context("curl to loopback")?;
+    let mut loopback_works = false;
+    let retry_start = std::time::Instant::now();
+    while retry_start.elapsed() < Duration::from_secs(30) {
+        let output = Command::new("curl")
+            .args([
+                "-s",
+                "--max-time",
+                "2",
+                &format!("http://{}:{}", loopback_ip, host_port),
+            ])
+            .output()
+            .context("curl to loopback")?;
 
-    let loopback_works = output.status.success() && !output.stdout.is_empty();
-    println!(
-        "Loopback access: {}",
-        if loopback_works { "OK" } else { "FAIL" }
-    );
+        if output.status.success() && !output.stdout.is_empty() {
+            loopback_works = true;
+            println!("Loopback access: OK");
+            println!(
+                "Response: {}",
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+            );
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 
-    if loopback_works {
-        println!(
-            "Response: {}",
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .next()
-                .unwrap_or("")
-        );
+    if !loopback_works {
+        println!("Loopback access: FAIL (timed out after 30s)");
     }
 
     // Cleanup
