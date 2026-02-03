@@ -1026,6 +1026,8 @@ RestartSec=1
 # Send stdout/stderr to serial console so fcvm host can see fc-agent logs
 StandardOutput=journal+console
 StandardError=journal+console
+# Delegate cgroup control so podman can use pids/memory/cpu controllers
+Delegate=yes
 
 [Install]
 WantedBy=multi-user.target
@@ -1042,6 +1044,8 @@ ExecStart=/usr/local/bin/fc-agent-strace-wrapper
 Restart=on-failure
 RestartSec=1
 # Send stdout/stderr to serial console so fcvm host can see fc-agent logs
+# Delegate cgroup control so podman can use pids/memory/cpu controllers
+Delegate=yes
 StandardOutput=journal+console
 StandardError=journal+console
 
