@@ -175,10 +175,10 @@ impl SlirpNetwork {
 set -e
 
 # Create slirp0 TAP for slirp4netns connectivity
-# Use 10.0.2.100 as the address for DNAT to work with port forwarding
+# Use 10.0.2.15 as the guest address (standard slirp4netns guest IP)
 # fd00::100 for IPv6 (slirp4netns uses fd00::/64 subnet with gateway fd00::2)
 ip tuntap add {slirp_dev} mode tap
-ip addr add 10.0.2.100/24 dev {slirp_dev}
+ip addr add 10.0.2.15/24 dev {slirp_dev}
 ip -6 addr add fd00::100/64 dev {slirp_dev}
 ip link set {slirp_dev} up
 
@@ -227,9 +227,9 @@ iptables -t nat -A POSTROUTING -s {guest_subnet} -o {slirp_dev} -j MASQUERADE 2>
 ip6tables -t nat -A POSTROUTING -s {guest_ipv6_subnet} -o {slirp_dev} -j MASQUERADE 2>/dev/null || true
 
 # Set up DNAT for inbound connections from slirp4netns
-# When slirp4netns forwards traffic to 10.0.2.100, redirect it to the actual guest IP
-# This enables port forwarding: host -> slirp4netns -> 10.0.2.100 -> DNAT -> guest (192.168.x.2)
-iptables -t nat -A PREROUTING -d 10.0.2.100 -j DNAT --to-destination {guest_ip} 2>/dev/null || true
+# When slirp4netns forwards traffic to 10.0.2.15, redirect it to the actual guest IP
+# This enables port forwarding: host -> slirp4netns -> 10.0.2.15 -> DNAT -> guest (192.168.x.2)
+iptables -t nat -A PREROUTING -d 10.0.2.15 -j DNAT --to-destination {guest_ip} 2>/dev/null || true
 "#,
             slirp_dev = self.slirp_device,
             fc_tap = self.tap_device,
@@ -388,7 +388,7 @@ iptables -t nat -A PREROUTING -d 10.0.2.100 -j DNAT --to-destination {guest_ip} 
                 super::Protocol::Udp => "udp",
             };
 
-            // Port forward to slirp's internal guest IP (10.0.2.100)
+            // Port forward to slirp's internal guest IP (10.0.2.15)
             // which then gets routed to the actual guest via IP forwarding
             let request = serde_json::json!({
                 "execute": "add_hostfwd",
@@ -396,7 +396,7 @@ iptables -t nat -A PREROUTING -d 10.0.2.100 -j DNAT --to-destination {guest_ip} 
                     "proto": proto,
                     "host_addr": bind_addr,
                     "host_port": mapping.host_port,
-                    "guest_addr": "10.0.2.100",
+                    "guest_addr": "10.0.2.15",
                     "guest_port": mapping.guest_port
                 }
             });
