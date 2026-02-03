@@ -68,6 +68,8 @@ async fn test_health_monitor_behaviors() {
                 dns_server: None,
                 guest_ipv6: None,
                 host_ipv6: None,
+                dns_search: None,
+                http_proxy: None,
             },
             volumes: vec![],
             extra_disks: vec![],

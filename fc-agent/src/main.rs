@@ -42,6 +42,12 @@ struct Plan {
     /// Allocate a pseudo-TTY
     #[serde(default)]
     tty: bool,
+    /// HTTP proxy for container registry access
+    #[serde(default)]
+    http_proxy: Option<String>,
+    /// HTTPS proxy for container registry access
+    #[serde(default)]
+    https_proxy: Option<String>,
 }
 
 /// Volume mount configuration from MMDS
@@ -848,6 +854,11 @@ fn handle_exec_connection_blocking(fd: i32) {
             if request.tty {
                 cmd.push("-t".to_string());
             }
+            // Pass proxy settings via -e flags for podman exec
+            for (key, value) in read_proxy_settings() {
+                cmd.push("-e".to_string());
+                cmd.push(format!("{}={}", key, value));
+            }
             cmd.push("--latest".to_string());
             cmd.extend(request.command.iter().cloned());
             cmd
@@ -869,6 +880,9 @@ fn handle_exec_connection_blocking(fd: i32) {
 fn handle_exec_pipe(fd: i32, request: &ExecRequest) {
     use std::io::{BufRead, BufReader};
 
+    // Read proxy settings for external network access
+    let proxy_settings = read_proxy_settings();
+
     // Build the command using std::process::Command (blocking)
     let mut cmd = if request.in_container {
         // Execute inside the container using podman exec
@@ -877,6 +891,10 @@ fn handle_exec_pipe(fd: i32, request: &ExecRequest) {
         // Pass -i flag if interactive mode requested
         if request.interactive {
             cmd.arg("-i");
+        }
+        // Pass proxy settings via -e flags for podman exec
+        for (key, value) in &proxy_settings {
+            cmd.arg("-e").arg(format!("{}={}", key, value));
         }
         // Use the first running container (there should only be one)
         cmd.arg("--latest");
@@ -887,6 +905,10 @@ fn handle_exec_pipe(fd: i32, request: &ExecRequest) {
         let mut cmd = std::process::Command::new(&request.command[0]);
         if request.command.len() > 1 {
             cmd.args(&request.command[1..]);
+        }
+        // Set proxy environment variables for VM-level commands
+        for (key, value) in &proxy_settings {
+            cmd.env(key, value);
         }
         cmd
     };
@@ -1829,6 +1851,83 @@ fn configure_ipv6_from_cmdline() {
     }
 }
 
+/// Save proxy settings from the plan to a file so exec commands can use them.
+///
+/// This is needed because exec commands run via vsock don't have access to the
+/// original plan.
+const PROXY_SETTINGS_FILE: &str = "/etc/fcvm-proxy.env";
+
+fn save_proxy_settings(plan: &Plan) {
+    use std::io::Write as _;
+
+    let mut content = String::new();
+    let mut env_vars = Vec::new();
+
+    if let Some(ref proxy) = plan.http_proxy {
+        content.push_str(&format!("http_proxy={}\n", proxy));
+        content.push_str(&format!("HTTP_PROXY={}\n", proxy));
+        env_vars.push(("http_proxy", proxy.clone()));
+        env_vars.push(("HTTP_PROXY", proxy.clone()));
+    }
+    if let Some(ref proxy) = plan.https_proxy {
+        content.push_str(&format!("https_proxy={}\n", proxy));
+        content.push_str(&format!("HTTPS_PROXY={}\n", proxy));
+        env_vars.push(("https_proxy", proxy.clone()));
+        env_vars.push(("HTTPS_PROXY", proxy.clone()));
+    }
+
+    if content.is_empty() {
+        eprintln!("[fc-agent] no proxy settings configured");
+        return;
+    }
+
+    // Set environment variables in current process so child processes (TTY mode) inherit them
+    for (key, value) in &env_vars {
+        std::env::set_var(key, value);
+    }
+    eprintln!(
+        "[fc-agent] ✓ set {} proxy environment variables",
+        env_vars.len()
+    );
+
+    // Also save to file for exec handler to read
+    match std::fs::File::create(PROXY_SETTINGS_FILE) {
+        Ok(mut file) => {
+            if let Err(e) = file.write_all(content.as_bytes()) {
+                eprintln!("[fc-agent] WARNING: failed to write proxy settings: {}", e);
+            } else {
+                eprintln!(
+                    "[fc-agent] ✓ saved proxy settings to {}",
+                    PROXY_SETTINGS_FILE
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "[fc-agent] WARNING: failed to create proxy settings file: {}",
+                e
+            );
+        }
+    }
+}
+
+/// Read proxy settings from the saved file.
+/// Returns a Vec of (key, value) pairs.
+fn read_proxy_settings() -> Vec<(String, String)> {
+    let content = match std::fs::read_to_string(PROXY_SETTINGS_FILE) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    content
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
 #[tokio::main]
 async fn main() {
     // Initialize tracing (fuse-pipe uses tracing for logging)
@@ -1890,6 +1989,9 @@ async fn run_agent() -> Result<()> {
             }
         }
     };
+
+    // Save proxy settings for exec commands to use
+    save_proxy_settings(&plan);
 
     // Sync VM clock from host before launching container
     // This ensures TLS certificate validation works immediately
@@ -2010,9 +2112,18 @@ async fn run_agent() -> Result<()> {
             eprintln!("[fc-agent] ==========================================");
 
             // Spawn podman pull and stream output in real-time
-            let mut child = Command::new("podman")
-                .arg("pull")
-                .arg(&plan.image)
+            let mut cmd = Command::new("podman");
+            cmd.arg("pull").arg(&plan.image);
+            // Pass proxy environment variables if configured
+            if let Some(ref proxy) = plan.http_proxy {
+                cmd.env("http_proxy", proxy);
+                cmd.env("HTTP_PROXY", proxy);
+            }
+            if let Some(ref proxy) = plan.https_proxy {
+                cmd.env("https_proxy", proxy);
+                cmd.env("HTTPS_PROXY", proxy);
+            }
+            let mut child = cmd
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()

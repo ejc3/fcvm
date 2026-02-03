@@ -486,6 +486,8 @@ impl NetworkManager for SlirpNetwork {
             dns_server: Some("10.0.2.3".to_string()), // slirp4netns built-in DNS forwarder
             guest_ipv6,
             host_ipv6,
+            dns_search: None,
+            http_proxy: None, // Could be set to IPv6-only proxy if needed
         })
     }
 

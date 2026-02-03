@@ -41,6 +41,8 @@ async fn test_state_persistence() {
                 dns_server: None,
                 guest_ipv6: None,
                 host_ipv6: None,
+                dns_search: None,
+                http_proxy: None,
             },
             volumes: vec![],
             extra_disks: vec![],

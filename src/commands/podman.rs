@@ -2431,6 +2431,15 @@ async fn run_vm_setup(
                 "privileged": args.privileged,
                 "interactive": args.interactive,
                 "tty": args.tty,
+                // Use network-provided proxy, or fall back to environment variables
+                "http_proxy": network_config.http_proxy.clone()
+                    .or_else(|| std::env::var("http_proxy").ok())
+                    .or_else(|| std::env::var("HTTP_PROXY").ok()),
+                "https_proxy": network_config.http_proxy.clone()
+                    .or_else(|| std::env::var("https_proxy").ok())
+                    .or_else(|| std::env::var("HTTPS_PROXY").ok())
+                    .or_else(|| std::env::var("http_proxy").ok())
+                    .or_else(|| std::env::var("HTTP_PROXY").ok()),
             },
             "host-time": chrono::Utc::now().timestamp().to_string(),
         }

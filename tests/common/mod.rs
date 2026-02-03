@@ -458,6 +458,65 @@ pub async fn spawn_fcvm_with_logs(
     Ok((child, pid))
 }
 
+/// Spawn fcvm with additional environment variables.
+///
+/// Similar to `spawn_fcvm_with_logs` but allows passing custom env vars.
+/// Useful for testing proxy configurations, etc.
+///
+/// # Arguments
+/// * `args` - Arguments to pass to fcvm
+/// * `env_vars` - Additional environment variables as (key, value) pairs
+pub async fn spawn_fcvm_with_env(
+    args: &[&str],
+    env_vars: &[(&str, &str)],
+) -> anyhow::Result<(tokio::process::Child, u32)> {
+    // Ensure config exists (runs once per test process)
+    ensure_config_exists();
+
+    let fcvm_path = find_fcvm_binary()?;
+    let final_args = maybe_add_test_flags(args);
+
+    // Extract name from args (--name value) for log file naming
+    let name = args
+        .windows(2)
+        .find(|w| w[0] == "--name")
+        .map(|w| w[1])
+        .unwrap_or("fcvm");
+
+    // Always create logger for debug output to file
+    let logger = TestLogger::new(name);
+
+    let mut cmd = tokio::process::Command::new(&fcvm_path);
+    cmd.args(&final_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("RUST_LOG", "debug");
+
+    // Add custom environment variables
+    for (key, value) in env_vars {
+        cmd.env(key, value);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn fcvm: {}", e))?;
+
+    let pid = child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("failed to get fcvm PID"))?;
+
+    logger.info(&format!(
+        "Spawned fcvm PID={} args={:?} env={:?}",
+        pid, args, env_vars
+    ));
+
+    // Spawn log consumers immediately to prevent pipe buffer deadlock
+    spawn_log_consumer_to_file(child.stdout.take(), name, Some(logger.clone()), false);
+    spawn_log_consumer_to_file(child.stderr.take(), name, Some(logger), true);
+
+    Ok((child, pid))
+}
+
 /// Spawn a task to consume stdout and print with `[name]` prefix
 pub fn spawn_log_consumer(stdout: Option<tokio::process::ChildStdout>, name: &str) {
     spawn_log_consumer_to_file(stdout, name, None, false);
