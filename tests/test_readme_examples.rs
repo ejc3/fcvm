@@ -15,7 +15,6 @@ mod common;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::time::Duration;
 
 /// Test read-only volume mapping (--map /host:/guest:ro)
 ///
@@ -418,6 +417,7 @@ async fn test_custom_command_bridged() -> Result<()> {
     // This matches the README pattern: --cmd "nginx -g 'daemon off;'"
     let custom_cmd = "sh -c 'echo CUSTOM_CMD_MARKER > /tmp/marker.txt && nginx -g \"daemon off;\"'";
 
+    // Use --health-check to wait for nginx to be ready (not just container running)
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
         "podman",
         "run",
@@ -427,21 +427,20 @@ async fn test_custom_command_bridged() -> Result<()> {
         "bridged",
         "--cmd",
         custom_cmd,
+        "--health-check",
+        "http://localhost/",
         common::TEST_IMAGE,
     ])
     .await
     .context("spawning fcvm")?;
     println!("Started VM with PID: {}", fcvm_pid);
 
-    // Wait for healthy
+    // Wait for healthy (HTTP health check waits for nginx to respond)
     if let Err(e) = common::poll_health_by_pid(fcvm_pid, 120).await {
         common::kill_process(fcvm_pid).await;
         return Err(e.context("VM failed to become healthy"));
     }
-    println!("VM is healthy");
-
-    // Give the command a moment to execute
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    println!("VM is healthy (nginx responding)");
 
     // Check that our custom command ran by looking for the marker file
     println!("Checking for marker file from custom command...");

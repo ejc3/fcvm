@@ -190,6 +190,52 @@ fn find_fcvm_binary() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Check if the container is running via podman inspect.
+///
+/// Returns:
+/// - `true` = container is running
+/// - `false` = container not running yet (or inspect failed)
+async fn check_container_running(pid: u32) -> bool {
+    let exe = match find_fcvm_binary() {
+        Some(e) => e,
+        None => return false, // Can't find fcvm binary
+    };
+
+    let output = match tokio::process::Command::new(&exe)
+        .args([
+            "exec",
+            "--pid",
+            &pid.to_string(),
+            "--vm", // Run in VM (not container) where podman is available
+            "--",
+            "podman",
+            "inspect",
+            "--format",
+            "{{.State.Running}}",
+            "fcvm-container",
+        ])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            debug!(target: "health-monitor", error = %e, "podman inspect exec failed");
+            return false;
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        debug!(target: "health-monitor", stderr = %stderr, "podman inspect failed");
+        return false;
+    }
+
+    let running = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    debug!(target: "health-monitor", running = %running, "container running status");
+
+    running == "true"
+}
+
 /// Check podman healthcheck status by exec'ing into VM.
 ///
 /// Returns:
@@ -278,19 +324,18 @@ async fn update_health_status_once(
                 .context("loading state for health check")?;
 
             // Two modes:
-            // 1. health_check_url = Some(url) -> HTTP check (container running + HTTP responds)
-            // 2. health_check_url = None -> Check container-ready file (written by fc-agent via vsock)
+            // 1. health_check_url = Some(url) -> HTTP check (app responds to HTTP)
+            // 2. health_check_url = None -> Check if container is running via podman inspect
             let status = match &state.config.health_check_url {
                 None => {
-                    // No HTTP check - check if container-ready file exists
-                    // fc-agent creates this file via vsock when the container starts
-                    let ready_file = paths::vm_runtime_dir(vm_id).join("container-ready");
-                    if ready_file.exists() {
-                        debug!(target: "health-monitor", "container-ready file exists, healthy");
+                    // No HTTP check - check if container is actually running
+                    // Uses podman inspect to verify container state (not just process spawned)
+                    if check_container_running(pid).await {
+                        debug!(target: "health-monitor", "container is running, healthy");
                         *last_failure_log = None;
                         HealthStatus::Healthy
                     } else {
-                        debug!(target: "health-monitor", "waiting for container-ready file");
+                        debug!(target: "health-monitor", "waiting for container to be running");
                         HealthStatus::Unknown
                     }
                 }
