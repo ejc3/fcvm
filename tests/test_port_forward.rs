@@ -34,6 +34,7 @@ fn test_port_forward_bridged() -> Result<()> {
     let host_port: u16 = 8080;
 
     // Start VM with port forwarding
+    // Use --health-check to wait for nginx to be ready (not just container running)
     let mut fcvm = Command::new(&fcvm_path)
         .args([
             "podman",
@@ -44,6 +45,8 @@ fn test_port_forward_bridged() -> Result<()> {
             "bridged",
             "--publish",
             "8080:80",
+            "--health-check",
+            "http://localhost/",
             common::TEST_IMAGE,
         ])
         .spawn()
@@ -179,6 +182,7 @@ fn test_port_forward_rootless() -> Result<()> {
 
     // Start VM with rootless networking and port forwarding
     // Rootless uses unique loopback IPs (127.x.y.z) per VM, so port 8080 is fine
+    // Use --health-check to wait for nginx to be ready (not just container running)
     let mut fcvm = Command::new(&fcvm_path)
         .args([
             "podman",
@@ -189,6 +193,8 @@ fn test_port_forward_rootless() -> Result<()> {
             "rootless",
             "--publish",
             "8080:80",
+            "--health-check",
+            "http://localhost/",
             common::TEST_IMAGE,
         ])
         .spawn()
