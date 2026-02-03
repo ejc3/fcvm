@@ -1268,3 +1268,29 @@ pub async fn delete_snapshot(snapshot_key: &str) -> anyhow::Result<()> {
 pub fn startup_snapshot_key(base_key: &str) -> String {
     fcvm::commands::podman::startup_snapshot_key(base_key)
 }
+
+/// Find an available TCP port starting from a given port.
+///
+/// Scans ports from start_port to start_port+range_size-1 and returns
+/// the first port that can be bound. This avoids conflicts with system
+/// services and wildcard binds.
+pub fn find_available_port(start_port: u16, range_size: u16) -> anyhow::Result<u16> {
+    use std::net::{SocketAddr, TcpListener};
+
+    for i in 0..range_size {
+        let port = start_port + i;
+        // Check 0.0.0.0 to detect wildcard binds that block all interfaces
+        let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
+
+        // Try to bind - if successful, no wildcard bind exists on this port
+        if TcpListener::bind(addr).is_ok() {
+            return Ok(port);
+        }
+    }
+
+    anyhow::bail!(
+        "No available port found in range {}..{}",
+        start_port,
+        start_port + range_size
+    )
+}

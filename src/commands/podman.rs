@@ -1181,11 +1181,9 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     let network_config = network.setup().await.context("setting up network")?;
 
-    // Use network-provided health check URL if user didn't specify one
-    // Each network type (bridged/rootless) generates its own appropriate URL
-    if vm_state.config.health_check_url.is_none() {
-        vm_state.config.health_check_url = network_config.health_check_url.clone();
-    }
+    // Don't auto-assign health check URL from network config.
+    // HTTP health checks require an HTTP server - use container-ready file by default.
+    // User can explicitly set --health-check if they want HTTP checks.
     if let Some(port) = network_config.health_check_port {
         vm_state.config.network.health_check_port = Some(port);
     }
