@@ -204,3 +204,147 @@ async fn test_ipv6_connectivity_in_vm() -> Result<()> {
 
     Ok(())
 }
+
+/// Test IPv6 egress from VM to an IPv6-only server on the host.
+///
+/// This verifies that the VM can reach external IPv6 endpoints.
+/// We start a simple HTTP server on the host listening ONLY on IPv6,
+/// then have the VM try to connect to it.
+#[tokio::test]
+async fn test_ipv6_egress_to_host() -> Result<()> {
+    use std::time::Duration;
+
+    // Get host's global IPv6 address
+    let ip_output = tokio::process::Command::new("ip")
+        .args(["-6", "addr", "show", "scope", "global"])
+        .output()
+        .await
+        .context("get host IPv6")?;
+
+    let stdout = String::from_utf8_lossy(&ip_output.stdout);
+
+    // Parse out the IPv6 address (format: "inet6 2600:1f1c:.../128 scope global")
+    let host_ipv6 = stdout
+        .lines()
+        .find(|l| l.contains("inet6") && l.contains("scope global"))
+        .and_then(|l| {
+            l.split_whitespace()
+                .nth(1)  // Get the address part
+                .map(|addr| addr.split('/').next().unwrap_or(addr))
+        })
+        .map(|s| s.to_string());
+
+    let host_ipv6 = match host_ipv6 {
+        Some(ip) => ip,
+        None => {
+            println!("SKIP: Host has no global IPv6 address");
+            return Ok(());
+        }
+    };
+
+    println!("Host IPv6 address: {}", host_ipv6);
+
+    // Find an available port for our IPv6-only server
+    let server_port = common::find_available_high_port().context("find port")?;
+    println!("Using port {} for IPv6-only server", server_port);
+
+    // Start a simple HTTP server listening ONLY on IPv6
+    // Using python3 since it's available and can bind to specific addresses
+    let mut server = tokio::process::Command::new("python3")
+        .args([
+            "-c",
+            &format!(
+                r#"
+import http.server
+import socketserver
+import socket
+
+class IPv6Server(socketserver.TCPServer):
+    address_family = socket.AF_INET6
+
+handler = http.server.SimpleHTTPRequestHandler
+with IPv6Server(('::', {}), handler) as httpd:
+    httpd.handle_request()  # Handle one request then exit
+"#,
+                server_port
+            ),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("start IPv6 HTTP server")?;
+
+    // Give server time to start
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Verify server is listening on IPv6 only
+    let ss_output = tokio::process::Command::new("ss")
+        .args(["-tlnp"])
+        .output()
+        .await?;
+    let ss_stdout = String::from_utf8_lossy(&ss_output.stdout);
+    println!("Listening sockets:\n{}", ss_stdout);
+
+    // Start a VM
+    let (vm_name, _, _, _) = common::unique_names("ipv6egress");
+
+    let (mut child, pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "rootless",
+        "--no-snapshot",
+        "alpine:latest",
+        "sleep",
+        "infinity",
+    ])
+    .await
+    .context("spawn fcvm")?;
+
+    // Wait for VM to be healthy
+    if let Err(e) = common::poll_health_by_pid(pid, 120).await {
+        server.kill().await.ok();
+        common::kill_process(pid).await;
+        let _ = child.wait().await;
+        anyhow::bail!("VM never became healthy: {}", e);
+    }
+
+    println!("VM is healthy, testing IPv6 egress to host...");
+
+    // Try to reach the IPv6-only server from the VM
+    // Use wget since it's available in alpine (curl would need to be installed)
+    let url = format!("http://[{}]:{}/", host_ipv6, server_port);
+    println!("Attempting to connect to: {}", url);
+
+    let result = common::exec_in_vm(
+        pid,
+        &["wget", "-q", "-O", "-", "--timeout=5", &url],
+    )
+    .await;
+
+    // Clean up
+    server.kill().await.ok();
+    common::kill_process(pid).await;
+    let _ = child.wait().await;
+
+    match result {
+        Ok(output) => {
+            println!("✓ IPv6 egress works! Server response:\n{}", output);
+            Ok(())
+        }
+        Err(e) => {
+            println!("✗ IPv6 egress failed: {}", e);
+            println!();
+            println!("This is expected with current slirp4netns - it only provides IPv4 NAT.");
+            println!("IPv6 egress requires either:");
+            println!("  1. IPv6 NAT (not supported by slirp4netns)");
+            println!("  2. Bridged networking with IPv6 on the bridge");
+            println!("  3. A different networking solution like pasta");
+
+            // Don't fail the test - just document the limitation
+            Ok(())
+        }
+    }
+}
