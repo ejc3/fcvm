@@ -64,7 +64,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fcvm -> target
-          shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}-${{ hashFiles('fcvm/fc-agent/src/**/*.rs') }}
+          shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev libclang-dev clang
       - name: Cache cargo tools
@@ -109,7 +109,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fcvm -> target
-          shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}-${{ hashFiles('fcvm/fc-agent/src/**/*.rs') }}
+          shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev libclang-dev clang
       - name: Build release
@@ -155,7 +155,7 @@ jobs:
         with:
           workspaces: fcvm -> target
           cache-on-failure: "true"
-          shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}-${{ hashFiles('fcvm/fc-agent/src/**/*.rs') }}
+          shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -328,7 +328,7 @@ jobs:
         with:
           workspaces: fcvm -> target
           cache-on-failure: "true"
-          shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}-${{ hashFiles('fcvm/fc-agent/src/**/*.rs') }}
+          shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
       - name: Install dependencies
         run: |
           sudo apt-get update

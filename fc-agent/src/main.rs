@@ -135,11 +135,15 @@ async fn wait_for_cgroup_controllers() {
 
     eprintln!("[fc-agent] current cgroup: {}", my_cgroup);
 
-    // Build the list of cgroup paths from root to our parent
+    // Build the list of cgroup paths from root to our cgroup (inclusive)
     // e.g., for "/system.slice/fc-agent.service":
     //   - /sys/fs/cgroup (root)
     //   - /sys/fs/cgroup/system.slice
-    // We don't need to enable pids in fc-agent.service itself (that's our cgroup)
+    //   - /sys/fs/cgroup/system.slice/fc-agent.service (our cgroup - containers go UNDER this)
+    //
+    // With --cgroups=split, podman/crun creates container cgroups as CHILDREN of fc-agent.service.
+    // For a child to use pids, the PARENT must have pids in its subtree_control.
+    // So we must enable pids in fc-agent.service/cgroup.subtree_control too.
     let mut paths_to_enable = vec!["/sys/fs/cgroup".to_string()];
     let mut current_path = "/sys/fs/cgroup".to_string();
 
@@ -148,11 +152,7 @@ async fn wait_for_cgroup_controllers() {
             continue;
         }
         current_path = format!("{}/{}", current_path, component);
-        // Don't include our own cgroup - containers go under it, not in it
-        // The parent's subtree_control is what matters
-        if current_path != format!("/sys/fs/cgroup{}", my_cgroup) {
-            paths_to_enable.push(current_path.clone());
-        }
+        paths_to_enable.push(current_path.clone());
     }
 
     eprintln!(
