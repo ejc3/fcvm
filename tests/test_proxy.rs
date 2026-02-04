@@ -164,10 +164,12 @@ async fn test_proxy_to_addr(host_bind: &str, vm_gateway: &str, addr_type: &str) 
     }
 }
 
-/// Test IPv6 proxy: VM uses fd00::2 to reach proxy on ::1
+/// Test IPv6 proxy: VM uses fd00::2 to reach proxy on all interfaces
 #[tokio::test]
 async fn test_proxy_ipv6() -> Result<()> {
-    test_proxy_to_addr("::1", "fd00::2", "ipv6").await
+    // Note: We use :: (all interfaces) instead of ::1 because slirp4netns IPv6
+    // doesn't have host loopback translation like IPv4's 10.0.2.2 → 127.0.0.1
+    test_proxy_to_addr("::", "fd00::2", "ipv6").await
 }
 
 /// Test IPv4 proxy: VM uses 10.0.2.2 to reach proxy on 127.0.0.1
@@ -272,12 +274,13 @@ async fn test_egress_ipv4_global() -> Result<()> {
     test_egress_to_addr("0.0.0.0", "10.0.2.2", "ipv4-global").await
 }
 
-/// Test VM egress to IPv6 loopback (::1)
-/// Server binds to ::1, VM connects via fd00::2 (slirp IPv6 gateway)
+/// Test VM egress to IPv6 all interfaces (::)
+/// Server binds to ::, VM connects via fd00::2 (slirp IPv6 gateway)
 #[tokio::test]
 async fn test_egress_ipv6_local() -> Result<()> {
-    // slirp4netns translates fd00::2 → host's ::1
-    test_egress_to_addr("::1", "fd00::2", "ipv6-local").await
+    // Note: We use :: (all interfaces) instead of ::1 because slirp4netns IPv6
+    // doesn't have host loopback translation like IPv4's 10.0.2.2 → 127.0.0.1
+    test_egress_to_addr("::", "fd00::2", "ipv6-local").await
 }
 
 /// Test VM egress to IPv6 global (host's public IPv6 address)
