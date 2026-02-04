@@ -99,123 +99,138 @@ struct LatestMetadata {
     volumes: Vec<VolumeMount>,
 }
 
-/// Ensure cgroup controllers are available in the root cgroup's subtree_control.
+/// Ensure cgroup controllers are available for container creation.
 ///
-/// With `--cgroups=split`, podman/crun creates container cgroups directly under the root cgroup,
-/// bypassing systemd. For this to work, the required controller (pids) must be enabled in the
-/// root cgroup's `cgroup.subtree_control`.
+/// With `--cgroups=split`, podman/crun creates container cgroups under fc-agent's cgroup,
+/// bypassing systemd. For this to work, the pids controller must be enabled in:
+/// 1. The root cgroup's subtree_control
+/// 2. All intermediate cgroups (system.slice, fc-agent.service, etc.)
 ///
 /// In cgroup v2, a controller must be in the parent's subtree_control for child cgroups to use it.
-/// Ubuntu's systemd enables controllers in slices (system.slice, user.slice) but NOT in the root
-/// cgroup. We must enable it ourselves for --cgroups=split to work.
-///
-/// This function:
-/// 1. Checks if pids is already in root's subtree_control
-/// 2. If not, tries to enable it by writing "+pids" to subtree_control
-/// 3. Verifies the controller is now available
+/// This function enables pids in the entire cgroup chain from root to fc-agent's parent cgroup.
 async fn wait_for_cgroup_controllers() {
     use tokio::fs;
-    use tokio::time::{sleep, Duration};
 
-    const MAX_WAIT_MS: u64 = 5000;
-    const POLL_INTERVAL_MS: u64 = 50;
     const REQUIRED_CONTROLLER: &str = "pids";
 
-    // With --cgroups=split, podman creates containers under the root cgroup.
-    // We need pids to be in the root's subtree_control, not our service's controllers.
-    let subtree_control_path = "/sys/fs/cgroup/cgroup.subtree_control";
+    // Get fc-agent's current cgroup from /proc/self/cgroup
+    // In cgroup v2, the format is "0::/path/to/cgroup"
+    let my_cgroup = match fs::read_to_string("/proc/self/cgroup").await {
+        Ok(content) => {
+            // Parse cgroup v2 format: "0::/system.slice/fc-agent.service"
+            content
+                .lines()
+                .find(|l| l.starts_with("0::"))
+                .map(|l| l.strip_prefix("0::").unwrap_or("/").to_string())
+                .unwrap_or_else(|| "/".to_string())
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: failed to read /proc/self/cgroup: {}", e);
+            "/".to_string()
+        }
+    };
+
+    eprintln!("[fc-agent] current cgroup: {}", my_cgroup);
+
+    // Build the list of cgroup paths from root to our parent
+    // e.g., for "/system.slice/fc-agent.service":
+    //   - /sys/fs/cgroup (root)
+    //   - /sys/fs/cgroup/system.slice
+    // We don't need to enable pids in fc-agent.service itself (that's our cgroup)
+    let mut paths_to_enable = vec!["/sys/fs/cgroup".to_string()];
+    let mut current_path = "/sys/fs/cgroup".to_string();
+
+    for component in my_cgroup.trim_start_matches('/').split('/') {
+        if component.is_empty() {
+            continue;
+        }
+        current_path = format!("{}/{}", current_path, component);
+        // Don't include our own cgroup - containers go under it, not in it
+        // The parent's subtree_control is what matters
+        if current_path != format!("/sys/fs/cgroup{}", my_cgroup) {
+            paths_to_enable.push(current_path.clone());
+        }
+    }
 
     eprintln!(
-        "[fc-agent] checking cgroup controllers at {}",
-        subtree_control_path
+        "[fc-agent] enabling pids controller in cgroup chain: {:?}",
+        paths_to_enable
     );
 
-    let start = std::time::Instant::now();
-    let mut attempts = 0;
-    let mut tried_enable = false;
+    // Enable pids in each cgroup's subtree_control
+    for cgroup_path in &paths_to_enable {
+        let subtree_control_path = format!("{}/cgroup.subtree_control", cgroup_path);
 
-    loop {
-        attempts += 1;
-
-        match fs::read_to_string(subtree_control_path).await {
+        // Check if pids is already enabled
+        match fs::read_to_string(&subtree_control_path).await {
             Ok(controllers) => {
                 let available: Vec<&str> = controllers.split_whitespace().collect();
                 if available.contains(&REQUIRED_CONTROLLER) {
-                    let elapsed = start.elapsed();
-                    if attempts > 1 {
+                    continue; // Already enabled
+                }
+
+                // Try to enable pids
+                match fs::write(&subtree_control_path, format!("+{}\n", REQUIRED_CONTROLLER)).await
+                {
+                    Ok(()) => {
                         eprintln!(
-                            "[fc-agent] cgroup controllers available after {}ms ({} attempts): {}",
-                            elapsed.as_millis(),
-                            attempts,
-                            controllers.trim()
-                        );
-                    } else {
-                        eprintln!(
-                            "[fc-agent] cgroup controllers available: {}",
-                            controllers.trim()
+                            "[fc-agent] enabled '{}' controller in {}",
+                            REQUIRED_CONTROLLER, subtree_control_path
                         );
                     }
-                    return;
-                }
-
-                // pids not in subtree_control - try to enable it
-                if !tried_enable {
-                    tried_enable = true;
-                    eprintln!(
-                        "[fc-agent] '{}' not in subtree_control (available: {}), enabling...",
-                        REQUIRED_CONTROLLER,
-                        controllers.trim()
-                    );
-
-                    // In cgroup v2, write "+pids" to enable the controller in subtree_control.
-                    // This only works if no processes are directly in the root cgroup
-                    // (all must be in child cgroups). By the time fc-agent runs, systemd
-                    // has moved all processes to slices, so this should succeed.
-                    match fs::write(subtree_control_path, format!("+{}\n", REQUIRED_CONTROLLER))
-                        .await
-                    {
-                        Ok(()) => {
-                            eprintln!(
-                                "[fc-agent] successfully enabled '{}' controller",
-                                REQUIRED_CONTROLLER
-                            );
-                            // Continue loop to verify it's now available
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "[fc-agent] WARNING: failed to enable '{}' controller: {}",
-                                REQUIRED_CONTROLLER, e
-                            );
-                            // Continue waiting in case systemd enables it
-                        }
+                    Err(e) => {
+                        eprintln!(
+                            "[fc-agent] WARNING: failed to enable '{}' in {}: {}",
+                            REQUIRED_CONTROLLER, subtree_control_path, e
+                        );
                     }
                 }
-
-                // Not available yet - wait and retry
-                if start.elapsed().as_millis() as u64 >= MAX_WAIT_MS {
-                    eprintln!(
-                        "[fc-agent] WARNING: '{}' controller not available after {}ms (available: {})",
-                        REQUIRED_CONTROLLER,
-                        MAX_WAIT_MS,
-                        controllers.trim()
-                    );
-                    return;
-                }
-
-                sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
             }
             Err(e) => {
-                // File might not exist yet
-                if start.elapsed().as_millis() as u64 >= MAX_WAIT_MS {
-                    eprintln!(
-                        "[fc-agent] WARNING: failed to read cgroup controllers after {}ms: {}",
-                        MAX_WAIT_MS, e
-                    );
-                    return;
-                }
-
-                sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+                eprintln!(
+                    "[fc-agent] WARNING: failed to read {}: {}",
+                    subtree_control_path, e
+                );
             }
+        }
+    }
+
+    // Verify pids is now available in our parent's subtree_control
+    let parent_subtree = if my_cgroup == "/" {
+        "/sys/fs/cgroup/cgroup.subtree_control".to_string()
+    } else {
+        let parent_cgroup = std::path::Path::new(&my_cgroup)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        if parent_cgroup == "/" || parent_cgroup.is_empty() {
+            "/sys/fs/cgroup/cgroup.subtree_control".to_string()
+        } else {
+            format!("/sys/fs/cgroup{}/cgroup.subtree_control", parent_cgroup)
+        }
+    };
+
+    match fs::read_to_string(&parent_subtree).await {
+        Ok(controllers) => {
+            let available: Vec<&str> = controllers.split_whitespace().collect();
+            if available.contains(&REQUIRED_CONTROLLER) {
+                eprintln!(
+                    "[fc-agent] cgroup controllers available in {}: {}",
+                    parent_subtree,
+                    controllers.trim()
+                );
+            } else {
+                eprintln!(
+                    "[fc-agent] WARNING: '{}' not available in {} after enabling (available: {})",
+                    REQUIRED_CONTROLLER, parent_subtree, controllers.trim()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "[fc-agent] WARNING: failed to verify controllers in {}: {}",
+                parent_subtree, e
+            );
         }
     }
 }
