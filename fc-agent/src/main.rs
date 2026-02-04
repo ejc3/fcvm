@@ -125,7 +125,10 @@ async fn wait_for_cgroup_controllers() {
                 .unwrap_or_else(|| "/".to_string())
         }
         Err(e) => {
-            eprintln!("[fc-agent] WARNING: failed to read /proc/self/cgroup: {}", e);
+            eprintln!(
+                "[fc-agent] WARNING: failed to read /proc/self/cgroup: {}",
+                e
+            );
             "/".to_string()
         }
     };
@@ -222,7 +225,9 @@ async fn wait_for_cgroup_controllers() {
             } else {
                 eprintln!(
                     "[fc-agent] WARNING: '{}' not available in {} after enabling (available: {})",
-                    REQUIRED_CONTROLLER, parent_subtree, controllers.trim()
+                    REQUIRED_CONTROLLER,
+                    parent_subtree,
+                    controllers.trim()
                 );
             }
         }
