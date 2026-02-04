@@ -879,9 +879,6 @@ async fn run_exec_server_with_ready_signal(ready_tx: tokio::sync::oneshot::Sende
         EXEC_VSOCK_PORT
     );
 
-    // Signal that we're ready
-    let _ = ready_tx.send(());
-
     // Wrap in AsyncFd for async accept
     let listener = VsockListener { fd: listener_fd };
     let async_fd = match tokio::io::unix::AsyncFd::new(listener) {
@@ -892,6 +889,9 @@ async fn run_exec_server_with_ready_signal(ready_tx: tokio::sync::oneshot::Sende
             return;
         }
     };
+
+    // Signal that we're ready (after AsyncFd creation succeeds)
+    let _ = ready_tx.send(());
 
     // Accept connections in a loop
     loop {
