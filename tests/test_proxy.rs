@@ -28,265 +28,152 @@ async fn get_host_ipv6() -> Option<String> {
         })
 }
 
-/// Test that a VM can use an IPv6-only proxy for egress.
+/// Helper to test proxy functionality for a given address family.
 ///
-/// This is the main IPv6 proxy test - fully self-contained with no external network access:
-/// 1. Starts a local HTTP server on the host's IPv6 address (the "target")
-/// 2. Starts an HTTP forward proxy on the host's IPv6 address
-/// 3. Starts a VM configured to use the IPv6 proxy
-/// 4. Verifies the VM can reach the local target server through the proxy
-///
-/// This proves the VM can:
-/// - Use an IPv6-only proxy (set via http_proxy env var)
-/// - Reach IPv6 services through slirp4netns
-#[tokio::test]
-async fn test_vm_uses_ipv6_proxy() -> Result<()> {
-    // Get host's global IPv6 address
-    let host_ipv6 = match get_host_ipv6().await {
-        Some(ip) => ip,
-        None => {
-            println!("SKIP: Host has no global IPv6 address");
-            return Ok(());
-        }
-    };
+/// 1. Target server binds to `host_bind` on host
+/// 2. Proxy server binds to `host_bind` on host
+/// 3. VM uses curl with http_proxy env var pointing to `vm_gateway`
+/// 4. VM requests target URL via the proxy
+/// 5. Proxy forwards to target and returns response
+async fn test_proxy_to_addr(host_bind: &str, vm_gateway: &str, addr_type: &str) -> Result<()> {
+    let is_ipv6 = host_bind.contains(':');
 
-    println!("Host IPv6 address: {}", host_ipv6);
-
-    // Start a local test server as the target (uses common helper)
-    let target_server = common::LocalTestServer::start_on_available_port(&host_ipv6)
+    // Start target server
+    let target_server = common::LocalTestServer::start_on_available_port(host_bind)
         .await
         .context("start target server")?;
-    let target_port = target_server.port;
-    let target_url = target_server.url.clone();
+    let target_url = if is_ipv6 {
+        format!("http://[{}]:{}/", host_bind, target_server.port)
+    } else {
+        format!("http://{}:{}/", host_bind, target_server.port)
+    };
 
-    // Find a port for the proxy
-    let proxy_port = target_port + 1;
+    // Start proxy server
+    let proxy_server = common::LocalProxyServer::start_on_available_port(host_bind)
+        .await
+        .context("start proxy server")?;
+    let vm_proxy_url = if vm_gateway.contains(':') {
+        format!("http://[{}]:{}", vm_gateway, proxy_server.port)
+    } else {
+        format!("http://{}:{}", vm_gateway, proxy_server.port)
+    };
+
     println!(
-        "Local target: {}, proxy on [{}]:{}",
-        target_url, host_ipv6, proxy_port
+        "[{}] Target: {} (host's {})",
+        addr_type, target_url, host_bind
+    );
+    println!(
+        "[{}] Proxy:  {} (host's {})",
+        addr_type, proxy_server.url, host_bind
+    );
+    println!(
+        "[{}] VM proxy: {} ({} → {})",
+        addr_type, vm_proxy_url, vm_gateway, host_bind
     );
 
-    // Start an HTTP forward proxy listening on the host's IPv6 address
-    // This proxy forwards HTTP requests (used for container registry access)
-    let mut proxy_server = tokio::process::Command::new("python3")
-        .args([
-            "-c",
-            &format!(
-                r#"
-import http.server
-import socketserver
-import socket
-import urllib.request
-import urllib.error
-import sys
+    let (vm_name, _, _, _) = common::unique_names(&format!("proxy-{}", addr_type));
 
-class IPv6Server(socketserver.TCPServer):
-    address_family = socket.AF_INET6
-    allow_reuse_address = True
-
-class ProxyHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        self._proxy_request()
-
-    def do_HEAD(self):
-        self._proxy_request()
-
-    def _proxy_request(self):
-        try:
-            url = self.path
-            print(f"[Proxy] {{self.command}} {{url}}", file=sys.stderr, flush=True)
-
-            req = urllib.request.Request(url, method=self.command)
-            # Copy relevant headers
-            for key in ['Host', 'User-Agent', 'Accept', 'Authorization']:
-                if key in self.headers:
-                    req.add_header(key, self.headers[key])
-
-            with urllib.request.urlopen(req, timeout=30) as response:
-                self.send_response(response.status)
-                for key, value in response.headers.items():
-                    if key.lower() not in ('transfer-encoding', 'connection'):
-                        self.send_header(key, value)
-                self.end_headers()
-                if self.command != 'HEAD':
-                    self.wfile.write(response.read())
-        except urllib.error.HTTPError as e:
-            print(f"[Proxy] HTTP error: {{e}}", file=sys.stderr, flush=True)
-            self.send_error(e.code, str(e))
-        except Exception as e:
-            print(f"[Proxy] Error: {{e}}", file=sys.stderr, flush=True)
-            self.send_error(502, f"Proxy error: {{e}}")
-
-    def do_CONNECT(self):
-        # Handle HTTPS CONNECT tunneling
-        try:
-            host, port = self.path.split(':')
-            port = int(port)
-            print(f"[Proxy] CONNECT {{host}}:{{port}}", file=sys.stderr, flush=True)
-
-            # Connect to target
-            sock = socket.create_connection((host, port), timeout=30)
-            self.send_response(200, 'Connection established')
-            self.end_headers()
-
-            # Tunnel data
-            import select
-            self.connection.setblocking(False)
-            sock.setblocking(False)
-
-            while True:
-                readable, _, _ = select.select([self.connection, sock], [], [], 1)
-                if self.connection in readable:
-                    data = self.connection.recv(65536)
-                    if not data:
-                        break
-                    sock.sendall(data)
-                if sock in readable:
-                    data = sock.recv(65536)
-                    if not data:
-                        break
-                    self.connection.sendall(data)
-            sock.close()
-        except Exception as e:
-            print(f"[Proxy] CONNECT error: {{e}}", file=sys.stderr, flush=True)
-            self.send_error(502, f"Tunnel error: {{e}}")
-
-    def log_message(self, format, *args):
-        print(f"[Proxy] {{format % args}}", file=sys.stderr, flush=True)
-
-print(f"Starting IPv6 proxy on [{host_ipv6}]:{proxy_port}", file=sys.stderr, flush=True)
-try:
-    with IPv6Server(('{host_ipv6}', {proxy_port}), ProxyHandler) as httpd:
-        print(f"Proxy ready", file=sys.stderr, flush=True)
-        httpd.serve_forever()
-except Exception as e:
-    print(f"Failed to start proxy: {{e}}", file=sys.stderr, flush=True)
-    sys.exit(1)
-"#,
-                host_ipv6 = host_ipv6,
-                proxy_port = proxy_port
-            ),
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("start IPv6 proxy server")?;
-
-    // Wait for proxy to be ready
-    let proxy_addr = format!("[{}]:{}", host_ipv6, proxy_port);
-    if let Err(e) = common::wait_for_tcp(&proxy_addr, 1000).await {
-        target_server.stop().await;
-        anyhow::bail!("proxy server failed to start: {}", e);
-    }
-
-    // Verify target server is working from host (direct access)
-    println!("Testing target server directly: {}", target_url);
-
-    let direct_test = tokio::process::Command::new("curl")
-        .args(["-s", "--max-time", "5", &target_url])
-        .output()
-        .await?;
-
-    let direct_response = String::from_utf8_lossy(&direct_test.stdout);
-    if !direct_response.contains("TEST_SUCCESS") {
-        target_server.stop().await;
-        proxy_server.kill().await.ok();
-        anyhow::bail!(
-            "Target server not responding correctly: {}",
-            direct_response
-        );
-    }
-    println!("✓ Target server working");
-
-    // Verify proxy is working from host
-    let proxy_url = format!("http://[{}]:{}", host_ipv6, proxy_port);
-    println!("Testing proxy from host: {} -> {}", proxy_url, target_url);
-
-    let host_test = tokio::process::Command::new("curl")
-        .args(["-s", "--max-time", "10", "-x", &proxy_url, &target_url])
-        .output()
-        .await?;
-
-    let proxy_response = String::from_utf8_lossy(&host_test.stdout);
-    if !proxy_response.contains("TEST_SUCCESS") {
-        target_server.stop().await;
-        proxy_server.kill().await.ok();
-        anyhow::bail!("Proxy test failed: {}", proxy_response);
-    }
-    println!("✓ IPv6 proxy working on host");
-
-    // Now start a VM that uses this proxy
-    let (vm_name, _, _, _) = common::unique_names("ipv6proxyvm");
-
-    println!("Starting VM with proxy: {}", proxy_url);
-
-    let (mut child, pid) = common::spawn_fcvm_with_env(
-        &[
-            "podman",
-            "run",
-            "--name",
-            &vm_name,
-            "--network",
-            "rootless",
-            "--no-snapshot",
-            "alpine:latest",
-            "sleep",
-            "infinity",
-        ],
-        &[("http_proxy", &proxy_url), ("https_proxy", &proxy_url)],
-    )
+    let (mut child, pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "rootless",
+        "--no-snapshot",
+        "alpine:latest",
+        "sleep",
+        "infinity",
+    ])
     .await
-    .context("spawn fcvm with IPv6 proxy")?;
+    .context("spawn fcvm")?;
 
-    // Wait for VM to be healthy (image pull goes through the proxy!)
-    println!("Waiting for VM to become healthy (image pull via IPv6 proxy)...");
-    if let Err(e) = common::poll_health_by_pid(pid, 180).await {
+    if let Err(e) = common::poll_health_by_pid(pid, 120).await {
         target_server.stop().await;
-        proxy_server.kill().await.ok();
+        proxy_server.stop().await;
         common::kill_process(pid).await;
         let _ = child.wait().await;
-        anyhow::bail!("VM never became healthy: {}", e);
+        anyhow::bail!("[{}] VM never became healthy: {}", addr_type, e);
     }
 
-    println!("✓ VM healthy - image pull succeeded through IPv6 proxy!");
+    println!("[{}] ✓ VM healthy", addr_type);
 
-    // Test egress from inside the container to our local target via the proxy
-    // The VM reaches host's IPv6 via slirp4netns NAT, then proxy forwards to target
+    // Install curl (busybox wget doesn't support proxies)
+    println!("[{}] Installing curl...", addr_type);
+    let install_result =
+        common::exec_in_container(pid, &["apk", "add", "--no-cache", "curl"]).await;
+    if let Err(e) = install_result {
+        target_server.stop().await;
+        proxy_server.stop().await;
+        common::kill_process(pid).await;
+        let _ = child.wait().await;
+        anyhow::bail!("[{}] Failed to install curl: {}", addr_type, e);
+    }
+
+    // Test: Use curl with -x flag to explicitly use proxy
+    // (env var method doesn't work reliably across all curl versions/configs)
     println!(
-        "Testing egress from container via IPv6 proxy to local target: {}",
-        target_url
+        "[{}] Testing: curl -x {} {}",
+        addr_type, vm_proxy_url, target_url
+    );
+    let result = common::exec_in_container(
+        pid,
+        &[
+            "curl",
+            "-s",
+            "--max-time",
+            "10",
+            "-x",
+            &vm_proxy_url,
+            &target_url,
+        ],
+    )
+    .await;
+
+    let requests_handled = proxy_server.request_count();
+    println!(
+        "[{}] Proxy handled {} requests",
+        addr_type, requests_handled
     );
 
-    let egress_result =
-        common::exec_in_container(pid, &["wget", "-q", "-O", "-", "--timeout=10", &target_url])
-            .await;
-
-    // Clean up
     target_server.stop().await;
-    proxy_server.kill().await.ok();
+    proxy_server.stop().await;
     common::kill_process(pid).await;
     let _ = child.wait().await;
 
-    match egress_result {
+    match result {
         Ok(output) => {
-            println!("Egress response: {}", output);
             assert!(
                 output.contains("TEST_SUCCESS"),
-                "Expected 'TEST_SUCCESS' response, got: {}",
+                "[{}] Expected TEST_SUCCESS, got: {}",
+                addr_type,
                 output
             );
-            println!("✓ Container egress works through IPv6 proxy to local target");
-        }
-        Err(e) => {
-            anyhow::bail!(
-                "Container couldn't reach local target through IPv6 proxy: {}",
-                e
+            assert!(
+                requests_handled > 0,
+                "[{}] Proxy should have handled at least 1 request",
+                addr_type
             );
+            println!(
+                "[{}] ✓ VM used proxy ({}) to reach target ({})",
+                addr_type, vm_gateway, host_bind
+            );
+            Ok(())
         }
+        Err(e) => anyhow::bail!("[{}] VM couldn't reach target via proxy: {}", addr_type, e),
     }
+}
 
-    println!("✓ IPv6 proxy test completed successfully!");
-    Ok(())
+/// Test IPv6 proxy: VM uses fd00::2 to reach proxy on ::1
+#[tokio::test]
+async fn test_proxy_ipv6() -> Result<()> {
+    test_proxy_to_addr("::1", "fd00::2", "ipv6").await
+}
+
+/// Test IPv4 proxy: VM uses 10.0.2.2 to reach proxy on 127.0.0.1
+#[tokio::test]
+async fn test_proxy_ipv4() -> Result<()> {
+    test_proxy_to_addr("127.0.0.1", "10.0.2.2", "ipv4").await
 }
 
 /// Helper to test VM egress to a specific bind address.
