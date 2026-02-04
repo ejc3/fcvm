@@ -2355,11 +2355,6 @@ async fn run_agent() -> Result<()> {
         "fcvm-container".to_string(),
         "--network=host".to_string(),
         "--cgroups=split".to_string(),
-        // Disable pids limit to avoid requiring pids cgroup controller.
-        // With --cgroups=split, crun creates intermediate cgroup directories that may not
-        // have pids enabled in subtree_control. Setting pids-limit=0 tells crun to skip
-        // pids controller entirely, avoiding "pids controller not available" errors.
-        "--pids-limit=0".to_string(),
         "--ulimit".to_string(),
         "nofile=65536:65536".to_string(),
     ];
