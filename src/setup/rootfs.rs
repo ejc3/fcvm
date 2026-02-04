@@ -871,6 +871,10 @@ pub async fn ensure_rootfs(allow_create: bool) -> Result<PathBuf> {
     combined.push_str(kernel_url);
     combined.push_str("\n# DOWNLOAD_SCRIPT:\n");
     combined.push_str(&download_script);
+    combined.push_str("\n# FC_AGENT_SERVICE:\n");
+    combined.push_str(FC_AGENT_SERVICE);
+    combined.push_str("\n# FC_AGENT_SERVICE_STRACE:\n");
+    combined.push_str(FC_AGENT_SERVICE_STRACE);
     let script_sha = compute_sha256(combined.as_bytes());
     let script_sha_short = &script_sha[..12];
 
