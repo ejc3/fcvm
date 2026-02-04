@@ -600,6 +600,11 @@ mv old_name.rs new_name.rs
 - Fixing lint/clippy/format errors
 - Running `cargo fmt` or `cargo clippy`
 
+**NEVER APPLY SKIP CONDITIONS FROM AUTO-FIX PRs.** When CI creates auto-fix PRs:
+- If the fix adds `#[ignore]`, early returns, or weakened assertions → CLOSE IT
+- Find and apply the ACTUAL FIX that makes tests pass
+- Tests must PASS, not be SKIPPED
+
 **Main branch is protected. All changes MUST go through pull requests.**
 
 #### Creating a PR
