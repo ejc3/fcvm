@@ -230,6 +230,10 @@ ip6tables -t nat -A POSTROUTING -s {guest_ipv6_subnet} -o {slirp_dev} -j MASQUER
 # When slirp4netns forwards traffic to 10.0.2.15, redirect it to the actual guest IP
 # This enables port forwarding: host -> slirp4netns -> 10.0.2.15 -> DNAT -> guest (192.168.x.2)
 iptables -t nat -A PREROUTING -d 10.0.2.15 -j DNAT --to-destination {guest_ip} 2>/dev/null || true
+
+# IPv6 DNAT for inbound connections from slirp4netns
+# When slirp4netns forwards traffic to fd00::100, redirect it to the actual guest IPv6
+ip6tables -t nat -A PREROUTING -d fd00::100 -j DNAT --to-destination {guest_ipv6} 2>/dev/null || true
 "#,
             slirp_dev = self.slirp_device,
             fc_tap = self.tap_device,
@@ -237,6 +241,7 @@ iptables -t nat -A PREROUTING -d 10.0.2.15 -j DNAT --to-destination {guest_ip} 2
             ns_ipv6 = self.namespace_ipv6,
             guest_subnet = self.guest_subnet,
             guest_ip = self.guest_ip,
+            guest_ipv6 = self.guest_ipv6,
             guest_ipv6_subnet = self.guest_ipv6_subnet,
             slirp_ipv6_gw = SLIRP_IPV6_GATEWAY,
         )
