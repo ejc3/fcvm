@@ -99,6 +99,88 @@ struct LatestMetadata {
     volumes: Vec<VolumeMount>,
 }
 
+/// Wait for cgroup controllers to be available in the root cgroup's subtree_control.
+///
+/// With `--cgroups=split`, podman/crun creates container cgroups directly under the root cgroup,
+/// bypassing systemd. For this to work, the required controller (pids) must be enabled in the
+/// root cgroup's `cgroup.subtree_control`.
+///
+/// In cgroup v2, a controller must be in the parent's subtree_control for child cgroups to use it.
+/// Systemd typically enables controllers in subtree_control during boot, but there can be a race
+/// where fc-agent starts before systemd has fully initialized the cgroup hierarchy.
+async fn wait_for_cgroup_controllers() {
+    use tokio::fs;
+    use tokio::time::{sleep, Duration};
+
+    const MAX_WAIT_MS: u64 = 5000;
+    const POLL_INTERVAL_MS: u64 = 50;
+    const REQUIRED_CONTROLLER: &str = "pids";
+
+    // With --cgroups=split, podman creates containers under the root cgroup.
+    // We need pids to be in the root's subtree_control, not our service's controllers.
+    let subtree_control_path = "/sys/fs/cgroup/cgroup.subtree_control";
+
+    eprintln!(
+        "[fc-agent] waiting for cgroup controllers at {}",
+        subtree_control_path
+    );
+
+    let start = std::time::Instant::now();
+    let mut attempts = 0;
+
+    loop {
+        attempts += 1;
+
+        match fs::read_to_string(subtree_control_path).await {
+            Ok(controllers) => {
+                let available: Vec<&str> = controllers.split_whitespace().collect();
+                if available.contains(&REQUIRED_CONTROLLER) {
+                    let elapsed = start.elapsed();
+                    if attempts > 1 {
+                        eprintln!(
+                            "[fc-agent] cgroup controllers available after {}ms ({} attempts): {}",
+                            elapsed.as_millis(),
+                            attempts,
+                            controllers.trim()
+                        );
+                    } else {
+                        eprintln!(
+                            "[fc-agent] cgroup controllers available: {}",
+                            controllers.trim()
+                        );
+                    }
+                    return;
+                }
+
+                // Not available yet
+                if start.elapsed().as_millis() as u64 >= MAX_WAIT_MS {
+                    eprintln!(
+                        "[fc-agent] WARNING: '{}' controller not available after {}ms (available: {})",
+                        REQUIRED_CONTROLLER,
+                        MAX_WAIT_MS,
+                        controllers.trim()
+                    );
+                    return;
+                }
+
+                sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+            }
+            Err(e) => {
+                // File might not exist yet
+                if start.elapsed().as_millis() as u64 >= MAX_WAIT_MS {
+                    eprintln!(
+                        "[fc-agent] WARNING: failed to read cgroup controllers after {}ms: {}",
+                        MAX_WAIT_MS, e
+                    );
+                    return;
+                }
+
+                sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+            }
+        }
+    }
+}
+
 async fn fetch_plan() -> Result<Plan> {
     // MMDS V2 requires getting a session token first
     let client = reqwest::Client::new();
@@ -2240,6 +2322,12 @@ async fn run_agent() -> Result<()> {
 
     eprintln!("[fc-agent] launching container: {}", image_ref);
 
+    // Wait for cgroup controllers to be available.
+    // With Delegate=yes on fc-agent.service, systemd should delegate controllers to our cgroup.
+    // But there can be a race condition where we start before delegation is complete.
+    // This is especially important for --cgroups=split which uses cgroupfs directly.
+    wait_for_cgroup_controllers().await;
+
     // Build Podman args (used for both TTY and non-TTY modes)
     //
     // CRITICAL: --cgroups=split is REQUIRED for snapshot restore.
@@ -2267,6 +2355,11 @@ async fn run_agent() -> Result<()> {
         "fcvm-container".to_string(),
         "--network=host".to_string(),
         "--cgroups=split".to_string(),
+        // Disable pids limit to avoid requiring pids cgroup controller.
+        // With --cgroups=split, crun creates intermediate cgroup directories that may not
+        // have pids enabled in subtree_control. Setting pids-limit=0 tells crun to skip
+        // pids controller entirely, avoiding "pids controller not available" errors.
+        "--pids-limit=0".to_string(),
         "--ulimit".to_string(),
         "nofile=65536:65536".to_string(),
     ];
