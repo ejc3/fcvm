@@ -99,15 +99,20 @@ struct LatestMetadata {
     volumes: Vec<VolumeMount>,
 }
 
-/// Wait for cgroup controllers to be available in the root cgroup's subtree_control.
+/// Ensure cgroup controllers are available in the root cgroup's subtree_control.
 ///
 /// With `--cgroups=split`, podman/crun creates container cgroups directly under the root cgroup,
 /// bypassing systemd. For this to work, the required controller (pids) must be enabled in the
 /// root cgroup's `cgroup.subtree_control`.
 ///
 /// In cgroup v2, a controller must be in the parent's subtree_control for child cgroups to use it.
-/// Systemd typically enables controllers in subtree_control during boot, but there can be a race
-/// where fc-agent starts before systemd has fully initialized the cgroup hierarchy.
+/// Ubuntu's systemd enables controllers in slices (system.slice, user.slice) but NOT in the root
+/// cgroup. We must enable it ourselves for --cgroups=split to work.
+///
+/// This function:
+/// 1. Checks if pids is already in root's subtree_control
+/// 2. If not, tries to enable it by writing "+pids" to subtree_control
+/// 3. Verifies the controller is now available
 async fn wait_for_cgroup_controllers() {
     use tokio::fs;
     use tokio::time::{sleep, Duration};
@@ -121,12 +126,13 @@ async fn wait_for_cgroup_controllers() {
     let subtree_control_path = "/sys/fs/cgroup/cgroup.subtree_control";
 
     eprintln!(
-        "[fc-agent] waiting for cgroup controllers at {}",
+        "[fc-agent] checking cgroup controllers at {}",
         subtree_control_path
     );
 
     let start = std::time::Instant::now();
     let mut attempts = 0;
+    let mut tried_enable = false;
 
     loop {
         attempts += 1;
@@ -152,7 +158,40 @@ async fn wait_for_cgroup_controllers() {
                     return;
                 }
 
-                // Not available yet
+                // pids not in subtree_control - try to enable it
+                if !tried_enable {
+                    tried_enable = true;
+                    eprintln!(
+                        "[fc-agent] '{}' not in subtree_control (available: {}), enabling...",
+                        REQUIRED_CONTROLLER,
+                        controllers.trim()
+                    );
+
+                    // In cgroup v2, write "+pids" to enable the controller in subtree_control.
+                    // This only works if no processes are directly in the root cgroup
+                    // (all must be in child cgroups). By the time fc-agent runs, systemd
+                    // has moved all processes to slices, so this should succeed.
+                    match fs::write(subtree_control_path, format!("+{}\n", REQUIRED_CONTROLLER))
+                        .await
+                    {
+                        Ok(()) => {
+                            eprintln!(
+                                "[fc-agent] successfully enabled '{}' controller",
+                                REQUIRED_CONTROLLER
+                            );
+                            // Continue loop to verify it's now available
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[fc-agent] WARNING: failed to enable '{}' controller: {}",
+                                REQUIRED_CONTROLLER, e
+                            );
+                            // Continue waiting in case systemd enables it
+                        }
+                    }
+                }
+
+                // Not available yet - wait and retry
                 if start.elapsed().as_millis() as u64 >= MAX_WAIT_MS {
                     eprintln!(
                         "[fc-agent] WARNING: '{}' controller not available after {}ms (available: {})",
