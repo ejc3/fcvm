@@ -84,9 +84,27 @@ gh pr list --search "base:<your-branch>"
 
 Comments may contain:
 - **Code review findings** - Fix these before merging
-- **Auto-fix PRs** - Cherry-pick or close if outdated
+- **Auto-fix PRs** - Cherry-pick ACTUAL FIXES only (see below)
 - **CI failure analysis** - Re-run if infra issue, fix if code issue
 - **Security concerns** - Must address before merge
+
+**CRITICAL: Never Apply Skip Conditions!**
+
+When reviewing auto-fix PRs or suggested fixes:
+- **NEVER** apply `#[ignore]`, `#[cfg(skip)]`, or similar skip attributes
+- **NEVER** apply early returns like `if !has_feature { return Ok(()); }`
+- **NEVER** weaken assertions or remove test coverage
+- **ALWAYS** find and apply the ACTUAL FIX that makes the test pass
+
+If an auto-fix PR adds skip logic, CLOSE IT and find the real fix:
+```bash
+# Example: Auto-fix PR adds skip condition
+# WRONG: gh pr merge <skip-pr>
+# RIGHT: Close the skip PR, find and apply the actual fix
+gh pr close <skip-pr> --comment "Skip conditions are not acceptable - finding actual fix"
+```
+
+The rule is simple: **Tests must PASS, not be SKIPPED.**
 
 ### Step 4: Verify CI is Green
 
@@ -146,3 +164,11 @@ Before considering code "done":
    RUST_LOG=debug make test-root FILTER=<failing_test> STREAM=1
    ```
 4. Fix the CODE, not the test
+
+**Examples of UNACCEPTABLE "fixes":**
+- Adding `#[ignore]` to a failing test
+- Adding `if condition { return Ok(()); }` to skip functionality
+- Changing `assert!(x)` to `if !x { println!("NOTE: known issue"); }`
+- Removing test coverage because it's "flaky"
+
+**The ONLY acceptable fix:** Change the actual code so the test passes.
