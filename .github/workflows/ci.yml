@@ -61,10 +61,12 @@ jobs:
         run: |
           echo "fuser=$(git -C fuser rev-parse HEAD)" >> $GITHUB_OUTPUT
           echo "fuse-backend-rs=$(git -C fuse-backend-rs rev-parse HEAD)" >> $GITHUB_OUTPUT
+          # Hash fc-agent source to invalidate cache when it changes
+          echo "fc-agent=$(find fcvm/fc-agent/src -type f -name '*.rs' | sort | xargs sha256sum | sha256sum | cut -d' ' -f1)" >> $GITHUB_OUTPUT
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fcvm -> target
-          shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
+          shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}-${{ steps.deps.outputs.fc-agent }}
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev libclang-dev clang
       - name: Cache cargo tools
@@ -106,10 +108,12 @@ jobs:
         run: |
           echo "fuser=$(git -C fuser rev-parse HEAD)" >> $GITHUB_OUTPUT
           echo "fuse-backend-rs=$(git -C fuse-backend-rs rev-parse HEAD)" >> $GITHUB_OUTPUT
+          # Hash fc-agent source to invalidate cache when it changes
+          echo "fc-agent=$(find fcvm/fc-agent/src -type f -name '*.rs' | sort | xargs sha256sum | sha256sum | cut -d' ' -f1)" >> $GITHUB_OUTPUT
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fcvm -> target
-          shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
+          shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}-${{ steps.deps.outputs.fc-agent }}
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev libclang-dev clang
       - name: Build release
@@ -151,11 +155,13 @@ jobs:
         run: |
           echo "fuser=$(git -C fuser rev-parse HEAD)" >> $GITHUB_OUTPUT
           echo "fuse-backend-rs=$(git -C fuse-backend-rs rev-parse HEAD)" >> $GITHUB_OUTPUT
+          # Hash fc-agent source to invalidate cache when it changes
+          echo "fc-agent=$(find fcvm/fc-agent/src -type f -name '*.rs' | sort | xargs sha256sum | sha256sum | cut -d' ' -f1)" >> $GITHUB_OUTPUT
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fcvm -> target
           cache-on-failure: "true"
-          shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
+          shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}-${{ steps.deps.outputs.fc-agent }}
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -324,11 +330,13 @@ jobs:
         run: |
           echo "fuser=$(git -C fuser rev-parse HEAD)" >> $GITHUB_OUTPUT
           echo "fuse-backend-rs=$(git -C fuse-backend-rs rev-parse HEAD)" >> $GITHUB_OUTPUT
+          # Hash fc-agent source to invalidate cache when it changes
+          echo "fc-agent=$(find fcvm/fc-agent/src -type f -name '*.rs' | sort | xargs sha256sum | sha256sum | cut -d' ' -f1)" >> $GITHUB_OUTPUT
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fcvm -> target
           cache-on-failure: "true"
-          shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
+          shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}-${{ steps.deps.outputs.fc-agent }}
       - name: Install dependencies
         run: |
           sudo apt-get update
