@@ -816,8 +816,9 @@ impl std::os::unix::io::AsRawFd for VsockListener {
     }
 }
 
-/// Run the exec server that listens for commands from host via vsock
-async fn run_exec_server() {
+/// Run the exec server with ready signal support.
+/// This is identical to run_exec_server() but sends a signal when the server is listening.
+async fn run_exec_server_with_ready_signal(ready_tx: tokio::sync::oneshot::Sender<()>) {
     eprintln!(
         "[fc-agent] starting exec server on vsock port {}",
         EXEC_VSOCK_PORT
@@ -877,6 +878,9 @@ async fn run_exec_server() {
         "[fc-agent] ✓ exec server listening on vsock port {}",
         EXEC_VSOCK_PORT
     );
+
+    // Signal that we're ready
+    let _ = ready_tx.send(());
 
     // Wrap in AsyncFd for async accept
     let listener = VsockListener { fd: listener_fd };
@@ -2149,9 +2153,25 @@ async fn run_agent() -> Result<()> {
     });
 
     // Start exec server to allow host to run commands in VM
+    // Use a oneshot channel to wait for the server to be listening before continuing.
+    // This ensures health checks (which use fcvm exec) work immediately.
+    let (exec_ready_tx, exec_ready_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async {
-        run_exec_server().await;
+        run_exec_server_with_ready_signal(exec_ready_tx).await;
     });
+
+    // Wait for exec server to be listening (with timeout to avoid hanging)
+    match tokio::time::timeout(Duration::from_secs(5), exec_ready_rx).await {
+        Ok(Ok(())) => {
+            eprintln!("[fc-agent] exec server is ready");
+        }
+        Ok(Err(_)) => {
+            eprintln!("[fc-agent] WARNING: exec server ready signal dropped");
+        }
+        Err(_) => {
+            eprintln!("[fc-agent] WARNING: exec server did not become ready within 5s");
+        }
+    }
 
     // Mount FUSE volumes from host before launching container
     // Note: mounted_volumes tracks which mounts succeeded, but we bind from plan.volumes
