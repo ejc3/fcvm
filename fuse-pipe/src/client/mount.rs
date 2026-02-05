@@ -208,17 +208,43 @@ pub fn mount_spawn<P: AsRef<Path> + Send + 'static>(
             // Mount failed or timed out - clean up the thread with short timeout.
             // The thread may be stuck in Session::new() or similar blocking call.
             warn!(target: "fuse-pipe::client", "mount_spawn failed, cleaning up thread: {:?}", e);
-            if !join_with_timeout(thread, Duration::from_secs(2)) {
-                warn!(target: "fuse-pipe::client", "mount thread stuck, abandoning");
-                // Try to forcefully unmount in case the mount succeeded but thread hung
-                force_unmount(&mount_path_for_cleanup);
-            }
 
-            Err(match e {
-                std::sync::mpsc::RecvTimeoutError::Timeout => {
+            // Try to get the actual error from the mount thread
+            let thread_error = {
+                let start = std::time::Instant::now();
+                let timeout = Duration::from_secs(2);
+                while !thread.is_finished() {
+                    if start.elapsed() > timeout {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                if thread.is_finished() {
+                    match thread.join() {
+                        Ok(Ok(())) => None,
+                        Ok(Err(mount_err)) => {
+                            error!(target: "fuse-pipe::client", "mount thread failed: {:#}", mount_err);
+                            Some(mount_err)
+                        }
+                        Err(_panic) => {
+                            error!(target: "fuse-pipe::client", "mount thread panicked");
+                            Some(anyhow::anyhow!("mount thread panicked"))
+                        }
+                    }
+                } else {
+                    warn!(target: "fuse-pipe::client", "mount thread stuck, abandoning");
+                    // Try to forcefully unmount in case the mount succeeded but thread hung
+                    force_unmount(&mount_path_for_cleanup);
+                    None
+                }
+            };
+
+            Err(match (e, thread_error) {
+                (_, Some(thread_err)) => thread_err,
+                (std::sync::mpsc::RecvTimeoutError::Timeout, None) => {
                     anyhow::anyhow!("mount timed out after 10s - check if running as root for FUSE")
                 }
-                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                (std::sync::mpsc::RecvTimeoutError::Disconnected, None) => {
                     anyhow::anyhow!("mount thread failed before sending unmounter")
                 }
             })
