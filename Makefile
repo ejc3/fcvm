@@ -44,6 +44,21 @@ else
 NEXTEST_IGNORED :=
 endif
 
+# On IPv6-only hosts, auto-exclude bridged tests (they require IPv4 iptables)
+# User can still explicitly run bridged tests with FILTER=bridged
+ifeq ($(IPV6_ONLY),1)
+ifndef FILTER
+# No filter set: exclude bridged tests
+NEXTEST_PARTITION := --partition hash:1/2
+IPV6_FILTER := -E 'not test(/bridged/)'
+else
+# User set a filter: respect it (they know what they're doing)
+IPV6_FILTER :=
+endif
+else
+IPV6_FILTER :=
+endif
+
 # Disable retries when FILTER is set (debugging specific tests)
 ifdef FILTER
 NEXTEST_RETRIES :=
@@ -69,6 +84,14 @@ ifeq ($(ARCH),aarch64)
 MUSL_TARGET := aarch64-unknown-linux-musl
 else
 MUSL_TARGET := x86_64-unknown-linux-musl
+endif
+
+# IPv6-only detection: If no IPv4 default route exists, bridged networking won't work
+# (bridged uses IPv4 iptables DNAT). Auto-exclude bridged tests on IPv6-only hosts.
+HAS_IPV4 := $(shell ip route show default 2>/dev/null | grep -q . && echo 1 || echo 0)
+ifeq ($(HAS_IPV4),0)
+IPV6_ONLY := 1
+$(info Note: IPv6-only host detected - bridged tests will be skipped)
 endif
 
 # Base test command
@@ -180,16 +203,20 @@ check-disk:
 
 # Clean leftover test data (VM disks, snapshots, state files)
 # Preserves cached assets (kernels, rootfs, initrd, image-cache)
-clean-test-data:
+# CRITICAL: Uses fcvm's proper cleanup commands to handle btrfs CoW correctly
+clean-test-data: build
 	@echo "==> Force unmounting stale FUSE mounts..."
 	@# Find and force unmount any FUSE mounts from previous test runs
 	@mount | grep fuse | grep -E '/tmp|/var/tmp' | cut -d' ' -f3 | xargs -r -I{} fusermount3 -u -z {} 2>/dev/null || true
+	@echo "==> Cleaning snapshots via fcvm (handles btrfs CoW properly)..."
+	@# Use fcvm's snapshot prune for proper cleanup - handles reflinks correctly
+	sudo ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
+	@# Also clean per-mode directories
+	sudo FCVM_DATA_DIR=$(ROOT_DATA_DIR) ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
+	sudo FCVM_DATA_DIR=$(CONTAINER_DATA_DIR) ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
 	@echo "==> Cleaning leftover VM disks..."
 	sudo rm -rf /mnt/fcvm-btrfs/vm-disks/*
 	sudo rm -rf $(ROOT_DATA_DIR)/vm-disks/* $(CONTAINER_DATA_DIR)/vm-disks/*
-	@echo "==> Cleaning snapshots..."
-	sudo rm -rf /mnt/fcvm-btrfs/snapshots/*
-	sudo rm -rf $(ROOT_DATA_DIR)/snapshots/* $(CONTAINER_DATA_DIR)/snapshots/*
 	@echo "==> Cleaning state files..."
 	sudo rm -rf /mnt/fcvm-btrfs/state/*.json
 	sudo rm -rf $(ROOT_DATA_DIR)/state/*.json $(CONTAINER_DATA_DIR)/state/*.json
@@ -233,7 +260,7 @@ _test-root:
 	FCVM_DATA_DIR=$(ROOT_DATA_DIR) \
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
-	$(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_IGNORED) $(NEXTEST_RETRIES) --features privileged-tests $(FILTER) || \
+	$(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_IGNORED) $(NEXTEST_RETRIES) --features privileged-tests $(IPV6_FILTER) $(FILTER) || \
 	{ echo ""; \
 	  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
 	  echo "TEST FAILED - Check debug logs for root cause:"; \

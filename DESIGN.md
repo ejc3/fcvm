@@ -392,55 +392,61 @@ Each VM has:
 
 ## Networking
 
-### Rootless Mode (slirp4netns with Dual-TAP Architecture)
+### Rootless Mode (slirp4netns with Bridge Architecture)
 
 **Key Insight**: slirp4netns and Firecracker CANNOT share a TAP device (both need exclusive access).
-**Solution**: Use two TAP devices with IP forwarding between them inside a user namespace.
+**Solution**: Use a Linux bridge (br0) for L2 forwarding between slirp4netns and Firecracker inside a user namespace.
 
 **Topology**:
 ```
 Host                     │ User Namespace (unshare --user --map-root-user --net)
                          │
-slirp4netns <────────────┼── slirp0 (10.0.2.100/24)
-  (userspace NAT)        │        │
-                         │        │ IP forwarding + iptables NAT
-                         │        ▼
-                         │   tap0 (192.168.1.1/24)
-                         │        │
-                         │        ▼
+slirp4netns <────────────┼── slirp0 ─┐
+  (userspace NAT)        │           │
+                         │        br0 (10.0.2.1/24)  ← namespace IP for health checks
+                         │           │
+                         │   tap-fc ─┘
+                         │      │
+                         │      ▼
                          │   Firecracker VM
-                         │     eth0: 192.168.1.2
+                         │     eth0: 10.0.2.15
 ```
+
+**Why Bridge Instead of IP Forwarding?**
+- Bridge operates at L2 (MAC addresses) - preserves source MAC for proper ARP/NDP learning
+- slirp4netns expects traffic from specific MAC addresses for its internal NAT tables
+- IP forwarding rewrites source MAC, breaking slirp4netns's connection tracking
+- Bridge also enables IPv6 with proper NDP neighbor discovery
 
 **Setup Sequence** (3-phase with nsenter):
 1. Spawn holder process: `unshare --user --map-root-user --net -- sleep infinity`
-2. Run setup via nsenter: create TAPs, iptables, enable IP forwarding
-3. Start slirp4netns attached to holder's namespace
+2. Run setup via nsenter: create bridge, TAPs, add namespace IP
+3. Start slirp4netns attached to holder's namespace (connects to slirp0)
 4. Run Firecracker via nsenter: `nsenter -t HOLDER_PID -U -n -- firecracker ...`
-5. Health checks via nsenter: `nsenter -t HOLDER_PID -U -n -- curl guest_ip:80`
+5. Health checks via nsenter: `nsenter -t HOLDER_PID -U -n -- curl 10.0.2.15:80`
 
 **Network Setup Script** (executed via nsenter):
 ```bash
-# Create slirp0 TAP for slirp4netns connectivity
+# Create bridge for L2 forwarding
+ip link add br0 type bridge
+ip link set br0 up
+
+# Create slirp0 TAP for slirp4netns
 ip tuntap add slirp0 mode tap
-ip addr add 10.0.2.100/24 dev slirp0
+ip link set slirp0 master br0
 ip link set slirp0 up
-ip route add default via 10.0.2.2 dev slirp0
 
-# Create tap0 for Firecracker (guest uses 192.168.1.2)
-ip tuntap add tap0 mode tap
-ip addr add 192.168.1.1/24 dev tap0
-ip link set tap0 up
+# Create tap-fc for Firecracker
+ip tuntap add tap-fc mode tap
+ip link set tap-fc master br0
+ip link set tap-fc up
 
-# Enable IP forwarding
-echo 1 > /proc/sys/net/ipv4/ip_forward
+# Add IP to bridge for health checks
+# This enables nsenter to route to guest via the 10.0.2.x subnet
+ip addr add 10.0.2.1/24 dev br0
 
-# Allow forwarding between slirp0 and FC TAP
-iptables -A FORWARD -i slirp0 -o tap0 -j ACCEPT
-iptables -A FORWARD -i tap0 -o slirp0 -j ACCEPT
-
-# NAT guest traffic (192.168.x.x) to slirp0's address (10.0.2.100)
-iptables -t nat -A POSTROUTING -s 192.168.1.0/24 -o slirp0 -j MASQUERADE
+# Set default route via slirp4netns gateway
+ip route add default via 10.0.2.2 dev br0
 ```
 
 **Port Forwarding** (unique loopback IPs):
@@ -450,29 +456,43 @@ iptables -t nat -A POSTROUTING -s 192.168.1.0/24 -o slirp0 -j MASQUERADE
 slirp4netns \
   --configure \
   --mtu=65520 \
+  --enable-ipv6 \
   --api-socket /tmp/slirp-{vm_id}.sock \
   <holder-pid> \
   slirp0
 
 # Port forwarding via JSON-RPC API:
-echo '{"execute":"add_hostfwd","arguments":{"proto":"tcp","host_addr":"127.0.0.2","host_port":8080,"guest_addr":"10.0.2.100","guest_port":8080}}' | nc -U /tmp/slirp-{vm_id}.sock
+echo '{"execute":"add_hostfwd","arguments":{"proto":"tcp","host_addr":"127.0.0.2","host_port":8080,"guest_addr":"10.0.2.15","guest_port":80}}' | nc -U /tmp/slirp-{vm_id}.sock
 ```
 
 **Traffic Flow** (VM to Internet):
 ```
-Guest (192.168.1.2) → tap0 → iptables MASQUERADE → slirp0 (10.0.2.100) → slirp4netns → Host → Internet
+Guest (10.0.2.15) → tap-fc → br0 (L2) → slirp0 → slirp4netns → Host → Internet
+```
+
+**Traffic Flow** (Health Check from namespace):
+```
+nsenter curl → br0 (10.0.2.1) → L2 forward → tap-fc → Guest (10.0.2.15:80)
 ```
 
 **Traffic Flow** (Host to VM port forward):
 ```
-Host (127.0.0.2:8080) → slirp4netns → slirp0 (10.0.2.100:8080) → IP forward → tap0 → Guest (192.168.1.2:80)
+Host (127.0.0.2:8080) → slirp4netns → slirp0 → br0 (L2) → tap-fc → Guest (10.0.2.15:80)
 ```
+
+**IPv6 Support**:
+- slirp4netns `--enable-ipv6` provides IPv6 connectivity
+- Guest uses fd00::2 (slirp's IPv6 gateway) and fd00::3 (IPv6 DNS)
+- fc-agent sends gratuitous NDP NA at boot for MAC learning
+- On snapshot restore, fc-agent re-sends NDP NA to teach new slirp process
 
 **Characteristics**:
 - No root required (runs entirely in user namespace)
-- Isolated 192.168.1.0/24 subnet per VM (no conflicts)
+- All VMs use same 10.0.2.x subnet (isolated by user namespace)
 - Unique loopback IP per VM enables same port on multiple VMs
-- Slightly slower than bridged (~10-20% overhead)
+- Bridge-based L2 preserves MAC addresses for proper slirp4netns operation
+- Namespace IP (10.0.2.1) enables health checks via nsenter
+- IPv6 support with native slirp4netns IPv6 DNS proxying
 - Works in nested VMs and restricted environments
 - Fully compatible with rootless Podman in guest
 

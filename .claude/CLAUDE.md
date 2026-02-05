@@ -1237,10 +1237,12 @@ fuse-pipe/benches/
 
 **Rootless Architecture:**
 - Firecracker starts with `unshare --user --map-root-user --net`
-- slirp4netns connects to the namespace via PID, creates TAP device
-- Dual-TAP design: slirp0 (10.0.2.x) for slirp4netns, tap0 (192.168.x.x) for Firecracker
+- Linux bridge (br0) connects slirp0 and tap-fc for L2 forwarding
+- Bridge preserves MAC addresses for proper slirp4netns ARP/NDP learning
+- Namespace IP (10.0.2.1) on bridge enables health checks via nsenter
+- Guest uses slirp4netns network directly (10.0.2.15)
 - Port forwarding via slirp4netns JSON-RPC API socket
-- Health checks use unique loopback IPs (127.x.y.z) per VM
+- IPv6 supported with `--enable-ipv6` and native DNS proxying
 
 **Loopback IP Allocation** (`src/state/manager.rs`):
 - Sequential allocation: 127.0.0.2, 127.0.0.3, ..., 127.0.0.254, then 127.0.1.2, etc.

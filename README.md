@@ -795,8 +795,11 @@ See [DESIGN.md](DESIGN.md#cli-interface) for architecture and design decisions.
 
 | Mode | Flag | Root | Notes |
 |------|------|------|-------|
-| Rootless | `--network rootless` (default) | No | slirp4netns, no root needed |
-| Bridged | `--network bridged` | Yes | iptables NAT |
+| Rootless | `--network rootless` (default) | No | slirp4netns with bridge, IPv6 support |
+| Bridged | `--network bridged` | Yes | iptables NAT, better performance |
+
+**Rootless architecture**: Uses a Linux bridge (br0) for L2 forwarding between slirp4netns and Firecracker.
+The bridge preserves MAC addresses for proper ARP/NDP learning, enabling IPv6 support.
 
 ### Host Service Access (Rootless Mode)
 

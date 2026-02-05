@@ -16,6 +16,8 @@ use crate::state::truncate_id;
 const GUEST_IP: &str = "10.0.2.100";
 const GUEST_GATEWAY: &str = "10.0.2.2";
 const GUEST_DNS: &str = "10.0.2.3";
+/// Namespace IP on bridge - enables nsenter health checks to route to guest
+const NAMESPACE_IP: &str = "10.0.2.1";
 
 /// Guest IPv6 addressing (slirp4netns IPv6 network)
 /// slirp4netns uses fd00::/64 by default for IPv6 with gateway at fd00::2
@@ -181,6 +183,10 @@ ip link set {fc_tap} up
 # Set up loopback
 ip link set lo up
 
+# Add IP to bridge for health checks (namespace needs route to reach guest)
+# This enables nsenter to curl guest directly via the 10.0.2.x subnet
+ip addr add {namespace_ip}/24 dev {bridge}
+
 # No IP forwarding or iptables NAT needed!
 # Bridge handles L2 forwarding directly.
 # Guest uses slirp4netns network (10.0.2.x) directly.
@@ -188,6 +194,7 @@ ip link set lo up
             bridge = BRIDGE_DEVICE,
             slirp_dev = self.slirp_device,
             fc_tap = self.tap_device,
+            namespace_ip = NAMESPACE_IP,
         )
     }
 
