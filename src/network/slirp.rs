@@ -27,6 +27,22 @@ const SLIRP_IPV6_GATEWAY: &str = "fd00::2";
 /// Default TAP device name for slirp4netns
 const SLIRP_DEVICE_NAME: &str = "slirp0";
 
+/// Custom slirp4netns path (built with libslirp 4.8.0+ for IPv6 DNS support)
+const CUSTOM_SLIRP_PATH: &str = "/mnt/fcvm-btrfs/deps/bin/slirp4netns";
+
+/// Find the best slirp4netns binary to use.
+///
+/// Prefers custom build at /mnt/fcvm-btrfs/deps/bin/slirp4netns if it exists,
+/// as it has libslirp 4.8.0+ with IPv6 DNS support. Falls back to system binary.
+fn find_slirp4netns() -> String {
+    let custom_path = std::path::Path::new(CUSTOM_SLIRP_PATH);
+    if custom_path.exists() && custom_path.is_file() {
+        CUSTOM_SLIRP_PATH.to_string()
+    } else {
+        "slirp4netns".to_string()
+    }
+}
+
 /// Rootless networking using slirp4netns with dual-TAP architecture
 ///
 /// This mode uses user namespaces and slirp4netns for true unprivileged operation.
@@ -325,7 +341,13 @@ ip6tables -t nat -A PREROUTING -d fd00::100 -j DNAT --to-destination {guest_ipv6
         // This avoids the issue where DNAT doesn't work for local addresses
         // The TAP is created and connected, but we handle routing ourselves
         // Use --enable-ipv6 for IPv6 egress support
-        let mut cmd = Command::new("slirp4netns");
+        //
+        // Prefer custom slirp4netns with newer libslirp (for IPv6 DNS support).
+        // System slirp4netns on RHEL9/CentOS9 has libslirp 4.4.0 which can't
+        // forward DNS queries to IPv6 nameservers. Custom build has 4.8.0+.
+        let slirp_path = find_slirp4netns();
+        debug!(slirp_path = %slirp_path, "using slirp4netns binary");
+        let mut cmd = Command::new(&slirp_path);
         cmd.arg("--ready-fd")
             .arg(ready_write_raw.to_string())
             .arg("--api-socket")

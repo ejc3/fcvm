@@ -9,6 +9,13 @@ RUST_BIN := $(shell command -v cargo >/dev/null 2>&1 && dirname $$(command -v ca
 export PATH := $(RUST_BIN):$(PATH)
 CARGO := cargo
 
+# Custom slirp4netns with newer libslirp (for IPv6 DNS support on RHEL9/CentOS9)
+# Build with: ./scripts/build-slirp4netns.sh
+CUSTOM_DEPS_BIN := /mnt/fcvm-btrfs/deps/bin
+ifneq ($(wildcard $(CUSTOM_DEPS_BIN)/slirp4netns),)
+export PATH := $(CUSTOM_DEPS_BIN):$(PATH)
+endif
+
 # Brief notes (see .claude/CLAUDE.md for details):
 #   FILTER=x STREAM=1 - filter tests, stream output
 #   Assets are content-addressed (kernel by URL SHA, rootfs by script SHA, initrd by binary SHA)
@@ -224,8 +231,8 @@ _test-all:
 _test-root:
 	@RUST_LOG="$(TEST_LOG)" \
 	FCVM_DATA_DIR=$(ROOT_DATA_DIR) \
-	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
-	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' \
+	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
 	$(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_IGNORED) $(NEXTEST_RETRIES) --features privileged-tests $(FILTER) || \
 	{ echo ""; \
 	  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
