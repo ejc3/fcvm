@@ -565,6 +565,44 @@ async fn test_clone_internet_rootless() -> Result<()> {
     clone_internet_test_impl("rootless").await
 }
 
+/// Get the host's primary network interface IP (used for reaching external networks)
+/// For bridged mode, VMs can reach this IP via NAT
+async fn get_host_primary_ip() -> Result<String> {
+    // Use "ip route get 8.8.8.8" to find which interface/IP is used for external traffic
+    let output = tokio::process::Command::new("ip")
+        .args(["route", "get", "8.8.8.8"])
+        .output()
+        .await
+        .context("running ip route get")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Output looks like: "8.8.8.8 via 172.31.0.1 dev enp3s0 src 172.31.15.123 uid 0"
+    // We want the IP after "src"
+    for part in stdout.split_whitespace().collect::<Vec<_>>().windows(2) {
+        if part[0] == "src" {
+            return Ok(part[1].to_string());
+        }
+    }
+
+    anyhow::bail!("Could not determine host primary IP from: {}", stdout)
+}
+
+/// Calculate the URL a VM should use to reach a test server on the host
+async fn get_egress_url(network: &str, port: u16) -> Result<String> {
+    match network {
+        "rootless" => {
+            // For rootless, slirp4netns gateway is 10.0.2.2
+            Ok(format!("http://10.0.2.2:{}/", port))
+        }
+        "bridged" => {
+            // For bridged, use host's primary IP (reachable via NAT)
+            let host_ip = get_host_primary_ip().await?;
+            Ok(format!("http://{}:{}/", host_ip, port))
+        }
+        _ => anyhow::bail!("Unknown network type: {}", network),
+    }
+}
+
 async fn clone_internet_test_impl(network: &str) -> Result<()> {
     let (baseline_name, clone_name, snapshot_name, _) =
         common::unique_names(&format!("inet-{}", network));
@@ -575,6 +613,42 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
         network
     );
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
+
+    // Start local test servers on host
+    let bind_addr = if network == "rootless" {
+        "127.0.0.1"
+    } else {
+        "0.0.0.0" // Bridged needs to bind to all interfaces
+    };
+
+    // HTTP test server
+    let test_server = common::LocalTestServer::start_on_available_port(bind_addr)
+        .await
+        .context("starting local HTTP test server")?;
+
+    let egress_url = get_egress_url(network, test_server.port).await?;
+    println!(
+        "  Local HTTP server: {} (VM will connect to {})",
+        test_server.url, egress_url
+    );
+
+    // DNS test server - responds with 93.184.216.34 (example.com IP) for any query
+    // Using high port since port 53 may be in use by systemd-resolved
+    let dns_response_ip: std::net::Ipv4Addr = "93.184.216.34".parse().unwrap();
+    let dns_server = common::LocalDnsServer::start_on_available_port(bind_addr, dns_response_ip)
+        .await
+        .context("starting local DNS test server")?;
+
+    // Calculate DNS server address for VM
+    let dns_server_addr = if network == "rootless" {
+        "10.0.2.2".to_string() // slirp gateway
+    } else {
+        get_host_primary_ip().await?
+    };
+    println!(
+        "  Local DNS server: {}:{} (VM will query {}:{})",
+        bind_addr, dns_server.port, dns_server_addr, dns_server.port
+    );
 
     let fcvm_path = common::find_fcvm_binary()?;
 
@@ -659,16 +733,23 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
     common::poll_health_by_pid(clone_pid, 120).await?;
     println!("  ✓ Clone is healthy (PID: {})", clone_pid);
 
-    // Step 5: Test internet connectivity from inside the clone
-    println!("\nStep 5: Testing internet connectivity from clone...");
+    // Step 5: Test connectivity from inside the clone
+    println!("\nStep 5: Testing connectivity from clone...");
 
-    // Test 1: DNS resolution using nslookup
+    // Test 1: DNS resolution using local DNS server
     println!("  Testing DNS resolution...");
-    let dns_result = test_clone_dns(&fcvm_path, clone_pid).await;
+    let dns_result = test_clone_dns(
+        &fcvm_path,
+        clone_pid,
+        &dns_server_addr,
+        dns_server.port,
+        &dns_response_ip.to_string(),
+    )
+    .await;
 
-    // Test 2: HTTPS connectivity using curl (with proxy)
-    println!("  Testing HTTPS connectivity via proxy...");
-    let http_result = test_clone_http(&fcvm_path, clone_pid).await;
+    // Test 2: HTTP connectivity to local test server
+    println!("  Testing HTTP connectivity to local server...");
+    let http_result = test_clone_http(&fcvm_path, clone_pid, &egress_url).await;
 
     // Cleanup
     println!("\nCleaning up...");
@@ -676,6 +757,10 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
     println!("  Killed clone");
     common::kill_process(serve_pid).await;
     println!("  Killed memory server");
+    dns_server.stop().await;
+    println!("  Stopped DNS server");
+    test_server.stop().await;
+    println!("  Stopped HTTP server");
 
     // Report results
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
@@ -686,18 +771,18 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
     let http_ok = http_result.is_ok();
 
     if dns_ok {
-        println!("║  DNS resolution:    ✓ PASSED                                 ║");
+        println!("║  DNS reachability:  ✓ PASSED                                 ║");
     } else {
-        println!("║  DNS resolution:    ✗ FAILED                                 ║");
+        println!("║  DNS reachability:  ✗ FAILED                                 ║");
         if let Err(ref e) = dns_result {
             eprintln!("    Error: {}", e);
         }
     }
 
     if http_ok {
-        println!("║  HTTPS connectivity: ✓ PASSED                                ║");
+        println!("║  HTTP connectivity: ✓ PASSED                                 ║");
     } else {
-        println!("║  HTTPS connectivity: ✗ FAILED                                ║");
+        println!("║  HTTP connectivity: ✗ FAILED                                 ║");
         if let Err(ref e) = http_result {
             eprintln!("    Error: {}", e);
         }
@@ -720,9 +805,21 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
     }
 }
 
-/// Test DNS resolution from inside the clone VM
-async fn test_clone_dns(fcvm_path: &std::path::Path, clone_pid: u32) -> Result<()> {
-    // Use nslookup to test DNS - available in the VM
+/// Test DNS resolution from inside the clone VM using a local DNS server
+///
+/// Tests that DNS resolution works by querying a local test DNS server.
+/// Uses `dig` which supports custom ports via `-p` option.
+/// This avoids external hostname dependencies while still validating DNS path.
+async fn test_clone_dns(
+    fcvm_path: &std::path::Path,
+    clone_pid: u32,
+    dns_server: &str,
+    dns_port: u16,
+    expected_ip: &str,
+) -> Result<()> {
+    // Use dig to query our local DNS server for test.local
+    // dig @server -p port hostname
+    // The local DNS server responds with our expected_ip for any query
     let output = tokio::process::Command::new(fcvm_path)
         .args([
             "exec",
@@ -730,18 +827,26 @@ async fn test_clone_dns(fcvm_path: &std::path::Path, clone_pid: u32) -> Result<(
             &clone_pid.to_string(),
             "--vm",
             "--",
-            "nslookup",
-            "facebook.com",
+            "dig",
+            &format!("@{}", dns_server),
+            "-p",
+            &dns_port.to_string(),
+            "test.local",
+            "+short",
         ])
         .output()
         .await
-        .context("running nslookup in clone")?;
+        .context("running dig in clone")?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    if output.status.success() && (stdout.contains("Address") || stdout.contains("Name:")) {
-        println!("    nslookup facebook.com: OK");
+    // dig +short should return just the IP address
+    if output.status.success() && stdout.contains(expected_ip) {
+        println!(
+            "    dig @{}:{} test.local: OK (got {})",
+            dns_server, dns_port, expected_ip
+        );
         Ok(())
     } else {
         anyhow::bail!(
@@ -753,9 +858,13 @@ async fn test_clone_dns(fcvm_path: &std::path::Path, clone_pid: u32) -> Result<(
     }
 }
 
-/// Test HTTPS connectivity from inside the clone VM
-async fn test_clone_http(fcvm_path: &std::path::Path, clone_pid: u32) -> Result<()> {
-    // Use curl to test HTTPS - curl properly respects HTTPS_PROXY
+/// Test HTTP connectivity from inside the clone VM using a local test server
+async fn test_clone_http(
+    fcvm_path: &std::path::Path,
+    clone_pid: u32,
+    egress_url: &str,
+) -> Result<()> {
+    // Use curl to test HTTP connectivity to local test server
     // Note: We use the VM (not container) because curl is available there
     let output = tokio::process::Command::new(fcvm_path)
         .args([
@@ -768,11 +877,7 @@ async fn test_clone_http(fcvm_path: &std::path::Path, clone_pid: u32) -> Result<
             "-s",
             "--max-time",
             "10",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            "https://checkip.amazonaws.com",
+            egress_url,
         ])
         .output()
         .await
@@ -781,13 +886,13 @@ async fn test_clone_http(fcvm_path: &std::path::Path, clone_pid: u32) -> Result<
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // checkip.amazonaws.com returns 200
-    if output.status.success() && stdout.contains("200") {
-        println!("    curl https://checkip.amazonaws.com: OK (HTTP 200)");
+    // Local test server returns "TEST_SUCCESS" in the body
+    if output.status.success() && stdout.contains("TEST_SUCCESS") {
+        println!("    curl {}: OK (got TEST_SUCCESS)", egress_url);
         Ok(())
     } else {
         anyhow::bail!(
-            "HTTPS connectivity failed: exit={}, stdout={}, stderr={}",
+            "HTTP connectivity failed: exit={}, stdout={}, stderr={}",
             output.status,
             stdout.trim(),
             stderr.trim()

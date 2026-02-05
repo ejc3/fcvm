@@ -52,10 +52,24 @@ async fn test_libslirp_version_detection() -> Result<()> {
     Ok(())
 }
 
-/// Test DNS resolution in a VM.
+/// Test DNS resolution in a VM using a local DNS server.
 #[tokio::test]
 async fn test_dns_resolution_in_vm() -> Result<()> {
     let (vm_name, _, _, _) = common::unique_names("dnstest");
+
+    // Start a local DNS server that responds with a test IP
+    // Using high port since port 53 may be in use by systemd-resolved
+    let dns_response_ip: std::net::Ipv4Addr = "93.184.216.34".parse().unwrap();
+    let dns_server = common::LocalDnsServer::start_on_available_port("127.0.0.1", dns_response_ip)
+        .await
+        .context("starting local DNS server")?;
+
+    // For rootless networking, the VM reaches the host via 10.0.2.2
+    let dns_server_addr = "10.0.2.2";
+    println!(
+        "Local DNS server started on port {} (VM will query {}:{})",
+        dns_server.port, dns_server_addr, dns_server.port
+    );
 
     // Use alpine with sleep - no HTTP server needed since health uses container-ready file
     let (mut child, pid) = common::spawn_fcvm(&[
@@ -75,6 +89,7 @@ async fn test_dns_resolution_in_vm() -> Result<()> {
 
     // Wait for VM to be healthy
     if let Err(e) = common::poll_health_by_pid(pid, 120).await {
+        dns_server.stop().await;
         common::kill_process(pid).await;
         let _ = child.wait().await;
         anyhow::bail!("VM never became healthy: {}", e);
@@ -82,24 +97,37 @@ async fn test_dns_resolution_in_vm() -> Result<()> {
 
     println!("VM is healthy, testing DNS resolution...");
 
-    // Test DNS resolution inside the container (alpine has nslookup via busybox)
-    // DNS uses the VM's /etc/resolv.conf which is configured by fc-agent from kernel cmdline.
-    let dns_result = common::exec_in_container(pid, &["nslookup", "facebook.com"]).await;
+    // Test DNS resolution inside the VM using dig (supports custom ports)
+    // dig @server -p port hostname +short
+    let dns_result = common::exec_in_vm(
+        pid,
+        &[
+            "dig",
+            &format!("@{}", dns_server_addr),
+            "-p",
+            &dns_server.port.to_string(),
+            "test.local",
+            "+short",
+        ],
+    )
+    .await;
 
-    // Clean up VM
+    // Clean up
+    dns_server.stop().await;
     common::kill_process(pid).await;
     let _ = child.wait().await;
 
     // Verify DNS resolution worked
     let stdout = dns_result.context("DNS resolution failed")?;
 
-    println!("nslookup output:\n{}", stdout);
+    println!("dig output:\n{}", stdout);
 
-    // nslookup should show resolved addresses
+    // dig +short should return just the IP
     assert!(
-        stdout.contains("Address") || stdout.contains("Name:"),
-        "DNS resolution failed - nslookup didn't return addresses.\n\
+        stdout.contains(&dns_response_ip.to_string()),
+        "DNS resolution failed - didn't get expected IP {}.\n\
          output: {}",
+        dns_response_ip,
         stdout
     );
 
