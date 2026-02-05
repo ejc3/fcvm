@@ -11,18 +11,19 @@ use super::{types::generate_mac, NetworkConfig, NetworkManager, PortMapping};
 use crate::paths;
 use crate::state::truncate_id;
 
-/// Guest network addressing (isolated per VM namespace)
-const GUEST_SUBNET: &str = "192.168.1.0/24";
-const GUEST_IP: &str = "192.168.1.2";
-const NAMESPACE_IP: &str = "192.168.1.1";
+/// Guest network addressing - uses slirp4netns network directly via bridge
+/// Bridge mode: slirp0 and tap-fc are bridged at L2, no NAT needed
+const GUEST_IP: &str = "10.0.2.100";
+const GUEST_GATEWAY: &str = "10.0.2.2";
+const GUEST_DNS: &str = "10.0.2.3";
 
-/// Guest IPv6 addressing (ULA prefix for guest network)
+/// Guest IPv6 addressing (slirp4netns IPv6 network)
 /// slirp4netns uses fd00::/64 by default for IPv6 with gateway at fd00::2
-const GUEST_IPV6_SUBNET: &str = "fd00:1::/64";
-const GUEST_IPV6: &str = "fd00:1::2";
-const NAMESPACE_IPV6: &str = "fd00:1::1";
-/// slirp4netns IPv6 gateway (fixed by slirp4netns)
-const SLIRP_IPV6_GATEWAY: &str = "fd00::2";
+const GUEST_IPV6: &str = "fd00::100";
+const GUEST_IPV6_GATEWAY: &str = "fd00::2";
+
+/// Bridge device name
+const BRIDGE_DEVICE: &str = "br0";
 
 /// Default TAP device name for slirp4netns
 const SLIRP_DEVICE_NAME: &str = "slirp0";
@@ -43,45 +44,44 @@ fn find_slirp4netns() -> String {
     }
 }
 
-/// Rootless networking using slirp4netns with dual-TAP architecture
+/// Rootless networking using slirp4netns with bridge architecture
 ///
 /// This mode uses user namespaces and slirp4netns for true unprivileged operation.
 /// No sudo/root required - everything runs in user namespace via nsenter.
 ///
-/// Architecture (Dual-TAP):
+/// Architecture (L2 Bridge - no NAT required):
 /// ```text
 /// Host                    | User Namespace (unshare --user --map-root-user --net)
 ///                         |
-/// slirp4netns <-----------+-- slirp0 (10.0.2.100/24) <--- IP forwarding <--- tap0
-///   (userspace NAT)       |                                                     |
-///                         |                                              Firecracker VM
-///                         |                                              (guest: 192.168.x.2)
+/// slirp4netns <-----------+-- slirp0 --+
+///   (userspace NAT)       |            |
+///                         |           br0 (L2 bridge)
+///                         |            |
+///                         |          tap-fc ---> Firecracker VM
+///                         |                      (guest: 10.0.2.100)
 /// ```
 ///
 /// Key insight: slirp4netns and Firecracker CANNOT share a TAP device (both need exclusive access).
-/// Solution: Use two TAP devices with IP forwarding between them.
+/// Solution: Bridge both TAP devices at L2 - no IP forwarding or iptables NAT needed!
+/// The bridge forwards Ethernet frames directly, preserving MAC addresses.
 ///
 /// Setup sequence (3-phase with nsenter):
 /// 1. Spawn holder process: `unshare --user --map-root-user --net -- sleep infinity`
-/// 2. Run setup via nsenter: create TAPs, iptables, IP forwarding
+/// 2. Run setup via nsenter: create bridge, TAPs, add TAPs to bridge
 /// 3. Start slirp4netns attached to holder's namespace
 /// 4. Run Firecracker via nsenter: `nsenter -t HOLDER_PID -U -n -- firecracker ...`
 /// 5. Health checks via nsenter: `nsenter -t HOLDER_PID -U -n -- curl guest_ip:80`
 pub struct SlirpNetwork {
     vm_id: String,
-    tap_device: String,   // TAP device for Firecracker (tap0)
+    tap_device: String,   // TAP device for Firecracker (tap-fc)
     slirp_device: String, // TAP device for slirp4netns (slirp0)
     port_mappings: Vec<PortMapping>,
 
-    // Network addressing (IPv4)
-    guest_subnet: String, // tap0: 192.168.x.0/24 (derived from vm_id)
-    guest_ip: String,     // Guest VM IP (192.168.x.2)
-    namespace_ip: String, // Namespace host IP on tap0 (192.168.x.1)
+    // Network addressing (IPv4) - guest uses slirp4netns network directly
+    guest_ip: String, // Guest VM IP (10.0.2.100)
 
     // Network addressing (IPv6)
-    guest_ipv6_subnet: String, // fd00:1::/64
-    guest_ipv6: String,        // fd00:1::2
-    namespace_ipv6: String,    // fd00:1::1
+    guest_ipv6: String, // fd00::100
 
     // State (populated during setup)
     api_socket_path: Option<PathBuf>,
@@ -91,19 +91,15 @@ pub struct SlirpNetwork {
 
 impl SlirpNetwork {
     pub fn new(vm_id: String, tap_device: String, port_mappings: Vec<PortMapping>) -> Self {
-        // Guest subnet is always 192.168.1.0/24 - no conflicts because each VM
-        // runs in its own isolated user namespace
+        // With bridge architecture, guest is directly on slirp4netns network
+        // No per-VM subnet needed - each VM is in its own namespace
         Self {
             vm_id,
             tap_device,
             slirp_device: SLIRP_DEVICE_NAME.to_string(),
             port_mappings,
-            guest_subnet: GUEST_SUBNET.to_string(),
             guest_ip: GUEST_IP.to_string(),
-            namespace_ip: NAMESPACE_IP.to_string(),
-            guest_ipv6_subnet: GUEST_IPV6_SUBNET.to_string(),
             guest_ipv6: GUEST_IPV6.to_string(),
-            namespace_ipv6: NAMESPACE_IPV6.to_string(),
             api_socket_path: None,
             slirp_process: None,
             loopback_ip: None,
@@ -126,31 +122,6 @@ impl SlirpNetwork {
     /// Get the loopback IP assigned to this VM for port forwarding
     pub fn loopback_ip(&self) -> Option<&str> {
         self.loopback_ip.as_deref()
-    }
-
-    /// Configure specific guest IP for clone operations
-    ///
-    /// When cloning from a snapshot, the guest already has its IP configured.
-    /// This method sets the network to use that same IP so that DNAT rules
-    /// forward traffic to the correct destination.
-    ///
-    /// The guest_ip should include CIDR notation (e.g., "192.168.155.2/24")
-    /// but the /24 is stripped when parsing since we always use /24 subnets.
-    pub fn with_guest_ip(mut self, guest_ip: String) -> Self {
-        // Parse the IP (strip CIDR notation if present)
-        let ip_only = guest_ip.split('/').next().unwrap_or(&guest_ip);
-
-        // Extract subnet from IP (e.g., "192.168.155.2" -> subnet 155)
-        let parts: Vec<&str> = ip_only.split('.').collect();
-        if parts.len() == 4 {
-            if let Ok(subnet_id) = parts[2].parse::<u8>() {
-                self.guest_subnet = format!("192.168.{}.0/24", subnet_id);
-                self.guest_ip = format!("192.168.{}.2", subnet_id);
-                self.namespace_ip = format!("192.168.{}.1", subnet_id);
-            }
-        }
-
-        self
     }
 
     /// Get API socket path for port forwarding
@@ -183,83 +154,40 @@ impl SlirpNetwork {
 
     /// Build the setup script to run inside the namespace via nsenter
     ///
-    /// This script creates both TAP devices and configures networking with IPv4 and IPv6.
+    /// This script creates a bridge and both TAP devices for L2 forwarding.
+    /// No iptables NAT needed - the bridge handles Ethernet frame forwarding.
     /// Run via: nsenter -t HOLDER_PID -U -n -- bash -c '<this script>'
     pub fn build_setup_script(&self) -> String {
         format!(
             r#"
 set -e
 
-# Create slirp0 TAP for slirp4netns connectivity
-# Use 10.0.2.15 as the guest address (standard slirp4netns guest IP)
-# fd00::100 for IPv6 (slirp4netns uses fd00::/64 subnet with gateway fd00::2)
+# Create L2 bridge - connects slirp0 and Firecracker TAP
+ip link add {bridge} type bridge
+ip link set {bridge} up
+
+# Create slirp0 TAP for slirp4netns and add to bridge
+# No IP on slirp0 - it's just a bridge port
 ip tuntap add {slirp_dev} mode tap
-ip addr add 10.0.2.15/24 dev {slirp_dev}
-ip -6 addr add fd00::100/64 dev {slirp_dev}
+ip link set {slirp_dev} master {bridge}
 ip link set {slirp_dev} up
 
-# Create TAP device for Firecracker (must exist before Firecracker starts)
+# Create TAP device for Firecracker and add to bridge
+# No IP on fc_tap - it's just a bridge port
 ip tuntap add {fc_tap} mode tap
-ip addr add {ns_ip}/24 dev {fc_tap}
-ip -6 addr add {ns_ipv6}/64 dev {fc_tap}
+ip link set {fc_tap} master {bridge}
 ip link set {fc_tap} up
 
 # Set up loopback
 ip link set lo up
 
-# Enable IP forwarding (required for NAT to work)
-# Must enable both global and per-interface forwarding.
-# The host's net.ipv4.conf.default.forwarding=0 means new interfaces
-# inherit forwarding=0 even when ip_forward=1.
-sysctl -w net.ipv4.ip_forward=1
-sysctl -w net.ipv4.conf.all.forwarding=1
-sysctl -w net.ipv4.conf.{slirp_dev}.forwarding=1
-sysctl -w net.ipv4.conf.{fc_tap}.forwarding=1
-
-# Enable IPv6 forwarding
-sysctl -w net.ipv6.conf.all.forwarding=1
-sysctl -w net.ipv6.conf.{slirp_dev}.forwarding=1 2>/dev/null || true
-sysctl -w net.ipv6.conf.{fc_tap}.forwarding=1 2>/dev/null || true
-
-# Set default route via slirp gateway (10.0.2.2 is slirp4netns internal gateway)
-ip route add default via 10.0.2.2 dev {slirp_dev}
-
-# Set IPv6 default route via slirp gateway (fd00::2 is slirp4netns IPv6 gateway)
-ip -6 route add default via {slirp_ipv6_gw} dev {slirp_dev} 2>/dev/null || true
-
-# Allow forwarding between slirp0 and FC TAP (IPv4)
-iptables -A FORWARD -i {slirp_dev} -o {fc_tap} -j ACCEPT 2>/dev/null || true
-iptables -A FORWARD -i {fc_tap} -o {slirp_dev} -j ACCEPT 2>/dev/null || true
-
-# Allow forwarding between slirp0 and FC TAP (IPv6)
-ip6tables -A FORWARD -i {slirp_dev} -o {fc_tap} -j ACCEPT 2>/dev/null || true
-ip6tables -A FORWARD -i {fc_tap} -o {slirp_dev} -j ACCEPT 2>/dev/null || true
-
-# Set up iptables MASQUERADE for traffic from guest subnet (egress)
-# This NATs guest traffic (192.168.x.x) to slirp0's address (10.0.2.100)
-iptables -t nat -A POSTROUTING -s {guest_subnet} -o {slirp_dev} -j MASQUERADE 2>/dev/null || true
-
-# IPv6 NAT66 for guest traffic
-ip6tables -t nat -A POSTROUTING -s {guest_ipv6_subnet} -o {slirp_dev} -j MASQUERADE 2>/dev/null || true
-
-# Set up DNAT for inbound connections from slirp4netns
-# When slirp4netns forwards traffic to 10.0.2.15, redirect it to the actual guest IP
-# This enables port forwarding: host -> slirp4netns -> 10.0.2.15 -> DNAT -> guest (192.168.x.2)
-iptables -t nat -A PREROUTING -d 10.0.2.15 -j DNAT --to-destination {guest_ip} 2>/dev/null || true
-
-# IPv6 DNAT for inbound connections from slirp4netns
-# When slirp4netns forwards traffic to fd00::100, redirect it to the actual guest IPv6
-ip6tables -t nat -A PREROUTING -d fd00::100 -j DNAT --to-destination {guest_ipv6} 2>/dev/null || true
+# No IP forwarding or iptables NAT needed!
+# Bridge handles L2 forwarding directly.
+# Guest uses slirp4netns network (10.0.2.x) directly.
 "#,
+            bridge = BRIDGE_DEVICE,
             slirp_dev = self.slirp_device,
             fc_tap = self.tap_device,
-            ns_ip = self.namespace_ip,
-            ns_ipv6 = self.namespace_ipv6,
-            guest_subnet = self.guest_subnet,
-            guest_ip = self.guest_ip,
-            guest_ipv6 = self.guest_ipv6,
-            guest_ipv6_subnet = self.guest_ipv6_subnet,
-            slirp_ipv6_gw = SLIRP_IPV6_GATEWAY,
         )
     }
 
@@ -309,6 +237,52 @@ ip6tables -t nat -A PREROUTING -d fd00::100 -j DNAT --to-destination {guest_ipv6
             }
         }
         None
+    }
+
+    /// Detect HTTP proxy from host environment
+    ///
+    /// On IPv6-only hosts, traffic must go through a proxy.
+    /// Returns the proxy URL with IPv6 address resolved from hostname.
+    fn detect_http_proxy() -> Option<String> {
+        // Check environment variables for proxy
+        let proxy_url = std::env::var("HTTP_PROXY")
+            .or_else(|_| std::env::var("http_proxy"))
+            .or_else(|_| std::env::var("HTTPS_PROXY"))
+            .or_else(|_| std::env::var("https_proxy"))
+            .ok()?;
+
+        // Parse the proxy URL to get hostname and port
+        // Format: http://hostname:port or http://[ipv6]:port
+        if let Some(rest) = proxy_url.strip_prefix("http://") {
+            let host_port = rest.trim_end_matches('/');
+
+            // If it's already an IPv6 literal, return as-is
+            if host_port.starts_with('[') {
+                return Some(proxy_url);
+            }
+
+            // Otherwise, try to resolve the hostname to IPv6
+            if let Some((host, port)) = host_port.rsplit_once(':') {
+                // Use getent to resolve hostname to IPv6 address
+                if let Ok(output) = std::process::Command::new("getent")
+                    .args(["hosts", host])
+                    .output()
+                {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    // getent output: "2401:db00:2ff:e002:face:b00c:0:1e10 fwdproxy"
+                    if let Some(ipv6) = stdout.split_whitespace().next() {
+                        // Check if it's IPv6 (contains ::)
+                        if ipv6.contains(':') {
+                            return Some(format!("http://[{}]:{}", ipv6, port));
+                        }
+                    }
+                }
+                // Fall back to original URL if resolution fails
+                return Some(proxy_url);
+            }
+        }
+
+        Some(proxy_url)
     }
 
     /// Start slirp4netns process attached to the namespace
@@ -415,15 +389,15 @@ ip6tables -t nat -A PREROUTING -d fd00::100 -j DNAT --to-destination {guest_ipv6
                 super::Protocol::Udp => "udp",
             };
 
-            // Port forward to slirp's internal guest IP (10.0.2.15)
-            // which then gets routed to the actual guest via IP forwarding
+            // Port forward directly to guest IP (10.0.2.100)
+            // With bridge mode, guest is directly on slirp network
             let request = serde_json::json!({
                 "execute": "add_hostfwd",
                 "arguments": {
                     "proto": proto,
                     "host_addr": bind_addr,
                     "host_port": mapping.host_port,
-                    "guest_addr": "10.0.2.15",
+                    "guest_addr": &self.guest_ip,
                     "guest_port": mapping.guest_port
                 }
             });
@@ -462,24 +436,24 @@ ip6tables -t nat -A PREROUTING -d fd00::100 -j DNAT --to-destination {guest_ipv6
         &self.guest_ip
     }
 
-    /// Get namespace host IP (gateway for guest)
-    pub fn namespace_ip(&self) -> &str {
-        &self.namespace_ip
+    /// Get gateway IP for guest (slirp4netns gateway)
+    pub fn gateway_ip(&self) -> &str {
+        GUEST_GATEWAY
     }
 }
 
 #[async_trait::async_trait]
 impl NetworkManager for SlirpNetwork {
     async fn setup(&mut self) -> Result<NetworkConfig> {
-        info!(vm_id = %self.vm_id, "setting up rootless networking with slirp4netns");
+        info!(vm_id = %self.vm_id, "setting up rootless networking with slirp4netns (bridge mode)");
 
         // Health checks use nsenter (don't need loopback)
         // Port forwarding uses loopback IP for unique binding per VM
         info!(
             guest_ip = %self.guest_ip,
-            namespace_ip = %self.namespace_ip,
+            gateway = %GUEST_GATEWAY,
             loopback_ip = ?self.loopback_ip,
-            "network configuration (nsenter health checks, loopback port forwarding)"
+            "network configuration (bridge mode, nsenter health checks)"
         );
 
         let guest_mac = generate_mac();
@@ -492,29 +466,35 @@ impl NetworkManager for SlirpNetwork {
 
         // Check if host has IPv6 - if so, we'll configure it in the guest too
         let (guest_ipv6, host_ipv6) = if Self::detect_host_ipv6().is_some() {
-            // Guest gets fd00:1::2, gateway is fd00:1::1 (the tap device in namespace)
+            // Guest gets fd00::100, gateway is fd00::2 (slirp4netns IPv6 gateway)
             (
                 Some(self.guest_ipv6.clone()),
-                Some(self.namespace_ipv6.clone()),
+                Some(GUEST_IPV6_GATEWAY.to_string()),
             )
         } else {
             (None, None)
         };
 
+        // Detect proxy for IPv6-only hosts
+        let http_proxy = Self::detect_http_proxy();
+        if let Some(ref proxy) = http_proxy {
+            info!(proxy = %proxy, "detected HTTP proxy for IPv6-only network");
+        }
+
         Ok(NetworkConfig {
             tap_device: self.tap_device.clone(),
             guest_mac,
             guest_ip: Some(format!("{}/24", self.guest_ip)),
-            host_ip: Some(self.namespace_ip.clone()),
+            host_ip: Some(GUEST_GATEWAY.to_string()), // slirp4netns gateway
             host_veth: None,
             loopback_ip: self.loopback_ip.clone(), // For port forwarding (no ip addr add needed!)
             health_check_port: Some(8080),         // Unprivileged port, forwards to guest:80
             health_check_url,
-            dns_server: Some("10.0.2.3".to_string()), // slirp4netns built-in DNS forwarder
+            dns_server: Some(GUEST_DNS.to_string()), // slirp4netns built-in DNS forwarder
             guest_ipv6,
             host_ipv6,
             dns_search: None,
-            http_proxy: None, // Could be set to IPv6-only proxy if needed
+            http_proxy,
         })
     }
 
@@ -580,21 +560,8 @@ mod tests {
 
         assert_eq!(net.tap_device, "tap0");
         assert_eq!(net.slirp_device, "slirp0");
-        // Fixed IPs - all VMs use same subnet (isolated per namespace)
-        assert_eq!(net.guest_ip, "192.168.1.2");
-        assert_eq!(net.namespace_ip, "192.168.1.1");
-        assert_eq!(net.guest_subnet, "192.168.1.0/24");
-    }
-
-    #[test]
-    fn test_with_guest_ip() {
-        let net = SlirpNetwork::new("vm-test123".to_string(), "tap0".to_string(), vec![]);
-
-        // Clones can override guest IP if snapshot used different subnet
-        let net = net.with_guest_ip("192.168.42.2/24".to_string());
-
-        assert_eq!(net.guest_ip, "192.168.42.2");
-        assert_eq!(net.namespace_ip, "192.168.42.1");
-        assert_eq!(net.guest_subnet, "192.168.42.0/24");
+        // With bridge mode, guest is directly on slirp4netns network
+        assert_eq!(net.guest_ip, "10.0.2.100");
+        assert_eq!(net.gateway_ip(), "10.0.2.2");
     }
 }

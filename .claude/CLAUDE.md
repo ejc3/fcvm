@@ -568,6 +568,47 @@ fcvm exec --pid <PID> -- curl -s --max-time 10 ifconfig.me
 fcvm exec --pid <PID> -c -- wget -q -O - --timeout=10 http://ifconfig.me
 ```
 
+### Debugging Network Issues with Quick VMs
+
+When debugging network issues (connectivity, DNS, routing), spawn quick one-off VMs with inline commands:
+
+```bash
+# Test basic connectivity
+./target/release/fcvm podman run --name net-test-$(date +%s) --privileged alpine:latest sh -c "
+echo '=== Network config ==='
+ip addr show eth0
+ip route
+cat /etc/resolv.conf
+echo ''
+echo '=== Test gateway ping ==='
+ping -c 2 -W 3 10.0.2.2 || echo 'gateway ping failed'
+echo ''
+echo '=== Test DNS ==='
+nslookup example.com || echo 'DNS failed'
+echo ''
+echo '=== Test external ==='
+wget -q -O - --timeout=10 http://ifconfig.me || echo 'external failed'
+" 2>&1 &
+sleep 60  # Wait for VM to boot and run commands
+```
+
+**Debugging technique:**
+1. Run background (`&`) so terminal stays available
+2. Sleep to let VM boot (~30-60s)
+3. Check stdout for results
+4. Use `--privileged` for ping (requires raw sockets)
+5. Test incrementally: gateway → DNS → external
+
+**Inspecting namespace state for running VM:**
+```bash
+# Get holder PID from state file
+HOLDER_PID=$(cat /mnt/fcvm-btrfs/state/*.json | jq -r '.holder_pid')
+# Check namespace network config
+sudo nsenter --net=/proc/$HOLDER_PID/ns/net ip addr
+sudo nsenter --net=/proc/$HOLDER_PID/ns/net bridge link  # Show bridge ports
+sudo nsenter --net=/proc/$HOLDER_PID/ns/net ip route
+```
+
 ### Code Philosophy
 
 **NO LEGACY/BACKWARD COMPATIBILITY.** This applies to everything: code, Makefile, documentation.

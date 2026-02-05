@@ -1171,6 +1171,37 @@ After changing the config, run `fcvm setup` to rebuild the rootfs with the new S
 - VMs may not be cleaning up properly
 - Manual cleanup: `ps aux | grep fcvm | grep test | awk '{print $2}' | xargs sudo kill`
 
+### Debugging Network Issues
+
+Spawn quick one-off VMs with inline commands to diagnose network problems:
+
+```bash
+# Test connectivity incrementally: gateway → DNS → external
+./target/release/fcvm podman run --name net-debug-$(date +%s) --privileged alpine:latest sh -c "
+echo '=== Network config ==='
+ip addr show eth0
+ip route
+cat /etc/resolv.conf
+echo ''
+echo '=== Gateway ==='
+ping -c 2 -W 3 10.0.2.2 || echo 'gateway failed'
+echo ''
+echo '=== DNS ==='
+nslookup example.com || echo 'DNS failed'
+echo ''
+echo '=== External ==='
+wget -q -O - --timeout=10 http://ifconfig.me || echo 'external failed'
+" 2>&1 &
+sleep 60  # Wait for VM to boot and run commands
+```
+
+**Inspect namespace for running VM:**
+```bash
+HOLDER_PID=$(cat /mnt/fcvm-btrfs/state/*.json | jq -r '.holder_pid')
+sudo nsenter --net=/proc/$HOLDER_PID/ns/net ip addr
+sudo nsenter --net=/proc/$HOLDER_PID/ns/net bridge link  # Show bridge ports
+```
+
 ### KVM not available
 - Firecracker requires `/dev/kvm`
 - On AWS: use c6g.metal or c5.metal (NOT c5.large or other regular instances)

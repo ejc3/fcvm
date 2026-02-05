@@ -2187,8 +2187,9 @@ async fn run_vm_setup(
             .as_ref()
             .map(|dns| format!(":{}", dns))
             .unwrap_or_default();
+        // Use /24 netmask for slirp4netns (10.0.2.0/24) or bridged (172.30.x.0/24)
         runtime_boot_args.push_str(&format!(
-            "ip={}::{}:255.255.255.252::eth0:off{}",
+            "ip={}::{}:255.255.255.0::eth0:off{}",
             guest_ip_clean, host_ip_clean, dns_suffix
         ));
     }
