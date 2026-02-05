@@ -6,7 +6,7 @@
 use super::{FuseClient, Multiplexer};
 use crate::telemetry::SpanCollector;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -83,6 +83,7 @@ impl MountConfig {
 pub struct MountHandle {
     thread: Option<JoinHandle<anyhow::Result<()>>>,
     unmounter: Option<SessionUnmounter>,
+    mount_path: PathBuf,
 }
 
 impl Drop for MountHandle {
@@ -100,7 +101,8 @@ impl Drop for MountHandle {
             if join_with_timeout(thread, Duration::from_secs(5)) {
                 debug!(target: "fuse-pipe::client", "MountHandle::drop() mount thread joined");
             } else {
-                warn!(target: "fuse-pipe::client", "MountHandle::drop() mount thread join timed out");
+                warn!(target: "fuse-pipe::client", "MountHandle::drop() mount thread join timed out, forcing unmount");
+                force_unmount(&self.mount_path);
             }
         }
         debug!(target: "fuse-pipe::client", "MountHandle::drop() complete");
@@ -181,6 +183,9 @@ pub fn mount_spawn<P: AsRef<Path> + Send + 'static>(
     let trace_rate = config.trace_rate;
     let collector = config.collector;
 
+    // Keep a copy of mount_point for cleanup on failure
+    let mount_path_for_cleanup = mount_point.as_ref().to_path_buf();
+
     let thread = thread::spawn(move || {
         mount_internal(
             &socket_path,
@@ -197,13 +202,16 @@ pub fn mount_spawn<P: AsRef<Path> + Send + 'static>(
         Ok(unmounter) => Ok(MountHandle {
             thread: Some(thread),
             unmounter: Some(unmounter),
+            mount_path: mount_path_for_cleanup,
         }),
         Err(e) => {
             // Mount failed or timed out - clean up the thread with short timeout.
             // The thread may be stuck in Session::new() or similar blocking call.
             warn!(target: "fuse-pipe::client", "mount_spawn failed, cleaning up thread: {:?}", e);
             if !join_with_timeout(thread, Duration::from_secs(2)) {
-                warn!(target: "fuse-pipe::client", "mount thread stuck, abandoning (will be cleaned up on process exit)");
+                warn!(target: "fuse-pipe::client", "mount thread stuck, abandoning");
+                // Try to forcefully unmount in case the mount succeeded but thread hung
+                force_unmount(&mount_path_for_cleanup);
             }
 
             Err(match e {
@@ -214,6 +222,28 @@ pub fn mount_spawn<P: AsRef<Path> + Send + 'static>(
                     anyhow::anyhow!("mount thread failed before sending unmounter")
                 }
             })
+        }
+    }
+}
+
+/// Force unmount a path using fusermount3 -u (lazy unmount).
+/// This is used as a fallback when normal unmount fails or thread is stuck.
+fn force_unmount(path: &Path) {
+    if let Some(path_str) = path.to_str() {
+        debug!(target: "fuse-pipe::client", path = %path_str, "attempting force unmount with fusermount3");
+        let result = std::process::Command::new("fusermount3")
+            .args(["-u", "-z", path_str]) // -z for lazy unmount
+            .status();
+        match result {
+            Ok(status) if status.success() => {
+                info!(target: "fuse-pipe::client", path = %path_str, "force unmount succeeded");
+            }
+            Ok(status) => {
+                debug!(target: "fuse-pipe::client", path = %path_str, ?status, "force unmount returned non-zero");
+            }
+            Err(e) => {
+                debug!(target: "fuse-pipe::client", path = %path_str, error = %e, "force unmount failed");
+            }
         }
     }
 }
