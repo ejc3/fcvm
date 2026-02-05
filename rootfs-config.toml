@@ -132,9 +132,6 @@ remove_dirs = [
     "/usr/share/doc/*",
     "/usr/share/man/*",
     "/var/cache/apt/archives/*",
-    # Remove any podman storage state created during package installation
-    # This ensures a clean podman database when the VM first boots
-    "/var/lib/containers/*",
 ]
 
 # Kernel Profiles
