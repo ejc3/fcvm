@@ -353,12 +353,12 @@ async fn update_health_status_once(
                         // so we can skip future checks if there isn't one
                         // Note: We don't return Unhealthy here because check_podman_healthcheck
                         // returns Some(false) when the container doesn't exist yet (inspect fails)
-                        if !*skip_podman_healthcheck {
-                            if let None = check_podman_healthcheck(pid).await {
-                                // No healthcheck defined - skip future checks
-                                debug!(target: "health-monitor", "no podman healthcheck defined, skipping future checks");
-                                *skip_podman_healthcheck = true;
-                            }
+                        if !*skip_podman_healthcheck
+                            && check_podman_healthcheck(pid).await.is_none()
+                        {
+                            // No healthcheck defined - skip future checks
+                            debug!(target: "health-monitor", "no podman healthcheck defined, skipping future checks");
+                            *skip_podman_healthcheck = true;
                         }
                         debug!(target: "health-monitor", "waiting for container to be running");
                         HealthStatus::Unknown
