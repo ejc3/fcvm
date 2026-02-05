@@ -39,8 +39,8 @@ tracing-log = "0.2"  # Bridge log crate to tracing
 fuse-backend-rs = { path = "../../fuse-backend-rs", default-features = false, features = ["fusedev"] }
 
 # FUSE client (fork with clone_fd for true parallel readers + remap_file_range)
-# Based on upstream PR #627 (stepancheg's multi-threaded approach)
-fuser = { git = "https://github.com/ejc3/fuser.git", branch = "remap-on-627", features = ["abi-7-28"] }
+# Based on upstream PR #636 (clone_fd for parallel processing) + remap_file_range
+fuser = { git = "https://github.com/ejc3/fuser.git", branch = "remap-file-range-on-clone-fd", features = ["abi-7-28"] }
 
 # Concurrent data structures
 dashmap = "5.5"
