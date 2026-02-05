@@ -133,7 +133,7 @@ async fn test_podman_snapshot_miss_creates_snapshot() -> Result<()> {
         &vm_name,
         "--network",
         "rootless",
-        "alpine:latest",
+        common::ALPINE_IMAGE,
         "echo",
         &unique_msg,
     ])
@@ -252,7 +252,7 @@ async fn test_podman_snapshot_different_network_modes() -> Result<()> {
         &vm_name1,
         "--network",
         "rootless",
-        "alpine:latest",
+        common::ALPINE_IMAGE,
         "echo",
         "rootless",
     ])
@@ -275,7 +275,7 @@ async fn test_podman_snapshot_different_network_modes() -> Result<()> {
         &vm_name2,
         "--network",
         "bridged",
-        "alpine:latest",
+        common::ALPINE_IMAGE,
         "echo",
         "bridged",
     ])
@@ -331,7 +331,7 @@ async fn test_podman_no_snapshot_flag() -> Result<()> {
         "--network",
         "rootless",
         "--no-snapshot",
-        "alpine:latest",
+        common::ALPINE_IMAGE,
         "echo",
         &unique_msg,
     ])
@@ -490,7 +490,7 @@ async fn test_podman_snapshot_type_is_system() -> Result<()> {
         &vm_name,
         "--network",
         "rootless",
-        "alpine:latest",
+        common::ALPINE_IMAGE,
         "echo",
         &unique_msg,
     ])

@@ -93,7 +93,7 @@ async fn test_proxy_to_addr(host_bind: &str, vm_gateway: &str, addr_type: &str) 
         "--network",
         "rootless",
         "--no-snapshot",
-        "alpine:latest",
+        common::ALPINE_IMAGE,
         "sleep",
         "infinity",
     ])
@@ -231,7 +231,7 @@ async fn test_egress_to_addr(bind_addr: &str, vm_target_addr: &str, addr_type: &
         "--network",
         "rootless",
         "--no-snapshot",
-        "alpine:latest",
+        common::ALPINE_IMAGE,
         "sleep",
         "infinity",
     ])

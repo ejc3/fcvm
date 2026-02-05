@@ -1356,7 +1356,7 @@ async fn test_podman_run_tty() -> Result<()> {
                 CString::new("--name").unwrap(),
                 CString::new(vm_name.as_str()).unwrap(),
                 CString::new("-t").unwrap(),
-                CString::new("alpine:latest").unwrap(),
+                CString::new(common::ALPINE_IMAGE).unwrap(),
                 CString::new("tty").unwrap(),
             ];
             #[allow(unreachable_code)]
@@ -1483,7 +1483,7 @@ async fn test_podman_run_interactive_tty() -> Result<()> {
                 CString::new("--name").unwrap(),
                 CString::new(vm_name.as_str()).unwrap(),
                 CString::new("-it").unwrap(),
-                CString::new("alpine:latest").unwrap(),
+                CString::new(common::ALPINE_IMAGE).unwrap(),
                 CString::new("head").unwrap(),
                 CString::new("-1").unwrap(),
             ];
@@ -1578,7 +1578,14 @@ async fn test_podman_run_no_tty() -> Result<()> {
     let output = tokio::time::timeout(
         Duration::from_secs(120),
         tokio::process::Command::new(&fcvm_path)
-            .args(["podman", "run", "--name", &vm_name, "alpine:latest", "tty"])
+            .args([
+                "podman",
+                "run",
+                "--name",
+                &vm_name,
+                common::ALPINE_IMAGE,
+                "tty",
+            ])
             .output(),
     )
     .await

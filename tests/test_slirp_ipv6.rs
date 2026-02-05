@@ -66,7 +66,7 @@ async fn test_dns_resolution_in_vm() -> Result<()> {
         "--network",
         "rootless",
         "--no-snapshot",
-        "alpine:latest",
+        common::ALPINE_IMAGE,
         "sleep",
         "infinity",
     ])
@@ -124,7 +124,7 @@ async fn test_ipv6_connectivity_in_vm() -> Result<()> {
         "--network",
         "rootless",
         "--no-snapshot",
-        "alpine:latest",
+        common::ALPINE_IMAGE,
         "sleep",
         "infinity",
     ])
@@ -297,7 +297,7 @@ with IPv6Server(('::', {}), handler) as httpd:
         "--network",
         "rootless",
         "--no-snapshot",
-        "alpine:latest",
+        common::ALPINE_IMAGE,
         "sleep",
         "infinity",
     ])
