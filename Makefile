@@ -215,11 +215,11 @@ _test-unit:
 
 _test-fast:
 	RUST_LOG="$(TEST_LOG)" \
-	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) --no-default-features --features integration-fast $(FILTER)
+	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_RETRIES) --no-default-features --features integration-fast $(FILTER)
 
 _test-all:
 	RUST_LOG="$(TEST_LOG)" \
-	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) $(FILTER)
+	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_RETRIES) $(FILTER)
 
 _test-root:
 	@RUST_LOG="$(TEST_LOG)" \
