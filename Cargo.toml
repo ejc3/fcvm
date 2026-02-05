@@ -72,6 +72,7 @@ regex = "1.12.2"
 fs2 = "0.4.3"
 directories = "5"
 glob = "0.3"
+tar = "0.4"
 
 [features]
 # Default: all integration tests that work without sudo (rootless networking)

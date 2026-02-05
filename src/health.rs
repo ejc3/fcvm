@@ -317,7 +317,19 @@ async fn update_health_status_once(
                 (HealthStatus::Unreachable, None)
             }
         } else {
-            // Process exists, now check application health
+            // Process exists - first check if container has already exited (e.g., failed to load)
+            // This catches cases where the container fails early (exit 125 = image load error)
+            // but the Firecracker VM is still running
+            let exit_file = paths::vm_runtime_dir(vm_id).join("container-exit");
+            if exit_file.exists() {
+                let exit_code = std::fs::read_to_string(&exit_file)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i32>().ok());
+                info!(target: "health-monitor", exit_code = ?exit_code, "container exited while VM still running");
+                return Ok((HealthStatus::Stopped, exit_code));
+            }
+
+            // Process exists and container hasn't exited, now check application health
             let state = state_manager
                 .load_state(vm_id)
                 .await
@@ -330,11 +342,24 @@ async fn update_health_status_once(
                 None => {
                     // No HTTP check - check if container is actually running
                     // Uses podman inspect to verify container state (not just process spawned)
-                    if check_container_running(pid).await {
-                        debug!(target: "health-monitor", "container is running, healthy");
+                    let container_running = check_container_running(pid).await;
+                    if container_running {
+                        debug!(target: "health-monitor", "container is running");
                         *last_failure_log = None;
+                        // Continue to podman healthcheck below
                         HealthStatus::Healthy
                     } else {
+                        // Container not running yet - check if there's a podman healthcheck defined
+                        // so we can skip future checks if there isn't one
+                        // Note: We don't return Unhealthy here because check_podman_healthcheck
+                        // returns Some(false) when the container doesn't exist yet (inspect fails)
+                        if !*skip_podman_healthcheck {
+                            if let None = check_podman_healthcheck(pid).await {
+                                // No healthcheck defined - skip future checks
+                                debug!(target: "health-monitor", "no podman healthcheck defined, skipping future checks");
+                                *skip_podman_healthcheck = true;
+                            }
+                        }
                         debug!(target: "health-monitor", "waiting for container to be running");
                         HealthStatus::Unknown
                     }

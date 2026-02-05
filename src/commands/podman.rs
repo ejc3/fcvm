@@ -67,6 +67,28 @@ pub enum SnapshotOutcome {
     Interrupted,
 }
 
+/// Validate that a Docker archive contains manifest.json.
+///
+/// Docker archive format requires manifest.json to be loadable.
+/// If this file is missing, the archive is corrupted and will fail to load.
+fn validate_docker_archive(archive_path: &Path) -> Result<bool> {
+    let tar_file = std::fs::File::open(archive_path)
+        .with_context(|| format!("opening archive {} for validation", archive_path.display()))?;
+
+    let mut archive = tar::Archive::new(tar_file);
+
+    for entry in archive.entries().context("reading archive entries")? {
+        let entry = entry.context("reading archive entry")?;
+        if let Ok(path) = entry.path() {
+            if path.to_str() == Some("manifest.json") {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
 /// Create a snapshot with signal interruption support.
 ///
 /// This wraps `create_podman_snapshot` in a `tokio::select!` that checks for
@@ -1082,9 +1104,62 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 );
             }
 
+            // Validate the archive contains manifest.json (required for docker-archive format)
+            // This catches corrupted exports early, before they get cached and cause repeated failures
+            if !validate_docker_archive(&archive_path)? {
+                let _ = tokio::fs::remove_file(&archive_path).await;
+                drop(lock_file);
+                bail!(
+                    "podman save produced invalid archive (missing manifest.json) for image '{}'",
+                    args.image
+                );
+            }
+
             info!(path = %archive_path.display(), "Image exported as Docker archive");
         } else {
-            info!(image = %args.image, digest = %digest, "Using cached Docker archive");
+            // Validate cached archive in case it was corrupted
+            if !validate_docker_archive(&archive_path)? {
+                warn!(path = %archive_path.display(), "Cached archive is invalid, re-exporting");
+                let _ = tokio::fs::remove_file(&archive_path).await;
+                // Re-export
+                let output = tokio::process::Command::new("podman")
+                    .args([
+                        "save",
+                        "--format",
+                        "docker-archive",
+                        "-o",
+                        archive_path.to_str().unwrap(),
+                        &args.image,
+                    ])
+                    .output()
+                    .await
+                    .context("running podman save for re-export")?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let _ = tokio::fs::remove_file(&archive_path).await;
+                    drop(lock_file);
+                    bail!(
+                        "Failed to re-export image '{}' with podman save: {}",
+                        args.image,
+                        stderr
+                    );
+                }
+
+                // Validate the re-exported archive
+                if !validate_docker_archive(&archive_path)? {
+                    let _ = tokio::fs::remove_file(&archive_path).await;
+                    drop(lock_file);
+                    bail!(
+                        "podman save produced invalid archive (missing manifest.json) for image '{}' on re-export",
+                        args.image
+                    );
+                }
+
+                info!(path = %archive_path.display(), "Image re-exported as Docker archive");
+            } else {
+                info!(image = %args.image, digest = %digest, "Using cached Docker archive");
+            }
         }
 
         // Lock released when lock_file is dropped
