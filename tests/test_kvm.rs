@@ -944,11 +944,12 @@ LEVEL=${1:-unknown}
 
 echo "=== BENCHMARK L${LEVEL} ==="
 
-# Test 1: Egress - can we reach the internet?
+# Test 1: Egress - can we reach the gateway?
 echo "--- Egress Test ---"
-if curl -s --max-time 10 http://ifconfig.me > /tmp/egress.txt 2>&1; then
-    IP=$(cat /tmp/egress.txt)
-    echo "EGRESS_L${LEVEL}=OK ip=${IP}"
+# Test by pinging the gateway (10.0.2.2 for rootless via slirp4netns)
+# This validates network connectivity without external dependencies
+if ping -c 1 -W 5 10.0.2.2 > /dev/null 2>&1; then
+    echo "EGRESS_L${LEVEL}=OK gateway=10.0.2.2"
 else
     echo "EGRESS_L${LEVEL}=FAIL"
 fi

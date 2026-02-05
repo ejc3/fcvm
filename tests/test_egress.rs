@@ -1,12 +1,10 @@
-//! Egress connectivity tests - verifies VMs can reach the internet
+//! Egress connectivity tests - verifies VMs can reach the host network
 //!
 //! Tests both fresh VMs and cloned VMs for:
-//! - HTTP connectivity from VM to container registry (ghcr.io)
-//! - HTTP connectivity from container to container registry
+//! - HTTP connectivity from VM to a local test server on the host
+//! - HTTP connectivity from container to the same test server
 //!
-//! Uses ghcr.io (GitHub Container Registry) as a reliable external endpoint.
-//! Any HTTP response (200, 401, etc.) proves egress connectivity works.
-//!
+//! Uses a pure Rust LocalTestServer bound on the host - no external network dependencies.
 //! Both bridged and rootless networking modes are tested.
 
 #![cfg(feature = "integration-slow")]
@@ -15,9 +13,6 @@ mod common;
 
 use anyhow::{Context, Result};
 use std::time::Duration;
-
-/// External URL to test egress connectivity - AWS EC2 metadata mock (fast, returns 200)
-const EGRESS_TEST_URL: &str = "https://checkip.amazonaws.com";
 
 /// Test egress connectivity for fresh VM with bridged networking
 #[cfg(feature = "privileged-tests")]
@@ -45,6 +40,44 @@ async fn test_egress_clone_rootless() -> Result<()> {
     egress_clone_test_impl("rootless").await
 }
 
+/// Get the host's primary network interface IP (used for reaching external networks)
+/// For bridged mode, VMs can reach this IP via NAT
+async fn get_host_primary_ip() -> Result<String> {
+    // Use "ip route get 8.8.8.8" to find which interface/IP is used for external traffic
+    let output = tokio::process::Command::new("ip")
+        .args(["route", "get", "8.8.8.8"])
+        .output()
+        .await
+        .context("running ip route get")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Output looks like: "8.8.8.8 via 172.31.0.1 dev enp3s0 src 172.31.15.123 uid 0"
+    // We want the IP after "src"
+    for part in stdout.split_whitespace().collect::<Vec<_>>().windows(2) {
+        if part[0] == "src" {
+            return Ok(part[1].to_string());
+        }
+    }
+
+    anyhow::bail!("Could not determine host primary IP from: {}", stdout)
+}
+
+/// Calculate the URL a VM should use to reach a test server on the host
+async fn get_egress_url(network: &str, port: u16) -> Result<String> {
+    match network {
+        "rootless" => {
+            // For rootless, slirp4netns gateway is 10.0.2.2
+            Ok(format!("http://10.0.2.2:{}/", port))
+        }
+        "bridged" => {
+            // For bridged, use host's primary IP (reachable via NAT)
+            let host_ip = get_host_primary_ip().await?;
+            Ok(format!("http://{}:{}/", host_ip, port))
+        }
+        _ => anyhow::bail!("Unknown network type: {}", network),
+    }
+}
+
 /// Implementation for testing egress on a fresh (non-cloned) VM
 async fn egress_fresh_test_impl(network: &str) -> Result<()> {
     let (vm_name, _, _, _) = common::unique_names(&format!("egress-fresh-{}", network));
@@ -56,10 +89,27 @@ async fn egress_fresh_test_impl(network: &str) -> Result<()> {
     );
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
+    // Start local test server on host
+    let bind_addr = if network == "rootless" {
+        "127.0.0.1"
+    } else {
+        "0.0.0.0" // Bridged needs to bind to all interfaces
+    };
+
+    let test_server = common::LocalTestServer::start_on_available_port(bind_addr)
+        .await
+        .context("starting local test server")?;
+
+    let egress_url = get_egress_url(network, test_server.port).await?;
+    println!(
+        "  Local test server: {} (VM will connect to {})",
+        test_server.url, egress_url
+    );
+
     let fcvm_path = common::find_fcvm_binary()?;
 
     // Step 1: Start VM
-    println!("Step 1: Starting fresh VM '{}'...", vm_name);
+    println!("\nStep 1: Starting fresh VM '{}'...", vm_name);
     let (_child, vm_pid) = common::spawn_fcvm_with_logs(
         &[
             "podman",
@@ -76,20 +126,22 @@ async fn egress_fresh_test_impl(network: &str) -> Result<()> {
     .context("spawning VM")?;
 
     println!("  Waiting for VM to become healthy (PID: {})...", vm_pid);
-    common::poll_health_by_pid(vm_pid, 180).await?;
+    if let Err(e) = common::poll_health_by_pid(vm_pid, 180).await {
+        test_server.stop().await;
+        common::kill_process(vm_pid).await;
+        return Err(e.context("VM failed to become healthy"));
+    }
     println!("  ✓ VM healthy");
 
     // Step 2: Test egress
-    println!(
-        "\nStep 2: Testing egress connectivity to {}...",
-        EGRESS_TEST_URL
-    );
-    let egress_result = test_egress(&fcvm_path, vm_pid).await;
+    println!("\nStep 2: Testing egress connectivity to local server...");
+    let egress_result = test_egress(&fcvm_path, vm_pid, &egress_url).await;
 
     // Cleanup
     println!("\nCleaning up...");
+    test_server.stop().await;
     common::kill_process(vm_pid).await;
-    println!("  Killed VM");
+    println!("  Killed VM and test server");
 
     // Report result
     match egress_result {
@@ -117,10 +169,27 @@ async fn egress_clone_test_impl(network: &str) -> Result<()> {
     );
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
+    // Start local test server on host
+    let bind_addr = if network == "rootless" {
+        "127.0.0.1"
+    } else {
+        "0.0.0.0" // Bridged needs to bind to all interfaces
+    };
+
+    let test_server = common::LocalTestServer::start_on_available_port(bind_addr)
+        .await
+        .context("starting local test server")?;
+
+    let egress_url = get_egress_url(network, test_server.port).await?;
+    println!(
+        "  Local test server: {} (VM will connect to {})",
+        test_server.url, egress_url
+    );
+
     let fcvm_path = common::find_fcvm_binary()?;
 
     // Step 1: Start baseline VM
-    println!("Step 1: Starting baseline VM '{}'...", baseline_name);
+    println!("\nStep 1: Starting baseline VM '{}'...", baseline_name);
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
         &[
             "podman",
@@ -142,14 +211,16 @@ async fn egress_clone_test_impl(network: &str) -> Result<()> {
     );
     // Use 300 second timeout to account for rootfs creation on first run
     if let Err(e) = common::poll_health_by_pid(baseline_pid, 300).await {
+        test_server.stop().await;
         common::kill_process(baseline_pid).await;
         return Err(e.context("baseline VM failed to become healthy"));
     }
     println!("  ✓ Baseline VM healthy");
 
     // Test egress on baseline first
-    println!("\n  Testing baseline egress to {}...", EGRESS_TEST_URL);
-    if let Err(e) = test_egress(&fcvm_path, baseline_pid).await {
+    println!("\n  Testing baseline egress to local server...");
+    if let Err(e) = test_egress(&fcvm_path, baseline_pid, &egress_url).await {
+        test_server.stop().await;
         common::kill_process(baseline_pid).await;
         return Err(anyhow::anyhow!("Baseline egress failed: {}", e));
     }
@@ -171,6 +242,7 @@ async fn egress_clone_test_impl(network: &str) -> Result<()> {
         .context("running snapshot create")?;
 
     if !output.status.success() {
+        test_server.stop().await;
         common::kill_process(baseline_pid).await;
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("Snapshot creation failed: {}", stderr);
@@ -220,11 +292,8 @@ async fn egress_clone_test_impl(network: &str) -> Result<()> {
     println!("  ✓ Clone is healthy");
 
     // Step 5: Test egress on clone
-    println!(
-        "\nStep 5: Testing clone egress connectivity to {}...",
-        EGRESS_TEST_URL
-    );
-    let clone_egress = test_egress(&fcvm_path, clone_pid).await;
+    println!("\nStep 5: Testing clone egress connectivity to local server...");
+    let clone_egress = test_egress(&fcvm_path, clone_pid, &egress_url).await;
 
     // Cleanup
     println!("\nCleaning up...");
@@ -232,6 +301,8 @@ async fn egress_clone_test_impl(network: &str) -> Result<()> {
     println!("  Killed clone");
     common::kill_process(serve_pid).await;
     println!("  Killed memory server");
+    test_server.stop().await;
+    println!("  Stopped test server");
 
     // Report result
     match clone_egress {
@@ -248,10 +319,9 @@ async fn egress_clone_test_impl(network: &str) -> Result<()> {
 }
 
 /// Test egress connectivity from both VM and container level
-async fn test_egress(fcvm_path: &std::path::Path, pid: u32) -> Result<()> {
+async fn test_egress(fcvm_path: &std::path::Path, pid: u32, egress_url: &str) -> Result<()> {
     // Test 1: VM-level egress using curl (available in Ubuntu guest)
-    // ghcr.io returns 401 for unauthenticated requests - any HTTP response proves egress works
-    println!("  Testing VM-level egress (curl to {})...", EGRESS_TEST_URL);
+    println!("  Testing VM-level egress (curl to {})...", egress_url);
     let vm_output = tokio::process::Command::new(fcvm_path)
         .args([
             "exec",
@@ -263,11 +333,7 @@ async fn test_egress(fcvm_path: &std::path::Path, pid: u32) -> Result<()> {
             "-s",
             "--max-time",
             "5",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            EGRESS_TEST_URL,
+            egress_url,
         ])
         .output()
         .await
@@ -282,65 +348,34 @@ async fn test_egress(fcvm_path: &std::path::Path, pid: u32) -> Result<()> {
         );
     }
 
-    let status_code = String::from_utf8_lossy(&vm_output.stdout);
-    let code = status_code.trim();
-    if code != "200" {
-        anyhow::bail!("VM egress got HTTP {}, expected 200", code);
+    let response = String::from_utf8_lossy(&vm_output.stdout);
+    if !response.contains("TEST_SUCCESS") {
+        anyhow::bail!("VM egress got unexpected response: {}", response.trim());
     }
-    println!("    ✓ VM egress succeeded (HTTP 200)");
+    println!("    ✓ VM egress succeeded (got TEST_SUCCESS)");
 
-    // Test 2: Container-level egress using curl
-    // Note: We install curl because busybox wget doesn't properly support HTTPS through HTTP proxy
+    // Test 2: Container-level egress using wget (available in nginx:alpine)
     println!(
-        "  Testing container-level egress (curl to {})...",
-        EGRESS_TEST_URL
+        "  Testing container-level egress (wget to {})...",
+        egress_url
     );
 
-    // First install curl (apk add is quick with cache)
-    let install_output = tokio::process::Command::new(fcvm_path)
-        .args([
-            "exec",
-            "--pid",
-            &pid.to_string(),
-            "--",
-            "apk",
-            "add",
-            "--no-cache",
-            "curl",
-        ])
-        .output()
-        .await
-        .context("installing curl in container")?;
-
-    if !install_output.status.success() {
-        let stderr = String::from_utf8_lossy(&install_output.stderr);
-        anyhow::bail!(
-            "Failed to install curl in container: exit={}, stderr='{}'",
-            install_output.status,
-            stderr.trim()
-        );
-    }
-
-    // Now test with curl
     let container_output = tokio::process::Command::new(fcvm_path)
         .args([
             "exec",
             "--pid",
             &pid.to_string(),
             "--",
-            "curl",
-            "-s",
-            "--max-time",
-            "10",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            EGRESS_TEST_URL,
+            "wget",
+            "-q",
+            "-O",
+            "-",
+            "--timeout=10",
+            egress_url,
         ])
         .output()
         .await
-        .context("running curl in container")?;
+        .context("running wget in container")?;
 
     if !container_output.status.success() {
         let stderr = String::from_utf8_lossy(&container_output.stderr);
@@ -351,12 +386,14 @@ async fn test_egress(fcvm_path: &std::path::Path, pid: u32) -> Result<()> {
         );
     }
 
-    let status_code = String::from_utf8_lossy(&container_output.stdout);
-    let code = status_code.trim();
-    if code != "200" {
-        anyhow::bail!("Container egress got HTTP {}, expected 200", code);
+    let response = String::from_utf8_lossy(&container_output.stdout);
+    if !response.contains("TEST_SUCCESS") {
+        anyhow::bail!(
+            "Container egress got unexpected response: {}",
+            response.trim()
+        );
     }
-    println!("    ✓ Container egress succeeded (HTTP 200)");
+    println!("    ✓ Container egress succeeded (got TEST_SUCCESS)");
 
     Ok(())
 }

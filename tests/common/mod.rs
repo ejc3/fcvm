@@ -1480,6 +1480,148 @@ impl LocalTestServer {
     }
 }
 
+/// A simple DNS server for integration tests.
+///
+/// Responds to any DNS A record query with a configurable IP address.
+/// Uses UDP and pure Rust (tokio) - no external processes.
+/// Used to test DNS resolution without external network dependencies.
+pub struct LocalDnsServer {
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+    pub port: u16,
+    pub response_ip: std::net::Ipv4Addr,
+}
+
+impl LocalDnsServer {
+    /// Start a local DNS server on the specified address and port.
+    ///
+    /// # Arguments
+    /// * `bind_addr` - Address to bind (e.g., "127.0.0.1" or "0.0.0.0")
+    /// * `port` - Port to listen on (typically 53 or a high port for testing)
+    /// * `response_ip` - IP address to return for all A record queries
+    ///
+    /// # Returns
+    /// A LocalDnsServer instance. Drop it to stop the server.
+    pub async fn start(
+        bind_addr: &str,
+        port: u16,
+        response_ip: std::net::Ipv4Addr,
+    ) -> anyhow::Result<Self> {
+        let socket_addr: std::net::SocketAddr = format!("{}:{}", bind_addr, port).parse()?;
+        let socket = tokio::net::UdpSocket::bind(socket_addr).await?;
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    result = socket.recv_from(&mut buf) => {
+                        if let Ok((len, src)) = result {
+                            // Parse minimal DNS query and construct response
+                            if len >= 12 {
+                                // Build DNS response
+                                let response = Self::build_dns_response(&buf[..len], response_ip);
+                                let _ = socket.send_to(&response, src).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            shutdown_tx,
+            task,
+            port,
+            response_ip,
+        })
+    }
+
+    /// Build a minimal DNS response for an A record query.
+    fn build_dns_response(query: &[u8], ip: std::net::Ipv4Addr) -> Vec<u8> {
+        if query.len() < 12 {
+            return query.to_vec(); // Invalid query, just echo back
+        }
+
+        let mut response = Vec::with_capacity(512);
+
+        // Copy transaction ID from query (bytes 0-1)
+        response.extend_from_slice(&query[0..2]);
+
+        // Flags: QR=1 (response), Opcode=0, AA=1, TC=0, RD=0, RA=0, Z=0, RCODE=0
+        // Byte 2: 0x84 = 1000 0100 (QR=1, Opcode=0, AA=1, TC=0, RD=0)
+        // Byte 3: 0x00 = 0000 0000 (RA=0, Z=0, RCODE=0)
+        response.extend_from_slice(&[0x84, 0x00]);
+
+        // QDCOUNT = 1 (copy from query)
+        response.extend_from_slice(&query[4..6]);
+        // ANCOUNT = 1 (one answer)
+        response.extend_from_slice(&[0x00, 0x01]);
+        // NSCOUNT = 0
+        response.extend_from_slice(&[0x00, 0x00]);
+        // ARCOUNT = 0
+        response.extend_from_slice(&[0x00, 0x00]);
+
+        // Copy the question section from query (starts at byte 12)
+        // The question section is: QNAME (variable) + QTYPE (2) + QCLASS (2)
+        // We need to find where the question ends
+        let mut pos = 12;
+        // Skip QNAME (labels until we hit 0)
+        while pos < query.len() && query[pos] != 0 {
+            let label_len = query[pos] as usize;
+            // Bounds check: ensure label doesn't extend past buffer
+            if pos + 1 + label_len > query.len() {
+                // Malformed query - label extends past buffer
+                return query.to_vec(); // Just echo back
+            }
+            pos += label_len + 1; // Skip label length + label
+        }
+        pos += 1; // Skip the terminating 0
+        pos += 4; // Skip QTYPE (2) + QCLASS (2)
+
+        // Copy question section
+        if pos <= query.len() {
+            response.extend_from_slice(&query[12..pos]);
+        } else {
+            // Malformed query, just use a simple question
+            response.extend_from_slice(&query[12..]);
+        }
+
+        // Answer section
+        // Name pointer to question at offset 12
+        response.extend_from_slice(&[0xc0, 0x0c]);
+        // Type A (1)
+        response.extend_from_slice(&[0x00, 0x01]);
+        // Class IN (1)
+        response.extend_from_slice(&[0x00, 0x01]);
+        // TTL (300 seconds)
+        response.extend_from_slice(&[0x00, 0x00, 0x01, 0x2c]);
+        // RDLENGTH (4 bytes for IPv4)
+        response.extend_from_slice(&[0x00, 0x04]);
+        // RDATA (IP address)
+        response.extend_from_slice(&ip.octets());
+
+        response
+    }
+
+    /// Start on an automatically selected port.
+    pub async fn start_on_available_port(
+        bind_addr: &str,
+        response_ip: std::net::Ipv4Addr,
+    ) -> anyhow::Result<Self> {
+        let port = find_available_high_port()?;
+        Self::start(bind_addr, port, response_ip).await
+    }
+
+    /// Stop the server.
+    pub async fn stop(self) {
+        let _ = self.shutdown_tx.send(());
+        let _ = self.task.await;
+    }
+}
+
 /// A simple HTTP forward proxy for integration tests.
 ///
 /// Proxies HTTP requests to their destination.
