@@ -890,6 +890,11 @@ async fn run_exec_server_with_ready_signal(ready_tx: tokio::sync::oneshot::Sende
         }
     };
 
+    // Yield to ensure the tokio runtime has fully registered the AsyncFd
+    // before signaling readiness. This prevents race conditions where
+    // connections arrive before the runtime is ready to dispatch events.
+    tokio::task::yield_now().await;
+
     // Signal that we're ready (after AsyncFd creation succeeds)
     let _ = ready_tx.send(());
 

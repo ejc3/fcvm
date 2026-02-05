@@ -21,6 +21,111 @@ use tracing::{debug, info};
 /// Vsock port for exec commands (fc-agent listens on this)
 pub const EXEC_VSOCK_PORT: u32 = 4998;
 
+/// Maximum number of connection attempts to the exec server
+const MAX_EXEC_CONNECT_ATTEMPTS: u32 = 30;
+
+/// Initial retry delay when connecting to exec server (doubles each attempt)
+const INITIAL_RETRY_DELAY_MS: u64 = 100;
+
+/// Connect to the exec server via vsock with retry logic.
+///
+/// The guest VM takes several seconds to boot and start fc-agent with the exec server.
+/// This function retries the connection with exponential backoff to handle this startup delay.
+///
+/// Returns a connected UnixStream on success.
+fn connect_to_exec_server_with_retry(vsock_socket: &Path) -> Result<UnixStream> {
+    let mut attempt = 0;
+    let mut delay_ms = INITIAL_RETRY_DELAY_MS;
+
+    loop {
+        attempt += 1;
+
+        // Connect to the vsock Unix socket
+        let mut stream = match UnixStream::connect(vsock_socket) {
+            Ok(s) => s,
+            Err(e) if attempt < MAX_EXEC_CONNECT_ATTEMPTS => {
+                debug!(attempt, delay_ms, "vsock socket not ready, retrying");
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                delay_ms = std::cmp::min(delay_ms * 2, 2000); // Cap at 2 seconds
+                continue;
+            }
+            Err(e) => {
+                bail!(
+                    "Failed to connect to vsock socket at {} after {} attempts: {}.\n\
+                     Make sure the VM is running.",
+                    vsock_socket.display(),
+                    attempt,
+                    e
+                );
+            }
+        };
+
+        // Set timeouts for the CONNECT handshake
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+
+        // Send CONNECT command to Firecracker's vsock proxy
+        let connect_cmd = format!("CONNECT {}\n", EXEC_VSOCK_PORT);
+        if let Err(e) = stream.write_all(connect_cmd.as_bytes()) {
+            if attempt < MAX_EXEC_CONNECT_ATTEMPTS {
+                debug!(attempt, delay_ms, error = %e, "failed to send CONNECT, retrying");
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                delay_ms = std::cmp::min(delay_ms * 2, 2000);
+                continue;
+            }
+            bail!("Failed to send CONNECT command after {} attempts: {}", attempt, e);
+        }
+
+        // Read the response - should be "OK <port>\n" on success
+        let mut response = [0u8; 32];
+        let n = match stream.read(&mut response) {
+            Ok(n) => n,
+            Err(e) => {
+                if attempt < MAX_EXEC_CONNECT_ATTEMPTS {
+                    debug!(attempt, delay_ms, error = %e, "failed to read CONNECT response, retrying");
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                    delay_ms = std::cmp::min(delay_ms * 2, 2000);
+                    continue;
+                }
+                bail!("Failed to read CONNECT response after {} attempts: {}", attempt, e);
+            }
+        };
+
+        let response_str = String::from_utf8_lossy(&response[..n]);
+
+        if !response_str.starts_with("OK ") {
+            if attempt < MAX_EXEC_CONNECT_ATTEMPTS {
+                // Exec server not ready yet, retry
+                if attempt == 1 || attempt % 10 == 0 {
+                    // Log occasionally to avoid spam
+                    debug!(
+                        attempt,
+                        delay_ms,
+                        response = %response_str.trim(),
+                        "exec server not ready (fc-agent still starting), retrying"
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                delay_ms = std::cmp::min(delay_ms * 2, 2000);
+                continue;
+            }
+
+            bail!(
+                "Failed to connect to guest exec server after {} attempts: {}. \
+                 Make sure fc-agent is running with exec server enabled.",
+                attempt,
+                response_str.trim()
+            );
+        }
+
+        // Success!
+        if attempt > 1 {
+            debug!(attempt, "successfully connected to exec server");
+        }
+        return Ok(stream);
+    }
+}
+
 /// Execute a command in a VM or its container (programmatic API)
 ///
 /// This is a simpler API for programmatic use (e.g., from snapshot run --exec).
@@ -39,39 +144,12 @@ pub async fn run_exec_in_vm(
         "executing command in VM"
     );
 
-    // Connect to the vsock Unix socket
-    let mut stream = UnixStream::connect(vsock_socket).with_context(|| {
-        format!(
-            "Failed to connect to vsock socket at {}.\n\
-             Make sure the VM is running.",
-            vsock_socket.display()
-        )
-    })?;
+    // Connect to the exec server with retry logic
+    let mut stream = connect_to_exec_server_with_retry(vsock_socket)?;
 
     // Set timeouts for non-interactive mode
     stream.set_read_timeout(Some(Duration::from_secs(300)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-
-    // Send CONNECT command to Firecracker's vsock proxy
-    let connect_cmd = format!("CONNECT {}\n", EXEC_VSOCK_PORT);
-    stream
-        .write_all(connect_cmd.as_bytes())
-        .context("sending CONNECT command to vsock")?;
-
-    // Read the response - should be "OK <port>\n" on success
-    let mut response = [0u8; 32];
-    let n = stream
-        .read(&mut response)
-        .context("reading CONNECT response")?;
-    let response_str = String::from_utf8_lossy(&response[..n]);
-
-    if !response_str.starts_with("OK ") {
-        bail!(
-            "Failed to connect to guest exec server: {}. \
-             Make sure fc-agent is running with exec server enabled.",
-            response_str.trim()
-        );
-    }
 
     debug!("connected to guest exec server");
 
@@ -128,41 +206,13 @@ pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
         );
     }
 
-    // Connect to the vsock Unix socket
-    let mut stream = UnixStream::connect(&vsock_socket).with_context(|| {
-        format!(
-            "Failed to connect to vsock socket at {}.\n\
-             Make sure the VM is running.",
-            vsock_socket.display()
-        )
-    })?;
+    // Connect to the exec server with retry logic
+    let mut stream = connect_to_exec_server_with_retry(&vsock_socket)?;
 
     // Set timeouts (longer for TTY mode)
     let timeout = if args.tty { 3600 } else { 300 };
     stream.set_read_timeout(Some(Duration::from_secs(timeout)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-
-    // Send CONNECT command to Firecracker's vsock proxy
-    // Format: "CONNECT <port>\n"
-    let connect_cmd = format!("CONNECT {}\n", EXEC_VSOCK_PORT);
-    stream
-        .write_all(connect_cmd.as_bytes())
-        .context("sending CONNECT command to vsock")?;
-
-    // Read the response - should be "OK <port>\n" on success
-    let mut response = [0u8; 32];
-    let n = stream
-        .read(&mut response)
-        .context("reading CONNECT response")?;
-    let response_str = String::from_utf8_lossy(&response[..n]);
-
-    if !response_str.starts_with("OK ") {
-        bail!(
-            "Failed to connect to guest exec server: {}. \
-             Make sure fc-agent is running with exec server enabled.",
-            response_str.trim()
-        );
-    }
 
     if !quiet {
         info!("connected to guest exec server");

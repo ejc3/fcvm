@@ -267,17 +267,17 @@ async fn check_podman_healthcheck(pid: u32) -> Option<bool> {
     {
         Ok(o) => o,
         Err(e) => {
-            // Exec not available yet, assume healthy (don't block startup)
-            debug!(target: "health-monitor", error = %e, "podman healthcheck exec failed, assuming healthy");
-            return Some(true);
+            // Exec not available yet, don't assume healthy - keep checking
+            debug!(target: "health-monitor", error = %e, "podman healthcheck exec failed, will retry");
+            return Some(false);
         }
     };
 
     if !output.status.success() {
-        // Container may not be running yet, assume healthy
+        // Container may not be running yet, don't assume healthy - keep checking
         let stderr = String::from_utf8_lossy(&output.stderr);
-        debug!(target: "health-monitor", stderr = %stderr, "podman inspect failed, assuming healthy");
-        return Some(true);
+        debug!(target: "health-monitor", stderr = %stderr, "podman inspect failed, will retry");
+        return Some(false);
     }
 
     let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
