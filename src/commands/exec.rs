@@ -73,7 +73,11 @@ fn connect_to_exec_server_with_retry(vsock_socket: &Path) -> Result<UnixStream> 
                 delay_ms = std::cmp::min(delay_ms * 2, 2000);
                 continue;
             }
-            bail!("Failed to send CONNECT command after {} attempts: {}", attempt, e);
+            bail!(
+                "Failed to send CONNECT command after {} attempts: {}",
+                attempt,
+                e
+            );
         }
 
         // Read the response - should be "OK <port>\n" on success
@@ -87,7 +91,11 @@ fn connect_to_exec_server_with_retry(vsock_socket: &Path) -> Result<UnixStream> 
                     delay_ms = std::cmp::min(delay_ms * 2, 2000);
                     continue;
                 }
-                bail!("Failed to read CONNECT response after {} attempts: {}", attempt, e);
+                bail!(
+                    "Failed to read CONNECT response after {} attempts: {}",
+                    attempt,
+                    e
+                );
             }
         };
 
