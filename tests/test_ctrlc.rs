@@ -38,7 +38,7 @@ async fn test_ctrlc_via_terminal() -> Result<()> {
         &vm_name,
         "--network",
         "rootless",
-        "alpine:latest",
+        common::ALPINE_IMAGE,
         "sleep",
         "120", // Long sleep so we can interrupt it
     ];

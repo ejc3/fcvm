@@ -190,6 +190,9 @@ fn find_fcvm_binary() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Timeout for exec-based health checks (5 seconds)
+const HEALTH_CHECK_EXEC_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Check if the container is running via podman inspect.
 ///
 /// Returns:
@@ -201,7 +204,7 @@ async fn check_container_running(pid: u32) -> bool {
         None => return false, // Can't find fcvm binary
     };
 
-    let output = match tokio::process::Command::new(&exe)
+    let cmd_future = tokio::process::Command::new(&exe)
         .args([
             "exec",
             "--pid",
@@ -214,12 +217,16 @@ async fn check_container_running(pid: u32) -> bool {
             "{{.State.Running}}",
             "fcvm-container",
         ])
-        .output()
-        .await
-    {
-        Ok(o) => o,
-        Err(e) => {
+        .output();
+
+    let output = match tokio::time::timeout(HEALTH_CHECK_EXEC_TIMEOUT, cmd_future).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
             debug!(target: "health-monitor", error = %e, "podman inspect exec failed");
+            return false;
+        }
+        Err(_) => {
+            debug!(target: "health-monitor", "podman inspect exec timed out");
             return false;
         }
     };
@@ -249,7 +256,7 @@ async fn check_podman_healthcheck(pid: u32) -> Option<bool> {
         None => return Some(true), // Can't find fcvm binary, assume healthy
     };
 
-    let output = match tokio::process::Command::new(&exe)
+    let cmd_future = tokio::process::Command::new(&exe)
         .args([
             "exec",
             "--pid",
@@ -262,22 +269,26 @@ async fn check_podman_healthcheck(pid: u32) -> Option<bool> {
             "{{.State.Health.Status}}",
             "fcvm-container",
         ])
-        .output()
-        .await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            // Exec not available yet, assume healthy (don't block startup)
-            debug!(target: "health-monitor", error = %e, "podman healthcheck exec failed, assuming healthy");
-            return Some(true);
+        .output();
+
+    let output = match tokio::time::timeout(HEALTH_CHECK_EXEC_TIMEOUT, cmd_future).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            // Exec not available yet, don't assume healthy - keep checking
+            debug!(target: "health-monitor", error = %e, "podman healthcheck exec failed, will retry");
+            return Some(false);
+        }
+        Err(_) => {
+            debug!(target: "health-monitor", "podman healthcheck exec timed out, will retry");
+            return Some(false);
         }
     };
 
     if !output.status.success() {
-        // Container may not be running yet, assume healthy
+        // Container may not be running yet, don't assume healthy - keep checking
         let stderr = String::from_utf8_lossy(&output.stderr);
-        debug!(target: "health-monitor", stderr = %stderr, "podman inspect failed, assuming healthy");
-        return Some(true);
+        debug!(target: "health-monitor", stderr = %stderr, "podman inspect failed, will retry");
+        return Some(false);
     }
 
     let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -317,7 +328,19 @@ async fn update_health_status_once(
                 (HealthStatus::Unreachable, None)
             }
         } else {
-            // Process exists, now check application health
+            // Process exists - first check if container has already exited (e.g., failed to load)
+            // This catches cases where the container fails early (exit 125 = image load error)
+            // but the Firecracker VM is still running
+            let exit_file = paths::vm_runtime_dir(vm_id).join("container-exit");
+            if exit_file.exists() {
+                let exit_code = std::fs::read_to_string(&exit_file)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i32>().ok());
+                info!(target: "health-monitor", exit_code = ?exit_code, "container exited while VM still running");
+                return Ok((HealthStatus::Stopped, exit_code));
+            }
+
+            // Process exists and container hasn't exited, now check application health
             let state = state_manager
                 .load_state(vm_id)
                 .await
@@ -330,11 +353,24 @@ async fn update_health_status_once(
                 None => {
                     // No HTTP check - check if container is actually running
                     // Uses podman inspect to verify container state (not just process spawned)
-                    if check_container_running(pid).await {
-                        debug!(target: "health-monitor", "container is running, healthy");
+                    let container_running = check_container_running(pid).await;
+                    if container_running {
+                        debug!(target: "health-monitor", "container is running");
                         *last_failure_log = None;
+                        // Continue to podman healthcheck below
                         HealthStatus::Healthy
                     } else {
+                        // Container not running yet - check if there's a podman healthcheck defined
+                        // so we can skip future checks if there isn't one
+                        // Note: We don't return Unhealthy here because check_podman_healthcheck
+                        // returns Some(false) when the container doesn't exist yet (inspect fails)
+                        if !*skip_podman_healthcheck
+                            && check_podman_healthcheck(pid).await.is_none()
+                        {
+                            // No healthcheck defined - skip future checks
+                            debug!(target: "health-monitor", "no podman healthcheck defined, skipping future checks");
+                            *skip_podman_healthcheck = true;
+                        }
                         debug!(target: "health-monitor", "waiting for container to be running");
                         HealthStatus::Unknown
                     }

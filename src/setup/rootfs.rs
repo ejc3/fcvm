@@ -871,6 +871,10 @@ pub async fn ensure_rootfs(allow_create: bool) -> Result<PathBuf> {
     combined.push_str(kernel_url);
     combined.push_str("\n# DOWNLOAD_SCRIPT:\n");
     combined.push_str(&download_script);
+    combined.push_str("\n# FC_AGENT_SERVICE:\n");
+    combined.push_str(FC_AGENT_SERVICE);
+    combined.push_str("\n# FC_AGENT_SERVICE_STRACE:\n");
+    combined.push_str(FC_AGENT_SERVICE_STRACE);
     let script_sha = compute_sha256(combined.as_bytes());
     let script_sha_short = &script_sha[..12];
 
@@ -1026,6 +1030,8 @@ RestartSec=1
 # Send stdout/stderr to serial console so fcvm host can see fc-agent logs
 StandardOutput=journal+console
 StandardError=journal+console
+# Delegate cgroup control so podman can use pids/memory/cpu controllers
+Delegate=yes
 
 [Install]
 WantedBy=multi-user.target
@@ -1042,6 +1048,8 @@ ExecStart=/usr/local/bin/fc-agent-strace-wrapper
 Restart=on-failure
 RestartSec=1
 # Send stdout/stderr to serial console so fcvm host can see fc-agent logs
+# Delegate cgroup control so podman can use pids/memory/cpu controllers
+Delegate=yes
 StandardOutput=journal+console
 StandardError=journal+console
 

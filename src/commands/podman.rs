@@ -67,6 +67,28 @@ pub enum SnapshotOutcome {
     Interrupted,
 }
 
+/// Validate that a Docker archive contains manifest.json.
+///
+/// Docker archive format requires manifest.json to be loadable.
+/// If this file is missing, the archive is corrupted and will fail to load.
+fn validate_docker_archive(archive_path: &Path) -> Result<bool> {
+    let tar_file = std::fs::File::open(archive_path)
+        .with_context(|| format!("opening archive {} for validation", archive_path.display()))?;
+
+    let mut archive = tar::Archive::new(tar_file);
+
+    for entry in archive.entries().context("reading archive entries")? {
+        let entry = entry.context("reading archive entry")?;
+        if let Ok(path) = entry.path() {
+            if path.to_str() == Some("manifest.json") {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
 /// Create a snapshot with signal interruption support.
 ///
 /// This wraps `create_podman_snapshot` in a `tokio::select!` that checks for
@@ -1082,9 +1104,62 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 );
             }
 
+            // Validate the archive contains manifest.json (required for docker-archive format)
+            // This catches corrupted exports early, before they get cached and cause repeated failures
+            if !validate_docker_archive(&archive_path)? {
+                let _ = tokio::fs::remove_file(&archive_path).await;
+                drop(lock_file);
+                bail!(
+                    "podman save produced invalid archive (missing manifest.json) for image '{}'",
+                    args.image
+                );
+            }
+
             info!(path = %archive_path.display(), "Image exported as Docker archive");
         } else {
-            info!(image = %args.image, digest = %digest, "Using cached Docker archive");
+            // Validate cached archive in case it was corrupted
+            if !validate_docker_archive(&archive_path)? {
+                warn!(path = %archive_path.display(), "Cached archive is invalid, re-exporting");
+                let _ = tokio::fs::remove_file(&archive_path).await;
+                // Re-export
+                let output = tokio::process::Command::new("podman")
+                    .args([
+                        "save",
+                        "--format",
+                        "docker-archive",
+                        "-o",
+                        archive_path.to_str().unwrap(),
+                        &args.image,
+                    ])
+                    .output()
+                    .await
+                    .context("running podman save for re-export")?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let _ = tokio::fs::remove_file(&archive_path).await;
+                    drop(lock_file);
+                    bail!(
+                        "Failed to re-export image '{}' with podman save: {}",
+                        args.image,
+                        stderr
+                    );
+                }
+
+                // Validate the re-exported archive
+                if !validate_docker_archive(&archive_path)? {
+                    let _ = tokio::fs::remove_file(&archive_path).await;
+                    drop(lock_file);
+                    bail!(
+                        "podman save produced invalid archive (missing manifest.json) for image '{}' on re-export",
+                        args.image
+                    );
+                }
+
+                info!(path = %archive_path.display(), "Image re-exported as Docker archive");
+            } else {
+                info!(image = %args.image, digest = %digest, "Using cached Docker archive");
+            }
         }
 
         // Lock released when lock_file is dropped
@@ -1181,11 +1256,9 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     let network_config = network.setup().await.context("setting up network")?;
 
-    // Use network-provided health check URL if user didn't specify one
-    // Each network type (bridged/rootless) generates its own appropriate URL
-    if vm_state.config.health_check_url.is_none() {
-        vm_state.config.health_check_url = network_config.health_check_url.clone();
-    }
+    // Don't auto-assign health check URL from network config.
+    // HTTP health checks require an HTTP server - use container-ready file by default.
+    // User can explicitly set --health-check if they want HTTP checks.
     if let Some(port) = network_config.health_check_port {
         vm_state.config.network.health_check_port = Some(port);
     }
@@ -2053,6 +2126,18 @@ async fn run_vm_setup(
         ));
     }
 
+    // IPv6 configuration via kernel cmdline (for rootless networking)
+    // Format: ipv6=<client>|<gateway> - parsed by fc-agent to configure eth0
+    // Uses | as delimiter since : is part of IPv6 addresses
+    if let (Some(guest_ipv6), Some(host_ipv6)) =
+        (&network_config.guest_ipv6, &network_config.host_ipv6)
+    {
+        if !runtime_boot_args.is_empty() {
+            runtime_boot_args.push(' ');
+        }
+        runtime_boot_args.push_str(&format!("ipv6={}|{}", guest_ipv6, host_ipv6));
+    }
+
     // Enable fc-agent strace debugging if requested
     if args.strace_agent {
         if !runtime_boot_args.is_empty() {
@@ -2421,6 +2506,15 @@ async fn run_vm_setup(
                 "privileged": args.privileged,
                 "interactive": args.interactive,
                 "tty": args.tty,
+                // Use network-provided proxy, or fall back to environment variables
+                "http_proxy": network_config.http_proxy.clone()
+                    .or_else(|| std::env::var("http_proxy").ok())
+                    .or_else(|| std::env::var("HTTP_PROXY").ok()),
+                "https_proxy": network_config.http_proxy.clone()
+                    .or_else(|| std::env::var("https_proxy").ok())
+                    .or_else(|| std::env::var("HTTPS_PROXY").ok())
+                    .or_else(|| std::env::var("http_proxy").ok())
+                    .or_else(|| std::env::var("HTTP_PROXY").ok()),
             },
             "host-time": chrono::Utc::now().timestamp().to_string(),
         }

@@ -798,6 +798,58 @@ See [DESIGN.md](DESIGN.md#cli-interface) for architecture and design decisions.
 | Rootless | `--network rootless` (default) | No | slirp4netns, no root needed |
 | Bridged | `--network bridged` | Yes | iptables NAT |
 
+### Host Service Access (Rootless Mode)
+
+In rootless mode, VMs can reach services on the host via slirp4netns gateways:
+
+| Host Address | VM Uses | Description |
+|--------------|---------|-------------|
+| `127.0.0.1` | `10.0.2.2` | IPv4 loopback gateway |
+| `::1` | `fd00::2` | IPv6 loopback gateway |
+
+#### IPv6 from Inside VMs
+
+VMs have full IPv6 support via slirp4netns. To reach host services bound to `::1`:
+
+```bash
+# From inside the VM/container, use fd00::2 to reach host's ::1
+wget http://[fd00::2]:8080/    # Reaches host's [::1]:8080
+curl http://[fd00::2]:3000/    # Reaches host's [::1]:3000
+```
+
+The VM's internal IPv6 address is `fd00:1::2` on the `fd00:1::/64` network.
+
+#### Using HTTP Proxies
+
+**Automatic Proxy Passthrough**: fcvm automatically forwards `http_proxy` and `https_proxy`
+environment variables from the host to the VM via MMDS. The VM's podman process inherits
+these settings for image pulls:
+
+```bash
+# Set proxy on host - fcvm passes it to VM automatically
+export http_proxy=http://[fd00::2]:8080
+export https_proxy=http://[fd00::2]:8080
+fcvm podman run --name myvm alpine:latest
+# Image pulls inside VM will use the proxy
+```
+
+**Manual Proxy Configuration**: You can also configure proxies inside the VM manually.
+The proxy binds to the host's loopback, and the VM connects via the gateway address:
+
+```bash
+# On host: start proxy listening on ::1:8080 (or 127.0.0.1:8080)
+
+# Inside VM: configure proxy using gateway address
+export http_proxy=http://[fd00::2]:8080   # For IPv6 proxy
+export http_proxy=http://10.0.2.2:8080    # For IPv4 proxy
+
+# Now HTTP requests go through the proxy
+wget http://example.com/
+```
+
+**Note**: The VM uses `fd00::2` or `10.0.2.2` (gateway addresses), not `::1` or `127.0.0.1`
+(which would be the VM's own loopback).
+
 See [DESIGN.md](DESIGN.md#networking) for architecture details.
 
 ---

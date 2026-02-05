@@ -42,6 +42,12 @@ struct Plan {
     /// Allocate a pseudo-TTY
     #[serde(default)]
     tty: bool,
+    /// HTTP proxy for container registry access
+    #[serde(default)]
+    http_proxy: Option<String>,
+    /// HTTPS proxy for container registry access
+    #[serde(default)]
+    https_proxy: Option<String>,
 }
 
 /// Volume mount configuration from MMDS
@@ -91,6 +97,147 @@ struct LatestMetadata {
     /// Volume mounts for clone restore (provided by fcvm snapshot run)
     #[serde(default)]
     volumes: Vec<VolumeMount>,
+}
+
+/// Ensure cgroup controllers are available for container creation.
+///
+/// With `--cgroups=split`, podman/crun creates container cgroups under fc-agent's cgroup,
+/// bypassing systemd. For this to work, the pids controller must be enabled in:
+/// 1. The root cgroup's subtree_control
+/// 2. All intermediate cgroups (system.slice, fc-agent.service, etc.)
+///
+/// In cgroup v2, a controller must be in the parent's subtree_control for child cgroups to use it.
+/// This function enables pids in the entire cgroup chain from root to fc-agent's parent cgroup.
+async fn wait_for_cgroup_controllers() {
+    use tokio::fs;
+
+    const REQUIRED_CONTROLLER: &str = "pids";
+
+    // Get fc-agent's current cgroup from /proc/self/cgroup
+    // In cgroup v2, the format is "0::/path/to/cgroup"
+    let my_cgroup = match fs::read_to_string("/proc/self/cgroup").await {
+        Ok(content) => {
+            // Parse cgroup v2 format: "0::/system.slice/fc-agent.service"
+            content
+                .lines()
+                .find(|l| l.starts_with("0::"))
+                .map(|l| l.strip_prefix("0::").unwrap_or("/").to_string())
+                .unwrap_or_else(|| "/".to_string())
+        }
+        Err(e) => {
+            eprintln!(
+                "[fc-agent] WARNING: failed to read /proc/self/cgroup: {}",
+                e
+            );
+            "/".to_string()
+        }
+    };
+
+    eprintln!("[fc-agent] current cgroup: {}", my_cgroup);
+
+    // Build the list of cgroup paths from root to our cgroup (inclusive)
+    // e.g., for "/system.slice/fc-agent.service":
+    //   - /sys/fs/cgroup (root)
+    //   - /sys/fs/cgroup/system.slice
+    //   - /sys/fs/cgroup/system.slice/fc-agent.service (our cgroup - containers go UNDER this)
+    //
+    // With --cgroups=split, podman/crun creates container cgroups as CHILDREN of fc-agent.service.
+    // For a child to use pids, the PARENT must have pids in its subtree_control.
+    // So we must enable pids in fc-agent.service/cgroup.subtree_control too.
+    let mut paths_to_enable = vec!["/sys/fs/cgroup".to_string()];
+    let mut current_path = "/sys/fs/cgroup".to_string();
+
+    for component in my_cgroup.trim_start_matches('/').split('/') {
+        if component.is_empty() {
+            continue;
+        }
+        current_path = format!("{}/{}", current_path, component);
+        paths_to_enable.push(current_path.clone());
+    }
+
+    eprintln!(
+        "[fc-agent] enabling pids controller in cgroup chain: {:?}",
+        paths_to_enable
+    );
+
+    // Enable pids in each cgroup's subtree_control
+    for cgroup_path in &paths_to_enable {
+        let subtree_control_path = format!("{}/cgroup.subtree_control", cgroup_path);
+
+        // Check if pids is already enabled
+        match fs::read_to_string(&subtree_control_path).await {
+            Ok(controllers) => {
+                let available: Vec<&str> = controllers.split_whitespace().collect();
+                if available.contains(&REQUIRED_CONTROLLER) {
+                    continue; // Already enabled
+                }
+
+                // Try to enable pids
+                match fs::write(&subtree_control_path, format!("+{}\n", REQUIRED_CONTROLLER)).await
+                {
+                    Ok(()) => {
+                        eprintln!(
+                            "[fc-agent] enabled '{}' controller in {}",
+                            REQUIRED_CONTROLLER, subtree_control_path
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[fc-agent] WARNING: failed to enable '{}' in {}: {}",
+                            REQUIRED_CONTROLLER, subtree_control_path, e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[fc-agent] WARNING: failed to read {}: {}",
+                    subtree_control_path, e
+                );
+            }
+        }
+    }
+
+    // Verify pids is now available in our parent's subtree_control
+    let parent_subtree = if my_cgroup == "/" {
+        "/sys/fs/cgroup/cgroup.subtree_control".to_string()
+    } else {
+        let parent_cgroup = std::path::Path::new(&my_cgroup)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        if parent_cgroup == "/" || parent_cgroup.is_empty() {
+            "/sys/fs/cgroup/cgroup.subtree_control".to_string()
+        } else {
+            format!("/sys/fs/cgroup{}/cgroup.subtree_control", parent_cgroup)
+        }
+    };
+
+    match fs::read_to_string(&parent_subtree).await {
+        Ok(controllers) => {
+            let available: Vec<&str> = controllers.split_whitespace().collect();
+            if available.contains(&REQUIRED_CONTROLLER) {
+                eprintln!(
+                    "[fc-agent] cgroup controllers available in {}: {}",
+                    parent_subtree,
+                    controllers.trim()
+                );
+            } else {
+                eprintln!(
+                    "[fc-agent] WARNING: '{}' not available in {} after enabling (available: {})",
+                    REQUIRED_CONTROLLER,
+                    parent_subtree,
+                    controllers.trim()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "[fc-agent] WARNING: failed to verify controllers in {}: {}",
+                parent_subtree, e
+            );
+        }
+    }
 }
 
 async fn fetch_plan() -> Result<Plan> {
@@ -669,8 +816,9 @@ impl std::os::unix::io::AsRawFd for VsockListener {
     }
 }
 
-/// Run the exec server that listens for commands from host via vsock
-async fn run_exec_server() {
+/// Run the exec server with ready signal support.
+/// This is identical to run_exec_server() but sends a signal when the server is listening.
+async fn run_exec_server_with_ready_signal(ready_tx: tokio::sync::oneshot::Sender<()>) {
     eprintln!(
         "[fc-agent] starting exec server on vsock port {}",
         EXEC_VSOCK_PORT
@@ -741,6 +889,14 @@ async fn run_exec_server() {
             return;
         }
     };
+
+    // Yield to ensure the tokio runtime has fully registered the AsyncFd
+    // before signaling readiness. This prevents race conditions where
+    // connections arrive before the runtime is ready to dispatch events.
+    tokio::task::yield_now().await;
+
+    // Signal that we're ready (after AsyncFd creation succeeds)
+    let _ = ready_tx.send(());
 
     // Accept connections in a loop
     loop {
@@ -848,6 +1004,11 @@ fn handle_exec_connection_blocking(fd: i32) {
             if request.tty {
                 cmd.push("-t".to_string());
             }
+            // Pass proxy settings via -e flags for podman exec
+            for (key, value) in read_proxy_settings() {
+                cmd.push("-e".to_string());
+                cmd.push(format!("{}={}", key, value));
+            }
             cmd.push("--latest".to_string());
             cmd.extend(request.command.iter().cloned());
             cmd
@@ -869,6 +1030,9 @@ fn handle_exec_connection_blocking(fd: i32) {
 fn handle_exec_pipe(fd: i32, request: &ExecRequest) {
     use std::io::{BufRead, BufReader};
 
+    // Read proxy settings for external network access
+    let proxy_settings = read_proxy_settings();
+
     // Build the command using std::process::Command (blocking)
     let mut cmd = if request.in_container {
         // Execute inside the container using podman exec
@@ -877,6 +1041,10 @@ fn handle_exec_pipe(fd: i32, request: &ExecRequest) {
         // Pass -i flag if interactive mode requested
         if request.interactive {
             cmd.arg("-i");
+        }
+        // Pass proxy settings via -e flags for podman exec
+        for (key, value) in &proxy_settings {
+            cmd.arg("-e").arg(format!("{}={}", key, value));
         }
         // Use the first running container (there should only be one)
         cmd.arg("--latest");
@@ -887,6 +1055,10 @@ fn handle_exec_pipe(fd: i32, request: &ExecRequest) {
         let mut cmd = std::process::Command::new(&request.command[0]);
         if request.command.len() > 1 {
             cmd.args(&request.command[1..]);
+        }
+        // Set proxy environment variables for VM-level commands
+        for (key, value) in &proxy_settings {
+            cmd.env(key, value);
         }
         cmd
     };
@@ -1730,6 +1902,182 @@ fn configure_dns_from_cmdline() {
     }
 }
 
+/// Configure IPv6 from kernel boot parameters
+/// Parses ipv6= parameter and configures eth0 with the address and route
+fn configure_ipv6_from_cmdline() {
+    eprintln!("[fc-agent] checking for IPv6 configuration");
+
+    // Read kernel command line
+    let cmdline = match std::fs::read_to_string("/proc/cmdline") {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: failed to read /proc/cmdline: {}", e);
+            return;
+        }
+    };
+
+    // Find ipv6= parameter
+    // Format: ipv6=<client>|<gateway> (using | as delimiter since : is in IPv6 addresses)
+    // Example: ipv6=fd00:1::2|fd00:1::1
+    let ipv6_param = cmdline
+        .split_whitespace()
+        .find(|s| s.starts_with("ipv6="))
+        .map(|s| s.trim_start_matches("ipv6="));
+
+    let ipv6_param = match ipv6_param {
+        Some(p) => p,
+        None => {
+            eprintln!("[fc-agent] no ipv6= parameter, IPv6 not configured");
+            return;
+        }
+    };
+    eprintln!("[fc-agent] ipv6 param: {}", ipv6_param);
+
+    // Parse client|gateway format (| delimiter to avoid conflict with : in IPv6 addresses)
+    let parts: Vec<&str> = ipv6_param.split('|').collect();
+    if parts.len() != 2 {
+        eprintln!("[fc-agent] WARNING: invalid ipv6= format, expected <client>|<gateway>");
+        return;
+    }
+    // Format is client|gateway
+    let client = parts[0];
+    let gateway = parts[1];
+
+    eprintln!("[fc-agent] IPv6: client={}, gateway={}", client, gateway);
+
+    // Add IPv6 address to eth0
+    let addr_output = std::process::Command::new("ip")
+        .args([
+            "-6",
+            "addr",
+            "add",
+            &format!("{}/64", client),
+            "dev",
+            "eth0",
+        ])
+        .output();
+
+    match addr_output {
+        Ok(output) if output.status.success() => {
+            eprintln!("[fc-agent] ✓ added IPv6 address {}/64 to eth0", client);
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // RTNETLINK: File exists means address is already configured
+            if stderr.contains("File exists") {
+                eprintln!("[fc-agent] IPv6 address already exists on eth0");
+            } else {
+                eprintln!("[fc-agent] WARNING: failed to add IPv6 address: {}", stderr);
+            }
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: failed to run ip -6 addr add: {}", e);
+        }
+    }
+
+    // Add IPv6 default route
+    let route_output = std::process::Command::new("ip")
+        .args([
+            "-6", "route", "add", "default", "via", gateway, "dev", "eth0",
+        ])
+        .output();
+
+    match route_output {
+        Ok(output) if output.status.success() => {
+            eprintln!("[fc-agent] ✓ added IPv6 default route via {}", gateway);
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // RTNETLINK: File exists means route is already configured
+            if stderr.contains("File exists") {
+                eprintln!("[fc-agent] IPv6 default route already exists");
+            } else {
+                eprintln!("[fc-agent] WARNING: failed to add IPv6 route: {}", stderr);
+            }
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: failed to run ip -6 route add: {}", e);
+        }
+    }
+}
+
+/// Save proxy settings from the plan to a file so exec commands can use them.
+///
+/// This is needed because exec commands run via vsock don't have access to the
+/// original plan.
+const PROXY_SETTINGS_FILE: &str = "/etc/fcvm-proxy.env";
+
+fn save_proxy_settings(plan: &Plan) {
+    use std::io::Write as _;
+
+    let mut content = String::new();
+    let mut env_vars = Vec::new();
+
+    if let Some(ref proxy) = plan.http_proxy {
+        content.push_str(&format!("http_proxy={}\n", proxy));
+        content.push_str(&format!("HTTP_PROXY={}\n", proxy));
+        env_vars.push(("http_proxy", proxy.clone()));
+        env_vars.push(("HTTP_PROXY", proxy.clone()));
+    }
+    if let Some(ref proxy) = plan.https_proxy {
+        content.push_str(&format!("https_proxy={}\n", proxy));
+        content.push_str(&format!("HTTPS_PROXY={}\n", proxy));
+        env_vars.push(("https_proxy", proxy.clone()));
+        env_vars.push(("HTTPS_PROXY", proxy.clone()));
+    }
+
+    if content.is_empty() {
+        eprintln!("[fc-agent] no proxy settings configured");
+        return;
+    }
+
+    // Set environment variables in current process so child processes (TTY mode) inherit them
+    for (key, value) in &env_vars {
+        std::env::set_var(key, value);
+    }
+    eprintln!(
+        "[fc-agent] ✓ set {} proxy environment variables",
+        env_vars.len()
+    );
+
+    // Also save to file for exec handler to read
+    match std::fs::File::create(PROXY_SETTINGS_FILE) {
+        Ok(mut file) => {
+            if let Err(e) = file.write_all(content.as_bytes()) {
+                eprintln!("[fc-agent] WARNING: failed to write proxy settings: {}", e);
+            } else {
+                eprintln!(
+                    "[fc-agent] ✓ saved proxy settings to {}",
+                    PROXY_SETTINGS_FILE
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "[fc-agent] WARNING: failed to create proxy settings file: {}",
+                e
+            );
+        }
+    }
+}
+
+/// Read proxy settings from the saved file.
+/// Returns a Vec of (key, value) pairs.
+fn read_proxy_settings() -> Vec<(String, String)> {
+    let content = match std::fs::read_to_string(PROXY_SETTINGS_FILE) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    content
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
 #[tokio::main]
 async fn main() {
     // Initialize tracing (fuse-pipe uses tracing for logging)
@@ -1773,6 +2121,9 @@ async fn run_agent() -> Result<()> {
     // Configure DNS from kernel boot parameters before any network operations
     configure_dns_from_cmdline();
 
+    // Configure IPv6 if specified in kernel parameters
+    configure_ipv6_from_cmdline();
+
     // Wait for MMDS to be ready
     let plan = loop {
         match fetch_plan().await {
@@ -1789,6 +2140,9 @@ async fn run_agent() -> Result<()> {
         }
     };
 
+    // Save proxy settings for exec commands to use
+    save_proxy_settings(&plan);
+
     // Sync VM clock from host before launching container
     // This ensures TLS certificate validation works immediately
     if let Err(e) = sync_clock_from_host().await {
@@ -1804,9 +2158,25 @@ async fn run_agent() -> Result<()> {
     });
 
     // Start exec server to allow host to run commands in VM
+    // Use a oneshot channel to wait for the server to be listening before continuing.
+    // This ensures health checks (which use fcvm exec) work immediately.
+    let (exec_ready_tx, exec_ready_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async {
-        run_exec_server().await;
+        run_exec_server_with_ready_signal(exec_ready_tx).await;
     });
+
+    // Wait for exec server to be listening (with timeout to avoid hanging)
+    match tokio::time::timeout(Duration::from_secs(5), exec_ready_rx).await {
+        Ok(Ok(())) => {
+            eprintln!("[fc-agent] exec server is ready");
+        }
+        Ok(Err(_)) => {
+            eprintln!("[fc-agent] WARNING: exec server ready signal dropped");
+        }
+        Err(_) => {
+            eprintln!("[fc-agent] WARNING: exec server did not become ready within 5s");
+        }
+    }
 
     // Mount FUSE volumes from host before launching container
     // Note: mounted_volumes tracks which mounts succeeded, but we bind from plan.volumes
@@ -1908,9 +2278,18 @@ async fn run_agent() -> Result<()> {
             eprintln!("[fc-agent] ==========================================");
 
             // Spawn podman pull and stream output in real-time
-            let mut child = Command::new("podman")
-                .arg("pull")
-                .arg(&plan.image)
+            let mut cmd = Command::new("podman");
+            cmd.arg("pull").arg(&plan.image);
+            // Pass proxy environment variables if configured
+            if let Some(ref proxy) = plan.http_proxy {
+                cmd.env("http_proxy", proxy);
+                cmd.env("HTTP_PROXY", proxy);
+            }
+            if let Some(ref proxy) = plan.https_proxy {
+                cmd.env("https_proxy", proxy);
+                cmd.env("HTTPS_PROXY", proxy);
+            }
+            let mut child = cmd
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -2026,6 +2405,12 @@ async fn run_agent() -> Result<()> {
     }
 
     eprintln!("[fc-agent] launching container: {}", image_ref);
+
+    // Wait for cgroup controllers to be available.
+    // With Delegate=yes on fc-agent.service, systemd should delegate controllers to our cgroup.
+    // But there can be a race condition where we start before delegation is complete.
+    // This is especially important for --cgroups=split which uses cgroupfs directly.
+    wait_for_cgroup_controllers().await;
 
     // Build Podman args (used for both TTY and non-TTY modes)
     //

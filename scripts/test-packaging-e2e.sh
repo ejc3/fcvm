@@ -28,10 +28,19 @@ INSTALL_DIR=$(mktemp -d)
 cleanup() {
     echo ""
     echo "Step 4: Clean up"
-    # Kill any VMs we started
+    # Kill any VMs we started - use the process tree to get all children
     if [[ -n "${FCVM_PID:-}" ]]; then
+        # First try graceful shutdown via SIGTERM to the fcvm process
         sudo kill "$FCVM_PID" 2>/dev/null || true
-        sleep 1
+        sleep 2
+        # Then forcefully kill any remaining processes in the tree
+        sudo pkill -9 -P "$FCVM_PID" 2>/dev/null || true
+        sudo kill -9 "$FCVM_PID" 2>/dev/null || true
+    fi
+    # Also kill via the sudo process tree we captured
+    if [[ -n "${SUDO_PID:-}" ]]; then
+        sudo pkill -9 -P "$SUDO_PID" 2>/dev/null || true
+        sudo kill -9 "$SUDO_PID" 2>/dev/null || true
     fi
     rm -rf "$INSTALL_DIR"
     rm -f /tmp/pkg-test-vm.log
@@ -89,6 +98,7 @@ sudo FC_AGENT_PATH="$FC_AGENT_PATH" nohup "$FCVM" podman run \
     --network bridged \
     nginx:alpine \
     > /tmp/pkg-test-vm.log 2>&1 &
+SUDO_PID=$!
 
 echo "Waiting for VM to become healthy..."
 

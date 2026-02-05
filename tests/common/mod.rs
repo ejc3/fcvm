@@ -9,6 +9,9 @@ use std::sync::{Arc, Mutex};
 /// Default test image - use AWS ECR to avoid Docker Hub rate limits
 pub const TEST_IMAGE: &str = "public.ecr.aws/nginx/nginx:alpine";
 
+/// Alpine test image - use AWS ECR to avoid Docker Hub rate limits
+pub const ALPINE_IMAGE: &str = "public.ecr.aws/docker/library/alpine:latest";
+
 /// Standard log directory for test logs
 const TEST_LOG_DIR: &str = "/tmp/fcvm-test-logs";
 
@@ -405,6 +408,63 @@ fn maybe_add_test_flags(args: &[&str]) -> Vec<String> {
     }
 
     result
+}
+
+/// Spawn fcvm with environment variables set.
+///
+/// # Arguments
+/// * `args` - Arguments to pass to fcvm
+/// * `env_vars` - Environment variables to set (key, value pairs)
+///
+/// # Returns
+/// Tuple of (Child process, PID)
+pub async fn spawn_fcvm_with_env(
+    args: &[&str],
+    env_vars: &[(&str, &str)],
+) -> anyhow::Result<(tokio::process::Child, u32)> {
+    // Ensure config exists (runs once per test process)
+    ensure_config_exists();
+
+    let fcvm_path = find_fcvm_binary()?;
+    let final_args = maybe_add_test_flags(args);
+
+    // Extract name from args for logging
+    let name = args
+        .windows(2)
+        .find(|w| w[0] == "--name")
+        .map(|w| w[1])
+        .unwrap_or("fcvm");
+
+    let logger = TestLogger::new(name);
+
+    let mut cmd = tokio::process::Command::new(&fcvm_path);
+    cmd.args(&final_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("RUST_LOG", "debug");
+
+    // Set additional environment variables
+    for (key, value) in env_vars {
+        cmd.env(key, value);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn fcvm: {}", e))?;
+
+    let pid = child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("failed to get fcvm PID"))?;
+
+    logger.info(&format!(
+        "Spawned fcvm PID={} args={:?} env={:?}",
+        pid, args, env_vars
+    ));
+
+    spawn_log_consumer_to_file(child.stdout.take(), name, Some(logger.clone()), false);
+    spawn_log_consumer_to_file(child.stderr.take(), name, Some(logger), true);
+
+    Ok((child, pid))
 }
 
 /// Spawn fcvm with piped IO and automatic log consumers.
@@ -1267,4 +1327,362 @@ pub async fn delete_snapshot(snapshot_key: &str) -> anyhow::Result<()> {
 /// Uses the same format as the production code: `{base_key}-startup`
 pub fn startup_snapshot_key(base_key: &str) -> String {
     fcvm::commands::podman::startup_snapshot_key(base_key)
+}
+
+/// Find an available TCP port starting from a given port.
+///
+/// Scans ports from start_port to start_port+range_size-1 and returns
+/// the first port that can be bound. This avoids conflicts with system
+/// services and wildcard binds.
+pub fn find_available_port(start_port: u16, range_size: u16) -> anyhow::Result<u16> {
+    use std::net::{SocketAddr, TcpListener};
+
+    for i in 0..range_size {
+        let port = start_port + i;
+        // Check 0.0.0.0 to detect wildcard binds that block all interfaces
+        let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
+
+        // Try to bind - if successful, no wildcard bind exists on this port
+        if TcpListener::bind(addr).is_ok() {
+            return Ok(port);
+        }
+    }
+
+    anyhow::bail!(
+        "No available port found in range {}..{}",
+        start_port,
+        start_port + range_size
+    )
+}
+
+/// Find an available port in the default high port range (10000-60000).
+///
+/// Uses a random starting point to avoid race conditions when multiple
+/// callers try to find ports in quick succession.
+pub fn find_available_high_port() -> anyhow::Result<u16> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Use time-based pseudo-random offset to reduce collision likelihood
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u16)
+        .unwrap_or(0);
+    let offset = seed % 40000; // Stay within 10000-50000 range
+    find_available_port(10000 + offset, 50000 - offset)
+}
+
+/// Wait for a TCP server to be ready by attempting to connect.
+///
+/// # Arguments
+/// * `addr` - Address to connect to (e.g., "127.0.0.1:8080" or "[::1]:8080")
+/// * `timeout_ms` - Maximum time to wait in milliseconds
+///
+/// # Returns
+/// Ok(()) if connection successful, Err if timeout reached
+pub async fn wait_for_tcp(addr: &str, timeout_ms: u64) -> anyhow::Result<()> {
+    let attempts = timeout_ms / 20;
+    for attempt in 0..attempts {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(_) => return Ok(()),
+            Err(_) if attempt < attempts - 1 => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(e) => {
+                anyhow::bail!("server at {} not ready after {}ms: {}", addr, timeout_ms, e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A simple local HTTP test server for integration tests.
+///
+/// Responds to GET requests with "TEST_SUCCESS\n".
+/// Supports both IPv4 and IPv6 binding.
+/// Uses pure Rust (tokio) - no external processes like Python.
+pub struct LocalTestServer {
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+    pub url: String,
+    pub port: u16,
+}
+
+impl LocalTestServer {
+    /// Start a local test server on the specified address and port.
+    ///
+    /// # Arguments
+    /// * `bind_addr` - Address to bind (e.g., "127.0.0.1", "::1", or IPv6 global address)
+    /// * `port` - Port to listen on
+    ///
+    /// # Returns
+    /// A LocalTestServer instance. Drop it to stop the server.
+    pub async fn start(bind_addr: &str, port: u16) -> anyhow::Result<Self> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let is_ipv6 = bind_addr.contains(':');
+        let url = if is_ipv6 {
+            format!("http://[{}]:{}/", bind_addr, port)
+        } else {
+            format!("http://{}:{}/", bind_addr, port)
+        };
+
+        // Parse address for binding
+        let socket_addr: std::net::SocketAddr = if is_ipv6 {
+            format!("[{}]:{}", bind_addr, port).parse()?
+        } else {
+            format!("{}:{}", bind_addr, port).parse()?
+        };
+
+        // Bind listener before spawning task to ensure port is available
+        let listener = tokio::net::TcpListener::bind(socket_addr).await?;
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    result = listener.accept() => {
+                        if let Ok((mut stream, _)) = result {
+                            // Spawn handler for each connection
+                            tokio::spawn(async move {
+                                // Read request (we don't care about content)
+                                let mut buf = [0u8; 1024];
+                                let _ = stream.read(&mut buf).await;
+
+                                // Send minimal HTTP response
+                                let response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: close\r\n\r\nTEST_SUCCESS\n";
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            });
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            shutdown_tx,
+            task,
+            url,
+            port,
+        })
+    }
+
+    /// Start on an automatically selected port.
+    pub async fn start_on_available_port(bind_addr: &str) -> anyhow::Result<Self> {
+        let port = find_available_high_port()?;
+        Self::start(bind_addr, port).await
+    }
+
+    /// Stop the server.
+    pub async fn stop(self) {
+        let _ = self.shutdown_tx.send(());
+        let _ = self.task.await;
+    }
+}
+
+/// A simple HTTP forward proxy for integration tests.
+///
+/// Proxies HTTP requests to their destination.
+/// Supports both IPv4 and IPv6 binding.
+/// Used to test that VMs can route through proxies via slirp4netns gateways.
+pub struct LocalProxyServer {
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+    pub url: String,
+    pub port: u16,
+    request_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl LocalProxyServer {
+    /// Start a local HTTP proxy on the specified address and port.
+    ///
+    /// # Arguments
+    /// * `bind_addr` - Address to bind (e.g., "127.0.0.1", "::1")
+    /// * `port` - Port to listen on
+    ///
+    /// # Returns
+    /// A LocalProxyServer instance. Drop it to stop the server.
+    pub async fn start(bind_addr: &str, port: u16) -> anyhow::Result<Self> {
+        let is_ipv6 = bind_addr.contains(':');
+        let url = if is_ipv6 {
+            format!("http://[{}]:{}", bind_addr, port)
+        } else {
+            format!("http://{}:{}", bind_addr, port)
+        };
+
+        let socket_addr: std::net::SocketAddr = if is_ipv6 {
+            format!("[{}]:{}", bind_addr, port).parse()?
+        } else {
+            format!("{}:{}", bind_addr, port).parse()?
+        };
+
+        let listener = tokio::net::TcpListener::bind(socket_addr).await?;
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        let request_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let request_count_clone = request_count.clone();
+
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    result = listener.accept() => {
+                        if let Ok((stream, _)) = result {
+                            let count = request_count_clone.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = Self::handle_proxy_request(stream, count).await {
+                                    eprintln!("[proxy] Error: {}", e);
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            shutdown_tx,
+            task,
+            url,
+            port,
+            request_count,
+        })
+    }
+
+    /// Handle a single proxy request.
+    ///
+    /// Parses the HTTP request, extracts the target URL, connects to it,
+    /// forwards the request, and returns the response.
+    async fn handle_proxy_request(
+        mut client: tokio::net::TcpStream,
+        request_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ) -> anyhow::Result<()> {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let (reader, mut writer) = client.split();
+        let mut reader = BufReader::new(reader);
+
+        // Read request line (e.g., "GET http://example.com/path HTTP/1.1")
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).await?;
+
+        eprintln!("[proxy] Request line: {:?}", request_line.trim());
+
+        let parts: Vec<&str> = request_line.split_whitespace().collect();
+        if parts.len() < 3 {
+            eprintln!("[proxy] Bad request: not enough parts");
+            writer
+                .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                .await?;
+            return Ok(());
+        }
+
+        let method = parts[0];
+        let url_str = parts[1];
+
+        eprintln!("[proxy] Method={} URL={}", method, url_str);
+
+        // Read headers first (we need Host header for relative URLs)
+        let mut headers = Vec::new();
+        let mut host_header: Option<String> = None;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await?;
+            if line.trim().is_empty() {
+                break;
+            }
+            let lower = line.to_lowercase();
+            if lower.starts_with("host:") {
+                host_header = Some(line.trim()[5..].trim().to_string());
+            }
+            // Skip proxy-specific headers
+            if !lower.starts_with("proxy-") {
+                headers.push(line);
+            }
+        }
+
+        // Parse URL to extract host and port
+        // Handle both absolute URLs (proxy mode) and relative URLs (direct mode)
+        let (host, port, path, query) =
+            if url_str.starts_with("http://") || url_str.starts_with("https://") {
+                // Absolute URL (proxy request)
+                let url =
+                    url::Url::parse(url_str).map_err(|e| anyhow::anyhow!("Invalid URL: {}", e))?;
+                let h = url
+                    .host_str()
+                    .ok_or_else(|| anyhow::anyhow!("No host in URL"))?
+                    .to_string();
+                let p = url.port().unwrap_or(80);
+                let path = url.path().to_string();
+                let query = url.query().map(|q| format!("?{}", q)).unwrap_or_default();
+                (h, p, path, query)
+            } else {
+                // Relative URL (direct request) - use Host header
+                let host_str = host_header
+                    .ok_or_else(|| anyhow::anyhow!("Relative URL without Host header"))?;
+                let (h, p) = if host_str.contains(':') {
+                    let parts: Vec<&str> = host_str.rsplitn(2, ':').collect();
+                    (parts[1].to_string(), parts[0].parse().unwrap_or(80))
+                } else {
+                    (host_str, 80)
+                };
+                let path = url_str.to_string();
+                (h, p, path, String::new())
+            };
+
+        eprintln!("[proxy] Parsed: host={} port={}", host, port);
+
+        // Connect to target server
+        let target_addr = format!("{}:{}", host, port);
+        eprintln!("[proxy] Connecting to target: {}", target_addr);
+        let mut target = tokio::net::TcpStream::connect(&target_addr).await?;
+
+        // Forward request to target (use path only, not full URL)
+        let request = format!("{} {}{} HTTP/1.1\r\n", method, path, query);
+        target.write_all(request.as_bytes()).await?;
+
+        // Write headers (add Host if not present)
+        let has_host = headers
+            .iter()
+            .any(|h| h.to_lowercase().starts_with("host:"));
+        if !has_host {
+            target
+                .write_all(format!("Host: {}\r\n", host).as_bytes())
+                .await?;
+        }
+        for header in &headers {
+            target.write_all(header.as_bytes()).await?;
+        }
+        target.write_all(b"\r\n").await?;
+
+        // Read response and forward to client
+        let mut response = Vec::new();
+        target.read_to_end(&mut response).await?;
+        eprintln!(
+            "[proxy] Got {} bytes from target, forwarding to client",
+            response.len()
+        );
+        writer.write_all(&response).await?;
+
+        request_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[proxy] Request complete");
+        Ok(())
+    }
+
+    /// Start on an automatically selected port.
+    pub async fn start_on_available_port(bind_addr: &str) -> anyhow::Result<Self> {
+        let port = find_available_high_port()?;
+        Self::start(bind_addr, port).await
+    }
+
+    /// Get the number of requests handled by this proxy.
+    pub fn request_count(&self) -> u32 {
+        self.request_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Stop the server.
+    pub async fn stop(self) {
+        let _ = self.shutdown_tx.send(());
+        let _ = self.task.await;
+    }
 }
