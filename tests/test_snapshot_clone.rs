@@ -733,6 +733,32 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
     common::poll_health_by_pid(clone_pid, 120).await?;
     println!("  ✓ Clone is healthy (PID: {})", clone_pid);
 
+    // Install bind-tools for dig command (Alpine doesn't include it by default)
+    println!("  Installing bind-tools for dig...");
+    let install_output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "exec",
+            "--pid",
+            &clone_pid.to_string(),
+            "--vm",
+            "--",
+            "apk",
+            "add",
+            "--no-cache",
+            "bind-tools",
+        ])
+        .output()
+        .await
+        .context("installing bind-tools")?;
+
+    if !install_output.status.success() {
+        let stderr = String::from_utf8_lossy(&install_output.stderr);
+        // Log but don't fail - dig might already be available
+        eprintln!("  Warning: bind-tools install: {}", stderr.trim());
+    } else {
+        println!("  ✓ bind-tools installed");
+    }
+
     // Step 5: Test connectivity from inside the clone
     println!("\nStep 5: Testing connectivity from clone...");
 

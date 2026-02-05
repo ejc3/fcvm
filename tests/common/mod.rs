@@ -1550,7 +1550,7 @@ impl LocalDnsServer {
         // Copy transaction ID from query (bytes 0-1)
         response.extend_from_slice(&query[0..2]);
 
-        // Flags: QR=1 (response), Opcode=0, AA=1, TC=0, RD=1, RA=1, Z=0, RCODE=0
+        // Flags: QR=1 (response), Opcode=0, AA=1, TC=0, RD=0, RA=0, Z=0, RCODE=0
         // Byte 2: 0x84 = 1000 0100 (QR=1, Opcode=0, AA=1, TC=0, RD=0)
         // Byte 3: 0x00 = 0000 0000 (RA=0, Z=0, RCODE=0)
         response.extend_from_slice(&[0x84, 0x00]);
@@ -1570,7 +1570,13 @@ impl LocalDnsServer {
         let mut pos = 12;
         // Skip QNAME (labels until we hit 0)
         while pos < query.len() && query[pos] != 0 {
-            pos += query[pos] as usize + 1; // Skip label length + label
+            let label_len = query[pos] as usize;
+            // Bounds check: ensure label doesn't extend past buffer
+            if pos + 1 + label_len > query.len() {
+                // Malformed query - label extends past buffer
+                return query.to_vec(); // Just echo back
+            }
+            pos += label_len + 1; // Skip label length + label
         }
         pos += 1; // Skip the terminating 0
         pos += 4; // Skip QTYPE (2) + QCLASS (2)
