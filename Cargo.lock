@@ -724,7 +724,7 @@ dependencies = [
 [[package]]
 name = "fuser"
 version = "0.16.0"
-source = "git+https://github.com/ejc3/fuser.git?branch=remap-on-627#baf714e91781568aac3971c5c8458210b65ba32a"
+source = "git+https://github.com/ejc3/fuser.git?branch=remap-file-range-on-clone-fd#283f574504d3954cda1157d8468820e76bffab4f"
 dependencies = [
  "bitflags 2.10.0",
  "libc",
