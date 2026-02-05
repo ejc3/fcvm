@@ -174,6 +174,9 @@ check-disk:
 # Clean leftover test data (VM disks, snapshots, state files)
 # Preserves cached assets (kernels, rootfs, initrd, image-cache)
 clean-test-data:
+	@echo "==> Force unmounting stale FUSE mounts..."
+	@# Find and force unmount any FUSE mounts from previous test runs
+	@mount | grep fuse | grep -E '/tmp|/var/tmp' | cut -d' ' -f3 | xargs -r -I{} fusermount3 -u -z {} 2>/dev/null || true
 	@echo "==> Cleaning leftover VM disks..."
 	sudo rm -rf /mnt/fcvm-btrfs/vm-disks/*
 	sudo rm -rf $(ROOT_DATA_DIR)/vm-disks/* $(CONTAINER_DATA_DIR)/vm-disks/*
