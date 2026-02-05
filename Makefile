@@ -92,7 +92,7 @@ CONTAINER_RUN := podman run --rm --privileged \
 	$(TARGET_MOUNT) \
 	-v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs -v $(FUSER):/workspace/fuser \
 	--device /dev/fuse -v /dev/kvm:/dev/kvm -v /dev/userfaultfd:/dev/userfaultfd \
-	--ulimit nofile=65536:65536 --pids-limit=65536 -v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
+	--ulimit nofile=65536:65536 --ulimit nproc=65536:65536 --pids-limit=65536 -v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	-v $(TEST_LOG_DIR):$(TEST_LOG_DIR) $(CARGO_CACHE_MOUNT) \
 	-e FCVM_DATA_DIR=$(CONTAINER_DATA_DIR)
 
