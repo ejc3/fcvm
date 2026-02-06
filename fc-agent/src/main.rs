@@ -2606,6 +2606,13 @@ async fn run_agent() -> Result<()> {
     let image_ref = if let Some(archive_path) = &plan.image_archive {
         eprintln!("[fc-agent] importing Docker archive: {}", archive_path);
 
+        // Make block device readable by non-root (needed with --userns=keep-id)
+        if archive_path.starts_with("/dev/") {
+            let _ = std::process::Command::new("chmod")
+                .args(["444", archive_path])
+                .output();
+        }
+
         // Import into podman storage so the pre-start snapshot captures the loaded image.
         // Without this, every snapshot restore would re-read the entire tar from /dev/vdb.
         let output = Command::new("podman")
