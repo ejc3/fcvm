@@ -1677,6 +1677,28 @@ The fuse-pipe library passes the pjdfstest POSIX compliance suite. Tests run via
 
 ---
 
+## Known Limitations
+
+### FUSE Volume Cache Coherency
+
+`--map` volumes use FUSE-over-vsock with `WRITEBACK_CACHE` and `AUTO_INVAL_DATA`. When a host process modifies a file in a mapped directory, the guest sees the change on its next read — but only after the kernel detects the mtime change (up to ~1 second granularity). Writes within the same second may not be visible immediately.
+
+Directory changes (new files, deletions) are subject to the kernel's directory entry cache TTL. A new file created on the host may not appear in guest `readdir()` until the cache expires.
+
+There are no push notifications from host to guest. The guest discovers changes only on access. inotify/fanotify in the guest watches the FUSE mount, not the host filesystem, so host-side changes don't trigger guest notifications.
+
+**Potential fix**: Use `FUSE_NOTIFY_INVAL_INODE` and `FUSE_NOTIFY_INVAL_ENTRY` — server-initiated invalidation notifications. The host VolumeServer would watch directories with inotify and push invalidations through the FUSE connection when files change. This is how production network filesystems (NFS, CIFS) handle it.
+
+### Nested VM Performance (NV2)
+
+ARM64 FEAT_NV2 has architectural issues with cache coherency under double Stage 2 translation. The DSB SY kernel patch fixes this for vsock/FUSE data paths, but multi-vCPU L2 VMs still hit interrupt delivery issues (NETDEV WATCHDOG). L2 VMs are limited to single vCPU.
+
+### Snapshot + FUSE Volumes
+
+Snapshots are disabled when `--map` volumes are present because the FUSE-over-vsock connection state may not survive the pause/resume cycle cleanly. This means VMs with volume mounts always do a fresh boot. Block device mounts (`--disk`, `--disk-dir`) do not have this limitation.
+
+---
+
 ## Future Enhancements
 
 ### Phase 2 (Post-MVP)
