@@ -672,6 +672,7 @@ async function runClaude(prompt: string): Promise<void> {
   for await (const message of query({
     prompt,
     options: {
+      model: "claude-opus-4-6",
       allowedTools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
       permissionMode: "acceptEdits",
       maxTurns: MAX_TURNS,
