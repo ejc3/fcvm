@@ -48,6 +48,9 @@ struct Plan {
     /// HTTPS proxy for container registry access
     #[serde(default)]
     https_proxy: Option<String>,
+    /// Hosts/domains that bypass the proxy
+    #[serde(default)]
+    no_proxy: Option<String>,
 }
 
 /// Volume mount configuration from MMDS
@@ -2113,6 +2116,12 @@ fn save_proxy_settings(plan: &Plan) {
         env_vars.push(("https_proxy", proxy.clone()));
         env_vars.push(("HTTPS_PROXY", proxy.clone()));
     }
+    if let Some(ref no_proxy) = plan.no_proxy {
+        content.push_str(&format!("no_proxy={}\n", no_proxy));
+        content.push_str(&format!("NO_PROXY={}\n", no_proxy));
+        env_vars.push(("no_proxy", no_proxy.clone()));
+        env_vars.push(("NO_PROXY", no_proxy.clone()));
+    }
 
     if content.is_empty() {
         eprintln!("[fc-agent] no proxy settings configured");
@@ -2376,6 +2385,10 @@ async fn run_agent() -> Result<()> {
             if let Some(ref proxy) = plan.https_proxy {
                 cmd.env("https_proxy", proxy);
                 cmd.env("HTTPS_PROXY", proxy);
+            }
+            if let Some(ref no_proxy) = plan.no_proxy {
+                cmd.env("no_proxy", no_proxy);
+                cmd.env("NO_PROXY", no_proxy);
             }
             let mut child = cmd
                 .stdout(Stdio::piped())

@@ -2632,6 +2632,9 @@ async fn run_vm_setup(
                     .or_else(|| std::env::var("http_proxy").ok())
                     .or_else(|| std::env::var("HTTP_PROXY").ok())
                     .and_then(|url| resolve_proxy_url(&url)),
+                "no_proxy": std::env::var("no_proxy")
+                    .or_else(|_| std::env::var("NO_PROXY"))
+                    .ok(),
             },
             "host-time": chrono::Utc::now().timestamp().to_string(),
         }

@@ -339,3 +339,66 @@ async fn test_egress_ipv6_global() -> Result<()> {
     // VM can reach host's global IPv6 directly through slirp4netns IPv6 NAT
     test_egress_to_addr(&host_ipv6, &host_ipv6, "ipv6-global").await
 }
+
+/// Test that no_proxy from host environment is passed through to the VM.
+///
+/// Verifies that NO_PROXY set on the host ends up in the container's
+/// environment via MMDS → fc-agent → /etc/fcvm-proxy.env → podman exec.
+#[tokio::test]
+async fn test_no_proxy() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("no-proxy");
+
+    // Spawn fcvm with NO_PROXY set in the environment.
+    // fcvm passes it to MMDS, fc-agent writes it to /etc/fcvm-proxy.env,
+    // and exec reads it back for container commands.
+    let fcvm_path = common::find_fcvm_binary()?;
+    let child = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "rootless",
+            "--no-snapshot",
+            common::TEST_IMAGE,
+        ])
+        .env("NO_PROXY", "thefacebook.com,localhost,10.0.2.2")
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .context("spawning fcvm")?;
+
+    let pid = child.id().expect("no pid");
+
+    if let Err(e) = common::poll_health_by_pid(pid, 300).await {
+        common::kill_process(pid).await;
+        anyhow::bail!("VM never became healthy: {}", e);
+    }
+
+    println!("VM healthy, checking no_proxy in container env...");
+
+    // Check that no_proxy made it into the container environment
+    let env_output = common::exec_in_container(pid, &["env"]).await?;
+
+    let has_no_proxy = env_output
+        .lines()
+        .any(|l| l.starts_with("no_proxy=") || l.starts_with("NO_PROXY="));
+
+    println!("  Container env (proxy lines):");
+    for line in env_output.lines() {
+        if line.contains("proxy") || line.contains("PROXY") {
+            println!("    {}", line);
+        }
+    }
+
+    assert!(has_no_proxy, "no_proxy should be set in container env");
+    assert!(
+        env_output.contains("thefacebook.com"),
+        "no_proxy should contain thefacebook.com"
+    );
+
+    common::kill_process(pid).await;
+    println!("✅ NO_PROXY TEST PASSED!");
+    Ok(())
+}
