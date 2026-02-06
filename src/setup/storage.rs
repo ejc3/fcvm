@@ -5,8 +5,6 @@ use tracing::info;
 
 use crate::setup::rootfs::load_config;
 
-const DEFAULT_SIZE_GB: u64 = 60;
-
 /// Required subdirectories under the btrfs mount
 const REQUIRED_DIRS: &[&str] = &[
     "kernels",
@@ -46,9 +44,10 @@ fn is_btrfs_mount(path: &Path) -> bool {
     false
 }
 
-/// Get storage paths from config
-fn get_storage_paths(config_path: Option<&str>) -> Result<(PathBuf, PathBuf)> {
+/// Get storage paths and btrfs size from config
+fn get_storage_paths(config_path: Option<&str>) -> Result<(PathBuf, PathBuf, String)> {
     let (config, _, _) = load_config(config_path)?;
+    let btrfs_size = config.paths.btrfs_size.clone();
     let mount_point = PathBuf::from(&config.paths.assets_dir);
 
     // Canonicalize the mount point to resolve .., ., and symlinks
@@ -82,7 +81,7 @@ fn get_storage_paths(config_path: Option<&str>) -> Result<(PathBuf, PathBuf)> {
         .unwrap_or("fcvm-btrfs");
     loopback_image.set_file_name(format!("{}.img", current_name));
 
-    Ok((canonical_mount, loopback_image))
+    Ok((canonical_mount, loopback_image, btrfs_size))
 }
 
 /// Ensure btrfs storage is set up at the configured assets_dir.
@@ -93,7 +92,7 @@ fn get_storage_paths(config_path: Option<&str>) -> Result<(PathBuf, PathBuf)> {
 ///
 /// Creating the loopback and mounting requires root privileges.
 pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
-    let (mount_point, loopback_image) = get_storage_paths(config_path)?;
+    let (mount_point, loopback_image, btrfs_size) = get_storage_paths(config_path)?;
 
     // Already btrfs? Just ensure directories exist (no root needed)
     if is_btrfs_mount(&mount_point) {
@@ -114,8 +113,8 @@ pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
         anyhow::bail!(
             "Storage not initialized. Run with sudo:\n\n  \
             sudo fcvm setup\n\n\
-            This creates a {}GB btrfs filesystem at {} for CoW disk snapshots.",
-            DEFAULT_SIZE_GB,
+            This creates a {} btrfs filesystem at {} for CoW disk snapshots.",
+            btrfs_size,
             mount_point.display()
         );
     }
@@ -147,15 +146,15 @@ pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
         }
 
         info!(
-            "Creating {}GB loopback image at {}",
-            DEFAULT_SIZE_GB,
+            "Creating {} loopback image at {}",
+            btrfs_size,
             loopback_image.display()
         );
 
         // Create sparse file
         let status = Command::new("truncate")
             .arg("-s")
-            .arg(format!("{}G", DEFAULT_SIZE_GB))
+            .arg(&btrfs_size)
             .arg(&loopback_image)
             .status()
             .context("executing truncate")?;
@@ -225,9 +224,9 @@ pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
     }
 
     info!(
-        "✓ btrfs storage ready at {} ({}GB)",
+        "✓ btrfs storage ready at {} ({})",
         mount_point.display(),
-        DEFAULT_SIZE_GB
+        btrfs_size
     );
 
     Ok(())
