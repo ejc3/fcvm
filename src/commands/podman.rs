@@ -297,6 +297,7 @@ fn build_firecracker_config(
         args.privileged,
         args.tty,
         args.interactive,
+        args.rootfs_size.clone(),
     )
 }
 
@@ -1695,6 +1696,11 @@ async fn run_vm_setup(
         .await
         .context("creating CoW disk")?;
 
+    // Ensure minimum free space (from --rootfs-size, stored in FirecrackerConfig)
+    crate::storage::disk::ensure_free_space(&rootfs_path, &args.rootfs_size)
+        .await
+        .context("ensuring rootfs free space")?;
+
     info!(rootfs = %rootfs_path.display(), "disk prepared (fc-agent baked into Layer 2)");
 
     let vm_name = args.name.clone();
@@ -2170,6 +2176,7 @@ async fn run_vm_setup(
                 args.privileged,
                 args.tty,
                 args.interactive,
+                args.rootfs_size.clone(),
             )
         });
 

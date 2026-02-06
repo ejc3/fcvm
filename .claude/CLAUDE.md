@@ -509,6 +509,9 @@ sudo fcvm podman run --name my-vm --network bridged --cmd "echo hello" alpine:la
 # Or run with auto-setup (first run takes 5-10 minutes)
 sudo fcvm podman run --name my-vm --network bridged --setup nginx:alpine
 
+# With extra root disk space (default: 10G free)
+sudo fcvm podman run --name my-vm --rootfs-size 50G nginx:alpine
+
 # Snapshot workflow
 fcvm snapshot create --pid <vm_pid> --tag my-snapshot
 fcvm snapshot serve my-snapshot      # Start UFFD server (prints serve PID)
@@ -1255,8 +1258,16 @@ fuse-pipe/benches/
 **Architecture:**
 - All data under `/mnt/fcvm-btrfs/` (btrfs filesystem)
 - Base rootfs: `/mnt/fcvm-btrfs/rootfs/layer2-{sha}.raw` (~10GB raw disk with Ubuntu 24.04 + Podman)
-- VM disks: `/mnt/fcvm-btrfs/vm-disks/{vm_id}/disks/rootfs.raw`
+- VM disks: `/mnt/fcvm-btrfs/vm-disks/{vm_id}/disks/rootfs.raw` (sparse, expanded per `--rootfs-size`)
 - Initrd: `/mnt/fcvm-btrfs/initrd/fc-agent-{sha}.initrd` (injects fc-agent at boot)
+
+**Per-VM Disk Sizing (`--rootfs-size`):**
+- Default: `10G` — ensures at least 10G free space on root filesystem
+- After btrfs reflink copy, `dumpe2fs` checks free space; if below threshold, expands with `truncate` + `resize2fs`
+- Sparse files: only written blocks use real disk space (50G file with 2G content uses ~2G)
+- Included in `FirecrackerConfig.rootfs_size` → affects snapshot cache key (different sizes = different snapshots)
+- Clones inherit parent's disk size naturally (reflink copies the already-resized file)
+- Implementation: `src/storage/disk.rs::ensure_free_space()`, called from `src/commands/podman.rs`
 
 **Layer System:**
 The rootfs is named after the SHA of a combined script that includes:

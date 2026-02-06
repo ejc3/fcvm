@@ -109,6 +109,11 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 2048)]
     pub mem: u32,
 
+    /// Minimum free space on root filesystem (default: 10G).
+    /// Disk is expanded after CoW copy if free space is below this threshold.
+    #[arg(long, default_value = "10G")]
+    pub rootfs_size: String,
+
     /// Volume mapping(s): HOST:GUEST[:ro] (repeat or comma-separated)
     #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
     pub map: Vec<String>,
