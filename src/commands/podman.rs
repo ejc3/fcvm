@@ -1374,7 +1374,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     // Create startup snapshot channel for health-triggered snapshot creation
     // Only create startup snapshots if:
-    // - Not skipping snapshots (no --no-snapshot, no volumes, not localhost image)
+    // - Not skipping snapshots (no --no-snapshot, no volumes)
     // - Have a snapshot key
     // - Have a health_check URL configured (HTTP health check, not just container-ready)
     let (startup_tx, mut startup_rx): (
