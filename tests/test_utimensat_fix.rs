@@ -69,23 +69,29 @@ async fn test_utimensat_pjdfstest_nested_kernel() -> Result<()> {
     let map_arg = format!("{}:/testdir", data_dir);
 
     // Start VM with nested kernel (which has our patch)
+    // Disable writeback cache: the kernel's FUSE writeback cache suppresses
+    // server-side ctime updates via fuse_get_cache_mask() returning STATX_CTIME,
+    // causing utimensat ctime assertions to fail under parallel load.
     println!("2. Starting VM with nested kernel profile...");
-    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
-        "podman",
-        "run",
-        "--name",
-        &vm_name,
-        "--network",
-        "bridged",
-        "--kernel-profile",
-        "nested",
-        "--privileged",
-        "--map",
-        &map_arg,
-        "--cmd",
-        "prove -v -j 8 /opt/pjdfstest/tests/utimensat/",
-        "localhost/pjdfstest",
-    ])
+    let (mut child, fcvm_pid) = common::spawn_fcvm_with_env(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "bridged",
+            "--kernel-profile",
+            "nested",
+            "--privileged",
+            "--map",
+            &map_arg,
+            "--cmd",
+            "prove -v -j 8 /opt/pjdfstest/tests/utimensat/",
+            "localhost/pjdfstest",
+        ],
+        &[("FCVM_NO_WRITEBACK_CACHE", "1")],
+    )
     .await
     .context("spawning VM with nested kernel")?;
 

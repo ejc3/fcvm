@@ -99,6 +99,27 @@ fn propagate_max_write_from_cmdline() {
     }
 }
 
+/// Set FCVM_NO_WRITEBACK_CACHE from kernel boot param if not already set.
+/// This propagates the writeback cache disable flag to the fuse-pipe client.
+/// Used when ctime accuracy is required (e.g., POSIX compliance tests).
+fn propagate_no_writeback_cache_from_cmdline() {
+    // Skip if already set in environment
+    if std::env::var("FCVM_NO_WRITEBACK_CACHE").is_ok() {
+        return;
+    }
+
+    // Check kernel command line for no_writeback_cache=1
+    if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
+        for part in cmdline.split_whitespace() {
+            if part == "no_writeback_cache=1" {
+                std::env::set_var("FCVM_NO_WRITEBACK_CACHE", "1");
+                eprintln!("[fc-agent] disabled FUSE writeback cache from kernel cmdline");
+                return;
+            }
+        }
+    }
+}
+
 /// Mount a FUSE filesystem from host via vsock.
 ///
 /// This connects to the host VolumeServer at the given port and mounts
@@ -110,8 +131,9 @@ fn propagate_max_write_from_cmdline() {
 /// * `port` - The vsock port where the host VolumeServer is listening
 /// * `mount_point` - The path where the filesystem will be mounted
 pub fn mount_vsock(port: u32, mount_point: &str) -> anyhow::Result<()> {
-    // Propagate max_write limit from kernel cmdline to env var for fuse-pipe
+    // Propagate config from kernel cmdline to env vars for fuse-pipe
     propagate_max_write_from_cmdline();
+    propagate_no_writeback_cache_from_cmdline();
 
     let num_readers = get_num_readers();
     let trace_rate = get_trace_rate();
