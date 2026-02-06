@@ -173,41 +173,25 @@ Before considering code "done":
 
 **The ONLY acceptable fix:** Change the actual code so the test passes.
 
-## Debugging CI Failures
+## Evaluating CI Failures
 
-When CI fails but tests pass locally, SSH to a CI runner to debug:
+**NEVER assume failures are "unrelated" or "pre-existing" without evidence.**
 
-### Finding CI Runners
+Before claiming a test failure is unrelated to your PR:
 
-```bash
-# List running CI runners
-aws ec2 describe-instances --filters "Name=tag:Name,Values=*runner*" \
-  --query 'Reservations[].Instances[].[Tags[?Key==`Name`].Value|[0],PublicIpAddress,State.Name]' \
-  --output table
+1. **Check if main is green:**
+   ```bash
+   gh run list --branch main --limit 3 --json conclusion --jq '.[].conclusion'
+   ```
+2. **If main is green and your PR is red, the failure IS your fault.** Period.
+   - Don't say "pre-existing failure" — main proves otherwise
+   - Don't say "unrelated to this PR" — the evidence says otherwise
+   - The PR introduced or exposed the bug. Fix it.
 
-# SSH to a runner (use runner_key identity)
-ssh -i ~/.ssh/runner_key ubuntu@<IP>
-```
+3. **Only call a failure "pre-existing" if main is ALSO failing the same test:**
+   ```bash
+   # Check main's latest run for the same test
+   gh run view <main-run-id> --log 2>&1 | grep "<test_name>"
+   ```
 
-### Debugging on the Runner
-
-```bash
-# Check test logs
-ls -la /tmp/fcvm-test-logs/
-
-# Run failing test manually
-cd /opt/actions-runner/_work/fcvm/fcvm
-sudo -E cargo nextest run --release --features integration-fast -E 'test(<failing_test>)'
-
-# Check container environment
-podman run --rm --privileged alpine sh -c 'ip addr; cat /proc/sys/net/ipv6/conf/all/disable_ipv6'
-```
-
-### Container vs Host Differences
-
-Tests may fail in container CI but pass on host due to:
-- Network namespace nesting differences
-- IPv6 routing limitations in nested containers
-- cgroup controller availability
-
-If tests pass on Host-Root but fail on Container jobs, the issue is container-specific.
+**The rule:** Green main + red PR = PR caused it. No exceptions, no excuses.
