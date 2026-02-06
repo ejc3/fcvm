@@ -2233,22 +2233,23 @@ async fn run_vm_setup(
         }
         // Use | delimiter since : is part of IPv6 addresses
         runtime_boot_args.push_str(&format!("fcvm_dns={}", dns_servers.join("|")));
-    }
-    // Pass search domains for short hostname resolution
-    if let Ok(content) = std::fs::read_to_string("/run/systemd/resolve/resolv.conf")
-        .or_else(|_| std::fs::read_to_string("/etc/resolv.conf"))
-    {
-        let search: Vec<&str> = content
-            .lines()
-            .filter_map(|l| l.trim().strip_prefix("search "))
-            .next()
-            .map(|s| s.split_whitespace().collect())
-            .unwrap_or_default();
-        if !search.is_empty() {
-            if !runtime_boot_args.is_empty() {
-                runtime_boot_args.push(' ');
+
+        // Pass search domains for short hostname resolution (only when DNS servers are available)
+        if let Ok(content) = std::fs::read_to_string("/run/systemd/resolve/resolv.conf")
+            .or_else(|_| std::fs::read_to_string("/etc/resolv.conf"))
+        {
+            let search: Vec<&str> = content
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("search "))
+                .next()
+                .map(|s| s.split_whitespace().collect())
+                .unwrap_or_default();
+            if !search.is_empty() {
+                if !runtime_boot_args.is_empty() {
+                    runtime_boot_args.push(' ');
+                }
+                runtime_boot_args.push_str(&format!("fcvm_dns_search={}", search.join("|")));
             }
-            runtime_boot_args.push_str(&format!("fcvm_dns_search={}", search.join("|")));
         }
     }
 
