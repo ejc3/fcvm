@@ -2225,6 +2225,34 @@ async fn run_vm_setup(
         runtime_boot_args.push_str(&format!("ipv6={}|{}", guest_ipv6, host_ipv6));
     }
 
+    // Pass host DNS servers to guest for direct resolution (bypasses slirp's DNS proxy)
+    // This is needed on IPv6-only hosts where slirp's 10.0.2.3 can't forward to IPv6 nameservers
+    if let Ok(dns_servers) = crate::network::get_host_dns_servers() {
+        if !runtime_boot_args.is_empty() {
+            runtime_boot_args.push(' ');
+        }
+        // Use | delimiter since : is part of IPv6 addresses
+        runtime_boot_args.push_str(&format!("fcvm_dns={}", dns_servers.join("|")));
+
+        // Pass search domains for short hostname resolution (only when DNS servers are available)
+        if let Ok(content) = std::fs::read_to_string("/run/systemd/resolve/resolv.conf")
+            .or_else(|_| std::fs::read_to_string("/etc/resolv.conf"))
+        {
+            let search: Vec<&str> = content
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("search "))
+                .next()
+                .map(|s| s.split_whitespace().collect())
+                .unwrap_or_default();
+            if !search.is_empty() {
+                if !runtime_boot_args.is_empty() {
+                    runtime_boot_args.push(' ');
+                }
+                runtime_boot_args.push_str(&format!("fcvm_dns_search={}", search.join("|")));
+            }
+        }
+    }
+
     // Enable fc-agent strace debugging if requested
     if args.strace_agent {
         if !runtime_boot_args.is_empty() {
@@ -2605,6 +2633,9 @@ async fn run_vm_setup(
                     .or_else(|| std::env::var("http_proxy").ok())
                     .or_else(|| std::env::var("HTTP_PROXY").ok())
                     .and_then(|url| resolve_proxy_url(&url)),
+                "no_proxy": std::env::var("no_proxy")
+                    .or_else(|_| std::env::var("NO_PROXY"))
+                    .ok(),
             },
             "host-time": chrono::Utc::now().timestamp().to_string(),
         }

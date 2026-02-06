@@ -48,6 +48,9 @@ struct Plan {
     /// HTTPS proxy for container registry access
     #[serde(default)]
     https_proxy: Option<String>,
+    /// Hosts/domains that bypass the proxy
+    #[serde(default)]
+    no_proxy: Option<String>,
 }
 
 /// Volume mount configuration from MMDS
@@ -1949,11 +1952,37 @@ fn configure_dns_from_cmdline() {
         return;
     };
 
+    // Check for fcvm_dns= boot parameter (host's real DNS servers, pipe-separated)
+    // This overrides slirp's 10.0.2.3 for direct DNS resolution on IPv6-only hosts
+    let nameservers: Vec<String> = cmdline
+        .split_whitespace()
+        .find(|s| s.starts_with("fcvm_dns="))
+        .map(|s| {
+            s.trim_start_matches("fcvm_dns=")
+                .split('|')
+                .map(|ns| ns.to_string())
+                .collect()
+        })
+        .unwrap_or_else(|| vec![nameserver.to_string()]);
+
+    // Check for fcvm_dns_search= boot parameter (search domains, pipe-separated)
+    let search_domains: Option<String> = cmdline
+        .split_whitespace()
+        .find(|s| s.starts_with("fcvm_dns_search="))
+        .map(|s| s.trim_start_matches("fcvm_dns_search=").replace('|', " "));
+
     // Write to /etc/resolv.conf
-    let resolv_conf = format!("nameserver {}\n", nameserver);
+    let mut resolv_conf = String::new();
+    if let Some(ref search) = search_domains {
+        resolv_conf.push_str(&format!("search {}\n", search));
+    }
+    for ns in &nameservers {
+        resolv_conf.push_str(&format!("nameserver {}\n", ns));
+    }
+
     match std::fs::write("/etc/resolv.conf", &resolv_conf) {
         Ok(_) => {
-            eprintln!("[fc-agent] ✓ configured DNS: nameserver {}", nameserver);
+            eprintln!("[fc-agent] ✓ configured DNS: {}", resolv_conf.trim());
         }
         Err(e) => {
             eprintln!(
@@ -2086,6 +2115,12 @@ fn save_proxy_settings(plan: &Plan) {
         content.push_str(&format!("HTTPS_PROXY={}\n", proxy));
         env_vars.push(("https_proxy", proxy.clone()));
         env_vars.push(("HTTPS_PROXY", proxy.clone()));
+    }
+    if let Some(ref no_proxy) = plan.no_proxy {
+        content.push_str(&format!("no_proxy={}\n", no_proxy));
+        content.push_str(&format!("NO_PROXY={}\n", no_proxy));
+        env_vars.push(("no_proxy", no_proxy.clone()));
+        env_vars.push(("NO_PROXY", no_proxy.clone()));
     }
 
     if content.is_empty() {
@@ -2350,6 +2385,10 @@ async fn run_agent() -> Result<()> {
             if let Some(ref proxy) = plan.https_proxy {
                 cmd.env("https_proxy", proxy);
                 cmd.env("HTTPS_PROXY", proxy);
+            }
+            if let Some(ref no_proxy) = plan.no_proxy {
+                cmd.env("no_proxy", no_proxy);
+                cmd.env("NO_PROXY", no_proxy);
             }
             let mut child = cmd
                 .stdout(Stdio::piped())
