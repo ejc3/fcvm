@@ -13,6 +13,11 @@ data_dir = "/mnt/fcvm-btrfs"
 # All nesting levels share this for deduplication via btrfs reflinks
 assets_dir = "/mnt/fcvm-btrfs"
 
+# Size of the btrfs loopback filesystem (sparse file, only written blocks use real space)
+# Only used on non-btrfs hosts where a loopback image must be created.
+# Ignored if the host filesystem is already btrfs.
+btrfs_size = "60G"
+
 # Rootfs Modification Plan
 #
 # The SHA256 of the generated setup script determines the image name: layer2-{sha}.raw

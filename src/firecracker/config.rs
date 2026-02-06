@@ -58,6 +58,14 @@ pub struct FirecrackerConfig {
     /// Affects MMDS plan and container stdin handling.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub interactive: bool,
+    /// Minimum free space on root filesystem (e.g., "10G").
+    /// Affects disk size after CoW copy, so must be in cache key.
+    #[serde(default = "default_rootfs_size")]
+    pub rootfs_size: String,
+}
+
+fn default_rootfs_size() -> String {
+    "10G".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +132,7 @@ impl FirecrackerConfig {
         privileged: bool,
         tty: bool,
         interactive: bool,
+        rootfs_size: String,
     ) -> Self {
         Self {
             boot_source: BootSource {
@@ -151,6 +160,7 @@ impl FirecrackerConfig {
             privileged,
             tty,
             interactive,
+            rootfs_size,
         }
     }
 
@@ -260,6 +270,7 @@ mod tests {
             false,
             false,
             false,
+            "10G".to_string(),
         )
     }
 

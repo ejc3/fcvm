@@ -1,7 +1,7 @@
-use anyhow::{Context, Result};
-use std::path::PathBuf;
+use anyhow::{bail, Context, Result};
+use std::path::{Path, PathBuf};
 use tokio::fs;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Configuration for a VM disk
 #[derive(Debug, Clone)]
@@ -122,4 +122,139 @@ impl DiskManager {
 
         Ok(())
     }
+}
+
+/// Ensure the ext4 filesystem has at least `min_free + extra_bytes` of free space.
+/// `extra_bytes` accounts for content that will be written after boot (e.g., container image layers).
+pub async fn ensure_free_space(
+    disk_path: &Path,
+    min_free_str: &str,
+    extra_bytes: u64,
+) -> Result<()> {
+    let min_free = parse_size(min_free_str)
+        .with_context(|| format!("parsing rootfs-size '{}'", min_free_str))?
+        + extra_bytes;
+
+    if min_free == 0 {
+        return Ok(());
+    }
+
+    // Get current free space via dumpe2fs
+    let output = tokio::process::Command::new("dumpe2fs")
+        .args(["-h", disk_path.to_string_lossy().as_ref()])
+        .output()
+        .await
+        .context("running dumpe2fs")?;
+
+    if !output.status.success() {
+        bail!(
+            "dumpe2fs failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let block_size = parse_dumpe2fs_value(&stdout, "Block size")?;
+    let free_blocks = parse_dumpe2fs_value(&stdout, "Free blocks")?;
+    let free_bytes = free_blocks * block_size;
+
+    if free_bytes >= min_free {
+        debug!(
+            disk = %disk_path.display(),
+            free_bytes,
+            min_free,
+            "disk already has sufficient free space"
+        );
+        return Ok(());
+    }
+
+    let expand_by = min_free - free_bytes;
+    info!(
+        disk = %disk_path.display(),
+        free_bytes,
+        min_free,
+        expand_by,
+        "expanding rootfs to ensure minimum free space"
+    );
+
+    // Expand the sparse file
+    let output = tokio::process::Command::new("truncate")
+        .args([
+            "-s",
+            &format!("+{}", expand_by),
+            disk_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .await
+        .context("expanding disk file")?;
+
+    if !output.status.success() {
+        bail!(
+            "truncate failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Check filesystem before resize (required by resize2fs)
+    let _ = tokio::process::Command::new("e2fsck")
+        .args(["-f", "-y", disk_path.to_string_lossy().as_ref()])
+        .output()
+        .await;
+
+    // Resize ext4 filesystem to fill the new space
+    let output = tokio::process::Command::new("resize2fs")
+        .arg(disk_path.to_string_lossy().as_ref())
+        .output()
+        .await
+        .context("resizing ext4 filesystem")?;
+
+    if !output.status.success() {
+        bail!(
+            "resize2fs failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    info!(disk = %disk_path.display(), "rootfs expanded successfully");
+    Ok(())
+}
+
+/// Parse a value from dumpe2fs -h output (e.g., "Block size:          4096")
+fn parse_dumpe2fs_value(output: &str, key: &str) -> Result<u64> {
+    for line in output.lines() {
+        if line.starts_with(key) {
+            if let Some(value) = line.split(':').nth(1) {
+                return value
+                    .trim()
+                    .parse::<u64>()
+                    .with_context(|| format!("parsing {} value", key));
+            }
+        }
+    }
+    bail!("'{}' not found in dumpe2fs output", key)
+}
+
+/// Parse size strings like "10G", "500M", "1024K", or plain bytes.
+/// Integers only — "10.5G" is not supported (matches truncate(1) convention).
+pub fn parse_size(s: &str) -> Result<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        bail!("empty size string");
+    }
+
+    let (num_str, multiplier) = if s.ends_with('G') || s.ends_with('g') {
+        (&s[..s.len() - 1], 1024u64 * 1024 * 1024)
+    } else if s.ends_with('M') || s.ends_with('m') {
+        (&s[..s.len() - 1], 1024u64 * 1024)
+    } else if s.ends_with('K') || s.ends_with('k') {
+        (&s[..s.len() - 1], 1024u64)
+    } else {
+        (s, 1u64)
+    };
+
+    let num: u64 = num_str
+        .parse()
+        .with_context(|| format!("parsing size number '{}'", num_str))?;
+
+    Ok(num * multiplier)
 }
