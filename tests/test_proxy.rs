@@ -245,8 +245,20 @@ async fn test_egress_to_addr(bind_addr: &str, vm_target_addr: &str, addr_type: &
         anyhow::bail!("[{}] VM never became healthy: {}", addr_type, e);
     }
 
-    let result =
-        common::exec_in_container(pid, &["wget", "-q", "-O", "-", "--timeout=10", &vm_url]).await;
+    let result = common::exec_in_container(
+        pid,
+        &[
+            "wget",
+            "-q",
+            "-O",
+            "-",
+            "-Y",
+            "off",
+            "--timeout=10",
+            &vm_url,
+        ],
+    )
+    .await;
 
     test_server.stop().await;
     common::kill_process(pid).await;

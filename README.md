@@ -795,8 +795,11 @@ See [DESIGN.md](DESIGN.md#cli-interface) for architecture and design decisions.
 
 | Mode | Flag | Root | Notes |
 |------|------|------|-------|
-| Rootless | `--network rootless` (default) | No | slirp4netns, no root needed |
-| Bridged | `--network bridged` | Yes | iptables NAT |
+| Rootless | `--network rootless` (default) | No | slirp4netns with bridge, IPv6 support |
+| Bridged | `--network bridged` | Yes | iptables NAT, better performance |
+
+**Rootless architecture**: Uses a Linux bridge (br0) for L2 forwarding between slirp4netns and Firecracker.
+The bridge preserves MAC addresses for proper ARP/NDP learning, enabling IPv6 support.
 
 ### Host Service Access (Rootless Mode)
 
@@ -1170,6 +1173,37 @@ After changing the config, run `fcvm setup` to rebuild the rootfs with the new S
 ### Tests hang indefinitely
 - VMs may not be cleaning up properly
 - Manual cleanup: `ps aux | grep fcvm | grep test | awk '{print $2}' | xargs sudo kill`
+
+### Debugging Network Issues
+
+Spawn quick one-off VMs with inline commands to diagnose network problems:
+
+```bash
+# Test connectivity incrementally: gateway → DNS → external
+./target/release/fcvm podman run --name net-debug-$(date +%s) --privileged alpine:latest sh -c "
+echo '=== Network config ==='
+ip addr show eth0
+ip route
+cat /etc/resolv.conf
+echo ''
+echo '=== Gateway ==='
+ping -c 2 -W 3 10.0.2.2 || echo 'gateway failed'
+echo ''
+echo '=== DNS ==='
+nslookup example.com || echo 'DNS failed'
+echo ''
+echo '=== External ==='
+wget -q -O - --timeout=10 http://ifconfig.me || echo 'external failed'
+" 2>&1 &
+sleep 60  # Wait for VM to boot and run commands
+```
+
+**Inspect namespace for running VM:**
+```bash
+HOLDER_PID=$(cat /mnt/fcvm-btrfs/state/*.json | jq -r '.holder_pid')
+sudo nsenter --net=/proc/$HOLDER_PID/ns/net ip addr
+sudo nsenter --net=/proc/$HOLDER_PID/ns/net bridge link  # Show bridge ports
+```
 
 ### KVM not available
 - Firecracker requires `/dev/kvm`

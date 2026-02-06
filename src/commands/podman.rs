@@ -1,11 +1,78 @@
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
+use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::cli::{NetworkMode, PodmanArgs, PodmanCommands, RunArgs};
+
+/// Resolve a proxy URL's hostname to an IP address.
+///
+/// VMs using slirp4netns with --enable-ipv6 can reach both IPv4 (via 10.0.2.2 gateway)
+/// and IPv6 (via fd00::2 gateway) addresses. We prefer IPv4 but fall back to IPv6.
+/// Returns None only if the hostname can't be resolved at all.
+fn resolve_proxy_url(url: &str) -> Option<String> {
+    // Parse URL to extract scheme, host, port
+    let scheme = if url.starts_with("https://") {
+        "https"
+    } else {
+        "http"
+    };
+    let without_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+
+    // Parse host:port
+    let (host_port, path) = without_scheme
+        .find('/')
+        .map(|i| (&without_scheme[..i], &without_scheme[i..]))
+        .unwrap_or((without_scheme, ""));
+
+    // Try to resolve to an IP address (prefer IPv4, fall back to IPv6)
+    match host_port.to_socket_addrs() {
+        Ok(addrs) => {
+            let addrs: Vec<_> = addrs.collect();
+
+            // First pass: look for IPv4
+            for addr in &addrs {
+                if addr.is_ipv4() {
+                    debug!(
+                        original = %url,
+                        resolved = %addr,
+                        "resolved proxy hostname to IPv4"
+                    );
+                    return Some(format!("{}://{}{}", scheme, addr, path));
+                }
+            }
+
+            // Second pass: use IPv6 if no IPv4 available
+            // With --enable-ipv6 and --outbound-addr6, VM can reach IPv6 via fd00::2 gateway
+            for addr in &addrs {
+                if addr.is_ipv6() {
+                    info!(
+                        original = %url,
+                        resolved = %addr,
+                        "resolved proxy hostname to IPv6 (no IPv4 available)"
+                    );
+                    // Format IPv6 with brackets: http://[::1]:8080
+                    let ip = addr.ip();
+                    let port = addr.port();
+                    return Some(format!("{}://[{}]:{}{}", scheme, ip, port, path));
+                }
+            }
+
+            warn!(url = %url, "proxy resolved but no addresses found");
+            None
+        }
+        Err(e) => {
+            warn!(url = %url, error = %e, "failed to resolve proxy hostname");
+            None
+        }
+    }
+}
 use crate::firecracker::VmManager;
 use crate::network::{BridgedNetwork, NetworkConfig, NetworkManager, PortMapping, SlirpNetwork};
 use crate::paths;
@@ -2120,8 +2187,9 @@ async fn run_vm_setup(
             .as_ref()
             .map(|dns| format!(":{}", dns))
             .unwrap_or_default();
+        // Use /24 netmask for slirp4netns (10.0.2.0/24) or bridged (172.30.x.0/24)
         runtime_boot_args.push_str(&format!(
-            "ip={}::{}:255.255.255.252::eth0:off{}",
+            "ip={}::{}:255.255.255.0::eth0:off{}",
             guest_ip_clean, host_ip_clean, dns_suffix
         ));
     }
@@ -2506,15 +2574,18 @@ async fn run_vm_setup(
                 "privileged": args.privileged,
                 "interactive": args.interactive,
                 "tty": args.tty,
-                // Use network-provided proxy, or fall back to environment variables
+                // Use network-provided proxy, or fall back to environment variables.
+                // Resolve hostname to IPv4 since slirp VMs can only reach IPv4 addresses.
                 "http_proxy": network_config.http_proxy.clone()
                     .or_else(|| std::env::var("http_proxy").ok())
-                    .or_else(|| std::env::var("HTTP_PROXY").ok()),
+                    .or_else(|| std::env::var("HTTP_PROXY").ok())
+                    .and_then(|url| resolve_proxy_url(&url)),
                 "https_proxy": network_config.http_proxy.clone()
                     .or_else(|| std::env::var("https_proxy").ok())
                     .or_else(|| std::env::var("HTTPS_PROXY").ok())
                     .or_else(|| std::env::var("http_proxy").ok())
-                    .or_else(|| std::env::var("HTTP_PROXY").ok()),
+                    .or_else(|| std::env::var("HTTP_PROXY").ok())
+                    .and_then(|url| resolve_proxy_url(&url)),
             },
             "host-time": chrono::Utc::now().timestamp().to_string(),
         }

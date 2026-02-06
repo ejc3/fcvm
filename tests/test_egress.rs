@@ -331,6 +331,8 @@ async fn test_egress(fcvm_path: &std::path::Path, pid: u32, egress_url: &str) ->
             "--",
             "curl",
             "-s",
+            "--noproxy",
+            "*",
             "--max-time",
             "5",
             egress_url,
@@ -370,6 +372,8 @@ async fn test_egress(fcvm_path: &std::path::Path, pid: u32, egress_url: &str) ->
             "-q",
             "-O",
             "-",
+            "-Y",
+            "off",
             "--timeout=10",
             egress_url,
         ])

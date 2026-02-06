@@ -407,7 +407,7 @@ async fn watch_restore_epoch() {
     }
 }
 
-/// Handle clone restore: kill stale sockets, flush ARP, and remount volumes
+/// Handle clone restore: kill stale sockets, flush ARP, send gratuitous ARP, and remount volumes
 async fn handle_clone_restore(volumes: &[VolumeMount]) {
     // 1. KILL all established TCP connections immediately
     // After snapshot restore, existing TCP connections are DEAD (different network namespace).
@@ -418,10 +418,15 @@ async fn handle_clone_restore(volumes: &[VolumeMount]) {
     // 2. Flush ARP cache (stale MAC entries from previous network)
     flush_arp_cache().await;
 
+    // 3. Send gratuitous ARP to teach new slirp4netns our MAC address
+    // Critical for bridge-based networking: the new slirp4netns process doesn't
+    // know our MAC, so health checks would fail without this.
+    send_gratuitous_arp().await;
+
     // Note: Interface bounce (ip link down/up) is NOT needed - ss -K handles socket cleanup
     // more effectively by directly destroying sockets rather than hoping they notice ENETDOWN.
 
-    // 3. Remount FUSE volumes if any
+    // 4. Remount FUSE volumes if any
     if !volumes.is_empty() {
         eprintln!(
             "[fc-agent] clone has {} volume(s) to remount",
@@ -539,6 +544,63 @@ async fn flush_arp_cache() {
         }
         Err(e) => {
             eprintln!("[fc-agent] WARNING: ARP flush error: {}", e);
+        }
+    }
+}
+
+/// Send gratuitous ARP to announce guest's MAC address to the network.
+/// This is critical after clone restore: the new slirp4netns process doesn't
+/// know the guest's MAC address. Without this, health checks fail because
+/// slirp can't route packets to the guest.
+///
+/// Uses ping to the gateway which forces an ARP exchange.
+async fn send_gratuitous_arp() {
+    // Get the default gateway IP
+    let route_output = Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .await;
+
+    let gateway = match route_output {
+        Ok(o) if o.status.success() => {
+            let output = String::from_utf8_lossy(&o.stdout);
+            // Parse "default via 10.0.2.2 dev eth0" to get gateway IP
+            output
+                .split_whitespace()
+                .skip_while(|&s| s != "via")
+                .nth(1)
+                .map(|s| s.to_string())
+        }
+        _ => None,
+    };
+
+    let Some(gateway) = gateway else {
+        eprintln!("[fc-agent] WARNING: could not determine gateway for gratuitous ARP");
+        return;
+    };
+
+    eprintln!("[fc-agent] sending gratuitous ARP to gateway {}", gateway);
+
+    // Ping the gateway to force an ARP exchange
+    // This makes slirp4netns learn our MAC address
+    let ping_output = Command::new("ping")
+        .args(["-c", "1", "-W", "1", &gateway])
+        .output()
+        .await;
+
+    match ping_output {
+        Ok(o) if o.status.success() => {
+            eprintln!("[fc-agent] ✓ gratuitous ARP sent (pinged gateway)");
+        }
+        Ok(o) => {
+            // Ping may fail (ICMP blocked) but ARP was still sent
+            eprintln!(
+                "[fc-agent] gratuitous ARP sent (ping returned: {})",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: failed to send gratuitous ARP: {}", e);
         }
     }
 }

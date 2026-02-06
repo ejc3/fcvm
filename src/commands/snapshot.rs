@@ -665,18 +665,10 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 .await
                 .context("allocating loopback IP")?;
 
-            let mut net =
-                SlirpNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
-                    .with_loopback_ip(loopback_ip);
-            // If snapshot has saved network config with guest_ip, use it
-            // This is critical: clones restore with the baseline's IP configuration
-            if let Some(ref guest_ip) = saved_network.guest_ip {
-                net = net.with_guest_ip(guest_ip.clone());
-                info!(
-                    guest_ip = %guest_ip,
-                    "clone will use same network config as snapshot"
-                );
-            }
+            // With bridge mode, guest IP is always 10.0.2.100 on slirp network
+            // Each clone runs in its own namespace, so no IP conflict
+            let net = SlirpNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
+                .with_loopback_ip(loopback_ip);
             Box::new(net)
         }
     };
