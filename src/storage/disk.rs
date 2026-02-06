@@ -141,7 +141,7 @@ pub async fn ensure_free_space(
 
     // Get current free space via dumpe2fs
     let output = tokio::process::Command::new("dumpe2fs")
-        .args(["-h", disk_path.to_str().unwrap()])
+        .args(["-h", disk_path.to_string_lossy().as_ref()])
         .output()
         .await
         .context("running dumpe2fs")?;
@@ -182,7 +182,7 @@ pub async fn ensure_free_space(
         .args([
             "-s",
             &format!("+{}", expand_by),
-            disk_path.to_str().unwrap(),
+            disk_path.to_string_lossy().as_ref(),
         ])
         .output()
         .await
@@ -197,13 +197,13 @@ pub async fn ensure_free_space(
 
     // Check filesystem before resize (required by resize2fs)
     let _ = tokio::process::Command::new("e2fsck")
-        .args(["-f", "-y", disk_path.to_str().unwrap()])
+        .args(["-f", "-y", disk_path.to_string_lossy().as_ref()])
         .output()
         .await;
 
     // Resize ext4 filesystem to fill the new space
     let output = tokio::process::Command::new("resize2fs")
-        .arg(disk_path.to_str().unwrap())
+        .arg(disk_path.to_string_lossy().as_ref())
         .output()
         .await
         .context("resizing ext4 filesystem")?;
@@ -234,7 +234,8 @@ fn parse_dumpe2fs_value(output: &str, key: &str) -> Result<u64> {
     bail!("'{}' not found in dumpe2fs output", key)
 }
 
-/// Parse size strings like "10G", "500M", "1024K", or plain bytes
+/// Parse size strings like "10G", "500M", "1024K", or plain bytes.
+/// Integers only — "10.5G" is not supported (matches truncate(1) convention).
 pub fn parse_size(s: &str) -> Result<u64> {
     let s = s.trim();
     if s.is_empty() {
