@@ -63,10 +63,10 @@ runtime = ["podman", "crun", "fuse-overlayfs", "skopeo", "uidmap"]
 fuse = ["fuse3"]
 
 # System services and disk/filesystem tools for nested --disk-dir and --nfs
-system = ["haveged", "chrony", "rsync", "nfs-common"]
+system = ["haveged", "chrony", "rsync", "nfs-common", "iptables"]
 
-# Debugging tools
-debug = ["strace"]
+# Debugging and networking tools
+debug = ["strace", "netcat-openbsd"]
 
 [services]
 # Services to enable

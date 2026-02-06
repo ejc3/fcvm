@@ -1161,7 +1161,7 @@ fn snapshot_run_firecracker_overrides(
     )
 }
 
-pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
+pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     info!("Starting fcvm podman run");
 
     // Validate VM name before any setup work
@@ -1171,6 +1171,19 @@ pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
     // Root users should run `fcvm setup` explicitly
     if args.setup && nix::unistd::geteuid().is_root() {
         bail!("--setup is not allowed when running as root. Run 'fcvm setup' first.");
+    }
+
+    // Resolve 0 → host values for cpu and mem
+    if args.cpu == 0 {
+        args.cpu = std::thread::available_parallelism()
+            .map(|n| n.get() as u8)
+            .unwrap_or(2);
+        info!("Using all host CPUs: {}", args.cpu);
+    }
+    if args.mem == 0 {
+        args.mem =
+            crate::host_memory_mib().context("failed to read host memory from /proc/meminfo")?;
+        info!("Using all host memory: {} MiB", args.mem);
     }
 
     // Build RuntimeConfig from kernel profile (replaces env var config passing)

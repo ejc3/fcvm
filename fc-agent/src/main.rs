@@ -36,6 +36,9 @@ struct Plan {
     /// Run container as USER:GROUP (e.g., "1000:1000")
     #[serde(default)]
     user: Option<String>,
+    /// Localhost ports to forward to host gateway via iptables DNAT
+    #[serde(default)]
+    forward_localhost: Vec<String>,
     /// Run container in privileged mode (allows mknod, device access, etc.)
     #[serde(default)]
     privileged: bool,
@@ -1940,12 +1943,10 @@ fn mount_fuse_volumes(volumes: &[VolumeMount]) -> Result<Vec<String>> {
         let path = std::path::Path::new(&vol.guest_path);
         let mut ready = false;
         for attempt in 1..=60 {
-            if let Ok(entries) = std::fs::read_dir(path) {
-                let count = entries.count();
+            if std::fs::read_dir(path).is_ok() {
                 eprintln!(
-                    "[fc-agent] ✓ mount {} ready ({} entries, {}ms)",
+                    "[fc-agent] ✓ mount {} ready ({}ms)",
                     vol.guest_path,
-                    count,
                     (attempt - 1) * 500
                 );
                 ready = true;
@@ -2487,6 +2488,44 @@ async fn run_agent() -> Result<()> {
 
     // Save proxy settings for exec commands to use
     save_proxy_settings(&plan);
+
+    // Forward specific localhost ports to host gateway via iptables DNAT.
+    // Only the listed ports are redirected — other localhost traffic stays local.
+    if !plan.forward_localhost.is_empty() {
+        // Allow routing from 127.0.0.0/8 to non-loopback destinations
+        let _ = std::process::Command::new("sysctl")
+            .args(["-w", "net.ipv4.conf.all.route_localnet=1"])
+            .output();
+        // Disable IPv6 on loopback so ::1 connections fall back to 127.0.0.1
+        // (IPv6 has no route_localnet equivalent — ::1 can't be DNAT'd)
+        let _ = std::process::Command::new("sysctl")
+            .args(["-w", "net.ipv6.conf.lo.disable_ipv6=1"])
+            .output();
+        for port in &plan.forward_localhost {
+            let _ = std::process::Command::new("iptables")
+                .args([
+                    "-t",
+                    "nat",
+                    "-A",
+                    "OUTPUT",
+                    "-d",
+                    "127.0.0.0/8",
+                    "-p",
+                    "tcp",
+                    "--dport",
+                    port,
+                    "-j",
+                    "DNAT",
+                    "--to-destination",
+                    "10.0.2.2",
+                ])
+                .output();
+        }
+        eprintln!(
+            "[fc-agent] ✓ forwarding localhost ports to host: {:?}",
+            plan.forward_localhost
+        );
+    }
 
     // Sync VM clock from host before launching container
     // This ensures TLS certificate validation works immediately

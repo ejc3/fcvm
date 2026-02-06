@@ -114,12 +114,12 @@ pub struct RunArgs {
     #[arg(long)]
     pub name: String,
 
-    /// vCPUs
-    #[arg(long, default_value_t = 2)]
+    /// vCPUs (0 = all host CPUs)
+    #[arg(long, default_value_t = 0)]
     pub cpu: u8,
 
-    /// Memory (MiB)
-    #[arg(long, default_value_t = 2048)]
+    /// Memory in MiB (0 = all host memory)
+    #[arg(long, default_value_t = 0)]
     pub mem: u32,
 
     /// Minimum free space on root filesystem (default: 10G).
@@ -190,6 +190,12 @@ pub struct RunArgs {
     /// Equivalent to podman run --userns=keep-id on the host
     #[arg(long)]
     pub user: Option<String>,
+
+    /// Forward specific localhost ports to the host gateway via iptables DNAT.
+    /// Enables containers to reach host-only services via localhost.
+    /// Comma-separated port list, e.g., --forward-localhost 1421,9099
+    #[arg(long, value_delimiter = ',')]
+    pub forward_localhost: Vec<u16>,
 
     /// Run container in privileged mode (allows mknod, device access, etc.)
     /// Use for POSIX compliance tests that need full filesystem capabilities
