@@ -1696,8 +1696,20 @@ async fn run_vm_setup(
         .await
         .context("creating CoW disk")?;
 
-    // Ensure minimum free space (from --rootfs-size, stored in FirecrackerConfig)
-    crate::storage::disk::ensure_free_space(&rootfs_path, &args.rootfs_size)
+    // Estimate space needed for container image extraction inside VM.
+    // The archive is loaded via podman load which extracts layers onto the rootfs.
+    let image_overhead = if let Some(archive_name) = image_archive_name {
+        let archive_path = crate::paths::image_cache_dir().join(archive_name);
+        match tokio::fs::metadata(&archive_path).await {
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
+        }
+    } else {
+        0
+    };
+
+    // Ensure minimum free space (from --rootfs-size) plus room for the container image
+    crate::storage::disk::ensure_free_space(&rootfs_path, &args.rootfs_size, image_overhead)
         .await
         .context("ensuring rootfs free space")?;
 

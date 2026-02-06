@@ -124,11 +124,16 @@ impl DiskManager {
     }
 }
 
-/// Ensure the ext4 filesystem has at least `min_free` bytes of free space.
-/// If not, expand the file and resize the filesystem.
-pub async fn ensure_free_space(disk_path: &Path, min_free_str: &str) -> Result<()> {
+/// Ensure the ext4 filesystem has at least `min_free + extra_bytes` of free space.
+/// `extra_bytes` accounts for content that will be written after boot (e.g., container image layers).
+pub async fn ensure_free_space(
+    disk_path: &Path,
+    min_free_str: &str,
+    extra_bytes: u64,
+) -> Result<()> {
     let min_free = parse_size(min_free_str)
-        .with_context(|| format!("parsing rootfs-size '{}'", min_free_str))?;
+        .with_context(|| format!("parsing rootfs-size '{}'", min_free_str))?
+        + extra_bytes;
 
     if min_free == 0 {
         return Ok(());
