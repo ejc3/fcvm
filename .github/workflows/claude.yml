@@ -143,7 +143,7 @@ jobs:
       github.event_name == 'pull_request' &&
       !startsWith(github.event.pull_request.head.ref, 'claude/fix-')
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     concurrency:
       group: claude-review-${{ github.event.pull_request.number }}
       cancel-in-progress: true
@@ -216,7 +216,7 @@ jobs:
       github.event.issue.pull_request &&
       contains(github.event.comment.body, '/claude-review')
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     concurrency:
       group: claude-manual-${{ github.event.issue.number }}
       cancel-in-progress: true
@@ -392,7 +392,7 @@ jobs:
       !startsWith(github.event.workflow_run.head_branch, 'claude/fix-') &&
       github.event.workflow_run.name != 'Claude Assistant'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     concurrency:
       group: claude-cifix-${{ github.event.workflow_run.head_branch }}
       cancel-in-progress: true
