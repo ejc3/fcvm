@@ -1704,7 +1704,7 @@ fn mount_fuse_volumes(volumes: &[VolumeMount]) -> Result<Vec<String>> {
                     "[fc-agent] ✓ mount {} ready ({} entries, {}ms)",
                     vol.guest_path,
                     count,
-                    attempt * 500
+                    (attempt - 1) * 500
                 );
                 ready = true;
                 break;
@@ -1712,10 +1712,10 @@ fn mount_fuse_volumes(volumes: &[VolumeMount]) -> Result<Vec<String>> {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
         if !ready {
-            eprintln!(
-                "[fc-agent] ✗ mount {} NOT accessible after 30s",
+            return Err(anyhow::anyhow!(
+                "mount {} not accessible after 30s",
                 vol.guest_path
-            );
+            ));
         }
     }
 
