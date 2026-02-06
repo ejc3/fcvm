@@ -186,6 +186,11 @@ pub struct RunArgs {
     #[arg(long)]
     pub health_check: Option<String>,
 
+    /// Run container as USER:GROUP (e.g., --user 1000:1000)
+    /// Equivalent to podman run --userns=keep-id on the host
+    #[arg(long)]
+    pub user: Option<String>,
+
     /// Run container in privileged mode (allows mknod, device access, etc.)
     /// Use for POSIX compliance tests that need full filesystem capabilities
     #[arg(long)]

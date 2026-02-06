@@ -57,7 +57,7 @@ path = "opt/kata/share/kata-containers/vmlinux-6.12.47-173"
 
 [packages]
 # Container runtime
-runtime = ["podman", "crun", "fuse-overlayfs", "skopeo"]
+runtime = ["podman", "crun", "fuse-overlayfs", "skopeo", "uidmap"]
 
 # FUSE support for overlay filesystem
 fuse = ["fuse3"]

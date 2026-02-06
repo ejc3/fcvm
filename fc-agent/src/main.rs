@@ -33,6 +33,9 @@ struct Plan {
     /// Path to Docker archive for localhost/ images (imported via podman load)
     #[serde(default)]
     image_archive: Option<String>,
+    /// Run container as USER:GROUP (e.g., "1000:1000")
+    #[serde(default)]
+    user: Option<String>,
     /// Run container in privileged mode (allows mknod, device access, etc.)
     #[serde(default)]
     privileged: bool,
@@ -2811,6 +2814,80 @@ async fn run_agent() -> Result<()> {
         "--ulimit".to_string(),
         "nofile=65536:65536".to_string(),
     ];
+
+    // User mapping: run podman as the specified user with --userns=keep-id
+    // This replicates host behavior where rootless podman maps the user as root
+    // inside the container while keeping the real UID on shared mounts.
+    if let Some(ref user_spec) = plan.user {
+        // Parse "uid:gid" format
+        let parts: Vec<&str> = user_spec.split(':').collect();
+        let uid = parts[0];
+        let gid = parts.get(1).unwrap_or(&"100");
+        let username = format!("fcvm-user");
+
+        eprintln!(
+            "[fc-agent] setting up user mapping: uid={} gid={}",
+            uid, gid
+        );
+
+        // Create group and user in the VM
+        let _ = std::process::Command::new("groupadd")
+            .args(["-g", gid, &username])
+            .output();
+        let _ = std::process::Command::new("useradd")
+            .args(["-u", uid, "-g", gid, "-m", "-s", "/bin/sh", &username])
+            .output();
+
+        // Set up subuid/subgid for rootless podman
+        let subuid_entry = format!("{}:100000:65536\n", username);
+        let _ = std::fs::write("/etc/subuid", &subuid_entry);
+        let _ = std::fs::write("/etc/subgid", &subuid_entry);
+
+        // Ensure XDG_RUNTIME_DIR exists for rootless podman
+        let runtime_dir = format!("/run/user/{}", uid);
+        let _ = std::fs::create_dir_all(&runtime_dir);
+        let _ = std::process::Command::new("chown")
+            .args([&format!("{}:{}", uid, gid), &runtime_dir])
+            .output();
+
+        // Delegate cgroup subtree to the user for rootless podman
+        let cgroup_dir = format!("/sys/fs/cgroup/user.slice/user-{}.slice", uid);
+        let _ = std::fs::create_dir_all(&cgroup_dir);
+        let _ = std::process::Command::new("chown")
+            .args(["-R", &format!("{}:{}", uid, gid), &cgroup_dir])
+            .output();
+        // Enable controllers in the user's cgroup
+        for path in &[
+            "/sys/fs/cgroup/cgroup.subtree_control",
+            &format!("{}/cgroup.subtree_control", cgroup_dir),
+        ] {
+            let _ = std::fs::write(path, "+cpu +memory +pids");
+        }
+
+        // Delegate fc-agent's own cgroup to the user so rootless podman can create sub-cgroups
+        if let Ok(cgroup_path) = std::fs::read_to_string("/proc/self/cgroup") {
+            // Format: "0::/system.slice/fc-agent.service"
+            if let Some(path) = cgroup_path.trim().strip_prefix("0::") {
+                let full_path = format!("/sys/fs/cgroup{}", path);
+                let _ = std::process::Command::new("chown")
+                    .args(["-R", &format!("{}:{}", uid, gid), &full_path])
+                    .output();
+                eprintln!("[fc-agent] delegated cgroup {} to user {}", full_path, uid);
+            }
+        }
+
+        // Remove --cgroups=split (rootless podman uses cgroupfs, not split)
+        podman_args.retain(|a| a != "--cgroups=split");
+
+        // Add --userns=keep-id to podman args (replicates host behavior)
+        podman_args.push("--userns=keep-id".to_string());
+
+        // Wrap entire command with runuser to run podman as the target user
+        podman_args.insert(0, "--".to_string());
+        podman_args.insert(0, username.clone());
+        podman_args.insert(0, "-u".to_string());
+        podman_args.insert(0, "runuser".to_string());
+    }
 
     // Privileged mode: allows mknod, device access, etc. for POSIX compliance tests
     if plan.privileged {
