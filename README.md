@@ -29,7 +29,7 @@ A Rust implementation that launches Firecracker microVMs to run Podman container
 - For building rootfs: qemu-utils, e2fsprogs
 
 **Storage**
-- btrfs filesystem at `/mnt/fcvm-btrfs` (for CoW disk snapshots)
+- btrfs filesystem at `/mnt/fcvm-btrfs` (native btrfs used directly; loopback created on non-btrfs hosts)
 - Kernel auto-downloaded from Kata Containers release on first run
 
 ---

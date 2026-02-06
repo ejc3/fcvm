@@ -22,26 +22,14 @@ fn cleanup_mount(path: &Path) {
     let _ = Command::new("umount").arg(path).status();
 }
 
-/// Check if a path is a btrfs filesystem
-fn is_btrfs_mount(path: &Path) -> bool {
-    // Check if it's a mountpoint first
-    let output = Command::new("mountpoint").arg("-q").arg(path).status();
-
-    if output.map(|s| s.success()).unwrap_or(false) {
-        // Check filesystem type
-        let output = Command::new("stat")
-            .arg("-f")
-            .arg("-c")
-            .arg("%T")
-            .arg(path)
-            .output();
-
-        if let Ok(output) = output {
-            let fstype = String::from_utf8_lossy(&output.stdout);
-            return fstype.trim() == "btrfs";
-        }
-    }
-    false
+/// Check if a path is on a btrfs filesystem
+fn is_btrfs(path: &Path) -> bool {
+    Command::new("stat")
+        .args(["-f", "-c", "%T"])
+        .arg(path)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "btrfs")
+        .unwrap_or(false)
 }
 
 /// Get storage paths and btrfs size from config
@@ -95,7 +83,7 @@ pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
     let (mount_point, loopback_image, btrfs_size) = get_storage_paths(config_path)?;
 
     // Already btrfs? Just ensure directories exist (no root needed)
-    if is_btrfs_mount(&mount_point) {
+    if is_btrfs(&mount_point) {
         for dir in REQUIRED_DIRS {
             let path = mount_point.join(dir);
             std::fs::create_dir_all(&path).with_context(|| {

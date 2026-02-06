@@ -14,7 +14,8 @@ data_dir = "/mnt/fcvm-btrfs"
 assets_dir = "/mnt/fcvm-btrfs"
 
 # Size of the btrfs loopback filesystem (sparse file, only written blocks use real space)
-# Only used when creating a new loopback; ignored if already mounted
+# Only used on non-btrfs hosts where a loopback image must be created.
+# Ignored if the host filesystem is already btrfs.
 btrfs_size = "60G"
 
 # Rootfs Modification Plan
