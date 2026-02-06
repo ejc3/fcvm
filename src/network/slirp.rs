@@ -276,7 +276,7 @@ ip addr add {namespace_ip}/24 dev {bridge}
                     .output()
                 {
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    // getent output: "2401:db00:2ff:e002:face:b00c:0:1e10 fwdproxy"
+                    // getent output: "2001:db8::1 proxy.example.com"
                     if let Some(ipv6) = stdout.split_whitespace().next() {
                         // Check if it's IPv6 (contains ::)
                         if ipv6.contains(':') {

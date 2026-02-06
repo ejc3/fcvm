@@ -667,9 +667,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
             // With bridge mode, guest IP is always 10.0.2.100 on slirp network
             // Each clone runs in its own namespace, so no IP conflict
-            let net =
-                SlirpNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
-                    .with_loopback_ip(loopback_ip);
+            let net = SlirpNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
+                .with_loopback_ip(loopback_ip);
             Box::new(net)
         }
     };

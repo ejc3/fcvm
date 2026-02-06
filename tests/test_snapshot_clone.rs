@@ -920,6 +920,8 @@ async fn test_clone_http(
             "--",
             "curl",
             "-s",
+            "--noproxy",
+            "*",
             "--max-time",
             "10",
             egress_url,
