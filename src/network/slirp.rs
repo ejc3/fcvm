@@ -360,7 +360,17 @@ ip addr add {namespace_ip}/24 dev {bridge}
 
         match read_result {
             Ok(1) => info!("slirp4netns ready"),
-            Ok(0) => anyhow::bail!("slirp4netns exited before becoming ready"),
+            Ok(0) => {
+                // slirp4netns died — capture stderr for diagnostics
+                let output = child.wait_with_output().await?;
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr = stderr.trim();
+                if stderr.is_empty() {
+                    anyhow::bail!("slirp4netns exited before becoming ready (no stderr)");
+                } else {
+                    anyhow::bail!("slirp4netns exited before becoming ready: {}", stderr);
+                }
+            }
             Ok(n) => anyhow::bail!("unexpected read from slirp4netns ready_fd: {} bytes", n),
             Err(e) => anyhow::bail!("failed to read from slirp4netns ready_fd: {}", e),
         }
