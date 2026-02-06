@@ -1949,11 +1949,37 @@ fn configure_dns_from_cmdline() {
         return;
     };
 
+    // Check for fcvm_dns= boot parameter (host's real DNS servers, pipe-separated)
+    // This overrides slirp's 10.0.2.3 for direct DNS resolution on IPv6-only hosts
+    let nameservers: Vec<String> = cmdline
+        .split_whitespace()
+        .find(|s| s.starts_with("fcvm_dns="))
+        .map(|s| {
+            s.trim_start_matches("fcvm_dns=")
+                .split('|')
+                .map(|ns| ns.to_string())
+                .collect()
+        })
+        .unwrap_or_else(|| vec![nameserver.to_string()]);
+
+    // Check for fcvm_dns_search= boot parameter (search domains, pipe-separated)
+    let search_domains: Option<String> = cmdline
+        .split_whitespace()
+        .find(|s| s.starts_with("fcvm_dns_search="))
+        .map(|s| s.trim_start_matches("fcvm_dns_search=").replace('|', " "));
+
     // Write to /etc/resolv.conf
-    let resolv_conf = format!("nameserver {}\n", nameserver);
+    let mut resolv_conf = String::new();
+    if let Some(ref search) = search_domains {
+        resolv_conf.push_str(&format!("search {}\n", search));
+    }
+    for ns in &nameservers {
+        resolv_conf.push_str(&format!("nameserver {}\n", ns));
+    }
+
     match std::fs::write("/etc/resolv.conf", &resolv_conf) {
         Ok(_) => {
-            eprintln!("[fc-agent] ✓ configured DNS: nameserver {}", nameserver);
+            eprintln!("[fc-agent] ✓ configured DNS: {}", resolv_conf.trim());
         }
         Err(e) => {
             eprintln!(
