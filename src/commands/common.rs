@@ -290,6 +290,7 @@ pub async fn cleanup_vm(
     data_dir: &Path,
     health_cancel_token: Option<tokio_util::sync::CancellationToken>,
     health_monitor_handle: Option<JoinHandle<()>>,
+    output_listener_handle: Option<JoinHandle<Vec<(String, String)>>>,
 ) {
     info!("cleaning up resources");
 
@@ -304,6 +305,11 @@ pub async fn cleanup_vm(
                 debug!("health monitor didn't stop in time, continuing cleanup");
             }
         }
+    }
+
+    // Abort output listener task if still running
+    if let Some(handle) = output_listener_handle {
+        handle.abort();
     }
 
     // Cancel VolumeServer tasks
