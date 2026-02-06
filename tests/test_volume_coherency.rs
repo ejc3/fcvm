@@ -137,8 +137,7 @@ async fn test_volume_coherency_clone() -> Result<()> {
 
     // Step 4: Spawn clone (volumes reconstituted from snapshot metadata)
     println!("Step 4: Spawning clone...");
-    let (_clone_child, clone_pid) =
-        common::spawn_clone(serve_pid, &clone_name, "rootless").await?;
+    let (_clone_child, clone_pid) = common::spawn_clone(serve_pid, &clone_name, "rootless").await?;
 
     common::poll_health_by_pid(clone_pid, 120).await?;
     println!("  Clone healthy (PID: {})", clone_pid);

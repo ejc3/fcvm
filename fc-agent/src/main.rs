@@ -97,9 +97,6 @@ struct LatestMetadata {
     host_time: String,
     #[serde(rename = "restore-epoch")]
     restore_epoch: Option<String>,
-    /// Volume mounts for clone restore (provided by fcvm snapshot run)
-    #[serde(default)]
-    volumes: Vec<VolumeMount>,
 }
 
 /// Ensure cgroup controllers are available for container creation.
@@ -359,9 +356,11 @@ async fn fetch_plan() -> Result<Plan> {
     Ok(plan)
 }
 
-/// Watch for restore-epoch changes in MMDS and handle clone restore
-/// This runs as a background task to handle snapshot restore scenarios
-async fn watch_restore_epoch() {
+/// Watch for restore-epoch changes in MMDS and handle clone restore.
+/// `boot_volumes` are the volumes from the initial boot plan — these are used
+/// directly for remount since they're always correct (clones inherit the same
+/// volume config from the snapshot).
+async fn watch_restore_epoch(boot_volumes: Vec<VolumeMount>) {
     let mut last_epoch: Option<String> = None;
 
     // Poll every 100ms - simple and fast enough to detect restores quickly
@@ -376,7 +375,7 @@ async fn watch_restore_epoch() {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
-        // Try to fetch current metadata (including restore-epoch and volumes)
+        // Try to fetch current restore-epoch from MMDS
         let metadata = match fetch_latest_metadata(&client).await {
             Ok(m) => m,
             Err(_) => continue, // Ignore errors, just keep polling
@@ -390,16 +389,21 @@ async fn watch_restore_epoch() {
                     // On fresh boot, there is no restore-epoch in MMDS yet.
                     // If we see one, we were restored from a snapshot.
                     eprintln!(
-                        "[fc-agent] detected restore-epoch: {} (clone restore detected)",
-                        current
+                        "[fc-agent] detected restore-epoch: {} (clone restore detected, volumes: {})",
+                        current, boot_volumes.len()
                     );
-                    handle_clone_restore(&metadata.volumes).await;
+                    handle_clone_restore(&boot_volumes).await;
                     last_epoch = metadata.restore_epoch;
                 }
                 Some(prev) if prev != current => {
                     // Epoch changed! This means we were restored from snapshot again
-                    eprintln!("[fc-agent] restore-epoch changed: {} -> {}", prev, current);
-                    handle_clone_restore(&metadata.volumes).await;
+                    eprintln!(
+                        "[fc-agent] restore-epoch changed: {} -> {} (volumes: {})",
+                        prev,
+                        current,
+                        boot_volumes.len()
+                    );
+                    handle_clone_restore(&boot_volumes).await;
                     last_epoch = metadata.restore_epoch;
                 }
                 _ => {
@@ -492,13 +496,16 @@ async fn remount_fuse_volumes(volumes: &[VolumeMount]) {
             // Small delay to ensure unmount completes
             sleep(Duration::from_millis(100)).await;
 
-            // Create mount point directory (in case it doesn't exist)
+            // Ensure mount point directory exists. Ignore AlreadyExists since
+            // the directory is expected to exist when remounting after snapshot.
             if let Err(e) = std::fs::create_dir_all(&vol.guest_path) {
-                eprintln!(
-                    "[fc-agent] ERROR: cannot create mount point {}: {}",
-                    vol.guest_path, e
-                );
-                break;
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    eprintln!(
+                        "[fc-agent] ERROR: cannot create mount point {}: {}",
+                        vol.guest_path, e
+                    );
+                    break;
+                }
             }
 
             // Mount FUSE filesystem in a background thread using fuse-pipe
@@ -562,7 +569,10 @@ async fn rebind_volumes_in_container(volumes: &[VolumeMount]) {
             return;
         }
         Err(e) => {
-            eprintln!("[fc-agent] podman inspect failed: {}, skipping mount rebind", e);
+            eprintln!(
+                "[fc-agent] podman inspect failed: {}, skipping mount rebind",
+                e
+            );
             return;
         }
     };
@@ -579,8 +589,7 @@ async fn rebind_volumes_in_container(volumes: &[VolumeMount]) {
         let pid = container_pid.clone();
         let path = vol.guest_path.clone();
 
-        let result =
-            tokio::task::spawn_blocking(move || rebind_mount_cross_ns(&pid, &path)).await;
+        let result = tokio::task::spawn_blocking(move || rebind_mount_cross_ns(&pid, &path)).await;
 
         match result {
             Ok(Ok(())) => {
@@ -2487,9 +2496,10 @@ async fn run_agent() -> Result<()> {
 
     // Start background task to watch for restore-epoch changes
     // This handles ARP cache flushing when VM is restored from snapshot
-    tokio::spawn(async {
+    let watcher_volumes = plan.volumes.clone();
+    tokio::spawn(async move {
         eprintln!("[fc-agent] starting restore-epoch watcher for ARP flush");
-        watch_restore_epoch().await;
+        watch_restore_epoch(watcher_volumes).await;
     });
 
     // Start exec server to allow host to run commands in VM
