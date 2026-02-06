@@ -1093,7 +1093,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         .context("parsing port mappings")?;
 
     // Parse volume mappings (HOST:GUEST[:ro])
-    let mut volume_mappings: Vec<VolumeMapping> = args
+    let volume_mappings: Vec<VolumeMapping> = args
         .map
         .iter()
         .map(|s| VolumeMapping::parse(s))
@@ -1102,7 +1102,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     // For localhost/ images, export as OCI archive for direct podman run
     // Uses content-addressable cache to avoid re-exporting the same image
-    let image_archive_name = if args.image.starts_with("localhost/") {
+    let image_disk_path = if args.image.starts_with("localhost/") {
         // Get image digest for content-addressable storage
         let inspect_output = tokio::process::Command::new("podman")
             .args(["image", "inspect", &args.image, "--format", "{{.Digest}}"])
@@ -1233,16 +1233,9 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         // Lock released when lock_file is dropped
         drop(lock_file);
 
-        // Add the image-cache directory as a read-only volume mount
-        // Guest will access the archive at /tmp/fcvm-image/{digest}.docker.tar
-        volume_mappings.push(VolumeMapping {
-            host_path: image_cache_dir.clone(),
-            guest_path: "/tmp/fcvm-image".to_string(),
-            read_only: true,
-        });
-
-        // Return the archive filename (relative to mount point)
-        Some(format!("{}.docker.tar", digest))
+        // Attach the tar directly as a Firecracker block device (read-only).
+        // fc-agent reads docker-archive:/dev/vdX — no FUSE, no ext4, no mount.
+        Some(archive_path)
     } else {
         None
     };
@@ -1471,7 +1464,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         &mut vm_state,
         &volume_mappings,
         &vsock_socket_path,
-        image_archive_name.as_deref(),
+        image_disk_path.as_deref(),
         fc_config,
     )
     .await;
@@ -1683,7 +1676,7 @@ async fn run_vm_setup(
     vm_state: &mut VmState,
     volume_mappings: &[VolumeMapping],
     vsock_socket_path: &std::path::Path,
-    image_archive_name: Option<&str>,
+    image_disk_path: Option<&std::path::Path>,
     fc_config: Option<crate::firecracker::FirecrackerConfig>,
 ) -> Result<(VmManager, Option<tokio::process::Child>)> {
     // Setup storage - just need CoW copy (fc-agent is injected via initrd at boot)
@@ -1698,9 +1691,8 @@ async fn run_vm_setup(
 
     // Estimate space needed for container image extraction inside VM.
     // The archive is loaded via podman load which extracts layers onto the rootfs.
-    let image_overhead = if let Some(archive_name) = image_archive_name {
-        let archive_path = crate::paths::image_cache_dir().join(archive_name);
-        match tokio::fs::metadata(&archive_path).await {
+    let image_overhead = if let Some(disk_path) = image_disk_path {
+        match tokio::fs::metadata(disk_path).await {
             Ok(meta) => meta.len(),
             Err(_) => 0,
         }
@@ -2443,6 +2435,36 @@ async fn run_vm_setup(
             )
             .await?;
     }
+    // Attach image archive as a raw read-only block device.
+    // fc-agent reads docker-archive:/dev/vdX directly — no FUSE, no mount.
+    let image_device = if let Some(disk_path) = image_disk_path {
+        let disk_idx = args.disk.len() + args.disk_dir.len();
+        let drive_id = format!("disk{}", disk_idx);
+        let device = format!("/dev/vd{}", (b'b' + disk_idx as u8) as char);
+
+        info!(
+            "Attaching image archive as block device: {} -> {}",
+            disk_path.display(),
+            device,
+        );
+        client
+            .add_drive(
+                &drive_id,
+                crate::firecracker::api::Drive {
+                    drive_id: drive_id.clone(),
+                    path_on_host: disk_path.display().to_string(),
+                    is_root_device: false,
+                    is_read_only: true,
+                    partuuid: None,
+                    rate_limiter: None,
+                },
+            )
+            .await?;
+        Some(device)
+    } else {
+        None
+    };
+
     vm_state.config.extra_disks = extra_disks;
 
     // Process --nfs: export directories via NFS for guest to mount
@@ -2617,7 +2639,7 @@ async fn run_vm_setup(
                 "volumes": volume_mounts,
                 "extra_disks": extra_disk_mounts,
                 "nfs_mounts": nfs_mounts,
-                "image_archive": image_archive_name.map(|name| format!("/tmp/fcvm-image/{}", name)),
+                "image_archive": image_device.clone(),
                 "privileged": args.privileged,
                 "interactive": args.interactive,
                 "tty": args.tty,
