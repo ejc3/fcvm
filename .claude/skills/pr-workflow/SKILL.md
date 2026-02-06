@@ -172,3 +172,42 @@ Before considering code "done":
 - Removing test coverage because it's "flaky"
 
 **The ONLY acceptable fix:** Change the actual code so the test passes.
+
+## Debugging CI Failures
+
+When CI fails but tests pass locally, SSH to a CI runner to debug:
+
+### Finding CI Runners
+
+```bash
+# List running CI runners
+aws ec2 describe-instances --filters "Name=tag:Name,Values=*runner*" \
+  --query 'Reservations[].Instances[].[Tags[?Key==`Name`].Value|[0],PublicIpAddress,State.Name]' \
+  --output table
+
+# SSH to a runner (use runner_key identity)
+ssh -i ~/.ssh/runner_key ubuntu@<IP>
+```
+
+### Debugging on the Runner
+
+```bash
+# Check test logs
+ls -la /tmp/fcvm-test-logs/
+
+# Run failing test manually
+cd /opt/actions-runner/_work/fcvm/fcvm
+sudo -E cargo nextest run --release --features integration-fast -E 'test(<failing_test>)'
+
+# Check container environment
+podman run --rm --privileged alpine sh -c 'ip addr; cat /proc/sys/net/ipv6/conf/all/disable_ipv6'
+```
+
+### Container vs Host Differences
+
+Tests may fail in container CI but pass on host due to:
+- Network namespace nesting differences
+- IPv6 routing limitations in nested containers
+- cgroup controller availability
+
+If tests pass on Host-Root but fail on Container jobs, the issue is container-specific.
