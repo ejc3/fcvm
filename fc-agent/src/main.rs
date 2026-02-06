@@ -1693,23 +1693,29 @@ fn mount_fuse_volumes(volumes: &[VolumeMount]) -> Result<Vec<String>> {
         mounted_paths.push(vol.guest_path.clone());
     }
 
-    // Give FUSE mounts time to initialize
-    if !volumes.is_empty() {
-        eprintln!("[fc-agent] waiting for FUSE mounts to initialize...");
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        // Verify each mount point is accessible
-        for vol in volumes {
-            let path = std::path::Path::new(&vol.guest_path);
+    // Wait for each FUSE mount to become accessible (up to 30s per mount)
+    for vol in volumes {
+        let path = std::path::Path::new(&vol.guest_path);
+        let mut ready = false;
+        for attempt in 1..=60 {
             if let Ok(entries) = std::fs::read_dir(path) {
                 let count = entries.count();
                 eprintln!(
-                    "[fc-agent] ✓ mount {} accessible ({} entries)",
-                    vol.guest_path, count
+                    "[fc-agent] ✓ mount {} ready ({} entries, {}ms)",
+                    vol.guest_path,
+                    count,
+                    attempt * 500
                 );
-            } else {
-                eprintln!("[fc-agent] ✗ mount {} NOT accessible", vol.guest_path);
+                ready = true;
+                break;
             }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        if !ready {
+            eprintln!(
+                "[fc-agent] ✗ mount {} NOT accessible after 30s",
+                vol.guest_path
+            );
         }
     }
 
