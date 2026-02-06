@@ -419,6 +419,7 @@ pub async fn restore_from_snapshot(
     network: &mut dyn NetworkManager,
     state_manager: &StateManager,
     vm_state: &mut VmState,
+    extra_mmds: Option<serde_json::Value>,
 ) -> Result<(VmManager, Option<tokio::process::Child>)> {
     let vm_dir = data_dir.join("disks");
 
@@ -759,13 +760,20 @@ pub async fn restore_from_snapshot(
         .context("system time before Unix epoch")?
         .as_secs();
 
-    client
-        .put_mmds(serde_json::json!({
-            "latest": {
-                "host-time": chrono::Utc::now().timestamp().to_string(),
-                "restore-epoch": restore_epoch.to_string()
+    let mut mmds_latest = serde_json::json!({
+        "host-time": chrono::Utc::now().timestamp().to_string(),
+        "restore-epoch": restore_epoch.to_string()
+    });
+    // Merge extra MMDS data (e.g. volume mounts for clone FUSE remount)
+    if let Some(extra) = extra_mmds {
+        if let (Some(target), Some(source)) = (mmds_latest.as_object_mut(), extra.as_object()) {
+            for (k, v) in source {
+                target.insert(k.clone(), v.clone());
             }
-        }))
+        }
+    }
+    client
+        .put_mmds(serde_json::json!({ "latest": mmds_latest }))
         .await
         .context("updating MMDS with restore-epoch")?;
     info!(
@@ -941,6 +949,24 @@ pub async fn create_snapshot_core(
     }
 
     info!(snapshot = %snapshot_config.name, "VM resumed, processing snapshot");
+
+    // Firecracker resets all vsock connections during snapshot creation
+    // (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET). Bump restore-epoch in MMDS so fc-agent's
+    // background watcher detects this and remounts FUSE volumes.
+    let restore_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Err(e) = client
+        .patch_mmds(serde_json::json!({
+            "latest": {
+                "restore-epoch": restore_epoch.to_string()
+            }
+        }))
+        .await
+    {
+        warn!(error = %e, "failed to bump restore-epoch after snapshot (FUSE remount may be delayed)");
+    }
 
     if has_base {
         // Diff snapshot: copy base to temp, merge diff onto it, then atomic rename

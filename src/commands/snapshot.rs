@@ -728,6 +728,22 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         snapshot_vm_id,
     };
 
+    // Build MMDS volume data so fc-agent can remount FUSE after clone restore
+    // (Firecracker resets vsock connections during snapshot, breaking FUSE mounts)
+    let extra_mmds = if !snapshot_config.metadata.volumes.is_empty() {
+        Some(serde_json::json!({
+            "volumes": snapshot_config.metadata.volumes.iter().map(|v| {
+                serde_json::json!({
+                    "guest_path": v.guest_path,
+                    "vsock_port": v.vsock_port,
+                    "read_only": v.read_only,
+                })
+            }).collect::<Vec<_>>()
+        }))
+    } else {
+        None
+    };
+
     // Run clone setup using shared restore function
     let setup_result = super::common::restore_from_snapshot(
         &vm_id,
@@ -740,6 +756,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         network.as_mut(),
         &state_manager,
         &mut vm_state,
+        extra_mmds,
     )
     .await;
 
