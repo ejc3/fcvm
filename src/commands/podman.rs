@@ -2279,6 +2279,14 @@ async fn run_vm_setup(
         runtime_boot_args.push_str(&format!("fuse_max_write={}", max_write));
     }
 
+    // Pass FUSE writeback cache disable flag to fc-agent via kernel command line.
+    if std::env::var("FCVM_NO_WRITEBACK_CACHE").is_ok() {
+        if !runtime_boot_args.is_empty() {
+            runtime_boot_args.push(' ');
+        }
+        runtime_boot_args.push_str("no_writeback_cache=1");
+    }
+
     // Apply FirecrackerConfig to client (boot_source, machine_config, rootfs drive)
     // This ensures the same config used for cache key is used for launch
     launch_config.apply(client, &runtime_boot_args).await?;
