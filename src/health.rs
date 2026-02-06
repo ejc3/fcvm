@@ -204,7 +204,7 @@ async fn check_container_running(pid: u32) -> bool {
         None => return false, // Can't find fcvm binary
     };
 
-    let cmd_future = tokio::process::Command::new(&exe)
+    let child = match tokio::process::Command::new(&exe)
         .args([
             "exec",
             "--pid",
@@ -217,19 +217,30 @@ async fn check_container_running(pid: u32) -> bool {
             "{{.State.Running}}",
             "fcvm-container",
         ])
-        .output();
-
-    let output = match tokio::time::timeout(HEALTH_CHECK_EXEC_TIMEOUT, cmd_future).await {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => {
-            debug!(target: "health-monitor", error = %e, "podman inspect exec failed");
-            return false;
-        }
-        Err(_) => {
-            debug!(target: "health-monitor", "podman inspect exec timed out");
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(target: "health-monitor", error = %e, "podman inspect spawn failed");
             return false;
         }
     };
+
+    let output =
+        match tokio::time::timeout(HEALTH_CHECK_EXEC_TIMEOUT, child.wait_with_output()).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                debug!(target: "health-monitor", error = %e, "podman inspect exec failed");
+                return false;
+            }
+            Err(_) => {
+                debug!(target: "health-monitor", "podman inspect exec timed out");
+                return false;
+            }
+        };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -256,7 +267,7 @@ async fn check_podman_healthcheck(pid: u32) -> Option<bool> {
         None => return Some(true), // Can't find fcvm binary, assume healthy
     };
 
-    let cmd_future = tokio::process::Command::new(&exe)
+    let child = match tokio::process::Command::new(&exe)
         .args([
             "exec",
             "--pid",
@@ -269,12 +280,24 @@ async fn check_podman_healthcheck(pid: u32) -> Option<bool> {
             "{{.State.Health.Status}}",
             "fcvm-container",
         ])
-        .output();
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(target: "health-monitor", error = %e, "podman healthcheck spawn failed");
+            return Some(false);
+        }
+    };
 
-    let output = match tokio::time::timeout(HEALTH_CHECK_EXEC_TIMEOUT, cmd_future).await {
+    // kill_on_drop ensures the child is killed if the timeout fires
+    let output = match tokio::time::timeout(HEALTH_CHECK_EXEC_TIMEOUT, child.wait_with_output())
+        .await
+    {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {
-            // Exec not available yet, don't assume healthy - keep checking
             debug!(target: "health-monitor", error = %e, "podman healthcheck exec failed, will retry");
             return Some(false);
         }
