@@ -31,7 +31,7 @@ pub enum VolumeResponse {
     Data { data: Vec<u8> },
 
     /// Number of bytes written.
-    Written { size: u32 },
+    Written { size: u64 },
 
     /// File opened response.
     Opened { fh: u64, flags: u32 },

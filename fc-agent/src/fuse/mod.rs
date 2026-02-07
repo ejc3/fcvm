@@ -74,29 +74,32 @@ fn get_trace_rate() -> u64 {
     0
 }
 
-/// Set FCVM_FUSE_MAX_WRITE from kernel boot param if not already set.
-/// This propagates the max_write limit to the fuse-pipe client which reads from env.
-/// Used to limit write sizes in nested VMs to avoid vsock data corruption.
-fn propagate_max_write_from_cmdline() {
-    // Skip if already set in environment
-    if std::env::var("FCVM_FUSE_MAX_WRITE").is_ok() {
-        return;
+/// Get max_write from FCVM_FUSE_MAX_WRITE env var or kernel boot param (0 = unbounded).
+/// Checks (in order):
+/// 1. FCVM_FUSE_MAX_WRITE environment variable
+/// 2. fuse_max_write=N kernel boot parameter (from /proc/cmdline)
+/// 3. Default: 0 (unbounded)
+fn get_max_write() -> u32 {
+    // First check environment variable
+    if let Some(n) = std::env::var("FCVM_FUSE_MAX_WRITE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        return n;
     }
 
-    // Check kernel command line for fuse_max_write=N
+    // Then check kernel command line
     if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
         for part in cmdline.split_whitespace() {
             if let Some(value) = part.strip_prefix("fuse_max_write=") {
-                // Set as environment variable for fuse-pipe to pick up
-                std::env::set_var("FCVM_FUSE_MAX_WRITE", value);
-                eprintln!(
-                    "[fc-agent] set FCVM_FUSE_MAX_WRITE={} from kernel cmdline",
-                    value
-                );
-                return;
+                if let Ok(n) = value.parse() {
+                    return n;
+                }
             }
         }
     }
+
+    0
 }
 
 /// Set FCVM_NO_WRITEBACK_CACHE from kernel boot param if not already set.
@@ -132,31 +135,21 @@ fn propagate_no_writeback_cache_from_cmdline() {
 /// * `mount_point` - The path where the filesystem will be mounted
 pub fn mount_vsock(port: u32, mount_point: &str) -> anyhow::Result<()> {
     // Propagate config from kernel cmdline to env vars for fuse-pipe
-    propagate_max_write_from_cmdline();
     propagate_no_writeback_cache_from_cmdline();
 
     let num_readers = get_num_readers();
     let trace_rate = get_trace_rate();
+    let max_write = get_max_write();
     eprintln!(
-        "[fc-agent] mounting FUSE volume at {} via vsock port {} ({} readers, trace_rate={})",
-        mount_point, port, num_readers, trace_rate
+        "[fc-agent] mounting FUSE volume at {} via vsock port {} ({} readers, trace_rate={}, max_write={})",
+        mount_point, port, num_readers, trace_rate, max_write
     );
-    fuse_pipe::mount_vsock_with_options(HOST_CID, port, mount_point, num_readers, trace_rate)
-}
-
-/// Mount a FUSE filesystem with multiple reader threads.
-///
-/// Same as `mount_vsock` but creates multiple FUSE reader threads for
-/// better parallel performance.
-#[allow(dead_code)]
-pub fn mount_vsock_with_readers(
-    port: u32,
-    mount_point: &str,
-    num_readers: usize,
-) -> anyhow::Result<()> {
-    eprintln!(
-        "[fc-agent] mounting FUSE volume at {} via vsock port {} ({} readers)",
-        mount_point, port, num_readers
-    );
-    fuse_pipe::mount_vsock_with_readers(HOST_CID, port, mount_point, num_readers)
+    fuse_pipe::mount_vsock_with_options(
+        HOST_CID,
+        port,
+        mount_point,
+        num_readers,
+        trace_rate,
+        max_write,
+    )
 }

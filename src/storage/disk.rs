@@ -196,10 +196,20 @@ pub async fn ensure_free_space(
     }
 
     // Check filesystem before resize (required by resize2fs)
-    let _ = tokio::process::Command::new("e2fsck")
+    let e2fsck_output = tokio::process::Command::new("e2fsck")
         .args(["-f", "-y", disk_path.to_string_lossy().as_ref()])
         .output()
-        .await;
+        .await
+        .context("running e2fsck")?;
+
+    // e2fsck exit codes: 0=clean, 1=corrected, 2=corrected+reboot needed
+    // Exit code >= 4 means uncorrected errors
+    if e2fsck_output.status.code().unwrap_or(8) >= 4 {
+        bail!(
+            "e2fsck found uncorrectable errors: {}",
+            String::from_utf8_lossy(&e2fsck_output.stderr)
+        );
+    }
 
     // Resize ext4 filesystem to fill the new space
     let output = tokio::process::Command::new("resize2fs")
@@ -256,5 +266,6 @@ pub fn parse_size(s: &str) -> Result<u64> {
         .parse()
         .with_context(|| format!("parsing size number '{}'", num_str))?;
 
-    Ok(num * multiplier)
+    num.checked_mul(multiplier)
+        .with_context(|| format!("size overflow: {} * {}", num, multiplier))
 }

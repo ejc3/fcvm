@@ -479,11 +479,18 @@ async fn create_disk_from_dir(
     );
 
     // Create sparse file
-    tokio::process::Command::new("truncate")
+    let truncate_status = tokio::process::Command::new("truncate")
         .args(["-s", &image_size.to_string(), output_path.to_str().unwrap()])
         .status()
         .await
         .context("creating sparse file")?;
+
+    if !truncate_status.success() {
+        bail!(
+            "truncate failed with exit code: {:?}",
+            truncate_status.code()
+        );
+    }
 
     // Format as ext4
     let mkfs = tokio::process::Command::new("mkfs.ext4")
