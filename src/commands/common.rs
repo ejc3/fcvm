@@ -1031,16 +1031,24 @@ pub async fn create_snapshot_core(
             .await
             .context("writing snapshot config")?;
 
-        // Atomic rename from temp to final location
-        // If final exists (e.g., from previous snapshot with same name), remove it first
+        // Atomic replace: rename old out of the way, then rename new into place.
+        // Same technique as the diff snapshot path above — avoids a window where
+        // no snapshot exists if we crash between remove and rename.
         if snapshot_dir.exists() {
-            tokio::fs::remove_dir_all(snapshot_dir)
+            let old_snapshot_dir = snapshot_dir.with_extension("old");
+            let _ = tokio::fs::remove_dir_all(&old_snapshot_dir).await;
+            tokio::fs::rename(snapshot_dir, &old_snapshot_dir)
                 .await
-                .context("removing existing snapshot directory")?;
+                .context("moving old snapshot out of the way")?;
+            tokio::fs::rename(&temp_snapshot_dir, snapshot_dir)
+                .await
+                .context("renaming temp snapshot to final location")?;
+            let _ = tokio::fs::remove_dir_all(&old_snapshot_dir).await;
+        } else {
+            tokio::fs::rename(&temp_snapshot_dir, snapshot_dir)
+                .await
+                .context("renaming temp snapshot to final location")?;
         }
-        tokio::fs::rename(&temp_snapshot_dir, snapshot_dir)
-            .await
-            .context("renaming temp snapshot to final location")?;
 
         info!(
             snapshot = %snapshot_config.name,

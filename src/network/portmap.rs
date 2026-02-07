@@ -383,11 +383,10 @@ pub async fn cleanup_global_nat_if_unused() {
         }
     }
 
-    // Disable IP forwarding
-    let _ = Command::new("sysctl")
-        .args(["-w", "net.ipv4.ip_forward=0"])
-        .output()
-        .await;
+    // Note: we intentionally do NOT disable ip_forward here.
+    // Other services on the host (Docker, Kubernetes, VPNs, etc.) may depend on
+    // IP forwarding being enabled. Since we can't know whether fcvm was the one
+    // that enabled it, the safe default is to leave it on.
 
     debug!("global NAT cleanup complete");
 }

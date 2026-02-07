@@ -37,8 +37,11 @@ async fn is_ip_in_use_on_veth(ip: &str) -> bool {
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // Match "inet <ip>/" exactly to avoid substring false positives
+    // (e.g., checking 10.1.1.1 should not match 10.1.1.10 or 210.1.1.1)
+    let inet_pattern = format!("inet {}/", ip);
     for line in stdout.lines() {
-        if line.contains(ip) && line.contains("veth0-") {
+        if line.contains(&inet_pattern) && line.contains("veth0-") {
             return true;
         }
     }
