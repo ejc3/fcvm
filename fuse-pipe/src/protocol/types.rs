@@ -64,7 +64,7 @@ impl FileAttr {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DirEntry {
     pub ino: u64,
-    pub name: String,
+    pub name: Vec<u8>,
     pub file_type: u8,
 }
 
@@ -75,7 +75,7 @@ pub struct DirEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DirEntryPlus {
     pub ino: u64,
-    pub name: String,
+    pub name: Vec<u8>,
     pub attr: FileAttr,
     pub generation: u64,
     pub attr_ttl_secs: u64,
@@ -84,7 +84,7 @@ pub struct DirEntryPlus {
 
 impl DirEntry {
     /// Create a new directory entry.
-    pub fn new(ino: u64, name: impl Into<String>, file_type: u8) -> Self {
+    pub fn new(ino: u64, name: impl Into<Vec<u8>>, file_type: u8) -> Self {
         Self {
             ino,
             name: name.into(),
@@ -94,12 +94,12 @@ impl DirEntry {
 
     /// Create a "." entry for the current directory.
     pub fn dot(ino: u64) -> Self {
-        Self::new(ino, ".", file_type::DIR)
+        Self::new(ino, b".".to_vec(), file_type::DIR)
     }
 
     /// Create a ".." entry for the parent directory.
     pub fn dotdot(parent_ino: u64) -> Self {
-        Self::new(parent_ino, "..", file_type::DIR)
+        Self::new(parent_ino, b"..".to_vec(), file_type::DIR)
     }
 }
 
@@ -144,11 +144,11 @@ mod tests {
     #[test]
     fn test_dir_entry() {
         let dot = DirEntry::dot(1);
-        assert_eq!(dot.name, ".");
+        assert_eq!(dot.name, b".");
         assert_eq!(dot.file_type, file_type::DIR);
 
         let dotdot = DirEntry::dotdot(1);
-        assert_eq!(dotdot.name, "..");
+        assert_eq!(dotdot.name, b"..");
     }
 
     #[test]

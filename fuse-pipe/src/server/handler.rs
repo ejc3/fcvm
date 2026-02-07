@@ -317,7 +317,7 @@ pub trait FilesystemHandler: Send + Sync {
     }
 
     /// Look up a directory entry by name.
-    fn lookup(&self, _parent: u64, _name: &str, _uid: u32, _gid: u32, _pid: u32) -> VolumeResponse {
+    fn lookup(&self, _parent: u64, _name: &[u8], _uid: u32, _gid: u32, _pid: u32) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
         }
@@ -379,7 +379,7 @@ pub trait FilesystemHandler: Send + Sync {
     fn mkdir(
         &self,
         _parent: u64,
-        _name: &str,
+        _name: &[u8],
         _mode: u32,
         _uid: u32,
         _gid: u32,
@@ -395,7 +395,7 @@ pub trait FilesystemHandler: Send + Sync {
     fn mknod(
         &self,
         _parent: u64,
-        _name: &str,
+        _name: &[u8],
         _mode: u32,
         _rdev: u32,
         _uid: u32,
@@ -408,7 +408,7 @@ pub trait FilesystemHandler: Send + Sync {
     }
 
     /// Remove a directory.
-    fn rmdir(&self, _parent: u64, _name: &str, _uid: u32, _gid: u32, _pid: u32) -> VolumeResponse {
+    fn rmdir(&self, _parent: u64, _name: &[u8], _uid: u32, _gid: u32, _pid: u32) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
         }
@@ -419,7 +419,7 @@ pub trait FilesystemHandler: Send + Sync {
     fn create(
         &self,
         _parent: u64,
-        _name: &str,
+        _name: &[u8],
         _mode: u32,
         _flags: u32,
         _uid: u32,
@@ -486,7 +486,7 @@ pub trait FilesystemHandler: Send + Sync {
     }
 
     /// Remove a file.
-    fn unlink(&self, _parent: u64, _name: &str, _uid: u32, _gid: u32, _pid: u32) -> VolumeResponse {
+    fn unlink(&self, _parent: u64, _name: &[u8], _uid: u32, _gid: u32, _pid: u32) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
         }
@@ -497,9 +497,9 @@ pub trait FilesystemHandler: Send + Sync {
     fn rename(
         &self,
         _parent: u64,
-        _name: &str,
+        _name: &[u8],
         _newparent: u64,
-        _newname: &str,
+        _newname: &[u8],
         _flags: u32,
         _uid: u32,
         _gid: u32,
@@ -515,8 +515,8 @@ pub trait FilesystemHandler: Send + Sync {
     fn symlink(
         &self,
         _parent: u64,
-        _name: &str,
-        _target: &str,
+        _name: &[u8],
+        _target: &[u8],
         _uid: u32,
         _gid: u32,
         _pid: u32,
@@ -539,7 +539,7 @@ pub trait FilesystemHandler: Send + Sync {
         &self,
         _ino: u64,
         _newparent: u64,
-        _newname: &str,
+        _newname: &[u8],
         _uid: u32,
         _gid: u32,
         _pid: u32,
@@ -591,7 +591,7 @@ pub trait FilesystemHandler: Send + Sync {
     fn setxattr(
         &self,
         _ino: u64,
-        _name: &str,
+        _name: &[u8],
         _value: &[u8],
         _flags: u32,
         _uid: u32,
@@ -608,7 +608,7 @@ pub trait FilesystemHandler: Send + Sync {
     fn getxattr(
         &self,
         _ino: u64,
-        _name: &str,
+        _name: &[u8],
         _size: u32,
         _uid: u32,
         _gid: u32,
@@ -630,7 +630,7 @@ pub trait FilesystemHandler: Send + Sync {
     fn removexattr(
         &self,
         _ino: u64,
-        _name: &str,
+        _name: &[u8],
         _uid: u32,
         _gid: u32,
         _pid: u32,
@@ -777,7 +777,7 @@ mod tests {
 
         // Most operations should return ENOSYS
         assert_eq!(
-            handler.lookup(1, "test", 1000, 1000, 1234).errno(),
+            handler.lookup(1, b"test", 1000, 1000, 1234).errno(),
             Some(libc::ENOSYS)
         );
         assert_eq!(handler.getattr(1).errno(), Some(libc::ENOSYS));
@@ -793,7 +793,7 @@ mod tests {
 
         let req = VolumeRequest::Lookup {
             parent: 1,
-            name: "test".to_string(),
+            name: b"test".to_vec(),
             uid: 1000,
             gid: 1000,
             pid: 1234,

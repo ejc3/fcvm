@@ -381,7 +381,7 @@ mod tests {
             1,
             VolumeRequest::Lookup {
                 parent: 1,
-                name: "test.txt".to_string(),
+                name: b"test.txt".to_vec(),
                 uid: 1000,
                 gid: 1000,
                 pid: 0,

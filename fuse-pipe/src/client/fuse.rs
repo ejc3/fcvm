@@ -11,6 +11,7 @@ use fuser::{
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
@@ -305,7 +306,7 @@ impl Filesystem for FuseClient {
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let response = self.send_request_sync(VolumeRequest::Lookup {
             parent: parent.into(),
-            name: name.to_string_lossy().to_string(),
+            name: name.as_bytes().to_vec(),
             uid: req.uid(),
             gid: req.gid(),
             pid: req.pid(),
@@ -423,7 +424,7 @@ impl Filesystem for FuseClient {
         tracing::debug!(target: "fuse-pipe::client", ?parent, ?name, mode, uid = req.uid(), gid = req.gid(), pid = req.pid(), "mkdir request");
         let response = self.send_request_sync(VolumeRequest::Mkdir {
             parent: parent.into(),
-            name: name.to_string_lossy().to_string(),
+            name: name.as_bytes().to_vec(),
             mode,
             uid: req.uid(),
             gid: req.gid(),
@@ -466,7 +467,7 @@ impl Filesystem for FuseClient {
     ) {
         let response = self.send_request_sync(VolumeRequest::Mknod {
             parent: parent.into(),
-            name: name.to_string_lossy().to_string(),
+            name: name.as_bytes().to_vec(),
             mode,
             rdev,
             uid: req.uid(),
@@ -494,7 +495,7 @@ impl Filesystem for FuseClient {
     fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let response = self.send_request_sync(VolumeRequest::Rmdir {
             parent: parent.into(),
-            name: name.to_string_lossy().to_string(),
+            name: name.as_bytes().to_vec(),
             uid: req.uid(),
             gid: req.gid(),
             pid: req.pid(),
@@ -519,7 +520,7 @@ impl Filesystem for FuseClient {
     ) {
         let response = self.send_request_sync(VolumeRequest::Create {
             parent: parent.into(),
-            name: name.to_string_lossy().to_string(),
+            name: name.as_bytes().to_vec(),
             mode,
             flags: flags as u32,
             uid: req.uid(),
@@ -689,7 +690,7 @@ impl Filesystem for FuseClient {
     fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let response = self.send_request_sync(VolumeRequest::Unlink {
             parent: parent.into(),
-            name: name.to_string_lossy().to_string(),
+            name: name.as_bytes().to_vec(),
             uid: req.uid(),
             gid: req.gid(),
             pid: req.pid(),
@@ -714,9 +715,9 @@ impl Filesystem for FuseClient {
     ) {
         let response = self.send_request_sync(VolumeRequest::Rename {
             parent: parent.into(),
-            name: name.to_string_lossy().to_string(),
+            name: name.as_bytes().to_vec(),
             newparent: newparent.into(),
-            newname: newname.to_string_lossy().to_string(),
+            newname: newname.as_bytes().to_vec(),
             flags: flags.bits(),
             uid: req.uid(),
             gid: req.gid(),
@@ -740,8 +741,8 @@ impl Filesystem for FuseClient {
     ) {
         let response = self.send_request_sync(VolumeRequest::Symlink {
             parent: parent.into(),
-            name: link_name.to_string_lossy().to_string(),
-            target: target.to_string_lossy().to_string(),
+            name: link_name.as_bytes().to_vec(),
+            target: target.as_os_str().as_bytes().to_vec(),
             uid: req.uid(),
             gid: req.gid(),
             pid: req.pid(),
@@ -768,7 +769,7 @@ impl Filesystem for FuseClient {
         let response = self.send_request_sync(VolumeRequest::Readlink { ino: ino.into() });
 
         match response {
-            VolumeResponse::Symlink { target } => reply.data(target.as_bytes()),
+            VolumeResponse::Symlink { target } => reply.data(&target),
             VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
             _ => reply.error(Errno::EIO),
         }
@@ -785,7 +786,7 @@ impl Filesystem for FuseClient {
         let response = self.send_request_sync(VolumeRequest::Link {
             ino: ino.into(),
             newparent: newparent.into(),
-            newname: newname.to_string_lossy().to_string(),
+            newname: newname.as_bytes().to_vec(),
             uid: req.uid(),
             gid: req.gid(),
             pid: req.pid(),
@@ -866,7 +867,7 @@ impl Filesystem for FuseClient {
                 for (i, entry) in entries.iter().enumerate() {
                     let entry_offset = offset + i as u64 + 1;
                     let ft = protocol_file_type_to_fuser(entry.file_type);
-                    if reply.add(INodeNo(entry.ino), entry_offset, ft, &entry.name) {
+                    if reply.add(INodeNo(entry.ino), entry_offset, ft, OsStr::from_bytes(&entry.name)) {
                         break;
                     }
                 }
@@ -903,7 +904,7 @@ impl Filesystem for FuseClient {
                     if reply.add(
                         INodeNo(entry.ino),
                         entry_offset,
-                        &entry.name,
+                        OsStr::from_bytes(&entry.name),
                         &ttl,
                         &attr,
                         Generation(entry.generation),
@@ -987,7 +988,7 @@ impl Filesystem for FuseClient {
     ) {
         let response = self.send_request_sync(VolumeRequest::Setxattr {
             ino: ino.into(),
-            name: name.to_string_lossy().to_string(),
+            name: name.as_bytes().to_vec(),
             value: value.to_vec(),
             flags: flags as u32,
             uid: req.uid(),
@@ -1005,7 +1006,7 @@ impl Filesystem for FuseClient {
     fn getxattr(&self, req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         let response = self.send_request_sync(VolumeRequest::Getxattr {
             ino: ino.into(),
-            name: name.to_string_lossy().to_string(),
+            name: name.as_bytes().to_vec(),
             size,
             uid: req.uid(),
             gid: req.gid(),
@@ -1040,7 +1041,7 @@ impl Filesystem for FuseClient {
     fn removexattr(&self, req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let response = self.send_request_sync(VolumeRequest::Removexattr {
             ino: ino.into(),
-            name: name.to_string_lossy().to_string(),
+            name: name.as_bytes().to_vec(),
             uid: req.uid(),
             gid: req.gid(),
             pid: req.pid(),
