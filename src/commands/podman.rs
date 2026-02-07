@@ -1473,6 +1473,11 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         // Abort status listener
         status_handle.abort();
 
+        // Abort output listener task if still running
+        if let Some(handle) = output_handle {
+            handle.abort();
+        }
+
         // Cleanup network
         if let Err(cleanup_err) = network.cleanup().await {
             warn!(
