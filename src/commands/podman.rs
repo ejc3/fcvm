@@ -2098,12 +2098,14 @@ async fn run_vm_setup(
 
         // Verify TAP device was created successfully
         let tap_device = &network_config.tap_device;
-        let verify_cmd = format!("ip link show {} >/dev/null 2>&1", tap_device);
         let verify_output = tokio::process::Command::new(&nsenter_prefix[0])
             .args(&nsenter_prefix[1..])
-            .arg("bash")
-            .arg("-c")
-            .arg(&verify_cmd)
+            .arg("ip")
+            .arg("link")
+            .arg("show")
+            .arg(tap_device)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .await
             .context("verifying TAP device")?;

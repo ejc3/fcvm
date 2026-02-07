@@ -1032,6 +1032,7 @@ fn write_line_to_fd(fd: i32, data: &str) {
 /// Blocking handler for exec connection
 fn handle_exec_connection_blocking(fd: i32) {
     // Read request line using raw read syscall (File wrapper doesn't work well with vsock)
+    const MAX_EXEC_LINE_LENGTH: usize = 1_048_576; // 1MB
     let mut line = String::new();
     let mut buf = [0u8; 1];
     loop {
@@ -1042,6 +1043,14 @@ fn handle_exec_connection_blocking(fd: i32) {
         }
         if buf[0] == b'\n' {
             break;
+        }
+        if line.len() >= MAX_EXEC_LINE_LENGTH {
+            eprintln!(
+                "[fc-agent] exec request line exceeds {} bytes, rejecting",
+                MAX_EXEC_LINE_LENGTH
+            );
+            unsafe { libc::close(fd) };
+            return;
         }
         line.push(buf[0] as char);
     }

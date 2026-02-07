@@ -60,12 +60,14 @@ pub struct FuseClient {
     destroyed: Arc<AtomicBool>,
     /// Maximum write size (0 = unbounded). Passed explicitly to avoid env var races.
     max_write: u32,
+    /// Disable FUSE writeback cache (passed explicitly to avoid set_var unsoundness).
+    no_writeback_cache: bool,
 }
 
 impl FuseClient {
     /// Create a new client using shared multiplexer.
     pub fn new(mux: Arc<Multiplexer>) -> Self {
-        Self::with_options(mux, Arc::new(AtomicBool::new(false)), 0)
+        Self::with_options(mux, Arc::new(AtomicBool::new(false)), 0, false)
     }
 
     /// Create a new client with a shared destroyed flag.
@@ -73,16 +75,22 @@ impl FuseClient {
     /// The destroyed flag is set by `destroy()` when the filesystem is unmounted.
     /// Reader threads can check this flag to distinguish clean shutdown from errors.
     pub fn with_destroyed_flag(mux: Arc<Multiplexer>, destroyed: Arc<AtomicBool>) -> Self {
-        Self::with_options(mux, destroyed, 0)
+        Self::with_options(mux, destroyed, 0, false)
     }
 
     /// Create a new client with a shared destroyed flag and max_write limit.
-    pub fn with_options(mux: Arc<Multiplexer>, destroyed: Arc<AtomicBool>, max_write: u32) -> Self {
+    pub fn with_options(
+        mux: Arc<Multiplexer>,
+        destroyed: Arc<AtomicBool>,
+        max_write: u32,
+        no_writeback_cache: bool,
+    ) -> Self {
         Self {
             mux,
             init_callback: Mutex::new(None),
             destroyed,
             max_write,
+            no_writeback_cache,
         }
     }
 
@@ -97,6 +105,7 @@ impl FuseClient {
             init_callback: Mutex::new(Some(callback)),
             destroyed,
             max_write: 0,
+            no_writeback_cache: false,
         }
     }
 
@@ -217,8 +226,10 @@ fn protocol_file_type_to_fuser(ft: u8) -> FileType {
 impl Filesystem for FuseClient {
     fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> Result<(), io::Error> {
         // Enable writeback cache for better write performance (kernel batches writes).
-        // Can be disabled via FCVM_NO_WRITEBACK_CACHE=1 for debugging.
-        let enable_writeback = std::env::var("FCVM_NO_WRITEBACK_CACHE").is_err();
+        // Disabled if no_writeback_cache field is set (propagated from caller) or
+        // FCVM_NO_WRITEBACK_CACHE env var is set (for standalone use).
+        let enable_writeback =
+            !self.no_writeback_cache && std::env::var("FCVM_NO_WRITEBACK_CACHE").is_err();
         if enable_writeback {
             if let Err(unsupported) = config.add_capabilities(InitFlags::FUSE_WRITEBACK_CACHE) {
                 tracing::warn!(
