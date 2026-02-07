@@ -315,6 +315,83 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
     Ok(())
 }
 
+/// Removes global NAT rules if no bridged VMs are running
+///
+/// Checks for veth0-* interfaces (indicates active bridged VMs).
+/// If none exist, removes the MASQUERADE rules and disables ip_forward.
+/// Best-effort — logs warnings but doesn't fail.
+pub async fn cleanup_global_nat_if_unused() {
+    // Check if any veth0- interfaces exist (active bridged VMs)
+    let output = match Command::new("ip")
+        .args(["-o", "link", "show"])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return, // Can't check — leave rules in place
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.lines().any(|line| line.contains("veth0-")) {
+        debug!("other bridged VMs still running, keeping global NAT rules");
+        return;
+    }
+
+    info!("no bridged VMs running, cleaning up global NAT rules");
+
+    // Detect outbound interface for MASQUERADE rule deletion
+    let outbound_iface = match detect_default_interface().await {
+        Ok(iface) => iface,
+        Err(e) => {
+            warn!(error = %e, "failed to detect default interface for NAT cleanup");
+            return;
+        }
+    };
+
+    // Remove MASQUERADE rules for both subnets
+    for subnet in &["172.30.0.0/16", "10.0.0.0/8"] {
+        let output = Command::new("iptables")
+            .args([
+                "-t",
+                "nat",
+                "-D",
+                "POSTROUTING",
+                "-s",
+                subnet,
+                "-o",
+                &outbound_iface,
+                "-j",
+                "MASQUERADE",
+            ])
+            .output()
+            .await;
+
+        match output {
+            Ok(o) if o.status.success() => {
+                debug!(subnet = %subnet, "removed MASQUERADE rule");
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                // Rule may already be gone
+                if !stderr.contains("does not exist") && !stderr.contains("No chain") {
+                    warn!(subnet = %subnet, error = %stderr, "failed to remove MASQUERADE rule");
+                }
+            }
+            Err(e) => {
+                warn!(subnet = %subnet, error = %e, "failed to run iptables for NAT cleanup");
+            }
+        }
+    }
+
+    // Disable IP forwarding
+    let _ = Command::new("sysctl")
+        .args(["-w", "net.ipv4.ip_forward=0"])
+        .output()
+        .await;
+
+    debug!("global NAT cleanup complete");
+}
+
 /// Detects the default network interface for outbound traffic
 pub async fn detect_default_interface() -> Result<String> {
     let output = Command::new("ip")
