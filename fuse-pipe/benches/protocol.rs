@@ -9,7 +9,7 @@ fn bench_serialize_lookup_request(c: &mut Criterion) {
         0,
         VolumeRequest::Lookup {
             parent: 1,
-            name: "test.txt".to_string(),
+            name: b"test.txt".to_vec(),
             uid: 1000,
             gid: 1000,
             pid: 42,
@@ -27,7 +27,7 @@ fn bench_deserialize_lookup_request(c: &mut Criterion) {
         0,
         VolumeRequest::Lookup {
             parent: 1,
-            name: "test.txt".to_string(),
+            name: b"test.txt".to_vec(),
             uid: 1000,
             gid: 1000,
             pid: 42,
