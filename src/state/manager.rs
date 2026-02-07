@@ -72,7 +72,12 @@ impl StateManager {
             .open(&lock_file)
             .context("opening lock file")?;
 
-        // Acquire exclusive lock (blocks if another process has lock)
+        // Acquire exclusive lock (blocks if another process has lock).
+        // NOTE: Flock::lock() is technically blocking I/O in an async context, but
+        // the lock is held for microseconds with near-zero contention (only this
+        // process writes its own state file). Using spawn_blocking would add more
+        // overhead than the lock itself. If contention becomes an issue, switch to
+        // FlockArg::LockExclusiveNonblock with retry + tokio::task::yield_now().
         use nix::fcntl::{Flock, FlockArg};
         let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
             .map_err(|(_, err)| err)
