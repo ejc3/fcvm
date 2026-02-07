@@ -514,8 +514,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     let mut vm_state = VmState::new(
         vm_id.clone(),
         snapshot_config.metadata.image.clone(),
-        snapshot_config.metadata.vcpu,
-        snapshot_config.metadata.memory_mib,
+        args.cpu.unwrap_or(snapshot_config.metadata.vcpu),
+        args.mem.unwrap_or(snapshot_config.metadata.memory_mib),
     );
     vm_state.name = Some(vm_name.clone());
 
@@ -680,9 +680,13 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     let network_config = network.setup().await.context("setting up network")?;
 
-    // Use network-provided health check URL if user didn't specify one
-    // Each network type (bridged/rootless) generates its own appropriate URL
-    if vm_state.config.health_check_url.is_none() {
+    // Set health check URL: prefer caller-provided URL (from podman run's --health-check),
+    // fall back to network-provided URL. The caller's URL uses the correct guest port (e.g., 80)
+    // while the network URL uses the host port-forwarding port (e.g., 8080), which doesn't work
+    // with nsenter-based health checks that connect directly to the guest.
+    if let Some(ref hc) = args.health_check {
+        vm_state.config.health_check_url = Some(hc.clone());
+    } else if vm_state.config.health_check_url.is_none() {
         vm_state.config.health_check_url = network_config.health_check_url.clone();
     }
     if let Some(port) = network_config.health_check_port {

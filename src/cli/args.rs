@@ -309,6 +309,21 @@ pub struct SnapshotRunArgs {
     /// Only used when startup_snapshot_base_key is set.
     #[arg(skip)]
     pub health_check_for_startup: Option<String>,
+
+    /// Health check URL for monitoring clone health (internal use only).
+    /// Passed from podman run's --health-check when restoring from a snapshot.
+    #[arg(skip)]
+    pub health_check: Option<String>,
+
+    /// vCPUs (internal use only).
+    /// Passed from podman run's --cpu when restoring from a snapshot.
+    #[arg(skip)]
+    pub cpu: Option<u8>,
+
+    /// Memory in MiB (internal use only).
+    /// Passed from podman run's --mem when restoring from a snapshot.
+    #[arg(skip)]
+    pub mem: Option<u32>,
 }
 
 // ============================================================================
