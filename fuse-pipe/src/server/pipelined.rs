@@ -370,6 +370,18 @@ async fn request_reader<H: FilesystemHandler + 'static>(
                     ascii = %ascii_dump,
                     "DESERIALIZE FAILED - raw bytes dumped"
                 );
+
+                // Send error response using the extracted unique ID so the client
+                // doesn't hang forever waiting for a reply that will never come.
+                if maybe_unique != 0 {
+                    let pending = PendingResponse {
+                        unique: maybe_unique,
+                        reader_id: 0,
+                        response: VolumeResponse::error(libc::EIO),
+                        span: None,
+                    };
+                    let _ = tx.send(pending).await;
+                }
                 continue;
             }
         };

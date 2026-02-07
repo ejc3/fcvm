@@ -353,15 +353,42 @@ fn reader_loop(mut socket: UnixStream, pending: Arc<DashMap<u64, Sender<Response
         }
 
         // Deserialize and route to waiting reader (lock-free lookup + remove)
-        if let Ok(wire) = bincode::deserialize::<WireResponse>(&resp_buf) {
-            // Mark client receive time on the span
-            let mut span = wire.span;
-            if let Some(ref mut s) = span {
-                s.mark("client_recv");
-            }
+        match bincode::deserialize::<WireResponse>(&resp_buf) {
+            Ok(wire) => {
+                // Mark client receive time on the span
+                let mut span = wire.span;
+                if let Some(ref mut s) = span {
+                    s.mark("client_recv");
+                }
 
-            if let Some((_, tx)) = pending.remove(&wire.unique) {
-                let _ = tx.send((wire.response, span));
+                if let Some((_, tx)) = pending.remove(&wire.unique) {
+                    let _ = tx.send((wire.response, span));
+                }
+            }
+            Err(e) => {
+                // Try to extract unique ID from raw bytes to unblock the waiting thread
+                let maybe_unique = if resp_buf.len() >= 8 {
+                    u64::from_le_bytes([
+                        resp_buf[0], resp_buf[1], resp_buf[2], resp_buf[3],
+                        resp_buf[4], resp_buf[5], resp_buf[6], resp_buf[7],
+                    ])
+                } else {
+                    0
+                };
+                tracing::error!(
+                    target: "fuse-pipe::mux",
+                    count,
+                    len,
+                    maybe_unique,
+                    error = %e,
+                    "reader: response deserialization failed"
+                );
+                // Send EIO to the waiting thread so it doesn't hang forever
+                if maybe_unique != 0 {
+                    if let Some((_, tx)) = pending.remove(&maybe_unique) {
+                        let _ = tx.send((VolumeResponse::error(libc::EIO), None));
+                    }
+                }
             }
         }
     }
