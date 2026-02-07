@@ -8,6 +8,7 @@
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use serde::Deserialize;
+use std::fs::File;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -31,7 +32,6 @@ struct VmConfigEntry {
 #[derive(Deserialize)]
 struct NetworkConfigEntry {
     loopback_ip: Option<String>,
-    health_check_port: Option<u16>,
 }
 
 /// Find the fcvm binary
@@ -66,6 +66,10 @@ impl CloneFixture {
 
         // Start baseline VM
         eprintln!("  Starting baseline VM...");
+        let log_path = format!("/tmp/fcvm-bench-{}.log", baseline_name);
+        let log_file =
+            File::create(&log_path).unwrap_or_else(|e| panic!("create {}: {}", log_path, e));
+        let log_err = log_file.try_clone().expect("clone log file");
         let baseline_child = Command::new(&fcvm)
             .args([
                 "podman",
@@ -76,8 +80,8 @@ impl CloneFixture {
                 network,
                 TEST_IMAGE,
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(log_err))
             .spawn()
             .expect("failed to spawn baseline VM");
 
@@ -88,6 +92,13 @@ impl CloneFixture {
         let timeout = Duration::from_secs(180);
         loop {
             if start.elapsed() > timeout {
+                if let Ok(logs) = std::fs::read_to_string(&log_path) {
+                    let tail: Vec<&str> = logs.lines().rev().take(50).collect();
+                    eprintln!("=== Last 50 lines of {} ===", log_path);
+                    for line in tail.into_iter().rev() {
+                        eprintln!("{}", line);
+                    }
+                }
                 panic!("Baseline VM failed to become healthy");
             }
             let output = Command::new(&fcvm)
@@ -135,10 +146,14 @@ impl CloneFixture {
 
         // Start serve process
         eprintln!("  Starting serve process...");
+        let serve_log_path = format!("/tmp/fcvm-bench-serve-{}.log", name);
+        let serve_log = File::create(&serve_log_path)
+            .unwrap_or_else(|e| panic!("create {}: {}", serve_log_path, e));
+        let serve_log_err = serve_log.try_clone().expect("clone log file");
         let serve_child = Command::new(&fcvm)
             .args(["snapshot", "serve", &snapshot_name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(serve_log))
+            .stderr(Stdio::from(serve_log_err))
             .spawn()
             .expect("failed to spawn serve process");
 
@@ -200,6 +215,11 @@ impl CloneFixture {
         let start = Instant::now();
 
         // Spawn clone (without --exec so it stays running)
+        let health_port = 8080;
+        let clone_log_path = format!("/tmp/fcvm-bench-clone-http-{}.log", network);
+        let clone_log = File::create(&clone_log_path)
+            .unwrap_or_else(|e| panic!("create {}: {}", clone_log_path, e));
+        let clone_log_err = clone_log.try_clone().expect("clone log file");
         let mut child = Command::new(&fcvm)
             .args([
                 "snapshot",
@@ -208,16 +228,18 @@ impl CloneFixture {
                 &self.serve_pid.to_string(),
                 "--network",
                 network,
+                "--publish",
+                &format!("{}:80", health_port),
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(clone_log))
+            .stderr(Stdio::from(clone_log_err))
             .spawn()
             .expect("failed to spawn clone");
 
         let clone_pid = child.id();
 
         // Poll for healthy and get loopback IP
-        let (loopback_ip, health_port) = loop {
+        let loopback_ip = loop {
             if start.elapsed() > Duration::from_secs(30) {
                 let _ = Command::new("kill")
                     .args(["-9", &clone_pid.to_string()])
@@ -241,8 +263,7 @@ impl CloneFixture {
                                 .loopback_ip
                                 .clone()
                                 .expect("no loopback_ip for healthy clone");
-                            let port = vm.config.network.health_check_port.unwrap_or(8080);
-                            break (ip, port);
+                            break ip;
                         }
                     }
                 }

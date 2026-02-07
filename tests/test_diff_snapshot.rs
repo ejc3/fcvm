@@ -469,3 +469,151 @@ async fn test_diff_snapshot_memory_size_valid() -> Result<()> {
     println!("  Diff snapshot created and merged successfully");
     Ok(())
 }
+
+/// Test that clones inherit the baseline VM's health check setting (or lack thereof).
+///
+/// When a baseline VM is started WITHOUT --health-check, clones should also have
+/// health_check_url = None. Previously, cmd_snapshot_run would auto-assign
+/// network_config.health_check_url (e.g., http://127.x.y.z:8080/) which gave clones
+/// HTTP health checks they shouldn't have.
+#[tokio::test]
+async fn test_snapshot_clone_inherits_no_health_check() -> Result<()> {
+    println!("\nSnapshot Clone: Inherits No Health Check");
+    println!("=========================================");
+
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("no-hc-inherit");
+
+    let fcvm_path = common::find_fcvm_binary()?;
+
+    // Step 1: Start baseline VM WITHOUT --health-check
+    println!("Step 1: Starting baseline VM (no --health-check)...");
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "rootless",
+            TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
+
+    println!("  Waiting for baseline VM to become healthy...");
+    common::poll_health_by_pid(baseline_pid, 120).await?;
+    println!("  Baseline VM healthy (PID: {})", baseline_pid);
+
+    // Verify baseline has no health_check_url
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args(["ls", "--json", "--pid", &baseline_pid.to_string()])
+        .output()
+        .await
+        .context("running ls for baseline")?;
+
+    #[derive(serde::Deserialize)]
+    struct VmDisplay {
+        #[serde(flatten)]
+        vm: fcvm::state::VmState,
+        #[allow(dead_code)]
+        stale: bool,
+    }
+
+    let baseline_vms: Vec<VmDisplay> =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
+            .context("parsing baseline ls output")?;
+    assert!(
+        baseline_vms[0].vm.config.health_check_url.is_none(),
+        "Baseline VM should have no health_check_url, got: {:?}",
+        baseline_vms[0].vm.config.health_check_url
+    );
+    println!("  Baseline health_check_url = None (correct)");
+
+    // Step 2: Create snapshot from baseline
+    println!("\nStep 2: Creating snapshot from baseline...");
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
+        ])
+        .output()
+        .await
+        .context("running snapshot create")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Snapshot creation failed: {}", stderr);
+    }
+    println!("  Snapshot created: {}", snapshot_name);
+
+    // Verify snapshot metadata has health_check_url = null
+    let snapshot_config_path = snapshot_dir().join(&snapshot_name).join("config.json");
+    let snapshot_json = tokio::fs::read_to_string(&snapshot_config_path)
+        .await
+        .context("reading snapshot config.json")?;
+    let snapshot_config: serde_json::Value =
+        serde_json::from_str(&snapshot_json).context("parsing snapshot config")?;
+    let metadata_hc = &snapshot_config["metadata"]["health_check_url"];
+    assert!(
+        metadata_hc.is_null(),
+        "Snapshot metadata health_check_url should be null, got: {}",
+        metadata_hc
+    );
+    println!("  Snapshot metadata health_check_url = null (correct)");
+
+    // Kill baseline
+    common::kill_process(baseline_pid).await;
+
+    // Step 3: Clone from snapshot WITHOUT --health-check
+    println!("\nStep 3: Creating clone from snapshot (no --health-check)...");
+    let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &snapshot_name,
+            "--name",
+            &clone_name,
+            "--network",
+            "rootless",
+        ],
+        &clone_name,
+    )
+    .await
+    .context("spawning clone")?;
+
+    println!("  Waiting for clone to become healthy...");
+    common::poll_health_by_pid(clone_pid, 120).await?;
+    println!("  Clone is healthy (PID: {})", clone_pid);
+
+    // Verify clone has no health_check_url
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args(["ls", "--json", "--pid", &clone_pid.to_string()])
+        .output()
+        .await
+        .context("running ls for clone")?;
+
+    let clone_vms: Vec<VmDisplay> = serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
+        .context("parsing clone ls output")?;
+    assert!(
+        clone_vms[0].vm.config.health_check_url.is_none(),
+        "Clone should have no health_check_url (inherited from baseline), got: {:?}",
+        clone_vms[0].vm.config.health_check_url
+    );
+    println!("  Clone health_check_url = None (correct - inherited from baseline)");
+
+    // Cleanup
+    println!("\nCleaning up...");
+    common::kill_process(clone_pid).await;
+
+    println!("\n✅ SNAPSHOT CLONE INHERITS NO HEALTH CHECK TEST PASSED!");
+    println!("  Clone correctly inherited baseline's None health_check_url");
+    println!("  (Previously would get auto-assigned http://127.x.y.z:8080/)");
+    Ok(())
+}

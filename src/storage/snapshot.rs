@@ -58,6 +58,9 @@ pub struct SnapshotMetadata {
     /// Volume mounts from the baseline VM (for clone volume support)
     #[serde(default)]
     pub volumes: Vec<SnapshotVolumeConfig>,
+    /// Health check URL from the baseline VM (None = no HTTP health check)
+    #[serde(default)]
+    pub health_check_url: Option<String>,
 }
 
 /// Volume configuration saved in snapshot metadata.
@@ -205,8 +208,6 @@ mod tests {
                     host_ip: Some("172.30.0.1".to_string()),
                     host_veth: Some("veth0-abc123".to_string()),
                     loopback_ip: None,
-                    health_check_port: None,
-                    health_check_url: None,
                     dns_server: None,
                     guest_ipv6: None,
                     host_ipv6: None,
@@ -214,6 +215,7 @@ mod tests {
                     http_proxy: None,
                 },
                 volumes: vec![],
+                health_check_url: None,
             },
         };
 
@@ -319,8 +321,6 @@ mod tests {
                     host_ip: Some("172.30.0.1".to_string()),
                     host_veth: None,
                     loopback_ip: None,
-                    health_check_port: None,
-                    health_check_url: None,
                     dns_server: None,
                     guest_ipv6: None,
                     host_ipv6: None,
@@ -328,6 +328,7 @@ mod tests {
                     http_proxy: None,
                 },
                 volumes: vec![],
+                health_check_url: None,
             },
         };
 
@@ -377,8 +378,6 @@ mod tests {
                         host_ip: None,
                         host_veth: None,
                         loopback_ip: None,
-                        health_check_port: None,
-                        health_check_url: None,
                         dns_server: None,
                         guest_ipv6: None,
                         host_ipv6: None,
@@ -386,6 +385,7 @@ mod tests {
                         http_proxy: None,
                     },
                     volumes: vec![],
+                    health_check_url: None,
                 },
             };
             manager.save_snapshot(config).await.unwrap();
@@ -422,8 +422,6 @@ mod tests {
                     host_ip: None,
                     host_veth: None,
                     loopback_ip: None,
-                    health_check_port: None,
-                    health_check_url: None,
                     dns_server: None,
                     guest_ipv6: None,
                     host_ipv6: None,
@@ -431,6 +429,7 @@ mod tests {
                     http_proxy: None,
                 },
                 volumes: vec![],
+                health_check_url: None,
             },
         };
         manager.save_snapshot(config).await.unwrap();
@@ -518,8 +517,6 @@ mod tests {
                     host_ip: None,
                     host_veth: None,
                     loopback_ip: None,
-                    health_check_port: None,
-                    health_check_url: None,
                     dns_server: None,
                     guest_ipv6: None,
                     host_ipv6: None,
@@ -527,6 +524,7 @@ mod tests {
                     http_proxy: None,
                 },
                 volumes: vec![],
+                health_check_url: None,
             },
         };
 

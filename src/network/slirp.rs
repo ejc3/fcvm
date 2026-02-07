@@ -488,12 +488,6 @@ impl NetworkManager for SlirpNetwork {
 
         let guest_mac = generate_mac();
 
-        // Generate health check URL from loopback IP if available
-        let health_check_url = self
-            .loopback_ip
-            .as_ref()
-            .map(|ip| format!("http://{}:8080/", ip));
-
         // Check if host has IPv6 - if so, we'll configure it in the guest too
         let (guest_ipv6, host_ipv6) = if Self::detect_host_ipv6().is_some() {
             // Guest gets fd00::100, gateway is fd00::2 (slirp4netns IPv6 gateway)
@@ -518,8 +512,6 @@ impl NetworkManager for SlirpNetwork {
             host_ip: Some(GUEST_GATEWAY.to_string()), // slirp4netns gateway
             host_veth: None,
             loopback_ip: self.loopback_ip.clone(), // For port forwarding (no ip addr add needed!)
-            health_check_port: Some(8080),         // Unprivileged port, forwards to guest:80
-            health_check_url,
             dns_server: Some(GUEST_DNS.to_string()), // slirp4netns built-in DNS forwarder
             guest_ipv6,
             host_ipv6,

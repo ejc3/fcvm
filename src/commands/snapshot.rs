@@ -168,6 +168,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             memory_mib: vm_state.config.memory_mib,
             network_config: vm_state.config.network.clone(),
             volumes: volume_configs,
+            health_check_url: vm_state.config.health_check_url.clone(),
         },
     };
 
@@ -514,8 +515,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     let mut vm_state = VmState::new(
         vm_id.clone(),
         snapshot_config.metadata.image.clone(),
-        snapshot_config.metadata.vcpu,
-        snapshot_config.metadata.memory_mib,
+        args.cpu.unwrap_or(snapshot_config.metadata.vcpu),
+        args.mem.unwrap_or(snapshot_config.metadata.memory_mib),
     );
     vm_state.name = Some(vm_name.clone());
 
@@ -680,14 +681,9 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     let network_config = network.setup().await.context("setting up network")?;
 
-    // Use network-provided health check URL if user didn't specify one
-    // Each network type (bridged/rootless) generates its own appropriate URL
-    if vm_state.config.health_check_url.is_none() {
-        vm_state.config.health_check_url = network_config.health_check_url.clone();
-    }
-    if let Some(port) = network_config.health_check_port {
-        vm_state.config.network.health_check_port = Some(port);
-    }
+    // Health check URL comes from snapshot metadata — it's a property of the VM image.
+    // The cache key includes health_check_url, so each config gets its own snapshot.
+    vm_state.config.health_check_url = snapshot_config.metadata.health_check_url.clone();
 
     info!(
         tap = %network_config.tap_device,
@@ -876,11 +872,13 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Create startup snapshot channel if:
     // - startup_snapshot_base_key is set (passed from podman run on cache hit)
-    // - health_check_for_startup is set (HTTP health check URL)
+    // - snapshot has a health check URL (needed to know when VM is fully initialized)
     let (startup_tx, mut startup_rx): (
         Option<tokio::sync::oneshot::Sender<()>>,
         Option<tokio::sync::oneshot::Receiver<()>>,
-    ) = if args.startup_snapshot_base_key.is_some() && args.health_check_for_startup.is_some() {
+    ) = if args.startup_snapshot_base_key.is_some()
+        && snapshot_config.metadata.health_check_url.is_some()
+    {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (Some(tx), Some(rx))
     } else {
