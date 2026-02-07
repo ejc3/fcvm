@@ -225,8 +225,9 @@ pub async fn cleanup_port_mappings(rules: &[String]) -> Result<()> {
 /// Ensures global NAT is enabled for VM traffic
 ///
 /// Sets up:
-/// 1. IP forwarding (sysctl)
-/// 2. MASQUERADE rule for outbound traffic from VM subnet
+/// 1. Verifies IP forwarding is enabled (errors if not — admin must configure)
+/// 2. Enables per-interface forwarding on the outbound interface
+/// 3. MASQUERADE rule for outbound traffic from VM subnet
 ///
 /// This should be called once during fcvm initialization, not per-VM.
 pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<()> {
@@ -236,16 +237,20 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
         "ensuring global NAT configuration"
     );
 
-    // Enable IP forwarding globally
+    // Verify IP forwarding is enabled (we don't set it — that's a system-wide
+    // setting the admin should configure, e.g. via sysctl.conf or cloud-init)
     let output = Command::new("sysctl")
-        .args(["-w", "net.ipv4.ip_forward=1"])
+        .args(["-n", "net.ipv4.ip_forward"])
         .output()
         .await
-        .context("enabling IP forwarding")?;
+        .context("checking IP forwarding")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!("failed to enable IP forwarding: {}", stderr);
+    if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() != "1" {
+        anyhow::bail!(
+            "IP forwarding is disabled. Bridged networking requires net.ipv4.ip_forward=1.\n\
+             Enable it with: sudo sysctl -w net.ipv4.ip_forward=1\n\
+             To persist across reboots: echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-ip-forward.conf"
+        );
     }
 
     // Enable forwarding on the outbound interface specifically
@@ -318,7 +323,7 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
 /// Removes global NAT rules if no bridged VMs are running
 ///
 /// Checks for veth0-* interfaces (indicates active bridged VMs).
-/// If none exist, removes the MASQUERADE rules and disables ip_forward.
+/// If none exist, removes the MASQUERADE rules.
 /// Best-effort — logs warnings but doesn't fail.
 pub async fn cleanup_global_nat_if_unused() {
     // Check if any veth0- interfaces exist (active bridged VMs)

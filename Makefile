@@ -336,6 +336,8 @@ setup-btrfs:
 	@# Ensure these dirs exist with correct permissions (may be missing after reboot/corruption)
 	@sudo mkdir -p /mnt/fcvm-btrfs/image-cache /mnt/fcvm-btrfs/containers
 	@sudo chown $$(id -un):$$(id -gn) /mnt/fcvm-btrfs/image-cache /mnt/fcvm-btrfs/containers
+	@# Enable IP forwarding (required for bridged networking)
+	@sudo sysctl -q -w net.ipv4.ip_forward=1
 	@# Create per-mode data directories (state, snapshots, vm-disks)
 	@# Default: owned by current user (test-fast runs as ubuntu)
 	@mkdir -p /mnt/fcvm-btrfs/{state,snapshots,vm-disks}
