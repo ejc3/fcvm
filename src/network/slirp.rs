@@ -343,8 +343,8 @@ ip addr add {namespace_ip}/24 dev {bridge}
         cmd.arg(namespace_pid.to_string())
             .arg(&self.slirp_device)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
 
         let child = cmd.spawn().context("failed to spawn slirp4netns")?;
 

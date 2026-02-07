@@ -121,20 +121,3 @@ pub fn mount_vsock(port: u32, mount_point: &str) -> anyhow::Result<()> {
     );
     fuse_pipe::mount_vsock_with_options(HOST_CID, port, mount_point, num_readers, trace_rate)
 }
-
-/// Mount a FUSE filesystem with multiple reader threads.
-///
-/// Same as `mount_vsock` but creates multiple FUSE reader threads for
-/// better parallel performance.
-#[allow(dead_code)]
-pub fn mount_vsock_with_readers(
-    port: u32,
-    mount_point: &str,
-    num_readers: usize,
-) -> anyhow::Result<()> {
-    eprintln!(
-        "[fc-agent] mounting FUSE volume at {} via vsock port {} ({} readers)",
-        mount_point, port, num_readers
-    );
-    fuse_pipe::mount_vsock_with_readers(HOST_CID, port, mount_point, num_readers)
-}

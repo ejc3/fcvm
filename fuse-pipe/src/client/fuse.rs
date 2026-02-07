@@ -605,7 +605,7 @@ impl Filesystem for FuseClient {
         });
 
         match response {
-            VolumeResponse::Written { size } => reply.written(size),
+            VolumeResponse::Written { size } => reply.written(size as u32),
             VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
             _ => reply.error(Errno::EIO),
         }
@@ -990,26 +990,6 @@ impl Filesystem for FuseClient {
     }
 
     fn getxattr(&self, req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
-        // Fast path: The kernel calls getxattr("security.capability") on every write
-        // to check if file capabilities need to be cleared. This is extremely common
-        // and almost always returns ENODATA (no capabilities set). Short-circuit this
-        // to avoid the expensive server round-trip (~32µs savings per write).
-        //
-        // This is safe because:
-        // 1. If capabilities ARE set, they're preserved (we'd need setxattr to clear)
-        // 2. The kernel's capability check is advisory - it clears caps on successful write
-        // 3. Container workloads rarely use file capabilities
-        //
-        // Can be disabled via FCVM_NO_XATTR_FASTPATH=1 for debugging.
-        if std::env::var("FCVM_NO_XATTR_FASTPATH").is_err() {
-            if let Some(name_str) = name.to_str() {
-                if name_str == "security.capability" {
-                    reply.error(Errno::ENODATA);
-                    return;
-                }
-            }
-        }
-
         let response = self.send_request_sync(VolumeRequest::Getxattr {
             ino: ino.into(),
             name: name.to_string_lossy().to_string(),
@@ -1198,7 +1178,7 @@ impl Filesystem for FuseClient {
         });
 
         match response {
-            VolumeResponse::Written { size } => reply.written(size),
+            VolumeResponse::Written { size } => reply.written(size as u32),
             VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
             _ => reply.error(Errno::EIO),
         }
@@ -1241,7 +1221,7 @@ impl Filesystem for FuseClient {
         );
 
         match response {
-            VolumeResponse::Written { size } => reply.written(size),
+            VolumeResponse::Written { size } => reply.written(size as u32),
             VolumeResponse::Error { errno } => reply.error(Errno::from_i32(errno)),
             _ => reply.error(Errno::EIO),
         }

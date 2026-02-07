@@ -656,7 +656,7 @@ impl FilesystemHandler for PassthroughFs {
         ) {
             Ok(n) => {
                 tracing::debug!(target: "passthrough", fh, written = n, "write succeeded");
-                VolumeResponse::Written { size: n as u32 }
+                VolumeResponse::Written { size: n as u64 }
             }
             Err(e) => {
                 tracing::debug!(target: "passthrough", fh, error = ?e, "write failed");
@@ -1149,7 +1149,7 @@ impl FilesystemHandler for PassthroughFs {
         ) {
             Ok(n) => {
                 tracing::debug!(target: "passthrough", copied = n, "copy_file_range succeeded");
-                VolumeResponse::Written { size: n as u32 }
+                VolumeResponse::Written { size: n as u64 }
             }
             Err(e) => {
                 tracing::debug!(target: "passthrough", error = ?e, "copy_file_range failed");
@@ -1190,7 +1190,7 @@ impl FilesystemHandler for PassthroughFs {
         ) {
             Ok(n) => {
                 tracing::debug!(target: "passthrough", cloned = n, "remap_file_range succeeded");
-                VolumeResponse::Written { size: n as u32 }
+                VolumeResponse::Written { size: n as u64 }
             }
             Err(e) => {
                 tracing::debug!(target: "passthrough", error = ?e, "remap_file_range failed");
@@ -1607,7 +1607,7 @@ mod tests {
                 // For whole-file clone (len=0), we return the file size on success
                 assert_eq!(
                     size,
-                    test_data.len() as u32,
+                    test_data.len() as u64,
                     "FICLONE should return file size for whole file (len=0)"
                 );
 
@@ -1726,7 +1726,7 @@ mod tests {
         match resp {
             VolumeResponse::Written { size } => {
                 eprintln!("FICLONERANGE succeeded, size={}", size);
-                assert_eq!(size, block_size as u32, "should clone requested size");
+                assert_eq!(size, block_size as u64, "should clone requested size");
 
                 // Verify: first block of dest should equal second block of source
                 let resp = fs.read(dst_ino, dst_fh, 0, block_size as u32, uid, gid, 0);

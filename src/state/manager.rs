@@ -524,20 +524,18 @@ impl StateManager {
         // Note: We rely on state file cleanup (cleanup_stale_state) to handle dead processes.
         // We don't check if port 8080 is available because wildcard binds (0.0.0.0:8080)
         // would cause false negatives. Real port conflicts are detected at slirp4netns add_hostfwd time.
-        let ip = (|| {
+        let ip = (|| -> Result<String> {
             for b2 in 0..=255u8 {
                 for b3 in 2..=254u8 {
                     // Skip 127.0.0.1 (localhost)
                     let ip = format!("127.0.{}.{}", b2, b3);
                     if !used_ips.contains(&ip) {
-                        return ip;
+                        return Ok(ip);
                     }
                 }
             }
-            // Fallback if all IPs are used (very unlikely - 65,000+ IPs)
-            tracing::warn!("all loopback IPs in use, reusing 127.0.0.2");
-            "127.0.0.2".to_string()
-        })();
+            anyhow::bail!("all loopback IPs exhausted (65,000+ VMs)")
+        })()?;
 
         // Update VM state with the allocated IP and SAVE WHILE HOLDING THE LOCK
         // This ensures no other process can allocate the same IP
