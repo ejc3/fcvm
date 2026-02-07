@@ -485,14 +485,12 @@ impl StateManager {
         let lock_file = self.state_dir.join("loopback-ip.lock");
 
         // Create/open lock file for exclusive locking
-        // Use 0o666 so both root and non-root processes can share the same lock file
-        // when they share a state directory (e.g., default /mnt/fcvm-btrfs/state/).
         use std::os::unix::fs::OpenOptionsExt;
         let lock_fd = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .mode(0o666)
+            .mode(0o600)
             .open(&lock_file)
             .context("opening loopback IP lock file")?;
 
