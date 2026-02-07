@@ -218,8 +218,9 @@ clean-test-data: build
 	sudo rm -rf /mnt/fcvm-btrfs/vm-disks/*
 	sudo rm -rf $(ROOT_DATA_DIR)/vm-disks/* $(CONTAINER_DATA_DIR)/vm-disks/*
 	@echo "==> Cleaning state files..."
-	sudo rm -rf /mnt/fcvm-btrfs/state/*.json
-	sudo rm -rf $(ROOT_DATA_DIR)/state/*.json $(CONTAINER_DATA_DIR)/state/*.json
+	sudo rm -rf /mnt/fcvm-btrfs/state/*.json /mnt/fcvm-btrfs/state/*.lock
+	sudo rm -rf $(ROOT_DATA_DIR)/state/*.json $(ROOT_DATA_DIR)/state/*.lock
+	sudo rm -rf $(CONTAINER_DATA_DIR)/state/*.json $(CONTAINER_DATA_DIR)/state/*.lock
 	@echo "==> Cleaning UFFD sockets..."
 	sudo rm -f /mnt/fcvm-btrfs/uffd-*.sock
 	sudo rm -f $(ROOT_DATA_DIR)/uffd-*.sock $(CONTAINER_DATA_DIR)/uffd-*.sock
