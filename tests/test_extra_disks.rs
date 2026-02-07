@@ -57,7 +57,13 @@ async fn create_test_disk(path: &Path) -> Result<()> {
         .await?;
 
     // Mount temporarily, write test file, unmount
-    let mount_dir = format!("/tmp/fcvm-disk-{}", std::process::id());
+    // Use path-derived name to avoid collisions when tests run in parallel
+    let mount_dir = format!("/tmp/fcvm-disk-{:x}", {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut h);
+        h.finish()
+    });
     tokio::fs::create_dir_all(&mount_dir).await?;
     tokio::process::Command::new("mount")
         .args([path.to_str().unwrap(), &mount_dir])
