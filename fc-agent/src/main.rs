@@ -870,7 +870,8 @@ enum ExecResponse {
     Error(String),
 }
 
-/// Wrapper for vsock fd to use with tokio's AsyncFd
+/// Wrapper for vsock fd to use with tokio's AsyncFd.
+/// Implements Drop to close the fd automatically on all exit paths.
 struct VsockListener {
     fd: i32,
 }
@@ -878,6 +879,12 @@ struct VsockListener {
 impl std::os::unix::io::AsRawFd for VsockListener {
     fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
         self.fd
+    }
+}
+
+impl Drop for VsockListener {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.fd) };
     }
 }
 
@@ -901,6 +908,9 @@ async fn run_exec_server_with_ready_signal(ready_tx: tokio::sync::oneshot::Sende
         return;
     }
 
+    // Wrap immediately in RAII so all error paths close the fd
+    let listener = VsockListener { fd: listener_fd };
+
     // Bind to the exec port
     let addr = libc::sockaddr_vm {
         svm_family: libc::AF_VSOCK as u16,
@@ -912,7 +922,7 @@ async fn run_exec_server_with_ready_signal(ready_tx: tokio::sync::oneshot::Sende
 
     let bind_result = unsafe {
         libc::bind(
-            listener_fd,
+            listener.fd,
             &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
             std::mem::size_of::<libc::sockaddr_vm>() as u32,
         )
@@ -923,19 +933,17 @@ async fn run_exec_server_with_ready_signal(ready_tx: tokio::sync::oneshot::Sende
             "[fc-agent] ERROR: failed to bind vsock listener: {}",
             std::io::Error::last_os_error()
         );
-        unsafe { libc::close(listener_fd) };
         return;
     }
 
     // Start listening with larger backlog for parallel exec stress
     // Default of 5 is too small when many execs arrive simultaneously
-    let listen_result = unsafe { libc::listen(listener_fd, 128) };
+    let listen_result = unsafe { libc::listen(listener.fd, 128) };
     if listen_result < 0 {
         eprintln!(
             "[fc-agent] ERROR: failed to listen on vsock: {}",
             std::io::Error::last_os_error()
         );
-        unsafe { libc::close(listener_fd) };
         return;
     }
 
@@ -944,13 +952,13 @@ async fn run_exec_server_with_ready_signal(ready_tx: tokio::sync::oneshot::Sende
         EXEC_VSOCK_PORT
     );
 
-    // Wrap in AsyncFd for async accept
-    let listener = VsockListener { fd: listener_fd };
+    // Wrap in AsyncFd for async accept.
+    // AsyncFd::new() takes ownership of listener; if it fails, it drops
+    // the listener which closes the fd via our Drop impl.
     let async_fd = match tokio::io::unix::AsyncFd::new(listener) {
         Ok(fd) => fd,
         Err(e) => {
             eprintln!("[fc-agent] ERROR: failed to create AsyncFd: {}", e);
-            unsafe { libc::close(listener_fd) };
             return;
         }
     };
@@ -977,7 +985,7 @@ async fn run_exec_server_with_ready_signal(ready_tx: tokio::sync::oneshot::Sende
         // Try to accept
         let client_fd = unsafe {
             libc::accept4(
-                listener_fd,
+                async_fd.get_ref().fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 libc::SOCK_CLOEXEC, // Don't set NONBLOCK for client - we'll use blocking I/O
