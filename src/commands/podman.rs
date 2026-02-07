@@ -854,21 +854,17 @@ pub(crate) async fn run_output_listener(
         None
     };
 
-    // Read lines until connection closes
+    // Read lines until connection closes (no read timeout — large image imports
+    // can take 10+ minutes during which fc-agent produces no output)
     loop {
         line_buf.clear();
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(300), // 5 min read timeout
-            reader.read_line(&mut line_buf),
-        )
-        .await
-        {
-            Ok(Ok(0)) => {
+        match reader.read_line(&mut line_buf).await {
+            Ok(0) => {
                 // EOF - connection closed
                 debug!(vm_id = %vm_id, "Output connection closed");
                 break;
             }
-            Ok(Ok(_)) => {
+            Ok(_) => {
                 // Parse raw line format: stream:content
                 let line = line_buf.trim_end();
                 if let Some((stream, content)) = line.split_once(':') {
@@ -886,13 +882,8 @@ pub(crate) async fn run_output_listener(
                     let _ = w.write_all(b"ack\n").await;
                 }
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 warn!(vm_id = %vm_id, error = %e, "Error reading output");
-                break;
-            }
-            Err(_) => {
-                // Read timeout
-                debug!(vm_id = %vm_id, "Output read timeout");
                 break;
             }
         }
@@ -1433,7 +1424,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     };
 
     // For non-TTY mode, use async output listener
-    let _output_handle = if !tty_mode {
+    let output_handle = if !tty_mode {
         let socket_path = output_socket_path.clone();
         let vm_id_clone = vm_id.clone();
         Some(tokio::spawn(async move {
@@ -1645,6 +1636,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         &data_dir,
         Some(health_cancel_token),
         Some(health_monitor_handle),
+        output_handle, // abort output listener task
     )
     .await;
 

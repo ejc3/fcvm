@@ -604,7 +604,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     };
 
     // For non-TTY mode, use async output listener
-    let _output_handle = if !tty_mode {
+    let output_handle = if !tty_mode {
         let socket_path = output_socket_path.clone();
         let vm_id_clone = vm_id.clone();
         Some(tokio::spawn(async move {
@@ -856,6 +856,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             &data_dir,
             None, // no health monitor in exec path
             None,
+            output_handle, // abort output listener task
         )
         .await;
 
@@ -983,6 +984,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         &data_dir,
         Some(health_cancel_token),
         Some(health_monitor_handle),
+        output_handle, // abort output listener task
     )
     .await;
 
