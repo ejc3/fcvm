@@ -1043,7 +1043,6 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 tty: args.tty,
                 interactive: args.interactive,
                 startup_snapshot_base_key: None, // Already using startup snapshot
-                health_check_for_startup: None,
                 cpu: Some(args.cpu),
                 mem: Some(args.mem),
             };
@@ -1068,9 +1067,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 exec: None,
                 tty: args.tty,
                 interactive: args.interactive,
-                // Pass startup snapshot context if health check URL is set
+                // Create startup snapshot if this config has a health check URL
                 startup_snapshot_base_key: args.health_check.as_ref().map(|_| key.clone()),
-                health_check_for_startup: args.health_check.clone(),
                 cpu: Some(args.cpu),
                 mem: Some(args.mem),
             };
@@ -1328,13 +1326,6 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     };
 
     let network_config = network.setup().await.context("setting up network")?;
-
-    // Don't auto-assign health check URL from network config.
-    // HTTP health checks require an HTTP server - use container-ready file by default.
-    // User can explicitly set --health-check if they want HTTP checks.
-    if let Some(port) = network_config.health_check_port {
-        vm_state.config.network.health_check_port = Some(port);
-    }
 
     info!(tap = %network_config.tap_device, mac = %network_config.guest_mac, "network configured");
 

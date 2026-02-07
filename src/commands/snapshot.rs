@@ -684,9 +684,6 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Health check URL comes from snapshot metadata — it's a property of the VM image.
     // The cache key includes health_check_url, so each config gets its own snapshot.
     vm_state.config.health_check_url = snapshot_config.metadata.health_check_url.clone();
-    if let Some(port) = network_config.health_check_port {
-        vm_state.config.network.health_check_port = Some(port);
-    }
 
     info!(
         tap = %network_config.tap_device,
@@ -875,11 +872,13 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Create startup snapshot channel if:
     // - startup_snapshot_base_key is set (passed from podman run on cache hit)
-    // - health_check_for_startup is set (HTTP health check URL)
+    // - snapshot has a health check URL (needed to know when VM is fully initialized)
     let (startup_tx, mut startup_rx): (
         Option<tokio::sync::oneshot::Sender<()>>,
         Option<tokio::sync::oneshot::Receiver<()>>,
-    ) = if args.startup_snapshot_base_key.is_some() && args.health_check_for_startup.is_some() {
+    ) = if args.startup_snapshot_base_key.is_some()
+        && snapshot_config.metadata.health_check_url.is_some()
+    {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (Some(tx), Some(rx))
     } else {

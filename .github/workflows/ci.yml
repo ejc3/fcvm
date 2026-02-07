@@ -414,6 +414,12 @@ jobs:
               echo "✓ Run 2 complete - snapshot hit paths tested"
             fi
           done
+      - name: bench-vm
+        if: matrix.mode == 'SnapshotEnabled'
+        working-directory: fcvm
+        run: |
+          make clean-test-data || true
+          make bench-vm
       - name: Capture kernel logs
         if: always()
         run: |

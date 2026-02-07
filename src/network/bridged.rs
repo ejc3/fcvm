@@ -210,9 +210,6 @@ impl NetworkManager for BridgedNetwork {
         }
 
         // Step 5: Connect TAP to network - different for clones vs baseline
-        // For clones, we'll use a different health check IP (the veth inner IP)
-        let mut health_check_ip = guest_ip.clone();
-
         if self.is_clone {
             // Clone: Use In-Namespace NAT
             // br0 gets gateway IP, veth1 gets unique IP, NAT inside namespace
@@ -226,9 +223,6 @@ impl NetworkManager for BridgedNetwork {
             let veth_inner_ip =
                 format!("{}.{}.{}.{}", parts[0], parts[1], parts[2], last_octet + 1);
             let veth_inner_ip_cidr = format!("{}/30", veth_inner_ip);
-
-            // Health checks for clones go to the veth inner IP, which gets DNATed to guest
-            health_check_ip = veth_inner_ip.clone();
 
             let nat_config = veth::InNamespaceNatConfig {
                 gateway_ip: gateway_ip.clone(),
@@ -352,8 +346,6 @@ impl NetworkManager for BridgedNetwork {
             host_ip: Some(host_ip.clone()),
             host_veth: self.host_veth.clone(),
             loopback_ip: None,
-            health_check_port: Some(80),
-            health_check_url: Some(format!("http://{}:80/", health_check_ip)),
             dns_server,
             guest_ipv6: None, // Bridged mode doesn't support IPv6 yet
             host_ipv6: None,

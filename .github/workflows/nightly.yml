@@ -30,3 +30,64 @@ jobs:
           name: benchmark-results-${{ github.run_id }}
           path: /tmp/fcvm-container-target/criterion/
           if-no-files-found: warn
+
+  # VM benchmarks (exec, clone) - require KVM, Firecracker, self-hosted runners
+  bench-vm:
+    name: VM-Benchmarks-${{ matrix.arch }}
+    runs-on: [self-hosted, Linux, '${{ matrix.arch }}']
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x64]
+    steps:
+      - name: Clean workspace (pre-checkout)
+        run: |
+          sudo rm -rf ${{ github.workspace }}/fcvm/target ${{ github.workspace }}/fcvm/artifacts || true
+          sudo chmod -R u+w ~/.cargo/advisory-db* 2>/dev/null || true
+          sudo chown -R $USER:$USER ~/.cargo/advisory-db* 2>/dev/null || true
+      - uses: actions/checkout@v6
+        with:
+          path: fcvm
+      - uses: ./fcvm/.github/actions/checkout-deps
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev libclang-dev clang musl-tools \
+            iproute2 iptables slirp4netns dnsmasq qemu-utils e2fsprogs parted \
+            podman skopeo busybox-static cpio zstd autoconf automake libtool cmake \
+            libseccomp-dev
+      - name: Install Firecracker
+        run: |
+          ARCH=$(uname -m)
+          FC_VERSION="1.14.0"
+          curl -L -o /tmp/firecracker.tgz \
+            "https://github.com/firecracker-microvm/firecracker/releases/download/v${FC_VERSION}/firecracker-v${FC_VERSION}-${ARCH}.tgz"
+          sudo tar -xzf /tmp/firecracker.tgz -C /usr/local/bin --strip-components=1 \
+            "release-v${FC_VERSION}-${ARCH}/firecracker-v${FC_VERSION}-${ARCH}" \
+            "release-v${FC_VERSION}-${ARCH}/jailer-v${FC_VERSION}-${ARCH}"
+          sudo mv "/usr/local/bin/firecracker-v${FC_VERSION}-${ARCH}" /usr/local/bin/firecracker
+          sudo mv "/usr/local/bin/jailer-v${FC_VERSION}-${ARCH}" /usr/local/bin/jailer
+      - name: Setup KVM and networking
+        run: |
+          sudo chmod 666 /dev/kvm
+          sudo mkdir -p /var/run/netns
+          if [ ! -e /dev/userfaultfd ]; then
+            sudo mknod /dev/userfaultfd c 10 126
+          fi
+          sudo chmod 666 /dev/userfaultfd
+          sudo sysctl -w vm.unprivileged_userfaultfd=1
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+          sudo sysctl -w net.ipv4.conf.all.forwarding=1
+          sudo sysctl -w net.ipv4.conf.default.forwarding=1
+          echo "user_allow_other" | sudo tee /etc/fuse.conf
+          podman system migrate || true
+      - name: Run VM benchmarks
+        working-directory: fcvm
+        env:
+          FUSE_BACKEND_RS: ${{ github.workspace }}/fuse-backend-rs
+          FUSER: ${{ github.workspace }}/fuser
+        run: make bench-vm

@@ -305,11 +305,6 @@ pub struct SnapshotRunArgs {
     #[arg(skip)]
     pub startup_snapshot_base_key: Option<String>,
 
-    /// Health check URL for triggering startup snapshot (internal use only).
-    /// Only used when startup_snapshot_base_key is set.
-    #[arg(skip)]
-    pub health_check_for_startup: Option<String>,
-
     /// vCPUs (internal use only).
     /// Passed from podman run's --cpu when restoring from a snapshot.
     #[arg(skip)]

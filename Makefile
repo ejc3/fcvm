@@ -376,6 +376,12 @@ bench: build
 	sudo $(CARGO) bench -p fuse-pipe --bench operations
 	$(CARGO) bench -p fuse-pipe --bench protocol
 
+# VM benchmarks (exec, clone) - require KVM, Firecracker, setup
+bench-vm: build setup-fcvm
+	@echo "==> Running VM benchmarks..."
+	sudo $(CARGO) bench --bench exec -- --test
+	sudo $(CARGO) bench --bench clone -- --test
+
 # Container benchmark target (used by nightly CI)
 container-bench: check-disk container-build
 	@echo "==> Running benchmarks in container..."

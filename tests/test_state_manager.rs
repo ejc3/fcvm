@@ -36,8 +36,6 @@ async fn test_state_persistence() {
                 host_ip: Some("172.16.0.1".to_string()),
                 host_veth: Some("veth0".to_string()),
                 loopback_ip: None,
-                health_check_port: None,
-                health_check_url: None,
                 dns_server: None,
                 guest_ipv6: None,
                 host_ipv6: None,
