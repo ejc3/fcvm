@@ -333,8 +333,9 @@ setup-btrfs:
 		sudo chown -R $$(id -un):$$(id -gn) /mnt/fcvm-btrfs && \
 		echo '==> btrfs ready at /mnt/fcvm-btrfs'; \
 	fi
-	@# Ensure image-cache exists with correct permissions (may be missing on older setups)
-	@sudo mkdir -p /mnt/fcvm-btrfs/image-cache && sudo chown $$(id -un):$$(id -gn) /mnt/fcvm-btrfs/image-cache
+	@# Ensure these dirs exist with correct permissions (may be missing after reboot/corruption)
+	@sudo mkdir -p /mnt/fcvm-btrfs/image-cache /mnt/fcvm-btrfs/containers
+	@sudo chown $$(id -un):$$(id -gn) /mnt/fcvm-btrfs/image-cache /mnt/fcvm-btrfs/containers
 	@# Create per-mode data directories (state, snapshots, vm-disks)
 	@# Default: owned by current user (test-fast runs as ubuntu)
 	@mkdir -p /mnt/fcvm-btrfs/{state,snapshots,vm-disks}
