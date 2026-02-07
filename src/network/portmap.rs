@@ -323,7 +323,8 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
 /// Removes global NAT rules if no bridged VMs are running
 ///
 /// Checks for veth0-* interfaces (indicates active bridged VMs).
-/// If none exist, removes the MASQUERADE rules.
+/// If none exist, removes the MASQUERADE rules for both subnets.
+/// IP forwarding is intentionally left enabled (other services may depend on it).
 /// Best-effort — logs warnings but doesn't fail.
 pub async fn cleanup_global_nat_if_unused() {
     // Check if any veth0- interfaces exist (active bridged VMs)
