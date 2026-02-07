@@ -259,7 +259,49 @@ fn test_multi_reader_mount_basic_io() {
     cleanup(&data_dir, &mount_dir);
 }
 
-/// Test that lseek supports negative offsets relative to SEEK_END.
+/// Test that RENAME_NOREPLACE returns EEXIST when destination exists.
+#[test]
+fn test_rename_noreplace_returns_eexist() {
+    let (data_dir, mount_dir) = unique_paths("fuse-integ");
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
+    let mount = fuse.mount_path();
+
+    let src = mount.join("src.txt");
+    let dst = mount.join("dst.txt");
+    fs::write(&src, "source").expect("write src");
+    fs::write(&dst, "destination").expect("write dst");
+
+    // Use renameat2 with RENAME_NOREPLACE — should fail with EEXIST
+    let src_name = std::ffi::CString::new(src.to_str().unwrap()).unwrap();
+    let dst_name = std::ffi::CString::new(dst.to_str().unwrap()).unwrap();
+    let ret = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            src_name.as_ptr(),
+            libc::AT_FDCWD,
+            dst_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    assert_eq!(ret, -1, "renameat2 RENAME_NOREPLACE should fail");
+    let err = std::io::Error::last_os_error();
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::EEXIST),
+        "expected EEXIST, got {:?}",
+        err
+    );
+
+    // Verify neither file was modified
+    assert_eq!(fs::read_to_string(&src).unwrap(), "source");
+    assert_eq!(fs::read_to_string(&dst).unwrap(), "destination");
+
+    let _ = fs::remove_file(&src);
+    let _ = fs::remove_file(&dst);
+
+    drop(fuse);
+    cleanup(&data_dir, &mount_dir);
+}
 #[test]
 fn test_lseek_supports_negative_offsets() {
     common::increase_ulimit();

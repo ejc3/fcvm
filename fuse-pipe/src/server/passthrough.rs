@@ -224,10 +224,10 @@ impl FilesystemHandler for PassthroughFs {
         self.handle_request(request)
     }
 
-    fn lookup(&self, parent: u64, name: &str, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
+    fn lookup(&self, parent: u64, name: &[u8], uid: u32, gid: u32, pid: u32) -> VolumeResponse {
         let ctx = Self::make_context_simple(uid, gid, pid);
 
-        let cname = match CString::new(name) {
+        let cname = match CString::new(name.to_vec()) {
             Ok(c) => c,
             Err(_) => return VolumeResponse::error(libc::EINVAL),
         };
@@ -374,16 +374,15 @@ impl FilesystemHandler for PassthroughFs {
 
             let mut add_entry =
                 |entry: fuse_backend_rs::api::filesystem::DirEntry| -> std::io::Result<usize> {
-                    // entry.name is already a &[u8]
-                    let name_str = String::from_utf8_lossy(entry.name).to_string();
+                    let name = entry.name.to_vec();
 
                     // Skip . and .. as we add them manually for offset 0
-                    if name_str != "." && name_str != ".." {
+                    if name != b"." && name != b".." {
                         // Note: entry.type_ is already a d_type value (like DT_DIR=4),
                         // NOT a mode value (like S_IFDIR=0o40000). Use it directly.
                         entries.push(DirEntry {
                             ino: entry.ino,
-                            name: name_str,
+                            name,
                             file_type: entry.type_ as u8,
                         });
                     }
@@ -462,16 +461,16 @@ impl FilesystemHandler for PassthroughFs {
     fn mkdir(
         &self,
         parent: u64,
-        name: &str,
+        name: &[u8],
         mode: u32,
         uid: u32,
         gid: u32,
         pid: u32,
     ) -> VolumeResponse {
-        tracing::debug!(target: "passthrough", parent, name, mode, uid, gid, "mkdir");
+        tracing::debug!(target: "passthrough", parent, ?name, mode, uid, gid, "mkdir");
         let ctx = Self::make_context_simple(uid, gid, pid);
 
-        let cname = match CString::new(name) {
+        let cname = match CString::new(name.to_vec()) {
             Ok(c) => c,
             Err(_) => return VolumeResponse::error(libc::EINVAL),
         };
@@ -500,7 +499,7 @@ impl FilesystemHandler for PassthroughFs {
     fn mknod(
         &self,
         parent: u64,
-        name: &str,
+        name: &[u8],
         mode: u32,
         rdev: u32,
         uid: u32,
@@ -509,7 +508,7 @@ impl FilesystemHandler for PassthroughFs {
     ) -> VolumeResponse {
         let ctx = Self::make_context_simple(uid, gid, pid);
 
-        let cname = match CString::new(name) {
+        let cname = match CString::new(name.to_vec()) {
             Ok(c) => c,
             Err(_) => return VolumeResponse::error(libc::EINVAL),
         };
@@ -529,12 +528,12 @@ impl FilesystemHandler for PassthroughFs {
         }
     }
 
-    fn rmdir(&self, parent: u64, name: &str, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
+    fn rmdir(&self, parent: u64, name: &[u8], uid: u32, gid: u32, pid: u32) -> VolumeResponse {
         let ctx = Self::make_context_simple(uid, gid, pid);
 
         // fuse-backend-rs handles credentials via Context internally.
 
-        let cname = match CString::new(name) {
+        let cname = match CString::new(name.to_vec()) {
             Ok(c) => c,
             Err(_) => return VolumeResponse::error(libc::EINVAL),
         };
@@ -548,7 +547,7 @@ impl FilesystemHandler for PassthroughFs {
     fn create(
         &self,
         parent: u64,
-        name: &str,
+        name: &[u8],
         mode: u32,
         flags: u32,
         uid: u32,
@@ -556,9 +555,9 @@ impl FilesystemHandler for PassthroughFs {
         pid: u32,
     ) -> VolumeResponse {
         let ctx = Self::make_context_simple(uid, gid, pid);
-        tracing::debug!(target: "passthrough", parent, name, mode, flags, uid, gid, "create");
+        tracing::debug!(target: "passthrough", parent, ?name, mode, flags, uid, gid, "create");
 
-        let cname = match CString::new(name) {
+        let cname = match CString::new(name.to_vec()) {
             Ok(c) => c,
             Err(_) => return VolumeResponse::error(libc::EINVAL),
         };
@@ -709,12 +708,12 @@ impl FilesystemHandler for PassthroughFs {
         }
     }
 
-    fn unlink(&self, parent: u64, name: &str, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
+    fn unlink(&self, parent: u64, name: &[u8], uid: u32, gid: u32, pid: u32) -> VolumeResponse {
         let ctx = Self::make_context_simple(uid, gid, pid);
 
         // fuse-backend-rs handles credentials via Context internally.
 
-        let cname = match CString::new(name) {
+        let cname = match CString::new(name.to_vec()) {
             Ok(c) => c,
             Err(_) => return VolumeResponse::error(libc::EINVAL),
         };
@@ -728,9 +727,10 @@ impl FilesystemHandler for PassthroughFs {
     fn rename(
         &self,
         parent: u64,
-        name: &str,
+        name: &[u8],
         newparent: u64,
-        newname: &str,
+        newname: &[u8],
+        flags: u32,
         uid: u32,
         gid: u32,
         pid: u32,
@@ -739,19 +739,19 @@ impl FilesystemHandler for PassthroughFs {
 
         // fuse-backend-rs handles credentials via Context internally.
 
-        let cname = match CString::new(name) {
+        let cname = match CString::new(name.to_vec()) {
             Ok(c) => c,
             Err(_) => return VolumeResponse::error(libc::EINVAL),
         };
 
-        let cnewname = match CString::new(newname) {
+        let cnewname = match CString::new(newname.to_vec()) {
             Ok(c) => c,
             Err(_) => return VolumeResponse::error(libc::EINVAL),
         };
 
         match self
             .inner
-            .rename(&ctx, parent, &cname, newparent, &cnewname, 0)
+            .rename(&ctx, parent, &cname, newparent, &cnewname, flags)
         {
             Ok(()) => VolumeResponse::Ok,
             Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
@@ -761,20 +761,20 @@ impl FilesystemHandler for PassthroughFs {
     fn symlink(
         &self,
         parent: u64,
-        name: &str,
-        target: &str,
+        name: &[u8],
+        target: &[u8],
         uid: u32,
         gid: u32,
         pid: u32,
     ) -> VolumeResponse {
         let ctx = Self::make_context_simple(uid, gid, pid);
 
-        let cname = match CString::new(name) {
+        let cname = match CString::new(name.to_vec()) {
             Ok(c) => c,
             Err(_) => return VolumeResponse::error(libc::EINVAL),
         };
 
-        let ctarget = match CString::new(target) {
+        let ctarget = match CString::new(target.to_vec()) {
             Ok(c) => c,
             Err(_) => return VolumeResponse::error(libc::EINVAL),
         };
@@ -798,10 +798,9 @@ impl FilesystemHandler for PassthroughFs {
         let ctx = Context::new();
 
         match self.inner.readlink(&ctx, ino) {
-            Ok(target_bytes) => {
-                let target = String::from_utf8_lossy(&target_bytes).to_string();
-                VolumeResponse::Symlink { target }
-            }
+            Ok(target_bytes) => VolumeResponse::Symlink {
+                target: target_bytes,
+            },
             Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
         }
     }
@@ -810,7 +809,7 @@ impl FilesystemHandler for PassthroughFs {
         &self,
         ino: u64,
         newparent: u64,
-        newname: &str,
+        newname: &[u8],
         uid: u32,
         gid: u32,
         pid: u32,
@@ -819,7 +818,7 @@ impl FilesystemHandler for PassthroughFs {
 
         // fuse-backend-rs handles credentials via Context internally.
 
-        let cnewname = match CString::new(newname) {
+        let cnewname = match CString::new(newname.to_vec()) {
             Ok(c) => c,
             Err(_) => return VolumeResponse::error(libc::EINVAL),
         };
@@ -898,7 +897,7 @@ impl FilesystemHandler for PassthroughFs {
     fn setxattr(
         &self,
         ino: u64,
-        name: &str,
+        name: &[u8],
         value: &[u8],
         flags: u32,
         uid: u32,
@@ -909,7 +908,7 @@ impl FilesystemHandler for PassthroughFs {
 
         // fuse-backend-rs handles credentials via Context internally.
 
-        let cname = match CString::new(name) {
+        let cname = match CString::new(name.to_vec()) {
             Ok(c) => c,
             Err(_) => return VolumeResponse::error(libc::EINVAL),
         };
@@ -923,7 +922,7 @@ impl FilesystemHandler for PassthroughFs {
     fn getxattr(
         &self,
         ino: u64,
-        name: &str,
+        name: &[u8],
         size: u32,
         uid: u32,
         gid: u32,
@@ -933,7 +932,7 @@ impl FilesystemHandler for PassthroughFs {
 
         let ctx = Self::make_context_simple(uid, gid, pid);
 
-        let cname = match CString::new(name) {
+        let cname = match CString::new(name.to_vec()) {
             Ok(c) => c,
             Err(_) => return VolumeResponse::error(libc::EINVAL),
         };
@@ -961,12 +960,12 @@ impl FilesystemHandler for PassthroughFs {
         }
     }
 
-    fn removexattr(&self, ino: u64, name: &str, uid: u32, gid: u32, pid: u32) -> VolumeResponse {
+    fn removexattr(&self, ino: u64, name: &[u8], uid: u32, gid: u32, pid: u32) -> VolumeResponse {
         let ctx = Self::make_context_simple(uid, gid, pid);
 
         // fuse-backend-rs handles credentials via Context internally.
 
-        let cname = match CString::new(name) {
+        let cname = match CString::new(name.to_vec()) {
             Ok(c) => c,
             Err(_) => return VolumeResponse::error(libc::EINVAL),
         };
@@ -1079,11 +1078,11 @@ impl FilesystemHandler for PassthroughFs {
             let mut add_entry = |dir_entry: fuse_backend_rs::api::filesystem::DirEntry,
                                  entry: Entry|
              -> std::io::Result<usize> {
-                let name_str = String::from_utf8_lossy(dir_entry.name).to_string();
+                let name = dir_entry.name.to_vec();
                 let attr = Self::entry_to_attr(&entry);
                 entries.push(DirEntryPlus {
                     ino: entry.inode,
-                    name: name_str,
+                    name,
                     attr,
                     generation: entry.generation,
                     attr_ttl_secs: self.attr_ttl_secs,
@@ -1201,6 +1200,22 @@ impl FilesystemHandler for PassthroughFs {
             }
         }
     }
+
+    fn forget(&self, ino: u64, nlookup: u64) {
+        let ctx = Context::new();
+        self.inner.forget(&ctx, ino, nlookup);
+    }
+
+    fn batch_forget(&self, inodes: &[(u64, u64)]) {
+        let ctx = Context::new();
+        self.inner.batch_forget(
+            &ctx,
+            inodes
+                .iter()
+                .map(|&(ino, nlookup)| (ino, nlookup))
+                .collect(),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1238,7 +1253,7 @@ mod tests {
 
         let uid = nix::unistd::Uid::effective().as_raw();
         let gid = nix::unistd::Gid::effective().as_raw();
-        let resp = fs.lookup(1, "test.txt", uid, gid, 0);
+        let resp = fs.lookup(1, b"test.txt", uid, gid, 0);
         match resp {
             VolumeResponse::Entry { attr, .. } => {
                 assert!(attr.is_file());
@@ -1257,7 +1272,7 @@ mod tests {
         // Note: flags must include O_RDWR for read/write access
         let uid = nix::unistd::Uid::effective().as_raw();
         let gid = nix::unistd::Gid::effective().as_raw();
-        let resp = fs.create(1, "test.txt", 0o644, libc::O_RDWR as u32, uid, gid, 0);
+        let resp = fs.create(1, b"test.txt", 0o644, libc::O_RDWR as u32, uid, gid, 0);
         let (ino, fh) = match resp {
             VolumeResponse::Created { attr, fh, .. } => (attr.ino, fh),
             VolumeResponse::Error { errno } => {
@@ -1300,7 +1315,7 @@ mod tests {
         let gid = nix::unistd::Gid::effective().as_raw();
 
         // Lookup the file first to get its inode
-        let resp = fs.lookup(1, "existing.txt", uid, gid, 0);
+        let resp = fs.lookup(1, b"existing.txt", uid, gid, 0);
         let ino = match resp {
             VolumeResponse::Entry { attr, .. } => attr.ino,
             _ => panic!("Expected Entry response"),
@@ -1415,7 +1430,7 @@ mod tests {
         let gid = nix::unistd::Gid::effective().as_raw();
 
         // Create source file
-        let resp = fs.create(1, "source.txt", 0o644, libc::O_RDWR as u32, uid, gid, 0);
+        let resp = fs.create(1, b"source.txt", 0o644, libc::O_RDWR as u32, uid, gid, 0);
         let (source_ino, fh) = match resp {
             VolumeResponse::Created { attr, fh, .. } => {
                 eprintln!("create() returned inode={}, fh={}", attr.ino, fh);
@@ -1433,7 +1448,7 @@ mod tests {
         // In real FUSE, the kernel calls LOOKUP on the source before LINK.
         // This lookup refreshes the inode reference in fuse-backend-rs.
         // We must do the same when calling PassthroughFs directly.
-        let resp = fs.lookup(1, "source.txt", uid, gid, 0);
+        let resp = fs.lookup(1, b"source.txt", uid, gid, 0);
         let source_ino = match resp {
             VolumeResponse::Entry { attr, .. } => {
                 eprintln!("lookup() returned inode={}", attr.ino);
@@ -1450,7 +1465,7 @@ mod tests {
             "Calling link(source_ino={}, parent=1, name='link.txt')...",
             source_ino
         );
-        let resp = fs.link(source_ino, 1, "link.txt", uid, gid, 0);
+        let resp = fs.link(source_ino, 1, b"link.txt", uid, gid, 0);
         let link_ino = match resp {
             VolumeResponse::Entry { attr, .. } => {
                 eprintln!("link() succeeded with inode={}", attr.ino);
@@ -1480,15 +1495,15 @@ mod tests {
         };
 
         // Delete source file
-        let resp = fs.unlink(1, "source.txt", uid, gid, 0);
+        let resp = fs.unlink(1, b"source.txt", uid, gid, 0);
         assert!(resp.is_ok(), "Unlink source failed");
 
         // Verify source is gone
-        let resp = fs.lookup(1, "source.txt", uid, gid, 0);
+        let resp = fs.lookup(1, b"source.txt", uid, gid, 0);
         assert!(matches!(resp, VolumeResponse::Error { errno } if errno == libc::ENOENT));
 
         // Hardlink should still be accessible and readable
-        let resp = fs.lookup(1, "link.txt", uid, gid, 0);
+        let resp = fs.lookup(1, b"link.txt", uid, gid, 0);
         let lookup_ino = match resp {
             VolumeResponse::Entry { attr, .. } => attr.ino,
             VolumeResponse::Error { errno } => {
@@ -1552,7 +1567,9 @@ mod tests {
         for i in 0..file_count {
             let expected = format!("entry-{i:03}-");
             assert!(
-                entries.iter().any(|e| e.name.starts_with(&expected)),
+                entries
+                    .iter()
+                    .any(|e| e.name.starts_with(expected.as_bytes())),
                 "missing directory entry for {}",
                 expected
             );
@@ -1572,7 +1589,7 @@ mod tests {
 
         // Create source file with test data
         let test_data = b"Hello, FICLONE! This tests reflink remap support.";
-        let resp = fs.create(1, "source.txt", 0o644, libc::O_RDWR as u32, uid, gid, 0);
+        let resp = fs.create(1, b"source.txt", 0o644, libc::O_RDWR as u32, uid, gid, 0);
         let (src_ino, src_fh) = match resp {
             VolumeResponse::Created { attr, fh, .. } => (attr.ino, fh),
             VolumeResponse::Error { errno } => panic!("Create source failed: {}", errno),
@@ -1588,7 +1605,7 @@ mod tests {
         assert!(resp.is_ok());
 
         // Create destination file
-        let resp = fs.create(1, "dest.txt", 0o644, libc::O_RDWR as u32, uid, gid, 0);
+        let resp = fs.create(1, b"dest.txt", 0o644, libc::O_RDWR as u32, uid, gid, 0);
         let (dst_ino, dst_fh) = match resp {
             VolumeResponse::Created { attr, fh, .. } => (attr.ino, fh),
             VolumeResponse::Error { errno } => panic!("Create dest failed: {}", errno),
@@ -1690,7 +1707,7 @@ mod tests {
         // Use 8K to ensure we have full blocks
         let block_size = 4096usize;
         let test_data: Vec<u8> = (0..block_size * 2).map(|i| (i % 256) as u8).collect();
-        let resp = fs.create(1, "source.txt", 0o644, libc::O_RDWR as u32, uid, gid, 0);
+        let resp = fs.create(1, b"source.txt", 0o644, libc::O_RDWR as u32, uid, gid, 0);
         let (src_ino, src_fh) = match resp {
             VolumeResponse::Created { attr, fh, .. } => (attr.ino, fh),
             VolumeResponse::Error { errno } => panic!("Create source failed: {}", errno),
@@ -1702,7 +1719,7 @@ mod tests {
         fs.fsync(src_ino, src_fh, false);
 
         // Create destination file, pre-allocate to same size
-        let resp = fs.create(1, "dest.txt", 0o644, libc::O_RDWR as u32, uid, gid, 0);
+        let resp = fs.create(1, b"dest.txt", 0o644, libc::O_RDWR as u32, uid, gid, 0);
         let (dst_ino, dst_fh) = match resp {
             VolumeResponse::Created { attr, fh, .. } => (attr.ino, fh),
             VolumeResponse::Error { errno } => panic!("Create dest failed: {}", errno),

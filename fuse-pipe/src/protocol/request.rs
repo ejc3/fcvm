@@ -15,7 +15,7 @@ pub enum VolumeRequest {
     /// Look up a directory entry by name.
     Lookup {
         parent: u64,
-        name: String,
+        name: Vec<u8>,
         uid: u32,
         gid: u32,
         pid: u32,
@@ -64,7 +64,7 @@ pub enum VolumeRequest {
     /// Create a directory.
     Mkdir {
         parent: u64,
-        name: String,
+        name: Vec<u8>,
         mode: u32,
         uid: u32,
         gid: u32,
@@ -74,7 +74,7 @@ pub enum VolumeRequest {
     /// Create a special file (device node, FIFO, socket).
     Mknod {
         parent: u64,
-        name: String,
+        name: Vec<u8>,
         mode: u32,
         rdev: u32,
         uid: u32,
@@ -85,7 +85,7 @@ pub enum VolumeRequest {
     /// Remove a directory.
     Rmdir {
         parent: u64,
-        name: String,
+        name: Vec<u8>,
         uid: u32,
         gid: u32,
         pid: u32,
@@ -94,7 +94,7 @@ pub enum VolumeRequest {
     /// Create and open a file.
     Create {
         parent: u64,
-        name: String,
+        name: Vec<u8>,
         mode: u32,
         flags: u32,
         uid: u32,
@@ -145,7 +145,7 @@ pub enum VolumeRequest {
     /// Remove a file.
     Unlink {
         parent: u64,
-        name: String,
+        name: Vec<u8>,
         uid: u32,
         gid: u32,
         pid: u32,
@@ -154,9 +154,11 @@ pub enum VolumeRequest {
     /// Rename a file or directory.
     Rename {
         parent: u64,
-        name: String,
+        name: Vec<u8>,
         newparent: u64,
-        newname: String,
+        newname: Vec<u8>,
+        /// Rename flags: RENAME_NOREPLACE (1), RENAME_EXCHANGE (2), RENAME_WHITEOUT (4)
+        flags: u32,
         uid: u32,
         gid: u32,
         pid: u32,
@@ -165,8 +167,8 @@ pub enum VolumeRequest {
     /// Create a symbolic link.
     Symlink {
         parent: u64,
-        name: String,
-        target: String,
+        name: Vec<u8>,
+        target: Vec<u8>,
         uid: u32,
         gid: u32,
         pid: u32,
@@ -179,7 +181,7 @@ pub enum VolumeRequest {
     Link {
         ino: u64,
         newparent: u64,
-        newname: String,
+        newname: Vec<u8>,
         uid: u32,
         gid: u32,
         pid: u32,
@@ -215,7 +217,7 @@ pub enum VolumeRequest {
     /// Set an extended attribute.
     Setxattr {
         ino: u64,
-        name: String,
+        name: Vec<u8>,
         value: Vec<u8>,
         flags: u32,
         uid: u32,
@@ -226,7 +228,7 @@ pub enum VolumeRequest {
     /// Get an extended attribute.
     Getxattr {
         ino: u64,
-        name: String,
+        name: Vec<u8>,
         size: u32,
         uid: u32,
         gid: u32,
@@ -245,7 +247,7 @@ pub enum VolumeRequest {
     /// Remove an extended attribute.
     Removexattr {
         ino: u64,
-        name: String,
+        name: Vec<u8>,
         uid: u32,
         gid: u32,
         pid: u32,
@@ -328,6 +330,21 @@ pub enum VolumeRequest {
         /// REMAP_FILE_DEDUP (1), REMAP_FILE_CAN_SHORTEN (2)
         remap_flags: u32,
     },
+
+    /// Decrement inode reference count (nlookup).
+    ///
+    /// The kernel sends this when it drops cached inode references.
+    /// No response is expected — fire-and-forget.
+    Forget { ino: u64, nlookup: u64 },
+
+    /// Batch decrement of inode reference counts.
+    ///
+    /// More efficient version of Forget for multiple inodes at once.
+    /// No response is expected — fire-and-forget.
+    BatchForget {
+        /// Vec of (inode, nlookup) pairs.
+        inodes: Vec<(u64, u64)>,
+    },
 }
 
 impl VolumeRequest {
@@ -369,6 +386,8 @@ impl VolumeRequest {
             VolumeRequest::Readdirplus { .. } => "readdirplus",
             VolumeRequest::CopyFileRange { .. } => "copy_file_range",
             VolumeRequest::RemapFileRange { .. } => "remap_file_range",
+            VolumeRequest::Forget { .. } => "forget",
+            VolumeRequest::BatchForget { .. } => "batch_forget",
         }
     }
 
@@ -391,6 +410,14 @@ impl VolumeRequest {
                 | VolumeRequest::Readdirplus { .. }
         )
     }
+
+    /// Check if this is a fire-and-forget operation (no response expected).
+    pub fn is_no_reply(&self) -> bool {
+        matches!(
+            self,
+            VolumeRequest::Forget { .. } | VolumeRequest::BatchForget { .. }
+        )
+    }
 }
 
 #[cfg(test)]
@@ -401,7 +428,7 @@ mod tests {
     fn test_op_name() {
         let req = VolumeRequest::Lookup {
             parent: 1,
-            name: "test".to_string(),
+            name: b"test".to_vec(),
             uid: 1000,
             gid: 1000,
             pid: 1234,
@@ -435,10 +462,34 @@ mod tests {
     }
 
     #[test]
+    fn test_is_no_reply() {
+        let forget = VolumeRequest::Forget {
+            ino: 42,
+            nlookup: 5,
+        };
+        assert!(forget.is_no_reply());
+
+        let batch = VolumeRequest::BatchForget {
+            inodes: vec![(1, 1), (2, 3)],
+        };
+        assert!(batch.is_no_reply());
+
+        // Regular ops should require a reply
+        let lookup = VolumeRequest::Lookup {
+            parent: 1,
+            name: b"test".to_vec(),
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        assert!(!lookup.is_no_reply());
+    }
+
+    #[test]
     fn test_serialization_roundtrip() {
         let req = VolumeRequest::Create {
             parent: 1,
-            name: "newfile.txt".to_string(),
+            name: b"newfile.txt".to_vec(),
             mode: 0o644,
             flags: libc::O_RDWR as u32,
             uid: 1000,

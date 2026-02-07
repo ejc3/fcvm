@@ -46,7 +46,7 @@ pub enum VolumeResponse {
     DirEntriesPlus { entries: Vec<DirEntryPlus> },
 
     /// Symbolic link target.
-    Symlink { target: String },
+    Symlink { target: Vec<u8> },
 
     /// Filesystem statistics.
     Statfs {

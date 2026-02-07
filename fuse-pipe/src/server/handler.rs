@@ -157,10 +157,11 @@ pub trait FilesystemHandler: Send + Sync {
                 name,
                 newparent,
                 newname,
+                flags,
                 uid,
                 gid,
                 pid,
-            } => self.rename(*parent, name, *newparent, newname, *uid, *gid, *pid),
+            } => self.rename(*parent, name, *newparent, newname, *flags, *uid, *gid, *pid),
             VolumeRequest::Symlink {
                 parent,
                 name,
@@ -304,11 +305,26 @@ pub trait FilesystemHandler: Send + Sync {
                 *len,
                 *remap_flags,
             ),
+            VolumeRequest::Forget { ino, nlookup } => {
+                self.forget(*ino, *nlookup);
+                VolumeResponse::Ok // Not sent — caller skips response for forget
+            }
+            VolumeRequest::BatchForget { inodes } => {
+                self.batch_forget(inodes);
+                VolumeResponse::Ok // Not sent — caller skips response for forget
+            }
         }
     }
 
     /// Look up a directory entry by name.
-    fn lookup(&self, _parent: u64, _name: &str, _uid: u32, _gid: u32, _pid: u32) -> VolumeResponse {
+    fn lookup(
+        &self,
+        _parent: u64,
+        _name: &[u8],
+        _uid: u32,
+        _gid: u32,
+        _pid: u32,
+    ) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
         }
@@ -370,7 +386,7 @@ pub trait FilesystemHandler: Send + Sync {
     fn mkdir(
         &self,
         _parent: u64,
-        _name: &str,
+        _name: &[u8],
         _mode: u32,
         _uid: u32,
         _gid: u32,
@@ -386,7 +402,7 @@ pub trait FilesystemHandler: Send + Sync {
     fn mknod(
         &self,
         _parent: u64,
-        _name: &str,
+        _name: &[u8],
         _mode: u32,
         _rdev: u32,
         _uid: u32,
@@ -399,7 +415,7 @@ pub trait FilesystemHandler: Send + Sync {
     }
 
     /// Remove a directory.
-    fn rmdir(&self, _parent: u64, _name: &str, _uid: u32, _gid: u32, _pid: u32) -> VolumeResponse {
+    fn rmdir(&self, _parent: u64, _name: &[u8], _uid: u32, _gid: u32, _pid: u32) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
         }
@@ -410,7 +426,7 @@ pub trait FilesystemHandler: Send + Sync {
     fn create(
         &self,
         _parent: u64,
-        _name: &str,
+        _name: &[u8],
         _mode: u32,
         _flags: u32,
         _uid: u32,
@@ -477,7 +493,14 @@ pub trait FilesystemHandler: Send + Sync {
     }
 
     /// Remove a file.
-    fn unlink(&self, _parent: u64, _name: &str, _uid: u32, _gid: u32, _pid: u32) -> VolumeResponse {
+    fn unlink(
+        &self,
+        _parent: u64,
+        _name: &[u8],
+        _uid: u32,
+        _gid: u32,
+        _pid: u32,
+    ) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
         }
@@ -488,9 +511,10 @@ pub trait FilesystemHandler: Send + Sync {
     fn rename(
         &self,
         _parent: u64,
-        _name: &str,
+        _name: &[u8],
         _newparent: u64,
-        _newname: &str,
+        _newname: &[u8],
+        _flags: u32,
         _uid: u32,
         _gid: u32,
         _pid: u32,
@@ -505,8 +529,8 @@ pub trait FilesystemHandler: Send + Sync {
     fn symlink(
         &self,
         _parent: u64,
-        _name: &str,
-        _target: &str,
+        _name: &[u8],
+        _target: &[u8],
         _uid: u32,
         _gid: u32,
         _pid: u32,
@@ -529,7 +553,7 @@ pub trait FilesystemHandler: Send + Sync {
         &self,
         _ino: u64,
         _newparent: u64,
-        _newname: &str,
+        _newname: &[u8],
         _uid: u32,
         _gid: u32,
         _pid: u32,
@@ -581,7 +605,7 @@ pub trait FilesystemHandler: Send + Sync {
     fn setxattr(
         &self,
         _ino: u64,
-        _name: &str,
+        _name: &[u8],
         _value: &[u8],
         _flags: u32,
         _uid: u32,
@@ -598,7 +622,7 @@ pub trait FilesystemHandler: Send + Sync {
     fn getxattr(
         &self,
         _ino: u64,
-        _name: &str,
+        _name: &[u8],
         _size: u32,
         _uid: u32,
         _gid: u32,
@@ -620,7 +644,7 @@ pub trait FilesystemHandler: Send + Sync {
     fn removexattr(
         &self,
         _ino: u64,
-        _name: &str,
+        _name: &[u8],
         _uid: u32,
         _gid: u32,
         _pid: u32,
@@ -740,6 +764,18 @@ pub trait FilesystemHandler: Send + Sync {
             errno: libc::ENOSYS,
         }
     }
+
+    /// Decrement inode reference count.
+    ///
+    /// Called when the kernel drops cached references to an inode.
+    /// This is fire-and-forget — no response is expected.
+    fn forget(&self, _ino: u64, _nlookup: u64) {}
+
+    /// Batch decrement of inode reference counts.
+    ///
+    /// More efficient version of forget for multiple inodes at once.
+    /// This is fire-and-forget — no response is expected.
+    fn batch_forget(&self, _inodes: &[(u64, u64)]) {}
 }
 
 #[cfg(test)]
@@ -755,7 +791,7 @@ mod tests {
 
         // Most operations should return ENOSYS
         assert_eq!(
-            handler.lookup(1, "test", 1000, 1000, 1234).errno(),
+            handler.lookup(1, b"test", 1000, 1000, 1234).errno(),
             Some(libc::ENOSYS)
         );
         assert_eq!(handler.getattr(1).errno(), Some(libc::ENOSYS));
@@ -771,12 +807,76 @@ mod tests {
 
         let req = VolumeRequest::Lookup {
             parent: 1,
-            name: "test".to_string(),
+            name: b"test".to_vec(),
             uid: 1000,
             gid: 1000,
             pid: 1234,
         };
         let resp = handler.handle_request(&req);
         assert_eq!(resp.errno(), Some(libc::ENOSYS));
+    }
+
+    #[test]
+    fn test_forget_dispatch() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        struct TrackingHandler {
+            forgotten_ino: Arc<AtomicU64>,
+            forgotten_nlookup: Arc<AtomicU64>,
+        }
+        impl FilesystemHandler for TrackingHandler {
+            fn forget(&self, ino: u64, nlookup: u64) {
+                self.forgotten_ino.store(ino, Ordering::SeqCst);
+                self.forgotten_nlookup.store(nlookup, Ordering::SeqCst);
+            }
+        }
+
+        let ino = Arc::new(AtomicU64::new(0));
+        let nlookup = Arc::new(AtomicU64::new(0));
+        let handler = TrackingHandler {
+            forgotten_ino: ino.clone(),
+            forgotten_nlookup: nlookup.clone(),
+        };
+
+        let req = VolumeRequest::Forget {
+            ino: 42,
+            nlookup: 5,
+        };
+
+        assert!(req.is_no_reply());
+        let resp = handler.handle_request(&req);
+        assert!(resp.is_ok());
+        assert_eq!(ino.load(Ordering::SeqCst), 42);
+        assert_eq!(nlookup.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn test_batch_forget_dispatch() {
+        use std::sync::Mutex;
+
+        struct TrackingHandler {
+            forgotten: Mutex<Vec<(u64, u64)>>,
+        }
+        impl FilesystemHandler for TrackingHandler {
+            fn batch_forget(&self, inodes: &[(u64, u64)]) {
+                *self.forgotten.lock().unwrap() = inodes.to_vec();
+            }
+        }
+
+        let handler = TrackingHandler {
+            forgotten: Mutex::new(Vec::new()),
+        };
+
+        let req = VolumeRequest::BatchForget {
+            inodes: vec![(10, 1), (20, 3), (30, 7)],
+        };
+
+        assert!(req.is_no_reply());
+        let resp = handler.handle_request(&req);
+        assert!(resp.is_ok());
+
+        let forgotten = handler.forgotten.lock().unwrap();
+        assert_eq!(*forgotten, vec![(10, 1), (20, 3), (30, 7)]);
     }
 }
