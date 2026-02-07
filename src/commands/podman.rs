@@ -102,6 +102,8 @@ pub struct SnapshotCreationParams {
     pub vcpu: u8,
     /// Memory in MiB
     pub memory_mib: u32,
+    /// Health check URL from the baseline VM (None = no HTTP health check)
+    pub health_check_url: Option<String>,
 }
 
 impl SnapshotCreationParams {
@@ -111,6 +113,7 @@ impl SnapshotCreationParams {
             image: args.image.clone(),
             vcpu: args.cpu,
             memory_mib: args.mem,
+            health_check_url: args.health_check.clone(),
         }
     }
 
@@ -120,6 +123,7 @@ impl SnapshotCreationParams {
             image: metadata.image.clone(),
             vcpu: metadata.vcpu,
             memory_mib: metadata.memory_mib,
+            health_check_url: metadata.health_check_url.clone(),
         }
     }
 }
@@ -434,6 +438,7 @@ pub async fn create_podman_snapshot(
             memory_mib: params.memory_mib,
             network_config: network_config.clone(),
             volumes: snapshot_volumes,
+            health_check_url: params.health_check_url.clone(),
         },
     };
 

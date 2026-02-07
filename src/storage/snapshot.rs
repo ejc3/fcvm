@@ -58,6 +58,9 @@ pub struct SnapshotMetadata {
     /// Volume mounts from the baseline VM (for clone volume support)
     #[serde(default)]
     pub volumes: Vec<SnapshotVolumeConfig>,
+    /// Health check URL from the baseline VM (None = no HTTP health check)
+    #[serde(default)]
+    pub health_check_url: Option<String>,
 }
 
 /// Volume configuration saved in snapshot metadata.
@@ -214,6 +217,7 @@ mod tests {
                     http_proxy: None,
                 },
                 volumes: vec![],
+                health_check_url: None,
             },
         };
 
@@ -328,6 +332,7 @@ mod tests {
                     http_proxy: None,
                 },
                 volumes: vec![],
+                health_check_url: None,
             },
         };
 
@@ -386,6 +391,7 @@ mod tests {
                         http_proxy: None,
                     },
                     volumes: vec![],
+                    health_check_url: None,
                 },
             };
             manager.save_snapshot(config).await.unwrap();
@@ -431,6 +437,7 @@ mod tests {
                     http_proxy: None,
                 },
                 volumes: vec![],
+                health_check_url: None,
             },
         };
         manager.save_snapshot(config).await.unwrap();
@@ -527,6 +534,7 @@ mod tests {
                     http_proxy: None,
                 },
                 volumes: vec![],
+                health_check_url: None,
             },
         };
 
