@@ -204,7 +204,7 @@ pub async fn ensure_free_space(
 
     // e2fsck exit codes: 0=clean, 1=corrected, 2=corrected+reboot needed
     // Exit code >= 4 means uncorrected errors
-    if e2fsck_output.status.code().unwrap_or(1) >= 4 {
+    if e2fsck_output.status.code().unwrap_or(8) >= 4 {
         bail!(
             "e2fsck found uncorrectable errors: {}",
             String::from_utf8_lossy(&e2fsck_output.stderr)
