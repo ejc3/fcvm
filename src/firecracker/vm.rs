@@ -193,8 +193,12 @@ impl VmManager {
             cmd.arg("--show-log-origin");
         }
 
-        // Disable seccomp for now (can enable later for production)
-        cmd.arg("--no-seccomp");
+        // Seccomp is enabled by default (Firecracker's security boundary).
+        // Set FCVM_NO_SECCOMP=1 to disable for debugging.
+        if std::env::var("FCVM_NO_SECCOMP").is_ok() {
+            warn!("Seccomp disabled via FCVM_NO_SECCOMP - reduced security");
+            cmd.arg("--no-seccomp");
+        }
 
         // Additional firecracker args from environment (caller controls)
         if let Ok(extra) = std::env::var("FCVM_FIRECRACKER_ARGS") {
