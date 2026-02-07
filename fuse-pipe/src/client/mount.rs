@@ -424,7 +424,7 @@ fn mount_internal<P: AsRef<Path>>(
 /// ```
 #[cfg(target_os = "linux")]
 pub fn mount_vsock<P: AsRef<Path>>(cid: u32, port: u32, mount_point: P) -> anyhow::Result<()> {
-    mount_vsock_with_options(cid, port, mount_point, 1, 0)
+    mount_vsock_with_options(cid, port, mount_point, 1, 0, 0)
 }
 
 /// Mount a FUSE filesystem via vsock with multiple reader threads.
@@ -435,7 +435,7 @@ pub fn mount_vsock_with_readers<P: AsRef<Path>>(
     mount_point: P,
     num_readers: usize,
 ) -> anyhow::Result<()> {
-    mount_vsock_with_options(cid, port, mount_point, num_readers, 0)
+    mount_vsock_with_options(cid, port, mount_point, num_readers, 0, 0)
 }
 
 /// Mount a FUSE filesystem via vsock with full configuration.
@@ -447,6 +447,7 @@ pub fn mount_vsock_with_readers<P: AsRef<Path>>(
 /// * `mount_point` - Directory where the FUSE filesystem will be mounted
 /// * `num_readers` - Number of FUSE reader threads (1-8 recommended)
 /// * `trace_rate` - Trace every Nth request (0 = disabled)
+/// * `max_write` - Maximum write size in bytes (0 = unbounded, use kernel default)
 #[cfg(target_os = "linux")]
 pub fn mount_vsock_with_options<P: AsRef<Path>>(
     cid: u32,
@@ -454,6 +455,7 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
     mount_point: P,
     num_readers: usize,
     trace_rate: u64,
+    max_write: u32,
 ) -> anyhow::Result<()> {
     info!(target: "fuse-pipe::client", cid, port, num_readers, "connecting via vsock");
 
@@ -516,7 +518,7 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
     let mut session = None;
     let mut last_error = None;
     for attempt in 0..=SESSION_NEW_MAX_RETRIES {
-        let fs = FuseClient::with_destroyed_flag(Arc::clone(&mux), Arc::clone(&destroyed));
+        let fs = FuseClient::with_options(Arc::clone(&mux), Arc::clone(&destroyed), max_write);
         match fuser::Session::new(fs, mount_point.as_ref(), &config) {
             Ok(s) => {
                 if attempt > 0 {

@@ -84,8 +84,8 @@ impl UffdServer {
         &self.socket_path
     }
 
-    /// Run the UFFD server (blocks until all VMs disconnect)
-    pub async fn run(&self) -> Result<()> {
+    /// Run the UFFD server (blocks until cancelled via CancellationToken)
+    pub async fn run(&self, cancel: tokio_util::sync::CancellationToken) -> Result<()> {
         info!(
             target: "uffd",
             snapshot = %self.snapshot_id,
@@ -165,12 +165,12 @@ impl UffdServer {
                     }
 
                     info!(target: "uffd", active_vms = vm_tasks.len(), "VM exited");
+                }
 
-                    // Exit when last VM disconnects
-                    if vm_tasks.is_empty() {
-                        info!(target: "uffd", "no active VMs remaining, shutting down server");
-                        break;
-                    }
+                // Shut down when cancellation token is triggered (Ctrl-C / SIGTERM)
+                _ = cancel.cancelled() => {
+                    info!(target: "uffd", "cancellation requested, shutting down server");
+                    break;
                 }
             }
         }

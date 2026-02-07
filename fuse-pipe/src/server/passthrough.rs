@@ -210,15 +210,18 @@ impl FilesystemHandler for PassthroughFs {
             *g.borrow_mut() = groups_opt;
         });
 
-        // Dispatch to the default handler
-        let result = self.handle_request(request);
+        // Use a Drop guard to ensure thread-local is cleared even on panic
+        struct GroupsGuard;
+        impl Drop for GroupsGuard {
+            fn drop(&mut self) {
+                CURRENT_GROUPS.with(|g| {
+                    *g.borrow_mut() = None;
+                });
+            }
+        }
+        let _guard = GroupsGuard;
 
-        // Clear thread-local
-        CURRENT_GROUPS.with(|g| {
-            *g.borrow_mut() = None;
-        });
-
-        result
+        self.handle_request(request)
     }
 
     fn lookup(&self, parent: u64, name: &str, uid: u32, gid: u32, pid: u32) -> VolumeResponse {

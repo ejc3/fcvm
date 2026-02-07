@@ -132,17 +132,24 @@ pub fn spawn_health_monitor_full(
                 }
             };
 
-            // Switch to slower polling once healthy
-            if health_status == HealthStatus::Healthy && !is_healthy {
-                is_healthy = true;
-                poll_interval = HEALTH_POLL_HEALTHY_INTERVAL;
-                info!(target: "health-monitor", "VM healthy, switching to {:?} polling", HEALTH_POLL_HEALTHY_INTERVAL);
+            // Adaptive polling: fast when unhealthy, slow when healthy
+            if health_status == HealthStatus::Healthy {
+                if !is_healthy {
+                    is_healthy = true;
+                    poll_interval = HEALTH_POLL_HEALTHY_INTERVAL;
+                    info!(target: "health-monitor", "VM healthy, switching to {:?} polling", HEALTH_POLL_HEALTHY_INTERVAL);
 
-                // Signal startup snapshot trigger (fires only once)
-                if let Some(tx) = startup_tx.take() {
-                    info!(target: "health-monitor", "signaling startup snapshot trigger");
-                    let _ = tx.send(()); // Ignore error if receiver dropped
+                    // Signal startup snapshot trigger (fires only once)
+                    if let Some(tx) = startup_tx.take() {
+                        info!(target: "health-monitor", "signaling startup snapshot trigger");
+                        let _ = tx.send(()); // Ignore error if receiver dropped
+                    }
                 }
+            } else if is_healthy {
+                // VM was healthy but is no longer — revert to fast polling
+                is_healthy = false;
+                poll_interval = HEALTH_POLL_STARTUP_INTERVAL;
+                warn!(target: "health-monitor", "VM no longer healthy, reverting to {:?} polling", HEALTH_POLL_STARTUP_INTERVAL);
             }
 
             // Stop monitoring if container has stopped
@@ -253,7 +260,7 @@ async fn check_podman_healthcheck(pid: u32) -> Option<bool> {
     // Use fcvm exec to run podman inspect inside the VM
     let exe = match find_fcvm_binary() {
         Some(e) => e,
-        None => return Some(true), // Can't find fcvm binary, assume healthy
+        None => return None, // Can't find fcvm binary, can't determine health
     };
 
     let cmd_future = tokio::process::Command::new(&exe)
@@ -391,7 +398,7 @@ async fn update_health_status_once(
                             .as_ref()
                             .map(|ip| ip.split('/').next().unwrap_or(ip))
                             .unwrap_or("192.168.1.2");
-                        let port = 80; // Always use port 80 directly to guest
+                        let port = url.port().unwrap_or(80);
                         debug!(target: "health-monitor", holder_pid = holder_pid, guest_ip = %guest_ip, port = port, "HTTP health check via nsenter");
 
                         match check_http_health_nsenter(holder_pid, guest_ip, port, health_path)

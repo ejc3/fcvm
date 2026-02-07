@@ -441,7 +441,14 @@ ip addr add {namespace_ip}/24 dev {bridge}
             debug!(response = %response_line.trim(), "slirp4netns API response");
 
             if response_line.contains("error") {
-                warn!(response = %response_line.trim(), "port forwarding may have failed");
+                anyhow::bail!(
+                    "port forwarding failed for {}:{} -> {}:{}: {}",
+                    bind_addr,
+                    mapping.host_port,
+                    self.guest_ip,
+                    mapping.guest_port,
+                    response_line.trim()
+                );
             }
         }
 

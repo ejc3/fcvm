@@ -277,8 +277,10 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
 
-    // Run server in background task
-    let mut server_handle = tokio::spawn(async move { server.run().await });
+    // Run server in background task with cancellation token
+    let server_cancel = tokio_util::sync::CancellationToken::new();
+    let server_cancel_clone = server_cancel.clone();
+    let mut server_handle = tokio::spawn(async move { server.run(server_cancel_clone).await });
 
     // Clone state_manager for signal handler use
     let state_manager_for_signal = state_manager.clone();
@@ -300,6 +302,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
 
             _ = sigterm.recv() => {
                 info!("received SIGTERM");
+                server_cancel.cancel();
                 break;
             }
             _ = sigint.recv() => {
@@ -308,6 +311,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
                     // Second Ctrl-C - force shutdown
                     info!("received second SIGINT, forcing shutdown");
                     println!("\nForcing shutdown...");
+                    server_cancel.cancel();
                     break;
                 }
 
@@ -321,6 +325,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
 
                 if running_clones.is_empty() {
                     println!("\nNo running clones, shutting down...");
+                    server_cancel.cancel();
                     break;
                 } else {
                     println!("\n⚠️  {} clone(s) still running!", running_clones.len());
@@ -760,6 +765,22 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 cleanup_err
             );
         }
+
+        // Cleanup data directory
+        if data_dir.exists() {
+            if let Err(cleanup_err) = tokio::fs::remove_dir_all(&data_dir).await {
+                warn!(
+                    "failed to cleanup data_dir after setup error: {}",
+                    cleanup_err
+                );
+            }
+        }
+
+        // Cleanup state file
+        if let Err(cleanup_err) = state_manager.delete_state(&vm_id).await {
+            warn!("failed to cleanup state after setup error: {}", cleanup_err);
+        }
+
         return Err(e);
     }
 

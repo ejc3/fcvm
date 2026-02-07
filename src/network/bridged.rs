@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::{
     get_host_dns_servers, namespace, portmap, types::generate_mac, veth, NetworkConfig,
@@ -364,39 +364,56 @@ impl NetworkManager for BridgedNetwork {
 
     async fn cleanup(&mut self) -> Result<()> {
         info!(vm_id = %self.vm_id, "cleaning up network namespace and resources");
+        let mut errors = Vec::new();
 
         // Step 1: Cleanup port mapping rules (if any)
         if !self.port_mapping_rules.is_empty() {
-            portmap::cleanup_port_mappings(&self.port_mapping_rules).await?;
+            if let Err(e) = portmap::cleanup_port_mappings(&self.port_mapping_rules).await {
+                warn!(vm_id = %self.vm_id, error = %e, "failed to cleanup port mappings");
+                errors.push(format!("port mappings: {}", e));
+            }
         }
 
         // Step 2: Delete host route to guest IP (for clones)
-        // This route was added to allow direct access to the guest IP from the host.
-        // Must be deleted before the veth to prevent stale routes.
         if self.is_clone {
             if let Some(ref guest_ip) = self.guest_ip {
-                veth::delete_host_route_to_guest(guest_ip).await?;
+                if let Err(e) = veth::delete_host_route_to_guest(guest_ip).await {
+                    warn!(vm_id = %self.vm_id, error = %e, "failed to delete host route");
+                    errors.push(format!("host route: {}", e));
+                }
             }
         }
 
         // Step 3: Delete FORWARD rule and veth pair
-        // Note: With In-Namespace NAT, all clone-specific rules are inside the namespace
-        // and get cleaned up automatically when the namespace is deleted.
         if let Some(ref host_veth) = self.host_veth {
-            // Delete FORWARD rule to avoid accumulating orphaned rules
-            veth::delete_veth_forward_rule(host_veth).await?;
-            // Then delete the veth pair (this will also remove the peer in the namespace)
-            veth::delete_veth_pair(host_veth).await?;
+            if let Err(e) = veth::delete_veth_forward_rule(host_veth).await {
+                warn!(vm_id = %self.vm_id, error = %e, "failed to delete forward rule");
+                errors.push(format!("forward rule: {}", e));
+            }
+            if let Err(e) = veth::delete_veth_pair(host_veth).await {
+                warn!(vm_id = %self.vm_id, error = %e, "failed to delete veth pair");
+                errors.push(format!("veth pair: {}", e));
+            }
         }
 
-        // Step 4: Delete network namespace (this cleans up everything inside it)
-        // Including all NAT rules, bridge, and veth peer
+        // Step 4: Delete network namespace
         if let Some(ref namespace_id) = self.namespace_id {
-            namespace::delete_namespace(namespace_id).await?;
+            if let Err(e) = namespace::delete_namespace(namespace_id).await {
+                warn!(vm_id = %self.vm_id, error = %e, "failed to delete namespace");
+                errors.push(format!("namespace: {}", e));
+            }
         }
 
-        debug!(vm_id = %self.vm_id, "network cleanup complete");
-        Ok(())
+        if errors.is_empty() {
+            debug!(vm_id = %self.vm_id, "network cleanup complete");
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "network cleanup had {} error(s): {}",
+                errors.len(),
+                errors.join("; ")
+            )
+        }
     }
 
     fn tap_device(&self) -> &str {

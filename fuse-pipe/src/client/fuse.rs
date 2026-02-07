@@ -57,12 +57,14 @@ pub struct FuseClient {
     init_callback: Mutex<Option<InitCallback>>,
     /// Shared flag set by destroy() to signal clean shutdown to reader threads
     destroyed: Arc<AtomicBool>,
+    /// Maximum write size (0 = unbounded). Passed explicitly to avoid env var races.
+    max_write: u32,
 }
 
 impl FuseClient {
     /// Create a new client using shared multiplexer.
     pub fn new(mux: Arc<Multiplexer>) -> Self {
-        Self::with_destroyed_flag(mux, Arc::new(AtomicBool::new(false)))
+        Self::with_options(mux, Arc::new(AtomicBool::new(false)), 0)
     }
 
     /// Create a new client with a shared destroyed flag.
@@ -70,10 +72,16 @@ impl FuseClient {
     /// The destroyed flag is set by `destroy()` when the filesystem is unmounted.
     /// Reader threads can check this flag to distinguish clean shutdown from errors.
     pub fn with_destroyed_flag(mux: Arc<Multiplexer>, destroyed: Arc<AtomicBool>) -> Self {
+        Self::with_options(mux, destroyed, 0)
+    }
+
+    /// Create a new client with a shared destroyed flag and max_write limit.
+    pub fn with_options(mux: Arc<Multiplexer>, destroyed: Arc<AtomicBool>, max_write: u32) -> Self {
         Self {
             mux,
             init_callback: Mutex::new(None),
             destroyed,
+            max_write,
         }
     }
 
@@ -87,6 +95,7 @@ impl FuseClient {
             mux,
             init_callback: Mutex::new(Some(callback)),
             destroyed,
+            max_write: 0,
         }
     }
 
@@ -204,12 +213,6 @@ fn protocol_file_type_to_fuser(ft: u8) -> FileType {
     }
 }
 
-/// Default max_write size for FUSE operations (0 = unbounded, use kernel default).
-///
-/// For nested virtualization (L2 VMs), set FCVM_FUSE_MAX_WRITE=32768 to avoid
-/// vsock data loss due to cache coherency issues in double Stage 2 translation.
-const DEFAULT_FUSE_MAX_WRITE: u32 = 0;
-
 impl Filesystem for FuseClient {
     fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> Result<(), io::Error> {
         // Enable writeback cache for better write performance (kernel batches writes).
@@ -252,11 +255,8 @@ impl Filesystem for FuseClient {
         }
 
         // Limit max_write to avoid vsock data loss under nested virtualization.
-        // Override with FCVM_FUSE_MAX_WRITE env var (0 = unbounded).
-        let max_write = std::env::var("FCVM_FUSE_MAX_WRITE")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(DEFAULT_FUSE_MAX_WRITE);
+        // Passed explicitly via mount_vsock_with_options to avoid env var races.
+        let max_write = self.max_write;
 
         if max_write > 0 {
             if let Err(max) = config.set_max_write(max_write) {
