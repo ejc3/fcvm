@@ -302,6 +302,7 @@ fn build_firecracker_config(
         args.tty,
         args.interactive,
         args.rootfs_size.clone(),
+        args.health_check.clone(),
     )
 }
 
@@ -1043,7 +1044,6 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 interactive: args.interactive,
                 startup_snapshot_base_key: None, // Already using startup snapshot
                 health_check_for_startup: None,
-                health_check: args.health_check.clone(),
                 cpu: Some(args.cpu),
                 mem: Some(args.mem),
             };
@@ -1071,7 +1071,6 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 // Pass startup snapshot context if health check URL is set
                 startup_snapshot_base_key: args.health_check.as_ref().map(|_| key.clone()),
                 health_check_for_startup: args.health_check.clone(),
-                health_check: args.health_check.clone(),
                 cpu: Some(args.cpu),
                 mem: Some(args.mem),
             };
@@ -2192,6 +2191,7 @@ async fn run_vm_setup(
                 args.tty,
                 args.interactive,
                 args.rootfs_size.clone(),
+                args.health_check.clone(),
             )
         });
 

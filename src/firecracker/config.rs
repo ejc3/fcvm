@@ -62,6 +62,11 @@ pub struct FirecrackerConfig {
     /// Affects disk size after CoW copy, so must be in cache key.
     #[serde(default = "default_rootfs_size")]
     pub rootfs_size: String,
+    /// Health check URL for the VM (e.g., "http://localhost/").
+    /// Part of cache key because it's a property of the VM configuration —
+    /// clones must inherit the same health check behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check_url: Option<String>,
 }
 
 fn default_rootfs_size() -> String {
@@ -133,6 +138,7 @@ impl FirecrackerConfig {
         tty: bool,
         interactive: bool,
         rootfs_size: String,
+        health_check_url: Option<String>,
     ) -> Self {
         Self {
             boot_source: BootSource {
@@ -161,6 +167,7 @@ impl FirecrackerConfig {
             tty,
             interactive,
             rootfs_size,
+            health_check_url,
         }
     }
 
@@ -271,6 +278,7 @@ mod tests {
             false,
             false,
             "10G".to_string(),
+            None,
         )
     }
 
@@ -352,6 +360,14 @@ mod tests {
         let config1 = test_config();
         let mut config2 = test_config();
         config2.data_dir = "/mnt/fcvm-btrfs/root".into();
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    #[test]
+    fn test_snapshot_key_changes_with_health_check_url() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.health_check_url = Some("http://localhost/".to_string());
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 }

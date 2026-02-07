@@ -310,11 +310,6 @@ pub struct SnapshotRunArgs {
     #[arg(skip)]
     pub health_check_for_startup: Option<String>,
 
-    /// Health check URL for monitoring clone health (internal use only).
-    /// Passed from podman run's --health-check when restoring from a snapshot.
-    #[arg(skip)]
-    pub health_check: Option<String>,
-
     /// vCPUs (internal use only).
     /// Passed from podman run's --cpu when restoring from a snapshot.
     #[arg(skip)]
