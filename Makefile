@@ -327,16 +327,18 @@ setup-btrfs:
 		fi && \
 		sudo mkdir -p /mnt/fcvm-btrfs && \
 		sudo mount -o loop /var/fcvm-btrfs.img /mnt/fcvm-btrfs && \
-		sudo mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,initrd,state,snapshots,vm-disks,cache,image-cache} && \
+		sudo mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,initrd,cache,image-cache} && \
 		sudo chown -R $$(id -un):$$(id -gn) /mnt/fcvm-btrfs && \
 		echo '==> btrfs ready at /mnt/fcvm-btrfs'; \
 	fi
 	@# Ensure image-cache exists with correct permissions (may be missing on older setups)
 	@sudo mkdir -p /mnt/fcvm-btrfs/image-cache && sudo chown $$(id -un):$$(id -gn) /mnt/fcvm-btrfs/image-cache
-	@# Create per-mode data directories
-	@# ROOT_DATA_DIR: owned by root (tests run with sudo)
-	@# CONTAINER_DATA_DIR: owned by user (podman rootless maps to subordinate UIDs)
+	@# Create per-mode data directories (state, snapshots, vm-disks)
+	@# Default: owned by current user (test-fast runs as ubuntu)
+	@mkdir -p /mnt/fcvm-btrfs/{state,snapshots,vm-disks}
+	@# ROOT_DATA_DIR: owned by root (test-root runs with sudo)
 	@sudo mkdir -p $(ROOT_DATA_DIR)/{state,snapshots,vm-disks}
+	@# CONTAINER_DATA_DIR: owned by current user (podman rootless maps to subordinate UIDs)
 	@sudo mkdir -p $(CONTAINER_DATA_DIR)/{state,snapshots,vm-disks}
 	@sudo chown -R $$(id -un):$$(id -gn) $(CONTAINER_DATA_DIR)
 

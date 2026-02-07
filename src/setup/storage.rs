@@ -5,17 +5,10 @@ use tracing::info;
 
 use crate::setup::rootfs::load_config;
 
-/// Required subdirectories under the btrfs mount
-const REQUIRED_DIRS: &[&str] = &[
-    "kernels",
-    "rootfs",
-    "initrd",
-    "state",
-    "snapshots",
-    "vm-disks",
-    "cache",
-    "image-cache",
-];
+/// Required asset subdirectories under the btrfs mount.
+/// Data dirs (state, snapshots, vm-disks) are created lazily by the code
+/// that uses them, allowing FCVM_DATA_DIR to point elsewhere.
+const REQUIRED_DIRS: &[&str] = &["kernels", "rootfs", "initrd", "cache", "image-cache"];
 
 /// Unmount a path, ignoring errors
 fn cleanup_mount(path: &Path) {
