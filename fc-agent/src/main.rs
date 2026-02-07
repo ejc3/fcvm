@@ -30,7 +30,7 @@ struct Plan {
     /// NFS shares from host (mounted automatically)
     #[serde(default)]
     nfs_mounts: Vec<NfsMount>,
-    /// Path to OCI archive for localhost/ images (run directly without import)
+    /// Path to Docker archive for localhost/ images (imported via podman load)
     #[serde(default)]
     image_archive: Option<String>,
     /// Run container in privileged mode (allows mknod, device access, etc.)
@@ -2358,12 +2358,28 @@ async fn run_agent() -> Result<()> {
     }
 
     // Determine the image reference for podman run
-    // If image_archive is set, we run directly from the Docker archive (no import needed)
+    // If image_archive is set, import into podman storage first (so snapshot captures it)
     // Otherwise, pull from registry
     let image_ref = if let Some(archive_path) = &plan.image_archive {
-        eprintln!("[fc-agent] using Docker archive: {}", archive_path);
+        eprintln!("[fc-agent] importing Docker archive: {}", archive_path);
 
-        format!("docker-archive:{}", archive_path)
+        // Import into podman storage so the pre-start snapshot captures the loaded image.
+        // Without this, every snapshot restore would re-read the entire tar from /dev/vdb.
+        let output = Command::new("podman")
+            .args(["load", "-i", archive_path])
+            .output()
+            .await
+            .context("running podman load")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("podman load failed: {}", stderr);
+        }
+
+        let loaded_output = String::from_utf8_lossy(&output.stdout);
+        eprintln!("[fc-agent] podman load: {}", loaded_output.trim());
+        eprintln!("[fc-agent] ✓ image imported as: {}", plan.image);
+        plan.image.clone()
     } else {
         // Pull image with retries to handle transient DNS/network errors
         const MAX_RETRIES: u32 = 3;
@@ -2481,33 +2497,19 @@ async fn run_agent() -> Result<()> {
     };
 
     // Notify host that image is ready for caching
-    // For registry images, get the digest from podman
-    // For Docker archives, use the image name as identifier
-    if !image_ref.starts_with("docker-archive:") {
-        // Registry image - get digest from podman
-        match get_image_digest(&plan.image).await {
-            Ok(digest) => {
-                eprintln!("[fc-agent] image digest: {}", digest);
-                if notify_cache_ready_and_wait(&digest) {
-                    eprintln!("[fc-agent] ✓ cache ready notification acknowledged");
-                } else {
-                    eprintln!(
-                        "[fc-agent] WARNING: cache-ready handshake failed, continuing anyway"
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!("[fc-agent] WARNING: failed to get image digest: {:?}", e);
-                eprintln!("[fc-agent] continuing without cache notification");
+    // Image is always in podman storage at this point (pulled or loaded from archive)
+    match get_image_digest(&image_ref).await {
+        Ok(digest) => {
+            eprintln!("[fc-agent] image digest: {}", digest);
+            if notify_cache_ready_and_wait(&digest) {
+                eprintln!("[fc-agent] ✓ cache ready notification acknowledged");
+            } else {
+                eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing anyway");
             }
         }
-    } else {
-        // Docker archive - notify with image name as identifier
-        eprintln!("[fc-agent] using Docker archive, notifying cache-ready with image name");
-        if notify_cache_ready_and_wait(&plan.image) {
-            eprintln!("[fc-agent] ✓ cache ready notification acknowledged");
-        } else {
-            eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing anyway");
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: failed to get image digest: {:?}", e);
+            eprintln!("[fc-agent] continuing without cache notification");
         }
     }
 
@@ -2605,7 +2607,7 @@ async fn run_agent() -> Result<()> {
         podman_args.push(mount_spec);
     }
 
-    // Image (either docker-archive:/path or image name from registry)
+    // Image name (from registry pull or archive load)
     podman_args.push(image_ref.clone());
 
     // Command override
