@@ -697,7 +697,7 @@ impl Filesystem for FuseClient {
         name: &OsStr,
         newparent: INodeNo,
         newname: &OsStr,
-        _flags: RenameFlags,
+        flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
         let response = self.send_request_sync(VolumeRequest::Rename {
@@ -705,6 +705,7 @@ impl Filesystem for FuseClient {
             name: name.to_string_lossy().to_string(),
             newparent: newparent.into(),
             newname: newname.to_string_lossy().to_string(),
+            flags: flags.bits(),
             uid: req.uid(),
             gid: req.gid(),
             pid: req.pid(),

@@ -157,6 +157,8 @@ pub enum VolumeRequest {
         name: String,
         newparent: u64,
         newname: String,
+        /// Rename flags: RENAME_NOREPLACE (1), RENAME_EXCHANGE (2), RENAME_WHITEOUT (4)
+        flags: u32,
         uid: u32,
         gid: u32,
         pid: u32,

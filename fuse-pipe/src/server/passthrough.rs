@@ -731,6 +731,7 @@ impl FilesystemHandler for PassthroughFs {
         name: &str,
         newparent: u64,
         newname: &str,
+        flags: u32,
         uid: u32,
         gid: u32,
         pid: u32,
@@ -751,7 +752,7 @@ impl FilesystemHandler for PassthroughFs {
 
         match self
             .inner
-            .rename(&ctx, parent, &cname, newparent, &cnewname, 0)
+            .rename(&ctx, parent, &cname, newparent, &cnewname, flags)
         {
             Ok(()) => VolumeResponse::Ok,
             Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
