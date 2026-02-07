@@ -19,6 +19,12 @@ use std::time::Instant;
 /// Number of parallel jobs within prove (inside VM)
 const JOBS: usize = 8;
 
+/// Categories where writeback cache must be disabled for POSIX ctime compliance.
+/// The kernel's FUSE writeback cache suppresses server-side ctime updates via
+/// fuse_get_cache_mask() returning STATX_CTIME, causing these tests to fail
+/// intermittently under parallel load (see DESIGN.md "Known Limitations").
+const WRITEBACK_CACHE_CTIME_CATEGORIES: &[&str] = &["chmod", "ftruncate", "link", "truncate"];
+
 /// Run a single pjdfstest category inside a VM
 async fn run_category_in_vm(category: &str) -> Result<()> {
     let test_id = format!("pjdfs-vm-{}-{}", category, std::process::id());
@@ -111,6 +117,11 @@ async fn run_category_in_vm(category: &str) -> Result<()> {
     // Preserve SUDO_USER if set
     if let Ok(sudo_user) = std::env::var("SUDO_USER") {
         cmd.env("SUDO_USER", sudo_user);
+    }
+
+    // Disable writeback cache for categories with ctime-sensitive tests
+    if WRITEBACK_CACHE_CTIME_CATEGORIES.contains(&category) {
+        cmd.env("FCVM_NO_WRITEBACK_CACHE", "1");
     }
 
     let mut child = cmd.spawn().context("spawning VM")?;

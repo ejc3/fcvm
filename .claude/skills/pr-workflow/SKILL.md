@@ -172,3 +172,26 @@ Before considering code "done":
 - Removing test coverage because it's "flaky"
 
 **The ONLY acceptable fix:** Change the actual code so the test passes.
+
+## Evaluating CI Failures
+
+**NEVER assume failures are "unrelated" or "pre-existing" without evidence.**
+
+Before claiming a test failure is unrelated to your PR:
+
+1. **Check if main is green:**
+   ```bash
+   gh run list --branch main --limit 3 --json conclusion --jq '.[].conclusion'
+   ```
+2. **If main is green and your PR is red, the failure IS your fault.** Period.
+   - Don't say "pre-existing failure" — main proves otherwise
+   - Don't say "unrelated to this PR" — the evidence says otherwise
+   - The PR introduced or exposed the bug. Fix it.
+
+3. **Only call a failure "pre-existing" if main is ALSO failing the same test:**
+   ```bash
+   # Check main's latest run for the same test
+   gh run view <main-run-id> --log 2>&1 | grep "<test_name>"
+   ```
+
+**The rule:** Green main + red PR = PR caused it. No exceptions, no excuses.

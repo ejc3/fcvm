@@ -996,15 +996,13 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         None
     };
 
-    // Check for snapshot cache (unless --no-snapshot is set, FCVM_NO_SNAPSHOT env var, or localhost image)
-    // Localhost images have tarball paths in MMDS that won't exist on restore
+    // Check for snapshot cache (unless --no-snapshot is set or FCVM_NO_SNAPSHOT env var)
     // Keep fc_config and snapshot_key available for later snapshot creation on miss
     let no_snapshot = args.no_snapshot || std::env::var("FCVM_NO_SNAPSHOT").is_ok();
-    let is_localhost_image = args.image.starts_with("localhost/");
     let (fc_config, snapshot_key): (
         Option<crate::firecracker::FirecrackerConfig>,
         Option<String>,
-    ) = if !no_snapshot && !is_localhost_image {
+    ) = if !no_snapshot {
         // Get image identifier for cache key computation
         let image_identifier = get_image_identifier(&args.image).await?;
         let config = build_firecracker_config(
@@ -1075,9 +1073,6 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
             "Snapshot miss, will create snapshot after image load"
         );
         (Some(config), Some(key))
-    } else if is_localhost_image {
-        info!("Snapshot disabled for localhost image (tarball path won't exist on restore)");
-        (None, None)
     } else {
         if std::env::var("FCVM_NO_SNAPSHOT").is_ok() {
             info!("Snapshot disabled via FCVM_NO_SNAPSHOT environment variable");
@@ -1368,9 +1363,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // Skip snapshot creation when:
     // - --no-snapshot flag or FCVM_NO_SNAPSHOT env var is set
     // - Volumes are specified (FUSE-over-vsock breaks during snapshot pause)
-    // - Localhost images (tarball path in MMDS won't exist on restore)
-    // Note: no_snapshot and is_localhost_image are already defined above
-    let skip_snapshot_creation = no_snapshot || !args.map.is_empty() || is_localhost_image;
+    let skip_snapshot_creation = no_snapshot || !args.map.is_empty();
     if !args.map.is_empty() && !no_snapshot {
         info!(
             "Skipping snapshot creation: volumes specified (FUSE doesn't survive snapshot pause)"
@@ -1388,7 +1381,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
     // Create startup snapshot channel for health-triggered snapshot creation
     // Only create startup snapshots if:
-    // - Not skipping snapshots (no --no-snapshot, no volumes, not localhost image)
+    // - Not skipping snapshots (no --no-snapshot, no volumes)
     // - Have a snapshot key
     // - Have a health_check URL configured (HTTP health check, not just container-ready)
     let (startup_tx, mut startup_rx): (
@@ -2291,6 +2284,14 @@ async fn run_vm_setup(
             runtime_boot_args.push(' ');
         }
         runtime_boot_args.push_str(&format!("fuse_max_write={}", max_write));
+    }
+
+    // Pass FUSE writeback cache disable flag to fc-agent via kernel command line.
+    if std::env::var("FCVM_NO_WRITEBACK_CACHE").is_ok() {
+        if !runtime_boot_args.is_empty() {
+            runtime_boot_args.push(' ');
+        }
+        runtime_boot_args.push_str("no_writeback_cache=1");
     }
 
     // Apply FirecrackerConfig to client (boot_source, machine_config, rootfs drive)
