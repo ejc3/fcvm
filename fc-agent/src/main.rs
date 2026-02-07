@@ -30,7 +30,7 @@ struct Plan {
     /// NFS shares from host (mounted automatically)
     #[serde(default)]
     nfs_mounts: Vec<NfsMount>,
-    /// Path to OCI archive for localhost/ images (run directly without import)
+    /// Path to Docker archive for localhost/ images (imported via podman load)
     #[serde(default)]
     image_archive: Option<String>,
     /// Run container in privileged mode (allows mknod, device access, etc.)
@@ -2376,6 +2376,8 @@ async fn run_agent() -> Result<()> {
             anyhow::bail!("podman load failed: {}", stderr);
         }
 
+        let loaded_output = String::from_utf8_lossy(&output.stdout);
+        eprintln!("[fc-agent] podman load: {}", loaded_output.trim());
         eprintln!("[fc-agent] ✓ image imported as: {}", plan.image);
         plan.image.clone()
     } else {
@@ -2502,9 +2504,7 @@ async fn run_agent() -> Result<()> {
             if notify_cache_ready_and_wait(&digest) {
                 eprintln!("[fc-agent] ✓ cache ready notification acknowledged");
             } else {
-                eprintln!(
-                    "[fc-agent] WARNING: cache-ready handshake failed, continuing anyway"
-                );
+                eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing anyway");
             }
         }
         Err(e) => {
@@ -2607,7 +2607,7 @@ async fn run_agent() -> Result<()> {
         podman_args.push(mount_spec);
     }
 
-    // Image (either docker-archive:/path or image name from registry)
+    // Image name (from registry pull or archive load)
     podman_args.push(image_ref.clone());
 
     // Command override
