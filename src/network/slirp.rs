@@ -344,9 +344,9 @@ ip addr add {namespace_ip}/24 dev {bridge}
             .arg(&self.slirp_device)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped()); // Piped for startup error capture; drained below
 
-        let child = cmd.spawn().context("failed to spawn slirp4netns")?;
+        let mut child = cmd.spawn().context("failed to spawn slirp4netns")?;
 
         drop(ready_write_fd);
 
@@ -359,7 +359,13 @@ ip addr add {namespace_ip}/24 dev {bridge}
         drop(ready_read_fd);
 
         match read_result {
-            Ok(1) => info!("slirp4netns ready"),
+            Ok(1) => {
+                info!("slirp4netns ready");
+                // Drop stderr handle now that startup succeeded — prevents pipe buffer
+                // deadlock if slirp4netns writes to stderr during its long-running lifetime.
+                // slirp4netns handles EPIPE gracefully.
+                drop(child.stderr.take());
+            }
             Ok(0) => {
                 // slirp4netns died — capture stderr for diagnostics
                 let output = child.wait_with_output().await?;
