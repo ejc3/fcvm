@@ -400,8 +400,14 @@ fn reader_loop(mut socket: UnixStream, pending: Arc<DashMap<u64, Sender<Response
                 // Try to extract unique ID from raw bytes to unblock the waiting thread
                 let maybe_unique = if resp_buf.len() >= 8 {
                     u64::from_le_bytes([
-                        resp_buf[0], resp_buf[1], resp_buf[2], resp_buf[3],
-                        resp_buf[4], resp_buf[5], resp_buf[6], resp_buf[7],
+                        resp_buf[0],
+                        resp_buf[1],
+                        resp_buf[2],
+                        resp_buf[3],
+                        resp_buf[4],
+                        resp_buf[5],
+                        resp_buf[6],
+                        resp_buf[7],
                     ])
                 } else {
                     0
