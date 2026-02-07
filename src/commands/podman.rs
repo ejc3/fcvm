@@ -1175,10 +1175,12 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
 
     // Resolve 0 → host values for cpu and mem
     if args.cpu == 0 {
-        args.cpu = std::thread::available_parallelism()
-            .map(|n| n.get() as u8)
+        // Firecracker allows max 32 vCPUs (and must be 1 or even)
+        let host_cpus = std::thread::available_parallelism()
+            .map(|n| n.get().min(32) as u8)
             .unwrap_or(2);
-        info!("Using all host CPUs: {}", args.cpu);
+        args.cpu = host_cpus;
+        info!("Using host CPUs (capped at 32): {}", args.cpu);
     }
     if args.mem == 0 {
         args.mem =
@@ -1426,8 +1428,23 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         // Check if already cached (inside lock to prevent race)
         // Use Docker archive format (preserves HEALTHCHECK, single tar file) for FUSE transfer
         let archive_path = cache_dir.with_extension("docker.tar");
-        if !archive_path.exists() {
+        let needs_export = if !archive_path.exists() {
+            true
+        } else if !validate_docker_archive(&archive_path)? {
+            warn!(path = %archive_path.display(), "Cached archive is invalid, re-exporting");
+            let _ = tokio::fs::remove_file(&archive_path).await;
+            true
+        } else {
+            info!(image = %args.image, digest = %digest, "Using cached Docker archive");
+            false
+        };
+
+        if needs_export {
             info!(image = %args.image, digest = %digest, "Exporting localhost image as Docker archive");
+
+            // Save to a temp file in the same directory, then rename.
+            // This avoids corrupt archives from interrupted exports (atomic rename).
+            let tmp_path = archive_path.with_extension("docker.tar.tmp");
 
             let output = tokio::process::Command::new("podman")
                 .args([
@@ -1435,7 +1452,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                     "--format",
                     "docker-archive",
                     "-o",
-                    archive_path.to_str().unwrap(),
+                    tmp_path.to_str().unwrap(),
                     &args.image,
                 ])
                 .output()
@@ -1444,9 +1461,8 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                // Clean up partial export
-                let _ = tokio::fs::remove_file(&archive_path).await;
-                drop(lock_file); // Release lock before bailing
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                drop(lock_file);
                 bail!(
                     "Failed to export image '{}' with podman save: {}",
                     args.image,
@@ -1455,9 +1471,8 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             }
 
             // Validate the archive contains manifest.json (required for docker-archive format)
-            // This catches corrupted exports early, before they get cached and cause repeated failures
-            if !validate_docker_archive(&archive_path)? {
-                let _ = tokio::fs::remove_file(&archive_path).await;
+            if !validate_docker_archive(&tmp_path)? {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
                 drop(lock_file);
                 bail!(
                     "podman save produced invalid archive (missing manifest.json) for image '{}'",
@@ -1465,51 +1480,12 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 );
             }
 
+            // Atomic rename within the same filesystem
+            tokio::fs::rename(&tmp_path, &archive_path)
+                .await
+                .context("renaming exported archive to final path")?;
+
             info!(path = %archive_path.display(), "Image exported as Docker archive");
-        } else {
-            // Validate cached archive in case it was corrupted
-            if !validate_docker_archive(&archive_path)? {
-                warn!(path = %archive_path.display(), "Cached archive is invalid, re-exporting");
-                let _ = tokio::fs::remove_file(&archive_path).await;
-                // Re-export
-                let output = tokio::process::Command::new("podman")
-                    .args([
-                        "save",
-                        "--format",
-                        "docker-archive",
-                        "-o",
-                        archive_path.to_str().unwrap(),
-                        &args.image,
-                    ])
-                    .output()
-                    .await
-                    .context("running podman save for re-export")?;
-
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let _ = tokio::fs::remove_file(&archive_path).await;
-                    drop(lock_file);
-                    bail!(
-                        "Failed to re-export image '{}' with podman save: {}",
-                        args.image,
-                        stderr
-                    );
-                }
-
-                // Validate the re-exported archive
-                if !validate_docker_archive(&archive_path)? {
-                    let _ = tokio::fs::remove_file(&archive_path).await;
-                    drop(lock_file);
-                    bail!(
-                        "podman save produced invalid archive (missing manifest.json) for image '{}' on re-export",
-                        args.image
-                    );
-                }
-
-                info!(path = %archive_path.display(), "Image re-exported as Docker archive");
-            } else {
-                info!(image = %args.image, digest = %digest, "Using cached Docker archive");
-            }
         }
 
         // Lock released when lock_file is dropped
