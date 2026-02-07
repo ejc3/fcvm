@@ -205,6 +205,8 @@ check-disk:
 # Preserves cached assets (kernels, rootfs, initrd, image-cache)
 # CRITICAL: Uses fcvm's proper cleanup commands to handle btrfs CoW correctly
 clean-test-data: build
+	@echo "==> Killing stale VM processes from previous runs..."
+	@sudo pkill -9 firecracker 2>/dev/null; sudo pkill -9 slirp4netns 2>/dev/null; sleep 1; true
 	@echo "==> Force unmounting stale FUSE mounts..."
 	@# Find and force unmount any FUSE mounts from previous test runs
 	@mount | grep fuse | grep -E '/tmp|/var/tmp' | cut -d' ' -f3 | xargs -r -I{} fusermount3 -u -z {} 2>/dev/null || true
