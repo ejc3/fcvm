@@ -395,6 +395,7 @@ async fn request_reader<H: FilesystemHandler + 'static>(
         let request = wire_req.request;
         let supplementary_groups = wire_req.supplementary_groups;
         let mut span = wire_req.span;
+        let no_reply = request.is_no_reply();
 
         // Update span with server timing
         if let Some(ref mut s) = span {
@@ -422,6 +423,11 @@ async fn request_reader<H: FilesystemHandler + 'static>(
                 error!(target: "fuse-pipe::server", unique, "handler task panicked: {:?}", e);
                 VolumeResponse::error(libc::EIO)
             });
+
+            // Skip response for fire-and-forget operations (forget/batch_forget)
+            if no_reply {
+                return;
+            }
 
             // Mark fs operation done
             if let Some(ref mut s) = span {

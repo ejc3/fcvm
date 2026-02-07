@@ -21,8 +21,9 @@ type ResponsePayload = (VolumeResponse, Option<Span>);
 struct PendingRequest {
     /// Pre-serialized request bytes (length prefix + body)
     data: Vec<u8>,
-    /// Channel to send response back to the waiting reader
-    response_tx: Sender<ResponsePayload>,
+    /// Channel to send response back to the waiting reader.
+    /// None for fire-and-forget requests (e.g., forget/batch_forget).
+    response_tx: Option<Sender<ResponsePayload>>,
     /// Unique request ID for response routing
     unique: u64,
 }
@@ -190,7 +191,7 @@ impl Multiplexer {
         // Submit request (lock-free via crossbeam channel)
         let pending = PendingRequest {
             data,
-            response_tx,
+            response_tx: Some(response_tx),
             unique,
         };
 
@@ -223,6 +224,33 @@ impl Multiplexer {
     /// Get the span collector, if one was configured.
     pub fn collector(&self) -> Option<&SpanCollector> {
         self.collector.as_ref()
+    }
+
+    /// Send a request without waiting for a response (fire-and-forget).
+    ///
+    /// Used for FUSE forget/batch_forget operations where the kernel does not
+    /// expect a reply. The server must not send a response for these requests.
+    pub fn send_request_no_reply(&self, request: VolumeRequest) {
+        let unique = self.next_id.fetch_add(1, Ordering::Relaxed);
+
+        let wire = WireRequest::with_groups(unique, 0, request, Vec::new());
+
+        let body = match bincode::serialize(&wire) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+
+        let mut data = Vec::with_capacity(4 + body.len());
+        data.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        data.extend_from_slice(&body);
+
+        let pending = PendingRequest {
+            data,
+            response_tx: None,
+            unique,
+        };
+
+        let _ = self.request_tx.send(pending);
     }
 
     /// Get the number of readers this multiplexer supports.
@@ -285,8 +313,11 @@ fn writer_loop(
             );
         }
 
-        // Register the response channel BEFORE writing (to avoid race)
-        pending.insert(req.unique, req.response_tx);
+        // Register the response channel BEFORE writing (to avoid race).
+        // For fire-and-forget requests (forget/batch_forget), no channel is registered.
+        if let Some(tx) = req.response_tx {
+            pending.insert(req.unique, tx);
+        }
 
         // Write to socket
         let write_result = socket.write_all(&req.data);

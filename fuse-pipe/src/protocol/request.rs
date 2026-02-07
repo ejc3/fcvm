@@ -330,6 +330,21 @@ pub enum VolumeRequest {
         /// REMAP_FILE_DEDUP (1), REMAP_FILE_CAN_SHORTEN (2)
         remap_flags: u32,
     },
+
+    /// Decrement inode reference count (nlookup).
+    ///
+    /// The kernel sends this when it drops cached inode references.
+    /// No response is expected — fire-and-forget.
+    Forget { ino: u64, nlookup: u64 },
+
+    /// Batch decrement of inode reference counts.
+    ///
+    /// More efficient version of Forget for multiple inodes at once.
+    /// No response is expected — fire-and-forget.
+    BatchForget {
+        /// Vec of (inode, nlookup) pairs.
+        inodes: Vec<(u64, u64)>,
+    },
 }
 
 impl VolumeRequest {
@@ -371,6 +386,8 @@ impl VolumeRequest {
             VolumeRequest::Readdirplus { .. } => "readdirplus",
             VolumeRequest::CopyFileRange { .. } => "copy_file_range",
             VolumeRequest::RemapFileRange { .. } => "remap_file_range",
+            VolumeRequest::Forget { .. } => "forget",
+            VolumeRequest::BatchForget { .. } => "batch_forget",
         }
     }
 
@@ -391,6 +408,14 @@ impl VolumeRequest {
                 | VolumeRequest::Lseek { .. }
                 | VolumeRequest::Getlk { .. }
                 | VolumeRequest::Readdirplus { .. }
+        )
+    }
+
+    /// Check if this is a fire-and-forget operation (no response expected).
+    pub fn is_no_reply(&self) -> bool {
+        matches!(
+            self,
+            VolumeRequest::Forget { .. } | VolumeRequest::BatchForget { .. }
         )
     }
 }
@@ -434,6 +459,30 @@ mod tests {
             pid: 0,
         };
         assert!(!write.is_read_op());
+    }
+
+    #[test]
+    fn test_is_no_reply() {
+        let forget = VolumeRequest::Forget {
+            ino: 42,
+            nlookup: 5,
+        };
+        assert!(forget.is_no_reply());
+
+        let batch = VolumeRequest::BatchForget {
+            inodes: vec![(1, 1), (2, 3)],
+        };
+        assert!(batch.is_no_reply());
+
+        // Regular ops should require a reply
+        let lookup = VolumeRequest::Lookup {
+            parent: 1,
+            name: "test".to_string(),
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        assert!(!lookup.is_no_reply());
     }
 
     #[test]

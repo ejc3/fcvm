@@ -290,6 +290,18 @@ impl Filesystem for FuseClient {
         tracing::debug!(target: "fuse-pipe::client", was_already_set = was, "destroy() called - signaling clean shutdown");
     }
 
+    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+        self.mux.send_request_no_reply(VolumeRequest::Forget {
+            ino: ino.into(),
+            nlookup,
+        });
+    }
+
+    // batch_forget: fuser's default impl calls forget() per node,
+    // which sends individual VolumeRequest::Forget messages.
+    // The server-side handler also supports VolumeRequest::BatchForget
+    // for clients that can batch them.
+
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let response = self.send_request_sync(VolumeRequest::Lookup {
             parent: parent.into(),
