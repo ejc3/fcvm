@@ -317,7 +317,14 @@ pub trait FilesystemHandler: Send + Sync {
     }
 
     /// Look up a directory entry by name.
-    fn lookup(&self, _parent: u64, _name: &[u8], _uid: u32, _gid: u32, _pid: u32) -> VolumeResponse {
+    fn lookup(
+        &self,
+        _parent: u64,
+        _name: &[u8],
+        _uid: u32,
+        _gid: u32,
+        _pid: u32,
+    ) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
         }
@@ -486,7 +493,14 @@ pub trait FilesystemHandler: Send + Sync {
     }
 
     /// Remove a file.
-    fn unlink(&self, _parent: u64, _name: &[u8], _uid: u32, _gid: u32, _pid: u32) -> VolumeResponse {
+    fn unlink(
+        &self,
+        _parent: u64,
+        _name: &[u8],
+        _uid: u32,
+        _gid: u32,
+        _pid: u32,
+    ) -> VolumeResponse {
         VolumeResponse::Error {
             errno: libc::ENOSYS,
         }

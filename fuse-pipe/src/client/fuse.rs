@@ -867,7 +867,12 @@ impl Filesystem for FuseClient {
                 for (i, entry) in entries.iter().enumerate() {
                     let entry_offset = offset + i as u64 + 1;
                     let ft = protocol_file_type_to_fuser(entry.file_type);
-                    if reply.add(INodeNo(entry.ino), entry_offset, ft, OsStr::from_bytes(&entry.name)) {
+                    if reply.add(
+                        INodeNo(entry.ino),
+                        entry_offset,
+                        ft,
+                        OsStr::from_bytes(&entry.name),
+                    ) {
                         break;
                     }
                 }

@@ -1208,8 +1208,13 @@ impl FilesystemHandler for PassthroughFs {
 
     fn batch_forget(&self, inodes: &[(u64, u64)]) {
         let ctx = Context::new();
-        self.inner
-            .batch_forget(&ctx, inodes.iter().map(|&(ino, nlookup)| (ino, nlookup)).collect());
+        self.inner.batch_forget(
+            &ctx,
+            inodes
+                .iter()
+                .map(|&(ino, nlookup)| (ino, nlookup))
+                .collect(),
+        );
     }
 }
 
