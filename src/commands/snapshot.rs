@@ -681,15 +681,13 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     let network_config = network.setup().await.context("setting up network")?;
 
-    // Set health check URL: prefer caller-provided URL (from podman run's --health-check),
-    // then fall back to what the baseline VM had (saved in snapshot metadata).
-    // Do NOT fall back to network_config.health_check_url — that auto-assigns an HTTP health
-    // check URL based on port forwarding, which gives clones HTTP health checks they shouldn't
-    // have when the baseline VM didn't use --health-check.
+    // Set health check URL from caller only (podman run's --health-check).
+    // Do NOT fall back to network_config.health_check_url or snapshot metadata — the network
+    // config auto-assigns http://127.x.y.z:8080/ which gives clones HTTP health checks they
+    // shouldn't have, and snapshot metadata may contain a health_check_url from a different
+    // caller that created the shared cache snapshot.
     if let Some(ref hc) = args.health_check {
         vm_state.config.health_check_url = Some(hc.clone());
-    } else {
-        vm_state.config.health_check_url = snapshot_config.metadata.health_check_url.clone();
     }
     if let Some(port) = network_config.health_check_port {
         vm_state.config.network.health_check_port = Some(port);
