@@ -656,11 +656,15 @@ async fn create_file(
             req.path.replace('\'', "'\\''"),
         )
     } else {
+        // Use a randomized heredoc delimiter to prevent content injection
+        let delimiter = format!("FCVM_EOF_{}", uuid::Uuid::new_v4().simple());
         format!(
-            "mkdir -p '{}' && cat > '{}' << 'FCVM_EOF'\n{}\nFCVM_EOF",
+            "mkdir -p '{}' && cat > '{}' << '{}'\n{}\n{}",
             dir.replace('\'', "'\\''"),
             req.path.replace('\'', "'\\''"),
+            delimiter,
             req.content,
+            delimiter,
         )
     };
 

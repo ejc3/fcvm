@@ -198,7 +198,7 @@ async fn test_serve_create_run_destroy() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.expect("parse read file");
     assert_eq!(
-        body["content"].as_str().unwrap().trim(),
+        body["data"]["content"].as_str().unwrap().trim(),
         "hello from serve test"
     );
 
