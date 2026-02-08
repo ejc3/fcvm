@@ -1021,8 +1021,8 @@ async fn reaper_task(state: SharedState) {
             let sandboxes = state.sandboxes.read().await;
             for (id, entry) in sandboxes.iter() {
                 if let Some(timeout_ms) = entry.timeout_ms {
-                    let elapsed = (now - entry.created_at).num_milliseconds();
-                    if elapsed > timeout_ms as i64 {
+                    let elapsed = (now - entry.created_at).num_milliseconds().max(0) as u64;
+                    if elapsed > timeout_ms {
                         expired.push(id.clone());
                     }
                 }
@@ -1097,8 +1097,10 @@ pub async fn cmd_serve(args: ServeArgs) -> Result<()> {
             }
 
             info!("Shutting down — stopping all sandboxes");
-            let mut sandboxes = shutdown_state.sandboxes.write().await;
-            for (id, entry) in sandboxes.drain() {
+            // Drain the map first to release the write lock, then stop handles
+            // outside the lock so in-flight API requests aren't blocked.
+            let entries: Vec<_> = shutdown_state.sandboxes.write().await.drain().collect();
+            for (id, entry) in entries {
                 info!(sandbox_id = %id, "Stopping sandbox");
                 let mut handle = entry.handle;
                 let _ = handle.stop().await;
