@@ -118,8 +118,8 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 0)]
     pub cpu: u8,
 
-    /// Memory in MiB (0 = all host memory)
-    #[arg(long, default_value_t = 0)]
+    /// Memory in MiB, or "unlimited" to use all host memory (default: 2048)
+    #[arg(long, default_value = "2048", value_parser = parse_mem)]
     pub mem: u32,
 
     /// Minimum free space on root filesystem (default: 10G).
@@ -487,4 +487,15 @@ pub struct ExecArgs {
     /// Command and arguments to execute
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
     pub command: Vec<String>,
+}
+
+/// Parse --mem value: either an integer (MiB) or "unlimited" (all host memory).
+fn parse_mem(s: &str) -> Result<u32, String> {
+    if s.eq_ignore_ascii_case("unlimited") {
+        crate::host_memory_mib().ok_or_else(|| "failed to read host memory from /proc/meminfo".to_string())
+    } else {
+        s.parse::<u32>().map_err(|_| {
+            format!("invalid --mem value '{}': expected integer (MiB) or 'unlimited'", s)
+        })
+    }
 }

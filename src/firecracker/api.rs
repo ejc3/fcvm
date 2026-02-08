@@ -29,6 +29,16 @@ impl FirecrackerClient {
         })
     }
 
+    /// Return a clone with a different request timeout.
+    /// Use for long-running operations like snapshot create/load.
+    pub fn with_timeout(&self, timeout: Duration) -> Self {
+        Self {
+            socket_path: self.socket_path.clone(),
+            client: self.client.clone(),
+            request_timeout: timeout,
+        }
+    }
+
     /// Build Unix socket URI for Firecracker API
     fn uri(&self, path: &str) -> hyper::Uri {
         UnixUri::new(&self.socket_path, path).into()

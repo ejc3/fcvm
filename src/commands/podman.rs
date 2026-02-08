@@ -46,7 +46,21 @@ fn resolve_proxy_url(url: &str) -> Option<String> {
         }
     };
 
-    // Try to resolve to an IP address (prefer IPv4, fall back to IPv6)
+    // If the host is already an IP address (IPv4 or IPv6), use it directly.
+    // This avoids double-resolution when detect_http_proxy() already resolved the hostname.
+    match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => {
+            debug!(url = %url, ip = %ip, "proxy URL already has IPv4 address");
+            return Some(rebuild_proxy_url(&parsed, ip.to_string(), port));
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            debug!(url = %url, ip = %ip, "proxy URL already has IPv6 address");
+            return Some(rebuild_proxy_url(&parsed, ip.to_string(), port));
+        }
+        _ => {}
+    }
+
+    // Try to resolve hostname to an IP address (prefer IPv4, fall back to IPv6)
     match (host, port).to_socket_addrs() {
         Ok(addrs) => {
             let addrs: Vec<_> = addrs.collect();
@@ -384,7 +398,19 @@ pub async fn create_snapshot_interruptible(
     parent_snapshot_key: Option<&str>,
     cancel: &CancellationToken,
 ) -> SnapshotOutcome {
-    let snapshot_fut = create_podman_snapshot(
+    // CRITICAL: Do NOT use tokio::select! to interrupt the snapshot future.
+    // create_snapshot_core pauses the VM, creates the snapshot, then resumes.
+    // If we drop the future between pause and resume (via select!), the VM
+    // stays paused forever. Instead, check cancellation before starting and
+    // let the snapshot run to completion once started.
+    if cancel.is_cancelled() {
+        info!("snapshot creation skipped — already cancelled");
+        return SnapshotOutcome::Interrupted;
+    }
+
+    // Run snapshot to completion. create_snapshot_core always resumes the VM
+    // before returning, even on error, so this is safe.
+    match create_podman_snapshot(
         vm_manager,
         snapshot_key,
         vm_id,
@@ -393,18 +419,23 @@ pub async fn create_snapshot_interruptible(
         network_config,
         volume_configs,
         parent_snapshot_key,
-    );
-
-    tokio::select! {
-        biased; // Check cancellation first
-        _ = cancel.cancelled() => {
-            info!("snapshot creation interrupted by cancellation");
-            SnapshotOutcome::Interrupted
+    )
+    .await
+    {
+        Ok(()) => {
+            if cancel.is_cancelled() {
+                // Snapshot succeeded but we're shutting down
+                SnapshotOutcome::Interrupted
+            } else {
+                SnapshotOutcome::Created
+            }
         }
-        result = snapshot_fut => {
-            match result {
-                Ok(()) => SnapshotOutcome::Created,
-                Err(e) => SnapshotOutcome::Failed(e),
+        Err(e) => {
+            if cancel.is_cancelled() {
+                info!("snapshot creation failed during shutdown: {:#}", e);
+                SnapshotOutcome::Interrupted
+            } else {
+                SnapshotOutcome::Failed(e)
             }
         }
     }
@@ -1189,11 +1220,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         args.cpu = host_cpus;
         info!("Using host CPUs (capped at 32): {}", args.cpu);
     }
-    if args.mem == 0 {
-        args.mem =
-            crate::host_memory_mib().context("failed to read host memory from /proc/meminfo")?;
-        info!("Using all host memory: {} MiB", args.mem);
-    }
+    info!("VM memory: {} MiB", args.mem);
 
     // Build RuntimeConfig from kernel profile (replaces env var config passing)
     let mut runtime_config = super::common::RuntimeConfig::default();
