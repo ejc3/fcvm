@@ -10,6 +10,7 @@ pub use slirp::SlirpNetwork;
 pub use types::*;
 
 use anyhow::Result;
+use std::net::IpAddr;
 
 /// Network manager trait
 #[async_trait::async_trait]
@@ -51,11 +52,13 @@ pub fn get_host_dns_servers() -> anyhow::Result<Vec<String>> {
     let servers: Vec<String> = resolv_content
         .lines()
         .filter_map(|line| {
-            line.trim()
-                .strip_prefix("nameserver ")
-                .map(|s| s.trim().to_string())
+            let mut parts = line.split_whitespace();
+            match (parts.next(), parts.next()) {
+                (Some("nameserver"), Some(addr)) => Some(addr.to_string()),
+                _ => None,
+            }
         })
-        .filter(|s| !s.starts_with("127.")) // Filter out localhost
+        .filter(|s| !is_loopback_nameserver(s))
         .collect();
 
     if servers.is_empty() {
@@ -68,9 +71,42 @@ pub fn get_host_dns_servers() -> anyhow::Result<Vec<String>> {
     Ok(servers)
 }
 
+fn is_loopback_nameserver(server: &str) -> bool {
+    match server.parse::<IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_nameserver_parsing_and_loopback_filtering() {
+        let resolv = r#"
+            # comment
+            nameserver 127.0.0.53
+            nameserver ::1
+            nameserver    8.8.8.8
+            nameserver	2001:4860:4860::8888
+            options edns0
+        "#;
+
+        let servers: Vec<String> = resolv
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                match (parts.next(), parts.next()) {
+                    (Some("nameserver"), Some(addr)) => Some(addr.to_string()),
+                    _ => None,
+                }
+            })
+            .filter(|s| !is_loopback_nameserver(s))
+            .collect();
+
+        assert_eq!(servers, vec!["8.8.8.8", "2001:4860:4860::8888"]);
+    }
 
     #[test]
     fn test_get_host_dns_servers() {
@@ -80,7 +116,7 @@ mod tests {
         if let Ok(servers) = result {
             assert!(!servers.is_empty());
             for server in &servers {
-                assert!(!server.starts_with("127."), "Should filter localhost");
+                assert!(!is_loopback_nameserver(server), "Should filter localhost");
             }
         }
     }

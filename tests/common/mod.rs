@@ -1419,11 +1419,6 @@ impl LocalTestServer {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let is_ipv6 = bind_addr.contains(':');
-        let url = if is_ipv6 {
-            format!("http://[{}]:{}/", bind_addr, port)
-        } else {
-            format!("http://{}:{}/", bind_addr, port)
-        };
 
         // Parse address for binding
         let socket_addr: std::net::SocketAddr = if is_ipv6 {
@@ -1434,6 +1429,12 @@ impl LocalTestServer {
 
         // Bind listener before spawning task to ensure port is available
         let listener = tokio::net::TcpListener::bind(socket_addr).await?;
+        let actual_port = listener.local_addr()?.port();
+        let url = if is_ipv6 {
+            format!("http://[{}]:{}/", bind_addr, actual_port)
+        } else {
+            format!("http://{}:{}/", bind_addr, actual_port)
+        };
 
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
 
@@ -1463,14 +1464,13 @@ impl LocalTestServer {
             shutdown_tx,
             task,
             url,
-            port,
+            port: actual_port,
         })
     }
 
     /// Start on an automatically selected port.
     pub async fn start_on_available_port(bind_addr: &str) -> anyhow::Result<Self> {
-        let port = find_available_high_port()?;
-        Self::start(bind_addr, port).await
+        Self::start(bind_addr, 0).await
     }
 
     /// Stop the server.
@@ -1509,6 +1509,7 @@ impl LocalDnsServer {
     ) -> anyhow::Result<Self> {
         let socket_addr: std::net::SocketAddr = format!("{}:{}", bind_addr, port).parse()?;
         let socket = tokio::net::UdpSocket::bind(socket_addr).await?;
+        let actual_port = socket.local_addr()?.port();
 
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
 
@@ -1534,7 +1535,7 @@ impl LocalDnsServer {
         Ok(Self {
             shutdown_tx,
             task,
-            port,
+            port: actual_port,
             response_ip,
         })
     }
@@ -1611,8 +1612,7 @@ impl LocalDnsServer {
         bind_addr: &str,
         response_ip: std::net::Ipv4Addr,
     ) -> anyhow::Result<Self> {
-        let port = find_available_high_port()?;
-        Self::start(bind_addr, port, response_ip).await
+        Self::start(bind_addr, 0, response_ip).await
     }
 
     /// Stop the server.
@@ -1646,11 +1646,6 @@ impl LocalProxyServer {
     /// A LocalProxyServer instance. Drop it to stop the server.
     pub async fn start(bind_addr: &str, port: u16) -> anyhow::Result<Self> {
         let is_ipv6 = bind_addr.contains(':');
-        let url = if is_ipv6 {
-            format!("http://[{}]:{}", bind_addr, port)
-        } else {
-            format!("http://{}:{}", bind_addr, port)
-        };
 
         let socket_addr: std::net::SocketAddr = if is_ipv6 {
             format!("[{}]:{}", bind_addr, port).parse()?
@@ -1659,6 +1654,12 @@ impl LocalProxyServer {
         };
 
         let listener = tokio::net::TcpListener::bind(socket_addr).await?;
+        let actual_port = listener.local_addr()?.port();
+        let url = if is_ipv6 {
+            format!("http://[{}]:{}", bind_addr, actual_port)
+        } else {
+            format!("http://{}:{}", bind_addr, actual_port)
+        };
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
         let request_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let request_count_clone = request_count.clone();
@@ -1685,7 +1686,7 @@ impl LocalProxyServer {
             shutdown_tx,
             task,
             url,
-            port,
+            port: actual_port,
             request_count,
         })
     }
@@ -1812,8 +1813,7 @@ impl LocalProxyServer {
 
     /// Start on an automatically selected port.
     pub async fn start_on_available_port(bind_addr: &str) -> anyhow::Result<Self> {
-        let port = find_available_high_port()?;
-        Self::start(bind_addr, port).await
+        Self::start(bind_addr, 0).await
     }
 
     /// Get the number of requests handled by this proxy.

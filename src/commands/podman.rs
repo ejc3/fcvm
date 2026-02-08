@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
+use url::Url;
 
 use crate::cli::{NetworkMode, PodmanArgs, PodmanCommands, RunArgs};
 
@@ -14,25 +15,39 @@ use crate::cli::{NetworkMode, PodmanArgs, PodmanCommands, RunArgs};
 /// and IPv6 (via fd00::2 gateway) addresses. We prefer IPv4 but fall back to IPv6.
 /// Returns None only if the hostname can't be resolved at all.
 fn resolve_proxy_url(url: &str) -> Option<String> {
-    // Parse URL to extract scheme, host, port
-    let scheme = if url.starts_with("https://") {
-        "https"
+    // Proxies should include a scheme, but default to http for legacy inputs.
+    let normalized = if url.contains("://") {
+        url.to_string()
     } else {
-        "http"
+        format!("http://{}", url)
     };
-    let without_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
 
-    // Parse host:port
-    let (host_port, path) = without_scheme
-        .find('/')
-        .map(|i| (&without_scheme[..i], &without_scheme[i..]))
-        .unwrap_or((without_scheme, ""));
+    let parsed = match Url::parse(&normalized) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            warn!(url = %url, error = %e, "failed to parse proxy URL");
+            return None;
+        }
+    };
+
+    let host = match parsed.host_str() {
+        Some(host) => host,
+        None => {
+            warn!(url = %url, "proxy URL has no host");
+            return None;
+        }
+    };
+
+    let port = match parsed.port_or_known_default() {
+        Some(port) => port,
+        None => {
+            warn!(url = %url, "proxy URL has unknown default port");
+            return None;
+        }
+    };
 
     // Try to resolve to an IP address (prefer IPv4, fall back to IPv6)
-    match host_port.to_socket_addrs() {
+    match (host, port).to_socket_addrs() {
         Ok(addrs) => {
             let addrs: Vec<_> = addrs.collect();
 
@@ -44,7 +59,11 @@ fn resolve_proxy_url(url: &str) -> Option<String> {
                         resolved = %addr,
                         "resolved proxy hostname to IPv4"
                     );
-                    return Some(format!("{}://{}{}", scheme, addr, path));
+                    return Some(rebuild_proxy_url(
+                        &parsed,
+                        addr.ip().to_string(),
+                        addr.port(),
+                    ));
                 }
             }
 
@@ -57,10 +76,11 @@ fn resolve_proxy_url(url: &str) -> Option<String> {
                         resolved = %addr,
                         "resolved proxy hostname to IPv6 (no IPv4 available)"
                     );
-                    // Format IPv6 with brackets: http://[::1]:8080
-                    let ip = addr.ip();
-                    let port = addr.port();
-                    return Some(format!("{}://[{}]:{}{}", scheme, ip, port, path));
+                    return Some(rebuild_proxy_url(
+                        &parsed,
+                        addr.ip().to_string(),
+                        addr.port(),
+                    ));
                 }
             }
 
@@ -72,6 +92,40 @@ fn resolve_proxy_url(url: &str) -> Option<String> {
             None
         }
     }
+}
+
+fn rebuild_proxy_url(parsed: &Url, host: String, port: u16) -> String {
+    let mut authority = String::new();
+    if !parsed.username().is_empty() {
+        authority.push_str(parsed.username());
+        if let Some(password) = parsed.password() {
+            authority.push(':');
+            authority.push_str(password);
+        }
+        authority.push('@');
+    }
+
+    // Preserve valid URL formatting for IPv6 literals.
+    if host.contains(':') {
+        authority.push('[');
+        authority.push_str(&host);
+        authority.push(']');
+    } else {
+        authority.push_str(&host);
+    }
+    authority.push(':');
+    authority.push_str(&port.to_string());
+
+    let mut rebuilt = format!("{}://{}{}", parsed.scheme(), authority, parsed.path());
+    if let Some(query) = parsed.query() {
+        rebuilt.push('?');
+        rebuilt.push_str(query);
+    }
+    if let Some(fragment) = parsed.fragment() {
+        rebuilt.push('#');
+        rebuilt.push_str(fragment);
+    }
+    rebuilt
 }
 use crate::firecracker::VmManager;
 use crate::network::{BridgedNetwork, NetworkConfig, NetworkManager, PortMapping, SlirpNetwork};
@@ -666,7 +720,7 @@ async fn run_status_listener(
     vm_id: &str,
     cache_tx: Option<mpsc::Sender<CacheRequest>>,
 ) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
     // Remove stale socket if it exists
@@ -680,6 +734,8 @@ async fn run_status_listener(
     let ready_file = runtime_dir.join("container-ready");
     let exit_file = runtime_dir.join("container-exit");
 
+    let mut exit_received = false;
+
     // Accept connections in a loop (we get "cache-ready" then "ready" then "exit")
     loop {
         let accept_result = tokio::time::timeout(
@@ -688,7 +744,7 @@ async fn run_status_listener(
         )
         .await;
 
-        let (mut stream, _) = match accept_result {
+        let (stream, _) = match accept_result {
             Ok(Ok(conn)) => conn,
             Ok(Err(e)) => {
                 warn!(vm_id = %vm_id, error = %e, "Error accepting status connection");
@@ -700,64 +756,99 @@ async fn run_status_listener(
             }
         };
 
-        // Read the message
-        let mut buf = [0u8; 128];
-        let n = match stream.read(&mut buf).await {
-            Ok(n) if n > 0 => n,
-            _ => continue,
-        };
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        let mut line = String::new();
 
-        let msg = String::from_utf8_lossy(&buf[..n]);
-        let msg = msg.trim();
+        loop {
+            line.clear();
+            let read_result = tokio::time::timeout(
+                std::time::Duration::from_secs(300),
+                reader.read_line(&mut line),
+            )
+            .await;
 
-        if msg == "ready" {
-            // Create ready file to signal container is running
-            std::fs::write(&ready_file, "ready\n")
-                .with_context(|| format!("writing ready file: {:?}", ready_file))?;
-            info!(vm_id = %vm_id, "Container ready notification received");
-        } else if let Some(debug_msg) = msg.strip_prefix("debug:") {
-            // Debug message from fc-agent (useful when serial console is broken after restore)
-            info!(vm_id = %vm_id, debug = %debug_msg, "fc-agent debug message");
-        } else if let Some(code_str) = msg.strip_prefix("exit:") {
-            // Write exit code to file
-            std::fs::write(&exit_file, format!("{}\n", code_str))
-                .with_context(|| format!("writing exit file: {:?}", exit_file))?;
-            info!(vm_id = %vm_id, exit_code = %code_str, "Container exit notification received");
-            // Exit loop after receiving exit code
-            break;
-        } else if let Some(digest) = msg.strip_prefix("cache-ready:") {
-            // fc-agent has loaded the image and is ready for caching
-            info!(vm_id = %vm_id, digest = %digest, "Cache-ready notification received");
-
-            if let Some(ref tx) = cache_tx {
-                // Create oneshot channel for ack
-                let (ack_tx, ack_rx) = oneshot::channel();
-
-                // Send cache request to main task
-                let request = CacheRequest {
-                    digest: digest.to_string(),
-                    ack_tx,
-                };
-
-                if tx.send(request).await.is_ok() {
-                    // Wait for main task to complete cache creation
-                    // No timeout - host is responsible for completing
-                    if ack_rx.await.is_ok() {
-                        info!(vm_id = %vm_id, "Cache created, sending ack to fc-agent");
-                    } else {
-                        warn!(vm_id = %vm_id, "Cache creation failed or was cancelled");
-                    }
-                } else {
-                    warn!(vm_id = %vm_id, "Failed to send cache request to main task");
+            let bytes = match read_result {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(e)) => {
+                    warn!(vm_id = %vm_id, error = %e, "Error reading status connection");
+                    break;
                 }
+                Err(_) => {
+                    warn!(
+                        vm_id = %vm_id,
+                        "Timed out waiting for status message on status connection"
+                    );
+                    break;
+                }
+            };
+
+            if bytes == 0 {
+                break;
             }
 
-            // Send ack back to fc-agent (even if cache creation failed)
-            if let Err(e) = stream.write_all(b"cache-ack\n").await {
-                warn!(vm_id = %vm_id, error = %e, "Failed to send cache-ack to fc-agent");
+            let msg = line.trim();
+            if msg.is_empty() {
+                continue;
             }
-        } else {
-            warn!(vm_id = %vm_id, msg = %msg, "Unexpected status message");
+
+            if msg == "ready" {
+                // Create ready file to signal container is running
+                std::fs::write(&ready_file, "ready\n")
+                    .with_context(|| format!("writing ready file: {:?}", ready_file))?;
+                info!(vm_id = %vm_id, "Container ready notification received");
+            } else if let Some(debug_msg) = msg.strip_prefix("debug:") {
+                // Debug message from fc-agent (useful when serial console is broken after restore)
+                info!(vm_id = %vm_id, debug = %debug_msg, "fc-agent debug message");
+            } else if let Some(code_str) = msg.strip_prefix("exit:") {
+                // Write exit code to file
+                std::fs::write(&exit_file, format!("{}\n", code_str))
+                    .with_context(|| format!("writing exit file: {:?}", exit_file))?;
+                info!(
+                    vm_id = %vm_id,
+                    exit_code = %code_str,
+                    "Container exit notification received"
+                );
+                exit_received = true;
+                break;
+            } else if let Some(digest) = msg.strip_prefix("cache-ready:") {
+                // fc-agent has loaded the image and is ready for caching
+                info!(vm_id = %vm_id, digest = %digest, "Cache-ready notification received");
+
+                if let Some(tx) = cache_tx.as_ref() {
+                    // Create oneshot channel for ack
+                    let (ack_tx, ack_rx) = oneshot::channel();
+
+                    // Send cache request to main task
+                    let request = CacheRequest {
+                        digest: digest.to_string(),
+                        ack_tx,
+                    };
+
+                    if tx.send(request).await.is_ok() {
+                        // Wait for main task to complete cache creation
+                        // No timeout - host is responsible for completing
+                        if ack_rx.await.is_ok() {
+                            info!(vm_id = %vm_id, "Cache created, sending ack to fc-agent");
+                        } else {
+                            warn!(vm_id = %vm_id, "Cache creation failed or was cancelled");
+                        }
+                    } else {
+                        warn!(vm_id = %vm_id, "Failed to send cache request to main task");
+                    }
+                }
+
+                // Send ack back to fc-agent (even if cache creation failed)
+                if let Err(e) = write_half.write_all(b"cache-ack\n").await {
+                    warn!(vm_id = %vm_id, error = %e, "Failed to send cache-ack to fc-agent");
+                }
+            } else {
+                warn!(vm_id = %vm_id, msg = %msg, "Unexpected status message");
+            }
+        }
+
+        if exit_received {
+            break;
         }
     }
 
@@ -1734,7 +1825,7 @@ async fn run_vm_setup(
         let retry_deadline = std::time::Instant::now() + super::common::HOLDER_RETRY_TIMEOUT;
         let mut attempt = 0;
 
-        let (mut child, holder_pid, mut holder_stderr) = loop {
+        let (mut child, mut holder_pid, mut holder_stderr) = loop {
             attempt += 1;
 
             // Spawn holder with piped stderr to capture errors if it fails
@@ -1880,7 +1971,7 @@ async fn run_vm_setup(
         // Step 2: Run setup script via nsenter (creates TAPs, iptables, etc.)
         // This is also inside retry logic - if holder dies during nsenter, retry everything
         let setup_script = slirp_net.build_setup_script();
-        let nsenter_prefix = slirp_net.build_nsenter_prefix(holder_pid);
+        let mut nsenter_prefix = slirp_net.build_nsenter_prefix(holder_pid);
 
         // Debug: Check if holder is still alive and namespace files exist
         let proc_dir = format!("/proc/{}", holder_pid);
@@ -2017,9 +2108,10 @@ async fn run_vm_setup(
 
                 // Success on retry - update variables for rest of function
                 child = retry_child;
-                // Note: holder_pid is shadowed in the outer scope, but we continue with retry_holder_pid
+                holder_pid = retry_holder_pid;
+                nsenter_prefix = slirp_net.build_nsenter_prefix(holder_pid);
                 info!(
-                    holder_pid = retry_holder_pid,
+                    holder_pid = holder_pid,
                     attempts = attempt,
                     "network setup succeeded after retry"
                 );
@@ -2699,4 +2791,71 @@ async fn run_vm_setup(
     super::common::save_vm_state_with_network(state_manager, vm_state, network_config).await?;
 
     Ok((vm_manager, holder_child))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn test_rebuild_proxy_url_preserves_auth_and_query() {
+        let parsed = Url::parse("http://user:pass@proxy.example/path?q=1").unwrap();
+        let rebuilt = rebuild_proxy_url(&parsed, "127.0.0.1".to_string(), 3128);
+        assert_eq!(rebuilt, "http://user:pass@127.0.0.1:3128/path?q=1");
+    }
+
+    #[test]
+    fn test_resolve_proxy_url_applies_default_port() {
+        let resolved_http = resolve_proxy_url("http://localhost")
+            .expect("localhost proxy URL should resolve with default port");
+        assert!(resolved_http.starts_with("http://"));
+        assert!(resolved_http.contains(":80"));
+
+        let resolved_https = resolve_proxy_url("https://localhost/proxy")
+            .expect("localhost proxy URL should resolve with default https port");
+        assert!(resolved_https.starts_with("https://"));
+        assert!(resolved_https.contains(":443"));
+        assert!(resolved_https.contains("/proxy"));
+    }
+
+    #[tokio::test]
+    async fn test_status_listener_handles_multiple_messages_on_single_connection() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runtime_dir = temp_dir.path().to_path_buf();
+        let socket_path = runtime_dir.join("status.sock");
+        let socket_path_string = socket_path.to_string_lossy().to_string();
+        let runtime_dir_for_task = runtime_dir.clone();
+
+        let listener_task = tokio::spawn(async move {
+            run_status_listener(&socket_path_string, &runtime_dir_for_task, "vm-test", None).await
+        });
+
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(socket_path.exists(), "status socket was not created");
+
+        let mut stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        stream.write_all(b"ready\nexit:0\n").await.unwrap();
+        drop(stream);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), listener_task)
+            .await
+            .expect("status listener timed out")
+            .expect("status listener task panicked");
+        result.expect("status listener returned error");
+
+        assert_eq!(
+            std::fs::read_to_string(runtime_dir.join("container-ready")).unwrap(),
+            "ready\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(runtime_dir.join("container-exit")).unwrap(),
+            "0\n"
+        );
+    }
 }

@@ -397,35 +397,17 @@ fn reader_loop(mut socket: UnixStream, pending: Arc<DashMap<u64, Sender<Response
                 }
             }
             Err(e) => {
-                // Try to extract unique ID from raw bytes to unblock the waiting thread
-                let maybe_unique = if resp_buf.len() >= 8 {
-                    u64::from_le_bytes([
-                        resp_buf[0],
-                        resp_buf[1],
-                        resp_buf[2],
-                        resp_buf[3],
-                        resp_buf[4],
-                        resp_buf[5],
-                        resp_buf[6],
-                        resp_buf[7],
-                    ])
-                } else {
-                    0
-                };
                 tracing::error!(
                     target: "fuse-pipe::mux",
                     count,
                     len,
-                    maybe_unique,
                     error = %e,
                     "reader: response deserialization failed"
                 );
-                // Send EIO to the waiting thread so it doesn't hang forever
-                if maybe_unique != 0 {
-                    if let Some((_, tx)) = pending.remove(&maybe_unique) {
-                        let _ = tx.send((VolumeResponse::error(libc::EIO), None));
-                    }
-                }
+                // Connection stream is now out of sync; fail pending requests
+                // so callers don't block forever waiting for responses.
+                fail_all_pending(&pending);
+                break;
             }
         }
     }
@@ -569,6 +551,39 @@ mod tests {
         server.write_all(&bad_len).unwrap();
 
         // Pending request should complete with an error instead of hanging.
+        let result = done_rx.recv_timeout(Duration::from_millis(200)).unwrap();
+        assert_eq!(result, Some(libc::EIO));
+    }
+
+    #[test]
+    fn test_deserialize_failure_fails_pending_request() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mux = Multiplexer::new(client, 1).unwrap();
+        let mux_clone = Arc::clone(&mux);
+
+        let (done_tx, done_rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let resp = mux_clone.send_request(VolumeRequest::Getattr { ino: 1 });
+            let _ = done_tx.send(resp.errno());
+        });
+
+        // Drain outgoing request.
+        let mut len_buf = [0u8; 4];
+        server.read_exact(&mut len_buf).unwrap();
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len];
+        server.read_exact(&mut body).unwrap();
+
+        // Send syntactically-framed but semantically-invalid bincode payload.
+        let bad_payload = vec![0xff; 16];
+        let bad_len = (bad_payload.len() as u32).to_be_bytes();
+        server.write_all(&bad_len).unwrap();
+        server.write_all(&bad_payload).unwrap();
+
         let result = done_rx.recv_timeout(Duration::from_millis(200)).unwrap();
         assert_eq!(result, Some(libc::EIO));
     }
