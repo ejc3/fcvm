@@ -668,6 +668,7 @@ gh pr create --base feature-a
 gh pr list --json number,headRefName,baseRefName
 ```
 Merge in order (#1 first, then #2). **Never use `--delete-branch` on the base PR**: it closes dependent PRs. Merge without delete, run `gh pr edit <dep> --base main`, then delete branch.
+For the full merge procedure and safety checks, see `.claude/skills/pr-workflow/SKILL.md`.
 
 **CRITICAL: Maintain Stack Coherence.** PR #2's branch must actually be based on PR #1's branch, not just have GitHub base set.
 ```bash
