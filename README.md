@@ -593,6 +593,8 @@ await sandbox.destroy();
 | `GET` | `/s/{id}/files/*path` | Read file |
 | `HEAD` | `/s/{id}/files/*path` | Check file exists |
 | `DELETE` | `/s/{id}/files/*path` | Delete file |
+| `POST` | `/s/{id}/terminals` | Create terminal session |
+| `GET` | `/s/{id}` | WebSocket terminal connection |
 
 ### curl Examples
 
