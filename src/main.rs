@@ -92,6 +92,7 @@ async fn main() -> Result<()> {
         Commands::Snapshot(args) => commands::cmd_snapshot(args).await,
         Commands::Snapshots(args) => commands::cmd_snapshots(args).await,
         Commands::Exec(args) => commands::cmd_exec(args).await,
+        Commands::Serve(args) => commands::cmd_serve(args).await,
         Commands::Setup(args) => commands::cmd_setup(args).await,
         Commands::Completions(args) => {
             commands::cmd_completions(args);

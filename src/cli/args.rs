@@ -30,6 +30,8 @@ pub enum Commands {
     Exec(ExecArgs),
     /// Setup kernel and rootfs (kernel ~15MB download, rootfs ~10GB creation, takes 5-10 minutes)
     Setup(SetupArgs),
+    /// Run HTTP/WebSocket API server for ComputeSDK integration
+    Serve(ServeArgs),
     /// Generate shell completions
     Completions(CompletionsArgs),
 }
@@ -66,6 +68,17 @@ pub struct SetupArgs {
     /// Requires --kernel-profile flag. After setup, reboot to activate.
     #[arg(long, requires = "kernel_profile")]
     pub install_host_kernel: bool,
+}
+
+// ============================================================================
+// Serve Command
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct ServeArgs {
+    /// Port to listen on
+    #[arg(long, default_value_t = 8090)]
+    pub port: u16,
 }
 
 // ============================================================================
