@@ -413,6 +413,7 @@ pub async fn restore_from_snapshot(
     vm_name: &str,
     data_dir: &Path,
     socket_path: &Path,
+    runtime_config: &RuntimeConfig,
     restore_config: &SnapshotRestoreConfig,
     network_config: &NetworkConfig,
     network: &mut dyn NetworkManager,
@@ -658,10 +659,14 @@ pub async fn restore_from_snapshot(
     );
     vm_manager.set_mount_redirects(baseline_dirs, data_dir.to_path_buf());
 
-    let firecracker_bin = find_firecracker(&RuntimeConfig::default())?;
+    let firecracker_bin = find_firecracker(runtime_config)?;
+    let firecracker_args = runtime_config
+        .firecracker_args
+        .clone()
+        .or_else(|| std::env::var("FCVM_FIRECRACKER_ARGS").ok());
 
     vm_manager
-        .start(&firecracker_bin, None, None)
+        .start(&firecracker_bin, None, firecracker_args.as_deref())
         .await
         .context("starting Firecracker")?;
 

@@ -21,7 +21,9 @@ use crate::storage::SnapshotManager;
 use crate::uffd::UffdServer;
 use crate::volume::{spawn_volume_servers, VolumeConfig};
 
-use super::common::{MemoryBackend, SnapshotRestoreConfig, VSOCK_OUTPUT_PORT, VSOCK_TTY_PORT};
+use super::common::{
+    MemoryBackend, RuntimeConfig, SnapshotRestoreConfig, VSOCK_OUTPUT_PORT, VSOCK_TTY_PORT,
+};
 use super::podman::run_output_listener;
 
 /// Main dispatcher for snapshot commands
@@ -31,6 +33,15 @@ pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
         SnapshotCommands::Serve(serve_args) => cmd_snapshot_serve(serve_args).await,
         SnapshotCommands::Run(run_args) => cmd_snapshot_run(run_args).await,
         SnapshotCommands::Ls => cmd_snapshot_ls().await,
+    }
+}
+
+fn snapshot_restore_runtime_config(args: &SnapshotRunArgs) -> RuntimeConfig {
+    RuntimeConfig {
+        firecracker_bin: args.firecracker_bin.as_ref().map(PathBuf::from),
+        firecracker_args: args.firecracker_args.clone(),
+        boot_args: None,
+        fuse_readers: None,
     }
 }
 
@@ -487,6 +498,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Generate VM ID and name
     let vm_id = generate_vm_id();
+    let runtime_config = snapshot_restore_runtime_config(&args);
     let vm_name = args.name.unwrap_or_else(|| {
         // Auto-generate: snapshot-name + random suffix
         format!("{}-{}", snapshot_name, &vm_id[..6])
@@ -722,6 +734,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         &vm_name,
         &data_dir,
         &socket_path,
+        &runtime_config,
         &restore_config,
         &network_config,
         network.as_mut(),
@@ -1029,4 +1042,35 @@ async fn cmd_snapshot_ls() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_snapshot_restore_runtime_config_preserves_firecracker_overrides() {
+        let args = SnapshotRunArgs {
+            pid: None,
+            snapshot: Some("snap".to_string()),
+            name: Some("clone".to_string()),
+            publish: vec![],
+            network: NetworkMode::Rootless,
+            exec: None,
+            tty: false,
+            interactive: false,
+            startup_snapshot_base_key: None,
+            cpu: None,
+            mem: None,
+            firecracker_bin: Some("/opt/firecracker-profile".to_string()),
+            firecracker_args: Some("--enable-nv2".to_string()),
+        };
+
+        let runtime = snapshot_restore_runtime_config(&args);
+        assert_eq!(
+            runtime.firecracker_bin,
+            Some(PathBuf::from("/opt/firecracker-profile"))
+        );
+        assert_eq!(runtime.firecracker_args, Some("--enable-nv2".to_string()));
+    }
 }

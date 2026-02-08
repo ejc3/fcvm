@@ -331,6 +331,16 @@ pub struct SnapshotRunArgs {
     /// Passed from podman run's --mem when restoring from a snapshot.
     #[arg(skip)]
     pub mem: Option<u32>,
+
+    /// Firecracker binary path (internal use only).
+    /// Passed from podman run runtime config when restoring from a snapshot cache hit.
+    #[arg(skip)]
+    pub firecracker_bin: Option<String>,
+
+    /// Extra Firecracker args (internal use only).
+    /// Passed from podman run runtime config when restoring from a snapshot cache hit.
+    #[arg(skip)]
+    pub firecracker_args: Option<String>,
 }
 
 // ============================================================================

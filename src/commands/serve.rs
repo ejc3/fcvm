@@ -8,7 +8,7 @@
 //! Sandbox daemon endpoints: `/s/{id}/*`
 
 use crate::cli::ServeArgs;
-use crate::commands::exec::run_exec_in_vm_captured;
+use crate::commands::exec::{run_exec_in_vm_captured, ExecOutput};
 use crate::commands::podman::{start_vm, VmHandle};
 use crate::state::HealthStatus;
 use anyhow::{Context, Result};
@@ -194,13 +194,42 @@ fn runtime_to_language(runtime: &str) -> &str {
     }
 }
 
+fn build_go_run_command(code: &str) -> Vec<String> {
+    let delimiter = format!("FCVM_GO_{}", uuid::Uuid::new_v4().simple());
+    let script = format!(
+        "tmp=$(mktemp /tmp/fcvm-go-XXXXXX.go) && cat > \"$tmp\" << '{}'\n{}\n{}\ngo run \"$tmp\"\nstatus=$?\nrm -f \"$tmp\"\nexit $status",
+        delimiter, code, delimiter
+    );
+    vec!["sh".into(), "-c".into(), script]
+}
+
 fn language_to_run_command(language: &str, code: &str) -> Vec<String> {
     match language {
         "python" | "python3" => vec!["python3".into(), "-c".into(), code.into()],
         "javascript" | "node" | "nodejs" => vec!["node".into(), "-e".into(), code.into()],
         "ruby" => vec!["ruby".into(), "-e".into(), code.into()],
+        "go" | "golang" => build_go_run_command(code),
         _ => vec!["sh".into(), "-c".into(), code.into()],
     }
+}
+
+fn ensure_exec_succeeded(operation: &str, output: &ExecOutput) -> std::result::Result<(), String> {
+    if output.exit_code == 0 {
+        return Ok(());
+    }
+
+    let detail = if !output.stderr.trim().is_empty() {
+        output.stderr.trim()
+    } else if !output.stdout.trim().is_empty() {
+        output.stdout.trim()
+    } else {
+        "command failed without output"
+    };
+
+    Err(format!(
+        "Failed to {}: {} (exit code {})",
+        operation, detail, output.exit_code
+    ))
 }
 
 // ============================================================================
@@ -670,11 +699,17 @@ async fn create_file(
 
     let cmd = vec!["sh".into(), "-c".into(), write_cmd];
 
-    if let Err(e) = run_exec_in_vm_captured(&vsock_path, &cmd, true).await {
-        return gateway_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to write file: {}", e),
-        );
+    let output = match run_exec_in_vm_captured(&vsock_path, &cmd, true).await {
+        Ok(o) => o,
+        Err(e) => {
+            return gateway_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to write file: {}", e),
+            );
+        }
+    };
+    if let Err(message) = ensure_exec_succeeded("write file", &output) {
+        return gateway_error(StatusCode::INTERNAL_SERVER_ERROR, message);
     }
 
     let body = serde_json::json!({
@@ -1053,4 +1088,41 @@ pub async fn cmd_serve(args: ServeArgs) -> Result<()> {
 
     info!("Server stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_language_to_run_command_go_uses_go_toolchain() {
+        let cmd = language_to_run_command("go", "package main\nfunc main() {}");
+        assert_eq!(cmd[0], "sh");
+        assert_eq!(cmd[1], "-c");
+        assert!(cmd[2].contains("go run \"$tmp\""));
+        assert!(cmd[2].contains("mktemp /tmp/fcvm-go-"));
+    }
+
+    #[test]
+    fn test_ensure_exec_succeeded_accepts_zero_exit() {
+        let output = ExecOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+        };
+        assert!(ensure_exec_succeeded("write file", &output).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_exec_succeeded_rejects_nonzero_exit() {
+        let output = ExecOutput {
+            stdout: String::new(),
+            stderr: "permission denied".to_string(),
+            exit_code: 1,
+        };
+        let err = ensure_exec_succeeded("write file", &output).unwrap_err();
+        assert!(err.contains("Failed to write file"));
+        assert!(err.contains("permission denied"));
+        assert!(err.contains("exit code 1"));
+    }
 }
