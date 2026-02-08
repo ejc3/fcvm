@@ -195,7 +195,7 @@ fcvm uses a two-tier snapshot system for optimal startup performance:
 2. **Subsequent snapshots (startup)**: Copies parent's memory.bin via reflink (CoW, instant), creates diff with only changed pages, merges diff onto base
 3. **Result**: Each snapshot ends up with a **complete memory.bin** - equivalent to a full snapshot, but created much faster
 
-We use reflink copy + diff merge, not persistent diff chains. The reflink copy is instant (btrfs CoW), and the diff contains only ~2% of pages (those changed during container startup). After merging, each snapshot has a complete memory.bin with no dependency on parent snapshots.
+No persistent diff chains — reflink copy is instant (btrfs CoW), diff contains ~2% of pages, merged onto base. Each snapshot has a complete memory.bin with no parent dependency.
 
 The startup snapshot is triggered by `--health-check <url>`. When the health check passes, fcvm creates a diff snapshot of the fully-initialized application. Second run restores from the startup snapshot, skipping container initialization entirely.
 
@@ -210,7 +210,7 @@ The startup snapshot is triggered by `--health-check <url>`. When the health che
 # → Restored from startup snapshot (application already running)
 ```
 
-**Parent lineage**: User snapshots from clones automatically use their source snapshot as a parent, enabling diff-based optimization across the entire snapshot chain.
+Clone snapshots automatically use their source as parent, enabling diff-based optimization across the chain.
 
 ### More Options
 
@@ -312,35 +312,7 @@ Clone timing measured on c7g.metal ARM64 with `RUST_LOG=debug`:
 | Command + cleanup | ~300ms | Run echo + shutdown |
 | **Total** | **~610ms** | Full clone cycle with exec |
 
-Core VM restore (snapshot load + resume) is ~10ms. The rest is network setup, agent recovery, and cleanup.
-
-#### 10-Clone Test Results
-
-Validated with 10 sequential clones from the same memory server:
-
-| Metric | Average | Range |
-|--------|---------|-------|
-| **Snapshot load (UFFD)** | 9.08ms | 8.76-9.56ms |
-| **VM resume** | 0.48ms | 0.44-0.56ms |
-| **Core VM restore** | ~9.5ms | — |
-| **Full clone cycle** | 611ms | 587-631ms |
-
-Individual clone times: 631, 599, 611, 611, 615, 618, 618, 622, 587, 599ms
-
-#### 10-Clone Parallel Test Results
-
-All 10 clones launched simultaneously:
-
-| Metric | Value |
-|--------|-------|
-| **Wall clock time** | **1.03s** |
-| **Snapshot load (UFFD)** | 9-11ms (consistent under load) |
-| **Individual clone times** | 743-1024ms |
-
-- Core restore is ~10ms regardless of sequential or parallel
-- Single memory server handles 10 concurrent clones
-- 10 VMs in 1.03s (not 10x sequential)
-- Bottleneck is network teardown and state cleanup under contention
+Core VM restore (snapshot load + resume) is ~10ms. The rest is network setup, agent recovery, and cleanup. 10 parallel clones complete in ~1s wall clock (not 10x sequential). See [PERFORMANCE.md](PERFORMANCE.md) for detailed clone benchmarks.
 
 **Demo: Time a clone cycle**
 
@@ -480,255 +452,36 @@ echo "hello" | ./fcvm podman run --name pipe -i alpine:latest cat
 
 ## Nested Virtualization
 
-> ⚠️ **Experimental Feature**: Nested virtualization (L2+) is experimental. While basic functionality works, there are known stability issues under high I/O load. See [Known Issues](#known-issues-nested) below.
-
-fcvm supports running VMs inside VMs using ARM64 FEAT_NV2 nested virtualization. Currently **one level of nesting works**: Host → L1 VM with full KVM support.
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  Host (bare metal c7g.metal)                            │
-│  ┌───────────────────────────────────────────────────┐  │
-│  │  L1 VM (fcvm + nested kernel profile)             │  │
-│  │  ┌─────────────────────────────────────────────┐  │  │
-│  │  │  L2 VM (fcvm inside L1)                     │  │  │
-│  │  │  - Runs containers                          │  │  │
-│  │  │  - Full VM isolation                        │  │  │
-│  │  └─────────────────────────────────────────────┘  │  │
-│  └───────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────┘
-```
-
-**What Works**: Host → L1 → L2 nesting is fully functional. The `arm64.nv2` kernel boot parameter enables recursive KVM (`KVM_CAP_ARM_EL2=1`).
-
-**Limitation**: L3+ nesting (L1 → L2 → L3...) is blocked by FUSE-over-FUSE latency. Each nesting level adds ~3-5 seconds per filesystem request due to the multi-hop FUSE chain. See `.claude/CLAUDE.md` for technical details.
-
-### Requirements
+fcvm supports running VMs inside VMs using ARM64 FEAT_NV2. Host → L1 → L2 nesting works. L3+ is blocked by FUSE-over-FUSE latency (~5x per level).
 
 | Requirement | Details |
 |-------------|---------|
-| **Hardware** | ARM64 with FEAT_NV2 (Graviton3+: c7g.metal, c7gn.metal, r7g.metal) |
-| **Host kernel** | 6.18+ with `kvm-arm.mode=nested` boot parameter |
-| **Nested kernel** | Pre-built from releases or `fcvm setup --kernel-profile nested --build-kernels` |
-| **Firecracker** | Fork with NV2 support (configured via kernel profile) |
-
-### Setting Up an EC2 Instance for Nested Virtualization
-
-**Step 1: Launch a metal instance**
+| **Hardware** | ARM64 with FEAT_NV2 (Graviton3+: c7g.metal) |
+| **Host kernel** | 6.18+ with `kvm-arm.mode=nested` |
+| **Nested kernel** | `fcvm setup --kernel-profile nested` |
 
 ```bash
-# Must be a metal instance for FEAT_NV2 hardware support
-# Recommended: c7g.metal, m7g.metal, r7g.metal (Graviton3)
-aws ec2 run-instances \
-    --instance-type c7g.metal \
-    --image-id ami-0xyz...  # Ubuntu 24.04 ARM64
-```
-
-**Step 2: Install fcvm and set up host kernel**
-
-```bash
-# Install fcvm (or build from source)
-cargo install fcvm
-
-# Download nested kernel profile and install as host kernel
-# This also configures GRUB with kvm-arm.mode=nested
+# Setup host kernel (one-time)
 sudo ./fcvm setup --kernel-profile nested --install-host-kernel
-
-# Reboot into the new kernel
 sudo reboot
-```
 
-**Step 3: Verify nested KVM is enabled**
-
-```bash
-# Check kernel version
-uname -r  # Should show 6.18-nested
-
-# Check nested mode is enabled
-cat /sys/module/kvm/parameters/mode  # Should show "nested"
-
-# Verify KVM works
-ls -la /dev/kvm
-```
-
-<details>
-<summary>Manual kernel build (alternative)</summary>
-
-If you prefer to build the host kernel manually:
-
-```bash
-# Install build dependencies
-sudo apt-get update
-sudo apt-get install -y build-essential flex bison bc libelf-dev libssl-dev
-
-# Download kernel source
-cd /tmp
-wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.2.tar.xz
-tar xf linux-6.18.2.tar.xz
-cd linux-6.18.2
-
-# Configure for ARM64 with KVM
-make defconfig
-./scripts/config --enable VIRTUALIZATION
-./scripts/config --enable KVM
-./scripts/config --enable CONFIG_FUSE_FS
-
-# Build and install (~10-20 minutes on metal)
-make -j$(nproc)
-sudo make modules_install
-sudo make install
-
-# Configure GRUB
-sudo sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="kvm-arm.mode=nested /' /etc/default/grub
-sudo update-grub
-sudo reboot
-```
-
-</details>
-
-### Getting the Nested Kernel
-
-> **Note**: If you followed "Setting Up an EC2 Instance" above, the kernel is already downloaded. This section is for users who already have a host with nested KVM enabled.
-
-```bash
-# Download pre-built kernel from GitHub releases (~20MB)
-./fcvm setup --kernel-profile nested
-
-# Kernel will be at /mnt/fcvm-btrfs/kernels/vmlinux-nested-6.18-aarch64-*.bin
-```
-
-Or build locally (takes 10-20 minutes):
-```bash
-./fcvm setup --kernel-profile nested --build-kernels
-```
-
-The nested kernel (6.18) includes:
-- **CONFIG_KVM=y** - KVM hypervisor for nested virtualization
-- **EL2 support** - ARM Exception Level 2 (hypervisor mode)
-- **MMFR4 patch** - Enables `arm64.nv2` boot param for NV2 capability
-- **FUSE** - For volume mounts between host and guest
-- **Networking** - TUN/VETH/netfilter for bridged networking in nested VMs
-
-### Running Nested VMs
-
-**Step 1: Start outer VM with nested kernel profile**
-```bash
-# Uses nested kernel profile from rootfs-config.toml
+# Start outer VM with nested kernel
 sudo ./fcvm podman run \
-    --name outer-vm \
-    --network bridged \
-    --kernel-profile nested \
-    --privileged \
+    --name outer --network bridged \
+    --kernel-profile nested --privileged \
     --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
-    --map /path/to/fcvm/binary:/opt/fcvm \
     nginx:alpine
+
+# Run inner VM (inside outer)
+./fcvm exec --pid <outer_pid> --vm -- \
+    /opt/fcvm/fcvm podman run --name inner --network bridged alpine:latest echo "nested!"
 ```
 
-**Step 2: Verify nested KVM works**
-```bash
-# Check guest sees HYP mode
-./fcvm exec --pid <outer_pid> --vm -- dmesg | grep -i kvm
-# Should show: "kvm [1]: VHE mode initialized successfully"
-
-# Verify /dev/kvm is accessible
-./fcvm exec --pid <outer_pid> --vm -- ls -la /dev/kvm
-```
-
-**Step 3: Run inner VM**
-```bash
-# Inside outer VM (via exec or SSH)
-cd /mnt/fcvm-btrfs
-/opt/fcvm/fcvm podman run --name inner-vm --network bridged alpine:latest echo "Hello from nested VM!"
-```
-
-### How It Works
-
-1. **FCVM_NV2=1** environment variable (auto-set when `--kernel-profile nested` is used) triggers fcvm to pass `--enable-nv2` to Firecracker
-2. **HAS_EL2 + HAS_EL2_E2H0** vCPU features are enabled
-   - HAS_EL2 (bit 7): Enables virtual EL2 for guest
-   - HAS_EL2_E2H0 (bit 8): Forces nVHE mode (avoids timer trap storm)
-3. **vCPU boots at EL2h** so guest kernel's `is_hyp_mode_available()` returns true
-4. **EL2 registers initialized**: HCR_EL2, CNTHCTL_EL2, VMPIDR_EL2, VPIDR_EL2
-5. Guest kernel initializes KVM: "CPU: All CPU(s) started at EL2"
-6. Nested fcvm creates VMs using the guest's KVM
-
-### Testing Nested Virtualization
+**Performance**: ~5-7x FUSE overhead at L2, local disk ~4x. L2 VMs limited to single vCPU (NV2 multi-vCPU interrupt issue). See [PERFORMANCE.md](PERFORMANCE.md#nested-virtualization) for benchmarks and [NESTED.md](NESTED.md) for setup details.
 
 ```bash
-# Run nested virtualization tests
-make test-root FILTER=kvm
-
-# Tests:
-# - test_kvm_available_in_vm: Verifies /dev/kvm works in guest with nested profile
-# - test_nested_run_fcvm_inside_vm: Full test of running fcvm inside fcvm
-# - test_nested_l2: Full L1→L2 nesting with benchmarks at each level
+make test-root FILTER=kvm   # Run nested virtualization tests
 ```
-
-### Nested Performance Benchmarks
-
-Performance at each nesting level (measured on c7g.metal, ARM64 Graviton3):
-
-| Metric | L1 (Host→VM) | L2 (VM→VM) | Overhead |
-|--------|-------------|------------|----------|
-| **Egress (curl)** | ✓ | ✓ | — |
-| **Local Write** (10MB sync) | 4ms | 16ms | 4x |
-| **Local Read** (10MB) | 2ms | 14ms | 7x |
-| **FUSE Write** (10MB sync) | 83ms | 295ms | 3.6x |
-| **FUSE Read** (10MB) | 45ms | 226ms | 5x |
-| **FUSE Stat** (per-op) | 1.1ms | 5.3ms | 4.8x |
-| **Copy TO FUSE** (100MB) | 1078ms (92 MB/s) | 7789ms (12 MB/s) | **7.2x** |
-| **Copy FROM FUSE** (100MB) | 398ms (250 MB/s) | 2227ms (44 MB/s) | **5.6x** |
-| **Memory Used** | 399MB | 341MB | — |
-
-- ~5-7x FUSE overhead at L2 due to FUSE-over-FUSE chaining (L2 → L1 → Host)
-- Large copies: 92 MB/s at L1, 12 MB/s write / 44 MB/s read at L2
-- Local disk overhead is lower (~4-7x), only traverses virtio block
-- Memory is similar at each level (~350-400MB)
-
-**Why L3+ is blocked:** Each additional nesting level adds another FUSE hop. At L3, a single stat() would take ~25ms (5x × 5x = 25x overhead), making container startup take 10+ minutes.
-
-#### Network Performance (iperf3)
-
-Egress/ingress throughput measured with iperf3 (3-second tests, various block sizes and parallelism):
-
-| Direction | Block Size | Streams | L1 | L2 | Overhead |
-|-----------|------------|---------|----|----|----------|
-| **Egress** (VM→Host) | 128K | 1 | 42.4 Gbps | 11.0 Gbps | 3.9x |
-| | 128K | 4 | 38.0 Gbps | 12.8 Gbps | 3.0x |
-| | 1M | 1 | 43.1 Gbps | 9.0 Gbps | 4.8x |
-| | 1M | 8 | 33.1 Gbps | 12.3 Gbps | 2.7x |
-| **Ingress** (Host→VM) | 128K | 1 | 48.7 Gbps | 8.4 Gbps | 5.8x |
-| | 128K | 4 | 44.3 Gbps | 8.6 Gbps | 5.2x |
-| | 1M | 1 | 53.4 Gbps | 11.7 Gbps | 4.6x |
-| | 1M | 8 | 43.0 Gbps | 10.4 Gbps | 4.1x |
-
-- L1: 40-53 Gbps
-- L2: 8-13 Gbps (~4-5x overhead from double NAT)
-- Single stream often outperforms parallel (virtio queue contention)
-- Egress slightly faster than ingress at L2 (asymmetric NAT path)
-
-### Limitations
-
-- ARM64 only (x86_64 nested virt uses different mechanism)
-- Requires bare-metal instance (c7g.metal) or host with nested virt enabled
-- L3+ nesting blocked by FUSE-over-FUSE latency (~5x per level)
-
-### L2 Cache Coherency Fix
-
-**Background**: Under NV2 nested virtualization, L2 FUSE writes could corrupt when using large packet sizes (~1MB). The root cause was missing cache synchronization at nested guest exit - L2's writes to the virtio ring weren't visible to L1's mmap reads.
-
-**Solution**: A kernel patch adds a DSB SY (Data Synchronization Barrier) in `kvm_nested_sync_hwstate()` to ensure L2's writes are visible to L1 before returning from the nested guest exit handler.
-
-The patch is at `kernel/patches/nv2-vsock-cache-sync.patch` and is automatically applied when building the nested kernel.
-
-**Test**: 100MB file copies through FUSE-over-FUSE complete successfully with unbounded max_write:
-```bash
-make test-root FILTER=nested_l2_with_large
-```
-
-### Known Issues (Nested) {#known-issues-nested}
-
-- **L3+ nesting**: Blocked by FUSE-over-FUSE latency (~5x per level). Each additional nesting level adds 3-5 seconds per filesystem request.
-- **Nested tests disabled**: L2/L3 nested tests are currently disabled in CI due to timing sensitivity and flakiness under NV2. The tests pass individually but are slow (~5 min each) and occasionally timeout. Run manually with `make test-root FILTER=nested` if needed.
 
 ---
 
@@ -1146,103 +899,15 @@ The rootfs is built automatically during `fcvm setup` and cached by script SHA. 
 
 ### Kernel Profiles
 
-For advanced use cases (like nested virtualization), fcvm supports **kernel profiles**. Profiles define:
+fcvm supports custom kernel profiles for advanced use cases (e.g., nested virtualization). Profiles define a kernel config, optional Firecracker binary, and boot arguments. Currently: `nested` (arm64, CONFIG_KVM=y).
 
-- Custom kernel with specific configuration
-- Optional custom Firecracker binary
-- Boot arguments and runtime settings
-
-**Current profiles:**
-
-| Profile | Architecture | Description |
-|---------|--------------|-------------|
-| `nested` | arm64 | Nested virtualization (NV2) with CONFIG_KVM=y |
-
-Usage:
 ```bash
-# Download/build kernel for profile
-./fcvm setup --kernel-profile nested
-
-# Run VM with profile
+./fcvm setup --kernel-profile nested                     # Download pre-built
+./fcvm setup --kernel-profile nested --build-kernels     # Or build locally
 sudo ./fcvm podman run --name vm1 --kernel-profile nested --privileged nginx:alpine
 ```
 
-### Adding a New Kernel Profile
-
-To add a custom kernel profile, edit `rootfs-config.toml`:
-
-```toml
-# Example: Add a minimal kernel profile for amd64
-[kernel_profiles.minimal.amd64]
-description = "Minimal kernel for fast boot"
-kernel_version = "6.12"
-kernel_repo = "your-org/your-kernel-repo"
-
-# Files that determine kernel SHA (supports globs)
-# When any of these change, kernel is rebuilt
-build_inputs = [
-    "kernel/minimal.conf",
-    "kernel/patches/*.patch",
-]
-
-# Build paths (relative to repo root)
-kernel_config = "kernel/minimal.conf"
-patches_dir = "kernel/patches"
-
-# Optional: Custom Firecracker binary
-# firecracker_bin = "/usr/local/bin/firecracker-custom"
-
-# Optional: Extra boot arguments
-boot_args = "quiet"
-```
-
-**Key fields:**
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `kernel_version` | Yes | Kernel version (e.g., "6.18.3") |
-| `kernel_repo` | Yes | GitHub repo for releases (e.g., "ejc3/firepod") |
-| `build_inputs` | Yes | Files to hash for kernel SHA (supports globs) |
-| `kernel_config` | No | Kernel .config file path |
-| `patches_dir` | No | Directory containing kernel patches |
-| `firecracker_bin` | No | Custom Firecracker binary path |
-| `firecracker_args` | No | Extra Firecracker CLI args |
-| `boot_args` | No | Extra kernel boot parameters |
-
-**How it works:**
-
-1. **Config is source of truth**: All kernel versions and build configuration flow from `rootfs-config.toml`
-2. **SHA computation**: fcvm hashes all files matching `build_inputs` patterns
-3. **Download first**: Tries to download from `kernel_repo` releases with tag `kernel-{profile}-{version}-{arch}-{sha}`
-4. **Dynamic build scripts**: If download fails and `--build-kernels` is set, Rust generates build scripts on-the-fly (no shell scripts in source control)
-5. **Config sync**: `make build` automatically syncs embedded config to `~/.config/fcvm/` so runtime matches compile-time config
-
-### Customizing the Base Image
-
-The rootfs is built from `rootfs-config.toml` sections:
-
-```toml
-[base]
-version = "24.04"
-codename = "noble"
-
-[packages]
-runtime = ["podman", "crun", "fuse-overlayfs", "skopeo"]
-fuse = ["fuse3"]
-system = ["haveged", "chrony"]
-debug = ["strace"]
-
-[services]
-enable = ["haveged", "chrony", "systemd-networkd"]
-disable = ["snapd", "cloud-init"]
-
-[files."/etc/myconfig"]
-content = """
-my custom config
-"""
-```
-
-After changing the config, run `fcvm setup` to rebuild the rootfs with the new SHA.
+To add custom profiles or customize the base image, edit `rootfs-config.toml`. See [DESIGN.md](DESIGN.md#kernel-profiles) for profile configuration reference.
 
 ---
 
@@ -1301,9 +966,10 @@ sudo nsenter --net=/proc/$HOLDER_PID/ns/net bridge link  # Show bridge ports
 
 ## Documentation
 
-- `DESIGN.md` - Comprehensive design specification and architecture
-- `PERFORMANCE.md` - Performance benchmarks, tuning guide, and tracing
-- `.claude/CLAUDE.md` - Development notes, debugging tips, implementation details
+- `DESIGN.md` - Architecture, configuration reference, design decisions
+- `PERFORMANCE.md` - Benchmarks, tuning, and tracing
+- `NESTED.md` - Nested virtualization setup and details
+- `.claude/CLAUDE.md` - Development notes, debugging tips
 - `LICENSE` - MIT License
 
 ---

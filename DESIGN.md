@@ -1677,6 +1677,73 @@ The fuse-pipe library passes the pjdfstest POSIX compliance suite. Tests run via
 
 ---
 
+## Kernel Profiles
+
+fcvm supports named kernel profiles for custom kernel configurations, defined in `rootfs-config.toml`.
+
+### Configuration Reference
+
+```toml
+[kernel_profiles.minimal.amd64]
+description = "Minimal kernel for fast boot"
+kernel_version = "6.12"
+kernel_repo = "your-org/your-kernel-repo"
+build_inputs = ["kernel/minimal.conf", "kernel/patches/*.patch"]
+kernel_config = "kernel/minimal.conf"
+patches_dir = "kernel/patches"
+# firecracker_bin = "/usr/local/bin/firecracker-custom"
+# firecracker_args = "--extra-flag"
+# boot_args = "quiet"
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `kernel_version` | Yes | Kernel version (e.g., "6.18.3") |
+| `kernel_repo` | Yes | GitHub repo for releases |
+| `build_inputs` | Yes | Files to hash for kernel SHA (supports globs) |
+| `kernel_config` | No | Kernel .config file path |
+| `patches_dir` | No | Directory containing kernel patches |
+| `firecracker_bin` | No | Custom Firecracker binary path |
+| `firecracker_args` | No | Extra Firecracker CLI args |
+| `boot_args` | No | Extra kernel boot parameters |
+
+### How It Works
+
+1. **Config is source of truth**: All kernel versions and build settings flow from `rootfs-config.toml`
+2. **SHA computation**: fcvm hashes all files matching `build_inputs` patterns
+3. **Download first**: Tries `kernel_repo` releases with tag `kernel-{profile}-{version}-{arch}-{sha}`
+4. **Build fallback**: If download fails and `--build-kernels` is set, Rust generates build scripts on-the-fly
+5. **Config sync**: `make build` syncs embedded config to `~/.config/fcvm/`
+
+### Customizing the Base Image
+
+The rootfs is built from `rootfs-config.toml`:
+
+```toml
+[base]
+version = "24.04"
+codename = "noble"
+
+[packages]
+runtime = ["podman", "crun", "fuse-overlayfs", "skopeo"]
+fuse = ["fuse3"]
+system = ["haveged", "chrony"]
+debug = ["strace"]
+
+[services]
+enable = ["haveged", "chrony", "systemd-networkd"]
+disable = ["snapd", "cloud-init"]
+
+[files."/etc/myconfig"]
+content = """
+my custom config
+"""
+```
+
+After changing the config, run `fcvm setup` to rebuild the rootfs with the new SHA.
+
+---
+
 ## Known Limitations
 
 ### FUSE Volume Cache Coherency
