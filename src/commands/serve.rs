@@ -10,7 +10,7 @@
 use crate::cli::ServeArgs;
 use crate::commands::exec::run_exec_in_vm_captured;
 use crate::commands::podman::{start_vm, VmHandle};
-use crate::state::{HealthStatus, StateManager};
+use crate::state::HealthStatus;
 use anyhow::{Context, Result};
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -954,27 +954,6 @@ async fn ws_terminal_handler(mut ws: axum::extract::ws::WebSocket, vsock_path: s
 // Cleanup
 // ============================================================================
 
-async fn cleanup_orphans() {
-    let state_dir = crate::paths::state_dir();
-    let mgr = StateManager::new(state_dir);
-
-    if let Ok(vms) = mgr.list_vms().await {
-        for vm in vms {
-            if let Some(pid) = vm.pid {
-                // Check if process is still alive
-                if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok() {
-                    warn!(pid = pid, vm_id = %vm.vm_id, "Killing orphaned VM");
-                    let _ = nix::sys::signal::kill(
-                        nix::unistd::Pid::from_raw(pid as i32),
-                        nix::sys::signal::Signal::SIGTERM,
-                    );
-                }
-            }
-            let _ = mgr.delete_state(&vm.vm_id).await;
-        }
-    }
-}
-
 async fn reaper_task(state: SharedState) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
     loop {
@@ -1010,9 +989,6 @@ async fn reaper_task(state: SharedState) {
 pub async fn cmd_serve(args: ServeArgs) -> Result<()> {
     info!(port = args.port, "Starting fcvm serve");
 
-    // Clean up orphaned VMs from previous runs
-    cleanup_orphans().await;
-
     let state = Arc::new(AppState {
         sandboxes: RwLock::new(HashMap::new()),
         port: args.port,
@@ -1043,7 +1019,7 @@ pub async fn cmd_serve(args: ServeArgs) -> Result<()> {
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
 
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.port));
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], args.port));
     info!(addr = %addr, "Listening");
 
     let listener = tokio::net::TcpListener::bind(addr)
