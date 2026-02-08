@@ -535,7 +535,10 @@ async fn run_command(
         Err(e) => return e,
     };
 
-    let shell_cmd = build_shell_command(&req.command, req.cwd.as_deref(), req.env.as_ref());
+    let shell_cmd = match build_shell_command(&req.command, req.cwd.as_deref(), req.env.as_ref()) {
+        Ok(cmd) => cmd,
+        Err(msg) => return gateway_error(StatusCode::BAD_REQUEST, msg),
+    };
     let start = std::time::Instant::now();
 
     let output = match run_exec_in_vm_captured(&vsock_path, &shell_cmd, true).await {
@@ -563,22 +566,40 @@ async fn run_command(
     Json(resp).into_response()
 }
 
+/// Validate that an environment variable key contains only safe characters
+/// (`[a-zA-Z_][a-zA-Z0-9_]*`), preventing shell injection via crafted keys.
+fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 fn build_shell_command(
     command: &str,
     cwd: Option<&str>,
     env: Option<&HashMap<String, String>>,
-) -> Vec<String> {
+) -> std::result::Result<Vec<String>, String> {
     let mut parts = String::new();
     if let Some(dir) = cwd {
         parts.push_str(&format!("cd '{}' && ", dir.replace('\'', "'\\''")));
     }
     if let Some(vars) = env {
         for (k, v) in vars {
+            if !is_valid_env_key(k) {
+                return Err(format!(
+                    "Invalid environment variable name: '{}'. \
+                     Keys must match [a-zA-Z_][a-zA-Z0-9_]*.",
+                    k
+                ));
+            }
             parts.push_str(&format!("export {}='{}'; ", k, v.replace('\'', "'\\''")));
         }
     }
     parts.push_str(command);
-    vec!["sh".into(), "-c".into(), parts]
+    Ok(vec!["sh".into(), "-c".into(), parts])
 }
 
 // ============================================================================
@@ -1124,5 +1145,47 @@ mod tests {
         assert!(err.contains("Failed to write file"));
         assert!(err.contains("permission denied"));
         assert!(err.contains("exit code 1"));
+    }
+
+    #[test]
+    fn test_is_valid_env_key_accepts_valid_keys() {
+        assert!(is_valid_env_key("HOME"));
+        assert!(is_valid_env_key("MY_VAR"));
+        assert!(is_valid_env_key("_private"));
+        assert!(is_valid_env_key("a"));
+        assert!(is_valid_env_key("PATH_2"));
+    }
+
+    #[test]
+    fn test_is_valid_env_key_rejects_invalid_keys() {
+        assert!(!is_valid_env_key(""));
+        assert!(!is_valid_env_key("1BAD"));
+        assert!(!is_valid_env_key("FOO$(whoami)"));
+        assert!(!is_valid_env_key("FOO;rm -rf /"));
+        assert!(!is_valid_env_key("FOO BAR"));
+        assert!(!is_valid_env_key("FOO=BAR"));
+    }
+
+    #[test]
+    fn test_build_shell_command_rejects_invalid_env_key() {
+        let mut env = HashMap::new();
+        env.insert("GOOD_KEY".to_string(), "value".to_string());
+        env.insert("BAD$(KEY)".to_string(), "value".to_string());
+        let result = build_shell_command("echo hi", None, Some(&env));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Invalid environment variable name"));
+    }
+
+    #[test]
+    fn test_build_shell_command_accepts_valid_env() {
+        let mut env = HashMap::new();
+        env.insert("MY_VAR".to_string(), "hello".to_string());
+        let result = build_shell_command("echo $MY_VAR", None, Some(&env));
+        assert!(result.is_ok());
+        let cmd = result.unwrap();
+        assert_eq!(cmd[0], "sh");
+        assert!(cmd[2].contains("export MY_VAR='hello'"));
     }
 }
