@@ -958,7 +958,7 @@ async fn ws_terminal_handler(mut ws: axum::extract::ws::WebSocket, vsock_path: s
     let (vsock_tx, mut vsock_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
 
     // Spawn task to read from vsock and send to channel
-    tokio::spawn(async move {
+    let reader_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];
         loop {
             match vsock_read.read(&mut buf).await {
@@ -1004,6 +1004,9 @@ async fn ws_terminal_handler(mut ws: axum::extract::ws::WebSocket, vsock_path: s
             }
         }
     }
+
+    // Cancel the reader task so it doesn't leak if vsock_read is blocked
+    reader_task.abort();
 }
 
 // ============================================================================
