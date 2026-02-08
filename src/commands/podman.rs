@@ -136,14 +136,39 @@ use crate::storage::{
     SnapshotVolumeConfig,
 };
 use crate::volume::{spawn_volume_servers, VolumeConfig};
+use tokio_util::sync::CancellationToken;
+
+/// All state accumulated during VM setup, bundled for the event loop and cleanup.
+pub struct VmContext {
+    pub vm_id: String,
+    pub vm_name: String,
+    pub data_dir: PathBuf,
+    pub vm_manager: VmManager,
+    pub holder_child: Option<tokio::process::Child>,
+    pub volume_server_handles: Vec<tokio::task::JoinHandle<()>>,
+    pub network: Box<dyn NetworkManager>,
+    pub network_config: NetworkConfig,
+    pub state_manager: StateManager,
+    pub health_cancel_token: CancellationToken,
+    pub health_monitor_handle: tokio::task::JoinHandle<()>,
+    pub status_handle: tokio::task::JoinHandle<()>,
+    pub tty_handle: Option<std::thread::JoinHandle<Result<i32>>>,
+    pub output_handle: Option<tokio::task::JoinHandle<Vec<(String, String)>>>,
+    pub cache_rx: Option<mpsc::Receiver<CacheRequest>>,
+    pub startup_rx: Option<oneshot::Receiver<()>>,
+    pub snapshot_key: Option<String>,
+    pub volume_configs: Vec<VolumeConfig>,
+    pub args: RunArgs,
+    pub disk_path: PathBuf,
+}
 
 /// Request to create a podman cache snapshot.
 /// Sent from status listener to main task when fc-agent signals cache-ready.
-struct CacheRequest {
+pub struct CacheRequest {
     /// Image digest from fc-agent
-    digest: String,
+    pub digest: String,
     /// Oneshot channel to signal completion back to status listener
-    ack_tx: oneshot::Sender<()>,
+    pub ack_tx: oneshot::Sender<()>,
 }
 
 /// Parameters for creating a snapshot, used by both podman run and snapshot run.
@@ -231,8 +256,7 @@ pub async fn create_snapshot_interruptible(
     network_config: &NetworkConfig,
     volume_configs: &[VolumeConfig],
     parent_snapshot_key: Option<&str>,
-    sigterm: &mut tokio::signal::unix::Signal,
-    sigint: &mut tokio::signal::unix::Signal,
+    cancel: &CancellationToken,
 ) -> SnapshotOutcome {
     let snapshot_fut = create_podman_snapshot(
         vm_manager,
@@ -246,13 +270,9 @@ pub async fn create_snapshot_interruptible(
     );
 
     tokio::select! {
-        biased; // Check signals first
-        _ = sigterm.recv() => {
-            info!("received SIGTERM during snapshot creation, shutting down VM");
-            SnapshotOutcome::Interrupted
-        }
-        _ = sigint.recv() => {
-            info!("received SIGINT during snapshot creation, shutting down VM");
+        biased; // Check cancellation first
+        _ = cancel.cancelled() => {
+            info!("snapshot creation interrupted by cancellation");
             SnapshotOutcome::Interrupted
         }
         result = snapshot_fut => {
@@ -992,7 +1012,9 @@ pub(crate) async fn run_output_listener(
     Ok(output_lines)
 }
 
-async fn cmd_podman_run(args: RunArgs) -> Result<()> {
+/// Set up all resources and start the VM. Returns `None` on snapshot cache hit
+/// (handled internally via `cmd_snapshot_run`).
+pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
     info!("Starting fcvm podman run");
 
     // Validate VM name before any setup work
@@ -1126,7 +1148,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 cpu: Some(args.cpu),
                 mem: Some(args.mem),
             };
-            return super::snapshot::cmd_snapshot_run(snapshot_args).await;
+            super::snapshot::cmd_snapshot_run(snapshot_args).await?;
+            return Ok(None);
         }
 
         // Check for pre-start snapshot (container loaded but not initialized)
@@ -1152,7 +1175,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 cpu: Some(args.cpu),
                 mem: Some(args.mem),
             };
-            return super::snapshot::cmd_snapshot_run(snapshot_args).await;
+            super::snapshot::cmd_snapshot_run(snapshot_args).await?;
+            return Ok(None);
         }
 
         info!(
@@ -1450,7 +1474,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
             "Skipping snapshot creation: volumes specified (FUSE doesn't survive snapshot pause)"
         );
     }
-    let (cache_tx, mut cache_rx): (
+    let (cache_tx, cache_rx): (
         Option<mpsc::Sender<CacheRequest>>,
         Option<mpsc::Receiver<CacheRequest>>,
     ) = if !skip_snapshot_creation {
@@ -1465,7 +1489,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // - Not skipping snapshots (no --no-snapshot, no volumes)
     // - Have a snapshot key
     // - Have a health_check URL configured (HTTP health check, not just container-ready)
-    let (startup_tx, mut startup_rx): (
+    let (startup_tx, startup_rx): (
         Option<tokio::sync::oneshot::Sender<()>>,
         Option<tokio::sync::oneshot::Receiver<()>>,
     ) = if !skip_snapshot_creation && snapshot_key.is_some() && args.health_check.is_some() {
@@ -1578,15 +1602,14 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         return Err(e);
     }
 
-    let (mut vm_manager, mut holder_child) = setup_result.unwrap();
+    let (vm_manager, holder_child) = setup_result.unwrap();
 
     info!(vm_id = %vm_id, "VM started successfully");
 
     // Create cancellation token for graceful health monitor shutdown
-    let health_cancel_token = tokio_util::sync::CancellationToken::new();
+    let health_cancel_token = CancellationToken::new();
 
     // Spawn health monitor task with startup snapshot trigger support
-    // Pass startup_tx to signal when health first becomes Healthy
     let health_monitor_handle = crate::health::spawn_health_monitor_full(
         vm_id.clone(),
         vm_state.pid,
@@ -1595,65 +1618,75 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         startup_tx,
     );
 
-    // Note: For rootless mode, slirp4netns wraps Firecracker and configures TAP automatically
-    // For bridged mode, TAP is configured via NAT routing during network setup
-
-    // Setup signal handlers
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
-
-    // Wait for signal, VM exit, or cache requests
-    // For TTY mode, we get exit code from the TTY listener thread
-    // For non-TTY mode, we read it from the file written by status listener
-    let container_exit_code: Option<i32>;
     let disk_path = data_dir.join("disks/rootfs.raw");
 
+    Ok(Some(VmContext {
+        vm_id,
+        vm_name,
+        data_dir,
+        vm_manager,
+        holder_child,
+        volume_server_handles,
+        network,
+        network_config,
+        state_manager,
+        health_cancel_token,
+        health_monitor_handle,
+        status_handle,
+        tty_handle,
+        output_handle,
+        cache_rx,
+        startup_rx,
+        snapshot_key,
+        volume_configs,
+        args,
+        disk_path,
+    }))
+}
+
+/// Event loop: waits for VM exit, cancellation, or snapshot requests.
+/// Returns the container exit code (None if cancelled/signalled).
+pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Result<Option<i32>> {
     loop {
         tokio::select! {
-            _ = sigterm.recv() => {
-                info!("received SIGTERM, shutting down VM");
-                container_exit_code = None;
-                break;
+            _ = cancel.cancelled() => {
+                info!("cancellation requested, shutting down VM");
+                return Ok(None);
             }
-            _ = sigint.recv() => {
-                info!("received SIGINT, shutting down VM");
-                container_exit_code = None;
-                break;
-            }
-            status = vm_manager.wait() => {
+            status = ctx.vm_manager.wait() => {
                 info!(status = ?status, "VM exited");
-                if let Some(handle) = tty_handle {
-                    container_exit_code = handle.join().ok().and_then(|r| r.ok());
-                    info!(container_exit_code = ?container_exit_code, "TTY container exit code");
+                if let Some(handle) = ctx.tty_handle.take() {
+                    let exit_code = handle.join().ok().and_then(|r| r.ok());
+                    info!(container_exit_code = ?exit_code, "TTY container exit code");
+                    return Ok(exit_code);
                 } else {
-                    let exit_file = data_dir.join("container-exit");
-                    container_exit_code = std::fs::read_to_string(&exit_file)
+                    let exit_file = ctx.data_dir.join("container-exit");
+                    let exit_code = std::fs::read_to_string(&exit_file)
                         .ok()
                         .and_then(|s| s.trim().parse::<i32>().ok());
-                    info!(container_exit_code = ?container_exit_code, "container exit code");
+                    info!(container_exit_code = ?exit_code, "container exit code");
+                    return Ok(exit_code);
                 }
-                break;
             }
             // Handle cache creation requests from fc-agent
             Some(cache_request) = async {
-                match cache_rx.as_mut() {
+                match ctx.cache_rx.as_mut() {
                     Some(rx) => rx.recv().await,
                     None => std::future::pending().await,
                 }
             } => {
-                if let Some(ref key) = snapshot_key {
+                if let Some(ref key) = ctx.snapshot_key {
                     info!(snapshot_key = %key, digest = %cache_request.digest, "Creating pre-start snapshot");
 
-                    let params = SnapshotCreationParams::from_run_args(&args);
+                    let params = SnapshotCreationParams::from_run_args(&ctx.args);
                     match create_snapshot_interruptible(
-                        &vm_manager, key, &vm_id, &params, &disk_path,
-                        &network_config, &volume_configs,
+                        &ctx.vm_manager, key, &ctx.vm_id, &params, &ctx.disk_path,
+                        &ctx.network_config, &ctx.volume_configs,
                         None, // Pre-start is the first snapshot, no parent
-                        &mut sigterm, &mut sigint,
+                        &cancel,
                     ).await {
                         SnapshotOutcome::Interrupted => {
-                            container_exit_code = None;
-                            break;
+                            return Ok(None);
                         }
                         SnapshotOutcome::Created => {
                             info!(snapshot_key = %key, "Pre-start snapshot created successfully");
@@ -1668,19 +1701,19 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                     // Should not happen if channel exists, but send ack anyway
                     let _ = cache_request.ack_tx.send(());
                 }
-                // Continue waiting for VM exit or signals
+                // Continue waiting for VM exit or cancellation
             }
             // Handle startup snapshot creation when health becomes healthy
             Ok(()) = async {
-                match startup_rx.as_mut() {
+                match ctx.startup_rx.as_mut() {
                     Some(rx) => rx.await,
                     None => std::future::pending().await,
                 }
             } => {
                 // Oneshot channel - prevent further attempts
-                startup_rx = None;
+                ctx.startup_rx = None;
 
-                if let Some(ref key) = snapshot_key {
+                if let Some(ref key) = ctx.snapshot_key {
                     let startup_key = startup_snapshot_key(key);
 
                     // Skip if startup snapshot already exists
@@ -1689,16 +1722,15 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                     } else {
                         info!(snapshot_key = %startup_key, "Creating startup snapshot (VM healthy)");
 
-                        let params = SnapshotCreationParams::from_run_args(&args);
+                        let params = SnapshotCreationParams::from_run_args(&ctx.args);
                         match create_snapshot_interruptible(
-                            &vm_manager, &startup_key, &vm_id, &params, &disk_path,
-                            &network_config, &volume_configs,
+                            &ctx.vm_manager, &startup_key, &ctx.vm_id, &params, &ctx.disk_path,
+                            &ctx.network_config, &ctx.volume_configs,
                             Some(key.as_str()), // Parent is pre-start snapshot
-                            &mut sigterm, &mut sigint,
+                            &cancel,
                         ).await {
                             SnapshotOutcome::Interrupted => {
-                                container_exit_code = None;
-                                break;
+                                return Ok(None);
                             }
                             SnapshotOutcome::Created => {
                                 info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
@@ -1709,34 +1741,60 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                         }
                     }
                 }
-                // Continue waiting for VM exit or signals
+                // Continue waiting for VM exit or cancellation
             }
         }
     }
+}
 
+/// Clean up all resources associated with a VM.
+pub async fn cleanup_vm_context(mut ctx: VmContext) {
     // Cancel status listener (podman-specific)
-    status_handle.abort();
+    ctx.status_handle.abort();
 
     // Cleanup NFS exports
-    cleanup_nfs_exports(&vm_id).await;
+    cleanup_nfs_exports(&ctx.vm_id).await;
 
     // Cleanup common resources
     super::common::cleanup_vm(
-        &vm_id,
-        &mut vm_manager,
-        &mut holder_child,
-        volume_server_handles,
-        network.as_mut(),
-        &state_manager,
-        &data_dir,
-        Some(health_cancel_token),
-        Some(health_monitor_handle),
-        output_handle, // abort output listener task
+        &ctx.vm_id,
+        &mut ctx.vm_manager,
+        &mut ctx.holder_child,
+        ctx.volume_server_handles,
+        ctx.network.as_mut(),
+        &ctx.state_manager,
+        &ctx.data_dir,
+        Some(ctx.health_cancel_token),
+        Some(ctx.health_monitor_handle),
+        ctx.output_handle,
     )
     .await;
+}
+
+/// CLI entrypoint for `fcvm podman run`. Thin wrapper around prepare_vm/run_vm_loop/cleanup.
+async fn cmd_podman_run(args: RunArgs) -> Result<()> {
+    let Some(mut ctx) = prepare_vm(args).await? else {
+        return Ok(()); // Snapshot cache hit, already handled
+    };
+
+    // Setup signal handlers → cancellation token
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    tokio::spawn(async move {
+        let mut sigterm = signal(SignalKind::terminate()).unwrap();
+        let mut sigint = signal(SignalKind::interrupt()).unwrap();
+        tokio::select! {
+            _ = sigterm.recv() => { info!("received SIGTERM, shutting down VM"); }
+            _ = sigint.recv() => { info!("received SIGINT, shutting down VM"); }
+        }
+        cancel_clone.cancel();
+    });
+
+    let exit_code = run_vm_loop(&mut ctx, cancel).await?;
+    cleanup_vm_context(ctx).await;
 
     // Return error if container exited with non-zero exit code
-    if let Some(code) = container_exit_code {
+    if let Some(code) = exit_code {
         if code != 0 {
             bail!("container exited with code {}", code);
         }

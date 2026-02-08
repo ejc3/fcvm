@@ -880,9 +880,18 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         startup_tx,
     );
 
-    // Setup signal handlers
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
+    // Setup signal handlers with cancellation token
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    tokio::spawn(async move {
+        let mut sigterm = signal(SignalKind::terminate()).unwrap();
+        let mut sigint = signal(SignalKind::interrupt()).unwrap();
+        tokio::select! {
+            _ = sigterm.recv() => { info!("received SIGTERM, shutting down VM"); }
+            _ = sigint.recv() => { info!("received SIGINT, shutting down VM"); }
+        }
+        cancel_clone.cancel();
+    });
 
     // Track container exit code (from TTY mode)
     let container_exit_code: Option<i32>;
@@ -890,16 +899,10 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Get disk path for startup snapshot creation
     let disk_path = data_dir.join("disks/rootfs.raw");
 
-    // Wait for signal, VM exit, or startup snapshot trigger
+    // Wait for cancellation, VM exit, or startup snapshot trigger
     loop {
         tokio::select! {
-            _ = sigterm.recv() => {
-                info!("received SIGTERM, shutting down VM");
-                container_exit_code = None;
-                break;
-            }
-            _ = sigint.recv() => {
-                info!("received SIGINT, shutting down VM");
+            _ = cancel.cancelled() => {
                 container_exit_code = None;
                 break;
             }
@@ -938,7 +941,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                             &vm_manager, &startup_key, &vm_id, &params, &disk_path,
                             &network_config, &volume_configs,
                             Some(base_key.as_str()), // Parent is pre-start snapshot
-                            &mut sigterm, &mut sigint,
+                            &cancel,
                         ).await {
                             SnapshotOutcome::Interrupted => {
                                 container_exit_code = None;
