@@ -41,6 +41,7 @@ fn test_run_args(name: &str) -> RunArgs {
         kernel_profile: None,
         vsock_dir: None,
         no_snapshot: true,
+        label: vec![],
         image: common::TEST_IMAGE.to_string(),
         command_args: vec![],
     }

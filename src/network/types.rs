@@ -37,7 +37,7 @@ pub struct NetworkConfig {
     pub http_proxy: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortMapping {
     pub host_ip: Option<String>,
     pub host_port: u16,
@@ -45,7 +45,8 @@ pub struct PortMapping {
     pub proto: Protocol,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Protocol {
     Tcp,
     Udp,

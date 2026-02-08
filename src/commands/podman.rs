@@ -160,6 +160,16 @@ pub struct VmContext {
     pub volume_configs: Vec<VolumeConfig>,
     pub args: RunArgs,
     pub disk_path: PathBuf,
+    pub log_tx: tokio::sync::broadcast::Sender<LogLine>,
+}
+
+/// A log line from the VM's container output.
+#[derive(Clone, Debug)]
+pub struct LogLine {
+    /// Stream type: "stdout", "stderr", or "system"
+    pub stream: String,
+    /// Line content
+    pub content: String,
 }
 
 /// Handle to a running VM. Returned by `start_vm()`.
@@ -178,6 +188,7 @@ pub struct VmHandle {
     pub pid: u32,
     cancel: CancellationToken,
     task: Option<tokio::task::JoinHandle<Result<Option<i32>>>>,
+    log_tx: tokio::sync::broadcast::Sender<LogLine>,
 }
 
 impl VmHandle {
@@ -209,6 +220,19 @@ impl VmHandle {
             None => Ok(None),
         }
     }
+
+    /// Query current VM state (health, IP, ports, labels, etc.) from the state manager.
+    pub async fn state(&self) -> Result<crate::state::VmState> {
+        let mgr = crate::state::StateManager::new(crate::paths::state_dir());
+        mgr.load_state(&self.vm_id).await
+    }
+
+    /// Subscribe to live container output (stdout/stderr) from this VM.
+    /// Returns a broadcast receiver that gets each log line as it's produced.
+    /// Late subscribers only see lines from the point of subscription.
+    pub fn subscribe_logs(&self) -> tokio::sync::broadcast::Receiver<LogLine> {
+        self.log_tx.subscribe()
+    }
 }
 
 impl Drop for VmHandle {
@@ -235,6 +259,7 @@ pub async fn start_vm(mut args: RunArgs) -> Result<VmHandle> {
 
     let vm_id = ctx.vm_id.clone();
     let name = ctx.vm_name.clone();
+    let log_tx = ctx.log_tx.clone();
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
 
@@ -259,6 +284,7 @@ pub async fn start_vm(mut args: RunArgs) -> Result<VmHandle> {
         pid: actual_pid,
         cancel,
         task: Some(task),
+        log_tx,
     })
 }
 
@@ -992,6 +1018,7 @@ pub(crate) async fn run_output_listener(
     socket_path: &str,
     vm_id: &str,
     interactive: bool,
+    log_tx: Option<tokio::sync::broadcast::Sender<LogLine>>,
 ) -> Result<Vec<(String, String)>> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
@@ -1087,6 +1114,14 @@ pub(crate) async fn run_output_listener(
                         eprintln!("{}", content);
                     }
                     output_lines.push((stream.to_string(), content.to_string()));
+
+                    // Forward to broadcast channel for library consumers
+                    if let Some(ref tx) = log_tx {
+                        let _ = tx.send(LogLine {
+                            stream: stream.to_string(),
+                            content: content.to_string(),
+                        });
+                    }
 
                     // Send ack back (bidirectional)
                     let mut w = writer.lock().await;
@@ -1485,6 +1520,13 @@ pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
     vm_state.name = Some(vm_name.clone());
     vm_state.config.volumes = args.map.clone();
     vm_state.config.health_check_url = args.health_check.clone();
+    vm_state.config.port_mappings = port_mappings.clone();
+    vm_state.config.labels = args
+        .label
+        .iter()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
 
     // Initialize state manager
     let state_manager = StateManager::new(paths::state_dir());
@@ -1636,12 +1678,16 @@ pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
         None
     };
 
+    // Broadcast channel for container output (used by VmHandle::subscribe_logs())
+    let (log_tx, _) = tokio::sync::broadcast::channel::<LogLine>(1000);
+
     // For non-TTY mode, use async output listener
     let output_handle = if !tty_mode {
         let socket_path = output_socket_path.clone();
         let vm_id_clone = vm_id.clone();
+        let log_tx_clone = Some(log_tx.clone());
         Some(tokio::spawn(async move {
-            match run_output_listener(&socket_path, &vm_id_clone, interactive).await {
+            match run_output_listener(&socket_path, &vm_id_clone, interactive, log_tx_clone).await {
                 Ok(lines) => lines,
                 Err(e) => {
                     tracing::warn!("Output listener error: {}", e);
@@ -1741,6 +1787,7 @@ pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
         volume_configs,
         args,
         disk_path,
+        log_tx,
     }))
 }
 

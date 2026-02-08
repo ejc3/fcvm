@@ -77,6 +77,8 @@ async fn test_health_monitor_behaviors() {
             process_type: Some(ProcessType::Vm),
             serve_pid: None,
             original_vsock_vm_id: None,
+            port_mappings: vec![],
+            labels: std::collections::HashMap::new(),
         },
     };
 

@@ -13,7 +13,9 @@ pub use completions::cmd_completions;
 pub use exec::cmd_exec;
 pub use ls::cmd_ls;
 pub use podman::cmd_podman;
-pub use podman::{cleanup_vm_context, prepare_vm, run_vm_loop, start_vm, VmContext, VmHandle};
+pub use podman::{
+    cleanup_vm_context, prepare_vm, run_vm_loop, start_vm, LogLine, VmContext, VmHandle,
+};
 pub use setup::cmd_setup;
 pub use snapshot::cmd_snapshot;
 pub use snapshots::cmd_snapshots;
