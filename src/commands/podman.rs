@@ -2027,8 +2027,12 @@ fn build_runtime_boot_args(
         info!("fc-agent strace debugging enabled - output will be in /tmp/fc-agent.strace");
     }
 
-    // Additional boot args from RuntimeConfig (kernel profile)
-    if let Some(ref extra) = runtime_config.boot_args {
+    // Additional boot args from RuntimeConfig (kernel profile) or FCVM_BOOT_ARGS env var
+    let extra_boot_args = runtime_config
+        .boot_args
+        .clone()
+        .or_else(|| std::env::var("FCVM_BOOT_ARGS").ok());
+    if let Some(ref extra) = extra_boot_args {
         if !boot_args.is_empty() {
             boot_args.push(' ');
         }
@@ -2856,12 +2860,15 @@ async fn run_vm_setup(
 
     let firecracker_bin = super::common::find_firecracker(runtime_config)?;
 
+    // Use RuntimeConfig firecracker_args (from --kernel-profile), falling back to env var
+    let fc_args_env = std::env::var("FCVM_FIRECRACKER_ARGS").ok();
+    let fc_args = runtime_config
+        .firecracker_args
+        .as_deref()
+        .or(fc_args_env.as_deref());
+
     vm_manager
-        .start(
-            &firecracker_bin,
-            None,
-            runtime_config.firecracker_args.as_deref(),
-        )
+        .start(&firecracker_bin, None, fc_args)
         .await
         .context("starting Firecracker")?;
 
