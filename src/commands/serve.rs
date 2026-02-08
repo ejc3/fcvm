@@ -280,12 +280,25 @@ async fn create_sandbox(
         disk: vec![],
         disk_dir: vec![],
         nfs: vec![],
-        env: req
-            .env
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect(),
+        env: {
+            let env_map = req.env.unwrap_or_default();
+            for k in env_map.keys() {
+                if !is_valid_env_key(k) {
+                    return gateway_error(
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "Invalid environment variable name: '{}'. \
+                             Keys must match [a-zA-Z_][a-zA-Z0-9_]*.",
+                            k
+                        ),
+                    );
+                }
+            }
+            env_map
+                .into_iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect()
+        },
         label: req
             .labels
             .unwrap_or_default()
@@ -984,7 +997,13 @@ async fn ws_terminal_handler(mut ws: axum::extract::ws::WebSocket, vsock_path: s
             result = ws.recv() => {
                 match result {
                     Some(Ok(WsMessage::Binary(data))) => {
-                        if vsock_write.write_all(&data).await.is_err() {
+                        // Binary frames: encode as exec-proto stdin message
+                        // (fc-agent expects framed messages on the vsock)
+                        let mut buf = Vec::new();
+                        if exec_proto::write_stdin(&mut buf, &data).is_err() {
+                            break;
+                        }
+                        if vsock_write.write_all(&buf).await.is_err() {
                             break;
                         }
                     }
@@ -1032,11 +1051,20 @@ async fn reaper_task(state: SharedState) {
             }
         }
 
-        for id in expired {
-            if let Some(mut entry) = state.sandboxes.write().await.remove(&id) {
-                info!(sandbox_id = %id, "Sandbox expired, destroying");
-                let _ = entry.handle.stop().await;
-            }
+        // Drain all expired entries in a single write lock, then stop
+        // outside the lock so API handlers aren't blocked.
+        let expired_entries: Vec<_> = if !expired.is_empty() {
+            let mut sandboxes = state.sandboxes.write().await;
+            expired
+                .iter()
+                .filter_map(|id| sandboxes.remove(id).map(|e| (id.clone(), e)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for (id, mut entry) in expired_entries {
+            info!(sandbox_id = %id, "Sandbox expired, destroying");
+            let _ = entry.handle.stop().await;
         }
     }
 }
