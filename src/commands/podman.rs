@@ -1004,8 +1004,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         bail!("--setup is not allowed when running as root. Run 'fcvm setup' first.");
     }
 
-    // Apply kernel profile runtime config (firecracker_args, boot_args, etc.)
-    // This is done regardless of whether --kernel is also specified
+    // Build RuntimeConfig from kernel profile (replaces env var config passing)
+    let mut runtime_config = super::common::RuntimeConfig::default();
     if let Some(ref profile_name) = args.kernel_profile {
         let profile = crate::setup::get_kernel_profile(profile_name)?.ok_or_else(|| {
             anyhow::anyhow!(
@@ -1017,22 +1017,20 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
         info!(profile = %profile_name, "using kernel profile");
 
-        // Apply runtime config from profile
-        // Get firecracker path (custom from profile or system fallback)
         let fc_path = crate::setup::get_firecracker_for_profile(&profile, profile_name).await?;
         info!(firecracker_bin = %fc_path.display(), "from profile");
-        std::env::set_var("FCVM_FIRECRACKER_BIN", fc_path.to_string_lossy().as_ref());
+        runtime_config.firecracker_bin = Some(fc_path);
         if let Some(ref fc_args) = profile.firecracker_args {
             info!(firecracker_args = %fc_args, "from profile");
-            std::env::set_var("FCVM_FIRECRACKER_ARGS", fc_args);
+            runtime_config.firecracker_args = Some(fc_args.clone());
         }
         if let Some(ref boot_args) = profile.boot_args {
             info!(boot_args = %boot_args, "from profile");
-            std::env::set_var("FCVM_BOOT_ARGS", boot_args);
+            runtime_config.boot_args = Some(boot_args.clone());
         }
         if let Some(readers) = profile.fuse_readers {
             info!(fuse_readers = %readers, "from profile");
-            std::env::set_var("FCVM_FUSE_READERS", readers.to_string());
+            runtime_config.fuse_readers = Some(readers);
         }
     }
 
@@ -1549,6 +1547,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         &vsock_socket_path,
         image_disk_path.as_deref(),
         fc_config,
+        &runtime_config,
     )
     .await;
 
@@ -1767,6 +1766,7 @@ async fn run_vm_setup(
     vsock_socket_path: &std::path::Path,
     image_disk_path: Option<&std::path::Path>,
     fc_config: Option<crate::firecracker::FirecrackerConfig>,
+    runtime_config: &super::common::RuntimeConfig,
 ) -> Result<(VmManager, Option<tokio::process::Child>)> {
     // Setup storage - just need CoW copy (fc-agent is injected via initrd at boot)
     let vm_dir = data_dir.join("disks");
@@ -2222,10 +2222,14 @@ async fn run_vm_setup(
         holder_child = None;
     }
 
-    let firecracker_bin = super::common::find_firecracker()?;
+    let firecracker_bin = super::common::find_firecracker(runtime_config)?;
 
     vm_manager
-        .start(&firecracker_bin, None)
+        .start(
+            &firecracker_bin,
+            None,
+            runtime_config.firecracker_args.as_deref(),
+        )
         .await
         .context("starting Firecracker")?;
 
@@ -2347,16 +2351,20 @@ async fn run_vm_setup(
         info!("fc-agent strace debugging enabled - output will be in /tmp/fc-agent.strace");
     }
 
-    // Additional boot args from environment (caller controls)
-    if let Ok(extra) = std::env::var("FCVM_BOOT_ARGS") {
+    // Additional boot args from RuntimeConfig (kernel profile)
+    if let Some(ref extra) = runtime_config.boot_args {
         if !runtime_boot_args.is_empty() {
             runtime_boot_args.push(' ');
         }
-        runtime_boot_args.push_str(&extra);
+        runtime_boot_args.push_str(extra);
     }
 
-    // Pass FUSE reader count to fc-agent via kernel command line.
-    if let Ok(readers) = std::env::var("FCVM_FUSE_READERS") {
+    // Pass FUSE reader count to fc-agent via kernel command line (from RuntimeConfig or env)
+    let fuse_readers = runtime_config
+        .fuse_readers
+        .map(|r| r.to_string())
+        .or_else(|| std::env::var("FCVM_FUSE_READERS").ok());
+    if let Some(readers) = fuse_readers {
         if !runtime_boot_args.is_empty() {
             runtime_boot_args.push(' ');
         }

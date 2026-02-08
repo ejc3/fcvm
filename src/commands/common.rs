@@ -22,6 +22,22 @@ use crate::{
     storage::DiskManager,
 };
 
+/// Runtime configuration from kernel profile, passed explicitly instead of env vars.
+///
+/// This replaces the pattern of writing config to process-global env vars (which races
+/// when multiple VMs with different profiles run concurrently in an async server).
+#[derive(Default, Clone, Debug)]
+pub struct RuntimeConfig {
+    /// Custom Firecracker binary path (from kernel profile)
+    pub firecracker_bin: Option<PathBuf>,
+    /// Extra Firecracker CLI arguments (e.g., "--enable-nv2")
+    pub firecracker_args: Option<String>,
+    /// Extra kernel boot arguments (e.g., "arm64.nv2")
+    pub boot_args: Option<String>,
+    /// FUSE reader thread count override
+    pub fuse_readers: Option<u32>,
+}
+
 /// Vsock base port for volume servers (used by both podman and snapshot commands)
 pub const VSOCK_VOLUME_PORT_BASE: u32 = 5000;
 
@@ -182,9 +198,18 @@ pub fn merge_diff_snapshot(base_path: &Path, diff_path: &Path) -> Result<u64> {
 /// Returns the path to the Firecracker binary if it exists and meets minimum version requirements.
 /// Fails with a clear error if Firecracker is not found or version is too old.
 ///
-/// Checks `FCVM_FIRECRACKER_BIN` env var first, then falls back to PATH lookup.
-pub fn find_firecracker() -> Result<std::path::PathBuf> {
-    let firecracker_bin = if let Ok(path) = std::env::var("FCVM_FIRECRACKER_BIN") {
+/// Checks `RuntimeConfig.firecracker_bin` first, then `FCVM_FIRECRACKER_BIN` env var,
+/// then falls back to PATH lookup.
+pub fn find_firecracker(config: &RuntimeConfig) -> Result<std::path::PathBuf> {
+    let firecracker_bin = if let Some(ref path) = config.firecracker_bin {
+        if !path.exists() {
+            anyhow::bail!(
+                "Firecracker binary from profile does not exist: {}",
+                path.display()
+            );
+        }
+        path.clone()
+    } else if let Ok(path) = std::env::var("FCVM_FIRECRACKER_BIN") {
         let p = std::path::PathBuf::from(&path);
         if !p.exists() {
             anyhow::bail!("FCVM_FIRECRACKER_BIN={} does not exist", path);
@@ -633,10 +658,10 @@ pub async fn restore_from_snapshot(
     );
     vm_manager.set_mount_redirects(baseline_dirs, data_dir.to_path_buf());
 
-    let firecracker_bin = find_firecracker()?;
+    let firecracker_bin = find_firecracker(&RuntimeConfig::default())?;
 
     vm_manager
-        .start(&firecracker_bin, None)
+        .start(&firecracker_bin, None, None)
         .await
         .context("starting Firecracker")?;
 

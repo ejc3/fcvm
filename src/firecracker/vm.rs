@@ -126,10 +126,14 @@ impl VmManager {
     }
 
     /// Start the Firecracker process
+    ///
+    /// `firecracker_args` provides extra CLI arguments (e.g., "--enable-nv2") passed
+    /// explicitly from RuntimeConfig instead of reading the FCVM_FIRECRACKER_ARGS env var.
     pub async fn start(
         &mut self,
         firecracker_bin: &Path,
         config_override: Option<&Path>,
+        firecracker_args: Option<&str>,
     ) -> Result<()> {
         if let Some(ref name) = self.vm_name {
             info!(target: "vm", vm_name = %name, vm_id = %self.vm_id, "starting Firecracker process");
@@ -200,8 +204,8 @@ impl VmManager {
             cmd.arg("--no-seccomp");
         }
 
-        // Additional firecracker args from environment (caller controls)
-        if let Ok(extra) = std::env::var("FCVM_FIRECRACKER_ARGS") {
+        // Additional firecracker args from RuntimeConfig (passed explicitly by caller)
+        if let Some(extra) = firecracker_args {
             for arg in extra.split_whitespace() {
                 cmd.arg(arg);
             }
