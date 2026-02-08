@@ -162,6 +162,85 @@ pub struct VmContext {
     pub disk_path: PathBuf,
 }
 
+/// Handle to a running VM. Returned by `start_vm()`.
+///
+/// The VM runs in a background tokio task. Use `stop()` to gracefully shut it down
+/// or `wait()` to wait for it to exit naturally.
+pub struct VmHandle {
+    /// Unique VM identifier (e.g., "vm-abc123")
+    pub vm_id: String,
+    /// Human-readable VM name
+    pub name: String,
+    /// Process ID of the fcvm process managing this VM
+    pub pid: u32,
+    cancel: CancellationToken,
+    task: tokio::task::JoinHandle<Result<Option<i32>>>,
+}
+
+impl VmHandle {
+    /// Get a clone of the cancellation token (for external cancellation).
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    /// Gracefully stop the VM and wait for cleanup to complete.
+    /// Returns the container exit code (None if the container didn't exit naturally).
+    pub async fn stop(self) -> Result<Option<i32>> {
+        self.cancel.cancel();
+        self.task.await?
+    }
+
+    /// Wait for the VM to exit naturally (without cancelling).
+    /// Returns the container exit code.
+    pub async fn wait(self) -> Result<Option<i32>> {
+        self.task.await?
+    }
+}
+
+/// Start a VM with the given args. Returns a handle to the running VM.
+///
+/// The VM event loop runs in a background task. On drop/cancellation, the VM
+/// is cleaned up automatically.
+///
+/// Note: `args.no_snapshot` is forced to `true` to skip snapshot cache lookups,
+/// ensuring a fresh VM is always started.
+pub async fn start_vm(mut args: RunArgs) -> Result<VmHandle> {
+    // Force no-snapshot mode — start_vm always creates a fresh VM
+    args.no_snapshot = true;
+
+    let mut ctx = prepare_vm(args)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("unexpected snapshot cache hit with no_snapshot=true"))?;
+
+    let vm_id = ctx.vm_id.clone();
+    let name = ctx.vm_name.clone();
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+
+    // Get actual PID from VM state (set during prepare_vm)
+    let actual_pid = ctx
+        .state_manager
+        .load_state_by_name(&name)
+        .await
+        .ok()
+        .and_then(|s| s.pid)
+        .unwrap_or(0);
+
+    let task = tokio::spawn(async move {
+        let result = run_vm_loop(&mut ctx, cancel_clone).await;
+        cleanup_vm_context(ctx).await;
+        result
+    });
+
+    Ok(VmHandle {
+        vm_id,
+        name,
+        pid: actual_pid,
+        cancel,
+        task,
+    })
+}
+
 /// Request to create a podman cache snapshot.
 /// Sent from status listener to main task when fc-agent signals cache-ready.
 pub struct CacheRequest {

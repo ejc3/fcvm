@@ -33,7 +33,7 @@ const INITIAL_RETRY_DELAY_MS: u64 = 100;
 /// This function retries the connection with exponential backoff to handle this startup delay.
 ///
 /// Returns a connected UnixStream on success.
-fn connect_to_exec_server_with_retry(vsock_socket: &Path) -> Result<UnixStream> {
+pub fn connect_to_exec_server_with_retry(vsock_socket: &Path) -> Result<UnixStream> {
     let mut attempt = 0;
     let mut delay_ms = INITIAL_RETRY_DELAY_MS;
 
@@ -368,4 +368,85 @@ pub enum ExecResponse {
     Exit(i32),
     #[serde(rename = "error")]
     Error(String),
+}
+
+/// Captured output from an exec command (for programmatic/server use).
+pub struct ExecOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+}
+
+/// Execute a command in a VM and capture stdout/stderr into strings.
+///
+/// Unlike `run_exec_in_vm` which prints to stdout/stderr directly,
+/// this returns the output as strings for programmatic use.
+pub async fn run_exec_in_vm_captured(
+    vsock_socket: &Path,
+    command: &[String],
+    in_container: bool,
+) -> Result<ExecOutput> {
+    debug!(
+        socket = %vsock_socket.display(),
+        command = ?command,
+        in_container,
+        "executing command in VM (captured)"
+    );
+
+    let mut stream = connect_to_exec_server_with_retry(vsock_socket)?;
+
+    stream.set_read_timeout(Some(Duration::from_secs(300)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+
+    let request = ExecRequest {
+        command: command.to_vec(),
+        in_container,
+        interactive: false,
+        tty: false,
+    };
+
+    let request_json = serde_json::to_string(&request)?;
+    writeln!(stream, "{}", request_json)?;
+    stream.flush()?;
+
+    // Read lines and capture into strings instead of printing
+    let reader = BufReader::new(stream);
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut exit_code = 0i32;
+
+    for line in reader.lines() {
+        let line = line.context("reading from exec socket")?;
+
+        if let Ok(response) = serde_json::from_str::<ExecResponse>(&line) {
+            match response {
+                ExecResponse::Stdout(data) => stdout.push_str(&data),
+                ExecResponse::Stderr(data) => stderr.push_str(&data),
+                ExecResponse::Exit(code) => {
+                    exit_code = code;
+                    break;
+                }
+                ExecResponse::Error(msg) => {
+                    stderr.push_str(&format!("Error: {}\n", msg));
+                    exit_code = 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(ExecOutput {
+        stdout,
+        stderr,
+        exit_code,
+    })
+}
+
+/// Connect to the exec server and return a tokio async UnixStream.
+///
+/// Useful for building WebSocket↔vsock bridges (terminal sessions).
+pub async fn connect_to_exec_server_async(vsock_socket: &Path) -> Result<tokio::net::UnixStream> {
+    let std_stream = connect_to_exec_server_with_retry(vsock_socket)?;
+    std_stream.set_nonblocking(true)?;
+    tokio::net::UnixStream::from_std(std_stream).context("converting to tokio UnixStream")
 }
