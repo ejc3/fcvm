@@ -116,9 +116,12 @@ gh pr checks <pr-number>
 
 ### Then Merge
 
+For standalone PRs (not part of a stack):
 ```bash
 gh pr merge <pr-number> --merge --delete-branch
 ```
+
+For stacked PRs, see the stacked PR merge procedure below.
 
 ## Stacked PRs (Branch of Branch)
 
@@ -136,10 +139,38 @@ gh pr create --base pr1-branch  # Target the parent branch!
 git log --oneline origin/main..HEAD  # Should show both PR's commits
 ```
 
-**After PR #1 merges:**
-1. Wait for GitHub to update PR #2's base to main
-2. Verify: `gh pr view 2 --json baseRefName`
-3. Only then merge PR #2
+### Merging Stacked PRs
+
+**CRITICAL: Never use `--delete-branch` when merging the base PR of a stack.**
+
+`gh pr merge --delete-branch` deletes the branch immediately, before GitHub's server-side
+retargeting can update dependent PRs. This causes dependent PRs to auto-close because their
+base branch no longer exists. See: https://github.com/cli/cli/issues/1168
+
+**Correct procedure:**
+```bash
+# Step 1: Merge base PR WITHOUT --delete-branch
+gh pr merge <base-pr> --merge
+
+# Step 2: Retarget dependent PR to main
+gh pr edit <dependent-pr> --base main
+
+# Step 3: Verify the retarget worked
+gh pr view <dependent-pr> --json baseRefName
+# Must show: {"baseRefName":"main"}
+
+# Step 4: NOW safe to delete the old branch
+git push origin --delete <base-branch-name>
+```
+
+**If you accidentally used `--delete-branch` and the dependent PR was closed:**
+```bash
+# Push the branch again (it still exists locally)
+git push origin <dependent-branch>
+
+# Create a new PR targeting main
+gh pr create --base main --title "..." --body "..."
+```
 
 ## Rust Code Quality Checklist
 

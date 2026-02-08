@@ -679,7 +679,7 @@ gh pr create --base feature-a  # Not main!
 # Verify the chain
 gh pr list --json number,headRefName,baseRefName
 ```
-Merge in order (#1 first, then #2). After merging #1, GitHub auto-updates #2's base to main.
+Merge in order (#1 first, then #2). **Never use `--delete-branch` on the base PR** — it closes dependent PRs. Instead: merge without delete, `gh pr edit <dep> --base main`, then delete branch. See `.claude/skills/pr-workflow/SKILL.md` for full procedure.
 
 **CRITICAL: Maintain Stack Coherence.** When PRs are stacked, the branch for PR #2 MUST actually be based on PR #1's branch - not just have the GitHub base set correctly. Verify with:
 ```bash
