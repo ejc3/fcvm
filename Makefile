@@ -131,7 +131,7 @@ CONTAINER_RUN := podman run --rm --privileged \
 	_test-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all \
 	container-setup-fcvm container-shell container-clean container-bench \
-	setup-btrfs setup-fcvm setup-pjdfstest bench lint fmt ssh
+	setup-btrfs setup-fcvm setup-pjdfstest bench lint fmt ssh test-serve-sdk
 
 all: build
 
@@ -169,6 +169,9 @@ help:
 	@echo "  kernel-patch-create PROFILE=nested NAME=0004-fix FILE=fs/fuse/dir.c"
 	@echo "  kernel-patch-edit PROFILE=nested PATCH=0002"
 	@echo "  kernel-patch-validate PROFILE=nested"
+	@echo ""
+	@echo "SDK:"
+	@echo "  test-serve-sdk     Run ComputeSDK E2E test (requires computesdk sibling repo)"
 	@echo ""
 	@echo "Other:"
 	@echo "  bench              Run fuse-pipe benchmarks"
@@ -377,6 +380,17 @@ _setup-fcvm:
 	sudo ./target/release/fcvm setup --generate-config --force
 	sudo ./target/release/fcvm setup
 	sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels
+
+# SDK E2E test — requires computesdk package as sibling repo and Node.js
+test-serve-sdk: build
+	@echo "==> Running ComputeSDK E2E test..."
+	@if [ ! -d "$(CURDIR)/../computesdk/packages/computesdk" ]; then \
+		echo "ERROR: computesdk not found at ../computesdk"; \
+		echo "Clone it: git clone <computesdk-repo> ../computesdk && cd ../computesdk && pnpm install && pnpm build"; \
+		exit 1; \
+	fi
+	cd tests && npm install --silent
+	npx tsx tests/test_serve_sdk.ts
 
 bench: build
 	@echo "==> Running benchmarks..."
