@@ -23,7 +23,8 @@ Run Podman containers in Firecracker microVMs with fast cloning via UFFD memory 
 - For AWS: c6g.metal (ARM64) or c5.metal (x86_64) - NOT regular instances
 
 **Runtime Dependencies**
-- Rust 1.83+ with cargo and musl target ([rustup.rs](https://rustup.rs), then `rustup target add $(uname -m)-unknown-linux-musl`)
+- Rust 1.83+ with cargo ([rustup.rs](https://rustup.rs))
+- musl target: `rustup target add $(uname -m)-unknown-linux-musl`
 - Firecracker binary in PATH
 - For bridged networking: sudo, iptables, iproute2
 - For rootless networking: slirp4netns
@@ -114,7 +115,8 @@ fcvm runs containers inside Firecracker microVMs:
 You → fcvm → Firecracker VM → Podman → Container
 ```
 
-Each `podman run` boots a VM, pulls the image, and starts the container with full VM isolation. First run takes ~3s; subsequent runs with the same image take ~540ms (cached).
+Each `podman run` boots a VM, pulls the image, and starts the container in an isolated microVM.
+First run is ~3s. Cached runs with the same image are ~540ms.
 
 ```bash
 # Install Rust (if not already installed)
@@ -179,7 +181,8 @@ fcvm caches container images after the first pull. Subsequent runs with the same
 2. Cache key: SHA256 of (image, tag, cmd, env, config)
 3. Subsequent runs: Restore snapshot, fc-agent starts container (image already pulled)
 
-The snapshot captures VM state **after image pull but before container start**. On restore, fc-agent runs `podman run` with the already-pulled image, skipping the slow pull/export step.
+The snapshot captures VM state **after image pull and before container start**.
+On restore, fc-agent runs `podman run` with the already-pulled image, so pull/export is skipped.
 
 ### Two-Tier Snapshot System
 
@@ -192,12 +195,16 @@ fcvm uses a two-tier snapshot system to reduce startup time:
 
 **How diff snapshots work:**
 1. **First snapshot (pre-start)**: Creates a full memory snapshot (~2GB)
-2. **Subsequent snapshots (startup)**: Copies parent's memory.bin via reflink (CoW, instant), creates diff with only changed pages, merges diff onto base
+2. **Subsequent snapshots (startup)**: Reflink-copy parent `memory.bin`, create a diff, then merge
 3. **Result**: Each snapshot ends up with a complete `memory.bin`, equivalent to a full snapshot
 
-No persistent diff chains — reflink copy is instant (btrfs CoW), diff contains ~2% of pages, merged onto base. Each snapshot has a complete memory.bin with no parent dependency.
+There are no persistent diff chains.
+Reflink copy is instant (btrfs CoW), and the diff is typically ~2% of pages.
+Merge produces a complete `memory.bin` with no parent dependency.
 
-The startup snapshot is triggered by `--health-check <url>`. When the health check passes, fcvm creates a diff snapshot of the fully-initialized application. Second run restores from the startup snapshot, skipping container initialization entirely.
+The startup snapshot is triggered by `--health-check <url>`.
+After the check passes, fcvm creates a diff snapshot of the initialized app.
+Second run restores from that snapshot and skips container initialization.
 
 ```bash
 # First run: Creates pre-start (full) + startup (diff, merged)
@@ -312,7 +319,10 @@ Clone timing measured on c7g.metal ARM64 with `RUST_LOG=debug`:
 | Command + cleanup | ~300ms | Run echo + shutdown |
 | **Total** | **~610ms** | Full clone cycle with exec |
 
-Core VM restore (snapshot load + resume) is ~10ms. The rest is network setup, agent recovery, and cleanup. 10 parallel clones complete in ~1s wall clock (not 10x sequential). See [PERFORMANCE.md](PERFORMANCE.md) for detailed clone benchmarks.
+Core VM restore (snapshot load + resume) is ~10ms.
+Remaining time is network setup, agent recovery, and cleanup.
+10 parallel clones complete in ~1s wall clock.
+See [PERFORMANCE.md](PERFORMANCE.md) for detailed benchmarks.
 
 **Demo: Time a clone cycle**
 
@@ -452,7 +462,9 @@ echo "hello" | ./fcvm podman run --name pipe -i alpine:latest cat
 
 ## Nested Virtualization
 
-fcvm supports VMs inside VMs using ARM64 FEAT_NV2. Host → L1 → L2 works. L3+ is currently limited by FUSE-over-FUSE latency (~5x per level).
+fcvm supports VMs inside VMs using ARM64 FEAT_NV2.
+Host → L1 → L2 works.
+L3+ is currently limited by FUSE-over-FUSE latency (~5x per level).
 
 | Requirement | Details |
 |-------------|---------|
@@ -477,7 +489,9 @@ sudo ./fcvm podman run \
     /opt/fcvm/fcvm podman run --name inner --network bridged alpine:latest echo "nested!"
 ```
 
-**Performance**: ~5-7x FUSE overhead at L2, local disk ~4x. L2 VMs limited to single vCPU (NV2 multi-vCPU interrupt issue). See [PERFORMANCE.md](PERFORMANCE.md#nested-virtualization) for benchmarks and [NESTED.md](NESTED.md) for setup details.
+**Performance**: L2 has ~5-7x FUSE overhead, and local disk is ~4x slower.
+L2 VMs are limited to one vCPU due to NV2 multi-vCPU interrupt issues.
+See [PERFORMANCE.md](PERFORMANCE.md#nested-virtualization) and [NESTED.md](NESTED.md).
 
 ```bash
 make test-root FILTER=kvm   # Run nested virtualization tests
@@ -545,7 +559,8 @@ See [DESIGN.md](DESIGN.md#cli-interface) for architecture and design decisions.
 
 ## ComputeSDK API (`fcvm serve`)
 
-`fcvm serve` starts an HTTP server that speaks the ComputeSDK gateway + sandbox daemon protocol. This lets the TypeScript `computesdk` package (or any HTTP client) manage sandboxes programmatically.
+`fcvm serve` starts an HTTP server that implements the ComputeSDK gateway + sandbox daemon protocol.
+Use it from the TypeScript `computesdk` package or any HTTP client.
 
 ```bash
 # Start the API server
@@ -721,7 +736,8 @@ See [DESIGN.md](DESIGN.md#guest-agent) for details.
 
 ### FUSE Writeback Cache
 
-FUSE writeback cache is **enabled by default** for ~9x write performance. The kernel batches writes and flushes asynchronously.
+FUSE writeback cache is **enabled by default** for ~9x write performance.
+The kernel batches writes and flushes them asynchronously.
 
 **Known POSIX edge cases** (disabled in pjdfstest):
 
@@ -860,7 +876,7 @@ sudo fusermount3 -u /tmp/fuse-*-mount*
 
 ## Data Layout
 
-All data stored under `/mnt/fcvm-btrfs/` (btrfs for CoW reflinks). See [DESIGN.md](DESIGN.md#data-directory) for details.
+All data is stored under `/mnt/fcvm-btrfs/` (btrfs CoW reflinks). See [DESIGN.md](DESIGN.md#data-directory).
 
 ```bash
 # Setup btrfs (done automatically by make setup-btrfs)
@@ -885,7 +901,7 @@ The default kernel is from [Kata Containers](https://github.com/kata-containers/
 | **Key Config** | `CONFIG_FUSE_FS=y` (required for volume mounts) |
 | **Architectures** | arm64, amd64 |
 
-The kernel is downloaded automatically during `fcvm setup` and cached by URL hash. Changing the URL in config triggers a re-download.
+The kernel is downloaded during `fcvm setup` and cached by URL hash. Changing the URL in config triggers a re-download.
 
 ### Base Image
 
@@ -897,11 +913,14 @@ The guest OS is Ubuntu 24.04 LTS (Noble Numbat):
 | **Source** | Ubuntu cloud images |
 | **Packages** | podman, crun, fuse-overlayfs, skopeo, fuse3, haveged, chrony |
 
-The rootfs is built automatically during `fcvm setup` and cached by script SHA. Changing packages, services, or files in config triggers a rebuild.
+The rootfs is built during `fcvm setup` and cached by script SHA.
+Changing packages, services, or files in config triggers a rebuild.
 
 ### Kernel Profiles
 
-fcvm supports custom kernel profiles for advanced use cases (e.g., nested virtualization). Profiles define a kernel config, optional Firecracker binary, and boot arguments. Currently: `nested` (arm64, CONFIG_KVM=y).
+fcvm supports custom kernel profiles for advanced use cases (for example nested virtualization).
+Profiles define kernel config, optional Firecracker binary, and boot args.
+Current profile: `nested` (arm64, CONFIG_KVM=y).
 
 ```bash
 ./fcvm setup --kernel-profile nested                     # Download pre-built
@@ -909,7 +928,8 @@ fcvm supports custom kernel profiles for advanced use cases (e.g., nested virtua
 sudo ./fcvm podman run --name vm1 --kernel-profile nested --privileged nginx:alpine
 ```
 
-To add custom profiles or customize the base image, edit `rootfs-config.toml`. See [DESIGN.md](DESIGN.md#kernel-profiles) for profile configuration reference.
+To add custom profiles or customize the base image, edit `rootfs-config.toml`.
+See [DESIGN.md](DESIGN.md#kernel-profiles) for the profile config reference.
 
 ---
 
@@ -978,7 +998,8 @@ sudo nsenter --net=/proc/$HOLDER_PID/ns/net bridge link  # Show bridge ports
 
 ## CI Infrastructure
 
-CI runs on self-hosted ARM64 runners (c7g.metal spot instances) managed by [ejc3/aws-setup](https://github.com/ejc3/aws-setup).
+CI runs on self-hosted ARM64 runners (c7g.metal spot instances) managed by
+[ejc3/aws-setup](https://github.com/ejc3/aws-setup).
 
 - **Auto-scaling**: Runners launch on demand, stop after 30 mins idle
 - **Hardware**: c7g.metal with /dev/kvm for VM tests
@@ -994,7 +1015,7 @@ PRs are reviewed automatically by Claude. Findings prefixed with `BLOCKING:` fai
 | `/claude-review` | Comment on any PR to trigger manual review |
 | `@claude ...` | Ask Claude questions in PR comments |
 
-Reviews check for security issues, bugs, and breaking changes. Issues prefixed with `BLOCKING:` will fail the status check.
+Reviews check for security issues, bugs, and breaking changes.
 
 ---
 
