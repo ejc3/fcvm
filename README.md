@@ -1,17 +1,18 @@
 # fcvm - Firecracker VM Manager
 
-A Rust implementation that launches Firecracker microVMs to run Podman containers, with lightning-fast cloning via UFFD memory sharing and btrfs CoW disk snapshots.
+Run Podman containers in Firecracker microVMs with fast cloning via UFFD memory sharing and btrfs CoW snapshots.
 
 > **Features**
 > - Run OCI containers in isolated Firecracker microVMs
 > - **~6x faster startup** with container image cache (540ms vs 3100ms)
-> - Fast VM cloning via UFFD memory server + btrfs reflinks (~10ms restore, ~610ms with exec)
+> - VM cloning via UFFD memory server + btrfs reflinks (~10ms restore, ~610ms with exec)
 > - Multiple VMs share memory via kernel page cache (50 VMs = ~512MB, not 25GB!)
 > - Dual networking: bridged (iptables) or rootless (slirp4netns)
 > - Port forwarding for both regular VMs and clones
 > - FUSE-based host directory mapping via fuse-pipe
 > - Container exit code forwarding
 > - Interactive shell support (`-it`) with full TTY (vim, editors, colors)
+> - HTTP API server (`fcvm serve`) — ComputeSDK-compatible gateway for programmatic sandbox management
 
 ---
 
@@ -72,7 +73,7 @@ sudo apt-get update && sudo apt-get install -y \
     uidmap
 ```
 
-**Complete prerequisites**: See [`Containerfile`](Containerfile) for the full list of dependencies used in CI. This includes additional packages for kernel builds, container runtime, and testing. Running fcvm inside a VM (nested virtualization) is experimental.
+See [`Containerfile`](Containerfile) for the full dependency list used in CI.
 
 **Host system configuration**:
 ```bash
@@ -194,7 +195,7 @@ fcvm uses a two-tier snapshot system for optimal startup performance:
 2. **Subsequent snapshots (startup)**: Copies parent's memory.bin via reflink (CoW, instant), creates diff with only changed pages, merges diff onto base
 3. **Result**: Each snapshot ends up with a **complete memory.bin** - equivalent to a full snapshot, but created much faster
 
-**Key insight**: We use reflink copy + diff merge, not persistent diff chains. The reflink copy is instant (btrfs CoW), and the diff contains only ~2% of pages (those changed during container startup). After merging, you have a complete memory.bin that can be restored without any dependency on parent snapshots.
+We use reflink copy + diff merge, not persistent diff chains. The reflink copy is instant (btrfs CoW), and the diff contains only ~2% of pages (those changed during container startup). After merging, each snapshot has a complete memory.bin with no dependency on parent snapshots.
 
 The startup snapshot is triggered by `--health-check <url>`. When the health check passes, fcvm creates a diff snapshot of the fully-initialized application. Second run restores from the startup snapshot, skipping container initialization entirely.
 
@@ -311,7 +312,7 @@ Clone timing measured on c7g.metal ARM64 with `RUST_LOG=debug`:
 | Command + cleanup | ~300ms | Run echo + shutdown |
 | **Total** | **~610ms** | Full clone cycle with exec |
 
-The **core VM restore** (snapshot load + resume) is just **~10ms**. The remaining time is network setup, guest agent recovery, and cleanup.
+Core VM restore (snapshot load + resume) is ~10ms. The rest is network setup, agent recovery, and cleanup.
 
 #### 10-Clone Test Results
 
@@ -336,11 +337,10 @@ All 10 clones launched simultaneously:
 | **Snapshot load (UFFD)** | 9-11ms (consistent under load) |
 | **Individual clone times** | 743-1024ms |
 
-**Key findings**:
-- **Core restore is fast**: ~10ms regardless of sequential or parallel execution
-- **UFFD scales well**: Single memory server handles 10 concurrent clones with minimal overhead
-- **Parallelism works**: 10 VMs in 1.03s (not 10× sequential time)
-- **Bottleneck is cleanup**: Network teardown and state deletion add latency under contention
+- Core restore is ~10ms regardless of sequential or parallel
+- Single memory server handles 10 concurrent clones
+- 10 VMs in 1.03s (not 10x sequential)
+- Bottleneck is network teardown and state cleanup under contention
 
 **Demo: Time a clone cycle**
 
@@ -437,7 +437,7 @@ Expose multiple ports and mount multiple volumes in one command:
 
 ## Interactive Mode & TTY
 
-fcvm supports full interactive terminal sessions, matching docker/podman's `-i` and `-t` flags:
+fcvm supports interactive terminal sessions, matching docker/podman's `-i` and `-t` flags:
 
 | Flag | Meaning | Use Case |
 |------|---------|----------|
@@ -679,11 +679,10 @@ Performance at each nesting level (measured on c7g.metal, ARM64 Graviton3):
 | **Copy FROM FUSE** (100MB) | 398ms (250 MB/s) | 2227ms (44 MB/s) | **5.6x** |
 | **Memory Used** | 399MB | 341MB | — |
 
-**Key observations:**
-- **~5-7x FUSE overhead** at L2 due to FUSE-over-FUSE chaining (L2 → L1 → Host)
-- **Large copies** show sustained throughput: 92 MB/s at L1, 12 MB/s at L2 (write) / 44 MB/s (read)
-- **Local disk** overhead is lower (~4-7x) since it only traverses the virtio block device
-- **Memory** is similar at each level (~350-400MB for the nested container image)
+- ~5-7x FUSE overhead at L2 due to FUSE-over-FUSE chaining (L2 → L1 → Host)
+- Large copies: 92 MB/s at L1, 12 MB/s write / 44 MB/s read at L2
+- Local disk overhead is lower (~4-7x), only traverses virtio block
+- Memory is similar at each level (~350-400MB)
 
 **Why L3+ is blocked:** Each additional nesting level adds another FUSE hop. At L3, a single stat() would take ~25ms (5x × 5x = 25x overhead), making container startup take 10+ minutes.
 
@@ -702,11 +701,10 @@ Egress/ingress throughput measured with iperf3 (3-second tests, various block si
 | | 1M | 1 | 53.4 Gbps | 11.7 Gbps | 4.6x |
 | | 1M | 8 | 43.0 Gbps | 10.4 Gbps | 4.1x |
 
-**Network observations:**
-- **L1 achieves 40-53 Gbps** - excellent virtio-net performance
-- **L2 achieves 8-13 Gbps** - ~4-5x overhead from double NAT chain
-- **Single stream often outperforms parallel** - likely virtio queue contention
-- **Egress slightly faster than ingress at L2** - asymmetric NAT path
+- L1: 40-53 Gbps
+- L2: 8-13 Gbps (~4-5x overhead from double NAT)
+- Single stream often outperforms parallel (virtio queue contention)
+- Egress slightly faster than ingress at L2 (asymmetric NAT path)
 
 ### Limitations
 
@@ -763,6 +761,7 @@ Run `fcvm --help` or `fcvm <command> --help` for full options.
 | `fcvm snapshot create` | Create snapshot from running VM |
 | `fcvm snapshot serve` | Start UFFD memory server for cloning |
 | `fcvm snapshot run` | Clone from snapshot (`--pid` for UFFD, `--snapshot` for direct) |
+| `fcvm serve` | Start HTTP API server (ComputeSDK gateway) |
 | `fcvm snapshots` | List available snapshots |
 
 See [DESIGN.md](DESIGN.md#cli-interface) for architecture and design decisions.
@@ -788,6 +787,97 @@ See [DESIGN.md](DESIGN.md#cli-interface) for architecture and design decisions.
 ./fcvm exec --name my-vm --vm -- curl -s ifconfig.me # In guest OS
 ./fcvm exec --name my-vm -it -- bash                 # Interactive shell
 ```
+
+---
+
+## ComputeSDK API (`fcvm serve`)
+
+`fcvm serve` starts an HTTP server that speaks the ComputeSDK gateway + sandbox daemon protocol. This lets the TypeScript `computesdk` package (or any HTTP client) manage sandboxes programmatically.
+
+```bash
+# Start the API server
+./fcvm serve --port 8090
+```
+
+### TypeScript SDK
+
+```typescript
+import { ComputeSDK } from 'computesdk';
+
+const sdk = new ComputeSDK({
+  provider: 'fcvm',
+  apiKey: 'local',
+  gatewayUrl: 'http://localhost:8090'
+});
+
+const sandbox = await sdk.sandbox.create({ runtime: 'python' });
+const result = await sandbox.runCode('print("hello")');
+console.log(result.output);  // "hello\n"
+await sandbox.destroy();
+```
+
+### API Endpoints
+
+**Gateway** (sandbox lifecycle):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/v1/sandboxes` | Create sandbox (`{ runtime: "python" }`) |
+| `GET` | `/v1/sandboxes` | List all sandboxes |
+| `GET` | `/v1/sandboxes/{id}` | Get sandbox details |
+| `DELETE` | `/v1/sandboxes/{id}` | Destroy sandbox |
+
+**Sandbox daemon** (per-sandbox operations):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/s/{id}/health` | Health check |
+| `GET` | `/s/{id}/ready` | Readiness check |
+| `POST` | `/s/{id}/run/code` | Run code (`{ code, language? }`) |
+| `POST` | `/s/{id}/run/command` | Run shell command (`{ command, cwd?, env? }`) |
+| `GET` | `/s/{id}/files?path=` | List directory |
+| `POST` | `/s/{id}/files` | Create file (`{ path, content }`) |
+| `GET` | `/s/{id}/files/*path` | Read file |
+| `HEAD` | `/s/{id}/files/*path` | Check file exists |
+| `DELETE` | `/s/{id}/files/*path` | Delete file |
+
+### curl Examples
+
+```bash
+# Create a Python sandbox
+curl -s -X POST localhost:8090/v1/sandboxes \
+  -H 'Content-Type: application/json' \
+  -d '{"runtime":"python"}' | jq .
+
+# Run code (use sandboxId from create response)
+curl -s -X POST localhost:8090/s/<id>/run/code \
+  -H 'Content-Type: application/json' \
+  -d '{"code":"print(42)"}' | jq .
+
+# Run a shell command
+curl -s -X POST localhost:8090/s/<id>/run/command \
+  -H 'Content-Type: application/json' \
+  -d '{"command":"ls -la /"}' | jq .
+
+# Write and read a file
+curl -s -X POST localhost:8090/s/<id>/files \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"/tmp/hello.txt","content":"hello world"}'
+curl -s localhost:8090/s/<id>/files/tmp/hello.txt | jq .
+
+# Destroy sandbox
+curl -s -X DELETE localhost:8090/v1/sandboxes/<id> | jq .
+```
+
+### Supported Runtimes
+
+| Runtime | Image |
+|---------|-------|
+| `python` | `python:3.12-slim` |
+| `node` | `node:22-slim` |
+| `ruby` | `ruby:3.3-slim` |
+| `go` | `golang:1.23-alpine` |
+| Custom | Pass any image name directly |
 
 ---
 
@@ -824,9 +914,7 @@ The VM's internal IPv6 address is `fd00:1::2` on the `fd00:1::/64` network.
 
 #### Using HTTP Proxies
 
-**Automatic Proxy Passthrough**: fcvm automatically forwards `http_proxy` and `https_proxy`
-environment variables from the host to the VM via MMDS. The VM's podman process inherits
-these settings for image pulls:
+fcvm forwards `http_proxy` and `https_proxy` from host to VM via MMDS:
 
 ```bash
 # Set proxy on host - fcvm passes it to VM automatically
@@ -836,8 +924,7 @@ fcvm podman run --name myvm alpine:latest
 # Image pulls inside VM will use the proxy
 ```
 
-**Manual Proxy Configuration**: You can also configure proxies inside the VM manually.
-The proxy binds to the host's loopback, and the VM connects via the gateway address:
+Manual configuration (proxy on host loopback, VM connects via gateway):
 
 ```bash
 # On host: start proxy listening on ::1:8080 (or 127.0.0.1:8080)
@@ -879,7 +966,7 @@ See [DESIGN.md](DESIGN.md#guest-agent) for details.
 
 ### FUSE Writeback Cache
 
-FUSE writeback cache is **enabled by default** for ~9x write performance improvement. The kernel batches writes and flushes them asynchronously, dramatically improving throughput for workloads with many small writes.
+FUSE writeback cache is **enabled by default** for ~9x write performance. The kernel batches writes and flushes asynchronously.
 
 **Known POSIX edge cases** (disabled in pjdfstest):
 
