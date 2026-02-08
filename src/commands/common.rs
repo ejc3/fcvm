@@ -942,6 +942,24 @@ pub async fn create_snapshot_core(
 
     info!(snapshot = %snapshot_config.name, "VM resumed, processing snapshot");
 
+    // Firecracker resets all vsock connections during snapshot creation
+    // (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET). Bump restore-epoch in MMDS so fc-agent's
+    // background watcher detects this and remounts FUSE volumes.
+    let restore_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Err(e) = client
+        .patch_mmds(serde_json::json!({
+            "latest": {
+                "restore-epoch": restore_epoch.to_string()
+            }
+        }))
+        .await
+    {
+        warn!(error = %e, "failed to bump restore-epoch after snapshot (FUSE remount may be delayed)");
+    }
+
     if has_base {
         // Diff snapshot: copy base to temp, merge diff onto it, then atomic rename
         // At this point:

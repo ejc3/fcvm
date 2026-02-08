@@ -1629,13 +1629,8 @@ pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
     // Create snapshot channel for snapshot-ready notifications
     // Skip snapshot creation when:
     // - --no-snapshot flag or FCVM_NO_SNAPSHOT env var is set
-    // - Volumes are specified (FUSE-over-vsock breaks during snapshot pause)
-    let skip_snapshot_creation = no_snapshot || !args.map.is_empty();
-    if !args.map.is_empty() && !no_snapshot {
-        info!(
-            "Skipping snapshot creation: volumes specified (FUSE doesn't survive snapshot pause)"
-        );
-    }
+    // Note: FUSE volumes survive snapshot/restore — fc-agent remounts them on clone restore
+    let skip_snapshot_creation = no_snapshot;
     let (cache_tx, cache_rx): (
         Option<mpsc::Sender<CacheRequest>>,
         Option<mpsc::Receiver<CacheRequest>>,
@@ -1648,7 +1643,7 @@ pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
 
     // Create startup snapshot channel for health-triggered snapshot creation
     // Only create startup snapshots if:
-    // - Not skipping snapshots (no --no-snapshot, no volumes)
+    // - Not skipping snapshots (no --no-snapshot)
     // - Have a snapshot key
     // - Have a health_check URL configured (HTTP health check, not just container-ready)
     let (startup_tx, startup_rx): (

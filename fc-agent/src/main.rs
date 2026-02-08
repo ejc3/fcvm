@@ -97,9 +97,6 @@ struct LatestMetadata {
     host_time: String,
     #[serde(rename = "restore-epoch")]
     restore_epoch: Option<String>,
-    /// Volume mounts for clone restore (provided by fcvm snapshot run)
-    #[serde(default)]
-    volumes: Vec<VolumeMount>,
 }
 
 /// Ensure cgroup controllers are available for container creation.
@@ -359,9 +356,11 @@ async fn fetch_plan() -> Result<Plan> {
     Ok(plan)
 }
 
-/// Watch for restore-epoch changes in MMDS and handle clone restore
-/// This runs as a background task to handle snapshot restore scenarios
-async fn watch_restore_epoch() {
+/// Watch for restore-epoch changes in MMDS and handle clone restore.
+/// `boot_volumes` are the volumes from the initial boot plan — these are used
+/// directly for remount since they're always correct (clones inherit the same
+/// volume config from the snapshot).
+async fn watch_restore_epoch(boot_volumes: Vec<VolumeMount>) {
     let mut last_epoch: Option<String> = None;
 
     // Poll every 100ms - simple and fast enough to detect restores quickly
@@ -376,7 +375,7 @@ async fn watch_restore_epoch() {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
-        // Try to fetch current metadata (including restore-epoch and volumes)
+        // Try to fetch current restore-epoch from MMDS
         let metadata = match fetch_latest_metadata(&client).await {
             Ok(m) => m,
             Err(_) => continue, // Ignore errors, just keep polling
@@ -390,16 +389,21 @@ async fn watch_restore_epoch() {
                     // On fresh boot, there is no restore-epoch in MMDS yet.
                     // If we see one, we were restored from a snapshot.
                     eprintln!(
-                        "[fc-agent] detected restore-epoch: {} (clone restore detected)",
-                        current
+                        "[fc-agent] detected restore-epoch: {} (clone restore detected, volumes: {})",
+                        current, boot_volumes.len()
                     );
-                    handle_clone_restore(&metadata.volumes).await;
+                    handle_clone_restore(&boot_volumes).await;
                     last_epoch = metadata.restore_epoch;
                 }
                 Some(prev) if prev != current => {
                     // Epoch changed! This means we were restored from snapshot again
-                    eprintln!("[fc-agent] restore-epoch changed: {} -> {}", prev, current);
-                    handle_clone_restore(&metadata.volumes).await;
+                    eprintln!(
+                        "[fc-agent] restore-epoch changed: {} -> {} (volumes: {})",
+                        prev,
+                        current,
+                        boot_volumes.len()
+                    );
+                    handle_clone_restore(&boot_volumes).await;
                     last_epoch = metadata.restore_epoch;
                 }
                 _ => {
@@ -442,68 +446,286 @@ async fn handle_clone_restore(volumes: &[VolumeMount]) {
 /// Remount FUSE volumes after clone restore.
 /// The old vsock connections are broken, so we unmount and remount.
 async fn remount_fuse_volumes(volumes: &[VolumeMount]) {
+    // After snapshot restore, Firecracker places VIRTIO_VSOCK_EVENT_TRANSPORT_RESET
+    // in the guest's virtio event queue. The kernel processes this asynchronously
+    // after resume, killing ALL vsock connections (including newly created ones).
+    // Wait for the transport reset to complete before creating new connections.
+    sleep(Duration::from_millis(500)).await;
+
     for vol in volumes {
-        eprintln!(
-            "[fc-agent] remounting volume at {} (port {})",
-            vol.guest_path, vol.vsock_port
-        );
-
-        // First, try to unmount the old (broken) FUSE mount
-        // Use lazy unmount (-l) in case there are open files
-        let umount_output = Command::new("umount")
-            .args(["-l", &vol.guest_path])
-            .output()
-            .await;
-
-        match umount_output {
-            Ok(o) if o.status.success() => {
-                eprintln!("[fc-agent] unmounted old FUSE mount at {}", vol.guest_path);
-            }
-            Ok(o) => {
-                // Not mounted or error - that's fine, we'll mount fresh
+        // Retry remount: the first attempt may fail if the kernel is still
+        // processing the vsock transport reset from the snapshot.
+        for attempt in 0..3 {
+            if attempt > 0 {
                 eprintln!(
-                    "[fc-agent] umount {} (may not be mounted): {}",
+                    "[fc-agent] retrying remount of {} (attempt {})",
                     vol.guest_path,
-                    String::from_utf8_lossy(&o.stderr).trim()
+                    attempt + 1
+                );
+                sleep(Duration::from_millis(500)).await;
+            }
+
+            eprintln!(
+                "[fc-agent] remounting volume at {} (port {})",
+                vol.guest_path, vol.vsock_port
+            );
+
+            // Unmount the old (broken) FUSE mount
+            // Use lazy unmount (-l) in case there are open files
+            let umount_output = Command::new("umount")
+                .args(["-l", &vol.guest_path])
+                .output()
+                .await;
+
+            match umount_output {
+                Ok(o) if o.status.success() => {
+                    eprintln!("[fc-agent] unmounted old FUSE mount at {}", vol.guest_path);
+                }
+                Ok(o) => {
+                    eprintln!(
+                        "[fc-agent] umount {} (may not be mounted): {}",
+                        vol.guest_path,
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[fc-agent] umount error for {}: {}", vol.guest_path, e);
+                }
+            }
+
+            // Small delay to ensure unmount completes
+            sleep(Duration::from_millis(100)).await;
+
+            // Ensure mount point directory exists. Ignore AlreadyExists since
+            // the directory is expected to exist when remounting after snapshot.
+            if let Err(e) = std::fs::create_dir_all(&vol.guest_path) {
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    eprintln!(
+                        "[fc-agent] ERROR: cannot create mount point {}: {}",
+                        vol.guest_path, e
+                    );
+                    break;
+                }
+            }
+
+            // Mount FUSE filesystem in a background thread using fuse-pipe
+            let mount_path = vol.guest_path.clone();
+            let port = vol.vsock_port;
+
+            thread::spawn(move || {
+                eprintln!("[fc-agent] fuse: starting remount at {}", mount_path);
+                if let Err(e) = fuse::mount_vsock(port, &mount_path) {
+                    eprintln!("[fc-agent] FUSE remount error at {}: {}", mount_path, e);
+                }
+                eprintln!("[fc-agent] fuse: remount at {} exited", mount_path);
+            });
+
+            eprintln!("[fc-agent] volume {} remount initiated", vol.guest_path);
+
+            // Wait for FUSE mount to initialize, then verify it works
+            sleep(Duration::from_millis(500)).await;
+
+            if std::fs::metadata(&vol.guest_path).is_ok() {
+                eprintln!("[fc-agent] ✓ volume {} remount verified", vol.guest_path);
+                break;
+            } else {
+                eprintln!(
+                    "[fc-agent] volume {} mount not accessible after remount",
+                    vol.guest_path
+                );
+            }
+        }
+    }
+
+    if volumes.is_empty() {
+        return;
+    }
+
+    // Rebind new FUSE mounts into the container's mount namespace.
+    // The container has stale bind mounts from before the snapshot — podman's
+    // -v flag creates bind mounts into the container's mount namespace, and
+    // those don't automatically see FUSE remounts in the root namespace.
+    rebind_volumes_in_container(volumes).await;
+
+    eprintln!("[fc-agent] ✓ volume remounts complete");
+}
+
+/// After FUSE remount in root namespace, rebind into the container's mount
+/// namespace so `podman exec` commands see the new FUSE mount instead of
+/// the stale bind mount from before the snapshot.
+///
+/// Uses the new mount API (open_tree + move_mount, Linux 5.2+) because the
+/// traditional mount --bind rejects cross-namespace sources (check_mnt).
+async fn rebind_volumes_in_container(volumes: &[VolumeMount]) {
+    // Get the container's PID (it may not be running yet during initial boot)
+    let pid_output = match Command::new("podman")
+        .args(["inspect", "--format", "{{.State.Pid}}", "fcvm-container"])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => o,
+        Ok(_) => {
+            eprintln!("[fc-agent] container not running, skipping mount rebind");
+            return;
+        }
+        Err(e) => {
+            eprintln!(
+                "[fc-agent] podman inspect failed: {}, skipping mount rebind",
+                e
+            );
+            return;
+        }
+    };
+
+    let container_pid = String::from_utf8_lossy(&pid_output.stdout)
+        .trim()
+        .to_string();
+    if container_pid.is_empty() || container_pid == "0" {
+        eprintln!("[fc-agent] container PID is 0, skipping mount rebind");
+        return;
+    }
+
+    for vol in volumes {
+        let pid = container_pid.clone();
+        let path = vol.guest_path.clone();
+
+        let result = tokio::task::spawn_blocking(move || rebind_mount_cross_ns(&pid, &path)).await;
+
+        match result {
+            Ok(Ok(())) => {
+                eprintln!(
+                    "[fc-agent] ✓ volume {} rebound in container namespace",
+                    vol.guest_path
+                );
+            }
+            Ok(Err(e)) => {
+                eprintln!(
+                    "[fc-agent] WARNING: rebind {} in container failed: {}",
+                    vol.guest_path, e
                 );
             }
             Err(e) => {
-                eprintln!("[fc-agent] umount error for {}: {}", vol.guest_path, e);
+                eprintln!(
+                    "[fc-agent] WARNING: rebind task failed for {}: {}",
+                    vol.guest_path, e
+                );
             }
         }
+    }
+}
 
-        // Small delay to ensure unmount completes
-        sleep(Duration::from_millis(100)).await;
+/// Rebind a FUSE mount from the root namespace into a container's mount namespace.
+///
+/// Uses fork + open_tree + move_mount:
+/// 1. open_tree(CLONE) creates a namespace-neutral detached mount clone
+/// 2. Child process enters the container's mount namespace via setns
+/// 3. move_mount places the detached clone at the target path
+///
+/// This avoids the check_mnt restriction that blocks traditional mount --bind
+/// across mount namespace boundaries.
+fn rebind_mount_cross_ns(container_pid: &str, guest_path: &str) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::unix::io::AsRawFd;
 
-        // Create mount point directory (in case it doesn't exist)
-        if let Err(e) = std::fs::create_dir_all(&vol.guest_path) {
-            eprintln!(
-                "[fc-agent] ERROR: cannot create mount point {}: {}",
-                vol.guest_path, e
-            );
-            continue;
-        }
+    // libc crate provides these for both aarch64 and x86_64
+    const SYS_OPEN_TREE: libc::c_long = libc::SYS_open_tree;
+    const SYS_MOVE_MOUNT: libc::c_long = libc::SYS_move_mount;
 
-        // Mount FUSE filesystem in a background thread using fuse-pipe
-        let mount_path = vol.guest_path.clone();
-        let port = vol.vsock_port;
+    const OPEN_TREE_CLONE: libc::c_ulong = 1;
+    const MOVE_MOUNT_F_EMPTY_PATH: libc::c_ulong = 4;
 
-        thread::spawn(move || {
-            eprintln!("[fc-agent] fuse: starting remount at {}", mount_path);
-            if let Err(e) = fuse::mount_vsock(port, &mount_path) {
-                eprintln!("[fc-agent] FUSE remount error at {}: {}", mount_path, e);
-            }
-            eprintln!("[fc-agent] fuse: remount at {} exited", mount_path);
-        });
+    let path_c = CString::new(guest_path).map_err(|e| format!("invalid path: {}", e))?;
 
-        eprintln!("[fc-agent] volume {} remount initiated", vol.guest_path);
+    // Step 1: Create a detached mount clone of the FUSE mount (from root namespace).
+    // open_tree with OPEN_TREE_CLONE creates a mount that belongs to no namespace,
+    // so it can be moved into any namespace with move_mount.
+    let tree_fd = unsafe {
+        libc::syscall(
+            SYS_OPEN_TREE,
+            libc::AT_FDCWD,
+            path_c.as_ptr(),
+            OPEN_TREE_CLONE,
+        )
+    };
+    if tree_fd < 0 {
+        return Err(format!(
+            "open_tree({}) failed: {}",
+            guest_path,
+            std::io::Error::last_os_error()
+        ));
+    }
+    let tree_fd = tree_fd as libc::c_int;
+
+    // Step 2: Open references for container namespace entry
+    let ns_path = format!("/proc/{}/ns/mnt", container_pid);
+    let root_path = format!("/proc/{}/root", container_pid);
+
+    let ns_file = std::fs::File::open(&ns_path).map_err(|e| {
+        unsafe { libc::close(tree_fd) };
+        format!("open container mount ns: {}", e)
+    })?;
+    let root_file = std::fs::File::open(&root_path).map_err(|e| {
+        unsafe { libc::close(tree_fd) };
+        format!("open container root: {}", e)
+    })?;
+
+    // Step 3: Fork a child to enter container namespace and move the mount.
+    // We fork because setns() changes the calling thread's namespace permanently.
+    // All syscalls in the child are async-signal-safe.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        unsafe { libc::close(tree_fd) };
+        return Err(format!("fork: {}", std::io::Error::last_os_error()));
     }
 
-    // Give FUSE mounts time to initialize
-    if !volumes.is_empty() {
-        eprintln!("[fc-agent] waiting for FUSE remounts to initialize...");
-        sleep(Duration::from_millis(500)).await;
-        eprintln!("[fc-agent] ✓ volume remounts complete");
+    if pid == 0 {
+        // === Child process ===
+        // Enter container's mount namespace
+        if unsafe { libc::setns(ns_file.as_raw_fd(), libc::CLONE_NEWNS) } != 0 {
+            unsafe { libc::_exit(1) };
+        }
+        // chroot to container's root (so path resolution works after pivot_root)
+        if unsafe { libc::fchdir(root_file.as_raw_fd()) } != 0 {
+            unsafe { libc::_exit(2) };
+        }
+        if unsafe { libc::chroot(c".".as_ptr()) } != 0 {
+            unsafe { libc::_exit(3) };
+        }
+
+        // Unmount the stale bind mount (lazy, ignore errors — may already be gone)
+        unsafe { libc::umount2(path_c.as_ptr(), libc::MNT_DETACH) };
+
+        // Move the detached mount clone into this namespace at guest_path
+        let empty = c"".as_ptr();
+        let ret = unsafe {
+            libc::syscall(
+                SYS_MOVE_MOUNT,
+                tree_fd,
+                empty,
+                libc::AT_FDCWD,
+                path_c.as_ptr(),
+                MOVE_MOUNT_F_EMPTY_PATH,
+            )
+        };
+
+        unsafe { libc::_exit(if ret == 0 { 0 } else { 5 }) };
+    }
+
+    // === Parent process ===
+    unsafe { libc::close(tree_fd) };
+
+    let mut status: libc::c_int = 0;
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+
+    // WIFEXITED: (status & 0x7f) == 0
+    // WEXITSTATUS: (status >> 8) & 0xff
+    let exited = (status & 0x7f) == 0;
+    let exit_code = (status >> 8) & 0xff;
+
+    if exited && exit_code == 0 {
+        Ok(())
+    } else {
+        Err(format!("rebind child failed (exit code {})", exit_code))
     }
 }
 
@@ -2272,9 +2494,10 @@ async fn run_agent() -> Result<()> {
 
     // Start background task to watch for restore-epoch changes
     // This handles ARP cache flushing when VM is restored from snapshot
-    tokio::spawn(async {
+    let watcher_volumes = plan.volumes.clone();
+    tokio::spawn(async move {
         eprintln!("[fc-agent] starting restore-epoch watcher for ARP flush");
-        watch_restore_epoch().await;
+        watch_restore_epoch(watcher_volumes).await;
     });
 
     // Start exec server to allow host to run commands in VM
@@ -2527,6 +2750,26 @@ async fn run_agent() -> Result<()> {
         Err(e) => {
             eprintln!("[fc-agent] WARNING: failed to get image digest: {:?}", e);
             eprintln!("[fc-agent] continuing without cache notification");
+        }
+    }
+
+    // After cache-ready handshake, Firecracker may have created a pre-start snapshot.
+    // Snapshot creation resets all vsock connections (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET),
+    // which breaks FUSE mounts. Check if mounts are still healthy and remount if needed.
+    if !mounted_fuse_paths.is_empty() {
+        let mut broken = false;
+        for path in &mounted_fuse_paths {
+            if std::fs::metadata(path).is_err() {
+                eprintln!(
+                    "[fc-agent] FUSE mount at {} broken after snapshot (vsock reset), will remount",
+                    path
+                );
+                broken = true;
+                break;
+            }
+        }
+        if broken {
+            remount_fuse_volumes(&plan.volumes).await;
         }
     }
 
