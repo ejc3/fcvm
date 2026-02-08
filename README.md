@@ -6,7 +6,7 @@ Run Podman containers in Firecracker microVMs with fast cloning via UFFD memory 
 > - Run OCI containers in isolated Firecracker microVMs
 > - **~6x faster startup** with container image cache (540ms vs 3100ms)
 > - VM cloning via UFFD memory server + btrfs reflinks (~10ms restore, ~610ms with exec)
-> - Multiple VMs share memory via kernel page cache (50 VMs = ~512MB, not 25GB!)
+> - Multiple VMs share memory via kernel page cache (50 VMs = ~512MB, not 25GB)
 > - Dual networking: bridged (iptables) or rootless (slirp4netns)
 > - Port forwarding for both regular VMs and clones
 > - FUSE-based host directory mapping via fuse-pipe
@@ -159,7 +159,7 @@ sudo ./fcvm podman run --name web-bridged --network bridged nginx:alpine
 
 ### Container Image Cache (~6x Faster Startup)
 
-fcvm automatically caches container images after the first pull. On subsequent runs with the same image, startup is **~6x faster** (540ms vs 3100ms).
+fcvm caches container images after the first pull. Subsequent runs with the same image are ~6x faster (540ms vs 3100ms).
 
 ```bash
 # First run: pulls image, creates cache (~3s)
@@ -183,7 +183,7 @@ The snapshot captures VM state **after image pull but before container start**. 
 
 ### Two-Tier Snapshot System
 
-fcvm uses a two-tier snapshot system for optimal startup performance:
+fcvm uses a two-tier snapshot system to reduce startup time:
 
 | Snapshot | When Created | Content | Size |
 |----------|--------------|---------|------|
@@ -193,7 +193,7 @@ fcvm uses a two-tier snapshot system for optimal startup performance:
 **How diff snapshots work:**
 1. **First snapshot (pre-start)**: Creates a full memory snapshot (~2GB)
 2. **Subsequent snapshots (startup)**: Copies parent's memory.bin via reflink (CoW, instant), creates diff with only changed pages, merges diff onto base
-3. **Result**: Each snapshot ends up with a **complete memory.bin** - equivalent to a full snapshot, but created much faster
+3. **Result**: Each snapshot ends up with a complete `memory.bin`, equivalent to a full snapshot
 
 No persistent diff chains — reflink copy is instant (btrfs CoW), diff contains ~2% of pages, merged onto base. Each snapshot has a complete memory.bin with no parent dependency.
 
@@ -205,7 +205,7 @@ The startup snapshot is triggered by `--health-check <url>`. When the health che
 # → Pre-start snapshot: 2048MB (full)
 # → Startup snapshot: ~50MB (diff) → merged onto base
 
-# Second run: Restores from startup snapshot (~100ms faster)
+# Second run: Restores from startup snapshot
 ./fcvm podman run --name web2 --health-check http://localhost/ nginx:alpine
 # → Restored from startup snapshot (application already running)
 ```
@@ -246,8 +246,8 @@ Clone snapshots automatically use their source as parent, enabling diff-based op
 ### Snapshot & Clone Workflow
 
 Two modes for restoring from snapshots:
-- **UFFD mode** (`--pid`): Memory served on-demand via UFFD server. Best for many concurrent clones sharing memory.
-- **Direct mode** (`--snapshot`): Memory loaded directly from file. Simpler, no server needed.
+- **UFFD mode** (`--pid`): Memory served on-demand via UFFD server. Use for many concurrent clones.
+- **Direct mode** (`--snapshot`): Memory loaded directly from file. Use for simpler single-clone flows.
 
 ```bash
 # 1. Start baseline VM (using bridged, or omit --network for rootless)
@@ -282,9 +282,9 @@ sudo ./fcvm snapshot run --snapshot nginx-warm --network bridged --exec "curl lo
 
 ---
 
-## Advanced Demos
+## Examples
 
-| Demo | What it proves |
+| Example | Purpose |
 |------|----------------|
 | **Clone Speed** | ~10ms memory restore, ~610ms full cycle |
 | **Memory Sharing** | 10 clones use ~1.5GB extra, not 20GB |
@@ -327,7 +327,7 @@ time ./fcvm snapshot run --pid <serve_pid> --exec "echo ready"
 # real 0m0.610s  ← 610ms total, ~10ms for VM restore
 ```
 
-### Memory Sharing Proof
+### Memory Sharing Example
 
 Show that multiple clones share memory via kernel page cache:
 
@@ -341,13 +341,13 @@ for i in {1..10}; do
 done
 wait
 
-# Memory barely increased! 10 VMs share the same pages
+# Memory increased only slightly. Clones share pages through the kernel page cache.
 free -m | grep Mem
 ```
 
 ### Scale-Out Demo (50 VMs in ~3s)
 
-Spin up a fleet of web servers quickly:
+Start 50 web servers in parallel:
 
 ```bash
 # Create warm nginx snapshot (one-time, in another terminal)
@@ -452,7 +452,7 @@ echo "hello" | ./fcvm podman run --name pipe -i alpine:latest cat
 
 ## Nested Virtualization
 
-fcvm supports running VMs inside VMs using ARM64 FEAT_NV2. Host → L1 → L2 nesting works. L3+ is blocked by FUSE-over-FUSE latency (~5x per level).
+fcvm supports VMs inside VMs using ARM64 FEAT_NV2. Host → L1 → L2 works. L3+ is currently limited by FUSE-over-FUSE latency (~5x per level).
 
 | Requirement | Details |
 |-------------|---------|
@@ -741,7 +741,7 @@ FCVM_NO_WRITEBACK_CACHE=1 ./fcvm podman run --name test alpine:latest
 
 ### CI Summary
 
-Every CI run exercises the full stack:
+CI covers the full stack:
 
 | Metric | Count |
 |--------|-------|
@@ -818,11 +818,11 @@ Tests run automatically on PRs and pushes to main:
 | **Host-Root-SnapshotEnabled** | Self-hosted ARM64 | Privileged tests run **twice** to verify snapshot hit |
 | **Container** | Self-hosted ARM64 | All tests in container |
 
-The **SnapshotEnabled** job runs the full test suite twice on the same runner:
+The **SnapshotEnabled** job runs the same suite twice on one runner:
 - **Run 1**: Creates snapshots (cache miss path)
 - **Run 2**: Uses existing snapshots (cache hit path - should be faster)
 
-This validates the complete snapshot lifecycle: creation, persistence, and restoration.
+This validates snapshot creation, persistence, and restore paths.
 
 Latest results: [CI Workflow](.github/workflows/ci.yml) → Actions tab
 
@@ -986,7 +986,7 @@ CI runs on self-hosted ARM64 runners (c7g.metal spot instances) managed by [ejc3
 
 ### Claude Code Review
 
-PRs are automatically reviewed by Claude. Reviews are blocking if critical issues are found.
+PRs are reviewed automatically by Claude. Findings prefixed with `BLOCKING:` fail the check.
 
 | Trigger | Description |
 |---------|-------------|
