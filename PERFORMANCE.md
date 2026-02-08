@@ -162,6 +162,24 @@ Response propagates back through all layers
 
 The fsync alone is **16× slower** because it blocks through two FUSE layers.
 
+### Network Performance (iperf3)
+
+Egress/ingress throughput (3-second tests, various block sizes and parallelism):
+
+| Direction | Block Size | Streams | L1 | L2 | Overhead |
+|-----------|------------|---------|----|----|----------|
+| **Egress** (VM→Host) | 128K | 1 | 42.4 Gbps | 11.0 Gbps | 3.9x |
+| | 128K | 4 | 38.0 Gbps | 12.8 Gbps | 3.0x |
+| | 1M | 1 | 43.1 Gbps | 9.0 Gbps | 4.8x |
+| | 1M | 8 | 33.1 Gbps | 12.3 Gbps | 2.7x |
+| **Ingress** (Host→VM) | 128K | 1 | 48.7 Gbps | 8.4 Gbps | 5.8x |
+| | 128K | 4 | 44.3 Gbps | 8.6 Gbps | 5.2x |
+| | 1M | 1 | 53.4 Gbps | 11.7 Gbps | 4.6x |
+| | 1M | 8 | 43.0 Gbps | 10.4 Gbps | 4.1x |
+
+- L1: 40-53 Gbps, L2: 8-13 Gbps (~4-5x overhead from double NAT)
+- Single stream often outperforms parallel (virtio queue contention)
+
 ### Optimizing L2 Workloads
 
 1. **Avoid fsync when possible** - async writes are only 3× slower, not 7×
@@ -202,6 +220,33 @@ FCVM_FUSE_TRACE_RATE=1 fcvm podman run ...
 | `fs` | Filesystem operation time |
 | `to_srv` | Network latency client→server (may show `?` if clocks differ) |
 | `to_cli` | Network latency server→client (may show `?` if clocks differ) |
+
+---
+
+## Clone Benchmarks
+
+### 10-Clone Sequential
+
+| Metric | Average | Range |
+|--------|---------|-------|
+| **Snapshot load (UFFD)** | 9.08ms | 8.76-9.56ms |
+| **VM resume** | 0.48ms | 0.44-0.56ms |
+| **Core VM restore** | ~9.5ms | — |
+| **Full clone cycle** | 611ms | 587-631ms |
+
+Individual clone times: 631, 599, 611, 611, 615, 618, 618, 622, 587, 599ms
+
+### 10-Clone Parallel
+
+All 10 clones launched simultaneously:
+
+| Metric | Value |
+|--------|-------|
+| **Wall clock time** | **1.03s** |
+| **Snapshot load (UFFD)** | 9-11ms (consistent under load) |
+| **Individual clone times** | 743-1024ms |
+
+Core restore is ~10ms regardless of sequential or parallel. Single memory server handles 10 concurrent clones. Bottleneck is network teardown and state cleanup under contention.
 
 ---
 
