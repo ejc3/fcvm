@@ -256,6 +256,21 @@ jobs:
       - name: test-fast
         working-directory: fcvm
         run: make test-fast
+      - name: test-serve-sdk
+        working-directory: fcvm
+        run: |
+          # SDK test requires computesdk package (sibling repo)
+          # On CI, check if it's available; on dev machines, always available
+          COMPUTESDK_DIR="${{ github.workspace }}/computesdk"
+          if [ ! -d "$COMPUTESDK_DIR/packages/computesdk" ]; then
+            echo "⚠ Skipping SDK E2E test (computesdk not checked out)"
+            echo "  To run locally: cd tests && npm install && cd .. && npx tsx tests/test_serve_sdk.ts"
+            exit 0
+          fi
+          # Install Node.js if not available
+          which node || { echo "⚠ Skipping SDK test (Node.js not available)"; exit 0; }
+          cd tests && npm install && cd ..
+          npx tsx tests/test_serve_sdk.ts
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v6

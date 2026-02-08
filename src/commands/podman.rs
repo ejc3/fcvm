@@ -1149,6 +1149,18 @@ pub(crate) async fn run_output_listener(
 
 /// Set up all resources and start the VM. Returns `None` on snapshot cache hit
 /// (handled internally via `cmd_snapshot_run`).
+fn snapshot_run_firecracker_overrides(
+    runtime_config: &super::common::RuntimeConfig,
+) -> (Option<String>, Option<String>) {
+    (
+        runtime_config
+            .firecracker_bin
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        runtime_config.firecracker_args.clone(),
+    )
+}
+
 pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
     info!("Starting fcvm podman run");
 
@@ -1268,6 +1280,8 @@ pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
                 image = %args.image,
                 "Startup snapshot hit! Restoring from fully-initialized snapshot"
             );
+            let (firecracker_bin, firecracker_args) =
+                snapshot_run_firecracker_overrides(&runtime_config);
             // Call snapshot run directly with startup snapshot
             // No need to create startup snapshot again since we're restoring from one
             let snapshot_args = crate::cli::SnapshotRunArgs {
@@ -1282,6 +1296,8 @@ pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
                 startup_snapshot_base_key: None, // Already using startup snapshot
                 cpu: Some(args.cpu),
                 mem: Some(args.mem),
+                firecracker_bin,
+                firecracker_args,
             };
             super::snapshot::cmd_snapshot_run(snapshot_args).await?;
             return Ok(None);
@@ -1294,6 +1310,8 @@ pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
                 image = %args.image,
                 "Pre-start snapshot hit! Restoring from cached snapshot"
             );
+            let (firecracker_bin, firecracker_args) =
+                snapshot_run_firecracker_overrides(&runtime_config);
             // Call snapshot run with startup snapshot creation enabled
             // (if health_check_url is set)
             let snapshot_args = crate::cli::SnapshotRunArgs {
@@ -1309,6 +1327,8 @@ pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
                 startup_snapshot_base_key: args.health_check.as_ref().map(|_| key.clone()),
                 cpu: Some(args.cpu),
                 mem: Some(args.mem),
+                firecracker_bin,
+                firecracker_args,
             };
             super::snapshot::cmd_snapshot_run(snapshot_args).await?;
             return Ok(None);
@@ -3102,6 +3122,20 @@ mod tests {
         assert!(resolved_https.starts_with("https://"));
         assert!(resolved_https.contains(":443"));
         assert!(resolved_https.contains("/proxy"));
+    }
+
+    #[test]
+    fn test_snapshot_run_firecracker_overrides_preserve_runtime_config() {
+        let runtime_config = crate::commands::common::RuntimeConfig {
+            firecracker_bin: Some(PathBuf::from("/opt/firecracker-nested")),
+            firecracker_args: Some("--enable-nv2".to_string()),
+            boot_args: None,
+            fuse_readers: None,
+        };
+
+        let (bin, args) = snapshot_run_firecracker_overrides(&runtime_config);
+        assert_eq!(bin, Some("/opt/firecracker-nested".to_string()));
+        assert_eq!(args, Some("--enable-nv2".to_string()));
     }
 
     #[tokio::test]
