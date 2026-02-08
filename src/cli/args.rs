@@ -145,6 +145,10 @@ pub struct RunArgs {
     #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
     pub env: Vec<String>,
 
+    /// Labels KEY=VALUE for tagging VMs (repeat or comma-separated)
+    #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
+    pub label: Vec<String>,
+
     /// Command to run inside container
     ///
     /// Example: --cmd "nginx -g 'daemon off;'"

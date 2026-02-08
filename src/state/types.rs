@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
-use crate::network::NetworkConfig;
+use crate::network::{NetworkConfig, PortMapping};
 
 /// Safely truncate a string to at most `max_len` characters.
 /// Returns a string slice without panicking for short inputs.
@@ -115,6 +117,12 @@ pub struct VmConfig {
     /// to preserve this original_vm_id for clones to use the correct redirect.
     #[serde(default)]
     pub original_vsock_vm_id: Option<String>,
+    /// Published port mappings (host:guest)
+    #[serde(default)]
+    pub port_mappings: Vec<PortMapping>,
+    /// User-defined labels for tagging/filtering VMs
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
 }
 
 impl VmState {
@@ -144,6 +152,8 @@ impl VmState {
                 process_type: Some(ProcessType::Vm),
                 serve_pid: None,
                 original_vsock_vm_id: None,
+                port_mappings: Vec::new(),
+                labels: HashMap::new(),
             },
         }
     }

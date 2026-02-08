@@ -136,14 +136,165 @@ use crate::storage::{
     SnapshotVolumeConfig,
 };
 use crate::volume::{spawn_volume_servers, VolumeConfig};
+use tokio_util::sync::CancellationToken;
+
+/// All state accumulated during VM setup, bundled for the event loop and cleanup.
+pub struct VmContext {
+    pub vm_id: String,
+    pub vm_name: String,
+    pub data_dir: PathBuf,
+    pub vm_manager: VmManager,
+    pub holder_child: Option<tokio::process::Child>,
+    pub volume_server_handles: Vec<tokio::task::JoinHandle<()>>,
+    pub network: Box<dyn NetworkManager>,
+    pub network_config: NetworkConfig,
+    pub state_manager: StateManager,
+    pub health_cancel_token: CancellationToken,
+    pub health_monitor_handle: tokio::task::JoinHandle<()>,
+    pub status_handle: tokio::task::JoinHandle<()>,
+    pub tty_handle: Option<std::thread::JoinHandle<Result<i32>>>,
+    pub output_handle: Option<tokio::task::JoinHandle<Vec<(String, String)>>>,
+    pub cache_rx: Option<mpsc::Receiver<CacheRequest>>,
+    pub startup_rx: Option<oneshot::Receiver<()>>,
+    pub snapshot_key: Option<String>,
+    pub volume_configs: Vec<VolumeConfig>,
+    pub args: RunArgs,
+    pub disk_path: PathBuf,
+    pub log_tx: tokio::sync::broadcast::Sender<LogLine>,
+}
+
+/// A log line from the VM's container output.
+#[derive(Clone, Debug)]
+pub struct LogLine {
+    /// Stream type: "stdout", "stderr", or "system"
+    pub stream: String,
+    /// Line content
+    pub content: String,
+}
+
+/// Handle to a running VM. Returned by `start_vm()`.
+///
+/// The VM runs in a background tokio task. Use `stop()` to gracefully shut it down
+/// or `wait()` to wait for it to exit naturally.
+///
+/// On drop, the VM is cancelled automatically (the background task will clean up
+/// resources on its next poll). For explicit shutdown with exit code, use `stop()`.
+pub struct VmHandle {
+    /// Unique VM identifier (e.g., "vm-abc123")
+    pub vm_id: String,
+    /// Human-readable VM name
+    pub name: String,
+    /// Process ID of the fcvm process managing this VM
+    pub pid: u32,
+    cancel: CancellationToken,
+    task: Option<tokio::task::JoinHandle<Result<Option<i32>>>>,
+    log_tx: tokio::sync::broadcast::Sender<LogLine>,
+}
+
+impl VmHandle {
+    /// Get a clone of the cancellation token (for external cancellation).
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    /// Get the vsock socket path for this VM (used for exec/terminal connections).
+    pub fn vsock_socket_path(&self) -> PathBuf {
+        crate::paths::vm_runtime_dir(&self.vm_id).join("vsock.sock")
+    }
+
+    /// Gracefully stop the VM and wait for cleanup to complete.
+    /// Returns the container exit code (None if the container didn't exit naturally).
+    pub async fn stop(&mut self) -> Result<Option<i32>> {
+        self.cancel.cancel();
+        match self.task.take() {
+            Some(task) => task.await?,
+            None => Ok(None),
+        }
+    }
+
+    /// Wait for the VM to exit naturally (without cancelling).
+    /// Returns the container exit code.
+    pub async fn wait(&mut self) -> Result<Option<i32>> {
+        match self.task.take() {
+            Some(task) => task.await?,
+            None => Ok(None),
+        }
+    }
+
+    /// Query current VM state (health, IP, ports, labels, etc.) from the state manager.
+    pub async fn state(&self) -> Result<crate::state::VmState> {
+        let mgr = crate::state::StateManager::new(crate::paths::state_dir());
+        mgr.load_state(&self.vm_id).await
+    }
+
+    /// Subscribe to live container output (stdout/stderr) from this VM.
+    /// Returns a broadcast receiver that gets each log line as it's produced.
+    /// Late subscribers only see lines from the point of subscription.
+    pub fn subscribe_logs(&self) -> tokio::sync::broadcast::Receiver<LogLine> {
+        self.log_tx.subscribe()
+    }
+}
+
+impl Drop for VmHandle {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+/// Start a VM with the given args. Returns a handle to the running VM.
+///
+/// The VM event loop runs in a background task. The handle's `Drop` impl cancels
+/// the VM, so dropping the handle triggers cleanup. Use `stop()` for explicit
+/// shutdown with exit code, or `wait()` to wait for natural exit.
+///
+/// Note: `args.no_snapshot` is forced to `true` to skip snapshot cache lookups,
+/// ensuring a fresh VM is always started.
+pub async fn start_vm(mut args: RunArgs) -> Result<VmHandle> {
+    // Force no-snapshot mode — start_vm always creates a fresh VM
+    args.no_snapshot = true;
+
+    let mut ctx = prepare_vm(args)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("unexpected snapshot cache hit with no_snapshot=true"))?;
+
+    let vm_id = ctx.vm_id.clone();
+    let name = ctx.vm_name.clone();
+    let log_tx = ctx.log_tx.clone();
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+
+    // Get actual PID from VM state (set during prepare_vm)
+    let actual_pid = ctx
+        .state_manager
+        .load_state_by_name(&name)
+        .await
+        .ok()
+        .and_then(|s| s.pid)
+        .unwrap_or(0);
+
+    let task = tokio::spawn(async move {
+        let result = run_vm_loop(&mut ctx, cancel_clone).await;
+        cleanup_vm_context(ctx).await;
+        result
+    });
+
+    Ok(VmHandle {
+        vm_id,
+        name,
+        pid: actual_pid,
+        cancel,
+        task: Some(task),
+        log_tx,
+    })
+}
 
 /// Request to create a podman cache snapshot.
 /// Sent from status listener to main task when fc-agent signals cache-ready.
-struct CacheRequest {
+pub struct CacheRequest {
     /// Image digest from fc-agent
-    digest: String,
+    pub digest: String,
     /// Oneshot channel to signal completion back to status listener
-    ack_tx: oneshot::Sender<()>,
+    pub ack_tx: oneshot::Sender<()>,
 }
 
 /// Parameters for creating a snapshot, used by both podman run and snapshot run.
@@ -231,8 +382,7 @@ pub async fn create_snapshot_interruptible(
     network_config: &NetworkConfig,
     volume_configs: &[VolumeConfig],
     parent_snapshot_key: Option<&str>,
-    sigterm: &mut tokio::signal::unix::Signal,
-    sigint: &mut tokio::signal::unix::Signal,
+    cancel: &CancellationToken,
 ) -> SnapshotOutcome {
     let snapshot_fut = create_podman_snapshot(
         vm_manager,
@@ -246,13 +396,9 @@ pub async fn create_snapshot_interruptible(
     );
 
     tokio::select! {
-        biased; // Check signals first
-        _ = sigterm.recv() => {
-            info!("received SIGTERM during snapshot creation, shutting down VM");
-            SnapshotOutcome::Interrupted
-        }
-        _ = sigint.recv() => {
-            info!("received SIGINT during snapshot creation, shutting down VM");
+        biased; // Check cancellation first
+        _ = cancel.cancelled() => {
+            info!("snapshot creation interrupted by cancellation");
             SnapshotOutcome::Interrupted
         }
         result = snapshot_fut => {
@@ -872,6 +1018,7 @@ pub(crate) async fn run_output_listener(
     socket_path: &str,
     vm_id: &str,
     interactive: bool,
+    log_tx: Option<tokio::sync::broadcast::Sender<LogLine>>,
 ) -> Result<Vec<(String, String)>> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
@@ -968,6 +1115,14 @@ pub(crate) async fn run_output_listener(
                     }
                     output_lines.push((stream.to_string(), content.to_string()));
 
+                    // Forward to broadcast channel for library consumers
+                    if let Some(ref tx) = log_tx {
+                        let _ = tx.send(LogLine {
+                            stream: stream.to_string(),
+                            content: content.to_string(),
+                        });
+                    }
+
                     // Send ack back (bidirectional)
                     let mut w = writer.lock().await;
                     let _ = w.write_all(b"ack\n").await;
@@ -992,7 +1147,9 @@ pub(crate) async fn run_output_listener(
     Ok(output_lines)
 }
 
-async fn cmd_podman_run(args: RunArgs) -> Result<()> {
+/// Set up all resources and start the VM. Returns `None` on snapshot cache hit
+/// (handled internally via `cmd_snapshot_run`).
+pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
     info!("Starting fcvm podman run");
 
     // Validate VM name before any setup work
@@ -1004,8 +1161,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         bail!("--setup is not allowed when running as root. Run 'fcvm setup' first.");
     }
 
-    // Apply kernel profile runtime config (firecracker_args, boot_args, etc.)
-    // This is done regardless of whether --kernel is also specified
+    // Build RuntimeConfig from kernel profile (replaces env var config passing)
+    let mut runtime_config = super::common::RuntimeConfig::default();
     if let Some(ref profile_name) = args.kernel_profile {
         let profile = crate::setup::get_kernel_profile(profile_name)?.ok_or_else(|| {
             anyhow::anyhow!(
@@ -1017,22 +1174,20 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
 
         info!(profile = %profile_name, "using kernel profile");
 
-        // Apply runtime config from profile
-        // Get firecracker path (custom from profile or system fallback)
         let fc_path = crate::setup::get_firecracker_for_profile(&profile, profile_name).await?;
         info!(firecracker_bin = %fc_path.display(), "from profile");
-        std::env::set_var("FCVM_FIRECRACKER_BIN", fc_path.to_string_lossy().as_ref());
+        runtime_config.firecracker_bin = Some(fc_path);
         if let Some(ref fc_args) = profile.firecracker_args {
             info!(firecracker_args = %fc_args, "from profile");
-            std::env::set_var("FCVM_FIRECRACKER_ARGS", fc_args);
+            runtime_config.firecracker_args = Some(fc_args.clone());
         }
         if let Some(ref boot_args) = profile.boot_args {
             info!(boot_args = %boot_args, "from profile");
-            std::env::set_var("FCVM_BOOT_ARGS", boot_args);
+            runtime_config.boot_args = Some(boot_args.clone());
         }
         if let Some(readers) = profile.fuse_readers {
             info!(fuse_readers = %readers, "from profile");
-            std::env::set_var("FCVM_FUSE_READERS", readers.to_string());
+            runtime_config.fuse_readers = Some(readers);
         }
     }
 
@@ -1128,7 +1283,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 cpu: Some(args.cpu),
                 mem: Some(args.mem),
             };
-            return super::snapshot::cmd_snapshot_run(snapshot_args).await;
+            super::snapshot::cmd_snapshot_run(snapshot_args).await?;
+            return Ok(None);
         }
 
         // Check for pre-start snapshot (container loaded but not initialized)
@@ -1154,7 +1310,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                 cpu: Some(args.cpu),
                 mem: Some(args.mem),
             };
-            return super::snapshot::cmd_snapshot_run(snapshot_args).await;
+            super::snapshot::cmd_snapshot_run(snapshot_args).await?;
+            return Ok(None);
         }
 
         info!(
@@ -1363,6 +1520,13 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     vm_state.name = Some(vm_name.clone());
     vm_state.config.volumes = args.map.clone();
     vm_state.config.health_check_url = args.health_check.clone();
+    vm_state.config.port_mappings = port_mappings.clone();
+    vm_state.config.labels = args
+        .label
+        .iter()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
 
     // Initialize state manager
     let state_manager = StateManager::new(paths::state_dir());
@@ -1452,7 +1616,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
             "Skipping snapshot creation: volumes specified (FUSE doesn't survive snapshot pause)"
         );
     }
-    let (cache_tx, mut cache_rx): (
+    let (cache_tx, cache_rx): (
         Option<mpsc::Sender<CacheRequest>>,
         Option<mpsc::Receiver<CacheRequest>>,
     ) = if !skip_snapshot_creation {
@@ -1467,7 +1631,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // - Not skipping snapshots (no --no-snapshot, no volumes)
     // - Have a snapshot key
     // - Have a health_check URL configured (HTTP health check, not just container-ready)
-    let (startup_tx, mut startup_rx): (
+    let (startup_tx, startup_rx): (
         Option<tokio::sync::oneshot::Sender<()>>,
         Option<tokio::sync::oneshot::Receiver<()>>,
     ) = if !skip_snapshot_creation && snapshot_key.is_some() && args.health_check.is_some() {
@@ -1514,12 +1678,16 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         None
     };
 
+    // Broadcast channel for container output (used by VmHandle::subscribe_logs())
+    let (log_tx, _) = tokio::sync::broadcast::channel::<LogLine>(1000);
+
     // For non-TTY mode, use async output listener
     let output_handle = if !tty_mode {
         let socket_path = output_socket_path.clone();
         let vm_id_clone = vm_id.clone();
+        let log_tx_clone = Some(log_tx.clone());
         Some(tokio::spawn(async move {
-            match run_output_listener(&socket_path, &vm_id_clone, interactive).await {
+            match run_output_listener(&socket_path, &vm_id_clone, interactive, log_tx_clone).await {
                 Ok(lines) => lines,
                 Err(e) => {
                     tracing::warn!("Output listener error: {}", e);
@@ -1549,6 +1717,7 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         &vsock_socket_path,
         image_disk_path.as_deref(),
         fc_config,
+        &runtime_config,
     )
     .await;
 
@@ -1579,15 +1748,14 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         return Err(e);
     }
 
-    let (mut vm_manager, mut holder_child) = setup_result.unwrap();
+    let (vm_manager, holder_child) = setup_result.unwrap();
 
     info!(vm_id = %vm_id, "VM started successfully");
 
     // Create cancellation token for graceful health monitor shutdown
-    let health_cancel_token = tokio_util::sync::CancellationToken::new();
+    let health_cancel_token = CancellationToken::new();
 
     // Spawn health monitor task with startup snapshot trigger support
-    // Pass startup_tx to signal when health first becomes Healthy
     let health_monitor_handle = crate::health::spawn_health_monitor_full(
         vm_id.clone(),
         vm_state.pid,
@@ -1596,65 +1764,76 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         startup_tx,
     );
 
-    // Note: For rootless mode, slirp4netns wraps Firecracker and configures TAP automatically
-    // For bridged mode, TAP is configured via NAT routing during network setup
-
-    // Setup signal handlers
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
-
-    // Wait for signal, VM exit, or cache requests
-    // For TTY mode, we get exit code from the TTY listener thread
-    // For non-TTY mode, we read it from the file written by status listener
-    let container_exit_code: Option<i32>;
     let disk_path = data_dir.join("disks/rootfs.raw");
 
+    Ok(Some(VmContext {
+        vm_id,
+        vm_name,
+        data_dir,
+        vm_manager,
+        holder_child,
+        volume_server_handles,
+        network,
+        network_config,
+        state_manager,
+        health_cancel_token,
+        health_monitor_handle,
+        status_handle,
+        tty_handle,
+        output_handle,
+        cache_rx,
+        startup_rx,
+        snapshot_key,
+        volume_configs,
+        args,
+        disk_path,
+        log_tx,
+    }))
+}
+
+/// Event loop: waits for VM exit, cancellation, or snapshot requests.
+/// Returns the container exit code (None if cancelled/signalled).
+pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Result<Option<i32>> {
     loop {
         tokio::select! {
-            _ = sigterm.recv() => {
-                info!("received SIGTERM, shutting down VM");
-                container_exit_code = None;
-                break;
+            _ = cancel.cancelled() => {
+                info!("cancellation requested, shutting down VM");
+                return Ok(None);
             }
-            _ = sigint.recv() => {
-                info!("received SIGINT, shutting down VM");
-                container_exit_code = None;
-                break;
-            }
-            status = vm_manager.wait() => {
+            status = ctx.vm_manager.wait() => {
                 info!(status = ?status, "VM exited");
-                if let Some(handle) = tty_handle {
-                    container_exit_code = handle.join().ok().and_then(|r| r.ok());
-                    info!(container_exit_code = ?container_exit_code, "TTY container exit code");
+                if let Some(handle) = ctx.tty_handle.take() {
+                    let exit_code = handle.join().ok().and_then(|r| r.ok());
+                    info!(container_exit_code = ?exit_code, "TTY container exit code");
+                    return Ok(exit_code);
                 } else {
-                    let exit_file = data_dir.join("container-exit");
-                    container_exit_code = std::fs::read_to_string(&exit_file)
+                    let exit_file = ctx.data_dir.join("container-exit");
+                    let exit_code = std::fs::read_to_string(&exit_file)
                         .ok()
                         .and_then(|s| s.trim().parse::<i32>().ok());
-                    info!(container_exit_code = ?container_exit_code, "container exit code");
+                    info!(container_exit_code = ?exit_code, "container exit code");
+                    return Ok(exit_code);
                 }
-                break;
             }
             // Handle cache creation requests from fc-agent
             Some(cache_request) = async {
-                match cache_rx.as_mut() {
+                match ctx.cache_rx.as_mut() {
                     Some(rx) => rx.recv().await,
                     None => std::future::pending().await,
                 }
             } => {
-                if let Some(ref key) = snapshot_key {
+                if let Some(ref key) = ctx.snapshot_key {
                     info!(snapshot_key = %key, digest = %cache_request.digest, "Creating pre-start snapshot");
 
-                    let params = SnapshotCreationParams::from_run_args(&args);
+                    let params = SnapshotCreationParams::from_run_args(&ctx.args);
                     match create_snapshot_interruptible(
-                        &vm_manager, key, &vm_id, &params, &disk_path,
-                        &network_config, &volume_configs,
+                        &ctx.vm_manager, key, &ctx.vm_id, &params, &ctx.disk_path,
+                        &ctx.network_config, &ctx.volume_configs,
                         None, // Pre-start is the first snapshot, no parent
-                        &mut sigterm, &mut sigint,
+                        &cancel,
                     ).await {
                         SnapshotOutcome::Interrupted => {
-                            container_exit_code = None;
-                            break;
+                            return Ok(None);
                         }
                         SnapshotOutcome::Created => {
                             info!(snapshot_key = %key, "Pre-start snapshot created successfully");
@@ -1669,19 +1848,19 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                     // Should not happen if channel exists, but send ack anyway
                     let _ = cache_request.ack_tx.send(());
                 }
-                // Continue waiting for VM exit or signals
+                // Continue waiting for VM exit or cancellation
             }
             // Handle startup snapshot creation when health becomes healthy
             Ok(()) = async {
-                match startup_rx.as_mut() {
+                match ctx.startup_rx.as_mut() {
                     Some(rx) => rx.await,
                     None => std::future::pending().await,
                 }
             } => {
                 // Oneshot channel - prevent further attempts
-                startup_rx = None;
+                ctx.startup_rx = None;
 
-                if let Some(ref key) = snapshot_key {
+                if let Some(ref key) = ctx.snapshot_key {
                     let startup_key = startup_snapshot_key(key);
 
                     // Skip if startup snapshot already exists
@@ -1690,16 +1869,15 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                     } else {
                         info!(snapshot_key = %startup_key, "Creating startup snapshot (VM healthy)");
 
-                        let params = SnapshotCreationParams::from_run_args(&args);
+                        let params = SnapshotCreationParams::from_run_args(&ctx.args);
                         match create_snapshot_interruptible(
-                            &vm_manager, &startup_key, &vm_id, &params, &disk_path,
-                            &network_config, &volume_configs,
+                            &ctx.vm_manager, &startup_key, &ctx.vm_id, &params, &ctx.disk_path,
+                            &ctx.network_config, &ctx.volume_configs,
                             Some(key.as_str()), // Parent is pre-start snapshot
-                            &mut sigterm, &mut sigint,
+                            &cancel,
                         ).await {
                             SnapshotOutcome::Interrupted => {
-                                container_exit_code = None;
-                                break;
+                                return Ok(None);
                             }
                             SnapshotOutcome::Created => {
                                 info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
@@ -1710,34 +1888,60 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
                         }
                     }
                 }
-                // Continue waiting for VM exit or signals
+                // Continue waiting for VM exit or cancellation
             }
         }
     }
+}
 
+/// Clean up all resources associated with a VM.
+pub async fn cleanup_vm_context(mut ctx: VmContext) {
     // Cancel status listener (podman-specific)
-    status_handle.abort();
+    ctx.status_handle.abort();
 
     // Cleanup NFS exports
-    cleanup_nfs_exports(&vm_id).await;
+    cleanup_nfs_exports(&ctx.vm_id).await;
 
     // Cleanup common resources
     super::common::cleanup_vm(
-        &vm_id,
-        &mut vm_manager,
-        &mut holder_child,
-        volume_server_handles,
-        network.as_mut(),
-        &state_manager,
-        &data_dir,
-        Some(health_cancel_token),
-        Some(health_monitor_handle),
-        output_handle, // abort output listener task
+        &ctx.vm_id,
+        &mut ctx.vm_manager,
+        &mut ctx.holder_child,
+        ctx.volume_server_handles,
+        ctx.network.as_mut(),
+        &ctx.state_manager,
+        &ctx.data_dir,
+        Some(ctx.health_cancel_token),
+        Some(ctx.health_monitor_handle),
+        ctx.output_handle,
     )
     .await;
+}
+
+/// CLI entrypoint for `fcvm podman run`. Thin wrapper around prepare_vm/run_vm_loop/cleanup.
+async fn cmd_podman_run(args: RunArgs) -> Result<()> {
+    let Some(mut ctx) = prepare_vm(args).await? else {
+        return Ok(()); // Snapshot cache hit, already handled
+    };
+
+    // Setup signal handlers → cancellation token
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    tokio::spawn(async move {
+        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
+        tokio::select! {
+            _ = sigterm.recv() => { info!("received SIGTERM, shutting down VM"); }
+            _ = sigint.recv() => { info!("received SIGINT, shutting down VM"); }
+        }
+        cancel_clone.cancel();
+    });
+
+    let exit_code = run_vm_loop(&mut ctx, cancel).await?;
+    cleanup_vm_context(ctx).await;
 
     // Return error if container exited with non-zero exit code
-    if let Some(code) = container_exit_code {
+    if let Some(code) = exit_code {
         if code != 0 {
             bail!("container exited with code {}", code);
         }
@@ -1746,540 +1950,16 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-/// Helper function that runs VM setup and returns VmManager on success.
-/// This allows the caller to cleanup network resources on error.
-/// For rootless mode, also returns the holder process that keeps the namespace alive.
-#[allow(clippy::too_many_arguments)]
-async fn run_vm_setup(
+/// Build runtime boot arguments for the kernel command line.
+///
+/// These are per-instance values NOT included in the snapshot cache key:
+/// network IP config, IPv6, DNS, strace, profile boot args, FUSE tuning.
+fn build_runtime_boot_args(
     args: &RunArgs,
-    vm_id: &str,
-    data_dir: &std::path::Path,
-    base_rootfs: &std::path::Path,
-    socket_path: &std::path::Path,
-    kernel_path: &std::path::Path,
-    initrd_path: &std::path::Path,
     network_config: &crate::network::NetworkConfig,
-    network: &mut dyn NetworkManager,
-    cmd_args: Option<Vec<String>>,
-    state_manager: &StateManager,
-    vm_state: &mut VmState,
-    volume_mappings: &[VolumeMapping],
-    vsock_socket_path: &std::path::Path,
-    image_disk_path: Option<&std::path::Path>,
-    fc_config: Option<crate::firecracker::FirecrackerConfig>,
-) -> Result<(VmManager, Option<tokio::process::Child>)> {
-    // Setup storage - just need CoW copy (fc-agent is injected via initrd at boot)
-    let vm_dir = data_dir.join("disks");
-    let disk_manager =
-        DiskManager::new(vm_id.to_string(), base_rootfs.to_path_buf(), vm_dir.clone());
-
-    let rootfs_path = disk_manager
-        .create_cow_disk()
-        .await
-        .context("creating CoW disk")?;
-
-    // Estimate space needed for container image extraction inside VM.
-    // The archive is loaded via podman load which extracts layers onto the rootfs.
-    let image_overhead = if let Some(disk_path) = image_disk_path {
-        match tokio::fs::metadata(disk_path).await {
-            Ok(meta) => meta.len(),
-            Err(_) => 0,
-        }
-    } else {
-        0
-    };
-
-    // Ensure minimum free space (from --rootfs-size) plus room for the container image
-    crate::storage::disk::ensure_free_space(&rootfs_path, &args.rootfs_size, image_overhead)
-        .await
-        .context("ensuring rootfs free space")?;
-
-    info!(rootfs = %rootfs_path.display(), "disk prepared (fc-agent baked into Layer 2)");
-
-    let vm_name = args.name.clone();
-    info!(vm_name = %vm_name, vm_id = %vm_id, "creating VM manager");
-    let mut vm_manager = VmManager::new(vm_id.to_string(), socket_path.to_path_buf(), None);
-
-    // Set VM name for logging
-    vm_manager.set_vm_name(vm_name);
-
-    // Configure namespace isolation based on network type
-    let holder_child: Option<tokio::process::Child>;
-
-    if let Some(bridged_net) = network.as_any().downcast_ref::<BridgedNetwork>() {
-        // Bridged mode: use pre-created network namespace
-        holder_child = None;
-        if let Some(ns_id) = bridged_net.namespace_id() {
-            info!(namespace = %ns_id, "configuring VM to run in network namespace");
-            vm_manager.set_namespace(ns_id.to_string());
-        }
-    } else if let Some(slirp_net) = network.as_any().downcast_ref::<SlirpNetwork>() {
-        // Rootless mode: spawn holder process and set up namespace via nsenter
-        // This is fully rootless - no sudo required!
-
-        // Step 1: Spawn holder process (keeps namespace alive)
-        // Retry for up to 5 seconds if holder dies (transient failures under load)
-        let holder_cmd = slirp_net.build_holder_command();
-        info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
-
-        let retry_deadline = std::time::Instant::now() + super::common::HOLDER_RETRY_TIMEOUT;
-        let mut attempt = 0;
-
-        let (mut child, mut holder_pid, mut holder_stderr) = loop {
-            attempt += 1;
-
-            // Spawn holder with piped stderr to capture errors if it fails
-            let mut child = tokio::process::Command::new(&holder_cmd[0])
-                .args(&holder_cmd[1..])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .with_context(|| format!("failed to spawn holder: {:?}", holder_cmd))?;
-
-            let holder_pid = child.id().context("getting holder process PID")?;
-            if attempt > 1 {
-                info!(
-                    holder_pid = holder_pid,
-                    attempt = attempt,
-                    "namespace holder started (retry)"
-                );
-            } else {
-                info!(holder_pid = holder_pid, "namespace holder started");
-            }
-
-            // Wait for namespace to be ready by checking uid_map
-            let namespace_ready = crate::utils::wait_for_namespace_ready(
-                holder_pid,
-                super::common::NAMESPACE_READY_TIMEOUT,
-            )
-            .await;
-
-            // If namespace didn't become ready, kill holder and retry
-            if !namespace_ready {
-                let _ = child.kill().await;
-
-                if std::time::Instant::now() < retry_deadline {
-                    warn!(
-                        holder_pid = holder_pid,
-                        attempt = attempt,
-                        "namespace not ready, retrying holder creation..."
-                    );
-                    tokio::time::sleep(super::common::HOLDER_RETRY_INTERVAL).await;
-                    continue;
-                } else {
-                    bail!(
-                        "namespace not ready after {} attempts (holder PID {})",
-                        attempt,
-                        holder_pid
-                    );
-                }
-            }
-
-            // Take stderr pipe - we'll use it for diagnostics if holder dies later
-            let mut holder_stderr = child.stderr.take();
-
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    // Holder exited - capture stderr to see why
-                    let stderr = if let Some(ref mut pipe) = holder_stderr {
-                        use tokio::io::AsyncReadExt;
-                        let mut buf = String::new();
-                        let _ = pipe.read_to_string(&mut buf).await;
-                        buf
-                    } else {
-                        String::new()
-                    };
-
-                    if std::time::Instant::now() < retry_deadline {
-                        warn!(
-                            holder_pid = holder_pid,
-                            attempt = attempt,
-                            status = %status,
-                            stderr = %stderr.trim(),
-                            "holder died, retrying..."
-                        );
-                        tokio::time::sleep(super::common::HOLDER_RETRY_INTERVAL).await;
-                        continue;
-                    } else {
-                        bail!(
-                            "holder process exited immediately after {} attempts: status={}, stderr={}, cmd={:?}",
-                            attempt,
-                            status,
-                            stderr.trim(),
-                            holder_cmd
-                        );
-                    }
-                }
-                Ok(None) => {
-                    debug!(holder_pid = holder_pid, "holder running");
-                }
-                Err(e) => {
-                    warn!(holder_pid = holder_pid, error = ?e, "failed to check holder status");
-                }
-            }
-
-            // Check if holder is still alive before proceeding
-            if !crate::utils::is_process_alive(holder_pid) {
-                // Try to capture stderr from the dead holder process
-                let holder_stderr_content = if let Some(ref mut pipe) = holder_stderr {
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = String::new();
-                    match tokio::time::timeout(
-                        std::time::Duration::from_millis(100),
-                        pipe.read_to_string(&mut buf),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => buf,
-                        _ => String::new(),
-                    }
-                } else {
-                    String::new()
-                };
-
-                let _ = child.kill().await;
-
-                if std::time::Instant::now() < retry_deadline {
-                    warn!(
-                        holder_pid = holder_pid,
-                        attempt = attempt,
-                        holder_stderr = %holder_stderr_content.trim(),
-                        "holder died after initial check, retrying..."
-                    );
-                    tokio::time::sleep(super::common::HOLDER_RETRY_INTERVAL).await;
-                    continue;
-                } else {
-                    let max_user_ns = std::fs::read_to_string("/proc/sys/user/max_user_namespaces")
-                        .unwrap_or_else(|_| "unknown".to_string());
-                    bail!(
-                        "holder process (PID {}) died after {} attempts. \
-                         stderr='{}', max_user_namespaces={}. \
-                         This may indicate resource exhaustion or namespace limit reached.",
-                        holder_pid,
-                        attempt,
-                        holder_stderr_content.trim(),
-                        max_user_ns.trim()
-                    );
-                }
-            }
-
-            // Holder is alive - break out of retry loop
-            break (child, holder_pid, holder_stderr);
-        };
-
-        // Step 2: Run setup script via nsenter (creates TAPs, iptables, etc.)
-        // This is also inside retry logic - if holder dies during nsenter, retry everything
-        let setup_script = slirp_net.build_setup_script();
-        let mut nsenter_prefix = slirp_net.build_nsenter_prefix(holder_pid);
-
-        // Debug: Check if holder is still alive and namespace files exist
-        let proc_dir = format!("/proc/{}", holder_pid);
-        let ns_user = format!("/proc/{}/ns/user", holder_pid);
-        let ns_net = format!("/proc/{}/ns/net", holder_pid);
-        debug!(
-            holder_pid = holder_pid,
-            proc_exists = std::path::Path::new(&proc_dir).exists(),
-            ns_user_exists = std::path::Path::new(&ns_user).exists(),
-            ns_net_exists = std::path::Path::new(&ns_net).exists(),
-            "checking holder process before nsenter"
-        );
-
-        // Check for required devices before attempting network setup
-        let tun_exists = std::path::Path::new("/dev/net/tun").exists();
-        debug!(
-            holder_pid = holder_pid,
-            tun_exists = tun_exists,
-            "checking /dev/net/tun availability"
-        );
-        if !tun_exists {
-            warn!("/dev/net/tun not available - TAP device creation will fail");
-        }
-
-        info!(holder_pid = holder_pid, "running network setup via nsenter");
-
-        // Log the setup script for debugging
-        debug!(
-            holder_pid = holder_pid,
-            script = %setup_script.lines().filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#')).collect::<Vec<_>>().join("; "),
-            "network setup script"
-        );
-
-        let setup_output = tokio::process::Command::new(&nsenter_prefix[0])
-            .args(&nsenter_prefix[1..])
-            .arg("bash")
-            .arg("-c")
-            .arg(&setup_script)
-            .output()
-            .await
-            .context("running network setup via nsenter")?;
-
-        if !setup_output.status.success() {
-            let stderr = String::from_utf8_lossy(&setup_output.stderr);
-            let stdout = String::from_utf8_lossy(&setup_output.stdout);
-
-            // Re-check state for diagnostics
-            let holder_alive = std::path::Path::new(&proc_dir).exists();
-            let ns_user_exists = std::path::Path::new(&ns_user).exists();
-            let ns_net_exists = std::path::Path::new(&ns_net).exists();
-
-            // If holder died during nsenter, this is a retryable error
-            if !holder_alive && std::time::Instant::now() < retry_deadline {
-                // Holder died during nsenter - retry the whole thing
-                let holder_stderr_content = if let Some(ref mut pipe) = holder_stderr {
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = String::new();
-                    match tokio::time::timeout(
-                        std::time::Duration::from_millis(100),
-                        pipe.read_to_string(&mut buf),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => buf,
-                        _ => String::new(),
-                    }
-                } else {
-                    String::new()
-                };
-
-                let _ = child.kill().await;
-
-                warn!(
-                    holder_pid = holder_pid,
-                    attempt = attempt,
-                    holder_stderr = %holder_stderr_content.trim(),
-                    nsenter_stderr = %stderr.trim(),
-                    "holder died during nsenter, retrying..."
-                );
-
-                // Jump back to the retry loop by recursing into this block
-                // We need to restructure - for now just retry once more inline
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-                // Retry: spawn new holder
-                attempt += 1;
-                let mut retry_child = tokio::process::Command::new(&holder_cmd[0])
-                    .args(&holder_cmd[1..])
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-                    .with_context(|| {
-                        format!("failed to spawn holder on retry: {:?}", holder_cmd)
-                    })?;
-
-                let retry_holder_pid = retry_child.id().context("getting retry holder PID")?;
-                info!(
-                    holder_pid = retry_holder_pid,
-                    attempt = attempt,
-                    "namespace holder started (retry after nsenter failure)"
-                );
-
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-                if !crate::utils::is_process_alive(retry_holder_pid) {
-                    let _ = retry_child.kill().await;
-                    bail!(
-                        "holder died on retry after nsenter failure (attempt {})",
-                        attempt
-                    );
-                }
-
-                // Retry nsenter with new holder
-                let retry_nsenter_prefix = slirp_net.build_nsenter_prefix(retry_holder_pid);
-                let retry_output = tokio::process::Command::new(&retry_nsenter_prefix[0])
-                    .args(&retry_nsenter_prefix[1..])
-                    .arg("bash")
-                    .arg("-c")
-                    .arg(&setup_script)
-                    .output()
-                    .await
-                    .context("running network setup via nsenter (retry)")?;
-
-                if !retry_output.status.success() {
-                    let retry_stderr = String::from_utf8_lossy(&retry_output.stderr);
-                    let _ = retry_child.kill().await;
-                    bail!(
-                        "network setup failed on retry: {} (attempt {})",
-                        retry_stderr.trim(),
-                        attempt
-                    );
-                }
-
-                // Success on retry - update variables for rest of function
-                child = retry_child;
-                holder_pid = retry_holder_pid;
-                nsenter_prefix = slirp_net.build_nsenter_prefix(holder_pid);
-                info!(
-                    holder_pid = holder_pid,
-                    attempts = attempt,
-                    "network setup succeeded after retry"
-                );
-            } else {
-                // If holder died, try to capture its stderr for more context
-                let holder_stderr_content = if !holder_alive {
-                    if let Some(ref mut pipe) = holder_stderr {
-                        use tokio::io::AsyncReadExt;
-                        let mut buf = String::new();
-                        match tokio::time::timeout(
-                            std::time::Duration::from_millis(100),
-                            pipe.read_to_string(&mut buf),
-                        )
-                        .await
-                        {
-                            Ok(Ok(_)) => buf,
-                            _ => String::new(),
-                        }
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    String::new()
-                };
-
-                // Kill holder before bailing
-                let _ = child.kill().await;
-
-                // Log comprehensive error info at ERROR level (always visible)
-                warn!(
-                    holder_pid = holder_pid,
-                    holder_alive = holder_alive,
-                    holder_stderr = %holder_stderr_content.trim(),
-                    tun_exists = tun_exists,
-                    ns_user_exists = ns_user_exists,
-                    ns_net_exists = ns_net_exists,
-                    nsenter_stderr = %stderr.trim(),
-                    nsenter_stdout = %stdout.trim(),
-                    "network setup failed - diagnostics"
-                );
-
-                if !holder_alive {
-                    bail!(
-                        "network setup failed: holder died during nsenter after {} attempts. \
-                         nsenter_stderr='{}', holder_stderr='{}', \
-                         (tun={}, ns_user={}, ns_net={})",
-                        attempt,
-                        stderr.trim(),
-                        holder_stderr_content.trim(),
-                        tun_exists,
-                        ns_user_exists,
-                        ns_net_exists
-                    );
-                } else {
-                    bail!(
-                        "network setup failed: {} (tun={}, holder_alive={}, ns_user={}, ns_net={})",
-                        stderr.trim(),
-                        tun_exists,
-                        holder_alive,
-                        ns_user_exists,
-                        ns_net_exists
-                    );
-                }
-            }
-        }
-
-        if attempt > 1 {
-            info!(
-                holder_pid = holder_pid,
-                attempts = attempt,
-                "namespace setup succeeded after retries"
-            );
-        }
-
-        info!(holder_pid = holder_pid, "network setup complete");
-
-        // Verify TAP device was created successfully
-        let tap_device = &network_config.tap_device;
-        let verify_output = tokio::process::Command::new(&nsenter_prefix[0])
-            .args(&nsenter_prefix[1..])
-            .arg("ip")
-            .arg("link")
-            .arg("show")
-            .arg(tap_device)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await
-            .context("verifying TAP device")?;
-
-        if !verify_output.success() {
-            let _ = child.kill().await;
-            bail!(
-                "TAP device '{}' not found after network setup - setup may have failed silently",
-                tap_device
-            );
-        }
-        debug!(tap_device = %tap_device, "TAP device verified");
-
-        // Step 3: Set holder_pid so VmManager uses nsenter
-        vm_manager.set_holder_pid(holder_pid);
-
-        // Store holder_pid in state for health checks and cleanup
-        vm_state.holder_pid = Some(holder_pid);
-
-        holder_child = Some(child);
-    } else {
-        holder_child = None;
-    }
-
-    let firecracker_bin = super::common::find_firecracker()?;
-
-    vm_manager
-        .start(&firecracker_bin, None)
-        .await
-        .context("starting Firecracker")?;
-
-    let vm_pid = vm_manager.pid()?;
-    let client = vm_manager.client()?;
-
-    // Configure VM via API
-    info!("configuring VM via Firecracker API");
-
-    // Build FirecrackerConfig for launch (single source of truth for VM config)
-    // Use fc_config from cache check if available, otherwise build fresh.
-    // IMPORTANT: fc_config uses content-addressed base_rootfs path for cache key,
-    // but launch must use per-instance CoW copy path (rootfs_path).
-    let launch_config = fc_config
-        .map(|config| config.with_rootfs_path(rootfs_path.to_path_buf()))
-        .unwrap_or_else(|| {
-            use crate::firecracker::FcNetworkMode;
-            let network_mode = match args.network {
-                crate::cli::args::NetworkMode::Bridged => FcNetworkMode::Bridged,
-                crate::cli::args::NetworkMode::Rootless => FcNetworkMode::Rootless,
-            };
-            // Collect extra disk specifications
-            let mut extra_disks: Vec<String> = Vec::new();
-            extra_disks.extend(args.disk.iter().cloned());
-            extra_disks.extend(args.disk_dir.iter().cloned());
-            extra_disks.extend(args.nfs.iter().cloned());
-            // Collect env vars and volume mounts for cache key
-            let env_vars: Vec<String> = args.env.to_vec();
-            let volume_mounts: Vec<String> = args.map.to_vec();
-
-            crate::firecracker::FirecrackerConfig::new(
-                kernel_path.to_path_buf(),
-                initrd_path.to_path_buf(),
-                rootfs_path.to_path_buf(),
-                args.image.clone(),
-                cmd_args.clone(),
-                args.cpu,
-                args.mem,
-                network_mode,
-                crate::paths::data_dir(),
-                extra_disks,
-                env_vars,
-                volume_mounts,
-                args.privileged,
-                args.tty,
-                args.interactive,
-                args.rootfs_size.clone(),
-                args.health_check.clone(),
-            )
-        });
-
-    // Build runtime boot args (per-instance values NOT in cache key)
-    // These are added to the static boot_args from FirecrackerConfig
-    let mut runtime_boot_args = String::new();
+    runtime_config: &super::common::RuntimeConfig,
+) -> String {
+    let mut boot_args = String::new();
 
     // Network configuration via kernel cmdline
     // Format: ip=<client-ip>:<server-ip>:<gw-ip>:<netmask>:<hostname>:<device>:<autoconf>:<dns0>
@@ -2292,7 +1972,7 @@ async fn run_vm_setup(
             .map(|dns| format!(":{}", dns))
             .unwrap_or_default();
         // Use /24 netmask for slirp4netns (10.0.2.0/24) or bridged (172.30.x.0/24)
-        runtime_boot_args.push_str(&format!(
+        boot_args.push_str(&format!(
             "ip={}::{}:255.255.255.0::eth0:off{}",
             guest_ip_clean, host_ip_clean, dns_suffix
         ));
@@ -2304,20 +1984,20 @@ async fn run_vm_setup(
     if let (Some(guest_ipv6), Some(host_ipv6)) =
         (&network_config.guest_ipv6, &network_config.host_ipv6)
     {
-        if !runtime_boot_args.is_empty() {
-            runtime_boot_args.push(' ');
+        if !boot_args.is_empty() {
+            boot_args.push(' ');
         }
-        runtime_boot_args.push_str(&format!("ipv6={}|{}", guest_ipv6, host_ipv6));
+        boot_args.push_str(&format!("ipv6={}|{}", guest_ipv6, host_ipv6));
     }
 
     // Pass host DNS servers to guest for direct resolution (bypasses slirp's DNS proxy)
     // This is needed on IPv6-only hosts where slirp's 10.0.2.3 can't forward to IPv6 nameservers
     if let Ok(dns_servers) = crate::network::get_host_dns_servers() {
-        if !runtime_boot_args.is_empty() {
-            runtime_boot_args.push(' ');
+        if !boot_args.is_empty() {
+            boot_args.push(' ');
         }
         // Use | delimiter since : is part of IPv6 addresses
-        runtime_boot_args.push_str(&format!("fcvm_dns={}", dns_servers.join("|")));
+        boot_args.push_str(&format!("fcvm_dns={}", dns_servers.join("|")));
 
         // Pass search domains for short hostname resolution (only when DNS servers are available)
         if let Ok(content) = std::fs::read_to_string("/run/systemd/resolve/resolv.conf")
@@ -2330,70 +2010,88 @@ async fn run_vm_setup(
                 .map(|s| s.split_whitespace().collect())
                 .unwrap_or_default();
             if !search.is_empty() {
-                if !runtime_boot_args.is_empty() {
-                    runtime_boot_args.push(' ');
+                if !boot_args.is_empty() {
+                    boot_args.push(' ');
                 }
-                runtime_boot_args.push_str(&format!("fcvm_dns_search={}", search.join("|")));
+                boot_args.push_str(&format!("fcvm_dns_search={}", search.join("|")));
             }
         }
     }
 
     // Enable fc-agent strace debugging if requested
     if args.strace_agent {
-        if !runtime_boot_args.is_empty() {
-            runtime_boot_args.push(' ');
+        if !boot_args.is_empty() {
+            boot_args.push(' ');
         }
-        runtime_boot_args.push_str("fc_agent_strace=1");
+        boot_args.push_str("fc_agent_strace=1");
         info!("fc-agent strace debugging enabled - output will be in /tmp/fc-agent.strace");
     }
 
-    // Additional boot args from environment (caller controls)
-    if let Ok(extra) = std::env::var("FCVM_BOOT_ARGS") {
-        if !runtime_boot_args.is_empty() {
-            runtime_boot_args.push(' ');
+    // Additional boot args from RuntimeConfig (kernel profile) or FCVM_BOOT_ARGS env var
+    let extra_boot_args = runtime_config
+        .boot_args
+        .clone()
+        .or_else(|| std::env::var("FCVM_BOOT_ARGS").ok());
+    if let Some(ref extra) = extra_boot_args {
+        if !boot_args.is_empty() {
+            boot_args.push(' ');
         }
-        runtime_boot_args.push_str(&extra);
+        boot_args.push_str(extra);
     }
 
-    // Pass FUSE reader count to fc-agent via kernel command line.
-    if let Ok(readers) = std::env::var("FCVM_FUSE_READERS") {
-        if !runtime_boot_args.is_empty() {
-            runtime_boot_args.push(' ');
+    // Pass FUSE reader count to fc-agent via kernel command line (from RuntimeConfig or env)
+    let fuse_readers = runtime_config
+        .fuse_readers
+        .map(|r| r.to_string())
+        .or_else(|| std::env::var("FCVM_FUSE_READERS").ok());
+    if let Some(readers) = fuse_readers {
+        if !boot_args.is_empty() {
+            boot_args.push(' ');
         }
-        runtime_boot_args.push_str(&format!("fuse_readers={}", readers));
+        boot_args.push_str(&format!("fuse_readers={}", readers));
     }
 
     // Pass FUSE trace rate to fc-agent via kernel command line.
     if let Ok(rate) = std::env::var("FCVM_FUSE_TRACE_RATE") {
-        if !runtime_boot_args.is_empty() {
-            runtime_boot_args.push(' ');
+        if !boot_args.is_empty() {
+            boot_args.push(' ');
         }
-        runtime_boot_args.push_str(&format!("fuse_trace_rate={}", rate));
+        boot_args.push_str(&format!("fuse_trace_rate={}", rate));
     }
 
     // Pass FUSE max_write to fc-agent via kernel command line.
     if let Ok(max_write) = std::env::var("FCVM_FUSE_MAX_WRITE") {
-        if !runtime_boot_args.is_empty() {
-            runtime_boot_args.push(' ');
+        if !boot_args.is_empty() {
+            boot_args.push(' ');
         }
-        runtime_boot_args.push_str(&format!("fuse_max_write={}", max_write));
+        boot_args.push_str(&format!("fuse_max_write={}", max_write));
     }
 
     // Pass FUSE writeback cache disable flag to fc-agent via kernel command line.
     if std::env::var("FCVM_NO_WRITEBACK_CACHE").is_ok() {
-        if !runtime_boot_args.is_empty() {
-            runtime_boot_args.push(' ');
+        if !boot_args.is_empty() {
+            boot_args.push(' ');
         }
-        runtime_boot_args.push_str("no_writeback_cache=1");
+        boot_args.push_str("no_writeback_cache=1");
     }
 
-    // Apply FirecrackerConfig to client (boot_source, machine_config, rootfs drive)
-    // This ensures the same config used for cache key is used for launch
-    launch_config.apply(client, &runtime_boot_args).await?;
+    boot_args
+}
+
+/// Attach extra disks (--disk, --disk-dir, image archive) to the VM.
+///
+/// Returns the list of extra disks and optionally the image archive device path.
+#[allow(clippy::too_many_arguments)]
+async fn attach_extra_disks(
+    args: &RunArgs,
+    client: &crate::firecracker::FirecrackerClient,
+    data_dir: &std::path::Path,
+    image_disk_path: Option<&std::path::Path>,
+) -> Result<(Vec<crate::state::types::ExtraDisk>, Option<String>)> {
+    let mut extra_disks = Vec::new();
 
     // Extra disks (appear as /dev/vdb, /dev/vdc, etc.)
     // Parse format: HOST_PATH:GUEST_MOUNT[:ro]
-    let mut extra_disks = Vec::new();
     for (i, disk_spec) in args.disk.iter().enumerate() {
         // Check for :ro suffix
         let (spec_without_ro, read_only) = if disk_spec.ends_with(":ro") {
@@ -2536,6 +2234,7 @@ async fn run_vm_setup(
             )
             .await?;
     }
+
     // Attach image archive as a raw read-only block device.
     // fc-agent reads docker-archive:/dev/vdX directly — no FUSE, no mount.
     let image_device = if let Some(disk_path) = image_disk_path {
@@ -2566,6 +2265,668 @@ async fn run_vm_setup(
         None
     };
 
+    Ok((extra_disks, image_device))
+}
+
+/// Build MMDS data (container plan) and send it to Firecracker.
+///
+/// Includes volume/disk/NFS mount info, container plan, proxy config, and host time.
+#[allow(clippy::too_many_arguments)]
+async fn build_and_send_mmds(
+    args: &RunArgs,
+    client: &crate::firecracker::FirecrackerClient,
+    network_config: &crate::network::NetworkConfig,
+    vm_state: &VmState,
+    volume_mappings: &[VolumeMapping],
+    cmd_args: &Option<Vec<String>>,
+    image_device: Option<String>,
+) -> Result<()> {
+    // Build volume mount info for MMDS
+    // Format: { guest_path, vsock_port, read_only }
+    let volume_mounts: Vec<serde_json::Value> = volume_mappings
+        .iter()
+        .enumerate()
+        .map(|(idx, v)| {
+            serde_json::json!({
+                "guest_path": v.guest_path,
+                "vsock_port": VSOCK_VOLUME_PORT_BASE + idx as u32,
+                "read_only": v.read_only,
+            })
+        })
+        .collect();
+
+    // Build extra disk info for MMDS
+    // Format: { device, mount_path, read_only }
+    // Disks are added as /dev/vdb, /dev/vdc, etc.
+    let extra_disk_mounts: Vec<serde_json::Value> = vm_state
+        .config
+        .extra_disks
+        .iter()
+        .enumerate()
+        .map(|(idx, disk)| {
+            serde_json::json!({
+                "device": format!("/dev/vd{}", (b'b' + idx as u8) as char),
+                "mount_path": &disk.mount_path,
+                "read_only": disk.read_only,
+            })
+        })
+        .collect();
+
+    // NFS mounts for guest
+    // Format: { host_ip, host_path, mount_path, read_only }
+    let nfs_mounts: Vec<serde_json::Value> = vm_state
+        .config
+        .nfs_shares
+        .iter()
+        .map(|share| {
+            serde_json::json!({
+                "host_ip": network_config.host_ip.as_ref().unwrap_or(&"".to_string()),
+                "host_path": &share.host_path,
+                "mount_path": &share.mount_path,
+                "read_only": share.read_only,
+            })
+        })
+        .collect();
+
+    // MMDS data (container plan) - nested under "latest" for V2 compatibility
+    // Include host timestamp so guest can set clock immediately (avoiding slow NTP sync)
+    // Format without subsecond precision for Alpine `date` compatibility
+    let mmds_data = serde_json::json!({
+        "latest": {
+            "container-plan": {
+                "image": args.image,
+                "env": args.env.iter().map(|e| {
+                    let parts: Vec<&str> = e.splitn(2, '=').collect();
+                    (parts[0], parts.get(1).copied().unwrap_or(""))
+                }).collect::<std::collections::HashMap<_, _>>(),
+                "cmd": cmd_args,
+                "volumes": volume_mounts,
+                "extra_disks": extra_disk_mounts,
+                "nfs_mounts": nfs_mounts,
+                "image_archive": image_device,
+                "privileged": args.privileged,
+                "interactive": args.interactive,
+                "tty": args.tty,
+                // Use network-provided proxy, or fall back to environment variables.
+                // Resolve hostname to IPv4 since slirp VMs can only reach IPv4 addresses.
+                "http_proxy": network_config.http_proxy.clone()
+                    .or_else(|| std::env::var("http_proxy").ok())
+                    .or_else(|| std::env::var("HTTP_PROXY").ok())
+                    .and_then(|url| resolve_proxy_url(&url)),
+                "https_proxy": network_config.http_proxy.clone()
+                    .or_else(|| std::env::var("https_proxy").ok())
+                    .or_else(|| std::env::var("HTTPS_PROXY").ok())
+                    .or_else(|| std::env::var("http_proxy").ok())
+                    .or_else(|| std::env::var("HTTP_PROXY").ok())
+                    .and_then(|url| resolve_proxy_url(&url)),
+                "no_proxy": std::env::var("no_proxy")
+                    .or_else(|_| std::env::var("NO_PROXY"))
+                    .ok(),
+            },
+            "host-time": chrono::Utc::now().timestamp().to_string(),
+        }
+    });
+
+    client.put_mmds(mmds_data).await?;
+    Ok(())
+}
+
+/// Set up rootless namespace for VM networking.
+///
+/// Spawns a holder process with retry logic, runs network setup via nsenter,
+/// and verifies TAP device creation. Returns the holder child process and PID.
+async fn setup_rootless_namespace(
+    slirp_net: &SlirpNetwork,
+    network_config: &crate::network::NetworkConfig,
+    vm_manager: &mut VmManager,
+    vm_state: &mut VmState,
+) -> Result<tokio::process::Child> {
+    // Step 1: Spawn holder process (keeps namespace alive)
+    // Retry for up to 5 seconds if holder dies (transient failures under load)
+    let holder_cmd = slirp_net.build_holder_command();
+    info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
+
+    let retry_deadline = std::time::Instant::now() + super::common::HOLDER_RETRY_TIMEOUT;
+    let mut attempt = 0;
+
+    let (mut child, mut holder_pid, mut holder_stderr) = loop {
+        attempt += 1;
+
+        // Spawn holder with piped stderr to capture errors if it fails
+        let mut child = tokio::process::Command::new(&holder_cmd[0])
+            .args(&holder_cmd[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .with_context(|| format!("failed to spawn holder: {:?}", holder_cmd))?;
+
+        let holder_pid = child.id().context("getting holder process PID")?;
+        if attempt > 1 {
+            info!(
+                holder_pid = holder_pid,
+                attempt = attempt,
+                "namespace holder started (retry)"
+            );
+        } else {
+            info!(holder_pid = holder_pid, "namespace holder started");
+        }
+
+        // Wait for namespace to be ready by checking uid_map
+        let namespace_ready = crate::utils::wait_for_namespace_ready(
+            holder_pid,
+            super::common::NAMESPACE_READY_TIMEOUT,
+        )
+        .await;
+
+        // If namespace didn't become ready, kill holder and retry
+        if !namespace_ready {
+            let _ = child.kill().await;
+
+            if std::time::Instant::now() < retry_deadline {
+                warn!(
+                    holder_pid = holder_pid,
+                    attempt = attempt,
+                    "namespace not ready, retrying holder creation..."
+                );
+                tokio::time::sleep(super::common::HOLDER_RETRY_INTERVAL).await;
+                continue;
+            } else {
+                bail!(
+                    "namespace not ready after {} attempts (holder PID {})",
+                    attempt,
+                    holder_pid
+                );
+            }
+        }
+
+        // Take stderr pipe - we'll use it for diagnostics if holder dies later
+        let mut holder_stderr = child.stderr.take();
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Holder exited - capture stderr to see why
+                let stderr = if let Some(ref mut pipe) = holder_stderr {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = String::new();
+                    let _ = pipe.read_to_string(&mut buf).await;
+                    buf
+                } else {
+                    String::new()
+                };
+
+                if std::time::Instant::now() < retry_deadline {
+                    warn!(
+                        holder_pid = holder_pid,
+                        attempt = attempt,
+                        status = %status,
+                        stderr = %stderr.trim(),
+                        "holder died, retrying..."
+                    );
+                    tokio::time::sleep(super::common::HOLDER_RETRY_INTERVAL).await;
+                    continue;
+                } else {
+                    bail!(
+                        "holder process exited immediately after {} attempts: status={}, stderr={}, cmd={:?}",
+                        attempt,
+                        status,
+                        stderr.trim(),
+                        holder_cmd
+                    );
+                }
+            }
+            Ok(None) => {
+                debug!(holder_pid = holder_pid, "holder running");
+            }
+            Err(e) => {
+                warn!(holder_pid = holder_pid, error = ?e, "failed to check holder status");
+            }
+        }
+
+        // Check if holder is still alive before proceeding
+        if !crate::utils::is_process_alive(holder_pid) {
+            // Try to capture stderr from the dead holder process
+            let holder_stderr_content = if let Some(ref mut pipe) = holder_stderr {
+                use tokio::io::AsyncReadExt;
+                let mut buf = String::new();
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    pipe.read_to_string(&mut buf),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => buf,
+                    _ => String::new(),
+                }
+            } else {
+                String::new()
+            };
+
+            let _ = child.kill().await;
+
+            if std::time::Instant::now() < retry_deadline {
+                warn!(
+                    holder_pid = holder_pid,
+                    attempt = attempt,
+                    holder_stderr = %holder_stderr_content.trim(),
+                    "holder died after initial check, retrying..."
+                );
+                tokio::time::sleep(super::common::HOLDER_RETRY_INTERVAL).await;
+                continue;
+            } else {
+                let max_user_ns = std::fs::read_to_string("/proc/sys/user/max_user_namespaces")
+                    .unwrap_or_else(|_| "unknown".to_string());
+                bail!(
+                    "holder process (PID {}) died after {} attempts. \
+                     stderr='{}', max_user_namespaces={}. \
+                     This may indicate resource exhaustion or namespace limit reached.",
+                    holder_pid,
+                    attempt,
+                    holder_stderr_content.trim(),
+                    max_user_ns.trim()
+                );
+            }
+        }
+
+        // Holder is alive - break out of retry loop
+        break (child, holder_pid, holder_stderr);
+    };
+
+    // Step 2: Run setup script via nsenter (creates TAPs, iptables, etc.)
+    // This is also inside retry logic - if holder dies during nsenter, retry everything
+    let setup_script = slirp_net.build_setup_script();
+    let mut nsenter_prefix = slirp_net.build_nsenter_prefix(holder_pid);
+
+    // Debug: Check if holder is still alive and namespace files exist
+    let proc_dir = format!("/proc/{}", holder_pid);
+    let ns_user = format!("/proc/{}/ns/user", holder_pid);
+    let ns_net = format!("/proc/{}/ns/net", holder_pid);
+    debug!(
+        holder_pid = holder_pid,
+        proc_exists = std::path::Path::new(&proc_dir).exists(),
+        ns_user_exists = std::path::Path::new(&ns_user).exists(),
+        ns_net_exists = std::path::Path::new(&ns_net).exists(),
+        "checking holder process before nsenter"
+    );
+
+    // Check for required devices before attempting network setup
+    let tun_exists = std::path::Path::new("/dev/net/tun").exists();
+    debug!(
+        holder_pid = holder_pid,
+        tun_exists = tun_exists,
+        "checking /dev/net/tun availability"
+    );
+    if !tun_exists {
+        warn!("/dev/net/tun not available - TAP device creation will fail");
+    }
+
+    info!(holder_pid = holder_pid, "running network setup via nsenter");
+
+    // Log the setup script for debugging
+    debug!(
+        holder_pid = holder_pid,
+        script = %setup_script.lines().filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#')).collect::<Vec<_>>().join("; "),
+        "network setup script"
+    );
+
+    let setup_output = tokio::process::Command::new(&nsenter_prefix[0])
+        .args(&nsenter_prefix[1..])
+        .arg("bash")
+        .arg("-c")
+        .arg(&setup_script)
+        .output()
+        .await
+        .context("running network setup via nsenter")?;
+
+    if !setup_output.status.success() {
+        let stderr = String::from_utf8_lossy(&setup_output.stderr);
+        let stdout = String::from_utf8_lossy(&setup_output.stdout);
+
+        // Re-check state for diagnostics
+        let holder_alive = std::path::Path::new(&proc_dir).exists();
+        let ns_user_exists = std::path::Path::new(&ns_user).exists();
+        let ns_net_exists = std::path::Path::new(&ns_net).exists();
+
+        // If holder died during nsenter, this is a retryable error
+        if !holder_alive && std::time::Instant::now() < retry_deadline {
+            // Holder died during nsenter - retry the whole thing
+            let holder_stderr_content = if let Some(ref mut pipe) = holder_stderr {
+                use tokio::io::AsyncReadExt;
+                let mut buf = String::new();
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    pipe.read_to_string(&mut buf),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => buf,
+                    _ => String::new(),
+                }
+            } else {
+                String::new()
+            };
+
+            let _ = child.kill().await;
+
+            warn!(
+                holder_pid = holder_pid,
+                attempt = attempt,
+                holder_stderr = %holder_stderr_content.trim(),
+                nsenter_stderr = %stderr.trim(),
+                "holder died during nsenter, retrying..."
+            );
+
+            // Jump back to the retry loop by recursing into this block
+            // We need to restructure - for now just retry once more inline
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            // Retry: spawn new holder
+            attempt += 1;
+            let mut retry_child = tokio::process::Command::new(&holder_cmd[0])
+                .args(&holder_cmd[1..])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .with_context(|| format!("failed to spawn holder on retry: {:?}", holder_cmd))?;
+
+            let retry_holder_pid = retry_child.id().context("getting retry holder PID")?;
+            info!(
+                holder_pid = retry_holder_pid,
+                attempt = attempt,
+                "namespace holder started (retry after nsenter failure)"
+            );
+
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            if !crate::utils::is_process_alive(retry_holder_pid) {
+                let _ = retry_child.kill().await;
+                bail!(
+                    "holder died on retry after nsenter failure (attempt {})",
+                    attempt
+                );
+            }
+
+            // Retry nsenter with new holder
+            let retry_nsenter_prefix = slirp_net.build_nsenter_prefix(retry_holder_pid);
+            let retry_output = tokio::process::Command::new(&retry_nsenter_prefix[0])
+                .args(&retry_nsenter_prefix[1..])
+                .arg("bash")
+                .arg("-c")
+                .arg(&setup_script)
+                .output()
+                .await
+                .context("running network setup via nsenter (retry)")?;
+
+            if !retry_output.status.success() {
+                let retry_stderr = String::from_utf8_lossy(&retry_output.stderr);
+                let _ = retry_child.kill().await;
+                bail!(
+                    "network setup failed on retry: {} (attempt {})",
+                    retry_stderr.trim(),
+                    attempt
+                );
+            }
+
+            // Success on retry - update variables for rest of function
+            child = retry_child;
+            holder_pid = retry_holder_pid;
+            nsenter_prefix = slirp_net.build_nsenter_prefix(holder_pid);
+            info!(
+                holder_pid = holder_pid,
+                attempts = attempt,
+                "network setup succeeded after retry"
+            );
+        } else {
+            // If holder died, try to capture its stderr for more context
+            let holder_stderr_content = if !holder_alive {
+                if let Some(ref mut pipe) = holder_stderr {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = String::new();
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        pipe.read_to_string(&mut buf),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => buf,
+                        _ => String::new(),
+                    }
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+
+            // Kill holder before bailing
+            let _ = child.kill().await;
+
+            // Log comprehensive error info at ERROR level (always visible)
+            warn!(
+                holder_pid = holder_pid,
+                holder_alive = holder_alive,
+                holder_stderr = %holder_stderr_content.trim(),
+                tun_exists = tun_exists,
+                ns_user_exists = ns_user_exists,
+                ns_net_exists = ns_net_exists,
+                nsenter_stderr = %stderr.trim(),
+                nsenter_stdout = %stdout.trim(),
+                "network setup failed - diagnostics"
+            );
+
+            if !holder_alive {
+                bail!(
+                    "network setup failed: holder died during nsenter after {} attempts. \
+                     nsenter_stderr='{}', holder_stderr='{}', \
+                     (tun={}, ns_user={}, ns_net={})",
+                    attempt,
+                    stderr.trim(),
+                    holder_stderr_content.trim(),
+                    tun_exists,
+                    ns_user_exists,
+                    ns_net_exists
+                );
+            } else {
+                bail!(
+                    "network setup failed: {} (tun={}, holder_alive={}, ns_user={}, ns_net={})",
+                    stderr.trim(),
+                    tun_exists,
+                    holder_alive,
+                    ns_user_exists,
+                    ns_net_exists
+                );
+            }
+        }
+    }
+
+    if attempt > 1 {
+        info!(
+            holder_pid = holder_pid,
+            attempts = attempt,
+            "namespace setup succeeded after retries"
+        );
+    }
+
+    info!(holder_pid = holder_pid, "network setup complete");
+
+    // Verify TAP device was created successfully
+    let tap_device = &network_config.tap_device;
+    let verify_output = tokio::process::Command::new(&nsenter_prefix[0])
+        .args(&nsenter_prefix[1..])
+        .arg("ip")
+        .arg("link")
+        .arg("show")
+        .arg(tap_device)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .context("verifying TAP device")?;
+
+    if !verify_output.success() {
+        let _ = child.kill().await;
+        bail!(
+            "TAP device '{}' not found after network setup - setup may have failed silently",
+            tap_device
+        );
+    }
+    debug!(tap_device = %tap_device, "TAP device verified");
+
+    // Set holder_pid so VmManager uses nsenter
+    vm_manager.set_holder_pid(holder_pid);
+
+    // Store holder_pid in state for health checks and cleanup
+    vm_state.holder_pid = Some(holder_pid);
+
+    Ok(child)
+}
+
+/// Helper function that runs VM setup and returns VmManager on success.
+/// This allows the caller to cleanup network resources on error.
+/// For rootless mode, also returns the holder process that keeps the namespace alive.
+#[allow(clippy::too_many_arguments)]
+async fn run_vm_setup(
+    args: &RunArgs,
+    vm_id: &str,
+    data_dir: &std::path::Path,
+    base_rootfs: &std::path::Path,
+    socket_path: &std::path::Path,
+    kernel_path: &std::path::Path,
+    initrd_path: &std::path::Path,
+    network_config: &crate::network::NetworkConfig,
+    network: &mut dyn NetworkManager,
+    cmd_args: Option<Vec<String>>,
+    state_manager: &StateManager,
+    vm_state: &mut VmState,
+    volume_mappings: &[VolumeMapping],
+    vsock_socket_path: &std::path::Path,
+    image_disk_path: Option<&std::path::Path>,
+    fc_config: Option<crate::firecracker::FirecrackerConfig>,
+    runtime_config: &super::common::RuntimeConfig,
+) -> Result<(VmManager, Option<tokio::process::Child>)> {
+    // Setup storage - just need CoW copy (fc-agent is injected via initrd at boot)
+    let vm_dir = data_dir.join("disks");
+    let disk_manager =
+        DiskManager::new(vm_id.to_string(), base_rootfs.to_path_buf(), vm_dir.clone());
+
+    let rootfs_path = disk_manager
+        .create_cow_disk()
+        .await
+        .context("creating CoW disk")?;
+
+    // Estimate space needed for container image extraction inside VM.
+    // The archive is loaded via podman load which extracts layers onto the rootfs.
+    let image_overhead = if let Some(disk_path) = image_disk_path {
+        match tokio::fs::metadata(disk_path).await {
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
+        }
+    } else {
+        0
+    };
+
+    // Ensure minimum free space (from --rootfs-size) plus room for the container image
+    crate::storage::disk::ensure_free_space(&rootfs_path, &args.rootfs_size, image_overhead)
+        .await
+        .context("ensuring rootfs free space")?;
+
+    info!(rootfs = %rootfs_path.display(), "disk prepared (fc-agent baked into Layer 2)");
+
+    let vm_name = args.name.clone();
+    info!(vm_name = %vm_name, vm_id = %vm_id, "creating VM manager");
+    let mut vm_manager = VmManager::new(vm_id.to_string(), socket_path.to_path_buf(), None);
+
+    // Set VM name for logging
+    vm_manager.set_vm_name(vm_name);
+
+    // Configure namespace isolation based on network type
+    let holder_child: Option<tokio::process::Child>;
+
+    if let Some(bridged_net) = network.as_any().downcast_ref::<BridgedNetwork>() {
+        // Bridged mode: use pre-created network namespace
+        holder_child = None;
+        if let Some(ns_id) = bridged_net.namespace_id() {
+            info!(namespace = %ns_id, "configuring VM to run in network namespace");
+            vm_manager.set_namespace(ns_id.to_string());
+        }
+    } else if let Some(slirp_net) = network.as_any().downcast_ref::<SlirpNetwork>() {
+        holder_child = Some(
+            setup_rootless_namespace(slirp_net, network_config, &mut vm_manager, vm_state).await?,
+        );
+    } else {
+        holder_child = None;
+    }
+
+    let firecracker_bin = super::common::find_firecracker(runtime_config)?;
+
+    // Use RuntimeConfig firecracker_args (from --kernel-profile), falling back to env var
+    let fc_args_env = std::env::var("FCVM_FIRECRACKER_ARGS").ok();
+    let fc_args = runtime_config
+        .firecracker_args
+        .as_deref()
+        .or(fc_args_env.as_deref());
+
+    vm_manager
+        .start(&firecracker_bin, None, fc_args)
+        .await
+        .context("starting Firecracker")?;
+
+    let vm_pid = vm_manager.pid()?;
+    let client = vm_manager.client()?;
+
+    // Configure VM via API
+    info!("configuring VM via Firecracker API");
+
+    // Build FirecrackerConfig for launch (single source of truth for VM config)
+    // Use fc_config from cache check if available, otherwise build fresh.
+    // IMPORTANT: fc_config uses content-addressed base_rootfs path for cache key,
+    // but launch must use per-instance CoW copy path (rootfs_path).
+    let launch_config = fc_config
+        .map(|config| config.with_rootfs_path(rootfs_path.to_path_buf()))
+        .unwrap_or_else(|| {
+            use crate::firecracker::FcNetworkMode;
+            let network_mode = match args.network {
+                crate::cli::args::NetworkMode::Bridged => FcNetworkMode::Bridged,
+                crate::cli::args::NetworkMode::Rootless => FcNetworkMode::Rootless,
+            };
+            // Collect extra disk specifications
+            let mut extra_disks: Vec<String> = Vec::new();
+            extra_disks.extend(args.disk.iter().cloned());
+            extra_disks.extend(args.disk_dir.iter().cloned());
+            extra_disks.extend(args.nfs.iter().cloned());
+            // Collect env vars and volume mounts for cache key
+            let env_vars: Vec<String> = args.env.to_vec();
+            let volume_mounts: Vec<String> = args.map.to_vec();
+
+            crate::firecracker::FirecrackerConfig::new(
+                kernel_path.to_path_buf(),
+                initrd_path.to_path_buf(),
+                rootfs_path.to_path_buf(),
+                args.image.clone(),
+                cmd_args.clone(),
+                args.cpu,
+                args.mem,
+                network_mode,
+                crate::paths::data_dir(),
+                extra_disks,
+                env_vars,
+                volume_mounts,
+                args.privileged,
+                args.tty,
+                args.interactive,
+                args.rootfs_size.clone(),
+                args.health_check.clone(),
+            )
+        });
+
+    // Build runtime boot args and apply FirecrackerConfig
+    let runtime_boot_args = build_runtime_boot_args(args, network_config, runtime_config);
+    launch_config.apply(client, &runtime_boot_args).await?;
+
+    // Attach extra disks and image archive
+    let (extra_disks, image_device) =
+        attach_extra_disks(args, client, data_dir, image_disk_path).await?;
     vm_state.config.extra_disks = extra_disks;
 
     // Process --nfs: export directories via NFS for guest to mount
@@ -2678,93 +3039,17 @@ async fn run_vm_setup(
         })
         .await?;
 
-    // Build volume mount info for MMDS
-    // Format: { guest_path, vsock_port, read_only }
-    let volume_mounts: Vec<serde_json::Value> = volume_mappings
-        .iter()
-        .enumerate()
-        .map(|(idx, v)| {
-            serde_json::json!({
-                "guest_path": v.guest_path,
-                "vsock_port": VSOCK_VOLUME_PORT_BASE + idx as u32,
-                "read_only": v.read_only,
-            })
-        })
-        .collect();
-
-    // Build extra disk info for MMDS
-    // Format: { device, mount_path, read_only }
-    // Disks are added as /dev/vdb, /dev/vdc, etc.
-    let extra_disk_mounts: Vec<serde_json::Value> = vm_state
-        .config
-        .extra_disks
-        .iter()
-        .enumerate()
-        .map(|(idx, disk)| {
-            serde_json::json!({
-                "device": format!("/dev/vd{}", (b'b' + idx as u8) as char),
-                "mount_path": &disk.mount_path,
-                "read_only": disk.read_only,
-            })
-        })
-        .collect();
-
-    // NFS mounts for guest
-    // Format: { host_ip, host_path, mount_path, read_only }
-    let nfs_mounts: Vec<serde_json::Value> = vm_state
-        .config
-        .nfs_shares
-        .iter()
-        .map(|share| {
-            serde_json::json!({
-                "host_ip": network_config.host_ip.as_ref().unwrap_or(&"".to_string()),
-                "host_path": &share.host_path,
-                "mount_path": &share.mount_path,
-                "read_only": share.read_only,
-            })
-        })
-        .collect();
-
-    // MMDS data (container plan) - nested under "latest" for V2 compatibility
-    // Include host timestamp so guest can set clock immediately (avoiding slow NTP sync)
-    // Format without subsecond precision for Alpine `date` compatibility
-    let mmds_data = serde_json::json!({
-        "latest": {
-            "container-plan": {
-                "image": args.image,
-                "env": args.env.iter().map(|e| {
-                    let parts: Vec<&str> = e.splitn(2, '=').collect();
-                    (parts[0], parts.get(1).copied().unwrap_or(""))
-                }).collect::<std::collections::HashMap<_, _>>(),
-                "cmd": cmd_args,
-                "volumes": volume_mounts,
-                "extra_disks": extra_disk_mounts,
-                "nfs_mounts": nfs_mounts,
-                "image_archive": image_device.clone(),
-                "privileged": args.privileged,
-                "interactive": args.interactive,
-                "tty": args.tty,
-                // Use network-provided proxy, or fall back to environment variables.
-                // Resolve hostname to IPv4 since slirp VMs can only reach IPv4 addresses.
-                "http_proxy": network_config.http_proxy.clone()
-                    .or_else(|| std::env::var("http_proxy").ok())
-                    .or_else(|| std::env::var("HTTP_PROXY").ok())
-                    .and_then(|url| resolve_proxy_url(&url)),
-                "https_proxy": network_config.http_proxy.clone()
-                    .or_else(|| std::env::var("https_proxy").ok())
-                    .or_else(|| std::env::var("HTTPS_PROXY").ok())
-                    .or_else(|| std::env::var("http_proxy").ok())
-                    .or_else(|| std::env::var("HTTP_PROXY").ok())
-                    .and_then(|url| resolve_proxy_url(&url)),
-                "no_proxy": std::env::var("no_proxy")
-                    .or_else(|_| std::env::var("NO_PROXY"))
-                    .ok(),
-            },
-            "host-time": chrono::Utc::now().timestamp().to_string(),
-        }
-    });
-
-    client.put_mmds(mmds_data).await?;
+    // Build and send MMDS data (container plan)
+    build_and_send_mmds(
+        args,
+        client,
+        network_config,
+        vm_state,
+        volume_mappings,
+        &cmd_args,
+        image_device,
+    )
+    .await?;
 
     // Configure entropy device (virtio-rng) for better random number generation
     client
