@@ -1033,23 +1033,11 @@ pub(crate) async fn run_output_listener(
 
     let mut output_lines: Vec<(String, String)> = Vec::new();
 
-    // Accept connection from fc-agent
-    let accept_result = tokio::time::timeout(
-        std::time::Duration::from_secs(120), // Wait up to 2 min for connection
-        listener.accept(),
-    )
-    .await;
-
-    let (stream, _) = match accept_result {
-        Ok(Ok(conn)) => conn,
-        Ok(Err(e)) => {
+    // Accept connection from fc-agent (no timeout - image import can take 10+ min)
+    let (stream, _) = match listener.accept().await {
+        Ok(conn) => conn,
+        Err(e) => {
             warn!(vm_id = %vm_id, error = %e, "Error accepting output connection");
-            let _ = std::fs::remove_file(socket_path);
-            return Ok(output_lines);
-        }
-        Err(_) => {
-            // Timeout - container probably didn't produce output
-            debug!(vm_id = %vm_id, "Output listener timeout, no connection");
             let _ = std::fs::remove_file(socket_path);
             return Ok(output_lines);
         }
@@ -1106,14 +1094,19 @@ pub(crate) async fn run_output_listener(
                 // Parse raw line format: stream:content
                 let line = line_buf.trim_end();
                 if let Some((stream, content)) = line.split_once(':') {
-                    // Print container output directly (stdout to stdout, stderr to stderr)
-                    // No prefix - clean output for scripting
-                    if stream == "stdout" {
-                        println!("{}", content);
+                    if stream == "heartbeat" {
+                        // Heartbeat from fc-agent during long operations (image import/pull)
+                        info!(vm_id = %vm_id, phase = %content, "VM heartbeat");
                     } else {
-                        eprintln!("{}", content);
+                        // Print container output directly (stdout to stdout, stderr to stderr)
+                        // No prefix - clean output for scripting
+                        if stream == "stdout" {
+                            println!("{}", content);
+                        } else {
+                            eprintln!("{}", content);
+                        }
+                        output_lines.push((stream.to_string(), content.to_string()));
                     }
-                    output_lines.push((stream.to_string(), content.to_string()));
 
                     // Forward to broadcast channel for library consumers
                     if let Some(ref tx) = log_tx {
@@ -1444,7 +1437,13 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
 
             // Save to a temp file in the same directory, then rename.
             // This avoids corrupt archives from interrupted exports (atomic rename).
-            let tmp_path = archive_path.with_extension("docker.tar.tmp");
+            // NOTE: Can't use with_extension("docker.tar.tmp") here because archive_path
+            // ends in .docker.tar — with_extension replaces after the last dot, producing
+            // .docker.docker.tar.tmp (double .docker). Use format! to just append .tmp.
+            let tmp_path = PathBuf::from(format!("{}.tmp", archive_path.display()));
+
+            // Remove stale tmp file if it exists (podman save won't overwrite)
+            let _ = tokio::fs::remove_file(&tmp_path).await;
 
             let output = tokio::process::Command::new("podman")
                 .args([

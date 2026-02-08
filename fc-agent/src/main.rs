@@ -2639,6 +2639,16 @@ async fn run_agent() -> Result<()> {
         });
     }
 
+    // Connect output vsock early so host can track our progress during long operations
+    // (image import can take 10+ minutes for large images)
+    let output_fd = create_output_vsock();
+    if output_fd >= 0 {
+        eprintln!(
+            "[fc-agent] output vsock connected early (port {})",
+            OUTPUT_VSOCK_PORT
+        );
+    }
+
     // Determine the image reference for podman run
     // If image_archive is set, import into podman storage first (so snapshot captures it)
     // Otherwise, pull from registry
@@ -2652,20 +2662,46 @@ async fn run_agent() -> Result<()> {
                 .output();
         }
 
-        // Import into podman storage so the pre-start snapshot captures the loaded image.
-        // Without this, every snapshot restore would re-read the entire tar from /dev/vdb.
-        let output = Command::new("podman")
+        // Import into podman storage with heartbeats so the host knows we're alive.
+        // podman load reads the entire archive (can be 26GB+), taking 10+ minutes.
+        let mut load_child = Command::new("podman")
             .args(["load", "-i", archive_path])
-            .output()
-            .await
-            .context("running podman load")?;
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawning podman load")?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        // Send heartbeats every 30s while waiting for podman load to finish
+        let status = loop {
+            tokio::select! {
+                result = load_child.wait() => {
+                    break result.context("waiting for podman load")?;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    send_output_line(output_fd, "heartbeat", "importing image");
+                    eprintln!("[fc-agent] heartbeat: still importing image...");
+                }
+            }
+        };
+
+        if !status.success() {
+            let stderr = if let Some(mut se) = load_child.stderr.take() {
+                let mut buf = String::new();
+                let _ = tokio::io::AsyncReadExt::read_to_string(&mut se, &mut buf).await;
+                buf
+            } else {
+                String::new()
+            };
             anyhow::bail!("podman load failed: {}", stderr);
         }
 
-        let loaded_output = String::from_utf8_lossy(&output.stdout);
+        let loaded_output = if let Some(mut so) = load_child.stdout.take() {
+            let mut buf = String::new();
+            let _ = tokio::io::AsyncReadExt::read_to_string(&mut so, &mut buf).await;
+            buf
+        } else {
+            String::new()
+        };
         eprintln!("[fc-agent] podman load: {}", loaded_output.trim());
         eprintln!("[fc-agent] ✓ image imported as: {}", plan.image);
         plan.image.clone()
@@ -2852,7 +2888,6 @@ async fn run_agent() -> Result<()> {
     let mut podman_args = vec![
         "podman".to_string(),
         "run".to_string(),
-        "--rm".to_string(),
         "--name".to_string(),
         "fcvm-container".to_string(),
         "--network=host".to_string(),
@@ -3049,16 +3084,6 @@ async fn run_agent() -> Result<()> {
     // The host listens on vsock.sock_4999 for status messages
     notify_container_started();
 
-    // Create vsock connection for container output streaming
-    // Port 4997 is dedicated for stdout/stderr
-    let output_fd = create_output_vsock();
-    if output_fd >= 0 {
-        eprintln!(
-            "[fc-agent] output vsock connected (port {})",
-            OUTPUT_VSOCK_PORT
-        );
-    }
-
     // Stream stdout via vsock (wrapped in Arc for sharing across tasks)
     let output_fd_arc = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(output_fd));
     let stdout_task = if let Some(stdout) = child.stdout.take() {
@@ -3162,7 +3187,45 @@ async fn run_agent() -> Result<()> {
             "[fc-agent] container exited with error: {} (code {})",
             status, exit_code
         );
+
+        // Capture podman logs on failure - the container might write to journald/files
+        // instead of stdout/stderr, so piped output alone may miss the real error
+        eprintln!("[fc-agent] capturing podman logs for failed container...");
+        match std::process::Command::new("podman")
+            .args(["logs", "fcvm-container"])
+            .output()
+        {
+            Ok(logs) => {
+                let stdout = String::from_utf8_lossy(&logs.stdout);
+                let stderr = String::from_utf8_lossy(&logs.stderr);
+                if !stdout.is_empty() {
+                    eprintln!("[fc-agent] === podman logs (stdout) ===");
+                    for line in stdout.lines() {
+                        eprintln!("[fc-agent] {}", line);
+                        send_output_line(output_fd, "stdout", line);
+                    }
+                }
+                if !stderr.is_empty() {
+                    eprintln!("[fc-agent] === podman logs (stderr) ===");
+                    for line in stderr.lines() {
+                        eprintln!("[fc-agent] {}", line);
+                        send_output_line(output_fd, "stderr", line);
+                    }
+                }
+                if stdout.is_empty() && stderr.is_empty() {
+                    eprintln!("[fc-agent] (no podman logs captured)");
+                }
+            }
+            Err(e) => {
+                eprintln!("[fc-agent] failed to get podman logs: {}", e);
+            }
+        }
     }
+
+    // Clean up the container (we don't use --rm so we can capture logs on failure)
+    let _ = std::process::Command::new("podman")
+        .args(["rm", "-f", "fcvm-container"])
+        .output();
 
     // Notify host of container exit status via vsock
     // The host can use this to determine if the container succeeded
