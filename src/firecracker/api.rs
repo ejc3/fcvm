@@ -3,13 +3,21 @@ use hyper::{Body, Client, Method, Request, StatusCode};
 use hyperlocal::{UnixClientExt, Uri as UnixUri};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Firecracker API client for managing VMs via HTTP over Unix socket
 #[derive(Debug, Clone)]
 pub struct FirecrackerClient {
     socket_path: PathBuf,
     client: Client<hyperlocal::UnixConnector>,
+    /// Timeout for individual API requests
+    request_timeout: Duration,
 }
+
+/// Default timeout for Firecracker API requests.
+/// Firecracker API calls are local Unix socket RPCs and should complete quickly.
+/// 30s is generous — if an API call takes this long, Firecracker is stuck.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl FirecrackerClient {
     pub fn new(socket_path: PathBuf) -> Result<Self> {
@@ -17,6 +25,7 @@ impl FirecrackerClient {
         Ok(Self {
             socket_path,
             client,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         })
     }
 
@@ -34,7 +43,15 @@ impl FirecrackerClient {
             .header("Content-Type", "application/json")
             .body(Body::from(json))?;
 
-        let resp = self.client.request(req).await?;
+        let resp = tokio::time::timeout(self.request_timeout, self.client.request(req))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Firecracker API PUT {} timed out after {:?}",
+                    path,
+                    self.request_timeout
+                )
+            })??;
         if resp.status() != StatusCode::NO_CONTENT && resp.status() != StatusCode::OK {
             let status = resp.status();
             let body_bytes = hyper::body::to_bytes(resp.into_body()).await?;
@@ -53,7 +70,15 @@ impl FirecrackerClient {
             .header("Content-Type", "application/json")
             .body(Body::from(json))?;
 
-        let resp = self.client.request(req).await?;
+        let resp = tokio::time::timeout(self.request_timeout, self.client.request(req))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Firecracker API PATCH {} timed out after {:?}",
+                    path,
+                    self.request_timeout
+                )
+            })??;
         if resp.status() != StatusCode::NO_CONTENT && resp.status() != StatusCode::OK {
             let status = resp.status();
             let body_bytes = hyper::body::to_bytes(resp.into_body()).await?;

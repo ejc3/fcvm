@@ -616,36 +616,39 @@ pub async fn setup_in_namespace_nat(
         anyhow::bail!("failed to add MASQUERADE rule in namespace: {}", stderr);
     }
 
-    // Step 8: Add DNAT rule for incoming traffic to reach the guest
+    // Step 8: Add DNAT rules for incoming traffic to reach the guest
     // This allows health checks from host to reach the guest via the veth IP
     // Host connects to veth_ip:80 → DNAT to guest_ip:80
+    // We add rules for both TCP and UDP so port forwarding works for all protocols
     let veth_ip = config
         .veth_ip_cidr
         .split('/')
         .next()
         .unwrap_or(&config.veth_ip_cidr);
-    let output = exec_in_namespace(
-        ns_name,
-        &[
-            "iptables",
-            "-t",
-            "nat",
-            "-A",
-            "PREROUTING",
-            "-d",
-            veth_ip,
-            "-p",
-            "tcp",
-            "-j",
-            "DNAT",
-            "--to-destination",
-            &config.guest_ip,
-        ],
-    )
-    .await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("failed to add DNAT rule in namespace: {}", stderr);
+    for proto in ["tcp", "udp"] {
+        let output = exec_in_namespace(
+            ns_name,
+            &[
+                "iptables",
+                "-t",
+                "nat",
+                "-A",
+                "PREROUTING",
+                "-d",
+                veth_ip,
+                "-p",
+                proto,
+                "-j",
+                "DNAT",
+                "--to-destination",
+                &config.guest_ip,
+            ],
+        )
+        .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("failed to add {} DNAT rule in namespace: {}", proto, stderr);
+        }
     }
 
     info!(
