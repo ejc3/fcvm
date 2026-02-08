@@ -301,7 +301,7 @@ async fn create_sandbox(
         interactive: false,
         tty: false,
         strace_agent: false,
-        setup: true,
+        setup: false,
         kernel: None,
         kernel_profile: None,
         vsock_dir: None,
