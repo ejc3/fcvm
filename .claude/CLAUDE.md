@@ -152,19 +152,10 @@ jq -r '.[] | select(.health_status == "healthy")' output.json
 **Never say "likely" - always find the actual root cause.**
 
 When tests fail in CI or parallel runs:
-1. Re-running in isolation to verify the test itself is correct is fine
-2. But you MUST root cause why it failed when run together
-3. All tests must pass together - that's the point of parallel testing
-4. If a test passes alone but fails in parallel, there's a race condition - find it
-
-**The pattern:**
-```
-Test failed in parallel run
-  → Re-run alone: passes
-  → "Probably resource contention" ← WRONG, this is speculation
-  → Look at actual error message ← CORRECT
-  → Find the race condition ← REQUIRED
-```
+1. Re-run in isolation to confirm the test itself is correct
+2. Root-cause why it failed when run together
+3. All tests must pass together
+4. If it passes alone but fails in parallel, find and fix the race condition
 
 ## Debugging Test Hangs
 
@@ -666,26 +657,22 @@ mv old_name.rs new_name.rs
 | Merge PR | `gh pr merge <pr-number> --merge --delete-branch` |
 | List my PRs | `gh pr list --author @me` |
 
-**Stacking PRs:** When work builds on unmerged PRs, create a chain:
+**Stacking PRs:** create a branch chain (not parallel branches):
 ```bash
-# PR #1 is on main
 git checkout -b feature-a && git push -u origin feature-a
 gh pr create --base main
 
-# PR #2 builds on PR #1
 git checkout -b feature-b && git push -u origin feature-b
-gh pr create --base feature-a  # Not main!
+gh pr create --base feature-a
 
-# Verify the chain
 gh pr list --json number,headRefName,baseRefName
 ```
-Merge in order (#1 first, then #2). **Never use `--delete-branch` on the base PR** — it closes dependent PRs. Instead: merge without delete, `gh pr edit <dep> --base main`, then delete branch. See `.claude/skills/pr-workflow/SKILL.md` for full procedure.
+Merge in order (#1 first, then #2). **Never use `--delete-branch` on the base PR**: it closes dependent PRs. Merge without delete, run `gh pr edit <dep> --base main`, then delete branch.
+For the full merge procedure and safety checks, see `.claude/skills/pr-workflow/SKILL.md`.
 
-**CRITICAL: Maintain Stack Coherence.** When PRs are stacked, the branch for PR #2 MUST actually be based on PR #1's branch - not just have the GitHub base set correctly. Verify with:
+**CRITICAL: Maintain Stack Coherence.** PR #2's branch must actually be based on PR #1's branch, not just have GitHub base set.
 ```bash
-# PR #2's commits should include PR #1's commits
 git log --oneline origin/main..feature-b
-# Should show: PR #2 commits THEN PR #1 commits
 ```
 
 If PR #2's branch is based on main instead of feature-a, tests will fail because PR #2 won't have PR #1's changes. Fix with:
@@ -737,7 +724,7 @@ git log --oneline origin/<base-branch>..HEAD   # Commits in THIS branch only
 git log --oneline origin/main..HEAD            # Only if PR targets main directly
 ```
 
-**Anti-pattern:** For a stacked PR, reviewing `main..HEAD` includes commits from parent branches. This causes incorrect claims like "X was never enabled on main" when X was enabled in THIS branch's commits.
+**Anti-pattern:** On stacked PRs, reviewing `main..HEAD` includes parent commits and causes incorrect claims.
 
 **Include test evidence.** Actual output, not "tested and works."
 
@@ -796,28 +783,9 @@ if vms.first().map(|v| v.health_status == "healthy").unwrap_or(false) { ... }
 
 ### Test Failure Philosophy
 
-**This project is designed for extreme scale, speed, and correctness.** Test failures are bugs, not excuses.
+Test failures are bugs. Do not dismiss them as "resource contention", "timing issues", "flaky tests", or "works on my machine".
 
-**NEVER dismiss failures as:**
-- "Resource contention" - **This is NEVER the answer. It's always a race condition.**
-- "Timing issues" - **This means there's a race condition. Find and fix it.**
-- "Flaky tests" - **No such thing. The test found a bug. Fix the bug.**
-- "Works on my machine" - **Your machine just got lucky. The bug is real.**
-
-**"Resource contention" is a lie you tell yourself to avoid finding the real bug.** When a test fails under load:
-1. The test is correct - it found a bug
-2. The bug only manifests under certain timing conditions
-3. This is called a **race condition**
-4. You MUST find the race and fix it
-
-**ALWAYS:**
-1. **Look at the logs** - The answer is always there
-2. Investigate the actual root cause with evidence
-3. Find the race condition - there IS one
-4. Fix the underlying bug
-5. Add regression tests if needed
-
-If a test fails intermittently or only under parallel execution, that's a **concurrency bug** or **race condition** that must be fixed, not ignored. The test passed in isolation? Great - that narrows down the timing window where the race occurs.
+For failures under load/parallel: use logs and timestamps, find the race/concurrency bug, fix the code, and add regression coverage.
 
 ### POSIX Compliance Testing
 
@@ -928,11 +896,7 @@ assert!(localhost_works, "Localhost port forwarding should work (requires route_
 
 ### Build and Test Rules
 
-**NEVER use `sudo cargo`. ALWAYS use Makefile targets.**
-
-The Makefile uses `CARGO_TARGET_*_RUNNER='sudo -E'` to run test binaries with sudo, not cargo itself. Using `sudo cargo` creates root-owned files in `target/` that break subsequent builds.
-
-See README.md for test tiers and Makefile targets.
+Do not run `sudo cargo`. Use Makefile targets so cargo runs as your user and test binaries run via `CARGO_TARGET_*_RUNNER='sudo -E'`; otherwise `target/` becomes root-owned and breaks builds.
 
 ### Container Build Rules
 
@@ -962,46 +926,31 @@ This ensures changes to fuse-backend-rs are immediately available without git co
 
 ### Preserving Logs from Failed Tests
 
-**CRITICAL: ALWAYS include branch name in tee log filenames.**
-
-Without the branch name, logs from different branches overwrite each other and you lose the ability to compare results or diagnose issues. This is especially important when:
-- Working on stacked PRs (branch A depends on branch B)
-- Developing two features in parallel
-- Switching between branches to compare behavior
-- Using multiple worktrees
+Always include branch name in tee log filenames to avoid overwrites across branches/worktrees.
 
 ```bash
-# ALWAYS get branch name first
 BRANCH=$(git branch --show-current)
 
-# Run full test suite - include branch AND target
+# Standard run
 make test-root 2>&1 | tee /tmp/test-${BRANCH}-root.log
 
-# Run filtered tests - include branch, target, AND filter
-make test-root FILTER=exec 2>&1 | tee /tmp/test-${BRANCH}-root-exec.log
-make test-root FILTER=sanity 2>&1 | tee /tmp/test-${BRANCH}-root-sanity.log
+# Filtered run
+make test-root FILTER=<name> 2>&1 | tee /tmp/test-${BRANCH}-root-<name>.log
 ```
 
-**When a test fails, IMMEDIATELY save the log to a uniquely-named file for diagnosis:**
+If a run fails, archive the log with test name + timestamp before re-running:
 
 ```bash
-# Pattern: /tmp/fcvm-failed-{branch}-{target}-{test_name}-{timestamp}.log
-BRANCH=$(git branch --show-current)
-
-# Example after test_exec_rootless fails in test-root run:
 cp /tmp/test-${BRANCH}-root.log /tmp/fcvm-failed-${BRANCH}-root-test_exec_rootless-$(date +%Y%m%d-%H%M%S).log
 
-# Then continue with other tests using a fresh log file
+# Continue with a fresh log file
 make test-root 2>&1 | tee /tmp/test-${BRANCH}-root-run2.log
 ```
 
-**Automated approach:**
+Optional automation:
 ```bash
-# After a test suite run, check for failures and save logs
-BRANCH=$(git branch --show-current)
 if grep -q "FAIL\|TIMEOUT" /tmp/test-${BRANCH}-root.log; then
   cp /tmp/test-${BRANCH}-root.log /tmp/fcvm-failed-${BRANCH}-root-$(date +%Y%m%d-%H%M%S).log
-  echo "Saved failed test log"
 fi
 ```
 
@@ -1010,17 +959,12 @@ fi
 **ALWAYS run tests with debug logging enabled when debugging issues:**
 
 ```bash
-# Run single test with debug logging
-sudo RUST_LOG=debug cargo test --release -p fuse-pipe --test test_permission_edge_cases test_write_clears_suid -- --nocapture
+# Full debug
+RUST_LOG=debug make test-root FILTER=permission STREAM=1
 
-# Run all permission tests with debug logging
-sudo RUST_LOG=debug cargo test --release -p fuse-pipe --test test_permission_edge_cases -- --nocapture --test-threads=1
-
-# Filter to specific components
-sudo RUST_LOG="passthrough=debug,fuse_pipe=debug" cargo test ...
-
-# Debug fuse-backend-rs internals
-sudo RUST_LOG="fuse_backend_rs=debug" cargo test ...
+# Component-focused
+RUST_LOG="passthrough=debug,fuse_pipe=debug" make test-root FILTER=permission STREAM=1
+RUST_LOG="fuse_backend_rs=debug" make test-root FILTER=permission STREAM=1
 ```
 
 **Tracing targets:**
@@ -1039,7 +983,7 @@ When a FUSE operation fails unexpectedly, trace the full path from kernel to fus
 
 2. **Run test with logging** to see the actual values:
    ```bash
-   RUST_LOG='passthrough=debug' sudo -E cargo test ... -- --nocapture
+   RUST_LOG='passthrough=debug' make test-root FILTER=permission STREAM=1
    ```
 
 3. **Check if kernel sends parameter but protocol drops it** - e.g., `handle=None` when it should be `Some(1)` means the protocol layer isn't passing it through.
@@ -1068,7 +1012,6 @@ println!("{}", tracer.read_grep("kvm_exit", 50)?);
 **See README.md for test categories, CI summary, and Makefile targets.** Run `make help` for full list.
 
 Key points for development:
-- Always use `make test-root FILTER=<pattern>` - never raw cargo commands
 - CI runs on every PR: Host (bare metal) + Container (privileged)
 - Manual trigger: `gh workflow run ci.yml --ref <branch>`
 - Get in-progress logs: `gh api repos/OWNER/REPO/actions/runs/RUN_ID/jobs`
@@ -1580,17 +1523,6 @@ let (mut child, pid) = common::spawn_fcvm(&["podman", "run", "--name", &vm_name,
 - `Stdio::inherit()` for stdout/stderr - output goes to parent (visible with `--nocapture`)
 - No deadlock because parent's stdout/stderr handle the data
 - Consistent error handling and PID extraction
-
-## fuse-pipe Debugging
-
-**Tracing targets** for debugging FUSE issues:
-- `passthrough` - PassthroughFs operations (most useful)
-- `fuse_pipe` - fuse-pipe client/server
-- `fuse_backend_rs` - fuse-backend-rs internals
-
-```bash
-RUST_LOG="passthrough=debug" make test-root FILTER=permission -- --nocapture
-```
 
 ## Exec Command Flags
 
