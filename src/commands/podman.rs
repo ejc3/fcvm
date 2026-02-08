@@ -166,6 +166,9 @@ pub struct VmContext {
 ///
 /// The VM runs in a background tokio task. Use `stop()` to gracefully shut it down
 /// or `wait()` to wait for it to exit naturally.
+///
+/// On drop, the VM is cancelled automatically (the background task will clean up
+/// resources on its next poll). For explicit shutdown with exit code, use `stop()`.
 pub struct VmHandle {
     /// Unique VM identifier (e.g., "vm-abc123")
     pub vm_id: String,
@@ -174,7 +177,7 @@ pub struct VmHandle {
     /// Process ID of the fcvm process managing this VM
     pub pid: u32,
     cancel: CancellationToken,
-    task: tokio::task::JoinHandle<Result<Option<i32>>>,
+    task: Option<tokio::task::JoinHandle<Result<Option<i32>>>>,
 }
 
 impl VmHandle {
@@ -190,22 +193,35 @@ impl VmHandle {
 
     /// Gracefully stop the VM and wait for cleanup to complete.
     /// Returns the container exit code (None if the container didn't exit naturally).
-    pub async fn stop(self) -> Result<Option<i32>> {
+    pub async fn stop(&mut self) -> Result<Option<i32>> {
         self.cancel.cancel();
-        self.task.await?
+        match self.task.take() {
+            Some(task) => task.await?,
+            None => Ok(None),
+        }
     }
 
     /// Wait for the VM to exit naturally (without cancelling).
     /// Returns the container exit code.
-    pub async fn wait(self) -> Result<Option<i32>> {
-        self.task.await?
+    pub async fn wait(&mut self) -> Result<Option<i32>> {
+        match self.task.take() {
+            Some(task) => task.await?,
+            None => Ok(None),
+        }
+    }
+}
+
+impl Drop for VmHandle {
+    fn drop(&mut self) {
+        self.cancel.cancel();
     }
 }
 
 /// Start a VM with the given args. Returns a handle to the running VM.
 ///
-/// The VM event loop runs in a background task. On drop/cancellation, the VM
-/// is cleaned up automatically.
+/// The VM event loop runs in a background task. The handle's `Drop` impl cancels
+/// the VM, so dropping the handle triggers cleanup. Use `stop()` for explicit
+/// shutdown with exit code, or `wait()` to wait for natural exit.
 ///
 /// Note: `args.no_snapshot` is forced to `true` to skip snapshot cache lookups,
 /// ensuring a fresh VM is always started.
@@ -242,7 +258,7 @@ pub async fn start_vm(mut args: RunArgs) -> Result<VmHandle> {
         name,
         pid: actual_pid,
         cancel,
-        task,
+        task: Some(task),
     })
 }
 
@@ -1865,8 +1881,8 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
     tokio::spawn(async move {
-        let mut sigterm = signal(SignalKind::terminate()).unwrap();
-        let mut sigint = signal(SignalKind::interrupt()).unwrap();
+        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
         tokio::select! {
             _ = sigterm.recv() => { info!("received SIGTERM, shutting down VM"); }
             _ = sigint.recv() => { info!("received SIGINT, shutting down VM"); }

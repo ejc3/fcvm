@@ -884,8 +884,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     let cancel = tokio_util::sync::CancellationToken::new();
     let cancel_clone = cancel.clone();
     tokio::spawn(async move {
-        let mut sigterm = signal(SignalKind::terminate()).unwrap();
-        let mut sigint = signal(SignalKind::interrupt()).unwrap();
+        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
         tokio::select! {
             _ = sigterm.recv() => { info!("received SIGTERM, shutting down VM"); }
             _ = sigint.recv() => { info!("received SIGINT, shutting down VM"); }

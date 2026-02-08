@@ -51,7 +51,7 @@ fn test_run_args(name: &str) -> RunArgs {
 async fn test_library_api_start_vm_and_stop() -> Result<()> {
     let (vm_name, _, _, _) = common::unique_names("api-start");
     let args = test_run_args(&vm_name);
-    let handle = start_vm(args).await?;
+    let mut handle = start_vm(args).await?;
 
     println!(
         "start_vm returned: vm_id={}, name={}, pid={}",
@@ -84,7 +84,7 @@ async fn test_library_api_exec_captured() -> Result<()> {
     let (vm_name, _, _, _) = common::unique_names("api-exec");
     let args = test_run_args(&vm_name);
 
-    let handle = start_vm(args).await?;
+    let mut handle = start_vm(args).await?;
     println!("VM started: vm_id={}, pid={}", handle.vm_id, handle.pid);
 
     common::poll_health_by_pid(handle.pid, 300).await?;
@@ -132,7 +132,7 @@ async fn test_library_api_async_connection() -> Result<()> {
     let (vm_name, _, _, _) = common::unique_names("api-conn");
     let args = test_run_args(&vm_name);
 
-    let handle = start_vm(args).await?;
+    let mut handle = start_vm(args).await?;
     println!("VM started: vm_id={}, pid={}", handle.vm_id, handle.pid);
 
     common::poll_health_by_pid(handle.pid, 300).await?;
