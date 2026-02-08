@@ -370,19 +370,9 @@ async fn request_reader<H: FilesystemHandler + 'static>(
                     ascii = %ascii_dump,
                     "DESERIALIZE FAILED - raw bytes dumped"
                 );
-
-                // Send error response using the extracted unique ID so the client
-                // doesn't hang forever waiting for a reply that will never come.
-                if maybe_unique != 0 {
-                    let pending = PendingResponse {
-                        unique: maybe_unique,
-                        reader_id: 0,
-                        response: VolumeResponse::error(libc::EIO),
-                        span: None,
-                    };
-                    let _ = tx.send(pending).await;
-                }
-                continue;
+                // Stream framing is now undefined; terminate the connection so
+                // clients fail pending requests instead of blocking forever.
+                return Err(anyhow::anyhow!("request deserialization failed: {}", e));
             }
         };
 
@@ -585,6 +575,34 @@ mod tests {
         assert!(
             result.is_ok(),
             "request_reader did not exit after receiving an oversized frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_reader_exits_on_deserialize_failure() {
+        let (server, mut client) = tokio::net::UnixStream::pair().unwrap();
+        let (read_half, _write_half) = server.into_split();
+
+        let handler = Arc::new(EchoHandler);
+        let (tx, _rx) = mpsc::channel::<PendingResponse>(1);
+
+        let reader_task = tokio::spawn(request_reader(read_half, handler, tx));
+
+        // 16-byte invalid bincode payload.
+        let bad_payload = [0xffu8; 16];
+        let bad_len = (bad_payload.len() as u32).to_be_bytes();
+        client.write_all(&bad_len).await.unwrap();
+        client.write_all(&bad_payload).await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_millis(200), reader_task).await;
+        assert!(
+            result.is_ok(),
+            "request_reader did not exit after deserialization failure"
+        );
+        let join_result = result.unwrap().unwrap();
+        assert!(
+            join_result.is_err(),
+            "request_reader should return an error on deserialization failure"
         );
     }
 }

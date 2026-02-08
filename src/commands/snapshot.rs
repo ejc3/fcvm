@@ -415,21 +415,6 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
         info!("deleted serve state");
     }
 
-    // Delete snapshot directory (memory.bin, disk.raw, vmstate.bin, config.json)
-    let snapshot_dir = paths::snapshot_dir().join(&args.snapshot_name);
-    if snapshot_dir.exists() {
-        println!("Cleaning up snapshot directory...");
-        if let Err(e) = std::fs::remove_dir_all(&snapshot_dir) {
-            warn!(
-                "failed to remove snapshot directory {}: {}",
-                snapshot_dir.display(),
-                e
-            );
-        } else {
-            info!("removed snapshot directory: {}", snapshot_dir.display());
-        }
-    }
-
     println!("Memory server stopped");
 
     Ok(())

@@ -181,8 +181,7 @@ pub async fn enable_route_localnet(interface: &str) -> Result<()> {
 ///
 /// Converts an -A (append) rule to -D (delete) and executes it.
 async fn delete_rule(rule: &str) -> Result<()> {
-    // Convert -A to -D for deletion
-    let delete_rule = rule.replace(" -A ", " -D ");
+    let delete_rule = to_delete_rule(rule);
 
     let output = Command::new("iptables")
         .args(delete_rule.split_whitespace())
@@ -199,6 +198,14 @@ async fn delete_rule(rule: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn to_delete_rule(rule: &str) -> String {
+    if let Some(rest) = rule.strip_prefix("-A ") {
+        format!("-D {}", rest)
+    } else {
+        rule.replacen(" -A ", " -D ", 1)
+    }
 }
 
 /// Cleans up port mapping rules for a VM
@@ -431,6 +438,25 @@ pub async fn detect_default_interface() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_delete_rule_conversion() {
+        let forward_rule = "-A FORWARD -p tcp -d 172.30.1.2 --dport 80 -j ACCEPT";
+        let dnat_rule =
+            "-t nat -A PREROUTING -p tcp --dport 8080 -j DNAT --to-destination 172.30.1.2:80";
+
+        let forward_delete = to_delete_rule(forward_rule);
+        let dnat_delete = to_delete_rule(dnat_rule);
+
+        assert_eq!(
+            forward_delete,
+            "-D FORWARD -p tcp -d 172.30.1.2 --dport 80 -j ACCEPT"
+        );
+        assert_eq!(
+            dnat_delete,
+            "-t nat -D PREROUTING -p tcp --dport 8080 -j DNAT --to-destination 172.30.1.2:80"
+        );
+    }
 
     #[tokio::test]
     async fn test_detect_default_interface() {
