@@ -225,8 +225,9 @@ pub async fn cleanup_port_mappings(rules: &[String]) -> Result<()> {
 /// Ensures global NAT is enabled for VM traffic
 ///
 /// Sets up:
-/// 1. IP forwarding (sysctl)
-/// 2. MASQUERADE rule for outbound traffic from VM subnet
+/// 1. Verifies IP forwarding is enabled (errors if not — admin must configure)
+/// 2. Enables per-interface forwarding on the outbound interface
+/// 3. MASQUERADE rule for outbound traffic from VM subnet
 ///
 /// This should be called once during fcvm initialization, not per-VM.
 pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<()> {
@@ -236,16 +237,20 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
         "ensuring global NAT configuration"
     );
 
-    // Enable IP forwarding globally
+    // Verify IP forwarding is enabled (we don't set it — that's a system-wide
+    // setting the admin should configure, e.g. via sysctl.conf or cloud-init)
     let output = Command::new("sysctl")
-        .args(["-w", "net.ipv4.ip_forward=1"])
+        .args(["-n", "net.ipv4.ip_forward"])
         .output()
         .await
-        .context("enabling IP forwarding")?;
+        .context("checking IP forwarding")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!("failed to enable IP forwarding: {}", stderr);
+    if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() != "1" {
+        anyhow::bail!(
+            "IP forwarding is disabled. Bridged networking requires net.ipv4.ip_forward=1.\n\
+             Enable it with: sudo sysctl -w net.ipv4.ip_forward=1\n\
+             To persist across reboots: echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-ip-forward.conf"
+        );
     }
 
     // Enable forwarding on the outbound interface specifically
@@ -313,6 +318,83 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
 
     debug!("global NAT configuration complete");
     Ok(())
+}
+
+/// Removes global NAT rules if no bridged VMs are running
+///
+/// Checks for veth0-* interfaces (indicates active bridged VMs).
+/// If none exist, removes the MASQUERADE rules for both subnets.
+/// IP forwarding is intentionally left enabled (other services may depend on it).
+/// Best-effort — logs warnings but doesn't fail.
+pub async fn cleanup_global_nat_if_unused() {
+    // Check if any veth0- interfaces exist (active bridged VMs)
+    let output = match Command::new("ip")
+        .args(["-o", "link", "show"])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return, // Can't check — leave rules in place
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.lines().any(|line| line.contains("veth0-")) {
+        debug!("other bridged VMs still running, keeping global NAT rules");
+        return;
+    }
+
+    info!("no bridged VMs running, cleaning up global NAT rules");
+
+    // Detect outbound interface for MASQUERADE rule deletion
+    let outbound_iface = match detect_default_interface().await {
+        Ok(iface) => iface,
+        Err(e) => {
+            warn!(error = %e, "failed to detect default interface for NAT cleanup");
+            return;
+        }
+    };
+
+    // Remove MASQUERADE rules for both subnets
+    for subnet in &["172.30.0.0/16", "10.0.0.0/8"] {
+        let output = Command::new("iptables")
+            .args([
+                "-t",
+                "nat",
+                "-D",
+                "POSTROUTING",
+                "-s",
+                subnet,
+                "-o",
+                &outbound_iface,
+                "-j",
+                "MASQUERADE",
+            ])
+            .output()
+            .await;
+
+        match output {
+            Ok(o) if o.status.success() => {
+                debug!(subnet = %subnet, "removed MASQUERADE rule");
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                // Rule may already be gone
+                if !stderr.contains("does not exist") && !stderr.contains("No chain") {
+                    warn!(subnet = %subnet, error = %stderr, "failed to remove MASQUERADE rule");
+                }
+            }
+            Err(e) => {
+                warn!(subnet = %subnet, error = %e, "failed to run iptables for NAT cleanup");
+            }
+        }
+    }
+
+    // Note: we intentionally do NOT disable ip_forward here.
+    // Other services on the host (Docker, Kubernetes, VPNs, etc.) may depend on
+    // IP forwarding being enabled. Since we can't know whether fcvm was the one
+    // that enabled it, the safe default is to leave it on.
+
+    debug!("global NAT cleanup complete");
 }
 
 /// Detects the default network interface for outbound traffic

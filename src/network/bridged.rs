@@ -7,6 +7,47 @@ use super::{
 };
 use crate::state::truncate_id;
 
+/// Derive the host-side IP for a given subnet_id
+fn derive_host_ip(subnet_id: u16, is_clone: bool) -> String {
+    let third_octet = (subnet_id / 64) as u8;
+    let subnet_within_block = (subnet_id % 64) as u8;
+    let subnet_base = subnet_within_block * 4;
+
+    if is_clone {
+        format!(
+            "10.{}.{}.{}",
+            third_octet,
+            subnet_within_block,
+            subnet_base + 1
+        )
+    } else {
+        format!("172.30.{}.{}", third_octet, subnet_base + 1)
+    }
+}
+
+/// Check if an IP address is already assigned to a veth interface
+async fn is_ip_in_use_on_veth(ip: &str) -> bool {
+    let output = match tokio::process::Command::new("ip")
+        .args(["-o", "addr", "show"])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return false, // Can't check — assume no collision
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Match "inet <ip>/" exactly to avoid substring false positives
+    // (e.g., checking 10.1.1.1 should not match 10.1.1.10 or 210.1.1.1)
+    let inet_pattern = format!("inet {}/", ip);
+    for line in stdout.lines() {
+        if line.contains(&inet_pattern) && line.contains("veth0-") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Bridged networking using network namespace isolation with veth pairs
 ///
 /// This mode requires sudo/root for network namespace and iptables setup.
@@ -101,7 +142,32 @@ impl NetworkManager for BridgedNetwork {
         let id_for_subnet = self.network_vm_id.as_ref().unwrap_or(&self.vm_id);
         let mut hasher = DefaultHasher::new();
         id_for_subnet.hash(&mut hasher);
-        let subnet_id = (hasher.finish() % 16384) as u16;
+        let mut subnet_id = (hasher.finish() % 16384) as u16;
+
+        // Check for subnet collisions with live VMs and retry with incremented ID
+        let subnet_id = {
+            let mut attempts = 0u32;
+            loop {
+                let host_ip = derive_host_ip(subnet_id, self.is_clone);
+                if !is_ip_in_use_on_veth(&host_ip).await {
+                    break subnet_id;
+                }
+                attempts += 1;
+                if attempts >= 100 {
+                    anyhow::bail!(
+                        "subnet allocation failed: no free subnet found after {} attempts",
+                        attempts
+                    );
+                }
+                warn!(
+                    subnet_id = subnet_id,
+                    host_ip = %host_ip,
+                    attempt = attempts,
+                    "subnet collision detected, trying next"
+                );
+                subnet_id = (subnet_id + 1) % 16384;
+            }
+        };
 
         // For clones, use In-Namespace NAT with unique 10.x.y.0/30 for veth
         // For baseline VMs, use 172.30.x.y/30 with L2 bridge
@@ -395,6 +461,9 @@ impl NetworkManager for BridgedNetwork {
                 errors.push(format!("namespace: {}", e));
             }
         }
+
+        // Step 5: Remove global NAT rules if no other bridged VMs are running
+        portmap::cleanup_global_nat_if_unused().await;
 
         if errors.is_empty() {
             debug!(vm_id = %self.vm_id, "network cleanup complete");

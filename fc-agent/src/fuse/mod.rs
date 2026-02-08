@@ -102,25 +102,27 @@ fn get_max_write() -> u32 {
     0
 }
 
-/// Set FCVM_NO_WRITEBACK_CACHE from kernel boot param if not already set.
-/// This propagates the writeback cache disable flag to the fuse-pipe client.
-/// Used when ctime accuracy is required (e.g., POSIX compliance tests).
-fn propagate_no_writeback_cache_from_cmdline() {
-    // Skip if already set in environment
+/// Check if writeback cache should be disabled.
+/// Checks (in order):
+/// 1. FCVM_NO_WRITEBACK_CACHE environment variable (any value)
+/// 2. no_writeback_cache=1 kernel boot parameter (from /proc/cmdline)
+/// 3. Default: false (writeback cache enabled)
+fn no_writeback_cache_from_cmdline() -> bool {
+    // Check environment first (set before threads start, or by caller)
     if std::env::var("FCVM_NO_WRITEBACK_CACHE").is_ok() {
-        return;
+        return true;
     }
 
     // Check kernel command line for no_writeback_cache=1
     if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
         for part in cmdline.split_whitespace() {
             if part == "no_writeback_cache=1" {
-                std::env::set_var("FCVM_NO_WRITEBACK_CACHE", "1");
                 eprintln!("[fc-agent] disabled FUSE writeback cache from kernel cmdline");
-                return;
+                return true;
             }
         }
     }
+    false
 }
 
 /// Mount a FUSE filesystem from host via vsock.
@@ -134,15 +136,13 @@ fn propagate_no_writeback_cache_from_cmdline() {
 /// * `port` - The vsock port where the host VolumeServer is listening
 /// * `mount_point` - The path where the filesystem will be mounted
 pub fn mount_vsock(port: u32, mount_point: &str) -> anyhow::Result<()> {
-    // Propagate config from kernel cmdline to env vars for fuse-pipe
-    propagate_no_writeback_cache_from_cmdline();
-
     let num_readers = get_num_readers();
     let trace_rate = get_trace_rate();
     let max_write = get_max_write();
+    let no_writeback_cache = no_writeback_cache_from_cmdline();
     eprintln!(
-        "[fc-agent] mounting FUSE volume at {} via vsock port {} ({} readers, trace_rate={}, max_write={})",
-        mount_point, port, num_readers, trace_rate, max_write
+        "[fc-agent] mounting FUSE volume at {} via vsock port {} ({} readers, trace_rate={}, max_write={}, no_writeback_cache={})",
+        mount_point, port, num_readers, trace_rate, max_write, no_writeback_cache
     );
     fuse_pipe::mount_vsock_with_options(
         HOST_CID,
@@ -151,5 +151,6 @@ pub fn mount_vsock(port: u32, mount_point: &str) -> anyhow::Result<()> {
         num_readers,
         trace_rate,
         max_write,
+        no_writeback_cache,
     )
 }
