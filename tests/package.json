@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "computesdk": "file:../../computesdk/packages/computesdk",
+    "tsx": "^4"
+  }
+}
