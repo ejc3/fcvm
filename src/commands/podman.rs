@@ -183,6 +183,11 @@ impl VmHandle {
         self.cancel.clone()
     }
 
+    /// Get the vsock socket path for this VM (used for exec/terminal connections).
+    pub fn vsock_socket_path(&self) -> PathBuf {
+        crate::paths::vm_runtime_dir(&self.vm_id).join("vsock.sock")
+    }
+
     /// Gracefully stop the VM and wait for cleanup to complete.
     /// Returns the container exit code (None if the container didn't exit naturally).
     pub async fn stop(self) -> Result<Option<i32>> {
