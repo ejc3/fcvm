@@ -32,7 +32,7 @@ async fn test_forward_localhost() -> Result<()> {
                 tv_usec: 0,
             };
             libc::setsockopt(
-                std::os::unix::io::AsRawFd::as_raw_fd(&listener) as i32,
+                std::os::unix::io::AsRawFd::as_raw_fd(&listener),
                 libc::SOL_SOCKET,
                 libc::SO_RCVTIMEO,
                 &tv as *const _ as *const libc::c_void,

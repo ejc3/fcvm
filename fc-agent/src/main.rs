@@ -2904,7 +2904,7 @@ async fn run_agent() -> Result<()> {
         let parts: Vec<&str> = user_spec.split(':').collect();
         let uid = parts[0];
         let gid = parts.get(1).unwrap_or(&"100");
-        let username = format!("fcvm-user");
+        let username = "fcvm-user".to_string();
 
         eprintln!(
             "[fc-agent] setting up user mapping: uid={} gid={}",
