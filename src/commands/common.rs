@@ -889,7 +889,7 @@ pub async fn create_snapshot_core(
             memory_bytes
         };
         if let Ok(stat) = nix::sys::statvfs::statvfs(snapshot_dir) {
-            let available_bytes = stat.blocks_available() * stat.fragment_size() as u64;
+            let available_bytes = stat.blocks_available() * stat.fragment_size();
             if available_bytes < required_bytes {
                 anyhow::bail!(
                     "Not enough disk space for {} snapshot: need {} MiB, have {} MiB free on {}. \

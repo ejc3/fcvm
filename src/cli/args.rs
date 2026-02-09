@@ -492,10 +492,14 @@ pub struct ExecArgs {
 /// Parse --mem value: either an integer (MiB) or "unlimited" (all host memory).
 fn parse_mem(s: &str) -> Result<u32, String> {
     if s.eq_ignore_ascii_case("unlimited") {
-        crate::host_memory_mib().ok_or_else(|| "failed to read host memory from /proc/meminfo".to_string())
+        crate::host_memory_mib()
+            .ok_or_else(|| "failed to read host memory from /proc/meminfo".to_string())
     } else {
         s.parse::<u32>().map_err(|_| {
-            format!("invalid --mem value '{}': expected integer (MiB) or 'unlimited'", s)
+            format!(
+                "invalid --mem value '{}': expected integer (MiB) or 'unlimited'",
+                s
+            )
         })
     }
 }
