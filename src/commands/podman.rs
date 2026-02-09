@@ -1166,6 +1166,20 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         bail!("--setup is not allowed when running as root. Run 'fcvm setup' first.");
     }
 
+    // Validate --user format (must be "uid:gid" with numeric values)
+    if let Some(ref user) = args.user {
+        let parts: Vec<&str> = user.split(':').collect();
+        if parts.len() != 2 {
+            bail!("invalid --user format '{}': expected 'uid:gid'", user);
+        }
+        parts[0]
+            .parse::<u32>()
+            .map_err(|_| anyhow::anyhow!("invalid --user uid '{}': must be numeric", parts[0]))?;
+        parts[1]
+            .parse::<u32>()
+            .map_err(|_| anyhow::anyhow!("invalid --user gid '{}': must be numeric", parts[1]))?;
+    }
+
     // Resolve 0 → host values for cpu and mem
     if args.cpu == 0 {
         // Firecracker allows max 32 vCPUs (and must be 1 or even)
@@ -2349,6 +2363,7 @@ async fn build_and_send_mmds(
                 "image_archive": image_device,
                 "privileged": args.privileged,
                 "user": args.user.as_deref(),
+                "forward_localhost": args.forward_localhost.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
                 "interactive": args.interactive,
                 "tty": args.tty,
                 // Use network-provided proxy, or fall back to environment variables.
