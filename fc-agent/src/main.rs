@@ -1619,12 +1619,13 @@ fn send_output_line(stream: &str, line: &str) {
     }
     // Raw format: stream:line\n
     let data = format!("{}:{}\n", stream, line);
-    let result = unsafe {
-        libc::write(fd, data.as_ptr() as *const libc::c_void, data.len())
-    };
+    let result = unsafe { libc::write(fd, data.as_ptr() as *const libc::c_void, data.len()) };
     if result < 0 {
         let err = std::io::Error::last_os_error();
-        eprintln!("[fc-agent] WARNING: output vsock write failed: {} (fd={})", err, fd);
+        eprintln!(
+            "[fc-agent] WARNING: output vsock write failed: {} (fd={})",
+            err, fd
+        );
     }
 }
 
@@ -3126,9 +3127,7 @@ async fn run_agent() -> Result<()> {
             if fd < 0 {
                 continue;
             }
-            let result = unsafe {
-                libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len())
-            };
+            let result = unsafe { libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len()) };
             if result < 0 {
                 let err = std::io::Error::last_os_error();
                 eprintln!(

@@ -513,8 +513,10 @@ fn parse_cpu(s: &str) -> Result<u8, String> {
         Ok(cpus)
     } else {
         s.parse::<u8>().map_err(|_| {
-            format!("invalid --cpu value '{}': expected integer or 'unlimited'", s)
+            format!(
+                "invalid --cpu value '{}': expected integer or 'unlimited'",
+                s
+            )
         })
     }
 }
-
