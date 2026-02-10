@@ -1315,8 +1315,12 @@ async fn test_exec_parallel_pipe_stress() -> Result<()> {
     let fcvm_path = common::find_fcvm_binary()?;
     let (vm_name, _, _, _) = common::unique_names("stress-pipe");
 
-    // Expected output: seq 1 100 with newlines stripped = concatenated numbers
-    let expected_output: String = (1..=100).map(|n| n.to_string()).collect();
+    // Expected output: seq 1 100 with trailing newlines preserved
+    let expected_output: String = (1..=100)
+        .map(|n| format!("{}\n", n))
+        .collect::<String>()
+        .trim()
+        .to_string();
 
     // Start VM with nginx (keeps running)
     println!("Starting VM...");
@@ -1390,10 +1394,7 @@ async fn test_exec_parallel_pipe_stress() -> Result<()> {
                         } else {
                             stdout.clone()
                         };
-                        failures.push((
-                            idx,
-                            format!("exit={}, output={:?}", exit_code, preview),
-                        ));
+                        failures.push((idx, format!("exit={}, output={:?}", exit_code, preview)));
                     }
                 }
                 Err(e) => {
@@ -1430,7 +1431,8 @@ async fn test_exec_parallel_pipe_stress() -> Result<()> {
 
     // Assert 100% success
     assert_eq!(
-        success_count, TOTAL_EXECS,
+        success_count,
+        TOTAL_EXECS,
         "Expected 100% success rate, got {}/{} failures: {:?}",
         success_count,
         TOTAL_EXECS,
