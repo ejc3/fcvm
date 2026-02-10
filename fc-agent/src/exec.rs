@@ -174,24 +174,29 @@ fn handle_pipe(fd: i32, request: &ExecRequest) {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let fd_clone = fd;
+    // Mutex protects the fd so stdout/stderr threads don't interleave writes
+    let fd_mu = std::sync::Arc::new(std::sync::Mutex::new(fd));
+
+    let fd_stdout = fd_mu.clone();
     let stdout_thread = stdout.map(|stdout| {
         std::thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
                 let response = ExecResponse::Stdout(line);
-                write_line_to_fd(fd_clone, &serde_json::to_string(&response).unwrap());
+                let fd = fd_stdout.lock().unwrap();
+                write_line_to_fd(*fd, &serde_json::to_string(&response).unwrap());
             }
         })
     });
 
-    let fd_clone2 = fd;
+    let fd_stderr = fd_mu.clone();
     let stderr_thread = stderr.map(|stderr| {
         std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines().map_while(Result::ok) {
                 let response = ExecResponse::Stderr(line);
-                write_line_to_fd(fd_clone2, &serde_json::to_string(&response).unwrap());
+                let fd = fd_stderr.lock().unwrap();
+                write_line_to_fd(*fd, &serde_json::to_string(&response).unwrap());
             }
         })
     });
