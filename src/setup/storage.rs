@@ -67,9 +67,8 @@ fn get_storage_paths(config_path: Option<&str>) -> Result<(PathBuf, PathBuf, Str
 
 /// Ensure btrfs storage is set up at the configured assets_dir.
 ///
-/// If the mount point doesn't exist or isn't btrfs, creates a loopback image
-/// as a sibling file (e.g., /mnt/fcvm-btrfs.img for /mnt/fcvm-btrfs),
-/// formats it as btrfs, and mounts it.
+/// If the host filesystem is already btrfs, just creates the directory — no loopback needed.
+/// Otherwise, creates a loopback btrfs image as a sibling file (e.g., /mnt/fcvm-btrfs.img).
 ///
 /// Creating the loopback and mounting requires root privileges.
 pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
@@ -87,6 +86,28 @@ pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
             })?;
         }
         return Ok(());
+    }
+
+    // Mount point doesn't exist (or isn't btrfs) — check if parent is already btrfs.
+    // If so, just create the directory directly. A loopback mount on a btrfs host
+    // causes podman namespace divergence (podman's pause process gets its own mount
+    // namespace, and file operations in the host namespace become invisible to podman).
+    if let Some(parent) = mount_point.parent() {
+        if parent.exists() && is_btrfs(parent) {
+            info!(
+                "Parent {} is already btrfs, creating {} directly (no loopback needed)",
+                parent.display(),
+                mount_point.display()
+            );
+            std::fs::create_dir_all(&mount_point)
+                .context("creating assets directory on existing btrfs")?;
+            for dir in REQUIRED_DIRS {
+                let path = mount_point.join(dir);
+                std::fs::create_dir_all(&path)
+                    .with_context(|| format!("creating directory {}", path.display()))?;
+            }
+            return Ok(());
+        }
     }
 
     // Need to create/mount btrfs - requires root

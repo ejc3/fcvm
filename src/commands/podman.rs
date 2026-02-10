@@ -46,7 +46,21 @@ fn resolve_proxy_url(url: &str) -> Option<String> {
         }
     };
 
-    // Try to resolve to an IP address (prefer IPv4, fall back to IPv6)
+    // If the host is already an IP address (IPv4 or IPv6), use it directly.
+    // This avoids double-resolution when detect_http_proxy() already resolved the hostname.
+    match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => {
+            debug!(url = %url, ip = %ip, "proxy URL already has IPv4 address");
+            return Some(rebuild_proxy_url(&parsed, ip.to_string(), port));
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            debug!(url = %url, ip = %ip, "proxy URL already has IPv6 address");
+            return Some(rebuild_proxy_url(&parsed, ip.to_string(), port));
+        }
+        _ => {}
+    }
+
+    // Try to resolve hostname to an IP address (prefer IPv4, fall back to IPv6)
     match (host, port).to_socket_addrs() {
         Ok(addrs) => {
             let addrs: Vec<_> = addrs.collect();
@@ -384,7 +398,19 @@ pub async fn create_snapshot_interruptible(
     parent_snapshot_key: Option<&str>,
     cancel: &CancellationToken,
 ) -> SnapshotOutcome {
-    let snapshot_fut = create_podman_snapshot(
+    // CRITICAL: Do NOT use tokio::select! to interrupt the snapshot future.
+    // create_snapshot_core pauses the VM, creates the snapshot, then resumes.
+    // If we drop the future between pause and resume (via select!), the VM
+    // stays paused forever. Instead, check cancellation before starting and
+    // let the snapshot run to completion once started.
+    if cancel.is_cancelled() {
+        info!("snapshot creation skipped — already cancelled");
+        return SnapshotOutcome::Interrupted;
+    }
+
+    // Run snapshot to completion. create_snapshot_core always resumes the VM
+    // before returning, even on error, so this is safe.
+    match create_podman_snapshot(
         vm_manager,
         snapshot_key,
         vm_id,
@@ -393,18 +419,23 @@ pub async fn create_snapshot_interruptible(
         network_config,
         volume_configs,
         parent_snapshot_key,
-    );
-
-    tokio::select! {
-        biased; // Check cancellation first
-        _ = cancel.cancelled() => {
-            info!("snapshot creation interrupted by cancellation");
-            SnapshotOutcome::Interrupted
+    )
+    .await
+    {
+        Ok(()) => {
+            if cancel.is_cancelled() {
+                // Snapshot succeeded but we're shutting down
+                SnapshotOutcome::Interrupted
+            } else {
+                SnapshotOutcome::Created
+            }
         }
-        result = snapshot_fut => {
-            match result {
-                Ok(()) => SnapshotOutcome::Created,
-                Err(e) => SnapshotOutcome::Failed(e),
+        Err(e) => {
+            if cancel.is_cancelled() {
+                info!("snapshot creation failed during shutdown: {:#}", e);
+                SnapshotOutcome::Interrupted
+            } else {
+                SnapshotOutcome::Failed(e)
             }
         }
     }
@@ -1033,111 +1064,117 @@ pub(crate) async fn run_output_listener(
 
     let mut output_lines: Vec<(String, String)> = Vec::new();
 
-    // Accept connection from fc-agent
-    let accept_result = tokio::time::timeout(
-        std::time::Duration::from_secs(120), // Wait up to 2 min for connection
-        listener.accept(),
-    )
-    .await;
-
-    let (stream, _) = match accept_result {
-        Ok(Ok(conn)) => conn,
-        Ok(Err(e)) => {
-            warn!(vm_id = %vm_id, error = %e, "Error accepting output connection");
-            let _ = std::fs::remove_file(socket_path);
-            return Ok(output_lines);
-        }
-        Err(_) => {
-            // Timeout - container probably didn't produce output
-            debug!(vm_id = %vm_id, "Output listener timeout, no connection");
-            let _ = std::fs::remove_file(socket_path);
-            return Ok(output_lines);
-        }
-    };
-
-    debug!(vm_id = %vm_id, "Output connection established");
-
-    let (reader, writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-    let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
-    let mut line_buf = String::new();
-
-    // Spawn stdin forwarder if interactive mode
-    let stdin_task = if interactive {
-        let writer = writer.clone();
-        Some(tokio::spawn(async move {
-            let stdin = tokio::io::stdin();
-            let mut stdin = BufReader::new(stdin);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match stdin.read_line(&mut line).await {
-                    Ok(0) => break, // EOF
-                    Ok(_) => {
-                        // Forward to container: "stdin:content\n"
-                        let msg = format!("stdin:{}", line.trim_end());
-                        let mut w = writer.lock().await;
-                        if w.write_all(msg.as_bytes()).await.is_err() {
-                            break;
-                        }
-                        if w.write_all(b"\n").await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        }))
-    } else {
-        None
-    };
-
-    // Read lines until connection closes (no read timeout — large image imports
-    // can take 10+ minutes during which fc-agent produces no output)
-    loop {
-        line_buf.clear();
-        match reader.read_line(&mut line_buf).await {
-            Ok(0) => {
-                // EOF - connection closed
-                debug!(vm_id = %vm_id, "Output connection closed");
-                break;
-            }
-            Ok(_) => {
-                // Parse raw line format: stream:content
-                let line = line_buf.trim_end();
-                if let Some((stream, content)) = line.split_once(':') {
-                    // Print container output directly (stdout to stdout, stderr to stderr)
-                    // No prefix - clean output for scripting
-                    if stream == "stdout" {
-                        println!("{}", content);
-                    } else {
-                        eprintln!("{}", content);
-                    }
-                    output_lines.push((stream.to_string(), content.to_string()));
-
-                    // Forward to broadcast channel for library consumers
-                    if let Some(ref tx) = log_tx {
-                        let _ = tx.send(LogLine {
-                            stream: stream.to_string(),
-                            content: content.to_string(),
-                        });
-                    }
-
-                    // Send ack back (bidirectional)
-                    let mut w = writer.lock().await;
-                    let _ = w.write_all(b"ack\n").await;
-                }
-            }
+    // Accept connections from fc-agent in a loop. The first connection may be closed
+    // by a snapshot (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET closes all vsock connections).
+    // When that happens, fc-agent reconnects, so we need to accept again.
+    'accept_loop: loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(conn) => conn,
             Err(e) => {
-                warn!(vm_id = %vm_id, error = %e, "Error reading output");
-                break;
+                warn!(vm_id = %vm_id, error = %e, "Error accepting output connection");
+                let _ = std::fs::remove_file(socket_path);
+                return Ok(output_lines);
+            }
+        };
+
+        debug!(vm_id = %vm_id, "Output connection established");
+
+        let (reader, writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
+        let mut line_buf = String::new();
+        let mut got_output = false;
+
+        // Spawn stdin forwarder if interactive mode (only on first connection)
+        let stdin_task = if interactive {
+            let writer = writer.clone();
+            Some(tokio::spawn(async move {
+                let stdin = tokio::io::stdin();
+                let mut stdin = BufReader::new(stdin);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match stdin.read_line(&mut line).await {
+                        Ok(0) => break, // EOF
+                        Ok(_) => {
+                            // Forward to container: "stdin:content\n"
+                            let msg = format!("stdin:{}", line.trim_end());
+                            let mut w = writer.lock().await;
+                            if w.write_all(msg.as_bytes()).await.is_err() {
+                                break;
+                            }
+                            if w.write_all(b"\n").await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
+        // Read lines until connection closes (no read timeout — large image imports
+        // can take 10+ minutes during which fc-agent produces no output)
+        loop {
+            line_buf.clear();
+            match reader.read_line(&mut line_buf).await {
+                Ok(0) => {
+                    // EOF - connection closed
+                    debug!(vm_id = %vm_id, "Output connection closed");
+                    break;
+                }
+                Ok(_) => {
+                    // Parse raw line format: stream:content
+                    let line = line_buf.trim_end();
+                    if let Some((stream, content)) = line.split_once(':') {
+                        if stream == "heartbeat" {
+                            // Heartbeat from fc-agent during long operations (image import/pull)
+                            info!(vm_id = %vm_id, phase = %content, "VM heartbeat");
+                        } else {
+                            // Print container output directly (stdout to stdout, stderr to stderr)
+                            // No prefix - clean output for scripting
+                            got_output = true;
+                            if stream == "stdout" {
+                                println!("{}", content);
+                            } else {
+                                eprintln!("{}", content);
+                            }
+                            output_lines.push((stream.to_string(), content.to_string()));
+                        }
+
+                        // Forward to broadcast channel for library consumers
+                        if let Some(ref tx) = log_tx {
+                            let _ = tx.send(LogLine {
+                                stream: stream.to_string(),
+                                content: content.to_string(),
+                            });
+                        }
+
+                        // Send ack back (bidirectional)
+                        let mut w = writer.lock().await;
+                        let _ = w.write_all(b"ack\n").await;
+                    }
+                }
+                Err(e) => {
+                    warn!(vm_id = %vm_id, error = %e, "Error reading output");
+                    break;
+                }
             }
         }
-    }
 
-    // Abort stdin task if it's still running
-    if let Some(task) = stdin_task {
-        task.abort();
+        // Abort stdin task if it's still running
+        if let Some(task) = stdin_task {
+            task.abort();
+        }
+
+        // If we received actual output, we're done. If we only got heartbeats or
+        // nothing (snapshot reset closed the connection), re-accept for the reconnect.
+        if got_output {
+            break 'accept_loop;
+        }
+        debug!(vm_id = %vm_id, "No output received, re-accepting (snapshot reset?)");
     }
 
     // Clean up
@@ -1161,7 +1198,7 @@ fn snapshot_run_firecracker_overrides(
     )
 }
 
-pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
+pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     info!("Starting fcvm podman run");
 
     // Validate VM name before any setup work
@@ -1172,6 +1209,31 @@ pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
     if args.setup && nix::unistd::geteuid().is_root() {
         bail!("--setup is not allowed when running as root. Run 'fcvm setup' first.");
     }
+
+    // Validate --user format (must be "uid:gid" with numeric values)
+    if let Some(ref user) = args.user {
+        let parts: Vec<&str> = user.split(':').collect();
+        if parts.len() != 2 {
+            bail!("invalid --user format '{}': expected 'uid:gid'", user);
+        }
+        parts[0]
+            .parse::<u32>()
+            .map_err(|_| anyhow::anyhow!("invalid --user uid '{}': must be numeric", parts[0]))?;
+        parts[1]
+            .parse::<u32>()
+            .map_err(|_| anyhow::anyhow!("invalid --user gid '{}': must be numeric", parts[1]))?;
+    }
+
+    // Resolve 0 → host values for cpu and mem
+    if args.cpu == 0 {
+        // Firecracker allows max 32 vCPUs (and must be 1 or even)
+        let host_cpus = std::thread::available_parallelism()
+            .map(|n| n.get().min(32) as u8)
+            .unwrap_or(2);
+        args.cpu = host_cpus;
+        info!("Using host CPUs (capped at 32): {}", args.cpu);
+    }
+    info!("VM memory: {} MiB", args.mem);
 
     // Build RuntimeConfig from kernel profile (replaces env var config passing)
     let mut runtime_config = super::common::RuntimeConfig::default();
@@ -1413,8 +1475,29 @@ pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
         // Check if already cached (inside lock to prevent race)
         // Use Docker archive format (preserves HEALTHCHECK, single tar file) for FUSE transfer
         let archive_path = cache_dir.with_extension("docker.tar");
-        if !archive_path.exists() {
+        let needs_export = if !archive_path.exists() {
+            true
+        } else if !validate_docker_archive(&archive_path)? {
+            warn!(path = %archive_path.display(), "Cached archive is invalid, re-exporting");
+            let _ = tokio::fs::remove_file(&archive_path).await;
+            true
+        } else {
+            info!(image = %args.image, digest = %digest, "Using cached Docker archive");
+            false
+        };
+
+        if needs_export {
             info!(image = %args.image, digest = %digest, "Exporting localhost image as Docker archive");
+
+            // Save to a temp file in the same directory, then rename.
+            // This avoids corrupt archives from interrupted exports (atomic rename).
+            // NOTE: Can't use with_extension("docker.tar.tmp") here because archive_path
+            // ends in .docker.tar — with_extension replaces after the last dot, producing
+            // .docker.docker.tar.tmp (double .docker). Use format! to just append .tmp.
+            let tmp_path = PathBuf::from(format!("{}.tmp", archive_path.display()));
+
+            // Remove stale tmp file if it exists (podman save won't overwrite)
+            let _ = tokio::fs::remove_file(&tmp_path).await;
 
             let output = tokio::process::Command::new("podman")
                 .args([
@@ -1422,7 +1505,7 @@ pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
                     "--format",
                     "docker-archive",
                     "-o",
-                    archive_path.to_str().unwrap(),
+                    tmp_path.to_str().unwrap(),
                     &args.image,
                 ])
                 .output()
@@ -1431,9 +1514,8 @@ pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                // Clean up partial export
-                let _ = tokio::fs::remove_file(&archive_path).await;
-                drop(lock_file); // Release lock before bailing
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                drop(lock_file);
                 bail!(
                     "Failed to export image '{}' with podman save: {}",
                     args.image,
@@ -1442,9 +1524,8 @@ pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
             }
 
             // Validate the archive contains manifest.json (required for docker-archive format)
-            // This catches corrupted exports early, before they get cached and cause repeated failures
-            if !validate_docker_archive(&archive_path)? {
-                let _ = tokio::fs::remove_file(&archive_path).await;
+            if !validate_docker_archive(&tmp_path)? {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
                 drop(lock_file);
                 bail!(
                     "podman save produced invalid archive (missing manifest.json) for image '{}'",
@@ -1452,51 +1533,12 @@ pub async fn prepare_vm(args: RunArgs) -> Result<Option<VmContext>> {
                 );
             }
 
+            // Atomic rename within the same filesystem
+            tokio::fs::rename(&tmp_path, &archive_path)
+                .await
+                .context("renaming exported archive to final path")?;
+
             info!(path = %archive_path.display(), "Image exported as Docker archive");
-        } else {
-            // Validate cached archive in case it was corrupted
-            if !validate_docker_archive(&archive_path)? {
-                warn!(path = %archive_path.display(), "Cached archive is invalid, re-exporting");
-                let _ = tokio::fs::remove_file(&archive_path).await;
-                // Re-export
-                let output = tokio::process::Command::new("podman")
-                    .args([
-                        "save",
-                        "--format",
-                        "docker-archive",
-                        "-o",
-                        archive_path.to_str().unwrap(),
-                        &args.image,
-                    ])
-                    .output()
-                    .await
-                    .context("running podman save for re-export")?;
-
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let _ = tokio::fs::remove_file(&archive_path).await;
-                    drop(lock_file);
-                    bail!(
-                        "Failed to re-export image '{}' with podman save: {}",
-                        args.image,
-                        stderr
-                    );
-                }
-
-                // Validate the re-exported archive
-                if !validate_docker_archive(&archive_path)? {
-                    let _ = tokio::fs::remove_file(&archive_path).await;
-                    drop(lock_file);
-                    bail!(
-                        "podman save produced invalid archive (missing manifest.json) for image '{}' on re-export",
-                        args.image
-                    );
-                }
-
-                info!(path = %archive_path.display(), "Image re-exported as Docker archive");
-            } else {
-                info!(image = %args.image, digest = %digest, "Using cached Docker archive");
-            }
         }
 
         // Lock released when lock_file is dropped
@@ -2360,6 +2402,8 @@ async fn build_and_send_mmds(
                 "nfs_mounts": nfs_mounts,
                 "image_archive": image_device,
                 "privileged": args.privileged,
+                "user": args.user.as_deref(),
+                "forward_localhost": args.forward_localhost.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
                 "interactive": args.interactive,
                 "tty": args.tty,
                 // Use network-provided proxy, or fall back to environment variables.

@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use nix::sys::uio::{pread, pwrite};
 use nix::unistd::{lseek, Whence};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use std::path::PathBuf;
 
@@ -877,6 +877,32 @@ pub async fn create_snapshot_core(
 
     let snapshot_type = if has_base { "Diff" } else { "Full" };
 
+    // Check available disk space before attempting snapshot.
+    // A full snapshot dumps all VM memory; a diff snapshot is smaller but still needs space.
+    // Failing ENOSPC mid-snapshot corrupts the VM (Firecracker can't resume properly).
+    {
+        let memory_bytes = (snapshot_config.metadata.memory_mib as u64) * 1024 * 1024;
+        // For full snapshots, need ~memory_mib. For diff, need ~10% as buffer.
+        let required_bytes = if has_base {
+            memory_bytes / 10
+        } else {
+            memory_bytes
+        };
+        if let Ok(stat) = nix::sys::statvfs::statvfs(snapshot_dir) {
+            let available_bytes = stat.blocks_available() * stat.fragment_size();
+            if available_bytes < required_bytes {
+                anyhow::bail!(
+                    "Not enough disk space for {} snapshot: need {} MiB, have {} MiB free on {}. \
+                     Use --mem to limit VM memory, or increase btrfs_size in rootfs-config.toml.",
+                    snapshot_type.to_lowercase(),
+                    required_bytes / (1024 * 1024),
+                    available_bytes / (1024 * 1024),
+                    snapshot_dir.display()
+                );
+            }
+        }
+    }
+
     info!(
         snapshot = %snapshot_config.name,
         snapshot_type = snapshot_type,
@@ -900,17 +926,27 @@ pub async fn create_snapshot_core(
     };
     let temp_vmstate_path = temp_snapshot_dir.join("vmstate.bin");
 
-    // Pause VM before snapshotting (required by Firecracker)
+    // Pause timeout: should be fast (just pauses vCPU threads). 30s is generous.
+    // Snapshot timeout: depends on memory size (32GB at ~500MB/s = ~64s). 5 min is generous.
+    let pause_client = client.with_timeout(std::time::Duration::from_secs(30));
+    let snapshot_client = client.with_timeout(std::time::Duration::from_secs(300));
+
+    // Pause VM before snapshotting (required by Firecracker).
+    // If Pause fails/times out, the VM is NOT paused — no resume needed.
     info!(snapshot = %snapshot_config.name, "pausing VM for snapshot");
-    client
+    if let Err(e) = pause_client
         .patch_vm_state(ApiVmState {
             state: "Paused".to_string(),
         })
         .await
-        .context("pausing VM for snapshot")?;
+    {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        return Err(e).context("pausing VM for snapshot (VM still running, no data loss)");
+    }
 
-    // Create Firecracker snapshot (Full or Diff based on whether base exists)
-    let snapshot_result = client
+    // VM is now paused — we MUST resume it before returning, no matter what.
+    // Use a closure-like pattern to ensure resume always runs.
+    let snapshot_result = snapshot_client
         .create_snapshot(SnapshotCreate {
             snapshot_type: Some(snapshot_type.to_string()),
             snapshot_path: temp_vmstate_path.display().to_string(),
@@ -918,19 +954,22 @@ pub async fn create_snapshot_core(
         })
         .await;
 
-    // Resume VM immediately (always, regardless of snapshot result)
-    // This minimizes pause time - diff merge happens after resume
-    let resume_result = client
+    // Resume VM immediately (ALWAYS, regardless of snapshot result).
+    // This minimizes pause time — diff merge happens after resume.
+    let resume_result = snapshot_client
         .patch_vm_state(ApiVmState {
             state: "Resumed".to_string(),
         })
         .await;
 
     if let Err(e) = &resume_result {
-        warn!(snapshot = %snapshot_config.name, error = %e, "failed to resume VM after snapshot");
+        // Resume failure is critical — VM may be stuck paused.
+        // Log prominently so the operator knows.
+        error!(snapshot = %snapshot_config.name, error = %e,
+            "CRITICAL: failed to resume VM after snapshot — VM may be paused!");
     }
 
-    // Check if snapshot succeeded - clean up temp dir on failure
+    // Check if snapshot succeeded — clean up temp dir on failure
     if let Err(e) = snapshot_result {
         let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
         return Err(e).context("creating Firecracker snapshot");

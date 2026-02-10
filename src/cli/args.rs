@@ -114,12 +114,12 @@ pub struct RunArgs {
     #[arg(long)]
     pub name: String,
 
-    /// vCPUs
-    #[arg(long, default_value_t = 2)]
+    /// vCPUs (0 = all host CPUs)
+    #[arg(long, default_value_t = 0)]
     pub cpu: u8,
 
-    /// Memory (MiB)
-    #[arg(long, default_value_t = 2048)]
+    /// Memory in MiB, or "unlimited" to use all host memory (default: 2048)
+    #[arg(long, default_value = "2048", value_parser = parse_mem)]
     pub mem: u32,
 
     /// Minimum free space on root filesystem (default: 10G).
@@ -185,6 +185,17 @@ pub struct RunArgs {
     /// Example: --health-check http://localhost/health
     #[arg(long)]
     pub health_check: Option<String>,
+
+    /// Run container as USER:GROUP (e.g., --user 1000:1000)
+    /// Equivalent to podman run --userns=keep-id on the host
+    #[arg(long)]
+    pub user: Option<String>,
+
+    /// Forward specific localhost ports to the host gateway via iptables DNAT.
+    /// Enables containers to reach host-only services via localhost.
+    /// Comma-separated port list, e.g., --forward-localhost 1421,9099
+    #[arg(long, value_delimiter = ',')]
+    pub forward_localhost: Vec<u16>,
 
     /// Run container in privileged mode (allows mknod, device access, etc.)
     /// Use for POSIX compliance tests that need full filesystem capabilities
@@ -476,4 +487,19 @@ pub struct ExecArgs {
     /// Command and arguments to execute
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
     pub command: Vec<String>,
+}
+
+/// Parse --mem value: either an integer (MiB) or "unlimited" (all host memory).
+fn parse_mem(s: &str) -> Result<u32, String> {
+    if s.eq_ignore_ascii_case("unlimited") {
+        crate::host_memory_mib()
+            .ok_or_else(|| "failed to read host memory from /proc/meminfo".to_string())
+    } else {
+        s.parse::<u32>().map_err(|_| {
+            format!(
+                "invalid --mem value '{}': expected integer (MiB) or 'unlimited'",
+                s
+            )
+        })
+    }
 }

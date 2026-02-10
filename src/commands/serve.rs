@@ -319,6 +319,8 @@ async fn create_sandbox(
         kernel_profile: None,
         vsock_dir: None,
         no_snapshot: true,
+        forward_localhost: vec![],
+        user: None,
         image,
         command_args: vec![],
     };

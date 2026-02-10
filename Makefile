@@ -94,6 +94,7 @@ IPV6_ONLY := 1
 $(info Note: IPv6-only host detected - bridged tests will be skipped)
 endif
 
+
 # Base test command
 export CARGO_TARGET_DIR := target
 NEXTEST := $(CARGO) nextest $(NEXTEST_CMD) --release
@@ -325,8 +326,15 @@ setup-pjdfstest:
 	fi
 
 setup-btrfs:
-	@if ! mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then \
-		echo '==> Creating btrfs loopback...'; \
+	@if [ -d /mnt/fcvm-btrfs ] && stat -f -c '%T' /mnt/fcvm-btrfs 2>/dev/null | grep -q btrfs; then \
+		echo '==> /mnt/fcvm-btrfs already on btrfs'; \
+	elif stat -f -c '%T' /mnt 2>/dev/null | grep -q btrfs; then \
+		echo '==> /mnt is btrfs, creating /mnt/fcvm-btrfs as directory (no loopback needed)'; \
+		sudo mkdir -p /mnt/fcvm-btrfs && \
+		sudo chown $$(id -un):$$(id -gn) /mnt/fcvm-btrfs && \
+		mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,initrd,cache,image-cache}; \
+	elif ! mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then \
+		echo '==> Creating btrfs loopback (host is not btrfs)...'; \
 		if [ ! -f /var/fcvm-btrfs.img ]; then \
 			sudo truncate -s 60G /var/fcvm-btrfs.img && sudo mkfs.btrfs /var/fcvm-btrfs.img; \
 		fi && \

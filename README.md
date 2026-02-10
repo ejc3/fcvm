@@ -546,6 +546,8 @@ See [DESIGN.md](DESIGN.md#cli-interface) for architecture and design decisions.
 -t, --tty           Allocate pseudo-TTY (for vim, colors, etc.)
 --setup             Auto-setup if kernel/rootfs missing (rootless only)
 --no-snapshot       Disable automatic snapshot creation (for testing)
+--forward-localhost <PORTS>  Forward localhost ports to host (e.g., 1421,9099)
+--rootfs-size <SIZE> Minimum free space on rootfs (default: 10G)
 ```
 
 **`fcvm exec`** - Execute in VM/container:

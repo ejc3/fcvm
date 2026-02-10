@@ -33,6 +33,12 @@ struct Plan {
     /// Path to Docker archive for localhost/ images (imported via podman load)
     #[serde(default)]
     image_archive: Option<String>,
+    /// Run container as USER:GROUP (e.g., "1000:1000")
+    #[serde(default)]
+    user: Option<String>,
+    /// Localhost ports to forward to host gateway via iptables DNAT
+    #[serde(default)]
+    forward_localhost: Vec<String>,
     /// Run container in privileged mode (allows mknod, device access, etc.)
     #[serde(default)]
     privileged: bool,
@@ -1937,12 +1943,10 @@ fn mount_fuse_volumes(volumes: &[VolumeMount]) -> Result<Vec<String>> {
         let path = std::path::Path::new(&vol.guest_path);
         let mut ready = false;
         for attempt in 1..=60 {
-            if let Ok(entries) = std::fs::read_dir(path) {
-                let count = entries.count();
+            if std::fs::read_dir(path).is_ok() {
                 eprintln!(
-                    "[fc-agent] ✓ mount {} ready ({} entries, {}ms)",
+                    "[fc-agent] ✓ mount {} ready ({}ms)",
                     vol.guest_path,
-                    count,
                     (attempt - 1) * 500
                 );
                 ready = true;
@@ -2485,6 +2489,44 @@ async fn run_agent() -> Result<()> {
     // Save proxy settings for exec commands to use
     save_proxy_settings(&plan);
 
+    // Forward specific localhost ports to host gateway via iptables DNAT.
+    // Only the listed ports are redirected — other localhost traffic stays local.
+    if !plan.forward_localhost.is_empty() {
+        // Allow routing from 127.0.0.0/8 to non-loopback destinations
+        let _ = std::process::Command::new("sysctl")
+            .args(["-w", "net.ipv4.conf.all.route_localnet=1"])
+            .output();
+        // Disable IPv6 on loopback so ::1 connections fall back to 127.0.0.1
+        // (IPv6 has no route_localnet equivalent — ::1 can't be DNAT'd)
+        let _ = std::process::Command::new("sysctl")
+            .args(["-w", "net.ipv6.conf.lo.disable_ipv6=1"])
+            .output();
+        for port in &plan.forward_localhost {
+            let _ = std::process::Command::new("iptables")
+                .args([
+                    "-t",
+                    "nat",
+                    "-A",
+                    "OUTPUT",
+                    "-d",
+                    "127.0.0.0/8",
+                    "-p",
+                    "tcp",
+                    "--dport",
+                    port,
+                    "-j",
+                    "DNAT",
+                    "--to-destination",
+                    "10.0.2.2",
+                ])
+                .output();
+        }
+        eprintln!(
+            "[fc-agent] ✓ forwarding localhost ports to host: {:?}",
+            plan.forward_localhost
+        );
+    }
+
     // Sync VM clock from host before launching container
     // This ensures TLS certificate validation works immediately
     if let Err(e) = sync_clock_from_host().await {
@@ -2597,26 +2639,69 @@ async fn run_agent() -> Result<()> {
         });
     }
 
+    // Connect output vsock early so host can track our progress during long operations
+    // (image import can take 10+ minutes for large images)
+    let mut output_fd = create_output_vsock();
+    if output_fd >= 0 {
+        eprintln!(
+            "[fc-agent] output vsock connected early (port {})",
+            OUTPUT_VSOCK_PORT
+        );
+    }
+
     // Determine the image reference for podman run
     // If image_archive is set, import into podman storage first (so snapshot captures it)
     // Otherwise, pull from registry
     let image_ref = if let Some(archive_path) = &plan.image_archive {
         eprintln!("[fc-agent] importing Docker archive: {}", archive_path);
 
-        // Import into podman storage so the pre-start snapshot captures the loaded image.
-        // Without this, every snapshot restore would re-read the entire tar from /dev/vdb.
-        let output = Command::new("podman")
-            .args(["load", "-i", archive_path])
-            .output()
-            .await
-            .context("running podman load")?;
+        // Make block device readable by non-root (needed with --userns=keep-id)
+        if archive_path.starts_with("/dev/") {
+            let _ = std::process::Command::new("chmod")
+                .args(["444", archive_path])
+                .output();
+        }
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        // Import into podman storage with heartbeats so the host knows we're alive.
+        // podman load reads the entire archive (can be 26GB+), taking 10+ minutes.
+        let mut load_child = Command::new("podman")
+            .args(["load", "-i", archive_path])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawning podman load")?;
+
+        // Send heartbeats every 30s while waiting for podman load to finish
+        let status = loop {
+            tokio::select! {
+                result = load_child.wait() => {
+                    break result.context("waiting for podman load")?;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    send_output_line(output_fd, "heartbeat", "importing image");
+                    eprintln!("[fc-agent] heartbeat: still importing image...");
+                }
+            }
+        };
+
+        if !status.success() {
+            let stderr = if let Some(mut se) = load_child.stderr.take() {
+                let mut buf = String::new();
+                let _ = tokio::io::AsyncReadExt::read_to_string(&mut se, &mut buf).await;
+                buf
+            } else {
+                String::new()
+            };
             anyhow::bail!("podman load failed: {}", stderr);
         }
 
-        let loaded_output = String::from_utf8_lossy(&output.stdout);
+        let loaded_output = if let Some(mut so) = load_child.stdout.take() {
+            let mut buf = String::new();
+            let _ = tokio::io::AsyncReadExt::read_to_string(&mut so, &mut buf).await;
+            buf
+        } else {
+            String::new()
+        };
         eprintln!("[fc-agent] podman load: {}", loaded_output.trim());
         eprintln!("[fc-agent] ✓ image imported as: {}", plan.image);
         plan.image.clone()
@@ -2755,7 +2840,17 @@ async fn run_agent() -> Result<()> {
 
     // After cache-ready handshake, Firecracker may have created a pre-start snapshot.
     // Snapshot creation resets all vsock connections (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET),
-    // which breaks FUSE mounts. Check if mounts are still healthy and remount if needed.
+    // which breaks FUSE mounts and the output vsock. Reconnect the output vsock and
+    // check if FUSE mounts are still healthy.
+    if output_fd >= 0 {
+        unsafe { libc::close(output_fd) };
+    }
+    output_fd = create_output_vsock();
+    if output_fd >= 0 {
+        eprintln!("[fc-agent] output vsock reconnected after snapshot");
+    }
+
+    // Check if FUSE mounts are still healthy and remount if needed.
     if !mounted_fuse_paths.is_empty() {
         let mut broken = false;
         for path in &mounted_fuse_paths {
@@ -2803,7 +2898,6 @@ async fn run_agent() -> Result<()> {
     let mut podman_args = vec![
         "podman".to_string(),
         "run".to_string(),
-        "--rm".to_string(),
         "--name".to_string(),
         "fcvm-container".to_string(),
         "--network=host".to_string(),
@@ -2811,6 +2905,80 @@ async fn run_agent() -> Result<()> {
         "--ulimit".to_string(),
         "nofile=65536:65536".to_string(),
     ];
+
+    // User mapping: run podman as the specified user with --userns=keep-id
+    // This replicates host behavior where rootless podman maps the user as root
+    // inside the container while keeping the real UID on shared mounts.
+    if let Some(ref user_spec) = plan.user {
+        // Parse "uid:gid" format
+        let parts: Vec<&str> = user_spec.split(':').collect();
+        let uid = parts[0];
+        let gid = parts.get(1).unwrap_or(&"100");
+        let username = "fcvm-user".to_string();
+
+        eprintln!(
+            "[fc-agent] setting up user mapping: uid={} gid={}",
+            uid, gid
+        );
+
+        // Create group and user in the VM
+        let _ = std::process::Command::new("groupadd")
+            .args(["-g", gid, &username])
+            .output();
+        let _ = std::process::Command::new("useradd")
+            .args(["-u", uid, "-g", gid, "-m", "-s", "/bin/sh", &username])
+            .output();
+
+        // Set up subuid/subgid for rootless podman
+        let subuid_entry = format!("{}:100000:65536\n", username);
+        let _ = std::fs::write("/etc/subuid", &subuid_entry);
+        let _ = std::fs::write("/etc/subgid", &subuid_entry);
+
+        // Ensure XDG_RUNTIME_DIR exists for rootless podman
+        let runtime_dir = format!("/run/user/{}", uid);
+        let _ = std::fs::create_dir_all(&runtime_dir);
+        let _ = std::process::Command::new("chown")
+            .args([&format!("{}:{}", uid, gid), &runtime_dir])
+            .output();
+
+        // Delegate cgroup subtree to the user for rootless podman
+        let cgroup_dir = format!("/sys/fs/cgroup/user.slice/user-{}.slice", uid);
+        let _ = std::fs::create_dir_all(&cgroup_dir);
+        let _ = std::process::Command::new("chown")
+            .args(["-R", &format!("{}:{}", uid, gid), &cgroup_dir])
+            .output();
+        // Enable controllers in the user's cgroup
+        for path in &[
+            "/sys/fs/cgroup/cgroup.subtree_control",
+            &format!("{}/cgroup.subtree_control", cgroup_dir),
+        ] {
+            let _ = std::fs::write(path, "+cpu +memory +pids");
+        }
+
+        // Delegate fc-agent's own cgroup to the user so rootless podman can create sub-cgroups
+        if let Ok(cgroup_path) = std::fs::read_to_string("/proc/self/cgroup") {
+            // Format: "0::/system.slice/fc-agent.service"
+            if let Some(path) = cgroup_path.trim().strip_prefix("0::") {
+                let full_path = format!("/sys/fs/cgroup{}", path);
+                let _ = std::process::Command::new("chown")
+                    .args(["-R", &format!("{}:{}", uid, gid), &full_path])
+                    .output();
+                eprintln!("[fc-agent] delegated cgroup {} to user {}", full_path, uid);
+            }
+        }
+
+        // Remove --cgroups=split (rootless podman uses cgroupfs, not split)
+        podman_args.retain(|a| a != "--cgroups=split");
+
+        // Add --userns=keep-id to podman args (replicates host behavior)
+        podman_args.push("--userns=keep-id".to_string());
+
+        // Wrap entire command with runuser to run podman as the target user
+        podman_args.insert(0, "--".to_string());
+        podman_args.insert(0, username.clone());
+        podman_args.insert(0, "-u".to_string());
+        podman_args.insert(0, "runuser".to_string());
+    }
 
     // Privileged mode: allows mknod, device access, etc. for POSIX compliance tests
     if plan.privileged {
@@ -2926,16 +3094,6 @@ async fn run_agent() -> Result<()> {
     // The host listens on vsock.sock_4999 for status messages
     notify_container_started();
 
-    // Create vsock connection for container output streaming
-    // Port 4997 is dedicated for stdout/stderr
-    let output_fd = create_output_vsock();
-    if output_fd >= 0 {
-        eprintln!(
-            "[fc-agent] output vsock connected (port {})",
-            OUTPUT_VSOCK_PORT
-        );
-    }
-
     // Stream stdout via vsock (wrapped in Arc for sharing across tasks)
     let output_fd_arc = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(output_fd));
     let stdout_task = if let Some(stdout) = child.stdout.take() {
@@ -3027,11 +3185,6 @@ async fn run_agent() -> Result<()> {
         let _ = task.await;
     }
 
-    // Close output vsock
-    if output_fd >= 0 {
-        unsafe { libc::close(output_fd) };
-    }
-
     if status.success() {
         eprintln!("[fc-agent] container exited successfully");
     } else {
@@ -3039,7 +3192,50 @@ async fn run_agent() -> Result<()> {
             "[fc-agent] container exited with error: {} (code {})",
             status, exit_code
         );
+
+        // Capture podman logs on failure - the container might write to journald/files
+        // instead of stdout/stderr, so piped output alone may miss the real error
+        eprintln!("[fc-agent] capturing podman logs for failed container...");
+        match std::process::Command::new("podman")
+            .args(["logs", "fcvm-container"])
+            .output()
+        {
+            Ok(logs) => {
+                let stdout = String::from_utf8_lossy(&logs.stdout);
+                let stderr = String::from_utf8_lossy(&logs.stderr);
+                if !stdout.is_empty() {
+                    eprintln!("[fc-agent] === podman logs (stdout) ===");
+                    for line in stdout.lines() {
+                        eprintln!("[fc-agent] {}", line);
+                        send_output_line(output_fd, "stdout", line);
+                    }
+                }
+                if !stderr.is_empty() {
+                    eprintln!("[fc-agent] === podman logs (stderr) ===");
+                    for line in stderr.lines() {
+                        eprintln!("[fc-agent] {}", line);
+                        send_output_line(output_fd, "stderr", line);
+                    }
+                }
+                if stdout.is_empty() && stderr.is_empty() {
+                    eprintln!("[fc-agent] (no podman logs captured)");
+                }
+            }
+            Err(e) => {
+                eprintln!("[fc-agent] failed to get podman logs: {}", e);
+            }
+        }
     }
+
+    // Close output vsock after all output (including failure logs) has been sent
+    if output_fd >= 0 {
+        unsafe { libc::close(output_fd) };
+    }
+
+    // Clean up the container (we don't use --rm so we can capture logs on failure)
+    let _ = std::process::Command::new("podman")
+        .args(["rm", "-f", "fcvm-container"])
+        .output();
 
     // Notify host of container exit status via vsock
     // The host can use this to determine if the container succeeded
