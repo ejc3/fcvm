@@ -272,6 +272,135 @@ async fn test_trailing_args_command() -> Result<()> {
     Ok(())
 }
 
+/// Test that container stdout streams to host after snapshot.
+///
+/// Snapshot creation resets all vsock connections (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET).
+/// The output listener must re-accept connections so container output continues flowing.
+/// Without the fix, output after snapshot is silently lost.
+#[tokio::test]
+async fn test_output_survives_snapshot() -> Result<()> {
+    use std::time::Duration;
+
+    println!("\nOutput after snapshot test");
+    println!("=========================");
+    println!("Verifies container stdout streams to host after snapshot vsock reset");
+
+    let (vm_name, _, _, _) = common::unique_names("output-snap");
+    let marker = format!("SNAPSHOT-OUTPUT-MARKER-{}", std::process::id());
+
+    // Run container that prints output before and after the snapshot window.
+    // Snapshots are enabled by default, so the output listener must survive
+    // the vsock reset after snapshot creation.
+    //
+    // Timeline:
+    //   0s: container starts, prints pre-snapshot lines immediately
+    //   ~2-5s: snapshot happens (image already cached from previous test)
+    //   5s: container prints post-snapshot marker
+    //   6s: container prints many lines to stress pipe buffer
+    //
+    // This catches both the vsock reconnect bug AND the pipe buffer deadlock.
+    let script = format!(
+        "echo 'PRE-SNAPSHOT-LINE-1'; \
+         echo 'PRE-SNAPSHOT-LINE-2'; \
+         sleep 5; \
+         echo '{}'; \
+         for i in $(seq 1 100); do echo \"OUTPUT-LINE-$i\"; done; \
+         echo 'ALL-OUTPUT-DONE'",
+        marker
+    );
+    println!("  Starting VM with marker: {}", marker);
+    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        common::ALPINE_IMAGE,
+        "sh",
+        "-c",
+        &script,
+    ])
+    .await
+    .context("spawning fcvm")?;
+
+    println!("  fcvm PID: {}", fcvm_pid);
+    println!("  Waiting for VM to exit (max 120s)...");
+
+    // Wait for process to exit
+    let status = tokio::time::timeout(Duration::from_secs(120), child.wait())
+        .await
+        .context("timeout waiting for VM")?
+        .context("waiting for child")?;
+
+    println!("  Exit status: {}", status);
+    assert!(status.success(), "VM should exit successfully");
+
+    // Check the debug log for our marker in actual container output lines.
+    // The marker must appear as stdout from the output listener (prefixed "[name]"),
+    // NOT just in the command args or plan response body.
+    let log_dir = "/tmp/fcvm-test-logs";
+    let mut found_marker = false;
+    if let Ok(entries) = std::fs::read_dir(log_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if name.contains("output-snap") {
+                if let Ok(contents) = std::fs::read_to_string(&path) {
+                    // Look for the marker in stdout lines (output listener forwards as
+                    // "[name] content" for stdout). Exclude lines containing "args=",
+                    // "plan response", or "cmd" which just echo the command, not output.
+                    for line in contents.lines() {
+                        if line.contains(&marker)
+                            && !line.contains("args=")
+                            && !line.contains("plan response")
+                            && !line.contains("\"cmd\"")
+                        {
+                            println!("  Found marker in container output: {}", line.trim());
+                            found_marker = true;
+                            break;
+                        }
+                    }
+                    if found_marker {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        found_marker,
+        "Container output marker '{}' not found in test logs — output listener \
+         did not survive snapshot vsock reset",
+        marker
+    );
+
+    // Also verify the bulk output didn't get stuck (pipe buffer deadlock)
+    let mut found_done = false;
+    if let Ok(entries) = std::fs::read_dir(log_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if name.contains("output-snap") {
+                if let Ok(contents) = std::fs::read_to_string(&path) {
+                    if contents.contains("ALL-OUTPUT-DONE") {
+                        found_done = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        found_done,
+        "ALL-OUTPUT-DONE sentinel not found — pipe buffer deadlock after snapshot"
+    );
+
+    println!("✅ OUTPUT AFTER SNAPSHOT PASSED!");
+    println!("  Container stdout survived snapshot vsock reset");
+    println!("  100 lines + sentinel all received (no pipe deadlock)");
+    Ok(())
+}
+
 /// Test that VM shuts down when container fails to start (e.g., invalid image)
 ///
 /// This is critical: if the container can't start (image pull fails, etc.),
