@@ -167,6 +167,7 @@ fn handle_pipe(fd: i32, request: &ExecRequest) {
         Err(e) => {
             let response = ExecResponse::Error(format!("Failed to spawn: {}", e));
             write_line_to_fd(fd, &serde_json::to_string(&response).unwrap());
+            unsafe { libc::close(fd) };
             return;
         }
     };
