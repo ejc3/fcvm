@@ -1,5 +1,9 @@
-use std::io::{BufRead, BufReader};
-use std::os::fd::IntoRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::sync::Arc;
+
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::Mutex;
 
 use crate::types::{ExecRequest, ExecResponse};
 use crate::vsock;
@@ -30,13 +34,7 @@ pub async fn run_server(ready_tx: tokio::sync::oneshot::Sender<()>) {
     loop {
         match listener.accept().await {
             Ok(client_fd) => {
-                // Consume OwnedFd into raw fd so handle_connection owns the fd.
-                // The TTY path closes it via File::from_raw_fd, and the non-TTY
-                // path closes it explicitly with libc::close.
-                let raw_fd = client_fd.into_raw_fd();
-                tokio::task::spawn_blocking(move || {
-                    handle_connection(raw_fd);
-                });
+                tokio::spawn(handle_connection(client_fd));
             }
             Err(e) => {
                 eprintln!("[fc-agent] exec server accept error: {}", e);
@@ -45,6 +43,43 @@ pub async fn run_server(ready_tx: tokio::sync::oneshot::Sender<()>) {
     }
 }
 
+/// Async write helper — writes a JSON line to the vsock fd using AsyncFd.
+async fn write_line_async(conn: &AsyncFd<OwnedFd>, data: &str) {
+    let bytes = format!("{}\n", data);
+    let buf = bytes.as_bytes();
+    let mut pos = 0;
+    while pos < buf.len() {
+        let mut guard = match conn.writable().await {
+            Ok(g) => g,
+            Err(_) => break,
+        };
+        match guard.try_io(|inner| {
+            let n = unsafe {
+                libc::write(
+                    inner.as_raw_fd(),
+                    buf[pos..].as_ptr().cast(),
+                    buf.len() - pos,
+                )
+            };
+            if n < 0 {
+                Err(std::io::Error::last_os_error())
+            } else if n == 0 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "write returned 0",
+                ))
+            } else {
+                Ok(n as usize)
+            }
+        }) {
+            Ok(Ok(n)) => pos += n,
+            Ok(Err(_)) => break,
+            Err(_would_block) => continue,
+        }
+    }
+}
+
+/// Blocking write helper — used for error responses before fd is made non-blocking.
 fn write_line_to_fd(fd: i32, data: &str) {
     let bytes = format!("{}\n", data);
     let mut written = 0;
@@ -63,7 +98,9 @@ fn write_line_to_fd(fd: i32, data: &str) {
     }
 }
 
-fn handle_connection(fd: i32) {
+/// Read the request line synchronously (blocking byte-by-byte read).
+/// Returns (ExecRequest, raw_fd) on success, or None if connection closed or parse error.
+fn read_request_line(fd: i32) -> Option<(ExecRequest, i32)> {
     const MAX_EXEC_LINE_LENGTH: usize = 1_048_576;
     let mut line = String::new();
     let mut buf = [0u8; 1];
@@ -71,7 +108,7 @@ fn handle_connection(fd: i32) {
         let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
         if n <= 0 {
             unsafe { libc::close(fd) };
-            return;
+            return None;
         }
         if buf[0] == b'\n' {
             break;
@@ -82,7 +119,7 @@ fn handle_connection(fd: i32) {
                 MAX_EXEC_LINE_LENGTH
             );
             unsafe { libc::close(fd) };
-            return;
+            return None;
         }
         line.push(buf[0] as char);
     }
@@ -93,18 +130,32 @@ fn handle_connection(fd: i32) {
             let response = ExecResponse::Error(format!("Invalid request: {}", e));
             write_line_to_fd(fd, &serde_json::to_string(&response).unwrap());
             unsafe { libc::close(fd) };
-            return;
+            return None;
         }
+    };
+
+    Some((request, fd))
+}
+
+async fn handle_connection(client_fd: OwnedFd) {
+    // Read request line in spawn_blocking (blocking byte-by-byte read, fast)
+    let raw_fd = client_fd.into_raw_fd();
+    let parsed = tokio::task::spawn_blocking(move || read_request_line(raw_fd)).await;
+
+    let (request, raw_fd) = match parsed {
+        Ok(Some((req, fd))) => (req, fd),
+        Ok(None) => return, // connection closed or parse error (already handled)
+        Err(_) => return,   // spawn_blocking panicked
     };
 
     if request.command.is_empty() {
         let response = ExecResponse::Error("Empty command".to_string());
-        write_line_to_fd(fd, &serde_json::to_string(&response).unwrap());
-        unsafe { libc::close(fd) };
+        write_line_to_fd(raw_fd, &serde_json::to_string(&response).unwrap());
+        unsafe { libc::close(raw_fd) };
         return;
     }
 
-    // TTY path: run_with_pty_fd takes ownership of fd via File::from_raw_fd
+    // TTY path: must be blocking (fork/PTY)
     if request.tty || request.interactive {
         let command = if request.in_container {
             let mut cmd = vec!["podman".to_string(), "exec".to_string()];
@@ -125,18 +176,20 @@ fn handle_connection(fd: i32) {
             request.command.clone()
         };
 
-        let _exit_code =
-            crate::tty::run_with_pty_fd(fd, &command, request.tty, request.interactive);
+        tokio::task::spawn_blocking(move || {
+            crate::tty::run_with_pty_fd(raw_fd, &command, request.tty, request.interactive);
+        });
     } else {
-        handle_pipe(fd, &request);
+        // Pipe path: fully async
+        handle_pipe_async(raw_fd, &request).await;
     }
 }
 
-fn handle_pipe(fd: i32, request: &ExecRequest) {
+async fn handle_pipe_async(raw_fd: i32, request: &ExecRequest) {
     let proxy_settings = crate::system::read_proxy_settings();
 
     let mut cmd = if request.in_container {
-        let mut cmd = std::process::Command::new("podman");
+        let mut cmd = tokio::process::Command::new("podman");
         cmd.arg("exec");
         if request.interactive {
             cmd.arg("-i");
@@ -148,7 +201,7 @@ fn handle_pipe(fd: i32, request: &ExecRequest) {
         cmd.args(&request.command);
         cmd
     } else {
-        let mut cmd = std::process::Command::new(&request.command[0]);
+        let mut cmd = tokio::process::Command::new(&request.command[0]);
         cmd.args(&request.command[1..]);
         for (key, value) in &proxy_settings {
             cmd.env(key, value);
@@ -166,64 +219,76 @@ fn handle_pipe(fd: i32, request: &ExecRequest) {
         Ok(c) => c,
         Err(e) => {
             let response = ExecResponse::Error(format!("Failed to spawn: {}", e));
-            write_line_to_fd(fd, &serde_json::to_string(&response).unwrap());
-            unsafe { libc::close(fd) };
+            write_line_to_fd(raw_fd, &serde_json::to_string(&response).unwrap());
+            unsafe { libc::close(raw_fd) };
             return;
         }
+    };
+
+    // Spawn succeeded — set non-blocking, take ownership, wrap in AsyncFd
+    nix::fcntl::fcntl(
+        raw_fd,
+        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+    )
+    .ok();
+    let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let async_fd = match AsyncFd::new(owned_fd) {
+        Ok(fd) => Arc::new(Mutex::new(fd)),
+        Err(_) => return, // fd closed by OwnedFd drop
     };
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    // Mutex protects the fd so stdout/stderr threads don't interleave writes
-    let fd_mu = std::sync::Arc::new(std::sync::Mutex::new(fd));
-
-    let fd_stdout = fd_mu.clone();
-    let stdout_thread = stdout.map(|stdout| {
-        std::thread::spawn(move || {
+    // Spawn async stdout reader
+    let conn_stdout = async_fd.clone();
+    let stdout_task = stdout.map(|stdout| {
+        tokio::spawn(async move {
             let reader = BufReader::new(stdout);
-            for line in reader.lines().map_while(Result::ok) {
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
                 let response = ExecResponse::Stdout(format!("{}\n", line));
-                let fd = fd_stdout.lock().unwrap();
-                write_line_to_fd(*fd, &serde_json::to_string(&response).unwrap());
+                let conn = conn_stdout.lock().await;
+                write_line_async(&conn, &serde_json::to_string(&response).unwrap()).await;
             }
         })
     });
 
-    let fd_stderr = fd_mu.clone();
-    let stderr_thread = stderr.map(|stderr| {
-        std::thread::spawn(move || {
+    // Spawn async stderr reader
+    let conn_stderr = async_fd.clone();
+    let stderr_task = stderr.map(|stderr| {
+        tokio::spawn(async move {
             let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
                 let response = ExecResponse::Stderr(format!("{}\n", line));
-                let fd = fd_stderr.lock().unwrap();
-                write_line_to_fd(*fd, &serde_json::to_string(&response).unwrap());
+                let conn = conn_stderr.lock().await;
+                write_line_async(&conn, &serde_json::to_string(&response).unwrap()).await;
             }
         })
     });
 
-    let exit_status = child.wait();
+    let exit_status = child.wait().await;
 
-    if let Some(t) = stdout_thread {
-        let _ = t.join();
+    if let Some(task) = stdout_task {
+        let _ = task.await;
     }
-    if let Some(t) = stderr_thread {
-        let _ = t.join();
+    if let Some(task) = stderr_task {
+        let _ = task.await;
     }
 
     let exit_code = match exit_status {
         Ok(status) => status.code().unwrap_or(1),
         Err(e) => {
             let response = ExecResponse::Error(format!("Wait failed: {}", e));
-            write_line_to_fd(fd, &serde_json::to_string(&response).unwrap());
+            let conn = async_fd.lock().await;
+            write_line_async(&conn, &serde_json::to_string(&response).unwrap()).await;
             1
         }
     };
 
     let response = ExecResponse::Exit(exit_code);
-    write_line_to_fd(fd, &serde_json::to_string(&response).unwrap());
-
-    // Close the fd — in non-TTY mode we own it (TTY mode transfers
-    // ownership to File::from_raw_fd inside run_with_pty_fd).
-    unsafe { libc::close(fd) };
+    let conn = async_fd.lock().await;
+    write_line_async(&conn, &serde_json::to_string(&response).unwrap()).await;
+    // fd closed by OwnedFd drop (inside AsyncFd, inside Mutex, inside Arc)
 }

@@ -1294,6 +1294,153 @@ async fn test_exec_parallel_tty_stress() -> Result<()> {
     Ok(())
 }
 
+/// Test 26: Parallel non-TTY pipe stress test (100 execs in waves of 10)
+///
+/// Validates the async pipe path under concurrent load. Each exec runs
+/// `seq 1 100` to generate multi-line output through the pipe path.
+/// The exec protocol sends each line as a separate Stdout JSON response
+/// (newlines stripped by BufReader::lines), so the captured output is
+/// all numbers concatenated: "123456789101112...99100".
+#[tokio::test]
+async fn test_exec_parallel_pipe_stress() -> Result<()> {
+    const TOTAL_EXECS: usize = 100;
+    const WAVE_SIZE: usize = 10;
+
+    println!(
+        "\nParallel Pipe Stress Test ({} execs in waves of {})",
+        TOTAL_EXECS, WAVE_SIZE
+    );
+    println!("==========================================================");
+
+    let fcvm_path = common::find_fcvm_binary()?;
+    let (vm_name, _, _, _) = common::unique_names("stress-pipe");
+
+    // Expected output: seq 1 100 with newlines stripped = concatenated numbers
+    let expected_output: String = (1..=100).map(|n| n.to_string()).collect();
+
+    // Start VM with nginx (keeps running)
+    println!("Starting VM...");
+    let (mut _child, fcvm_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "rootless",
+        common::TEST_IMAGE,
+    ])
+    .await
+    .context("spawning VM")?;
+
+    println!("  fcvm process started (PID: {})", fcvm_pid);
+
+    // Wait for VM to become healthy
+    common::poll_health_by_pid(fcvm_pid, 60)
+        .await
+        .context("waiting for VM to be healthy")?;
+    println!("  VM is healthy");
+
+    // Run execs in waves
+    println!(
+        "\nRunning {} non-TTY execs in waves of {}...",
+        TOTAL_EXECS, WAVE_SIZE
+    );
+    let start = std::time::Instant::now();
+
+    let mut success_count = 0;
+    let mut failures: Vec<(usize, String)> = Vec::new();
+
+    for wave in 0..(TOTAL_EXECS / WAVE_SIZE) {
+        let mut handles = Vec::new();
+        for i in 0..WAVE_SIZE {
+            let idx = wave * WAVE_SIZE + i;
+            let fcvm_path = fcvm_path.clone();
+            let pid = fcvm_pid;
+            handles.push(tokio::spawn(async move {
+                let output = tokio::process::Command::new(&fcvm_path)
+                    .args([
+                        "exec",
+                        "--pid",
+                        &pid.to_string(),
+                        "--vm",
+                        "--",
+                        "seq",
+                        "1",
+                        "100",
+                    ])
+                    .output()
+                    .await;
+                (idx, output)
+            }));
+        }
+
+        // Collect wave results
+        for handle in handles {
+            let (idx, result) = handle.await.context("joining task")?;
+            match result {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    let exit_code = output.status.code().unwrap_or(-1);
+
+                    if exit_code == 0 && stdout == expected_output {
+                        success_count += 1;
+                    } else {
+                        let preview = if stdout.len() > 40 {
+                            format!("{}...(len={})", &stdout[..40], stdout.len())
+                        } else {
+                            stdout.clone()
+                        };
+                        failures.push((
+                            idx,
+                            format!("exit={}, output={:?}", exit_code, preview),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    failures.push((idx, format!("error: {}", e)));
+                }
+            }
+        }
+
+        // Brief pause between waves to let vsock recover
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let elapsed = start.elapsed();
+    println!("\n===== PIPE STRESS TEST RESULTS =====");
+    println!("Total execs: {}", TOTAL_EXECS);
+    println!("Success: {}", success_count);
+    println!("Failures: {}", failures.len());
+    println!("Duration: {:?}", elapsed);
+    println!(
+        "Throughput: {:.1} execs/sec",
+        TOTAL_EXECS as f64 / elapsed.as_secs_f64()
+    );
+
+    if !failures.is_empty() {
+        println!("\n=== FAILURES (first 10) ===");
+        for (idx, msg) in failures.iter().take(10) {
+            println!("  #{}: {}", idx, msg);
+        }
+    }
+
+    // Cleanup
+    println!("\nCleaning up...");
+    common::kill_process(fcvm_pid).await;
+
+    // Assert 100% success
+    assert_eq!(
+        success_count, TOTAL_EXECS,
+        "Expected 100% success rate, got {}/{} failures: {:?}",
+        success_count,
+        TOTAL_EXECS,
+        failures.iter().take(5).collect::<Vec<_>>()
+    );
+
+    println!("✓ ALL {} PARALLEL PIPE EXECS PASSED!", TOTAL_EXECS);
+    Ok(())
+}
+
 // ============================================================================
 // Tests for `fcvm podman run -it` (not exec, but container run with -i/-t)
 // ============================================================================
