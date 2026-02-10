@@ -340,8 +340,23 @@ if [ -n "${{http_proxy:-}}" ]; then
     echo "Acquire::http::Proxy \"$http_proxy\";" > /etc/apt/apt.conf.d/99proxy
     echo "Acquire::https::Proxy \"$http_proxy\";" >> /etc/apt/apt.conf.d/99proxy
 fi
+# Configure apt to retry on transient failures (e.g. 403 from mirrors)
+echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/80retries
 apt-get update -qq
-apt-get install --download-only --yes --no-install-recommends {packages}
+# Retry apt-get download up to 3 times with delay for transient mirror errors
+for attempt in 1 2 3; do
+    if apt-get install --download-only --yes --no-install-recommends {packages}; then
+        break
+    fi
+    if [ "$attempt" -lt 3 ]; then
+        echo "apt-get download failed (attempt $attempt/3), retrying in $((attempt * 10))s..."
+        sleep $((attempt * 10))
+        apt-get update -qq
+    else
+        echo "apt-get download failed after 3 attempts"
+        exit 1
+    fi
+done
 cp /var/cache/apt/archives/*.deb /packages/ 2>/dev/null || true
 "#,
         codename = codename,
