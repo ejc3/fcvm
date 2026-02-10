@@ -183,7 +183,7 @@ fn handle_pipe(fd: i32, request: &ExecRequest) {
         std::thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
-                let response = ExecResponse::Stdout(line);
+                let response = ExecResponse::Stdout(format!("{}\n", line));
                 let fd = fd_stdout.lock().unwrap();
                 write_line_to_fd(*fd, &serde_json::to_string(&response).unwrap());
             }
@@ -195,7 +195,7 @@ fn handle_pipe(fd: i32, request: &ExecRequest) {
         std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines().map_while(Result::ok) {
-                let response = ExecResponse::Stderr(line);
+                let response = ExecResponse::Stderr(format!("{}\n", line));
                 let fd = fd_stderr.lock().unwrap();
                 write_line_to_fd(*fd, &serde_json::to_string(&response).unwrap());
             }
