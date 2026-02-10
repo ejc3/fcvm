@@ -296,6 +296,7 @@ pub fn build_podman_args(plan: &Plan, image_ref: &str) -> Vec<String> {
         "--cgroups=split".to_string(),
         "--ulimit".to_string(),
         "nofile=65536:65536".to_string(),
+        "--pids-limit=-1".to_string(),
     ];
 
     if let Some(ref user_spec) = plan.user {
