@@ -2641,7 +2641,7 @@ async fn run_agent() -> Result<()> {
 
     // Connect output vsock early so host can track our progress during long operations
     // (image import can take 10+ minutes for large images)
-    let output_fd = create_output_vsock();
+    let mut output_fd = create_output_vsock();
     if output_fd >= 0 {
         eprintln!(
             "[fc-agent] output vsock connected early (port {})",
@@ -2840,7 +2840,17 @@ async fn run_agent() -> Result<()> {
 
     // After cache-ready handshake, Firecracker may have created a pre-start snapshot.
     // Snapshot creation resets all vsock connections (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET),
-    // which breaks FUSE mounts. Check if mounts are still healthy and remount if needed.
+    // which breaks FUSE mounts and the output vsock. Reconnect the output vsock and
+    // check if FUSE mounts are still healthy.
+    if output_fd >= 0 {
+        unsafe { libc::close(output_fd) };
+    }
+    output_fd = create_output_vsock();
+    if output_fd >= 0 {
+        eprintln!("[fc-agent] output vsock reconnected after snapshot");
+    }
+
+    // Check if FUSE mounts are still healthy and remount if needed.
     if !mounted_fuse_paths.is_empty() {
         let mut broken = false;
         for path in &mounted_fuse_paths {
@@ -3175,11 +3185,6 @@ async fn run_agent() -> Result<()> {
         let _ = task.await;
     }
 
-    // Close output vsock
-    if output_fd >= 0 {
-        unsafe { libc::close(output_fd) };
-    }
-
     if status.success() {
         eprintln!("[fc-agent] container exited successfully");
     } else {
@@ -3220,6 +3225,11 @@ async fn run_agent() -> Result<()> {
                 eprintln!("[fc-agent] failed to get podman logs: {}", e);
             }
         }
+    }
+
+    // Close output vsock after all output (including failure logs) has been sent
+    if output_fd >= 0 {
+        unsafe { libc::close(output_fd) };
     }
 
     // Clean up the container (we don't use --rm so we can capture logs on failure)
