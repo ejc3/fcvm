@@ -58,6 +58,11 @@ impl VsockStream {
                 };
                 if n < 0 {
                     Err(std::io::Error::last_os_error())
+                } else if n == 0 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "write returned 0",
+                    ))
                 } else {
                     Ok(n as usize)
                 }

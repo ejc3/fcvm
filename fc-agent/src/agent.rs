@@ -141,6 +141,12 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    // After cache-ready handshake, Firecracker may have created a pre-start snapshot.
+    // Snapshot creation resets all vsock connections (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET),
+    // which breaks FUSE mounts and the output vsock. Reconnect the output vsock and
+    // check if FUSE mounts are still healthy.
+    output.reconnect();
+
     // Check FUSE health after potential snapshot
     mounts::check_and_remount_fuse(&plan.volumes, &mounted_fuse_paths).await;
 
