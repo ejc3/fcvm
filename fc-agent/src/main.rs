@@ -2872,7 +2872,19 @@ async fn run_agent() -> Result<()> {
 
     // After cache-ready handshake, Firecracker may have created a pre-start snapshot.
     // Snapshot creation resets all vsock connections (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET),
-    // which breaks FUSE mounts. Check if mounts are still healthy and remount if needed.
+    // which breaks FUSE mounts and the output vsock. Reconnect the output vsock and
+    // check if FUSE mounts are still healthy.
+    {
+        let old_fd = OUTPUT_VSOCK_FD.load(std::sync::atomic::Ordering::Relaxed);
+        if old_fd >= 0 {
+            unsafe { libc::close(old_fd) };
+        }
+        let new_fd = create_output_vsock();
+        OUTPUT_VSOCK_FD.store(new_fd, std::sync::atomic::Ordering::Release);
+        if new_fd >= 0 {
+            eprintln!("[fc-agent] output vsock reconnected after snapshot");
+        }
+    }
     if !mounted_fuse_paths.is_empty() {
         let mut broken = false;
         for path in &mounted_fuse_paths {
@@ -3140,8 +3152,8 @@ async fn run_agent() -> Result<()> {
 
     // Stream stdout via channel → writer thread → vsock
     let stdout_tx = output_tx.clone();
-    let stdout_task = if let Some(stdout) = child.stdout.take() {
-        Some(tokio::spawn(async move {
+    let stdout_task = child.stdout.take().map(|stdout| {
+        tokio::spawn(async move {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -3150,15 +3162,13 @@ async fn run_agent() -> Result<()> {
                     break; // Writer thread exited
                 }
             }
-        }))
-    } else {
-        None
-    };
+        })
+    });
 
     // Stream stderr via channel → writer thread → vsock
     let stderr_tx = output_tx.clone();
-    let stderr_task = if let Some(stderr) = child.stderr.take() {
-        Some(tokio::spawn(async move {
+    let stderr_task = child.stderr.take().map(|stderr| {
+        tokio::spawn(async move {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -3167,10 +3177,8 @@ async fn run_agent() -> Result<()> {
                     break; // Writer thread exited
                 }
             }
-        }))
-    } else {
-        None
-    };
+        })
+    });
 
     // Drop our copy of the sender (stdout/stderr tasks hold their own clones)
     drop(output_tx);
@@ -3188,12 +3196,6 @@ async fn run_agent() -> Result<()> {
     }
     // All senders dropped → writer_thread recv() returns Err → thread exits
     let _ = writer_thread.join();
-
-    // Close output vsock
-    let final_fd = OUTPUT_VSOCK_FD.swap(-1, std::sync::atomic::Ordering::Release);
-    if final_fd >= 0 {
-        unsafe { libc::close(final_fd) };
-    }
 
     if status.success() {
         eprintln!("[fc-agent] container exited successfully");
@@ -3235,6 +3237,12 @@ async fn run_agent() -> Result<()> {
                 eprintln!("[fc-agent] failed to get podman logs: {}", e);
             }
         }
+    }
+
+    // Close output vsock after all output (including failure logs) has been sent
+    let final_fd = OUTPUT_VSOCK_FD.swap(-1, std::sync::atomic::Ordering::Release);
+    if final_fd >= 0 {
+        unsafe { libc::close(final_fd) };
     }
 
     // Clean up the container (we don't use --rm so we can capture logs on failure)
