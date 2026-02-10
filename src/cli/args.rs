@@ -114,8 +114,8 @@ pub struct RunArgs {
     #[arg(long)]
     pub name: String,
 
-    /// vCPUs (0 = all host CPUs)
-    #[arg(long, default_value_t = 0)]
+    /// vCPUs, or "unlimited" to use all host CPUs (default: 2, max: 32)
+    #[arg(long, default_value = "2", value_parser = parse_cpu)]
     pub cpu: u8,
 
     /// Memory in MiB, or "unlimited" to use all host memory (default: 2048)
@@ -498,6 +498,23 @@ fn parse_mem(s: &str) -> Result<u32, String> {
         s.parse::<u32>().map_err(|_| {
             format!(
                 "invalid --mem value '{}': expected integer (MiB) or 'unlimited'",
+                s
+            )
+        })
+    }
+}
+
+/// Parse --cpu value: either an integer or "unlimited" (all host CPUs, capped at 32).
+fn parse_cpu(s: &str) -> Result<u8, String> {
+    if s.eq_ignore_ascii_case("unlimited") {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get().min(32) as u8)
+            .unwrap_or(2);
+        Ok(cpus)
+    } else {
+        s.parse::<u8>().map_err(|_| {
+            format!(
+                "invalid --cpu value '{}': expected integer or 'unlimited'",
                 s
             )
         })
