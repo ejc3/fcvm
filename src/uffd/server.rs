@@ -15,8 +15,6 @@ use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::paths;
 
-const PAGE_SIZE: usize = 4096;
-
 /// Async UFFD server that serves memory pages for multiple VMs from a single snapshot
 pub struct UffdServer {
     snapshot_id: String,
@@ -189,7 +187,16 @@ async fn handle_vm_page_faults(
     mappings: Vec<GuestRegionUffdMapping>,
     mmap: Arc<memmap2::Mmap>,
 ) -> Result<()> {
-    info!(target: "uffd", vm_id = %vm_id, "page fault handler started");
+    // Derive page size from mappings (all regions use the same page size)
+    let page_size = mappings.first().map(|m| m.page_size).unwrap_or(4096);
+    let page_mask = !(page_size - 1);
+
+    info!(
+        target: "uffd",
+        vm_id = %vm_id,
+        page_size,
+        "page fault handler started"
+    );
 
     // Set UFFD to non-blocking mode for async integration
     let uffd_fd = uffd.as_raw_fd();
@@ -244,7 +251,7 @@ async fn handle_vm_page_faults(
                     fault_count += 1;
 
                     // Find which memory region this address belongs to
-                    let fault_page = (addr as usize) & !(PAGE_SIZE - 1);
+                    let fault_page = (addr as usize) & page_mask;
 
                     let mapping = mappings
                         .iter()
@@ -277,12 +284,13 @@ async fn handle_vm_page_faults(
                             fault_addr = format!("0x{:x}", fault_page),
                             "page fault past end of snapshot memory, zero-filling page"
                         );
-                        let zero_page = [0u8; PAGE_SIZE];
+                        // Heap-allocate zero buffer (2MB on stack would overflow for hugepages)
+                        let zero_page: Vec<u8> = vec![0u8; page_size];
                         let result = unsafe {
                             guard.get_inner().copy(
                                 zero_page.as_ptr() as *const std::ffi::c_void,
                                 fault_page as *mut std::ffi::c_void,
-                                PAGE_SIZE,
+                                page_size,
                                 true,
                             )
                         };
@@ -301,18 +309,20 @@ async fn handle_vm_page_faults(
 
                     let bytes_available = mmap_len - offset_in_file;
 
-                    let copy_result = if bytes_available >= PAGE_SIZE {
-                        let page_data = &mmap[offset_in_file..offset_in_file + PAGE_SIZE];
+                    let copy_result = if bytes_available >= page_size {
+                        let page_data = &mmap[offset_in_file..offset_in_file + page_size];
                         unsafe {
                             guard.get_inner().copy(
                                 page_data.as_ptr() as *const std::ffi::c_void,
                                 fault_page as *mut std::ffi::c_void,
-                                PAGE_SIZE,
+                                page_size,
                                 true,
                             )
                         }
                     } else {
-                        let mut temp = [0u8; PAGE_SIZE];
+                        // Partial page at end of file: copy available data, zero-fill rest
+                        // Heap-allocate (2MB on stack would overflow for hugepages)
+                        let mut temp: Vec<u8> = vec![0u8; page_size];
                         temp[..bytes_available].copy_from_slice(
                             &mmap[offset_in_file..offset_in_file + bytes_available],
                         );
@@ -320,7 +330,7 @@ async fn handle_vm_page_faults(
                             guard.get_inner().copy(
                                 temp.as_ptr() as *const std::ffi::c_void,
                                 fault_page as *mut std::ffi::c_void,
-                                PAGE_SIZE,
+                                page_size,
                                 true,
                             )
                         }
@@ -390,12 +400,23 @@ async fn handle_vm_page_faults(
     }
 }
 
-/// Memory region mapping from Firecracker
+/// Memory region mapping from Firecracker.
+///
+/// Firecracker sends these in the UFFD handshake JSON. The `page_size` field
+/// indicates the page granularity for this region:
+/// - 4096 (4KB): standard pages
+/// - 2097152 (2MB): hugepage-backed memory (`huge_pages: "2M"`)
+/// - 16384 (16KB): ARM64 with CONFIG_ARM64_16K_PAGES (future)
+///
+/// The `page_size` field is required — our Firecracker fork always sends it.
 #[derive(Debug, serde::Deserialize)]
 struct GuestRegionUffdMapping {
     base_host_virt_addr: u64,
     size: usize,
     offset: u64,
+    /// Page size for this region (from Firecracker handshake).
+    /// Standard: 4096, hugepages: 2097152.
+    page_size: usize,
 }
 
 impl GuestRegionUffdMapping {
@@ -417,6 +438,13 @@ impl GuestRegionUffdMapping {
             anyhow::bail!(
                 "mapping has zero size at base 0x{:x}",
                 self.base_host_virt_addr
+            );
+        }
+        // Validate page_size is a non-zero power of two
+        if self.page_size == 0 || !self.page_size.is_power_of_two() {
+            anyhow::bail!(
+                "invalid page_size {}: must be a non-zero power of two",
+                self.page_size
             );
         }
         // Check for overflow in base + size
@@ -446,6 +474,7 @@ async fn receive_uffd_async(
     let std_stream = stream.into_std().context("converting to std stream")?;
     // Keep non-blocking — AsyncFd handles readiness
     let async_stream = AsyncFd::new(std_stream).context("creating AsyncFd for handshake socket")?;
+    // 4096 bytes for JSON message buffer (unrelated to page size)
     let mut message_buf = vec![0u8; 4096];
 
     // Wait for data to arrive, then recv with fd passing
@@ -496,6 +525,7 @@ mod tests {
             base_host_virt_addr: 0x1000,
             size: 0x1000, // 4KB
             offset: 0,
+            page_size: 4096,
         };
 
         // Before mapping
@@ -519,6 +549,7 @@ mod tests {
             base_host_virt_addr: u64::MAX - 0x1000,
             size: 0x800,
             offset: 0,
+            page_size: 4096,
         };
 
         // Should contain addresses within range
@@ -536,6 +567,7 @@ mod tests {
             base_host_virt_addr: u64::MAX - 100,
             size: 200, // This would overflow
             offset: 0,
+            page_size: 4096,
         };
 
         // With overflow, contains() returns true for addresses >= base
@@ -551,6 +583,7 @@ mod tests {
             base_host_virt_addr: 0x1000,
             size: 0x1000,
             offset: 0,
+            page_size: 4096,
         };
         assert!(mapping.validate().is_ok());
     }
@@ -561,6 +594,7 @@ mod tests {
             base_host_virt_addr: 0x1000,
             size: 0, // Invalid
             offset: 0,
+            page_size: 4096,
         };
         let result = mapping.validate();
         assert!(result.is_err());
@@ -573,6 +607,7 @@ mod tests {
             base_host_virt_addr: u64::MAX - 100,
             size: 200, // Would overflow
             offset: 0,
+            page_size: 4096,
         };
         let result = mapping.validate();
         assert!(result.is_err());
@@ -580,22 +615,72 @@ mod tests {
     }
 
     #[test]
-    fn test_mapping_json_parsing() {
+    fn test_mapping_validate_invalid_page_size() {
+        let mapping = GuestRegionUffdMapping {
+            base_host_virt_addr: 0x1000,
+            size: 0x1000,
+            offset: 0,
+            page_size: 0,
+        };
+        let result = mapping.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid page_size"));
+
+        let mapping = GuestRegionUffdMapping {
+            base_host_virt_addr: 0x1000,
+            size: 0x1000,
+            offset: 0,
+            page_size: 123, // Not a power of two
+        };
+        let result = mapping.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid page_size"));
+    }
+
+    #[test]
+    fn test_mapping_json_with_page_size() {
+        // Firecracker sends page_size in UFFD handshake
         let json = r#"[
-            {"base_host_virt_addr": 140000000, "size": 536870912, "offset": 0}
+            {"base_host_virt_addr": 140000000, "size": 536870912, "offset": 0, "page_size": 2097152}
         ]"#;
         let mappings: Vec<GuestRegionUffdMapping> = serde_json::from_str(json).unwrap();
         assert_eq!(mappings.len(), 1);
         assert_eq!(mappings[0].base_host_virt_addr, 140000000);
         assert_eq!(mappings[0].size, 536870912); // 512MB
         assert_eq!(mappings[0].offset, 0);
+        assert_eq!(mappings[0].page_size, 2097152); // 2MB hugepages
+    }
+
+    #[test]
+    fn test_mapping_json_with_4k_page_size() {
+        let json = r#"[
+            {"base_host_virt_addr": 140000000, "size": 536870912, "offset": 0, "page_size": 4096}
+        ]"#;
+        let mappings: Vec<GuestRegionUffdMapping> = serde_json::from_str(json).unwrap();
+        assert_eq!(mappings[0].page_size, 4096);
+    }
+
+    #[test]
+    fn test_mapping_json_with_16k_page_size() {
+        // Future-proofing: ARM64 CONFIG_ARM64_16K_PAGES
+        let json = r#"[
+            {"base_host_virt_addr": 140000000, "size": 536870912, "offset": 0, "page_size": 16384}
+        ]"#;
+        let mappings: Vec<GuestRegionUffdMapping> = serde_json::from_str(json).unwrap();
+        assert_eq!(mappings[0].page_size, 16384);
     }
 
     #[test]
     fn test_mapping_json_multiple_regions() {
         let json = r#"[
-            {"base_host_virt_addr": 140000000, "size": 268435456, "offset": 0},
-            {"base_host_virt_addr": 408435456, "size": 268435456, "offset": 268435456}
+            {"base_host_virt_addr": 140000000, "size": 268435456, "offset": 0, "page_size": 4096},
+            {"base_host_virt_addr": 408435456, "size": 268435456, "offset": 268435456, "page_size": 4096}
         ]"#;
         let mappings: Vec<GuestRegionUffdMapping> = serde_json::from_str(json).unwrap();
         assert_eq!(mappings.len(), 2);
@@ -606,5 +691,19 @@ mod tests {
 
         // Second region
         assert_eq!(mappings[1].offset, 268435456); // Starts after first
+    }
+
+    #[test]
+    fn test_mapping_contains_with_hugepage_alignment() {
+        // 2MB-aligned mapping
+        let mapping = GuestRegionUffdMapping {
+            base_host_virt_addr: 0x200000, // 2MB aligned
+            size: 0x200000,                // 2MB
+            offset: 0,
+            page_size: 2097152,
+        };
+        assert!(mapping.contains(0x200000));
+        assert!(mapping.contains(0x300000));
+        assert!(!mapping.contains(0x400000));
     }
 }

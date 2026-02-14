@@ -321,6 +321,7 @@ async fn create_sandbox(
         no_snapshot: true,
         forward_localhost: vec![],
         user: None,
+        hugepages: false,
         image,
         command_args: vec![],
     };

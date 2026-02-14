@@ -327,6 +327,8 @@ pub struct SnapshotCreationParams {
     pub memory_mib: u32,
     /// Health check URL from the baseline VM (None = no HTTP health check)
     pub health_check_url: Option<String>,
+    /// Whether VM uses 2MB hugepage-backed memory
+    pub hugepages: bool,
 }
 
 impl SnapshotCreationParams {
@@ -337,6 +339,7 @@ impl SnapshotCreationParams {
             vcpu: args.cpu,
             memory_mib: args.mem,
             health_check_url: args.health_check.clone(),
+            hugepages: args.hugepages,
         }
     }
 
@@ -347,6 +350,7 @@ impl SnapshotCreationParams {
             vcpu: metadata.vcpu,
             memory_mib: metadata.memory_mib,
             health_check_url: metadata.health_check_url.clone(),
+            hugepages: metadata.hugepages,
         }
     }
 }
@@ -538,6 +542,7 @@ fn build_firecracker_config(
         args.interactive,
         args.rootfs_size.clone(),
         args.health_check.clone(),
+        args.hugepages,
     )
 }
 
@@ -675,6 +680,7 @@ pub async fn create_podman_snapshot(
             network_config: network_config.clone(),
             volumes: snapshot_volumes,
             health_check_url: params.health_check_url.clone(),
+            hugepages: params.hugepages,
         },
     };
 
@@ -1165,6 +1171,14 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     // Validate VM name before any setup work
     validate_vm_name(&args.name).context("invalid VM name")?;
 
+    // Validate hugepages memory alignment (2MB pages require even MiB)
+    if args.hugepages && args.mem % 2 != 0 {
+        bail!(
+            "--mem {} is not divisible by 2: hugepages requires 2MB-aligned memory size",
+            args.mem
+        );
+    }
+
     // Disallow --setup when running as root
     // Root users should run `fcvm setup` explicitly
     if args.setup && nix::unistd::geteuid().is_root() {
@@ -1321,6 +1335,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 mem: Some(args.mem),
                 firecracker_bin,
                 firecracker_args,
+                hugepages: Some(args.hugepages),
             };
             super::snapshot::cmd_snapshot_run(snapshot_args).await?;
             return Ok(None);
@@ -1352,6 +1367,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 mem: Some(args.mem),
                 firecracker_bin,
                 firecracker_args,
+                hugepages: Some(args.hugepages),
             };
             super::snapshot::cmd_snapshot_run(snapshot_args).await?;
             return Ok(None);
@@ -1543,6 +1559,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     vm_state.name = Some(vm_name.clone());
     vm_state.config.volumes = args.map.clone();
     vm_state.config.health_check_url = args.health_check.clone();
+    vm_state.config.hugepages = args.hugepages;
     vm_state.config.port_mappings = port_mappings.clone();
     vm_state.config.labels = args
         .label
@@ -2948,6 +2965,7 @@ async fn run_vm_setup(
                 args.interactive,
                 args.rootfs_size.clone(),
                 args.health_check.clone(),
+                args.hugepages,
             )
         });
 

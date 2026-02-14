@@ -123,6 +123,9 @@ pub struct VmConfig {
     /// User-defined labels for tagging/filtering VMs
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// Whether VM uses 2MB hugepage-backed memory
+    #[serde(default)]
+    pub hugepages: bool,
 }
 
 impl VmState {
@@ -154,6 +157,7 @@ impl VmState {
                 original_vsock_vm_id: None,
                 port_mappings: Vec::new(),
                 labels: HashMap::new(),
+                hugepages: false,
             },
         }
     }
