@@ -41,7 +41,28 @@ make test-root FILTER=sanity
    gh pr create --fill
    ```
 
-3. **Wait for CI** - Do NOT proceed until all checks pass:
+3. **Verify PR description matches commits** (also do this after pushing new commits):
+   ```bash
+   # Read ALL commits in the branch
+   git log --oneline origin/main..HEAD
+
+   # Read the current PR description
+   gh pr view <pr-number> --json body --jq '.body'
+
+   # Compare: every commit's changes must be reflected in the description
+   # If commits were added/removed since the PR was created, UPDATE the description
+   gh pr edit <pr-number> --body "$(cat <<'EOF'
+   ...updated description covering ALL commits...
+   EOF
+   )"
+   ```
+   **Anti-patterns to catch:**
+   - Description only mentions the first or last commit (ignores the rest)
+   - Description mentions changes that were reverted or amended away
+   - Description claims functionality that no commit actually implements
+   - Stacked PR description includes parent branch commits (only describe YOUR commits)
+
+4. **Wait for CI** - Do NOT proceed until all checks pass:
    ```bash
    gh pr checks <pr-number>
    # All checks must show "pass" before proceeding
