@@ -2864,10 +2864,11 @@ async fn run_vm_setup(
         .context("creating CoW disk")?;
 
     // Estimate space needed for container image extraction inside VM.
-    // The archive is loaded via podman load which extracts layers onto the rootfs.
+    // podman load extracts layers to /var/tmp first, then copies to overlay storage,
+    // so we need ~2x the archive size (temp + final). Use 3x for safety margin.
     let image_overhead = if let Some(disk_path) = image_disk_path {
         match tokio::fs::metadata(disk_path).await {
-            Ok(meta) => meta.len(),
+            Ok(meta) => meta.len() * 3,
             Err(_) => 0,
         }
     } else {
