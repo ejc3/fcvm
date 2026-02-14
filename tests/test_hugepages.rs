@@ -203,10 +203,14 @@ async fn test_hugepage_cache_restore_uses_uffd() -> Result<()> {
     // Wait for snapshot cache to be created (happens after health check)
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    // Kill first VM
+    // Kill first VM and wait for hugepages to be released
     common::kill_process(pid1).await;
     let _ = child1.wait().await;
-    println!("  First VM stopped");
+    let needed_pages = (HP_TEST_MEM_MIB as u64) / 2;
+    wait_for_hugepages_free(needed_pages, 30)
+        .await
+        .context("waiting for first VM hugepages to be released")?;
+    println!("  First VM stopped, hugepages released");
 
     // Second run: should hit cache and use implicit UFFD server
     println!("  Second run: should hit hugepage cache...");
