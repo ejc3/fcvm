@@ -2097,6 +2097,7 @@ async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
             smt: Some(false),
             cpu_template: None,
             track_dirty_pages: None,
+            huge_pages: None,
         })
         .await?;
 

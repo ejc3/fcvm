@@ -122,6 +122,13 @@ pub struct RunArgs {
     #[arg(long, default_value = "2048", value_parser = parse_mem)]
     pub mem: u32,
 
+    /// Enable 2MB hugepage-backed VM memory for improved TLB performance.
+    /// Requires pre-allocated hugepage pool on the host.
+    /// Memory size (--mem) must be divisible by 2 when using hugepages.
+    /// Snapshot restore uses UFFD page fault handler automatically.
+    #[arg(long)]
+    pub hugepages: bool,
+
     /// Minimum free space on root filesystem (default: 10G).
     /// Disk is expanded after CoW copy if free space is below this threshold.
     #[arg(long, default_value = "10G")]
@@ -352,6 +359,11 @@ pub struct SnapshotRunArgs {
     /// Passed from podman run runtime config when restoring from a snapshot cache hit.
     #[arg(skip)]
     pub firecracker_args: Option<String>,
+
+    /// Whether hugepages are enabled (internal use only).
+    /// Passed from podman run's --hugepages when restoring from a snapshot cache hit.
+    #[arg(skip)]
+    pub hugepages: Option<bool>,
 }
 
 // ============================================================================

@@ -408,6 +408,10 @@ jobs:
           sudo ./target/release/fcvm setup --generate-config --force
           # Build nested kernel locally (don't rely on GitHub releases)
           sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels
+      - name: Allocate hugepages
+        run: |
+          echo 512 | sudo tee /proc/sys/vm/nr_hugepages
+          echo "Allocated $(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages) hugepages"
       - name: test-root
         working-directory: fcvm
         run: |

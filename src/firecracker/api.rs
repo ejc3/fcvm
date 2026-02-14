@@ -205,6 +205,9 @@ pub struct MachineConfig {
     pub cpu_template: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub track_dirty_pages: Option<bool>,
+    /// Enable 2MB hugepage-backed guest memory ("2M" or None)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub huge_pages: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -43,6 +43,7 @@ fn test_run_args(name: &str) -> RunArgs {
         no_snapshot: true,
         user: None,
         forward_localhost: vec![],
+        hugepages: false,
         label: vec![],
         image: common::TEST_IMAGE.to_string(),
         command_args: vec![],

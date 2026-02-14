@@ -52,6 +52,7 @@ async fn test_state_persistence() {
             original_vsock_vm_id: None,
             port_mappings: vec![],
             labels: std::collections::HashMap::new(),
+            hugepages: false,
         },
     };
 
@@ -120,6 +121,7 @@ async fn test_list_vms() {
                 original_vsock_vm_id: None,
                 port_mappings: vec![],
                 labels: std::collections::HashMap::new(),
+                hugepages: false,
             },
         };
         manager.save_state(&state).await.unwrap();

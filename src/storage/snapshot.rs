@@ -61,6 +61,9 @@ pub struct SnapshotMetadata {
     /// Health check URL from the baseline VM (None = no HTTP health check)
     #[serde(default)]
     pub health_check_url: Option<String>,
+    /// Whether VM uses 2MB hugepage-backed memory
+    #[serde(default)]
+    pub hugepages: bool,
 }
 
 /// Volume configuration saved in snapshot metadata.
@@ -216,6 +219,7 @@ mod tests {
                 },
                 volumes: vec![],
                 health_check_url: None,
+                hugepages: false,
             },
         };
 
@@ -329,6 +333,7 @@ mod tests {
                 },
                 volumes: vec![],
                 health_check_url: None,
+                hugepages: false,
             },
         };
 
@@ -386,6 +391,7 @@ mod tests {
                     },
                     volumes: vec![],
                     health_check_url: None,
+                    hugepages: false,
                 },
             };
             manager.save_snapshot(config).await.unwrap();
@@ -430,6 +436,7 @@ mod tests {
                 },
                 volumes: vec![],
                 health_check_url: None,
+                hugepages: false,
             },
         };
         manager.save_snapshot(config).await.unwrap();
@@ -525,6 +532,7 @@ mod tests {
                 },
                 volumes: vec![],
                 health_check_url: None,
+                hugepages: false,
             },
         };
 

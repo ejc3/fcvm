@@ -87,6 +87,9 @@ pub struct BootSource {
 pub struct MachineConfig {
     pub vcpu_count: u8,
     pub mem_size_mib: u32,
+    /// 2MB hugepage backing ("2M" or None)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub huge_pages: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +142,7 @@ impl FirecrackerConfig {
         interactive: bool,
         rootfs_size: String,
         health_check_url: Option<String>,
+        hugepages: bool,
     ) -> Self {
         Self {
             boot_source: BootSource {
@@ -149,6 +153,11 @@ impl FirecrackerConfig {
             machine_config: MachineConfig {
                 vcpu_count: cpu,
                 mem_size_mib: mem,
+                huge_pages: if hugepages {
+                    Some("2M".to_string())
+                } else {
+                    None
+                },
             },
             drives: vec![Drive {
                 drive_id: "rootfs".to_string(),
@@ -219,13 +228,17 @@ impl FirecrackerConfig {
             .await?;
 
         // Set machine config
+        // Hugepages negate dirty page tracking benefits (KVM forces 4K page tables),
+        // but diff snapshots still work via mincore(2) fallback.
+        let track_dirty_pages = self.machine_config.huge_pages.is_none();
         client
             .set_machine_config(super::api::MachineConfig {
                 vcpu_count: self.machine_config.vcpu_count,
                 mem_size_mib: self.machine_config.mem_size_mib,
                 smt: Some(false),
                 cpu_template: None,
-                track_dirty_pages: Some(true), // Enable snapshot support
+                track_dirty_pages: Some(track_dirty_pages),
+                huge_pages: self.machine_config.huge_pages.clone(),
             })
             .await?;
 
@@ -279,6 +292,7 @@ mod tests {
             false,
             "10G".to_string(),
             None,
+            false,
         )
     }
 
@@ -360,6 +374,14 @@ mod tests {
         let config1 = test_config();
         let mut config2 = test_config();
         config2.data_dir = "/mnt/fcvm-btrfs/root".into();
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    #[test]
+    fn test_snapshot_key_changes_with_hugepages() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.machine_config.huge_pages = Some("2M".to_string());
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 

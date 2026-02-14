@@ -79,6 +79,7 @@ async fn test_health_monitor_behaviors() {
             original_vsock_vm_id: None,
             port_mappings: vec![],
             labels: std::collections::HashMap::new(),
+            hugepages: false,
         },
     };
 

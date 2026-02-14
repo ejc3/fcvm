@@ -180,6 +180,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             network_config: vm_state.config.network.clone(),
             volumes: volume_configs,
             health_check_url: vm_state.config.health_check_url.clone(),
+            hugepages: vm_state.config.hugepages,
         },
     };
 
@@ -688,6 +689,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Health check URL comes from snapshot metadata — it's a property of the VM image.
     // The cache key includes health_check_url, so each config gets its own snapshot.
     vm_state.config.health_check_url = snapshot_config.metadata.health_check_url.clone();
+    vm_state.config.hugepages = args.hugepages.unwrap_or(snapshot_config.metadata.hugepages);
 
     info!(
         tap = %network_config.tap_device,
@@ -717,9 +719,46 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     };
 
     // Choose memory backend based on mode
+    // Hugepages require UFFD restore (Firecracker rejects File backend for hugepage snapshots).
+    // When restoring from cache (no explicit serve process), start an implicit in-process
+    // UFFD server as a background tokio task.
+    let hugepages = args.hugepages.unwrap_or(snapshot_config.metadata.hugepages);
+    let implicit_uffd_cancel = tokio_util::sync::CancellationToken::new();
+
     let memory_backend = if let Some(ref uffd_socket_path) = uffd_socket {
+        // Explicit UFFD mode (--pid): connect to existing serve process
         MemoryBackend::Uffd {
             socket_path: uffd_socket_path.clone(),
+        }
+    } else if hugepages {
+        // Implicit UFFD mode: hugepages require UFFD, start in-process server
+        let implicit_socket_path = data_dir.join("uffd.sock");
+        info!(
+            target: "uffd",
+            socket = %implicit_socket_path.display(),
+            "starting implicit UFFD server for hugepage snapshot restore"
+        );
+
+        let server = UffdServer::new_with_path(
+            format!("implicit-{}", truncate_id(&vm_id, 8)),
+            &snapshot_config.memory_path,
+            &implicit_socket_path,
+        )
+        .await
+        .context("creating implicit UFFD server for hugepages")?;
+
+        let cancel = implicit_uffd_cancel.clone();
+        tokio::spawn(async move {
+            if let Err(e) = server.run(cancel).await {
+                tracing::error!(target: "uffd", error = ?e, "implicit UFFD server error");
+            }
+        });
+
+        // Give the server a moment to bind the socket
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        MemoryBackend::Uffd {
+            socket_path: implicit_socket_path,
         }
     } else {
         MemoryBackend::File {
@@ -753,6 +792,9 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // If setup failed, cleanup all resources before propagating error
     if let Err(e) = setup_result {
         warn!("Clone setup failed, cleaning up resources");
+
+        // Stop implicit UFFD server if running
+        implicit_uffd_cancel.cancel();
 
         // Abort VolumeServer tasks
         for handle in volume_server_handles {
@@ -981,6 +1023,9 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         }
     }
 
+    // Stop implicit UFFD server if running
+    implicit_uffd_cancel.cancel();
+
     // Cleanup common resources
     super::common::cleanup_vm(
         &vm_id,
@@ -1071,6 +1116,7 @@ mod tests {
             mem: None,
             firecracker_bin: Some("/opt/firecracker-profile".to_string()),
             firecracker_args: Some("--enable-nv2".to_string()),
+            hugepages: None,
         };
 
         let runtime = snapshot_restore_runtime_config(&args);
