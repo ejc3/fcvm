@@ -369,8 +369,37 @@ fn test_sigterm_cleanup_rootless() -> Result<()> {
         }
     }
 
-    // Give a moment for cleanup
-    std::thread::sleep(common::POLL_INTERVAL);
+    // Wait for child processes to be cleaned up (rootless cleanup involves namespace
+    // teardown which can take longer than bridged mode, especially when a snapshot
+    // operation is in progress when SIGTERM arrives)
+    let cleanup_start = std::time::Instant::now();
+    let cleanup_timeout = Duration::from_secs(10);
+    loop {
+        let fc_done = our_fc_pid.map_or(true, |pid| !process_exists(pid));
+        let slirp_done = our_slirp_pid.map_or(true, |pid| !process_exists(pid));
+        let fcvm_done = !process_exists(fcvm_pid);
+
+        if fc_done && slirp_done && fcvm_done {
+            println!(
+                "All processes cleaned up after {:?}",
+                cleanup_start.elapsed()
+            );
+            break;
+        }
+
+        if cleanup_start.elapsed() > cleanup_timeout {
+            println!(
+                "Cleanup timed out after {:?}: fc_done={}, slirp_done={}, fcvm_done={}",
+                cleanup_start.elapsed(),
+                fc_done,
+                slirp_done,
+                fcvm_done
+            );
+            break;
+        }
+
+        std::thread::sleep(common::POLL_INTERVAL);
+    }
 
     // Verify our SPECIFIC processes are cleaned up
     if let Some(fc_pid) = our_fc_pid {
