@@ -360,7 +360,7 @@ setup-btrfs:
 	@sudo sysctl -q -w net.ipv4.ip_forward=1
 	@# Create per-mode data directories (state, snapshots, vm-disks)
 	@# Default: owned by current user (test-fast runs as ubuntu)
-	@mkdir -p /mnt/fcvm-btrfs/{state,snapshots,vm-disks}
+	@mkdir -p /mnt/fcvm-btrfs/{state,snapshots,vm-disks,tmp}
 	@# ROOT_DATA_DIR: owned by root (test-root runs with sudo)
 	@sudo mkdir -p $(ROOT_DATA_DIR)/{state,snapshots,vm-disks}
 	@# CONTAINER_DATA_DIR: owned by current user (podman rootless maps to subordinate UIDs)
@@ -439,7 +439,7 @@ bench-hugepages: build setup-fcvm
 	@echo "==> Allocating hugepage pool ($(HUGEPAGE_POOL_FULL) pages = $$(( $(HUGEPAGE_POOL_FULL) * 2 ))MB)..."
 	sudo sh -c 'echo $(HUGEPAGE_POOL_FULL) > /proc/sys/vm/nr_hugepages'
 	@echo "==> Running hugepages benchmark (full)..."
-	$(CARGO) bench --bench hugepages; \
+	TMPDIR=/mnt/fcvm-btrfs/tmp $(CARGO) bench --bench hugepages; \
 	RC=$$?; \
 	echo "==> Releasing hugepage pool..."; \
 	sudo sh -c 'echo 0 > /proc/sys/vm/nr_hugepages'; \
@@ -449,7 +449,7 @@ bench-hugepages-test: build setup-fcvm
 	@echo "==> Allocating hugepage pool ($(HUGEPAGE_POOL_TEST) pages = $$(( $(HUGEPAGE_POOL_TEST) * 2 ))MB)..."
 	sudo sh -c 'echo $(HUGEPAGE_POOL_TEST) > /proc/sys/vm/nr_hugepages'
 	@echo "==> Running hugepages benchmark (test)..."
-	$(CARGO) bench --bench hugepages -- --test; \
+	TMPDIR=/mnt/fcvm-btrfs/tmp $(CARGO) bench --bench hugepages -- --test; \
 	RC=$$?; \
 	echo "==> Releasing hugepage pool..."; \
 	sudo sh -c 'echo 0 > /proc/sys/vm/nr_hugepages'; \

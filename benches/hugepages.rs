@@ -204,6 +204,11 @@ fn build_image(data_mb: u32) {
         }
     }
 
+    // Set TMPDIR to btrfs volume to avoid tmpfs overflow during large image builds.
+    // The overlay commit step creates tar archives that can exceed /run/user tmpfs (13GB).
+    let tmpdir = "/mnt/fcvm-btrfs/tmp";
+    let _ = std::fs::create_dir_all(tmpdir);
+
     let status = Command::new("podman")
         .args([
             "build",
@@ -217,6 +222,7 @@ fn build_image(data_mb: u32) {
             &format!("data_size_mb={}", data_mb),
             ".",
         ])
+        .env("TMPDIR", tmpdir)
         .status()
         .expect("failed to run podman build — is podman installed?");
 
