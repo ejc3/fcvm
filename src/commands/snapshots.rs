@@ -31,6 +31,7 @@ struct SnapshotInfo {
     age: String,
     size_bytes: u64,
     size_human: String,
+    memory_size_bytes: u64,
 }
 
 /// List all snapshots
@@ -62,6 +63,13 @@ async fn cmd_snapshots_ls(args: SnapshotsLsArgs) -> Result<()> {
                         SnapshotTypeFilter::System => config.snapshot_type == SnapshotType::System,
                     };
                     if !matches {
+                        continue;
+                    }
+                }
+
+                // Filter by image if specified
+                if let Some(ref image) = args.image {
+                    if config.metadata.image != *image {
                         continue;
                     }
                 }
@@ -147,6 +155,12 @@ async fn build_snapshot_info(
         (size, format_size(size))
     };
 
+    // Memory file size (memory.bin)
+    let memory_size_bytes = tokio::fs::metadata(&config.memory_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+
     SnapshotInfo {
         name: name.to_string(),
         snapshot_type: config.snapshot_type.to_string(),
@@ -155,6 +169,7 @@ async fn build_snapshot_info(
         age,
         size_bytes,
         size_human,
+        memory_size_bytes,
     }
 }
 
@@ -319,14 +334,22 @@ async fn cmd_snapshots_prune(args: SnapshotsPruneArgs) -> Result<()> {
     let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
     let snapshot_names = snapshot_manager.list_snapshots().await?;
 
-    // Find snapshots to delete (all or just system)
+    // Find snapshots to delete (all or just system, optionally filtered by image)
     let mut snapshots_to_delete: Vec<(String, SnapshotConfig)> = Vec::new();
 
     for name in snapshot_names {
         if let Ok(config) = snapshot_manager.load_snapshot(&name).await {
-            if prune_all || config.snapshot_type == SnapshotType::System {
-                snapshots_to_delete.push((name, config));
+            // Filter by type
+            if !prune_all && config.snapshot_type != SnapshotType::System {
+                continue;
             }
+            // Filter by image if specified
+            if let Some(ref image) = args.image {
+                if config.metadata.image != *image {
+                    continue;
+                }
+            }
+            snapshots_to_delete.push((name, config));
         }
     }
 
