@@ -108,3 +108,7 @@ harness = false
 [[bench]]
 name = "clone"
 harness = false
+
+[[bench]]
+name = "hugepages"
+harness = false

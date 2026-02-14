@@ -84,6 +84,9 @@ jobs:
           sudo sysctl -w net.ipv4.conf.all.forwarding=1
           sudo sysctl -w net.ipv4.conf.default.forwarding=1
           echo "user_allow_other" | sudo tee /etc/fuse.conf
+          # Move podman storage to btrfs (more space for large benchmark images)
+          mkdir -p ~/.config/containers
+          printf '[storage]\ndriver = "overlay"\ngraphroot = "/mnt/fcvm-btrfs/containers/storage"\n' > ~/.config/containers/storage.conf
           podman system migrate || true
       - name: Run VM benchmarks
         working-directory: fcvm
@@ -91,3 +94,9 @@ jobs:
           FUSE_BACKEND_RS: ${{ github.workspace }}/fuse-backend-rs
           FUSER: ${{ github.workspace }}/fuser
         run: make bench-vm
+      - name: Run hugepages benchmark (test mode)
+        working-directory: fcvm
+        env:
+          FUSE_BACKEND_RS: ${{ github.workspace }}/fuse-backend-rs
+          FUSER: ${{ github.workspace }}/fuser
+        run: make bench-hugepages-test

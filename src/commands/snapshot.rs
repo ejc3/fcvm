@@ -837,7 +837,10 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     let (mut vm_manager, mut holder_child) = setup_result.unwrap();
 
-    if use_uffd {
+    // Determine actual memory mode: use_uffd covers explicit UFFD (serve PID),
+    // but hugepages also use implicit UFFD without a serve process.
+    let actual_uffd = use_uffd || hugepages;
+    if actual_uffd {
         info!(
             vm_id = %vm_id,
             vm_name = %vm_name,

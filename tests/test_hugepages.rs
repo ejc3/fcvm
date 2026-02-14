@@ -17,18 +17,75 @@ mod common;
 use anyhow::{Context, Result};
 use std::time::Duration;
 
-/// Ensure hugepages are available, fail the test if not
-async fn ensure_hugepages() -> Result<()> {
+/// VM memory size for hugepage tests (MiB).
+/// Must be even (2MB-aligned) and small enough to fit in the hugepage pool.
+const HP_TEST_MEM_MIB: u32 = 512;
+
+/// Ensure enough FREE hugepages are available for the test VM.
+///
+/// Checks free_hugepages (not nr_hugepages) because stale Firecracker processes
+/// from previous test runs may still be consuming hugepages from the pool.
+async fn ensure_hugepages(mem_mib: u32) -> Result<()> {
     let nr = tokio::fs::read_to_string("/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages")
         .await
         .context("reading nr_hugepages")?;
-    let count: u64 = nr.trim().parse().context("parsing nr_hugepages")?;
+    let total: u64 = nr.trim().parse().context("parsing nr_hugepages")?;
+
+    let free =
+        tokio::fs::read_to_string("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages")
+            .await
+            .context("reading free_hugepages")?;
+    let free: u64 = free.trim().parse().context("parsing free_hugepages")?;
+
+    let needed = (mem_mib as u64) / 2; // Each hugepage is 2MB
+    let in_use = total - free;
+
+    println!(
+        "  Hugepages: {} total, {} free, {} in use (need {} for {}MB VM)",
+        total, free, in_use, needed, mem_mib
+    );
+
     anyhow::ensure!(
-        count > 0,
+        total > 0,
         "No hugepages allocated. Run: echo 512 | sudo tee /proc/sys/vm/nr_hugepages"
     );
-    println!("  Hugepages available: {}", count);
+    anyhow::ensure!(
+        free >= needed,
+        "Not enough free hugepages: need {} but only {} free ({} in use by other processes). \
+         Kill stale VMs or increase pool: echo {} | sudo tee /proc/sys/vm/nr_hugepages",
+        needed,
+        free,
+        in_use,
+        needed * 2
+    );
     Ok(())
+}
+
+/// Wait for hugepages to become free after killing a VM.
+///
+/// Firecracker under `unshare` (rootless) or in a namespace (bridged) may take
+/// a moment to fully exit and release hugepage-backed guest memory.
+async fn wait_for_hugepages_free(needed: u64, timeout_secs: u64) -> Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        let free =
+            tokio::fs::read_to_string("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages")
+                .await
+                .context("reading free_hugepages")?;
+        let free: u64 = free.trim().parse().context("parsing free_hugepages")?;
+        if free >= needed {
+            return Ok(());
+        }
+        if start.elapsed() > Duration::from_secs(timeout_secs) {
+            anyhow::bail!(
+                "Hugepages not freed after {}s: need {} but only {} free",
+                timeout_secs,
+                needed,
+                free
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// Test that a VM boots successfully with --hugepages flag
@@ -41,11 +98,11 @@ async fn ensure_hugepages() -> Result<()> {
 async fn test_hugepage_vm_boot() -> Result<()> {
     println!("\nHugepage VM boot test");
     println!("=====================");
-    ensure_hugepages().await?;
+    ensure_hugepages(HP_TEST_MEM_MIB).await?;
 
     let (vm_name, _, _, _) = common::unique_names("hugepages-boot");
+    let mem_str = HP_TEST_MEM_MIB.to_string();
 
-    // Use --mem 512 (even number, 2MB aligned) with --hugepages
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
         "podman",
         "run",
@@ -55,7 +112,7 @@ async fn test_hugepage_vm_boot() -> Result<()> {
         "bridged",
         "--hugepages",
         "--mem",
-        "512",
+        &mem_str,
         common::TEST_IMAGE,
     ])
     .await
@@ -112,7 +169,9 @@ async fn test_hugepage_vm_boot() -> Result<()> {
 async fn test_hugepage_cache_restore_uses_uffd() -> Result<()> {
     println!("\nHugepage cache restore test");
     println!("===========================");
-    ensure_hugepages().await?;
+    ensure_hugepages(HP_TEST_MEM_MIB).await?;
+
+    let mem_str = HP_TEST_MEM_MIB.to_string();
 
     // Use unique env var so we get a unique cache key
     let test_id = format!("TEST_ID=hp-cache-{}", std::process::id());
@@ -129,7 +188,7 @@ async fn test_hugepage_cache_restore_uses_uffd() -> Result<()> {
         "bridged",
         "--hugepages",
         "--mem",
-        "512",
+        &mem_str,
         "--env",
         &test_id,
         common::TEST_IMAGE,
@@ -144,10 +203,14 @@ async fn test_hugepage_cache_restore_uses_uffd() -> Result<()> {
     // Wait for snapshot cache to be created (happens after health check)
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    // Kill first VM
+    // Kill first VM and wait for hugepages to be released
     common::kill_process(pid1).await;
     let _ = child1.wait().await;
-    println!("  First VM stopped");
+    let needed_pages = (HP_TEST_MEM_MIB as u64) / 2;
+    wait_for_hugepages_free(needed_pages, 30)
+        .await
+        .context("waiting for first VM hugepages to be released")?;
+    println!("  First VM stopped, hugepages released");
 
     // Second run: should hit cache and use implicit UFFD server
     println!("  Second run: should hit hugepage cache...");
@@ -161,7 +224,7 @@ async fn test_hugepage_cache_restore_uses_uffd() -> Result<()> {
         "bridged",
         "--hugepages",
         "--mem",
-        "512",
+        &mem_str,
         "--env",
         &test_id,
         common::TEST_IMAGE,
@@ -206,9 +269,10 @@ async fn test_hugepage_cache_restore_uses_uffd() -> Result<()> {
 async fn test_hugepage_snapshot_clone() -> Result<()> {
     println!("\nHugepage snapshot/clone test");
     println!("============================");
-    ensure_hugepages().await?;
+    ensure_hugepages(HP_TEST_MEM_MIB).await?;
 
     let (baseline_name, clone_name, snap_name, serve_name) = common::unique_names("hp-snap-clone");
+    let mem_str = HP_TEST_MEM_MIB.to_string();
 
     let fcvm_path = common::find_fcvm_binary()?;
 
@@ -223,7 +287,7 @@ async fn test_hugepage_snapshot_clone() -> Result<()> {
         "bridged",
         "--hugepages",
         "--mem",
-        "512",
+        &mem_str,
         common::TEST_IMAGE,
     ])
     .await
@@ -256,9 +320,14 @@ async fn test_hugepage_snapshot_clone() -> Result<()> {
     }
     println!("  Snapshot created");
 
-    // Kill baseline (no longer needed)
+    // Kill baseline (no longer needed) and wait for hugepages to be released
     common::kill_process(baseline_pid).await;
     let _ = baseline.wait().await;
+    let needed_pages = (HP_TEST_MEM_MIB as u64) / 2;
+    wait_for_hugepages_free(needed_pages, 30)
+        .await
+        .context("waiting for baseline VM hugepages to be released")?;
+    println!("  Baseline killed, hugepages released");
 
     // 3. Start serve
     println!("  Starting serve for '{}'...", snap_name);

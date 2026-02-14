@@ -1,0 +1,3 @@
+FROM public.ecr.aws/nginx/nginx:alpine
+ARG DATA_SIZE_MB=16384
+RUN dd if=/dev/urandom of=/data bs=1M count=${DATA_SIZE_MB}
