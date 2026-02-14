@@ -282,6 +282,17 @@ Then link to it: "As noted in [previous review](URL), the PATH inconsistency rem
 
 ## STEP 3: ANALYZE
 
+### 3a. Check PR description consistency
+
+Compare the PR description (from step 1a) against the commit list (from step 1b).
+Every commit's changes must be reflected in the description. Flag as [MEDIUM] if:
+- Description only covers some commits (e.g., mentions 3 of 7 commits)
+- Description claims changes that no commit implements
+- Description mentions reverted or amended-away changes
+- For stacked PRs: description includes parent branch changes instead of just this branch's commits
+
+### 3b. Categorize code issues
+
 Categorize issues:
 - \`[CRITICAL]\` - Security holes, data loss, crashes, breaking changes
 - \`[MEDIUM]\` - Bugs, logic errors, race conditions, missing validation
