@@ -893,6 +893,9 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         // Cleanup resources (exec path has no health monitor)
         info!("exec completed with exit code {}, cleaning up", exit_code);
 
+        // Stop implicit UFFD server if running (hugepage cache restore)
+        implicit_uffd_cancel.cancel();
+
         super::common::cleanup_vm(
             &vm_id,
             &mut vm_manager,
