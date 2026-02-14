@@ -337,7 +337,10 @@ fn run_mode(mode: &str, mem_mb: u32, data_mb: u32, hugepages: bool) -> BenchResu
     // Extract the actual diff size from the debug log (bytes_merged in diff merge)
     let diff_bytes = extract_diff_bytes(&log_path1);
     let diff_size_mb = diff_bytes / (1024 * 1024);
-    eprintln!("    Memory snapshot size: {} MB (diff: {} MB)", snapshot_size_mb, diff_size_mb);
+    eprintln!(
+        "    Memory snapshot size: {} MB (diff: {} MB)",
+        snapshot_size_mb, diff_size_mb
+    );
 
     let first_run_secs = t1.elapsed().as_secs_f64();
 
