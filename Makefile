@@ -114,18 +114,21 @@ endif
 # Test log directory (mounted into container)
 TEST_LOG_DIR := /tmp/fcvm-test-logs
 
-# Container run command
+# Container run command (base)
 # Note: Use -v instead of --device for /dev/kvm to preserve group permissions in rootless mode
 # See: https://github.com/containers/podman/issues/16701
-CONTAINER_RUN := podman run --rm --privileged \
+CONTAINER_RUN_BASE := podman run --rm --privileged \
 	--security-opt label=disable --group-add keep-groups \
 	-v .:/workspace/fcvm \
 	$(TARGET_MOUNT) \
 	-v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs -v $(FUSER):/workspace/fuser \
 	--device /dev/fuse -v /dev/kvm:/dev/kvm -v /dev/userfaultfd:/dev/userfaultfd \
-	--ulimit nofile=65536:65536 --ulimit nproc=65536:65536 --pids-limit=65536 -v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
+	--ulimit nofile=65536:65536 -v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	-v $(TEST_LOG_DIR):$(TEST_LOG_DIR) $(CARGO_CACHE_MOUNT) \
 	-e FCVM_DATA_DIR=$(CONTAINER_DATA_DIR)
+
+# Container run with high process limits (for parallel test suites)
+CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=65536
 
 .PHONY: all help build clean clean-test-data check-disk \
 	test test-unit test-fast test-all test-root test-packaging \
@@ -402,20 +405,29 @@ test-serve-sdk: build
 
 bench: build
 	@echo "==> Running benchmarks..."
-	sudo $(CARGO) bench -p fuse-pipe --bench throughput
-	sudo $(CARGO) bench -p fuse-pipe --bench operations
+	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
+	$(CARGO) bench -p fuse-pipe --bench throughput
+	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
+	$(CARGO) bench -p fuse-pipe --bench operations
 	$(CARGO) bench -p fuse-pipe --bench protocol
 
 # VM benchmarks (exec, clone) - require KVM, Firecracker, setup
 bench-vm: build setup-fcvm
 	@echo "==> Running VM benchmarks..."
-	sudo $(CARGO) bench --bench exec -- --test
-	sudo $(CARGO) bench --bench clone -- --test
+	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
+	$(CARGO) bench --bench exec -- --test
+	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
+	$(CARGO) bench --bench clone -- --test
 
 # Container benchmark target (used by nightly CI)
+# Uses CONTAINER_RUN_BASE (no --ulimit nproc) to avoid EPERM on GHA ubuntu-latest
 container-bench: check-disk container-build
 	@echo "==> Running benchmarks in container..."
-	$(CONTAINER_RUN) $(CONTAINER_TAG) make build _bench
+	$(CONTAINER_RUN_BASE) $(CONTAINER_TAG) make build _bench
 
 _bench:
 	@echo "==> Running benchmarks..."
