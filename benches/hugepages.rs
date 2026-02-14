@@ -258,8 +258,6 @@ fn run_mode(mode: &str, mem_mb: u32, data_mb: u32, hugepages: bool) -> BenchResu
     let log_file1 = File::create(&log_path1).expect("create log file");
     let log_err1 = log_file1.try_clone().expect("clone log file");
 
-    // Hugepages require root (MAP_HUGETLB needs real privileges), so use bridged
-    let network = if hugepages { "bridged" } else { "rootless" };
     let mut args1 = vec![
         "podman",
         "run",
@@ -269,8 +267,6 @@ fn run_mode(mode: &str, mem_mb: u32, data_mb: u32, hugepages: bool) -> BenchResu
         &mem_str,
         "--health-check",
         "http://localhost:80/",
-        "--network",
-        network,
     ];
     if hugepages {
         args1.push("--hugepages");
@@ -364,8 +360,6 @@ fn run_mode(mode: &str, mem_mb: u32, data_mb: u32, hugepages: bool) -> BenchResu
         &mem_str,
         "--health-check",
         "http://localhost:80/",
-        "--network",
-        network,
     ];
     if hugepages {
         args2.push("--hugepages");

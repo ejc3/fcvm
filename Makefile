@@ -439,8 +439,6 @@ bench-hugepages: build setup-fcvm
 	@echo "==> Allocating hugepage pool ($(HUGEPAGE_POOL_FULL) pages = $$(( $(HUGEPAGE_POOL_FULL) * 2 ))MB)..."
 	sudo sh -c 'echo $(HUGEPAGE_POOL_FULL) > /proc/sys/vm/nr_hugepages'
 	@echo "==> Running hugepages benchmark (full)..."
-	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
-	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
 	$(CARGO) bench --bench hugepages; \
 	RC=$$?; \
 	echo "==> Releasing hugepage pool..."; \
@@ -451,8 +449,6 @@ bench-hugepages-test: build setup-fcvm
 	@echo "==> Allocating hugepage pool ($(HUGEPAGE_POOL_TEST) pages = $$(( $(HUGEPAGE_POOL_TEST) * 2 ))MB)..."
 	sudo sh -c 'echo $(HUGEPAGE_POOL_TEST) > /proc/sys/vm/nr_hugepages'
 	@echo "==> Running hugepages benchmark (test)..."
-	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
-	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
 	$(CARGO) bench --bench hugepages -- --test; \
 	RC=$$?; \
 	echo "==> Releasing hugepage pool..."; \
