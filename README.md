@@ -287,6 +287,64 @@ sudo ./fcvm snapshot run --pid <serve_pid> --network bridged --exec "curl localh
 sudo ./fcvm snapshot run --snapshot nginx-warm --network bridged --exec "curl localhost"
 ```
 
+### Hugepages (2MB Pages)
+
+Use `--hugepages` to back VM memory with 2MB hugepages instead of 4KB pages.
+Hugepages reduce TLB pressure for memory-intensive workloads by mapping guest memory
+with 2MB Stage 2 block entries instead of 4KB page table entries.
+
+```bash
+# Allocate hugepage pool (must cover VM memory)
+sudo sh -c 'echo 1200 > /proc/sys/vm/nr_hugepages'  # 2400MB for a 2GB VM
+
+# Run with hugepages
+./fcvm podman run --name web --hugepages --health-check http://localhost/ nginx:alpine
+
+# Release hugepage pool when done
+sudo sh -c 'echo 0 > /proc/sys/vm/nr_hugepages'
+```
+
+**How it works with snapshots:**
+
+The snapshot cache flow creates two snapshots on the initial VM:
+1. **Pre-start (Full)**: After container image import
+2. **Startup (Diff)**: After container is healthy
+
+KVM dirty page tracking is enabled on the initial VM so the startup diff snapshot
+captures only the pages that changed between pre-start and startup (~100MB for a
+typical nginx container, vs dumping the entire VM memory).
+
+Dirty tracking requires KVM to split ARM64 Stage 2 block mappings from 2MB to 4KB
+entries. This only affects the initial VM (runs once for cache creation). Restored
+VMs (clones) do not enable dirty tracking, so they get full 2MB Stage 2 block
+mappings and the TLB benefit of hugepages.
+
+| VM role | Dirty tracking | Stage 2 mapping | Runs |
+|---------|---------------|-----------------|------|
+| Initial (cache creation) | Enabled | 4KB (split for tracking) | Once |
+| Clone (hugepage) | Disabled | 2MB blocks (full TLB benefit) | Many times |
+| Clone (non-hugepage) | Enabled | 4KB (no hugepages anyway) | Many times |
+
+**Benchmark results** (c7gd.metal ARM64, 2GB VM, 256MB dirty data):
+
+```
+Phase                       Standard (4KB)   Hugepages (2MB)    Ratio
+--------------------------------------------------------------------
+First Run (cold)                     10.1s              8.6s    0.85x
+Diff Size (dirty)                   95 MB              98 MB    1.03x
+Clone Restore                        0.5s              1.0s    1.99x
+```
+
+**Limitations:**
+- Hugepage pool must be pre-allocated (`/proc/sys/vm/nr_hugepages`)
+- Hugepage VMs require UFFD for snapshot restore (file-based restore is not supported by Firecracker with hugepages)
+- Clone restore is ~2x slower with hugepages due to UFFD page fault handling at 2MB granularity
+- Diff snapshots from hugepage clones use `mincore(2)` fallback (reports in-core pages, not dirty pages), so they may be larger than necessary
+
+**When to use hugepages:** Workloads where the TLB benefit of 2MB mappings on clones
+outweighs the ~2x slower clone restore. Best for long-running VMs with large working sets
+where TLB misses dominate performance.
+
 ---
 
 ## Examples
@@ -546,6 +604,7 @@ See [DESIGN.md](DESIGN.md#cli-interface) for architecture and design decisions.
 -t, --tty           Allocate pseudo-TTY (for vim, colors, etc.)
 --setup             Auto-setup if kernel/rootfs missing (rootless only)
 --no-snapshot       Disable automatic snapshot creation (for testing)
+--hugepages         Use 2MB hugepages for VM memory (requires pre-allocated pool)
 --forward-localhost <PORTS>  Forward localhost ports to host (e.g., 1421,9099)
 --rootfs-size <SIZE> Minimum free space on rootfs (default: 10G)
 ```
