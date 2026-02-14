@@ -699,8 +699,6 @@ async fn create_disk_from_dir(
     source_dir: &std::path::Path,
     output_path: &std::path::Path,
 ) -> Result<()> {
-    use std::process::Stdio;
-
     // Calculate directory size (add 20% overhead for ext4 metadata, min 16MB)
     let dir_size = tokio::process::Command::new("du")
         .args(["-sb", source_dir.to_str().unwrap()])
@@ -739,66 +737,103 @@ async fn create_disk_from_dir(
         );
     }
 
-    // Format as ext4
+    // Format as ext4 and populate from source directory in one step.
+    // Uses mkfs.ext4 -d which doesn't require root (no mount/loop device needed).
     let mkfs = tokio::process::Command::new("mkfs.ext4")
-        .args(["-q", "-F", output_path.to_str().unwrap()])
+        .args([
+            "-q",
+            "-F",
+            "-d",
+            source_dir.to_str().unwrap(),
+            output_path.to_str().unwrap(),
+        ])
         .output()
         .await
-        .context("formatting as ext4")?;
+        .context("formatting as ext4 with directory contents")?;
 
     if !mkfs.status.success() {
         bail!(
-            "mkfs.ext4 failed: {}",
+            "mkfs.ext4 -d failed: {}",
             String::from_utf8_lossy(&mkfs.stderr)
         );
     }
 
-    // Mount and copy contents
-    let mount_dir = format!("/tmp/fcvm-disk-dir-{}", std::process::id());
-    tokio::fs::create_dir_all(&mount_dir).await?;
-
-    let mount = tokio::process::Command::new("mount")
-        .args([output_path.to_str().unwrap(), &mount_dir])
-        .output()
-        .await
-        .context("mounting image")?;
-
-    if !mount.status.success() {
-        tokio::fs::remove_dir(&mount_dir).await.ok();
-        bail!("mount failed: {}", String::from_utf8_lossy(&mount.stderr));
-    }
-
-    // Copy directory contents (use rsync for reliability)
-    let copy = tokio::process::Command::new("rsync")
-        .args([
-            "-a",
-            &format!("{}/", source_dir.display()),
-            &format!("{}/", mount_dir),
-        ])
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .context("copying directory contents")?;
-
-    // Always unmount
-    let umount = tokio::process::Command::new("umount")
-        .arg(&mount_dir)
-        .output()
-        .await;
-
-    tokio::fs::remove_dir(&mount_dir).await.ok();
-
-    if !copy.status.success() {
-        bail!("rsync failed: {}", String::from_utf8_lossy(&copy.stderr));
-    }
-
-    if let Ok(u) = umount {
-        if !u.status.success() {
-            warn!("umount warning: {}", String::from_utf8_lossy(&u.stderr));
-        }
-    }
-
     info!("Created disk image: {}", output_path.display());
+    Ok(())
+}
+
+/// Build a podman storage image from a Docker archive.
+///
+/// Loads the archive into a temporary podman storage root using the overlay driver,
+/// then packages the result as an ext4 image. The guest can mount this read-only
+/// and use it as an `additionalImageStore`, eliminating the need for `podman load`.
+async fn build_storage_image(
+    archive_path: &std::path::Path,
+    output_path: &std::path::Path,
+) -> Result<()> {
+    let tmp_dir = PathBuf::from(format!("/tmp/fcvm-storage-{}", std::process::id()));
+
+    // Clean up any stale temp dir from a previous interrupted run
+    if tmp_dir.exists() {
+        tokio::fs::remove_dir_all(&tmp_dir).await.ok();
+    }
+    tokio::fs::create_dir_all(&tmp_dir)
+        .await
+        .context("creating temp storage dir")?;
+
+    // Load the docker archive into a custom podman storage root
+    info!(
+        "Loading archive into podman storage: {} -> {}",
+        archive_path.display(),
+        tmp_dir.display()
+    );
+
+    let load_output = tokio::process::Command::new("podman")
+        .args([
+            "--root",
+            tmp_dir.to_str().unwrap(),
+            "--storage-driver",
+            "overlay",
+            "load",
+            "-i",
+            archive_path.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .context("running podman load into storage root")?;
+
+    if !load_output.status.success() {
+        let stderr = String::from_utf8_lossy(&load_output.stderr);
+        tokio::fs::remove_dir_all(&tmp_dir).await.ok();
+        bail!(
+            "podman load into storage root failed: {}",
+            stderr
+        );
+    }
+
+    let loaded_msg = String::from_utf8_lossy(&load_output.stdout);
+    info!("podman load output: {}", loaded_msg.trim());
+
+    // Package the storage tree as an ext4 image using the existing helper.
+    // NOTE: Can't use with_extension() here because output_path ends in .storage.img
+    // — with_extension replaces after the last dot, producing a double "storage".
+    let tmp_img = PathBuf::from(format!("{}.tmp", output_path.display()));
+    let result = create_disk_from_dir(&tmp_dir, &tmp_img).await;
+
+    // Clean up temp storage dir regardless of result
+    tokio::fs::remove_dir_all(&tmp_dir).await.ok();
+
+    result.context("creating ext4 image from storage dir")?;
+
+    // Atomic rename to final path
+    tokio::fs::rename(&tmp_img, output_path)
+        .await
+        .context("renaming storage image to final path")?;
+
+    info!(
+        "Built storage image: {}",
+        output_path.display()
+    );
     Ok(())
 }
 
@@ -1518,12 +1553,27 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             info!(path = %archive_path.display(), "Image exported as Docker archive");
         }
 
+        let disk_path = if !args.no_direct_image_mount {
+            // Direct image mount: pre-build podman storage as ext4 image.
+            // Guest mounts this as additionalImageStore — no podman load needed.
+            let storage_img_path = cache_dir.with_extension("storage.img");
+            if !storage_img_path.exists() {
+                info!(image = %args.image, digest = %digest, "Building podman storage image");
+                build_storage_image(&archive_path, &storage_img_path).await?;
+            } else {
+                info!(image = %args.image, digest = %digest, "Using cached storage image");
+            }
+            storage_img_path
+        } else {
+            // Legacy path: attach docker archive as raw block device.
+            // fc-agent reads docker-archive:/dev/vdX via podman load.
+            archive_path
+        };
+
         // Lock released when lock_file is dropped
         drop(lock_file);
 
-        // Attach the tar directly as a Firecracker block device (read-only).
-        // fc-agent reads docker-archive:/dev/vdX — no FUSE, no ext4, no mount.
-        Some(archive_path)
+        Some(disk_path)
     } else {
         None
     };
@@ -2389,7 +2439,8 @@ async fn build_and_send_mmds(
                 "volumes": volume_mounts,
                 "extra_disks": extra_disk_mounts,
                 "nfs_mounts": nfs_mounts,
-                "image_archive": image_device,
+                "image_archive": if args.no_direct_image_mount { image_device.clone() } else { None::<String> },
+                "image_storage_device": if !args.no_direct_image_mount { image_device } else { None::<String> },
                 "privileged": args.privileged,
                 "user": args.user.as_deref(),
                 "forward_localhost": args.forward_localhost.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
@@ -2864,12 +2915,19 @@ async fn run_vm_setup(
         .context("creating CoW disk")?;
 
     // Estimate space needed for container image extraction inside VM.
+    // When using direct image mount (storage image), layers live on a separate read-only
+    // block device and are NOT extracted onto the rootfs, so no extra space is needed.
+    // When using legacy podman load, the archive is extracted onto the rootfs.
     // podman load extracts layers to /var/tmp first, then copies to overlay storage,
-    // so we need ~2x the archive size (temp + final). Use 3x for safety margin.
-    let image_overhead = if let Some(disk_path) = image_disk_path {
-        match tokio::fs::metadata(disk_path).await {
-            Ok(meta) => meta.len() * 3,
-            Err(_) => 0,
+    // so we need ~3x the archive size for safety margin.
+    let image_overhead = if args.no_direct_image_mount {
+        if let Some(disk_path) = image_disk_path {
+            match tokio::fs::metadata(disk_path).await {
+                Ok(meta) => meta.len() * 3,
+                Err(_) => 0,
+            }
+        } else {
+            0
         }
     } else {
         0
