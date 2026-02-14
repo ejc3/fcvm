@@ -754,8 +754,16 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             }
         });
 
-        // Give the server a moment to bind the socket
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Poll for socket to appear (server binds it asynchronously)
+        for i in 0..100 {
+            if implicit_socket_path.exists() {
+                break;
+            }
+            if i == 99 {
+                bail!("implicit UFFD server did not bind socket within 5s");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
         MemoryBackend::Uffd {
             socket_path: implicit_socket_path,
