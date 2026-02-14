@@ -316,7 +316,32 @@ fn run_mode(mode: &str, mem_mb: u32, data_mb: u32, hugepages: bool) -> BenchResu
 
     eprintln!("    Killing cold start VM...");
     drop(_guard1);
-    std::thread::sleep(Duration::from_secs(2));
+
+    // Wait for hugepages to be freed (Firecracker under unshare may take a moment)
+    if hugepages {
+        let needed = (mem_mb as u64) / 2;
+        let start_wait = Instant::now();
+        loop {
+            let free =
+                std::fs::read_to_string("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or(0);
+            if free >= needed {
+                break;
+            }
+            if start_wait.elapsed() > Duration::from_secs(30) {
+                panic!(
+                    "Hugepages not freed after 30s: need {} but only {} free",
+                    needed, free
+                );
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    } else {
+        std::thread::sleep(Duration::from_secs(2));
+    }
 
     // Second run: warm start (cache hit → clone from startup snapshot)
     let name2 = format!("bench-hp-{}-warm-{}", mode, pid_suffix);
@@ -375,15 +400,21 @@ fn run_mode(mode: &str, mem_mb: u32, data_mb: u32, hugepages: bool) -> BenchResu
 }
 
 fn print_comparison(mem_mb: u32, data_mb: u32, std: &BenchResult, hp: &BenchResult) {
-    let mem_gb = mem_mb / 1024;
-    let data_gb = data_mb / 1024;
-
     eprintln!();
     println!("=================================================================");
-    println!(
-        "  Hugepages Benchmark: {}GB VM, {}GB dirty memory",
-        mem_gb, data_gb
-    );
+    if data_mb >= 1024 {
+        println!(
+            "  Hugepages Benchmark: {}GB VM, {}GB dirty memory",
+            mem_mb / 1024,
+            data_mb / 1024
+        );
+    } else {
+        println!(
+            "  Hugepages Benchmark: {}GB VM, {}MB dirty memory",
+            mem_mb / 1024,
+            data_mb
+        );
+    }
     println!("=================================================================");
     println!();
     println!(
@@ -396,7 +427,7 @@ fn print_comparison(mem_mb: u32, data_mb: u32, std: &BenchResult, hp: &BenchResu
         "First Run (cold)",
         std.first_run_secs,
         hp.first_run_secs,
-        hp.first_run_secs / std.first_run_secs
+        hp.first_run_secs / std.first_run_secs.max(0.001)
     );
     println!(
         "{:<24} {:>14} MB {:>14} MB {:>7.2}x",
