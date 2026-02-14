@@ -278,6 +278,7 @@ fn run_mode(mode: &str, mem_mb: u32, data_mb: u32, hugepages: bool) -> BenchResu
     let t1 = Instant::now();
     let child1 = Command::new(&fcvm)
         .args(&args1)
+        .env("RUST_LOG", "debug")
         .stdout(Stdio::from(log_file1))
         .stderr(Stdio::from(log_err1))
         .spawn()
@@ -288,6 +289,7 @@ fn run_mode(mode: &str, mem_mb: u32, data_mb: u32, hugepages: bool) -> BenchResu
         pid: pid1,
         child: child1,
     };
+    eprintln!("    Log: {}", log_path1);
 
     let healthy_timeout = if data_mb > 1000 { 900 } else { 300 };
     let health_elapsed = poll_health(&fcvm, pid1, healthy_timeout);
@@ -371,6 +373,7 @@ fn run_mode(mode: &str, mem_mb: u32, data_mb: u32, hugepages: bool) -> BenchResu
     let t2 = Instant::now();
     let child2 = Command::new(&fcvm)
         .args(&args2)
+        .env("RUST_LOG", "debug")
         .stdout(Stdio::from(log_file2))
         .stderr(Stdio::from(log_err2))
         .spawn()
@@ -381,6 +384,7 @@ fn run_mode(mode: &str, mem_mb: u32, data_mb: u32, hugepages: bool) -> BenchResu
         pid: pid2,
         child: child2,
     };
+    eprintln!("    Log: {}", log_path2);
 
     let clone_timeout = if data_mb > 1000 { 300 } else { 120 };
     let clone_elapsed = poll_health(&fcvm, pid2, clone_timeout);

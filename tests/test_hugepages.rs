@@ -61,6 +61,33 @@ async fn ensure_hugepages(mem_mib: u32) -> Result<()> {
     Ok(())
 }
 
+/// Wait for hugepages to become free after killing a VM.
+///
+/// Firecracker under `unshare` (rootless) or in a namespace (bridged) may take
+/// a moment to fully exit and release hugepage-backed guest memory.
+async fn wait_for_hugepages_free(needed: u64, timeout_secs: u64) -> Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        let free =
+            tokio::fs::read_to_string("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages")
+                .await
+                .context("reading free_hugepages")?;
+        let free: u64 = free.trim().parse().context("parsing free_hugepages")?;
+        if free >= needed {
+            return Ok(());
+        }
+        if start.elapsed() > Duration::from_secs(timeout_secs) {
+            anyhow::bail!(
+                "Hugepages not freed after {}s: need {} but only {} free",
+                timeout_secs,
+                needed,
+                free
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Test that a VM boots successfully with --hugepages flag
 ///
 /// Verifies:
@@ -289,9 +316,14 @@ async fn test_hugepage_snapshot_clone() -> Result<()> {
     }
     println!("  Snapshot created");
 
-    // Kill baseline (no longer needed)
+    // Kill baseline (no longer needed) and wait for hugepages to be released
     common::kill_process(baseline_pid).await;
     let _ = baseline.wait().await;
+    let needed_pages = (HP_TEST_MEM_MIB as u64) / 2;
+    wait_for_hugepages_free(needed_pages, 30)
+        .await
+        .context("waiting for baseline VM hugepages to be released")?;
+    println!("  Baseline killed, hugepages released");
 
     // 3. Start serve
     println!("  Starting serve for '{}'...", snap_name);
