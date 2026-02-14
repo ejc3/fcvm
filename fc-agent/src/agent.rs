@@ -119,8 +119,10 @@ pub async fn run() -> Result<()> {
         });
     }
 
-    // Prepare image (import archive or pull from registry)
-    let image_ref = if let Some(archive_path) = &plan.image_archive {
+    // Prepare image (mount storage, import archive, or pull from registry)
+    let image_ref = if let Some(storage_device) = &plan.image_storage_device {
+        container::mount_storage_image(storage_device, &plan.image)?
+    } else if let Some(archive_path) = &plan.image_archive {
         container::import_image(archive_path, &plan.image, &output).await?
     } else {
         container::pull_image(&plan).await?
@@ -174,6 +176,9 @@ pub async fn run() -> Result<()> {
         sleep(Duration::from_millis(100)).await;
     }
     mounts::unmount_disks(&mounted_disk_paths);
+    if plan.image_storage_device.is_some() {
+        mounts::unmount_paths(&["/mnt/image-store".to_string()], "image store");
+    }
 
     // Shutdown output writer
     output.shutdown().await;

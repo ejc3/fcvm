@@ -100,3 +100,9 @@ jobs:
           FUSE_BACKEND_RS: ${{ github.workspace }}/fuse-backend-rs
           FUSER: ${{ github.workspace }}/fuser
         run: make bench-hugepages-test
+      - name: Run container import benchmark
+        working-directory: fcvm
+        env:
+          FUSE_BACKEND_RS: ${{ github.workspace }}/fuse-backend-rs
+          FUSER: ${{ github.workspace }}/fuser
+        run: make bench-container-import

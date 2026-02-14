@@ -247,6 +247,12 @@ pub struct RunArgs {
     #[arg(long)]
     pub no_snapshot: bool,
 
+    /// Disable direct image mount and fall back to podman load for localhost images.
+    /// By default, fcvm pre-builds podman overlay storage on the host and mounts it
+    /// read-only in the guest, bypassing podman load for faster container startup.
+    #[arg(long)]
+    pub no_direct_image_mount: bool,
+
     /// Container image (e.g., nginx:alpine or localhost/myimage)
     pub image: String,
 
