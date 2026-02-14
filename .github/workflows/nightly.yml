@@ -91,3 +91,9 @@ jobs:
           FUSE_BACKEND_RS: ${{ github.workspace }}/fuse-backend-rs
           FUSER: ${{ github.workspace }}/fuser
         run: make bench-vm
+      - name: Run hugepages benchmark (test mode)
+        working-directory: fcvm
+        env:
+          FUSE_BACKEND_RS: ${{ github.workspace }}/fuse-backend-rs
+          FUSER: ${{ github.workspace }}/fuser
+        run: make bench-hugepages-test

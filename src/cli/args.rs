@@ -396,6 +396,10 @@ pub struct SnapshotsLsArgs {
     #[arg(long, value_enum)]
     pub filter: Option<SnapshotTypeFilter>,
 
+    /// Filter by container image name
+    #[arg(long)]
+    pub image: Option<String>,
+
     /// Show accurate disk usage accounting for btrfs shared extents (slower)
     #[arg(long)]
     pub shared: bool,
@@ -420,6 +424,10 @@ pub struct SnapshotsPruneArgs {
     /// Delete ALL snapshots (including user-created ones)
     #[arg(long)]
     pub all: bool,
+
+    /// Only delete snapshots matching this container image name
+    #[arg(long)]
+    pub image: Option<String>,
 }
 
 /// Filter for snapshot type in list command

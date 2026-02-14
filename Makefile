@@ -135,7 +135,8 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	_test-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all \
 	container-setup-fcvm container-shell container-clean container-bench \
-	setup-btrfs setup-fcvm setup-pjdfstest bench lint fmt ssh test-serve-sdk
+	setup-btrfs setup-fcvm setup-pjdfstest bench bench-vm bench-hugepages bench-hugepages-test \
+	lint fmt ssh test-serve-sdk
 
 all: build
 
@@ -177,8 +178,13 @@ help:
 	@echo "SDK:"
 	@echo "  test-serve-sdk     Run ComputeSDK E2E test (requires computesdk sibling repo)"
 	@echo ""
-	@echo "Other:"
+	@echo "Benchmarks:"
 	@echo "  bench              Run fuse-pipe benchmarks"
+	@echo "  bench-vm           Run VM benchmarks (exec, clone)"
+	@echo "  bench-hugepages    Run hugepages benchmark (32GB VM, 16GB dirty)"
+	@echo "  bench-hugepages-test  Run hugepages benchmark (2GB VM, 256MB dirty)"
+	@echo ""
+	@echo "Other:"
 	@echo "  lint               Run linting (auto-installs tools if needed)"
 	@echo "  fmt                Format code"
 	@echo "  clean-test-data    Remove VM disks, snapshots, state (keeps cached assets)"
@@ -422,6 +428,32 @@ bench-vm: build setup-fcvm
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
 	$(CARGO) bench --bench clone -- --test
+
+# Hugepages benchmark: compare clone speed with 4KB vs 2MB pages
+# Full mode: 32GB VM, 16GB dirty memory (~20 min)
+# Test mode: 2GB VM, 256MB dirty memory (~5 min)
+HUGEPAGE_POOL_FULL := 17000
+HUGEPAGE_POOL_TEST := 1200
+
+bench-hugepages: build setup-fcvm
+	@echo "==> Allocating hugepage pool ($(HUGEPAGE_POOL_FULL) pages = $$(( $(HUGEPAGE_POOL_FULL) * 2 ))MB)..."
+	sudo sh -c 'echo $(HUGEPAGE_POOL_FULL) > /proc/sys/vm/nr_hugepages'
+	@echo "==> Running hugepages benchmark (full)..."
+	$(CARGO) bench --bench hugepages; \
+	RC=$$?; \
+	echo "==> Releasing hugepage pool..."; \
+	sudo sh -c 'echo 0 > /proc/sys/vm/nr_hugepages'; \
+	exit $$RC
+
+bench-hugepages-test: build setup-fcvm
+	@echo "==> Allocating hugepage pool ($(HUGEPAGE_POOL_TEST) pages = $$(( $(HUGEPAGE_POOL_TEST) * 2 ))MB)..."
+	sudo sh -c 'echo $(HUGEPAGE_POOL_TEST) > /proc/sys/vm/nr_hugepages'
+	@echo "==> Running hugepages benchmark (test)..."
+	$(CARGO) bench --bench hugepages -- --test; \
+	RC=$$?; \
+	echo "==> Releasing hugepage pool..."; \
+	sudo sh -c 'echo 0 > /proc/sys/vm/nr_hugepages'; \
+	exit $$RC
 
 # Container benchmark target (used by nightly CI)
 # Uses CONTAINER_RUN_BASE (no --ulimit nproc) to avoid EPERM on GHA ubuntu-latest
