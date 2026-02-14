@@ -42,6 +42,51 @@ env:
   CACHE_KEY_HOST: cargo-tools-nextest-0.9.115-audit-0.22.0-deny-0.18.9
 
 jobs:
+  # Skip expensive CI jobs on main pushes when the tree SHA already passed on a PR.
+  # When a PR merges via fast-forward or rebase, the merge commit has the same tree
+  # SHA as the PR tip. Re-running all tests on self-hosted runners is wasteful.
+  skip-check:
+    name: Skip Check
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 20
+      - name: Check if tree SHA already passed CI
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Not a push event, running CI"
+            exit 0
+          fi
+
+          TREE_SHA=$(git rev-parse HEAD^{tree})
+          echo "Current tree SHA: $TREE_SHA"
+
+          # Check recent successful CI runs on PRs for the same tree SHA
+          # Look at the last 20 commits on main to find PR branch tips
+          SKIP=false
+          for sha in $(git log --format=%H -20 HEAD^ 2>/dev/null || true); do
+            COMMIT_TREE=$(git rev-parse "$sha^{tree}" 2>/dev/null || true)
+            if [ "$COMMIT_TREE" = "$TREE_SHA" ] && [ "$sha" != "$(git rev-parse HEAD)" ]; then
+              # Found a commit with the same tree — check if it passed CI
+              STATUS=$(gh api "repos/${{ github.repository }}/commits/$sha/status" --jq '.state' 2>/dev/null || echo "unknown")
+              echo "Commit $sha has same tree SHA, CI status: $STATUS"
+              if [ "$STATUS" = "success" ]; then
+                SKIP=true
+                echo "Tree SHA $TREE_SHA already passed CI on commit $sha"
+                break
+              fi
+            fi
+          done
+
+          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+
   # Runner 0: Lint (default GitHub runner, no KVM needed)
   # Fast checks: fmt, clippy, audit, deny
   lint:
@@ -124,7 +169,8 @@ jobs:
   # Self-hosted runners with nested virtualization (ARM64: c7g.metal, x86: c5.metal)
   host:
     name: Host-${{ matrix.arch }}
-    if: ${{ github.event.inputs.job != 'container' }}
+    needs: [skip-check]
+    if: ${{ github.event.inputs.job != 'container' && needs.skip-check.outputs.skip != 'true' }}
     runs-on: [self-hosted, Linux, '${{ matrix.arch }}']
     strategy:
       fail-fast: false
@@ -305,7 +351,8 @@ jobs:
   #   This validates the full snapshot lifecycle: create -> persist -> restore
   host-root:
     name: Host-Root-${{ matrix.arch }}-${{ matrix.mode }}
-    if: ${{ github.event.inputs.job != 'container' }}
+    needs: [skip-check]
+    if: ${{ github.event.inputs.job != 'container' && needs.skip-check.outputs.skip != 'true' }}
     runs-on: [self-hosted, Linux, '${{ matrix.arch }}']
     strategy:
       fail-fast: false
@@ -469,7 +516,8 @@ jobs:
   # Needs KVM for VM tests (container mounts /dev/kvm)
   container:
     name: Container-${{ matrix.arch }}
-    if: ${{ github.event.inputs.job != 'host' }}
+    needs: [skip-check]
+    if: ${{ github.event.inputs.job != 'host' && needs.skip-check.outputs.skip != 'true' }}
     runs-on: [self-hosted, Linux, '${{ matrix.arch }}']
     strategy:
       fail-fast: false
@@ -554,10 +602,13 @@ jobs:
   # Final summary job - runs after all test jobs
   summary:
     name: Summary
-    needs: [lint, packaging, host, host-root, container]
+    needs: [skip-check, lint, packaging, host, host-root, container]
     if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Report skipped
+        if: needs.skip-check.outputs.skip == 'true'
+        run: echo "::notice::Skipped self-hosted tests — tree SHA already passed CI on a PR branch"
       - uses: actions/checkout@v6
       - name: Download all artifacts
         uses: actions/download-artifact@v7
