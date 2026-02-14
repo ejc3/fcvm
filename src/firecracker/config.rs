@@ -228,16 +228,18 @@ impl FirecrackerConfig {
             .await?;
 
         // Set machine config
-        // Hugepages negate dirty page tracking benefits (KVM forces 4K page tables),
-        // but diff snapshots still work via mincore(2) fallback.
-        let track_dirty_pages = self.machine_config.huge_pages.is_none();
+        // Always enable dirty page tracking for accurate diff snapshots.
+        // With hugepages, KVM splits Stage 2 block mappings from 2MB to 4K for
+        // dirty tracking. This only affects the initial VM (cache creation, runs once).
+        // Restored VMs (clones) don't enable dirty tracking, so they get full 2MB
+        // Stage 2 entries and the TLB benefit of hugepages.
         client
             .set_machine_config(super::api::MachineConfig {
                 vcpu_count: self.machine_config.vcpu_count,
                 mem_size_mib: self.machine_config.mem_size_mib,
                 smt: Some(false),
                 cpu_template: None,
-                track_dirty_pages: Some(track_dirty_pages),
+                track_dirty_pages: Some(true),
                 huge_pages: self.machine_config.huge_pages.clone(),
             })
             .await?;
