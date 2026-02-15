@@ -247,3 +247,40 @@ Before claiming a test failure is unrelated to your PR:
    ```
 
 **The rule:** Green main + red PR = PR caused it. No exceptions, no excuses.
+
+## SSH into CI Runners
+
+When you need to reproduce a CI failure on the actual runner hardware:
+
+```bash
+# 1. Find runner names and status
+gh api repos/ejc3/fcvm/actions/runners --jq '.runners[] | "\(.name) busy=\(.busy) labels=\(.labels | map(.name) | join(","))"'
+
+# 2. Get runner public IPs (filter by architecture)
+# x64 runners:
+aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=*runner*" "Name=architecture,Values=x86_64" \
+  --query 'Reservations[*].Instances[*].[InstanceId,PublicIpAddress,State.Name]' \
+  --output text
+
+# arm64 runners:
+aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=*runner*" "Name=architecture,Values=arm64" \
+  --query 'Reservations[*].Instances[*].[InstanceId,PublicIpAddress,State.Name]' \
+  --output text
+
+# 3. SSH using the runner key
+ssh -i ~/.ssh/runner_key -o StrictHostKeyChecking=no ubuntu@<public-ip>
+
+# 4. On the runner, the repo is at ~/fcvm
+# Build and run specific tests:
+cd ~/fcvm && git fetch && git checkout <branch>
+make build
+sudo make test-root FILTER=<test_name> STREAM=1 2>&1 | tee /tmp/test.log
+```
+
+**Important:**
+- Runner key is at `~/.ssh/runner_key` on the dev machine
+- Runners may be busy with CI jobs - check `busy=` status first
+- Don't interfere with running CI jobs on busy runners
+- Tests on runners may cause resource contention with concurrent CI runs
