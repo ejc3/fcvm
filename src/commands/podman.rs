@@ -1533,12 +1533,15 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     vm_state.config.user = args.user.clone();
     // Store the username for health checks (runuser -u <username>).
     // Derived from USER env var, matching what fc-agent creates in the VM.
+    // Falls back to "fcvm-user" to match fc-agent's default (agent.rs create_vm_user).
     if args.user.is_some() {
-        vm_state.config.username = args
-            .env
-            .iter()
-            .find(|s| s.starts_with("USER="))
-            .map(|s| s.strip_prefix("USER=").unwrap_or("fcvm-user").to_string());
+        vm_state.config.username = Some(
+            args.env
+                .iter()
+                .find_map(|s| s.strip_prefix("USER="))
+                .unwrap_or("fcvm-user")
+                .to_string(),
+        );
     }
     vm_state.config.labels = args
         .label
