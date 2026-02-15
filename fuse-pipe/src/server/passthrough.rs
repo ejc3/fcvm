@@ -82,6 +82,13 @@ impl PassthroughFs {
             no_open: false,
             no_opendir: false,
             xattr: true,
+            // Use real host inode numbers instead of sequential virtual ones.
+            // Critical for snapshot/clone: when a clone starts a new VolumeServer,
+            // sequential numbering would reuse the same FUSE ino (e.g., 2) for a
+            // different file than the baseline had. The kernel's writeback cache
+            // preserves the old i_size for reused inodes, causing truncated reads.
+            // Host inodes are unique per-file, preventing this collision.
+            use_host_ino: true,
             cache_policy: fuse_backend_rs::passthrough::CachePolicy::Auto,
             attr_timeout: Duration::from_secs(ATTR_TTL_SECS),
             entry_timeout: Duration::from_secs(ATTR_TTL_SECS),
@@ -235,6 +242,12 @@ impl FilesystemHandler for PassthroughFs {
         match self.inner.lookup(&ctx, parent, &cname) {
             Ok(entry) => {
                 let attr = Self::entry_to_attr(&entry);
+                tracing::debug!(
+                    target: "passthrough",
+                    parent, name = %String::from_utf8_lossy(name),
+                    ino = attr.ino, size = attr.size, mode = format_args!("{:#o}", attr.mode),
+                    "lookup result"
+                );
                 VolumeResponse::Entry {
                     attr,
                     generation: entry.generation,
@@ -251,6 +264,11 @@ impl FilesystemHandler for PassthroughFs {
         match self.inner.getattr(&ctx, ino, None) {
             Ok((st, _timeout)) => {
                 let attr = Self::stat_to_attr(ino, &st);
+                tracing::debug!(
+                    target: "passthrough",
+                    ino, size = attr.size, mode = format_args!("{:#o}", attr.mode),
+                    "getattr result"
+                );
                 VolumeResponse::Attr {
                     attr,
                     ttl_secs: self.attr_ttl_secs,
@@ -597,10 +615,18 @@ impl FilesystemHandler for PassthroughFs {
         // fuse-backend-rs handles credentials via Context internally.
 
         match self.inner.open(&ctx, ino, flags, 0) {
-            Ok((handle, _opts, _passthrough)) => VolumeResponse::Opened {
-                fh: handle.unwrap_or(0),
-                flags: 0,
-            },
+            Ok((handle, _opts, _passthrough)) => {
+                tracing::debug!(
+                    target: "passthrough",
+                    ino, flags = format_args!("{:#x}", flags),
+                    fh = handle.unwrap_or(0),
+                    "open result"
+                );
+                VolumeResponse::Opened {
+                    fh: handle.unwrap_or(0),
+                    flags: 0,
+                }
+            }
             Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
         }
     }
@@ -622,10 +648,24 @@ impl FilesystemHandler for PassthroughFs {
             .inner
             .read(&ctx, ino, fh, &mut writer, size, offset, None, 0)
         {
-            Ok(_) => VolumeResponse::Data {
-                data: writer.into_vec(),
-            },
-            Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
+            Ok(_) => {
+                let data = writer.into_vec();
+                tracing::debug!(
+                    target: "passthrough",
+                    ino, fh, offset, requested_size = size, actual_len = data.len(),
+                    first_bytes = ?&data[..std::cmp::min(32, data.len())],
+                    "read result"
+                );
+                VolumeResponse::Data { data }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "passthrough",
+                    ino, fh, offset, size, error = ?e,
+                    "read failed"
+                );
+                VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO))
+            }
         }
     }
 

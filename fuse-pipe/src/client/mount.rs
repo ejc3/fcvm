@@ -427,6 +427,124 @@ pub fn mount_vsock<P: AsRef<Path>>(cid: u32, port: u32, mount_point: P) -> anyho
     mount_vsock_with_options(cid, port, mount_point, 1, 0, 0, false)
 }
 
+/// Mount a FUSE filesystem via vsock with transparent reconnection.
+///
+/// Like `mount_vsock_with_options`, but uses a reconnectable multiplexer.
+/// When the vsock connection dies (e.g., after snapshot/restore), the FUSE
+/// session stays alive. The multiplexer automatically reconnects to the same
+/// CID:port and re-sends pending requests — the kernel never knows anything
+/// happened.
+///
+/// This function blocks until the FUSE session is unmounted.
+#[cfg(target_os = "linux")]
+pub fn mount_vsock_with_reconnect<P: AsRef<Path>>(
+    cid: u32,
+    port: u32,
+    mount_point: P,
+    num_readers: usize,
+    trace_rate: u64,
+    max_write: u32,
+    no_writeback_cache: bool,
+) -> anyhow::Result<()> {
+    info!(target: "fuse-pipe::client", cid, port, num_readers, "connecting via vsock (reconnectable)");
+
+    // Create initial vsock connection
+    let transport = VsockTransport::connect(cid, port)?;
+    debug!(target: "fuse-pipe::client", cid, port, "connected to server via vsock");
+
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let fd = unsafe { libc::dup(transport.as_raw_fd()) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let socket = unsafe { UnixStream::from_raw_fd(fd) };
+    socket.set_read_timeout(Some(Duration::from_secs(30)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(30)))?;
+
+    // Create reconnection closure that establishes a new vsock connection.
+    // Called by the multiplexer writer thread when the current socket dies.
+    let reconnect_fn: Box<dyn Fn() -> std::io::Result<UnixStream> + Send> = Box::new(move || {
+        let transport = VsockTransport::connect(cid, port)?;
+        let new_fd = unsafe { libc::dup(transport.as_raw_fd()) };
+        if new_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { UnixStream::from_raw_fd(new_fd) })
+    });
+
+    // Create reconnectable multiplexer
+    let mux = Multiplexer::new_reconnectable(socket, num_readers, trace_rate, reconnect_fn)?;
+    debug!(target: "fuse-pipe::client", num_readers, "reconnectable multiplexer started");
+
+    // Mount options (same as regular vsock mount)
+    let options = vec![
+        fuser::MountOption::FSName("fuse-pipe".to_string()),
+        fuser::MountOption::Suid,
+        fuser::MountOption::Dev,
+        fuser::MountOption::DefaultPermissions,
+    ];
+
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let fuse_conf_allows = std::fs::read_to_string("/etc/fuse.conf")
+        .map(|s| s.lines().any(|l| l.trim() == "user_allow_other"))
+        .unwrap_or(false);
+
+    let acl = if is_root || fuse_conf_allows {
+        fuser::SessionACL::All
+    } else {
+        fuser::SessionACL::Owner
+    };
+    let mut config = fuser::Config::default();
+    config.mount_options = options;
+    config.acl = acl;
+    config.n_threads = Some(num_readers);
+    config.clone_fd = true;
+
+    let destroyed = Arc::new(AtomicBool::new(false));
+
+    let mut session = None;
+    let mut last_error = None;
+    for attempt in 0..=SESSION_NEW_MAX_RETRIES {
+        let fs = FuseClient::with_options(
+            Arc::clone(&mux),
+            Arc::clone(&destroyed),
+            max_write,
+            no_writeback_cache,
+        );
+        match fuser::Session::new(fs, mount_point.as_ref(), &config) {
+            Ok(s) => {
+                if attempt > 0 {
+                    info!(target: "fuse-pipe::client", attempt, "Session::new succeeded after retry");
+                }
+                session = Some(s);
+                break;
+            }
+            Err(e) => {
+                if attempt < SESSION_NEW_MAX_RETRIES {
+                    debug!(target: "fuse-pipe::client", attempt, error = %e, "Session::new failed, retrying");
+                    thread::sleep(SESSION_NEW_RETRY_DELAY);
+                }
+                last_error = Some(e);
+            }
+        }
+    }
+    let session = session.ok_or_else(|| last_error.unwrap())?;
+    info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), num_readers, "mounted via vsock (reconnectable)");
+
+    let bg_session = session.spawn()?;
+    if let Err(e) = bg_session.join() {
+        let destroyed_flag = destroyed.load(Ordering::SeqCst);
+        if destroyed_flag {
+            debug!(target: "fuse-pipe::client", "FUSE session exited (clean shutdown)");
+        } else {
+            error!(target: "fuse-pipe::client", error = %e, "FUSE session error");
+        }
+    }
+
+    debug!(target: "fuse-pipe::client", "FUSE session exited");
+    Ok(())
+}
+
 /// Mount a FUSE filesystem via vsock with multiple reader threads.
 #[cfg(target_os = "linux")]
 pub fn mount_vsock_with_readers<P: AsRef<Path>>(

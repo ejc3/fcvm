@@ -2,6 +2,10 @@
 //!
 //! Uses crossbeam channels for lock-free request submission and DashMap
 //! for lock-free response routing, eliminating mutex contention.
+//!
+//! Supports transparent reconnection: when the underlying socket dies (e.g.,
+//! vsock reset after snapshot), pending requests are re-sent on the new socket
+//! without the FUSE session or kernel knowing anything happened.
 
 use crate::protocol::{
     Span, VolumeRequest, VolumeResponse, WireRequest, WireResponse, MAX_MESSAGE_SIZE,
@@ -16,6 +20,16 @@ use std::sync::Arc;
 
 /// Response channel payload: (response, optional span for tracing)
 type ResponsePayload = (VolumeResponse, Option<Span>);
+
+/// Entry in the pending requests map.
+/// Stores both the serialized request data (for re-send on reconnection)
+/// and the response channel (to deliver the response to the waiting caller).
+struct PendingEntry {
+    /// Serialized request bytes (length prefix + body) for re-sending
+    data: Vec<u8>,
+    /// Channel to send response back to the waiting reader
+    response_tx: Sender<ResponsePayload>,
+}
 
 /// A pending request with its response channel.
 struct PendingRequest {
@@ -98,8 +112,7 @@ impl Multiplexer {
         let (request_tx, request_rx) = bounded::<PendingRequest>(num_readers * 4);
 
         // Lock-free map for routing responses back to waiting readers
-        // Key: unique request ID, Value: oneshot sender for response
-        let pending: Arc<DashMap<u64, Sender<ResponsePayload>>> =
+        let pending: Arc<DashMap<u64, PendingEntry>> =
             Arc::new(DashMap::with_capacity(num_readers * 2));
 
         let pending_for_writer = Arc::clone(&pending);
@@ -129,6 +142,66 @@ impl Multiplexer {
             num_readers,
             trace_rate,
             collector,
+        }))
+    }
+
+    /// Create a reconnectable multiplexer.
+    ///
+    /// Like `with_collector`, but supports transparent reconnection when the
+    /// underlying socket dies. When the socket fails, the writer thread calls
+    /// `reconnect_fn` in a retry loop to obtain a new socket, spawns a new
+    /// reader, and re-sends all pending requests.
+    ///
+    /// This keeps the FUSE session alive across socket reconnections — the
+    /// kernel never knows anything happened. Callers waiting on responses
+    /// simply experience a brief delay, not an error.
+    ///
+    /// # Arguments
+    ///
+    /// * `reconnect_fn` - Called to create a new socket when the current one dies.
+    ///   Retried with exponential backoff (500ms to 5s) until successful.
+    pub fn new_reconnectable(
+        socket: UnixStream,
+        num_readers: usize,
+        trace_rate: u64,
+        reconnect_fn: Box<dyn Fn() -> std::io::Result<UnixStream> + Send>,
+    ) -> std::io::Result<Arc<Self>> {
+        let socket_reader = socket.try_clone()?;
+        let socket_writer = socket;
+
+        socket_reader.set_read_timeout(None).ok();
+        socket_writer.set_write_timeout(None).ok();
+
+        let (request_tx, request_rx) = bounded::<PendingRequest>(num_readers * 4);
+
+        let pending: Arc<DashMap<u64, PendingEntry>> =
+            Arc::new(DashMap::with_capacity(num_readers * 2));
+
+        let pending_for_writer = Arc::clone(&pending);
+        let pending_for_reader = Arc::clone(&pending);
+
+        // Spawn reconnectable writer thread (manages reader lifecycle)
+        std::thread::Builder::new()
+            .name("fuse-mux-writer".to_string())
+            .stack_size(512 * 1024)
+            .spawn(move || {
+                writer_loop_reconnectable(
+                    socket_writer,
+                    socket_reader,
+                    request_rx,
+                    pending_for_writer,
+                    pending_for_reader,
+                    reconnect_fn,
+                );
+            })
+            .expect("failed to spawn fuse mux writer thread");
+
+        Ok(Arc::new(Self {
+            request_tx,
+            next_id: AtomicU64::new(1),
+            num_readers,
+            trace_rate,
+            collector: None,
         }))
     }
 
@@ -260,13 +333,14 @@ impl Multiplexer {
 }
 
 /// Writer thread: receives requests from channel, writes to socket.
+/// Non-reconnectable version: fails pending on write error and continues.
 fn writer_loop(
     mut socket: UnixStream,
     request_rx: Receiver<PendingRequest>,
-    pending: Arc<DashMap<u64, Sender<ResponsePayload>>>,
+    pending: Arc<DashMap<u64, PendingEntry>>,
 ) {
     let mut count = 0u64;
-    let mut total_bytes_written: u64 = 0; // Track for corruption debugging
+    let mut total_bytes_written: u64 = 0;
 
     while let Ok(req) = request_rx.recv() {
         count += 1;
@@ -316,7 +390,13 @@ fn writer_loop(
         // Register the response channel BEFORE writing (to avoid race).
         // For fire-and-forget requests (forget/batch_forget), no channel is registered.
         if let Some(tx) = req.response_tx {
-            pending.insert(req.unique, tx);
+            pending.insert(
+                req.unique,
+                PendingEntry {
+                    data: req.data.clone(),
+                    response_tx: tx,
+                },
+            );
         }
 
         // Write to socket
@@ -337,27 +417,335 @@ fn writer_loop(
                 "writer: socket write failed"
             );
             // Remove from pending and signal error
-            if let Some((_, tx)) = pending.remove(&req.unique) {
-                let _ = tx.send((VolumeResponse::error(libc::EIO), None));
+            if let Some((_, entry)) = pending.remove(&req.unique) {
+                let _ = entry
+                    .response_tx
+                    .send((VolumeResponse::error(libc::EIO), None));
             }
         } else {
             total_bytes_written += msg_len as u64;
         }
-        // Note: client_socket_write is marked by server_recv on the server side
-        // since we can't update the span after serialization
     }
     tracing::info!(target: "fuse-pipe::mux", count, total_bytes_written, "writer: exiting");
 }
 
+/// Writer thread with reconnection support.
+///
+/// Uses `crossbeam_channel::select!` to wake on either:
+/// - A new request from the request channel
+/// - A reader-death notification (socket died while writer was idle)
+///
+/// When reconnection is needed (write failure or reader death), this thread:
+/// 1. Calls `reconnect_fn` in a retry loop with backoff to get a new socket
+/// 2. Spawns a new reader thread for the new socket
+/// 3. Re-sends all pending requests on the new socket
+/// 4. Resumes normal operation
+///
+/// This keeps the FUSE session alive — callers waiting on responses
+/// simply experience a delay, not an error.
+fn writer_loop_reconnectable(
+    mut writer_socket: UnixStream,
+    reader_socket: UnixStream,
+    request_rx: Receiver<PendingRequest>,
+    pending: Arc<DashMap<u64, PendingEntry>>,
+    pending_for_initial_reader: Arc<DashMap<u64, PendingEntry>>,
+    reconnect_fn: Box<dyn Fn() -> std::io::Result<UnixStream> + Send>,
+) {
+    let mut count = 0u64;
+    let mut total_bytes_written: u64 = 0;
+
+    // Channel for reader-death notifications. When the reader thread exits
+    // (socket EOF/error), it sends () to wake the writer for reconnection.
+    let (reader_died_tx, reader_died_rx) = bounded::<()>(1);
+
+    // Spawn initial reader thread
+    let initial_died_tx = reader_died_tx.clone();
+    std::thread::Builder::new()
+        .name("fuse-mux-reader".to_string())
+        .stack_size(512 * 1024)
+        .spawn(move || {
+            reader_loop_reconnectable(reader_socket, pending_for_initial_reader, initial_died_tx);
+        })
+        .expect("failed to spawn fuse mux reader thread");
+
+    loop {
+        // Wait for either a new request or reader death
+        crossbeam_channel::select! {
+            recv(request_rx) -> msg => {
+                let req = match msg {
+                    Ok(r) => r,
+                    Err(_) => break, // request channel closed — shutdown
+                };
+
+                count += 1;
+                let msg_len = req.data.len();
+
+                if count <= 10 || count.is_multiple_of(100) {
+                    tracing::info!(
+                        target: "fuse-pipe::mux",
+                        count,
+                        unique = req.unique,
+                        msg_len,
+                        total_bytes_written,
+                        pending_count = pending.len(),
+                        "writer[reconnectable]: sending request"
+                    );
+                }
+
+                // Validate message structure
+                if req.data.len() < 4 {
+                    continue;
+                }
+                let len_prefix = u32::from_be_bytes([req.data[0], req.data[1], req.data[2], req.data[3]]);
+                if len_prefix == 0 {
+                    continue;
+                }
+
+                // Register in pending BEFORE writing (stores data for re-send)
+                if let Some(tx) = req.response_tx {
+                    pending.insert(
+                        req.unique,
+                        PendingEntry {
+                            data: req.data.clone(),
+                            response_tx: tx,
+                        },
+                    );
+                }
+
+                // Try to write
+                let write_ok = writer_socket
+                    .write_all(&req.data)
+                    .and_then(|_| writer_socket.flush())
+                    .is_ok();
+
+                if write_ok {
+                    total_bytes_written += msg_len as u64;
+                    continue;
+                }
+
+                // Write failed — socket is dead. Reconnect.
+                tracing::warn!(
+                    target: "fuse-pipe::mux",
+                    unique = req.unique,
+                    total_bytes_written,
+                    pending_count = pending.len(),
+                    "writer[reconnectable]: socket write failed, reconnecting"
+                );
+
+                do_reconnect(
+                    &mut writer_socket,
+                    &mut total_bytes_written,
+                    &pending,
+                    &reconnect_fn,
+                    &reader_died_tx,
+                );
+            },
+            recv(reader_died_rx) -> _ => {
+                // Reader detected socket death while writer was idle.
+                // If there are pending requests, reconnect now so they get responses.
+                if pending.is_empty() {
+                    // No pending requests — reconnect lazily on next write attempt.
+                    // But mark the socket as dead so next write triggers reconnect.
+                    tracing::info!(
+                        target: "fuse-pipe::mux",
+                        "writer[reconnectable]: reader died, no pending requests, reconnecting proactively"
+                    );
+                }
+
+                if !pending.is_empty() {
+                    tracing::warn!(
+                        target: "fuse-pipe::mux",
+                        pending_count = pending.len(),
+                        "writer[reconnectable]: reader died with pending requests, reconnecting"
+                    );
+                }
+
+                do_reconnect(
+                    &mut writer_socket,
+                    &mut total_bytes_written,
+                    &pending,
+                    &reconnect_fn,
+                    &reader_died_tx,
+                );
+            },
+        }
+    }
+    tracing::info!(target: "fuse-pipe::mux", count, total_bytes_written, "writer[reconnectable]: exiting");
+}
+
+/// Perform reconnection: get new socket, spawn new reader, re-send pending.
+fn do_reconnect(
+    writer_socket: &mut UnixStream,
+    total_bytes_written: &mut u64,
+    pending: &Arc<DashMap<u64, PendingEntry>>,
+    reconnect_fn: &dyn Fn() -> std::io::Result<UnixStream>,
+    reader_died_tx: &Sender<()>,
+) {
+    // Retry reconnect_fn with exponential backoff
+    let mut backoff_ms = 500u64;
+    let max_backoff_ms = 5000u64;
+    let new_socket = loop {
+        match (reconnect_fn)() {
+            Ok(s) => break s,
+            Err(e) => {
+                tracing::warn!(
+                    target: "fuse-pipe::mux",
+                    error = %e,
+                    backoff_ms,
+                    "writer[reconnectable]: reconnect attempt failed, retrying"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
+            }
+        }
+    };
+
+    tracing::info!(
+        target: "fuse-pipe::mux",
+        pending_count = pending.len(),
+        "writer[reconnectable]: reconnected, setting up new socket"
+    );
+
+    // Set up new socket pair
+    let new_reader_socket = match new_socket.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(target: "fuse-pipe::mux", error = %e, "writer[reconnectable]: failed to clone new socket");
+            fail_all_pending(pending);
+            return;
+        }
+    };
+    *writer_socket = new_socket;
+    writer_socket.set_write_timeout(None).ok();
+    new_reader_socket.set_read_timeout(None).ok();
+
+    // Spawn new reader thread for the new socket
+    let pending_for_reader = Arc::clone(pending);
+    let died_tx = reader_died_tx.clone();
+    std::thread::Builder::new()
+        .name("fuse-mux-reader".to_string())
+        .stack_size(512 * 1024)
+        .spawn(move || {
+            reader_loop_reconnectable(new_reader_socket, pending_for_reader, died_tx);
+        })
+        .expect("failed to spawn fuse mux reader thread");
+
+    // Re-send all pending requests on the new socket.
+    //
+    // For baselines (reconnecting to the SAME VolumeServer):
+    //   Safe — same PassthroughFs, stable inode numbers, valid file handles.
+    //
+    // For clones (reconnecting to a NEW VolumeServer with fresh PassthroughFs):
+    //   Pending requests may reference unknown inodes → server returns ENOENT.
+    //   This is acceptable: pending requests at snapshot time are rare (usually 0),
+    //   and the affected process can retry. All NEW operations after reconnect work
+    //   because FUSE TTL (1s) expires during boot, forcing fresh LOOKUPs from root.
+    let keys: Vec<u64> = pending.iter().map(|r| *r.key()).collect();
+    let mut resent = 0;
+    let mut resend_failed = 0;
+    for key in &keys {
+        if let Some(entry) = pending.get(key) {
+            if writer_socket
+                .write_all(&entry.data)
+                .and_then(|_| writer_socket.flush())
+                .is_err()
+            {
+                resend_failed += 1;
+                tracing::error!(
+                    target: "fuse-pipe::mux",
+                    unique = key,
+                    "writer[reconnectable]: re-send failed on new socket"
+                );
+            } else {
+                resent += 1;
+            }
+        }
+    }
+
+    tracing::info!(
+        target: "fuse-pipe::mux",
+        resent,
+        resend_failed,
+        total_pending = keys.len(),
+        "writer[reconnectable]: re-sent pending requests"
+    );
+
+    if resend_failed > 0 {
+        tracing::error!(target: "fuse-pipe::mux", "writer[reconnectable]: new socket failed during re-send");
+    }
+
+    *total_bytes_written = 0;
+}
+
+/// Reader thread for reconnectable mode.
+///
+/// When the socket dies, notifies the writer via `died_tx` so it can
+/// proactively reconnect (even if no new write is pending).
+fn reader_loop_reconnectable(
+    mut socket: UnixStream,
+    pending: Arc<DashMap<u64, PendingEntry>>,
+    died_tx: Sender<()>,
+) {
+    let mut len_buf = [0u8; 4];
+    let mut count = 0u64;
+
+    loop {
+        if socket.read_exact(&mut len_buf).is_err() {
+            tracing::warn!(target: "fuse-pipe::mux", count, pending_count = pending.len(), "reader[reconnectable]: socket read failed, notifying writer");
+            let _ = died_tx.send(());
+            break;
+        }
+
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_MESSAGE_SIZE {
+            tracing::error!(target: "fuse-pipe::mux", len, "reader[reconnectable]: oversized message");
+            let _ = died_tx.send(());
+            break;
+        }
+
+        let mut resp_buf = vec![0u8; len];
+        if socket.read_exact(&mut resp_buf).is_err() {
+            tracing::warn!(target: "fuse-pipe::mux", count, "reader[reconnectable]: failed to read response body");
+            let _ = died_tx.send(());
+            break;
+        }
+
+        count += 1;
+        if count <= 10 || count.is_multiple_of(100) {
+            tracing::info!(target: "fuse-pipe::mux", count, pending_count = pending.len(), "reader[reconnectable]: received response");
+        }
+
+        match bincode::deserialize::<WireResponse>(&resp_buf) {
+            Ok(wire) => {
+                let mut span = wire.span;
+                if let Some(ref mut s) = span {
+                    s.mark("client_recv");
+                }
+                if let Some((_, entry)) = pending.remove(&wire.unique) {
+                    let _ = entry.response_tx.send((wire.response, span));
+                }
+            }
+            Err(e) => {
+                tracing::error!(target: "fuse-pipe::mux", count, len, error = %e, "reader[reconnectable]: deserialization failed");
+                let _ = died_tx.send(());
+                break;
+            }
+        }
+    }
+    tracing::info!(target: "fuse-pipe::mux", count, "reader[reconnectable]: exiting");
+}
+
 /// Reader thread: reads responses from socket, routes to waiting readers.
-fn reader_loop(mut socket: UnixStream, pending: Arc<DashMap<u64, Sender<ResponsePayload>>>) {
+///
+/// Used by non-reconnectable multiplexers. Calls fail_all_pending() when
+/// the socket dies to unblock waiting callers with EIO.
+fn reader_loop(mut socket: UnixStream, pending: Arc<DashMap<u64, PendingEntry>>) {
     let mut len_buf = [0u8; 4];
     let mut count = 0u64;
 
     loop {
         // Read response length
         if socket.read_exact(&mut len_buf).is_err() {
-            // Server disconnected - fail all pending requests
             tracing::warn!(target: "fuse-pipe::mux", count, pending_count = pending.len(), "reader: socket read failed, disconnected");
             fail_all_pending(&pending);
             break;
@@ -392,8 +780,8 @@ fn reader_loop(mut socket: UnixStream, pending: Arc<DashMap<u64, Sender<Response
                     s.mark("client_recv");
                 }
 
-                if let Some((_, tx)) = pending.remove(&wire.unique) {
-                    let _ = tx.send((wire.response, span));
+                if let Some((_, entry)) = pending.remove(&wire.unique) {
+                    let _ = entry.response_tx.send((wire.response, span));
                 }
             }
             Err(e) => {
@@ -404,8 +792,6 @@ fn reader_loop(mut socket: UnixStream, pending: Arc<DashMap<u64, Sender<Response
                     error = %e,
                     "reader: response deserialization failed"
                 );
-                // Connection stream is now out of sync; fail pending requests
-                // so callers don't block forever waiting for responses.
                 fail_all_pending(&pending);
                 break;
             }
@@ -415,12 +801,14 @@ fn reader_loop(mut socket: UnixStream, pending: Arc<DashMap<u64, Sender<Response
 }
 
 /// Fail all pending requests on disconnect.
-fn fail_all_pending(pending: &DashMap<u64, Sender<ResponsePayload>>) {
+fn fail_all_pending(pending: &DashMap<u64, PendingEntry>) {
     // Collect keys first to avoid holding shard locks during send
     let keys: Vec<u64> = pending.iter().map(|r| *r.key()).collect();
     for key in keys {
-        if let Some((_, tx)) = pending.remove(&key) {
-            let _ = tx.send((VolumeResponse::error(libc::EIO), None));
+        if let Some((_, entry)) = pending.remove(&key) {
+            let _ = entry
+                .response_tx
+                .send((VolumeResponse::error(libc::EIO), None));
         }
     }
 }
@@ -586,5 +974,80 @@ mod tests {
 
         let result = done_rx.recv_timeout(Duration::from_millis(200)).unwrap();
         assert_eq!(result, Some(libc::EIO));
+    }
+
+    #[test]
+    fn test_reconnectable_resends_pending_on_reconnect() {
+        use crate::protocol::{VolumeRequest, VolumeResponse, WireRequest, WireResponse};
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Create initial socket pair
+        let (client1, mut server1) = UnixStream::pair().unwrap();
+
+        // Use a channel-based closure for test control:
+        // the test sends a new socket when it's ready
+        let (reconnect_tx, reconnect_rx) = mpsc::channel::<UnixStream>();
+        let reconnect_fn = Box::new(move || {
+            reconnect_rx.recv().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reconnect channel closed")
+            })
+        });
+
+        let mux = Multiplexer::new_reconnectable(client1, 1, 0, reconnect_fn).unwrap();
+        let mux_clone = Arc::clone(&mux);
+
+        let (done_tx, done_rx) = mpsc::channel();
+
+        // Send a request
+        std::thread::spawn(move || {
+            let resp = mux_clone.send_request(VolumeRequest::Getattr { ino: 42 });
+            let _ = done_tx.send(resp);
+        });
+
+        // Read the request on server1
+        let mut len_buf = [0u8; 4];
+        server1.read_exact(&mut len_buf).unwrap();
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len];
+        server1.read_exact(&mut body).unwrap();
+        let wire1: WireRequest = bincode::deserialize(&body).unwrap();
+
+        // Kill server1 to simulate disconnect (don't respond)
+        drop(server1);
+
+        // Wait a bit for the writer to detect disconnect
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Create new socket pair and send via reconnect closure
+        let (client2, mut server2) = UnixStream::pair().unwrap();
+        reconnect_tx.send(client2).unwrap();
+
+        // The multiplexer should re-send the pending request on server2
+        let mut len_buf2 = [0u8; 4];
+        server2.read_exact(&mut len_buf2).unwrap();
+        let len2 = u32::from_be_bytes(len_buf2) as usize;
+        let mut body2 = vec![0u8; len2];
+        server2.read_exact(&mut body2).unwrap();
+        let wire2: WireRequest = bincode::deserialize(&body2).unwrap();
+
+        // Same unique ID — it's a re-send of the same request
+        assert_eq!(wire2.unique, wire1.unique);
+
+        // Now respond on server2
+        let wire_resp = WireResponse::new(wire2.unique, 0, VolumeResponse::Ok);
+        let resp_body = bincode::serialize(&wire_resp).unwrap();
+        let resp_len = (resp_body.len() as u32).to_be_bytes();
+        server2.write_all(&resp_len).unwrap();
+        server2.write_all(&resp_body).unwrap();
+
+        // The caller should get the response (not EIO)
+        let result = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            result.is_ok(),
+            "expected Ok response after reconnect, got {:?}",
+            result
+        );
     }
 }
