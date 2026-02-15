@@ -694,12 +694,16 @@ pub async fn create_podman_snapshot(
 use super::common::{VSOCK_OUTPUT_PORT, VSOCK_STATUS_PORT, VSOCK_TTY_PORT, VSOCK_VOLUME_PORT_BASE};
 
 /// Create an ext4 disk image from a directory's contents.
-/// Returns the path to the created image.
+///
+/// When `shrink` is true, runs `resize2fs -M` after creation to minimize the image size.
+/// Use `shrink: true` for read-only images (e.g. additionalImageStore) and
+/// `shrink: false` for read-write images (e.g. --disk-dir) that need free space.
 async fn create_disk_from_dir(
     source_dir: &std::path::Path,
     output_path: &std::path::Path,
+    shrink: bool,
 ) -> Result<()> {
-    // Calculate directory size (add 20% overhead for ext4 metadata, min 16MB)
+    // Calculate directory size for ext4 image sizing
     let dir_size = tokio::process::Command::new("du")
         .args(["-sb", source_dir.to_str().unwrap()])
         .output()
@@ -713,8 +717,11 @@ async fn create_disk_from_dir(
         .and_then(|s| s.parse().ok())
         .unwrap_or(16 * 1024 * 1024);
 
-    // Add 20% overhead, minimum 16MB
-    let image_size = std::cmp::max(size_bytes * 120 / 100, 16 * 1024 * 1024);
+    // Use 2x the data size for the image. mkfs.ext4 needs space for inodes, journal,
+    // superblock, and directory entries — 20% is insufficient for images with many small
+    // files (like CA certificate bundles). Since the image is a sparse file, unused space
+    // doesn't consume actual disk. After mkfs, we shrink with resize2fs -M.
+    let image_size = std::cmp::max(size_bytes * 2, 64 * 1024 * 1024);
 
     info!(
         "Creating disk image from {}: {} bytes -> {} bytes",
@@ -756,6 +763,24 @@ async fn create_disk_from_dir(
             "mkfs.ext4 -d failed: {}",
             String::from_utf8_lossy(&mkfs.stderr)
         );
+    }
+
+    if shrink {
+        // Shrink the filesystem to its minimum size. The sparse file was deliberately
+        // oversized to ensure mkfs.ext4 had enough space; resize2fs -M reclaims the slack.
+        // Only used for read-only images; read-write images need the free space.
+        let resize = tokio::process::Command::new("resize2fs")
+            .args(["-M", output_path.to_str().unwrap()])
+            .output()
+            .await
+            .context("shrinking ext4 image")?;
+
+        if !resize.status.success() {
+            warn!(
+                "resize2fs -M failed (non-fatal): {}",
+                String::from_utf8_lossy(&resize.stderr)
+            );
+        }
     }
 
     info!("Created disk image: {}", output_path.display());
@@ -820,7 +845,7 @@ async fn build_storage_image(
     // NOTE: Can't use with_extension() here because output_path ends in .storage.img
     // — with_extension replaces after the last dot, producing a double "storage".
     let tmp_img = PathBuf::from(format!("{}.tmp", output_path.display()));
-    let result = create_disk_from_dir(&tmp_dir, &tmp_img).await;
+    let result = create_disk_from_dir(&tmp_dir, &tmp_img, true).await;
 
     // Clean up temp storage dir regardless of result
     tokio::fs::remove_dir_all(&tmp_dir).await.ok();
@@ -2303,7 +2328,7 @@ async fn attach_extra_disks(
         let image_path = data_dir
             .join("disks")
             .join(format!("disk-dir-{}.raw", disk_idx));
-        create_disk_from_dir(source_dir, &image_path).await?;
+        create_disk_from_dir(source_dir, &image_path, false).await?;
 
         let drive_id = format!("disk{}", disk_idx);
 
