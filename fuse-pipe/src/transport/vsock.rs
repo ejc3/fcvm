@@ -112,13 +112,19 @@ mod linux {
                 tv_sec: 0,
                 tv_usec: 0,
             };
-            unsafe {
+            let ret = unsafe {
                 libc::setsockopt(
                     fd,
                     libc::SOL_SOCKET,
                     libc::SO_SNDTIMEO,
                     &zero_timeout as *const _ as *const libc::c_void,
                     std::mem::size_of::<libc::timeval>() as u32,
+                )
+            };
+            if ret < 0 {
+                eprintln!(
+                    "warning: failed to clear SO_SNDTIMEO: {}",
+                    io::Error::last_os_error()
                 );
             }
 
