@@ -1349,6 +1349,12 @@ fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
 - 50 VMs with 512MB snapshot = ~512MB physical RAM (not 25.6GB)
 - Pages only copied on write (true CoW at page level)
 
+### FUSE Parallelism (fuse-pipe)
+
+**Client side (guest):** `fuser` is configured with `clone_fd = true` and `n_threads = num_readers`. Each reader thread gets a cloned `/dev/fuse` fd via `FUSE_DEV_IOC_CLONE`. The kernel distributes FUSE requests among reader threads concurrently — each request delivered to exactly one thread. Reader threads forward requests to the server via the `Multiplexer`.
+
+**Server side:** A single reader loop deserializes requests from the socket sequentially, but each request is dispatched via `tokio::spawn` + `spawn_blocking` (`pipelined.rs:400-410`). Multiple handler tasks run concurrently on tokio's blocking thread pool. This means `FilesystemHandler` implementations (including `RemapFs`) must be thread-safe — shared state requires atomic operations or lock-free data structures (e.g., `DashMap::entry()` for atomic check-and-insert).
+
 ### FUSE Passthrough Performance (fuse-pipe)
 
 **Benchmark**: 256 workers, 1024 files × 4KB
