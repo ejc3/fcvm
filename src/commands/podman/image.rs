@@ -61,7 +61,7 @@ pub(super) async fn create_disk_from_dir(
     source_dir: &std::path::Path,
     output_path: &std::path::Path,
 ) -> Result<()> {
-    // Calculate directory size (add 20% overhead for ext4 metadata, min 16MB)
+    // Calculate directory size (add 50% overhead for ext4 metadata, min 16MB)
     let dir_size = tokio::process::Command::new("du")
         .args(["-sb", source_dir.to_str().unwrap()])
         .output()
@@ -75,8 +75,10 @@ pub(super) async fn create_disk_from_dir(
         .and_then(|s| s.parse().ok())
         .unwrap_or(16 * 1024 * 1024);
 
-    // Add 20% overhead, minimum 16MB
-    let image_size = std::cmp::max(size_bytes * 120 / 100, 16 * 1024 * 1024);
+    // Add 50% overhead for ext4 metadata (inodes, block groups, journal, etc.),
+    // minimum 16MB. Container images with many small files (e.g., CA certificates)
+    // need more metadata overhead than the data itself suggests.
+    let image_size = std::cmp::max(size_bytes * 150 / 100, 16 * 1024 * 1024);
 
     info!(
         "Creating disk image from {}: {} bytes -> {} bytes",
