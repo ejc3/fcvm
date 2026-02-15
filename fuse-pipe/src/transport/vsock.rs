@@ -122,8 +122,8 @@ mod linux {
                 )
             };
             if ret < 0 {
-                eprintln!(
-                    "warning: failed to clear SO_SNDTIMEO: {}",
+                tracing::warn!(
+                    "failed to clear SO_SNDTIMEO: {}",
                     io::Error::last_os_error()
                 );
             }
