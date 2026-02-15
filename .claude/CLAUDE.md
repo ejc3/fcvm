@@ -1349,6 +1349,33 @@ fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
 - 50 VMs with 512MB snapshot = ~512MB physical RAM (not 25.6GB)
 - Pages only copied on write (true CoW at page level)
 
+### FUSE Parallelism (fuse-pipe)
+
+**Kernel clone fd model (`FUSE_DEV_IOC_CLONE`):**
+
+Each cloned fd is a complete request-response pipeline. A request dequeued from clone_fd_A is pinned to that fd — the response **must** be written back to clone_fd_A (`fuse_request_find()` searches only per-fd `fpq->processing`, not a global list).
+
+| What | Serialized | Parallel |
+|------|-----------|----------|
+| Dequeue from `fiq->pending` | Yes — brief `fiq->lock` spinlock shared across ALL fds | N/A (one request dequeued at a time) |
+| Copy request to userspace | No lock held | Yes — each fd copies independently |
+| Process request | N/A | Yes — each thread processes its own request |
+| Write response | Per-fd `fpq->lock` (no cross-fd contention) | Yes — each fd writes independently |
+| FORGET/BATCH_FORGET | Fire-and-forget, no response written | Dequeued from shared `fiq->forget_list` |
+
+Without clone fd, all threads share one fd and contend on both `fiq->lock` and the single `fpq->lock`.
+
+**fuse-pipe layers:**
+
+| Layer | Serialized | Parallel |
+|-------|-----------|----------|
+| Client reader threads (`mount.rs`) | Dequeue briefly serialized (kernel `fiq->lock`) | N threads with N cloned fds read/write independently |
+| Multiplexer (socket) | Socket write serialized by channel | Request submission lock-free; responses routed by unique ID |
+| Server socket reader (`pipelined.rs`) | Reads requests sequentially from socket | — |
+| Server handler dispatch | — | Each request dispatched via `tokio::spawn` + `spawn_blocking`; concurrent on tokio blocking pool |
+
+**Implication:** `FilesystemHandler` implementations (including `RemapFs`) must be thread-safe. Shared state requires atomic operations or lock-free data structures (e.g., `DashMap::entry()` for atomic check-and-insert).
+
 ### FUSE Passthrough Performance (fuse-pipe)
 
 **Benchmark**: 256 workers, 1024 files × 4KB

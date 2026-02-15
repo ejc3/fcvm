@@ -22,6 +22,7 @@ mod config;
 mod handler;
 mod passthrough;
 mod pipelined;
+pub mod remap;
 mod zerocopy;
 
 pub use config::ServerConfig;
