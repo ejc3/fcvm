@@ -579,6 +579,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             guest_path: vol.guest_path.clone().into(),
             read_only: vol.read_only,
             port: VSOCK_VOLUME_PORT_BASE + idx as u32,
+            portable: args.portable_volumes,
         })
         .collect();
 

@@ -94,6 +94,7 @@ pub async fn create_podman_snapshot(
             guest_path: v.guest_path.to_string_lossy().to_string(),
             read_only: v.read_only,
             vsock_port: v.port,
+            portable: v.portable,
         })
         .collect();
 
