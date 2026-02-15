@@ -107,6 +107,21 @@ mod linux {
                 return Err(err);
             }
 
+            // Clear send timeout now that connect succeeded — don't constrain normal sends.
+            let zero_timeout = libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            };
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDTIMEO,
+                    &zero_timeout as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::timeval>() as u32,
+                );
+            }
+
             // Wrap fd in UnixStream for Read/Write impls
             let stream = unsafe { UnixStream::from_raw_fd(fd) };
 

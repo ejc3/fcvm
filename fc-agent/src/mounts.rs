@@ -6,9 +6,13 @@ use crate::types::{ExtraDiskMount, NfsMount, VolumeMount};
 /// Check if a path has an active FUSE mount by examining /proc/self/mountinfo.
 fn is_fuse_mounted(path: &str) -> bool {
     let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-    mounts
-        .lines()
-        .any(|line| line.contains(path) && (line.contains("fuse") || line.contains("FUSE")))
+    // mountinfo format: 36 35 98:0 /mnt1 /mnt2 rw,... - type source options
+    // Field 5 (0-indexed: 4) is the mount point. Match exactly to avoid
+    // partial path matches (e.g., "/mnt/data" matching "/mnt/data2").
+    mounts.lines().any(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        fields.get(4) == Some(&path) && (line.contains("fuse") || line.contains("FUSE"))
+    })
 }
 
 /// Mount FUSE volumes from host via vsock. Returns list of mounted paths.

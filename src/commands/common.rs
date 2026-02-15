@@ -856,12 +856,14 @@ pub async fn restore_from_snapshot(
 ///
 /// Copy a file using btrfs reflink (instant CoW copy).
 async fn reflink_copy(source: &Path, dest: &Path) -> Result<()> {
+    let source_str = source
+        .to_str()
+        .with_context(|| format!("non-UTF-8 path: {}", source.display()))?;
+    let dest_str = dest
+        .to_str()
+        .with_context(|| format!("non-UTF-8 path: {}", dest.display()))?;
     let result = tokio::process::Command::new("cp")
-        .args([
-            "--reflink=always",
-            source.to_str().unwrap(),
-            dest.to_str().unwrap(),
-        ])
+        .args(["--reflink=always", source_str, dest_str])
         .status()
         .await
         .with_context(|| format!("reflink copy {} -> {}", source.display(), dest.display()))?;
