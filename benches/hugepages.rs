@@ -196,31 +196,13 @@ fn extract_diff_bytes(log_path: &str) -> u64 {
     0
 }
 
-/// Build the benchmark container image with the specified data size
+/// Build the benchmark container image with the specified data size.
+/// Always runs podman build and relies on podman's layer cache.
 fn build_image(data_mb: u32) {
     eprintln!(
         "==> Building benchmark container image ({} MB data)...",
         data_mb
     );
-
-    // Check if image already exists with correct data size
-    let inspect = Command::new("podman")
-        .args([
-            "inspect",
-            BENCH_IMAGE,
-            "--format",
-            "{{.Config.Labels.data_size_mb}}",
-        ])
-        .output();
-    if let Ok(output) = inspect {
-        if output.status.success() {
-            let label = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if label == data_mb.to_string() {
-                eprintln!("    Image already exists with correct data size, skipping build");
-                return;
-            }
-        }
-    }
 
     // Set TMPDIR to btrfs volume to avoid tmpfs overflow during large image builds.
     // The overlay commit step creates tar archives that can exceed /run/user tmpfs (13GB).
@@ -236,8 +218,6 @@ fn build_image(data_mb: u32) {
             "Containerfile.bench-hugepages",
             "--build-arg",
             &format!("DATA_SIZE_MB={}", data_mb),
-            "--label",
-            &format!("data_size_mb={}", data_mb),
             ".",
         ])
         .env("TMPDIR", tmpdir)

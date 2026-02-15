@@ -16,6 +16,8 @@ pub struct Plan {
     #[serde(default)]
     pub image_archive: Option<String>,
     #[serde(default)]
+    pub image_storage_device: Option<String>,
+    #[serde(default)]
     pub user: Option<String>,
     #[serde(default)]
     pub forward_localhost: Vec<String>,
@@ -127,6 +129,18 @@ mod tests {
         assert!(!plan.volumes[0].read_only);
         assert!(plan.tty);
         assert!(plan.privileged);
+    }
+
+    #[test]
+    fn test_plan_with_storage_device() {
+        let json = r#"{
+            "image": "localhost/myapp",
+            "image_storage_device": "/dev/vdb"
+        }"#;
+        let plan: Plan = serde_json::from_str(json).unwrap();
+        assert_eq!(plan.image, "localhost/myapp");
+        assert_eq!(plan.image_storage_device.as_deref(), Some("/dev/vdb"));
+        assert!(plan.image_archive.is_none());
     }
 
     #[test]
