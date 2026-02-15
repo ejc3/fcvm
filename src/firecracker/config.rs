@@ -206,10 +206,16 @@ impl FirecrackerConfig {
     ///
     /// `runtime_boot_args` contains per-instance values (IPs, strace, etc.)
     /// that don't affect cache but are needed for launch.
+    ///
+    /// `track_dirty_pages`: enable KVM dirty page tracking for diff snapshots.
+    /// Should be true when creating a snapshot cache (need accurate diffs),
+    /// false when snapshots are disabled (avoids splitting hugepage 2MB Stage 2
+    /// block mappings to 4K).
     pub async fn apply(
         &self,
         client: &super::api::FirecrackerClient,
         runtime_boot_args: &str,
+        track_dirty_pages: bool,
     ) -> Result<()> {
         // Build full boot args: static (cached) + runtime (per-instance)
         let full_boot_args = if runtime_boot_args.is_empty() {
@@ -228,18 +234,16 @@ impl FirecrackerConfig {
             .await?;
 
         // Set machine config
-        // Always enable dirty page tracking for accurate diff snapshots.
-        // With hugepages, KVM splits Stage 2 block mappings from 2MB to 4K for
-        // dirty tracking. This only affects the initial VM (cache creation, runs once).
-        // Restored VMs (clones) don't enable dirty tracking, so they get full 2MB
-        // Stage 2 entries and the TLB benefit of hugepages.
+        // Dirty page tracking enables diff snapshots but has a cost with hugepages:
+        // KVM splits 2MB Stage 2 block mappings to 4K for per-page tracking.
+        // Only enable when we'll actually create a snapshot (cache miss path).
         client
             .set_machine_config(super::api::MachineConfig {
                 vcpu_count: self.machine_config.vcpu_count,
                 mem_size_mib: self.machine_config.mem_size_mib,
                 smt: Some(false),
                 cpu_template: None,
-                track_dirty_pages: Some(true),
+                track_dirty_pages: Some(track_dirty_pages),
                 huge_pages: self.machine_config.huge_pages.clone(),
             })
             .await?;
