@@ -134,6 +134,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                     guest_path: parts[1].to_string(),
                     read_only: parts.get(2).map(|s| *s == "ro").unwrap_or(false),
                     vsock_port: VSOCK_VOLUME_PORT_BASE + idx as u32,
+                    portable: false,
                 })
             } else {
                 warn!("Invalid volume spec in VM state: {}", spec);
@@ -619,6 +620,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             guest_path: vol.guest_path.clone().into(),
             read_only: vol.read_only,
             port: vol.vsock_port,
+            portable: vol.portable,
         })
         .collect();
 

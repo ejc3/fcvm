@@ -473,6 +473,20 @@ Expose multiple ports and mount multiple volumes in one command:
   nginx:alpine
 ```
 
+### Portable Volumes
+
+Use `--portable-volumes` to enable deterministic inode numbering for FUSE volumes. This allows snapshots with mounted volumes to be restored on a different machine:
+
+```bash
+# Standard mode (host inodes, same-machine clones only)
+./fcvm podman run --name app --map /data:/data:ro alpine:latest
+
+# Portable mode (path-hash inodes, cross-machine snapshot/restore)
+./fcvm podman run --name app --portable-volumes --map /data:/data:ro alpine:latest
+```
+
+When `--portable-volumes` is set, volumes use a `RemapFs` wrapper that translates between stable path-based inodes and host-specific inodes. The flag applies to all `--map` volumes on the VM and is persisted in snapshot metadata so clones inherit it automatically.
+
 ---
 
 ## Interactive Mode & TTY

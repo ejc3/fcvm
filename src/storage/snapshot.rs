@@ -95,6 +95,9 @@ pub struct SnapshotVolumeConfig {
     pub read_only: bool,
     /// Vsock port number
     pub vsock_port: u32,
+    /// Use portable inode numbering
+    #[serde(default)]
+    pub portable: bool,
 }
 
 /// Manages VM snapshots
