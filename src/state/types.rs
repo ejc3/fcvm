@@ -126,6 +126,9 @@ pub struct VmConfig {
     /// Whether VM uses 2MB hugepage-backed memory
     #[serde(default)]
     pub hugepages: bool,
+    /// Whether FUSE volumes use portable inode numbering (RemapFs)
+    #[serde(default)]
+    pub portable_volumes: bool,
 }
 
 impl VmState {
@@ -158,6 +161,7 @@ impl VmState {
                 port_mappings: Vec::new(),
                 labels: HashMap::new(),
                 hugepages: false,
+                portable_volumes: false,
             },
         }
     }
