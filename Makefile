@@ -319,7 +319,9 @@ container-build:
 	@sudo mkdir -p /mnt/fcvm-btrfs 2>/dev/null || true
 	@mkdir -p /tmp/fcvm-container-target
 	podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) \
-		--layers --cache-from $(CONTAINER_CACHE_REPO) $(CACHE_TO_FLAG) .
+		--layers --cache-from $(CONTAINER_CACHE_REPO) $(CACHE_TO_FLAG) . \
+	|| podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) \
+		--layers --cache-from $(CONTAINER_CACHE_REPO) .
 
 container-shell: container-build
 	$(CONTAINER_RUN) -it $(CONTAINER_TAG) bash
