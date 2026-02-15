@@ -168,13 +168,12 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                 .to_str()?
                 .to_string();
             // Derive drive_id from filename: "disk-dir-0.raw" → "disk0"
-            let drive_id = format!(
-                "disk{}",
-                filename
-                    .strip_prefix("disk-dir-")
-                    .and_then(|s| s.strip_suffix(".raw"))
-                    .unwrap_or("0")
-            );
+            // Falls back to "disk0" if filename doesn't match the expected pattern.
+            let index = filename
+                .strip_prefix("disk-dir-")
+                .and_then(|s| s.strip_suffix(".raw"))
+                .unwrap_or("0");
+            let drive_id = format!("disk{}", index);
             Some(SnapshotExtraDisk {
                 filename,
                 mount_path: disk.mount_path.clone(),
