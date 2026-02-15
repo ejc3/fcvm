@@ -162,6 +162,23 @@ async fn test_remap_fs_stat_deterministic() -> Result<()> {
     );
     println!("  mount root → inode {} (correct)", ino_root);
 
+    // Verify FUSE inodes differ from host inodes (proves RemapFs is active)
+    let host_ino_a = std::fs::metadata(format!("{}/file-a.txt", host_dir))
+        .map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            m.ino()
+        })
+        .unwrap_or(0);
+    assert_ne!(
+        ino_a, host_ino_a,
+        "FUSE inode matches host inode {} — RemapFs not active",
+        host_ino_a
+    );
+    println!(
+        "  FUSE inode {} differs from host inode {} (RemapFs active)",
+        ino_a, host_ino_a
+    );
+
     // Cleanup
     common::kill_process(pid).await;
     tokio::fs::remove_dir_all(&host_dir).await.ok();
@@ -237,6 +254,25 @@ async fn test_remap_fs_snapshot_clone() -> Result<()> {
         baseline_ino_beta, clone_ino_beta
     );
     println!("  All inodes match between baseline and clone!");
+
+    // Verify inodes are NOT host inodes (proves RemapFs is active, not PassthroughFs).
+    // If --portable-volumes wasn't propagated to the clone, it would use PassthroughFs
+    // which returns host inodes — these would differ from the baseline's hash-based inodes.
+    let host_ino = std::fs::metadata(format!("{}/alpha.txt", host_dir))
+        .map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            m.ino()
+        })
+        .unwrap_or(0);
+    assert_ne!(
+        clone_ino_alpha, host_ino,
+        "clone inode matches host inode {} — RemapFs not active on clone (portable flag lost in snapshot?)",
+        host_ino
+    );
+    println!(
+        "  Clone inode {} differs from host inode {} (RemapFs confirmed active)",
+        clone_ino_alpha, host_ino
+    );
 
     // Cleanup
     common::kill_process(clone_pid).await;

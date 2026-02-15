@@ -80,6 +80,7 @@ async fn test_health_monitor_behaviors() {
             port_mappings: vec![],
             labels: std::collections::HashMap::new(),
             hugepages: false,
+            portable_volumes: false,
         },
     };
 
