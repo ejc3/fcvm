@@ -120,6 +120,7 @@ pub async fn create_podman_snapshot(
             volumes: snapshot_volumes,
             health_check_url: params.health_check_url.clone(),
             hugepages: params.hugepages,
+            extra_disks: vec![],
         },
     };
 

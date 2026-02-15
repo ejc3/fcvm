@@ -49,7 +49,7 @@ fn snapshot_restore_runtime_config(args: &SnapshotRunArgs) -> RuntimeConfig {
 async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     use super::common::VSOCK_VOLUME_PORT_BASE;
     use crate::storage::snapshot::{
-        SnapshotConfig, SnapshotMetadata, SnapshotType, SnapshotVolumeConfig,
+        SnapshotConfig, SnapshotExtraDisk, SnapshotMetadata, SnapshotType, SnapshotVolumeConfig,
     };
 
     // Determine which VM to snapshot
@@ -150,6 +150,47 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         );
     }
 
+    // Parse extra disk configs from VM state (RO disks only — RW already blocked above)
+    // Only include disk-dir disks (images inside VM data directory), not external --disk files.
+    // External --disk files are at arbitrary paths and don't need copying — the clone can
+    // access them directly at the same external path.
+    let vm_data_dir = paths::vm_runtime_dir(&vm_state.vm_id);
+    let vm_data_prefix = vm_data_dir.to_string_lossy().to_string();
+    let extra_disk_configs: Vec<SnapshotExtraDisk> = vm_state
+        .config
+        .extra_disks
+        .iter()
+        .filter(|disk| disk.path.starts_with(&vm_data_prefix))
+        .filter_map(|disk| {
+            let filename = std::path::Path::new(&disk.path)
+                .file_name()?
+                .to_str()?
+                .to_string();
+            // Derive drive_id from filename: "disk-dir-0.raw" → "disk0"
+            let drive_id = format!(
+                "disk{}",
+                filename
+                    .strip_prefix("disk-dir-")
+                    .and_then(|s| s.strip_suffix(".raw"))
+                    .unwrap_or("0")
+            );
+            Some(SnapshotExtraDisk {
+                filename,
+                mount_path: disk.mount_path.clone(),
+                read_only: disk.read_only,
+                drive_id,
+            })
+        })
+        .collect();
+
+    if !extra_disk_configs.is_empty() {
+        info!(
+            num_disks = extra_disk_configs.len(),
+            "saving {} extra disk config(s) to snapshot metadata",
+            extra_disk_configs.len()
+        );
+    }
+
     // Use original_vsock_vm_id from the VM state if available.
     // When a VM is restored from cache, its vmstate.bin references vsock paths from the
     // ORIGINAL (cached) VM. Taking a snapshot of this restored VM creates a NEW vmstate.bin,
@@ -181,6 +222,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             volumes: volume_configs,
             health_check_url: vm_state.config.health_check_url.clone(),
             hugepages: vm_state.config.hugepages,
+            extra_disks: extra_disk_configs,
         },
     };
 
@@ -774,6 +816,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         }
     };
 
+    let snapshot_dir = paths::snapshot_dir().join(&snapshot_name);
     let restore_config = SnapshotRestoreConfig {
         vmstate_path: snapshot_config.vmstate_path.clone(),
         memory_backend,
@@ -781,6 +824,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         original_vm_id,
         snapshot_vm_id,
         hugepages,
+        extra_disks: snapshot_config.metadata.extra_disks.clone(),
+        snapshot_dir: Some(snapshot_dir),
     };
 
     // Run clone setup using shared restore function
