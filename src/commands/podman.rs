@@ -699,7 +699,7 @@ async fn create_disk_from_dir(
     source_dir: &std::path::Path,
     output_path: &std::path::Path,
 ) -> Result<()> {
-    // Calculate directory size (add 20% overhead for ext4 metadata, min 16MB)
+    // Calculate directory size for ext4 image sizing
     let dir_size = tokio::process::Command::new("du")
         .args(["-sb", source_dir.to_str().unwrap()])
         .output()
@@ -713,8 +713,11 @@ async fn create_disk_from_dir(
         .and_then(|s| s.parse().ok())
         .unwrap_or(16 * 1024 * 1024);
 
-    // Add 20% overhead, minimum 16MB
-    let image_size = std::cmp::max(size_bytes * 120 / 100, 16 * 1024 * 1024);
+    // Use 2x the data size for the image. mkfs.ext4 needs space for inodes, journal,
+    // superblock, and directory entries — 20% is insufficient for images with many small
+    // files (like CA certificate bundles). Since the image is a sparse file, unused space
+    // doesn't consume actual disk. After mkfs, we shrink with resize2fs -M.
+    let image_size = std::cmp::max(size_bytes * 2, 64 * 1024 * 1024);
 
     info!(
         "Creating disk image from {}: {} bytes -> {} bytes",
@@ -755,6 +758,21 @@ async fn create_disk_from_dir(
         bail!(
             "mkfs.ext4 -d failed: {}",
             String::from_utf8_lossy(&mkfs.stderr)
+        );
+    }
+
+    // Shrink the filesystem to its minimum size. The sparse file was deliberately
+    // oversized to ensure mkfs.ext4 had enough space; resize2fs -M reclaims the slack.
+    let resize = tokio::process::Command::new("resize2fs")
+        .args(["-M", output_path.to_str().unwrap()])
+        .output()
+        .await
+        .context("shrinking ext4 image")?;
+
+    if !resize.status.success() {
+        warn!(
+            "resize2fs -M failed (non-fatal): {}",
+            String::from_utf8_lossy(&resize.stderr)
         );
     }
 
