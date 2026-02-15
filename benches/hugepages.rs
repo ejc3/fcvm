@@ -90,24 +90,24 @@ fn is_process_alive(pid: u32) -> bool {
 
 /// Wait for a VM to become healthy, polling fcvm ls --json --pid.
 /// Detects early process death to avoid waiting the full timeout.
-fn poll_health(fcvm: &Path, pid: u32, timeout_secs: u64) -> Duration {
+fn poll_health(fcvm: &Path, pid: u32, timeout_secs: u64) -> Result<Duration, String> {
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
     loop {
         if start.elapsed() > timeout {
-            panic!(
+            return Err(format!(
                 "VM (PID {}) failed to become healthy within {}s",
                 pid, timeout_secs
-            );
+            ));
         }
 
         // Detect early process death
         if !is_process_alive(pid) {
-            panic!(
+            return Err(format!(
                 "VM process (PID {}) died after {:.1}s — check /tmp/fcvm-bench-*.log",
                 pid,
                 start.elapsed().as_secs_f64()
-            );
+            ));
         }
 
         let output = Command::new(fcvm)
@@ -123,7 +123,7 @@ fn poll_health(fcvm: &Path, pid: u32, timeout_secs: u64) -> Duration {
                     .map(|v| v.health_status == "healthy")
                     .unwrap_or(false)
                 {
-                    return start.elapsed();
+                    return Ok(start.elapsed());
                 }
             }
         }
@@ -254,47 +254,80 @@ fn run_mode(mode: &str, mem_mb: u32, data_mb: u32, hugepages: bool) -> BenchResu
     // Delete only benchmark snapshots to ensure cold start
     prune_bench_snapshots(&fcvm);
 
-    // First run: cold start (cache miss)
-    let name1 = format!("bench-hp-{}-cold-{}", mode, pid_suffix);
-    eprintln!("  [1/2] Cold start: {}", name1);
-
-    let log_path1 = format!("/tmp/fcvm-bench-{}.log", name1);
-    let log_file1 = File::create(&log_path1).expect("create log file");
-    let log_err1 = log_file1.try_clone().expect("clone log file");
-
-    let mut args1 = vec![
-        "podman",
-        "run",
-        "--name",
-        &name1,
-        "--mem",
-        &mem_str,
-        "--health-check",
-        "http://localhost:80/",
-    ];
-    if hugepages {
-        args1.push("--hugepages");
-    }
-    args1.push(BENCH_IMAGE);
-
-    let t1 = Instant::now();
-    let child1 = Command::new(&fcvm)
-        .args(&args1)
-        .env("RUST_LOG", "debug")
-        .stdout(Stdio::from(log_file1))
-        .stderr(Stdio::from(log_err1))
-        .spawn()
-        .expect("failed to spawn cold start VM");
-
-    let pid1 = child1.id();
-    let _guard1 = ProcessGuard {
-        pid: pid1,
-        child: child1,
-    };
-    eprintln!("    Log: {}", log_path1);
-
+    // First run: cold start (cache miss) — retry once on transient timeout
     let healthy_timeout = if data_mb > 1000 { 900 } else { 300 };
-    let health_elapsed = poll_health(&fcvm, pid1, healthy_timeout);
+    let max_cold_attempts = 2;
+    let mut health_elapsed = Duration::ZERO;
+    let mut cold_guard: Option<ProcessGuard> = None;
+    let mut cold_log_path = String::new();
+    let t1 = Instant::now();
+
+    for cold_attempt in 1..=max_cold_attempts {
+        let name1 = format!("bench-hp-{}-cold-{}-{}", mode, pid_suffix, cold_attempt);
+        if cold_attempt > 1 {
+            eprintln!("  [1/2] Cold start (retry {}): {}", cold_attempt, name1);
+            // Clean up snapshots from failed attempt
+            prune_bench_snapshots(&fcvm);
+            std::thread::sleep(Duration::from_secs(3));
+        } else {
+            eprintln!("  [1/2] Cold start: {}", name1);
+        }
+
+        let log_path1 = format!("/tmp/fcvm-bench-{}.log", name1);
+        let log_file1 = File::create(&log_path1).expect("create log file");
+        let log_err1 = log_file1.try_clone().expect("clone log file");
+
+        let mut args1 = vec![
+            "podman",
+            "run",
+            "--name",
+            &name1,
+            "--mem",
+            &mem_str,
+            "--health-check",
+            "http://localhost:80/",
+        ];
+        if hugepages {
+            args1.push("--hugepages");
+        }
+        args1.push(BENCH_IMAGE);
+
+        let child1 = Command::new(&fcvm)
+            .args(&args1)
+            .env("RUST_LOG", "debug")
+            .stdout(Stdio::from(log_file1))
+            .stderr(Stdio::from(log_err1))
+            .spawn()
+            .expect("failed to spawn cold start VM");
+
+        let pid1 = child1.id();
+        let guard1 = ProcessGuard {
+            pid: pid1,
+            child: child1,
+        };
+        eprintln!("    Log: {}", log_path1);
+
+        match poll_health(&fcvm, pid1, healthy_timeout) {
+            Ok(elapsed) => {
+                health_elapsed = elapsed;
+                cold_guard = Some(guard1);
+                cold_log_path = log_path1;
+                break;
+            }
+            Err(e) => {
+                eprintln!("    Cold start failed: {}", e);
+                drop(guard1); // Kill the failed VM
+                if cold_attempt == max_cold_attempts {
+                    panic!(
+                        "Cold start failed after {} attempts: {}",
+                        max_cold_attempts, e
+                    );
+                }
+            }
+        }
+    }
+    let _guard1 = cold_guard.expect("cold start must succeed");
+    let log_path1 = cold_log_path;
     eprintln!("    Healthy after {:.1}s", health_elapsed.as_secs_f64());
 
     // Wait for startup snapshot
@@ -393,7 +426,8 @@ fn run_mode(mode: &str, mem_mb: u32, data_mb: u32, hugepages: bool) -> BenchResu
     eprintln!("    Log: {}", log_path2);
 
     let clone_timeout = if data_mb > 1000 { 300 } else { 120 };
-    let clone_elapsed = poll_health(&fcvm, pid2, clone_timeout);
+    let clone_elapsed =
+        poll_health(&fcvm, pid2, clone_timeout).unwrap_or_else(|e| panic!("Clone failed: {}", e));
     let clone_secs = clone_elapsed.as_secs_f64();
     eprintln!("    Clone healthy after {:.1}s", clone_secs);
 

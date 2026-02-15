@@ -487,18 +487,34 @@ pub fn custom_kernel_filename(profile_name: &str, kernel_version: &str, sha: &st
 
 async fn download_kernel_binary(url: &str, dest: &Path) -> Result<()> {
     let temp_path = dest.with_extension("downloading");
+    let max_retries = 3;
 
-    let output = Command::new("curl")
-        .args(["-fSL", url, "-o"])
-        .arg(&temp_path)
-        .output()
-        .await
-        .context("running curl")?;
+    for attempt in 1..=max_retries {
+        let output = Command::new("curl")
+            .args(["-fSL", url, "-o"])
+            .arg(&temp_path)
+            .output()
+            .await
+            .context("running curl")?;
 
-    if !output.status.success() {
+        if output.status.success() {
+            break;
+        }
+
         let stderr = String::from_utf8_lossy(&output.stderr);
         let _ = tokio::fs::remove_file(&temp_path).await;
-        bail!("curl failed: {}", stderr);
+
+        if attempt < max_retries {
+            warn!(
+                attempt,
+                max_retries,
+                error = %stderr.trim(),
+                "kernel download failed, retrying in 5s"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        } else {
+            bail!("curl failed after {} attempts: {}", max_retries, stderr);
+        }
     }
 
     // Verify it's a valid kernel binary
