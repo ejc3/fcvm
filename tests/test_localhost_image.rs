@@ -1,8 +1,8 @@
 //! Integration test for localhost/ container images
 //!
-//! This test verifies that locally-built container images can be run inside VMs.
-//! The image is exported from the host using `podman save`, mounted into the VM via FUSE,
-//! and then imported by fc-agent using `podman load` before running with podman.
+//! Tests both import paths:
+//! - Default (direct mount): Pre-built podman storage mounted as additionalImageStore
+//! - Legacy (--no-direct-image-mount): Docker archive imported via podman load
 
 #![cfg(feature = "integration-fast")]
 
@@ -13,25 +13,54 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-/// Test that a localhost/ container image can be built and run in a VM (rootless)
+/// Test with default direct image mount path
 #[tokio::test]
 async fn test_localhost_hello_world() -> Result<()> {
-    println!("\nLocalhost Image Test");
+    run_localhost_test(false).await
+}
+
+/// Test with legacy podman load path (--no-direct-image-mount)
+#[tokio::test]
+async fn test_localhost_hello_world_legacy_import() -> Result<()> {
+    run_localhost_test(true).await
+}
+
+async fn run_localhost_test(no_direct_image_mount: bool) -> Result<()> {
+    let mode = if no_direct_image_mount {
+        "legacy (podman load)"
+    } else {
+        "direct mount (additionalImageStore)"
+    };
+
+    println!("\nLocalhost Image Test ({})", mode);
     println!("====================");
-    println!("Testing that localhost/ container images work via podman save/load");
 
     // Find fcvm binary
     let fcvm_path = common::find_fcvm_binary()?;
-    let (vm_name, _, _, _) = common::unique_names("localhost-hello");
+    let suffix = if no_direct_image_mount {
+        "localhost-legacy"
+    } else {
+        "localhost-direct"
+    };
+    let (vm_name, _, _, _) = common::unique_names(suffix);
 
     // Step 1: Build a test container image on the host
     println!("Step 1: Building test container image localhost/test-hello...");
     build_test_image().await?;
 
     // Step 2: Start VM with localhost image (rootless mode)
-    println!("Step 2: Starting VM with localhost/test-hello image...");
+    println!(
+        "Step 2: Starting VM with localhost/test-hello image ({})...",
+        mode
+    );
+    let mut args = vec!["podman", "run", "--name", &vm_name];
+    if no_direct_image_mount {
+        args.push("--no-direct-image-mount");
+    }
+    args.push("localhost/test-hello");
+
     let mut child = tokio::process::Command::new(&fcvm_path)
-        .args(["podman", "run", "--name", &vm_name, "localhost/test-hello"])
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -107,19 +136,17 @@ async fn test_localhost_hello_world() -> Result<()> {
 
     // Check results - verify we got the container output
     if found_hello {
-        println!("\n✅ LOCALHOST IMAGE TEST PASSED!");
-        println!("  - Image exported via podman save on host");
-        println!("  - Image imported via podman load in guest");
+        println!("\n  LOCALHOST IMAGE TEST PASSED! ({})", mode);
         println!("  - Container ran and printed: Hello from localhost container!");
         if container_exited_zero {
             println!("  - Container exited with code 0");
         }
         Ok(())
     } else {
-        println!("\n❌ LOCALHOST IMAGE TEST FAILED!");
+        println!("\n  LOCALHOST IMAGE TEST FAILED! ({})", mode);
         println!("  - Did not find expected output: 'Hello from localhost container!'");
         println!("  - Check logs above for error details");
-        anyhow::bail!("Localhost image test failed")
+        anyhow::bail!("Localhost image test failed ({})", mode)
     }
 }
 

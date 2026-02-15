@@ -136,6 +136,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	container-build container-test container-test-unit container-test-fast container-test-all \
 	container-setup-fcvm container-shell container-clean container-bench \
 	setup-btrfs setup-fcvm setup-pjdfstest bench bench-vm bench-hugepages bench-hugepages-test \
+	bench-container-import \
 	lint fmt ssh test-serve-sdk
 
 all: build
@@ -183,6 +184,7 @@ help:
 	@echo "  bench-vm           Run VM benchmarks (exec, clone)"
 	@echo "  bench-hugepages    Run hugepages benchmark (32GB VM, 16GB dirty)"
 	@echo "  bench-hugepages-test  Run hugepages benchmark (2GB VM, 256MB dirty)"
+	@echo "  bench-container-import  Compare podman load vs direct image mount"
 	@echo ""
 	@echo "Other:"
 	@echo "  lint               Run linting (auto-installs tools if needed)"
@@ -454,6 +456,10 @@ bench-hugepages-test: build setup-fcvm
 	echo "==> Releasing hugepage pool..."; \
 	sudo sh -c 'echo 0 > /proc/sys/vm/nr_hugepages'; \
 	exit $$RC
+
+bench-container-import: build setup-fcvm
+	@echo "==> Running container import benchmark..."
+	$(CARGO) bench --bench container_import
 
 # Container benchmark target (used by nightly CI)
 # Uses CONTAINER_RUN_BASE (no --ulimit nproc) to avoid EPERM on GHA ubuntu-latest

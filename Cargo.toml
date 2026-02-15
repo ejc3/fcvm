@@ -112,3 +112,7 @@ harness = false
 [[bench]]
 name = "hugepages"
 harness = false
+
+[[bench]]
+name = "container_import"
+harness = false

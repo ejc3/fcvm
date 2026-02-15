@@ -10,6 +10,65 @@ use crate::output::OutputHandle;
 use crate::types::Plan;
 use crate::vsock;
 
+/// Mount a pre-built podman storage image and configure as additionalImageStore.
+///
+/// The storage image is an ext4 filesystem containing a podman overlay storage tree
+/// (overlay/, overlay-images/, overlay-layers/). It is mounted read-only and podman
+/// finds the image there without needing `podman load`.
+pub fn mount_storage_image(device: &str, image_name: &str) -> Result<String> {
+    eprintln!("[fc-agent] mounting pre-built storage image: {}", device);
+
+    let mount_path = "/mnt/image-store";
+    std::fs::create_dir_all(mount_path).context("creating image store mount point")?;
+
+    // Wait for device to appear
+    let device_path = std::path::Path::new(device);
+    for attempt in 1..=10 {
+        if device_path.exists() {
+            break;
+        }
+        if attempt == 10 {
+            anyhow::bail!("Device {} not found after 10 attempts", device);
+        }
+        eprintln!(
+            "[fc-agent] waiting for device {} (attempt {}/10)",
+            device, attempt
+        );
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    // Mount read-only
+    let output = std::process::Command::new("mount")
+        .args(["-o", "ro", device, mount_path])
+        .output()
+        .context("mounting storage image")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to mount storage image {} at {}: {}",
+            device,
+            mount_path,
+            stderr
+        );
+    }
+
+    // Configure podman to use this as an additional image store.
+    // Write a complete storage.conf with runroot/graphroot (required when
+    // storage.options is present) but omit "driver" to let podman auto-detect
+    // — setting it explicitly causes "database graph driver mismatch" errors.
+    let storage_conf = format!(
+        "[storage]\nrunroot = \"/run/containers/storage\"\ngraphroot = \"/var/lib/containers/storage\"\n\n[storage.options]\nadditionalimagestores = [\"{mount_path}\"]\n"
+    );
+    std::fs::write("/etc/containers/storage.conf", storage_conf).context("writing storage.conf")?;
+
+    eprintln!(
+        "[fc-agent] storage image mounted at {}, configured as additional image store",
+        mount_path
+    );
+    Ok(image_name.to_string())
+}
+
 /// Import a Docker archive into podman storage. Returns image reference.
 pub async fn import_image(
     archive_path: &str,
