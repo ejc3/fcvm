@@ -176,8 +176,18 @@ pub async fn pull_image(plan: &Plan) -> Result<String> {
             plan.image, attempt, MAX_RETRIES
         );
 
-        let mut cmd = Command::new("podman");
-        cmd.arg("pull").arg(&plan.image);
+        let prefix = podman_cmd_prefix();
+        let mut cmd = if prefix.is_empty() {
+            let mut c = Command::new("podman");
+            c.arg("pull");
+            c
+        } else {
+            let mut c = Command::new(&prefix[0]);
+            c.args(&prefix[1..]);
+            c.arg("podman").arg("pull");
+            c
+        };
+        cmd.arg(&plan.image);
         if let Some(ref proxy) = plan.http_proxy {
             cmd.env("http_proxy", proxy).env("HTTP_PROXY", proxy);
         }
