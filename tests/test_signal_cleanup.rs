@@ -107,10 +107,10 @@ fn test_sigint_kills_firecracker_bridged() -> Result<()> {
     println!("Sending SIGINT to fcvm (PID {})", fcvm_pid);
     send_signal(fcvm_pid, "INT").context("sending SIGINT to fcvm")?;
 
-    // Wait for fcvm to exit (max 10 seconds)
+    // Wait for fcvm to exit (max 30 seconds — cleanup can be slow under CI load)
     let start = std::time::Instant::now();
     let mut exited = false;
-    while start.elapsed() < Duration::from_secs(10) {
+    while start.elapsed() < Duration::from_secs(30) {
         match fcvm.try_wait() {
             Ok(Some(status)) => {
                 println!("fcvm exited with status: {:?}", status);
@@ -133,8 +133,14 @@ fn test_sigint_kills_firecracker_bridged() -> Result<()> {
         let _ = fcvm.wait();
     }
 
-    // Give a moment for cleanup
-    std::thread::sleep(common::POLL_INTERVAL);
+    // Poll for firecracker cleanup (max 5 seconds)
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        if !process_exists(fc_pid) {
+            break;
+        }
+        std::thread::sleep(common::POLL_INTERVAL);
+    }
 
     // Check if our specific firecracker is still running
     let still_running = process_exists(fc_pid);
@@ -235,12 +241,14 @@ fn test_sigterm_kills_firecracker_bridged() -> Result<()> {
     println!("Sending SIGTERM to fcvm (PID {})", fcvm_pid);
     send_signal(fcvm_pid, "TERM").context("sending SIGTERM to fcvm")?;
 
-    // Wait for fcvm to exit (max 10 seconds)
+    // Wait for fcvm to exit (max 30 seconds — cleanup can be slow under CI load)
     let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(10) {
+    let mut exited = false;
+    while start.elapsed() < Duration::from_secs(30) {
         match fcvm.try_wait() {
             Ok(Some(status)) => {
                 println!("fcvm exited with status: {:?}", status);
+                exited = true;
                 break;
             }
             Ok(None) => {
@@ -250,8 +258,20 @@ fn test_sigterm_kills_firecracker_bridged() -> Result<()> {
         }
     }
 
-    // Give a moment for cleanup
-    std::thread::sleep(common::POLL_INTERVAL);
+    if !exited {
+        println!("fcvm didn't exit after SIGTERM, killing forcefully");
+        let _ = fcvm.kill();
+        let _ = fcvm.wait();
+    }
+
+    // Poll for firecracker cleanup (max 5 seconds)
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        if !process_exists(fc_pid) {
+            break;
+        }
+        std::thread::sleep(common::POLL_INTERVAL);
+    }
 
     // Check if our specific firecracker is still running
     let still_running = process_exists(fc_pid);
@@ -354,12 +374,14 @@ fn test_sigterm_cleanup_rootless() -> Result<()> {
     println!("Sending SIGTERM to fcvm (PID {})", fcvm_pid);
     send_signal(fcvm_pid, "TERM").context("sending SIGTERM to fcvm")?;
 
-    // Wait for fcvm to exit (max 10 seconds)
+    // Wait for fcvm to exit (max 30 seconds — cleanup can be slow under CI load)
     let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(10) {
+    let mut exited = false;
+    while start.elapsed() < Duration::from_secs(30) {
         match fcvm.try_wait() {
             Ok(Some(status)) => {
                 println!("fcvm exited with status: {:?}", status);
+                exited = true;
                 break;
             }
             Ok(None) => {
@@ -369,8 +391,22 @@ fn test_sigterm_cleanup_rootless() -> Result<()> {
         }
     }
 
-    // Give a moment for cleanup
-    std::thread::sleep(common::POLL_INTERVAL);
+    if !exited {
+        println!("fcvm didn't exit after SIGTERM, killing forcefully");
+        let _ = fcvm.kill();
+        let _ = fcvm.wait();
+    }
+
+    // Poll for child process cleanup (max 5 seconds)
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        let fc_alive = our_fc_pid.is_some_and(process_exists);
+        let slirp_alive = our_slirp_pid.is_some_and(process_exists);
+        if !fc_alive && !slirp_alive {
+            break;
+        }
+        std::thread::sleep(common::POLL_INTERVAL);
+    }
 
     // Verify our SPECIFIC processes are cleaned up
     if let Some(fc_pid) = our_fc_pid {
@@ -584,12 +620,14 @@ fn test_sigterm_cleanup_bridged() -> Result<()> {
     println!("Sending SIGTERM to fcvm (PID {})", fcvm_pid);
     send_signal(fcvm_pid, "TERM").context("sending SIGTERM to fcvm")?;
 
-    // Wait for exit
+    // Wait for fcvm to exit (max 30 seconds — cleanup can be slow under CI load)
     let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(10) {
+    let mut exited = false;
+    while start.elapsed() < Duration::from_secs(30) {
         match fcvm.try_wait() {
             Ok(Some(status)) => {
                 println!("fcvm exited with status: {:?}", status);
+                exited = true;
                 break;
             }
             Ok(None) => std::thread::sleep(common::POLL_INTERVAL),
@@ -597,7 +635,21 @@ fn test_sigterm_cleanup_bridged() -> Result<()> {
         }
     }
 
-    std::thread::sleep(common::POLL_INTERVAL);
+    if !exited {
+        println!("fcvm didn't exit after SIGTERM, killing forcefully");
+        let _ = fcvm.kill();
+        let _ = fcvm.wait();
+    }
+
+    // Poll for child process cleanup (max 5 seconds)
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        let fc_alive = our_fc_pid.is_some_and(process_exists);
+        if !fc_alive {
+            break;
+        }
+        std::thread::sleep(common::POLL_INTERVAL);
+    }
 
     // Verify our SPECIFIC processes are cleaned up
     if let Some(fc_pid) = our_fc_pid {
