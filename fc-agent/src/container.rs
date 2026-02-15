@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::process::Stdio;
+use std::sync::OnceLock;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
@@ -69,11 +70,28 @@ pub fn mount_storage_image(device: &str, image_name: &str) -> Result<String> {
     Ok(image_name.to_string())
 }
 
+/// Global command prefix for running podman commands as the target user.
+/// Set once during setup, used by exec server and health checks.
+/// Empty when running as root (no user mapping).
+static PODMAN_CMD_PREFIX: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Store the command prefix for use by exec and other podman commands.
+pub fn set_podman_cmd_prefix(prefix: Vec<String>) {
+    let _ = PODMAN_CMD_PREFIX.set(prefix);
+}
+
+/// Get the command prefix (empty vec if running as root).
+pub fn podman_cmd_prefix() -> &'static [String] {
+    PODMAN_CMD_PREFIX.get().map(|v| v.as_slice()).unwrap_or(&[])
+}
+
 /// Import a Docker archive into podman storage. Returns image reference.
+/// If cmd_prefix is provided, prepend it to the podman command (e.g., for runuser).
 pub async fn import_image(
     archive_path: &str,
     image_name: &str,
     output: &OutputHandle,
+    cmd_prefix: &[String],
 ) -> Result<String> {
     eprintln!("[fc-agent] importing Docker archive: {}", archive_path);
 
@@ -83,8 +101,28 @@ pub async fn import_image(
             .output();
     }
 
-    let mut load_child = Command::new("podman")
-        .args(["load", "-i", archive_path])
+    let (cmd, args) = if cmd_prefix.is_empty() {
+        (
+            "podman".to_string(),
+            vec![
+                "load".to_string(),
+                "-i".to_string(),
+                archive_path.to_string(),
+            ],
+        )
+    } else {
+        let mut all_args: Vec<String> = cmd_prefix[1..].to_vec();
+        all_args.extend([
+            "podman".to_string(),
+            "load".to_string(),
+            "-i".to_string(),
+            archive_path.to_string(),
+        ]);
+        (cmd_prefix[0].clone(), all_args)
+    };
+
+    let mut load_child = Command::new(&cmd)
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -217,9 +255,24 @@ pub async fn pull_image(plan: &Plan) -> Result<String> {
 }
 
 /// Get the digest of a pulled image.
-pub async fn get_image_digest(image: &str) -> Result<String> {
-    let output = Command::new("podman")
-        .args(["image", "inspect", "--format", "{{.Digest}}", image])
+pub async fn get_image_digest(image: &str, cmd_prefix: &[String]) -> Result<String> {
+    let (cmd, mut args) = if cmd_prefix.is_empty() {
+        ("podman".to_string(), vec![])
+    } else {
+        let mut a: Vec<String> = cmd_prefix[1..].to_vec();
+        a.push("podman".to_string());
+        (cmd_prefix[0].clone(), a)
+    };
+    args.extend([
+        "image".to_string(),
+        "inspect".to_string(),
+        "--format".to_string(),
+        "{{.Digest}}".to_string(),
+        image.to_string(),
+    ]);
+
+    let output = Command::new(&cmd)
+        .args(&args)
         .output()
         .await
         .context("running podman image inspect")?;
@@ -345,27 +398,61 @@ pub fn notify_cache_ready_and_wait(digest: &str) -> bool {
 }
 
 /// Build podman run args from the plan.
-pub fn build_podman_args(plan: &Plan, image_ref: &str) -> Vec<String> {
+/// If user_info is Some, the container runs as the specified user (rootless podman).
+pub fn build_podman_args(
+    plan: &Plan,
+    image_ref: &str,
+    user_info: Option<(&str, &str)>, // (username, runtime_dir)
+) -> Vec<String> {
     let mut args = vec![
         "podman".to_string(),
         "run".to_string(),
         "--name".to_string(),
         "fcvm-container".to_string(),
-        "--network=host".to_string(),
+    ];
+
+    // Always use host networking inside the VM. The VM already has its own
+    // network namespace (via slirp4netns). Pasta inside the VM would create
+    // double-NAT that breaks port forwarding and health checks.
+    args.push("--network=host".to_string());
+
+    args.extend([
         "--cgroups=split".to_string(),
         "--ulimit".to_string(),
         "nofile=65536:65536".to_string(),
-    ];
+        "--pids-limit=-1".to_string(),
+    ]);
 
-    if let Some(ref user_spec) = plan.user {
-        setup_user_mapping(&mut args, user_spec);
+    if let Some((username, runtime_dir)) = user_info {
+        setup_user_mapping(&mut args, username, runtime_dir);
     }
 
     if plan.privileged {
         eprintln!("[fc-agent] privileged mode enabled");
-        args.push("--device-cgroup-rule=b *:* rwm".to_string());
-        args.push("--device-cgroup-rule=c *:* rwm".to_string());
-        args.push("--privileged".to_string());
+        if user_info.is_some() {
+            // Rootless podman: --privileged gives zero effective capabilities with
+            // --userns=keep-id. Instead, use explicit --cap-add for the caps we need.
+            // These match the host podman's cap-add list exactly.
+            for cap in &[
+                "net_bind_service",
+                "net_admin",
+                "sys_nice",
+                "sys_resource",
+                "sys_ptrace",
+                "sys_admin",
+            ] {
+                args.push(format!("--cap-add={}", cap));
+            }
+            args.push("--security-opt".to_string());
+            args.push("seccomp=unconfined".to_string());
+            args.push("--device".to_string());
+            args.push("/dev/fuse".to_string());
+        } else {
+            // Root podman: full device cgroup access + privileged.
+            args.push("--device-cgroup-rule=b *:* rwm".to_string());
+            args.push("--device-cgroup-rule=c *:* rwm".to_string());
+            args.push("--privileged".to_string());
+        }
     }
 
     if plan.interactive {
@@ -418,11 +505,14 @@ pub fn build_podman_args(plan: &Plan, image_ref: &str) -> Vec<String> {
     args
 }
 
-fn setup_user_mapping(args: &mut Vec<String>, user_spec: &str) {
+/// Create the VM user and set up rootless podman prerequisites.
+/// Call this BEFORE importing images so podman load runs as the target user.
+/// Returns (username, uid, runtime_dir) for use by run_as_user_prefix().
+pub fn create_vm_user(user_spec: &str, desired_name: &str) -> (String, String, String) {
     let parts: Vec<&str> = user_spec.split(':').collect();
-    let uid = parts[0];
-    let gid = parts.get(1).unwrap_or(&"100");
-    let username = "fcvm-user".to_string();
+    let uid = parts[0].to_string();
+    let gid = parts.get(1).unwrap_or(&"100").to_string();
+    let username = desired_name.to_string();
 
     eprintln!(
         "[fc-agent] setting up user mapping: uid={} gid={}",
@@ -430,10 +520,10 @@ fn setup_user_mapping(args: &mut Vec<String>, user_spec: &str) {
     );
 
     let _ = std::process::Command::new("groupadd")
-        .args(["-g", gid, &username])
+        .args(["-g", &gid, &username])
         .output();
     let _ = std::process::Command::new("useradd")
-        .args(["-u", uid, "-g", gid, "-m", "-s", "/bin/sh", &username])
+        .args(["-u", &uid, "-g", &gid, "-m", "-s", "/bin/sh", &username])
         .output();
 
     let subuid_entry = format!("{}:100000:65536\n", username);
@@ -446,14 +536,31 @@ fn setup_user_mapping(args: &mut Vec<String>, user_spec: &str) {
         .args([&format!("{}:{}", uid, gid), &runtime_dir])
         .output();
 
+    // Clean stale podman storage from previous VM runs. The run root may have
+    // changed between runs (e.g., /tmp vs /run/user), causing "database
+    // configuration mismatch" errors.
+    let _ = std::process::Command::new("env")
+        .args([
+            &format!("XDG_RUNTIME_DIR={}", runtime_dir),
+            "runuser",
+            "-u",
+            &username,
+            "--",
+            "podman",
+            "system",
+            "reset",
+            "--force",
+        ])
+        .output();
+
     let cgroup_dir = format!("/sys/fs/cgroup/user.slice/user-{}.slice", uid);
     let _ = std::fs::create_dir_all(&cgroup_dir);
     let _ = std::process::Command::new("chown")
         .args(["-R", &format!("{}:{}", uid, gid), &cgroup_dir])
         .output();
     for path in &[
-        "/sys/fs/cgroup/cgroup.subtree_control",
-        &format!("{}/cgroup.subtree_control", cgroup_dir),
+        "/sys/fs/cgroup/cgroup.subtree_control".to_string(),
+        format!("{}/cgroup.subtree_control", cgroup_dir),
     ] {
         let _ = std::fs::write(path, "+cpu +memory +pids");
     }
@@ -468,13 +575,33 @@ fn setup_user_mapping(args: &mut Vec<String>, user_spec: &str) {
         }
     }
 
-    // Rootless podman: remove split, add keep-id, wrap with runuser
+    (username, uid, runtime_dir)
+}
+
+/// Build the env + runuser prefix for running commands as the VM user.
+pub fn run_as_user_prefix(username: &str, runtime_dir: &str) -> Vec<String> {
+    vec![
+        "env".to_string(),
+        format!("XDG_RUNTIME_DIR={}", runtime_dir),
+        "runuser".to_string(),
+        "-u".to_string(),
+        username.to_string(),
+        "--".to_string(),
+    ]
+}
+
+fn setup_user_mapping(args: &mut Vec<String>, username: &str, runtime_dir: &str) {
+    // Rootless podman: remove split cgroups, add keep-id + cgroupfs manager.
+    // No systemd user session in the VM, so use cgroupfs directly.
     args.retain(|a| a != "--cgroups=split");
     args.push("--userns=keep-id".to_string());
-    args.insert(0, "--".to_string());
-    args.insert(0, username);
-    args.insert(0, "-u".to_string());
-    args.insert(0, "runuser".to_string());
+    args.push("--cgroup-manager=cgroupfs".to_string());
+
+    // Wrap with env + runuser to set XDG_RUNTIME_DIR (rootless podman needs it)
+    let prefix = run_as_user_prefix(username, runtime_dir);
+    for (i, arg) in prefix.into_iter().enumerate() {
+        args.insert(i, arg);
+    }
 }
 
 /// Run container in TTY mode (blocks until exit).
@@ -545,12 +672,20 @@ pub async fn run_async(podman_args: &[String], output: &OutputHandle) -> Result<
             status, exit_code
         );
 
-        // Capture podman logs on failure
+        // Capture podman logs on failure (use user prefix for rootless podman)
         eprintln!("[fc-agent] capturing podman logs for failed container...");
-        match std::process::Command::new("podman")
-            .args(["logs", "fcvm-container"])
-            .output()
-        {
+        let prefix = podman_cmd_prefix();
+        let logs_result = if prefix.is_empty() {
+            std::process::Command::new("podman")
+                .args(["logs", "fcvm-container"])
+                .output()
+        } else {
+            let mut c = std::process::Command::new(&prefix[0]);
+            c.args(&prefix[1..]);
+            c.args(["podman", "logs", "fcvm-container"]);
+            c.output()
+        };
+        match logs_result {
             Ok(logs) => {
                 let stdout = String::from_utf8_lossy(&logs.stdout);
                 let stderr = String::from_utf8_lossy(&logs.stderr);
@@ -578,10 +713,18 @@ pub async fn run_async(podman_args: &[String], output: &OutputHandle) -> Result<
         }
     }
 
-    // Clean up the container
-    let _ = std::process::Command::new("podman")
-        .args(["rm", "-f", "fcvm-container"])
-        .output();
+    // Clean up the container (use user prefix for rootless podman)
+    let prefix = podman_cmd_prefix();
+    if prefix.is_empty() {
+        let _ = std::process::Command::new("podman")
+            .args(["rm", "-f", "fcvm-container"])
+            .output();
+    } else {
+        let _ = std::process::Command::new(&prefix[0])
+            .args(&prefix[1..])
+            .args(["podman", "rm", "-f", "fcvm-container"])
+            .output();
+    }
 
     Ok(exit_code)
 }

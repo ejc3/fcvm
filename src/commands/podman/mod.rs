@@ -110,18 +110,26 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         bail!("--setup is not allowed when running as root. Run 'fcvm setup' first.");
     }
 
-    // Validate --user format (must be "uid:gid" with numeric values)
+    // Validate --user format and resolve username from /etc/passwd (matching podman behavior).
+    // Accepts "uid:gid" (numeric) - username is looked up from host passwd, just like
+    // podman --userns=keep-id resolves the username from the container's passwd.
     if let Some(ref user) = args.user {
         let parts: Vec<&str> = user.split(':').collect();
         if parts.len() != 2 {
             bail!("invalid --user format '{}': expected 'uid:gid'", user);
         }
-        parts[0]
-            .parse::<u32>()
+        let uid: u32 = parts[0]
+            .parse()
             .map_err(|_| anyhow::anyhow!("invalid --user uid '{}': must be numeric", parts[0]))?;
         parts[1]
             .parse::<u32>()
             .map_err(|_| anyhow::anyhow!("invalid --user gid '{}': must be numeric", parts[1]))?;
+
+        // Resolve username from host /etc/passwd (like podman does with keep-id)
+        if !args.env.iter().any(|e| e.starts_with("USER=")) {
+            let username = resolve_username(uid);
+            args.env.push(format!("USER={}", username));
+        }
     }
 
     // Resolve 0 → host values for cpu and mem
@@ -502,6 +510,16 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     vm_state.config.hugepages = args.hugepages;
     vm_state.config.portable_volumes = args.portable_volumes;
     vm_state.config.port_mappings = port_mappings.clone();
+    vm_state.config.user = args.user.clone();
+    // Store the username for health checks (runuser -u <username>).
+    // USER env var was resolved from host /etc/passwd above (or explicitly passed).
+    if args.user.is_some() {
+        vm_state.config.username = args
+            .env
+            .iter()
+            .find_map(|s| s.strip_prefix("USER="))
+            .map(|s| s.to_string());
+    }
     vm_state.config.labels = args
         .label
         .iter()
@@ -769,6 +787,16 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         log_tx,
         output_reconnect,
     }))
+}
+
+/// Resolve a UID to a username via the host's /etc/passwd.
+/// Falls back to "u{uid}" if the UID isn't found (matching podman's numeric fallback).
+fn resolve_username(uid: u32) -> String {
+    // Use nix::unistd::User which reads /etc/passwd
+    match nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
+        Ok(Some(user)) => user.name,
+        _ => format!("u{}", uid),
+    }
 }
 
 /// Event loop: waits for VM exit, cancellation, or snapshot requests.

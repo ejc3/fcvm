@@ -118,17 +118,42 @@ pub async fn run() -> Result<()> {
         });
     }
 
+    // If --user is specified, create the VM user BEFORE image import so
+    // podman load runs as the target user (rootless podman has separate storage).
+    let user_info = if let Some(ref user_spec) = plan.user {
+        // Username comes from USER env var, which the host resolves from /etc/passwd
+        // for the given UID (matching podman --userns=keep-id behavior).
+        let desired_name = plan
+            .env
+            .get("USER")
+            .map(|s| s.as_str())
+            .unwrap_or("fcvm-user");
+        let (username, _uid, runtime_dir) = container::create_vm_user(user_spec, desired_name);
+        Some((username, runtime_dir))
+    } else {
+        None
+    };
+
+    // Build the command prefix for running commands as the target user
+    let cmd_prefix: Vec<String> = match &user_info {
+        Some((username, runtime_dir)) => container::run_as_user_prefix(username, runtime_dir),
+        None => vec![],
+    };
+
+    // Store prefix globally so exec server and health checks can use it
+    container::set_podman_cmd_prefix(cmd_prefix.clone());
+
     // Prepare image (mount storage, import archive, or pull from registry)
     let image_ref = if let Some(storage_device) = &plan.image_storage_device {
         container::mount_storage_image(storage_device, &plan.image)?
     } else if let Some(archive_path) = &plan.image_archive {
-        container::import_image(archive_path, &plan.image, &output).await?
+        container::import_image(archive_path, &plan.image, &output, &cmd_prefix).await?
     } else {
         container::pull_image(&plan).await?
     };
 
     // Notify host for cache snapshot
-    match container::get_image_digest(&image_ref).await {
+    match container::get_image_digest(&image_ref, &cmd_prefix).await {
         Ok(digest) => {
             eprintln!("[fc-agent] image digest: {}", digest);
             if container::notify_cache_ready_and_wait(&digest) {
@@ -148,11 +173,61 @@ pub async fn run() -> Result<()> {
     // the reconnectable multiplexer — no explicit check needed.
     output.reconnect();
 
+    // VM-level setup: hostname and sysctl (runs as root before container starts).
+    // When using --user, the container runs as non-root and can't do these.
+    // With --network=host, the container shares the VM's hostname.
+    if let Some(hostname) = plan.env.get("WWW_HOSTNAME") {
+        if !hostname.is_empty() {
+            let _ = std::process::Command::new("hostname")
+                .arg(hostname)
+                .output();
+            eprintln!("[fc-agent] set hostname to {}", hostname);
+        }
+    }
+    // net.ipv4.ip_unprivileged_port_start=0: With --user, the container runs as
+    // a non-root user but needs to bind port 80. The VM is single-tenant so this is safe.
+    for sysctl in &[
+        "fs.file-max=2097152",
+        "fs.nr_open=2097152",
+        "net.ipv4.ip_unprivileged_port_start=0",
+    ] {
+        let _ = std::process::Command::new("sysctl")
+            .args(["-w", sysctl])
+            .output();
+    }
+
+    // Add host identity IPv6 to loopback and eth0 (requires root, can't do from
+    // rootless container). Pass the address via HOST_IPV6 env var in the Plan.
+    if let Some(ipv6) = plan.env.get("HOST_IPV6") {
+        if !ipv6.is_empty() {
+            for dev in &["lo", "eth0"] {
+                let result = std::process::Command::new("ip")
+                    .args(["addr", "add", &format!("{}/128", ipv6), "dev", dev])
+                    .output();
+                match result {
+                    Ok(o) if o.status.success() => {
+                        eprintln!("[fc-agent] added {} to {} for host identity", ipv6, dev);
+                    }
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        if stderr.contains("File exists") {
+                            eprintln!("[fc-agent] {} already on {}", ipv6, dev);
+                        }
+                    }
+                    Err(e) => eprintln!("[fc-agent] ip addr add failed: {}", e),
+                }
+            }
+        }
+    }
+
     eprintln!("[fc-agent] launching container: {}", image_ref);
     system::wait_for_cgroup_controllers().await;
 
-    // Build podman args
-    let podman_args = container::build_podman_args(&plan, &image_ref);
+    // Build podman args (pass user info if available for rootless setup)
+    let user_ref = user_info
+        .as_ref()
+        .map(|(username, runtime_dir)| (username.as_str(), runtime_dir.as_str()));
+    let podman_args = container::build_podman_args(&plan, &image_ref, user_ref);
 
     // TTY mode: blocks, never returns
     if plan.tty {
