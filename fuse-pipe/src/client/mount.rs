@@ -476,73 +476,14 @@ pub fn mount_vsock_with_reconnect<P: AsRef<Path>>(
     let mux = Multiplexer::new_reconnectable(socket, num_readers, trace_rate, reconnect_fn)?;
     debug!(target: "fuse-pipe::client", num_readers, "reconnectable multiplexer started");
 
-    // Mount options (same as regular vsock mount)
-    let options = vec![
-        fuser::MountOption::FSName("fuse-pipe".to_string()),
-        fuser::MountOption::Suid,
-        fuser::MountOption::Dev,
-        fuser::MountOption::DefaultPermissions,
-    ];
-
-    let is_root = unsafe { libc::geteuid() } == 0;
-    let fuse_conf_allows = std::fs::read_to_string("/etc/fuse.conf")
-        .map(|s| s.lines().any(|l| l.trim() == "user_allow_other"))
-        .unwrap_or(false);
-
-    let acl = if is_root || fuse_conf_allows {
-        fuser::SessionACL::All
-    } else {
-        fuser::SessionACL::Owner
-    };
-    let mut config = fuser::Config::default();
-    config.mount_options = options;
-    config.acl = acl;
-    config.n_threads = Some(num_readers);
-    config.clone_fd = true;
-
-    let destroyed = Arc::new(AtomicBool::new(false));
-
-    let mut session = None;
-    let mut last_error = None;
-    for attempt in 0..=SESSION_NEW_MAX_RETRIES {
-        let fs = FuseClient::with_options(
-            Arc::clone(&mux),
-            Arc::clone(&destroyed),
-            max_write,
-            no_writeback_cache,
-        );
-        match fuser::Session::new(fs, mount_point.as_ref(), &config) {
-            Ok(s) => {
-                if attempt > 0 {
-                    info!(target: "fuse-pipe::client", attempt, "Session::new succeeded after retry");
-                }
-                session = Some(s);
-                break;
-            }
-            Err(e) => {
-                if attempt < SESSION_NEW_MAX_RETRIES {
-                    debug!(target: "fuse-pipe::client", attempt, error = %e, "Session::new failed, retrying");
-                    thread::sleep(SESSION_NEW_RETRY_DELAY);
-                }
-                last_error = Some(e);
-            }
-        }
-    }
-    let session = session.ok_or_else(|| last_error.unwrap())?;
-    info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), num_readers, "mounted via vsock (reconnectable)");
-
-    let bg_session = session.spawn()?;
-    if let Err(e) = bg_session.join() {
-        let destroyed_flag = destroyed.load(Ordering::SeqCst);
-        if destroyed_flag {
-            debug!(target: "fuse-pipe::client", "FUSE session exited (clean shutdown)");
-        } else {
-            error!(target: "fuse-pipe::client", error = %e, "FUSE session error");
-        }
-    }
-
-    debug!(target: "fuse-pipe::client", "FUSE session exited");
-    Ok(())
+    mount_fuse_session(
+        mux,
+        mount_point,
+        num_readers,
+        max_write,
+        no_writeback_cache,
+        "reconnectable",
+    )
 }
 
 /// Mount a FUSE filesystem via vsock with multiple reader threads.
@@ -599,8 +540,25 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
     let mux = Multiplexer::with_trace_rate(socket, num_readers, trace_rate)?;
     debug!(target: "fuse-pipe::client", num_readers, "multiplexer started");
 
-    // Mount options (same as Unix socket version - see comments there for details)
-    // Build mount options.
+    mount_fuse_session(
+        mux,
+        mount_point,
+        num_readers,
+        max_write,
+        no_writeback_cache,
+        "vsock",
+    )
+}
+
+/// Shared FUSE session setup: configure mount options, create session, run until unmount.
+fn mount_fuse_session<P: AsRef<Path>>(
+    mux: Arc<Multiplexer>,
+    mount_point: P,
+    num_readers: usize,
+    max_write: u32,
+    no_writeback_cache: bool,
+    mode_label: &str,
+) -> anyhow::Result<()> {
     let options = vec![
         fuser::MountOption::FSName("fuse-pipe".to_string()),
         fuser::MountOption::Suid,
@@ -662,9 +620,8 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
         }
     }
     let session = session.ok_or_else(|| last_error.unwrap())?;
-    info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), num_readers, "mounted via vsock");
+    info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), num_readers, mode_label, "mounted");
 
-    debug!(target: "fuse-pipe::client", num_readers, "FUSE session starting with n_threads");
     // spawn() handles all threading internally with clone_fd, join() waits for completion
     let bg_session = session.spawn()?;
     if let Err(e) = bg_session.join() {
