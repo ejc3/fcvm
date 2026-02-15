@@ -38,6 +38,7 @@ struct SnapshotLsEntry {
 struct BenchResult {
     first_run_secs: f64,
     snapshot_size_mb: u64,
+    diff_size_mb: u64,
     clone_secs: f64,
 }
 
@@ -178,6 +179,23 @@ fn wait_for_startup_snapshot(fcvm: &Path, timeout_secs: u64) -> Option<SnapshotL
     }
 }
 
+/// Extract bytes_merged from the debug log to get the actual diff snapshot size.
+/// Searches for "diff merge complete" log line which contains bytes_merged=N.
+fn extract_diff_bytes(log_path: &str) -> u64 {
+    let content = std::fs::read_to_string(log_path).unwrap_or_default();
+    for line in content.lines().rev() {
+        if line.contains("diff merge complete") {
+            // Format: ... bytes_merged=99524608
+            if let Some(pos) = line.find("bytes_merged=") {
+                let after = &line[pos + "bytes_merged=".len()..];
+                let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                return num_str.parse().unwrap_or(0);
+            }
+        }
+    }
+    0
+}
+
 /// Build the benchmark container image with the specified data size
 fn build_image(data_mb: u32) {
     eprintln!(
@@ -316,7 +334,13 @@ fn run_mode(mode: &str, mem_mb: u32, data_mb: u32, hugepages: bool) -> BenchResu
             0
         }
     };
-    eprintln!("    Memory snapshot size: {} MB", snapshot_size_mb);
+    // Extract the actual diff size from the debug log (bytes_merged in diff merge)
+    let diff_bytes = extract_diff_bytes(&log_path1);
+    let diff_size_mb = diff_bytes / (1024 * 1024);
+    eprintln!(
+        "    Memory snapshot size: {} MB (diff: {} MB)",
+        snapshot_size_mb, diff_size_mb
+    );
 
     let first_run_secs = t1.elapsed().as_secs_f64();
 
@@ -401,6 +425,7 @@ fn run_mode(mode: &str, mem_mb: u32, data_mb: u32, hugepages: bool) -> BenchResu
     BenchResult {
         first_run_secs,
         snapshot_size_mb,
+        diff_size_mb,
         clone_secs: total_clone_secs,
     }
 }
@@ -441,6 +466,13 @@ fn print_comparison(mem_mb: u32, data_mb: u32, std: &BenchResult, hp: &BenchResu
         std.snapshot_size_mb,
         hp.snapshot_size_mb,
         hp.snapshot_size_mb as f64 / std.snapshot_size_mb.max(1) as f64
+    );
+    println!(
+        "{:<24} {:>14} MB {:>14} MB {:>7.2}x",
+        "Diff Size (dirty)",
+        std.diff_size_mb,
+        hp.diff_size_mb,
+        hp.diff_size_mb as f64 / std.diff_size_mb.max(1) as f64
     );
     println!(
         "{:<24} {:>16.1}s {:>16.1}s {:>7.2}x",

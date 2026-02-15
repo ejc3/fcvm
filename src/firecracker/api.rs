@@ -279,7 +279,7 @@ pub struct SnapshotLoad {
     pub snapshot_path: String,
     pub mem_backend: MemBackend,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub enable_diff_snapshots: Option<bool>,
+    pub track_dirty_pages: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_vm: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

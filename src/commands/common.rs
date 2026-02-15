@@ -396,6 +396,8 @@ pub struct SnapshotRestoreConfig {
     /// This is needed because disk paths are patched during cache restore,
     /// so vmstate.bin has a different VM ID for disk than for vsock.
     pub snapshot_vm_id: Option<String>,
+    /// Whether this VM uses hugepages
+    pub hugepages: bool,
 }
 
 /// Restore a VM from a snapshot
@@ -714,12 +716,11 @@ pub async fn restore_from_snapshot(
         .load_snapshot(SnapshotLoad {
             snapshot_path: restore_config.vmstate_path.display().to_string(),
             mem_backend,
-            // NOTE: enable_diff_snapshots is DEPRECATED in Firecracker v1.13.0+
-            // It was for legacy KVM dirty page tracking. Firecracker now uses mincore(2)
-            // to find dirty pages automatically. Enabling this on restored VMs causes
-            // kernel stack corruption ("stack-protector: Kernel stack is corrupted in: do_idle").
-            // Diff snapshots still work via snapshot_type: "Diff" + mincore(2).
-            enable_diff_snapshots: Some(false),
+            // Enable dirty tracking on non-hugepage VMs so subsequent snapshots
+            // from clones produce accurate diffs. Skip for hugepage VMs because
+            // KVM splits 2MB Stage 2 block mappings to 4K for dirty tracking,
+            // negating the TLB benefit of hugepages.
+            track_dirty_pages: Some(!restore_config.hugepages),
             resume_vm: Some(false), // Update devices before resume
             network_overrides: Some(vec![NetworkOverride {
                 iface_id: "eth0".to_string(),

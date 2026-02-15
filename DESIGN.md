@@ -718,7 +718,7 @@ curl http://172.30.x.1:8080
                  ▼
 ┌─────────────────────────────────────────────────────────┐
 │ 4. Load snapshot via Firecracker API                    │
-│    - enable_diff_snapshots = true                       │
+│    - track_dirty_pages = !hugepages                     │
 │    - resume_vm = true                                   │
 └────────────────┬────────────────────────────────────────┘
                  ▼
