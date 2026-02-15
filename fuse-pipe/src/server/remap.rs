@@ -95,49 +95,55 @@ impl<T: FilesystemHandler> RemapFs<T> {
     /// Returns `Err(())` if a hash collision is detected and no alternative
     /// stable_ino can be found.
     fn register_entry(&self, parent_stable: u64, name: &[u8], inner_ino: u64) -> Result<u64, ()> {
-        // Hard link / already-known check
-        if let Some(existing_stable) = self.inner_to_stable.get(&inner_ino) {
-            return Ok(*existing_stable);
-        }
+        // Atomic check-and-insert via DashMap::entry() — holds a shard write lock
+        // so concurrent threads discovering the same inner_ino don't race.
+        use dashmap::mapref::entry::Entry;
+        match self.inner_to_stable.entry(inner_ino) {
+            Entry::Occupied(e) => {
+                // Hard link or concurrent duplicate — return existing mapping
+                Ok(*e.get())
+            }
+            Entry::Vacant(e) => {
+                // Compute path and hash while holding the shard lock
+                let name_str = String::from_utf8_lossy(name);
+                let parent_path = self
+                    .paths
+                    .get(&parent_stable)
+                    .map(|p| p.value().clone())
+                    .unwrap_or_default();
+                let path = Self::format_path(&parent_path, &name_str);
+                let mut stable_ino = Self::path_hash(&path);
 
-        // Compute path and initial hash
-        let name_str = String::from_utf8_lossy(name);
-        let parent_path = self
-            .paths
-            .get(&parent_stable)
-            .map(|p| p.value().clone())
-            .unwrap_or_default();
-        let path = Self::format_path(&parent_path, &name_str);
-        let mut stable_ino = Self::path_hash(&path);
-
-        // Handle conflicts (true hash collision or rename-then-recreate)
-        if self.stable_to_inner.contains_key(&stable_ino) {
-            debug!(
-                stable_ino,
-                path = %path,
-                "stable_ino taken, finding alternative"
-            );
-            let mut found = false;
-            for i in 1u64..10000 {
-                let alt = stable_ino.wrapping_add(i);
-                if alt >= 2 && !self.stable_to_inner.contains_key(&alt) {
-                    stable_ino = alt;
-                    found = true;
-                    break;
+                // Handle conflicts (true hash collision or rename-then-recreate)
+                if self.stable_to_inner.contains_key(&stable_ino) {
+                    debug!(
+                        stable_ino,
+                        path = %path,
+                        "stable_ino taken, finding alternative"
+                    );
+                    let mut found = false;
+                    for i in 1u64..10000 {
+                        let alt = stable_ino.wrapping_add(i);
+                        if alt >= 2 && !self.stable_to_inner.contains_key(&alt) {
+                            stable_ino = alt;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        error!(path = %path, "failed to find free stable_ino");
+                        return Err(());
+                    }
                 }
-            }
-            if !found {
-                error!(path = %path, "failed to find free stable_ino");
-                return Err(());
+
+                // Register bidirectional mapping
+                e.insert(stable_ino);
+                self.stable_to_inner.insert(stable_ino, inner_ino);
+                self.paths.insert(stable_ino, path);
+
+                Ok(stable_ino)
             }
         }
-
-        // Register bidirectional mapping
-        self.inner_to_stable.insert(inner_ino, stable_ino);
-        self.stable_to_inner.insert(stable_ino, inner_ino);
-        self.paths.insert(stable_ino, path);
-
-        Ok(stable_ino)
     }
 
     /// Remap inode fields in a request from stable to inner.
