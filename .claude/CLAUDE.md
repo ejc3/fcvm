@@ -1351,9 +1351,30 @@ fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
 
 ### FUSE Parallelism (fuse-pipe)
 
-**Client side (guest):** `fuser` is configured with `clone_fd = true` and `n_threads = num_readers`. Each reader thread gets a cloned `/dev/fuse` fd via `FUSE_DEV_IOC_CLONE`. The kernel distributes FUSE requests among reader threads concurrently — each request delivered to exactly one thread. Reader threads forward requests to the server via the `Multiplexer`.
+**Kernel clone fd model (`FUSE_DEV_IOC_CLONE`):**
 
-**Server side:** A single reader loop deserializes requests from the socket sequentially, but each request is dispatched via `tokio::spawn` + `spawn_blocking` (`pipelined.rs:400-410`). Multiple handler tasks run concurrently on tokio's blocking thread pool. This means `FilesystemHandler` implementations (including `RemapFs`) must be thread-safe — shared state requires atomic operations or lock-free data structures (e.g., `DashMap::entry()` for atomic check-and-insert).
+Each cloned fd is a complete request-response pipeline. A request dequeued from clone_fd_A is pinned to that fd — the response **must** be written back to clone_fd_A (`fuse_request_find()` searches only per-fd `fpq->processing`, not a global list).
+
+| What | Serialized | Parallel |
+|------|-----------|----------|
+| Dequeue from `fiq->pending` | Yes — brief `fiq->lock` spinlock shared across ALL fds | N/A (one request dequeued at a time) |
+| Copy request to userspace | No lock held | Yes — each fd copies independently |
+| Process request | N/A | Yes — each thread processes its own request |
+| Write response | Per-fd `fpq->lock` (no cross-fd contention) | Yes — each fd writes independently |
+| FORGET/BATCH_FORGET | Fire-and-forget, no response written | Dequeued from shared `fiq->forget_list` |
+
+Without clone fd, all threads share one fd and contend on both `fiq->lock` and the single `fpq->lock`.
+
+**fuse-pipe layers:**
+
+| Layer | Serialized | Parallel |
+|-------|-----------|----------|
+| Client reader threads (`mount.rs`) | Dequeue briefly serialized (kernel `fiq->lock`) | N threads with N cloned fds read/write independently |
+| Multiplexer (socket) | Socket write serialized by channel | Request submission lock-free; responses routed by unique ID |
+| Server socket reader (`pipelined.rs`) | Reads requests sequentially from socket | — |
+| Server handler dispatch | — | Each request dispatched via `tokio::spawn` + `spawn_blocking`; concurrent on tokio blocking pool |
+
+**Implication:** `FilesystemHandler` implementations (including `RemapFs`) must be thread-safe. Shared state requires atomic operations or lock-free data structures (e.g., `DashMap::entry()` for atomic check-and-insert).
 
 ### FUSE Passthrough Performance (fuse-pipe)
 
