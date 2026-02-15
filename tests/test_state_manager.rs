@@ -54,6 +54,8 @@ async fn test_state_persistence() {
             labels: std::collections::HashMap::new(),
             hugepages: false,
             portable_volumes: false,
+            user: None,
+            username: None,
         },
     };
 
@@ -124,6 +126,8 @@ async fn test_list_vms() {
                 labels: std::collections::HashMap::new(),
                 hugepages: false,
                 portable_volumes: false,
+                user: None,
+                username: None,
             },
         };
         manager.save_state(&state).await.unwrap();
