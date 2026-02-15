@@ -771,7 +771,12 @@ async fn build_storage_image(
     archive_path: &std::path::Path,
     output_path: &std::path::Path,
 ) -> Result<()> {
-    let tmp_dir = PathBuf::from(format!("/tmp/fcvm-storage-{}", std::process::id()));
+    // Use output_path's parent (the image-cache dir on btrfs) for temp storage,
+    // not /tmp which may be tmpfs with limited space.
+    let cache_dir = output_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("output_path has no parent directory"))?;
+    let tmp_dir = cache_dir.join(format!("tmp-storage-{}", std::process::id()));
 
     // Clean up any stale temp dir from a previous interrupted run
     if tmp_dir.exists() {
@@ -823,12 +828,18 @@ async fn build_storage_image(
     // Clean up temp storage dir regardless of result
     tokio::fs::remove_dir_all(&tmp_dir).await.ok();
 
-    result.context("creating ext4 image from storage dir")?;
+    if let Err(e) = result {
+        // Clean up partial .tmp image file on failure
+        tokio::fs::remove_file(&tmp_img).await.ok();
+        return Err(e).context("creating ext4 image from storage dir");
+    }
 
     // Atomic rename to final path
-    tokio::fs::rename(&tmp_img, output_path)
-        .await
-        .context("renaming storage image to final path")?;
+    if let Err(e) = tokio::fs::rename(&tmp_img, output_path).await {
+        // Clean up .tmp image file if rename fails
+        tokio::fs::remove_file(&tmp_img).await.ok();
+        return Err(e).context("renaming storage image to final path");
+    }
 
     info!(
         "Built storage image: {}",
