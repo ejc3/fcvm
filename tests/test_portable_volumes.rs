@@ -1,0 +1,413 @@
+//! Integration tests for --portable-volumes (RemapFs)
+//!
+//! Tests the full stack: --portable-volumes flag → RemapFs wrapping PassthroughFs
+//! → VolumeServer → vsock → guest FUSE mount.
+//!
+//! Run with: make test-root FILTER=portable_volumes STREAM=1
+
+#![cfg(feature = "integration-slow")]
+
+mod common;
+
+use anyhow::{Context, Result};
+use std::time::Duration;
+
+/// Read a file from the container's FUSE mount, retrying until success or timeout.
+async fn fuse_read(pid: u32, path: &str, timeout_secs: u64) -> Result<String> {
+    let attempts = (timeout_secs * 5) as usize; // 200ms intervals
+    let mut last_err = None;
+    for _ in 0..attempts {
+        match common::exec_in_container(pid, &[&format!("cat {}", path)]).await {
+            Ok(output) => return Ok(output),
+            Err(e) => last_err = Some(format!("{}", e)),
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    anyhow::bail!(
+        "fuse_read {} failed after {}s: {}",
+        path,
+        timeout_secs,
+        last_err.unwrap_or_default()
+    )
+}
+
+/// Get the inode number of a file inside the container via stat.
+async fn get_inode(pid: u32, path: &str, timeout_secs: u64) -> Result<u64> {
+    let attempts = (timeout_secs * 5) as usize;
+    let mut last_err = None;
+    for _ in 0..attempts {
+        match common::exec_in_container(pid, &[&format!("stat -c %i {}", path)]).await {
+            Ok(output) => {
+                let trimmed = output.trim();
+                if let Ok(ino) = trimmed.parse::<u64>() {
+                    return Ok(ino);
+                }
+                last_err = Some(format!("parse error: '{}'", trimmed));
+            }
+            Err(e) => last_err = Some(format!("{}", e)),
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    anyhow::bail!(
+        "get_inode {} failed after {}s: {}",
+        path,
+        timeout_secs,
+        last_err.unwrap_or_default()
+    )
+}
+
+/// Start a VM with --portable-volumes and a FUSE mount.
+async fn start_portable_vm(
+    vm_name: &str,
+    host_dir: &str,
+    guest_path: &str,
+    read_only: bool,
+) -> Result<(tokio::process::Child, u32)> {
+    let map_arg = if read_only {
+        format!("{}:{}:ro", host_dir, guest_path)
+    } else {
+        format!("{}:{}", host_dir, guest_path)
+    };
+
+    common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            vm_name,
+            "--network",
+            "rootless",
+            "--portable-volumes",
+            "--map",
+            &map_arg,
+            common::TEST_IMAGE,
+        ],
+        vm_name,
+    )
+    .await
+    .context("spawning portable-volumes VM")
+}
+
+// =============================================================================
+// Test 13: stat() returns deterministic inodes with --portable-volumes
+// =============================================================================
+
+/// Mount with RemapFs via --portable-volumes, stat() same files multiple times.
+/// Inodes must be stable (hash-based) and consistent across calls.
+#[tokio::test]
+async fn test_remap_fs_stat_deterministic() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("pv-stat");
+    let host_dir = format!("/tmp/fcvm-pv-stat-{}", std::process::id());
+    tokio::fs::create_dir_all(&host_dir).await?;
+
+    println!("=== test_remap_fs_stat_deterministic ===");
+
+    // Create test files on host
+    tokio::fs::write(format!("{}/file-a.txt", host_dir), "content-a").await?;
+    tokio::fs::write(format!("{}/file-b.txt", host_dir), "content-b").await?;
+    tokio::fs::create_dir_all(format!("{}/subdir", host_dir)).await?;
+    tokio::fs::write(format!("{}/subdir/nested.txt", host_dir), "nested").await?;
+
+    let (_child, pid) = start_portable_vm(&vm_name, &host_dir, "/mnt/test", true).await?;
+    common::poll_health_by_pid(pid, 180).await?;
+    println!("  VM healthy (PID: {})", pid);
+
+    // Stat each file 3 times — inode must be identical every time
+    for file in &[
+        "/mnt/test/file-a.txt",
+        "/mnt/test/file-b.txt",
+        "/mnt/test/subdir/nested.txt",
+        "/mnt/test/subdir",
+    ] {
+        let ino1 = get_inode(pid, file, 30).await?;
+        let ino2 = get_inode(pid, file, 5).await?;
+        let ino3 = get_inode(pid, file, 5).await?;
+
+        assert_eq!(
+            ino1, ino2,
+            "inode for {} changed between stat calls: {} vs {}",
+            file, ino1, ino2
+        );
+        assert_eq!(
+            ino2, ino3,
+            "inode for {} changed between stat calls: {} vs {}",
+            file, ino2, ino3
+        );
+
+        // RemapFs inodes are hash-based, must not be 0 or 1
+        assert!(ino1 >= 2, "inode for {} is reserved value: {}", file, ino1);
+
+        println!("  {} → inode {} (stable across 3 calls)", file, ino1);
+    }
+
+    // Different files must have different inodes
+    let ino_a = get_inode(pid, "/mnt/test/file-a.txt", 5).await?;
+    let ino_b = get_inode(pid, "/mnt/test/file-b.txt", 5).await?;
+    assert_ne!(
+        ino_a, ino_b,
+        "different files should have different inodes: {} vs {}",
+        ino_a, ino_b
+    );
+    println!(
+        "  file-a and file-b have different inodes ({} vs {})",
+        ino_a, ino_b
+    );
+
+    // Root mount point should have inode 1 (FUSE convention)
+    let ino_root = get_inode(pid, "/mnt/test", 5).await?;
+    assert_eq!(
+        ino_root, 1,
+        "mount root should have inode 1, got {}",
+        ino_root
+    );
+    println!("  mount root → inode {} (correct)", ino_root);
+
+    // Cleanup
+    common::kill_process(pid).await;
+    tokio::fs::remove_dir_all(&host_dir).await.ok();
+
+    println!("PASSED: test_remap_fs_stat_deterministic");
+    Ok(())
+}
+
+// =============================================================================
+// Test 14: Snapshot/clone preserves inodes with --portable-volumes
+// =============================================================================
+
+/// Baseline with RemapFs → snapshot → clone → same inodes on clone.
+/// This is the core portability guarantee: clone sees the same inodes as baseline.
+#[tokio::test]
+async fn test_remap_fs_snapshot_clone() -> Result<()> {
+    let (vm_name, clone_name, snap_name, _) = common::unique_names("pv-clone");
+    let host_dir = format!("/tmp/fcvm-pv-clone-{}", std::process::id());
+    tokio::fs::create_dir_all(&host_dir).await?;
+
+    println!("=== test_remap_fs_snapshot_clone ===");
+
+    // Create test files
+    tokio::fs::write(format!("{}/alpha.txt", host_dir), "alpha-content").await?;
+    tokio::fs::write(format!("{}/beta.txt", host_dir), "beta-content").await?;
+
+    // Start baseline with --portable-volumes
+    let (_child, pid) = start_portable_vm(&vm_name, &host_dir, "/mnt/test", true).await?;
+    common::poll_health_by_pid(pid, 180).await?;
+    println!("  Baseline healthy (PID: {})", pid);
+
+    // Get inodes on baseline
+    let baseline_ino_alpha = get_inode(pid, "/mnt/test/alpha.txt", 30).await?;
+    let baseline_ino_beta = get_inode(pid, "/mnt/test/beta.txt", 30).await?;
+    let baseline_ino_root = get_inode(pid, "/mnt/test", 5).await?;
+    println!(
+        "  Baseline inodes: root={}, alpha={}, beta={}",
+        baseline_ino_root, baseline_ino_alpha, baseline_ino_beta
+    );
+
+    // Snapshot
+    common::create_snapshot_by_pid(pid, &snap_name).await?;
+    println!("  Snapshot created");
+
+    // Start clone
+    let (_serve, serve_pid) = common::start_memory_server(&snap_name).await?;
+    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name, "rootless").await?;
+    common::poll_health_by_pid(clone_pid, 180).await?;
+    println!("  Clone healthy (PID: {})", clone_pid);
+
+    // Get inodes on clone — they must match baseline
+    let clone_ino_alpha = get_inode(clone_pid, "/mnt/test/alpha.txt", 30).await?;
+    let clone_ino_beta = get_inode(clone_pid, "/mnt/test/beta.txt", 30).await?;
+    let clone_ino_root = get_inode(clone_pid, "/mnt/test", 5).await?;
+    println!(
+        "  Clone inodes: root={}, alpha={}, beta={}",
+        clone_ino_root, clone_ino_alpha, clone_ino_beta
+    );
+
+    assert_eq!(
+        baseline_ino_root, clone_ino_root,
+        "root inode mismatch: baseline={} clone={}",
+        baseline_ino_root, clone_ino_root
+    );
+    assert_eq!(
+        baseline_ino_alpha, clone_ino_alpha,
+        "alpha.txt inode mismatch: baseline={} clone={}",
+        baseline_ino_alpha, clone_ino_alpha
+    );
+    assert_eq!(
+        baseline_ino_beta, clone_ino_beta,
+        "beta.txt inode mismatch: baseline={} clone={}",
+        baseline_ino_beta, clone_ino_beta
+    );
+    println!("  All inodes match between baseline and clone!");
+
+    // Cleanup
+    common::kill_process(clone_pid).await;
+    common::kill_process(serve_pid).await;
+    common::kill_process(pid).await;
+    tokio::fs::remove_dir_all(&host_dir).await.ok();
+
+    println!("PASSED: test_remap_fs_snapshot_clone");
+    Ok(())
+}
+
+// =============================================================================
+// Test 15: Host file modifications visible through RemapFs
+// =============================================================================
+
+/// Modify file on host, guest sees updated content through portable FUSE mount.
+/// Verifies RemapFs doesn't break data transparency.
+#[tokio::test]
+async fn test_remap_fs_host_file_changes() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("pv-host-mod");
+    let host_dir = format!("/tmp/fcvm-pv-host-mod-{}", std::process::id());
+    tokio::fs::create_dir_all(&host_dir).await?;
+
+    println!("=== test_remap_fs_host_file_changes ===");
+
+    // Create initial file
+    tokio::fs::write(format!("{}/data.txt", host_dir), "version-1").await?;
+
+    let (_child, pid) = start_portable_vm(&vm_name, &host_dir, "/mnt/test", true).await?;
+    common::poll_health_by_pid(pid, 180).await?;
+    println!("  VM healthy");
+
+    // Read initial content
+    let content = fuse_read(pid, "/mnt/test/data.txt", 30).await?;
+    assert!(
+        content.contains("version-1"),
+        "initial read failed: got '{}'",
+        content.trim()
+    );
+    let ino_before = get_inode(pid, "/mnt/test/data.txt", 5).await?;
+    println!("  Initial read: '{}', inode={}", content.trim(), ino_before);
+
+    // Modify on host
+    tokio::fs::write(format!("{}/data.txt", host_dir), "version-2").await?;
+    println!("  Host file modified to version-2");
+
+    // Guest should see the update (may need to wait for cache expiry)
+    let mut saw_update = false;
+    for _ in 0..50 {
+        // 10s at 200ms intervals
+        if let Ok(content) = fuse_read(pid, "/mnt/test/data.txt", 2).await {
+            if content.contains("version-2") {
+                saw_update = true;
+                println!("  Guest sees updated content: '{}'", content.trim());
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(saw_update, "guest never saw updated content 'version-2'");
+
+    // Inode should remain the same after content change (same path = same hash)
+    let ino_after = get_inode(pid, "/mnt/test/data.txt", 5).await?;
+    assert_eq!(
+        ino_before, ino_after,
+        "inode changed after content update: {} vs {}",
+        ino_before, ino_after
+    );
+    println!("  Inode stable through content update: {}", ino_after);
+
+    // Add new file on host
+    tokio::fs::write(format!("{}/new-file.txt", host_dir), "new-content").await?;
+    let content = fuse_read(pid, "/mnt/test/new-file.txt", 10).await?;
+    assert!(
+        content.contains("new-content"),
+        "new file read failed: got '{}'",
+        content.trim()
+    );
+    println!("  New host file visible in guest: '{}'", content.trim());
+
+    // Cleanup
+    common::kill_process(pid).await;
+    tokio::fs::remove_dir_all(&host_dir).await.ok();
+
+    println!("PASSED: test_remap_fs_host_file_changes");
+    Ok(())
+}
+
+// =============================================================================
+// Test 16: Host-side rename detected via readdir
+// =============================================================================
+
+/// Rename file on host, guest readdir sees the new name.
+/// Verifies RemapFs's path staleness detection works end-to-end.
+#[tokio::test]
+async fn test_remap_fs_host_rename_then_readdir() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("pv-rename");
+    let host_dir = format!("/tmp/fcvm-pv-rename-{}", std::process::id());
+    tokio::fs::create_dir_all(&host_dir).await?;
+
+    println!("=== test_remap_fs_host_rename_then_readdir ===");
+
+    // Create initial files
+    tokio::fs::write(format!("{}/original.txt", host_dir), "rename-test").await?;
+    tokio::fs::write(format!("{}/stable.txt", host_dir), "not-renamed").await?;
+
+    let (_child, pid) = start_portable_vm(&vm_name, &host_dir, "/mnt/test", true).await?;
+    common::poll_health_by_pid(pid, 180).await?;
+    println!("  VM healthy");
+
+    // Read original file and get its inode
+    let content = fuse_read(pid, "/mnt/test/original.txt", 30).await?;
+    assert!(content.contains("rename-test"));
+    let ino_original = get_inode(pid, "/mnt/test/original.txt", 5).await?;
+    println!("  original.txt: inode={}", ino_original);
+
+    // Get inode for stable.txt (should not change)
+    let ino_stable = get_inode(pid, "/mnt/test/stable.txt", 5).await?;
+    println!("  stable.txt: inode={}", ino_stable);
+
+    // Rename on host
+    tokio::fs::rename(
+        format!("{}/original.txt", host_dir),
+        format!("{}/renamed.txt", host_dir),
+    )
+    .await?;
+    println!("  Host: renamed original.txt → renamed.txt");
+
+    // Guest readdir should eventually show the new name
+    let mut saw_renamed = false;
+    for _ in 0..50 {
+        // 10s at 200ms intervals
+        if let Ok(output) = common::exec_in_container(pid, &["ls /mnt/test/"]).await {
+            if output.contains("renamed.txt") && !output.contains("original.txt") {
+                saw_renamed = true;
+                println!(
+                    "  Guest readdir shows: {}",
+                    output.trim().replace('\n', ", ")
+                );
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        saw_renamed,
+        "guest readdir never showed renamed.txt (host-side rename not detected)"
+    );
+
+    // The renamed file should be readable with the same content
+    let content = fuse_read(pid, "/mnt/test/renamed.txt", 10).await?;
+    assert!(
+        content.contains("rename-test"),
+        "renamed file content wrong: got '{}'",
+        content.trim()
+    );
+    println!("  renamed.txt readable with correct content");
+
+    // stable.txt should still have the same inode
+    let ino_stable_after = get_inode(pid, "/mnt/test/stable.txt", 5).await?;
+    assert_eq!(
+        ino_stable, ino_stable_after,
+        "stable.txt inode changed: {} vs {}",
+        ino_stable, ino_stable_after
+    );
+    println!("  stable.txt inode unchanged: {}", ino_stable_after);
+
+    // Cleanup
+    common::kill_process(pid).await;
+    tokio::fs::remove_dir_all(&host_dir).await.ok();
+
+    println!("PASSED: test_remap_fs_host_rename_then_readdir");
+    Ok(())
+}
