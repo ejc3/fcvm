@@ -3,7 +3,7 @@ use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 
 use crate::output::OutputHandle;
-use crate::types::{LatestMetadata, Plan, VolumeMount};
+use crate::types::{LatestMetadata, Plan};
 
 /// Fetch the container plan from MMDS with retry.
 pub async fn fetch_plan() -> Result<Plan> {
@@ -131,7 +131,7 @@ async fn fetch_latest_metadata(client: &reqwest::Client) -> Result<LatestMetadat
 }
 
 /// Watch for restore-epoch changes in MMDS and handle clone restore.
-pub async fn watch_restore_epoch(boot_volumes: Vec<VolumeMount>, output: OutputHandle) {
+pub async fn watch_restore_epoch(output: OutputHandle) {
     let mut last_epoch: Option<String> = None;
 
     loop {
@@ -151,21 +151,15 @@ pub async fn watch_restore_epoch(boot_volumes: Vec<VolumeMount>, output: OutputH
             match &last_epoch {
                 None => {
                     eprintln!(
-                        "[fc-agent] detected restore-epoch: {} (clone restore detected, volumes: {})",
+                        "[fc-agent] detected restore-epoch: {} (clone restore detected)",
                         current,
-                        boot_volumes.len()
                     );
-                    crate::restore::handle_clone_restore(&boot_volumes, &output).await;
+                    crate::restore::handle_clone_restore(&output).await;
                     last_epoch = metadata.restore_epoch;
                 }
                 Some(prev) if prev != current => {
-                    eprintln!(
-                        "[fc-agent] restore-epoch changed: {} -> {} (volumes: {})",
-                        prev,
-                        current,
-                        boot_volumes.len()
-                    );
-                    crate::restore::handle_clone_restore(&boot_volumes, &output).await;
+                    eprintln!("[fc-agent] restore-epoch changed: {} -> {}", prev, current,);
+                    crate::restore::handle_clone_restore(&output).await;
                     last_epoch = metadata.restore_epoch;
                 }
                 _ => {}
