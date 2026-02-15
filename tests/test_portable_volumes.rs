@@ -447,3 +447,143 @@ async fn test_remap_fs_host_rename_then_readdir() -> Result<()> {
     println!("PASSED: test_remap_fs_host_rename_then_readdir");
     Ok(())
 }
+
+// =============================================================================
+// Test 17: Persistent reader survives snapshot, sees host file replacement
+// =============================================================================
+
+/// Mount a directory, start a background reader that logs file contents in a loop,
+/// snapshot the VM, replace files on host, start clone from snapshot, verify the
+/// clone's reader process sees the new content.
+///
+/// This proves:
+/// - FUSE mount survives snapshot/restore on clones
+/// - RemapFs works across snapshot/clone boundary
+/// - Host-side file replacement is visible to clone
+/// - Open file operations continue working after restore
+#[tokio::test]
+async fn test_remap_fs_snapshot_file_replace() -> Result<()> {
+    let (vm_name, clone_name, snap_name, _) = common::unique_names("pv-replace");
+    let host_dir = format!("/tmp/fcvm-pv-replace-{}", std::process::id());
+    tokio::fs::create_dir_all(&host_dir).await?;
+
+    println!("=== test_remap_fs_snapshot_file_replace ===");
+
+    // Create initial file
+    tokio::fs::write(format!("{}/data.txt", host_dir), "original-v1").await?;
+
+    // Start VM with portable volumes
+    let (_child, pid) = start_portable_vm(&vm_name, &host_dir, "/mnt/test", true).await?;
+    common::poll_health_by_pid(pid, 180).await?;
+    println!("  VM healthy (PID: {})", pid);
+
+    // Verify initial content is readable
+    let content = fuse_read(pid, "/mnt/test/data.txt", 30).await?;
+    assert!(
+        content.contains("original-v1"),
+        "initial read failed: {}",
+        content.trim()
+    );
+    println!("  Initial read: '{}'", content.trim());
+
+    // Start a persistent reader inside the container that reads the file every 0.5s
+    // and appends each read to a log file. This process will be captured in the snapshot
+    // and resume on the clone.
+    common::exec_in_container(
+        pid,
+        &["sh -c 'while true; do echo \"$(cat /mnt/test/data.txt 2>&1)\" >> /tmp/reader.log; sleep 0.5; done &'"],
+    )
+    .await?;
+    println!("  Background reader started");
+
+    // Wait for reader to accumulate a few entries
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Verify reader is logging original content
+    let log = common::exec_in_container(pid, &["cat /tmp/reader.log"]).await?;
+    assert!(
+        log.contains("original-v1"),
+        "reader not logging original content: {}",
+        log
+    );
+    let pre_snap_lines = log.lines().count();
+    println!(
+        "  Reader confirmed logging original content ({} lines)",
+        pre_snap_lines
+    );
+
+    // Snapshot the VM (reader is still running inside)
+    common::create_snapshot_by_pid(pid, &snap_name).await?;
+    println!("  Snapshot created (reader process captured in snapshot)");
+
+    // Replace file on host with new content
+    tokio::fs::write(format!("{}/data.txt", host_dir), "replaced-v2").await?;
+    println!("  Host file replaced: 'original-v1' → 'replaced-v2'");
+
+    // Start clone from snapshot — the reader process resumes automatically
+    let (_serve, serve_pid) = common::start_memory_server(&snap_name).await?;
+    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name, "rootless").await?;
+    common::poll_health_by_pid(clone_pid, 180).await?;
+    println!("  Clone healthy (PID: {})", clone_pid);
+
+    // Wait for clone's reader to run several iterations with the new content
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Read the clone's log file — it should have pre-snapshot entries (original-v1)
+    // from before the snapshot, plus post-snapshot entries (replaced-v2) from after
+    // the reader resumed on the clone and saw the new host content.
+    let clone_log = common::exec_in_container(clone_pid, &["cat /tmp/reader.log"]).await?;
+    let total_lines = clone_log.lines().count();
+    println!("  Clone reader log ({} lines):", total_lines);
+    for line in clone_log
+        .lines()
+        .rev()
+        .take(5)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        println!("    {}", line);
+    }
+
+    // Log must contain both original and replaced content, proving the reader
+    // saw the transition across snapshot/restore + host file replacement.
+    assert!(
+        clone_log.contains("original-v1"),
+        "clone log missing pre-snapshot content 'original-v1'"
+    );
+    assert!(
+        clone_log.contains("replaced-v2"),
+        "clone reader never saw replaced content 'replaced-v2' — FUSE mount may not have \
+         reconnected after snapshot restore. Log:\n{}",
+        clone_log
+    );
+    assert!(
+        total_lines > pre_snap_lines,
+        "clone log has {} lines (same as pre-snapshot {}) — reader didn't resume",
+        total_lines,
+        pre_snap_lines
+    );
+    println!(
+        "  Clone reader log proves transition: original-v1 → replaced-v2 ({} → {} lines)",
+        pre_snap_lines, total_lines
+    );
+
+    // Also verify a direct read confirms the new content
+    let direct = fuse_read(clone_pid, "/mnt/test/data.txt", 10).await?;
+    assert!(
+        direct.contains("replaced-v2"),
+        "clone direct read got '{}', expected 'replaced-v2'",
+        direct.trim()
+    );
+    println!("  Direct read confirms: '{}'", direct.trim());
+
+    // Cleanup
+    common::kill_process(clone_pid).await;
+    common::kill_process(serve_pid).await;
+    common::kill_process(pid).await;
+    tokio::fs::remove_dir_all(&host_dir).await.ok();
+
+    println!("PASSED: test_remap_fs_snapshot_file_replace");
+    Ok(())
+}
