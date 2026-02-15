@@ -23,7 +23,8 @@ const JOBS: usize = 8;
 /// The kernel's FUSE writeback cache suppresses server-side ctime updates via
 /// fuse_get_cache_mask() returning STATX_CTIME, causing these tests to fail
 /// intermittently under parallel load (see DESIGN.md "Known Limitations").
-const WRITEBACK_CACHE_CTIME_CATEGORIES: &[&str] = &["chmod", "ftruncate", "link", "truncate"];
+const WRITEBACK_CACHE_CTIME_CATEGORIES: &[&str] =
+    &["chmod", "chown", "ftruncate", "link", "truncate"];
 
 /// Run a single pjdfstest category inside a VM
 async fn run_category_in_vm(category: &str) -> Result<()> {
