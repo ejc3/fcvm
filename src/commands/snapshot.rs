@@ -780,6 +780,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         source_disk_path: snapshot_config.disk_path.clone(),
         original_vm_id,
         snapshot_vm_id,
+        hugepages,
     };
 
     // Run clone setup using shared restore function

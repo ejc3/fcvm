@@ -2931,6 +2931,11 @@ async fn run_vm_setup(
     // Use fc_config from cache check if available, otherwise build fresh.
     // IMPORTANT: fc_config uses content-addressed base_rootfs path for cache key,
     // but launch must use per-instance CoW copy path (rootfs_path).
+    //
+    // Enable dirty page tracking only when snapshots are enabled (fc_config is Some).
+    // With hugepages, dirty tracking splits 2MB Stage 2 block mappings to 4K,
+    // so we avoid it when snapshots are disabled (--no-snapshot / FCVM_NO_SNAPSHOT).
+    let track_dirty_pages = fc_config.is_some();
     let launch_config = fc_config
         .map(|config| config.with_rootfs_path(rootfs_path.to_path_buf()))
         .unwrap_or_else(|| {
@@ -2972,7 +2977,9 @@ async fn run_vm_setup(
 
     // Build runtime boot args and apply FirecrackerConfig
     let runtime_boot_args = build_runtime_boot_args(args, network_config, runtime_config);
-    launch_config.apply(client, &runtime_boot_args).await?;
+    launch_config
+        .apply(client, &runtime_boot_args, track_dirty_pages)
+        .await?;
 
     // Attach extra disks and image archive
     let (extra_disks, image_device) =
