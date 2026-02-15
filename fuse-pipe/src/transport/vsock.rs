@@ -62,6 +62,27 @@ mod linux {
                 return Err(io::Error::last_os_error());
             }
 
+            // Set connect timeout to 10 seconds to prevent indefinite blocking
+            // when the host VolumeServer isn't ready after snapshot restore.
+            let timeout = libc::timeval {
+                tv_sec: 10,
+                tv_usec: 0,
+            };
+            let ret = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDTIMEO,
+                    &timeout as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::timeval>() as u32,
+                )
+            };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                unsafe { libc::close(fd) };
+                return Err(err);
+            }
+
             // Build sockaddr_vm structure
             let addr = libc::sockaddr_vm {
                 svm_family: libc::AF_VSOCK as u16,

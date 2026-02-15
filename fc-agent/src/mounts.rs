@@ -3,7 +3,19 @@ use std::thread;
 
 use crate::types::{ExtraDiskMount, NfsMount, VolumeMount};
 
+/// Check if a path has an active FUSE mount by examining /proc/self/mountinfo.
+fn is_fuse_mounted(path: &str) -> bool {
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    mounts
+        .lines()
+        .any(|line| line.contains(path) && (line.contains("fuse") || line.contains("FUSE")))
+}
+
 /// Mount FUSE volumes from host via vsock. Returns list of mounted paths.
+///
+/// Uses reconnectable mounts: when vsock connections die (e.g., after
+/// snapshot), the multiplexer automatically reconnects and re-sends
+/// pending requests. The kernel FUSE session stays alive — no remount needed.
 pub fn mount_fuse_volumes(volumes: &[VolumeMount]) -> Result<Vec<String>> {
     let mut mounted_paths = Vec::new();
 
@@ -32,8 +44,8 @@ pub fn mount_fuse_volumes(volumes: &[VolumeMount]) -> Result<Vec<String>> {
         let port = vol.vsock_port;
 
         thread::spawn(move || {
-            eprintln!("[fc-agent] fuse: starting mount at {}", path);
-            if let Err(e) = crate::fuse::mount_vsock(port, &path) {
+            eprintln!("[fc-agent] fuse: starting reconnectable mount at {}", path);
+            if let Err(e) = crate::fuse::mount_vsock_reconnectable(port, &path) {
                 eprintln!("[fc-agent] FUSE mount error at {}: {}", path, e);
             }
             eprintln!("[fc-agent] fuse: mount at {} exited", path);
@@ -47,7 +59,9 @@ pub fn mount_fuse_volumes(volumes: &[VolumeMount]) -> Result<Vec<String>> {
         let path = std::path::Path::new(&vol.guest_path);
         let mut ready = false;
         for attempt in 1..=60 {
-            if std::fs::read_dir(path).is_ok() {
+            // Check both read_dir (mount is functional) AND mountinfo (mount is FUSE,
+            // not just an empty directory after a failed mount attempt)
+            if is_fuse_mounted(&vol.guest_path) && std::fs::read_dir(path).is_ok() {
                 eprintln!(
                     "[fc-agent] mount {} ready ({}ms)",
                     vol.guest_path,
@@ -250,26 +264,5 @@ pub fn unmount_disks(paths: &[String]) {
                 eprintln!("[fc-agent] umount {} error: {}", path, e);
             }
         }
-    }
-}
-
-/// Check if FUSE mounts are still healthy after a potential snapshot.
-pub async fn check_and_remount_fuse(volumes: &[VolumeMount], mounted_paths: &[String]) {
-    if mounted_paths.is_empty() {
-        return;
-    }
-    let mut broken = false;
-    for path in mounted_paths {
-        if std::fs::metadata(path).is_err() {
-            eprintln!(
-                "[fc-agent] FUSE mount at {} broken after snapshot (vsock reset), will remount",
-                path
-            );
-            broken = true;
-            break;
-        }
-    }
-    if broken {
-        crate::restore::remount_fuse_volumes(volumes).await;
     }
 }

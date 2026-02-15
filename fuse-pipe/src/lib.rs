@@ -79,7 +79,9 @@ pub use telemetry::{SpanCollector, SpanSummary};
 // Re-export client types
 pub use client::{mount, mount_spawn, FuseClient, MountConfig, MountHandle, Multiplexer};
 #[cfg(target_os = "linux")]
-pub use client::{mount_vsock, mount_vsock_with_options, mount_vsock_with_readers};
+pub use client::{
+    mount_vsock, mount_vsock_with_options, mount_vsock_with_readers, mount_vsock_with_reconnect,
+};
 
 /// Prelude for common imports.
 pub mod prelude {
