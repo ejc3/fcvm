@@ -205,25 +205,35 @@ const HEALTH_CHECK_EXEC_TIMEOUT: Duration = Duration::from_secs(5);
 /// Returns:
 /// - `true` = container is running
 /// - `false` = container not running yet (or inspect failed)
-async fn check_container_running(pid: u32) -> bool {
+async fn check_container_running(pid: u32, username: Option<&str>) -> bool {
     let exe = match find_fcvm_binary() {
         Some(e) => e,
         None => return false, // Can't find fcvm binary
     };
 
+    // Build the command to run inside the VM.
+    // With --user, podman runs as the target user (rootless), so we need runuser.
+    let mut cmd_args: Vec<String> = vec![
+        "exec".into(),
+        "--pid".into(),
+        pid.to_string(),
+        "--vm".into(),
+        "--".into(),
+    ];
+    if let Some(name) = username {
+        // Run podman as the target user (rootless podman owner)
+        cmd_args.extend(["runuser".into(), "-u".into(), name.to_string(), "--".into()]);
+    }
+    cmd_args.extend([
+        "podman".into(),
+        "inspect".into(),
+        "--format".into(),
+        "{{.State.Running}}".into(),
+        "fcvm-container".into(),
+    ]);
+
     let child = match tokio::process::Command::new(&exe)
-        .args([
-            "exec",
-            "--pid",
-            &pid.to_string(),
-            "--vm", // Run in VM (not container) where podman is available
-            "--",
-            "podman",
-            "inspect",
-            "--format",
-            "{{.State.Running}}",
-            "fcvm-container",
-        ])
+        .args(&cmd_args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -267,26 +277,33 @@ async fn check_container_running(pid: u32) -> bool {
 /// - `Some(true)` = healthcheck exists and is healthy
 /// - `Some(false)` = healthcheck exists and is unhealthy/starting
 /// - `None` = no healthcheck defined (caller should skip future calls)
-async fn check_podman_healthcheck(pid: u32) -> Option<bool> {
+async fn check_podman_healthcheck(pid: u32, username: Option<&str>) -> Option<bool> {
     // Use fcvm exec to run podman inspect inside the VM
     let exe = match find_fcvm_binary() {
         Some(e) => e,
         None => return None, // Can't find fcvm binary, can't determine health
     };
 
+    let mut cmd_args: Vec<String> = vec![
+        "exec".into(),
+        "--pid".into(),
+        pid.to_string(),
+        "--vm".into(),
+        "--".into(),
+    ];
+    if let Some(name) = username {
+        cmd_args.extend(["runuser".into(), "-u".into(), name.to_string(), "--".into()]);
+    }
+    cmd_args.extend([
+        "podman".into(),
+        "inspect".into(),
+        "--format".into(),
+        "{{.State.Health.Status}}".into(),
+        "fcvm-container".into(),
+    ]);
+
     let child = match tokio::process::Command::new(&exe)
-        .args([
-            "exec",
-            "--pid",
-            &pid.to_string(),
-            "--vm", // Run in VM (not container) where podman is available
-            "--",
-            "podman",
-            "inspect",
-            "--format",
-            "{{.State.Health.Status}}",
-            "fcvm-container",
-        ])
+        .args(&cmd_args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -383,7 +400,8 @@ async fn update_health_status_once(
                 None => {
                     // No HTTP check - check if container is actually running
                     // Uses podman inspect to verify container state (not just process spawned)
-                    let container_running = check_container_running(pid).await;
+                    let container_running =
+                        check_container_running(pid, state.config.username.as_deref()).await;
                     if container_running {
                         debug!(target: "health-monitor", "container is running");
                         *last_failure_log = None;
@@ -395,7 +413,9 @@ async fn update_health_status_once(
                         // Note: We don't return Unhealthy here because check_podman_healthcheck
                         // returns Some(false) when the container doesn't exist yet (inspect fails)
                         if !*skip_podman_healthcheck
-                            && check_podman_healthcheck(pid).await.is_none()
+                            && check_podman_healthcheck(pid, state.config.username.as_deref())
+                                .await
+                                .is_none()
                         {
                             // No healthcheck defined - skip future checks
                             debug!(target: "health-monitor", "no podman healthcheck defined, skipping future checks");
@@ -504,7 +524,7 @@ async fn update_health_status_once(
             // If base health check passed, also check podman healthcheck (AND logic)
             // Skip if we already know the container has no healthcheck
             let final_status = if status == HealthStatus::Healthy && !*skip_podman_healthcheck {
-                match check_podman_healthcheck(pid).await {
+                match check_podman_healthcheck(pid, state.config.username.as_deref()).await {
                     Some(true) => {
                         debug!(target: "health-monitor", "all health checks passed");
                         HealthStatus::Healthy

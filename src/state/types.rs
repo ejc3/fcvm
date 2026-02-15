@@ -129,6 +129,14 @@ pub struct VmConfig {
     /// Whether FUSE volumes use portable inode numbering (RemapFs)
     #[serde(default)]
     pub portable_volumes: bool,
+    /// Container user spec (e.g. "UID:GID"). When set, the container runs
+    /// as this user via rootless podman. Health checks must query via the user.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Username created in the VM for rootless podman.
+    /// Used by health checks to run `runuser -u <username> -- podman inspect`.
+    #[serde(default)]
+    pub username: Option<String>,
 }
 
 impl VmState {
@@ -162,6 +170,8 @@ impl VmState {
                 labels: HashMap::new(),
                 hugepages: false,
                 portable_volumes: false,
+                user: None,
+                username: None,
             },
         }
     }

@@ -715,7 +715,14 @@ pub(super) async fn run_vm_setup(
 
     let vm_name = args.name.clone();
     info!(vm_name = %vm_name, vm_id = %vm_id, "creating VM manager");
-    let mut vm_manager = VmManager::new(vm_id.to_string(), socket_path.to_path_buf(), None);
+    // Enable Firecracker debug logging
+    let fc_log_path = data_dir.join("firecracker.log");
+    let _ = std::fs::File::create(&fc_log_path);
+    let mut vm_manager = VmManager::new(
+        vm_id.to_string(),
+        socket_path.to_path_buf(),
+        Some(fc_log_path),
+    );
 
     // Set VM name for logging
     vm_manager.set_vm_name(vm_name);
