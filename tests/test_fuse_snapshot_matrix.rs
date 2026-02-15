@@ -932,14 +932,161 @@ async fn test_fuse_snapshot_matrix_continuous_read() -> Result<()> {
 }
 
 // =============================================================================
-// Tests excluded: disk-dir + snapshot/clone
+// Test 10: FUSE + disk-dir combined through snapshot/clone (privileged)
 // =============================================================================
-//
-// --disk-dir + snapshot/clone is NOT YET IMPLEMENTED. The snapshot metadata
-// doesn't include extra_disks, and the clone restore code doesn't copy
-// disk-dir images from the base VM to the clone VM. Firecracker fails with
-// "No such file or directory" for the missing disk image.
-//
-// When disk-dir snapshot support is added, tests should be added here for:
-// - test_fuse_snapshot_matrix_plus_diskdir: FUSE + disk-dir combined
-// - test_fuse_snapshot_matrix_diskdir_only: disk-dir alone through clone
+
+/// Combined --map (RO FUSE) + --disk-dir (RO directory-backed disk) through snapshot/clone.
+/// Verifies both FUSE volume and disk-dir mount are accessible on the clone.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_fuse_snapshot_matrix_plus_diskdir() -> Result<()> {
+    let (vm_name, clone_name, snap_name, _) = common::unique_names("fuse-diskdir");
+    let fuse_dir = format!("/tmp/fcvm-fuse-diskdir-fuse-{}", std::process::id());
+    let diskdir_dir = format!("/tmp/fcvm-fuse-diskdir-data-{}", std::process::id());
+    tokio::fs::create_dir_all(&fuse_dir).await?;
+    tokio::fs::create_dir_all(&diskdir_dir).await?;
+
+    println!("=== test_fuse_snapshot_matrix_plus_diskdir ===");
+
+    // Write test files
+    tokio::fs::write(format!("{}/fuse-file.txt", fuse_dir), "fuse-content").await?;
+    tokio::fs::write(
+        format!("{}/diskdir-file.txt", diskdir_dir),
+        "diskdir-content\n",
+    )
+    .await?;
+
+    let map_arg = format!("{}:/mnt/fuse:ro", fuse_dir);
+    let diskdir_arg = format!("{}:/mnt/data:ro", diskdir_dir);
+    let (_child, pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "bridged",
+            "--map",
+            &map_arg,
+            "--disk-dir",
+            &diskdir_arg,
+            common::TEST_IMAGE,
+        ],
+        &vm_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
+
+    common::poll_health_by_pid(pid, 180).await?;
+
+    // Verify both on baseline
+    verify_fuse_read(pid, "/mnt/fuse", "fuse-file.txt", "fuse-content", 30).await?;
+    let disk_content = common::exec_in_container(pid, &["cat /mnt/data/diskdir-file.txt"]).await?;
+    assert!(
+        disk_content.contains("diskdir-content"),
+        "Baseline disk-dir read failed: got '{}'",
+        disk_content.trim()
+    );
+    println!("  Baseline: FUSE + disk-dir verified");
+
+    // Snapshot + clone
+    common::create_snapshot_by_pid(pid, &snap_name).await?;
+    let (_serve, serve_pid) = common::start_memory_server(&snap_name).await?;
+    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name, "bridged").await?;
+    common::poll_health_by_pid(clone_pid, 180).await?;
+    println!("  Clone healthy");
+
+    // Verify both on clone
+    verify_fuse_read(clone_pid, "/mnt/fuse", "fuse-file.txt", "fuse-content", 30).await?;
+    let disk_content =
+        common::exec_in_container(clone_pid, &["cat /mnt/data/diskdir-file.txt"]).await?;
+    assert!(
+        disk_content.contains("diskdir-content"),
+        "Clone disk-dir read failed: got '{}'",
+        disk_content.trim()
+    );
+    println!("  Clone: FUSE + disk-dir verified");
+
+    // Cleanup
+    common::kill_process(clone_pid).await;
+    common::kill_process(serve_pid).await;
+    common::kill_process(pid).await;
+    tokio::fs::remove_dir_all(&fuse_dir).await.ok();
+    tokio::fs::remove_dir_all(&diskdir_dir).await.ok();
+
+    println!("PASSED: test_fuse_snapshot_matrix_plus_diskdir");
+    Ok(())
+}
+
+// =============================================================================
+// Test 11: Disk-dir alone through snapshot/clone (privileged)
+// =============================================================================
+
+/// Disk-dir (RO directory-backed disk) alone through snapshot/clone.
+/// No FUSE volumes — tests disk-dir snapshot support in isolation.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_fuse_snapshot_matrix_diskdir_only() -> Result<()> {
+    let (vm_name, clone_name, snap_name, _) = common::unique_names("diskdir-only");
+    let diskdir_dir = format!("/tmp/fcvm-diskdir-only-{}", std::process::id());
+    tokio::fs::create_dir_all(&diskdir_dir).await?;
+
+    println!("=== test_fuse_snapshot_matrix_diskdir_only ===");
+
+    // Write test file
+    tokio::fs::write(format!("{}/hello.txt", diskdir_dir), "disk-dir-hello\n").await?;
+
+    let diskdir_arg = format!("{}:/mnt/data:ro", diskdir_dir);
+    let (_child, pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "bridged",
+            "--disk-dir",
+            &diskdir_arg,
+            common::TEST_IMAGE,
+        ],
+        &vm_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
+
+    common::poll_health_by_pid(pid, 180).await?;
+
+    // Verify on baseline
+    let content = common::exec_in_container(pid, &["cat /mnt/data/hello.txt"]).await?;
+    assert!(
+        content.contains("disk-dir-hello"),
+        "Baseline disk-dir read failed: got '{}'",
+        content.trim()
+    );
+    println!("  Baseline: disk-dir verified");
+
+    // Snapshot + clone
+    common::create_snapshot_by_pid(pid, &snap_name).await?;
+    let (_serve, serve_pid) = common::start_memory_server(&snap_name).await?;
+    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name, "bridged").await?;
+    common::poll_health_by_pid(clone_pid, 180).await?;
+    println!("  Clone healthy");
+
+    // Verify on clone
+    let content = common::exec_in_container(clone_pid, &["cat /mnt/data/hello.txt"]).await?;
+    assert!(
+        content.contains("disk-dir-hello"),
+        "Clone disk-dir read failed: got '{}'",
+        content.trim()
+    );
+    println!("  Clone: disk-dir verified");
+
+    // Cleanup
+    common::kill_process(clone_pid).await;
+    common::kill_process(serve_pid).await;
+    common::kill_process(pid).await;
+    tokio::fs::remove_dir_all(&diskdir_dir).await.ok();
+
+    println!("PASSED: test_fuse_snapshot_matrix_diskdir_only");
+    Ok(())
+}

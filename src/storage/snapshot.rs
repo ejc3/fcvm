@@ -64,6 +64,23 @@ pub struct SnapshotMetadata {
     /// Whether VM uses 2MB hugepage-backed memory
     #[serde(default)]
     pub hugepages: bool,
+    /// Extra disk images from the baseline VM (for clone disk-dir support)
+    #[serde(default)]
+    pub extra_disks: Vec<SnapshotExtraDisk>,
+}
+
+/// Extra disk configuration saved in snapshot metadata.
+/// Used to copy disk-dir images when restoring clones.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotExtraDisk {
+    /// Filename of disk image within snapshot directory (e.g., "disk-dir-0.raw")
+    pub filename: String,
+    /// Mount path inside guest
+    pub mount_path: String,
+    /// Read-only flag
+    pub read_only: bool,
+    /// Firecracker drive ID (e.g., "disk0")
+    pub drive_id: String,
 }
 
 /// Volume configuration saved in snapshot metadata.
@@ -220,6 +237,7 @@ mod tests {
                 volumes: vec![],
                 health_check_url: None,
                 hugepages: false,
+                extra_disks: vec![],
             },
         };
 
@@ -334,6 +352,7 @@ mod tests {
                 volumes: vec![],
                 health_check_url: None,
                 hugepages: false,
+                extra_disks: vec![],
             },
         };
 
@@ -392,6 +411,7 @@ mod tests {
                     volumes: vec![],
                     health_check_url: None,
                     hugepages: false,
+                    extra_disks: vec![],
                 },
             };
             manager.save_snapshot(config).await.unwrap();
@@ -437,6 +457,7 @@ mod tests {
                 volumes: vec![],
                 health_check_url: None,
                 hugepages: false,
+                extra_disks: vec![],
             },
         };
         manager.save_snapshot(config).await.unwrap();
@@ -533,6 +554,7 @@ mod tests {
                 volumes: vec![],
                 health_check_url: None,
                 hugepages: false,
+                extra_disks: vec![],
             },
         };
 
