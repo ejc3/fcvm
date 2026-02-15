@@ -581,16 +581,32 @@ fn do_reconnect(
     reconnect_fn: &dyn Fn() -> std::io::Result<UnixStream>,
     reader_died_tx: &Sender<()>,
 ) {
-    // Retry reconnect_fn with exponential backoff
+    // Retry reconnect_fn with exponential backoff, capped at ~3 minutes total
     let mut backoff_ms = 500u64;
     let max_backoff_ms = 5000u64;
+    let max_attempts = 60u32;
+    let mut attempt = 0u32;
     let new_socket = loop {
         match (reconnect_fn)() {
             Ok(s) => break s,
             Err(e) => {
+                attempt += 1;
+                if attempt >= max_attempts {
+                    tracing::error!(
+                        target: "fuse-pipe::mux",
+                        error = %e,
+                        attempt,
+                        max_attempts,
+                        "writer[reconnectable]: reconnect failed after max attempts, failing pending requests"
+                    );
+                    fail_all_pending(pending);
+                    return;
+                }
                 tracing::warn!(
                     target: "fuse-pipe::mux",
                     error = %e,
+                    attempt,
+                    max_attempts,
                     backoff_ms,
                     "writer[reconnectable]: reconnect attempt failed, retrying"
                 );
