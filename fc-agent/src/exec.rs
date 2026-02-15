@@ -100,7 +100,9 @@ fn handle_connection(fd: i32) {
 
     if request.tty || request.interactive {
         let command = if request.in_container {
-            let mut cmd = vec!["podman".to_string(), "exec".to_string()];
+            let prefix = crate::container::podman_cmd_prefix();
+            let mut cmd: Vec<String> = prefix.to_vec();
+            cmd.extend(["podman".to_string(), "exec".to_string()]);
             if request.interactive {
                 cmd.push("-i".to_string());
             }
@@ -129,8 +131,18 @@ fn handle_pipe(fd: i32, request: &ExecRequest) {
     let proxy_settings = crate::system::read_proxy_settings();
 
     let mut cmd = if request.in_container {
-        let mut cmd = std::process::Command::new("podman");
-        cmd.arg("exec");
+        let prefix = crate::container::podman_cmd_prefix();
+        let mut cmd = if prefix.is_empty() {
+            let mut c = std::process::Command::new("podman");
+            c.arg("exec");
+            c
+        } else {
+            // Run as target user: env XDG_RUNTIME_DIR=... runuser -u user -- podman exec
+            let mut c = std::process::Command::new(&prefix[0]);
+            c.args(&prefix[1..]);
+            c.arg("podman").arg("exec");
+            c
+        };
         if request.interactive {
             cmd.arg("-i");
         }

@@ -118,11 +118,17 @@ pub async fn remount_fuse_volumes(volumes: &[VolumeMount]) {
 
 /// Rebind new FUSE mounts into the container's mount namespace.
 async fn rebind_volumes_in_container(volumes: &[VolumeMount]) {
-    let pid_output = match Command::new("podman")
-        .args(["inspect", "--format", "{{.State.Pid}}", "fcvm-container"])
-        .output()
-        .await
-    {
+    let prefix = crate::container::podman_cmd_prefix();
+    let mut inspect_cmd = if prefix.is_empty() {
+        Command::new("podman")
+    } else {
+        let mut c = Command::new(&prefix[0]);
+        c.args(&prefix[1..]);
+        c.arg("podman");
+        c
+    };
+    inspect_cmd.args(["inspect", "--format", "{{.State.Pid}}", "fcvm-container"]);
+    let pid_output = match inspect_cmd.output().await {
         Ok(o) if o.status.success() => o,
         Ok(_) => {
             eprintln!("[fc-agent] container not running, skipping mount rebind");

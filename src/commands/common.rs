@@ -927,9 +927,10 @@ pub async fn create_snapshot_core(
     let temp_vmstate_path = temp_snapshot_dir.join("vmstate.bin");
 
     // Pause timeout: should be fast (just pauses vCPU threads). 30s is generous.
-    // Snapshot timeout: depends on memory size (32GB at ~500MB/s = ~64s). 5 min is generous.
+    // Snapshot timeout: 64GB with heavy dirty pages can take 20+ minutes due to
+    // Firecracker iterating all guest memory for the snapshot. 1 hour for safety.
     let pause_client = client.with_timeout(std::time::Duration::from_secs(30));
-    let snapshot_client = client.with_timeout(std::time::Duration::from_secs(300));
+    let snapshot_client = client.with_timeout(std::time::Duration::from_secs(3600));
 
     // Pause VM before snapshotting (required by Firecracker).
     // If Pause fails/times out, the VM is NOT paused — no resume needed.

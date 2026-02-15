@@ -1530,6 +1530,16 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     vm_state.config.volumes = args.map.clone();
     vm_state.config.health_check_url = args.health_check.clone();
     vm_state.config.port_mappings = port_mappings.clone();
+    vm_state.config.user = args.user.clone();
+    // Store the username for health checks (runuser -u <username>).
+    // Derived from USER env var, matching what fc-agent creates in the VM.
+    if args.user.is_some() {
+        vm_state.config.username = args
+            .env
+            .iter()
+            .find(|s| s.starts_with("USER="))
+            .map(|s| s.strip_prefix("USER=").unwrap_or("fcvm-user").to_string());
+    }
     vm_state.config.labels = args
         .label
         .iter()
@@ -2851,7 +2861,14 @@ async fn run_vm_setup(
 
     let vm_name = args.name.clone();
     info!(vm_name = %vm_name, vm_id = %vm_id, "creating VM manager");
-    let mut vm_manager = VmManager::new(vm_id.to_string(), socket_path.to_path_buf(), None);
+    // Enable Firecracker debug logging
+    let fc_log_path = data_dir.join("firecracker.log");
+    let _ = std::fs::File::create(&fc_log_path);
+    let mut vm_manager = VmManager::new(
+        vm_id.to_string(),
+        socket_path.to_path_buf(),
+        Some(fc_log_path),
+    );
 
     // Set VM name for logging
     vm_manager.set_vm_name(vm_name);

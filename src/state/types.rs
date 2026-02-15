@@ -123,6 +123,14 @@ pub struct VmConfig {
     /// User-defined labels for tagging/filtering VMs
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// Container user spec (e.g. "UID:GID"). When set, the container runs
+    /// as this user via rootless podman. Health checks must query via the user.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Username created in the VM for rootless podman.
+    /// Used by health checks to run `runuser -u <username> -- podman inspect`.
+    #[serde(default)]
+    pub username: Option<String>,
 }
 
 impl VmState {
@@ -154,6 +162,8 @@ impl VmState {
                 original_vsock_vm_id: None,
                 port_mappings: Vec::new(),
                 labels: HashMap::new(),
+                user: None,
+                username: None,
             },
         }
     }

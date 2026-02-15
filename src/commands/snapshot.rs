@@ -605,7 +605,14 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         let socket_path = output_socket_path.clone();
         let vm_id_clone = vm_id.clone();
         Some(tokio::spawn(async move {
-            match run_output_listener(&socket_path, &vm_id_clone, None, std::sync::Arc::new(tokio::sync::Notify::new())).await {
+            match run_output_listener(
+                &socket_path,
+                &vm_id_clone,
+                None,
+                std::sync::Arc::new(tokio::sync::Notify::new()),
+            )
+            .await
+            {
                 Ok(lines) => lines,
                 Err(e) => {
                     tracing::warn!("Output listener error: {}", e);
