@@ -699,7 +699,10 @@ async fn create_disk_from_dir(
     source_dir: &std::path::Path,
     output_path: &std::path::Path,
 ) -> Result<()> {
-    // Calculate directory size (add 20% overhead for ext4 metadata, min 16MB)
+    // Calculate directory size with enough overhead for ext4 metadata.
+    // ext4 needs space for: journal (~8-16MB), inode table, superblock, group
+    // descriptors, and bitmaps. For directories with many small files (like podman
+    // storage), metadata overhead can be 30-50%+ of data size.
     let dir_size = tokio::process::Command::new("du")
         .args(["-sb", source_dir.to_str().unwrap()])
         .output()
@@ -713,8 +716,14 @@ async fn create_disk_from_dir(
         .and_then(|s| s.parse().ok())
         .unwrap_or(16 * 1024 * 1024);
 
-    // Add 20% overhead, minimum 16MB
-    let image_size = std::cmp::max(size_bytes * 120 / 100, 16 * 1024 * 1024);
+    // Add 50% overhead for ext4 metadata + 32MB fixed minimum for journal/structures.
+    // The fixed 32MB covers the journal (~8-16MB), inode tables, and other structures
+    // that don't scale linearly with data size. The 50% covers per-file inode overhead
+    // which is significant for podman storage directories with many small files.
+    let image_size = std::cmp::max(
+        size_bytes * 150 / 100 + 32 * 1024 * 1024,
+        64 * 1024 * 1024,
+    );
 
     info!(
         "Creating disk image from {}: {} bytes -> {} bytes",
