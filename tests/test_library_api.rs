@@ -44,6 +44,7 @@ fn test_run_args(name: &str) -> RunArgs {
         user: None,
         forward_localhost: vec![],
         hugepages: false,
+        portable_volumes: false,
         no_direct_image_mount: false,
         label: vec![],
         image: common::TEST_IMAGE.to_string(),

@@ -53,6 +53,7 @@ async fn test_state_persistence() {
             port_mappings: vec![],
             labels: std::collections::HashMap::new(),
             hugepages: false,
+            portable_volumes: false,
         },
     };
 
@@ -122,6 +123,7 @@ async fn test_list_vms() {
                 port_mappings: vec![],
                 labels: std::collections::HashMap::new(),
                 hugepages: false,
+                portable_volumes: false,
             },
         };
         manager.save_state(&state).await.unwrap();

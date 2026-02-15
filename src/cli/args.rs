@@ -138,6 +138,12 @@ pub struct RunArgs {
     #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
     pub map: Vec<String>,
 
+    /// Use portable inode numbering for FUSE volumes.
+    /// Enables deterministic inodes based on file paths instead of host inodes,
+    /// allowing snapshots with volumes to be restored on different machines.
+    #[arg(long)]
+    pub portable_volumes: bool,
+
     /// Extra disk(s): HOST_PATH:GUEST_MOUNT[:ro] (repeat or comma-separated)
     /// Disks appear as /dev/vdb, /dev/vdc, etc. in order specified.
     /// Mounted at GUEST_MOUNT in both VM and container.

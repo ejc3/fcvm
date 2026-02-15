@@ -46,6 +46,8 @@ pub struct VolumeConfig {
     pub read_only: bool,
     /// Vsock port number
     pub port: u32,
+    /// Use portable inode numbering (RemapFs wrapper)
+    pub portable: bool,
 }
 
 /// Volume server that serves host directories to guests.
@@ -107,18 +109,30 @@ impl VolumeServer {
         // Note: read_only enforcement is handled at the PassthroughFs level
         // TODO: Add read_only support to PassthroughFs if needed
 
-        // Create and run the async server
-        let server = fuse_pipe::AsyncServer::new(fs);
-        server
-            .serve_vsock_forwarded_with_ready_signal(&base_path, self.config.port, ready)
-            .await
-            .with_context(|| {
-                format!(
-                    "VolumeServer failed for port {} serving {}",
-                    self.config.port,
-                    self.host_path.display()
-                )
-            })
+        let serve_err = || {
+            format!(
+                "VolumeServer failed for port {} serving {}",
+                self.config.port,
+                self.host_path.display()
+            )
+        };
+
+        if self.config.portable {
+            // Wrap in RemapFs for deterministic inode numbering
+            info!("using portable inode remapping (RemapFs)");
+            let remap = fuse_pipe::RemapFs::new(fs);
+            let server = fuse_pipe::AsyncServer::new(remap);
+            server
+                .serve_vsock_forwarded_with_ready_signal(&base_path, self.config.port, ready)
+                .await
+                .with_context(serve_err)
+        } else {
+            let server = fuse_pipe::AsyncServer::new(fs);
+            server
+                .serve_vsock_forwarded_with_ready_signal(&base_path, self.config.port, ready)
+                .await
+                .with_context(serve_err)
+        }
     }
 
     /// Serve volumes over a Unix socket (for testing/development).
