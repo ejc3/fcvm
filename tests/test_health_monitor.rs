@@ -81,6 +81,8 @@ async fn test_health_monitor_behaviors() {
             labels: std::collections::HashMap::new(),
             hugepages: false,
             portable_volumes: false,
+            user: None,
+            username: None,
         },
     };
 
