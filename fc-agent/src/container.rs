@@ -19,8 +19,7 @@ pub fn mount_storage_image(device: &str, image_name: &str) -> Result<String> {
     eprintln!("[fc-agent] mounting pre-built storage image: {}", device);
 
     let mount_path = "/mnt/image-store";
-    std::fs::create_dir_all(mount_path)
-        .context("creating image store mount point")?;
+    std::fs::create_dir_all(mount_path).context("creating image store mount point")?;
 
     // Wait for device to appear
     let device_path = std::path::Path::new(device);
@@ -48,7 +47,9 @@ pub fn mount_storage_image(device: &str, image_name: &str) -> Result<String> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
             "Failed to mount storage image {} at {}: {}",
-            device, mount_path, stderr
+            device,
+            mount_path,
+            stderr
         );
     }
 
@@ -59,8 +60,7 @@ pub fn mount_storage_image(device: &str, image_name: &str) -> Result<String> {
     let storage_conf = format!(
         "[storage]\nrunroot = \"/run/containers/storage\"\ngraphroot = \"/var/lib/containers/storage\"\n\n[storage.options]\nadditionalimagestores = [\"{mount_path}\"]\n"
     );
-    std::fs::write("/etc/containers/storage.conf", storage_conf)
-        .context("writing storage.conf")?;
+    std::fs::write("/etc/containers/storage.conf", storage_conf).context("writing storage.conf")?;
 
     eprintln!(
         "[fc-agent] storage image mounted at {}, configured as additional image store",

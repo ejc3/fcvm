@@ -49,13 +49,11 @@ async fn run_localhost_test(no_direct_image_mount: bool) -> Result<()> {
     build_test_image().await?;
 
     // Step 2: Start VM with localhost image (rootless mode)
-    println!("Step 2: Starting VM with localhost/test-hello image ({})...", mode);
-    let mut args = vec![
-        "podman",
-        "run",
-        "--name",
-        &vm_name,
-    ];
+    println!(
+        "Step 2: Starting VM with localhost/test-hello image ({})...",
+        mode
+    );
+    let mut args = vec!["podman", "run", "--name", &vm_name];
     if no_direct_image_mount {
         args.push("--no-direct-image-mount");
     }

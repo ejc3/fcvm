@@ -810,10 +810,7 @@ async fn build_storage_image(
     if !load_output.status.success() {
         let stderr = String::from_utf8_lossy(&load_output.stderr);
         tokio::fs::remove_dir_all(&tmp_dir).await.ok();
-        bail!(
-            "podman load into storage root failed: {}",
-            stderr
-        );
+        bail!("podman load into storage root failed: {}", stderr);
     }
 
     let loaded_msg = String::from_utf8_lossy(&load_output.stdout);
@@ -841,10 +838,7 @@ async fn build_storage_image(
         return Err(e).context("renaming storage image to final path");
     }
 
-    info!(
-        "Built storage image: {}",
-        output_path.display()
-    );
+    info!("Built storage image: {}", output_path.display());
     Ok(())
 }
 
