@@ -141,11 +141,16 @@ impl Drop for ProcessGuard {
     }
 }
 
-/// Delete cached storage images so the next run is a true cold start
+/// Delete cached image artifacts so the next run is a true cold start.
+/// Removes both .storage.img (direct mount) and .docker.tar (legacy) to ensure
+/// symmetric benchmarking — both modes pay the full export + build cost.
 fn clear_image_cache() {
     eprintln!("    Clearing image cache...");
     let _ = Command::new("sh")
-        .args(["-c", "rm -f /mnt/fcvm-btrfs/image-cache/*.storage.img"])
+        .args([
+            "-c",
+            "rm -f /mnt/fcvm-btrfs/image-cache/*.storage.img /mnt/fcvm-btrfs/image-cache/*.docker.tar",
+        ])
         .output();
 }
 
@@ -207,10 +212,8 @@ fn run_mode(mode: &str, no_direct_image_mount: bool, iterations: u32) -> BenchRe
     for i in 1..=iterations {
         // Clean state for each iteration
         prune_bench_snapshots(&fcvm);
-        if !no_direct_image_mount {
-            // Clear cached storage images to measure full build + mount time
-            clear_image_cache();
-        }
+        // Clear cached image artifacts so both modes measure full cold start
+        clear_image_cache();
 
         let name = format!("bench-import-{}-{}-{}", mode, i, pid_suffix);
         eprintln!("  [{}/{}] Cold start: {}", i, iterations, name);
