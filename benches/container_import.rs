@@ -59,17 +59,13 @@ fn graceful_kill(pid: u32, timeout_ms: u64) {
 
     let start = Instant::now();
     loop {
-        let status = Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .output();
+        let status = Command::new("kill").args(["-0", &pid.to_string()]).output();
         match status {
             Ok(o) if !o.status.success() => return,
             _ => {}
         }
         if start.elapsed() > Duration::from_millis(timeout_ms) {
-            let _ = Command::new("kill")
-                .args(["-9", &pid.to_string()])
-                .output();
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
             return;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -273,7 +269,10 @@ fn run_mode(mode: &str, no_direct_image_mount: bool, iterations: u32) -> BenchRe
 fn print_comparison(legacy: &BenchResult, direct: &BenchResult, iterations: u32) {
     eprintln!();
     println!("=================================================================");
-    println!("  Container Import Benchmark ({} iterations each)", iterations);
+    println!(
+        "  Container Import Benchmark ({} iterations each)",
+        iterations
+    );
     println!("=================================================================");
     println!();
     println!(

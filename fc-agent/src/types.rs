@@ -139,10 +139,7 @@ mod tests {
         }"#;
         let plan: Plan = serde_json::from_str(json).unwrap();
         assert_eq!(plan.image, "localhost/myapp");
-        assert_eq!(
-            plan.image_storage_device.as_deref(),
-            Some("/dev/vdb")
-        );
+        assert_eq!(plan.image_storage_device.as_deref(), Some("/dev/vdb"));
         assert!(plan.image_archive.is_none());
     }
 
