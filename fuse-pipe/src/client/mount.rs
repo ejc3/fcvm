@@ -427,6 +427,65 @@ pub fn mount_vsock<P: AsRef<Path>>(cid: u32, port: u32, mount_point: P) -> anyho
     mount_vsock_with_options(cid, port, mount_point, 1, 0, 0, false)
 }
 
+/// Mount a FUSE filesystem via vsock with transparent reconnection.
+///
+/// Like `mount_vsock_with_options`, but uses a reconnectable multiplexer.
+/// When the vsock connection dies (e.g., after snapshot/restore), the FUSE
+/// session stays alive. The multiplexer automatically reconnects to the same
+/// CID:port and re-sends pending requests — the kernel never knows anything
+/// happened.
+///
+/// This function blocks until the FUSE session is unmounted.
+#[cfg(target_os = "linux")]
+pub fn mount_vsock_with_reconnect<P: AsRef<Path>>(
+    cid: u32,
+    port: u32,
+    mount_point: P,
+    num_readers: usize,
+    trace_rate: u64,
+    max_write: u32,
+    no_writeback_cache: bool,
+) -> anyhow::Result<()> {
+    info!(target: "fuse-pipe::client", cid, port, num_readers, "connecting via vsock (reconnectable)");
+
+    // Create initial vsock connection
+    let transport = VsockTransport::connect(cid, port)?;
+    debug!(target: "fuse-pipe::client", cid, port, "connected to server via vsock");
+
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let fd = unsafe { libc::dup(transport.as_raw_fd()) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let socket = unsafe { UnixStream::from_raw_fd(fd) };
+    socket.set_read_timeout(Some(Duration::from_secs(30)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(30)))?;
+
+    // Create reconnection closure that establishes a new vsock connection.
+    // Called by the multiplexer writer thread when the current socket dies.
+    let reconnect_fn: Box<dyn Fn() -> std::io::Result<UnixStream> + Send> = Box::new(move || {
+        let transport = VsockTransport::connect(cid, port)?;
+        let new_fd = unsafe { libc::dup(transport.as_raw_fd()) };
+        if new_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { UnixStream::from_raw_fd(new_fd) })
+    });
+
+    // Create reconnectable multiplexer
+    let mux = Multiplexer::new_reconnectable(socket, num_readers, trace_rate, reconnect_fn)?;
+    debug!(target: "fuse-pipe::client", num_readers, "reconnectable multiplexer started");
+
+    mount_fuse_session(
+        mux,
+        mount_point,
+        num_readers,
+        max_write,
+        no_writeback_cache,
+        "reconnectable",
+    )
+}
+
 /// Mount a FUSE filesystem via vsock with multiple reader threads.
 #[cfg(target_os = "linux")]
 pub fn mount_vsock_with_readers<P: AsRef<Path>>(
@@ -481,8 +540,25 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
     let mux = Multiplexer::with_trace_rate(socket, num_readers, trace_rate)?;
     debug!(target: "fuse-pipe::client", num_readers, "multiplexer started");
 
-    // Mount options (same as Unix socket version - see comments there for details)
-    // Build mount options.
+    mount_fuse_session(
+        mux,
+        mount_point,
+        num_readers,
+        max_write,
+        no_writeback_cache,
+        "vsock",
+    )
+}
+
+/// Shared FUSE session setup: configure mount options, create session, run until unmount.
+fn mount_fuse_session<P: AsRef<Path>>(
+    mux: Arc<Multiplexer>,
+    mount_point: P,
+    num_readers: usize,
+    max_write: u32,
+    no_writeback_cache: bool,
+    mode_label: &str,
+) -> anyhow::Result<()> {
     let options = vec![
         fuser::MountOption::FSName("fuse-pipe".to_string()),
         fuser::MountOption::Suid,
@@ -544,9 +620,8 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
         }
     }
     let session = session.ok_or_else(|| last_error.unwrap())?;
-    info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), num_readers, "mounted via vsock");
+    info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), num_readers, mode_label, "mounted");
 
-    debug!(target: "fuse-pipe::client", num_readers, "FUSE session starting with n_threads");
     // spawn() handles all threading internally with clone_fd, join() waits for completion
     let bg_session = session.spawn()?;
     if let Err(e) = bg_session.join() {

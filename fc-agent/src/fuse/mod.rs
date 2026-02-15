@@ -125,26 +125,26 @@ fn no_writeback_cache_from_cmdline() -> bool {
     false
 }
 
-/// Mount a FUSE filesystem from host via vsock.
+/// Mount a FUSE filesystem with transparent reconnection support.
 ///
-/// This connects to the host VolumeServer at the given port and mounts
-/// the FUSE filesystem at the specified path. The function blocks until
-/// the filesystem is unmounted.
+/// Connects to the host VolumeServer at the given port and mounts the FUSE
+/// filesystem. The multiplexer automatically reconnects when the vsock dies
+/// (e.g., after Firecracker snapshot/restore). The kernel FUSE session stays
+/// alive and pending requests are re-sent on the new connection.
 ///
-/// # Arguments
-///
-/// * `port` - The vsock port where the host VolumeServer is listening
-/// * `mount_point` - The path where the filesystem will be mounted
-pub fn mount_vsock(port: u32, mount_point: &str) -> anyhow::Result<()> {
+/// Works for both baseline VMs (same VolumeServer) and clones (new
+/// VolumeServer). For clones, FUSE TTL expiry during boot ensures fresh
+/// LOOKUPs that correctly resolve on the new server.
+pub fn mount_vsock_reconnectable(port: u32, mount_point: &str) -> anyhow::Result<()> {
     let num_readers = get_num_readers();
     let trace_rate = get_trace_rate();
     let max_write = get_max_write();
     let no_writeback_cache = no_writeback_cache_from_cmdline();
     eprintln!(
-        "[fc-agent] mounting FUSE volume at {} via vsock port {} ({} readers, trace_rate={}, max_write={}, no_writeback_cache={})",
+        "[fc-agent] mounting FUSE volume at {} via vsock port {} (reconnectable, {} readers, trace_rate={}, max_write={}, no_writeback_cache={})",
         mount_point, port, num_readers, trace_rate, max_write, no_writeback_cache
     );
-    fuse_pipe::mount_vsock_with_options(
+    fuse_pipe::mount_vsock_with_reconnect(
         HOST_CID,
         port,
         mount_point,

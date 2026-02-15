@@ -135,7 +135,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	_test-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all \
 	container-setup-fcvm container-shell container-clean container-bench \
-	setup-btrfs setup-fcvm setup-pjdfstest bench bench-vm bench-hugepages bench-hugepages-test \
+	setup-btrfs setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import \
 	lint fmt ssh test-serve-sdk
 
@@ -291,7 +291,7 @@ _test-root:
 test-unit: show-notes check-disk build _test-unit
 test-fast: show-notes check-disk setup-fcvm _test-fast
 test-all: show-notes check-disk setup-fcvm _test-all
-test-root: show-notes check-disk setup-fcvm setup-pjdfstest _test-root
+test-root: show-notes check-disk setup-fcvm setup-pjdfstest setup-hugepages _test-root
 test: test-root
 
 # Container targets (setup on host where needed, run-only in container)
@@ -336,6 +336,17 @@ setup-pjdfstest:
 		rm -rf /tmp/pjdfstest-check && \
 		git clone --depth 1 https://github.com/pjd/pjdfstest /tmp/pjdfstest-check && \
 		cd /tmp/pjdfstest-check && autoreconf -ifs && ./configure && make; \
+	fi
+
+# Hugepage pool for privileged tests (512 pages = 1GB, enough for 512MB test VMs)
+HUGEPAGE_POOL_TESTS := 512
+setup-hugepages:
+	@current=$$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null || echo 0); \
+	if [ "$$current" -ge "$(HUGEPAGE_POOL_TESTS)" ]; then \
+		echo "==> Hugepages already allocated: $$current (need $(HUGEPAGE_POOL_TESTS))"; \
+	else \
+		echo "==> Allocating hugepage pool ($(HUGEPAGE_POOL_TESTS) pages = $$(( $(HUGEPAGE_POOL_TESTS) * 2 ))MB)..."; \
+		sudo sh -c 'echo $(HUGEPAGE_POOL_TESTS) > /proc/sys/vm/nr_hugepages'; \
 	fi
 
 setup-btrfs:

@@ -43,11 +43,10 @@ pub async fn run() -> Result<()> {
     tokio::spawn(output_writer);
 
     // Start restore-epoch watcher
-    let watcher_volumes = plan.volumes.clone();
     let watcher_output = output.clone();
     tokio::spawn(async move {
         eprintln!("[fc-agent] starting restore-epoch watcher");
-        mmds::watch_restore_epoch(watcher_volumes, watcher_output).await;
+        mmds::watch_restore_epoch(watcher_output).await;
     });
 
     // Start exec server
@@ -144,13 +143,10 @@ pub async fn run() -> Result<()> {
     }
 
     // After cache-ready handshake, Firecracker may have created a pre-start snapshot.
-    // Snapshot creation resets all vsock connections (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET),
-    // which breaks FUSE mounts and the output vsock. Reconnect the output vsock and
-    // check if FUSE mounts are still healthy.
+    // Snapshot creation resets all vsock connections (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET).
+    // Reconnect the output vsock. FUSE mounts handle reconnection automatically via
+    // the reconnectable multiplexer — no explicit check needed.
     output.reconnect();
-
-    // Check FUSE health after potential snapshot
-    mounts::check_and_remount_fuse(&plan.volumes, &mounted_fuse_paths).await;
 
     eprintln!("[fc-agent] launching container: {}", image_ref);
     system::wait_for_cgroup_controllers().await;

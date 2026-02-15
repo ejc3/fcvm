@@ -55,5 +55,7 @@ mod multiplexer;
 pub use fuse::FuseClient;
 pub use mount::{mount, mount_spawn, MountConfig, MountHandle};
 #[cfg(target_os = "linux")]
-pub use mount::{mount_vsock, mount_vsock_with_options, mount_vsock_with_readers};
+pub use mount::{
+    mount_vsock, mount_vsock_with_options, mount_vsock_with_readers, mount_vsock_with_reconnect,
+};
 pub use multiplexer::Multiplexer;

@@ -398,6 +398,10 @@ pub struct SnapshotRestoreConfig {
     pub snapshot_vm_id: Option<String>,
     /// Whether this VM uses hugepages
     pub hugepages: bool,
+    /// Extra disk images to copy from snapshot directory
+    pub extra_disks: Vec<crate::storage::snapshot::SnapshotExtraDisk>,
+    /// Snapshot directory for extra disk source files
+    pub snapshot_dir: Option<PathBuf>,
 }
 
 /// Restore a VM from a snapshot
@@ -661,6 +665,26 @@ pub async fn restore_from_snapshot(
     );
     vm_manager.set_mount_redirects(baseline_dirs, data_dir.to_path_buf());
 
+    // Copy extra disk images (disk-dir) from snapshot to clone's disk directory.
+    // The mount namespace will redirect Firecracker's baseline paths to clone paths,
+    // so these files need to exist at {vm_dir}/{filename}.
+    if !restore_config.extra_disks.is_empty() {
+        if let Some(ref snap_dir) = restore_config.snapshot_dir {
+            for extra_disk in &restore_config.extra_disks {
+                let source = snap_dir.join(&extra_disk.filename);
+                let dest = vm_dir.join(&extra_disk.filename);
+                reflink_copy(&source, &dest)
+                    .await
+                    .with_context(|| format!("copying extra disk {}", extra_disk.filename))?;
+            }
+            info!(
+                num_disks = restore_config.extra_disks.len(),
+                "copied {} extra disk image(s) to clone",
+                restore_config.extra_disks.len()
+            );
+        }
+    }
+
     let firecracker_bin = find_firecracker(runtime_config)?;
     let firecracker_args = runtime_config
         .firecracker_args
@@ -797,6 +821,19 @@ pub async fn restore_from_snapshot(
     // for vsock redirect because vmstate.bin stores paths from this vm
     vm_state.config.original_vsock_vm_id = Some(restore_config.original_vm_id.clone());
 
+    // Update extra_disks in clone state with clone-local paths
+    if !restore_config.extra_disks.is_empty() {
+        vm_state.config.extra_disks = restore_config
+            .extra_disks
+            .iter()
+            .map(|d| crate::state::types::ExtraDisk {
+                path: vm_dir.join(&d.filename).display().to_string(),
+                mount_path: d.mount_path.clone(),
+                read_only: d.read_only,
+            })
+            .collect();
+    }
+
     // Save VM state with complete network configuration
     save_vm_state_with_network(state_manager, vm_state, network_config).await?;
 
@@ -817,6 +854,28 @@ pub async fn restore_from_snapshot(
 /// - If base exists: Diff snapshot, merge onto existing base
 /// - Result is always a complete memory.bin
 ///
+/// Copy a file using btrfs reflink (instant CoW copy).
+async fn reflink_copy(source: &Path, dest: &Path) -> Result<()> {
+    let result = tokio::process::Command::new("cp")
+        .args([
+            "--reflink=always",
+            source.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        ])
+        .status()
+        .await
+        .with_context(|| format!("reflink copy {} -> {}", source.display(), dest.display()))?;
+
+    if !result.success() {
+        anyhow::bail!(
+            "Reflink copy failed ({} -> {}) - btrfs filesystem required",
+            source.display(),
+            dest.display()
+        );
+    }
+    Ok(())
+}
+
 /// # Arguments
 /// * `client` - Firecracker API client for the running VM
 /// * `snapshot_config` - Pre-built config with FINAL paths (after atomic rename)
@@ -859,18 +918,7 @@ pub async fn create_snapshot_core(
                     .await
                     .context("creating snapshot directory")?;
                 // Reflink copy parent's memory.bin
-                let reflink_result = tokio::process::Command::new("cp")
-                    .args([
-                        "--reflink=always",
-                        parent_memory.to_str().unwrap(),
-                        base_memory_path.to_str().unwrap(),
-                    ])
-                    .status()
-                    .await
-                    .context("copying parent memory.bin")?;
-                if !reflink_result.success() {
-                    anyhow::bail!("Failed to reflink copy parent memory.bin");
-                }
+                reflink_copy(&parent_memory, &base_memory_path).await?;
                 has_base = true;
             }
         }
@@ -1046,22 +1094,15 @@ pub async fn create_snapshot_core(
 
         // Copy disk using btrfs reflink to temp dir
         let temp_disk_path = temp_snapshot_dir.join("disk.raw");
-        let reflink_result = tokio::process::Command::new("cp")
-            .args([
-                "--reflink=always",
-                disk_path.to_str().unwrap(),
-                temp_disk_path.to_str().unwrap(),
-            ])
-            .status()
-            .await
-            .context("copying disk with reflink")?;
+        reflink_copy(disk_path, &temp_disk_path).await?;
 
-        if !reflink_result.success() {
-            let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-            anyhow::bail!(
-                "Reflink copy failed - btrfs filesystem required. Ensure {} is on btrfs.",
-                paths::assets_dir().display()
-            );
+        // Copy extra disk images (disk-dir) to snapshot directory
+        for extra_disk in &snapshot_config.metadata.extra_disks {
+            let source = paths::vm_runtime_dir(&snapshot_config.vm_id)
+                .join("disks")
+                .join(&extra_disk.filename);
+            let dest = temp_snapshot_dir.join(&extra_disk.filename);
+            reflink_copy(&source, &dest).await?;
         }
 
         // Write config.json to temp directory
@@ -1098,22 +1139,15 @@ pub async fn create_snapshot_core(
 
         // Copy disk using btrfs reflink (instant CoW copy)
         let temp_disk_path = temp_snapshot_dir.join("disk.raw");
-        let reflink_result = tokio::process::Command::new("cp")
-            .args([
-                "--reflink=always",
-                disk_path.to_str().unwrap(),
-                temp_disk_path.to_str().unwrap(),
-            ])
-            .status()
-            .await
-            .context("copying disk with reflink")?;
+        reflink_copy(disk_path, &temp_disk_path).await?;
 
-        if !reflink_result.success() {
-            let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-            anyhow::bail!(
-                "Reflink copy failed - btrfs filesystem required. Ensure {} is on btrfs.",
-                paths::assets_dir().display()
-            );
+        // Copy extra disk images (disk-dir) to snapshot directory
+        for extra_disk in &snapshot_config.metadata.extra_disks {
+            let source = paths::vm_runtime_dir(&snapshot_config.vm_id)
+                .join("disks")
+                .join(&extra_disk.filename);
+            let dest = temp_snapshot_dir.join(&extra_disk.filename);
+            reflink_copy(&source, &dest).await?;
         }
 
         // Write config.json to temp directory
