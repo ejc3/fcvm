@@ -249,6 +249,7 @@ pub(super) fn build_firecracker_config(
         args.health_check.clone(),
         args.hugepages,
         args.user.clone(),
+        args.forward_localhost.clone(),
     )
 }
 
