@@ -115,12 +115,22 @@ pub fn setup_btrfs_storage_if_available() {
 
     // Create sparse 8G loopback file
     let _ = std::fs::create_dir_all(storage_dir);
-    if let Err(e) = std::process::Command::new("truncate")
+    let truncate = std::process::Command::new("truncate")
         .args(["-s", "8G", loopback_path])
-        .output()
-    {
-        eprintln!("[fc-agent] WARNING: failed to create btrfs loopback: {}", e);
-        return;
+        .output();
+    match truncate {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            eprintln!(
+                "[fc-agent] WARNING: truncate failed: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: failed to create btrfs loopback: {}", e);
+            return;
+        }
     }
 
     // Format as btrfs
