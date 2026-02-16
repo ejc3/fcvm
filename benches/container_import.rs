@@ -197,7 +197,7 @@ fn build_image() {
 }
 
 /// Run one mode through a cold start cycle (no snapshot cache)
-fn run_mode(mode: &str, no_direct_image_mount: bool, iterations: u32) -> BenchResult {
+fn run_mode(mode: &str, image_mode: Option<&str>, iterations: u32) -> BenchResult {
     let fcvm = find_fcvm_binary();
     let pid_suffix = std::process::id();
 
@@ -227,8 +227,9 @@ fn run_mode(mode: &str, no_direct_image_mount: bool, iterations: u32) -> BenchRe
             "--health-check",
             "http://localhost:80/",
         ];
-        if no_direct_image_mount {
-            args.push("--no-direct-image-mount");
+        if let Some(im) = image_mode {
+            args.push("--image-mode");
+            args.push(im);
         }
         args.push(BENCH_IMAGE);
 
@@ -308,11 +309,11 @@ fn main() {
     // Build container image
     build_image();
 
-    // Run legacy mode (podman load)
-    let legacy_result = run_mode("podman-load", true, iterations);
+    // Run archive mode (podman load)
+    let legacy_result = run_mode("archive", Some("archive"), iterations);
 
-    // Run direct mount mode
-    let direct_result = run_mode("direct-mount", false, iterations);
+    // Run overlay mode (direct mount)
+    let direct_result = run_mode("overlay", None, iterations);
 
     // Print comparison
     print_comparison(&legacy_result, &direct_result, iterations);

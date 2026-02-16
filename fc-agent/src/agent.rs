@@ -152,14 +152,29 @@ pub async fn run() -> Result<()> {
     // Store prefix globally so exec server and health checks can use it
     container::set_podman_cmd_prefix(cmd_prefix.clone());
 
-    // Prepare image (mount storage, import archive, or pull from registry)
-    let image_ref = if let Some(storage_device) = &plan.image_storage_device {
-        let username = user_info.as_ref().map(|(name, _)| name.as_str());
-        container::mount_storage_image(storage_device, &plan.image, username)?
-    } else if let Some(archive_path) = &plan.image_archive {
-        container::import_image(archive_path, &plan.image, &output, &cmd_prefix).await?
-    } else {
-        container::pull_image(&plan).await?
+    // Prepare image based on delivery mode
+    let image_ref = match (plan.image_mode.as_deref(), &plan.image_device) {
+        (Some("overlay"), Some(device)) => {
+            let username = user_info.as_ref().map(|(name, _)| name.as_str());
+            container::mount_overlay_image(device, &plan.image, username)?
+        }
+        (Some("btrfs"), Some(device)) => {
+            let username = user_info.as_ref().map(|(name, _)| name.as_str());
+            container::mount_btrfs_image(device, &plan.image, username)?
+        }
+        (Some("archive"), Some(device)) => {
+            container::import_image(device, &plan.image, &output, &cmd_prefix).await?
+        }
+        (None, None) => {
+            // Remote image — pull from registry
+            container::pull_image(&plan).await?
+        }
+        (Some(mode), _) => {
+            anyhow::bail!("unknown image_mode: {}", mode);
+        }
+        (None, Some(_)) => {
+            anyhow::bail!("image_device set but image_mode is missing");
+        }
     };
 
     // Notify host for cache snapshot
@@ -257,8 +272,17 @@ pub async fn run() -> Result<()> {
         sleep(Duration::from_millis(100)).await;
     }
     mounts::unmount_disks(&mounted_disk_paths);
-    if plan.image_storage_device.is_some() {
-        mounts::unmount_paths(&["/mnt/image-store".to_string()], "image store");
+    match plan.image_mode.as_deref() {
+        Some("overlay") => {
+            mounts::unmount_paths(&["/mnt/image-store".to_string()], "image store");
+        }
+        Some("btrfs") => {
+            mounts::unmount_paths(
+                &["/var/lib/containers/storage".to_string()],
+                "btrfs image store",
+            );
+        }
+        _ => {}
     }
 
     // Shutdown output writer

@@ -319,7 +319,7 @@ async fn create_sandbox(
         kernel_profile: None,
         vsock_dir: None,
         no_snapshot: true,
-        no_direct_image_mount: false,
+        image_mode: None,
         forward_localhost: vec![],
         user: None,
         hugepages: false,

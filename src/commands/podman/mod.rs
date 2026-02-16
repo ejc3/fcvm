@@ -36,6 +36,39 @@ use crate::volume::{spawn_volume_servers, VolumeConfig};
 use image::{build_storage_image, get_image_identifier, validate_docker_archive};
 use tokio_util::sync::CancellationToken;
 
+/// Resolve the image delivery mode from CLI args and kernel profile.
+///
+/// Priority: explicit `--image-mode` > auto-detect from kernel profile.
+/// Auto-detect: kernel profile name containing "btrfs" → Btrfs, otherwise Overlay.
+fn resolve_image_mode(
+    args: &RunArgs,
+    runtime_config: &super::common::RuntimeConfig,
+) -> crate::firecracker::ImageMode {
+    use crate::firecracker::ImageMode;
+
+    // Explicit CLI flag wins
+    if let Some(ref mode) = args.image_mode {
+        return match mode {
+            crate::cli::ImageMode::Overlay => ImageMode::Overlay,
+            crate::cli::ImageMode::Btrfs => ImageMode::Btrfs,
+            crate::cli::ImageMode::Archive => ImageMode::Archive,
+        };
+    }
+
+    // Auto-detect from kernel profile name
+    if let Some(ref profile_name) = args.kernel_profile {
+        if profile_name.contains("btrfs") {
+            return ImageMode::Btrfs;
+        }
+    }
+
+    // Check if runtime_config suggests btrfs (from boot_args or other hints)
+    let _ = runtime_config;
+
+    // Default: overlay
+    ImageMode::Overlay
+}
+
 /// Start a VM with the given args. Returns a handle to the running VM.
 ///
 /// The VM event loop runs in a background task. The handle's `Drop` impl cancels
@@ -230,6 +263,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     ) = if !no_snapshot {
         // Get image identifier for cache key computation
         let image_identifier = get_image_identifier(&args.image).await?;
+        let resolved_mode = resolve_image_mode(&args, &runtime_config);
         let config = build_firecracker_config(
             &args,
             &image_identifier,
@@ -237,6 +271,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             &base_rootfs,
             &initrd_path,
             cmd_args.clone(),
+            resolved_mode,
         );
         let key = config.snapshot_key();
 
@@ -451,21 +486,39 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             info!(path = %archive_path.display(), "Image exported as Docker archive");
         }
 
-        let disk_path = if !args.no_direct_image_mount {
-            // Direct image mount: pre-build podman storage as ext4 image.
-            // Guest mounts this as additionalImageStore — no podman load needed.
-            let storage_img_path = cache_dir.with_extension("storage.img");
-            if !storage_img_path.exists() {
-                info!(image = %args.image, digest = %digest, "Building podman storage image");
-                build_storage_image(&archive_path, &storage_img_path).await?;
-            } else {
-                info!(image = %args.image, digest = %digest, "Using cached storage image");
+        let resolved_image_mode = resolve_image_mode(&args, &runtime_config);
+        info!(image = %args.image, digest = %digest, mode = %resolved_image_mode, "Image delivery mode");
+
+        let disk_path = match resolved_image_mode {
+            crate::firecracker::ImageMode::Overlay => {
+                // Pre-built overlay storage: ext4 image with podman storage.
+                // Guest mounts this as additionalImageStore — no podman load needed.
+                let storage_img_path = cache_dir.with_extension("storage.img");
+                if !storage_img_path.exists() {
+                    info!(image = %args.image, digest = %digest, "Building overlay storage image");
+                    build_storage_image(&archive_path, &storage_img_path).await?;
+                } else {
+                    info!(image = %args.image, digest = %digest, "Using cached overlay storage image");
+                }
+                storage_img_path
             }
-            storage_img_path
-        } else {
-            // Legacy path: attach docker archive as raw block device.
-            // fc-agent reads docker-archive:/dev/vdX via podman load.
-            archive_path
+            crate::firecracker::ImageMode::Btrfs => {
+                // Pre-built btrfs storage: btrfs image with real subvolumes.
+                // Guest reflink-copies it and mounts as graphroot — no podman load needed.
+                let btrfs_img_path = cache_dir.with_extension("btrfs.img");
+                if !btrfs_img_path.exists() {
+                    info!(image = %args.image, digest = %digest, "Building btrfs storage image");
+                    image::build_btrfs_storage_image(&archive_path, &btrfs_img_path).await?;
+                } else {
+                    info!(image = %args.image, digest = %digest, "Using cached btrfs storage image");
+                }
+                btrfs_img_path
+            }
+            crate::firecracker::ImageMode::Archive => {
+                // Docker archive: attach as raw block device.
+                // fc-agent reads docker-archive:/dev/vdX via podman load at boot.
+                archive_path
+            }
         };
 
         // Lock released when lock_file is dropped
@@ -964,4 +1017,103 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::args::{ImageMode as CliImageMode, NetworkMode};
+    use crate::firecracker::ImageMode;
+
+    fn test_args() -> RunArgs {
+        RunArgs {
+            name: "test".to_string(),
+            cpu: 2,
+            mem: 2048,
+            rootfs_size: "10G".to_string(),
+            map: vec![],
+            disk: vec![],
+            disk_dir: vec![],
+            nfs: vec![],
+            env: vec![],
+            cmd: None,
+            publish: vec![],
+            balloon: None,
+            network: NetworkMode::Rootless,
+            health_check: None,
+            privileged: false,
+            interactive: false,
+            tty: false,
+            strace_agent: false,
+            setup: false,
+            kernel: None,
+            kernel_profile: None,
+            vsock_dir: None,
+            no_snapshot: true,
+            user: None,
+            forward_localhost: vec![],
+            hugepages: false,
+            portable_volumes: false,
+            image_mode: None,
+            label: vec![],
+            image: "alpine:latest".to_string(),
+            command_args: vec![],
+        }
+    }
+
+    #[test]
+    fn test_resolve_image_mode_default_is_overlay() {
+        let args = test_args();
+        let rc = super::super::common::RuntimeConfig::default();
+        assert_eq!(resolve_image_mode(&args, &rc), ImageMode::Overlay);
+    }
+
+    #[test]
+    fn test_resolve_image_mode_btrfs_profile_auto_detects() {
+        let mut args = test_args();
+        args.kernel_profile = Some("btrfs".to_string());
+        let rc = super::super::common::RuntimeConfig::default();
+        assert_eq!(resolve_image_mode(&args, &rc), ImageMode::Btrfs);
+    }
+
+    #[test]
+    fn test_resolve_image_mode_btrfs_in_profile_name() {
+        let mut args = test_args();
+        args.kernel_profile = Some("nested-btrfs-test".to_string());
+        let rc = super::super::common::RuntimeConfig::default();
+        assert_eq!(resolve_image_mode(&args, &rc), ImageMode::Btrfs);
+    }
+
+    #[test]
+    fn test_resolve_image_mode_non_btrfs_profile_is_overlay() {
+        let mut args = test_args();
+        args.kernel_profile = Some("nested".to_string());
+        let rc = super::super::common::RuntimeConfig::default();
+        assert_eq!(resolve_image_mode(&args, &rc), ImageMode::Overlay);
+    }
+
+    #[test]
+    fn test_resolve_image_mode_explicit_overrides_profile() {
+        let mut args = test_args();
+        args.kernel_profile = Some("btrfs".to_string());
+        args.image_mode = Some(CliImageMode::Archive);
+        let rc = super::super::common::RuntimeConfig::default();
+        assert_eq!(resolve_image_mode(&args, &rc), ImageMode::Archive);
+    }
+
+    #[test]
+    fn test_resolve_image_mode_explicit_overlay() {
+        let mut args = test_args();
+        args.image_mode = Some(CliImageMode::Overlay);
+        let rc = super::super::common::RuntimeConfig::default();
+        assert_eq!(resolve_image_mode(&args, &rc), ImageMode::Overlay);
+    }
+
+    #[test]
+    fn test_resolve_image_mode_explicit_btrfs_no_profile() {
+        let mut args = test_args();
+        args.image_mode = Some(CliImageMode::Btrfs);
+        let rc = super::super::common::RuntimeConfig::default();
+        assert_eq!(resolve_image_mode(&args, &rc), ImageMode::Btrfs);
+    }
 }

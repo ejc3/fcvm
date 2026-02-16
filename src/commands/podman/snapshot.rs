@@ -208,6 +208,7 @@ pub(super) fn build_firecracker_config(
     rootfs_path: &Path,
     initrd_path: &Path,
     cmd_args: Option<Vec<String>>,
+    image_mode: crate::firecracker::ImageMode,
 ) -> crate::firecracker::FirecrackerConfig {
     use crate::firecracker::{FcNetworkMode, FirecrackerConfig};
 
@@ -250,6 +251,7 @@ pub(super) fn build_firecracker_config(
         args.hugepages,
         args.user.clone(),
         args.forward_localhost.clone(),
+        image_mode,
     )
 }
 
