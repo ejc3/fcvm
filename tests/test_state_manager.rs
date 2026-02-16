@@ -143,3 +143,100 @@ async fn test_list_vms() {
     assert!(vm_ids.contains(&"vm-2".to_string()));
     assert!(vm_ids.contains(&"vm-3".to_string()));
 }
+
+#[tokio::test]
+async fn test_load_state_by_name_duplicate_detection() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = StateManager::new(temp_dir.path().to_path_buf());
+    manager.init().await.unwrap();
+
+    let now = Utc::now();
+
+    // Save two VMs with the same name but different vm_ids and PIDs
+    for (i, pid) in [(1u32, 5000u32), (2, 5001)] {
+        let state = VmState {
+            schema_version: 1,
+            vm_id: format!("vm-dup-{}", i),
+            name: Some("duplicate-name".to_string()),
+            status: VmStatus::Running,
+            health_status: HealthStatus::Healthy,
+            exit_code: None,
+            pid: Some(pid),
+            holder_pid: None,
+            created_at: now,
+            last_updated: now,
+            config: VmConfig {
+                image: "nginx:alpine".to_string(),
+                vcpu: 1,
+                memory_mib: 256,
+                network: NetworkConfig::default(),
+                volumes: vec![],
+                extra_disks: vec![],
+                nfs_shares: vec![],
+                health_check_url: None,
+                snapshot_name: None,
+                process_type: Some(ProcessType::Vm),
+                serve_pid: None,
+                original_vsock_vm_id: None,
+                port_mappings: vec![],
+                labels: std::collections::HashMap::new(),
+                hugepages: false,
+                portable_volumes: false,
+                user: None,
+                username: None,
+            },
+        };
+        manager.save_state(&state).await.unwrap();
+    }
+
+    // Looking up the duplicate name should error with both PIDs listed
+    let err = manager
+        .load_state_by_name("duplicate-name")
+        .await
+        .expect_err("should fail with duplicate names");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Multiple VMs"),
+        "error should mention multiple VMs: {}",
+        msg
+    );
+    assert!(msg.contains("5000"), "error should list PID 5000: {}", msg);
+    assert!(msg.contains("5001"), "error should list PID 5001: {}", msg);
+
+    // Looking up a unique name should still work
+    let state = VmState {
+        schema_version: 1,
+        vm_id: "vm-unique".to_string(),
+        name: Some("unique-name".to_string()),
+        status: VmStatus::Running,
+        health_status: HealthStatus::Healthy,
+        exit_code: None,
+        pid: Some(6000),
+        holder_pid: None,
+        created_at: now,
+        last_updated: now,
+        config: VmConfig {
+            image: "nginx:alpine".to_string(),
+            vcpu: 1,
+            memory_mib: 256,
+            network: NetworkConfig::default(),
+            volumes: vec![],
+            extra_disks: vec![],
+            nfs_shares: vec![],
+            health_check_url: None,
+            snapshot_name: None,
+            process_type: Some(ProcessType::Vm),
+            serve_pid: None,
+            original_vsock_vm_id: None,
+            port_mappings: vec![],
+            labels: std::collections::HashMap::new(),
+            hugepages: false,
+            portable_volumes: false,
+            user: None,
+            username: None,
+        },
+    };
+    manager.save_state(&state).await.unwrap();
+    let found = manager.load_state_by_name("unique-name").await.unwrap();
+    assert_eq!(found.pid, Some(6000));
+}
