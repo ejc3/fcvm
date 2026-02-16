@@ -16,7 +16,11 @@ use crate::vsock;
 /// The storage image is an ext4 filesystem containing a podman overlay storage tree
 /// (overlay/, overlay-images/, overlay-layers/). It is mounted read-only and podman
 /// finds the image there without needing `podman load`.
-pub fn mount_storage_image(device: &str, image_name: &str, username: Option<&str>) -> Result<String> {
+pub fn mount_storage_image(
+    device: &str,
+    image_name: &str,
+    username: Option<&str>,
+) -> Result<String> {
     eprintln!("[fc-agent] mounting pre-built storage image: {}", device);
 
     let mount_path = "/mnt/image-store";
@@ -63,25 +67,23 @@ pub fn mount_storage_image(device: &str, image_name: &str, username: Option<&str
         let config_dir = format!("{}/.config", home);
         let conf_dir = format!("{}/containers", config_dir);
         let _ = std::fs::create_dir_all(&conf_dir);
-        // Chown .config and children so podman can create subdirs (cni, etc.)
-        if let Ok(pw) = nix::unistd::User::from_name(name) {
-            if let Some(pw) = pw {
-                let _ = nix::unistd::chown(
-                    config_dir.as_str(),
-                    Some(pw.uid),
-                    Some(pw.gid),
-                );
-                let _ = nix::unistd::chown(
-                    conf_dir.as_str(),
-                    Some(pw.uid),
-                    Some(pw.gid),
-                );
-            }
+        // Look up user once and reuse for chown + runroot path
+        let pw = nix::unistd::User::from_name(name).ok().flatten();
+        if let Some(ref pw) = pw {
+            // Chown .config and children so podman can create subdirs (cni, etc.)
+            let _ = nix::unistd::chown(config_dir.as_str(), Some(pw.uid), Some(pw.gid));
+            let _ = nix::unistd::chown(conf_dir.as_str(), Some(pw.uid), Some(pw.gid));
         }
+        let uid = pw.map(|u| u.uid.as_raw()).unwrap_or_else(|| {
+            eprintln!(
+                "[fc-agent] WARNING: could not look up user '{}', falling back to uid from spec",
+                name
+            );
+            0
+        });
         (
             format!("{}/storage.conf", conf_dir),
-            format!("/run/user/{}/containers", nix::unistd::User::from_name(name)
-                .ok().flatten().map(|u| u.uid.as_raw()).unwrap_or(0)),
+            format!("/run/user/{}/containers", uid),
             format!("{}/.local/share/containers/storage", home),
         )
     } else {

@@ -15,15 +15,10 @@ use super::types::VolumeMapping;
 
 use crate::commands::common::VSOCK_VOLUME_PORT_BASE;
 
-/// Read the current user's subordinate UID range start from /etc/subuid.
+/// Read the current user's subordinate UID range (start, count) from /etc/subuid.
 /// Returns None if the file doesn't exist or the user has no entry.
-fn get_host_subuid_start() -> Option<u64> {
-    parse_subid_file("/etc/subuid").map(|(start, _)| start)
-}
-
-/// Read the current user's subordinate UID range count from /etc/subuid.
-fn get_host_subuid_count() -> Option<u64> {
-    parse_subid_file("/etc/subuid").map(|(_, count)| count)
+fn get_host_subuid_range() -> Option<(u64, u64)> {
+    parse_subid_file("/etc/subuid")
 }
 
 /// Parse /etc/subuid or /etc/subgid for the current user.
@@ -562,6 +557,9 @@ pub(super) async fn build_and_send_mmds(
 
     // MMDS data (container plan) - nested under "latest" for V2 compatibility
     // Include host timestamp so guest can set clock immediately (avoiding slow NTP sync)
+    // Read host subuid range once to avoid TOCTOU race from double-parsing /etc/subuid
+    let host_subuid_range = args.user.as_ref().and_then(|_| get_host_subuid_range());
+
     // Format without subsecond precision for Alpine `date` compatibility
     let mmds_data = serde_json::json!({
         "latest": {
@@ -579,8 +577,8 @@ pub(super) async fn build_and_send_mmds(
                 "image_storage_device": if !args.no_direct_image_mount { image_device } else { None::<String> },
                 "privileged": args.privileged,
                 "user": args.user.as_deref(),
-                "subuid_start": args.user.as_ref().and_then(|_| get_host_subuid_start()),
-                "subuid_count": args.user.as_ref().and_then(|_| get_host_subuid_count()),
+                "subuid_start": host_subuid_range.map(|(s, _)| s),
+                "subuid_count": host_subuid_range.map(|(_, c)| c),
                 "forward_localhost": args.forward_localhost.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
                 "interactive": args.interactive,
                 "tty": args.tty,
