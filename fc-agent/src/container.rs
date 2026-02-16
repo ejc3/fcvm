@@ -55,11 +55,21 @@ pub fn mount_storage_image(device: &str, image_name: &str) -> Result<String> {
     }
 
     // Configure podman to use this as an additional image store.
-    // Write a complete storage.conf with runroot/graphroot (required when
-    // storage.options is present) but omit "driver" to let podman auto-detect
-    // — setting it explicitly causes "database graph driver mismatch" errors.
+    // Detect if btrfs storage was already configured (by setup_btrfs_storage_if_available).
+    // If so, preserve the btrfs driver — overwriting with overlay would undo the btrfs setup.
+    let graphroot = "/var/lib/containers/storage";
+    let driver = if std::process::Command::new("findmnt")
+        .args(["-n", "-o", "FSTYPE", graphroot])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "btrfs")
+        .unwrap_or(false)
+    {
+        "btrfs"
+    } else {
+        "overlay"
+    };
     let storage_conf = format!(
-        "[storage]\nrunroot = \"/run/containers/storage\"\ngraphroot = \"/var/lib/containers/storage\"\n\n[storage.options]\nadditionalimagestores = [\"{mount_path}\"]\n"
+        "[storage]\ndriver = \"{driver}\"\nrunroot = \"/run/containers/storage\"\ngraphroot = \"{graphroot}\"\n\n[storage.options]\nadditionalimagestores = [\"{mount_path}\"]\n"
     );
     std::fs::write("/etc/containers/storage.conf", storage_conf).context("writing storage.conf")?;
 
