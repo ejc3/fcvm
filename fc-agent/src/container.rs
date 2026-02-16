@@ -56,10 +56,22 @@ pub fn mount_storage_image(device: &str, image_name: &str) -> Result<String> {
 
     // Configure podman to use this as an additional image store.
     // Write a complete storage.conf with runroot/graphroot (required when
-    // storage.options is present) but omit "driver" to let podman auto-detect
-    // — setting it explicitly causes "database graph driver mismatch" errors.
+    // storage.options is present). If btrfs storage was already set up by
+    // setup_btrfs_storage_if_available(), preserve the driver = "btrfs" setting
+    // so podman doesn't fall back to overlay auto-detection.
+    let storage_dir = "/var/lib/containers/storage";
+    let is_btrfs = std::process::Command::new("findmnt")
+        .args(["-n", "-o", "FSTYPE", storage_dir])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "btrfs")
+        .unwrap_or(false);
+    let driver_line = if is_btrfs {
+        "driver = \"btrfs\"\n"
+    } else {
+        ""
+    };
     let storage_conf = format!(
-        "[storage]\nrunroot = \"/run/containers/storage\"\ngraphroot = \"/var/lib/containers/storage\"\n\n[storage.options]\nadditionalimagestores = [\"{mount_path}\"]\n"
+        "[storage]\n{driver_line}runroot = \"/run/containers/storage\"\ngraphroot = \"{storage_dir}\"\n\n[storage.options]\nadditionalimagestores = [\"{mount_path}\"]\n"
     );
     std::fs::write("/etc/containers/storage.conf", storage_conf).context("writing storage.conf")?;
 
@@ -176,8 +188,10 @@ pub fn setup_btrfs_storage_if_available() {
         }
     }
 
-    // Write storage.conf for root podman
-    let storage_conf = "[storage]\ndriver = \"btrfs\"\n";
+    // Write storage.conf for root podman. Must include runroot/graphroot
+    // or podman will error with "runroot must be set" when storage.options
+    // or driver are specified.
+    let storage_conf = "[storage]\ndriver = \"btrfs\"\nrunroot = \"/run/containers/storage\"\ngraphroot = \"/var/lib/containers/storage\"\n";
     let _ = std::fs::create_dir_all("/etc/containers");
     if let Err(e) = std::fs::write("/etc/containers/storage.conf", storage_conf) {
         eprintln!("[fc-agent] WARNING: failed to write storage.conf: {}", e);
