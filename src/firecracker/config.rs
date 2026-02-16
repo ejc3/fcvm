@@ -72,6 +72,10 @@ pub struct FirecrackerConfig {
     /// it changes how podman sets up user namespaces and storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// Ports to forward from guest localhost to host localhost.
+    /// Affects fc-agent's iptables setup, must be in cache key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forward_localhost: Vec<u16>,
 }
 
 fn default_rootfs_size() -> String {
@@ -149,6 +153,7 @@ impl FirecrackerConfig {
         health_check_url: Option<String>,
         hugepages: bool,
         user: Option<String>,
+        forward_localhost: Vec<u16>,
     ) -> Self {
         Self {
             boot_source: BootSource {
@@ -184,6 +189,7 @@ impl FirecrackerConfig {
             rootfs_size,
             health_check_url,
             user,
+            forward_localhost,
         }
     }
 
@@ -279,6 +285,70 @@ impl FirecrackerConfig {
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).expect("FirecrackerConfig serialization failed")
     }
+
+    /// Build the MMDS container-plan JSON.
+    ///
+    /// User-input fields come from `self` (part of snapshot key).
+    /// Runtime parameters are values that legitimately differ between launches
+    /// using the same snapshot (network config, resolved proxies, timestamps).
+    pub fn to_mmds_json(&self, runtime: MmdsRuntime) -> serde_json::Value {
+        // Parse env vars from "KEY=value" format to HashMap
+        let env: std::collections::HashMap<&str, &str> = self
+            .env_vars
+            .iter()
+            .map(|e| {
+                let parts: Vec<&str> = e.splitn(2, '=').collect();
+                (parts[0], parts.get(1).copied().unwrap_or(""))
+            })
+            .collect();
+
+        serde_json::json!({
+            "latest": {
+                "container-plan": {
+                    "image": self.container_image,
+                    "env": env,
+                    "cmd": self.container_cmd,
+                    "volumes": runtime.volumes,
+                    "extra_disks": runtime.extra_disks,
+                    "nfs_mounts": runtime.nfs_mounts,
+                    "image_archive": runtime.image_archive,
+                    "image_storage_device": runtime.image_storage_device,
+                    "privileged": self.privileged,
+                    "user": self.user.as_deref(),
+                    "forward_localhost": self.forward_localhost.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+                    "interactive": self.interactive,
+                    "tty": self.tty,
+                    "http_proxy": runtime.http_proxy,
+                    "https_proxy": runtime.https_proxy,
+                    "no_proxy": runtime.no_proxy,
+                },
+                "host-time": runtime.host_time,
+            }
+        })
+    }
+}
+
+/// Runtime-only MMDS parameters that differ between launches using the same snapshot.
+/// These are NOT part of the cache key.
+pub struct MmdsRuntime {
+    /// Volume mount details with assigned vsock ports
+    pub volumes: Vec<serde_json::Value>,
+    /// Extra disk device assignments (e.g., /dev/vdb)
+    pub extra_disks: Vec<serde_json::Value>,
+    /// NFS mount details with host IP
+    pub nfs_mounts: Vec<serde_json::Value>,
+    /// Device path for image archive (localhost images, no-direct-image-mount mode)
+    pub image_archive: Option<String>,
+    /// Device path for image storage (direct-image-mount mode)
+    pub image_storage_device: Option<String>,
+    /// Resolved HTTP proxy URL (IP, not hostname)
+    pub http_proxy: Option<String>,
+    /// Resolved HTTPS proxy URL
+    pub https_proxy: Option<String>,
+    /// NO_PROXY value from environment
+    pub no_proxy: Option<String>,
+    /// Host timestamp (UTC epoch seconds)
+    pub host_time: String,
 }
 
 #[cfg(test)]
@@ -307,6 +377,7 @@ mod tests {
             None,
             false,
             None,
+            vec![],
         )
     }
 
@@ -412,6 +483,14 @@ mod tests {
         let config1 = test_config();
         let mut config2 = test_config();
         config2.user = Some("1000:1000".to_string());
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    #[test]
+    fn test_snapshot_key_changes_with_forward_localhost() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.forward_localhost = vec![8080];
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 }
