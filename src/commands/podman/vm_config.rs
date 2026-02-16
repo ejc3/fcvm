@@ -467,20 +467,20 @@ pub(super) async fn attach_extra_disks(
 
 /// Build MMDS data (container plan) and send it to Firecracker.
 ///
-/// Includes volume/disk/NFS mount info, container plan, proxy config, and host time.
-#[allow(clippy::too_many_arguments)]
+/// User-input fields come from `launch_config` (part of snapshot cache key).
+/// Runtime-only values (network, proxies, timestamps) are computed here.
 pub(super) async fn build_and_send_mmds(
-    args: &RunArgs,
+    launch_config: &crate::firecracker::FirecrackerConfig,
     client: &crate::firecracker::FirecrackerClient,
     network_config: &crate::network::NetworkConfig,
     vm_state: &VmState,
     volume_mappings: &[VolumeMapping],
-    cmd_args: &Option<Vec<String>>,
     image_device: Option<String>,
+    no_direct_image_mount: bool,
 ) -> Result<()> {
     // Build volume mount info for MMDS
     // Format: { guest_path, vsock_port, read_only }
-    let volume_mounts: Vec<serde_json::Value> = volume_mappings
+    let volumes: Vec<serde_json::Value> = volume_mappings
         .iter()
         .enumerate()
         .map(|(idx, v)| {
@@ -495,7 +495,7 @@ pub(super) async fn build_and_send_mmds(
     // Build extra disk info for MMDS
     // Format: { device, mount_path, read_only }
     // Disks are added as /dev/vdb, /dev/vdc, etc.
-    let extra_disk_mounts: Vec<serde_json::Value> = vm_state
+    let extra_disks: Vec<serde_json::Value> = vm_state
         .config
         .extra_disks
         .iter()
@@ -525,48 +525,48 @@ pub(super) async fn build_and_send_mmds(
         })
         .collect();
 
-    // MMDS data (container plan) - nested under "latest" for V2 compatibility
-    // Include host timestamp so guest can set clock immediately (avoiding slow NTP sync)
-    // Format without subsecond precision for Alpine `date` compatibility
-    let mmds_data = serde_json::json!({
-        "latest": {
-            "container-plan": {
-                "image": args.image,
-                "env": args.env.iter().map(|e| {
-                    let parts: Vec<&str> = e.splitn(2, '=').collect();
-                    (parts[0], parts.get(1).copied().unwrap_or(""))
-                }).collect::<std::collections::HashMap<_, _>>(),
-                "cmd": cmd_args,
-                "volumes": volume_mounts,
-                "extra_disks": extra_disk_mounts,
-                "nfs_mounts": nfs_mounts,
-                "image_archive": if args.no_direct_image_mount { image_device.clone() } else { None::<String> },
-                "image_storage_device": if !args.no_direct_image_mount { image_device } else { None::<String> },
-                "privileged": args.privileged,
-                "user": args.user.as_deref(),
-                "forward_localhost": args.forward_localhost.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
-                "interactive": args.interactive,
-                "tty": args.tty,
-                // Use network-provided proxy, or fall back to environment variables.
-                // Resolve hostname to IPv4 since slirp VMs can only reach IPv4 addresses.
-                "http_proxy": network_config.http_proxy.clone()
-                    .or_else(|| std::env::var("http_proxy").ok())
-                    .or_else(|| std::env::var("HTTP_PROXY").ok())
-                    .and_then(|url| resolve_proxy_url(&url)),
-                "https_proxy": network_config.http_proxy.clone()
-                    .or_else(|| std::env::var("https_proxy").ok())
-                    .or_else(|| std::env::var("HTTPS_PROXY").ok())
-                    .or_else(|| std::env::var("http_proxy").ok())
-                    .or_else(|| std::env::var("HTTP_PROXY").ok())
-                    .and_then(|url| resolve_proxy_url(&url)),
-                "no_proxy": std::env::var("no_proxy")
-                    .or_else(|_| std::env::var("NO_PROXY"))
-                    .ok(),
-            },
-            "host-time": chrono::Utc::now().timestamp().to_string(),
-        }
-    });
+    // Resolve proxy URLs — runtime behavior, not part of cache key.
+    // Use network-provided proxy, or fall back to environment variables.
+    // Resolve hostname to IPv4 since slirp VMs can only reach IPv4 addresses.
+    let http_proxy = network_config
+        .http_proxy
+        .clone()
+        .or_else(|| std::env::var("http_proxy").ok())
+        .or_else(|| std::env::var("HTTP_PROXY").ok())
+        .and_then(|url| resolve_proxy_url(&url));
+    let https_proxy = network_config
+        .http_proxy
+        .clone()
+        .or_else(|| std::env::var("https_proxy").ok())
+        .or_else(|| std::env::var("HTTPS_PROXY").ok())
+        .or_else(|| std::env::var("http_proxy").ok())
+        .or_else(|| std::env::var("HTTP_PROXY").ok())
+        .and_then(|url| resolve_proxy_url(&url));
+    let no_proxy = std::env::var("no_proxy")
+        .or_else(|_| std::env::var("NO_PROXY"))
+        .ok();
 
+    let runtime = crate::firecracker::MmdsRuntime {
+        volumes,
+        extra_disks,
+        nfs_mounts,
+        image_archive: if no_direct_image_mount {
+            image_device.clone()
+        } else {
+            None
+        },
+        image_storage_device: if !no_direct_image_mount {
+            image_device
+        } else {
+            None
+        },
+        http_proxy,
+        https_proxy,
+        no_proxy,
+        host_time: chrono::Utc::now().timestamp().to_string(),
+    };
+
+    let mmds_data = launch_config.to_mmds_json(runtime);
     client.put_mmds(mmds_data).await?;
     Ok(())
 }
@@ -811,6 +811,7 @@ pub(super) async fn run_vm_setup(
                 args.health_check.clone(),
                 args.hugepages,
                 args.user.clone(),
+                args.forward_localhost.clone(),
             )
         });
 
@@ -937,13 +938,13 @@ pub(super) async fn run_vm_setup(
 
     // Build and send MMDS data (container plan)
     build_and_send_mmds(
-        args,
+        &launch_config,
         client,
         network_config,
         vm_state,
         volume_mappings,
-        &cmd_args,
         image_device,
+        args.no_direct_image_mount,
     )
     .await?;
 
