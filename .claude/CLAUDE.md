@@ -1244,14 +1244,19 @@ All assets are content-addressed - changing the input automatically creates new 
 - **Rootfs**: Cached by setup script SHA. Change script = new rootfs.
 - **Initrd**: Cached by fc-agent binary SHA. Rebuild fc-agent = new initrd.
 
-**NEVER manually delete cached assets.** Just rebuild and run `make setup-fcvm`:
+**Pre-Start Snapshot Cache**: `FirecrackerConfig::snapshot_key()` hashes the full config JSON
+(kernel path, initrd path, rootfs path, image name, user, cmd, env, etc.). Since kernel/initrd/rootfs
+paths are content-addressed (SHA in filename), changing any build input automatically produces a new
+snapshot key. Old snapshots become orphaned harmlessly — don't manually delete them.
+
+**NEVER manually delete cached assets or snapshots.** Just rebuild and run `make setup-fcvm`:
 ```bash
 # Change fc-agent code, then:
 cargo build --release -p fc-agent
-make setup-fcvm  # Creates new initrd with new SHA
+make setup-fcvm  # Creates new initrd with new SHA → new snapshot key
 
 # Change rootfs-config.toml, then:
-make setup-fcvm  # Creates new rootfs with new SHA
+make setup-fcvm  # Creates new rootfs with new SHA → new snapshot key
 ```
 
 **Custom Kernel (Nested Virtualization)**

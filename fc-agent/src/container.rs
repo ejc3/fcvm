@@ -11,10 +11,12 @@ use crate::types::Plan;
 use crate::vsock;
 
 /// Import a Docker archive into podman storage. Returns image reference.
+/// If `run_as_user` is set, runs podman load via `runuser -u <user>`.
 pub async fn import_image(
     archive_path: &str,
     image_name: &str,
     output: &OutputHandle,
+    run_as_user: Option<&str>,
 ) -> Result<String> {
     eprintln!("[fc-agent] importing Docker archive: {}", archive_path);
 
@@ -24,12 +26,22 @@ pub async fn import_image(
             .output();
     }
 
-    let mut load_child = Command::new("podman")
-        .args(["load", "-i", archive_path])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning podman load")?;
+    let mut load_child = if let Some(username) = run_as_user {
+        eprintln!("[fc-agent] importing as user: {}", username);
+        Command::new("runuser")
+            .args(["-u", username, "--", "podman", "load", "-i", archive_path])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawning podman load via runuser")?
+    } else {
+        Command::new("podman")
+            .args(["load", "-i", archive_path])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawning podman load")?
+    };
 
     let status = loop {
         tokio::select! {
@@ -158,12 +170,31 @@ pub async fn pull_image(plan: &Plan) -> Result<String> {
 }
 
 /// Get the digest of a pulled image.
-pub async fn get_image_digest(image: &str) -> Result<String> {
-    let output = Command::new("podman")
-        .args(["image", "inspect", "--format", "{{.Digest}}", image])
-        .output()
-        .await
-        .context("running podman image inspect")?;
+/// If `run_as_user` is set, runs podman inspect via `runuser -u <user>`.
+pub async fn get_image_digest(image: &str, run_as_user: Option<&str>) -> Result<String> {
+    let output = if let Some(username) = run_as_user {
+        Command::new("runuser")
+            .args([
+                "-u",
+                username,
+                "--",
+                "podman",
+                "image",
+                "inspect",
+                "--format",
+                "{{.Digest}}",
+                image,
+            ])
+            .output()
+            .await
+            .context("running podman image inspect via runuser")?
+    } else {
+        Command::new("podman")
+            .args(["image", "inspect", "--format", "{{.Digest}}", image])
+            .output()
+            .await
+            .context("running podman image inspect")?
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -285,6 +316,89 @@ pub fn notify_cache_ready_and_wait(digest: &str) -> bool {
     }
 }
 
+/// If the kernel supports btrfs, set up a btrfs loopback for podman storage.
+///
+/// This avoids the overlay idmapped mount issue where `checkAndRecordIDMappedSupport()`
+/// returns false for rootless, forcing `--userns=keep-id` through the expensive
+/// `storage-chown-by-maps` chown-copy fallback. Btrfs handles user namespaces natively.
+///
+/// No-op if the kernel lacks btrfs support.
+pub fn setup_btrfs_storage_if_available() {
+    // Check if kernel has btrfs support (built-in = /sys/fs/btrfs exists)
+    if !std::path::Path::new("/sys/fs/btrfs").exists() {
+        eprintln!("[fc-agent] kernel lacks btrfs support, using default storage driver");
+        return;
+    }
+
+    let img = "/var/lib/containers/storage.btrfs.img";
+    let mnt = "/var/lib/containers/storage";
+
+    // Check if already mounted (e.g., from a previous run or snapshot restore)
+    if let Ok(output) = std::process::Command::new("findmnt")
+        .args(["-n", "-o", "FSTYPE", mnt])
+        .output()
+    {
+        let fstype = String::from_utf8_lossy(&output.stdout);
+        if fstype.trim() == "btrfs" {
+            eprintln!("[fc-agent] btrfs storage already mounted at {}", mnt);
+            return;
+        }
+    }
+
+    // Create loopback image if it doesn't exist
+    if !std::path::Path::new(img).exists() {
+        eprintln!("[fc-agent] creating btrfs loopback at {}", img);
+        let _ = std::process::Command::new("truncate")
+            .args(["-s", "8G", img])
+            .output();
+        let _ = std::process::Command::new("mkfs.btrfs")
+            .args(["-f", img])
+            .output();
+    }
+
+    // Mount the btrfs loopback
+    let _ = std::fs::create_dir_all(mnt);
+    let result = std::process::Command::new("mount")
+        .args(["-o", "loop", img, mnt])
+        .output();
+
+    match result {
+        Ok(output) if output.status.success() => {
+            eprintln!("[fc-agent] btrfs storage mounted at {}", mnt);
+            // Make mount and its parent traversable by non-root users.
+            // /var/lib/containers is created by podman package with mode 700;
+            // rootless podman needs to traverse it to reach the btrfs mount.
+            let _ = std::process::Command::new("chmod")
+                .args(["755", "/var/lib/containers", mnt])
+                .output();
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!(
+                "[fc-agent] WARNING: failed to mount btrfs loopback: {}",
+                stderr.trim()
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: failed to run mount: {}", e);
+            return;
+        }
+    }
+
+    // Create runroot directory (on tmpfs /run)
+    let _ = std::fs::create_dir_all("/run/containers/storage");
+
+    // Configure podman to use btrfs storage driver
+    let storage_conf = "[storage]\ndriver = \"btrfs\"\nrunroot = \"/run/containers/storage\"\ngraphroot = \"/var/lib/containers/storage\"\n";
+    if let Err(e) = std::fs::write("/etc/containers/storage.conf", storage_conf) {
+        eprintln!(
+            "[fc-agent] WARNING: failed to write storage.conf: {}",
+            e
+        );
+    }
+}
+
 /// Build podman run args from the plan.
 pub fn build_podman_args(plan: &Plan, image_ref: &str) -> Vec<String> {
     let mut args = vec![
@@ -359,25 +473,29 @@ pub fn build_podman_args(plan: &Plan, image_ref: &str) -> Vec<String> {
     args
 }
 
-fn setup_user_mapping(args: &mut Vec<String>, user_spec: &str) {
+const FCVM_USERNAME: &str = "fcvm-user";
+
+/// Create the user, set up subuid/subgid, runtime dir, cgroups, and user-level
+/// btrfs storage if available. Must be called before import_image when --user is set.
+/// Returns the username for use with runuser.
+pub fn prepare_user_environment(user_spec: &str) -> String {
     let parts: Vec<&str> = user_spec.split(':').collect();
     let uid = parts[0];
     let gid = parts.get(1).unwrap_or(&"100");
-    let username = "fcvm-user".to_string();
 
     eprintln!(
-        "[fc-agent] setting up user mapping: uid={} gid={}",
+        "[fc-agent] preparing user environment: uid={} gid={}",
         uid, gid
     );
 
     let _ = std::process::Command::new("groupadd")
-        .args(["-g", gid, &username])
+        .args(["-g", gid, FCVM_USERNAME])
         .output();
     let _ = std::process::Command::new("useradd")
-        .args(["-u", uid, "-g", gid, "-m", "-s", "/bin/sh", &username])
+        .args(["-u", uid, "-g", gid, "-m", "-s", "/bin/sh", FCVM_USERNAME])
         .output();
 
-    let subuid_entry = format!("{}:100000:65536\n", username);
+    let subuid_entry = format!("{}:100000:65536\n", FCVM_USERNAME);
     let _ = std::fs::write("/etc/subuid", &subuid_entry);
     let _ = std::fs::write("/etc/subgid", &subuid_entry);
 
@@ -409,11 +527,80 @@ fn setup_user_mapping(args: &mut Vec<String>, user_spec: &str) {
         }
     }
 
+    // Set up user-level btrfs storage if root btrfs is available
+    setup_user_btrfs_storage(uid, gid);
+
+    FCVM_USERNAME.to_string()
+}
+
+/// Set up btrfs storage for a rootless user by creating a subdirectory
+/// under the root btrfs mount and writing a user-level storage.conf.
+fn setup_user_btrfs_storage(uid: &str, gid: &str) {
+    let root_mnt = "/var/lib/containers/storage";
+
+    // Check if root btrfs storage is mounted
+    let is_btrfs = std::process::Command::new("findmnt")
+        .args(["-n", "-o", "FSTYPE", root_mnt])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string() == "btrfs")
+        .unwrap_or(false);
+
+    if !is_btrfs {
+        return;
+    }
+
+    // Create user-specific subdirectory on the btrfs mount
+    let user_graphroot = format!("{}/user-{}", root_mnt, uid);
+    let _ = std::fs::create_dir_all(&user_graphroot);
+    let _ = std::process::Command::new("chown")
+        .args([&format!("{}:{}", uid, gid), &user_graphroot])
+        .output();
+
+    // Create user-level runroot
+    let user_runroot = format!("/run/user/{}/containers", uid);
+    let _ = std::fs::create_dir_all(&user_runroot);
+    let _ = std::process::Command::new("chown")
+        .args([&format!("{}:{}", uid, gid), &user_runroot])
+        .output();
+
+    // Write user-level storage.conf
+    let user_config_dir = format!("/home/{FCVM_USERNAME}/.config/containers");
+    let _ = std::fs::create_dir_all(&user_config_dir);
+    let storage_conf = format!(
+        "[storage]\ndriver = \"btrfs\"\ngraphroot = \"{}\"\nrunroot = \"{}\"\n",
+        user_graphroot, user_runroot
+    );
+    if let Err(e) = std::fs::write(format!("{}/storage.conf", user_config_dir), &storage_conf) {
+        eprintln!(
+            "[fc-agent] WARNING: failed to write user storage.conf: {}",
+            e
+        );
+        return;
+    }
+    // Ensure the user owns their config
+    let _ = std::process::Command::new("chown")
+        .args([
+            "-R",
+            &format!("{}:{}", uid, gid),
+            &format!("/home/{FCVM_USERNAME}/.config"),
+        ])
+        .output();
+
+    eprintln!(
+        "[fc-agent] user btrfs storage configured at {}",
+        user_graphroot
+    );
+}
+
+fn setup_user_mapping(args: &mut Vec<String>, _user_spec: &str) {
+    // User environment (user creation, cgroups, btrfs) is already set up
+    // by prepare_user_environment(). This just modifies the podman args.
+
     // Rootless podman: remove split, add keep-id, wrap with runuser
     args.retain(|a| a != "--cgroups=split");
     args.push("--userns=keep-id".to_string());
     args.insert(0, "--".to_string());
-    args.insert(0, username);
+    args.insert(0, FCVM_USERNAME.to_string());
     args.insert(0, "-u".to_string());
     args.insert(0, "runuser".to_string());
 }

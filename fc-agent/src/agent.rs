@@ -119,15 +119,27 @@ pub async fn run() -> Result<()> {
         });
     }
 
+    // Set up btrfs storage if kernel supports it (avoids overlay idmap issues).
+    // Must happen before any podman operations (import_image, pull_image, etc.)
+    container::setup_btrfs_storage_if_available();
+
+    // If --user is set, create the user and set up their storage before importing.
+    // This ensures the image gets loaded into the user's rootless podman storage.
+    let run_as_user = plan
+        .user
+        .as_deref()
+        .map(container::prepare_user_environment);
+
     // Prepare image (import archive or pull from registry)
     let image_ref = if let Some(archive_path) = &plan.image_archive {
-        container::import_image(archive_path, &plan.image, &output).await?
+        container::import_image(archive_path, &plan.image, &output, run_as_user.as_deref())
+            .await?
     } else {
         container::pull_image(&plan).await?
     };
 
     // Notify host for cache snapshot
-    match container::get_image_digest(&image_ref).await {
+    match container::get_image_digest(&image_ref, run_as_user.as_deref()).await {
         Ok(digest) => {
             eprintln!("[fc-agent] image digest: {}", digest);
             if container::notify_cache_ready_and_wait(&digest) {
@@ -155,6 +167,7 @@ pub async fn run() -> Result<()> {
 
     // Build podman args
     let podman_args = container::build_podman_args(&plan, &image_ref);
+    eprintln!("[fc-agent] container args: {:?}", podman_args);
 
     // TTY mode: blocks, never returns
     if plan.tty {

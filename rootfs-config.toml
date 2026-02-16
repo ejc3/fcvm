@@ -63,7 +63,7 @@ runtime = ["podman", "crun", "fuse-overlayfs", "skopeo", "uidmap"]
 fuse = ["fuse3"]
 
 # System services and disk/filesystem tools for nested --disk-dir and --nfs
-system = ["haveged", "chrony", "rsync", "nfs-common", "iptables"]
+system = ["haveged", "chrony", "rsync", "nfs-common", "iptables", "btrfs-progs"]
 
 # Debugging and networking tools
 debug = ["strace", "netcat-openbsd"]
@@ -231,3 +231,36 @@ patches_dir = "kernel/patches-x86"
 build_inputs = [
     "kernel/patches-x86/*.patch",
 ]
+
+# arm64 btrfs profile (FUSE + btrfs, no KVM/nested)
+# Minimal kernel for running containers with btrfs storage driver.
+# When the kernel supports btrfs, fc-agent auto-detects it and configures
+# podman to use btrfs instead of overlay (avoids idmapped mount issues).
+[kernel_profiles.btrfs.arm64]
+description = "Kernel with FUSE and btrfs support for efficient container storage"
+kernel_version = "6.18.3"
+kernel_repo = "ejc3/fcvm"
+
+build_inputs = [
+    "kernel/default.conf",
+]
+
+kernel_config = "kernel/default.conf"
+# No patches_dir — no FUSE patches needed for btrfs profile
+
+base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-aarch64-6.1.config"
+
+# x86_64 btrfs profile (FUSE + btrfs, no KVM/nested)
+[kernel_profiles.btrfs.amd64]
+description = "Kernel with FUSE and btrfs support for efficient container storage (x86_64)"
+kernel_version = "6.18.3"
+kernel_repo = "ejc3/fcvm"
+
+build_inputs = [
+    "kernel/default-x86.conf",
+]
+
+kernel_config = "kernel/default-x86.conf"
+# No patches_dir — no FUSE patches needed for btrfs profile
+
+base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"

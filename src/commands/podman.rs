@@ -542,6 +542,7 @@ fn build_firecracker_config(
         args.interactive,
         args.rootfs_size.clone(),
         args.health_check.clone(),
+        args.user.clone(),
         args.hugepages,
     )
 }
@@ -2971,6 +2972,7 @@ async fn run_vm_setup(
                 args.interactive,
                 args.rootfs_size.clone(),
                 args.health_check.clone(),
+                args.user.clone(),
                 args.hugepages,
             )
         });
