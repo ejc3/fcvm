@@ -243,10 +243,10 @@ kernel_version = "6.18.3"
 kernel_repo = "ejc3/fcvm"
 
 build_inputs = [
-    "kernel/default.conf",
+    "kernel/btrfs.conf",
 ]
 
-kernel_config = "kernel/default.conf"
+kernel_config = "kernel/btrfs.conf"
 # No patches_dir — no FUSE patches needed for btrfs profile
 
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-aarch64-6.1.config"
@@ -258,10 +258,10 @@ kernel_version = "6.18.3"
 kernel_repo = "ejc3/fcvm"
 
 build_inputs = [
-    "kernel/default-x86.conf",
+    "kernel/btrfs-x86.conf",
 ]
 
-kernel_config = "kernel/default-x86.conf"
+kernel_config = "kernel/btrfs-x86.conf"
 # No patches_dir — no FUSE patches needed for btrfs profile
 
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
