@@ -118,6 +118,10 @@ pub async fn run() -> Result<()> {
         });
     }
 
+    // Set up btrfs storage if kernel supports it (avoids overlay idmap issues).
+    // Must happen before any podman operations (import_image, pull_image, etc.)
+    container::setup_btrfs_storage_if_available();
+
     // If --user is specified, create the VM user BEFORE image import so
     // podman load runs as the target user (rootless podman has separate storage).
     let user_info = if let Some(ref user_spec) = plan.user {

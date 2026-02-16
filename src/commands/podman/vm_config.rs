@@ -810,6 +810,7 @@ pub(super) async fn run_vm_setup(
                 args.rootfs_size.clone(),
                 args.health_check.clone(),
                 args.hugepages,
+                args.user.clone(),
             )
         });
 
