@@ -68,20 +68,16 @@ pub fn mount_storage_image(
         let conf_dir = format!("{}/containers", config_dir);
         let _ = std::fs::create_dir_all(&conf_dir);
         // Chown .config and children so podman can create subdirs (cni, etc.)
-        if let Ok(Some(pw)) = nix::unistd::User::from_name(name) {
+        // Look up the user once and reuse the result for both chown and runroot path.
+        let pw = nix::unistd::User::from_name(name).ok().flatten();
+        if let Some(ref pw) = pw {
             let _ = nix::unistd::chown(config_dir.as_str(), Some(pw.uid), Some(pw.gid));
             let _ = nix::unistd::chown(conf_dir.as_str(), Some(pw.uid), Some(pw.gid));
         }
+        let uid_raw = pw.map(|u| u.uid.as_raw()).unwrap_or(0);
         (
             format!("{}/storage.conf", conf_dir),
-            format!(
-                "/run/user/{}/containers",
-                nix::unistd::User::from_name(name)
-                    .ok()
-                    .flatten()
-                    .map(|u| u.uid.as_raw())
-                    .unwrap_or(0)
-            ),
+            format!("/run/user/{}/containers", uid_raw),
             format!("{}/.local/share/containers/storage", home),
         )
     } else {
