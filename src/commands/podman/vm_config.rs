@@ -1043,4 +1043,36 @@ mod tests {
         assert!(resolved_https.contains(":443"));
         assert!(resolved_https.contains("/proxy"));
     }
+
+    #[test]
+    fn test_parse_subid_file_finds_current_user() {
+        let username = std::env::var("USER").expect("USER env var must be set");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subuid");
+        std::fs::write(
+            &path,
+            format!(
+                "nobody:100000:65536\n{}:1879048192:65536\nother:200000:65536\n",
+                username
+            ),
+        )
+        .unwrap();
+        let result = parse_subid_file(path.to_str().unwrap());
+        assert_eq!(result, Some((1879048192, 65536)));
+    }
+
+    #[test]
+    fn test_parse_subid_file_returns_none_for_missing_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subuid");
+        std::fs::write(&path, "nobody:100000:65536\nother:200000:65536\n").unwrap();
+        let result = parse_subid_file(path.to_str().unwrap());
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_subid_file_returns_none_for_missing_file() {
+        let result = parse_subid_file("/tmp/nonexistent-subuid-test-file");
+        assert_eq!(result, None);
+    }
 }
