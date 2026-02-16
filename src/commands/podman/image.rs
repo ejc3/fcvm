@@ -203,6 +203,23 @@ pub(super) async fn build_storage_image(
     let loaded_msg = String::from_utf8_lossy(&load_output.stdout);
     info!("podman load output: {}", loaded_msg.trim());
 
+    // Remove podman database files from the storage tree. These contain absolute
+    // paths from the host's temp directory. When the guest mounts the image at a
+    // different path, podman detects a "database configuration mismatch" (e.g.,
+    // static_dir or graph_driver doesn't match). The storage layers (overlay/,
+    // overlay-images/, overlay-layers/) are sufficient for additionalImageStores,
+    // and for btrfs import via `podman save --root`, podman recreates the database.
+    for db_entry in &["libpod", "db.sql", "defaultNetworkBackend", "networks"] {
+        let db_path = tmp_dir.join(db_entry);
+        if db_path.exists() {
+            if db_path.is_dir() {
+                tokio::fs::remove_dir_all(&db_path).await.ok();
+            } else {
+                tokio::fs::remove_file(&db_path).await.ok();
+            }
+        }
+    }
+
     // Package the storage tree as an ext4 image using the existing helper.
     // NOTE: Can't use with_extension() here because output_path ends in .storage.img
     // -- with_extension replaces after the last dot, producing a double "storage".

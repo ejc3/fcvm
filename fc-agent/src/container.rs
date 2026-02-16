@@ -76,11 +76,15 @@ pub fn mount_storage_image(device: &str, image_name: &str) -> Result<String> {
             mount_path
         );
 
-        // Save the image from the overlay store to a tar archive
+        // Save the image from the overlay store to a tar archive.
+        // Use --runroot to provide a writable temp directory for podman's runtime
+        // state — the image store at mount_path is mounted read-only.
         let save_output = std::process::Command::new("podman")
             .args([
                 "--root",
                 mount_path,
+                "--runroot",
+                "/tmp/podman-save-runroot",
                 "--storage-driver",
                 "overlay",
                 "save",
@@ -107,8 +111,9 @@ pub fn mount_storage_image(device: &str, image_name: &str) -> Result<String> {
             anyhow::bail!("podman load into btrfs store failed: {}", stderr);
         }
 
-        // Clean up temp archive
+        // Clean up temp files
         let _ = std::fs::remove_file("/tmp/image-import.tar");
+        let _ = std::fs::remove_dir_all("/tmp/podman-save-runroot");
 
         eprintln!(
             "[fc-agent] image imported into btrfs store: {}",
