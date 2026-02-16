@@ -61,6 +61,9 @@ pub fn mount_storage_image(
     // Configure podman to use this as an additional image store.
     // For rootless podman (--user mode), write to the user's config dir.
     // For root podman, write to /etc/containers/.
+    // Look up user info once and reuse for chown, runroot UID, and btrfs load.
+    let user_pw = username.and_then(|name| nix::unistd::User::from_name(name).ok().flatten());
+
     let (conf_path, runroot, graphroot) = if let Some(name) = username {
         // Rootless: user's home directory config
         let home = format!("/home/{}", name);
@@ -68,20 +71,14 @@ pub fn mount_storage_image(
         let conf_dir = format!("{}/containers", config_dir);
         let _ = std::fs::create_dir_all(&conf_dir);
         // Chown .config and children so podman can create subdirs (cni, etc.)
-        if let Ok(Some(pw)) = nix::unistd::User::from_name(name) {
+        if let Some(ref pw) = user_pw {
             let _ = nix::unistd::chown(config_dir.as_str(), Some(pw.uid), Some(pw.gid));
             let _ = nix::unistd::chown(conf_dir.as_str(), Some(pw.uid), Some(pw.gid));
         }
+        let uid = user_pw.as_ref().map(|u| u.uid.as_raw()).unwrap_or(0);
         (
             format!("{}/storage.conf", conf_dir),
-            format!(
-                "/run/user/{}/containers",
-                nix::unistd::User::from_name(name)
-                    .ok()
-                    .flatten()
-                    .map(|u| u.uid.as_raw())
-                    .unwrap_or(0)
-            ),
+            format!("/run/user/{}/containers", uid),
             format!("{}/.local/share/containers/storage", home),
         )
     } else {
@@ -140,9 +137,8 @@ pub fn mount_storage_image(
         // Load the image into the btrfs store.
         // For rootless users, use runuser so podman reads the user's storage.conf.
         let load_output = if let Some(name) = username {
-            let uid_str = nix::unistd::User::from_name(name)
-                .ok()
-                .flatten()
+            let uid_str = user_pw
+                .as_ref()
                 .map(|u| u.uid.as_raw().to_string())
                 .unwrap_or_default();
             std::process::Command::new("env")

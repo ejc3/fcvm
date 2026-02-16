@@ -15,15 +15,10 @@ use super::types::VolumeMapping;
 
 use crate::commands::common::VSOCK_VOLUME_PORT_BASE;
 
-/// Read the current user's subordinate UID range start from /etc/subuid.
+/// Read the current user's subordinate UID range (start, count) from /etc/subuid.
 /// Returns None if the file doesn't exist or the user has no entry.
-fn get_host_subuid_start() -> Option<u64> {
-    parse_subid_file("/etc/subuid").map(|(start, _)| start)
-}
-
-/// Read the current user's subordinate UID range count from /etc/subuid.
-fn get_host_subuid_count() -> Option<u64> {
-    parse_subid_file("/etc/subuid").map(|(_, count)| count)
+fn get_host_subuid_range() -> Option<(u64, u64)> {
+    parse_subid_file("/etc/subuid")
 }
 
 /// Parse /etc/subuid or /etc/subgid for the current user.
@@ -581,6 +576,11 @@ pub(super) async fn build_and_send_mmds(
         .or_else(|_| std::env::var("NO_PROXY"))
         .ok();
 
+    let subuid_range = launch_config
+        .user
+        .as_ref()
+        .and_then(|_| get_host_subuid_range());
+
     let runtime = crate::firecracker::MmdsRuntime {
         volumes,
         extra_disks,
@@ -598,14 +598,8 @@ pub(super) async fn build_and_send_mmds(
         http_proxy,
         https_proxy,
         no_proxy,
-        subuid_start: launch_config
-            .user
-            .as_ref()
-            .and_then(|_| get_host_subuid_start()),
-        subuid_count: launch_config
-            .user
-            .as_ref()
-            .and_then(|_| get_host_subuid_count()),
+        subuid_start: subuid_range.map(|(start, _)| start),
+        subuid_count: subuid_range.map(|(_, count)| count),
         host_time: chrono::Utc::now().timestamp().to_string(),
     };
 
@@ -1046,7 +1040,16 @@ mod tests {
 
     #[test]
     fn test_parse_subid_file_finds_current_user() {
-        let username = std::env::var("USER").expect("USER env var must be set");
+        // Use USER env var if set, otherwise fall back to UID lookup (matches production logic)
+        let username = std::env::var("USER")
+            .or_else(|_| {
+                nix::unistd::User::from_uid(nix::unistd::getuid())
+                    .ok()
+                    .flatten()
+                    .map(|u| u.name)
+                    .ok_or(std::env::VarError::NotPresent)
+            })
+            .expect("Could not determine current username");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("subuid");
         std::fs::write(
