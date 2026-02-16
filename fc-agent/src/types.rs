@@ -33,6 +33,13 @@ pub struct Plan {
     pub https_proxy: Option<String>,
     #[serde(default)]
     pub no_proxy: Option<String>,
+    /// Host user's subordinate UID range start (from /etc/subuid).
+    /// When set, the VM user is created with the same subuid range so that
+    /// the storage image (built by rootless podman on the host) has valid UIDs.
+    #[serde(default)]
+    pub subuid_start: Option<u64>,
+    #[serde(default)]
+    pub subuid_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
