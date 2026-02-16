@@ -1046,7 +1046,15 @@ mod tests {
 
     #[test]
     fn test_parse_subid_file_finds_current_user() {
-        let username = std::env::var("USER").expect("USER env var must be set");
+        let username = std::env::var("USER")
+            .or_else(|_| {
+                nix::unistd::User::from_uid(nix::unistd::getuid())
+                    .ok()
+                    .flatten()
+                    .map(|u| u.name)
+                    .ok_or(())
+            })
+            .expect("Could not determine current username from USER env var or UID lookup");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("subuid");
         std::fs::write(
