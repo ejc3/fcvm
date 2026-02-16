@@ -67,6 +67,11 @@ pub struct FirecrackerConfig {
     /// clones must inherit the same health check behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check_url: Option<String>,
+    /// User specification (uid:gid) for rootless podman inside the VM.
+    /// Triggers --userns=keep-id in fc-agent. Must be in cache key because
+    /// it changes how podman sets up user namespaces and storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 }
 
 fn default_rootfs_size() -> String {
@@ -143,6 +148,7 @@ impl FirecrackerConfig {
         rootfs_size: String,
         health_check_url: Option<String>,
         hugepages: bool,
+        user: Option<String>,
     ) -> Self {
         Self {
             boot_source: BootSource {
@@ -177,6 +183,7 @@ impl FirecrackerConfig {
             interactive,
             rootfs_size,
             health_check_url,
+            user,
         }
     }
 
@@ -299,6 +306,7 @@ mod tests {
             "10G".to_string(),
             None,
             false,
+            None,
         )
     }
 
@@ -396,6 +404,14 @@ mod tests {
         let config1 = test_config();
         let mut config2 = test_config();
         config2.health_check_url = Some("http://localhost/".to_string());
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    #[test]
+    fn test_snapshot_key_changes_with_user() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.user = Some("1000:1000".to_string());
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 }

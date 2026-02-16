@@ -248,6 +248,7 @@ pub(super) fn build_firecracker_config(
         args.rootfs_size.clone(),
         args.health_check.clone(),
         args.hugepages,
+        args.user.clone(),
     )
 }
 
