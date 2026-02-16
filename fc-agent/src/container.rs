@@ -89,8 +89,13 @@ pub fn podman_cmd_prefix() -> &'static [String] {
 /// Creates an 8G sparse loopback btrfs filesystem and configures podman to use it.
 /// This avoids overlay's idmap issues that cause expensive chown-copy on rootless podman.
 pub fn setup_btrfs_storage_if_available() {
-    // Check if kernel has btrfs support
-    if !std::path::Path::new("/sys/fs/btrfs").exists() {
+    // Check if kernel has btrfs support via /proc/filesystems.
+    // Note: /sys/fs/btrfs only appears after a btrfs filesystem is mounted,
+    // so it can't detect built-in (CONFIG_BTRFS_FS=y) support before first mount.
+    let has_btrfs = std::fs::read_to_string("/proc/filesystems")
+        .map(|content| content.lines().any(|line| line.trim().ends_with("btrfs")))
+        .unwrap_or(false);
+    if !has_btrfs {
         eprintln!("[fc-agent] btrfs not available in kernel, using default storage driver");
         return;
     }
