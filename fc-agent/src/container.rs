@@ -392,10 +392,7 @@ pub fn setup_btrfs_storage_if_available() {
     // Configure podman to use btrfs storage driver
     let storage_conf = "[storage]\ndriver = \"btrfs\"\nrunroot = \"/run/containers/storage\"\ngraphroot = \"/var/lib/containers/storage\"\n";
     if let Err(e) = std::fs::write("/etc/containers/storage.conf", storage_conf) {
-        eprintln!(
-            "[fc-agent] WARNING: failed to write storage.conf: {}",
-            e
-        );
+        eprintln!("[fc-agent] WARNING: failed to write storage.conf: {}", e);
     }
 }
 
@@ -542,7 +539,7 @@ fn setup_user_btrfs_storage(uid: &str, gid: &str) {
     let is_btrfs = std::process::Command::new("findmnt")
         .args(["-n", "-o", "FSTYPE", root_mnt])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string() == "btrfs")
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "btrfs")
         .unwrap_or(false);
 
     if !is_btrfs {

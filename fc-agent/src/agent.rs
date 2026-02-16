@@ -132,8 +132,7 @@ pub async fn run() -> Result<()> {
 
     // Prepare image (import archive or pull from registry)
     let image_ref = if let Some(archive_path) = &plan.image_archive {
-        container::import_image(archive_path, &plan.image, &output, run_as_user.as_deref())
-            .await?
+        container::import_image(archive_path, &plan.image, &output, run_as_user.as_deref()).await?
     } else {
         container::pull_image(&plan).await?
     };

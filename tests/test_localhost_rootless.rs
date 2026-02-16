@@ -110,7 +110,13 @@ async fn test_localhost_rootless_btrfs_storage() -> Result<()> {
     println!("\n5. Checking btrfs mount...");
     let fstype = common::exec_in_vm(
         fcvm_pid,
-        &["findmnt", "-n", "-o", "FSTYPE", "/var/lib/containers/storage"],
+        &[
+            "findmnt",
+            "-n",
+            "-o",
+            "FSTYPE",
+            "/var/lib/containers/storage",
+        ],
     )
     .await
     .context("checking btrfs mount")?;
@@ -124,12 +130,9 @@ async fn test_localhost_rootless_btrfs_storage() -> Result<()> {
 
     // Step 6: Verify container ran (check podman ps -a for our container)
     println!("\n6. Checking container execution...");
-    let ps_output = common::exec_in_vm(
-        fcvm_pid,
-        &["podman", "ps", "-a", "--format", "{{.Names}}"],
-    )
-    .await
-    .context("checking container status")?;
+    let ps_output = common::exec_in_vm(fcvm_pid, &["podman", "ps", "-a", "--format", "{{.Names}}"])
+        .await
+        .context("checking container status")?;
     println!("  Container names: {}", ps_output.trim());
     assert!(
         ps_output.contains("fcvm-container"),
@@ -252,7 +255,13 @@ async fn test_localhost_rootless_btrfs_keepid() -> Result<()> {
     println!("\n5. Checking btrfs mount...");
     let fstype = common::exec_in_vm(
         fcvm_pid,
-        &["findmnt", "-n", "-o", "FSTYPE", "/var/lib/containers/storage"],
+        &[
+            "findmnt",
+            "-n",
+            "-o",
+            "FSTYPE",
+            "/var/lib/containers/storage",
+        ],
     )
     .await
     .context("checking btrfs mount")?;
