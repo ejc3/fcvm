@@ -15,6 +15,23 @@ fn cleanup_mount(path: &Path) {
     let _ = Command::new("umount").arg(path).status();
 }
 
+/// Get the total size of the filesystem containing `path` (e.g., "1.8T").
+/// Returns None if the size can't be determined.
+fn get_filesystem_size(path: &Path) -> Option<String> {
+    let output = Command::new("df")
+        .args(["--output=size", "-B1"])
+        .arg(path)
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // df output: header line then value line with size in bytes
+    let bytes: u64 = stdout.lines().nth(1)?.trim().parse().ok()?;
+    if bytes == 0 {
+        return None;
+    }
+    Some(format!("{}", bytes))
+}
+
 /// Check if a path is on a btrfs filesystem
 fn is_btrfs(path: &Path) -> bool {
     Command::new("stat")
@@ -147,16 +164,25 @@ pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
             std::fs::create_dir_all(parent).context("creating loopback image parent directory")?;
         }
 
+        // Size the sparse loopback to the full parent filesystem capacity.
+        // Since it's sparse, only written blocks use real space — so we can
+        // share the full disk capacity without reserving anything up front.
+        let loopback_size = if let Some(parent) = loopback_image.parent() {
+            get_filesystem_size(parent).unwrap_or_else(|| btrfs_size.clone())
+        } else {
+            btrfs_size.clone()
+        };
+
         info!(
-            "Creating {} loopback image at {}",
-            btrfs_size,
+            "Creating {} sparse loopback image at {}",
+            loopback_size,
             loopback_image.display()
         );
 
         // Create sparse file
         let status = Command::new("truncate")
             .arg("-s")
-            .arg(&btrfs_size)
+            .arg(&loopback_size)
             .arg(&loopback_image)
             .status()
             .context("executing truncate")?;
