@@ -415,7 +415,6 @@ _setup-fcvm:
 	sudo ./target/release/fcvm setup
 	sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels
 	sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels
-	sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels
 
 # SDK E2E test — requires computesdk package as sibling repo and Node.js
 test-serve-sdk: build
