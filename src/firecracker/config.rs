@@ -315,6 +315,8 @@ impl FirecrackerConfig {
                     "image_storage_device": runtime.image_storage_device,
                     "privileged": self.privileged,
                     "user": self.user.as_deref(),
+                    "subuid_start": runtime.subuid_start,
+                    "subuid_count": runtime.subuid_count,
                     "forward_localhost": self.forward_localhost.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
                     "interactive": self.interactive,
                     "tty": self.tty,
@@ -347,6 +349,10 @@ pub struct MmdsRuntime {
     pub https_proxy: Option<String>,
     /// NO_PROXY value from environment
     pub no_proxy: Option<String>,
+    /// Host user's subordinate UID range start (from /etc/subuid)
+    pub subuid_start: Option<u64>,
+    /// Host user's subordinate UID range count
+    pub subuid_count: Option<u64>,
     /// Host timestamp (UTC epoch seconds)
     pub host_time: String,
 }

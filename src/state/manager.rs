@@ -257,9 +257,30 @@ impl StateManager {
     /// Load VM state by name
     pub async fn load_state_by_name(&self, name: &str) -> Result<VmState> {
         let vms = self.list_vms().await?;
-        vms.into_iter()
-            .find(|vm| vm.name.as_deref() == Some(name))
-            .ok_or_else(|| anyhow::anyhow!("VM not found: {}", name))
+        let matches: Vec<_> = vms
+            .into_iter()
+            .filter(|vm| vm.name.as_deref() == Some(name))
+            .collect();
+        match matches.len() {
+            0 => anyhow::bail!("VM not found: {}", name),
+            1 => Ok(matches.into_iter().next().unwrap()),
+            n => {
+                let pids: Vec<String> = matches
+                    .iter()
+                    .map(|vm| {
+                        vm.pid
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "none".to_string())
+                    })
+                    .collect();
+                anyhow::bail!(
+                    "Multiple VMs named '{}' ({}). Use --pid to specify: {}",
+                    name,
+                    n,
+                    pids.join(", ")
+                )
+            }
+        }
     }
 
     /// Load VM state by PID
