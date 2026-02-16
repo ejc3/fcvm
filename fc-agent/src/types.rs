@@ -13,10 +13,12 @@ pub struct Plan {
     pub extra_disks: Vec<ExtraDiskMount>,
     #[serde(default)]
     pub nfs_mounts: Vec<NfsMount>,
+    /// Device path for localhost image (e.g., "/dev/vdb")
     #[serde(default)]
-    pub image_archive: Option<String>,
+    pub image_device: Option<String>,
+    /// Image delivery mode: "overlay", "btrfs", or "archive"
     #[serde(default)]
-    pub image_storage_device: Option<String>,
+    pub image_mode: Option<String>,
     #[serde(default)]
     pub user: Option<String>,
     #[serde(default)]
@@ -139,15 +141,40 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_with_storage_device() {
+    fn test_plan_with_overlay_image() {
         let json = r#"{
             "image": "localhost/myapp",
-            "image_storage_device": "/dev/vdb"
+            "image_device": "/dev/vdb",
+            "image_mode": "overlay"
         }"#;
         let plan: Plan = serde_json::from_str(json).unwrap();
         assert_eq!(plan.image, "localhost/myapp");
-        assert_eq!(plan.image_storage_device.as_deref(), Some("/dev/vdb"));
-        assert!(plan.image_archive.is_none());
+        assert_eq!(plan.image_device.as_deref(), Some("/dev/vdb"));
+        assert_eq!(plan.image_mode.as_deref(), Some("overlay"));
+    }
+
+    #[test]
+    fn test_plan_with_btrfs_image() {
+        let json = r#"{
+            "image": "localhost/myapp",
+            "image_device": "/dev/vdb",
+            "image_mode": "btrfs"
+        }"#;
+        let plan: Plan = serde_json::from_str(json).unwrap();
+        assert_eq!(plan.image_device.as_deref(), Some("/dev/vdb"));
+        assert_eq!(plan.image_mode.as_deref(), Some("btrfs"));
+    }
+
+    #[test]
+    fn test_plan_with_archive_image() {
+        let json = r#"{
+            "image": "localhost/myapp",
+            "image_device": "/dev/vdb",
+            "image_mode": "archive"
+        }"#;
+        let plan: Plan = serde_json::from_str(json).unwrap();
+        assert_eq!(plan.image_device.as_deref(), Some("/dev/vdb"));
+        assert_eq!(plan.image_mode.as_deref(), Some("archive"));
     }
 
     #[test]

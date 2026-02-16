@@ -11,36 +11,25 @@ use crate::output::OutputHandle;
 use crate::types::Plan;
 use crate::vsock;
 
-/// Mount a pre-built podman storage image and configure as additionalImageStore.
+/// Mount a pre-built overlay storage image and configure as additionalImageStore.
 ///
 /// The storage image is an ext4 filesystem containing a podman overlay storage tree
 /// (overlay/, overlay-images/, overlay-layers/). It is mounted read-only and podman
 /// finds the image there without needing `podman load`.
-pub fn mount_storage_image(
+pub fn mount_overlay_image(
     device: &str,
     image_name: &str,
     username: Option<&str>,
 ) -> Result<String> {
-    eprintln!("[fc-agent] mounting pre-built storage image: {}", device);
+    eprintln!(
+        "[fc-agent] mounting overlay storage image: {}",
+        device
+    );
 
     let mount_path = "/mnt/image-store";
     std::fs::create_dir_all(mount_path).context("creating image store mount point")?;
 
-    // Wait for device to appear
-    let device_path = std::path::Path::new(device);
-    for attempt in 1..=10 {
-        if device_path.exists() {
-            break;
-        }
-        if attempt == 10 {
-            anyhow::bail!("Device {} not found after 10 attempts", device);
-        }
-        eprintln!(
-            "[fc-agent] waiting for device {} (attempt {}/10)",
-            device, attempt
-        );
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
+    wait_for_device(device)?;
 
     // Mount read-only
     let output = std::process::Command::new("mount")
@@ -51,7 +40,7 @@ pub fn mount_storage_image(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
-            "Failed to mount storage image {} at {}: {}",
+            "Failed to mount overlay storage image {} at {}: {}",
             device,
             mount_path,
             stderr
@@ -59,10 +48,98 @@ pub fn mount_storage_image(
     }
 
     // Configure podman to use this as an additional image store.
-    // For rootless podman (--user mode), write to the user's config dir.
-    // For root podman, write to /etc/containers/.
-    let (conf_path, runroot, graphroot) = if let Some(name) = username {
-        // Rootless: user's home directory config
+    let (conf_path, runroot, graphroot) = storage_paths(username);
+
+    let storage_conf = format!(
+        "[storage]\ndriver = \"overlay\"\nrunroot = \"{runroot}\"\ngraphroot = \"{graphroot}\"\n\n[storage.options]\nadditionalimagestores = [\"{mount_path}\"]\n"
+    );
+    std::fs::write(&conf_path, &storage_conf).context("writing storage.conf")?;
+
+    eprintln!(
+        "[fc-agent] overlay image mounted at {}, configured as additional image store (conf: {})",
+        mount_path, conf_path
+    );
+
+    Ok(image_name.to_string())
+}
+
+/// Mount a pre-built btrfs storage image directly as the podman graphroot.
+///
+/// The btrfs image contains real btrfs subvolumes with podman's storage tree.
+/// It is mounted read-write at `/var/lib/containers/storage` so podman uses it
+/// as the primary graphroot — no podman load or import needed.
+///
+/// When `setup_btrfs_storage_if_available()` runs later, it detects btrfs is already
+/// mounted at this path and skips loopback creation.
+pub fn mount_btrfs_image(
+    device: &str,
+    image_name: &str,
+    username: Option<&str>,
+) -> Result<String> {
+    eprintln!(
+        "[fc-agent] mounting btrfs storage image: {}",
+        device
+    );
+
+    let mount_path = "/var/lib/containers/storage";
+    std::fs::create_dir_all(mount_path).context("creating graphroot mount point")?;
+
+    wait_for_device(device)?;
+
+    // Mount read-write (podman needs to create container subvolumes)
+    let output = std::process::Command::new("mount")
+        .args(["-t", "btrfs", device, mount_path])
+        .output()
+        .context("mounting btrfs storage image")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to mount btrfs storage image {} at {}: {}",
+            device,
+            mount_path,
+            stderr
+        );
+    }
+
+    // Configure podman to use btrfs driver with this graphroot.
+    let (conf_path, runroot, _graphroot) = storage_paths(username);
+
+    let storage_conf = format!(
+        "[storage]\ndriver = \"btrfs\"\nrunroot = \"{runroot}\"\ngraphroot = \"{mount_path}\"\n"
+    );
+    std::fs::write(&conf_path, &storage_conf).context("writing storage.conf")?;
+
+    eprintln!(
+        "[fc-agent] btrfs image mounted at {}, configured as graphroot (conf: {})",
+        mount_path, conf_path
+    );
+
+    Ok(image_name.to_string())
+}
+
+/// Wait for a block device to appear (up to 5 seconds).
+fn wait_for_device(device: &str) -> Result<()> {
+    let device_path = std::path::Path::new(device);
+    for attempt in 1..=10 {
+        if device_path.exists() {
+            return Ok(());
+        }
+        if attempt == 10 {
+            anyhow::bail!("Device {} not found after 10 attempts", device);
+        }
+        eprintln!(
+            "[fc-agent] waiting for device {} (attempt {}/10)",
+            device, attempt
+        );
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Ok(())
+}
+
+/// Get storage.conf path, runroot, and graphroot for the given user.
+fn storage_paths(username: Option<&str>) -> (String, String, String) {
+    if let Some(name) = username {
         let home = format!("/home/{}", name);
         let config_dir = format!("{}/.config", home);
         let conf_dir = format!("{}/containers", config_dir);
@@ -90,108 +167,7 @@ pub fn mount_storage_image(
             "/run/containers/storage".to_string(),
             "/var/lib/containers/storage".to_string(),
         )
-    };
-
-    // Detect if btrfs storage was already configured (by setup_btrfs_storage_if_available).
-    // Check the ROOT storage path — for rootless users, setup_user_btrfs_storage() creates
-    // subdirs under the root btrfs mount, but the per-user graphroot uses a different path.
-    let is_btrfs = std::process::Command::new("findmnt")
-        .args(["-n", "-o", "FSTYPE", "/var/lib/containers/storage"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "btrfs")
-        .unwrap_or(false);
-
-    if is_btrfs {
-        // btrfs driver doesn't support overlay-format additionalimagestores.
-        // For rootless users, setup_user_btrfs_storage() already wrote the correct
-        // storage.conf — don't overwrite it. For root, write a minimal btrfs config.
-        if username.is_none() {
-            let storage_conf = format!(
-                "[storage]\ndriver = \"btrfs\"\nrunroot = \"{runroot}\"\ngraphroot = \"{graphroot}\"\n"
-            );
-            std::fs::write(&conf_path, &storage_conf).context("writing storage.conf")?;
-        }
-
-        eprintln!(
-            "[fc-agent] btrfs driver: importing image from overlay store at {}",
-            mount_path
-        );
-
-        // Save the image from the overlay store to a tar archive
-        let save_output = std::process::Command::new("podman")
-            .args([
-                "--root",
-                mount_path,
-                "--storage-driver",
-                "overlay",
-                "save",
-                "-o",
-                "/tmp/image-import.tar",
-                image_name,
-            ])
-            .output()
-            .context("running podman save from overlay store")?;
-
-        if !save_output.status.success() {
-            let stderr = String::from_utf8_lossy(&save_output.stderr);
-            anyhow::bail!("podman save from overlay store failed: {}", stderr);
-        }
-
-        // Load the image into the btrfs store.
-        // For rootless users, use runuser so podman reads the user's storage.conf.
-        let load_output = if let Some(name) = username {
-            let uid_str = nix::unistd::User::from_name(name)
-                .ok()
-                .flatten()
-                .map(|u| u.uid.as_raw().to_string())
-                .unwrap_or_default();
-            std::process::Command::new("env")
-                .args([
-                    &format!("XDG_RUNTIME_DIR=/run/user/{}", uid_str),
-                    "runuser",
-                    "-u",
-                    name,
-                    "--",
-                    "podman",
-                    "load",
-                    "-i",
-                    "/tmp/image-import.tar",
-                ])
-                .output()
-                .context("running podman load as user into btrfs store")?
-        } else {
-            std::process::Command::new("podman")
-                .args(["load", "-i", "/tmp/image-import.tar"])
-                .output()
-                .context("running podman load into btrfs store")?
-        };
-
-        if !load_output.status.success() {
-            let stderr = String::from_utf8_lossy(&load_output.stderr);
-            anyhow::bail!("podman load into btrfs store failed: {}", stderr);
-        }
-
-        // Clean up temp archive
-        let _ = std::fs::remove_file("/tmp/image-import.tar");
-
-        eprintln!(
-            "[fc-agent] image imported into btrfs store: {}",
-            String::from_utf8_lossy(&load_output.stdout).trim()
-        );
-    } else {
-        // overlay driver: use additionalimagestores for instant image access
-        let storage_conf = format!(
-            "[storage]\ndriver = \"overlay\"\nrunroot = \"{runroot}\"\ngraphroot = \"{graphroot}\"\n\n[storage.options]\nadditionalimagestores = [\"{mount_path}\"]\n"
-        );
-        std::fs::write(&conf_path, &storage_conf).context("writing storage.conf")?;
-
-        eprintln!(
-            "[fc-agent] storage image mounted at {}, configured as additional image store (conf: {})",
-            mount_path, conf_path
-        );
     }
-
-    Ok(image_name.to_string())
 }
 
 /// Global command prefix for running podman commands as the target user.

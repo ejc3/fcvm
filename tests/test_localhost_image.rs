@@ -1,8 +1,9 @@
 //! Integration test for localhost/ container images
 //!
-//! Tests both import paths:
-//! - Default (direct mount): Pre-built podman storage mounted as additionalImageStore
-//! - Legacy (--no-direct-image-mount): Docker archive imported via podman load
+//! Tests all three image delivery modes:
+//! - Overlay (default): Pre-built overlay storage mounted as additionalImageStore
+//! - Archive: Docker archive imported via podman load at boot
+//! - Btrfs: Pre-built btrfs image mounted as graphroot (requires btrfs kernel)
 
 #![cfg(feature = "integration-fast")]
 
@@ -13,35 +14,38 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-/// Test with default direct image mount path
+/// Test with overlay mode (default, additionalImageStore)
 #[tokio::test]
-async fn test_localhost_hello_world() -> Result<()> {
-    run_localhost_test(false).await
+async fn test_localhost_overlay_mode() -> Result<()> {
+    run_localhost_test(Some("overlay"), "localhost-overlay").await
 }
 
-/// Test with legacy podman load path (--no-direct-image-mount)
+/// Test with archive mode (podman load at boot)
 #[tokio::test]
-async fn test_localhost_hello_world_legacy_import() -> Result<()> {
-    run_localhost_test(true).await
+async fn test_localhost_archive_mode() -> Result<()> {
+    run_localhost_test(Some("archive"), "localhost-archive").await
 }
 
-async fn run_localhost_test(no_direct_image_mount: bool) -> Result<()> {
-    let mode = if no_direct_image_mount {
-        "legacy (podman load)"
-    } else {
-        "direct mount (additionalImageStore)"
-    };
+/// Test with btrfs mode (pre-built btrfs image as graphroot)
+#[tokio::test]
+async fn test_localhost_btrfs_mode() -> Result<()> {
+    run_localhost_test(Some("btrfs"), "localhost-btrfs").await
+}
 
-    println!("\nLocalhost Image Test ({})", mode);
+/// Test with default mode (auto-detect, should be overlay without btrfs kernel)
+#[tokio::test]
+async fn test_localhost_default_mode() -> Result<()> {
+    run_localhost_test(None, "localhost-default").await
+}
+
+async fn run_localhost_test(image_mode: Option<&str>, suffix: &str) -> Result<()> {
+    let mode_label = image_mode.unwrap_or("default (auto-detect)");
+
+    println!("\nLocalhost Image Test ({})", mode_label);
     println!("====================");
 
     // Find fcvm binary
     let fcvm_path = common::find_fcvm_binary()?;
-    let suffix = if no_direct_image_mount {
-        "localhost-legacy"
-    } else {
-        "localhost-direct"
-    };
     let (vm_name, _, _, _) = common::unique_names(suffix);
 
     // Step 1: Build a test container image on the host
@@ -51,11 +55,12 @@ async fn run_localhost_test(no_direct_image_mount: bool) -> Result<()> {
     // Step 2: Start VM with localhost image (rootless mode)
     println!(
         "Step 2: Starting VM with localhost/test-hello image ({})...",
-        mode
+        mode_label
     );
     let mut args = vec!["podman", "run", "--name", &vm_name];
-    if no_direct_image_mount {
-        args.push("--no-direct-image-mount");
+    if let Some(mode) = image_mode {
+        args.push("--image-mode");
+        args.push(mode);
     }
     args.push("localhost/test-hello");
 
@@ -136,17 +141,17 @@ async fn run_localhost_test(no_direct_image_mount: bool) -> Result<()> {
 
     // Check results - verify we got the container output
     if found_hello {
-        println!("\n  LOCALHOST IMAGE TEST PASSED! ({})", mode);
+        println!("\n  LOCALHOST IMAGE TEST PASSED! ({})", mode_label);
         println!("  - Container ran and printed: Hello from localhost container!");
         if container_exited_zero {
             println!("  - Container exited with code 0");
         }
         Ok(())
     } else {
-        println!("\n  LOCALHOST IMAGE TEST FAILED! ({})", mode);
+        println!("\n  LOCALHOST IMAGE TEST FAILED! ({})", mode_label);
         println!("  - Did not find expected output: 'Hello from localhost container!'");
         println!("  - Check logs above for error details");
-        anyhow::bail!("Localhost image test failed ({})", mode)
+        anyhow::bail!("Localhost image test failed ({})", mode_label)
     }
 }
 

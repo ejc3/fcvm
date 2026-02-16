@@ -253,11 +253,11 @@ pub struct RunArgs {
     #[arg(long)]
     pub no_snapshot: bool,
 
-    /// Disable direct image mount and fall back to podman load for localhost images.
-    /// By default, fcvm pre-builds podman overlay storage on the host and mounts it
-    /// read-only in the guest, bypassing podman load for faster container startup.
-    #[arg(long)]
-    pub no_direct_image_mount: bool,
+    /// Image delivery mode for localhost images (default: auto-detect from kernel profile).
+    /// overlay: pre-built overlay storage (instant), btrfs: pre-built btrfs image (instant),
+    /// archive: docker archive via podman load (slow).
+    #[arg(long, value_enum)]
+    pub image_mode: Option<ImageMode>,
 
     /// Container image (e.g., nginx:alpine or localhost/myimage)
     pub image: String,
@@ -465,6 +465,20 @@ pub enum NetworkMode {
     Bridged,
     /// True rootless networking using slirp4netns (no sudo required)
     Rootless,
+}
+
+/// Image delivery mode for localhost container images.
+///
+/// Controls how pre-built container images are delivered to the guest VM.
+/// Auto-detected from kernel profile if not specified.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
+pub enum ImageMode {
+    /// Pre-built overlay storage image mounted as additionalImageStore (read-only, instant)
+    Overlay,
+    /// Pre-built btrfs storage image with real subvolumes, reflink-copied as graphroot (read-write, instant)
+    Btrfs,
+    /// Docker archive loaded via podman at boot (slow, works with any storage driver)
+    Archive,
 }
 
 // ============================================================================

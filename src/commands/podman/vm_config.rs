@@ -319,6 +319,7 @@ pub(super) async fn attach_extra_disks(
     client: &crate::firecracker::FirecrackerClient,
     data_dir: &std::path::Path,
     image_disk_path: Option<&std::path::Path>,
+    image_disk_read_only: bool,
 ) -> Result<(Vec<crate::state::types::ExtraDisk>, Option<String>)> {
     let mut extra_disks = Vec::new();
 
@@ -467,17 +468,17 @@ pub(super) async fn attach_extra_disks(
             .await?;
     }
 
-    // Attach image archive as a raw read-only block device.
-    // fc-agent reads docker-archive:/dev/vdX directly -- no FUSE, no mount.
+    // Attach image disk as a block device.
     let image_device = if let Some(disk_path) = image_disk_path {
         let disk_idx = args.disk.len() + args.disk_dir.len();
         let drive_id = format!("disk{}", disk_idx);
         let device = format!("/dev/vd{}", (b'b' + disk_idx as u8) as char);
 
         info!(
-            "Attaching image archive as block device: {} -> {}",
+            "Attaching image disk as block device: {} -> {} (read_only={})",
             disk_path.display(),
             device,
+            image_disk_read_only,
         );
         client
             .add_drive(
@@ -486,7 +487,7 @@ pub(super) async fn attach_extra_disks(
                     drive_id: drive_id.clone(),
                     path_on_host: disk_path.display().to_string(),
                     is_root_device: false,
-                    is_read_only: true,
+                    is_read_only: image_disk_read_only,
                     partuuid: None,
                     rate_limiter: None,
                 },
@@ -511,7 +512,6 @@ pub(super) async fn build_and_send_mmds(
     vm_state: &VmState,
     volume_mappings: &[VolumeMapping],
     image_device: Option<String>,
-    no_direct_image_mount: bool,
 ) -> Result<()> {
     // Build volume mount info for MMDS
     // Format: { guest_path, vsock_port, read_only }
@@ -585,16 +585,7 @@ pub(super) async fn build_and_send_mmds(
         volumes,
         extra_disks,
         nfs_mounts,
-        image_archive: if no_direct_image_mount {
-            image_device.clone()
-        } else {
-            None
-        },
-        image_storage_device: if !no_direct_image_mount {
-            image_device
-        } else {
-            None
-        },
+        image_device,
         http_proxy,
         https_proxy,
         no_proxy,
@@ -731,12 +722,12 @@ pub(super) async fn run_vm_setup(
         .context("creating CoW disk")?;
 
     // Estimate space needed for container image extraction inside VM.
-    // When using direct image mount (storage image), layers live on a separate read-only
-    // block device and are NOT extracted onto the rootfs, so no extra space is needed.
-    // When using legacy podman load, the archive is extracted onto the rootfs.
-    // podman load extracts layers to /var/tmp first, then copies to overlay storage,
+    // Overlay and btrfs modes use separate block devices — no rootfs impact.
+    // Archive mode extracts layers onto the rootfs via podman load.
+    // podman load extracts layers to /var/tmp first, then copies to storage,
     // so we need ~3x the archive size for safety margin.
-    let image_overhead = if args.no_direct_image_mount {
+    let resolved_mode = super::resolve_image_mode(args, runtime_config);
+    let image_overhead = if resolved_mode == crate::firecracker::ImageMode::Archive {
         if let Some(disk_path) = image_disk_path {
             match tokio::fs::metadata(disk_path).await {
                 Ok(meta) => meta.len() * 3,
@@ -833,6 +824,7 @@ pub(super) async fn run_vm_setup(
             // Collect env vars and volume mounts for cache key
             let env_vars: Vec<String> = args.env.to_vec();
             let volume_mounts: Vec<String> = args.map.to_vec();
+            let image_mode = super::resolve_image_mode(args, runtime_config);
 
             crate::firecracker::FirecrackerConfig::new(
                 kernel_path.to_path_buf(),
@@ -855,6 +847,7 @@ pub(super) async fn run_vm_setup(
                 args.hugepages,
                 args.user.clone(),
                 args.forward_localhost.clone(),
+                image_mode,
             )
         });
 
@@ -864,9 +857,12 @@ pub(super) async fn run_vm_setup(
         .apply(client, &runtime_boot_args, track_dirty_pages)
         .await?;
 
-    // Attach extra disks and image archive
+    // Attach extra disks and image disk.
+    // Btrfs mode needs read-write (podman creates new subvolumes in graphroot).
+    // Overlay and archive modes are read-only.
+    let image_disk_read_only = launch_config.image_mode != crate::firecracker::ImageMode::Btrfs;
     let (extra_disks, image_device) =
-        attach_extra_disks(args, client, data_dir, image_disk_path).await?;
+        attach_extra_disks(args, client, data_dir, image_disk_path, image_disk_read_only).await?;
     vm_state.config.extra_disks = extra_disks;
 
     // Process --nfs: export directories via NFS for guest to mount
@@ -987,7 +983,6 @@ pub(super) async fn run_vm_setup(
         vm_state,
         volume_mappings,
         image_device,
-        args.no_direct_image_mount,
     )
     .await?;
 
