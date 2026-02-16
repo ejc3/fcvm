@@ -98,14 +98,14 @@ pub fn setup_btrfs_storage_if_available() {
     let storage_dir = "/var/lib/containers/storage";
     let loopback_path = "/var/lib/containers/btrfs.img";
 
-    // Skip if already mounted
-    let already_mounted = std::process::Command::new("findmnt")
+    // Skip if already mounted as btrfs
+    let already_btrfs = std::process::Command::new("findmnt")
         .args(["-n", "-o", "FSTYPE", storage_dir])
         .output()
-        .map(|o| !o.stdout.is_empty())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "btrfs")
         .unwrap_or(false);
 
-    if already_mounted {
+    if already_btrfs {
         eprintln!(
             "[fc-agent] btrfs storage already mounted at {}",
             storage_dir

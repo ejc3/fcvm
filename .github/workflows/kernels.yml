@@ -237,8 +237,8 @@ jobs:
         id: kernel
         working-directory: fcvm
         run: |
-          # SHA is computed from build_inputs: kernel/default.conf only (no patches)
-          SHA=$(cat kernel/default.conf | sha256sum | cut -c1-12)
+          # SHA is computed from build_inputs: kernel/btrfs.conf only (no patches)
+          SHA=$(cat kernel/btrfs.conf | sha256sum | cut -c1-12)
 
           VERSION="6.18.3"
           ARCH=$(uname -m)
