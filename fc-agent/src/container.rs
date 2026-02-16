@@ -54,29 +54,80 @@ pub fn mount_storage_image(device: &str, image_name: &str) -> Result<String> {
         );
     }
 
-    // Configure podman to use this as an additional image store.
     // Detect if btrfs storage was already configured (by setup_btrfs_storage_if_available).
-    // If so, preserve the btrfs driver — overwriting with overlay would undo the btrfs setup.
     let graphroot = "/var/lib/containers/storage";
-    let driver = if std::process::Command::new("findmnt")
+    let is_btrfs = std::process::Command::new("findmnt")
         .args(["-n", "-o", "FSTYPE", graphroot])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "btrfs")
-        .unwrap_or(false)
-    {
-        "btrfs"
-    } else {
-        "overlay"
-    };
-    let storage_conf = format!(
-        "[storage]\ndriver = \"{driver}\"\nrunroot = \"/run/containers/storage\"\ngraphroot = \"{graphroot}\"\n\n[storage.options]\nadditionalimagestores = [\"{mount_path}\"]\n"
-    );
-    std::fs::write("/etc/containers/storage.conf", storage_conf).context("writing storage.conf")?;
+        .unwrap_or(false);
 
-    eprintln!(
-        "[fc-agent] storage image mounted at {}, configured as additional image store",
-        mount_path
-    );
+    if is_btrfs {
+        // btrfs driver doesn't support overlay-format additionalimagestores.
+        // Import the image from the mounted overlay store into btrfs via save/load.
+        let storage_conf = format!(
+            "[storage]\ndriver = \"btrfs\"\nrunroot = \"/run/containers/storage\"\ngraphroot = \"{graphroot}\"\n"
+        );
+        std::fs::write("/etc/containers/storage.conf", storage_conf)
+            .context("writing storage.conf")?;
+
+        eprintln!(
+            "[fc-agent] btrfs driver: importing image from overlay store at {}",
+            mount_path
+        );
+
+        // Save the image from the overlay store to a tar archive
+        let save_output = std::process::Command::new("podman")
+            .args([
+                "--root",
+                mount_path,
+                "--storage-driver",
+                "overlay",
+                "save",
+                "-o",
+                "/tmp/image-import.tar",
+                image_name,
+            ])
+            .output()
+            .context("running podman save from overlay store")?;
+
+        if !save_output.status.success() {
+            let stderr = String::from_utf8_lossy(&save_output.stderr);
+            anyhow::bail!("podman save from overlay store failed: {}", stderr);
+        }
+
+        // Load the image into the btrfs store
+        let load_output = std::process::Command::new("podman")
+            .args(["load", "-i", "/tmp/image-import.tar"])
+            .output()
+            .context("running podman load into btrfs store")?;
+
+        if !load_output.status.success() {
+            let stderr = String::from_utf8_lossy(&load_output.stderr);
+            anyhow::bail!("podman load into btrfs store failed: {}", stderr);
+        }
+
+        // Clean up temp archive
+        let _ = std::fs::remove_file("/tmp/image-import.tar");
+
+        eprintln!(
+            "[fc-agent] image imported into btrfs store: {}",
+            String::from_utf8_lossy(&load_output.stdout).trim()
+        );
+    } else {
+        // overlay driver: use additionalimagestores for instant image access
+        let storage_conf = format!(
+            "[storage]\ndriver = \"overlay\"\nrunroot = \"/run/containers/storage\"\ngraphroot = \"{graphroot}\"\n\n[storage.options]\nadditionalimagestores = [\"{mount_path}\"]\n"
+        );
+        std::fs::write("/etc/containers/storage.conf", storage_conf)
+            .context("writing storage.conf")?;
+
+        eprintln!(
+            "[fc-agent] storage image mounted at {}, configured as additional image store",
+            mount_path
+        );
+    }
+
     Ok(image_name.to_string())
 }
 
@@ -95,8 +146,26 @@ pub fn podman_cmd_prefix() -> &'static [String] {
     PODMAN_CMD_PREFIX.get().map(|v| v.as_slice()).unwrap_or(&[])
 }
 
+/// Get the total size of the filesystem containing `path` in bytes.
+fn get_filesystem_size_bytes(path: &str) -> Option<u64> {
+    let output = std::process::Command::new("df")
+        .args(["--output=size", "-B1", path])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // df output: header line then value line with size in bytes
+    stdout
+        .lines()
+        .nth(1)?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|&b: &u64| b > 0)
+}
+
 /// Set up btrfs storage if the kernel supports it.
-/// Creates an 8G sparse loopback btrfs filesystem and configures podman to use it.
+/// Creates a sparse loopback btrfs filesystem sized to the root disk capacity
+/// and configures podman to use it.
 /// This avoids overlay's idmap issues that cause expensive chown-copy on rootless podman.
 pub fn setup_btrfs_storage_if_available() {
     // Check if kernel has btrfs support via /proc/filesystems.
@@ -128,10 +197,15 @@ pub fn setup_btrfs_storage_if_available() {
         return;
     }
 
-    // Create sparse 8G loopback file
+    // Size the sparse loopback to the root filesystem capacity.
+    // Since it's sparse, only written blocks use real space — share full disk capacity.
+    let loopback_size = get_filesystem_size_bytes("/")
+        .map(|b| b.to_string())
+        .unwrap_or_else(|| "8G".to_string());
+
     let _ = std::fs::create_dir_all(storage_dir);
     let truncate = std::process::Command::new("truncate")
-        .args(["-s", "8G", loopback_path])
+        .args(["-s", &loopback_size, loopback_path])
         .output();
     match truncate {
         Ok(o) if o.status.success() => {}
@@ -186,16 +260,20 @@ pub fn setup_btrfs_storage_if_available() {
         }
     }
 
-    // Write storage.conf for root podman
-    let storage_conf = "[storage]\ndriver = \"btrfs\"\n";
+    // Write storage.conf for root podman with explicit paths.
+    // runroot is required by podman when driver is set explicitly.
+    let storage_conf = format!(
+        "[storage]\ndriver = \"btrfs\"\nrunroot = \"/run/containers/storage\"\ngraphroot = \"{}\"\n",
+        storage_dir
+    );
     let _ = std::fs::create_dir_all("/etc/containers");
     if let Err(e) = std::fs::write("/etc/containers/storage.conf", storage_conf) {
         eprintln!("[fc-agent] WARNING: failed to write storage.conf: {}", e);
     }
 
     eprintln!(
-        "[fc-agent] btrfs storage configured at {} (8G sparse loopback)",
-        storage_dir
+        "[fc-agent] btrfs storage configured at {} ({} sparse loopback)",
+        storage_dir, loopback_size
     );
 }
 
