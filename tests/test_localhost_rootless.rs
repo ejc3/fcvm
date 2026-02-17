@@ -196,13 +196,15 @@ async fn test_localhost_rootless_btrfs_snapshot_restore() -> Result<()> {
         println!("  First run: VM is healthy");
 
         // Verify container runs
-        let vm_username = common::exec_in_vm(
-            fcvm_pid,
-            &["getent", "passwd", "1000"],
-        )
-        .await
-        .context("resolving UID 1000 username")?;
-        let vm_username = vm_username.trim().split(':').next().unwrap_or("ubuntu").to_string();
+        let vm_username = common::exec_in_vm(fcvm_pid, &["getent", "passwd", "1000"])
+            .await
+            .context("resolving UID 1000 username")?;
+        let vm_username = vm_username
+            .trim()
+            .split(':')
+            .next()
+            .unwrap_or("ubuntu")
+            .to_string();
 
         // Wait for container to appear
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
@@ -212,8 +214,20 @@ async fn test_localhost_rootless_btrfs_snapshot_restore() -> Result<()> {
             }
             if let Ok(ps) = common::exec_in_vm(
                 fcvm_pid,
-                &["runuser", "-u", &vm_username, "--", "podman", "ps", "-a", "--format", "{{.Names}}"],
-            ).await {
+                &[
+                    "runuser",
+                    "-u",
+                    &vm_username,
+                    "--",
+                    "podman",
+                    "ps",
+                    "-a",
+                    "--format",
+                    "{{.Names}}",
+                ],
+            )
+            .await
+            {
                 if ps.contains("fcvm-container") {
                     println!("  First run: container is running as {}", vm_username);
                     break;
@@ -252,13 +266,15 @@ async fn test_localhost_rootless_btrfs_snapshot_restore() -> Result<()> {
         println!("  Second run: VM is healthy (restored from snapshot!)");
 
         // Verify btrfs storage driver
-        let vm_username = common::exec_in_vm(
-            fcvm_pid,
-            &["getent", "passwd", "1000"],
-        )
-        .await
-        .context("resolving UID 1000 username")?;
-        let vm_username = vm_username.trim().split(':').next().unwrap_or("ubuntu").to_string();
+        let vm_username = common::exec_in_vm(fcvm_pid, &["getent", "passwd", "1000"])
+            .await
+            .context("resolving UID 1000 username")?;
+        let vm_username = vm_username
+            .trim()
+            .split(':')
+            .next()
+            .unwrap_or("ubuntu")
+            .to_string();
 
         // Wait for container
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
@@ -268,8 +284,20 @@ async fn test_localhost_rootless_btrfs_snapshot_restore() -> Result<()> {
             }
             if let Ok(ps) = common::exec_in_vm(
                 fcvm_pid,
-                &["runuser", "-u", &vm_username, "--", "podman", "ps", "-a", "--format", "{{.Names}}"],
-            ).await {
+                &[
+                    "runuser",
+                    "-u",
+                    &vm_username,
+                    "--",
+                    "podman",
+                    "ps",
+                    "-a",
+                    "--format",
+                    "{{.Names}}",
+                ],
+            )
+            .await
+            {
                 if ps.contains("fcvm-container") {
                     println!("  Second run: container is running as {}", vm_username);
                     break;
@@ -281,11 +309,26 @@ async fn test_localhost_rootless_btrfs_snapshot_restore() -> Result<()> {
         // Verify btrfs driver in restored VM
         let driver = common::exec_in_vm(
             fcvm_pid,
-            &["runuser", "-u", &vm_username, "--", "podman", "info", "--format", "{{.Store.GraphDriverName}}"],
-        ).await.context("checking storage driver")?;
+            &[
+                "runuser",
+                "-u",
+                &vm_username,
+                "--",
+                "podman",
+                "info",
+                "--format",
+                "{{.Store.GraphDriverName}}",
+            ],
+        )
+        .await
+        .context("checking storage driver")?;
         let driver = driver.trim();
         println!("  GraphDriverName: {}", driver);
-        assert_eq!(driver, "btrfs", "Expected btrfs after snapshot restore, got: {}", driver);
+        assert_eq!(
+            driver, "btrfs",
+            "Expected btrfs after snapshot restore, got: {}",
+            driver
+        );
 
         common::kill_process(fcvm_pid).await;
     }
@@ -346,13 +389,15 @@ async fn test_localhost_rootless_btrfs_keepid() -> Result<()> {
     println!("  VM is healthy");
 
     // Resolve the actual username for UID 1000 in the guest
-    let vm_username = common::exec_in_vm(
-        fcvm_pid,
-        &["getent", "passwd", "1000"],
-    )
-    .await
-    .context("resolving UID 1000 username")?;
-    let vm_username = vm_username.trim().split(':').next().unwrap_or("ubuntu").to_string();
+    let vm_username = common::exec_in_vm(fcvm_pid, &["getent", "passwd", "1000"])
+        .await
+        .context("resolving UID 1000 username")?;
+    let vm_username = vm_username
+        .trim()
+        .split(':')
+        .next()
+        .unwrap_or("ubuntu")
+        .to_string();
     println!("  VM user for UID 1000: {}", vm_username);
 
     // Step 4: Wait for container to start by polling rootless podman.
@@ -416,13 +461,7 @@ async fn test_localhost_rootless_btrfs_keepid() -> Result<()> {
     let user_graphroot = format!("/home/{}/.local/share/containers/storage", vm_username);
     let fstype = common::exec_in_vm(
         fcvm_pid,
-        &[
-            "findmnt",
-            "-n",
-            "-o",
-            "FSTYPE",
-            &user_graphroot,
-        ],
+        &["findmnt", "-n", "-o", "FSTYPE", &user_graphroot],
     )
     .await
     .context("checking btrfs mount")?;

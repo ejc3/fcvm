@@ -21,10 +21,7 @@ pub fn mount_overlay_image(
     image_name: &str,
     username: Option<&str>,
 ) -> Result<String> {
-    eprintln!(
-        "[fc-agent] mounting overlay storage image: {}",
-        device
-    );
+    eprintln!("[fc-agent] mounting overlay storage image: {}", device);
 
     let mount_path = "/mnt/image-store";
     std::fs::create_dir_all(mount_path).context("creating image store mount point")?;
@@ -194,11 +191,19 @@ fn clear_podman_database(graphroot: &str) {
         let path = graphroot_path.join(entry);
         if path.is_dir() {
             if let Err(e) = std::fs::remove_dir_all(&path) {
-                eprintln!("[fc-agent] WARNING: failed to remove {}: {}", path.display(), e);
+                eprintln!(
+                    "[fc-agent] WARNING: failed to remove {}: {}",
+                    path.display(),
+                    e
+                );
             }
         } else if path.is_file() {
             if let Err(e) = std::fs::remove_file(&path) {
-                eprintln!("[fc-agent] WARNING: failed to remove {}: {}", path.display(), e);
+                eprintln!(
+                    "[fc-agent] WARNING: failed to remove {}: {}",
+                    path.display(),
+                    e
+                );
             }
         }
     }
@@ -306,14 +311,19 @@ pub fn mount_btrfs_for_user(device: &str, username: &str) -> Result<()> {
 /// Write a btrfs storage.conf for root podman.
 pub fn write_btrfs_storage_conf(conf_path: &str, graphroot: &str, runroot: &str) {
     let _ = std::fs::create_dir_all(
-        std::path::Path::new(conf_path).parent().unwrap_or(std::path::Path::new("/etc/containers")),
+        std::path::Path::new(conf_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("/etc/containers")),
     );
     let storage_conf = format!(
         "[storage]\ndriver = \"btrfs\"\nrunroot = \"{}\"\ngraphroot = \"{}\"\n",
         runroot, graphroot
     );
     if let Err(e) = std::fs::write(conf_path, &storage_conf) {
-        eprintln!("[fc-agent] WARNING: failed to write storage.conf at {}: {}", conf_path, e);
+        eprintln!(
+            "[fc-agent] WARNING: failed to write storage.conf at {}: {}",
+            conf_path, e
+        );
     }
     let containers_conf = conf_path.replace("storage.conf", "containers.conf");
     write_containers_conf(&containers_conf);
@@ -367,7 +377,11 @@ pub fn setup_btrfs_storage_if_available() {
             "[fc-agent] btrfs storage already mounted at {}",
             storage_dir
         );
-        write_btrfs_storage_conf("/etc/containers/storage.conf", storage_dir, "/run/containers/storage");
+        write_btrfs_storage_conf(
+            "/etc/containers/storage.conf",
+            storage_dir,
+            "/run/containers/storage",
+        );
         return;
     }
 
@@ -434,7 +448,11 @@ pub fn setup_btrfs_storage_if_available() {
         }
     }
 
-    write_btrfs_storage_conf("/etc/containers/storage.conf", storage_dir, "/run/containers/storage");
+    write_btrfs_storage_conf(
+        "/etc/containers/storage.conf",
+        storage_dir,
+        "/run/containers/storage",
+    );
 
     eprintln!(
         "[fc-agent] btrfs storage configured at {} ({} sparse loopback)",

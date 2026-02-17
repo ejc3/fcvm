@@ -428,8 +428,12 @@ async fn update_health_status_once(
                 None => {
                     // No HTTP check - check if container is actually running
                     // Uses podman inspect to verify container state (not just process spawned)
-                    let container_running =
-                        check_container_running(pid, state.config.username.as_deref(), state.config.user.as_deref()).await;
+                    let container_running = check_container_running(
+                        pid,
+                        state.config.username.as_deref(),
+                        state.config.user.as_deref(),
+                    )
+                    .await;
                     if container_running {
                         debug!(target: "health-monitor", "container is running");
                         *last_failure_log = None;
@@ -441,9 +445,13 @@ async fn update_health_status_once(
                         // Note: We don't return Unhealthy here because check_podman_healthcheck
                         // returns Some(false) when the container doesn't exist yet (inspect fails)
                         if !*skip_podman_healthcheck
-                            && check_podman_healthcheck(pid, state.config.username.as_deref(), state.config.user.as_deref())
-                                .await
-                                .is_none()
+                            && check_podman_healthcheck(
+                                pid,
+                                state.config.username.as_deref(),
+                                state.config.user.as_deref(),
+                            )
+                            .await
+                            .is_none()
                         {
                             // No healthcheck defined - skip future checks
                             debug!(target: "health-monitor", "no podman healthcheck defined, skipping future checks");
@@ -552,7 +560,13 @@ async fn update_health_status_once(
             // If base health check passed, also check podman healthcheck (AND logic)
             // Skip if we already know the container has no healthcheck
             let final_status = if status == HealthStatus::Healthy && !*skip_podman_healthcheck {
-                match check_podman_healthcheck(pid, state.config.username.as_deref(), state.config.user.as_deref()).await {
+                match check_podman_healthcheck(
+                    pid,
+                    state.config.username.as_deref(),
+                    state.config.user.as_deref(),
+                )
+                .await
+                {
                     Some(true) => {
                         debug!(target: "health-monitor", "all health checks passed");
                         HealthStatus::Healthy

@@ -861,8 +861,14 @@ pub(super) async fn run_vm_setup(
     // Btrfs mode needs read-write (podman creates new subvolumes in graphroot).
     // Overlay and archive modes are read-only.
     let image_disk_read_only = launch_config.image_mode != crate::firecracker::ImageMode::Btrfs;
-    let (extra_disks, image_device) =
-        attach_extra_disks(args, client, data_dir, image_disk_path, image_disk_read_only).await?;
+    let (extra_disks, image_device) = attach_extra_disks(
+        args,
+        client,
+        data_dir,
+        image_disk_path,
+        image_disk_read_only,
+    )
+    .await?;
     vm_state.config.extra_disks = extra_disks;
 
     // Process --nfs: export directories via NFS for guest to mount
@@ -1041,7 +1047,16 @@ mod tests {
 
     #[test]
     fn test_parse_subid_file_finds_current_user() {
-        let username = std::env::var("USER").expect("USER env var must be set");
+        // Ensure USER env var is set (may be missing in some CI environments)
+        let username = std::env::var("USER").unwrap_or_else(|_| {
+            let name = nix::unistd::User::from_uid(nix::unistd::getuid())
+                .ok()
+                .flatten()
+                .map(|u| u.name)
+                .expect("could not resolve current username");
+            std::env::set_var("USER", &name);
+            name
+        });
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("subuid");
         std::fs::write(

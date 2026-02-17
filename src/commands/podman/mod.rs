@@ -503,18 +503,20 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 // For --user mode: build as uid 1000 (rootless podman), creating storage
                 // with correct ownership — matching a physical host. Separate cache path
                 // because rootless builds have different UID ownership than root builds.
-                let build_uid = args.user.as_ref().and_then(|user_spec| {
-                    user_spec.split(':').next()?.parse::<u32>().ok()
-                });
+                let build_uid = args
+                    .user
+                    .as_ref()
+                    .and_then(|user_spec| user_spec.split(':').next()?.parse::<u32>().ok());
                 let btrfs_img_path = match build_uid {
-                    Some(uid) => PathBuf::from(format!(
-                        "{}.btrfs-uid{}.img", cache_dir.display(), uid
-                    )),
+                    Some(uid) => {
+                        PathBuf::from(format!("{}.btrfs-uid{}.img", cache_dir.display(), uid))
+                    }
                     None => cache_dir.with_extension("btrfs.img"),
                 };
                 if !btrfs_img_path.exists() {
                     info!(image = %args.image, digest = %digest, uid = ?build_uid, "Building btrfs storage image");
-                    image::build_btrfs_storage_image(&archive_path, &btrfs_img_path, build_uid).await?;
+                    image::build_btrfs_storage_image(&archive_path, &btrfs_img_path, build_uid)
+                        .await?;
                 } else {
                     info!(image = %args.image, digest = %digest, "Using cached btrfs storage image");
                 }
