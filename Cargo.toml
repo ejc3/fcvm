@@ -88,10 +88,6 @@ integration-slow = []        # Slow VM tests, > 30s each (clone, snapshot, fuse 
 # Privileged tests require sudo (bridged networking, pjdfstest, iptables)
 privileged-tests = []
 
-# Bare-metal tests require host user namespace (not nested inside a container).
-# e.g. btrfs --user builds need newuidmap which fails under nested user namespaces.
-bare-metal = []
-
 # libfuse remap_file_range container test (requires pre-built container)
 libfuse-test = []
 

@@ -231,6 +231,9 @@ clean-test-data: build
 	@# Also clean per-mode directories
 	sudo FCVM_DATA_DIR=$(ROOT_DATA_DIR) ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
 	sudo FCVM_DATA_DIR=$(CONTAINER_DATA_DIR) ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
+	@# Fallback: remove any snapshots that prune couldn't parse (stale/incompatible configs)
+	sudo rm -rf /mnt/fcvm-btrfs/snapshots/*
+	sudo rm -rf $(ROOT_DATA_DIR)/snapshots/* $(CONTAINER_DATA_DIR)/snapshots/*
 	@echo "==> Cleaning leftover VM disks..."
 	sudo rm -rf /mnt/fcvm-btrfs/vm-disks/*
 	sudo rm -rf $(ROOT_DATA_DIR)/vm-disks/* $(CONTAINER_DATA_DIR)/vm-disks/*
@@ -261,32 +264,24 @@ test-packaging: build
 clean:
 	sudo rm -rf target
 
-# Bare-metal feature: tests that need host user namespace (not nested in a container).
-# Set BARE_METAL=1 to include these tests (host targets set this automatically).
-ifeq ($(BARE_METAL),1)
-BARE_METAL_FEATURES := ,bare-metal
-else
-BARE_METAL_FEATURES :=
-endif
-
 # Run-only targets (no setup deps, used by container)
 _test-unit:
 	$(NEXTEST) --no-default-features
 
 _test-fast:
 	RUST_LOG="$(TEST_LOG)" \
-	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_RETRIES) --no-default-features --features integration-fast$(BARE_METAL_FEATURES) $(FILTER)
+	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_RETRIES) --no-default-features --features integration-fast $(FILTER)
 
 _test-all:
 	RUST_LOG="$(TEST_LOG)" \
-	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_RETRIES) --features default$(BARE_METAL_FEATURES) $(FILTER)
+	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_RETRIES) $(FILTER)
 
 _test-root:
 	@RUST_LOG="$(TEST_LOG)" \
 	FCVM_DATA_DIR=$(ROOT_DATA_DIR) \
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
-	$(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_IGNORED) $(NEXTEST_RETRIES) --features privileged-tests,bare-metal $(IPV6_FILTER) $(FILTER) || \
+	$(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_IGNORED) $(NEXTEST_RETRIES) --features privileged-tests $(IPV6_FILTER) $(FILTER) || \
 	{ echo ""; \
 	  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
 	  echo "TEST FAILED - Check debug logs for root cause:"; \
@@ -296,12 +291,9 @@ _test-root:
 	  exit 1; }
 
 # Host targets (with setup, check-disk first to fail fast if disk is full)
-# BARE_METAL=1 enables tests that need host user namespace (not container)
 test-unit: show-notes check-disk build _test-unit
-test-fast: show-notes check-disk setup-fcvm
-	$(MAKE) _test-fast BARE_METAL=1
-test-all: show-notes check-disk setup-fcvm
-	$(MAKE) _test-all BARE_METAL=1
+test-fast: show-notes check-disk setup-fcvm _test-fast
+test-all: show-notes check-disk setup-fcvm _test-all
 test-root: show-notes check-disk setup-fcvm setup-pjdfstest setup-hugepages _test-root
 test: test-root
 
@@ -426,7 +418,6 @@ _setup-fcvm:
 	sudo ./target/release/fcvm setup
 	sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels
 	sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels
-	./scripts/build-btrfs-progs.sh
 
 # SDK E2E test — requires computesdk package as sibling repo and Node.js
 test-serve-sdk: build
