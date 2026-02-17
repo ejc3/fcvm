@@ -291,11 +291,23 @@ Every commit's changes must be reflected in the description. Flag as [MEDIUM] if
 - Description mentions reverted or amended-away changes
 - For stacked PRs: description includes parent branch changes instead of just this branch's commits
 
-### 3b. Categorize code issues
+### 3b. Check code/documentation consistency
+
+When a PR modifies both code and documentation (README.md, CLAUDE.md, comments, doc strings),
+verify they are consistent:
+- Function/field names in docs match actual code names
+- CLI flags and options documented match what the code accepts
+- Described behavior matches the implementation
+- Examples in docs use correct syntax and current API
+- Tables or lists of modes/options are complete (no missing or stale entries)
+
+Flag mismatches as [MEDIUM] - stale docs are worse than no docs because they actively mislead.
+
+### 3c. Categorize code issues
 
 Categorize issues:
 - \`[CRITICAL]\` - Security holes, data loss, crashes, breaking changes
-- \`[MEDIUM]\` - Bugs, logic errors, race conditions, missing validation
+- \`[MEDIUM]\` - Bugs, logic errors, race conditions, missing validation, code/docs mismatches
 - \`[LOW]\` - Style, naming, minor improvements (only if not previously mentioned)
 
 ## STEP 4: POST REVIEW
