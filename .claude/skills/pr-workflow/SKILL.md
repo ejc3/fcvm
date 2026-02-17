@@ -109,6 +109,11 @@ Comments may contain:
 - **CI failure analysis** - Re-run if infra issue, fix if code issue
 - **Security concerns** - Must address before merge
 
+**Fix ALL severity levels.** Low-severity findings (naming inconsistencies, minor
+code quality issues, pattern mismatches) should still be fixed before merging.
+They're quick to address and prevent technical debt from accumulating. Only skip
+a finding if you have a concrete reason to disagree with it — not because it's low severity.
+
 **CRITICAL: Never Apply Skip Conditions!**
 
 When reviewing auto-fix PRs or suggested fixes:
@@ -284,3 +289,87 @@ sudo make test-root FILTER=<test_name> STREAM=1 2>&1 | tee /tmp/test.log
 - Runners may be busy with CI jobs - check `busy=` status first
 - Don't interfere with running CI jobs on busy runners
 - Tests on runners may cause resource contention with concurrent CI runs
+
+## CI Not Starting? Check Your Branch Base
+
+If CI checks don't start automatically after pushing a PR, it likely means the PR branch
+is not based on main (or its target base branch). GitHub Actions CI triggers are configured
+to run on PRs targeting specific branches.
+
+**Common causes:**
+- Branch was created from an old commit, not from current main
+- Branch diverged significantly and GitHub can't compute the diff
+- PR targets a non-default base branch that doesn't have CI workflows
+
+**How to fix:**
+```bash
+# 1. Check what branch your PR targets
+gh pr view <pr-number> --json baseRefName
+
+# 2. Check if your branch is actually based on that branch
+git log --oneline origin/main..HEAD | tail -5   # Should show only YOUR commits
+
+# 3. If the branch is stale or incorrectly based, rebase onto main
+git fetch origin
+git rebase origin/main
+git push --force-with-lease
+
+# 4. If the PR targets wrong base, update it
+gh pr edit <pr-number> --base main
+```
+
+**Prevention:** Always create branches from current main:
+```bash
+git fetch origin
+git checkout origin/main -b my-feature
+```
+
+## Investigating CI Failures with Test Log Artifacts
+
+CI uploads test logs to `/tmp/fcvm-test-logs/` as artifacts (14 day retention). When tests fail,
+**always download and read the full logs** before drawing conclusions.
+
+### Download Artifacts
+
+```bash
+# 1. Find the run ID for the failing CI run
+gh run list --branch <branch-name> --limit 5 --json databaseId,conclusion,startedTime \
+  --jq '.[] | "\(.databaseId) \(.conclusion) \(.startedTime)"'
+
+# 2. List artifacts for that run
+gh api "repos/{owner}/{repo}/actions/runs/{run_id}/artifacts" \
+  --jq '.artifacts[] | "\(.id) \(.name) \(.size_in_bytes)"'
+
+# 3. Download a specific artifact (e.g., test-logs-host-root-arm64-SnapshotDisabled)
+gh api "repos/{owner}/{repo}/actions/runs/{run_id}/artifacts/{artifact_id}/zip" > /tmp/artifact.zip
+unzip -o /tmp/artifact.zip -d /tmp/ci-logs/
+
+# 4. Read the full debug logs
+ls /tmp/ci-logs/
+cat /tmp/ci-logs/<test-name>-*.log
+```
+
+### Quick Artifact Download Script
+
+```bash
+# Download ALL test log artifacts for a run
+RUN_ID=<run_id>
+REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
+for artifact in $(gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts" \
+  --jq '.artifacts[] | select(.name | startswith("test-logs")) | "\(.id):\(.name)"'); do
+  ID=${artifact%%:*}
+  NAME=${artifact#*:}
+  echo "Downloading $NAME..."
+  gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts/$ID/zip" > "/tmp/$NAME.zip"
+  mkdir -p "/tmp/ci-logs/$NAME"
+  unzip -o "/tmp/$NAME.zip" -d "/tmp/ci-logs/$NAME"
+done
+echo "All logs in /tmp/ci-logs/"
+```
+
+### What to Look For
+
+- **Full error messages**: CI test output truncates stderr; the log files have everything
+- **Timestamps**: Compare failing vs passing test timings to identify contention
+- **Boot sequence**: fc-agent logs show exactly where startup stalled
+- **dmesg**: `dmesg-filtered.log` artifact has KVM/UFFD/OOM kernel messages
