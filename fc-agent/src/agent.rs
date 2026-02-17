@@ -132,7 +132,12 @@ pub async fn run() -> Result<()> {
             .get("USER")
             .map(|s| s.as_str())
             .unwrap_or("fcvm-user");
-        let (username, _uid, runtime_dir) = container::create_vm_user(user_spec, desired_name);
+        let subuid_range = plan
+            .subuid_start
+            .zip(plan.subuid_count)
+            .or_else(|| plan.subuid_start.map(|s| (s, 65536)));
+        let (username, _uid, runtime_dir) =
+            container::create_vm_user(user_spec, desired_name, subuid_range);
         Some((username, runtime_dir))
     } else {
         None
@@ -149,7 +154,8 @@ pub async fn run() -> Result<()> {
 
     // Prepare image (mount storage, import archive, or pull from registry)
     let image_ref = if let Some(storage_device) = &plan.image_storage_device {
-        container::mount_storage_image(storage_device, &plan.image)?
+        let username = user_info.as_ref().map(|(name, _)| name.as_str());
+        container::mount_storage_image(storage_device, &plan.image, username)?
     } else if let Some(archive_path) = &plan.image_archive {
         container::import_image(archive_path, &plan.image, &output, &cmd_prefix).await?
     } else {

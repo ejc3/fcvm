@@ -15,6 +15,41 @@ use super::types::VolumeMapping;
 
 use crate::commands::common::VSOCK_VOLUME_PORT_BASE;
 
+/// Read the current user's subordinate UID range start from /etc/subuid.
+/// Returns None if the file doesn't exist or the user has no entry.
+fn get_host_subuid_start() -> Option<u64> {
+    parse_subid_file("/etc/subuid").map(|(start, _)| start)
+}
+
+/// Read the current user's subordinate UID range count from /etc/subuid.
+fn get_host_subuid_count() -> Option<u64> {
+    parse_subid_file("/etc/subuid").map(|(_, count)| count)
+}
+
+/// Parse /etc/subuid or /etc/subgid for the current user.
+/// Format: username:start:count
+fn parse_subid_file(path: &str) -> Option<(u64, u64)> {
+    let username = std::env::var("USER")
+        .or_else(|_| {
+            nix::unistd::User::from_uid(nix::unistd::getuid())
+                .ok()
+                .flatten()
+                .map(|u| u.name)
+                .ok_or(())
+        })
+        .ok()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    for line in content.lines() {
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() >= 3 && parts[0] == username {
+            let start = parts[1].parse().ok()?;
+            let count = parts[2].parse().ok()?;
+            return Some((start, count));
+        }
+    }
+    None
+}
+
 /// Resolve a proxy URL's hostname to an IP address.
 ///
 /// VMs using slirp4netns with --enable-ipv6 can reach both IPv4 (via 10.0.2.2 gateway)
@@ -563,6 +598,14 @@ pub(super) async fn build_and_send_mmds(
         http_proxy,
         https_proxy,
         no_proxy,
+        subuid_start: launch_config
+            .user
+            .as_ref()
+            .and_then(|_| get_host_subuid_start()),
+        subuid_count: launch_config
+            .user
+            .as_ref()
+            .and_then(|_| get_host_subuid_count()),
         host_time: chrono::Utc::now().timestamp().to_string(),
     };
 
@@ -999,5 +1042,37 @@ mod tests {
         assert!(resolved_https.starts_with("https://"));
         assert!(resolved_https.contains(":443"));
         assert!(resolved_https.contains("/proxy"));
+    }
+
+    #[test]
+    fn test_parse_subid_file_finds_current_user() {
+        let username = std::env::var("USER").expect("USER env var must be set");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subuid");
+        std::fs::write(
+            &path,
+            format!(
+                "nobody:100000:65536\n{}:1879048192:65536\nother:200000:65536\n",
+                username
+            ),
+        )
+        .unwrap();
+        let result = parse_subid_file(path.to_str().unwrap());
+        assert_eq!(result, Some((1879048192, 65536)));
+    }
+
+    #[test]
+    fn test_parse_subid_file_returns_none_for_missing_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subuid");
+        std::fs::write(&path, "nobody:100000:65536\nother:200000:65536\n").unwrap();
+        let result = parse_subid_file(path.to_str().unwrap());
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_subid_file_returns_none_for_missing_file() {
+        let result = parse_subid_file("/tmp/nonexistent-subuid-test-file");
+        assert_eq!(result, None);
     }
 }

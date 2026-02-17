@@ -16,7 +16,11 @@ use crate::vsock;
 /// The storage image is an ext4 filesystem containing a podman overlay storage tree
 /// (overlay/, overlay-images/, overlay-layers/). It is mounted read-only and podman
 /// finds the image there without needing `podman load`.
-pub fn mount_storage_image(device: &str, image_name: &str) -> Result<String> {
+pub fn mount_storage_image(
+    device: &str,
+    image_name: &str,
+    username: Option<&str>,
+) -> Result<String> {
     eprintln!("[fc-agent] mounting pre-built storage image: {}", device);
 
     let mount_path = "/mnt/image-store";
@@ -54,22 +58,59 @@ pub fn mount_storage_image(device: &str, image_name: &str) -> Result<String> {
         );
     }
 
+    // Configure podman to use this as an additional image store.
+    // For rootless podman (--user mode), write to the user's config dir.
+    // For root podman, write to /etc/containers/.
+    let (conf_path, runroot, graphroot) = if let Some(name) = username {
+        // Rootless: user's home directory config
+        let home = format!("/home/{}", name);
+        let config_dir = format!("{}/.config", home);
+        let conf_dir = format!("{}/containers", config_dir);
+        let _ = std::fs::create_dir_all(&conf_dir);
+        // Chown .config and children so podman can create subdirs (cni, etc.)
+        if let Ok(Some(pw)) = nix::unistd::User::from_name(name) {
+            let _ = nix::unistd::chown(config_dir.as_str(), Some(pw.uid), Some(pw.gid));
+            let _ = nix::unistd::chown(conf_dir.as_str(), Some(pw.uid), Some(pw.gid));
+        }
+        (
+            format!("{}/storage.conf", conf_dir),
+            format!(
+                "/run/user/{}/containers",
+                nix::unistd::User::from_name(name)
+                    .ok()
+                    .flatten()
+                    .map(|u| u.uid.as_raw())
+                    .unwrap_or(0)
+            ),
+            format!("{}/.local/share/containers/storage", home),
+        )
+    } else {
+        (
+            "/etc/containers/storage.conf".to_string(),
+            "/run/containers/storage".to_string(),
+            "/var/lib/containers/storage".to_string(),
+        )
+    };
+
     // Detect if btrfs storage was already configured (by setup_btrfs_storage_if_available).
-    let graphroot = "/var/lib/containers/storage";
+    // Check the ROOT storage path — for rootless users, setup_user_btrfs_storage() creates
+    // subdirs under the root btrfs mount, but the per-user graphroot uses a different path.
     let is_btrfs = std::process::Command::new("findmnt")
-        .args(["-n", "-o", "FSTYPE", graphroot])
+        .args(["-n", "-o", "FSTYPE", "/var/lib/containers/storage"])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "btrfs")
         .unwrap_or(false);
 
     if is_btrfs {
         // btrfs driver doesn't support overlay-format additionalimagestores.
-        // Import the image from the mounted overlay store into btrfs via save/load.
-        let storage_conf = format!(
-            "[storage]\ndriver = \"btrfs\"\nrunroot = \"/run/containers/storage\"\ngraphroot = \"{graphroot}\"\n"
-        );
-        std::fs::write("/etc/containers/storage.conf", storage_conf)
-            .context("writing storage.conf")?;
+        // For rootless users, setup_user_btrfs_storage() already wrote the correct
+        // storage.conf — don't overwrite it. For root, write a minimal btrfs config.
+        if username.is_none() {
+            let storage_conf = format!(
+                "[storage]\ndriver = \"btrfs\"\nrunroot = \"{runroot}\"\ngraphroot = \"{graphroot}\"\n"
+            );
+            std::fs::write(&conf_path, &storage_conf).context("writing storage.conf")?;
+        }
 
         eprintln!(
             "[fc-agent] btrfs driver: importing image from overlay store at {}",
@@ -96,11 +137,34 @@ pub fn mount_storage_image(device: &str, image_name: &str) -> Result<String> {
             anyhow::bail!("podman save from overlay store failed: {}", stderr);
         }
 
-        // Load the image into the btrfs store
-        let load_output = std::process::Command::new("podman")
-            .args(["load", "-i", "/tmp/image-import.tar"])
-            .output()
-            .context("running podman load into btrfs store")?;
+        // Load the image into the btrfs store.
+        // For rootless users, use runuser so podman reads the user's storage.conf.
+        let load_output = if let Some(name) = username {
+            let uid_str = nix::unistd::User::from_name(name)
+                .ok()
+                .flatten()
+                .map(|u| u.uid.as_raw().to_string())
+                .unwrap_or_default();
+            std::process::Command::new("env")
+                .args([
+                    &format!("XDG_RUNTIME_DIR=/run/user/{}", uid_str),
+                    "runuser",
+                    "-u",
+                    name,
+                    "--",
+                    "podman",
+                    "load",
+                    "-i",
+                    "/tmp/image-import.tar",
+                ])
+                .output()
+                .context("running podman load as user into btrfs store")?
+        } else {
+            std::process::Command::new("podman")
+                .args(["load", "-i", "/tmp/image-import.tar"])
+                .output()
+                .context("running podman load into btrfs store")?
+        };
 
         if !load_output.status.success() {
             let stderr = String::from_utf8_lossy(&load_output.stderr);
@@ -117,14 +181,13 @@ pub fn mount_storage_image(device: &str, image_name: &str) -> Result<String> {
     } else {
         // overlay driver: use additionalimagestores for instant image access
         let storage_conf = format!(
-            "[storage]\ndriver = \"overlay\"\nrunroot = \"/run/containers/storage\"\ngraphroot = \"{graphroot}\"\n\n[storage.options]\nadditionalimagestores = [\"{mount_path}\"]\n"
+            "[storage]\ndriver = \"overlay\"\nrunroot = \"{runroot}\"\ngraphroot = \"{graphroot}\"\n\n[storage.options]\nadditionalimagestores = [\"{mount_path}\"]\n"
         );
-        std::fs::write("/etc/containers/storage.conf", storage_conf)
-            .context("writing storage.conf")?;
+        std::fs::write(&conf_path, &storage_conf).context("writing storage.conf")?;
 
         eprintln!(
-            "[fc-agent] storage image mounted at {}, configured as additional image store",
-            mount_path
+            "[fc-agent] storage image mounted at {}, configured as additional image store (conf: {})",
+            mount_path, conf_path
         );
     }
 
@@ -710,7 +773,16 @@ pub fn build_podman_args(
 /// Create the VM user and set up rootless podman prerequisites.
 /// Call this BEFORE importing images so podman load runs as the target user.
 /// Returns (username, uid, runtime_dir) for use by run_as_user_prefix().
-pub fn create_vm_user(user_spec: &str, desired_name: &str) -> (String, String, String) {
+///
+/// `subuid_range`: optional (start, count) from the host's /etc/subuid.
+/// When the storage image is built by rootless podman on the host, it contains
+/// files with UIDs from the host's subuid range. The VM must use the same range
+/// so those UIDs are valid in the VM's user namespace.
+pub fn create_vm_user(
+    user_spec: &str,
+    desired_name: &str,
+    subuid_range: Option<(u64, u64)>,
+) -> (String, String, String) {
     let parts: Vec<&str> = user_spec.split(':').collect();
     let uid = parts[0].to_string();
     let gid = parts.get(1).unwrap_or(&"100").to_string();
@@ -728,7 +800,14 @@ pub fn create_vm_user(user_spec: &str, desired_name: &str) -> (String, String, S
         .args(["-u", &uid, "-g", &gid, "-m", "-s", "/bin/sh", &username])
         .output();
 
-    let subuid_entry = format!("{}:100000:65536\n", username);
+    // Use host's subuid range if provided (matches storage image UIDs),
+    // otherwise fall back to a default range.
+    let (subuid_start, subuid_count) = subuid_range.unwrap_or((100000, 65536));
+    let subuid_entry = format!("{}:{}:{}\n", username, subuid_start, subuid_count);
+    eprintln!(
+        "[fc-agent] subuid/subgid: {}:{}",
+        subuid_start, subuid_count
+    );
     let _ = std::fs::write("/etc/subuid", &subuid_entry);
     let _ = std::fs::write("/etc/subgid", &subuid_entry);
 
