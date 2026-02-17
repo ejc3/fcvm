@@ -208,7 +208,8 @@ jobs:
           sudo apt-get install -y fuse3 libfuse3-dev libclang-dev clang musl-tools \
             iproute2 iptables slirp4netns dnsmasq qemu-utils e2fsprogs parted \
             podman skopeo busybox-static cpio zstd autoconf automake libtool cmake \
-            libseccomp-dev nfs-kernel-server
+            libseccomp-dev nfs-kernel-server \
+            flex bison bc libelf-dev libssl-dev
       - name: Install Firecracker
         run: |
           ARCH=$(uname -m)
@@ -299,6 +300,13 @@ jobs:
       - name: setup-fcvm
         working-directory: fcvm
         run: make setup-fcvm
+      - name: Build btrfs kernel
+        working-directory: fcvm
+        run: |
+          # Regenerate config for root (setup-fcvm wrote to CI user's config dir)
+          sudo ./target/release/fcvm setup --generate-config --force
+          # Build btrfs kernel locally (needed for test_localhost_rootless tests)
+          sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels
       - name: test-packaging-e2e
         working-directory: fcvm
         run: ./scripts/test-packaging-e2e.sh ./target/release/fcvm
@@ -400,7 +408,8 @@ jobs:
           sudo apt-get install -y fuse3 libfuse3-dev libclang-dev clang musl-tools \
             iproute2 iptables slirp4netns dnsmasq qemu-utils e2fsprogs parted \
             podman skopeo busybox-static cpio zstd autoconf automake libtool cmake \
-            libseccomp-dev nfs-kernel-server
+            libseccomp-dev nfs-kernel-server \
+            flex bison bc libelf-dev libssl-dev
       - name: Install Firecracker
         run: |
           ARCH=$(uname -m)
@@ -461,6 +470,11 @@ jobs:
           sudo ./target/release/fcvm setup --generate-config --force
           # Build nested kernel locally (don't rely on GitHub releases)
           sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels
+      - name: Build btrfs kernel
+        working-directory: fcvm
+        run: |
+          # Build btrfs kernel locally (needed for test_localhost_rootless tests)
+          sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels
       - name: Allocate hugepages
         run: |
           echo 512 | sudo tee /proc/sys/vm/nr_hugepages

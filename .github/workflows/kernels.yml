@@ -206,3 +206,175 @@ jobs:
           echo "| Tag | ${{ steps.kernel.outputs.tag }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Filename | ${{ steps.kernel.outputs.filename }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Already Existed | ${{ steps.check.outputs.exists }} |" >> $GITHUB_STEP_SUMMARY
+
+  build-btrfs-kernel:
+    name: Build Btrfs Kernel
+    runs-on: [self-hosted, Linux, ARM64]
+    permissions:
+      contents: write  # Required for creating releases
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fcvm
+
+      - uses: ./fcvm/.github/actions/checkout-deps
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libclang-dev clang musl-tools
+
+      - name: Build fcvm and fc-agent
+        working-directory: fcvm
+        run: cargo build --release -p fcvm -p fc-agent
+
+      - name: Compute kernel version and SHA
+        id: kernel
+        working-directory: fcvm
+        run: |
+          # SHA is computed from build_inputs: kernel/btrfs.conf only (no patches)
+          SHA=$(cat kernel/btrfs.conf | sha256sum | cut -c1-12)
+
+          VERSION="6.18.3"
+          ARCH=$(uname -m)
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "arch=$ARCH" >> $GITHUB_OUTPUT
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "tag=kernel-btrfs-${VERSION}-${ARCH}-${SHA}" >> $GITHUB_OUTPUT
+          echo "filename=vmlinux-btrfs-${VERSION}-${ARCH}-${SHA}.bin" >> $GITHUB_OUTPUT
+
+          echo "Kernel version: $VERSION"
+          echo "Architecture: $ARCH"
+          echo "Build SHA: $SHA"
+
+      - name: Install GitHub CLI
+        run: |
+          if ! command -v gh &> /dev/null; then
+            echo "Installing GitHub CLI..."
+            sudo apt-get update
+            sudo apt-get install -y gh
+          else
+            echo "GitHub CLI already installed: $(gh --version)"
+          fi
+
+      - name: Check if release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.kernel.outputs.tag }}"
+          if gh release view "$TAG" &>/dev/null; then
+            echo "Release $TAG already exists"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Release $TAG does not exist"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup btrfs for fcvm
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        run: |
+          # Create btrfs filesystem if needed
+          if [ ! -d /mnt/fcvm-btrfs ]; then
+            sudo mkdir -p /mnt/fcvm-btrfs
+            sudo truncate -s 50G /var/fcvm-btrfs.img
+            sudo mkfs.btrfs /var/fcvm-btrfs.img
+            sudo mount /var/fcvm-btrfs.img /mnt/fcvm-btrfs
+          fi
+          sudo chown $USER:$USER /mnt/fcvm-btrfs
+
+      - name: Build kernel using fcvm
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        working-directory: fcvm
+        run: |
+          # Build the btrfs kernel using fcvm
+          sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels
+
+          # Find the built kernel and copy to expected location
+          KERNEL_PATH="/tmp/${{ steps.kernel.outputs.filename }}"
+          SHA="${{ steps.kernel.outputs.sha }}"
+
+          # The kernel is at /mnt/fcvm-btrfs/kernels/vmlinux-btrfs-{version}-{arch}-{sha}.bin
+          BUILT_KERNEL=$(find /mnt/fcvm-btrfs/kernels -name "vmlinux-btrfs-*-${SHA}.bin" | head -1)
+
+          if [ -z "$BUILT_KERNEL" ] || [ ! -f "$BUILT_KERNEL" ]; then
+            echo "ERROR: Built kernel not found"
+            ls -la /mnt/fcvm-btrfs/kernels/ || true
+            exit 1
+          fi
+
+          cp "$BUILT_KERNEL" "$KERNEL_PATH"
+          ls -lh "$KERNEL_PATH"
+          file "$KERNEL_PATH"
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        working-directory: fcvm
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.kernel.outputs.tag }}"
+          FILENAME="${{ steps.kernel.outputs.filename }}"
+          VERSION="${{ steps.kernel.outputs.version }}"
+          SHA="${{ steps.kernel.outputs.sha }}"
+          ARCH="${{ steps.kernel.outputs.arch }}"
+
+          # Delete existing release if force rebuilding
+          if [ "${{ inputs.force_build }}" == "true" ]; then
+            gh release delete "$TAG" --yes 2>/dev/null || true
+          fi
+
+          # Create release with kernel binary
+          gh release create "$TAG" \
+            --title "Btrfs Kernel ${VERSION} (${ARCH}) - ${SHA}" \
+            --notes "Kernel with FUSE and btrfs support for efficient container storage.
+
+          ## Kernel Details
+
+          | Property | Value |
+          |----------|-------|
+          | Version | ${VERSION} |
+          | Build SHA | ${SHA} |
+          | Architecture | ${ARCH} |
+
+          ## Features
+
+          - **CONFIG_FUSE_FS=y** - FUSE passthrough for fuse-pipe volumes
+          - **CONFIG_BTRFS_FS=y** - Btrfs filesystem for container storage
+          - **FUSE remap_file_range patch** - Enables reflink/CoW through FUSE
+
+          ## Why Btrfs?
+
+          Avoids the overlay \`checkAndRecordIDMappedSupport\` issue in containers/storage
+          that forces rootless podman through the slow \`storage-chown-by-maps\` path.
+          Btrfs handles user namespaces natively without idmapped mounts.
+
+          ## Usage
+
+          \`\`\`bash
+          fcvm setup --kernel-profile btrfs --build-kernels
+          fcvm podman run --kernel-profile btrfs --name test localhost/myapp
+          \`\`\`
+          " \
+            "/tmp/$FILENAME"
+
+          echo "✅ Created release: $TAG"
+
+      - name: Summary
+        run: |
+          echo "### Btrfs Kernel Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | ${{ steps.kernel.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Architecture | ${{ steps.kernel.outputs.arch }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SHA | ${{ steps.kernel.outputs.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | ${{ steps.kernel.outputs.tag }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Filename | ${{ steps.kernel.outputs.filename }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Already Existed | ${{ steps.check.outputs.exists }} |" >> $GITHUB_STEP_SUMMARY
