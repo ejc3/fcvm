@@ -425,8 +425,14 @@ fn run_mode(mode: &str, mem_mb: u32, data_mb: u32, hugepages: bool) -> BenchResu
     eprintln!("    Log: {}", log_path2);
 
     let clone_timeout = if data_mb > 1000 { 300 } else { 120 };
-    let clone_elapsed = poll_health(&fcvm, &mut child2, clone_timeout)
-        .unwrap_or_else(|e| panic!("Clone failed: {}", e));
+    let clone_elapsed = match poll_health(&fcvm, &mut child2, clone_timeout) {
+        Ok(elapsed) => elapsed,
+        Err(e) => {
+            graceful_kill(pid2, 5000);
+            let _ = child2.wait();
+            panic!("Clone failed: {}", e);
+        }
+    };
     let _guard2 = ProcessGuard {
         pid: pid2,
         child: child2,
