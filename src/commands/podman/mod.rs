@@ -507,11 +507,23 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                     .user
                     .as_ref()
                     .and_then(|user_spec| user_spec.split(':').next()?.parse::<u32>().ok());
+                // Format version for btrfs image cache. Bump when the build process
+                // changes in a way that invalidates previously-cached images.
+                // v2: host-side cleanup of podman state files before mkfs.btrfs
+                const BTRFS_CACHE_VERSION: u32 = 2;
+
                 let btrfs_img_path = match build_uid {
-                    Some(uid) => {
-                        PathBuf::from(format!("{}.btrfs-uid{}.img", cache_dir.display(), uid))
-                    }
-                    None => cache_dir.with_extension("btrfs.img"),
+                    Some(uid) => PathBuf::from(format!(
+                        "{}.btrfs-v{}-uid{}.img",
+                        cache_dir.display(),
+                        BTRFS_CACHE_VERSION,
+                        uid
+                    )),
+                    None => PathBuf::from(format!(
+                        "{}.btrfs-v{}.img",
+                        cache_dir.display(),
+                        BTRFS_CACHE_VERSION
+                    )),
                 };
                 if !btrfs_img_path.exists() {
                     info!(image = %args.image, digest = %digest, uid = ?build_uid, "Building btrfs storage image");

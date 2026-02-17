@@ -115,9 +115,10 @@ pub fn mount_btrfs_device(device: &str, mount_path: &str) -> Result<()> {
         let _ = std::fs::set_permissions(mount_path, std::fs::Permissions::from_mode(0o755));
     }
 
-    // Clear stale podman database AFTER mounting so we clean the actual btrfs content.
-    // The cached .btrfs.img may have stale db/containers from previous VM runs
-    // (btrfs image disk is read-write, so previous runs' container creates persist).
+    // Clean podman state files from the mounted image. The host-side build removes
+    // these before mkfs.btrfs, but they can reappear: btrfs metadata operations or
+    // podman initialization may recreate db.sql with graph_driver="" before we write
+    // storage.conf with driver="btrfs", causing a mismatch error.
     clear_podman_database(mount_path);
 
     eprintln!(
@@ -219,22 +220,17 @@ fn clear_podman_database(graphroot: &str) {
             Ok(ft) => ft,
             Err(_) => continue,
         };
-        if ft.is_dir() {
-            if let Err(e) = std::fs::remove_dir_all(&path) {
-                eprintln!(
-                    "[fc-agent] WARNING: failed to remove {}: {}",
-                    path.display(),
-                    e
-                );
-            }
+        let result = if ft.is_dir() {
+            std::fs::remove_dir_all(&path)
         } else {
-            if let Err(e) = std::fs::remove_file(&path) {
-                eprintln!(
-                    "[fc-agent] WARNING: failed to remove {}: {}",
-                    path.display(),
-                    e
-                );
-            }
+            std::fs::remove_file(&path)
+        };
+        if let Err(e) = result {
+            eprintln!(
+                "[fc-agent] WARNING: failed to remove {}: {}",
+                path.display(),
+                e
+            );
         }
     }
 }
