@@ -322,25 +322,108 @@ fn find_mkfs_btrfs() -> Result<PathBuf> {
     )
 }
 
+/// Load a Docker archive into a btrfs podman storage root using a containerized podman.
+///
+/// Runs inside an Ubuntu Noble container with `--privileged` because:
+/// 1. Host podman may lack the btrfs storage driver (EL9 RPM excludes it)
+/// 2. Rootless podman load needs user namespace support (`newuidmap`)
+///
+/// The btrfs temp dirs are bind-mounted so subvolumes are created on the host filesystem.
+/// For rootless builds (`build_uid`), creates a user inside the container with matching UID.
+async fn podman_btrfs_load_in_container(
+    archive_path: &Path,
+    tmp_dir: &Path,
+    tmp_runroot: &Path,
+) -> Result<()> {
+    info!("Running podman btrfs load inside ubuntu:noble container");
+
+    // Always run podman load as root inside the container. In rootless podman with
+    // --privileged, container uid 0 maps to the host user's uid via the user namespace.
+    // Files created as root inside the container are owned by the host uid on the
+    // bind-mounted btrfs, which is exactly the ownership we want for --user builds.
+    let inner_script = r#"set -e
+# Configure apt proxy from any proxy env var
+PROXY="${http_proxy:-${HTTPS_PROXY:-${https_proxy:-}}}"
+echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/10sandbox
+if [ -n "$PROXY" ]; then
+    echo "Acquire::http::Proxy \"$PROXY\";" > /etc/apt/apt.conf.d/99proxy
+    echo "Acquire::https::Proxy \"$PROXY\";" >> /etc/apt/apt.conf.d/99proxy
+fi
+echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/80retries
+apt-get update -qq
+apt-get install -y -qq podman
+podman --root /btrfs-root --runroot /btrfs-runroot --storage-driver btrfs load -i /archive.tar"#
+        .to_string();
+
+    let mut podman_args = vec![
+        "run".to_string(),
+        "--rm".to_string(),
+        "--privileged".to_string(),
+        "--cgroups=disabled".to_string(),
+        "--network=host".to_string(),
+    ];
+
+    // Pass through proxy environment variables (same pattern as rootfs.rs download_packages)
+    for var in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
+        if let Ok(val) = std::env::var(var) {
+            podman_args.push("-e".to_string());
+            podman_args.push(format!("{}={}", var, val));
+        }
+    }
+
+    podman_args.extend([
+        "-v".to_string(),
+        format!("{}:/btrfs-root", tmp_dir.display()),
+        "-v".to_string(),
+        format!("{}:/btrfs-runroot", tmp_runroot.display()),
+        "-v".to_string(),
+        format!("{}:/archive.tar:ro", archive_path.display()),
+        "ubuntu:noble".to_string(),
+        "bash".to_string(),
+        "-c".to_string(),
+        inner_script,
+    ]);
+
+    let output = tokio::process::Command::new("podman")
+        .args(&podman_args)
+        .output()
+        .await
+        .context("running containerized podman btrfs load")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(
+            "containerized podman btrfs load failed:\nstdout: {}\nstderr: {}",
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
+
+    let msg = String::from_utf8_lossy(&output.stdout);
+    info!("podman btrfs load output: {}", msg.trim());
+    Ok(())
+}
+
 /// Build a btrfs storage image from a Docker archive.
 ///
 /// Loads the archive into a temporary podman storage root on btrfs (creating real
-/// btrfs subvolumes), then packages the result as a btrfs image using
-/// `mkfs.btrfs --rootdir --subvol`. The guest mounts this directly as its
+/// btrfs subvolumes via a containerized podman), then packages the result as a btrfs
+/// image using `mkfs.btrfs --rootdir --subvol`. The guest mounts this directly as its
 /// podman graphroot — no podman load needed, instant startup.
 ///
-/// When `build_uid` is set, runs `podman load` as that user (rootless podman).
-/// This creates storage with the correct UID ownership for rootless use in the guest,
-/// matching how rootless podman works on a physical host. When None, builds as root.
+/// The podman load step runs inside an Ubuntu Noble container because the host
+/// podman may lack the btrfs storage driver (e.g., EL9). The mkfs.btrfs step
+/// runs on the host using a bundled binary with libraries.
 ///
 /// Requires:
 /// - The temp dir must be on a btrfs filesystem (for real subvolumes)
 /// - mkfs.btrfs >= 6.12 (for --rootdir --subvol support)
-/// - Kernel 5.18+ (for unprivileged btrfs subvolume creation)
 pub(super) async fn build_btrfs_storage_image(
     archive_path: &Path,
     output_path: &Path,
     build_uid: Option<u32>,
+    rootfs_size: &str,
 ) -> Result<()> {
     // Find mkfs.btrfs with --rootdir --subvol support
     let mkfs_btrfs = find_mkfs_btrfs()?;
@@ -385,91 +468,53 @@ pub(super) async fn build_btrfs_storage_image(
         .await
         .context("creating temp btrfs runroot dir")?;
 
-    // For user builds: find username and chown temp dirs so rootless podman can use them.
-    // Skip runuser if we're already running as the target uid (rootless fcvm, no sudo).
-    let build_username = if let Some(uid) = build_uid {
-        let current_uid = nix::unistd::getuid().as_raw();
-        if current_uid == uid {
-            // Already running as the target user — no runuser needed
-            info!("Building btrfs image as current user (uid {})", uid);
-            None
-        } else {
-            let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
-                .context("looking up build user")?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "no user with uid {} on host (needed for rootless btrfs image build)",
-                        uid
-                    )
-                })?;
-            let nix_uid = nix::unistd::Uid::from_raw(uid);
-            let nix_gid = nix::unistd::Gid::from_raw(user.gid.as_raw());
-            nix::unistd::chown(tmp_dir.as_path(), Some(nix_uid), Some(nix_gid))
-                .context("chowning temp dir to build user")?;
-            nix::unistd::chown(tmp_runroot.as_path(), Some(nix_uid), Some(nix_gid))
-                .context("chowning temp runroot to build user")?;
-            info!("Building btrfs image as user {} (uid {})", user.name, uid);
-            Some(user.name)
-        }
-    } else {
-        None
-    };
+    // For user builds: chown temp dirs so the containerized rootless podman can use them.
+    if let Some(uid) = build_uid {
+        let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+            .context("looking up build user")?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no user with uid {} on host (needed for rootless btrfs image build)",
+                    uid
+                )
+            })?;
+        let nix_uid = nix::unistd::Uid::from_raw(uid);
+        let nix_gid = nix::unistd::Gid::from_raw(user.gid.as_raw());
+        nix::unistd::chown(tmp_dir.as_path(), Some(nix_uid), Some(nix_gid))
+            .context("chowning temp dir to build user")?;
+        nix::unistd::chown(tmp_runroot.as_path(), Some(nix_uid), Some(nix_gid))
+            .context("chowning temp runroot to build user")?;
+        info!("Building btrfs image for uid {}", uid);
+    }
 
     // Load the docker archive into a custom podman storage root on btrfs.
     // This creates real btrfs subvolumes for each layer.
-    // For user builds, `runuser -u <username>` runs rootless podman, creating
-    // storage with correct UID ownership — matching a physical host.
+    // Runs inside an Ubuntu Noble container because the host podman may not have
+    // the btrfs storage driver (e.g., EL9 RPM excludes it).
     info!(
         "Loading archive into btrfs podman storage: {} -> {}",
         archive_path.display(),
         tmp_dir.display()
     );
 
-    let mut cmd_args: Vec<String> = Vec::new();
-    if let Some(ref username) = build_username {
-        cmd_args.extend(
-            ["runuser", "-u", username, "--"]
-                .iter()
-                .map(|s| s.to_string()),
-        );
-    }
-    cmd_args.extend(
-        [
-            "podman",
-            "--root",
-            tmp_dir.to_str().unwrap(),
-            "--runroot",
-            tmp_runroot.to_str().unwrap(),
-            "--storage-driver",
-            "btrfs",
-            "load",
-            "-i",
-            archive_path.to_str().unwrap(),
-        ]
-        .iter()
-        .map(|s| s.to_string()),
-    );
-
-    let load_output = tokio::process::Command::new(&cmd_args[0])
-        .args(&cmd_args[1..])
-        .output()
-        .await
-        .context("running podman load into btrfs storage root")?;
-
-    if !load_output.status.success() {
-        let stderr = String::from_utf8_lossy(&load_output.stderr);
+    if let Err(e) = podman_btrfs_load_in_container(archive_path, &tmp_dir, &tmp_runroot).await {
         cleanup_btrfs_tmp(&tmp_dir).await;
         tokio::fs::remove_dir_all(&tmp_runroot).await.ok();
-        bail!("podman load into btrfs storage root failed: {}", stderr);
+        return Err(e);
     }
 
-    let loaded_msg = String::from_utf8_lossy(&load_output.stdout);
-    info!("podman load output: {}", loaded_msg.trim());
-
-    // Remove podman state files that contain hardcoded paths from the temp dir.
-    // Keep only image/layer data directories. When the guest mounts the image at a
-    // different path, stale state causes "database graph driver does not match".
-    clean_podman_state(&tmp_dir, &["btrfs", "btrfs-images", "btrfs-layers"]).await;
+    // Remove podman database files — they contain hardcoded paths from the temp dir.
+    // When the guest mounts the image at a different path, podman would complain about
+    // "database static dir does not match". Deleting them forces podman to recreate
+    // the database at the correct mount path.
+    for db_file in ["db.sql", "libpod", "storage.lock"] {
+        let path = tmp_dir.join(db_file);
+        if path.is_dir() {
+            tokio::fs::remove_dir_all(&path).await.ok();
+        } else if path.is_file() {
+            tokio::fs::remove_file(&path).await.ok();
+        }
+    }
 
     // Enumerate btrfs subvolumes in the temp dir for --subvol flags.
     // Btrfs subvolumes always have inode 256 — this detects them without root.
@@ -498,7 +543,13 @@ pub(super) async fn build_btrfs_storage_image(
         mkfs_args.push("--subvol".to_string());
         mkfs_args.push(format!("rw:{}", subvol_path));
     }
-    mkfs_args.push("--shrink".to_string());
+    // Create a sparse btrfs image sized to match --rootfs-size (same as ext4 rootfs).
+    // Only used blocks take real host disk space. Without this, --shrink creates a
+    // minimal image with no free space for container runtime writes.
+    let size_bytes = crate::storage::disk::parse_size(rootfs_size)
+        .context("parsing rootfs_size for btrfs image")?;
+    mkfs_args.push("--byte-count".to_string());
+    mkfs_args.push(size_bytes.to_string());
     mkfs_args.push(tmp_img.to_str().unwrap().to_string());
 
     let mkfs_output = tokio::process::Command::new(&mkfs_btrfs)
