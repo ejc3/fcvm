@@ -855,7 +855,7 @@ pub async fn restore_from_snapshot(
 /// - Result is always a complete memory.bin
 ///
 /// Copy a file using btrfs reflink (instant CoW copy).
-async fn reflink_copy(source: &Path, dest: &Path) -> Result<()> {
+pub(crate) async fn reflink_copy(source: &Path, dest: &Path) -> Result<()> {
     let source_str = source
         .to_str()
         .with_context(|| format!("non-UTF-8 path: {}", source.display()))?;

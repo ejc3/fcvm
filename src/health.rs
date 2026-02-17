@@ -200,12 +200,37 @@ fn find_fcvm_binary() -> Option<std::path::PathBuf> {
 /// Timeout for exec-based health checks (5 seconds)
 const HEALTH_CHECK_EXEC_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Build the env + runuser prefix for health check commands running as a user.
+///
+/// Must mirror fc-agent's `run_as_user_prefix()`: sets HOME and XDG_RUNTIME_DIR
+/// so podman finds user-level config and runtime state.
+fn user_cmd_prefix(name: &str, user_spec: Option<&str>) -> Vec<String> {
+    // Extract UID from user spec (format: "UID:GID" or just "UID")
+    let uid = user_spec
+        .and_then(|s| s.split(':').next())
+        .unwrap_or("1000");
+
+    vec![
+        "env".into(),
+        format!("HOME=/home/{}", name),
+        format!("XDG_RUNTIME_DIR=/run/user/{}", uid),
+        "runuser".into(),
+        "-u".into(),
+        name.to_string(),
+        "--".into(),
+    ]
+}
+
 /// Check if the container is running via podman inspect.
 ///
 /// Returns:
 /// - `true` = container is running
 /// - `false` = container not running yet (or inspect failed)
-async fn check_container_running(pid: u32, username: Option<&str>) -> bool {
+async fn check_container_running(
+    pid: u32,
+    username: Option<&str>,
+    user_spec: Option<&str>,
+) -> bool {
     let exe = match find_fcvm_binary() {
         Some(e) => e,
         None => return false, // Can't find fcvm binary
@@ -221,8 +246,7 @@ async fn check_container_running(pid: u32, username: Option<&str>) -> bool {
         "--".into(),
     ];
     if let Some(name) = username {
-        // Run podman as the target user (rootless podman owner)
-        cmd_args.extend(["runuser".into(), "-u".into(), name.to_string(), "--".into()]);
+        cmd_args.extend(user_cmd_prefix(name, user_spec));
     }
     cmd_args.extend([
         "podman".into(),
@@ -277,7 +301,11 @@ async fn check_container_running(pid: u32, username: Option<&str>) -> bool {
 /// - `Some(true)` = healthcheck exists and is healthy
 /// - `Some(false)` = healthcheck exists and is unhealthy/starting
 /// - `None` = no healthcheck defined (caller should skip future calls)
-async fn check_podman_healthcheck(pid: u32, username: Option<&str>) -> Option<bool> {
+async fn check_podman_healthcheck(
+    pid: u32,
+    username: Option<&str>,
+    user_spec: Option<&str>,
+) -> Option<bool> {
     // Use fcvm exec to run podman inspect inside the VM
     let exe = match find_fcvm_binary() {
         Some(e) => e,
@@ -292,7 +320,7 @@ async fn check_podman_healthcheck(pid: u32, username: Option<&str>) -> Option<bo
         "--".into(),
     ];
     if let Some(name) = username {
-        cmd_args.extend(["runuser".into(), "-u".into(), name.to_string(), "--".into()]);
+        cmd_args.extend(user_cmd_prefix(name, user_spec));
     }
     cmd_args.extend([
         "podman".into(),
@@ -401,7 +429,7 @@ async fn update_health_status_once(
                     // No HTTP check - check if container is actually running
                     // Uses podman inspect to verify container state (not just process spawned)
                     let container_running =
-                        check_container_running(pid, state.config.username.as_deref()).await;
+                        check_container_running(pid, state.config.username.as_deref(), state.config.user.as_deref()).await;
                     if container_running {
                         debug!(target: "health-monitor", "container is running");
                         *last_failure_log = None;
@@ -413,7 +441,7 @@ async fn update_health_status_once(
                         // Note: We don't return Unhealthy here because check_podman_healthcheck
                         // returns Some(false) when the container doesn't exist yet (inspect fails)
                         if !*skip_podman_healthcheck
-                            && check_podman_healthcheck(pid, state.config.username.as_deref())
+                            && check_podman_healthcheck(pid, state.config.username.as_deref(), state.config.user.as_deref())
                                 .await
                                 .is_none()
                         {
@@ -524,7 +552,7 @@ async fn update_health_status_once(
             // If base health check passed, also check podman healthcheck (AND logic)
             // Skip if we already know the container has no healthcheck
             let final_status = if status == HealthStatus::Healthy && !*skip_podman_healthcheck {
-                match check_podman_healthcheck(pid, state.config.username.as_deref()).await {
+                match check_podman_healthcheck(pid, state.config.username.as_deref(), state.config.user.as_deref()).await {
                     Some(true) => {
                         debug!(target: "health-monitor", "all health checks passed");
                         HealthStatus::Healthy

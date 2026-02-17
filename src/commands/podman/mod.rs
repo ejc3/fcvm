@@ -40,10 +40,7 @@ use tokio_util::sync::CancellationToken;
 ///
 /// Priority: explicit `--image-mode` > auto-detect from kernel profile.
 /// Auto-detect: kernel profile name containing "btrfs" → Btrfs, otherwise Overlay.
-fn resolve_image_mode(
-    args: &RunArgs,
-    runtime_config: &super::common::RuntimeConfig,
-) -> crate::firecracker::ImageMode {
+fn resolve_image_mode(args: &RunArgs) -> crate::firecracker::ImageMode {
     use crate::firecracker::ImageMode;
 
     // Explicit CLI flag wins
@@ -61,9 +58,6 @@ fn resolve_image_mode(
             return ImageMode::Btrfs;
         }
     }
-
-    // Check if runtime_config suggests btrfs (from boot_args or other hints)
-    let _ = runtime_config;
 
     // Default: overlay
     ImageMode::Overlay
@@ -263,7 +257,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     ) = if !no_snapshot {
         // Get image identifier for cache key computation
         let image_identifier = get_image_identifier(&args.image).await?;
-        let resolved_mode = resolve_image_mode(&args, &runtime_config);
+        let resolved_mode = resolve_image_mode(&args);
         let config = build_firecracker_config(
             &args,
             &image_identifier,
@@ -486,7 +480,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             info!(path = %archive_path.display(), "Image exported as Docker archive");
         }
 
-        let resolved_image_mode = resolve_image_mode(&args, &runtime_config);
+        let resolved_image_mode = resolve_image_mode(&args);
         info!(image = %args.image, digest = %digest, mode = %resolved_image_mode, "Image delivery mode");
 
         let disk_path = match resolved_image_mode {
@@ -505,10 +499,22 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             crate::firecracker::ImageMode::Btrfs => {
                 // Pre-built btrfs storage: btrfs image with real subvolumes.
                 // Guest reflink-copies it and mounts as graphroot — no podman load needed.
-                let btrfs_img_path = cache_dir.with_extension("btrfs.img");
+                //
+                // For --user mode: build as uid 1000 (rootless podman), creating storage
+                // with correct ownership — matching a physical host. Separate cache path
+                // because rootless builds have different UID ownership than root builds.
+                let build_uid = args.user.as_ref().and_then(|user_spec| {
+                    user_spec.split(':').next()?.parse::<u32>().ok()
+                });
+                let btrfs_img_path = match build_uid {
+                    Some(uid) => PathBuf::from(format!(
+                        "{}.btrfs-uid{}.img", cache_dir.display(), uid
+                    )),
+                    None => cache_dir.with_extension("btrfs.img"),
+                };
                 if !btrfs_img_path.exists() {
-                    info!(image = %args.image, digest = %digest, "Building btrfs storage image");
-                    image::build_btrfs_storage_image(&archive_path, &btrfs_img_path).await?;
+                    info!(image = %args.image, digest = %digest, uid = ?build_uid, "Building btrfs storage image");
+                    image::build_btrfs_storage_image(&archive_path, &btrfs_img_path, build_uid).await?;
                 } else {
                     info!(image = %args.image, digest = %digest, "Using cached btrfs storage image");
                 }
@@ -550,6 +556,35 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     tokio::fs::create_dir_all(&data_dir)
         .await
         .context("creating VM data directory")?;
+
+    // For btrfs mode, reflink copy the image from cache to per-VM directory.
+    // Each VM needs its own read-write copy because:
+    // 1. Btrfs images are read-write (podman creates subvolumes in graphroot)
+    // 2. Snapshot restore needs a pristine copy (not modified by previous VM runs)
+    // 3. Mount namespace redirects vm_runtime_dir paths for clones
+    let image_disk_path = if let Some(cache_path) = image_disk_path {
+        let resolved_mode = resolve_image_mode(&args);
+        if resolved_mode == crate::firecracker::ImageMode::Btrfs {
+            let disks_dir = data_dir.join("disks");
+            tokio::fs::create_dir_all(&disks_dir)
+                .await
+                .context("creating disks directory for btrfs image")?;
+            let per_vm_path = disks_dir.join("image.btrfs");
+            crate::commands::common::reflink_copy(&cache_path, &per_vm_path)
+                .await
+                .context("reflink copying btrfs image to per-VM directory")?;
+            info!(
+                cache = %cache_path.display(),
+                per_vm = %per_vm_path.display(),
+                "reflink copied btrfs image to per-VM directory"
+            );
+            Some(per_vm_path)
+        } else {
+            Some(cache_path)
+        }
+    } else {
+        None
+    };
 
     let socket_path = data_dir.join("firecracker.sock");
 
@@ -816,6 +851,24 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
 
     let disk_path = data_dir.join("disks/rootfs.raw");
 
+    // Build image extra disk entries for snapshot metadata.
+    // For btrfs mode, the per-VM image copy needs to be saved with snapshots
+    // so clones get their own isolated copy.
+    let image_extra_disks = if image_disk_path.as_ref().map_or(false, |p| {
+        p.file_name()
+            .map_or(false, |f| f.to_string_lossy().ends_with(".btrfs"))
+    }) {
+        let disk_idx = args.disk.len() + args.disk_dir.len();
+        vec![crate::storage::SnapshotExtraDisk {
+            filename: "image.btrfs".to_string(),
+            mount_path: String::new(),
+            read_only: false,
+            drive_id: format!("disk{}", disk_idx),
+        }]
+    } else {
+        vec![]
+    };
+
     Ok(Some(VmContext {
         vm_id,
         vm_name,
@@ -839,6 +892,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         disk_path,
         log_tx,
         output_reconnect,
+        image_extra_disks,
     }))
 }
 
@@ -886,7 +940,8 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                 if let Some(ref key) = ctx.snapshot_key {
                     info!(snapshot_key = %key, digest = %cache_request.digest, "Creating pre-start snapshot");
 
-                    let params = SnapshotCreationParams::from_run_args(&ctx.args);
+                    let mut params = SnapshotCreationParams::from_run_args(&ctx.args);
+                    params.extra_disks = ctx.image_extra_disks.clone();
                     match create_snapshot_interruptible(
                         &ctx.vm_manager, key, &ctx.vm_id, &params, &ctx.disk_path,
                         &ctx.network_config, &ctx.volume_configs,
@@ -934,7 +989,8 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                     } else {
                         info!(snapshot_key = %startup_key, "Creating startup snapshot (VM healthy)");
 
-                        let params = SnapshotCreationParams::from_run_args(&ctx.args);
+                        let mut params = SnapshotCreationParams::from_run_args(&ctx.args);
+                        params.extra_disks = ctx.image_extra_disks.clone();
                         match create_snapshot_interruptible(
                             &ctx.vm_manager, &startup_key, &ctx.vm_id, &params, &ctx.disk_path,
                             &ctx.network_config, &ctx.volume_configs,
@@ -1064,32 +1120,32 @@ mod tests {
     #[test]
     fn test_resolve_image_mode_default_is_overlay() {
         let args = test_args();
-        let rc = super::super::common::RuntimeConfig::default();
-        assert_eq!(resolve_image_mode(&args, &rc), ImageMode::Overlay);
+
+        assert_eq!(resolve_image_mode(&args), ImageMode::Overlay);
     }
 
     #[test]
     fn test_resolve_image_mode_btrfs_profile_auto_detects() {
         let mut args = test_args();
         args.kernel_profile = Some("btrfs".to_string());
-        let rc = super::super::common::RuntimeConfig::default();
-        assert_eq!(resolve_image_mode(&args, &rc), ImageMode::Btrfs);
+
+        assert_eq!(resolve_image_mode(&args), ImageMode::Btrfs);
     }
 
     #[test]
     fn test_resolve_image_mode_btrfs_in_profile_name() {
         let mut args = test_args();
         args.kernel_profile = Some("nested-btrfs-test".to_string());
-        let rc = super::super::common::RuntimeConfig::default();
-        assert_eq!(resolve_image_mode(&args, &rc), ImageMode::Btrfs);
+
+        assert_eq!(resolve_image_mode(&args), ImageMode::Btrfs);
     }
 
     #[test]
     fn test_resolve_image_mode_non_btrfs_profile_is_overlay() {
         let mut args = test_args();
         args.kernel_profile = Some("nested".to_string());
-        let rc = super::super::common::RuntimeConfig::default();
-        assert_eq!(resolve_image_mode(&args, &rc), ImageMode::Overlay);
+
+        assert_eq!(resolve_image_mode(&args), ImageMode::Overlay);
     }
 
     #[test]
@@ -1097,23 +1153,23 @@ mod tests {
         let mut args = test_args();
         args.kernel_profile = Some("btrfs".to_string());
         args.image_mode = Some(CliImageMode::Archive);
-        let rc = super::super::common::RuntimeConfig::default();
-        assert_eq!(resolve_image_mode(&args, &rc), ImageMode::Archive);
+
+        assert_eq!(resolve_image_mode(&args), ImageMode::Archive);
     }
 
     #[test]
     fn test_resolve_image_mode_explicit_overlay() {
         let mut args = test_args();
         args.image_mode = Some(CliImageMode::Overlay);
-        let rc = super::super::common::RuntimeConfig::default();
-        assert_eq!(resolve_image_mode(&args, &rc), ImageMode::Overlay);
+
+        assert_eq!(resolve_image_mode(&args), ImageMode::Overlay);
     }
 
     #[test]
     fn test_resolve_image_mode_explicit_btrfs_no_profile() {
         let mut args = test_args();
         args.image_mode = Some(CliImageMode::Btrfs);
-        let rc = super::super::common::RuntimeConfig::default();
-        assert_eq!(resolve_image_mode(&args, &rc), ImageMode::Btrfs);
+
+        assert_eq!(resolve_image_mode(&args), ImageMode::Btrfs);
     }
 }

@@ -121,7 +121,8 @@ pub async fn create_podman_snapshot(
             volumes: snapshot_volumes,
             health_check_url: params.health_check_url.clone(),
             hugepages: params.hugepages,
-            extra_disks: vec![],
+            extra_disks: params.extra_disks.clone(),
+            username: params.username.clone(),
         },
     };
 
@@ -210,6 +211,9 @@ pub(super) fn build_firecracker_config(
     cmd_args: Option<Vec<String>>,
     image_mode: crate::firecracker::ImageMode,
 ) -> crate::firecracker::FirecrackerConfig {
+    // image_identifier is the digest for localhost images (content-addressed cache key).
+    // args.image is the original name (what the guest uses to find the image).
+    // FirecrackerConfig stores both: container_image for cache key, container_image_name for MMDS.
     use crate::firecracker::{FcNetworkMode, FirecrackerConfig};
 
     let network_mode = match args.network {
@@ -230,7 +234,7 @@ pub(super) fn build_firecracker_config(
     // Collect volume mounts for cache key (affects MMDS plan)
     let volume_mounts: Vec<String> = args.map.to_vec();
 
-    FirecrackerConfig::new(
+    let mut config = FirecrackerConfig::new(
         kernel_path.to_path_buf(),
         initrd_path.to_path_buf(),
         rootfs_path.to_path_buf(),
@@ -252,7 +256,10 @@ pub(super) fn build_firecracker_config(
         args.user.clone(),
         args.forward_localhost.clone(),
         image_mode,
-    )
+    );
+    // Set the original image name for MMDS (separate from cache key identifier)
+    config.container_image_name = args.image.clone();
+    config
 }
 
 /// Extract Firecracker binary path and args from RuntimeConfig for snapshot restore.

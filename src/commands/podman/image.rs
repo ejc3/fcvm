@@ -301,6 +301,10 @@ fn find_mkfs_btrfs() -> Result<PathBuf> {
 /// `mkfs.btrfs --rootdir --subvol`. The guest mounts this directly as its
 /// podman graphroot — no podman load needed, instant startup.
 ///
+/// When `build_uid` is set, runs `podman load` as that user (rootless podman).
+/// This creates storage with the correct UID ownership for rootless use in the guest,
+/// matching how rootless podman works on a physical host. When None, builds as root.
+///
 /// Requires:
 /// - The temp dir must be on a btrfs filesystem (for real subvolumes)
 /// - mkfs.btrfs >= 6.12 (for --rootdir --subvol support)
@@ -308,6 +312,7 @@ fn find_mkfs_btrfs() -> Result<PathBuf> {
 pub(super) async fn build_btrfs_storage_image(
     archive_path: &Path,
     output_path: &Path,
+    build_uid: Option<u32>,
 ) -> Result<()> {
     // Find mkfs.btrfs with --rootdir --subvol support
     let mkfs_btrfs = find_mkfs_btrfs()?;
@@ -318,9 +323,11 @@ pub(super) async fn build_btrfs_storage_image(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("output_path has no parent directory"))?;
 
-    // Verify cache_dir is on btrfs
+    // Verify cache_dir is on btrfs.
+    // Use -T (target) flag to find the filesystem containing the path,
+    // not just exact mount points.
     let findmnt = std::process::Command::new("findmnt")
-        .args(["-n", "-o", "FSTYPE", cache_dir.to_str().unwrap()])
+        .args(["-n", "-o", "FSTYPE", "-T", cache_dir.to_str().unwrap()])
         .output()
         .context("checking filesystem type of cache directory")?;
     let fstype = String::from_utf8_lossy(&findmnt.stdout).trim().to_string();
@@ -334,33 +341,73 @@ pub(super) async fn build_btrfs_storage_image(
     }
 
     let tmp_dir = cache_dir.join(format!("tmp-btrfs-{}", std::process::id()));
+    let tmp_runroot = cache_dir.join(format!("tmp-btrfs-run-{}", std::process::id()));
 
-    // Clean up any stale temp dir from a previous interrupted run
+    // Clean up any stale temp dirs from a previous interrupted run
     if tmp_dir.exists() {
         cleanup_btrfs_tmp(&tmp_dir).await;
+    }
+    if tmp_runroot.exists() {
+        tokio::fs::remove_dir_all(&tmp_runroot).await.ok();
     }
     tokio::fs::create_dir_all(&tmp_dir)
         .await
         .context("creating temp btrfs storage dir")?;
+    tokio::fs::create_dir_all(&tmp_runroot)
+        .await
+        .context("creating temp btrfs runroot dir")?;
+
+    // For user builds: find username and chown temp dirs so rootless podman can use them.
+    // Skip runuser if we're already running as the target uid (rootless fcvm, no sudo).
+    let build_username = if let Some(uid) = build_uid {
+        let current_uid = nix::unistd::getuid().as_raw();
+        if current_uid == uid {
+            // Already running as the target user — no runuser needed
+            info!("Building btrfs image as current user (uid {})", uid);
+            None
+        } else {
+            let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+                .context("looking up build user")?
+                .ok_or_else(|| anyhow::anyhow!(
+                    "no user with uid {} on host (needed for rootless btrfs image build)", uid
+                ))?;
+            let nix_uid = nix::unistd::Uid::from_raw(uid);
+            let nix_gid = nix::unistd::Gid::from_raw(user.gid.as_raw());
+            nix::unistd::chown(tmp_dir.as_path(), Some(nix_uid), Some(nix_gid))
+                .context("chowning temp dir to build user")?;
+            nix::unistd::chown(tmp_runroot.as_path(), Some(nix_uid), Some(nix_gid))
+                .context("chowning temp runroot to build user")?;
+            info!("Building btrfs image as user {} (uid {})", user.name, uid);
+            Some(user.name)
+        }
+    } else {
+        None
+    };
 
     // Load the docker archive into a custom podman storage root on btrfs.
     // This creates real btrfs subvolumes for each layer.
+    // For user builds, `runuser -u <username>` runs rootless podman, creating
+    // storage with correct UID ownership — matching a physical host.
     info!(
         "Loading archive into btrfs podman storage: {} -> {}",
         archive_path.display(),
         tmp_dir.display()
     );
 
-    let load_output = tokio::process::Command::new("podman")
-        .args([
-            "--root",
-            tmp_dir.to_str().unwrap(),
-            "--storage-driver",
-            "btrfs",
-            "load",
-            "-i",
-            archive_path.to_str().unwrap(),
-        ])
+    let mut cmd_args: Vec<String> = Vec::new();
+    if let Some(ref username) = build_username {
+        cmd_args.extend(["runuser", "-u", username, "--"].iter().map(|s| s.to_string()));
+    }
+    cmd_args.extend([
+        "podman",
+        "--root", tmp_dir.to_str().unwrap(),
+        "--runroot", tmp_runroot.to_str().unwrap(),
+        "--storage-driver", "btrfs",
+        "load", "-i", archive_path.to_str().unwrap(),
+    ].iter().map(|s| s.to_string()));
+
+    let load_output = tokio::process::Command::new(&cmd_args[0])
+        .args(&cmd_args[1..])
         .output()
         .await
         .context("running podman load into btrfs storage root")?;
@@ -368,15 +415,38 @@ pub(super) async fn build_btrfs_storage_image(
     if !load_output.status.success() {
         let stderr = String::from_utf8_lossy(&load_output.stderr);
         cleanup_btrfs_tmp(&tmp_dir).await;
+        tokio::fs::remove_dir_all(&tmp_runroot).await.ok();
         bail!("podman load into btrfs storage root failed: {}", stderr);
     }
 
     let loaded_msg = String::from_utf8_lossy(&load_output.stdout);
     info!("podman load output: {}", loaded_msg.trim());
 
+    // Remove podman database files — they contain hardcoded paths from the temp dir.
+    // When the guest mounts the image at a different path, podman would complain about
+    // "database static dir does not match". Deleting them forces podman to recreate
+    // the database at the correct mount path.
+    for db_file in ["db.sql", "libpod", "storage.lock"] {
+        let path = tmp_dir.join(db_file);
+        if path.is_dir() {
+            tokio::fs::remove_dir_all(&path).await.ok();
+        } else if path.is_file() {
+            tokio::fs::remove_file(&path).await.ok();
+        }
+    }
+
+    // Enumerate btrfs subvolumes in the temp dir for --subvol flags.
+    // Btrfs subvolumes always have inode 256 — this detects them without root.
+    // Podman's btrfs driver creates subvolumes at btrfs/subvolumes/<layer-hash>.
+    let subvol_args = enumerate_btrfs_subvolumes(&tmp_dir)?;
+    info!(
+        "Found {} btrfs subvolumes in temp storage",
+        subvol_args.len()
+    );
+
     // Create btrfs image from the storage tree using mkfs.btrfs --rootdir --subvol.
-    // This preserves btrfs subvolumes from the source directory as real subvolumes
-    // in the output image.
+    // Each subvolume is passed as --subvol rw:<relative-path> to preserve it as a
+    // real subvolume in the output image.
     let tmp_img = PathBuf::from(format!("{}.tmp", output_path.display()));
     info!(
         "Creating btrfs image: {} -> {}",
@@ -384,20 +454,26 @@ pub(super) async fn build_btrfs_storage_image(
         tmp_img.display()
     );
 
+    let mut mkfs_args = vec![
+        "--rootdir".to_string(),
+        tmp_dir.to_str().unwrap().to_string(),
+    ];
+    for subvol_path in &subvol_args {
+        mkfs_args.push("--subvol".to_string());
+        mkfs_args.push(format!("rw:{}", subvol_path));
+    }
+    mkfs_args.push("--shrink".to_string());
+    mkfs_args.push(tmp_img.to_str().unwrap().to_string());
+
     let mkfs_output = tokio::process::Command::new(&mkfs_btrfs)
-        .args([
-            "--rootdir",
-            tmp_dir.to_str().unwrap(),
-            "--subvol",
-            "--shrink",
-            tmp_img.to_str().unwrap(),
-        ])
+        .args(&mkfs_args)
         .output()
         .await
         .context("running mkfs.btrfs --rootdir --subvol")?;
 
     // Clean up temp storage dir (contains btrfs subvolumes, needs special handling)
     cleanup_btrfs_tmp(&tmp_dir).await;
+    tokio::fs::remove_dir_all(&tmp_runroot).await.ok();
 
     if !mkfs_output.status.success() {
         let stderr = String::from_utf8_lossy(&mkfs_output.stderr);
@@ -412,6 +488,50 @@ pub(super) async fn build_btrfs_storage_image(
     }
 
     info!("Built btrfs storage image: {}", output_path.display());
+    Ok(())
+}
+
+/// Enumerate btrfs subvolumes in a directory tree.
+///
+/// Returns paths relative to `root_dir`. Detects subvolumes by checking for
+/// inode 256, which is the canonical inode number for btrfs subvolume root
+/// directories. This works without root privileges.
+fn enumerate_btrfs_subvolumes(root_dir: &Path) -> Result<Vec<String>> {
+    let mut subvolumes = Vec::new();
+    enumerate_subvolumes_recursive(root_dir, root_dir, &mut subvolumes)?;
+    Ok(subvolumes)
+}
+
+fn enumerate_subvolumes_recursive(
+    base_dir: &Path,
+    current_dir: &Path,
+    subvolumes: &mut Vec<String>,
+) -> Result<()> {
+    let entries = std::fs::read_dir(current_dir)
+        .with_context(|| format!("reading directory {}", current_dir.display()))?;
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        // Check if this directory is a btrfs subvolume (inode 256)
+        let metadata = std::fs::metadata(&path)?;
+        use std::os::unix::fs::MetadataExt;
+        if metadata.ino() == 256 {
+            // Found a subvolume — record its path relative to the base dir
+            if let Ok(rel) = path.strip_prefix(base_dir) {
+                subvolumes.push(rel.to_string_lossy().to_string());
+            }
+            // Don't recurse into subvolumes — mkfs.btrfs handles their contents
+            continue;
+        }
+
+        // Regular directory — recurse to find nested subvolumes
+        enumerate_subvolumes_recursive(base_dir, &path, subvolumes)?;
+    }
     Ok(())
 }
 

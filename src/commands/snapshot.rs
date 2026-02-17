@@ -223,6 +223,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             health_check_url: vm_state.config.health_check_url.clone(),
             hugepages: vm_state.config.hugepages,
             extra_disks: extra_disk_configs,
+            username: vm_state.config.username.clone(),
         },
     };
 
@@ -733,6 +734,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // The cache key includes health_check_url, so each config gets its own snapshot.
     vm_state.config.health_check_url = snapshot_config.metadata.health_check_url.clone();
     vm_state.config.hugepages = args.hugepages.unwrap_or(snapshot_config.metadata.hugepages);
+    // Restore username for rootless health checks (runuser -u <username>).
+    vm_state.config.username = snapshot_config.metadata.username.clone();
 
     info!(
         tap = %network_config.tap_device,
