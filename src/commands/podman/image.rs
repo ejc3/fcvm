@@ -3,6 +3,29 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use tracing::{debug, info, warn};
 
+/// Remove podman state files from a storage root, keeping only image/layer data.
+///
+/// `podman load` creates state files (db.sql, storage.lock, libpod/, etc.) that
+/// contain hardcoded paths. When the storage root is mounted at a different path
+/// in the guest, these stale files cause "database graph driver does not match".
+async fn clean_podman_state(dir: &Path, keep: &[&str]) {
+    if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if keep.iter().any(|&k| k == name_str.as_ref()) {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                tokio::fs::remove_dir_all(&path).await.ok();
+            } else {
+                tokio::fs::remove_file(&path).await.ok();
+            }
+        }
+    }
+}
+
 /// Validate that a Docker archive contains manifest.json.
 ///
 /// Docker archive format requires manifest.json to be loadable.
@@ -202,6 +225,11 @@ pub(super) async fn build_storage_image(
 
     let loaded_msg = String::from_utf8_lossy(&load_output.stdout);
     info!("podman load output: {}", loaded_msg.trim());
+
+    // Remove podman state files that contain hardcoded paths from the temp dir.
+    // Keep only image/layer data directories. When the guest mounts this read-only
+    // at a different path, stale state files cause "database graph driver does not match".
+    clean_podman_state(&tmp_dir, &["overlay", "overlay-images", "overlay-layers"]).await;
 
     // Package the storage tree as an ext4 image using the existing helper.
     // NOTE: Can't use with_extension() here because output_path ends in .storage.img
@@ -438,26 +466,10 @@ pub(super) async fn build_btrfs_storage_image(
     let loaded_msg = String::from_utf8_lossy(&load_output.stdout);
     info!("podman load output: {}", loaded_msg.trim());
 
-    // Remove ALL podman state files — they contain hardcoded paths from the temp dir.
-    // Keep only image/layer data directories (btrfs/, btrfs-images/, btrfs-layers/).
-    // When the guest mounts the image at a different path, stale state causes
-    // "database graph driver does not match" or "database static dir does not match".
-    let keep = ["btrfs", "btrfs-images", "btrfs-layers"];
-    if let Ok(mut entries) = tokio::fs::read_dir(&tmp_dir).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if keep.iter().any(|&k| k == name_str.as_ref()) {
-                continue;
-            }
-            let path = entry.path();
-            if path.is_dir() {
-                tokio::fs::remove_dir_all(&path).await.ok();
-            } else {
-                tokio::fs::remove_file(&path).await.ok();
-            }
-        }
-    }
+    // Remove podman state files that contain hardcoded paths from the temp dir.
+    // Keep only image/layer data directories. When the guest mounts the image at a
+    // different path, stale state causes "database graph driver does not match".
+    clean_podman_state(&tmp_dir, &["btrfs", "btrfs-images", "btrfs-layers"]).await;
 
     // Enumerate btrfs subvolumes in the temp dir for --subvol flags.
     // Btrfs subvolumes always have inode 256 — this detects them without root.
