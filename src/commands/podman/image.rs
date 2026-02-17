@@ -438,16 +438,24 @@ pub(super) async fn build_btrfs_storage_image(
     let loaded_msg = String::from_utf8_lossy(&load_output.stdout);
     info!("podman load output: {}", loaded_msg.trim());
 
-    // Remove podman database files — they contain hardcoded paths from the temp dir.
-    // When the guest mounts the image at a different path, podman would complain about
-    // "database static dir does not match". Deleting them forces podman to recreate
-    // the database at the correct mount path.
-    for db_file in ["db.sql", "libpod", "storage.lock"] {
-        let path = tmp_dir.join(db_file);
-        if path.is_dir() {
-            tokio::fs::remove_dir_all(&path).await.ok();
-        } else if path.is_file() {
-            tokio::fs::remove_file(&path).await.ok();
+    // Remove ALL podman state files — they contain hardcoded paths from the temp dir.
+    // Keep only image/layer data directories (btrfs/, btrfs-images/, btrfs-layers/).
+    // When the guest mounts the image at a different path, stale state causes
+    // "database graph driver does not match" or "database static dir does not match".
+    let keep = ["btrfs", "btrfs-images", "btrfs-layers"];
+    if let Ok(mut entries) = tokio::fs::read_dir(&tmp_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if keep.iter().any(|&k| k == name_str.as_ref()) {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                tokio::fs::remove_dir_all(&path).await.ok();
+            } else {
+                tokio::fs::remove_file(&path).await.ok();
+            }
         }
     }
 

@@ -174,17 +174,52 @@ fn storage_paths(username: Option<&str>) -> (String, String, String) {
     }
 }
 
-/// Clear stale podman database files that might have a mismatched driver.
+/// Clear ALL podman state files, keeping only image/layer data.
 ///
-/// Podman stores its graph driver in the database. If we write a storage.conf
-/// with a different driver, podman refuses to start ("database graph driver X
-/// does not match our graph driver Y"). Clearing the database lets podman
-/// recreate it with the correct driver.
+/// Podman stores its graph driver in the database (db.sql, libpod/).
+/// If we write a storage.conf with a different driver, podman refuses to start:
+/// "database graph driver X does not match our graph driver Y".
+///
+/// Instead of maintaining a list of files to delete (which misses new state files
+/// added in newer podman versions), we keep only the directories containing
+/// actual image/layer data and delete everything else.
 fn clear_podman_database(graphroot: &str) {
     let graphroot_path = std::path::Path::new(graphroot);
-    for entry in ["libpod", "db.sql", "btrfs-containers", "overlay-containers"] {
-        let path = graphroot_path.join(entry);
-        if path.is_dir() {
+
+    // Directories containing actual image/layer data — keep these.
+    // All other files/dirs are state/database/locks that must be recreated.
+    let keep = [
+        "btrfs",
+        "btrfs-images",
+        "btrfs-layers",
+        "overlay",
+        "overlay-images",
+        "overlay-layers",
+    ];
+
+    let entries = match std::fs::read_dir(graphroot_path) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!(
+                "[fc-agent] WARNING: cannot read graphroot {}: {}",
+                graphroot, e
+            );
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if keep.iter().any(|&k| k == name_str.as_ref()) {
+            continue;
+        }
+        let path = entry.path();
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if ft.is_dir() {
             if let Err(e) = std::fs::remove_dir_all(&path) {
                 eprintln!(
                     "[fc-agent] WARNING: failed to remove {}: {}",
@@ -192,7 +227,7 @@ fn clear_podman_database(graphroot: &str) {
                     e
                 );
             }
-        } else if path.is_file() {
+        } else {
             if let Err(e) = std::fs::remove_file(&path) {
                 eprintln!(
                     "[fc-agent] WARNING: failed to remove {}: {}",
