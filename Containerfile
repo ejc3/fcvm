@@ -33,6 +33,7 @@ RUN echo "user_allow_other" >> /etc/fuse.conf \
     && useradd -m -s /bin/bash testuser \
     && usermod -aG fuse,kvm testuser \
     && echo "testuser ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \
+    && sed -i '/^testuser:/d' /etc/subuid /etc/subgid \
     && echo "testuser:100000:65536" >> /etc/subuid \
     && echo "testuser:100000:65536" >> /etc/subgid
 

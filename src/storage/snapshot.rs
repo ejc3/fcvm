@@ -67,6 +67,9 @@ pub struct SnapshotMetadata {
     /// Extra disk images from the baseline VM (for clone disk-dir support)
     #[serde(default)]
     pub extra_disks: Vec<SnapshotExtraDisk>,
+    /// Username for rootless container health checks (e.g., "ubuntu")
+    #[serde(default)]
+    pub username: Option<String>,
 }
 
 /// Extra disk configuration saved in snapshot metadata.
@@ -241,6 +244,7 @@ mod tests {
                 health_check_url: None,
                 hugepages: false,
                 extra_disks: vec![],
+                username: None,
             },
         };
 
@@ -356,6 +360,7 @@ mod tests {
                 health_check_url: None,
                 hugepages: false,
                 extra_disks: vec![],
+                username: None,
             },
         };
 
@@ -415,6 +420,7 @@ mod tests {
                     health_check_url: None,
                     hugepages: false,
                     extra_disks: vec![],
+                    username: None,
                 },
             };
             manager.save_snapshot(config).await.unwrap();
@@ -461,6 +467,7 @@ mod tests {
                 health_check_url: None,
                 hugepages: false,
                 extra_disks: vec![],
+                username: None,
             },
         };
         manager.save_snapshot(config).await.unwrap();
@@ -558,6 +565,7 @@ mod tests {
                 health_check_url: None,
                 hugepages: false,
                 extra_disks: vec![],
+                username: None,
             },
         };
 

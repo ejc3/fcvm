@@ -219,6 +219,50 @@ Second run restores from that snapshot and skips container initialization.
 
 Clone snapshots automatically use their source as parent, enabling diff-based optimization across the chain.
 
+### Image Delivery Modes
+
+fcvm supports three modes for delivering container images to VMs:
+
+| Mode | Flag | Description | Speed |
+|------|------|-------------|-------|
+| **Overlay** (default) | `--image-mode overlay` | Pre-built ext4 image, mounted read-only as `additionalImageStore` | Fast (~540ms cached) |
+| **Btrfs** | `--image-mode btrfs` | Pre-built btrfs image with native subvolumes, reflink-copied per VM | Fast (~540ms cached) |
+| **Archive** | `--image-mode archive` | Docker tar archive, `podman load` at boot | Slow (~3s) |
+
+The mode is auto-detected from the kernel profile (btrfs profile → btrfs mode) or can be set explicitly:
+
+```bash
+# Auto-detect from kernel profile
+./fcvm podman run --name web --kernel-profile btrfs nginx:alpine
+
+# Explicit mode
+./fcvm podman run --name web --image-mode btrfs nginx:alpine
+
+# Archive mode (fallback, no pre-built image needed)
+./fcvm podman run --name web --image-mode archive nginx:alpine
+```
+
+**Btrfs mode** is designed for rootless podman with `--user`. It builds the btrfs storage image as the target user on the host, so file ownership matches what rootless podman expects — no chown needed at boot:
+
+```bash
+# Rootless podman in VM with btrfs storage (no sudo needed)
+./fcvm podman run --name app \
+    --user 1000:1000 \
+    --kernel-profile btrfs \
+    localhost/myimage
+```
+
+**How btrfs mode works:**
+1. Host exports container as Docker archive (`podman save`)
+2. Host loads archive into a temp btrfs storage root (`podman --root <tmp> --storage-driver btrfs load`)
+3. Host packages the storage tree as a btrfs image (`mkfs.btrfs --rootdir --subvol`)
+4. Per-VM: btrfs reflink copy of the image (instant, read-write)
+5. Guest mounts the btrfs image as podman's graphroot — container is ready immediately
+
+**Requirements for btrfs mode:**
+- btrfs-progs >= 6.12 (for `--rootdir --subvol` support). Build from source: `./scripts/build-btrfs-progs.sh`
+- A btrfs kernel profile with `CONFIG_BTRFS_FS=y`: `./fcvm setup --kernel-profile btrfs --build-kernels`
+
 ### More Options
 
 ```bash

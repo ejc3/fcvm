@@ -599,15 +599,36 @@ pub fn generate_setup_script(plan: &Plan) -> String {
     // Also enable serial console
     s.push_str("systemctl enable serial-getty@ttyS0\n\n");
 
-    // Disable services
+    // Disable services by removing symlinks from target.wants directories.
+    // We run in chroot (no systemd), so `systemctl disable` fails silently.
+    // Manually remove all symlinks that reference these units.
     if !plan.services.disable.is_empty() {
-        s.push_str("# Disable services\n");
-        s.push_str("systemctl disable");
+        s.push_str("# Disable services (remove symlinks from *.target.wants)\n");
         for svc in &plan.services.disable {
-            s.push_str(&format!(" {}", svc));
+            // Bare names like "multipathd" match multipathd.service, multipathd.socket, etc.
+            // Full names like "podman.service" match exactly.
+            let pattern = if svc.contains('.') {
+                svc.to_string()
+            } else {
+                format!("{}.*", svc)
+            };
+            s.push_str(&format!(
+                "find /etc/systemd/system -name '{}' -type l -delete 2>/dev/null || true\n",
+                pattern
+            ));
         }
-        s.push_str(" || true\n\n");
+        s.push('\n');
     }
+
+    // Remove podman state files created during package installation.
+    // apt's post-install scripts initialize /var/lib/containers/storage with an
+    // empty db.sql (driver=""). fc-agent writes storage.conf with the actual
+    // driver at boot, but podman refuses to start if db.sql already exists with
+    // a different driver. Remove state files but not directories (overlay/ may
+    // be busy from postinst).
+    s.push_str("# Remove podman state files created by apt post-install scripts\n");
+    s.push_str("rm -f /var/lib/containers/storage/db.sql /var/lib/containers/storage/storage.lock /var/lib/containers/storage/userns.lock /var/lib/containers/storage/defaultNetworkBackend 2>/dev/null || true\n");
+    s.push_str("rm -rf /var/lib/containers/storage/libpod /var/lib/containers/storage/overlay-containers /var/lib/containers/storage/overlay-images 2>/dev/null || true\n\n");
 
     // Cleanup
     if !plan.cleanup.remove_dirs.is_empty() {
