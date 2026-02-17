@@ -329,7 +329,6 @@ fn find_mkfs_btrfs() -> Result<PathBuf> {
 /// 2. Rootless podman load needs user namespace support (`newuidmap`)
 ///
 /// The btrfs temp dirs are bind-mounted so subvolumes are created on the host filesystem.
-/// For rootless builds (`build_uid`), creates a user inside the container with matching UID.
 async fn podman_btrfs_load_in_container(
     archive_path: &Path,
     tmp_dir: &Path,
@@ -497,9 +496,7 @@ pub(super) async fn build_btrfs_storage_image(
         tmp_dir.display()
     );
 
-    if let Err(e) =
-        podman_btrfs_load_in_container(archive_path, &tmp_dir, &tmp_runroot).await
-    {
+    if let Err(e) = podman_btrfs_load_in_container(archive_path, &tmp_dir, &tmp_runroot).await {
         cleanup_btrfs_tmp(&tmp_dir).await;
         tokio::fs::remove_dir_all(&tmp_runroot).await.ok();
         return Err(e);
@@ -554,10 +551,7 @@ pub(super) async fn build_btrfs_storage_image(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("tmp_img has no parent directory"))?;
 
-    let mut mkfs_cmd_parts = vec![
-        "--rootdir".to_string(),
-        "/btrfs-src".to_string(),
-    ];
+    let mut mkfs_cmd_parts = vec!["--rootdir".to_string(), "/btrfs-src".to_string()];
     for subvol_path in &subvol_args {
         mkfs_cmd_parts.push("--subvol".to_string());
         mkfs_cmd_parts.push(format!("rw:{}", subvol_path));
@@ -574,9 +568,18 @@ pub(super) async fn build_btrfs_storage_image(
     let mkfs_bin = mkfs_dir.join("mkfs.btrfs.bin");
     let mkfs_lib = mkfs_dir.join("lib");
 
+    // Detect the dynamic linker name based on host architecture.
+    // The bundled libs were built for the same arch as the host.
+    let ld_linux_name = if cfg!(target_arch = "aarch64") {
+        "ld-linux-aarch64.so.1"
+    } else {
+        "ld-linux-x86-64.so.2"
+    };
+
     let inner_cmd = if mkfs_bin.exists() && mkfs_lib.exists() {
         format!(
-            "/mkfs-bin/lib/ld-linux-x86-64.so.2 --library-path /mkfs-bin/lib /mkfs-bin/mkfs.btrfs.bin {}",
+            "/mkfs-bin/lib/{} --library-path /mkfs-bin/lib /mkfs-bin/mkfs.btrfs.bin {}",
+            ld_linux_name,
             mkfs_cmd_parts.join(" ")
         )
     } else {
@@ -724,7 +727,11 @@ async fn cleanup_btrfs_tmp(tmp_dir: &Path) {
             );
         }
         Err(e) => {
-            warn!("containerized cleanup of {} failed: {}", tmp_dir.display(), e);
+            warn!(
+                "containerized cleanup of {} failed: {}",
+                tmp_dir.display(),
+                e
+            );
         }
     }
 

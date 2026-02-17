@@ -49,7 +49,22 @@ elif [[ -n "${HTTPS_PROXY:-}" ]]; then
     CURL_PROXY="-x $HTTPS_PROXY"
 fi
 
-echo "Building in Ubuntu Noble container..."
+# Detect architecture for dynamic linker path
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64)
+        LD_LINUX_NAME="ld-linux-x86-64.so.2"
+        ;;
+    aarch64)
+        LD_LINUX_NAME="ld-linux-aarch64.so.1"
+        ;;
+    *)
+        echo "ERROR: Unsupported architecture: $ARCH"
+        exit 1
+        ;;
+esac
+
+echo "Building in Ubuntu Noble container (arch: $ARCH)..."
 podman run --rm --cgroups=disabled --network=host \
     "${PROXY_ARGS[@]}" \
     -v "$OUTPUT_DIR:/output:Z" \
@@ -91,18 +106,24 @@ chmod +x /output/mkfs.btrfs.bin
 for lib in \$(ldd mkfs.btrfs | awk '/=>/ {print \$3}'); do
     cp \"\$lib\" /output/lib/ 2>/dev/null || true
 done
-cp /lib64/ld-linux-x86-64.so.2 /output/lib/ 2>/dev/null || \
-    cp /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /output/lib/ 2>/dev/null || true
+# Copy the dynamic linker (architecture-dependent)
+LD_LINUX=${LD_LINUX_NAME}
+for candidate in /lib64/\$LD_LINUX /lib/\$(uname -m)-linux-gnu/\$LD_LINUX; do
+    if [ -f \"\$candidate\" ]; then
+        cp \"\$candidate\" /output/lib/
+        break
+    fi
+done
 
 echo '  Done!'
 ./mkfs.btrfs --version
 "
 
-# Create wrapper script that uses bundled libraries
-cat > "$OUTPUT_DIR/mkfs.btrfs" << 'WRAPPER'
+# Create wrapper script that uses bundled libraries (architecture-aware)
+cat > "$OUTPUT_DIR/mkfs.btrfs" << WRAPPER
 #!/bin/bash
-DIR="$(cd "$(dirname "$0")" && pwd)"
-exec "$DIR/lib/ld-linux-x86-64.so.2" --library-path "$DIR/lib" "$DIR/mkfs.btrfs.bin" "$@"
+DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+exec "\$DIR/lib/${LD_LINUX_NAME}" --library-path "\$DIR/lib" "\$DIR/mkfs.btrfs.bin" "\$@"
 WRAPPER
 chmod +x "$OUTPUT_DIR/mkfs.btrfs"
 
