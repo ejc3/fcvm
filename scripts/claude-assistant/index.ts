@@ -293,15 +293,24 @@ Every commit's changes must be reflected in the description. Flag as [MEDIUM] if
 
 ### 3b. Check code/documentation consistency
 
-When a PR modifies both code and documentation (README.md, CLAUDE.md, comments, doc strings),
-verify they are consistent:
+**When a PR modifies code**, check if related documentation needs updating.
+The project has three doc files — README.md (user-facing), DESIGN.md (architecture), CLAUDE.md (dev guide):
+- New or renamed CLI flags/options → update README.md usage sections
+- Changed behavior or defaults → update relevant docs, DESIGN.md, and CLAUDE.md
+- New features or modes → check if README.md and DESIGN.md tables/lists need new entries
+- Renamed functions/fields/types → check if CLAUDE.md and DESIGN.md reference the old names
+- Architecture changes (new modules, changed data flow) → update DESIGN.md
+- Changed error messages or output format → update examples in docs
+
+**When a PR modifies both code and docs**, verify they are consistent:
 - Function/field names in docs match actual code names
 - CLI flags and options documented match what the code accepts
 - Described behavior matches the implementation
 - Examples in docs use correct syntax and current API
 - Tables or lists of modes/options are complete (no missing or stale entries)
 
-Flag mismatches as [MEDIUM] - stale docs are worse than no docs because they actively mislead.
+Flag mismatches or missing doc updates as [MEDIUM] - stale docs are worse than no docs
+because they actively mislead.
 
 ### 3c. Categorize code issues
 
