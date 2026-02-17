@@ -570,13 +570,30 @@ pub(super) async fn build_btrfs_storage_image(
     let mkfs_lib = mkfs_dir.join("lib");
 
     let inner_cmd = if mkfs_bin.exists() && mkfs_lib.exists() {
+        // Find the ld-linux dynamic linker in the bundled lib directory.
+        // On x86_64 it's ld-linux-x86-64.so.2, on aarch64 it's ld-linux-aarch64.so.1.
+        let ld_linux = std::fs::read_dir(&mkfs_lib)
+            .ok()
+            .and_then(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .find(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with("ld-linux")
+                    })
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+            })
+            .unwrap_or_else(|| "ld-linux-x86-64.so.2".to_string());
         format!(
-            "/mkfs-bin/lib/ld-linux-x86-64.so.2 --library-path /mkfs-bin/lib /mkfs-bin/mkfs.btrfs.bin {}",
+            "/mkfs-bin/lib/{} --library-path /mkfs-bin/lib /mkfs-bin/mkfs.btrfs.bin {}",
+            ld_linux,
             mkfs_cmd_parts.join(" ")
         )
     } else {
-        // System mkfs.btrfs (if >= 6.12 is available in the container)
-        format!("{} {}", mkfs_btrfs.display(), mkfs_cmd_parts.join(" "))
+        // Bundled .bin and lib/ not found — use mkfs.btrfs directly via container mount.
+        // The mkfs dir is mounted at /mkfs-bin, so reference it there (not the host path).
+        format!("/mkfs-bin/mkfs.btrfs {}", mkfs_cmd_parts.join(" "))
     };
 
     info!("Running mkfs.btrfs inside privileged container");

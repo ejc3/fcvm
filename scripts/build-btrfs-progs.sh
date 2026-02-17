@@ -91,18 +91,27 @@ chmod +x /output/mkfs.btrfs.bin
 for lib in \$(ldd mkfs.btrfs | awk '/=>/ {print \$3}'); do
     cp \"\$lib\" /output/lib/ 2>/dev/null || true
 done
-cp /lib64/ld-linux-x86-64.so.2 /output/lib/ 2>/dev/null || \
-    cp /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /output/lib/ 2>/dev/null || true
+# Copy the dynamic linker (architecture-dependent)
+# x86_64: ld-linux-x86-64.so.2, aarch64: ld-linux-aarch64.so.1
+cp /lib64/ld-linux-*.so.* /output/lib/ 2>/dev/null || \
+    cp /lib/x86_64-linux-gnu/ld-linux-*.so.* /output/lib/ 2>/dev/null || \
+    cp /lib/aarch64-linux-gnu/ld-linux-*.so.* /output/lib/ 2>/dev/null || true
 
 echo '  Done!'
 ./mkfs.btrfs --version
 "
 
-# Create wrapper script that uses bundled libraries
+# Create wrapper script that uses bundled libraries (architecture-independent)
 cat > "$OUTPUT_DIR/mkfs.btrfs" << 'WRAPPER'
 #!/bin/bash
 DIR="$(cd "$(dirname "$0")" && pwd)"
-exec "$DIR/lib/ld-linux-x86-64.so.2" --library-path "$DIR/lib" "$DIR/mkfs.btrfs.bin" "$@"
+# Find the dynamic linker (works on both x86_64 and aarch64)
+LD_LINUX=$(find "$DIR/lib" -name 'ld-linux-*.so.*' -type f 2>/dev/null | head -1)
+if [ -z "$LD_LINUX" ]; then
+    echo "Error: ld-linux not found in $DIR/lib" >&2
+    exit 1
+fi
+exec "$LD_LINUX" --library-path "$DIR/lib" "$DIR/mkfs.btrfs.bin" "$@"
 WRAPPER
 chmod +x "$OUTPUT_DIR/mkfs.btrfs"
 
