@@ -242,7 +242,7 @@ The mode is auto-detected from the kernel profile (btrfs profile → btrfs mode)
 ./fcvm podman run --name web --image-mode archive nginx:alpine
 ```
 
-**Btrfs mode** is designed for rootless podman with `--user`. It builds the btrfs storage image as the target user on the host, so file ownership matches what rootless podman expects — no chown needed at boot:
+**Btrfs mode** is designed for rootless podman with `--user`. It builds the btrfs storage image inside an Ubuntu Noble container (for host OS compatibility), so file ownership matches what rootless podman expects — no chown needed at boot:
 
 ```bash
 # Rootless podman in VM with btrfs storage (no sudo needed)
@@ -254,7 +254,7 @@ The mode is auto-detected from the kernel profile (btrfs profile → btrfs mode)
 
 **How btrfs mode works:**
 1. Host exports container as Docker archive (`podman save`)
-2. Host loads archive into a temp btrfs storage root (`podman --root <tmp> --storage-driver btrfs load`)
+2. Containerized `podman load` into a temp btrfs storage root (runs inside Ubuntu Noble for EL9 compatibility)
 3. Host packages the storage tree as a btrfs image (`mkfs.btrfs --rootdir --subvol`)
 4. Per-VM: btrfs reflink copy of the image (instant, read-write)
 5. Guest mounts the btrfs image as podman's graphroot — container is ready immediately

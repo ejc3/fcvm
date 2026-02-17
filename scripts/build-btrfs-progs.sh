@@ -3,7 +3,9 @@
 #
 # btrfs-progs 6.12+ includes mkfs.btrfs --rootdir --subvol which creates
 # btrfs images from directories containing btrfs subvolumes — without root.
-# Ubuntu 24.04 ships btrfs-progs 6.6.3 which lacks this feature.
+#
+# Builds inside an Ubuntu Noble container to work on any host OS (EL9, Ubuntu, etc.).
+# Uses the same proxy pattern as fcvm's rootfs package download.
 #
 # Usage: ./scripts/build-btrfs-progs.sh [output_dir]
 #        Output defaults to /mnt/fcvm-btrfs/deps/bin/
@@ -13,25 +15,11 @@ set -euo pipefail
 BTRFS_PROGS_VERSION="6.12"
 OUTPUT_DIR="${1:-/mnt/fcvm-btrfs/deps/bin}"
 
-# Source URL
-BTRFS_PROGS_URL="https://github.com/kdave/btrfs-progs/archive/refs/tags/v${BTRFS_PROGS_VERSION}.tar.gz"
-
-# Build directory
-BUILD_DIR="/tmp/btrfs-progs-build-$$"
-PREFIX="$BUILD_DIR/install"
-
-cleanup() {
-    if [[ -d "$BUILD_DIR" ]]; then
-        rm -rf "$BUILD_DIR"
-    fi
-}
-trap cleanup EXIT
-
 echo "=== Building btrfs-progs ${BTRFS_PROGS_VERSION} ==="
 echo "Output: $OUTPUT_DIR/mkfs.btrfs"
 echo ""
 
-# Check if already built
+# Check if already built and runnable
 if [[ -x "$OUTPUT_DIR/mkfs.btrfs" ]]; then
     EXISTING_VERSION=$("$OUTPUT_DIR/mkfs.btrfs" --version 2>/dev/null | grep -oP '[\d.]+' || echo "0")
     MAJOR=$(echo "$EXISTING_VERSION" | cut -d. -f1)
@@ -43,93 +31,97 @@ if [[ -x "$OUTPUT_DIR/mkfs.btrfs" ]]; then
     fi
 fi
 
-mkdir -p "$BUILD_DIR" "$PREFIX"
-cd "$BUILD_DIR"
+mkdir -p "$OUTPUT_DIR"
 
-# Check and install build dependencies
-echo "Checking build dependencies..."
-MISSING_PKGS=""
-
-for pkg in uuid-dev libblkid-dev liblzo2-dev libzstd-dev zlib1g-dev libext2fs-dev libudev-dev; do
-    if ! dpkg -s "$pkg" &>/dev/null; then
-        MISSING_PKGS="$MISSING_PKGS $pkg"
+# Build proxy args for podman (same pattern as fcvm rootfs download)
+PROXY_ARGS=()
+for var in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; do
+    if [[ -n "${!var:-}" ]]; then
+        PROXY_ARGS+=("-e" "${var}=${!var}")
     fi
 done
 
-# Also need python3 for documentation/autogen (python3-setuptools for sphinx)
-if ! command -v python3 &>/dev/null; then
-    MISSING_PKGS="$MISSING_PKGS python3"
+# Determine curl proxy flag from http_proxy
+CURL_PROXY=""
+if [[ -n "${http_proxy:-}" ]]; then
+    CURL_PROXY="-x $http_proxy"
+elif [[ -n "${HTTPS_PROXY:-}" ]]; then
+    CURL_PROXY="-x $HTTPS_PROXY"
 fi
 
-if ! command -v autoconf &>/dev/null; then
-    MISSING_PKGS="$MISSING_PKGS autoconf"
+echo "Building in Ubuntu Noble container..."
+podman run --rm --cgroups=disabled --network=host \
+    "${PROXY_ARGS[@]}" \
+    -v "$OUTPUT_DIR:/output:Z" \
+    ubuntu:noble bash -c "
+set -e
+# Configure apt proxy (same as fcvm rootfs download)
+echo 'APT::Sandbox::User \"root\";' > /etc/apt/apt.conf.d/10sandbox
+if [ -n \"\${http_proxy:-}\" ]; then
+    echo \"Acquire::http::Proxy \\\"\$http_proxy\\\";\" > /etc/apt/apt.conf.d/99proxy
+    echo \"Acquire::https::Proxy \\\"\$http_proxy\\\";\" >> /etc/apt/apt.conf.d/99proxy
+fi
+echo 'Acquire::Retries \"3\";' > /etc/apt/apt.conf.d/80retries
+
+echo '  Installing build deps...'
+apt-get update -qq >/dev/null 2>&1
+apt-get install -y --no-install-recommends >/dev/null 2>&1 \
+    curl ca-certificates build-essential autoconf automake pkg-config \
+    uuid-dev libblkid-dev liblzo2-dev libzstd-dev zlib1g-dev libext2fs-dev libudev-dev
+
+echo '  Downloading btrfs-progs ${BTRFS_PROGS_VERSION}...'
+cd /tmp
+curl ${CURL_PROXY} -sL https://github.com/kdave/btrfs-progs/archive/refs/tags/v${BTRFS_PROGS_VERSION}.tar.gz | tar xz
+cd btrfs-progs-${BTRFS_PROGS_VERSION}
+
+echo '  Configuring...'
+./autogen.sh >/dev/null 2>&1
+./configure --disable-documentation --disable-python >/dev/null 2>&1
+
+echo '  Compiling...'
+make -j\$(nproc) >/dev/null 2>&1
+
+# Copy the binary AND its required shared libraries so it runs on any host
+echo '  Bundling binary + libraries...'
+mkdir -p /output/lib
+cp mkfs.btrfs /output/mkfs.btrfs.bin
+chmod +x /output/mkfs.btrfs.bin
+
+# Copy required shared libraries
+for lib in \$(ldd mkfs.btrfs | awk '/=>/ {print \$3}'); do
+    cp \"\$lib\" /output/lib/ 2>/dev/null || true
+done
+# Copy the dynamic linker (architecture-dependent)
+ARCH=\$(uname -m)
+if [ \"\$ARCH\" = \"aarch64\" ]; then
+    cp /lib/ld-linux-aarch64.so.1 /output/lib/ 2>/dev/null || true
+else
+    cp /lib64/ld-linux-x86-64.so.2 /output/lib/ 2>/dev/null || \
+        cp /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /output/lib/ 2>/dev/null || true
 fi
 
-if ! command -v automake &>/dev/null; then
-    MISSING_PKGS="$MISSING_PKGS automake"
-fi
-
-if ! command -v pkg-config &>/dev/null; then
-    MISSING_PKGS="$MISSING_PKGS pkg-config"
-fi
-
-if [[ -n "$MISSING_PKGS" ]]; then
-    echo "Installing missing build dependencies:$MISSING_PKGS"
-    sudo apt-get update -qq
-    sudo apt-get install -y --no-install-recommends $MISSING_PKGS
-fi
-
-# Download and extract
-echo ""
-echo "=== Downloading btrfs-progs ${BTRFS_PROGS_VERSION} ==="
-curl -sL "$BTRFS_PROGS_URL" | tar xz
-cd "btrfs-progs-${BTRFS_PROGS_VERSION}"
-
-# Generate configure script
-echo ""
-echo "=== Running autogen ==="
-./autogen.sh
-
-# Configure - disable documentation (requires sphinx) and python bindings
-echo ""
-echo "=== Configuring ==="
-./configure \
-    --prefix="$PREFIX" \
-    --disable-documentation \
-    --disable-python
-
-# Build
-echo ""
-echo "=== Building ==="
-make -j"$(nproc)"
-
-# Verify the build
-echo ""
-echo "=== Verifying build ==="
+echo '  Done!'
 ./mkfs.btrfs --version
+"
 
-# Check that --rootdir is supported (mkfs.btrfs has had -r/--rootdir since 4.x)
-# Verify by checking the version is >= 6.12
-BUILT_VERSION=$(./mkfs.btrfs --version 2>/dev/null | grep -oP '[\d.]+' || echo "0")
-echo "Built version: $BUILT_VERSION"
-BUILT_MAJOR=$(echo "$BUILT_VERSION" | cut -d. -f1)
-BUILT_MINOR=$(echo "$BUILT_VERSION" | cut -d. -f2)
-if [[ "$BUILT_MAJOR" -lt 6 ]] || [[ "$BUILT_MAJOR" -eq 6 && "$BUILT_MINOR" -lt 12 ]]; then
-    echo "ERROR: built mkfs.btrfs version $BUILT_VERSION is too old (need >= 6.12 for --rootdir --subvol)"
-    exit 1
+# Create wrapper script that uses bundled libraries
+cat > "$OUTPUT_DIR/mkfs.btrfs" << 'WRAPPER'
+#!/bin/bash
+DIR="$(cd "$(dirname "$0")" && pwd)"
+ARCH=$(uname -m)
+if [ "$ARCH" = "aarch64" ]; then
+    LINKER="$DIR/lib/ld-linux-aarch64.so.1"
+else
+    LINKER="$DIR/lib/ld-linux-x86-64.so.2"
 fi
-
-# Install to output directory
-echo ""
-echo "=== Installing to $OUTPUT_DIR ==="
-mkdir -p "$OUTPUT_DIR"
-cp -v mkfs.btrfs "$OUTPUT_DIR/mkfs.btrfs"
+exec "$LINKER" --library-path "$DIR/lib" "$DIR/mkfs.btrfs.bin" "$@"
+WRAPPER
 chmod +x "$OUTPUT_DIR/mkfs.btrfs"
+
+echo ""
+echo "=== Verifying ==="
+"$OUTPUT_DIR/mkfs.btrfs" --version
 
 echo ""
 echo "=== Success! ==="
 echo "Binary: $OUTPUT_DIR/mkfs.btrfs"
-VERSION=$("$OUTPUT_DIR/mkfs.btrfs" --version 2>/dev/null || echo "unknown")
-echo "Version: $VERSION"
-echo ""
-echo "Test with: $OUTPUT_DIR/mkfs.btrfs --version"

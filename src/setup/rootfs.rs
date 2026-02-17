@@ -628,7 +628,9 @@ pub fn generate_setup_script(plan: &Plan) -> String {
     // be busy from postinst).
     s.push_str("# Remove podman state files created by apt post-install scripts\n");
     s.push_str("rm -f /var/lib/containers/storage/db.sql /var/lib/containers/storage/storage.lock /var/lib/containers/storage/userns.lock /var/lib/containers/storage/defaultNetworkBackend 2>/dev/null || true\n");
-    s.push_str("rm -rf /var/lib/containers/storage/libpod /var/lib/containers/storage/overlay-containers /var/lib/containers/storage/overlay-images 2>/dev/null || true\n\n");
+    s.push_str("rm -rf /var/lib/containers/storage/libpod /var/lib/containers/storage/overlay-containers /var/lib/containers/storage/overlay-images 2>/dev/null || true\n");
+    s.push_str("# Remove .has-mount-program marker — causes podman to create broken db.sql with driver=\"\"\n");
+    s.push_str("rm -f /var/lib/containers/storage/overlay/.has-mount-program 2>/dev/null || true\n\n");
 
     // Cleanup
     if !plan.cleanup.remove_dirs.is_empty() {

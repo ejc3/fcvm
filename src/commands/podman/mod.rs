@@ -490,7 +490,8 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 // Format version for overlay image cache. Bump when the build process
                 // changes in a way that invalidates previously-cached images.
                 // v2: host-side cleanup of podman state files before ext4 packaging
-                const OVERLAY_CACHE_VERSION: u32 = 2;
+                // v3: also remove .has-mount-program marker from overlay dir
+                const OVERLAY_CACHE_VERSION: u32 = 3;
                 let storage_img_path = PathBuf::from(format!(
                     "{}.storage-v{}.img",
                     cache_dir.display(),
@@ -518,25 +519,34 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 // Format version for btrfs image cache. Bump when the build process
                 // changes in a way that invalidates previously-cached images.
                 // v2: host-side cleanup of podman state files before mkfs.btrfs
-                const BTRFS_CACHE_VERSION: u32 = 2;
+                // v3: containerized podman load, explicit db file cleanup
+                const BTRFS_CACHE_VERSION: u32 = 3;
 
+                // Cache key includes version, UID, and rootfs_size
                 let btrfs_img_path = match build_uid {
                     Some(uid) => PathBuf::from(format!(
-                        "{}.btrfs-v{}-uid{}.img",
+                        "{}.btrfs-v{}-uid{}-{}.img",
                         cache_dir.display(),
                         BTRFS_CACHE_VERSION,
-                        uid
+                        uid,
+                        args.rootfs_size
                     )),
                     None => PathBuf::from(format!(
-                        "{}.btrfs-v{}.img",
+                        "{}.btrfs-v{}-{}.img",
                         cache_dir.display(),
-                        BTRFS_CACHE_VERSION
+                        BTRFS_CACHE_VERSION,
+                        args.rootfs_size
                     )),
                 };
                 if !btrfs_img_path.exists() {
                     info!(image = %args.image, digest = %digest, uid = ?build_uid, "Building btrfs storage image");
-                    image::build_btrfs_storage_image(&archive_path, &btrfs_img_path, build_uid)
-                        .await?;
+                    image::build_btrfs_storage_image(
+                        &archive_path,
+                        &btrfs_img_path,
+                        build_uid,
+                        &args.rootfs_size,
+                    )
+                    .await?;
                 } else {
                     info!(image = %args.image, digest = %digest, "Using cached btrfs storage image");
                 }
