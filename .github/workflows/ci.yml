@@ -307,6 +307,9 @@ jobs:
           sudo ./target/release/fcvm setup --generate-config --force
           # Build btrfs kernel locally (needed for test_localhost_rootless tests)
           sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels
+      - name: Build btrfs-progs
+        working-directory: fcvm
+        run: ./scripts/build-btrfs-progs.sh
       - name: test-packaging-e2e
         working-directory: fcvm
         run: ./scripts/test-packaging-e2e.sh ./target/release/fcvm
@@ -475,6 +478,9 @@ jobs:
         run: |
           # Build btrfs kernel locally (needed for test_localhost_rootless tests)
           sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels
+      - name: Build btrfs-progs
+        working-directory: fcvm
+        run: ./scripts/build-btrfs-progs.sh
       - name: Allocate hugepages
         run: |
           echo 512 | sudo tee /proc/sys/vm/nr_hugepages

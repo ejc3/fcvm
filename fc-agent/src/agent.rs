@@ -196,10 +196,10 @@ pub async fn run() -> Result<()> {
             container::mount_overlay_image(device, &plan.image, username)?
         }
         (Some("btrfs"), Some(_device)) => {
-            // Device was already mounted in Phase 1 (before user creation).
-            // setup_btrfs_storage_if_available() wrote root storage.conf.
-            // setup_user_btrfs_storage() created user subdirs (if --user).
-            // Just return the image name — it's already in the store.
+            // Device was already mounted in Phase 1 (before user creation):
+            // - Root mode: mount_btrfs_device() + write_btrfs_storage_conf()
+            // - User mode: mount_btrfs_for_user() (mounts at user graphroot)
+            // Image is already in the btrfs store — just return the name.
             plan.image.clone()
         }
         (Some("archive"), Some(device)) => {
