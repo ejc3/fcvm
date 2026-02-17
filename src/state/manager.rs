@@ -1,8 +1,24 @@
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 
 use super::types::VmState;
+
+/// Open or create a lock file with world-readable/writable permissions.
+/// Uses fchmod after creation to ensure permissions are set regardless of umask.
+/// This allows both root and non-root processes to coordinate via flock.
+fn open_lock_file(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o666)
+        .open(path)?;
+    // Force permissions regardless of umask (only effective if we own the file or are root)
+    let _ = file.set_permissions(std::fs::Permissions::from_mode(0o666));
+    Ok(file)
+}
 
 /// Manages VM state persistence
 ///
@@ -63,14 +79,7 @@ impl StateManager {
         let lock_file = self.state_dir.join(format!("{}.json.lock", state.vm_id));
 
         // Create/open lock file for exclusive locking
-        use std::os::unix::fs::OpenOptionsExt;
-        let lock_fd = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o666)
-            .open(&lock_file)
-            .context("opening lock file")?;
+        let lock_fd = open_lock_file(&lock_file).context("opening lock file")?;
 
         // Acquire exclusive lock (blocks if another process has lock).
         // NOTE: Flock::lock() is technically blocking I/O in an async context, but
@@ -426,14 +435,7 @@ impl StateManager {
         let lock_file = self.state_dir.join(format!("{}.json.lock", vm_id));
 
         // Create/open lock file for exclusive locking
-        use std::os::unix::fs::OpenOptionsExt;
-        let lock_fd = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o666)
-            .open(&lock_file)
-            .context("opening lock file for health update")?;
+        let lock_fd = open_lock_file(&lock_file).context("opening lock file for health update")?;
 
         // Acquire exclusive lock (blocks if another process has lock)
         use nix::fcntl::{Flock, FlockArg};
@@ -511,14 +513,7 @@ impl StateManager {
         let lock_file = self.state_dir.join("loopback-ip.lock");
 
         // Create/open lock file for exclusive locking
-        use std::os::unix::fs::OpenOptionsExt;
-        let lock_fd = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o666)
-            .open(&lock_file)
-            .context("opening loopback IP lock file")?;
+        let lock_fd = open_lock_file(&lock_file).context("opening loopback IP lock file")?;
 
         // Acquire exclusive lock (blocks if another process has lock)
         use nix::fcntl::{Flock, FlockArg};
