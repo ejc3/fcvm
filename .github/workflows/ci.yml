@@ -310,6 +310,8 @@ jobs:
       - name: Build btrfs-progs
         working-directory: fcvm
         run: ./scripts/build-btrfs-progs.sh
+      - name: Refresh KVM permissions
+        run: sudo chmod 666 /dev/kvm
       - name: test-packaging-e2e
         working-directory: fcvm
         run: ./scripts/test-packaging-e2e.sh ./target/release/fcvm
@@ -481,6 +483,8 @@ jobs:
       - name: Build btrfs-progs
         working-directory: fcvm
         run: ./scripts/build-btrfs-progs.sh
+      - name: Refresh KVM permissions
+        run: sudo chmod 666 /dev/kvm
       - name: Allocate hugepages
         run: |
           echo 512 | sudo tee /proc/sys/vm/nr_hugepages
