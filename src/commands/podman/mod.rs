@@ -517,15 +517,27 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                     .and_then(|user_spec| user_spec.split(':').next()?.parse::<u32>().ok());
                 // Cache key includes UID and rootfs_size — different sizes need different images
                 let btrfs_img_path = match build_uid {
-                    Some(uid) => {
-                        PathBuf::from(format!("{}.btrfs-uid{}-{}.img", cache_dir.display(), uid, args.rootfs_size))
-                    }
-                    None => PathBuf::from(format!("{}.btrfs-{}.img", cache_dir.display(), args.rootfs_size)),
+                    Some(uid) => PathBuf::from(format!(
+                        "{}.btrfs-uid{}-{}.img",
+                        cache_dir.display(),
+                        uid,
+                        args.rootfs_size
+                    )),
+                    None => PathBuf::from(format!(
+                        "{}.btrfs-{}.img",
+                        cache_dir.display(),
+                        args.rootfs_size
+                    )),
                 };
                 if !btrfs_img_path.exists() {
                     info!(image = %args.image, digest = %digest, uid = ?build_uid, "Building btrfs storage image");
-                    image::build_btrfs_storage_image(&archive_path, &btrfs_img_path, build_uid, &args.rootfs_size)
-                        .await?;
+                    image::build_btrfs_storage_image(
+                        &archive_path,
+                        &btrfs_img_path,
+                        build_uid,
+                        &args.rootfs_size,
+                    )
+                    .await?;
                 } else {
                     info!(image = %args.image, digest = %digest, "Using cached btrfs storage image");
                 }
