@@ -162,10 +162,7 @@ async fn test_localhost_rootless_btrfs_storage() -> Result<()> {
 /// Runs the VM twice with the same args — first creates a snapshot, second restores from it.
 /// The key test is that the second run (from snapshot) also succeeds.
 ///
-/// Requires host user namespace: btrfs --user builds need rootless podman on the host,
-/// which calls newuidmap to write /proc/PID/uid_map. Gated behind bare-metal
-/// (newuidmap fails under nested user namespaces in container CI).
-#[cfg(feature = "bare-metal")]
+/// VM-side btrfs loading: no host-side rootless podman needed, so this runs everywhere.
 #[tokio::test]
 async fn test_localhost_rootless_btrfs_snapshot_restore() -> Result<()> {
     println!("\nBtrfs Snapshot Restore Test");
@@ -359,10 +356,7 @@ async fn test_localhost_rootless_btrfs_snapshot_restore() -> Result<()> {
 /// health monitor can't detect container health. We poll btrfs readiness
 /// and use `runuser -u fcvm-user` for podman queries.
 ///
-/// Requires host user namespace: btrfs --user builds need rootless podman on the host,
-/// which calls newuidmap to write /proc/PID/uid_map. Gated behind bare-metal
-/// (newuidmap fails under nested user namespaces in container CI).
-#[cfg(feature = "bare-metal")]
+/// VM-side btrfs loading: no host-side rootless podman needed, so this runs everywhere.
 #[tokio::test]
 async fn test_localhost_rootless_btrfs_keepid() -> Result<()> {
     println!("\nRootless Localhost + Btrfs + keep-id Test");
@@ -466,21 +460,28 @@ async fn test_localhost_rootless_btrfs_keepid() -> Result<()> {
         driver
     );
 
-    // Step 6: Verify btrfs mount at user's default rootless graphroot
+    // Step 6: Verify btrfs mount at root graphroot (loopback).
+    // With VM-side btrfs loading, the loopback btrfs is mounted at
+    // /var/lib/containers/storage. The user's graphroot is a subdirectory there.
     println!("\n6. Checking btrfs mount...");
-    let user_graphroot = format!("/home/{}/.local/share/containers/storage", vm_username);
     let fstype = common::exec_in_vm(
         fcvm_pid,
-        &["findmnt", "-n", "-o", "FSTYPE", &user_graphroot],
+        &[
+            "findmnt",
+            "-n",
+            "-o",
+            "FSTYPE",
+            "/var/lib/containers/storage",
+        ],
     )
     .await
     .context("checking btrfs mount")?;
     let fstype = fstype.trim();
-    println!("  {} fstype: {}", user_graphroot, fstype);
+    println!("  /var/lib/containers/storage fstype: {}", fstype);
     assert_eq!(
         fstype, "btrfs",
-        "Expected btrfs filesystem at {}, got: {}",
-        user_graphroot, fstype
+        "Expected btrfs filesystem at /var/lib/containers/storage, got: {}",
+        fstype
     );
 
     // Step 7: Verify container ran with correct user
