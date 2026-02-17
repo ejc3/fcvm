@@ -254,8 +254,8 @@ The mode is auto-detected from the kernel profile (btrfs profile → btrfs mode)
 
 **How btrfs mode works:**
 1. Host exports container as Docker archive (`podman save`)
-2. Host loads archive into a temp btrfs storage root (`podman --root <tmp> --storage-driver btrfs load`)
-3. Host packages the storage tree as a btrfs image (`mkfs.btrfs --rootdir --subvol`)
+2. Containerized podman loads archive into a temp btrfs storage root (`podman --storage-driver btrfs load` inside Ubuntu Noble container)
+3. Containerized mkfs.btrfs packages the storage tree as a btrfs image (`mkfs.btrfs --rootdir --subvol` inside privileged container)
 4. Per-VM: btrfs reflink copy of the image (instant, read-write)
 5. Guest mounts the btrfs image as podman's graphroot — container is ready immediately
 

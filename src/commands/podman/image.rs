@@ -412,9 +412,10 @@ podman --root /btrfs-root --runroot /btrfs-runroot --storage-driver btrfs load -
 /// image using `mkfs.btrfs --rootdir --subvol`. The guest mounts this directly as its
 /// podman graphroot — no podman load needed, instant startup.
 ///
-/// The podman load step runs inside an Ubuntu Noble container because the host
-/// podman may lack the btrfs storage driver (e.g., EL9). The mkfs.btrfs step
-/// runs on the host using a bundled binary with libraries.
+/// Both the podman load and mkfs.btrfs steps run inside Ubuntu Noble containers
+/// because the host podman may lack the btrfs storage driver (e.g., EL9) and
+/// the containerized podman load creates root-owned files that the host user
+/// can't read.
 ///
 /// Requires:
 /// - The temp dir must be on a btrfs filesystem (for real subvolumes)
@@ -681,30 +682,49 @@ async fn cleanup_btrfs_tmp(tmp_dir: &Path) {
     // Use a privileged container to delete everything — it has root access
     // to both btrfs subvolume operations and root-owned files.
     let cleanup_script = "set -e\n\
-        # Delete all btrfs subvolumes first (can't rm -rf a subvolume)\n\
+        # Install btrfs-progs so we can delete btrfs subvolumes.\n\
+        # Without this, rm -rf fails on subvolumes (kernel refuses unlink).\n\
+        apt-get update -qq >/dev/null 2>&1\n\
+        apt-get install -y -qq btrfs-progs >/dev/null 2>&1 || true\n\
+        # Delete all btrfs subvolumes first (can't rm -rf a subvolume).\n\
+        # Use find + inode 256 to detect subvolumes (same as enumerate_btrfs_subvolumes).\n\
+        # Process deepest paths first so nested subvolumes are deleted before parents.\n\
         if command -v btrfs >/dev/null 2>&1; then\n\
-            btrfs subvolume list -o /cleanup 2>/dev/null | awk '{print $NF}' | while read sv; do\n\
-                btrfs subvolume delete \"/cleanup/$sv\" 2>/dev/null || true\n\
-            done\n\
+            find /cleanup -mindepth 1 -type d -inum 256 2>/dev/null | \
+                awk '{print length, $0}' | sort -rn | awk '{print $2}' | \
+                while read sv; do\n\
+                    btrfs subvolume delete \"$sv\" 2>/dev/null || true\n\
+                done\n\
         fi\n\
         # Then remove everything\n\
         rm -rf /cleanup/*\n\
         rm -rf /cleanup/.[!.]* 2>/dev/null || true";
 
+    // Build proxy args so apt-get can reach package repos
+    let mut cleanup_args = vec![
+        "run".to_string(),
+        "--rm".to_string(),
+        "--privileged".to_string(),
+        "--cgroups=disabled".to_string(),
+        "--network=host".to_string(),
+    ];
+    for var in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
+        if let Ok(val) = std::env::var(var) {
+            cleanup_args.push("-e".to_string());
+            cleanup_args.push(format!("{}={}", var, val));
+        }
+    }
+    cleanup_args.extend([
+        "-v".to_string(),
+        format!("{}:/cleanup", tmp_dir.display()),
+        "ubuntu:noble".to_string(),
+        "bash".to_string(),
+        "-c".to_string(),
+        cleanup_script.to_string(),
+    ]);
+
     let result = tokio::process::Command::new("podman")
-        .args([
-            "run",
-            "--rm",
-            "--privileged",
-            "--cgroups=disabled",
-            "--network=none",
-            "-v",
-            &format!("{}:/cleanup", tmp_dir.display()),
-            "ubuntu:noble",
-            "bash",
-            "-c",
-            cleanup_script,
-        ])
+        .args(&cleanup_args)
         .output()
         .await;
 
