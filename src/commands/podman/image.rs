@@ -301,9 +301,10 @@ fn find_mkfs_btrfs() -> Result<PathBuf> {
 /// `mkfs.btrfs --rootdir --subvol`. The guest mounts this directly as its
 /// podman graphroot — no podman load needed, instant startup.
 ///
-/// When `build_uid` is set, runs `podman load` as that user (rootless podman).
-/// This creates storage with the correct UID ownership for rootless use in the guest,
-/// matching how rootless podman works on a physical host. When None, builds as root.
+/// When `build_uid` is set, runs `podman load` as root and then recursively chowns the
+/// resulting storage tree to the target UID/GID. This creates storage with the correct
+/// ownership for rootless use in the guest without requiring user namespace support
+/// (newuidmap/subuid), which may not be available in containerized environments.
 ///
 /// Requires:
 /// - The temp dir must be on a btrfs filesystem (for real subvolumes)
@@ -357,12 +358,11 @@ pub(super) async fn build_btrfs_storage_image(
         .await
         .context("creating temp btrfs runroot dir")?;
 
-    // For user builds: find username and chown temp dirs so rootless podman can use them.
-    // Skip runuser if we're already running as the target uid (rootless fcvm, no sudo).
-    let build_username = if let Some(uid) = build_uid {
+    // Resolve target UID/GID for user builds.
+    // Skip if we're already running as the target uid (rootless fcvm, no sudo).
+    let chown_uid_gid = if let Some(uid) = build_uid {
         let current_uid = nix::unistd::getuid().as_raw();
         if current_uid == uid {
-            // Already running as the target user — no runuser needed
             info!("Building btrfs image as current user (uid {})", uid);
             None
         } else {
@@ -374,14 +374,8 @@ pub(super) async fn build_btrfs_storage_image(
                         uid
                     )
                 })?;
-            let nix_uid = nix::unistd::Uid::from_raw(uid);
-            let nix_gid = nix::unistd::Gid::from_raw(user.gid.as_raw());
-            nix::unistd::chown(tmp_dir.as_path(), Some(nix_uid), Some(nix_gid))
-                .context("chowning temp dir to build user")?;
-            nix::unistd::chown(tmp_runroot.as_path(), Some(nix_uid), Some(nix_gid))
-                .context("chowning temp runroot to build user")?;
-            info!("Building btrfs image as user {} (uid {})", user.name, uid);
-            Some(user.name)
+            info!("Building btrfs image for user {} (uid {})", user.name, uid);
+            Some((uid, user.gid.as_raw()))
         }
     } else {
         None
@@ -389,38 +383,30 @@ pub(super) async fn build_btrfs_storage_image(
 
     // Load the docker archive into a custom podman storage root on btrfs.
     // This creates real btrfs subvolumes for each layer.
-    // For user builds, `runuser -u <username>` runs rootless podman, creating
-    // storage with correct UID ownership — matching a physical host.
+    // We always run podman load as the current user (root) to avoid user namespace
+    // issues with newuidmap in containerized environments. For user builds, we
+    // chown the resulting files afterward to get the correct UID ownership.
     info!(
         "Loading archive into btrfs podman storage: {} -> {}",
         archive_path.display(),
         tmp_dir.display()
     );
 
-    let mut cmd_args: Vec<String> = Vec::new();
-    if let Some(ref username) = build_username {
-        cmd_args.extend(
-            ["runuser", "-u", username, "--"]
-                .iter()
-                .map(|s| s.to_string()),
-        );
-    }
-    cmd_args.extend(
-        [
-            "podman",
-            "--root",
-            tmp_dir.to_str().unwrap(),
-            "--runroot",
-            tmp_runroot.to_str().unwrap(),
-            "--storage-driver",
-            "btrfs",
-            "load",
-            "-i",
-            archive_path.to_str().unwrap(),
-        ]
-        .iter()
-        .map(|s| s.to_string()),
-    );
+    let cmd_args: Vec<String> = [
+        "podman",
+        "--root",
+        tmp_dir.to_str().unwrap(),
+        "--runroot",
+        tmp_runroot.to_str().unwrap(),
+        "--storage-driver",
+        "btrfs",
+        "load",
+        "-i",
+        archive_path.to_str().unwrap(),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
 
     let load_output = tokio::process::Command::new(&cmd_args[0])
         .args(&cmd_args[1..])
@@ -433,6 +419,27 @@ pub(super) async fn build_btrfs_storage_image(
         cleanup_btrfs_tmp(&tmp_dir).await;
         tokio::fs::remove_dir_all(&tmp_runroot).await.ok();
         bail!("podman load into btrfs storage root failed: {}", stderr);
+    }
+
+    // For user builds: recursively chown the storage tree to the target UID/GID.
+    // This is equivalent to running podman as that user but avoids the newuidmap
+    // requirement that fails in containerized CI environments.
+    if let Some((uid, gid)) = chown_uid_gid {
+        info!(
+            "Chowning btrfs storage to uid:gid {}:{}",
+            uid, gid
+        );
+        let chown_output = tokio::process::Command::new("chown")
+            .args(["-R", &format!("{}:{}", uid, gid), tmp_dir.to_str().unwrap()])
+            .output()
+            .await
+            .context("chowning btrfs storage to target user")?;
+        if !chown_output.status.success() {
+            let stderr = String::from_utf8_lossy(&chown_output.stderr);
+            cleanup_btrfs_tmp(&tmp_dir).await;
+            tokio::fs::remove_dir_all(&tmp_runroot).await.ok();
+            bail!("chown of btrfs storage failed: {}", stderr);
+        }
     }
 
     let loaded_msg = String::from_utf8_lossy(&load_output.stdout);
