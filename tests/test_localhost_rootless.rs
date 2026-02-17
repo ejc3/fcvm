@@ -161,6 +161,11 @@ async fn test_localhost_rootless_btrfs_storage() -> Result<()> {
 ///
 /// Runs the VM twice with the same args — first creates a snapshot, second restores from it.
 /// The key test is that the second run (from snapshot) also succeeds.
+///
+/// Requires host user namespace: btrfs --user builds need rootless podman on the host,
+/// which calls newuidmap to write /proc/PID/uid_map. Gated behind bare-metal
+/// (newuidmap fails under nested user namespaces in container CI).
+#[cfg(feature = "bare-metal")]
 #[tokio::test]
 async fn test_localhost_rootless_btrfs_snapshot_restore() -> Result<()> {
     println!("\nBtrfs Snapshot Restore Test");
@@ -353,6 +358,11 @@ async fn test_localhost_rootless_btrfs_snapshot_restore() -> Result<()> {
 /// Root's `podman inspect` can't see rootless containers, so the standard
 /// health monitor can't detect container health. We poll btrfs readiness
 /// and use `runuser -u fcvm-user` for podman queries.
+///
+/// Requires host user namespace: btrfs --user builds need rootless podman on the host,
+/// which calls newuidmap to write /proc/PID/uid_map. Gated behind bare-metal
+/// (newuidmap fails under nested user namespaces in container CI).
+#[cfg(feature = "bare-metal")]
 #[tokio::test]
 async fn test_localhost_rootless_btrfs_keepid() -> Result<()> {
     println!("\nRootless Localhost + Btrfs + keep-id Test");
