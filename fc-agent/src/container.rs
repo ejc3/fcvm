@@ -47,11 +47,6 @@ pub fn mount_overlay_image(
     // Configure podman to use this as an additional image store.
     let (conf_path, runroot, graphroot) = storage_paths(username);
 
-    // Clear any stale podman database that might have a different driver.
-    // The rootfs may have a pre-existing database from setup that conflicts
-    // with our explicit driver="overlay" setting.
-    clear_podman_database(&graphroot);
-
     let storage_conf = format!(
         "[storage]\ndriver = \"overlay\"\nrunroot = \"{runroot}\"\ngraphroot = \"{graphroot}\"\n\n[storage.options]\nadditionalimagestores = [\"{mount_path}\"]\n"
     );
@@ -115,12 +110,6 @@ pub fn mount_btrfs_device(device: &str, mount_path: &str) -> Result<()> {
         let _ = std::fs::set_permissions(mount_path, std::fs::Permissions::from_mode(0o755));
     }
 
-    // Clean podman state files from the mounted image. The host-side build removes
-    // these before mkfs.btrfs, but they can reappear: btrfs metadata operations or
-    // podman initialization may recreate db.sql with graph_driver="" before we write
-    // storage.conf with driver="btrfs", causing a mismatch error.
-    clear_podman_database(mount_path);
-
     eprintln!(
         "[fc-agent] btrfs device {} mounted at {} (early mount)",
         device, mount_path
@@ -172,66 +161,6 @@ fn storage_paths(username: Option<&str>) -> (String, String, String) {
             "/run/containers/storage".to_string(),
             "/var/lib/containers/storage".to_string(),
         )
-    }
-}
-
-/// Clear ALL podman state files, keeping only image/layer data.
-///
-/// Podman stores its graph driver in the database (db.sql, libpod/).
-/// If we write a storage.conf with a different driver, podman refuses to start:
-/// "database graph driver X does not match our graph driver Y".
-///
-/// Instead of maintaining a list of files to delete (which misses new state files
-/// added in newer podman versions), we keep only the directories containing
-/// actual image/layer data and delete everything else.
-fn clear_podman_database(graphroot: &str) {
-    let graphroot_path = std::path::Path::new(graphroot);
-
-    // Directories containing actual image/layer data — keep these.
-    // All other files/dirs are state/database/locks that must be recreated.
-    let keep = [
-        "btrfs",
-        "btrfs-images",
-        "btrfs-layers",
-        "overlay",
-        "overlay-images",
-        "overlay-layers",
-    ];
-
-    let entries = match std::fs::read_dir(graphroot_path) {
-        Ok(entries) => entries,
-        Err(e) => {
-            eprintln!(
-                "[fc-agent] WARNING: cannot read graphroot {}: {}",
-                graphroot, e
-            );
-            return;
-        }
-    };
-
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if keep.iter().any(|&k| k == name_str.as_ref()) {
-            continue;
-        }
-        let path = entry.path();
-        let ft = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        let result = if ft.is_dir() {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-        if let Err(e) = result {
-            eprintln!(
-                "[fc-agent] WARNING: failed to remove {}: {}",
-                path.display(),
-                e
-            );
-        }
     }
 }
 
