@@ -717,12 +717,15 @@ pub(super) async fn run_vm_setup(
         .context("creating CoW disk")?;
 
     // Estimate space needed for container image extraction inside VM.
-    // Overlay and btrfs modes use separate block devices — no rootfs impact.
-    // Archive mode extracts layers onto the rootfs via podman load.
+    // Overlay mode uses a separate block device — no rootfs impact.
+    // Btrfs and archive modes load the archive onto the rootfs via podman load.
     // podman load extracts layers to /var/tmp first, then copies to storage,
     // so we need ~3x the archive size for safety margin.
     let resolved_mode = super::resolve_image_mode(args);
-    let image_overhead = if resolved_mode == crate::firecracker::ImageMode::Archive {
+    let image_overhead = if matches!(
+        resolved_mode,
+        crate::firecracker::ImageMode::Archive | crate::firecracker::ImageMode::Btrfs
+    ) {
         if let Some(disk_path) = image_disk_path {
             match tokio::fs::metadata(disk_path).await {
                 Ok(meta) => meta.len() * 3,
@@ -853,9 +856,9 @@ pub(super) async fn run_vm_setup(
         .await?;
 
     // Attach extra disks and image disk.
-    // Btrfs mode needs read-write (podman creates new subvolumes in graphroot).
-    // Overlay and archive modes are read-only.
-    let image_disk_read_only = launch_config.image_mode != crate::firecracker::ImageMode::Btrfs;
+    // All image modes use read-only: overlay (additionalImageStore), btrfs (Docker archive),
+    // and archive (Docker archive). Btrfs creates loopback storage on rootfs internally.
+    let image_disk_read_only = true;
     let (extra_disks, image_device) = attach_extra_disks(
         args,
         client,

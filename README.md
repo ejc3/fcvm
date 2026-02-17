@@ -254,13 +254,11 @@ The mode is auto-detected from the kernel profile (btrfs profile → btrfs mode)
 
 **How btrfs mode works:**
 1. Host exports container as Docker archive (`podman save`)
-2. Host loads archive into a temp btrfs storage root (`podman --root <tmp> --storage-driver btrfs load`)
-3. Host packages the storage tree as a btrfs image (`mkfs.btrfs --rootdir --subvol`)
-4. Per-VM: btrfs reflink copy of the image (instant, read-write)
-5. Guest mounts the btrfs image as podman's graphroot — container is ready immediately
+2. Docker archive is attached to the VM as a read-only block device
+3. VM creates a btrfs loopback on the rootfs and runs `podman load` from the archive device
+4. Snapshot caches the post-load state for instant subsequent boots
 
 **Requirements for btrfs mode:**
-- btrfs-progs >= 6.12 (for `--rootdir --subvol` support). Build from source: `./scripts/build-btrfs-progs.sh`
 - A btrfs kernel profile with `CONFIG_BTRFS_FS=y`: `./fcvm setup --kernel-profile btrfs --build-kernels`
 
 ### More Options
