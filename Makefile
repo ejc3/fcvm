@@ -359,7 +359,7 @@ setup-btrfs:
 		echo '==> /mnt is btrfs, creating /mnt/fcvm-btrfs as directory (no loopback needed)'; \
 		sudo mkdir -p /mnt/fcvm-btrfs && \
 		sudo chown $$(id -un):$$(id -gn) /mnt/fcvm-btrfs && \
-		mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,initrd,cache,image-cache}; \
+		mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,initrd,cache,image-cache,firecracker}; \
 	elif ! mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then \
 		echo '==> Creating btrfs loopback (host is not btrfs)...'; \
 		if [ ! -f /var/fcvm-btrfs.img ]; then \
@@ -367,13 +367,14 @@ setup-btrfs:
 		fi && \
 		sudo mkdir -p /mnt/fcvm-btrfs && \
 		sudo mount -o loop /var/fcvm-btrfs.img /mnt/fcvm-btrfs && \
-		sudo mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,initrd,cache,image-cache} && \
+		sudo mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,initrd,cache,image-cache,firecracker} && \
 		sudo chown -R $$(id -un):$$(id -gn) /mnt/fcvm-btrfs && \
 		echo '==> btrfs ready at /mnt/fcvm-btrfs'; \
 	fi
 	@# Ensure these dirs exist with correct permissions (may be missing after reboot/corruption)
-	@sudo mkdir -p /mnt/fcvm-btrfs/image-cache /mnt/fcvm-btrfs/containers
+	@sudo mkdir -p /mnt/fcvm-btrfs/image-cache /mnt/fcvm-btrfs/containers /mnt/fcvm-btrfs/firecracker
 	@sudo chown $$(id -un):$$(id -gn) /mnt/fcvm-btrfs/image-cache /mnt/fcvm-btrfs/containers
+	@sudo chown -R $$(id -un):$$(id -gn) /mnt/fcvm-btrfs/firecracker
 	@# Enable IP forwarding (required for bridged networking)
 	@sudo sysctl -q -w net.ipv4.ip_forward=1
 	@# Create per-mode data directories (state, snapshots, vm-disks)
