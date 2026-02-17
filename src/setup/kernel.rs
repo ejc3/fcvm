@@ -651,9 +651,6 @@ curl -fSL "$BASE_CONFIG_URL" -o .config
 # Apply options from config fragment
 {apply_config_fragment}
 
-# Always enable BTRFS
-./scripts/config --enable CONFIG_BTRFS_FS
-
 # Update config with defaults for new options
 make ARCH="$KERNEL_ARCH" olddefconfig
 
