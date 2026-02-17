@@ -487,7 +487,15 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             crate::firecracker::ImageMode::Overlay => {
                 // Pre-built overlay storage: ext4 image with podman storage.
                 // Guest mounts this as additionalImageStore — no podman load needed.
-                let storage_img_path = cache_dir.with_extension("storage.img");
+                // Format version for overlay image cache. Bump when the build process
+                // changes in a way that invalidates previously-cached images.
+                // v2: host-side cleanup of podman state files before ext4 packaging
+                const OVERLAY_CACHE_VERSION: u32 = 2;
+                let storage_img_path = PathBuf::from(format!(
+                    "{}.storage-v{}.img",
+                    cache_dir.display(),
+                    OVERLAY_CACHE_VERSION
+                ));
                 if !storage_img_path.exists() {
                     info!(image = %args.image, digest = %digest, "Building overlay storage image");
                     build_storage_image(&archive_path, &storage_img_path).await?;
