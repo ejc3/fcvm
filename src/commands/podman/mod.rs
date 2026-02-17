@@ -503,18 +503,20 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 // For --user mode: build as uid 1000 (rootless podman), creating storage
                 // with correct ownership — matching a physical host. Separate cache path
                 // because rootless builds have different UID ownership than root builds.
-                let build_uid = args.user.as_ref().and_then(|user_spec| {
-                    user_spec.split(':').next()?.parse::<u32>().ok()
-                });
+                let build_uid = args
+                    .user
+                    .as_ref()
+                    .and_then(|user_spec| user_spec.split(':').next()?.parse::<u32>().ok());
                 let btrfs_img_path = match build_uid {
-                    Some(uid) => PathBuf::from(format!(
-                        "{}.btrfs-uid{}.img", cache_dir.display(), uid
-                    )),
+                    Some(uid) => {
+                        PathBuf::from(format!("{}.btrfs-uid{}.img", cache_dir.display(), uid))
+                    }
                     None => cache_dir.with_extension("btrfs.img"),
                 };
                 if !btrfs_img_path.exists() {
                     info!(image = %args.image, digest = %digest, uid = ?build_uid, "Building btrfs storage image");
-                    image::build_btrfs_storage_image(&archive_path, &btrfs_img_path, build_uid).await?;
+                    image::build_btrfs_storage_image(&archive_path, &btrfs_img_path, build_uid)
+                        .await?;
                 } else {
                     info!(image = %args.image, digest = %digest, "Using cached btrfs storage image");
                 }
@@ -854,9 +856,9 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     // Build image extra disk entries for snapshot metadata.
     // For btrfs mode, the per-VM image copy needs to be saved with snapshots
     // so clones get their own isolated copy.
-    let image_extra_disks = if image_disk_path.as_ref().map_or(false, |p| {
+    let image_extra_disks = if image_disk_path.as_ref().is_some_and(|p| {
         p.file_name()
-            .map_or(false, |f| f.to_string_lossy().ends_with(".btrfs"))
+            .is_some_and(|f| f.to_string_lossy().ends_with(".btrfs"))
     }) {
         let disk_idx = args.disk.len() + args.disk_dir.len();
         vec![crate::storage::SnapshotExtraDisk {
