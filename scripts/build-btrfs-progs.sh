@@ -91,18 +91,27 @@ chmod +x /output/mkfs.btrfs.bin
 for lib in \$(ldd mkfs.btrfs | awk '/=>/ {print \$3}'); do
     cp \"\$lib\" /output/lib/ 2>/dev/null || true
 done
-cp /lib64/ld-linux-x86-64.so.2 /output/lib/ 2>/dev/null || \
-    cp /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /output/lib/ 2>/dev/null || true
+# Copy the dynamic linker — detect path from ldd output for architecture portability
+# (x86-64 uses ld-linux-x86-64.so.2, aarch64 uses ld-linux-aarch64.so.1)
+LD_LINUX=\$(ldd mkfs.btrfs | grep 'ld-linux' | awk '{print \$1}')
+if [ -n \"\$LD_LINUX\" ] && [ -f \"\$LD_LINUX\" ]; then
+    cp \"\$LD_LINUX\" /output/lib/
+fi
+# Write the detected linker basename for the wrapper script
+basename \"\$LD_LINUX\" > /output/lib/.ld-linux-name
 
 echo '  Done!'
 ./mkfs.btrfs --version
 "
 
-# Create wrapper script that uses bundled libraries
-cat > "$OUTPUT_DIR/mkfs.btrfs" << 'WRAPPER'
+# Create wrapper script that uses bundled libraries.
+# Read the dynamic linker name detected during the container build
+# (supports both x86-64 and aarch64).
+LD_LINUX_NAME=$(cat "$OUTPUT_DIR/lib/.ld-linux-name" 2>/dev/null || echo "ld-linux-x86-64.so.2")
+cat > "$OUTPUT_DIR/mkfs.btrfs" << WRAPPER
 #!/bin/bash
-DIR="$(cd "$(dirname "$0")" && pwd)"
-exec "$DIR/lib/ld-linux-x86-64.so.2" --library-path "$DIR/lib" "$DIR/mkfs.btrfs.bin" "$@"
+DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+exec "\$DIR/lib/${LD_LINUX_NAME}" --library-path "\$DIR/lib" "\$DIR/mkfs.btrfs.bin" "\$@"
 WRAPPER
 chmod +x "$OUTPUT_DIR/mkfs.btrfs"
 
