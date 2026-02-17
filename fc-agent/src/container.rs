@@ -69,54 +69,6 @@ pub fn mount_overlay_image(
     Ok(image_name.to_string())
 }
 
-/// Mount a btrfs device at the given path (Phase 1: before user creation).
-///
-/// This is the early mount step for btrfs image mode. The device is mounted read-write
-/// so that `setup_btrfs_storage_if_available()` detects btrfs and writes storage.conf,
-/// and `setup_user_btrfs_storage()` creates user subdirs on it.
-pub fn mount_btrfs_device(device: &str, mount_path: &str) -> Result<()> {
-    std::fs::create_dir_all(mount_path).context("creating mount point")?;
-
-    // Ensure parent directories are traversable by non-root users.
-    // /var/lib/containers is typically 0700 root:root (podman default),
-    // but rootless podman needs to traverse it to reach the graphroot.
-    if let Some(parent) = std::path::Path::new(mount_path).parent() {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
-    }
-
-    wait_for_device(device)?;
-
-    let output = std::process::Command::new("mount")
-        .args(["-t", "btrfs", device, mount_path])
-        .output()
-        .context("mounting btrfs device")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "Failed to mount btrfs device {} at {}: {}",
-            device,
-            mount_path,
-            stderr
-        );
-    }
-
-    // The btrfs image's root directory may have mode 0700 (podman graphroot default
-    // from mkfs.btrfs --rootdir). Set to 0755 so rootless podman's user namespace
-    // can traverse it (real root maps to "nobody" in user namespaces).
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(mount_path, std::fs::Permissions::from_mode(0o755));
-    }
-
-    eprintln!(
-        "[fc-agent] btrfs device {} mounted at {} (early mount)",
-        device, mount_path
-    );
-    Ok(())
-}
-
 /// Wait for a block device to appear (up to 5 seconds).
 fn wait_for_device(device: &str) -> Result<()> {
     let device_path = std::path::Path::new(device);
@@ -198,69 +150,6 @@ pub fn set_podman_cmd_prefix(prefix: Vec<String>) {
 /// Get the command prefix (empty vec if running as root).
 pub fn podman_cmd_prefix() -> &'static [String] {
     PODMAN_CMD_PREFIX.get().map(|v| v.as_slice()).unwrap_or(&[])
-}
-
-/// Mount a pre-built btrfs image at the user's standard rootless graphroot.
-///
-/// Mounts at ~/.local/share/containers/storage — the default rootless graphroot.
-/// The btrfs image was built by rootless podman on the host (uid 1000), so all
-/// storage files already have correct ownership. No chown needed — just mount
-/// and configure, matching how rootless podman works on a physical host.
-pub fn mount_btrfs_for_user(device: &str, username: &str) -> Result<()> {
-    let home = format!("/home/{}", username);
-    let storage_dir = format!("{}/.local/share/containers/storage", home);
-
-    // Create the directory chain to the mount point
-    std::fs::create_dir_all(&storage_dir).context("creating user graphroot")?;
-
-    let pw = nix::unistd::User::from_name(username)?
-        .ok_or_else(|| anyhow::anyhow!("user not found: {}", username))?;
-    let uid = pw.uid.as_raw();
-    let gid = pw.gid.as_raw();
-    let owner = format!("{}:{}", uid, gid);
-
-    // Chown only the directory chain leading to the mount point (non-recursive).
-    // These are empty directories created by root; the user needs to traverse them.
-    let _ = std::process::Command::new("chown")
-        .args([
-            &owner,
-            &format!("{}/.local", home),
-            &format!("{}/.local/share", home),
-            &format!("{}/.local/share/containers", home),
-            &storage_dir,
-        ])
-        .output();
-
-    mount_btrfs_device(device, &storage_dir)?;
-
-    // Write user storage.conf with just driver = "btrfs".
-    // No custom graphroot needed — podman uses ~/.local/share/containers/storage by default.
-    let user_config_dir = format!("{}/.config/containers", home);
-    let _ = std::fs::create_dir_all(&user_config_dir);
-    let user_runroot = format!("/run/user/{}/containers", uid);
-    let _ = std::fs::create_dir_all(&user_runroot);
-    let _ = std::process::Command::new("chown")
-        .args([&owner, &user_runroot])
-        .output();
-
-    let storage_conf = format!(
-        "[storage]\ndriver = \"btrfs\"\nrunroot = \"{}\"\n",
-        user_runroot
-    );
-    std::fs::write(format!("{}/storage.conf", user_config_dir), &storage_conf)
-        .context("writing user storage.conf")?;
-    write_containers_conf(&format!("{}/containers.conf", user_config_dir));
-
-    // Chown config dir to user (tiny tree — just 2 config files)
-    let _ = std::process::Command::new("chown")
-        .args(["-R", &owner, &format!("{}/.config", home)])
-        .output();
-
-    eprintln!(
-        "[fc-agent] btrfs image mounted at user graphroot {} (uid={})",
-        storage_dir, uid
-    );
-    Ok(())
 }
 
 /// Write a btrfs storage.conf for root podman.
@@ -403,6 +292,22 @@ pub fn setup_btrfs_storage_if_available() {
         }
     }
 
+    // Make the btrfs mount and parent traversable by non-root users.
+    // Rootless podman needs to traverse this path to reach its graphroot subdirectory.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(parent) = std::path::Path::new(storage_dir).parent() {
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
+        }
+        let _ = std::fs::set_permissions(storage_dir, std::fs::Permissions::from_mode(0o755));
+    }
+
+    // Reset podman state to avoid driver mismatch errors.
+    // The rootfs may have been initialized with a different driver during setup.
+    let _ = std::process::Command::new("podman")
+        .args(["system", "reset", "--force"])
+        .output();
+
     write_btrfs_storage_conf(
         "/etc/containers/storage.conf",
         storage_dir,
@@ -451,8 +356,28 @@ pub async fn import_image(
         (cmd_prefix[0].clone(), all_args)
     };
 
-    let mut load_child = Command::new(&cmd)
-        .args(&args)
+    // Use btrfs tmpdir if available so podman extracts layers on the same
+    // filesystem (avoids ext4→btrfs cross-fs copy during podman load).
+    // For rootless: extract uid from cmd_prefix (runuser -u <username>).
+    // For root: use uid 0.
+    let target_uid = cmd_prefix
+        .windows(2)
+        .find(|w| w[0] == "-u")
+        .and_then(|w| {
+            nix::unistd::User::from_name(&w[1])
+                .ok()
+                .flatten()
+                .map(|u| u.uid.as_raw())
+        })
+        .unwrap_or(0);
+    let btrfs_tmpdir = format!("/var/lib/containers/storage/tmp-{}", target_uid);
+    let mut cmd_builder = Command::new(&cmd);
+    cmd_builder.args(&args);
+    if std::path::Path::new(&btrfs_tmpdir).is_dir() {
+        eprintln!("[fc-agent] using btrfs tmpdir: {}", btrfs_tmpdir);
+        cmd_builder.env("TMPDIR", &btrfs_tmpdir);
+    }
+    let mut load_child = cmd_builder
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -854,14 +779,10 @@ pub fn build_podman_args(
 /// files with UIDs from the host's subuid range. The VM must use the same range
 /// so those UIDs are valid in the VM's user namespace.
 ///
-/// `image_mode`: the image delivery mode ("overlay", "btrfs", "archive", or None).
-/// When "btrfs", the pre-built btrfs image is mounted at the root graphroot and
-/// the user's graphroot points directly there (btrfs doesn't support additionalImageStores).
 pub fn create_vm_user(
     user_spec: &str,
     desired_name: &str,
     subuid_range: Option<(u64, u64)>,
-    image_mode: Option<&str>,
 ) -> (String, String, String) {
     let parts: Vec<&str> = user_spec.split(':').collect();
     let uid = parts[0].to_string();
@@ -939,22 +860,16 @@ pub fn create_vm_user(
     }
 
     // Set up user-level btrfs storage if root btrfs is available
-    setup_user_btrfs_storage(&uid, &gid, &username, image_mode);
+    setup_user_btrfs_storage(&uid, &gid, &username);
 
     (username, uid, runtime_dir)
 }
 
-/// Set up btrfs storage for a rootless user (loopback mode only).
+/// Set up btrfs storage for a rootless user (loopback mode).
 ///
-/// For btrfs image mode, `mount_btrfs_for_user()` handles everything.
-/// This function creates a user-specific subdirectory on the loopback btrfs mount
-/// for archive/pull modes where no pre-built image is provided.
-fn setup_user_btrfs_storage(uid: &str, gid: &str, username: &str, image_mode: Option<&str>) {
-    // Btrfs image mode is handled by mount_btrfs_for_user() in agent.rs
-    if image_mode == Some("btrfs") {
-        return;
-    }
-
+/// Creates a user-specific subdirectory on the loopback btrfs mount
+/// so rootless podman has its own btrfs graphroot.
+fn setup_user_btrfs_storage(uid: &str, gid: &str, username: &str) {
     let root_mnt = "/var/lib/containers/storage";
 
     // Check if root btrfs storage is mounted (loopback from setup_btrfs_storage_if_available)
@@ -968,12 +883,17 @@ fn setup_user_btrfs_storage(uid: &str, gid: &str, username: &str, image_mode: Op
         return;
     }
 
-    // Loopback mode: create user-specific subdirectory
+    // Loopback mode: create user-specific subdirectory and temp dir.
+    // The temp dir is on btrfs so podman extracts layers on the same filesystem
+    // (avoids ext4→btrfs cross-filesystem copy during podman load).
     let user_graphroot = format!("{}/user-{}", root_mnt, uid);
-    let _ = std::fs::create_dir_all(&user_graphroot);
-    let _ = std::process::Command::new("chown")
-        .args([&format!("{}:{}", uid, gid), &user_graphroot])
-        .output();
+    let user_tmpdir = format!("{}/tmp-{}", root_mnt, uid);
+    for dir in [&user_graphroot, &user_tmpdir] {
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::process::Command::new("chown")
+            .args([&format!("{}:{}", uid, gid), dir.as_str()])
+            .output();
+    }
 
     // Create user-level runroot
     let user_runroot = format!("/run/user/{}/containers", uid);

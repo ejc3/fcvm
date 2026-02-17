@@ -505,43 +505,10 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 storage_img_path
             }
             crate::firecracker::ImageMode::Btrfs => {
-                // Pre-built btrfs storage: btrfs image with real subvolumes.
-                // Guest reflink-copies it and mounts as graphroot — no podman load needed.
-                //
-                // For --user mode: build as uid 1000 (rootless podman), creating storage
-                // with correct ownership — matching a physical host. Separate cache path
-                // because rootless builds have different UID ownership than root builds.
-                let build_uid = args
-                    .user
-                    .as_ref()
-                    .and_then(|user_spec| user_spec.split(':').next()?.parse::<u32>().ok());
-                // Cache key includes UID and rootfs_size — different sizes need different images
-                let btrfs_img_path = match build_uid {
-                    Some(uid) => PathBuf::from(format!(
-                        "{}.btrfs-uid{}-{}.img",
-                        cache_dir.display(),
-                        uid,
-                        args.rootfs_size
-                    )),
-                    None => PathBuf::from(format!(
-                        "{}.btrfs-{}.img",
-                        cache_dir.display(),
-                        args.rootfs_size
-                    )),
-                };
-                if !btrfs_img_path.exists() {
-                    info!(image = %args.image, digest = %digest, uid = ?build_uid, "Building btrfs storage image");
-                    image::build_btrfs_storage_image(
-                        &archive_path,
-                        &btrfs_img_path,
-                        build_uid,
-                        &args.rootfs_size,
-                    )
-                    .await?;
-                } else {
-                    info!(image = %args.image, digest = %digest, "Using cached btrfs storage image");
-                }
-                btrfs_img_path
+                // VM-side btrfs loading: attach Docker archive as read-only block device.
+                // fc-agent creates btrfs loopback on rootfs and runs `podman load` from
+                // the archive device into the btrfs storage.
+                archive_path.clone()
             }
             crate::firecracker::ImageMode::Archive => {
                 // Docker archive: attach as raw block device.
@@ -580,34 +547,10 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         .await
         .context("creating VM data directory")?;
 
-    // For btrfs mode, reflink copy the image from cache to per-VM directory.
-    // Each VM needs its own read-write copy because:
-    // 1. Btrfs images are read-write (podman creates subvolumes in graphroot)
-    // 2. Snapshot restore needs a pristine copy (not modified by previous VM runs)
-    // 3. Mount namespace redirects vm_runtime_dir paths for clones
-    let image_disk_path = if let Some(cache_path) = image_disk_path {
-        let resolved_mode = resolve_image_mode(&args);
-        if resolved_mode == crate::firecracker::ImageMode::Btrfs {
-            let disks_dir = data_dir.join("disks");
-            tokio::fs::create_dir_all(&disks_dir)
-                .await
-                .context("creating disks directory for btrfs image")?;
-            let per_vm_path = disks_dir.join("image.btrfs");
-            crate::commands::common::reflink_copy(&cache_path, &per_vm_path)
-                .await
-                .context("reflink copying btrfs image to per-VM directory")?;
-            info!(
-                cache = %cache_path.display(),
-                per_vm = %per_vm_path.display(),
-                "reflink copied btrfs image to per-VM directory"
-            );
-            Some(per_vm_path)
-        } else {
-            Some(cache_path)
-        }
-    } else {
-        None
-    };
+    // All image modes use the cache path directly (read-only):
+    // - Overlay: ext4 storage image as additionalImageStore
+    // - Btrfs: Docker archive (fc-agent creates btrfs loopback on rootfs)
+    // - Archive: Docker archive for podman load
 
     let socket_path = data_dir.join("firecracker.sock");
 
@@ -874,23 +817,9 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
 
     let disk_path = data_dir.join("disks/rootfs.raw");
 
-    // Build image extra disk entries for snapshot metadata.
-    // For btrfs mode, the per-VM image copy needs to be saved with snapshots
-    // so clones get their own isolated copy.
-    let image_extra_disks = if image_disk_path.as_ref().is_some_and(|p| {
-        p.file_name()
-            .is_some_and(|f| f.to_string_lossy().ends_with(".btrfs"))
-    }) {
-        let disk_idx = args.disk.len() + args.disk_dir.len();
-        vec![crate::storage::SnapshotExtraDisk {
-            filename: "image.btrfs".to_string(),
-            mount_path: String::new(),
-            read_only: false,
-            drive_id: format!("disk{}", disk_idx),
-        }]
-    } else {
-        vec![]
-    };
+    // No per-VM image disks needed — all image modes use read-only cache paths
+    // or btrfs loopback on rootfs.
+    let image_extra_disks = vec![];
 
     Ok(Some(VmContext {
         vm_id,
