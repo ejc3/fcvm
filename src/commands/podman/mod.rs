@@ -515,28 +515,29 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                     .user
                     .as_ref()
                     .and_then(|user_spec| user_spec.split(':').next()?.parse::<u32>().ok());
-                // Format version for btrfs image cache. Bump when the build process
-                // changes in a way that invalidates previously-cached images.
-                // v2: host-side cleanup of podman state files before mkfs.btrfs
-                const BTRFS_CACHE_VERSION: u32 = 2;
-
+                // Cache key includes UID and rootfs_size — different sizes need different images
                 let btrfs_img_path = match build_uid {
                     Some(uid) => PathBuf::from(format!(
-                        "{}.btrfs-v{}-uid{}.img",
+                        "{}.btrfs-uid{}-{}.img",
                         cache_dir.display(),
-                        BTRFS_CACHE_VERSION,
-                        uid
+                        uid,
+                        args.rootfs_size
                     )),
                     None => PathBuf::from(format!(
-                        "{}.btrfs-v{}.img",
+                        "{}.btrfs-{}.img",
                         cache_dir.display(),
-                        BTRFS_CACHE_VERSION
+                        args.rootfs_size
                     )),
                 };
                 if !btrfs_img_path.exists() {
                     info!(image = %args.image, digest = %digest, uid = ?build_uid, "Building btrfs storage image");
-                    image::build_btrfs_storage_image(&archive_path, &btrfs_img_path, build_uid)
-                        .await?;
+                    image::build_btrfs_storage_image(
+                        &archive_path,
+                        &btrfs_img_path,
+                        build_uid,
+                        &args.rootfs_size,
+                    )
+                    .await?;
                 } else {
                     info!(image = %args.image, digest = %digest, "Using cached btrfs storage image");
                 }
