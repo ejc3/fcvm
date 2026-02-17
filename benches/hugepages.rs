@@ -79,18 +79,10 @@ fn graceful_kill(pid: u32, timeout_ms: u64) {
     }
 }
 
-/// Check if a process is still alive
-fn is_process_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
 /// Wait for a VM to become healthy, polling fcvm ls --json --pid.
 /// Detects early process death to avoid waiting the full timeout.
-fn poll_health(fcvm: &Path, pid: u32, timeout_secs: u64) -> Result<Duration, String> {
+fn poll_health(fcvm: &Path, child: &mut Child, timeout_secs: u64) -> Result<Duration, String> {
+    let pid = child.id();
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
     loop {
@@ -101,13 +93,23 @@ fn poll_health(fcvm: &Path, pid: u32, timeout_secs: u64) -> Result<Duration, Str
             ));
         }
 
-        // Detect early process death
-        if !is_process_alive(pid) {
-            return Err(format!(
-                "VM process (PID {}) died after {:.1}s — check /tmp/fcvm-bench-*.log",
-                pid,
-                start.elapsed().as_secs_f64()
-            ));
+        // Detect early process death using try_wait (reaps zombies properly)
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(format!(
+                    "VM process (PID {}) exited with {} after {:.1}s — check /tmp/fcvm-bench-*.log",
+                    pid,
+                    status,
+                    start.elapsed().as_secs_f64()
+                ));
+            }
+            Ok(None) => {} // Still running
+            Err(e) => {
+                return Err(format!(
+                    "Failed to check VM process (PID {}): {} — check /tmp/fcvm-bench-*.log",
+                    pid, e
+                ));
+            }
         }
 
         let output = Command::new(fcvm)
@@ -292,7 +294,7 @@ fn run_mode(mode: &str, mem_mb: u32, data_mb: u32, hugepages: bool) -> BenchResu
         }
         args1.push(BENCH_IMAGE);
 
-        let child1 = Command::new(&fcvm)
+        let mut child1 = Command::new(&fcvm)
             .args(&args1)
             .env("RUST_LOG", "debug")
             .stdout(Stdio::from(log_file1))
@@ -301,22 +303,23 @@ fn run_mode(mode: &str, mem_mb: u32, data_mb: u32, hugepages: bool) -> BenchResu
             .expect("failed to spawn cold start VM");
 
         let pid1 = child1.id();
-        let guard1 = ProcessGuard {
-            pid: pid1,
-            child: child1,
-        };
         eprintln!("    Log: {}", log_path1);
 
-        match poll_health(&fcvm, pid1, healthy_timeout) {
+        match poll_health(&fcvm, &mut child1, healthy_timeout) {
             Ok(elapsed) => {
                 health_elapsed = elapsed;
-                cold_guard = Some(guard1);
+                cold_guard = Some(ProcessGuard {
+                    pid: pid1,
+                    child: child1,
+                });
                 cold_log_path = log_path1;
                 break;
             }
             Err(e) => {
                 eprintln!("    Cold start failed: {}", e);
-                drop(guard1); // Kill the failed VM
+                // Kill the failed VM
+                graceful_kill(pid1, 5000);
+                let _ = child1.wait();
                 if cold_attempt == max_cold_attempts {
                     panic!(
                         "Cold start failed after {} attempts: {}",
@@ -410,7 +413,7 @@ fn run_mode(mode: &str, mem_mb: u32, data_mb: u32, hugepages: bool) -> BenchResu
     args2.push(BENCH_IMAGE);
 
     let t2 = Instant::now();
-    let child2 = Command::new(&fcvm)
+    let mut child2 = Command::new(&fcvm)
         .args(&args2)
         .env("RUST_LOG", "debug")
         .stdout(Stdio::from(log_file2))
@@ -419,15 +422,15 @@ fn run_mode(mode: &str, mem_mb: u32, data_mb: u32, hugepages: bool) -> BenchResu
         .expect("failed to spawn warm start VM");
 
     let pid2 = child2.id();
+    eprintln!("    Log: {}", log_path2);
+
+    let clone_timeout = if data_mb > 1000 { 300 } else { 120 };
+    let clone_elapsed = poll_health(&fcvm, &mut child2, clone_timeout)
+        .unwrap_or_else(|e| panic!("Clone failed: {}", e));
     let _guard2 = ProcessGuard {
         pid: pid2,
         child: child2,
     };
-    eprintln!("    Log: {}", log_path2);
-
-    let clone_timeout = if data_mb > 1000 { 300 } else { 120 };
-    let clone_elapsed =
-        poll_health(&fcvm, pid2, clone_timeout).unwrap_or_else(|e| panic!("Clone failed: {}", e));
     let clone_secs = clone_elapsed.as_secs_f64();
     eprintln!("    Clone healthy after {:.1}s", clone_secs);
 

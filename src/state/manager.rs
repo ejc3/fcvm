@@ -68,7 +68,7 @@ impl StateManager {
             .create(true)
             .write(true)
             .truncate(true)
-            .mode(0o600)
+            .mode(0o666)
             .open(&lock_file)
             .context("opening lock file")?;
 
@@ -431,7 +431,7 @@ impl StateManager {
             .create(true)
             .write(true)
             .truncate(true)
-            .mode(0o600)
+            .mode(0o666)
             .open(&lock_file)
             .context("opening lock file for health update")?;
 
@@ -516,7 +516,7 @@ impl StateManager {
             .create(true)
             .write(true)
             .truncate(true)
-            .mode(0o600)
+            .mode(0o666)
             .open(&lock_file)
             .context("opening loopback IP lock file")?;
 
