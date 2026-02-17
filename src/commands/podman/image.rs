@@ -530,6 +530,10 @@ pub(super) async fn build_btrfs_storage_image(
     // Create btrfs image from the storage tree using mkfs.btrfs --rootdir --subvol.
     // Each subvolume is passed as --subvol rw:<relative-path> to preserve it as a
     // real subvolume in the output image.
+    //
+    // Runs inside a --privileged container because the podman load (also containerized)
+    // creates files with their original permissions (e.g. /etc/gshadow mode 000).
+    // The host user can't read these, but container root can.
     let tmp_img = PathBuf::from(format!("{}.tmp", output_path.display()));
     info!(
         "Creating btrfs image: {} -> {}",
@@ -537,28 +541,71 @@ pub(super) async fn build_btrfs_storage_image(
         tmp_img.display()
     );
 
-    let mut mkfs_args = vec![
-        "--rootdir".to_string(),
-        tmp_dir.to_str().unwrap().to_string(),
-    ];
-    for subvol_path in &subvol_args {
-        mkfs_args.push("--subvol".to_string());
-        mkfs_args.push(format!("rw:{}", subvol_path));
-    }
-    // Create a sparse btrfs image sized to match --rootfs-size (same as ext4 rootfs).
-    // Only used blocks take real host disk space. Without this, --shrink creates a
-    // minimal image with no free space for container runtime writes.
     let size_bytes = crate::storage::disk::parse_size(rootfs_size)
         .context("parsing rootfs_size for btrfs image")?;
-    mkfs_args.push("--byte-count".to_string());
-    mkfs_args.push(size_bytes.to_string());
-    mkfs_args.push(tmp_img.to_str().unwrap().to_string());
 
-    let mkfs_output = tokio::process::Command::new(&mkfs_btrfs)
-        .args(&mkfs_args)
+    // Build mkfs.btrfs command line for inside the container.
+    // The source tree is mounted at /btrfs-src, output dir at /btrfs-out.
+    let tmp_img_name = tmp_img
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("tmp_img has no filename"))?
+        .to_string_lossy();
+    let output_dir = tmp_img
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("tmp_img has no parent directory"))?;
+
+    let mut mkfs_cmd_parts = vec![
+        "--rootdir".to_string(),
+        "/btrfs-src".to_string(),
+    ];
+    for subvol_path in &subvol_args {
+        mkfs_cmd_parts.push("--subvol".to_string());
+        mkfs_cmd_parts.push(format!("rw:{}", subvol_path));
+    }
+    mkfs_cmd_parts.push("--byte-count".to_string());
+    mkfs_cmd_parts.push(size_bytes.to_string());
+    mkfs_cmd_parts.push(format!("/btrfs-out/{}", tmp_img_name));
+
+    // The mkfs.btrfs wrapper script uses ld-linux to load bundled libs.
+    // Inside the container, mount the deps dir and invoke via bundled ld-linux.
+    let mkfs_dir = mkfs_btrfs
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("mkfs.btrfs has no parent directory"))?;
+    let mkfs_bin = mkfs_dir.join("mkfs.btrfs.bin");
+    let mkfs_lib = mkfs_dir.join("lib");
+
+    let inner_cmd = if mkfs_bin.exists() && mkfs_lib.exists() {
+        format!(
+            "/mkfs-bin/lib/ld-linux-x86-64.so.2 --library-path /mkfs-bin/lib /mkfs-bin/mkfs.btrfs.bin {}",
+            mkfs_cmd_parts.join(" ")
+        )
+    } else {
+        // System mkfs.btrfs (if >= 6.12 is available in the container)
+        format!("{} {}", mkfs_btrfs.display(), mkfs_cmd_parts.join(" "))
+    };
+
+    info!("Running mkfs.btrfs inside privileged container");
+    let mkfs_output = tokio::process::Command::new("podman")
+        .args([
+            "run",
+            "--rm",
+            "--privileged",
+            "--cgroups=disabled",
+            "--network=none",
+            "-v",
+            &format!("{}:/btrfs-src:ro", tmp_dir.display()),
+            "-v",
+            &format!("{}:/btrfs-out", output_dir.display()),
+            "-v",
+            &format!("{}:/mkfs-bin:ro", mkfs_dir.display()),
+            "ubuntu:noble",
+            "bash",
+            "-c",
+            &inner_cmd,
+        ])
         .output()
         .await
-        .context("running mkfs.btrfs --rootdir --subvol")?;
+        .context("running containerized mkfs.btrfs --rootdir --subvol")?;
 
     // Clean up temp storage dir (contains btrfs subvolumes, needs special handling)
     cleanup_btrfs_tmp(&tmp_dir).await;
@@ -566,8 +613,13 @@ pub(super) async fn build_btrfs_storage_image(
 
     if !mkfs_output.status.success() {
         let stderr = String::from_utf8_lossy(&mkfs_output.stderr);
+        let stdout = String::from_utf8_lossy(&mkfs_output.stdout);
         tokio::fs::remove_file(&tmp_img).await.ok();
-        bail!("mkfs.btrfs --rootdir --subvol failed: {}", stderr);
+        bail!(
+            "mkfs.btrfs --rootdir --subvol failed:\nstdout: {}\nstderr: {}",
+            stdout.trim(),
+            stderr.trim()
+        );
     }
 
     // Atomic rename to final path
@@ -627,42 +679,56 @@ fn enumerate_subvolumes_recursive(
 /// Clean up a temporary btrfs storage directory.
 ///
 /// btrfs subvolumes can't be removed with regular rm -rf.
-/// Use `podman --root <dir> system reset --force` to clean up properly,
-/// then remove the directory.
+/// The containerized podman load creates files as root (inside --privileged),
+/// so the host user may not have permission to delete them.
+/// Run cleanup inside a privileged container to handle both issues.
 async fn cleanup_btrfs_tmp(tmp_dir: &Path) {
-    // First try podman system reset to properly clean up subvolumes
-    let reset = tokio::process::Command::new("podman")
+    // Use a privileged container to delete everything — it has root access
+    // to both btrfs subvolume operations and root-owned files.
+    let cleanup_script = "set -e\n\
+        # Delete all btrfs subvolumes first (can't rm -rf a subvolume)\n\
+        if command -v btrfs >/dev/null 2>&1; then\n\
+            btrfs subvolume list -o /cleanup 2>/dev/null | awk '{print $NF}' | while read sv; do\n\
+                btrfs subvolume delete \"/cleanup/$sv\" 2>/dev/null || true\n\
+            done\n\
+        fi\n\
+        # Then remove everything\n\
+        rm -rf /cleanup/*\n\
+        rm -rf /cleanup/.[!.]* 2>/dev/null || true";
+
+    let result = tokio::process::Command::new("podman")
         .args([
-            "--root",
-            tmp_dir.to_str().unwrap_or(""),
-            "--storage-driver",
-            "btrfs",
-            "system",
-            "reset",
-            "--force",
+            "run",
+            "--rm",
+            "--privileged",
+            "--cgroups=disabled",
+            "--network=none",
+            "-v",
+            &format!("{}:/cleanup", tmp_dir.display()),
+            "ubuntu:noble",
+            "bash",
+            "-c",
+            cleanup_script,
         ])
         .output()
         .await;
 
-    if let Err(e) = &reset {
-        warn!("podman system reset for tmp dir failed: {}", e);
-    }
-
-    // Then try btrfs subvolume delete on any remaining subvolumes
-    if let Ok(entries) = std::fs::read_dir(tmp_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                // Try btrfs subvolume delete (ignores errors on non-subvolumes)
-                let _ = tokio::process::Command::new("btrfs")
-                    .args(["subvolume", "delete", path.to_str().unwrap_or("")])
-                    .output()
-                    .await;
-            }
+    match &result {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!(
+                "containerized cleanup of {} had errors: {}",
+                tmp_dir.display(),
+                stderr.trim()
+            );
+        }
+        Err(e) => {
+            warn!("containerized cleanup of {} failed: {}", tmp_dir.display(), e);
         }
     }
 
-    // Finally remove the directory tree
+    // Try to remove the now-empty directory
     if let Err(e) = tokio::fs::remove_dir_all(tmp_dir).await {
         warn!("Failed to remove temp dir {}: {}", tmp_dir.display(), e);
     }
