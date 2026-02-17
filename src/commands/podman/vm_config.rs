@@ -726,7 +726,7 @@ pub(super) async fn run_vm_setup(
     // Archive mode extracts layers onto the rootfs via podman load.
     // podman load extracts layers to /var/tmp first, then copies to storage,
     // so we need ~3x the archive size for safety margin.
-    let resolved_mode = super::resolve_image_mode(args, runtime_config);
+    let resolved_mode = super::resolve_image_mode(args);
     let image_overhead = if resolved_mode == crate::firecracker::ImageMode::Archive {
         if let Some(disk_path) = image_disk_path {
             match tokio::fs::metadata(disk_path).await {
@@ -824,7 +824,7 @@ pub(super) async fn run_vm_setup(
             // Collect env vars and volume mounts for cache key
             let env_vars: Vec<String> = args.env.to_vec();
             let volume_mounts: Vec<String> = args.map.to_vec();
-            let image_mode = super::resolve_image_mode(args, runtime_config);
+            let image_mode = super::resolve_image_mode(args);
 
             crate::firecracker::FirecrackerConfig::new(
                 kernel_path.to_path_buf(),

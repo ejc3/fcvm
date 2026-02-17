@@ -26,10 +26,10 @@ async fn test_localhost_archive_mode() -> Result<()> {
     run_localhost_test(Some("archive"), "localhost-archive").await
 }
 
-/// Test with btrfs mode (pre-built btrfs image as graphroot)
+/// Test with btrfs mode (pre-built btrfs image as graphroot, requires btrfs kernel)
 #[tokio::test]
 async fn test_localhost_btrfs_mode() -> Result<()> {
-    run_localhost_test(Some("btrfs"), "localhost-btrfs").await
+    run_localhost_test_with_kernel(Some("btrfs"), Some("btrfs"), "localhost-btrfs").await
 }
 
 /// Test with default mode (auto-detect, should be overlay without btrfs kernel)
@@ -39,6 +39,14 @@ async fn test_localhost_default_mode() -> Result<()> {
 }
 
 async fn run_localhost_test(image_mode: Option<&str>, suffix: &str) -> Result<()> {
+    run_localhost_test_with_kernel(image_mode, None, suffix).await
+}
+
+async fn run_localhost_test_with_kernel(
+    image_mode: Option<&str>,
+    kernel_profile: Option<&str>,
+    suffix: &str,
+) -> Result<()> {
     let mode_label = image_mode.unwrap_or("default (auto-detect)");
 
     println!("\nLocalhost Image Test ({})", mode_label);
@@ -61,6 +69,10 @@ async fn run_localhost_test(image_mode: Option<&str>, suffix: &str) -> Result<()
     if let Some(mode) = image_mode {
         args.push("--image-mode");
         args.push(mode);
+    }
+    if let Some(profile) = kernel_profile {
+        args.push("--kernel-profile");
+        args.push(profile);
     }
     args.push("localhost/test-hello");
 

@@ -119,8 +119,27 @@ pub async fn run() -> Result<()> {
     }
 
     // Set up btrfs storage if kernel supports it (avoids overlay idmap issues).
-    // Must happen before any podman operations (import_image, pull_image, etc.)
-    container::setup_btrfs_storage_if_available();
+    // Skip for overlay/btrfs modes — they manage their own storage.
+    // For archive/pull: creates loopback btrfs if kernel supports it.
+    match plan.image_mode.as_deref() {
+        Some("overlay") => {
+            eprintln!("[fc-agent] skipping btrfs loopback setup (image_mode=overlay)");
+        }
+        Some("btrfs") => {
+            // Pre-built btrfs image — mount it directly, no loopback needed.
+            // For root mode: mount at /var/lib/containers/storage now.
+            // For user mode: mount at user's default rootless path after user creation.
+            if plan.user.is_none() {
+                if let Some(ref device) = plan.image_device {
+                    container::mount_btrfs_device(device, "/var/lib/containers/storage")?;
+                    container::write_btrfs_storage_conf("/etc/containers/storage.conf", "/var/lib/containers/storage", "/run/containers/storage");
+                }
+            }
+        }
+        _ => {
+            container::setup_btrfs_storage_if_available();
+        }
+    }
 
     // If --user is specified, create the VM user BEFORE image import so
     // podman load runs as the target user (rootless podman has separate storage).
@@ -137,11 +156,21 @@ pub async fn run() -> Result<()> {
             .zip(plan.subuid_count)
             .or_else(|| plan.subuid_start.map(|s| (s, 65536)));
         let (username, _uid, runtime_dir) =
-            container::create_vm_user(user_spec, desired_name, subuid_range);
+            container::create_vm_user(user_spec, desired_name, subuid_range, plan.image_mode.as_deref());
         Some((username, runtime_dir))
     } else {
         None
     };
+
+    // For btrfs image mode + user: mount at the user's standard rootless graphroot.
+    // This happens AFTER user creation so we know the home directory.
+    // Podman finds btrfs at its default path — no custom graphroot needed.
+    if plan.image_mode.as_deref() == Some("btrfs") && plan.user.is_some() {
+        if let Some(ref device) = plan.image_device {
+            let (username, _) = user_info.as_ref().unwrap();
+            container::mount_btrfs_for_user(device, username)?;
+        }
+    }
 
     // Build the command prefix for running commands as the target user
     let cmd_prefix: Vec<String> = match &user_info {
@@ -158,9 +187,12 @@ pub async fn run() -> Result<()> {
             let username = user_info.as_ref().map(|(name, _)| name.as_str());
             container::mount_overlay_image(device, &plan.image, username)?
         }
-        (Some("btrfs"), Some(device)) => {
-            let username = user_info.as_ref().map(|(name, _)| name.as_str());
-            container::mount_btrfs_image(device, &plan.image, username)?
+        (Some("btrfs"), Some(_device)) => {
+            // Device was already mounted in Phase 1 (before user creation).
+            // setup_btrfs_storage_if_available() wrote root storage.conf.
+            // setup_user_btrfs_storage() created user subdirs (if --user).
+            // Just return the image name — it's already in the store.
+            plan.image.clone()
         }
         (Some("archive"), Some(device)) => {
             container::import_image(device, &plan.image, &output, &cmd_prefix).await?
@@ -277,10 +309,13 @@ pub async fn run() -> Result<()> {
             mounts::unmount_paths(&["/mnt/image-store".to_string()], "image store");
         }
         Some("btrfs") => {
-            mounts::unmount_paths(
-                &["/var/lib/containers/storage".to_string()],
-                "btrfs image store",
-            );
+            // Btrfs image is mounted at either root graphroot or user graphroot
+            let btrfs_mount = if let Some((username, _)) = &user_info {
+                format!("/home/{}/.local/share/containers/storage", username)
+            } else {
+                "/var/lib/containers/storage".to_string()
+            };
+            mounts::unmount_paths(&[btrfs_mount], "btrfs image store");
         }
         _ => {}
     }

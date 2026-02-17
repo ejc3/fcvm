@@ -37,6 +37,8 @@ pub struct VmContext {
     /// Notify the output listener to drop its current connection and re-accept.
     /// Triggered after each snapshot (vsock connections reset during snapshot).
     pub output_reconnect: Arc<tokio::sync::Notify>,
+    /// Extra disk entries for the image disk (btrfs mode), included in snapshot metadata.
+    pub image_extra_disks: Vec<crate::storage::SnapshotExtraDisk>,
 }
 
 /// A log line from the VM's container output.
@@ -140,17 +142,30 @@ pub struct SnapshotCreationParams {
     pub health_check_url: Option<String>,
     /// Whether VM uses 2MB hugepage-backed memory
     pub hugepages: bool,
+    /// Username for rootless container health checks
+    pub username: Option<String>,
+    /// Extra disks to include in snapshot (e.g., btrfs image disk)
+    pub extra_disks: Vec<crate::storage::SnapshotExtraDisk>,
 }
 
 impl SnapshotCreationParams {
-    /// Create from RunArgs (for fresh VMs)
+    /// Create from RunArgs (for fresh VMs).
+    /// Note: `extra_disks` must be set separately after VM setup (drive IDs are assigned then).
     pub fn from_run_args(args: &RunArgs) -> Self {
+        // Resolve username from USER= env var (set during podman arg parsing)
+        let username = args
+            .env
+            .iter()
+            .find_map(|s| s.strip_prefix("USER="))
+            .map(|s| s.to_string());
         Self {
             image: args.image.clone(),
             vcpu: args.cpu,
             memory_mib: args.mem,
             health_check_url: args.health_check.clone(),
             hugepages: args.hugepages,
+            username,
+            extra_disks: vec![],
         }
     }
 
@@ -162,6 +177,8 @@ impl SnapshotCreationParams {
             memory_mib: metadata.memory_mib,
             health_check_url: metadata.health_check_url.clone(),
             hugepages: metadata.hugepages,
+            username: metadata.username.clone(),
+            extra_disks: metadata.extra_disks.clone(),
         }
     }
 }

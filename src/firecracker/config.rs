@@ -23,8 +23,13 @@ pub struct FirecrackerConfig {
     pub machine_config: MachineConfig,
     /// Root drive configuration
     pub drives: Vec<Drive>,
-    /// Container image to pull (for fc-agent)
+    /// Container image identifier (digest for localhost images, name for remote).
+    /// Used in snapshot cache key computation.
     pub container_image: String,
+    /// Original image name for the MMDS plan (what the guest uses to find the image).
+    /// Excluded from cache key — content hash in container_image handles cache correctness.
+    #[serde(skip)]
+    pub container_image_name: String,
     /// Container command (affects what runs after container starts)
     pub container_cmd: Option<Vec<String>>,
     /// Network mode (bridged or rootless)
@@ -208,6 +213,7 @@ impl FirecrackerConfig {
                 is_root_device: true,
                 is_read_only: false,
             }],
+            container_image_name: container_image.clone(),
             container_image,
             container_cmd,
             network_mode,
@@ -338,7 +344,7 @@ impl FirecrackerConfig {
         serde_json::json!({
             "latest": {
                 "container-plan": {
-                    "image": self.container_image,
+                    "image": self.container_image_name,
                     "env": env,
                     "cmd": self.container_cmd,
                     "volumes": runtime.volumes,

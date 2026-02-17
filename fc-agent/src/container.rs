@@ -50,10 +50,24 @@ pub fn mount_overlay_image(
     // Configure podman to use this as an additional image store.
     let (conf_path, runroot, graphroot) = storage_paths(username);
 
+    // Clear any stale podman database that might have a different driver.
+    // The rootfs may have a pre-existing database from setup that conflicts
+    // with our explicit driver="overlay" setting.
+    clear_podman_database(&graphroot);
+
     let storage_conf = format!(
         "[storage]\ndriver = \"overlay\"\nrunroot = \"{runroot}\"\ngraphroot = \"{graphroot}\"\n\n[storage.options]\nadditionalimagestores = [\"{mount_path}\"]\n"
     );
     std::fs::write(&conf_path, &storage_conf).context("writing storage.conf")?;
+
+    // Write containers.conf to disable netavark (VM uses --network=host)
+    let containers_conf_path = if username.is_some() {
+        // User-level containers.conf lives alongside storage.conf
+        conf_path.replace("storage.conf", "containers.conf")
+    } else {
+        "/etc/containers/containers.conf".to_string()
+    };
+    write_containers_conf(&containers_conf_path);
 
     eprintln!(
         "[fc-agent] overlay image mounted at {}, configured as additional image store (conf: {})",
@@ -63,59 +77,57 @@ pub fn mount_overlay_image(
     Ok(image_name.to_string())
 }
 
-/// Mount a pre-built btrfs storage image directly as the podman graphroot.
+/// Mount a btrfs device at the given path (Phase 1: before user creation).
 ///
-/// The btrfs image contains real btrfs subvolumes with podman's storage tree.
-/// It is mounted read-write at `/var/lib/containers/storage` so podman uses it
-/// as the primary graphroot — no podman load or import needed.
-///
-/// When `setup_btrfs_storage_if_available()` runs later, it detects btrfs is already
-/// mounted at this path and skips loopback creation.
-pub fn mount_btrfs_image(
-    device: &str,
-    image_name: &str,
-    username: Option<&str>,
-) -> Result<String> {
-    eprintln!(
-        "[fc-agent] mounting btrfs storage image: {}",
-        device
-    );
+/// This is the early mount step for btrfs image mode. The device is mounted read-write
+/// so that `setup_btrfs_storage_if_available()` detects btrfs and writes storage.conf,
+/// and `setup_user_btrfs_storage()` creates user subdirs on it.
+pub fn mount_btrfs_device(device: &str, mount_path: &str) -> Result<()> {
+    std::fs::create_dir_all(mount_path).context("creating mount point")?;
 
-    let mount_path = "/var/lib/containers/storage";
-    std::fs::create_dir_all(mount_path).context("creating graphroot mount point")?;
+    // Ensure parent directories are traversable by non-root users.
+    // /var/lib/containers is typically 0700 root:root (podman default),
+    // but rootless podman needs to traverse it to reach the graphroot.
+    if let Some(parent) = std::path::Path::new(mount_path).parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
+    }
 
     wait_for_device(device)?;
 
-    // Mount read-write (podman needs to create container subvolumes)
     let output = std::process::Command::new("mount")
         .args(["-t", "btrfs", device, mount_path])
         .output()
-        .context("mounting btrfs storage image")?;
+        .context("mounting btrfs device")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
-            "Failed to mount btrfs storage image {} at {}: {}",
+            "Failed to mount btrfs device {} at {}: {}",
             device,
             mount_path,
             stderr
         );
     }
 
-    // Configure podman to use btrfs driver with this graphroot.
-    let (conf_path, runroot, _graphroot) = storage_paths(username);
+    // The btrfs image's root directory may have mode 0700 (podman graphroot default
+    // from mkfs.btrfs --rootdir). Set to 0755 so rootless podman's user namespace
+    // can traverse it (real root maps to "nobody" in user namespaces).
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(mount_path, std::fs::Permissions::from_mode(0o755));
+    }
 
-    let storage_conf = format!(
-        "[storage]\ndriver = \"btrfs\"\nrunroot = \"{runroot}\"\ngraphroot = \"{mount_path}\"\n"
-    );
-    std::fs::write(&conf_path, &storage_conf).context("writing storage.conf")?;
+    // Clear stale podman database AFTER mounting so we clean the actual btrfs content.
+    // The cached .btrfs.img may have stale db/containers from previous VM runs
+    // (btrfs image disk is read-write, so previous runs' container creates persist).
+    clear_podman_database(mount_path);
 
     eprintln!(
-        "[fc-agent] btrfs image mounted at {}, configured as graphroot (conf: {})",
-        mount_path, conf_path
+        "[fc-agent] btrfs device {} mounted at {} (early mount)",
+        device, mount_path
     );
-
-    Ok(image_name.to_string())
+    Ok(())
 }
 
 /// Wait for a block device to appear (up to 5 seconds).
@@ -170,6 +182,49 @@ fn storage_paths(username: Option<&str>) -> (String, String, String) {
     }
 }
 
+/// Clear stale podman database files that might have a mismatched driver.
+///
+/// Podman stores its graph driver in the database. If we write a storage.conf
+/// with a different driver, podman refuses to start ("database graph driver X
+/// does not match our graph driver Y"). Clearing the database lets podman
+/// recreate it with the correct driver.
+fn clear_podman_database(graphroot: &str) {
+    let graphroot_path = std::path::Path::new(graphroot);
+    for entry in ["libpod", "db.sql", "btrfs-containers", "overlay-containers"] {
+        let path = graphroot_path.join(entry);
+        if path.is_dir() {
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                eprintln!("[fc-agent] WARNING: failed to remove {}: {}", path.display(), e);
+            }
+        } else if path.is_file() {
+            if let Err(e) = std::fs::remove_file(&path) {
+                eprintln!("[fc-agent] WARNING: failed to remove {}: {}", path.display(), e);
+            }
+        }
+    }
+}
+
+/// Write containers.conf to disable netavark requirement.
+///
+/// The VM always uses `--network=host` for containers, so podman never needs
+/// netavark for container networking. However, podman 4.x checks for netavark
+/// at startup even with `--network=host`. The rootfs may not have netavark
+/// installed (it's not required for our use case), so we configure podman to
+/// skip the check by setting `network_backend = "cni"`.
+fn write_containers_conf(conf_path: &str) {
+    let containers_conf = "[network]\nnetwork_backend = \"cni\"\n";
+    let conf_dir = std::path::Path::new(conf_path).parent();
+    if let Some(dir) = conf_dir {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(conf_path, containers_conf) {
+        eprintln!(
+            "[fc-agent] WARNING: failed to write containers.conf at {}: {}",
+            conf_path, e
+        );
+    }
+}
+
 /// Global command prefix for running podman commands as the target user.
 /// Set once during setup, used by exec server and health checks.
 /// Empty when running as root (no user mapping).
@@ -183,6 +238,85 @@ pub fn set_podman_cmd_prefix(prefix: Vec<String>) {
 /// Get the command prefix (empty vec if running as root).
 pub fn podman_cmd_prefix() -> &'static [String] {
     PODMAN_CMD_PREFIX.get().map(|v| v.as_slice()).unwrap_or(&[])
+}
+
+/// Mount a pre-built btrfs image at the user's standard rootless graphroot.
+///
+/// Mounts at ~/.local/share/containers/storage — the default rootless graphroot.
+/// The btrfs image was built by rootless podman on the host (uid 1000), so all
+/// storage files already have correct ownership. No chown needed — just mount
+/// and configure, matching how rootless podman works on a physical host.
+pub fn mount_btrfs_for_user(device: &str, username: &str) -> Result<()> {
+    let home = format!("/home/{}", username);
+    let storage_dir = format!("{}/.local/share/containers/storage", home);
+
+    // Create the directory chain to the mount point
+    std::fs::create_dir_all(&storage_dir).context("creating user graphroot")?;
+
+    let pw = nix::unistd::User::from_name(username)?
+        .ok_or_else(|| anyhow::anyhow!("user not found: {}", username))?;
+    let uid = pw.uid.as_raw();
+    let gid = pw.gid.as_raw();
+    let owner = format!("{}:{}", uid, gid);
+
+    // Chown only the directory chain leading to the mount point (non-recursive).
+    // These are empty directories created by root; the user needs to traverse them.
+    let _ = std::process::Command::new("chown")
+        .args([
+            &owner,
+            &format!("{}/.local", home),
+            &format!("{}/.local/share", home),
+            &format!("{}/.local/share/containers", home),
+            &storage_dir,
+        ])
+        .output();
+
+    mount_btrfs_device(device, &storage_dir)?;
+
+    // Write user storage.conf with just driver = "btrfs".
+    // No custom graphroot needed — podman uses ~/.local/share/containers/storage by default.
+    let user_config_dir = format!("{}/.config/containers", home);
+    let _ = std::fs::create_dir_all(&user_config_dir);
+    let user_runroot = format!("/run/user/{}/containers", uid);
+    let _ = std::fs::create_dir_all(&user_runroot);
+    let _ = std::process::Command::new("chown")
+        .args([&owner, &user_runroot])
+        .output();
+
+    let storage_conf = format!(
+        "[storage]\ndriver = \"btrfs\"\nrunroot = \"{}\"\n",
+        user_runroot
+    );
+    std::fs::write(format!("{}/storage.conf", user_config_dir), &storage_conf)
+        .context("writing user storage.conf")?;
+    write_containers_conf(&format!("{}/containers.conf", user_config_dir));
+
+    // Chown config dir to user (tiny tree — just 2 config files)
+    let _ = std::process::Command::new("chown")
+        .args(["-R", &owner, &format!("{}/.config", home)])
+        .output();
+
+    eprintln!(
+        "[fc-agent] btrfs image mounted at user graphroot {} (uid={})",
+        storage_dir, uid
+    );
+    Ok(())
+}
+
+/// Write a btrfs storage.conf for root podman.
+pub fn write_btrfs_storage_conf(conf_path: &str, graphroot: &str, runroot: &str) {
+    let _ = std::fs::create_dir_all(
+        std::path::Path::new(conf_path).parent().unwrap_or(std::path::Path::new("/etc/containers")),
+    );
+    let storage_conf = format!(
+        "[storage]\ndriver = \"btrfs\"\nrunroot = \"{}\"\ngraphroot = \"{}\"\n",
+        runroot, graphroot
+    );
+    if let Err(e) = std::fs::write(conf_path, &storage_conf) {
+        eprintln!("[fc-agent] WARNING: failed to write storage.conf at {}: {}", conf_path, e);
+    }
+    let containers_conf = conf_path.replace("storage.conf", "containers.conf");
+    write_containers_conf(&containers_conf);
 }
 
 /// Get the total size of the filesystem containing `path` in bytes.
@@ -233,6 +367,7 @@ pub fn setup_btrfs_storage_if_available() {
             "[fc-agent] btrfs storage already mounted at {}",
             storage_dir
         );
+        write_btrfs_storage_conf("/etc/containers/storage.conf", storage_dir, "/run/containers/storage");
         return;
     }
 
@@ -299,16 +434,7 @@ pub fn setup_btrfs_storage_if_available() {
         }
     }
 
-    // Write storage.conf for root podman with explicit paths.
-    // runroot is required by podman when driver is set explicitly.
-    let storage_conf = format!(
-        "[storage]\ndriver = \"btrfs\"\nrunroot = \"/run/containers/storage\"\ngraphroot = \"{}\"\n",
-        storage_dir
-    );
-    let _ = std::fs::create_dir_all("/etc/containers");
-    if let Err(e) = std::fs::write("/etc/containers/storage.conf", storage_conf) {
-        eprintln!("[fc-agent] WARNING: failed to write storage.conf: {}", e);
-    }
+    write_btrfs_storage_conf("/etc/containers/storage.conf", storage_dir, "/run/containers/storage");
 
     eprintln!(
         "[fc-agent] btrfs storage configured at {} ({} sparse loopback)",
@@ -754,10 +880,15 @@ pub fn build_podman_args(
 /// When the storage image is built by rootless podman on the host, it contains
 /// files with UIDs from the host's subuid range. The VM must use the same range
 /// so those UIDs are valid in the VM's user namespace.
+///
+/// `image_mode`: the image delivery mode ("overlay", "btrfs", "archive", or None).
+/// When "btrfs", the pre-built btrfs image is mounted at the root graphroot and
+/// the user's graphroot points directly there (btrfs doesn't support additionalImageStores).
 pub fn create_vm_user(
     user_spec: &str,
     desired_name: &str,
     subuid_range: Option<(u64, u64)>,
+    image_mode: Option<&str>,
 ) -> (String, String, String) {
     let parts: Vec<&str> = user_spec.split(':').collect();
     let uid = parts[0].to_string();
@@ -796,8 +927,10 @@ pub fn create_vm_user(
     // Clean stale podman storage from previous VM runs. The run root may have
     // changed between runs (e.g., /tmp vs /run/user), causing "database
     // configuration mismatch" errors.
+    // HOME is set so podman finds user-level config (if it exists at this point).
     let _ = std::process::Command::new("env")
         .args([
+            &format!("HOME=/home/{}", username),
             &format!("XDG_RUNTIME_DIR={}", runtime_dir),
             "runuser",
             "-u",
@@ -833,17 +966,25 @@ pub fn create_vm_user(
     }
 
     // Set up user-level btrfs storage if root btrfs is available
-    setup_user_btrfs_storage(&uid, &gid, &username);
+    setup_user_btrfs_storage(&uid, &gid, &username, image_mode);
 
     (username, uid, runtime_dir)
 }
 
-/// Set up btrfs storage for a rootless user by creating a subdirectory
-/// under the root btrfs mount and writing a user-level storage.conf.
-fn setup_user_btrfs_storage(uid: &str, gid: &str, username: &str) {
+/// Set up btrfs storage for a rootless user (loopback mode only).
+///
+/// For btrfs image mode, `mount_btrfs_for_user()` handles everything.
+/// This function creates a user-specific subdirectory on the loopback btrfs mount
+/// for archive/pull modes where no pre-built image is provided.
+fn setup_user_btrfs_storage(uid: &str, gid: &str, username: &str, image_mode: Option<&str>) {
+    // Btrfs image mode is handled by mount_btrfs_for_user() in agent.rs
+    if image_mode == Some("btrfs") {
+        return;
+    }
+
     let root_mnt = "/var/lib/containers/storage";
 
-    // Check if root btrfs storage is mounted
+    // Check if root btrfs storage is mounted (loopback from setup_btrfs_storage_if_available)
     let is_btrfs = std::process::Command::new("findmnt")
         .args(["-n", "-o", "FSTYPE", root_mnt])
         .output()
@@ -854,7 +995,7 @@ fn setup_user_btrfs_storage(uid: &str, gid: &str, username: &str) {
         return;
     }
 
-    // Create user-specific subdirectory on the btrfs mount
+    // Loopback mode: create user-specific subdirectory
     let user_graphroot = format!("{}/user-{}", root_mnt, uid);
     let _ = std::fs::create_dir_all(&user_graphroot);
     let _ = std::process::Command::new("chown")
@@ -882,6 +1023,7 @@ fn setup_user_btrfs_storage(uid: &str, gid: &str, username: &str) {
         );
         return;
     }
+    write_containers_conf(&format!("{}/containers.conf", user_config_dir));
     // Ensure the user owns their config
     let _ = std::process::Command::new("chown")
         .args([
@@ -898,9 +1040,13 @@ fn setup_user_btrfs_storage(uid: &str, gid: &str, username: &str) {
 }
 
 /// Build the env + runuser prefix for running commands as the VM user.
+///
+/// Sets HOME so podman finds user-level config at ~/.config/containers/,
+/// and XDG_RUNTIME_DIR for the user's runtime state.
 pub fn run_as_user_prefix(username: &str, runtime_dir: &str) -> Vec<String> {
     vec![
         "env".to_string(),
+        format!("HOME=/home/{}", username),
         format!("XDG_RUNTIME_DIR={}", runtime_dir),
         "runuser".to_string(),
         "-u".to_string(),
