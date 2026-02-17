@@ -119,8 +119,31 @@ pub async fn run() -> Result<()> {
     }
 
     // Set up btrfs storage if kernel supports it (avoids overlay idmap issues).
-    // Must happen before any podman operations (import_image, pull_image, etc.)
-    container::setup_btrfs_storage_if_available();
+    // Skip for overlay/btrfs modes — they manage their own storage.
+    // For archive/pull: creates loopback btrfs if kernel supports it.
+    match plan.image_mode.as_deref() {
+        Some("overlay") => {
+            eprintln!("[fc-agent] skipping btrfs loopback setup (image_mode=overlay)");
+        }
+        Some("btrfs") => {
+            // Pre-built btrfs image — mount it directly, no loopback needed.
+            // For root mode: mount at /var/lib/containers/storage now.
+            // For user mode: mount at user's default rootless path after user creation.
+            if plan.user.is_none() {
+                if let Some(ref device) = plan.image_device {
+                    container::mount_btrfs_device(device, "/var/lib/containers/storage")?;
+                    container::write_btrfs_storage_conf(
+                        "/etc/containers/storage.conf",
+                        "/var/lib/containers/storage",
+                        "/run/containers/storage",
+                    );
+                }
+            }
+        }
+        _ => {
+            container::setup_btrfs_storage_if_available();
+        }
+    }
 
     // If --user is specified, create the VM user BEFORE image import so
     // podman load runs as the target user (rootless podman has separate storage).
@@ -136,12 +159,26 @@ pub async fn run() -> Result<()> {
             .subuid_start
             .zip(plan.subuid_count)
             .or_else(|| plan.subuid_start.map(|s| (s, 65536)));
-        let (username, _uid, runtime_dir) =
-            container::create_vm_user(user_spec, desired_name, subuid_range);
+        let (username, _uid, runtime_dir) = container::create_vm_user(
+            user_spec,
+            desired_name,
+            subuid_range,
+            plan.image_mode.as_deref(),
+        );
         Some((username, runtime_dir))
     } else {
         None
     };
+
+    // For btrfs image mode + user: mount at the user's standard rootless graphroot.
+    // This happens AFTER user creation so we know the home directory.
+    // Podman finds btrfs at its default path — no custom graphroot needed.
+    if plan.image_mode.as_deref() == Some("btrfs") && plan.user.is_some() {
+        if let Some(ref device) = plan.image_device {
+            let (username, _) = user_info.as_ref().unwrap();
+            container::mount_btrfs_for_user(device, username)?;
+        }
+    }
 
     // Build the command prefix for running commands as the target user
     let cmd_prefix: Vec<String> = match &user_info {
@@ -152,14 +189,32 @@ pub async fn run() -> Result<()> {
     // Store prefix globally so exec server and health checks can use it
     container::set_podman_cmd_prefix(cmd_prefix.clone());
 
-    // Prepare image (mount storage, import archive, or pull from registry)
-    let image_ref = if let Some(storage_device) = &plan.image_storage_device {
-        let username = user_info.as_ref().map(|(name, _)| name.as_str());
-        container::mount_storage_image(storage_device, &plan.image, username)?
-    } else if let Some(archive_path) = &plan.image_archive {
-        container::import_image(archive_path, &plan.image, &output, &cmd_prefix).await?
-    } else {
-        container::pull_image(&plan).await?
+    // Prepare image based on delivery mode
+    let image_ref = match (plan.image_mode.as_deref(), &plan.image_device) {
+        (Some("overlay"), Some(device)) => {
+            let username = user_info.as_ref().map(|(name, _)| name.as_str());
+            container::mount_overlay_image(device, &plan.image, username)?
+        }
+        (Some("btrfs"), Some(_device)) => {
+            // Device was already mounted in Phase 1 (before user creation):
+            // - Root mode: mount_btrfs_device() + write_btrfs_storage_conf()
+            // - User mode: mount_btrfs_for_user() (mounts at user graphroot)
+            // Image is already in the btrfs store — just return the name.
+            plan.image.clone()
+        }
+        (Some("archive"), Some(device)) => {
+            container::import_image(device, &plan.image, &output, &cmd_prefix).await?
+        }
+        (None, None) => {
+            // Remote image — pull from registry
+            container::pull_image(&plan).await?
+        }
+        (Some(mode), _) => {
+            anyhow::bail!("unknown image_mode: {}", mode);
+        }
+        (None, Some(_)) => {
+            anyhow::bail!("image_device set but image_mode is missing");
+        }
     };
 
     // Notify host for cache snapshot
@@ -257,8 +312,20 @@ pub async fn run() -> Result<()> {
         sleep(Duration::from_millis(100)).await;
     }
     mounts::unmount_disks(&mounted_disk_paths);
-    if plan.image_storage_device.is_some() {
-        mounts::unmount_paths(&["/mnt/image-store".to_string()], "image store");
+    match plan.image_mode.as_deref() {
+        Some("overlay") => {
+            mounts::unmount_paths(&["/mnt/image-store".to_string()], "image store");
+        }
+        Some("btrfs") => {
+            // Btrfs image is mounted at either root graphroot or user graphroot
+            let btrfs_mount = if let Some((username, _)) = &user_info {
+                format!("/home/{}/.local/share/containers/storage", username)
+            } else {
+                "/var/lib/containers/storage".to_string()
+            };
+            mounts::unmount_paths(&[btrfs_mount], "btrfs image store");
+        }
+        _ => {}
     }
 
     // Shutdown output writer

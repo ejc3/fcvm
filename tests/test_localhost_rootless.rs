@@ -152,6 +152,200 @@ async fn test_localhost_rootless_btrfs_storage() -> Result<()> {
     Ok(())
 }
 
+/// Test btrfs snapshot restore with --user (keep-id mode).
+///
+/// This validates that snapshot clones work correctly when:
+/// 1. The btrfs image is read-write (each clone needs its own copy)
+/// 2. The username is preserved across snapshot/restore for health checks
+/// 3. The container starts correctly in the restored VM
+///
+/// Runs the VM twice with the same args — first creates a snapshot, second restores from it.
+/// The key test is that the second run (from snapshot) also succeeds.
+///
+/// Requires host user namespace: btrfs --user builds need rootless podman on the host,
+/// which calls newuidmap to write /proc/PID/uid_map. Gated behind bare-metal
+/// (newuidmap fails under nested user namespaces in container CI).
+#[cfg(feature = "bare-metal")]
+#[tokio::test]
+async fn test_localhost_rootless_btrfs_snapshot_restore() -> Result<()> {
+    println!("\nBtrfs Snapshot Restore Test");
+    println!("==========================");
+
+    // Step 1: Build test image
+    println!("\n1. Building test container image...");
+    build_test_image().await?;
+
+    // Step 2: First run (creates snapshot cache)
+    println!("\n2. First run (fresh boot, creates snapshot)...");
+    {
+        let (vm_name, _, _, _) = common::unique_names("btrfs-snap-1st");
+
+        let (mut _child, fcvm_pid) = common::spawn_fcvm(&[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--kernel-profile",
+            "btrfs",
+            "--user",
+            "1000:1000",
+            "localhost/test-btrfs-rootless",
+        ])
+        .await
+        .context("spawning fcvm (first run)")?;
+        println!("  fcvm PID: {}", fcvm_pid);
+
+        common::poll_health_by_pid(fcvm_pid, 120)
+            .await
+            .context("first run: VM failed to become healthy")?;
+        println!("  First run: VM is healthy");
+
+        // Verify container runs
+        let vm_username = common::exec_in_vm(fcvm_pid, &["getent", "passwd", "1000"])
+            .await
+            .context("resolving UID 1000 username")?;
+        let vm_username = vm_username
+            .trim()
+            .split(':')
+            .next()
+            .unwrap_or("ubuntu")
+            .to_string();
+
+        // Wait for container to appear
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
+        loop {
+            if tokio::time::Instant::now() > deadline {
+                anyhow::bail!("First run: timed out waiting for container");
+            }
+            if let Ok(ps) = common::exec_in_vm(
+                fcvm_pid,
+                &[
+                    "runuser",
+                    "-u",
+                    &vm_username,
+                    "--",
+                    "podman",
+                    "ps",
+                    "-a",
+                    "--format",
+                    "{{.Names}}",
+                ],
+            )
+            .await
+            {
+                if ps.contains("fcvm-container") {
+                    println!("  First run: container is running as {}", vm_username);
+                    break;
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+
+        common::kill_process(fcvm_pid).await;
+        println!("  First run: completed (snapshot should be cached)");
+    }
+
+    // Step 3: Second run (should restore from snapshot)
+    println!("\n3. Second run (snapshot restore)...");
+    {
+        let (vm_name, _, _, _) = common::unique_names("btrfs-snap-2nd");
+
+        let (mut _child, fcvm_pid) = common::spawn_fcvm(&[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--kernel-profile",
+            "btrfs",
+            "--user",
+            "1000:1000",
+            "localhost/test-btrfs-rootless",
+        ])
+        .await
+        .context("spawning fcvm (second run)")?;
+        println!("  fcvm PID: {}", fcvm_pid);
+
+        common::poll_health_by_pid(fcvm_pid, 120)
+            .await
+            .context("second run (from snapshot): VM failed to become healthy")?;
+        println!("  Second run: VM is healthy (restored from snapshot!)");
+
+        // Verify btrfs storage driver
+        let vm_username = common::exec_in_vm(fcvm_pid, &["getent", "passwd", "1000"])
+            .await
+            .context("resolving UID 1000 username")?;
+        let vm_username = vm_username
+            .trim()
+            .split(':')
+            .next()
+            .unwrap_or("ubuntu")
+            .to_string();
+
+        // Wait for container
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
+        loop {
+            if tokio::time::Instant::now() > deadline {
+                anyhow::bail!("Second run: timed out waiting for container");
+            }
+            if let Ok(ps) = common::exec_in_vm(
+                fcvm_pid,
+                &[
+                    "runuser",
+                    "-u",
+                    &vm_username,
+                    "--",
+                    "podman",
+                    "ps",
+                    "-a",
+                    "--format",
+                    "{{.Names}}",
+                ],
+            )
+            .await
+            {
+                if ps.contains("fcvm-container") {
+                    println!("  Second run: container is running as {}", vm_username);
+                    break;
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+
+        // Verify btrfs driver in restored VM
+        let driver = common::exec_in_vm(
+            fcvm_pid,
+            &[
+                "runuser",
+                "-u",
+                &vm_username,
+                "--",
+                "podman",
+                "info",
+                "--format",
+                "{{.Store.GraphDriverName}}",
+            ],
+        )
+        .await
+        .context("checking storage driver")?;
+        let driver = driver.trim();
+        println!("  GraphDriverName: {}", driver);
+        assert_eq!(
+            driver, "btrfs",
+            "Expected btrfs after snapshot restore, got: {}",
+            driver
+        );
+
+        common::kill_process(fcvm_pid).await;
+    }
+
+    println!("\n  BTRFS SNAPSHOT RESTORE TEST PASSED");
+    println!("  - First run: fresh boot, btrfs image, snapshot created");
+    println!("  - Second run: restored from snapshot, btrfs image isolated per-clone");
+    println!("  - Username preserved across snapshot for health checks");
+
+    Ok(())
+}
+
 /// Test rootless localhost container with --user (keep-id) and btrfs storage
 ///
 /// This is the critical path that triggered the original issue:
@@ -164,6 +358,11 @@ async fn test_localhost_rootless_btrfs_storage() -> Result<()> {
 /// Root's `podman inspect` can't see rootless containers, so the standard
 /// health monitor can't detect container health. We poll btrfs readiness
 /// and use `runuser -u fcvm-user` for podman queries.
+///
+/// Requires host user namespace: btrfs --user builds need rootless podman on the host,
+/// which calls newuidmap to write /proc/PID/uid_map. Gated behind bare-metal
+/// (newuidmap fails under nested user namespaces in container CI).
+#[cfg(feature = "bare-metal")]
 #[tokio::test]
 async fn test_localhost_rootless_btrfs_keepid() -> Result<()> {
     println!("\nRootless Localhost + Btrfs + keep-id Test");
@@ -192,22 +391,38 @@ async fn test_localhost_rootless_btrfs_keepid() -> Result<()> {
     .context("spawning fcvm")?;
     println!("  fcvm PID: {}", fcvm_pid);
 
-    // Step 3: Wait for container to start by polling btrfs mount and user container.
-    // Standard health monitor uses root's `podman inspect` which can't see rootless
-    // containers, so we poll directly using runuser.
-    println!("\n3. Waiting for container to start...");
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(180);
+    // Step 3: Wait for VM health and resolve the VM username for UID 1000.
+    // The host resolves UID 1000 via /etc/passwd (e.g., "ubuntu") and passes it as
+    // USER env var. The guest creates a user with that name, not "fcvm-user".
+    println!("\n3. Waiting for VM to become healthy...");
+    common::poll_health_by_pid(fcvm_pid, 120).await?;
+    println!("  VM is healthy");
+
+    // Resolve the actual username for UID 1000 in the guest
+    let vm_username = common::exec_in_vm(fcvm_pid, &["getent", "passwd", "1000"])
+        .await
+        .context("resolving UID 1000 username")?;
+    let vm_username = vm_username
+        .trim()
+        .split(':')
+        .next()
+        .unwrap_or("ubuntu")
+        .to_string();
+    println!("  VM user for UID 1000: {}", vm_username);
+
+    // Step 4: Wait for container to start by polling rootless podman.
+    println!("\n4. Waiting for container to start...");
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(120);
     loop {
         if tokio::time::Instant::now() > deadline {
             anyhow::bail!("Timed out waiting for container to start");
         }
-        // Check if the container is visible via rootless podman
         if let Ok(ps) = common::exec_in_vm(
             fcvm_pid,
             &[
                 "runuser",
                 "-u",
-                "fcvm-user",
+                &vm_username,
                 "--",
                 "podman",
                 "ps",
@@ -226,14 +441,14 @@ async fn test_localhost_rootless_btrfs_keepid() -> Result<()> {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
 
-    // Step 4: Verify btrfs storage driver (root's podman info shows system-wide config)
-    println!("\n4. Checking podman storage driver...");
+    // Step 5: Verify btrfs storage driver
+    println!("\n5. Checking podman storage driver...");
     let driver = common::exec_in_vm(
         fcvm_pid,
         &[
             "runuser",
             "-u",
-            "fcvm-user",
+            &vm_username,
             "--",
             "podman",
             "info",
@@ -251,36 +466,31 @@ async fn test_localhost_rootless_btrfs_keepid() -> Result<()> {
         driver
     );
 
-    // Step 5: Verify btrfs mount
-    println!("\n5. Checking btrfs mount...");
+    // Step 6: Verify btrfs mount at user's default rootless graphroot
+    println!("\n6. Checking btrfs mount...");
+    let user_graphroot = format!("/home/{}/.local/share/containers/storage", vm_username);
     let fstype = common::exec_in_vm(
         fcvm_pid,
-        &[
-            "findmnt",
-            "-n",
-            "-o",
-            "FSTYPE",
-            "/var/lib/containers/storage",
-        ],
+        &["findmnt", "-n", "-o", "FSTYPE", &user_graphroot],
     )
     .await
     .context("checking btrfs mount")?;
     let fstype = fstype.trim();
-    println!("  /var/lib/containers/storage fstype: {}", fstype);
+    println!("  {} fstype: {}", user_graphroot, fstype);
     assert_eq!(
         fstype, "btrfs",
-        "Expected btrfs filesystem at /var/lib/containers/storage, got: {}",
-        fstype
+        "Expected btrfs filesystem at {}, got: {}",
+        user_graphroot, fstype
     );
 
-    // Step 6: Verify container ran with correct user
-    println!("\n6. Checking container execution...");
+    // Step 7: Verify container ran with correct user
+    println!("\n7. Checking container execution...");
     let ps_output = common::exec_in_vm(
         fcvm_pid,
         &[
             "runuser",
             "-u",
-            "fcvm-user",
+            &vm_username,
             "--",
             "podman",
             "ps",
@@ -298,17 +508,14 @@ async fn test_localhost_rootless_btrfs_keepid() -> Result<()> {
         ps_output
     );
 
-    // Step 7: Verify userns=keep-id was used (container process runs as uid 1000)
-    // Note: podman's HostConfig.UsernsMode reports "private" for keep-id (Docker compat
-    // doesn't distinguish the two). Instead, verify the actual behavior: the container
-    // process should run as uid 1000, proving keep-id mapped host UID into the container.
-    println!("\n7. Checking container runs as expected user...");
+    // Step 8: Verify userns=keep-id was used (container process runs as uid 1000)
+    println!("\n8. Checking container runs as expected user...");
     let container_uid = common::exec_in_vm(
         fcvm_pid,
         &[
             "runuser",
             "-u",
-            "fcvm-user",
+            &vm_username,
             "--",
             "podman",
             "exec",
@@ -328,7 +535,7 @@ async fn test_localhost_rootless_btrfs_keepid() -> Result<()> {
     );
 
     // Cleanup
-    println!("\n8. Cleaning up...");
+    println!("\n9. Cleaning up...");
     common::kill_process(fcvm_pid).await;
 
     println!("\n  ROOTLESS + BTRFS + KEEP-ID TEST PASSED");

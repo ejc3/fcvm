@@ -80,12 +80,21 @@ enable = [
 ]
 
 # Services to disable
+# podman services race with fc-agent: they run `podman start --all` at boot,
+# which initializes db.sql before fc-agent writes storage.conf, causing
+# "database graph driver does not match" errors.
 disable = [
     "multipathd",
     "snapd",
     "cloud-init",
     "cloud-config",
     "cloud-final",
+    "podman.service",
+    "podman.socket",
+    "podman-restart.service",
+    "podman-auto-update.service",
+    "podman-auto-update.timer",
+    "podman-clean-transient.service",
 ]
 
 [files]

@@ -11,6 +11,18 @@
 
 This is non-negotiable. A test failure means the CODE is broken - fix the code, not the test.
 
+## VERIFY PLAN AND RUN NEW TESTS LOCALLY
+
+**Before committing, ALWAYS:**
+
+1. **Re-read the plan** — check every numbered step and verification item against what was implemented
+2. **Run new tests locally** — don't just compile them, actually execute them and verify output
+3. **Check for dead code** — search for old function/field names that should have been removed
+
+Writing tests without running them is pointless. Compilation does not equal correctness. A test that passes `--no-run` might fail at runtime due to logic bugs, missing `-T` flags, wrong paths, etc.
+
+**Anti-pattern:** "All 85 unit tests pass" + never ran the integration tests that actually exercise the new code paths.
+
 ## STACKED PRs BY DEFAULT
 
 **All work goes in stacked PRs.** Each new PR should be based on the previous one, not main.

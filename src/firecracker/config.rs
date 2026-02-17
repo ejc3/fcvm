@@ -23,8 +23,13 @@ pub struct FirecrackerConfig {
     pub machine_config: MachineConfig,
     /// Root drive configuration
     pub drives: Vec<Drive>,
-    /// Container image to pull (for fc-agent)
+    /// Container image identifier (digest for localhost images, name for remote).
+    /// Used in snapshot cache key computation.
     pub container_image: String,
+    /// Original image name for the MMDS plan (what the guest uses to find the image).
+    /// Excluded from cache key — content hash in container_image handles cache correctness.
+    #[serde(skip)]
+    pub container_image_name: String,
     /// Container command (affects what runs after container starts)
     pub container_cmd: Option<Vec<String>>,
     /// Network mode (bridged or rootless)
@@ -76,6 +81,14 @@ pub struct FirecrackerConfig {
     /// Affects fc-agent's iptables setup, must be in cache key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forward_localhost: Vec<u16>,
+    /// How localhost images are delivered to the guest.
+    /// Affects whether guest mounts overlay store, btrfs store, or runs podman load.
+    #[serde(default = "default_image_mode")]
+    pub image_mode: ImageMode,
+}
+
+fn default_image_mode() -> ImageMode {
+    ImageMode::Overlay
 }
 
 fn default_rootfs_size() -> String {
@@ -117,6 +130,29 @@ pub enum NetworkMode {
     Rootless,
 }
 
+/// How localhost container images are delivered to the guest VM.
+/// Part of snapshot cache key — different modes produce different VM states.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageMode {
+    /// Pre-built overlay storage image as additionalImageStore (read-only, instant)
+    Overlay,
+    /// Pre-built btrfs storage image with real subvolumes as graphroot (read-write, instant)
+    Btrfs,
+    /// Docker archive loaded via podman at boot (slow, works with any driver)
+    Archive,
+}
+
+impl std::fmt::Display for ImageMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ImageMode::Overlay => write!(f, "overlay"),
+            ImageMode::Btrfs => write!(f, "btrfs"),
+            ImageMode::Archive => write!(f, "archive"),
+        }
+    }
+}
+
 /// Static boot arguments that affect cached VM state.
 /// Does NOT include per-instance values like IP addresses.
 /// Architecture-specific because reboot method differs (ARM64=k, x86=t).
@@ -154,6 +190,7 @@ impl FirecrackerConfig {
         hugepages: bool,
         user: Option<String>,
         forward_localhost: Vec<u16>,
+        image_mode: ImageMode,
     ) -> Self {
         Self {
             boot_source: BootSource {
@@ -176,6 +213,7 @@ impl FirecrackerConfig {
                 is_root_device: true,
                 is_read_only: false,
             }],
+            container_image_name: container_image.clone(),
             container_image,
             container_cmd,
             network_mode,
@@ -190,6 +228,7 @@ impl FirecrackerConfig {
             health_check_url,
             user,
             forward_localhost,
+            image_mode,
         }
     }
 
@@ -305,14 +344,14 @@ impl FirecrackerConfig {
         serde_json::json!({
             "latest": {
                 "container-plan": {
-                    "image": self.container_image,
+                    "image": self.container_image_name,
                     "env": env,
                     "cmd": self.container_cmd,
                     "volumes": runtime.volumes,
                     "extra_disks": runtime.extra_disks,
                     "nfs_mounts": runtime.nfs_mounts,
-                    "image_archive": runtime.image_archive,
-                    "image_storage_device": runtime.image_storage_device,
+                    "image_device": runtime.image_device,
+                    "image_mode": runtime.image_device.as_ref().map(|_| self.image_mode.to_string()),
                     "privileged": self.privileged,
                     "user": self.user.as_deref(),
                     "subuid_start": runtime.subuid_start,
@@ -339,10 +378,8 @@ pub struct MmdsRuntime {
     pub extra_disks: Vec<serde_json::Value>,
     /// NFS mount details with host IP
     pub nfs_mounts: Vec<serde_json::Value>,
-    /// Device path for image archive (localhost images, no-direct-image-mount mode)
-    pub image_archive: Option<String>,
-    /// Device path for image storage (direct-image-mount mode)
-    pub image_storage_device: Option<String>,
+    /// Device path for localhost image (e.g., "/dev/vdb"), used by all image modes
+    pub image_device: Option<String>,
     /// Resolved HTTP proxy URL (IP, not hostname)
     pub http_proxy: Option<String>,
     /// Resolved HTTPS proxy URL
@@ -384,6 +421,7 @@ mod tests {
             false,
             None,
             vec![],
+            ImageMode::Overlay,
         )
     }
 
@@ -498,5 +536,18 @@ mod tests {
         let mut config2 = test_config();
         config2.forward_localhost = vec![8080];
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    #[test]
+    fn test_snapshot_key_changes_with_image_mode() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.image_mode = ImageMode::Btrfs;
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+
+        let mut config3 = test_config();
+        config3.image_mode = ImageMode::Archive;
+        assert_ne!(config1.snapshot_key(), config3.snapshot_key());
+        assert_ne!(config2.snapshot_key(), config3.snapshot_key());
     }
 }
