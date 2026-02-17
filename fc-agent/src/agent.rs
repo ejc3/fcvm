@@ -132,7 +132,11 @@ pub async fn run() -> Result<()> {
             if plan.user.is_none() {
                 if let Some(ref device) = plan.image_device {
                     container::mount_btrfs_device(device, "/var/lib/containers/storage")?;
-                    container::write_btrfs_storage_conf("/etc/containers/storage.conf", "/var/lib/containers/storage", "/run/containers/storage");
+                    container::write_btrfs_storage_conf(
+                        "/etc/containers/storage.conf",
+                        "/var/lib/containers/storage",
+                        "/run/containers/storage",
+                    );
                 }
             }
         }
@@ -155,8 +159,12 @@ pub async fn run() -> Result<()> {
             .subuid_start
             .zip(plan.subuid_count)
             .or_else(|| plan.subuid_start.map(|s| (s, 65536)));
-        let (username, _uid, runtime_dir) =
-            container::create_vm_user(user_spec, desired_name, subuid_range, plan.image_mode.as_deref());
+        let (username, _uid, runtime_dir) = container::create_vm_user(
+            user_spec,
+            desired_name,
+            subuid_range,
+            plan.image_mode.as_deref(),
+        );
         Some((username, runtime_dir))
     } else {
         None

@@ -256,7 +256,7 @@ fn find_mkfs_btrfs() -> Result<PathBuf> {
             // Parse version from "mkfs.btrfs, part of btrfs-progs v6.12"
             if let Some(version) = version_str
                 .split('v')
-                .last()
+                .next_back()
                 .and_then(|s| s.trim().split_once('.'))
             {
                 let major: u32 = version.0.parse().unwrap_or(0);
@@ -368,9 +368,12 @@ pub(super) async fn build_btrfs_storage_image(
         } else {
             let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
                 .context("looking up build user")?
-                .ok_or_else(|| anyhow::anyhow!(
-                    "no user with uid {} on host (needed for rootless btrfs image build)", uid
-                ))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no user with uid {} on host (needed for rootless btrfs image build)",
+                        uid
+                    )
+                })?;
             let nix_uid = nix::unistd::Uid::from_raw(uid);
             let nix_gid = nix::unistd::Gid::from_raw(user.gid.as_raw());
             nix::unistd::chown(tmp_dir.as_path(), Some(nix_uid), Some(nix_gid))
@@ -396,15 +399,28 @@ pub(super) async fn build_btrfs_storage_image(
 
     let mut cmd_args: Vec<String> = Vec::new();
     if let Some(ref username) = build_username {
-        cmd_args.extend(["runuser", "-u", username, "--"].iter().map(|s| s.to_string()));
+        cmd_args.extend(
+            ["runuser", "-u", username, "--"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
     }
-    cmd_args.extend([
-        "podman",
-        "--root", tmp_dir.to_str().unwrap(),
-        "--runroot", tmp_runroot.to_str().unwrap(),
-        "--storage-driver", "btrfs",
-        "load", "-i", archive_path.to_str().unwrap(),
-    ].iter().map(|s| s.to_string()));
+    cmd_args.extend(
+        [
+            "podman",
+            "--root",
+            tmp_dir.to_str().unwrap(),
+            "--runroot",
+            tmp_runroot.to_str().unwrap(),
+            "--storage-driver",
+            "btrfs",
+            "load",
+            "-i",
+            archive_path.to_str().unwrap(),
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
 
     let load_output = tokio::process::Command::new(&cmd_args[0])
         .args(&cmd_args[1..])
@@ -575,10 +591,6 @@ async fn cleanup_btrfs_tmp(tmp_dir: &Path) {
 
     // Finally remove the directory tree
     if let Err(e) = tokio::fs::remove_dir_all(tmp_dir).await {
-        warn!(
-            "Failed to remove temp dir {}: {}",
-            tmp_dir.display(),
-            e
-        );
+        warn!("Failed to remove temp dir {}: {}", tmp_dir.display(), e);
     }
 }
