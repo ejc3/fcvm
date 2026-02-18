@@ -108,7 +108,7 @@ async fn test_heavy_output_after_snapshot_restore() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(10)).await;
 
     // Sample counter twice to verify it's incrementing
-    let sample1 = common::exec_in_container(fcvm_pid, &["sh", "-c", "echo COUNT_SAMPLE"]).await;
+    let _sample1 = common::exec_in_container(fcvm_pid, &["sh", "-c", "echo COUNT_SAMPLE"]).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Verify container is still alive (not deadlocked after pre-start snapshot)
@@ -162,9 +162,7 @@ async fn test_heavy_output_after_snapshot_restore() -> Result<()> {
         Err(_) => {
             common::kill_process(fcvm_pid2).await;
             let _ = child2.wait().await;
-            anyhow::bail!(
-                "warm start timed out — likely deadlock from output pipeline"
-            );
+            anyhow::bail!("warm start timed out — likely deadlock from output pipeline");
         }
     }
 

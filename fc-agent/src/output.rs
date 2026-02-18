@@ -131,10 +131,7 @@ impl OutputConnection {
 /// On reconnect, resumes reading — channel drains, backpressure releases.
 ///
 /// Zero messages dropped. No separate buffer. The mpsc channel IS the buffer.
-async fn output_writer(
-    mut rx: mpsc::Receiver<OutputMessage>,
-    reconnect_signal: Arc<Notify>,
-) {
+async fn output_writer(mut rx: mpsc::Receiver<OutputMessage>, reconnect_signal: Arc<Notify>) {
     let mut conn = match OutputConnection::connect() {
         Some(c) => {
             eprintln!(
