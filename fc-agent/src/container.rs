@@ -94,6 +94,46 @@ fn wait_for_device(device: &str) -> Result<()> {
     Ok(())
 }
 
+/// Write a minimal storage.conf with driver="overlay" so that any early
+/// `podman` commands create db.sql with the correct graph driver.
+/// Called before the exec server starts to prevent the race where health
+/// monitor's `podman inspect` creates db.sql with an empty driver.
+/// `mount_overlay_image()` later overwrites this with the full config
+/// (including additionalimagestores).
+pub fn write_overlay_storage_conf(user_spec: Option<&str>) {
+    // At this early stage the user may not be created yet (create_vm_user
+    // runs later).  Write root-level storage.conf which is what early
+    // health monitor exec commands will use.
+    let (conf_path, runroot, graphroot) = storage_paths(None);
+    let storage_conf = format!(
+        "[storage]\ndriver = \"overlay\"\nrunroot = \"{runroot}\"\ngraphroot = \"{graphroot}\"\n"
+    );
+    if let Err(e) = std::fs::write(&conf_path, &storage_conf) {
+        eprintln!(
+            "[fc-agent] WARNING: failed to write early overlay storage.conf at {}: {}",
+            conf_path, e
+        );
+    } else {
+        eprintln!(
+            "[fc-agent] wrote early overlay storage.conf (driver=overlay) at {}",
+            conf_path
+        );
+    }
+    // Reset stale podman state from rootfs build (apt post-install may create
+    // db.sql with empty driver before storage.conf exists).
+    let _ = std::process::Command::new("podman")
+        .args(["system", "reset", "--force"])
+        .output();
+
+    // Also write containers.conf to prevent netavark errors
+    write_containers_conf("/etc/containers/containers.conf");
+
+    // If there's a user spec, we can't write user-level config yet since
+    // the user doesn't exist.  mount_overlay_image() handles that later
+    // after create_vm_user().
+    let _ = user_spec; // acknowledge parameter
+}
+
 /// Get storage.conf path, runroot, and graphroot for the given user.
 fn storage_paths(username: Option<&str>) -> (String, String, String) {
     if let Some(name) = username {

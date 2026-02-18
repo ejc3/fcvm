@@ -45,6 +45,11 @@ pub async fn run() -> Result<()> {
     match plan.image_mode.as_deref() {
         Some("overlay") => {
             eprintln!("[fc-agent] skipping btrfs loopback setup (image_mode=overlay)");
+            // Write storage.conf with overlay driver now so any early `podman`
+            // commands (e.g. health monitor's `podman inspect`) create db.sql
+            // with the correct driver.  mount_overlay_image() will overwrite
+            // this later with the full config including additionalimagestores.
+            container::write_overlay_storage_conf(plan.user.as_deref());
         }
         _ => {
             container::setup_btrfs_storage_if_available();
