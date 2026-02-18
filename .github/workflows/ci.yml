@@ -17,12 +17,18 @@ on:
       - 'kernel/**'
       - 'scripts/claude-assistant/**'
       - '.github/workflows/claude*.yml'
+      - '.claude/**'
+      - '*.md'
+      - 'docs/**'
   push:
     branches: [main]
     paths-ignore:
       - 'kernel/**'  # When kernel changes, wait for Build Kernels workflow
       - 'scripts/claude-assistant/**'
       - '.github/workflows/claude*.yml'
+      - '.claude/**'
+      - '*.md'
+      - 'docs/**'
   workflow_run:
     workflows: ["Build Kernels"]
     types: [completed]
