@@ -43,6 +43,39 @@ impl VsockStream {
         Ok(Self { inner })
     }
 
+    /// Clone the underlying fd (via dup). The clone shares the same socket
+    /// but has an independent AsyncFd registration, so it can be used in a
+    /// separate task (e.g., a reader monitoring for EOF while the writer writes).
+    pub fn try_clone(&self) -> Result<Self> {
+        let raw_fd = self.inner.get_ref().as_raw_fd();
+        let new_fd = nix::unistd::dup(raw_fd).context("dup vsock fd")?;
+        let owned = unsafe { OwnedFd::from_raw_fd(new_fd) };
+        let inner = AsyncFd::new(owned).context("wrapping cloned vsock in AsyncFd")?;
+        Ok(Self { inner })
+    }
+
+    /// Wait for the socket to become readable, then read. Returns 0 on EOF.
+    /// Used to detect dead connections (Firecracker transport reset → EOF).
+    pub async fn wait_for_eof(&self) -> std::io::Result<()> {
+        let mut buf = [0u8; 1];
+        loop {
+            let mut guard = self.inner.readable().await?;
+            match guard.try_io(|inner| {
+                let n = unsafe { libc::read(inner.as_raw_fd(), buf.as_mut_ptr().cast(), 1) };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }) {
+                Ok(Ok(0)) => return Ok(()), // EOF — socket dead
+                Ok(Ok(_)) => continue,      // Got data (unexpected, but keep waiting)
+                Ok(Err(e)) => return Err(e), // Error — socket dead
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
     /// Async write_all — waits for writability via epoll, then writes.
     pub async fn write_all(&self, buf: &[u8]) -> std::io::Result<()> {
         let mut pos = 0;
