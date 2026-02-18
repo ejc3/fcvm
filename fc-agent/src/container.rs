@@ -52,6 +52,12 @@ pub fn mount_overlay_image(
     );
     std::fs::write(&conf_path, &storage_conf).context("writing storage.conf")?;
 
+    // Reset stale podman state from rootfs build (apt post-install may create
+    // db.sql with empty driver before storage.conf exists).
+    let _ = std::process::Command::new("podman")
+        .args(["system", "reset", "--force"])
+        .output();
+
     // Write containers.conf to disable netavark (VM uses --network=host)
     let containers_conf_path = if username.is_some() {
         // User-level containers.conf lives alongside storage.conf
@@ -239,6 +245,11 @@ pub fn setup_btrfs_storage_if_available() {
             storage_dir,
             "/run/containers/storage",
         );
+        // Reset stale podman state from rootfs build (apt post-install may create
+        // db.sql with empty driver before storage.conf exists).
+        let _ = std::process::Command::new("podman")
+            .args(["system", "reset", "--force"])
+            .output();
         return;
     }
 
@@ -354,35 +365,6 @@ pub fn setup_btrfs_storage_if_available() {
         "[fc-agent] btrfs storage configured at {} ({} sparse loopback)",
         storage_dir, loopback_size
     );
-}
-
-/// Reset root podman state to match the current storage.conf.
-///
-/// Fixes "database graph driver does not match" errors caused by the health
-/// monitor running `podman inspect` via exec before storage setup completes,
-/// creating db.sql with an empty or wrong driver.
-///
-/// Only call for root podman (empty cmd_prefix). User-mode podman already
-/// resets in create_vm_user(). A root reset would destroy the user's btrfs
-/// storage subdirectory at /var/lib/containers/storage/user-{uid}.
-pub fn reset_podman_state() {
-    match std::process::Command::new("podman")
-        .args(["system", "reset", "--force"])
-        .output()
-    {
-        Ok(o) if o.status.success() => {
-            eprintln!("[fc-agent] podman state reset to match storage.conf");
-        }
-        Ok(o) => {
-            eprintln!(
-                "[fc-agent] WARNING: podman system reset failed: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-        }
-        Err(e) => {
-            eprintln!("[fc-agent] WARNING: podman system reset error: {}", e);
-        }
-    }
 }
 
 /// Import a Docker archive into podman storage. Returns image reference.
