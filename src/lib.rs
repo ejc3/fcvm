@@ -2,6 +2,7 @@ pub mod cli;
 pub mod commands;
 pub mod firecracker;
 pub mod health;
+pub mod kvm_trace;
 pub mod network;
 pub mod paths;
 pub mod setup;

@@ -776,47 +776,51 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         MemoryBackend::Uffd {
             socket_path: uffd_socket_path.clone(),
         }
-    } else if hugepages {
-        // Implicit UFFD mode: hugepages require UFFD, start in-process server
-        let implicit_socket_path = data_dir.join("uffd.sock");
-        info!(
-            target: "uffd",
-            socket = %implicit_socket_path.display(),
-            "starting implicit UFFD server for hugepage snapshot restore"
-        );
-
-        let server = UffdServer::new_with_path(
-            format!("implicit-{}", truncate_id(&vm_id, 8)),
-            &snapshot_config.memory_path,
-            &implicit_socket_path,
-        )
-        .await
-        .context("creating implicit UFFD server for hugepages")?;
-
-        let cancel = implicit_uffd_cancel.clone();
-        tokio::spawn(async move {
-            if let Err(e) = server.run(cancel).await {
-                tracing::error!(target: "uffd", error = ?e, "implicit UFFD server error");
-            }
-        });
-
-        // Poll for socket to appear (server binds it asynchronously)
-        for i in 0..100 {
-            if implicit_socket_path.exists() {
-                break;
-            }
-            if i == 99 {
-                bail!("implicit UFFD server did not bind socket within 5s");
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-
-        MemoryBackend::Uffd {
-            socket_path: implicit_socket_path,
-        }
     } else {
-        MemoryBackend::File {
-            memory_path: snapshot_config.memory_path.clone(),
+        // Use file-backed restore by default.
+        // Note: Firecracker v1.14.0 has a bug where file-backed restore of VMs >= 4GB
+        // causes a triple fault (guest page tables for memory above the MMIO gap at 3GB
+        // are invalid). Fixed in v1.15.0+. If /dev/userfaultfd is accessible (chmod 666),
+        // UFFD can be used as a workaround via FCVM_FORCE_UFFD=1.
+        if std::env::var("FCVM_FORCE_UFFD").is_ok() {
+            let implicit_socket_path = data_dir.join("uffd.sock");
+            info!(
+                socket = %implicit_socket_path.display(),
+                "starting implicit UFFD server for snapshot restore (FCVM_FORCE_UFFD)"
+            );
+
+            let server = UffdServer::new_with_path(
+                format!("implicit-{}", truncate_id(&vm_id, 8)),
+                &snapshot_config.memory_path,
+                &implicit_socket_path,
+            )
+            .await
+            .context("creating implicit UFFD server")?;
+
+            let cancel = implicit_uffd_cancel.clone();
+            tokio::spawn(async move {
+                if let Err(e) = server.run(cancel).await {
+                    tracing::error!(target: "uffd", error = ?e, "implicit UFFD server error");
+                }
+            });
+
+            for i in 0..100 {
+                if implicit_socket_path.exists() {
+                    break;
+                }
+                if i == 99 {
+                    bail!("implicit UFFD server did not bind socket within 5s");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            MemoryBackend::Uffd {
+                socket_path: implicit_socket_path,
+            }
+        } else {
+            MemoryBackend::File {
+                memory_path: snapshot_config.memory_path.clone(),
+            }
         }
     };
 
@@ -887,30 +891,18 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     let (mut vm_manager, mut holder_child) = setup_result.unwrap();
 
-    // Determine actual memory mode: use_uffd covers explicit UFFD (serve PID),
-    // but hugepages also use implicit UFFD without a serve process.
-    let actual_uffd = use_uffd || hugepages;
-    if actual_uffd {
-        info!(
-            vm_id = %vm_id,
-            vm_name = %vm_name,
-            "VM cloned successfully with UFFD memory sharing!"
-        );
-        println!(
-            "✓ VM '{}' cloned from snapshot '{}' (UFFD mode)",
-            vm_name, snapshot_name
-        );
-        println!("  Memory pages shared via UFFD server");
+    let is_uffd = use_uffd || std::env::var("FCVM_FORCE_UFFD").is_ok() || hugepages;
+    if is_uffd {
+        info!(vm_id = %vm_id, vm_name = %vm_name, "VM cloned with UFFD memory");
+        println!("✓ VM '{}' cloned from snapshot '{}' (UFFD mode)", vm_name, snapshot_name);
+        if use_uffd {
+            println!("  Memory pages shared via UFFD serve process");
+        } else {
+            println!("  Memory pages served on-demand from snapshot file");
+        }
     } else {
-        info!(
-            vm_id = %vm_id,
-            vm_name = %vm_name,
-            "VM cloned successfully from snapshot files!"
-        );
-        println!(
-            "✓ VM '{}' cloned from snapshot '{}' (direct mode)",
-            vm_name, snapshot_name
-        );
+        info!(vm_id = %vm_id, vm_name = %vm_name, "VM cloned from snapshot files");
+        println!("✓ VM '{}' cloned from snapshot '{}' (direct mode)", vm_name, snapshot_name);
         println!("  Memory loaded from file");
     }
     println!("  Disk uses CoW overlay");
