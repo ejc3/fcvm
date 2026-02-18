@@ -356,6 +356,37 @@ pub fn setup_btrfs_storage_if_available() {
     );
 }
 
+/// Reset podman state to match the current storage.conf.
+///
+/// Must be called after storage.conf is written (by btrfs/overlay setup) and
+/// immediately before the first real podman operation (pull/load/run).
+///
+/// This fixes "database graph driver does not match" errors caused by:
+/// 1. Stale db.sql from rootfs build (apt post-install creates it with driver="")
+/// 2. Concurrent health monitor `podman inspect` recreating db.sql during setup
+///
+/// `podman system reset --force` atomically drops and recreates all podman state
+/// to match the current storage.conf, eliminating any driver mismatch.
+pub fn reset_podman_state() {
+    match std::process::Command::new("podman")
+        .args(["system", "reset", "--force"])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            eprintln!("[fc-agent] podman state reset to match storage.conf");
+        }
+        Ok(o) => {
+            eprintln!(
+                "[fc-agent] WARNING: podman system reset failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: podman system reset error: {}", e);
+        }
+    }
+}
+
 /// Import a Docker archive into podman storage. Returns image reference.
 /// If cmd_prefix is provided, prepend it to the podman command (e.g., for runuser).
 pub async fn import_image(
