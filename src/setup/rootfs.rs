@@ -1503,6 +1503,11 @@ fn find_busybox() -> Result<PathBuf> {
 /// Requires a clean ext4 filesystem (runs e2fsck first).
 /// btrfs-convert works on image files, not just block devices.
 async fn convert_to_btrfs(image_path: &Path) -> Result<()> {
+    // Verify btrfs-convert is available (from btrfs-progs package)
+    if which::which("btrfs-convert").is_err() {
+        bail!("btrfs-convert not found — install btrfs-progs: apt-get install btrfs-progs");
+    }
+
     // e2fsck first — btrfs-convert requires a clean ext4 filesystem
     let e2fsck_output = Command::new("e2fsck")
         .args(["-f", "-y", path_to_str(image_path)?])
