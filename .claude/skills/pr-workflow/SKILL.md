@@ -198,6 +198,63 @@ git push origin <dependent-branch>
 gh pr create --base main --title "..." --body "..."
 ```
 
+### Rebasing Stacked PRs After Base Merges
+
+**CRITICAL: Never use plain `git rebase origin/main` on stacked branches.**
+
+When a base PR merges to main, the dependent branch contains copies of the base PR's commits
+(same content, different SHAs due to merge). A plain `git rebase origin/main` tries to replay
+these already-merged commits, causing **false conflicts** that look real but aren't.
+
+**Diagnosis:** If `git rebase origin/main` produces conflicts in files you didn't touch in YOUR
+commits, you're probably replaying already-merged commits.
+
+**Correct approach — use `--onto` to skip already-merged commits:**
+
+```bash
+# Step 1: Identify which commits are yours vs already-merged
+git log --oneline origin/main..your-branch
+
+# Step 2: Check which commits have equivalents in main
+for commit in $(git log --format="%h" origin/main..your-branch); do
+  subject=$(git log --format="%s" -1 $commit)
+  match=$(git log --oneline origin/main --grep="$subject" | head -1)
+  echo "$commit: $subject"
+  echo "  main match: ${match:-NONE (unique)}"
+done
+
+# Step 3: Find the last already-merged commit (the old base tip)
+# This is the commit AFTER which your unique commits begin.
+# Example: if commits are A B C D E F and A B C are in main:
+#   C is the old base tip, D E F are your unique commits
+
+# Step 4: Rebase only unique commits onto main
+git rebase --onto origin/main <old-base-tip> your-branch
+# This replays only D E F onto origin/main, skipping A B C
+
+# Step 5: Force push
+git push origin your-branch --force-with-lease
+```
+
+**For deeper stacks (PR #3 depends on PR #2 depends on PR #1):**
+Rebase from bottom up. After rebasing PR #2's branch, rebase PR #3 using PR #2's
+old tip as the skip point:
+
+```bash
+# After rebasing pr2-branch onto main:
+git rebase --onto pr2-branch <pr2-old-tip> pr3-branch
+git push origin pr3-branch --force-with-lease
+```
+
+**Why this works:** `--onto` tells git "replay commits AFTER `<old-base-tip>` onto `<new-base>`".
+Commits before `<old-base-tip>` (the already-merged ones) are skipped entirely, so there are
+no false conflicts from replaying content that's already in main.
+
+**Why plain rebase fails:** Without `--onto`, git replays ALL commits from the branch's
+merge-base with main. If the branch was based on `pr1-branch` which is now merged, those
+commits have different SHAs in main (merge commits, squashes, etc.), so git sees them as
+"new" changes and tries to apply them, hitting conflicts with the identical content already in main.
+
 ## Rust Code Quality Checklist
 
 Before considering code "done":
