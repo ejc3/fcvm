@@ -46,6 +46,12 @@ pub async fn ensure_kernel(
 
     if profile.inherits_kernel() {
         // Runtime-only profile — uses default kernel
+        if profile_name == "default" {
+            bail!(
+                "'default' kernel profile must define kernel_url or \
+                 kernel_version/kernel_repo — cannot inherit from itself"
+            );
+        }
         debug!(profile = %profile_name, "profile inherits kernel from default");
         return Box::pin(ensure_kernel("default", allow_create, allow_build)).await;
     }
@@ -66,6 +72,12 @@ pub fn get_kernel_path(profile_name: &str) -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("kernel profile '{}' not found in config", profile_name))?;
 
     if profile.inherits_kernel() {
+        if profile_name == "default" {
+            bail!(
+                "'default' kernel profile must define kernel_url or \
+                 kernel_version/kernel_repo — cannot inherit from itself"
+            );
+        }
         return get_kernel_path("default");
     }
 
@@ -80,11 +92,16 @@ pub fn get_kernel_path(profile_name: &str) -> Result<PathBuf> {
 /// For URL-based profiles, this is the URL hash.
 /// Used to include in Layer 2 SHA calculation.
 pub fn get_kernel_url_hash(profile_name: &str) -> Result<String> {
-    let profile = get_kernel_profile(profile_name)?.ok_or_else(|| {
-        anyhow::anyhow!("kernel profile '{}' not found in config", profile_name)
-    })?;
+    let profile = get_kernel_profile(profile_name)?
+        .ok_or_else(|| anyhow::anyhow!("kernel profile '{}' not found in config", profile_name))?;
 
     if profile.inherits_kernel() {
+        if profile_name == "default" {
+            bail!(
+                "'default' kernel profile must define kernel_url or \
+                 kernel_version/kernel_repo — cannot inherit from itself"
+            );
+        }
         return get_kernel_url_hash("default");
     }
 
@@ -119,10 +136,9 @@ async fn ensure_url_kernel(profile: &KernelProfile, allow_create: bool) -> Resul
         return Ok(path);
     }
 
-    let url = profile
-        .kernel_url
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("kernel profile must specify kernel_url or kernel_local_path"))?;
+    let url = profile.kernel_url.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("kernel profile must specify kernel_url or kernel_local_path")
+    })?;
     let archive_path = profile
         .kernel_archive_path
         .as_ref()
