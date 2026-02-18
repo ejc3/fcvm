@@ -206,9 +206,18 @@ const HEALTH_CHECK_EXEC_TIMEOUT: Duration = Duration::from_secs(5);
 /// so podman finds user-level config and runtime state.
 fn user_cmd_prefix(name: &str, user_spec: Option<&str>) -> Vec<String> {
     // Extract UID from user spec (format: "UID:GID" or just "UID")
+    // Extract UID from user spec. If missing, resolve from username via /etc/passwd.
     let uid = user_spec
         .and_then(|s| s.split(':').next())
-        .unwrap_or("1000");
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            // Fallback: look up UID from username
+            nix::unistd::User::from_name(name)
+                .ok()
+                .flatten()
+                .map(|u| u.uid.as_raw().to_string())
+                .unwrap_or_else(|| "1000".to_string())
+        });
 
     vec![
         "env".into(),
