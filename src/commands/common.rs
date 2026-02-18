@@ -1045,7 +1045,6 @@ pub async fn create_snapshot_core(
     }
 
     // VM is now paused — we MUST resume it before returning, no matter what.
-    // Use a closure-like pattern to ensure resume always runs.
     let snapshot_result = snapshot_client
         .create_snapshot(SnapshotCreate {
             snapshot_type: Some(snapshot_type.to_string()),
@@ -1054,8 +1053,44 @@ pub async fn create_snapshot_core(
         })
         .await;
 
-    // Resume VM immediately (ALWAYS, regardless of snapshot result).
-    // This minimizes pause time — diff merge happens after resume.
+    // Copy disk while VM is still paused to maintain memory/disk consistency.
+    // If we copy after resume, the disk may have post-resume writes that don't
+    // match the snapshot's memory state. This causes filesystem corruption on
+    // restore (e.g., btrfs detects inconsistent transaction log and goes read-only).
+    // Reflink copy is instant (O(1) metadata operation), so pause time is not affected.
+    let disk_copy_result = if snapshot_result.is_ok() {
+        let temp_disk_path = temp_snapshot_dir.join("disk.raw");
+        info!(snapshot = %snapshot_config.name, "copying disk (VM paused)");
+        let r = reflink_copy(disk_path, &temp_disk_path).await;
+
+        // Also copy extra disks while paused
+        if r.is_ok() {
+            let mut extra_ok = true;
+            for extra_disk in &snapshot_config.metadata.extra_disks {
+                let source = paths::vm_runtime_dir(&snapshot_config.vm_id)
+                    .join("disks")
+                    .join(&extra_disk.filename);
+                let dest = temp_snapshot_dir.join(&extra_disk.filename);
+                if let Err(e) = reflink_copy(&source, &dest).await {
+                    error!(error = %e, disk = %extra_disk.filename, "failed to copy extra disk");
+                    extra_ok = false;
+                    break;
+                }
+            }
+            if extra_ok {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("extra disk copy failed"))
+            }
+        } else {
+            r
+        }
+    } else {
+        Ok(()) // Skip disk copy if snapshot failed
+    };
+
+    // Resume VM (ALWAYS, regardless of snapshot/disk copy result).
+    // Memory merge happens after resume since it operates on snapshot files, not live disk.
     let resume_result = snapshot_client
         .patch_vm_state(ApiVmState {
             state: "Resumed".to_string(),
@@ -1064,15 +1099,18 @@ pub async fn create_snapshot_core(
 
     if let Err(e) = &resume_result {
         // Resume failure is critical — VM may be stuck paused.
-        // Log prominently so the operator knows.
         error!(snapshot = %snapshot_config.name, error = %e,
             "CRITICAL: failed to resume VM after snapshot — VM may be paused!");
     }
 
-    // Check if snapshot succeeded — clean up temp dir on failure
+    // Check results — clean up temp dir on failure
     if let Err(e) = snapshot_result {
         let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
         return Err(e).context("creating Firecracker snapshot");
+    }
+    if let Err(e) = disk_copy_result {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        return Err(e).context("copying disk during snapshot");
     }
     if let Err(e) = resume_result {
         let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
@@ -1138,19 +1176,7 @@ pub async fn create_snapshot_core(
             "diff merge complete, building atomic update"
         );
 
-        // Copy disk using btrfs reflink to temp dir
-        let temp_disk_path = temp_snapshot_dir.join("disk.raw");
-        reflink_copy(disk_path, &temp_disk_path).await?;
-
-        // Copy extra disk images (disk-dir) to snapshot directory
-        for extra_disk in &snapshot_config.metadata.extra_disks {
-            let source = paths::vm_runtime_dir(&snapshot_config.vm_id)
-                .join("disks")
-                .join(&extra_disk.filename);
-            let dest = temp_snapshot_dir.join(&extra_disk.filename);
-            reflink_copy(&source, &dest).await?;
-        }
-
+        // Disk was already copied while VM was paused (above).
         // Write config.json to temp directory
         let temp_config_path = temp_snapshot_dir.join("config.json");
         let config_json = serde_json::to_string_pretty(&snapshot_config)
@@ -1160,10 +1186,7 @@ pub async fn create_snapshot_core(
             .context("writing snapshot config")?;
 
         // Atomic replace: rename old out of the way, then rename new into place.
-        // If we crash after step 1 but before step 2, the old snapshot is at .old
-        // and can be recovered. This avoids the window where no snapshot exists.
         let old_snapshot_dir = snapshot_dir.with_extension("old");
-        // Clean up any leftover .old dir from a previous crash
         let _ = tokio::fs::remove_dir_all(&old_snapshot_dir).await;
         tokio::fs::rename(snapshot_dir, &old_snapshot_dir)
             .await
@@ -1171,7 +1194,6 @@ pub async fn create_snapshot_core(
         tokio::fs::rename(&temp_snapshot_dir, snapshot_dir)
             .await
             .context("renaming temp snapshot to final location")?;
-        // Best-effort cleanup of old dir
         let _ = tokio::fs::remove_dir_all(&old_snapshot_dir).await;
 
         info!(
@@ -1180,22 +1202,7 @@ pub async fn create_snapshot_core(
             "diff snapshot merged successfully"
         );
     } else {
-        // Full snapshot: atomic rename to final location
-        info!(snapshot = %snapshot_config.name, "copying disk");
-
-        // Copy disk using btrfs reflink (instant CoW copy)
-        let temp_disk_path = temp_snapshot_dir.join("disk.raw");
-        reflink_copy(disk_path, &temp_disk_path).await?;
-
-        // Copy extra disk images (disk-dir) to snapshot directory
-        for extra_disk in &snapshot_config.metadata.extra_disks {
-            let source = paths::vm_runtime_dir(&snapshot_config.vm_id)
-                .join("disks")
-                .join(&extra_disk.filename);
-            let dest = temp_snapshot_dir.join(&extra_disk.filename);
-            reflink_copy(&source, &dest).await?;
-        }
-
+        // Full snapshot: disk already copied while VM was paused.
         // Write config.json to temp directory
         let config_path = temp_snapshot_dir.join("config.json");
         let config_json = serde_json::to_string_pretty(&snapshot_config)
