@@ -2101,8 +2101,7 @@ async fn boot_vm_for_setup(
     // Find kernel — rootfs_type ("btrfs") matches the kernel profile name by convention.
     // Falls back to "default" profile for ext4 rootfs.
     let kernel_profile_name = rootfs_type.unwrap_or("default");
-    let kernel_path =
-        crate::setup::kernel::ensure_kernel(kernel_profile_name, true, false).await?;
+    let kernel_path = crate::setup::kernel::ensure_kernel(kernel_profile_name, true, false).await?;
 
     // Create serial console output file
     let serial_path = temp_dir.join("serial.log");
