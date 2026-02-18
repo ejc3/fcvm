@@ -1045,7 +1045,7 @@ pub async fn ensure_nested_image() -> anyhow::Result<()> {
 /// Build a container image for nested testing, serialized via file lock.
 ///
 /// Uses an exclusive file lock to prevent concurrent builds from racing on
-/// overlay unmount. Skips the build if another process already built the image.
+/// overlay unmount. Redundant builds are fast due to podman's layer caching.
 /// If the container extends localhost/nested-test, call ensure_nested_image() first.
 ///
 /// # Arguments
