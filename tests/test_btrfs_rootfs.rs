@@ -54,10 +54,9 @@ async fn test_btrfs_rootfs_native() -> Result<()> {
 
     // Step 3: Verify root filesystem is btrfs
     println!("\n3. Checking root filesystem type...");
-    let root_fstype =
-        common::exec_in_vm(fcvm_pid, &["findmnt", "-n", "-o", "FSTYPE", "/"])
-            .await
-            .context("checking root fstype")?;
+    let root_fstype = common::exec_in_vm(fcvm_pid, &["findmnt", "-n", "-o", "FSTYPE", "/"])
+        .await
+        .context("checking root fstype")?;
     let root_fstype = root_fstype.trim();
     println!("  / fstype: {}", root_fstype);
     assert_eq!(
@@ -70,7 +69,17 @@ async fn test_btrfs_rootfs_native() -> Result<()> {
     println!("\n4. Checking that no btrfs loopback file exists...");
     let loopback_check = common::exec_in_vm(
         fcvm_pid,
-        &["test", "-f", "/var/lib/containers/btrfs.img", "&&", "echo", "exists", "||", "echo", "absent"],
+        &[
+            "test",
+            "-f",
+            "/var/lib/containers/btrfs.img",
+            "&&",
+            "echo",
+            "exists",
+            "||",
+            "echo",
+            "absent",
+        ],
     )
     .await
     .context("checking loopback file")?;
@@ -163,10 +172,9 @@ async fn test_btrfs_rootfs_keepid() -> Result<()> {
 
     // Step 3: Verify root is btrfs
     println!("\n3. Checking root filesystem type...");
-    let root_fstype =
-        common::exec_in_vm(fcvm_pid, &["findmnt", "-n", "-o", "FSTYPE", "/"])
-            .await
-            .context("checking root fstype")?;
+    let root_fstype = common::exec_in_vm(fcvm_pid, &["findmnt", "-n", "-o", "FSTYPE", "/"])
+        .await
+        .context("checking root fstype")?;
     let root_fstype = root_fstype.trim();
     println!("  / fstype: {}", root_fstype);
     assert_eq!(root_fstype, "btrfs", "Root should be btrfs");
@@ -178,7 +186,11 @@ async fn test_btrfs_rootfs_keepid() -> Result<()> {
         .context("checking uid in container")?;
     let uid = uid.trim();
     println!("  Container UID: {}", uid);
-    assert_eq!(uid, "1000", "Container should run as UID 1000, got: {}", uid);
+    assert_eq!(
+        uid, "1000",
+        "Container should run as UID 1000, got: {}",
+        uid
+    );
 
     // Cleanup
     println!("\n5. Cleaning up...");
@@ -228,10 +240,9 @@ async fn test_btrfs_rootfs_ext4_loopback() -> Result<()> {
 
     // Step 3: Verify root filesystem is ext4
     println!("\n3. Checking root filesystem type...");
-    let root_fstype =
-        common::exec_in_vm(fcvm_pid, &["findmnt", "-n", "-o", "FSTYPE", "/"])
-            .await
-            .context("checking root fstype")?;
+    let root_fstype = common::exec_in_vm(fcvm_pid, &["findmnt", "-n", "-o", "FSTYPE", "/"])
+        .await
+        .context("checking root fstype")?;
     let root_fstype = root_fstype.trim();
     println!("  / fstype: {}", root_fstype);
     assert_eq!(
@@ -244,7 +255,17 @@ async fn test_btrfs_rootfs_ext4_loopback() -> Result<()> {
     println!("\n4. Checking btrfs loopback file...");
     let loopback_check = common::exec_in_vm(
         fcvm_pid,
-        &["test", "-f", "/var/lib/containers/btrfs.img", "&&", "echo", "exists", "||", "echo", "absent"],
+        &[
+            "test",
+            "-f",
+            "/var/lib/containers/btrfs.img",
+            "&&",
+            "echo",
+            "exists",
+            "||",
+            "echo",
+            "absent",
+        ],
     )
     .await
     .context("checking loopback file")?;

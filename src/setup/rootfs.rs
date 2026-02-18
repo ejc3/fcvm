@@ -1017,8 +1017,14 @@ pub async fn ensure_rootfs(allow_create: bool, rootfs_type: Option<&str>) -> Res
     let temp_rootfs_path = rootfs_path.with_extension("raw.tmp");
     let _ = tokio::fs::remove_file(&temp_rootfs_path).await;
 
-    let result =
-        create_layer2_rootless(&plan, script_sha_short, &setup_script, &temp_rootfs_path, rootfs_type).await;
+    let result = create_layer2_rootless(
+        &plan,
+        script_sha_short,
+        &setup_script,
+        &temp_rootfs_path,
+        rootfs_type,
+    )
+    .await;
 
     if result.is_ok() {
         tokio::fs::rename(&temp_rootfs_path, &rootfs_path)
@@ -2014,8 +2020,7 @@ async fn boot_vm_for_setup(
     } else {
         None
     };
-    let kernel_path =
-        crate::setup::kernel::ensure_kernel(kernel_profile, true, false).await?;
+    let kernel_path = crate::setup::kernel::ensure_kernel(kernel_profile, true, false).await?;
 
     // Create serial console output file
     let serial_path = temp_dir.join("serial.log");

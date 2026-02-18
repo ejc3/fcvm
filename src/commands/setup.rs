@@ -77,8 +77,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
             crate::cli::RootfsType::Ext4 => None,
         }
     } else if let Some(ref profile_name) = args.kernel_profile {
-        get_kernel_profile(profile_name)?
-            .and_then(|p| p.rootfs_type)
+        get_kernel_profile(profile_name)?.and_then(|p| p.rootfs_type)
     } else {
         None
     };
