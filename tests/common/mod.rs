@@ -1042,9 +1042,10 @@ pub async fn ensure_nested_image() -> anyhow::Result<()> {
     ensure_nested_container("localhost/nested-test", "Containerfile.nested").await
 }
 
-/// Build a container image for nested testing.
+/// Build a container image for nested testing, serialized via file lock.
 ///
-/// Always runs podman build - relies on podman's layer caching for speed.
+/// Uses an exclusive file lock to prevent concurrent builds from racing on
+/// overlay unmount. Redundant builds are fast due to podman's layer caching.
 /// If the container extends localhost/nested-test, call ensure_nested_image() first.
 ///
 /// # Arguments
@@ -1053,6 +1054,19 @@ pub async fn ensure_nested_image() -> anyhow::Result<()> {
 pub async fn ensure_nested_container(image_name: &str, containerfile: &str) -> anyhow::Result<()> {
     let fcvm_path = find_fcvm_binary()?;
     let fcvm_dir = fcvm_path.parent().unwrap();
+
+    // Serialize concurrent builds with a file lock. Multiple nextest processes
+    // may call this simultaneously; without locking, concurrent `podman build`
+    // races on overlay unmount and corrupts the build cache (x64-specific).
+    let lock_name = image_name.replace('/', "-");
+    let lock_path = format!("/tmp/fcvm-build-{}.lock", lock_name);
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .context("creating build lock file")?;
+    lock_file.lock_exclusive().context("acquiring build lock")?;
 
     // Copy binaries to build context (needed for nested-test base)
     if image_name == "localhost/nested-test" {
@@ -1080,6 +1094,7 @@ pub async fn ensure_nested_container(image_name: &str, containerfile: &str) -> a
         .context("running podman build")?;
 
     if !output.status.success() {
+        drop(lock_file);
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("Failed to build {}: {}", image_name, stderr);
     }
@@ -1130,6 +1145,7 @@ pub async fn ensure_nested_container(image_name: &str, containerfile: &str) -> a
         println!("✓ {} built", image_name);
     }
 
+    drop(lock_file);
     Ok(())
 }
 

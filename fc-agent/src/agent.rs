@@ -162,11 +162,14 @@ pub async fn run() -> Result<()> {
     // Store prefix globally so exec server and health checks can use it
     container::set_podman_cmd_prefix(cmd_prefix.clone());
 
-    // Reset podman state to match storage.conf before the first real podman operation.
-    // By this point, storage setup is complete (btrfs loopback mounted, storage.conf
-    // written with correct driver). Reset ensures db.sql matches storage.conf even if
-    // concurrent health monitor `podman inspect` created stale state during setup.
-    container::reset_podman_state();
+    // Reset root podman state to match storage.conf. The health monitor may have
+    // run `podman inspect` via the exec server during setup, creating a stale
+    // db.sql with the wrong graph driver. Only needed for root podman — user mode
+    // already resets in create_vm_user(), and a root reset would destroy the
+    // user's storage directory.
+    if cmd_prefix.is_empty() {
+        container::reset_podman_state();
+    }
 
     // Prepare image based on delivery mode
     let image_ref = match (plan.image_mode.as_deref(), &plan.image_device) {

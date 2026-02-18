@@ -356,17 +356,15 @@ pub fn setup_btrfs_storage_if_available() {
     );
 }
 
-/// Reset podman state to match the current storage.conf.
+/// Reset root podman state to match the current storage.conf.
 ///
-/// Must be called after storage.conf is written (by btrfs/overlay setup) and
-/// immediately before the first real podman operation (pull/load/run).
+/// Fixes "database graph driver does not match" errors caused by the health
+/// monitor running `podman inspect` via exec before storage setup completes,
+/// creating db.sql with an empty or wrong driver.
 ///
-/// This fixes "database graph driver does not match" errors caused by:
-/// 1. Stale db.sql from rootfs build (apt post-install creates it with driver="")
-/// 2. Concurrent health monitor `podman inspect` recreating db.sql during setup
-///
-/// `podman system reset --force` atomically drops and recreates all podman state
-/// to match the current storage.conf, eliminating any driver mismatch.
+/// Only call for root podman (empty cmd_prefix). User-mode podman already
+/// resets in create_vm_user(). A root reset would destroy the user's btrfs
+/// storage subdirectory at /var/lib/containers/storage/user-{uid}.
 pub fn reset_podman_state() {
     match std::process::Command::new("podman")
         .args(["system", "reset", "--force"])
