@@ -215,10 +215,23 @@ pub fn setup_btrfs_storage_if_available() {
         .unwrap_or(false);
 
     if root_is_btrfs {
-        let _ = std::process::Command::new("btrfs")
+        match std::process::Command::new("btrfs")
             .args(["filesystem", "resize", "max", "/"])
-            .output();
-        eprintln!("[fc-agent] root filesystem is btrfs, resized to fill disk");
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                eprintln!("[fc-agent] root filesystem is btrfs, resized to fill disk");
+            }
+            Ok(output) => {
+                eprintln!(
+                    "[fc-agent] WARNING: btrfs resize failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Err(e) => {
+                eprintln!("[fc-agent] WARNING: btrfs resize command failed: {}", e);
+            }
+        }
         let storage_dir = "/var/lib/containers/storage";
         let _ = std::fs::create_dir_all(storage_dir);
         write_btrfs_storage_conf(

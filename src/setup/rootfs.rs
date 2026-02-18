@@ -1504,11 +1504,18 @@ fn find_busybox() -> Result<PathBuf> {
 /// btrfs-convert works on image files, not just block devices.
 async fn convert_to_btrfs(image_path: &Path) -> Result<()> {
     // e2fsck first — btrfs-convert requires a clean ext4 filesystem
-    let _ = Command::new("e2fsck")
+    let e2fsck_output = Command::new("e2fsck")
         .args(["-f", "-y", path_to_str(image_path)?])
         .output()
         .await
         .context("e2fsck before btrfs-convert")?;
+    // e2fsck exit codes: 0=clean, 1=corrected, 2=corrected+reboot needed, >=4=uncorrectable
+    if e2fsck_output.status.code().unwrap_or(255) >= 4 {
+        bail!(
+            "e2fsck found uncorrectable errors: {}",
+            String::from_utf8_lossy(&e2fsck_output.stderr)
+        );
+    }
 
     let output = Command::new("btrfs-convert")
         .arg(path_to_str(image_path)?)
