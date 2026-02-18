@@ -73,6 +73,13 @@ filter = "package(fcvm) & test(/pjdfstest_vm/)"
 test-group = "vm-tests"
 slow-timeout = { period = "900s", terminate-after = 1 }
 
+# Utimensat pjdfstest with nested kernel is flaky due to container startup
+# under nested KVM + high parallel load (podman exit code 125).
+# Give it extra retries beyond the Makefile default.
+[[profile.default.overrides]]
+filter = "package(fcvm) & test(/utimensat_pjdfstest/)"
+retries = 4
+
 # fuse-pipe tests can run with full parallelism
 [[profile.default.overrides]]
 filter = "package(fuse-pipe)"
