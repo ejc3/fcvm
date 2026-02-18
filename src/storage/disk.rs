@@ -124,8 +124,9 @@ impl DiskManager {
     }
 }
 
-/// Ensure the ext4 filesystem has at least `min_free + extra_bytes` of free space.
+/// Ensure the filesystem has at least `min_free + extra_bytes` of free space.
 /// `extra_bytes` accounts for content that will be written after boot (e.g., container image layers).
+/// Auto-detects filesystem type (ext4 or btrfs) and uses the appropriate tools.
 pub async fn ensure_free_space(
     disk_path: &Path,
     min_free_str: &str,
@@ -139,6 +140,32 @@ pub async fn ensure_free_space(
         return Ok(());
     }
 
+    let fs_type = detect_filesystem_type(disk_path).await?;
+    match fs_type.as_str() {
+        "btrfs" => ensure_free_space_btrfs(disk_path, min_free).await,
+        _ => ensure_free_space_ext4(disk_path, min_free).await,
+    }
+}
+
+/// Detect filesystem type of an image file using blkid.
+async fn detect_filesystem_type(path: &Path) -> Result<String> {
+    let output = tokio::process::Command::new("blkid")
+        .args(["-o", "value", "-s", "TYPE", path.to_string_lossy().as_ref()])
+        .output()
+        .await
+        .context("running blkid")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "blkid failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Ensure ext4 filesystem has sufficient free space by expanding and resizing.
+async fn ensure_free_space_ext4(disk_path: &Path, min_free: u64) -> Result<()> {
     // Get current free space via dumpe2fs
     let output = tokio::process::Command::new("dumpe2fs")
         .args(["-h", disk_path.to_string_lossy().as_ref()])
@@ -174,7 +201,7 @@ pub async fn ensure_free_space(
         free_bytes,
         min_free,
         expand_by,
-        "expanding rootfs to ensure minimum free space"
+        "expanding ext4 rootfs to ensure minimum free space"
     );
 
     // Expand the sparse file
@@ -225,8 +252,91 @@ pub async fn ensure_free_space(
         );
     }
 
-    info!(disk = %disk_path.display(), "rootfs expanded successfully");
+    info!(disk = %disk_path.display(), "ext4 rootfs expanded successfully");
     Ok(())
+}
+
+/// Ensure btrfs filesystem has sufficient free space by expanding the sparse file.
+/// The guest resizes the btrfs filesystem at boot via `btrfs filesystem resize max /`.
+async fn ensure_free_space_btrfs(disk_path: &Path, min_free: u64) -> Result<()> {
+    // Parse btrfs superblock to get size info (no mount needed)
+    let output = tokio::process::Command::new("btrfs")
+        .args([
+            "inspect-internal",
+            "dump-super",
+            disk_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .await
+        .context("running btrfs dump-super")?;
+
+    if !output.status.success() {
+        bail!(
+            "btrfs dump-super failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let total_bytes = parse_dump_super_value(&stdout, "total_bytes")?;
+    let bytes_used = parse_dump_super_value(&stdout, "bytes_used")?;
+    let free_bytes = total_bytes.saturating_sub(bytes_used);
+
+    if free_bytes >= min_free {
+        debug!(
+            disk = %disk_path.display(),
+            free_bytes,
+            min_free,
+            "btrfs disk already has sufficient free space"
+        );
+        return Ok(());
+    }
+
+    let expand_by = min_free - free_bytes;
+    info!(
+        disk = %disk_path.display(),
+        free_bytes,
+        min_free,
+        expand_by,
+        "expanding btrfs rootfs sparse file"
+    );
+
+    // Expand sparse file — fc-agent resizes btrfs at boot
+    let output = tokio::process::Command::new("truncate")
+        .args([
+            "-s",
+            &format!("+{}", expand_by),
+            disk_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .await
+        .context("expanding btrfs sparse file")?;
+
+    if !output.status.success() {
+        bail!(
+            "truncate failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    info!(disk = %disk_path.display(), "btrfs rootfs sparse file expanded");
+    Ok(())
+}
+
+/// Parse a value from `btrfs inspect-internal dump-super` output.
+/// Format: "total_bytes\t\t10737418240" or "bytes_used\t\t2147483648"
+fn parse_dump_super_value(output: &str, key: &str) -> Result<u64> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with(key) {
+            if let Some(value) = trimmed.split_whitespace().last() {
+                return value
+                    .parse::<u64>()
+                    .with_context(|| format!("parsing {} value '{}'", key, value));
+            }
+        }
+    }
+    bail!("'{}' not found in btrfs dump-super output", key)
 }
 
 /// Parse a value from dumpe2fs -h output (e.g., "Block size:          4096")

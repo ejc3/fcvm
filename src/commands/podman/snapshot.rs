@@ -234,6 +234,9 @@ pub(super) fn build_firecracker_config(
     // Collect volume mounts for cache key (affects MMDS plan)
     let volume_mounts: Vec<String> = args.map.to_vec();
 
+    // Resolve rootfs_type for cache key
+    let rootfs_type = super::resolve_rootfs_type(args);
+
     let mut config = FirecrackerConfig::new(
         kernel_path.to_path_buf(),
         initrd_path.to_path_buf(),
@@ -256,6 +259,7 @@ pub(super) fn build_firecracker_config(
         args.user.clone(),
         args.forward_localhost.clone(),
         image_mode,
+        rootfs_type,
     );
     // Set the original image name for MMDS (separate from cache key identifier)
     config.container_image_name = args.image.clone();
