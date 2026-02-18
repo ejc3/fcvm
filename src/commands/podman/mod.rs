@@ -40,22 +40,7 @@ use tokio_util::sync::CancellationToken;
 ///
 /// Priority: explicit `--rootfs-type` CLI flag > kernel profile config > None (ext4).
 fn resolve_rootfs_type(args: &RunArgs) -> Option<String> {
-    // CLI override wins
-    if let Some(ref rt) = args.rootfs_type {
-        return match rt {
-            crate::cli::RootfsType::Btrfs => Some("btrfs".to_string()),
-            crate::cli::RootfsType::Ext4 => None,
-        };
-    }
-
-    // Read from kernel profile config
-    if let Some(ref profile_name) = args.kernel_profile {
-        if let Ok(Some(profile)) = crate::setup::get_kernel_profile(profile_name) {
-            return profile.rootfs_type;
-        }
-    }
-
-    None
+    crate::setup::resolve_rootfs_type(args.rootfs_type.as_ref(), args.kernel_profile.as_deref())
 }
 
 /// Resolve the image delivery mode from CLI args and kernel profile.

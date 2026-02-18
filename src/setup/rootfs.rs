@@ -836,6 +836,32 @@ pub fn get_kernel_profile(name: &str) -> Result<Option<KernelProfile>> {
         .cloned())
 }
 
+/// Resolve rootfs filesystem type from CLI override and kernel profile name.
+///
+/// Priority: explicit CLI `--rootfs-type` flag > kernel profile config > None (ext4 default).
+/// Used by both `setup` and `podman run` commands.
+pub fn resolve_rootfs_type(
+    cli_rootfs_type: Option<&crate::cli::RootfsType>,
+    kernel_profile_name: Option<&str>,
+) -> Option<String> {
+    // CLI override wins
+    if let Some(rt) = cli_rootfs_type {
+        return match rt {
+            crate::cli::RootfsType::Btrfs => Some("btrfs".to_string()),
+            crate::cli::RootfsType::Ext4 => None,
+        };
+    }
+
+    // Read from kernel profile config
+    if let Some(profile_name) = kernel_profile_name {
+        if let Ok(Some(profile)) = get_kernel_profile(profile_name) {
+            return profile.rootfs_type;
+        }
+    }
+
+    None
+}
+
 /// Detect kernel profile from kernel path.
 ///
 /// Checks if the kernel filename matches a configured profile name.
@@ -1017,8 +1043,14 @@ pub async fn ensure_rootfs(allow_create: bool, rootfs_type: Option<&str>) -> Res
     let temp_rootfs_path = rootfs_path.with_extension("raw.tmp");
     let _ = tokio::fs::remove_file(&temp_rootfs_path).await;
 
-    let result =
-        create_layer2_rootless(&plan, script_sha_short, &setup_script, &temp_rootfs_path, rootfs_type).await;
+    let result = create_layer2_rootless(
+        &plan,
+        script_sha_short,
+        &setup_script,
+        &temp_rootfs_path,
+        rootfs_type,
+    )
+    .await;
 
     if result.is_ok() {
         tokio::fs::rename(&temp_rootfs_path, &rootfs_path)
@@ -2014,8 +2046,7 @@ async fn boot_vm_for_setup(
     } else {
         None
     };
-    let kernel_path =
-        crate::setup::kernel::ensure_kernel(kernel_profile, true, false).await?;
+    let kernel_path = crate::setup::kernel::ensure_kernel(kernel_profile, true, false).await?;
 
     // Create serial console output file
     let serial_path = temp_dir.join("serial.log");
