@@ -52,35 +52,53 @@ CMD ["sh", "-c", "echo 'btrfs-rootless-test-ok' && sleep 600"]"#
     Ok(())
 }
 
-/// Test rootless localhost container with btrfs kernel profile
-///
-/// Uses --kernel-profile btrfs to get a kernel with CONFIG_BTRFS_FS=y.
-/// fc-agent detects btrfs support at runtime and auto-configures podman
-/// to use the btrfs storage driver via a loopback filesystem.
+/// Test rootless btrfs storage with native btrfs rootfs (profile default).
 #[tokio::test]
 async fn test_localhost_rootless_btrfs_storage() -> Result<()> {
-    println!("\nRootless Localhost + Btrfs Storage Test");
-    println!("=======================================");
+    run_btrfs_storage_test(None).await
+}
+
+/// Test rootless btrfs storage with ext4 rootfs + loopback.
+#[tokio::test]
+async fn test_localhost_rootless_btrfs_storage_ext4() -> Result<()> {
+    run_btrfs_storage_test(Some("ext4")).await
+}
+
+/// Shared btrfs storage test — works with any rootfs type.
+///
+/// Uses --kernel-profile btrfs to get a kernel with CONFIG_BTRFS_FS=y.
+/// Verifies btrfs storage driver is active and container runs successfully.
+async fn run_btrfs_storage_test(rootfs_type: Option<&str>) -> Result<()> {
+    let label = rootfs_type.unwrap_or("default (btrfs from profile)");
+    println!("\nRootless Localhost + Btrfs Storage Test (rootfs: {})", label);
+    println!("===================================================");
 
     // Step 1: Build test image
     println!("\n1. Building test container image...");
     build_test_image().await?;
 
     // Step 2: Start VM in rootless mode with btrfs kernel
-    println!("\n2. Starting VM (rootless, --kernel-profile btrfs)...");
-    let (vm_name, _, _, _) = common::unique_names("btrfs-rootless");
+    println!("\n2. Starting VM (rootless, --kernel-profile btrfs, rootfs: {})...", label);
+    let suffix = format!("btrfs-{}", rootfs_type.unwrap_or("native"));
+    let (vm_name, _, _, _) = common::unique_names(&suffix);
 
-    let (mut _child, fcvm_pid) = common::spawn_fcvm(&[
+    let mut args = vec![
         "podman",
         "run",
         "--name",
         &vm_name,
         "--kernel-profile",
         "btrfs",
-        "localhost/test-btrfs-rootless",
-    ])
-    .await
-    .context("spawning fcvm")?;
+    ];
+    if let Some(rt) = rootfs_type {
+        args.push("--rootfs-type");
+        args.push(rt);
+    }
+    args.push("localhost/test-btrfs-rootless");
+
+    let (mut _child, fcvm_pid) = common::spawn_fcvm(&args)
+        .await
+        .context("spawning fcvm")?;
     println!("  fcvm PID: {}", fcvm_pid);
 
     // Step 3: Wait for healthy
@@ -106,8 +124,10 @@ async fn test_localhost_rootless_btrfs_storage() -> Result<()> {
         driver
     );
 
-    // Step 5: Verify btrfs mount
-    println!("\n5. Checking btrfs mount...");
+    // Step 5: Verify btrfs at storage path (works with both native btrfs root and loopback)
+    // Use -T (target) flag so findmnt finds the mount containing the path,
+    // not just exact mount points. On native btrfs, storage is under / (no separate mount).
+    println!("\n5. Checking btrfs at storage path...");
     let fstype = common::exec_in_vm(
         fcvm_pid,
         &[
@@ -115,11 +135,12 @@ async fn test_localhost_rootless_btrfs_storage() -> Result<()> {
             "-n",
             "-o",
             "FSTYPE",
+            "--target",
             "/var/lib/containers/storage",
         ],
     )
     .await
-    .context("checking btrfs mount")?;
+    .context("checking btrfs at storage path")?;
     let fstype = fstype.trim();
     println!("  /var/lib/containers/storage fstype: {}", fstype);
     assert_eq!(
@@ -144,7 +165,7 @@ async fn test_localhost_rootless_btrfs_storage() -> Result<()> {
     println!("\n7. Cleaning up...");
     common::kill_process(fcvm_pid).await;
 
-    println!("\n  ROOTLESS + BTRFS STORAGE TEST PASSED");
+    println!("\n  ROOTLESS + BTRFS STORAGE TEST PASSED (rootfs: {})", label);
     println!("  - localhost image built and loaded in rootless mode");
     println!("  - btrfs storage driver auto-detected and configured");
     println!("  - Container ran successfully on btrfs storage");
@@ -343,51 +364,56 @@ async fn test_localhost_rootless_btrfs_snapshot_restore() -> Result<()> {
     Ok(())
 }
 
-/// Test rootless localhost container with --user (keep-id) and btrfs storage
-///
-/// This is the critical path that triggered the original issue:
-/// - --user 1000:1000 causes fc-agent to run podman with --userns=keep-id
-/// - With overlay, checkAndRecordIDMappedSupport() returns false for rootless
-/// - This forces storage-chown-by-maps (expensive chown-copy of every layer)
-/// - With btrfs, user namespaces work natively — no chown fallback needed
-///
-/// Note: --user causes fc-agent to run podman as fcvm-user (rootless).
-/// Root's `podman inspect` can't see rootless containers, so the standard
-/// health monitor can't detect container health. We poll btrfs readiness
-/// and use `runuser -u fcvm-user` for podman queries.
-///
-/// VM-side btrfs loading: no host-side rootless podman needed, so this runs everywhere.
+/// Test rootless btrfs + keep-id with native btrfs rootfs (profile default).
 #[tokio::test]
 async fn test_localhost_rootless_btrfs_keepid() -> Result<()> {
-    println!("\nRootless Localhost + Btrfs + keep-id Test");
-    println!("==========================================");
+    run_btrfs_keepid_test(None).await
+}
+
+/// Test rootless btrfs + keep-id with ext4 rootfs + loopback.
+#[tokio::test]
+async fn test_localhost_rootless_btrfs_keepid_ext4() -> Result<()> {
+    run_btrfs_keepid_test(Some("ext4")).await
+}
+
+/// Shared btrfs keep-id test — works with any rootfs type.
+///
+/// Tests --user 1000:1000 (keep-id) with btrfs storage.
+/// With btrfs, user namespaces work natively — no chown fallback needed.
+async fn run_btrfs_keepid_test(rootfs_type: Option<&str>) -> Result<()> {
+    let label = rootfs_type.unwrap_or("default (btrfs from profile)");
+    println!("\nRootless Localhost + Btrfs + keep-id Test (rootfs: {})", label);
+    println!("=========================================================");
 
     // Step 1: Build test image (same image, snapshot key includes --user)
     println!("\n1. Building test container image...");
     build_test_image().await?;
 
     // Step 2: Start VM with --user 1000:1000 (triggers keep-id in fc-agent)
-    println!("\n2. Starting VM (rootless, --kernel-profile btrfs, --user 1000:1000)...");
-    let (vm_name, _, _, _) = common::unique_names("btrfs-keepid");
+    println!("\n2. Starting VM (rootless, --kernel-profile btrfs, --user 1000:1000, rootfs: {})...", label);
+    let suffix = format!("btrfs-kid-{}", rootfs_type.unwrap_or("native"));
+    let (vm_name, _, _, _) = common::unique_names(&suffix);
 
-    let (mut _child, fcvm_pid) = common::spawn_fcvm(&[
+    let mut args = vec![
         "podman",
         "run",
         "--name",
         &vm_name,
         "--kernel-profile",
         "btrfs",
-        "--user",
-        "1000:1000",
-        "localhost/test-btrfs-rootless",
-    ])
-    .await
-    .context("spawning fcvm")?;
+    ];
+    if let Some(rt) = rootfs_type {
+        args.push("--rootfs-type");
+        args.push(rt);
+    }
+    args.extend_from_slice(&["--user", "1000:1000", "localhost/test-btrfs-rootless"]);
+
+    let (mut _child, fcvm_pid) = common::spawn_fcvm(&args)
+        .await
+        .context("spawning fcvm")?;
     println!("  fcvm PID: {}", fcvm_pid);
 
     // Step 3: Wait for VM health and resolve the VM username for UID 1000.
-    // The host resolves UID 1000 via /etc/passwd (e.g., "ubuntu") and passes it as
-    // USER env var. The guest creates a user with that name, not "fcvm-user".
     println!("\n3. Waiting for VM to become healthy...");
     common::poll_health_by_pid(fcvm_pid, 120).await?;
     println!("  VM is healthy");
@@ -460,10 +486,8 @@ async fn test_localhost_rootless_btrfs_keepid() -> Result<()> {
         driver
     );
 
-    // Step 6: Verify btrfs mount at root graphroot (loopback).
-    // With VM-side btrfs loading, the loopback btrfs is mounted at
-    // /var/lib/containers/storage. The user's graphroot is a subdirectory there.
-    println!("\n6. Checking btrfs mount...");
+    // Step 6: Verify btrfs at storage path (works with both native btrfs root and loopback)
+    println!("\n6. Checking btrfs at storage path...");
     let fstype = common::exec_in_vm(
         fcvm_pid,
         &[
@@ -471,11 +495,12 @@ async fn test_localhost_rootless_btrfs_keepid() -> Result<()> {
             "-n",
             "-o",
             "FSTYPE",
+            "--target",
             "/var/lib/containers/storage",
         ],
     )
     .await
-    .context("checking btrfs mount")?;
+    .context("checking btrfs at storage path")?;
     let fstype = fstype.trim();
     println!("  /var/lib/containers/storage fstype: {}", fstype);
     assert_eq!(
@@ -539,7 +564,7 @@ async fn test_localhost_rootless_btrfs_keepid() -> Result<()> {
     println!("\n9. Cleaning up...");
     common::kill_process(fcvm_pid).await;
 
-    println!("\n  ROOTLESS + BTRFS + KEEP-ID TEST PASSED");
+    println!("\n  ROOTLESS + BTRFS + KEEP-ID TEST PASSED (rootfs: {})", label);
     println!("  - localhost image with --user 1000:1000 (keep-id mode)");
     println!("  - btrfs storage driver avoids storage-chown-by-maps fallback");
     println!("  - Container ran successfully with user namespace mapping");
