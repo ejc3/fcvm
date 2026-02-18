@@ -894,7 +894,10 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     let is_uffd = use_uffd || std::env::var("FCVM_FORCE_UFFD").is_ok() || hugepages;
     if is_uffd {
         info!(vm_id = %vm_id, vm_name = %vm_name, "VM cloned with UFFD memory");
-        println!("✓ VM '{}' cloned from snapshot '{}' (UFFD mode)", vm_name, snapshot_name);
+        println!(
+            "✓ VM '{}' cloned from snapshot '{}' (UFFD mode)",
+            vm_name, snapshot_name
+        );
         if use_uffd {
             println!("  Memory pages shared via UFFD serve process");
         } else {
@@ -902,7 +905,10 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         }
     } else {
         info!(vm_id = %vm_id, vm_name = %vm_name, "VM cloned from snapshot files");
-        println!("✓ VM '{}' cloned from snapshot '{}' (direct mode)", vm_name, snapshot_name);
+        println!(
+            "✓ VM '{}' cloned from snapshot '{}' (direct mode)",
+            vm_name, snapshot_name
+        );
         println!("  Memory loaded from file");
     }
     println!("  Disk uses CoW overlay");
