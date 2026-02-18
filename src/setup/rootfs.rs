@@ -2053,7 +2053,9 @@ async fn boot_vm_for_setup(
     } else {
         None
     };
-    let kernel_path = crate::setup::kernel::ensure_kernel(kernel_profile, true, false).await?;
+    // allow_build=true so that if the pre-built kernel hasn't been published yet
+    // (e.g., new profile), we fall back to building locally with --build-kernels
+    let kernel_path = crate::setup::kernel::ensure_kernel(kernel_profile, true, true).await?;
 
     // Create serial console output file
     let serial_path = temp_dir.join("serial.log");
