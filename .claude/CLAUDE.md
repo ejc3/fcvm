@@ -1184,7 +1184,7 @@ fuse-pipe/benches/
 
 ### Firecracker Requirements
 - **Kernel**: vmlinux or bzImage, boot args: `console=ttyS0 reboot=k panic=1 pci=off`
-- **Rootfs**: ext4 with Ubuntu 24.04, systemd, Podman, iproute2, fc-agent at `/usr/local/bin/fc-agent`
+- **Rootfs**: ext4 or btrfs (via `--rootfs-type`) with Ubuntu 24.04, systemd, Podman, iproute2, fc-agent injected at boot via initrd
 
 ### Network Modes
 
@@ -1218,7 +1218,7 @@ fuse-pipe/benches/
 
 **Per-VM Disk Sizing (`--rootfs-size`):**
 - Default: `10G` — ensures at least 10G free space on root filesystem
-- After btrfs reflink copy, `dumpe2fs` checks free space; if below threshold, expands with `truncate` + `resize2fs`
+- After btrfs reflink copy, `ensure_free_space()` auto-detects filesystem type: ext4 uses `dumpe2fs` + `truncate` + `resize2fs`; btrfs uses `btrfs dump-super` + `truncate` (guest resizes btrfs at boot)
 - Sparse files: only written blocks use real disk space (50G file with 2G content uses ~2G)
 - Included in `FirecrackerConfig.rootfs_size` → affects snapshot cache key (different sizes = different snapshots)
 - Clones inherit parent's disk size naturally (reflink copies the already-resized file)
@@ -1241,8 +1241,8 @@ This ensures packages match the target Ubuntu version (Noble/24.04), not the hos
 The `codename` is specified in `rootfs-config.toml`.
 
 **Setup Verification:**
-Layer 2 setup writes a marker file `/etc/fcvm-setup-complete` on successful completion.
-After the setup VM exits, fcvm mounts the rootfs and verifies this marker exists.
+Layer 2 setup writes a marker file `/etc/fcvm-setup-complete` and prints `FCVM_SETUP_COMPLETE` to serial console on successful completion.
+After the setup VM exits, fcvm checks the serial console output for the completion marker.
 If missing, setup fails with a clear error.
 
 The initrd contains a statically-linked busybox and fc-agent binary, injected at boot before systemd.
