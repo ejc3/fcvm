@@ -2052,12 +2052,9 @@ async fn boot_vm_for_setup(
     std::fs::File::create(&log_path).context("creating Firecracker log file")?;
 
     // Find kernel - use btrfs profile kernel if rootfs is btrfs (needs CONFIG_BTRFS_FS),
-    // otherwise use default Kata kernel
-    let kernel_profile = if rootfs_type == Some("btrfs") {
-        Some("btrfs")
-    } else {
-        None
-    };
+    // otherwise use default Kata kernel.
+    // The rootfs_type value ("btrfs") matches the kernel profile name by convention.
+    let kernel_profile = rootfs_type;
     let kernel_path = crate::setup::kernel::ensure_kernel(kernel_profile, true, false).await?;
 
     // Create serial console output file

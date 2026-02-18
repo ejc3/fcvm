@@ -255,7 +255,7 @@ The mode is auto-detected from the kernel profile (btrfs profile → btrfs mode)
 **How btrfs mode works:**
 1. Host exports container as Docker archive (`podman save`)
 2. Docker archive is attached to the VM as a read-only block device
-3. VM creates a btrfs loopback on the rootfs and runs `podman load` from the archive device
+3. VM rootfs is natively btrfs — fc-agent runs `podman load` directly on the btrfs root filesystem (no loopback)
 4. Snapshot caches the post-load state for instant subsequent boots
 
 **Requirements for btrfs mode:**
