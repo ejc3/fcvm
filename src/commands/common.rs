@@ -366,6 +366,17 @@ pub async fn cleanup_vm(
         warn!("failed to delete state file: {}", e);
     }
 
+    // Save Firecracker log before cleanup (for debugging snapshot restore failures)
+    let fc_log = data_dir.join("firecracker.log");
+    if fc_log.exists() {
+        let dest = std::path::PathBuf::from(format!("/tmp/fcvm-firecracker-{}.log", vm_id));
+        if let Err(e) = tokio::fs::copy(&fc_log, &dest).await {
+            debug!(vm_id = %vm_id, error = %e, "could not save firecracker log");
+        } else {
+            info!(vm_id = %vm_id, log = %dest.display(), "saved firecracker log");
+        }
+    }
+
     // Cleanup VM data directory (includes disks, sockets, etc.)
     if let Err(e) = tokio::fs::remove_dir_all(data_dir).await {
         warn!(vm_id = %vm_id, error = %e, "failed to cleanup VM data directory");
@@ -431,7 +442,12 @@ pub async fn restore_from_snapshot(
     // Configure namespace isolation if network provides one
     let mut holder_child: Option<tokio::process::Child> = None;
     let mut holder_pid_for_post_start: Option<u32> = None;
-    let mut vm_manager = VmManager::new(vm_id.to_string(), socket_path.to_path_buf(), None);
+    let fc_log_path = data_dir.join("firecracker.log");
+    let mut vm_manager = VmManager::new(
+        vm_id.to_string(),
+        socket_path.to_path_buf(),
+        Some(fc_log_path),
+    );
     vm_manager.set_vm_name(vm_name.to_string());
 
     // rootfs_path is set by either the bridged or rootless branch
@@ -1113,8 +1129,8 @@ pub async fn create_snapshot_core(
                 .context("diff merge task panicked")?
                 .context("merging diff snapshot")?;
 
-        // Clean up the diff file - we only need the merged memory.bin
-        let _ = tokio::fs::remove_file(&diff_file_path).await;
+        // Keep the diff file for debugging (renamed to memory.diff in final dir)
+        // The full-debug file (if present) is also preserved for comparison.
 
         info!(
             snapshot = %snapshot_config.name,
