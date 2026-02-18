@@ -85,6 +85,10 @@ pub struct FirecrackerConfig {
     /// Affects whether guest mounts overlay store, btrfs store, or runs podman load.
     #[serde(default = "default_image_mode")]
     pub image_mode: ImageMode,
+    /// Root filesystem type ("ext4" or "btrfs").
+    /// Different rootfs types produce different VM states and must not share snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rootfs_type: Option<String>,
 }
 
 fn default_image_mode() -> ImageMode {
@@ -191,6 +195,7 @@ impl FirecrackerConfig {
         user: Option<String>,
         forward_localhost: Vec<u16>,
         image_mode: ImageMode,
+        rootfs_type: Option<String>,
     ) -> Self {
         Self {
             boot_source: BootSource {
@@ -229,6 +234,7 @@ impl FirecrackerConfig {
             user,
             forward_localhost,
             image_mode,
+            rootfs_type,
         }
     }
 
@@ -422,6 +428,7 @@ mod tests {
             None,
             vec![],
             ImageMode::Overlay,
+            None,
         )
     }
 
@@ -549,5 +556,13 @@ mod tests {
         config3.image_mode = ImageMode::Archive;
         assert_ne!(config1.snapshot_key(), config3.snapshot_key());
         assert_ne!(config2.snapshot_key(), config3.snapshot_key());
+    }
+
+    #[test]
+    fn test_snapshot_key_changes_with_rootfs_type() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.rootfs_type = Some("btrfs".to_string());
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 }
