@@ -40,7 +40,10 @@ use tokio_util::sync::CancellationToken;
 ///
 /// Priority: explicit `--rootfs-type` CLI flag > kernel profile config > None (ext4).
 fn resolve_rootfs_type(args: &RunArgs) -> Option<String> {
-    crate::setup::resolve_rootfs_type(args.rootfs_type.as_ref(), args.kernel_profile.as_deref())
+    crate::setup::resolve_rootfs_type(
+        args.rootfs_type.as_ref(),
+        args.kernel_profile.as_deref().unwrap_or("default"),
+    )
 }
 
 /// Resolve the image delivery mode from CLI args and kernel profile.
@@ -208,7 +211,8 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     }
 
     // Get kernel path
-    // Priority: --kernel (explicit) > --kernel-profile (computed) > default
+    // Priority: --kernel (explicit) > profile (named or "default")
+    let kernel_profile_name = args.kernel_profile.as_deref().unwrap_or("default");
     let kernel_path = if let Some(custom_kernel) = &args.kernel {
         // Explicit kernel path - use directly
         let path = PathBuf::from(custom_kernel);
@@ -217,21 +221,9 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         }
         info!(kernel = %path.display(), "using custom kernel");
         path
-    } else if let Some(ref profile_name) = args.kernel_profile {
-        // Compute kernel path from profile
-        let kernel = crate::setup::get_kernel_path(Some(profile_name))?;
-        if !kernel.exists() {
-            bail!(
-                "Profile '{}' kernel not found at {}.\nRun: fcvm setup --kernel-profile {}",
-                profile_name,
-                kernel.display(),
-                profile_name
-            );
-        }
-        kernel
     } else {
-        // Default kernel (downloads if --setup is set)
-        crate::setup::ensure_kernel(None, args.setup, false)
+        // Profile kernel (named or "default")
+        crate::setup::ensure_kernel(kernel_profile_name, args.setup, false)
             .await
             .context("setting up kernel")?
     };
