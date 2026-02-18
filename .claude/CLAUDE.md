@@ -11,6 +11,20 @@
 
 This is non-negotiable. A test failure means the CODE is broken - fix the code, not the test.
 
+## ZERO RACE CONDITIONS. ZERO.
+
+**Never write code that can race.** Not "unlikely to race." Not "only races under load." ZERO.
+
+- If two processes can touch the same file, use `flock()` or atomic rename
+- If two threads can touch the same state, use a mutex or atomic
+- If setup runs at shutdown, it WILL race with the shutdown sequence — handle it
+- If a container build runs in parallel tests, it WILL collide — serialize or lock it
+- "Works most of the time" means "broken" — races are bugs, period
+
+The stale `db.sql` disaster happened because setup "usually" cleaned up before shutdown recreated the file. "Usually" is not "always." One race condition broke every VM boot across all CI runners.
+
+**Before committing, ask:** "Can any other process/thread/test touch this state at the same time?" If yes, add synchronization or make it atomic. No exceptions.
+
 ## VERIFY PLAN AND RUN NEW TESTS LOCALLY
 
 **Before committing, ALWAYS:**
