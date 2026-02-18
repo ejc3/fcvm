@@ -70,6 +70,9 @@ pub struct SnapshotMetadata {
     /// Username for rootless container health checks (e.g., "ubuntu")
     #[serde(default)]
     pub username: Option<String>,
+    /// User spec (UID:GID) for rootless podman in the VM
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 /// Extra disk configuration saved in snapshot metadata.
@@ -245,6 +248,7 @@ mod tests {
                 hugepages: false,
                 extra_disks: vec![],
                 username: None,
+                user: None,
             },
         };
 
@@ -361,6 +365,7 @@ mod tests {
                 hugepages: false,
                 extra_disks: vec![],
                 username: None,
+                user: None,
             },
         };
 
@@ -421,6 +426,7 @@ mod tests {
                     hugepages: false,
                     extra_disks: vec![],
                     username: None,
+                    user: None,
                 },
             };
             manager.save_snapshot(config).await.unwrap();
@@ -468,6 +474,7 @@ mod tests {
                 hugepages: false,
                 extra_disks: vec![],
                 username: None,
+                user: None,
             },
         };
         manager.save_snapshot(config).await.unwrap();
@@ -566,6 +573,7 @@ mod tests {
                 hugepages: false,
                 extra_disks: vec![],
                 username: None,
+                user: None,
             },
         };
 

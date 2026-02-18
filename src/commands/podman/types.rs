@@ -144,6 +144,8 @@ pub struct SnapshotCreationParams {
     pub hugepages: bool,
     /// Username for rootless container health checks
     pub username: Option<String>,
+    /// User spec (UID:GID) for rootless podman
+    pub user: Option<String>,
     /// Extra disks to include in snapshot (e.g., btrfs image disk)
     pub extra_disks: Vec<crate::storage::SnapshotExtraDisk>,
 }
@@ -165,6 +167,7 @@ impl SnapshotCreationParams {
             health_check_url: args.health_check.clone(),
             hugepages: args.hugepages,
             username,
+            user: args.user.clone(),
             extra_disks: vec![],
         }
     }
@@ -178,6 +181,7 @@ impl SnapshotCreationParams {
             health_check_url: metadata.health_check_url.clone(),
             hugepages: metadata.hugepages,
             username: metadata.username.clone(),
+            user: metadata.user.clone(),
             extra_disks: metadata.extra_disks.clone(),
         }
     }

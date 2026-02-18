@@ -224,6 +224,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             hugepages: vm_state.config.hugepages,
             extra_disks: extra_disk_configs,
             username: vm_state.config.username.clone(),
+            user: vm_state.config.user.clone(),
         },
     };
 
@@ -736,6 +737,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     vm_state.config.hugepages = args.hugepages.unwrap_or(snapshot_config.metadata.hugepages);
     // Restore username for rootless health checks (runuser -u <username>).
     vm_state.config.username = snapshot_config.metadata.username.clone();
+    vm_state.config.user = snapshot_config.metadata.user.clone();
 
     info!(
         tap = %network_config.tap_device,

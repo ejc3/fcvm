@@ -773,6 +773,12 @@ pub fn build_podman_args(
         "--ulimit".to_string(),
         "nofile=65536:65536".to_string(),
         "--pids-limit=-1".to_string(),
+        // Disable conmon log capture. fc-agent captures container output through
+        // podman's stdout/stderr pipes directly. conmon's default k8s-file log
+        // driver adds a redundant buffering layer that blocks under burst output
+        // with rootless podman (--user mode), causing the container to deadlock
+        // on stdout/stderr pipe write.
+        "--log-driver=none".to_string(),
     ]);
 
     if let Some((username, runtime_dir)) = user_info {

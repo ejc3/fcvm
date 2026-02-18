@@ -7,7 +7,10 @@ use crate::types::{LatestMetadata, Plan};
 
 /// Fetch the container plan from MMDS with retry.
 pub async fn fetch_plan() -> Result<Plan> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
 
     eprintln!(
         "[fc-agent] requesting MMDS V2 session token from http://169.254.169.254/latest/api/token"
@@ -139,6 +142,7 @@ pub async fn watch_restore_epoch(output: OutputHandle) {
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(500))
+            .no_proxy()
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -172,7 +176,10 @@ pub async fn watch_restore_epoch(output: OutputHandle) {
 pub async fn sync_clock_from_host() -> Result<()> {
     eprintln!("[fc-agent] syncing VM clock from host time via MMDS");
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
 
     let token_response = client
         .put("http://169.254.169.254/latest/api/token")
