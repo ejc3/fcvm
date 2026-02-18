@@ -1893,12 +1893,25 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
         "--network=host".to_string(),
     ];
 
-    // Pass through proxy environment variables if set
-    for var in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
-        if let Ok(val) = std::env::var(var) {
-            podman_args.push("-e".to_string());
-            podman_args.push(format!("{}={}", var, val));
-        }
+    // Pass through proxy environment variables, normalizing case.
+    // For each protocol, check lowercase then uppercase. If neither is set,
+    // fall back to the other protocol's value (e.g., HTTPS_PROXY → http_proxy)
+    // since apt repos use http:// URLs but the env may only have HTTPS_PROXY.
+    let http_val = std::env::var("http_proxy")
+        .or_else(|_| std::env::var("HTTP_PROXY"))
+        .ok();
+    let https_val = std::env::var("https_proxy")
+        .or_else(|_| std::env::var("HTTPS_PROXY"))
+        .ok();
+    let http_final = http_val.as_deref().or(https_val.as_deref());
+    let https_final = https_val.as_deref().or(http_val.as_deref());
+    if let Some(val) = http_final {
+        podman_args.extend(["-e".to_string(), format!("http_proxy={}", val)]);
+        podman_args.extend(["-e".to_string(), format!("HTTP_PROXY={}", val)]);
+    }
+    if let Some(val) = https_final {
+        podman_args.extend(["-e".to_string(), format!("https_proxy={}", val)]);
+        podman_args.extend(["-e".to_string(), format!("HTTPS_PROXY={}", val)]);
     }
 
     podman_args.extend([
