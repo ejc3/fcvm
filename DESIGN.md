@@ -1706,6 +1706,7 @@ patches_dir = "kernel/patches"
 | `firecracker_bin` | No | Custom Firecracker binary path |
 | `firecracker_args` | No | Extra Firecracker CLI args |
 | `boot_args` | No | Extra kernel boot parameters |
+| `rootfs_type` | No | Root filesystem type: `"ext4"` (default) or `"btrfs"` (converts via btrfs-convert) |
 
 ### How It Works
 

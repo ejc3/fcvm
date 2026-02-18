@@ -70,25 +70,8 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         .context("setting up kernel")?;
     println!("  ✓ Kernel ready: {}", kernel_path.display());
 
-    // Resolve rootfs type: CLI override > kernel profile config > default (ext4)
-    let rootfs_type = crate::setup::resolve_rootfs_type(
-        args.rootfs_type.as_ref(),
-        args.kernel_profile.as_deref(),
-    );
-
-    // Ensure rootfs exists (creates Layer 2 if missing)
-    let rootfs_path = crate::setup::ensure_rootfs(true, rootfs_type.as_deref())
-        .await
-        .context("setting up rootfs")?;
-    println!("  ✓ Rootfs ready: {}", rootfs_path.display());
-
-    // Ensure fc-agent initrd exists
-    let initrd_path = crate::setup::ensure_fc_agent_initrd(true)
-        .await
-        .context("setting up fc-agent initrd")?;
-    println!("  ✓ Initrd ready: {}", initrd_path.display());
-
-    // Setup kernel profile if requested (e.g., "nested" for nested virtualization)
+    // Setup kernel profile if requested — must happen BEFORE rootfs creation
+    // because btrfs rootfs needs the profile kernel to boot the setup VM
     if let Some(profile_name) = &args.kernel_profile {
         let profile = get_kernel_profile(profile_name)?.ok_or_else(|| {
             anyhow::anyhow!("kernel profile '{}' not found in config", profile_name)
@@ -113,7 +96,28 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         crate::setup::ensure_profile_firecracker(&profile, profile_name)
             .await
             .context("setting up profile firecracker")?;
+    }
 
+    // Resolve rootfs type: CLI override > kernel profile config > default (ext4)
+    let rootfs_type = crate::setup::resolve_rootfs_type(
+        args.rootfs_type.as_ref(),
+        args.kernel_profile.as_deref(),
+    );
+
+    // Ensure rootfs exists (creates Layer 2 if missing)
+    let rootfs_path = crate::setup::ensure_rootfs(true, rootfs_type.as_deref())
+        .await
+        .context("setting up rootfs")?;
+    println!("  ✓ Rootfs ready: {}", rootfs_path.display());
+
+    // Ensure fc-agent initrd exists
+    let initrd_path = crate::setup::ensure_fc_agent_initrd(true)
+        .await
+        .context("setting up fc-agent initrd")?;
+    println!("  ✓ Initrd ready: {}", initrd_path.display());
+
+    if args.kernel_profile.is_some() {
+        let profile_name = args.kernel_profile.as_ref().unwrap();
         println!("\nFor '{}' profile, use:", profile_name);
         println!(
             "  fcvm podman run --kernel-profile {} --privileged ...",
