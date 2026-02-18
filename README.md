@@ -253,10 +253,11 @@ The mode is auto-detected from the kernel profile (btrfs profile → btrfs mode)
 ```
 
 **How btrfs mode works:**
-1. Host exports container as Docker archive (`podman save`)
-2. Docker archive is attached to the VM as a read-only block device
-3. VM creates a btrfs loopback on the rootfs and runs `podman load` from the archive device
-4. Snapshot caches the post-load state for instant subsequent boots
+1. Root filesystem is natively btrfs (converted from ext4 via `btrfs-convert` during setup)
+2. fc-agent resizes btrfs to fill disk at boot, uses it directly for container storage (no loopback)
+3. Host exports container as Docker archive (`podman save`), attached as read-only block device
+4. VM runs `podman load` from the archive device
+5. Snapshot caches the post-load state for instant subsequent boots
 
 **Requirements for btrfs mode:**
 - A btrfs kernel profile with `CONFIG_BTRFS_FS=y`: `./fcvm setup --kernel-profile btrfs --build-kernels`
