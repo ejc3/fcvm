@@ -626,7 +626,7 @@ except OSError as e:
 
     // Get the nested kernel path for the nesting script
     let nested_kernel =
-        fcvm::setup::get_kernel_path(Some("nested")).context("getting nested kernel path")?;
+        fcvm::setup::get_kernel_path("nested").context("getting nested kernel path")?;
     let kernel_path_str = nested_kernel.to_string_lossy();
 
     // The nesting script is baked into the container at /usr/local/bin/nested
@@ -1247,7 +1247,7 @@ async fn run_nested_n_levels(
     // This is needed because inside L1, the kernel build inputs don't exist
     // so the SHA computation would fail
     let nested_kernel =
-        fcvm::setup::get_kernel_path(Some("nested")).context("getting nested kernel path")?;
+        fcvm::setup::get_kernel_path("nested").context("getting nested kernel path")?;
     let nested_kernel_path = nested_kernel.to_string_lossy();
 
     // Get the digest of localhost/nested-test
