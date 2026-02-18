@@ -1679,11 +1679,17 @@ The fuse-pipe library passes the pjdfstest POSIX compliance suite. Tests run via
 
 ## Kernel Profiles
 
-fcvm supports named kernel profiles for custom kernel configurations, defined in `rootfs-config.toml`.
+Every kernel in fcvm is delivered through a profile. The `[kernel]` config section is synthesized into a `"default"` profile at load time, so all code paths use profiles uniformly. Named profiles (e.g., `nested`, `btrfs`) can build custom kernels from source or download from GitHub releases.
+
+A profile delivers a kernel in one of three ways:
+1. **URL-based** (default profile): Downloads a pre-built kernel archive (e.g., Kata release)
+2. **Custom build**: Builds from source using `kernel_version`/`kernel_repo`
+3. **Inherited**: Uses the default profile's kernel, adding only runtime overrides (boot_args, firecracker_args, etc.)
 
 ### Configuration Reference
 
 ```toml
+# Custom kernel profile (build from source)
 [kernel_profiles.minimal.amd64]
 description = "Minimal kernel for fast boot"
 kernel_version = "6.12"
@@ -1698,10 +1704,14 @@ patches_dir = "kernel/patches"
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `kernel_version` | Yes | Kernel version (e.g., "6.18.3") |
-| `kernel_repo` | Yes | GitHub repo for releases |
-| `build_inputs` | Yes | Files to hash for kernel SHA (supports globs) |
-| `kernel_config` | No | Kernel .config file path |
+| `kernel_url` | URL-based | URL to kernel archive (e.g., Kata release tarball) |
+| `kernel_archive_path` | URL-based | Path within the archive to extract the kernel binary |
+| `kernel_local_path` | No | Local filesystem path to kernel binary (overrides URL) |
+| `kernel_version` | Custom | Kernel version (e.g., "6.18.3") |
+| `kernel_repo` | Custom | GitHub repo for releases |
+| `build_inputs` | Custom | Files to hash for kernel SHA (supports globs) |
+| `base_config_url` | Custom | Base kernel .config URL (e.g., Firecracker's microvm config) |
+| `kernel_config` | No | Kernel config fragment file path (applied on top of base) |
 | `patches_dir` | No | Directory containing kernel patches |
 | `firecracker_bin` | No | Custom Firecracker binary path |
 | `firecracker_args` | No | Extra Firecracker CLI args |
