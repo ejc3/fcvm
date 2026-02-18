@@ -798,6 +798,24 @@ pub async fn restore_from_snapshot(
         "signaled fc-agent to flush ARP via MMDS"
     );
 
+    // FCVM_KVM_TRACE: enable KVM ftrace around VM resume for debugging snapshot restore.
+    // Captures KVM exit reasons (NPF, shutdown, etc.) to /tmp/fcvm-kvm-trace-{vm_id}.log.
+    // Requires: sudo access (ftrace needs debugfs). Safe to set without sudo — just skips.
+    let kvm_trace = if std::env::var("FCVM_KVM_TRACE").is_ok() {
+        match crate::kvm_trace::KvmTrace::start(&vm_state.vm_id) {
+            Ok(t) => {
+                info!("KVM trace started for VM resume");
+                Some(t)
+            }
+            Err(e) => {
+                warn!("FCVM_KVM_TRACE: could not start KVM trace: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Timing instrumentation: measure VM resume operation
     let resume_start = std::time::Instant::now();
     client
@@ -812,6 +830,16 @@ pub async fn restore_from_snapshot(
         total_snapshot_ms = (load_duration + patch_duration + resume_duration).as_millis(),
         "VM resume completed"
     );
+
+    // Stop KVM trace and dump results (captures resume + early VM execution)
+    if let Some(trace) = kvm_trace {
+        // Brief delay to capture initial KVM exits after resume
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        match trace.stop_and_dump() {
+            Ok(path) => info!("KVM trace saved to {}", path),
+            Err(e) => warn!("FCVM_KVM_TRACE: failed to save: {}", e),
+        }
+    }
 
     // Store fcvm process PID (not Firecracker PID)
     vm_state.pid = Some(std::process::id());
