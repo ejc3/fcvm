@@ -64,6 +64,10 @@ pub struct SetupArgs {
     #[arg(long)]
     pub build_kernels: bool,
 
+    /// Override rootfs filesystem type from kernel profile config (for testing).
+    #[arg(long, value_enum, hide = true)]
+    pub rootfs_type: Option<RootfsType>,
+
     /// Install kernel as the host kernel and configure GRUB.
     /// Requires --kernel-profile flag. After setup, reboot to activate.
     #[arg(long, requires = "kernel_profile")]
@@ -252,6 +256,11 @@ pub struct RunArgs {
     /// By default, fcvm creates snapshots after container image pull for fast subsequent launches.
     #[arg(long)]
     pub no_snapshot: bool,
+
+    /// Override rootfs filesystem type from kernel profile config (for testing).
+    /// Normally driven by rootfs_type in kernel profile config.
+    #[arg(long, value_enum, hide = true)]
+    pub rootfs_type: Option<RootfsType>,
 
     /// Image delivery mode for localhost images (default: auto-detect from kernel profile).
     /// overlay: pre-built overlay storage (instant), btrfs: pre-built btrfs image (instant),
@@ -465,6 +474,18 @@ pub enum NetworkMode {
     Bridged,
     /// True rootless networking using slirp4netns (no sudo required)
     Rootless,
+}
+
+/// Root filesystem type for the VM.
+///
+/// Controls whether the rootfs is ext4 (default) or btrfs.
+/// Normally driven by the kernel profile config; this enum enables CLI override for testing.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
+pub enum RootfsType {
+    /// Standard ext4 rootfs (default)
+    Ext4,
+    /// btrfs rootfs (converted from ext4 via btrfs-convert)
+    Btrfs,
 }
 
 /// Image delivery mode for localhost container images.

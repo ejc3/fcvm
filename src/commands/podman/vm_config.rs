@@ -823,6 +823,7 @@ pub(super) async fn run_vm_setup(
             let env_vars: Vec<String> = args.env.to_vec();
             let volume_mounts: Vec<String> = args.map.to_vec();
             let image_mode = super::resolve_image_mode(args);
+            let rootfs_type = super::resolve_rootfs_type(args);
 
             crate::firecracker::FirecrackerConfig::new(
                 kernel_path.to_path_buf(),
@@ -846,6 +847,7 @@ pub(super) async fn run_vm_setup(
                 args.user.clone(),
                 args.forward_localhost.clone(),
                 image_mode,
+                rootfs_type,
             )
         });
 

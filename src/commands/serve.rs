@@ -320,6 +320,7 @@ async fn create_sandbox(
         vsock_dir: None,
         no_snapshot: true,
         image_mode: None,
+        rootfs_type: None,
         forward_localhost: vec![],
         user: None,
         hugepages: false,

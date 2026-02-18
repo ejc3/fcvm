@@ -36,6 +36,28 @@ use crate::volume::{spawn_volume_servers, VolumeConfig};
 use image::{build_storage_image, get_image_identifier, validate_docker_archive};
 use tokio_util::sync::CancellationToken;
 
+/// Resolve the rootfs filesystem type from CLI args and kernel profile config.
+///
+/// Priority: explicit `--rootfs-type` CLI flag > kernel profile config > None (ext4).
+fn resolve_rootfs_type(args: &RunArgs) -> Option<String> {
+    // CLI override wins
+    if let Some(ref rt) = args.rootfs_type {
+        return match rt {
+            crate::cli::RootfsType::Btrfs => Some("btrfs".to_string()),
+            crate::cli::RootfsType::Ext4 => None,
+        };
+    }
+
+    // Read from kernel profile config
+    if let Some(ref profile_name) = args.kernel_profile {
+        if let Ok(Some(profile)) = crate::setup::get_kernel_profile(profile_name) {
+            return profile.rootfs_type;
+        }
+    }
+
+    None
+}
+
 /// Resolve the image delivery mode from CLI args and kernel profile.
 ///
 /// Priority: explicit `--image-mode` > auto-detect from kernel profile.
@@ -229,7 +251,10 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             .context("setting up kernel")?
     };
 
-    let base_rootfs = crate::setup::ensure_rootfs(args.setup)
+    // Resolve rootfs type: CLI override > kernel profile config > default (ext4)
+    let rootfs_type = resolve_rootfs_type(&args);
+
+    let base_rootfs = crate::setup::ensure_rootfs(args.setup, rootfs_type.as_deref())
         .await
         .context("setting up rootfs")?;
     let initrd_path = crate::setup::ensure_fc_agent_initrd(args.setup)
@@ -1063,6 +1088,7 @@ mod tests {
             hugepages: false,
             portable_volumes: false,
             image_mode: None,
+            rootfs_type: None,
             label: vec![],
             image: "alpine:latest".to_string(),
             command_args: vec![],

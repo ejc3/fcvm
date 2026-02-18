@@ -206,10 +206,33 @@ pub fn setup_btrfs_storage_if_available() {
         return;
     }
 
+    // If root filesystem is natively btrfs, resize to fill disk and skip loopback.
+    // The host may have expanded the sparse file for --rootfs-size.
+    let root_is_btrfs = std::process::Command::new("findmnt")
+        .args(["-n", "-o", "FSTYPE", "/"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "btrfs")
+        .unwrap_or(false);
+
+    if root_is_btrfs {
+        let _ = std::process::Command::new("btrfs")
+            .args(["filesystem", "resize", "max", "/"])
+            .output();
+        eprintln!("[fc-agent] root filesystem is btrfs, resized to fill disk");
+        let storage_dir = "/var/lib/containers/storage";
+        let _ = std::fs::create_dir_all(storage_dir);
+        write_btrfs_storage_conf(
+            "/etc/containers/storage.conf",
+            storage_dir,
+            "/run/containers/storage",
+        );
+        return;
+    }
+
     let storage_dir = "/var/lib/containers/storage";
     let loopback_path = "/var/lib/containers/btrfs.img";
 
-    // Skip if already mounted as btrfs
+    // Skip if already btrfs (either native btrfs root or pre-existing loopback mount)
     let already_btrfs = std::process::Command::new("findmnt")
         .args(["-n", "-o", "FSTYPE", storage_dir])
         .output()

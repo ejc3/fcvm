@@ -70,8 +70,21 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         .context("setting up kernel")?;
     println!("  ✓ Kernel ready: {}", kernel_path.display());
 
+    // Resolve rootfs type: CLI override > kernel profile config > default (ext4)
+    let rootfs_type = if let Some(ref rt) = args.rootfs_type {
+        match rt {
+            crate::cli::RootfsType::Btrfs => Some("btrfs".to_string()),
+            crate::cli::RootfsType::Ext4 => None,
+        }
+    } else if let Some(ref profile_name) = args.kernel_profile {
+        get_kernel_profile(profile_name)?
+            .and_then(|p| p.rootfs_type)
+    } else {
+        None
+    };
+
     // Ensure rootfs exists (creates Layer 2 if missing)
-    let rootfs_path = crate::setup::ensure_rootfs(true)
+    let rootfs_path = crate::setup::ensure_rootfs(true, rootfs_type.as_deref())
         .await
         .context("setting up rootfs")?;
     println!("  ✓ Rootfs ready: {}", rootfs_path.display());

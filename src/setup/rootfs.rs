@@ -51,6 +51,11 @@ pub struct KernelProfile {
     #[serde(default)]
     pub description: String,
 
+    /// Root filesystem type: "ext4" (default) or "btrfs"
+    /// When "btrfs", the rootfs is converted from ext4 to btrfs before setup VM boot.
+    #[serde(default)]
+    pub rootfs_type: Option<String>,
+
     // ========== Custom kernel (build from source) ==========
     /// Kernel version (e.g., "6.18")
     #[serde(default)]
@@ -403,6 +408,12 @@ if [ $? -ne 0 ]; then
     echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
     echo o > /proc/sysrq-trigger 2>/dev/null || poweroff -f
 fi
+
+# Fix fstab: remove entries for partitions that don't exist in microVM.
+# Ubuntu cloud images have LABEL=BOOT and LABEL=UEFI entries that cause
+# systemd to enter emergency mode when these partitions are missing.
+echo "FCVM Layer 2 Setup: Fixing fstab..."
+sed -i '/LABEL=BOOT/d;/LABEL=UEFI/d' /newroot/etc/fstab 2>/dev/null || true
 
 # Copy embedded packages from initrd to rootfs
 # Packages are in /packages directory inside the initrd (loaded in RAM)
@@ -902,7 +913,7 @@ pub fn compute_sha256(data: &[u8]) -> String {
 /// Layer 2 only contains packages (podman, crun, etc.).
 ///
 /// If `allow_create` is false, bail if rootfs doesn't exist.
-pub async fn ensure_rootfs(allow_create: bool) -> Result<PathBuf> {
+pub async fn ensure_rootfs(allow_create: bool, rootfs_type: Option<&str>) -> Result<PathBuf> {
     let (plan, _plan_sha_full, _plan_sha_short) = load_plan()?;
 
     // Generate all scripts and compute hash of the complete init script
@@ -915,11 +926,12 @@ pub async fn ensure_rootfs(allow_create: bool) -> Result<PathBuf> {
     let kernel_config = plan.kernel.current_arch()?;
     let kernel_url = &kernel_config.url;
 
-    // Hash the complete init script + kernel URL + download script
+    // Hash the complete init script + kernel URL + download script + rootfs_type
     // Any change to:
     // - init logic, install script, or setup script
     // - kernel URL (different kernel version/release)
     // - download method (podman image, codename, packages)
+    // - rootfs filesystem type (ext4 vs btrfs)
     // invalidates the cache
     let mut combined = init_script.clone();
     combined.push_str("\n# KERNEL_URL: ");
@@ -930,11 +942,20 @@ pub async fn ensure_rootfs(allow_create: bool) -> Result<PathBuf> {
     combined.push_str(FC_AGENT_SERVICE);
     combined.push_str("\n# FC_AGENT_SERVICE_STRACE:\n");
     combined.push_str(FC_AGENT_SERVICE_STRACE);
+    if let Some(fs_type) = rootfs_type {
+        combined.push_str("\n# ROOTFS_TYPE: ");
+        combined.push_str(fs_type);
+    }
     let script_sha = compute_sha256(combined.as_bytes());
     let script_sha_short = &script_sha[..12];
 
     let rootfs_dir = paths::rootfs_dir();
-    let rootfs_path = rootfs_dir.join(format!("layer2-{}.raw", script_sha_short));
+    // Different rootfs types use different cache filenames
+    let rootfs_path = if rootfs_type == Some("btrfs") {
+        rootfs_dir.join(format!("layer2-{}-btrfs.raw", script_sha_short))
+    } else {
+        rootfs_dir.join(format!("layer2-{}.raw", script_sha_short))
+    };
     let lock_file = rootfs_dir.join(".rootfs-creation.lock");
 
     // If rootfs exists for this script, return it
@@ -997,7 +1018,7 @@ pub async fn ensure_rootfs(allow_create: bool) -> Result<PathBuf> {
     let _ = tokio::fs::remove_file(&temp_rootfs_path).await;
 
     let result =
-        create_layer2_rootless(&plan, script_sha_short, &setup_script, &temp_rootfs_path).await;
+        create_layer2_rootless(&plan, script_sha_short, &setup_script, &temp_rootfs_path, rootfs_type).await;
 
     if result.is_ok() {
         tokio::fs::rename(&temp_rootfs_path, &rootfs_path)
@@ -1445,15 +1466,35 @@ fn find_busybox() -> Result<PathBuf> {
 // Layer 2 Creation (Rootless)
 // ============================================================================
 
-/// Create Layer 2 rootfs without requiring root
+/// Convert an ext4 image file to btrfs in-place using btrfs-convert.
 ///
-/// 1. Download cloud image (qcow2, cached)
-/// 2. Convert to raw with qemu-img (no root)
-/// 3. Expand to 10GB (no root)
-/// 4. Download .deb packages on host (has network)
-/// 5. Create initrd with embedded packages
-/// 6. Boot VM with initrd to install packages (no network needed)
-/// 7. Wait for VM to shut down
+/// Requires a clean ext4 filesystem (runs e2fsck first).
+/// btrfs-convert works on image files, not just block devices.
+async fn convert_to_btrfs(image_path: &Path) -> Result<()> {
+    // e2fsck first — btrfs-convert requires a clean ext4 filesystem
+    let _ = Command::new("e2fsck")
+        .args(["-f", "-y", path_to_str(image_path)?])
+        .output()
+        .await
+        .context("e2fsck before btrfs-convert")?;
+
+    let output = Command::new("btrfs-convert")
+        .arg(path_to_str(image_path)?)
+        .output()
+        .await
+        .context("running btrfs-convert")?;
+
+    if !output.status.success() {
+        bail!(
+            "btrfs-convert failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    info!("rootfs converted from ext4 to btrfs");
+    Ok(())
+}
+
+/// Create Layer 2 rootfs without requiring root
 ///
 /// NOTE: fc-agent is NOT included - it will be injected per-VM at boot time.
 async fn create_layer2_rootless(
@@ -1461,6 +1502,7 @@ async fn create_layer2_rootless(
     script_sha_short: &str,
     script: &str,
     output_path: &Path,
+    rootfs_type: Option<&str>,
 ) -> Result<()> {
     // Step 1: Download cloud image (cached by URL)
     let cloud_image = download_cloud_image(plan).await?;
@@ -1599,10 +1641,11 @@ async fn create_layer2_rootless(
         );
     }
 
-    // Step 4b: Fix /etc/fstab to remove BOOT and UEFI entries
-    // This MUST happen before booting - systemd reads fstab before cloud-init runs
-    info!("fixing /etc/fstab to remove non-existent partition entries");
-    fix_fstab_in_image(&partition_path).await?;
+    // Step 4b: Convert ext4 to btrfs if requested (before setup VM boot)
+    if rootfs_type == Some("btrfs") {
+        info!("converting rootfs from ext4 to btrfs");
+        convert_to_btrfs(&partition_path).await?;
+    }
 
     // Step 5: Download packages on host (host has network!)
     let packages_dir = download_packages(plan, script_sha_short).await?;
@@ -1619,15 +1662,15 @@ async fn create_layer2_rootless(
 
     let setup_initrd = create_layer2_setup_initrd(&install_script, script, &packages_dir).await?;
 
-    // Step 7: Boot VM with initrd to run setup (no cloud-init needed!)
-    // Now we boot a pure ext4 partition (no GPT), so root=/dev/vda works
-    // Only one disk needed - packages are in the initrd
+    // Step 7: Boot VM with initrd to run setup
+    // Boots a partition (ext4 or btrfs) with root=/dev/vda
+    // Uses btrfs kernel profile when rootfs is btrfs (needs CONFIG_BTRFS_FS)
     info!(
         script_sha = %script_sha_short,
         "booting VM with setup initrd (packages embedded)"
     );
 
-    boot_vm_for_setup(&partition_path, &setup_initrd).await?;
+    boot_vm_for_setup(&partition_path, &setup_initrd, rootfs_type).await?;
 
     // Step 8: Rename to final path
     tokio::fs::rename(&partition_path, output_path)
@@ -1635,97 +1678,6 @@ async fn create_layer2_rootless(
         .context("renaming partition to output path")?;
 
     info!("Layer 2 creation complete (packages embedded in initrd)");
-    Ok(())
-}
-
-/// Fix /etc/fstab in an ext4 image to remove BOOT and UEFI partition entries
-///
-/// The Ubuntu cloud image has fstab entries for LABEL=BOOT and LABEL=UEFI
-/// which cause systemd to enter emergency mode when these partitions don't exist.
-/// We use debugfs to modify fstab directly in the ext4 image without mounting.
-async fn fix_fstab_in_image(image_path: &Path) -> Result<()> {
-    // Read current fstab using debugfs
-    let output = Command::new("debugfs")
-        .args(["-R", "cat /etc/fstab", path_to_str(image_path)?])
-        .output()
-        .await
-        .context("reading fstab with debugfs")?;
-
-    if !output.status.success() {
-        bail!(
-            "debugfs read failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    let fstab_content = String::from_utf8_lossy(&output.stdout);
-
-    // Filter out BOOT and UEFI entries
-    let new_fstab: String = fstab_content
-        .lines()
-        .filter(|line| !line.contains("LABEL=BOOT") && !line.contains("LABEL=UEFI"))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    debug!("new fstab content:\n{}", new_fstab);
-
-    // Write new fstab to a temp file
-    let temp_fstab = std::env::temp_dir().join("fstab.new");
-    tokio::fs::write(&temp_fstab, format!("{}\n", new_fstab))
-        .await
-        .context("writing temp fstab")?;
-
-    // Write the new fstab back using debugfs -w
-    // debugfs command: rm /etc/fstab; write /tmp/fstab.new /etc/fstab
-    let output = Command::new("debugfs")
-        .args(["-w", "-R", "rm /etc/fstab", path_to_str(image_path)?])
-        .output()
-        .await
-        .context("removing old fstab with debugfs")?;
-
-    // rm might fail if file doesn't exist, that's OK
-    if !output.status.success() {
-        debug!(
-            "debugfs rm fstab (might be expected): {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    let output = Command::new("debugfs")
-        .args([
-            "-w",
-            "-R",
-            &format!("write {} /etc/fstab", temp_fstab.display()),
-            path_to_str(image_path)?,
-        ])
-        .output()
-        .await
-        .context("writing new fstab with debugfs")?;
-
-    if !output.status.success() {
-        bail!(
-            "debugfs write failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    // Cleanup temp file
-    let _ = tokio::fs::remove_file(&temp_fstab).await;
-
-    // Verify the change
-    let output = Command::new("debugfs")
-        .args(["-R", "cat /etc/fstab", path_to_str(image_path)?])
-        .output()
-        .await
-        .context("verifying fstab with debugfs")?;
-
-    let new_content = String::from_utf8_lossy(&output.stdout);
-    if new_content.contains("LABEL=BOOT") || new_content.contains("LABEL=UEFI") {
-        warn!("fstab still contains BOOT/UEFI entries after fix - VM may enter emergency mode");
-    } else {
-        info!("fstab fixed - removed BOOT and UEFI entries");
-    }
-
     Ok(())
 }
 
@@ -2034,7 +1986,11 @@ async fn download_cloud_image(plan: &Plan) -> Result<PathBuf> {
 ///
 /// Only one disk is needed - packages are embedded in the initrd.
 /// This allows using Kata's kernel which has FUSE but no ISO9660/SquashFS.
-async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
+async fn boot_vm_for_setup(
+    disk_path: &Path,
+    initrd_path: &Path,
+    rootfs_type: Option<&str>,
+) -> Result<()> {
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -2051,9 +2007,15 @@ async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
     // Create log file (Firecracker requires it to exist)
     std::fs::File::create(&log_path).context("creating Firecracker log file")?;
 
-    // Find kernel - downloaded from Kata release if needed
-    // Use default kernel (None profile), allow_create=true, allow_build=false
-    let kernel_path = crate::setup::kernel::ensure_kernel(None, true, false).await?;
+    // Find kernel - use btrfs profile kernel if rootfs is btrfs (needs CONFIG_BTRFS_FS),
+    // otherwise use default Kata kernel
+    let kernel_profile = if rootfs_type == Some("btrfs") {
+        Some("btrfs")
+    } else {
+        None
+    };
+    let kernel_path =
+        crate::setup::kernel::ensure_kernel(kernel_profile, true, false).await?;
 
     // Create serial console output file
     let serial_path = temp_dir.join("serial.log");
@@ -2095,9 +2057,9 @@ async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
     // Configure VM via API
     let client = crate::firecracker::api::FirecrackerClient::new(api_socket.clone())?;
 
-    // Set boot source - boot from raw ext4 partition (no GPT)
+    // Set boot source - boot from raw partition (ext4 or btrfs, no GPT)
     // The disk IS the filesystem, so use root=/dev/vda directly
-    // No cloud-init needed - scripts are injected via debugfs and run by rc.local
+    // No cloud-init needed - scripts are injected via initrd
     client
         .set_boot_source(crate::firecracker::api::BootSource {
             kernel_image_path: kernel_path.display().to_string(),
@@ -2108,7 +2070,7 @@ async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
         })
         .await?;
 
-    // Add root drive (raw ext4 filesystem, no partition table)
+    // Add root drive (raw filesystem, no partition table)
     client
         .add_drive(
             "rootfs",
@@ -2208,23 +2170,6 @@ async fn boot_vm_for_setup(disk_path: &Path, initrd_path: &Path) -> Result<()> {
                 }
                 let _ = tokio::fs::remove_dir_all(&temp_dir).await;
                 bail!("Layer 2 setup failed (no FCVM_SETUP_COMPLETE marker found)");
-            }
-
-            // Verify marker file exists in the rootfs using debugfs (no root needed)
-            let debugfs_output = Command::new("debugfs")
-                .args([
-                    "-R",
-                    "stat /etc/fcvm-setup-complete",
-                    path_to_str(disk_path)?,
-                ])
-                .output()
-                .await?;
-            let marker_exists = debugfs_output.status.success()
-                && !String::from_utf8_lossy(&debugfs_output.stdout).contains("not found");
-            if !marker_exists {
-                warn!("Setup failed! Serial console output:\n{}", serial_content);
-                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-                bail!("Layer 2 setup failed: marker file /etc/fcvm-setup-complete not found in rootfs");
             }
 
             let _ = tokio::fs::remove_dir_all(&temp_dir).await;

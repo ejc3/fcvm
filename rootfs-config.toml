@@ -247,6 +247,7 @@ build_inputs = [
 # When the kernel supports btrfs, fc-agent auto-detects it and configures
 # podman to use btrfs instead of overlay (avoids idmapped mount issues).
 [kernel_profiles.btrfs.arm64]
+rootfs_type = "btrfs"
 description = "Kernel with FUSE and btrfs support for efficient container storage"
 kernel_version = "6.18.3"
 kernel_repo = "ejc3/fcvm"
@@ -262,6 +263,7 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 
 # x86_64 btrfs profile (FUSE + btrfs, no KVM/nested)
 [kernel_profiles.btrfs.amd64]
+rootfs_type = "btrfs"
 description = "Kernel with FUSE and btrfs support for efficient container storage (x86_64)"
 kernel_version = "6.18.3"
 kernel_repo = "ejc3/fcvm"
