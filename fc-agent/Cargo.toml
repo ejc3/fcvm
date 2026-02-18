@@ -15,3 +15,4 @@ fs2 = "0.4"
 fuse-pipe = { path = "../fuse-pipe", default-features = false }
 exec-proto = { path = "../exec-proto" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"

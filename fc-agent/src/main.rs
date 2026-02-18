@@ -17,14 +17,21 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
+    // Use a non-blocking writer for stderr so that log writes never block the
+    // tokio runtime. Without this, heavy FUSE traffic generates thousands of
+    // INFO messages/sec which synchronously write to the serial console (virtio),
+    // starving the async output handler that drains the container's stdout pipe.
+    // The container's entrypoint then deadlocks on pipe write.
+    let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stderr());
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,fuse_pipe=warn")),
+                .unwrap_or_else(|_| EnvFilter::new("fc_agent=info,warn")),
         )
         .with_target(true)
         .with_ansi(false)
-        .with_writer(std::io::stderr)
+        .with_writer(non_blocking)
         .init();
 
     eprintln!("[fc-agent] starting");
