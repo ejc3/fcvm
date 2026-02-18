@@ -68,8 +68,8 @@ impl VsockStream {
                     Ok(n as usize)
                 }
             }) {
-                Ok(Ok(0)) => return Ok(()), // EOF — socket dead
-                Ok(Ok(_)) => continue,      // Got data (unexpected, but keep waiting)
+                Ok(Ok(0)) => return Ok(()),  // EOF — socket dead
+                Ok(Ok(_)) => continue,       // Got data (unexpected, but keep waiting)
                 Ok(Err(e)) => return Err(e), // Error — socket dead
                 Err(_would_block) => continue,
             }
