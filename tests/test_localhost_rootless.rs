@@ -70,7 +70,10 @@ async fn test_localhost_rootless_btrfs_storage_ext4() -> Result<()> {
 /// Verifies btrfs storage driver is active and container runs successfully.
 async fn run_btrfs_storage_test(rootfs_type: Option<&str>) -> Result<()> {
     let label = rootfs_type.unwrap_or("default (btrfs from profile)");
-    println!("\nRootless Localhost + Btrfs Storage Test (rootfs: {})", label);
+    println!(
+        "\nRootless Localhost + Btrfs Storage Test (rootfs: {})",
+        label
+    );
     println!("===================================================");
 
     // Step 1: Build test image
@@ -78,7 +81,10 @@ async fn run_btrfs_storage_test(rootfs_type: Option<&str>) -> Result<()> {
     build_test_image().await?;
 
     // Step 2: Start VM in rootless mode with btrfs kernel
-    println!("\n2. Starting VM (rootless, --kernel-profile btrfs, rootfs: {})...", label);
+    println!(
+        "\n2. Starting VM (rootless, --kernel-profile btrfs, rootfs: {})...",
+        label
+    );
     let suffix = format!("btrfs-{}", rootfs_type.unwrap_or("native"));
     let (vm_name, _, _, _) = common::unique_names(&suffix);
 
@@ -96,9 +102,7 @@ async fn run_btrfs_storage_test(rootfs_type: Option<&str>) -> Result<()> {
     }
     args.push("localhost/test-btrfs-rootless");
 
-    let (mut _child, fcvm_pid) = common::spawn_fcvm(&args)
-        .await
-        .context("spawning fcvm")?;
+    let (mut _child, fcvm_pid) = common::spawn_fcvm(&args).await.context("spawning fcvm")?;
     println!("  fcvm PID: {}", fcvm_pid);
 
     // Step 3: Wait for healthy
@@ -165,7 +169,10 @@ async fn run_btrfs_storage_test(rootfs_type: Option<&str>) -> Result<()> {
     println!("\n7. Cleaning up...");
     common::kill_process(fcvm_pid).await;
 
-    println!("\n  ROOTLESS + BTRFS STORAGE TEST PASSED (rootfs: {})", label);
+    println!(
+        "\n  ROOTLESS + BTRFS STORAGE TEST PASSED (rootfs: {})",
+        label
+    );
     println!("  - localhost image built and loaded in rootless mode");
     println!("  - btrfs storage driver auto-detected and configured");
     println!("  - Container ran successfully on btrfs storage");
@@ -382,7 +389,10 @@ async fn test_localhost_rootless_btrfs_keepid_ext4() -> Result<()> {
 /// With btrfs, user namespaces work natively — no chown fallback needed.
 async fn run_btrfs_keepid_test(rootfs_type: Option<&str>) -> Result<()> {
     let label = rootfs_type.unwrap_or("default (btrfs from profile)");
-    println!("\nRootless Localhost + Btrfs + keep-id Test (rootfs: {})", label);
+    println!(
+        "\nRootless Localhost + Btrfs + keep-id Test (rootfs: {})",
+        label
+    );
     println!("=========================================================");
 
     // Step 1: Build test image (same image, snapshot key includes --user)
@@ -390,7 +400,10 @@ async fn run_btrfs_keepid_test(rootfs_type: Option<&str>) -> Result<()> {
     build_test_image().await?;
 
     // Step 2: Start VM with --user 1000:1000 (triggers keep-id in fc-agent)
-    println!("\n2. Starting VM (rootless, --kernel-profile btrfs, --user 1000:1000, rootfs: {})...", label);
+    println!(
+        "\n2. Starting VM (rootless, --kernel-profile btrfs, --user 1000:1000, rootfs: {})...",
+        label
+    );
     let suffix = format!("btrfs-kid-{}", rootfs_type.unwrap_or("native"));
     let (vm_name, _, _, _) = common::unique_names(&suffix);
 
@@ -408,9 +421,7 @@ async fn run_btrfs_keepid_test(rootfs_type: Option<&str>) -> Result<()> {
     }
     args.extend_from_slice(&["--user", "1000:1000", "localhost/test-btrfs-rootless"]);
 
-    let (mut _child, fcvm_pid) = common::spawn_fcvm(&args)
-        .await
-        .context("spawning fcvm")?;
+    let (mut _child, fcvm_pid) = common::spawn_fcvm(&args).await.context("spawning fcvm")?;
     println!("  fcvm PID: {}", fcvm_pid);
 
     // Step 3: Wait for VM health and resolve the VM username for UID 1000.
@@ -564,7 +575,10 @@ async fn run_btrfs_keepid_test(rootfs_type: Option<&str>) -> Result<()> {
     println!("\n9. Cleaning up...");
     common::kill_process(fcvm_pid).await;
 
-    println!("\n  ROOTLESS + BTRFS + KEEP-ID TEST PASSED (rootfs: {})", label);
+    println!(
+        "\n  ROOTLESS + BTRFS + KEEP-ID TEST PASSED (rootfs: {})",
+        label
+    );
     println!("  - localhost image with --user 1000:1000 (keep-id mode)");
     println!("  - btrfs storage driver avoids storage-chown-by-maps fallback");
     println!("  - Container ran successfully with user namespace mapping");
