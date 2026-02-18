@@ -1054,6 +1054,34 @@ pub async fn ensure_nested_container(image_name: &str, containerfile: &str) -> a
     let fcvm_path = find_fcvm_binary()?;
     let fcvm_dir = fcvm_path.parent().unwrap();
 
+    // Serialize concurrent builds with a file lock. Multiple nextest processes
+    // may call this simultaneously; without locking, concurrent `podman build`
+    // races on overlay unmount and corrupts the build cache (x64-specific).
+    let lock_name = image_name.replace('/', "-");
+    let lock_path = format!("/tmp/fcvm-build-{}.lock", lock_name);
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .context("creating build lock file")?;
+    lock_file.lock_exclusive().context("acquiring build lock")?;
+
+    // After acquiring the lock, check if the image was already built by
+    // another process that held the lock before us.
+    let already_exists = tokio::process::Command::new("podman")
+        .args(["image", "exists", image_name])
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if already_exists {
+        println!("✓ {} already built (by another process)", image_name);
+        drop(lock_file);
+        return Ok(());
+    }
+
     // Copy binaries to build context (needed for nested-test base)
     if image_name == "localhost/nested-test" {
         let profile = fcvm::setup::get_kernel_profile("nested")?
@@ -1080,6 +1108,7 @@ pub async fn ensure_nested_container(image_name: &str, containerfile: &str) -> a
         .context("running podman build")?;
 
     if !output.status.success() {
+        drop(lock_file);
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("Failed to build {}: {}", image_name, stderr);
     }
@@ -1130,6 +1159,7 @@ pub async fn ensure_nested_container(image_name: &str, containerfile: &str) -> a
         println!("✓ {} built", image_name);
     }
 
+    drop(lock_file);
     Ok(())
 }
 
