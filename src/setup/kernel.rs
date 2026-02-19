@@ -1449,8 +1449,10 @@ pub async fn ensure_profile_firecracker(
     let mut binary = build_dir.join(format!("target/{}/release/firecracker", musl_target));
     if !binary.exists() {
         // Try alternative path (Firecracker's custom build system)
-        let alt_binary =
-            build_dir.join(format!("build/cargo_target/{}/release/firecracker", musl_target));
+        let alt_binary = build_dir.join(format!(
+            "build/cargo_target/{}/release/firecracker",
+            musl_target
+        ));
         if alt_binary.exists() {
             binary = alt_binary;
         } else {
