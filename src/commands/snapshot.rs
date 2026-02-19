@@ -1067,21 +1067,33 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                         info!(snapshot_key = %startup_key, "Creating startup snapshot (VM healthy)");
 
                         let params = SnapshotCreationParams::from_metadata(&snapshot_config.metadata);
-                        match create_snapshot_interruptible(
-                            &vm_manager, &startup_key, &vm_id, &params, &disk_path,
-                            &network_config, &volume_configs,
-                            Some(base_key.as_str()), // Parent is pre-start snapshot
-                            &cancel,
-                        ).await {
-                            SnapshotOutcome::Interrupted => {
+                        // Use select! so SIGTERM can abort startup snapshot immediately.
+                        // Startup snapshots are optional (just caching), so if the VM is
+                        // paused mid-snapshot, cleanup will kill it via vm_manager.kill().
+                        tokio::select! {
+                            outcome = create_snapshot_interruptible(
+                                &vm_manager, &startup_key, &vm_id, &params, &disk_path,
+                                &network_config, &volume_configs,
+                                Some(base_key.as_str()), // Parent is pre-start snapshot
+                                &cancel,
+                            ) => {
+                                match outcome {
+                                    SnapshotOutcome::Interrupted => {
+                                        container_exit_code = None;
+                                        break;
+                                    }
+                                    SnapshotOutcome::Created => {
+                                        info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
+                                    }
+                                    SnapshotOutcome::Failed(e) => {
+                                        warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");
+                                    }
+                                }
+                            }
+                            _ = cancel.cancelled() => {
+                                info!(snapshot_key = %startup_key, "Startup snapshot aborted by shutdown signal");
                                 container_exit_code = None;
                                 break;
-                            }
-                            SnapshotOutcome::Created => {
-                                info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
-                            }
-                            SnapshotOutcome::Failed(e) => {
-                                warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");
                             }
                         }
                     }
