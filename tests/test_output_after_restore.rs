@@ -43,16 +43,22 @@ fn setup_fuse_mounts(n: usize) -> (Vec<String>, Vec<String>, std::path::PathBuf)
 }
 
 /// Build the fcvm args (identical for cold and warm — required for snapshot key match)
-fn build_fcvm_args<'a>(vm_name: &'a str, map_args: &'a [String], cmd: &'a str) -> Vec<&'a str> {
+fn build_fcvm_args<'a>(
+    vm_name: &'a str,
+    map_args: &'a [String],
+    cmd: &'a str,
+    user_spec: &'a str,
+) -> Vec<&'a str> {
     let mut args: Vec<&str> = vec![
         "podman",
         "run",
         "--name",
         vm_name,
-        "--network",
-        "bridged",
         "--kernel-profile",
         "btrfs",
+        "--user",
+        user_spec,
+        "--privileged",
     ];
     for m in map_args {
         args.push("--map");
@@ -87,17 +93,16 @@ async fn test_heavy_output_after_snapshot_restore() -> Result<()> {
         .map(|p| format!("cat {}/*.txt >/dev/null 2>&1; ", p))
         .collect();
     let pad = "x".repeat(200); // long lines like falcon_proxy
-                               // Phase 1: burst 5000 lines to both stdout and stderr (like service startup)
-                               // Phase 2: continuous loop with FUSE reads + output
-                               // Burst 5000 lines (like falcon_proxy startup dump), then continuous counter.
-                               // The burst must drain — if conmon is broken after snapshot restore, this hangs.
     let cmd = format!(
         "b=0; while [ $b -lt 5000 ]; do echo \"BURST:$b {pad}\"; echo \"BURST_ERR:$b {pad}\" >&2; b=$((b+1)); done; i=0; while true; do {reads}echo \"COUNT:$i {pad}\"; echo \"ERR:$i {pad}\" >&2; i=$((i+1)); done",
         reads = reads,
         pad = pad,
     );
 
-    let fcvm_args = build_fcvm_args(&vm_name, &map_args, &cmd);
+    let uid = std::env::var("SUDO_UID").unwrap_or_else(|_| nix::unistd::getuid().to_string());
+    let gid = std::env::var("SUDO_GID").unwrap_or_else(|_| nix::unistd::getgid().to_string());
+    let user_spec = format!("{}:{}", uid, gid);
+    let fcvm_args = build_fcvm_args(&vm_name, &map_args, &cmd, &user_spec);
 
     // Phase 1: Cold boot
     println!("Phase 1: Cold boot with 13 FUSE mounts...");
@@ -179,6 +184,47 @@ async fn test_heavy_output_after_snapshot_restore() -> Result<()> {
     assert!(
         snapshot_used,
         "warm start did NOT use snapshot — test is invalid"
+    );
+
+    // Verify container output ACTUALLY reaches host on warm start.
+    // Without the output listener fix, the listener stays stuck on a stale vsock
+    // connection while fc-agent writes to a newer one.
+    let warm_log_name = format!("{}-warm", vm_name);
+    let mut found_container_output = false;
+    let mut output_line_count = 0;
+    if let Ok(entries) = std::fs::read_dir(log_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.contains(&warm_log_name) {
+                let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
+                for line in content.lines() {
+                    let is_container_output = (line.contains("COUNT:") || line.contains("BURST:"))
+                        && !line.contains("args=")
+                        && !line.contains("Spawned");
+                    if is_container_output {
+                        output_line_count += 1;
+                        if !found_container_output {
+                            println!(
+                                "  First container output: {}",
+                                line.trim().chars().take(100).collect::<String>()
+                            );
+                            found_container_output = true;
+                        }
+                    }
+                }
+                if found_container_output {
+                    println!(
+                        "  Container output lines in warm log: {}",
+                        output_line_count
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        found_container_output,
+        "No container output (COUNT:/BURST:) in warm start logs — \
+         output pipeline broken after snapshot restore"
     );
 
     // Cleanup
