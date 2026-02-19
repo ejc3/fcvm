@@ -896,11 +896,14 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     let (mut vm_manager, mut holder_child) = setup_result.unwrap();
 
-    // Signal the output listener to drop its old (dead) vsock stream and re-accept.
-    // restore_from_snapshot() resumes the VM which resets all vsock connections.
-    // fc-agent will reconnect on the new vsock, but the host-side listener is stuck
-    // reading from the old dead stream unless we notify it to cycle back to accept().
-    output_reconnect.notify_one();
+    // For startup snapshots (container already running), the output listener has an
+    // active connection from fc-agent that's now dead after VM resume. Signal it to
+    // drop the dead stream and re-accept. For pre-start snapshots (container not yet
+    // started), the listener is fresh with no connection — DON'T notify, or the
+    // stored permit will poison the first real connection by dropping it immediately.
+    if args.startup_snapshot_base_key.is_some() {
+        output_reconnect.notify_one();
+    }
 
     let is_uffd = use_uffd || std::env::var("FCVM_FORCE_UFFD").is_ok() || hugepages;
     if is_uffd {

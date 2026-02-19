@@ -816,29 +816,7 @@ pub async fn restore_from_snapshot(
         "disk patch completed"
     );
 
-    // Signal fc-agent to flush ARP cache via MMDS restore-epoch update
-    let restore_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("system time before Unix epoch")?
-        .as_secs();
-
-    client
-        .put_mmds(serde_json::json!({
-            "latest": {
-                "host-time": chrono::Utc::now().timestamp().to_string(),
-                "restore-epoch": restore_epoch.to_string()
-            }
-        }))
-        .await
-        .context("updating MMDS with restore-epoch")?;
-    info!(
-        restore_epoch = restore_epoch,
-        "signaled fc-agent to flush ARP via MMDS"
-    );
-
     // FCVM_KVM_TRACE: enable KVM ftrace around VM resume for debugging snapshot restore.
-    // Captures KVM exit reasons (NPF, shutdown, etc.) to /tmp/fcvm-kvm-trace-{vm_id}.log.
-    // Requires: sudo access (ftrace needs debugfs). Safe to set without sudo — just skips.
     let kvm_trace = if std::env::var("FCVM_KVM_TRACE").is_ok() {
         match crate::kvm_trace::KvmTrace::start(&vm_state.vm_id) {
             Ok(t) => {
@@ -867,6 +845,28 @@ pub async fn restore_from_snapshot(
         duration_ms = resume_duration.as_millis(),
         total_snapshot_ms = (load_duration + patch_duration + resume_duration).as_millis(),
         "VM resume completed"
+    );
+
+    // Signal fc-agent to flush ARP cache and reconnect output vsock via MMDS.
+    // MUST be after VM resume — Firecracker accepts PUT /mmds while paused but
+    // the guest-visible MMDS data isn't updated until after resume.
+    let restore_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system time before Unix epoch")?
+        .as_secs();
+
+    client
+        .put_mmds(serde_json::json!({
+            "latest": {
+                "host-time": chrono::Utc::now().timestamp().to_string(),
+                "restore-epoch": restore_epoch.to_string()
+            }
+        }))
+        .await
+        .context("updating MMDS with restore-epoch")?;
+    info!(
+        restore_epoch = restore_epoch,
+        "signaled fc-agent to flush ARP via MMDS"
     );
 
     // Stop KVM trace and dump results (captures resume + early VM execution)

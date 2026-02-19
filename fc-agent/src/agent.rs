@@ -64,18 +64,24 @@ pub async fn run() -> Result<()> {
     // Breaks the 30s poll loop when POLLHUP is not delivered after snapshot restore.
     let restore_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Exec server rebind signal — shared by restore-epoch watcher and cache-ready handshake.
+    // After vsock transport reset, the listener's AsyncFd epoll becomes stale.
+    let exec_rebind = std::sync::Arc::new(tokio::sync::Notify::new());
+
     // Start restore-epoch watcher
     let watcher_output = output.clone();
     let watcher_restore_flag = restore_flag.clone();
+    let watcher_exec_rebind = exec_rebind.clone();
     tokio::spawn(async move {
         eprintln!("[fc-agent] starting restore-epoch watcher");
-        mmds::watch_restore_epoch(watcher_output, watcher_restore_flag).await;
+        mmds::watch_restore_epoch(watcher_output, watcher_restore_flag, watcher_exec_rebind).await;
     });
 
-    // Start exec server
+    // Start exec server with rebind signal for vsock transport reset recovery
     let (exec_ready_tx, exec_ready_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async {
-        exec::run_server(exec_ready_tx).await;
+    let exec_rebind_clone = exec_rebind.clone();
+    tokio::spawn(async move {
+        exec::run_server(exec_ready_tx, exec_rebind_clone).await;
     });
 
     match tokio::time::timeout(Duration::from_secs(5), exec_ready_rx).await {
@@ -214,6 +220,11 @@ pub async fn run() -> Result<()> {
             eprintln!("[fc-agent] image digest: {}", digest);
             if container::notify_cache_ready_and_wait(&digest, &restore_flag) {
                 eprintln!("[fc-agent] cache ready notification acknowledged");
+                // Pre-start snapshot was taken and we've been restored into a new
+                // Firecracker instance. The vsock transport was reset, which
+                // invalidates the exec server's listener socket (stale AsyncFd epoll).
+                // Signal it to re-bind.
+                exec_rebind.notify_one();
             } else {
                 eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing");
             }
@@ -225,9 +236,11 @@ pub async fn run() -> Result<()> {
 
     // After cache-ready handshake, Firecracker may have created a pre-start snapshot.
     // Snapshot creation resets all vsock connections (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET).
-    // Reconnect the output vsock. FUSE mounts handle reconnection automatically via
-    // the reconnectable multiplexer — no explicit check needed.
-    output.reconnect();
+    // Output vsock reconnection is handled by handle_clone_restore() which is triggered
+    // by the restore-epoch watcher. Do NOT reconnect here — a second reconnect() call
+    // races with handle_clone_restore's reconnect and causes the output writer to cycle
+    // through multiple ghost connections (Notify stored-permit cascade), dropping data.
+    // FUSE mounts handle reconnection automatically via the reconnectable multiplexer.
 
     // VM-level setup: hostname and sysctl (runs as root before container starts).
     // When using --user, the container runs as non-root and can't do these.

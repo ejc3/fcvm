@@ -3,19 +3,27 @@ use std::sync::Arc;
 
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::types::{ExecRequest, ExecResponse};
 use crate::vsock;
 
 /// Run the exec server. Sends ready signal when listening.
-pub async fn run_server(ready_tx: tokio::sync::oneshot::Sender<()>) {
+///
+/// The `rebind_signal` handles vsock transport reset after snapshot restore.
+/// When Firecracker creates a snapshot and restores, the vsock transport is reset
+/// (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET). The listener's AsyncFd epoll registration
+/// becomes stale — accept() hangs forever because tokio never delivers readability
+/// events for incoming connections. On signal, re-registers the epoll via
+/// `VsockListener::re_register()` (extracts fd, re-wraps in new AsyncFd) without
+/// closing or rebinding the socket. Falls back to full rebind if re-register fails.
+pub async fn run_server(ready_tx: tokio::sync::oneshot::Sender<()>, rebind_signal: Arc<Notify>) {
     eprintln!(
         "[fc-agent] starting exec server on vsock port {}",
         vsock::EXEC_PORT
     );
 
-    let listener = match vsock::VsockListener::bind(vsock::EXEC_PORT) {
+    let mut listener = match vsock::VsockListener::bind(vsock::EXEC_PORT) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[fc-agent] ERROR: failed to bind exec server: {}", e);
@@ -32,12 +40,51 @@ pub async fn run_server(ready_tx: tokio::sync::oneshot::Sender<()>) {
     let _ = ready_tx.send(());
 
     loop {
-        match listener.accept().await {
-            Ok(client_fd) => {
-                tokio::spawn(handle_connection(client_fd));
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok(client_fd) => {
+                        tokio::spawn(handle_connection(client_fd));
+                    }
+                    Err(e) => {
+                        eprintln!("[fc-agent] exec server accept error: {}", e);
+                    }
+                }
             }
-            Err(e) => {
-                eprintln!("[fc-agent] exec server accept error: {}", e);
+            _ = rebind_signal.notified() => {
+                eprintln!("[fc-agent] exec server: vsock transport reset, re-registering listener");
+                // Re-register the AsyncFd (epoll) without closing the socket.
+                // Drop+rebind fails when accepted connections keep the port bound.
+                match listener.re_register() {
+                    Ok(l) => {
+                        listener = l;
+                        eprintln!("[fc-agent] exec server: re-registered on vsock port {}", vsock::EXEC_PORT);
+                    }
+                    Err(e) => {
+                        // re_register consumed the listener; socket is closed.
+                        eprintln!("[fc-agent] exec server: re-register failed: {}, trying full rebind", e);
+                        let mut retries = 0;
+                        loop {
+                            match vsock::VsockListener::bind(vsock::EXEC_PORT) {
+                                Ok(l) => {
+                                    listener = l;
+                                    eprintln!("[fc-agent] exec server: re-bound to vsock port {}", vsock::EXEC_PORT);
+                                    break;
+                                }
+                                Err(e2) => {
+                                    retries += 1;
+                                    if retries >= 50 {
+                                        eprintln!("[fc-agent] exec server: re-bind failed after {} retries: {}", retries, e2);
+                                        eprintln!("[fc-agent] exec server: giving up, exec will be unavailable");
+                                        return;
+                                    }
+                                    eprintln!("[fc-agent] exec server: re-bind failed: {}, retrying ({}/50)", e2, retries);
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
