@@ -88,6 +88,8 @@ jobs:
           mkdir -p ~/.config/containers
           printf '[storage]\ndriver = "overlay"\ngraphroot = "/mnt/fcvm-btrfs/containers/storage"\n' > ~/.config/containers/storage.conf
           podman system migrate || true
+          # Fix lock file permissions from previous sudo runs (bench-vm runs as root)
+          sudo chmod 666 /mnt/fcvm-btrfs/state/*.lock 2>/dev/null || true
       - name: Run VM benchmarks
         working-directory: fcvm
         env:
