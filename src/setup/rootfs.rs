@@ -43,8 +43,9 @@ pub struct Plan {
 
 /// Kernel profile configuration
 ///
-/// Profiles override the default [kernel] section for special use cases.
-/// Custom kernels are built from source or downloaded from GitHub releases.
+/// Every kernel is delivered through a profile. The `[kernel]` config section
+/// is synthesized into a `"default"` profile at load time. Custom profiles
+/// (nested, btrfs) build kernels from source or download from GitHub releases.
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct KernelProfile {
     /// Human-readable description
@@ -55,6 +56,17 @@ pub struct KernelProfile {
     /// When "btrfs", the rootfs is converted from ext4 to btrfs before setup VM boot.
     #[serde(default)]
     pub rootfs_type: Option<String>,
+
+    // ========== URL-based kernel delivery (synthesized "default" profile) ==========
+    /// URL to kernel archive (e.g., Kata release tarball)
+    #[serde(default)]
+    pub kernel_url: Option<String>,
+    /// Path within the archive to extract the kernel binary
+    #[serde(default)]
+    pub kernel_archive_path: Option<String>,
+    /// Local filesystem path to kernel binary (overrides URL)
+    #[serde(default)]
+    pub kernel_local_path: Option<String>,
 
     // ========== Custom kernel (build from source) ==========
     /// Kernel version (e.g., "6.18")
@@ -135,9 +147,19 @@ pub struct HostKernelConfig {
 }
 
 impl KernelProfile {
-    /// Check if this profile has a custom kernel configured
+    /// Check if this profile builds a custom kernel from source
     pub fn is_custom(&self) -> bool {
         !self.kernel_version.is_empty() && !self.kernel_repo.is_empty()
+    }
+
+    /// Check if this profile uses URL-based kernel download
+    pub fn is_url_based(&self) -> bool {
+        self.kernel_url.is_some()
+    }
+
+    /// This profile doesn't define its own kernel — it inherits from "default"
+    pub fn inherits_kernel(&self) -> bool {
+        !self.is_custom() && !self.is_url_based()
     }
 }
 
@@ -796,8 +818,12 @@ pub fn load_config(explicit_path: Option<&str>) -> Result<(Plan, String, String)
     let config_sha = compute_sha256(config_content.as_bytes());
     let config_sha_short = config_sha[..12].to_string();
 
-    let config: Plan = toml::from_str(&config_content)
+    let mut config: Plan = toml::from_str(&config_content)
         .with_context(|| format!("parsing config file: {}", config_path.display()))?;
+
+    // Synthesize a "default" profile from the [kernel] section so all code
+    // paths use profiles uniformly — no more None vs Some branching.
+    synthesize_default_profile(&mut config);
 
     info!(
         config_file = %config_path.display(),
@@ -806,6 +832,29 @@ pub fn load_config(explicit_path: Option<&str>) -> Result<(Plan, String, String)
     );
 
     Ok((config, config_sha, config_sha_short))
+}
+
+/// Create a synthetic "default" kernel profile from the [kernel] config section.
+///
+/// This allows all kernel code to work with profiles uniformly. The [kernel]
+/// section in rootfs-config.toml stays as-is for backward compatibility.
+/// If a user explicitly defines [kernel_profiles.default], their definition wins.
+fn synthesize_default_profile(plan: &mut Plan) {
+    let arch = config_arch();
+    if let Ok(kernel_config) = plan.kernel.current_arch() {
+        let default_profile = KernelProfile {
+            description: "Default kernel (Kata Containers)".into(),
+            kernel_url: Some(kernel_config.url.clone()),
+            kernel_archive_path: Some(kernel_config.path.clone()),
+            kernel_local_path: kernel_config.local_path.clone(),
+            ..Default::default()
+        };
+        plan.kernel_profiles
+            .entry("default".into())
+            .or_default()
+            .entry(arch.into())
+            .or_insert(default_profile);
+    }
 }
 
 /// Legacy alias for load_config (for backward compatibility during migration)
@@ -842,7 +891,7 @@ pub fn get_kernel_profile(name: &str) -> Result<Option<KernelProfile>> {
 /// Used by both `setup` and `podman run` commands.
 pub fn resolve_rootfs_type(
     cli_rootfs_type: Option<&crate::cli::RootfsType>,
-    kernel_profile_name: Option<&str>,
+    kernel_profile_name: &str,
 ) -> Option<String> {
     // CLI override wins
     if let Some(rt) = cli_rootfs_type {
@@ -853,10 +902,8 @@ pub fn resolve_rootfs_type(
     }
 
     // Read from kernel profile config
-    if let Some(profile_name) = kernel_profile_name {
-        if let Ok(Some(profile)) = get_kernel_profile(profile_name) {
-            return profile.rootfs_type;
-        }
+    if let Ok(Some(profile)) = get_kernel_profile(kernel_profile_name) {
+        return profile.rootfs_type;
     }
 
     None
@@ -2064,11 +2111,10 @@ async fn boot_vm_for_setup(
     // Create log file (Firecracker requires it to exist)
     std::fs::File::create(&log_path).context("creating Firecracker log file")?;
 
-    // Find kernel - use btrfs profile kernel if rootfs is btrfs (needs CONFIG_BTRFS_FS),
-    // otherwise use default Kata kernel.
-    // The rootfs_type value ("btrfs") matches the kernel profile name by convention.
-    let kernel_profile = rootfs_type;
-    let kernel_path = crate::setup::kernel::ensure_kernel(kernel_profile, true, false).await?;
+    // Find kernel — rootfs_type ("btrfs") matches the kernel profile name by convention.
+    // Falls back to "default" profile for ext4 rootfs.
+    let kernel_profile_name = rootfs_type.unwrap_or("default");
+    let kernel_path = crate::setup::kernel::ensure_kernel(kernel_profile_name, true, false).await?;
 
     // Create serial console output file
     let serial_path = temp_dir.join("serial.log");
