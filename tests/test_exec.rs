@@ -1647,36 +1647,51 @@ async fn test_podman_run_interactive_tty() -> Result<()> {
 
             let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
 
-            // Wait for container to be ready
-            std::thread::sleep(Duration::from_secs(10));
-
-            // Write input to container
-            master
-                .write_all(b"hello-from-stdin\n")
-                .context("writing stdin")?;
-            master.flush()?;
-
-            // Read output with timeout
-            let mut output = Vec::new();
-            let mut buf = [0u8; 4096];
-
-            // Set non-blocking
+            // Set non-blocking for reading
             unsafe {
                 let flags = libc::fcntl(master_fd, libc::F_GETFL);
                 libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
             }
 
-            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            // Heartbeat strategy: periodically send stdin lines until the
+            // container is actually running and `head -1` consumes one.
+            // In SnapshotEnabled mode, the VM may pause for 20-30s during
+            // snapshot creation before the container starts. A fixed sleep
+            // before writing is unreliable. Instead, we send a line every
+            // 2 seconds and read output between sends. Once `head -1` reads
+            // a line, it exits, and we'll see it in the output.
+            let mut output = Vec::new();
+            let mut buf = [0u8; 4096];
+            let deadline = std::time::Instant::now() + Duration::from_secs(180);
+            let mut next_heartbeat = std::time::Instant::now() + Duration::from_secs(10);
+            let mut heartbeats_sent = 0u32;
+
             loop {
                 if std::time::Instant::now() > deadline {
+                    println!("  WARNING: timed out after 180s");
                     nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL).ok();
                     break;
+                }
+
+                // Send a heartbeat line every 2 seconds
+                if std::time::Instant::now() >= next_heartbeat {
+                    heartbeats_sent += 1;
+                    let _ = master.write_all(b"hello-from-stdin\n");
+                    let _ = master.flush();
+                    next_heartbeat = std::time::Instant::now() + Duration::from_secs(2);
                 }
 
                 use std::io::Read;
                 match master.read(&mut buf) {
                     Ok(0) => break,
-                    Ok(n) => output.extend_from_slice(&buf[..n]),
+                    Ok(n) => {
+                        output.extend_from_slice(&buf[..n]);
+                        // Check if we already got what we need
+                        let so_far = String::from_utf8_lossy(&output);
+                        if so_far.contains("hello-from-stdin") {
+                            break;
+                        }
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         match nix::sys::wait::waitpid(
                             child,
@@ -1691,7 +1706,10 @@ async fn test_podman_run_interactive_tty() -> Result<()> {
                 }
             }
 
-            // Wait for child
+            println!("  heartbeats sent: {}", heartbeats_sent);
+
+            // Kill fcvm — we got what we need, don't wait for VM shutdown
+            nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGTERM).ok();
             let _ = nix::sys::wait::waitpid(child, None);
 
             let output_str = String::from_utf8_lossy(&output);
