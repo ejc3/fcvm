@@ -261,6 +261,7 @@ pub(super) fn build_firecracker_config(
         args.forward_localhost.clone(),
         image_mode,
         rootfs_type,
+        args.non_blocking_output,
     );
     // Set the original image name for MMDS (separate from cache key identifier)
     config.container_image_name = args.image.clone();
