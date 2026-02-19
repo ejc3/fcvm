@@ -136,23 +136,34 @@ pub async fn run() -> Result<()> {
         });
     }
 
-    // If --user is specified, create the VM user BEFORE image import so
-    // podman load runs as the target user (rootless podman has separate storage).
+    // If --user is specified with a non-root UID, create the VM user BEFORE image import
+    // so podman load runs as the target user (rootless podman has separate storage).
+    // uid 0 is root — no user mapping needed, podman runs as root directly.
     let user_info = if let Some(ref user_spec) = plan.user {
-        // Username comes from USER env var, which the host resolves from /etc/passwd
-        // for the given UID (matching podman --userns=keep-id behavior).
-        let desired_name = plan
-            .env
-            .get("USER")
-            .map(|s| s.as_str())
-            .unwrap_or("fcvm-user");
-        let subuid_range = plan
-            .subuid_start
-            .zip(plan.subuid_count)
-            .or_else(|| plan.subuid_start.map(|s| (s, 65536)));
-        let (username, _uid, runtime_dir) =
-            container::create_vm_user(user_spec, desired_name, subuid_range);
-        Some((username, runtime_dir))
+        let uid: u32 = user_spec
+            .split(':')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if uid == 0 {
+            eprintln!("[fc-agent] --user 0 (root), skipping user mapping");
+            None
+        } else {
+            // Username comes from USER env var, which the host resolves from /etc/passwd
+            // for the given UID (matching podman --userns=keep-id behavior).
+            let desired_name = plan
+                .env
+                .get("USER")
+                .map(|s| s.as_str())
+                .unwrap_or("fcvm-user");
+            let subuid_range = plan
+                .subuid_start
+                .zip(plan.subuid_count)
+                .or_else(|| plan.subuid_start.map(|s| (s, 65536)));
+            let (username, _uid, runtime_dir) =
+                container::create_vm_user(user_spec, desired_name, subuid_range);
+            Some((username, runtime_dir))
+        }
     } else {
         None
     };
