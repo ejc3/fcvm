@@ -93,19 +93,35 @@ async fn test_btrfs_rw_after_snapshot_restore() -> Result<()> {
         }
     }
 
-    // Verify btrfs storage driver and rw on cold boot
+    // Verify btrfs storage driver and rw on cold boot.
+    // The btrfs mount at /var/lib/containers/storage is set up asynchronously
+    // by fc-agent during boot, so we need to poll until it's ready.
     println!("  Checking btrfs mount (cold boot)...");
-    let mount_info = common::exec_in_vm(
-        fcvm_pid,
-        &[
-            "findmnt",
-            "-n",
-            "-o",
-            "FSTYPE,OPTIONS",
-            "/var/lib/containers/storage",
-        ],
-    )
-    .await?;
+    let mount_info = {
+        let mount_start = std::time::Instant::now();
+        loop {
+            if mount_start.elapsed() > Duration::from_secs(60) {
+                anyhow::bail!(
+                    "cold boot: btrfs mount at /var/lib/containers/storage not ready after 60s"
+                );
+            }
+            match common::exec_in_vm(
+                fcvm_pid,
+                &[
+                    "findmnt",
+                    "-n",
+                    "-o",
+                    "FSTYPE,OPTIONS",
+                    "/var/lib/containers/storage",
+                ],
+            )
+            .await
+            {
+                Ok(info) if info.contains("btrfs") => break info,
+                _ => tokio::time::sleep(Duration::from_millis(500)).await,
+            }
+        }
+    };
     println!("  Mount: {}", mount_info.trim());
     assert!(
         mount_info.contains("btrfs") && mount_info.contains("rw"),
@@ -167,19 +183,34 @@ async fn test_btrfs_rw_after_snapshot_restore() -> Result<()> {
         }
     }
 
-    // Verify btrfs is rw after snapshot restore (no remount hack needed)
+    // Verify btrfs is rw after snapshot restore (no remount hack needed).
+    // Poll for btrfs mount readiness in case restore takes a moment.
     println!("  Checking btrfs mount (warm start)...");
-    let mount_info2 = common::exec_in_vm(
-        fcvm_pid2,
-        &[
-            "findmnt",
-            "-n",
-            "-o",
-            "FSTYPE,OPTIONS",
-            "/var/lib/containers/storage",
-        ],
-    )
-    .await?;
+    let mount_info2 = {
+        let mount_start = std::time::Instant::now();
+        loop {
+            if mount_start.elapsed() > Duration::from_secs(60) {
+                anyhow::bail!(
+                    "warm start: btrfs mount at /var/lib/containers/storage not ready after 60s"
+                );
+            }
+            match common::exec_in_vm(
+                fcvm_pid2,
+                &[
+                    "findmnt",
+                    "-n",
+                    "-o",
+                    "FSTYPE,OPTIONS",
+                    "/var/lib/containers/storage",
+                ],
+            )
+            .await
+            {
+                Ok(info) if info.contains("btrfs") => break info,
+                _ => tokio::time::sleep(Duration::from_millis(500)).await,
+            }
+        }
+    };
     println!("  Mount: {}", mount_info2.trim());
     assert!(
         mount_info2.contains("btrfs") && mount_info2.contains("rw"),
