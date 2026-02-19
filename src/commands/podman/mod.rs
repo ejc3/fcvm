@@ -951,24 +951,36 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
 
                         let mut params = SnapshotCreationParams::from_run_args(&ctx.args);
                         params.extra_disks = ctx.image_extra_disks.clone();
-                        match create_snapshot_interruptible(
-                            &ctx.vm_manager, &startup_key, &ctx.vm_id, &params, &ctx.disk_path,
-                            &ctx.network_config, &ctx.volume_configs,
-                            Some(key.as_str()), // Parent is pre-start snapshot
-                            &cancel,
-                        ).await {
-                            SnapshotOutcome::Interrupted => {
+                        // Use select! so SIGTERM can abort startup snapshot immediately.
+                        // This is safe: startup snapshots are optional (just caching), so
+                        // if the VM is paused mid-snapshot when we cancel, cleanup will
+                        // kill the VM anyway via vm_manager.kill().
+                        tokio::select! {
+                            outcome = create_snapshot_interruptible(
+                                &ctx.vm_manager, &startup_key, &ctx.vm_id, &params, &ctx.disk_path,
+                                &ctx.network_config, &ctx.volume_configs,
+                                Some(key.as_str()), // Parent is pre-start snapshot
+                                &cancel,
+                            ) => {
+                                match outcome {
+                                    SnapshotOutcome::Interrupted => {
+                                        return Ok(None);
+                                    }
+                                    SnapshotOutcome::Created => {
+                                        info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
+                                        // Signal output listener to re-accept (vsock reset during snapshot)
+                                        ctx.output_reconnect.notify_one();
+                                    }
+                                    SnapshotOutcome::Failed(e) => {
+                                        warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");
+                                        // Signal even on failure — vsock was still reset during the attempt
+                                        ctx.output_reconnect.notify_one();
+                                    }
+                                }
+                            }
+                            _ = cancel.cancelled() => {
+                                info!(snapshot_key = %startup_key, "Startup snapshot aborted by shutdown signal");
                                 return Ok(None);
-                            }
-                            SnapshotOutcome::Created => {
-                                info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
-                                // Signal output listener to re-accept (vsock reset during snapshot)
-                                ctx.output_reconnect.notify_one();
-                            }
-                            SnapshotOutcome::Failed(e) => {
-                                warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");
-                                // Signal even on failure — vsock was still reset during the attempt
-                                ctx.output_reconnect.notify_one();
                             }
                         }
                     }
