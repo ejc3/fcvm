@@ -225,9 +225,11 @@ pub async fn run() -> Result<()> {
 
     // After cache-ready handshake, Firecracker may have created a pre-start snapshot.
     // Snapshot creation resets all vsock connections (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET).
-    // Reconnect the output vsock. FUSE mounts handle reconnection automatically via
-    // the reconnectable multiplexer — no explicit check needed.
-    output.reconnect();
+    // Output vsock reconnection is handled by handle_clone_restore() which is triggered
+    // by the restore-epoch watcher. Do NOT reconnect here — a second reconnect() call
+    // races with handle_clone_restore's reconnect and causes the output writer to cycle
+    // through multiple ghost connections (Notify stored-permit cascade), dropping data.
+    // FUSE mounts handle reconnection automatically via the reconnectable multiplexer.
 
     // VM-level setup: hostname and sysctl (runs as root before container starts).
     // When using --user, the container runs as non-root and can't do these.
