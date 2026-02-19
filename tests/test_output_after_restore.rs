@@ -72,6 +72,15 @@ fn build_fcvm_args<'a>(vm_name: &'a str, map_args: &'a [String], cmd: &'a str) -
 
 #[tokio::test]
 async fn test_heavy_output_after_snapshot_restore() -> Result<()> {
+    // This test requires snapshot support — skip if FCVM_NO_SNAPSHOT is set
+    if std::env::var("FCVM_NO_SNAPSHOT")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        println!("Skipping test: FCVM_NO_SNAPSHOT is set");
+        return Ok(());
+    }
+
     println!("\nOutput integrity: 13 FUSE mounts + monotonic counter across snapshot");
     println!("=====================================================================");
 
