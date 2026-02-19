@@ -652,12 +652,15 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // listener to drop its dead vsock stream and re-accept. Without this, the listener
     // stays stuck reading from the old (dead) connection after VM resume resets vsock.
     let output_reconnect = Arc::new(tokio::sync::Notify::new());
+    let lossy_output = args.lossy_output;
     let output_handle = if !tty_mode {
         let socket_path = output_socket_path.clone();
         let vm_id_clone = vm_id.clone();
         let reconnect = output_reconnect.clone();
         Some(tokio::spawn(async move {
-            match run_output_listener(&socket_path, &vm_id_clone, None, reconnect, false).await {
+            match run_output_listener(&socket_path, &vm_id_clone, None, reconnect, lossy_output)
+                .await
+            {
                 Ok(lines) => lines,
                 Err(e) => {
                     tracing::warn!("Output listener error: {}", e);
@@ -1202,6 +1205,7 @@ mod tests {
             firecracker_bin: Some("/opt/firecracker-profile".to_string()),
             firecracker_args: Some("--enable-nv2".to_string()),
             hugepages: None,
+            lossy_output: false,
         };
 
         let runtime = snapshot_restore_runtime_config(&args);

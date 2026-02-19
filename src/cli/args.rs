@@ -393,6 +393,11 @@ pub struct SnapshotRunArgs {
     /// Passed from podman run's --hugepages when restoring from a snapshot cache hit.
     #[arg(skip)]
     pub hugepages: Option<bool>,
+
+    /// Whether lossy output mode is enabled (internal use only).
+    /// Passed from podman run's --lossy-output when restoring from a snapshot cache hit.
+    #[arg(skip)]
+    pub lossy_output: bool,
 }
 
 // ============================================================================

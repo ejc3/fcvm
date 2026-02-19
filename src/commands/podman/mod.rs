@@ -303,6 +303,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 firecracker_bin,
                 firecracker_args,
                 hugepages: Some(args.hugepages),
+                lossy_output: args.lossy_output,
             };
             super::snapshot::cmd_snapshot_run(snapshot_args).await?;
             return Ok(None);
@@ -335,6 +336,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 firecracker_bin,
                 firecracker_args,
                 hugepages: Some(args.hugepages),
+                lossy_output: args.lossy_output,
             };
             super::snapshot::cmd_snapshot_run(snapshot_args).await?;
             return Ok(None);
@@ -747,7 +749,15 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         let reconnect = output_reconnect.clone();
         let lossy_output = args.lossy_output;
         Some(tokio::spawn(async move {
-            match run_output_listener(&socket_path, &vm_id_clone, log_tx_clone, reconnect, lossy_output).await {
+            match run_output_listener(
+                &socket_path,
+                &vm_id_clone,
+                log_tx_clone,
+                reconnect,
+                lossy_output,
+            )
+            .await
+            {
                 Ok(lines) => lines,
                 Err(e) => {
                     tracing::warn!("Output listener error: {}", e);
