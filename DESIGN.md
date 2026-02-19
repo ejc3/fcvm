@@ -661,12 +661,16 @@ curl http://172.30.x.1:8080
 ┌─────────────────────────────────────────────────────────┐
 │ 2. Create Firecracker snapshot                          │
 │    - Snapshot memory to file                            │
-│    - Snapshot disk state                                │
-│    - Save VM configuration                              │
 └────────────────┬────────────────────────────────────────┘
                  ▼
 ┌─────────────────────────────────────────────────────────┐
-│ 3. Resume the original VM                               │
+│ 3. Copy disk via reflink (VM still paused)              │
+│    - Ensures memory/disk consistency                    │
+│    - Reflink is O(1) — no pause time impact             │
+└────────────────┬────────────────────────────────────────┘
+                 ▼
+┌─────────────────────────────────────────────────────────┐
+│ 4. Resume the original VM                               │
 │    - VM continues running                               │
 └─────────────────────────────────────────────────────────┘
 ```
