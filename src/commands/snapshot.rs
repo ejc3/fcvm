@@ -782,11 +782,18 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         // causes a triple fault (guest page tables for memory above the MMIO gap at 3GB
         // are invalid). Fixed in v1.15.0+. If /dev/userfaultfd is accessible (chmod 666),
         // UFFD can be used as a workaround via FCVM_FORCE_UFFD=1.
-        if std::env::var("FCVM_FORCE_UFFD").is_ok() {
+        // Hugepages always require UFFD (Firecracker rejects File backend for hugepage snapshots).
+        if hugepages || std::env::var("FCVM_FORCE_UFFD").is_ok() {
             let implicit_socket_path = data_dir.join("uffd.sock");
+            let reason = if hugepages {
+                "hugepages require UFFD"
+            } else {
+                "FCVM_FORCE_UFFD"
+            };
             info!(
                 socket = %implicit_socket_path.display(),
-                "starting implicit UFFD server for snapshot restore (FCVM_FORCE_UFFD)"
+                reason = %reason,
+                "starting implicit UFFD server for snapshot restore"
             );
 
             let server = UffdServer::new_with_path(

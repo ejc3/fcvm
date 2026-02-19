@@ -443,6 +443,8 @@ pub async fn restore_from_snapshot(
     let mut holder_child: Option<tokio::process::Child> = None;
     let mut holder_pid_for_post_start: Option<u32> = None;
     let fc_log_path = data_dir.join("firecracker.log");
+    // Create log file (Firecracker requires --log-path file to already exist)
+    let _ = std::fs::File::create(&fc_log_path);
     let mut vm_manager = VmManager::new(
         vm_id.to_string(),
         socket_path.to_path_buf(),
