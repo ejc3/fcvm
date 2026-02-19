@@ -3,19 +3,29 @@ use std::sync::Arc;
 
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::types::{ExecRequest, ExecResponse};
 use crate::vsock;
 
 /// Run the exec server. Sends ready signal when listening.
-pub async fn run_server(ready_tx: tokio::sync::oneshot::Sender<()>) {
+///
+/// The `rebind_signal` handles vsock transport reset after snapshot restore.
+/// When Firecracker creates a snapshot and restores, the vsock transport is reset
+/// (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET). The listener's AsyncFd epoll registration
+/// becomes stale — accept() hangs forever because tokio never delivers readability
+/// events for incoming connections. Re-binding creates a fresh socket + epoll
+/// registration, restoring the exec server.
+pub async fn run_server(
+    ready_tx: tokio::sync::oneshot::Sender<()>,
+    rebind_signal: Arc<Notify>,
+) {
     eprintln!(
         "[fc-agent] starting exec server on vsock port {}",
         vsock::EXEC_PORT
     );
 
-    let listener = match vsock::VsockListener::bind(vsock::EXEC_PORT) {
+    let mut listener = match vsock::VsockListener::bind(vsock::EXEC_PORT) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[fc-agent] ERROR: failed to bind exec server: {}", e);
@@ -32,12 +42,33 @@ pub async fn run_server(ready_tx: tokio::sync::oneshot::Sender<()>) {
     let _ = ready_tx.send(());
 
     loop {
-        match listener.accept().await {
-            Ok(client_fd) => {
-                tokio::spawn(handle_connection(client_fd));
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok(client_fd) => {
+                        tokio::spawn(handle_connection(client_fd));
+                    }
+                    Err(e) => {
+                        eprintln!("[fc-agent] exec server accept error: {}", e);
+                    }
+                }
             }
-            Err(e) => {
-                eprintln!("[fc-agent] exec server accept error: {}", e);
+            _ = rebind_signal.notified() => {
+                eprintln!("[fc-agent] exec server: vsock transport reset, re-binding listener");
+                drop(listener);
+                loop {
+                    match vsock::VsockListener::bind(vsock::EXEC_PORT) {
+                        Ok(l) => {
+                            listener = l;
+                            eprintln!("[fc-agent] exec server: re-bound to vsock port {}", vsock::EXEC_PORT);
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("[fc-agent] exec server: re-bind failed: {}, retrying in 100ms", e);
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    }
+                }
             }
         }
     }
