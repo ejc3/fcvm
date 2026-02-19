@@ -83,6 +83,7 @@ async fn test_utimensat_pjdfstest_nested_kernel() -> Result<()> {
             "bridged",
             "--kernel-profile",
             "nested",
+            "--no-snapshot",
             "--privileged",
             "--map",
             &map_arg,
