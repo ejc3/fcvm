@@ -1716,8 +1716,10 @@ async fn test_podman_run_interactive_tty() -> Result<()> {
 
             println!("  heartbeats sent: {}", heartbeats_sent);
 
-            // Kill fcvm — we got what we need, don't wait for VM shutdown
-            nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGTERM).ok();
+            // Kill fcvm — we got what we need, don't wait for VM shutdown.
+            // Use SIGKILL to avoid blocking on graceful shutdown (which can
+            // take minutes if the VM is still booting).
+            nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL).ok();
             let _ = nix::sys::wait::waitpid(child, None);
 
             let output_str = String::from_utf8_lossy(&output);
