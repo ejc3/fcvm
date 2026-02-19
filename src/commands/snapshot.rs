@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{debug, info, warn};
@@ -224,6 +225,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             hugepages: vm_state.config.hugepages,
             extra_disks: extra_disk_configs,
             username: vm_state.config.username.clone(),
+            user: vm_state.config.user.clone(),
         },
     };
 
@@ -306,7 +308,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     serve_state.config.process_type = Some(crate::state::ProcessType::Serve);
     serve_state.status = VmStatus::Running;
 
-    let state_manager = std::sync::Arc::new(StateManager::new(paths::state_dir()));
+    let state_manager = Arc::new(StateManager::new(paths::state_dir()));
     state_manager.init().await?;
     state_manager
         .save_state(&serve_state)
@@ -645,19 +647,17 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         None
     };
 
-    // For non-TTY mode, use async output listener
+    // For non-TTY mode, use async output listener.
+    // The reconnect_notify is fired after restore_from_snapshot() to signal the output
+    // listener to drop its dead vsock stream and re-accept. Without this, the listener
+    // stays stuck reading from the old (dead) connection after VM resume resets vsock.
+    let output_reconnect = Arc::new(tokio::sync::Notify::new());
     let output_handle = if !tty_mode {
         let socket_path = output_socket_path.clone();
         let vm_id_clone = vm_id.clone();
+        let reconnect = output_reconnect.clone();
         Some(tokio::spawn(async move {
-            match run_output_listener(
-                &socket_path,
-                &vm_id_clone,
-                None,
-                std::sync::Arc::new(tokio::sync::Notify::new()),
-            )
-            .await
-            {
+            match run_output_listener(&socket_path, &vm_id_clone, None, reconnect).await {
                 Ok(lines) => lines,
                 Err(e) => {
                     tracing::warn!("Output listener error: {}", e);
@@ -736,6 +736,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     vm_state.config.hugepages = args.hugepages.unwrap_or(snapshot_config.metadata.hugepages);
     // Restore username for rootless health checks (runuser -u <username>).
     vm_state.config.username = snapshot_config.metadata.username.clone();
+    vm_state.config.user = snapshot_config.metadata.user.clone();
 
     info!(
         tap = %network_config.tap_device,
@@ -777,16 +778,20 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             socket_path: uffd_socket_path.clone(),
         }
     } else {
-        // Use file-backed restore by default.
-        // Note: Firecracker v1.14.0 has a bug where file-backed restore of VMs >= 4GB
-        // causes a triple fault (guest page tables for memory above the MMIO gap at 3GB
-        // are invalid). Fixed in v1.15.0+. If /dev/userfaultfd is accessible (chmod 666),
-        // UFFD can be used as a workaround via FCVM_FORCE_UFFD=1.
-        if std::env::var("FCVM_FORCE_UFFD").is_ok() {
+        // Use file-backed restore by default, UFFD when required.
+        // Hugepages require UFFD (Firecracker rejects File backend for hugepage snapshots).
+        // FCVM_FORCE_UFFD=1 forces UFFD for debugging/testing.
+        if hugepages || std::env::var("FCVM_FORCE_UFFD").is_ok() {
             let implicit_socket_path = data_dir.join("uffd.sock");
+            let reason = if hugepages {
+                "hugepages require UFFD"
+            } else {
+                "FCVM_FORCE_UFFD"
+            };
             info!(
                 socket = %implicit_socket_path.display(),
-                "starting implicit UFFD server for snapshot restore (FCVM_FORCE_UFFD)"
+                reason = %reason,
+                "starting implicit UFFD server for snapshot restore"
             );
 
             let server = UffdServer::new_with_path(
@@ -890,6 +895,12 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     }
 
     let (mut vm_manager, mut holder_child) = setup_result.unwrap();
+
+    // Signal the output listener to drop its old (dead) vsock stream and re-accept.
+    // restore_from_snapshot() resumes the VM which resets all vsock connections.
+    // fc-agent will reconnect on the new vsock, but the host-side listener is stuck
+    // reading from the old dead stream unless we notify it to cycle back to accept().
+    output_reconnect.notify_one();
 
     let is_uffd = use_uffd || std::env::var("FCVM_FORCE_UFFD").is_ok() || hugepages;
     if is_uffd {
@@ -1061,21 +1072,33 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                         info!(snapshot_key = %startup_key, "Creating startup snapshot (VM healthy)");
 
                         let params = SnapshotCreationParams::from_metadata(&snapshot_config.metadata);
-                        match create_snapshot_interruptible(
-                            &vm_manager, &startup_key, &vm_id, &params, &disk_path,
-                            &network_config, &volume_configs,
-                            Some(base_key.as_str()), // Parent is pre-start snapshot
-                            &cancel,
-                        ).await {
-                            SnapshotOutcome::Interrupted => {
+                        // Use select! so SIGTERM can abort startup snapshot immediately.
+                        // Startup snapshots are optional (just caching), so if the VM is
+                        // paused mid-snapshot, cleanup will kill it via vm_manager.kill().
+                        tokio::select! {
+                            outcome = create_snapshot_interruptible(
+                                &vm_manager, &startup_key, &vm_id, &params, &disk_path,
+                                &network_config, &volume_configs,
+                                Some(base_key.as_str()), // Parent is pre-start snapshot
+                                &cancel,
+                            ) => {
+                                match outcome {
+                                    SnapshotOutcome::Interrupted => {
+                                        container_exit_code = None;
+                                        break;
+                                    }
+                                    SnapshotOutcome::Created => {
+                                        info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
+                                    }
+                                    SnapshotOutcome::Failed(e) => {
+                                        warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");
+                                    }
+                                }
+                            }
+                            _ = cancel.cancelled() => {
+                                info!(snapshot_key = %startup_key, "Startup snapshot aborted by shutdown signal");
                                 container_exit_code = None;
                                 break;
-                            }
-                            SnapshotOutcome::Created => {
-                                info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
-                            }
-                            SnapshotOutcome::Failed(e) => {
-                                warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");
                             }
                         }
                     }

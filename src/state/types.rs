@@ -130,7 +130,13 @@ pub struct VmConfig {
     #[serde(default)]
     pub portable_volumes: bool,
     /// Container user spec (e.g. "UID:GID"). When set, the container runs
-    /// as this user via rootless podman. Health checks must query via the user.
+    /// as this user via rootless podman. Health checks use this to set
+    /// XDG_RUNTIME_DIR=/run/user/<uid>.
+    ///
+    /// IMPORTANT: When adding fields here that affect snapshot restore behavior,
+    /// also add them to SnapshotMetadata (storage/snapshot.rs) and update
+    /// snapshot.rs to restore them from metadata. Otherwise warm starts will
+    /// have missing config.
     #[serde(default)]
     pub user: Option<String>,
     /// Username created in the VM for rootless podman.

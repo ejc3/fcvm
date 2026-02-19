@@ -1269,8 +1269,36 @@ fn compute_profile_firecracker_sha_with_commit(
     hasher.update(repo.as_bytes());
     hasher.update(branch.as_bytes());
     hasher.update(commit_hash.as_bytes());
+    // Include libc version so host and container don't share a dynamically-linked binary.
+    // Different glibc versions produce incompatible binaries.
+    hasher.update(libc_version_tag().as_bytes());
     let result = hasher.finalize();
     hex::encode(&result[..6]) // 12 hex chars
+}
+
+/// Return a string identifying the C library (e.g. "glibc-2.39" or "musl-1.2.4").
+/// Used to namespace the firecracker binary cache per build environment.
+fn libc_version_tag() -> String {
+    // Try GNU libc first (most common on host and Ubuntu containers)
+    if let Ok(output) = std::process::Command::new("ldd").arg("--version").output() {
+        // ldd --version prints to stdout on glibc, stderr on musl
+        let text = String::from_utf8_lossy(&output.stdout);
+        let text = if text.is_empty() {
+            String::from_utf8_lossy(&output.stderr).to_string()
+        } else {
+            text.to_string()
+        };
+        // Extract version like "2.39" from "ldd (Ubuntu GLIBC 2.39-0ubuntu8.4) 2.39"
+        for line in text.lines() {
+            if let Some(ver) = line.split_whitespace().last() {
+                if ver.contains('.') {
+                    return format!("libc-{}", ver);
+                }
+            }
+        }
+    }
+    // Fallback: unknown libc, binary won't be shared
+    "libc-unknown".to_string()
 }
 
 /// Get the content-addressed path for profile firecracker binary.
@@ -1344,7 +1372,7 @@ pub async fn ensure_profile_firecracker(
     let filename = format!("firecracker-{}-{}.bin", profile_name, sha);
     let bin_path = firecracker_dir.join(&filename);
 
-    // Already exists
+    // Already exists — use it (built statically with musl, portable across environments)
     if bin_path.exists() {
         info!(
             path = %bin_path.display(),
@@ -1375,7 +1403,7 @@ pub async fn ensure_profile_firecracker(
         .map_err(|(_, err)| err)
         .context("acquiring exclusive lock for firecracker build")?;
 
-    // Double-check after lock
+    // Double-check after lock (another process may have built it)
     if bin_path.exists() {
         debug!(path = %bin_path.display(), "firecracker exists (built by another process)");
         flock.unlock().map_err(|(_, err)| err)?;

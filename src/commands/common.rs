@@ -223,10 +223,32 @@ pub fn find_firecracker(config: &RuntimeConfig) -> Result<std::path::PathBuf> {
     let output = std::process::Command::new(&firecracker_bin)
         .arg("--version")
         .output()
-        .context("failed to run firecracker --version")?;
+        .with_context(|| {
+            format!(
+                "failed to run firecracker --version (binary: {})",
+                firecracker_bin.display()
+            )
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "firecracker --version failed (exit {}, binary: {}): {}",
+            output.status,
+            firecracker_bin.display(),
+            stderr.trim()
+        );
+    }
 
     let version_str = String::from_utf8_lossy(&output.stdout);
-    let version = parse_firecracker_version(&version_str)?;
+    let version = parse_firecracker_version(&version_str).with_context(|| {
+        format!(
+            "binary: {}, stdout: {:?}, stderr: {:?}",
+            firecracker_bin.display(),
+            version_str.trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    })?;
 
     if version < MIN_FIRECRACKER_VERSION {
         anyhow::bail!(

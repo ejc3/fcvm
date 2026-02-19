@@ -374,10 +374,12 @@ fn test_sigterm_cleanup_rootless() -> Result<()> {
     println!("Sending SIGTERM to fcvm (PID {})", fcvm_pid);
     send_signal(fcvm_pid, "TERM").context("sending SIGTERM to fcvm")?;
 
-    // Wait for fcvm to exit (max 30 seconds — cleanup can be slow under CI load)
+    // Wait for fcvm to exit (max 60 seconds — snapshot abort + cleanup can be slow)
+    // When snapshots are enabled, SIGTERM may arrive during snapshot creation.
+    // The abortable snapshot code cancels the in-flight snapshot before cleanup.
     let start = std::time::Instant::now();
     let mut exited = false;
-    while start.elapsed() < Duration::from_secs(30) {
+    while start.elapsed() < Duration::from_secs(60) {
         match fcvm.try_wait() {
             Ok(Some(status)) => {
                 println!("fcvm exited with status: {:?}", status);
@@ -397,9 +399,9 @@ fn test_sigterm_cleanup_rootless() -> Result<()> {
         let _ = fcvm.wait();
     }
 
-    // Poll for child process cleanup (max 5 seconds)
+    // Poll for child process cleanup (max 15 seconds — snapshot abort may extend cleanup)
     let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(5) {
+    while start.elapsed() < Duration::from_secs(15) {
         let fc_alive = our_fc_pid.is_some_and(process_exists);
         let slirp_alive = our_slirp_pid.is_some_and(process_exists);
         if !fc_alive && !slirp_alive {

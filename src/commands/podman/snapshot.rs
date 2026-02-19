@@ -123,6 +123,7 @@ pub async fn create_podman_snapshot(
             hugepages: params.hugepages,
             extra_disks: params.extra_disks.clone(),
             username: params.username.clone(),
+            user: params.user.clone(),
         },
     };
 
