@@ -16,10 +16,7 @@ use crate::vsock;
 /// becomes stale — accept() hangs forever because tokio never delivers readability
 /// events for incoming connections. Re-binding creates a fresh socket + epoll
 /// registration, restoring the exec server.
-pub async fn run_server(
-    ready_tx: tokio::sync::oneshot::Sender<()>,
-    rebind_signal: Arc<Notify>,
-) {
+pub async fn run_server(ready_tx: tokio::sync::oneshot::Sender<()>, rebind_signal: Arc<Notify>) {
     eprintln!(
         "[fc-agent] starting exec server on vsock port {}",
         vsock::EXEC_PORT

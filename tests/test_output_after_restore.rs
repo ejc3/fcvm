@@ -202,10 +202,9 @@ async fn test_heavy_output_after_snapshot_restore() -> Result<()> {
     // a different vsock connection that the guest establishes proactively.
     println!("\nPhase 2: Warm start from snapshot...");
     let warm_log_name = format!("{}-warm", vm_name);
-    let (mut child2, fcvm_pid2) =
-        common::spawn_fcvm_with_logs(&fcvm_args, &warm_log_name)
-            .await
-            .context("spawning warm start VM")?;
+    let (mut child2, fcvm_pid2) = common::spawn_fcvm_with_logs(&fcvm_args, &warm_log_name)
+        .await
+        .context("spawning warm start VM")?;
 
     println!("  fcvm PID: {}", fcvm_pid2);
 
