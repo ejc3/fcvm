@@ -725,20 +725,20 @@ pub async fn add_host_route_to_guest(
                             old_route = %existing_route.trim(),
                             "removing stale route to dead device"
                         );
-                        let _ = Command::new("ip")
-                            .args(["route", "del", &route])
-                            .output()
-                            .await;
                     } else {
-                        // Route exists and device is alive - another VM is using this guest IP
-                        // This shouldn't happen in normal operation but let's not break it
+                        // Route exists and device is alive - likely a snapshot clone
+                        // replacing a base VM or another clone with the same guest IP.
+                        // We must replace the route so the new clone is reachable.
                         warn!(
                             guest_ip = %guest_ip,
                             existing_route = %existing_route.trim(),
-                            "route already exists to live device, skipping"
+                            "replacing route to live device with new clone route"
                         );
-                        return Ok(());
                     }
+                    let _ = Command::new("ip")
+                        .args(["route", "del", &route])
+                        .output()
+                        .await;
                 }
             } else {
                 // Route already points to the correct gateway
