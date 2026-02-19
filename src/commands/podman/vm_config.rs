@@ -848,6 +848,7 @@ pub(super) async fn run_vm_setup(
                 args.forward_localhost.clone(),
                 image_mode,
                 rootfs_type,
+                args.non_blocking_output,
             )
         });
 

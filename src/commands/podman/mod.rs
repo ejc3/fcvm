@@ -745,8 +745,9 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         let vm_id_clone = vm_id.clone();
         let log_tx_clone = Some(log_tx.clone());
         let reconnect = output_reconnect.clone();
+        let non_blocking_output = args.non_blocking_output;
         Some(tokio::spawn(async move {
-            match run_output_listener(&socket_path, &vm_id_clone, log_tx_clone, reconnect).await {
+            match run_output_listener(&socket_path, &vm_id_clone, log_tx_clone, reconnect, non_blocking_output).await {
                 Ok(lines) => lines,
                 Err(e) => {
                     tracing::warn!("Output listener error: {}", e);
@@ -1084,6 +1085,7 @@ mod tests {
             portable_volumes: false,
             image_mode: None,
             rootfs_type: None,
+            non_blocking_output: false,
             label: vec![],
             image: "alpine:latest".to_string(),
             command_args: vec![],

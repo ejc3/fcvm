@@ -1134,7 +1134,7 @@ pub fn run_tty(podman_args: &[String], plan: &Plan, mounted_fuse_paths: &[String
 }
 
 /// Run container in non-TTY async mode. Returns exit code.
-pub async fn run_async(podman_args: &[String], output: &OutputHandle) -> Result<i32> {
+pub async fn run_async(podman_args: &[String], output: &OutputHandle, non_blocking_output: bool) -> Result<i32> {
     let mut cmd = Command::new(&podman_args[0]);
     cmd.args(&podman_args[1..]);
     cmd.stdout(Stdio::piped());
@@ -1144,25 +1144,38 @@ pub async fn run_async(podman_args: &[String], output: &OutputHandle) -> Result<
 
     vsock::notify_container_started();
 
-    // Stream stdout via OutputHandle
+    // Stream stdout via OutputHandle.
+    // In non-blocking mode, use try_send_line (drops on full) to prevent
+    // backpressure from cascading into the container and deadlocking
+    // FUSE-based services like configerator_fuse.
     let out = output.clone();
+    let nb = non_blocking_output;
     let stdout_task = child.stdout.take().map(|stdout| {
         tokio::spawn(async move {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                out.send_line("stdout", &line).await;
+                if nb {
+                    out.try_send_line("stdout", &line);
+                } else {
+                    out.send_line("stdout", &line).await;
+                }
             }
         })
     });
 
     let out = output.clone();
+    let nb = non_blocking_output;
     let stderr_task = child.stderr.take().map(|stderr| {
         tokio::spawn(async move {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                out.send_line("stderr", &line).await;
+                if nb {
+                    out.try_send_line("stderr", &line);
+                } else {
+                    out.send_line("stderr", &line).await;
+                }
             }
         })
     });
