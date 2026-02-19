@@ -84,6 +84,8 @@ async fn test_btrfs_rw_after_snapshot_restore() -> Result<()> {
     }
 
     // Verify btrfs storage driver and rw on cold boot
+    // Use --target flag so findmnt finds the mount containing the path,
+    // not just exact mount points. On native btrfs root, storage is under / (no separate mount).
     println!("  Checking btrfs mount (cold boot)...");
     let mount_info = common::exec_in_vm(
         fcvm_pid,
@@ -92,6 +94,7 @@ async fn test_btrfs_rw_after_snapshot_restore() -> Result<()> {
             "-n",
             "-o",
             "FSTYPE,OPTIONS",
+            "--target",
             "/var/lib/containers/storage",
         ],
     )
@@ -158,6 +161,8 @@ async fn test_btrfs_rw_after_snapshot_restore() -> Result<()> {
     }
 
     // Verify btrfs is rw after snapshot restore (no remount hack needed)
+    // Use --target flag so findmnt finds the mount containing the path,
+    // not just exact mount points. On native btrfs root, storage is under / (no separate mount).
     println!("  Checking btrfs mount (warm start)...");
     let mount_info2 = common::exec_in_vm(
         fcvm_pid2,
@@ -166,6 +171,7 @@ async fn test_btrfs_rw_after_snapshot_restore() -> Result<()> {
             "-n",
             "-o",
             "FSTYPE,OPTIONS",
+            "--target",
             "/var/lib/containers/storage",
         ],
     )
