@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{debug, info, warn};
@@ -307,7 +308,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     serve_state.config.process_type = Some(crate::state::ProcessType::Serve);
     serve_state.status = VmStatus::Running;
 
-    let state_manager = std::sync::Arc::new(StateManager::new(paths::state_dir()));
+    let state_manager = Arc::new(StateManager::new(paths::state_dir()));
     state_manager.init().await?;
     state_manager
         .save_state(&serve_state)
@@ -646,19 +647,17 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         None
     };
 
-    // For non-TTY mode, use async output listener
+    // For non-TTY mode, use async output listener.
+    // The reconnect_notify is fired after restore_from_snapshot() to signal the output
+    // listener to drop its dead vsock stream and re-accept. Without this, the listener
+    // stays stuck reading from the old (dead) connection after VM resume resets vsock.
+    let output_reconnect = Arc::new(tokio::sync::Notify::new());
     let output_handle = if !tty_mode {
         let socket_path = output_socket_path.clone();
         let vm_id_clone = vm_id.clone();
+        let reconnect = output_reconnect.clone();
         Some(tokio::spawn(async move {
-            match run_output_listener(
-                &socket_path,
-                &vm_id_clone,
-                None,
-                std::sync::Arc::new(tokio::sync::Notify::new()),
-            )
-            .await
-            {
+            match run_output_listener(&socket_path, &vm_id_clone, None, reconnect).await {
                 Ok(lines) => lines,
                 Err(e) => {
                     tracing::warn!("Output listener error: {}", e);
@@ -896,6 +895,12 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     }
 
     let (mut vm_manager, mut holder_child) = setup_result.unwrap();
+
+    // Signal the output listener to drop its old (dead) vsock stream and re-accept.
+    // restore_from_snapshot() resumes the VM which resets all vsock connections.
+    // fc-agent will reconnect on the new vsock, but the host-side listener is stuck
+    // reading from the old dead stream unless we notify it to cycle back to accept().
+    output_reconnect.notify_one();
 
     let is_uffd = use_uffd || std::env::var("FCVM_FORCE_UFFD").is_ok() || hugepages;
     if is_uffd {
