@@ -140,7 +140,9 @@ async fn test_graceful_shutdown() -> Result<()> {
 
     // Wait for process to exit on its own (NO kill!)
     let start = std::time::Instant::now();
-    let timeout = Duration::from_secs(60);
+    // With snapshots enabled, cache-ack wait adds ~30s to startup before
+    // the container even runs, plus image load and PSCI shutdown time.
+    let timeout = Duration::from_secs(120);
 
     loop {
         match child.try_wait()? {
