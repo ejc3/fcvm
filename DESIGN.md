@@ -381,12 +381,12 @@ Each VM has:
 3. Patch identity (MAC address, hostname, VM ID)
 4. Setup new networking (TAP device, ports)
 5. Resume VM
+6. Update MMDS with new config (must be after resume — guest-visible MMDS data isn't updated until VM is running)
 
 **Identity Patching**:
 - Generate new MAC address
 - Update hostname in guest
 - Regenerate machine IDs
-- Update MMDS with new config
 
 ---
 
