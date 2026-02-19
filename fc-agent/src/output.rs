@@ -77,7 +77,10 @@ async fn try_reconnect() -> Option<VsockStream> {
             }
             Err(e) => {
                 if attempt == 30 {
-                    eprintln!("[fc-agent] output vsock reconnect failed after 30 attempts: {}", e);
+                    eprintln!(
+                        "[fc-agent] output vsock reconnect failed after 30 attempts: {}",
+                        e
+                    );
                 } else {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
@@ -284,20 +287,20 @@ mod tests {
 
         // Notify should have exactly one stored permit (second notify_one is a no-op
         // when no waiter exists and permit already stored)
-        let notified = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            notify.notified(),
-        )
-        .await;
-        assert!(notified.is_ok(), "first notified() should return immediately");
+        let notified =
+            tokio::time::timeout(std::time::Duration::from_millis(50), notify.notified()).await;
+        assert!(
+            notified.is_ok(),
+            "first notified() should return immediately"
+        );
 
         // No second permit
-        let notified2 = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            notify.notified(),
-        )
-        .await;
-        assert!(notified2.is_err(), "second notified() should timeout (no stored permit)");
+        let notified2 =
+            tokio::time::timeout(std::time::Duration::from_millis(50), notify.notified()).await;
+        assert!(
+            notified2.is_err(),
+            "second notified() should timeout (no stored permit)"
+        );
     }
 
     /// Verify the Notify stored-permit cascade bug is fixed.
@@ -317,23 +320,20 @@ mod tests {
         notify.notify_one();
 
         // Simulate: writer's select! consumes the permit
-        let consumed = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            notify.notified(),
-        )
-        .await;
+        let consumed =
+            tokio::time::timeout(std::time::Duration::from_millis(50), notify.notified()).await;
         assert!(consumed.is_ok(), "should consume the stored permit");
 
         // OLD CODE would do: notify.notify_one() here (re-store)
         // NEW CODE does NOT re-store.
 
         // Verify: no ghost permit exists
-        let ghost = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            notify.notified(),
-        )
-        .await;
-        assert!(ghost.is_err(), "no ghost permit should exist after consuming");
+        let ghost =
+            tokio::time::timeout(std::time::Duration::from_millis(50), notify.notified()).await;
+        assert!(
+            ghost.is_err(),
+            "no ghost permit should exist after consuming"
+        );
     }
 
     /// Verify that messages queued during reconnection are not lost.

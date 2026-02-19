@@ -1,7 +1,7 @@
-//! Verifies zero message loss across snapshot restore with heavy output + FUSE.
+//! Verifies zero message loss across snapshot restore with FUSE mounts.
 //!
 //! Container writes a monotonic counter at max speed to both stdout and stderr
-//! while reading from 13 FUSE mounts. Test collects host-side output and verifies:
+//! while reading from FUSE mounts. Test collects host-side output and verifies:
 //! 1. Snapshot was created on cold boot
 //! 2. Warm start used the snapshot (not a fresh boot)
 //! 3. Container counter keeps incrementing after restore (no deadlock)
@@ -13,6 +13,8 @@ mod common;
 
 use anyhow::{Context, Result};
 use std::time::Duration;
+
+const NUM_FUSE_MOUNTS: usize = 13;
 
 /// Create N host directories with files, return (map_args, guest_paths, base_dir)
 fn setup_fuse_mounts(n: usize) -> (Vec<String>, Vec<String>, std::path::PathBuf) {
@@ -79,12 +81,14 @@ async fn test_heavy_output_after_snapshot_restore() -> Result<()> {
         return Ok(());
     }
 
-    println!("\nOutput integrity: 13 FUSE mounts + monotonic counter across snapshot");
+    println!(
+        "\nOutput integrity: {NUM_FUSE_MOUNTS} FUSE mounts + monotonic counter across snapshot"
+    );
     println!("=====================================================================");
 
     let (vm_name, _, _, _) = common::unique_names("output-restore");
 
-    let (map_args, guest_paths, base_dir) = setup_fuse_mounts(13);
+    let (map_args, guest_paths, base_dir) = setup_fuse_mounts(NUM_FUSE_MOUNTS);
 
     // Build command: bursty output like falcon_proxy (200+ lines instantly)
     // then continuous FUSE reads + output
@@ -105,7 +109,7 @@ async fn test_heavy_output_after_snapshot_restore() -> Result<()> {
     let fcvm_args = build_fcvm_args(&vm_name, &map_args, &cmd, &user_spec);
 
     // Phase 1: Cold boot
-    println!("Phase 1: Cold boot with 13 FUSE mounts...");
+    println!("Phase 1: Cold boot with {NUM_FUSE_MOUNTS} FUSE mounts...");
     let (mut child, fcvm_pid) = common::spawn_fcvm_with_logs(&fcvm_args, &vm_name)
         .await
         .context("spawning cold boot VM")?;
@@ -144,15 +148,28 @@ async fn test_heavy_output_after_snapshot_restore() -> Result<()> {
 
     println!("  fcvm PID: {}", fcvm_pid2);
 
+    let warm_start_timer = std::time::Instant::now();
     tokio::time::timeout(
-        Duration::from_secs(60),
-        common::poll_health_by_pid(fcvm_pid2, 60),
+        Duration::from_secs(120),
+        common::poll_health_by_pid(fcvm_pid2, 120),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("warm start timed out after 60s — output pipeline deadlock"))?
+    .map_err(|_| anyhow::anyhow!("warm start timed out after 120s — output pipeline deadlock"))?
     .context("warm start failed")?;
 
-    println!("  Warm start healthy");
+    let warm_start_secs = warm_start_timer.elapsed().as_secs();
+    println!("  Warm start healthy in {}s", warm_start_secs);
+
+    // The warm start should become healthy within 30s. If notify_cache_ready_and_wait()
+    // falls through to its 30s timeout (because the write probe isn't detecting the dead
+    // vsock connection), the container startup is delayed by 30s + ~15s setup = ~45s.
+    // With the write probe fix, the dead connection is detected in <1s.
+    assert!(
+        warm_start_secs < 30,
+        "warm start took {}s — notify_cache_ready_and_wait() likely timed out \
+         instead of detecting dead vsock connection via write probe",
+        warm_start_secs,
+    );
 
     // Let counter run 15s
     println!("  Letting counter run 15s under FUSE load...");
@@ -233,6 +250,6 @@ async fn test_heavy_output_after_snapshot_restore() -> Result<()> {
     let _ = child2.wait().await;
     let _ = std::fs::remove_dir_all(&base_dir);
 
-    println!("  PASSED: output flows with 13 FUSE mounts across snapshot restore");
+    println!("  PASSED: output flows with {NUM_FUSE_MOUNTS} FUSE mounts across snapshot restore");
     Ok(())
 }
