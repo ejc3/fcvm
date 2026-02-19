@@ -1372,7 +1372,7 @@ pub async fn ensure_profile_firecracker(
     let filename = format!("firecracker-{}-{}.bin", profile_name, sha);
     let bin_path = firecracker_dir.join(&filename);
 
-    // Already exists — use it (built statically with musl, portable across environments)
+    // Already exists — use it (SHA includes libc version, so each environment caches its own binary)
     if bin_path.exists() {
         info!(
             path = %bin_path.display(),
