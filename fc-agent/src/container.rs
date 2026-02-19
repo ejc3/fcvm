@@ -1123,45 +1123,10 @@ pub async fn run_async(podman_args: &[String], output: &OutputHandle) -> Result<
             status, exit_code
         );
 
-        // Capture podman logs on failure (use user prefix for rootless podman)
-        eprintln!("[fc-agent] capturing podman logs for failed container...");
-        let prefix = podman_cmd_prefix();
-        let logs_result = if prefix.is_empty() {
-            std::process::Command::new("podman")
-                .args(["logs", "fcvm-container"])
-                .output()
-        } else {
-            let mut c = std::process::Command::new(&prefix[0]);
-            c.args(&prefix[1..]);
-            c.args(["podman", "logs", "fcvm-container"]);
-            c.output()
-        };
-        match logs_result {
-            Ok(logs) => {
-                let stdout = String::from_utf8_lossy(&logs.stdout);
-                let stderr = String::from_utf8_lossy(&logs.stderr);
-                if !stdout.is_empty() {
-                    eprintln!("[fc-agent] === podman logs (stdout) ===");
-                    for line in stdout.lines() {
-                        eprintln!("[fc-agent] {}", line);
-                        output.try_send_line("stdout", line);
-                    }
-                }
-                if !stderr.is_empty() {
-                    eprintln!("[fc-agent] === podman logs (stderr) ===");
-                    for line in stderr.lines() {
-                        eprintln!("[fc-agent] {}", line);
-                        output.try_send_line("stderr", line);
-                    }
-                }
-                if stdout.is_empty() && stderr.is_empty() {
-                    eprintln!("[fc-agent] (no podman logs captured)");
-                }
-            }
-            Err(e) => {
-                eprintln!("[fc-agent] failed to get podman logs: {}", e);
-            }
-        }
+        // Note: podman logs are unavailable because we use --log-driver=none
+        // (required to prevent conmon deadlock under burst output).
+        // Container output was already captured through fc-agent's pipe-based
+        // output forwarding and sent to the host via vsock.
     }
 
     // Clean up the container (use user prefix for rootless podman)
