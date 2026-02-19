@@ -26,8 +26,18 @@ async fn test_btrfs_rw_after_snapshot_restore() -> Result<()> {
     println!("=======================================");
 
     let (vm_name, _, _, _) = common::unique_names("btrfs-rw");
-    let uid = nix::unistd::getuid().as_raw();
-    let gid = nix::unistd::getgid().as_raw();
+    // Use the real user UID (not root) to match rootless container mode.
+    // Under sudo, getuid() returns 0 but SUDO_UID has the real user.
+    // Using uid 0 with --privileged causes fc-agent to use --cap-add instead
+    // of --privileged (user namespace limitation), which can't mount sysfs.
+    let uid: u32 = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| nix::unistd::getuid().as_raw());
+    let gid: u32 = std::env::var("SUDO_GID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| nix::unistd::getgid().as_raw());
     let user_spec = format!("{}:{}", uid, gid);
     let username = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
         .ok()
