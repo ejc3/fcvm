@@ -211,6 +211,41 @@ impl VmManager {
             }
         }
 
+        // FCVM_STRACE_FC: wrap Firecracker with strace for debugging.
+        // Output goes to /tmp/fcvm-strace-fc-{vm_id}.log on the host.
+        // Traces ioctl, mmap, and signal syscalls by default.
+        // Set FCVM_STRACE_FC=all for full trace.
+        if let Ok(trace_filter) = std::env::var("FCVM_STRACE_FC") {
+            let strace_log = format!("/tmp/fcvm-strace-fc-{}.log", &self.vm_id);
+            let filter = if trace_filter == "all" {
+                String::new()
+            } else if trace_filter.contains('=') || trace_filter.contains(',') {
+                // Custom filter like "ioctl,mmap" or "trace=ioctl"
+                format!("-e {}", trace_filter)
+            } else {
+                "-e trace=ioctl,mmap,madvise,mprotect".to_string()
+            };
+            warn!(
+                strace_log = %strace_log,
+                filter = %filter,
+                "FCVM_STRACE_FC: wrapping Firecracker with strace"
+            );
+            // Prepend strace to the command
+            let program = cmd.as_std().get_program().to_owned();
+            let args: Vec<_> = cmd.as_std().get_args().map(|a| a.to_owned()).collect();
+            cmd = Command::new("strace");
+            cmd.arg("-f").arg("-tt").arg("-o").arg(&strace_log);
+            if !filter.is_empty() {
+                for part in filter.split_whitespace() {
+                    cmd.arg(part);
+                }
+            }
+            cmd.arg(program);
+            for arg in args {
+                cmd.arg(arg);
+            }
+        }
+
         // Setup namespace isolation if specified (network namespace and/or mount namespace)
         // We need to handle these in a single pre_exec because it can only be called once
         let ns_id_clone = self.namespace_id.clone();
