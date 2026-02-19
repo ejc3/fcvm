@@ -136,13 +136,14 @@ async fn test_graceful_shutdown() -> Result<()> {
     .context("spawning fcvm")?;
 
     println!("  fcvm PID: {}", fcvm_pid);
-    println!("  Waiting for VM to exit gracefully (max 60s)...");
-
     // Wait for process to exit on its own (NO kill!)
     let start = std::time::Instant::now();
-    // With snapshots enabled, cache-ack wait adds ~30s to startup before
-    // the container even runs, plus image load and PSCI shutdown time.
-    let timeout = Duration::from_secs(120);
+    // With snapshots enabled, the full lifecycle is:
+    //   boot + image pull (~20s) + snapshot pause (~45s) + cache-ack wait (~30s)
+    //   + container run (instant) + PSCI shutdown (~5s) = ~100s minimum.
+    // Use 180s to allow headroom under CI load.
+    let timeout = Duration::from_secs(180);
+    println!("  Waiting for VM to exit gracefully (max {}s)...", timeout.as_secs());
 
     loop {
         match child.try_wait()? {
