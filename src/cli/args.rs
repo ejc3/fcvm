@@ -257,6 +257,14 @@ pub struct RunArgs {
     #[arg(long)]
     pub no_snapshot: bool,
 
+    /// Drop container output when the host stdout/stderr pipe is full instead of blocking.
+    /// Without this flag, a slow or broken pipe reader (e.g., `fcvm ... | slow-consumer`)
+    /// backpressures the entire output pipeline into the container, potentially deadlocking
+    /// FUSE-based services like configerator_fuse. With this flag, output that can't be
+    /// written immediately is dropped, keeping the container healthy at the cost of lost logs.
+    #[arg(long)]
+    pub lossy_output: bool,
+
     /// Override rootfs filesystem type from kernel profile config (for testing).
     /// Normally driven by rootfs_type in kernel profile config.
     #[arg(long, value_enum, hide = true)]
