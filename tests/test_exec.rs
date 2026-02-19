@@ -1751,9 +1751,11 @@ async fn test_podman_run_no_tty() -> Result<()> {
     let fcvm_path = common::find_fcvm_binary()?;
     let (vm_name, _, _, _) = common::unique_names("run-no-tty");
 
-    // Run without -t, check tty command output
+    // Run without -t, check tty command output.
+    // 240s timeout: in SnapshotEnabled mode, first run creates a snapshot (20-30s extra)
+    // and CI parallel load can add further delays.
     let output = tokio::time::timeout(
-        Duration::from_secs(120),
+        Duration::from_secs(240),
         tokio::process::Command::new(&fcvm_path)
             .args([
                 "podman",
