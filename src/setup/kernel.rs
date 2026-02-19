@@ -1344,41 +1344,15 @@ pub async fn ensure_profile_firecracker(
     let filename = format!("firecracker-{}-{}.bin", profile_name, sha);
     let bin_path = firecracker_dir.join(&filename);
 
-    // Already exists — verify it actually runs in this environment
-    // (a dynamically linked binary built on a different OS may fail with glibc mismatch)
+    // Already exists — use it (built statically with musl, portable across environments)
     if bin_path.exists() {
-        let check = std::process::Command::new(&bin_path)
-            .arg("--version")
-            .output();
-        match check {
-            Ok(output) if output.status.success() => {
-                info!(
-                    path = %bin_path.display(),
-                    profile = %profile_name,
-                    sha = %sha,
-                    "firecracker binary exists"
-                );
-                return Ok(Some(bin_path));
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                warn!(
-                    path = %bin_path.display(),
-                    exit = %output.status,
-                    stderr = %stderr.trim(),
-                    "cached firecracker binary failed to execute, rebuilding"
-                );
-                let _ = std::fs::remove_file(&bin_path);
-            }
-            Err(e) => {
-                warn!(
-                    path = %bin_path.display(),
-                    error = %e,
-                    "cached firecracker binary not executable, rebuilding"
-                );
-                let _ = std::fs::remove_file(&bin_path);
-            }
-        }
+        info!(
+            path = %bin_path.display(),
+            profile = %profile_name,
+            sha = %sha,
+            "firecracker binary exists"
+        );
+        return Ok(Some(bin_path));
     }
 
     // Create directory
@@ -1401,18 +1375,11 @@ pub async fn ensure_profile_firecracker(
         .map_err(|(_, err)| err)
         .context("acquiring exclusive lock for firecracker build")?;
 
-    // Double-check after lock — also verify it runs (same glibc check as above)
+    // Double-check after lock (another process may have built it)
     if bin_path.exists() {
-        let check = std::process::Command::new(&bin_path)
-            .arg("--version")
-            .output();
-        if matches!(check, Ok(ref o) if o.status.success()) {
-            debug!(path = %bin_path.display(), "firecracker exists (built by another process)");
-            flock.unlock().map_err(|(_, err)| err)?;
-            return Ok(Some(bin_path));
-        }
-        // Binary exists but doesn't run — delete and rebuild
-        let _ = std::fs::remove_file(&bin_path);
+        debug!(path = %bin_path.display(), "firecracker exists (built by another process)");
+        flock.unlock().map_err(|(_, err)| err)?;
+        return Ok(Some(bin_path));
     }
 
     println!(
@@ -1451,9 +1418,23 @@ pub async fn ensure_profile_firecracker(
         bail!("Failed to clone firecracker repo from {}", clone_url);
     }
 
-    // Build firecracker
+    // Build firecracker with musl target for a fully static binary.
+    // This ensures the binary is portable across glibc versions (host vs container).
+    let musl_target = if cfg!(target_arch = "aarch64") {
+        "aarch64-unknown-linux-musl"
+    } else {
+        "x86_64-unknown-linux-musl"
+    };
+
     let status = Command::new("cargo")
-        .args(["build", "--release", "-p", "firecracker"])
+        .args([
+            "build",
+            "--release",
+            "-p",
+            "firecracker",
+            "--target",
+            musl_target,
+        ])
         .current_dir(&build_dir)
         .status()
         .await
@@ -1464,11 +1445,12 @@ pub async fn ensure_profile_firecracker(
         bail!("Firecracker build failed");
     }
 
-    // Find the built binary
-    let mut binary = build_dir.join("target/release/firecracker");
+    // Find the built binary (musl target puts it under target/{target}/release/)
+    let mut binary = build_dir.join(format!("target/{}/release/firecracker", musl_target));
     if !binary.exists() {
         // Try alternative path (Firecracker's custom build system)
-        let alt_binary = build_dir.join("build/cargo_target/release/firecracker");
+        let alt_binary =
+            build_dir.join(format!("build/cargo_target/{}/release/firecracker", musl_target));
         if alt_binary.exists() {
             binary = alt_binary;
         } else {
