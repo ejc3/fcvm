@@ -92,6 +92,7 @@ async fn test_btrfs_rw_after_snapshot_restore() -> Result<()> {
             "-n",
             "-o",
             "FSTYPE,OPTIONS",
+            "-T",
             "/var/lib/containers/storage",
         ],
     )
@@ -166,6 +167,7 @@ async fn test_btrfs_rw_after_snapshot_restore() -> Result<()> {
             "-n",
             "-o",
             "FSTYPE,OPTIONS",
+            "-T",
             "/var/lib/containers/storage",
         ],
     )
