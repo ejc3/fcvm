@@ -252,7 +252,10 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
 
     // Check for snapshot cache (unless --no-snapshot is set or FCVM_NO_SNAPSHOT env var)
     // Keep fc_config and snapshot_key available for later snapshot creation on miss
-    let no_snapshot = args.no_snapshot || std::env::var("FCVM_NO_SNAPSHOT").is_ok();
+    let no_snapshot = args.no_snapshot
+        || std::env::var("FCVM_NO_SNAPSHOT")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
     let (fc_config, snapshot_key): (
         Option<crate::firecracker::FirecrackerConfig>,
         Option<String>,
@@ -344,7 +347,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         );
         (Some(config), Some(key))
     } else {
-        if std::env::var("FCVM_NO_SNAPSHOT").is_ok() {
+        if std::env::var("FCVM_NO_SNAPSHOT").map(|v| !v.is_empty()).unwrap_or(false) {
             info!("Snapshot disabled via FCVM_NO_SNAPSHOT environment variable");
         } else {
             info!("Snapshot disabled via --no-snapshot flag");

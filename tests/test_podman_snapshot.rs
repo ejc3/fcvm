@@ -37,7 +37,9 @@ use std::time::{Duration, Instant};
 
 /// Check if snapshot is disabled via FCVM_NO_SNAPSHOT environment variable
 fn snapshot_disabled_by_env() -> bool {
-    std::env::var("FCVM_NO_SNAPSHOT").is_ok()
+    std::env::var("FCVM_NO_SNAPSHOT")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
 }
 
 /// Get the snapshot directory path

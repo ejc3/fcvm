@@ -48,7 +48,7 @@ async fn test_health_monitor_behaviors() {
         status: VmStatus::Running,
         health_status: HealthStatus::Unknown,
         exit_code: None,
-        pid: Some(99999), // Non-existent PID
+        pid: Some(4_000_000), // Non-existent PID (well above typical pid_max)
         holder_pid: None,
         created_at: now,
         last_updated: now,
@@ -91,7 +91,7 @@ async fn test_health_monitor_behaviors() {
 
     // Run a single health check iteration
     let status =
-        fcvm::health::run_health_check_once("health-test-vm", Some(99999), base_dir.join("state"))
+        fcvm::health::run_health_check_once("health-test-vm", Some(4_000_000), base_dir.join("state"))
             .await
             .expect("health check should complete");
 
