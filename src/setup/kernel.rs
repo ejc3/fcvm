@@ -1344,15 +1344,41 @@ pub async fn ensure_profile_firecracker(
     let filename = format!("firecracker-{}-{}.bin", profile_name, sha);
     let bin_path = firecracker_dir.join(&filename);
 
-    // Already exists
+    // Already exists — verify it actually runs in this environment
+    // (a dynamically linked binary built on a different OS may fail with glibc mismatch)
     if bin_path.exists() {
-        info!(
-            path = %bin_path.display(),
-            profile = %profile_name,
-            sha = %sha,
-            "firecracker binary exists"
-        );
-        return Ok(Some(bin_path));
+        let check = std::process::Command::new(&bin_path)
+            .arg("--version")
+            .output();
+        match check {
+            Ok(output) if output.status.success() => {
+                info!(
+                    path = %bin_path.display(),
+                    profile = %profile_name,
+                    sha = %sha,
+                    "firecracker binary exists"
+                );
+                return Ok(Some(bin_path));
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!(
+                    path = %bin_path.display(),
+                    exit = %output.status,
+                    stderr = %stderr.trim(),
+                    "cached firecracker binary failed to execute, rebuilding"
+                );
+                let _ = std::fs::remove_file(&bin_path);
+            }
+            Err(e) => {
+                warn!(
+                    path = %bin_path.display(),
+                    error = %e,
+                    "cached firecracker binary not executable, rebuilding"
+                );
+                let _ = std::fs::remove_file(&bin_path);
+            }
+        }
     }
 
     // Create directory
@@ -1375,11 +1401,18 @@ pub async fn ensure_profile_firecracker(
         .map_err(|(_, err)| err)
         .context("acquiring exclusive lock for firecracker build")?;
 
-    // Double-check after lock
+    // Double-check after lock — also verify it runs (same glibc check as above)
     if bin_path.exists() {
-        debug!(path = %bin_path.display(), "firecracker exists (built by another process)");
-        flock.unlock().map_err(|(_, err)| err)?;
-        return Ok(Some(bin_path));
+        let check = std::process::Command::new(&bin_path)
+            .arg("--version")
+            .output();
+        if matches!(check, Ok(ref o) if o.status.success()) {
+            debug!(path = %bin_path.display(), "firecracker exists (built by another process)");
+            flock.unlock().map_err(|(_, err)| err)?;
+            return Ok(Some(bin_path));
+        }
+        // Binary exists but doesn't run — delete and rebuild
+        let _ = std::fs::remove_file(&bin_path);
     }
 
     println!(
