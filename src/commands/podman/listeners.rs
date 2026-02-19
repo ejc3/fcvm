@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -173,6 +174,7 @@ pub(crate) async fn run_output_listener(
     vm_id: &str,
     log_tx: Option<tokio::sync::broadcast::Sender<LogLine>>,
     reconnect_notify: Arc<tokio::sync::Notify>,
+    non_blocking_output: bool,
 ) -> Result<Vec<(String, String)>> {
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::UnixListener;
@@ -182,6 +184,29 @@ pub(crate) async fn run_output_listener(
 
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("binding output listener to {}", socket_path))?;
+
+    // In non-blocking mode, use a bounded channel + writer thread so the
+    // listener never blocks on stdout/stderr. Messages are dropped when the
+    // channel is full, preventing backpressure from cascading into the container.
+    let nb_tx = if non_blocking_output {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(bool, String)>(1024);
+        std::thread::Builder::new()
+            .name("output-writer".into())
+            .spawn(move || {
+                for (is_stdout, content) in rx {
+                    if is_stdout {
+                        let _ = writeln!(std::io::stdout(), "{}", content);
+                    } else {
+                        let _ = writeln!(std::io::stderr(), "{}", content);
+                    }
+                }
+            })
+            .expect("spawn output writer thread");
+        info!(vm_id = %vm_id, "Non-blocking output mode: dropping messages when pipe is full");
+        Some(tx)
+    } else {
+        None
+    };
 
     info!(socket = %socket_path, "Output listener started");
 
@@ -232,12 +257,19 @@ pub(crate) async fn run_output_listener(
                             // Heartbeat from fc-agent during long operations (image import/pull)
                             info!(vm_id = %vm_id, phase = %content, "VM heartbeat");
                         } else {
-                            // Print container output directly (stdout to stdout, stderr to stderr)
-                            // No prefix - clean output for scripting
-                            if stream == "stdout" {
-                                println!("{}", content);
+                            // Use writeln! instead of println!/eprintln! to avoid
+                            // panicking on broken pipe. println! panics on write
+                            // error, which kills the listener task and stops
+                            // draining the vsock — deadlocking the container.
+                            let is_stdout = stream == "stdout";
+                            if let Some(ref tx) = nb_tx {
+                                // Non-blocking mode: try_send drops if channel full.
+                                // Writer thread handles the blocking stdout write.
+                                let _ = tx.try_send((is_stdout, content.to_string()));
+                            } else if is_stdout {
+                                let _ = writeln!(std::io::stdout(), "{}", content);
                             } else {
-                                eprintln!("{}", content);
+                                let _ = writeln!(std::io::stderr(), "{}", content);
                             }
                             output_lines.push((stream.to_string(), content.to_string()));
                         }
@@ -270,6 +302,110 @@ pub(crate) async fn run_output_listener(
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    /// Verify that writeln! to a broken pipe doesn't panic (returns Err),
+    /// while println! would panic with "failed printing to stdout".
+    #[test]
+    fn test_writeln_survives_broken_pipe() {
+        use std::io::Write;
+        use std::os::unix::io::FromRawFd;
+
+        let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
+        drop(read_fd);
+
+        let mut writer = unsafe { std::fs::File::from_raw_fd(std::os::unix::io::IntoRawFd::into_raw_fd(write_fd)) };
+        let result = writeln!(writer, "test output");
+
+        assert!(result.is_err(), "writeln! should return Err on broken pipe");
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    /// Without --non-blocking-output: blocking send blocks on a full channel.
+    /// This is what causes the backpressure deadlock in default mode.
+    #[test]
+    fn test_sync_channel_send_blocks_when_full() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<String>(1);
+        tx.send("msg1".to_string()).unwrap();
+
+        let result = tx.try_send("msg2".to_string());
+        assert!(result.is_err(), "channel should be full");
+        assert!(matches!(result.unwrap_err(), std::sync::mpsc::TrySendError::Full(_)));
+    }
+
+    /// With --non-blocking-output: try_send drops messages when channel is full.
+    /// This prevents backpressure from cascading into the container.
+    #[test]
+    fn test_lossy_try_send_drops_on_full_channel() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(bool, String)>(2);
+
+        tx.try_send((true, "line1".to_string())).unwrap();
+        tx.try_send((true, "line2".to_string())).unwrap();
+
+        let result = tx.try_send((true, "line3-dropped".to_string()));
+        assert!(result.is_err(), "try_send should fail on full channel");
+
+        assert_eq!(rx.recv().unwrap().1, "line1");
+        assert_eq!(rx.recv().unwrap().1, "line2");
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Helper: spawn the output listener, wait for socket, return JoinHandle.
+    async fn spawn_listener(
+        socket_path: &std::path::Path,
+        lossy: bool,
+    ) -> tokio::task::JoinHandle<Result<Vec<(String, String)>>> {
+        let socket_str = socket_path.to_string_lossy().to_string();
+        let reconnect = std::sync::Arc::new(tokio::sync::Notify::new());
+        let handle = tokio::spawn(async move {
+            run_output_listener(&socket_str, "test-vm", None, reconnect, lossy).await
+        });
+        for _ in 0..50 {
+            if socket_path.exists() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(socket_path.exists(), "output socket not created");
+        handle
+    }
+
+    /// With --non-blocking-output, the listener processes all input without blocking.
+    #[tokio::test]
+    async fn test_output_listener_lossy_mode_processes_all_input() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("output-lossy.sock");
+
+        let listener = spawn_listener(&socket_path, true).await;
+
+        let mut stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        for i in 0..100 {
+            stream.write_all(format!("stdout:lossy-line-{}\n", i).as_bytes()).await.unwrap();
+        }
+        drop(stream);
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        listener.abort();
+        let err = listener.await.unwrap_err();
+        assert!(err.is_cancelled(), "lossy listener should be cancelled, not panicked: {:?}", err);
+    }
+
+    /// Default mode processes lines normally when stdout is healthy.
+    #[tokio::test]
+    async fn test_output_listener_default_mode_processes_lines() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("output-default.sock");
+
+        let listener = spawn_listener(&socket_path, false).await;
+
+        let mut stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        stream.write_all(b"stdout:hello\nstderr:world\n").await.unwrap();
+        drop(stream);
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        listener.abort();
+        let err = listener.await.unwrap_err();
+        assert!(err.is_cancelled(), "default listener should be cancelled, not panicked: {:?}", err);
+    }
 
     #[tokio::test]
     async fn test_status_listener_handles_multiple_messages_on_single_connection() {

@@ -63,6 +63,11 @@ pub struct FirecrackerConfig {
     /// Affects MMDS plan and container stdin handling.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub interactive: bool,
+    /// Non-blocking output: fc-agent drops container output when channel is full.
+    /// Part of cache key because fc-agent reads this from the Plan at boot,
+    /// and that value is baked into the snapshot memory.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub non_blocking_output: bool,
     /// Minimum free space on root filesystem (e.g., "10G").
     /// Affects disk size after CoW copy, so must be in cache key.
     #[serde(default = "default_rootfs_size")]
@@ -196,6 +201,7 @@ impl FirecrackerConfig {
         forward_localhost: Vec<u16>,
         image_mode: ImageMode,
         rootfs_type: Option<String>,
+        non_blocking_output: bool,
     ) -> Self {
         Self {
             boot_source: BootSource {
@@ -233,6 +239,7 @@ impl FirecrackerConfig {
             health_check_url,
             user,
             forward_localhost,
+            non_blocking_output,
             image_mode,
             rootfs_type,
         }
@@ -362,6 +369,7 @@ impl FirecrackerConfig {
                     "user": self.user.as_deref(),
                     "subuid_start": runtime.subuid_start,
                     "subuid_count": runtime.subuid_count,
+                    "non_blocking_output": self.non_blocking_output,
                     "forward_localhost": self.forward_localhost.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
                     "interactive": self.interactive,
                     "tty": self.tty,
@@ -429,6 +437,7 @@ mod tests {
             vec![],
             ImageMode::Overlay,
             None,
+            false,
         )
     }
 
