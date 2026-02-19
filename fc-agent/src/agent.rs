@@ -60,11 +60,16 @@ pub async fn run() -> Result<()> {
     let (output, output_writer) = output::create();
     tokio::spawn(output_writer);
 
+    // Shared flag: set by restore-epoch watcher, checked by notify_cache_ready_and_wait.
+    // Breaks the 30s poll loop when POLLHUP is not delivered after snapshot restore.
+    let restore_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Start restore-epoch watcher
     let watcher_output = output.clone();
+    let watcher_restore_flag = restore_flag.clone();
     tokio::spawn(async move {
         eprintln!("[fc-agent] starting restore-epoch watcher");
-        mmds::watch_restore_epoch(watcher_output).await;
+        mmds::watch_restore_epoch(watcher_output, watcher_restore_flag).await;
     });
 
     // Start exec server
@@ -207,7 +212,7 @@ pub async fn run() -> Result<()> {
     match container::get_image_digest(&image_ref, &cmd_prefix).await {
         Ok(digest) => {
             eprintln!("[fc-agent] image digest: {}", digest);
-            if container::notify_cache_ready_and_wait(&digest) {
+            if container::notify_cache_ready_and_wait(&digest, &restore_flag) {
                 eprintln!("[fc-agent] cache ready notification acknowledged");
             } else {
                 eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing");

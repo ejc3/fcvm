@@ -638,7 +638,14 @@ pub async fn get_image_digest(image: &str, cmd_prefix: &[String]) -> Result<Stri
 }
 
 /// Notify host that image is cached, wait for snapshot ack.
-pub fn notify_cache_ready_and_wait(digest: &str) -> bool {
+///
+/// The `restore_flag` is set by the restore-epoch watcher when it detects
+/// a snapshot restore. This breaks the poll loop early when POLLHUP is not
+/// detected (e.g., after pre-start snapshot restore in rootless mode).
+pub fn notify_cache_ready_and_wait(
+    digest: &str,
+    restore_flag: &std::sync::atomic::AtomicBool,
+) -> bool {
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
     use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
     use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, VsockAddr};
@@ -711,6 +718,14 @@ pub fn notify_cache_ready_and_wait(digest: &str) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 
     loop {
+        // Check if the restore-epoch watcher detected a snapshot restore.
+        // This breaks the loop when POLLHUP is not delivered (observed in
+        // rootless mode after pre-start snapshot restore).
+        if restore_flag.load(std::sync::atomic::Ordering::Acquire) {
+            eprintln!("[fc-agent] cache-ack: restore detected via epoch watcher, skipping wait");
+            return true;
+        }
+
         let remaining_ms = deadline
             .saturating_duration_since(std::time::Instant::now())
             .as_millis();
