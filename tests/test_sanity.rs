@@ -215,8 +215,8 @@ async fn test_ftrace_sanity() -> Result<()> {
     ])
     .await?;
 
-    // Wait for exit
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await??;
+    // Wait for exit — snapshot creation adds ~10-15s overhead (image pull + pause/resume)
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(120), child.wait()).await??;
 
     // Stop and read
     tracer.stop()?;
@@ -260,8 +260,8 @@ async fn test_trailing_args_command() -> Result<()> {
 
     println!("  fcvm PID: {}", fcvm_pid);
 
-    // Wait for exit
-    let status = tokio::time::timeout(Duration::from_secs(60), child.wait())
+    // Wait for exit — snapshot creation adds ~10-15s overhead (image pull + pause/resume)
+    let status = tokio::time::timeout(Duration::from_secs(120), child.wait())
         .await
         .context("timeout waiting for VM")?
         .context("waiting for child")?;
