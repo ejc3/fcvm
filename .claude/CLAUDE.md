@@ -1158,7 +1158,7 @@ fuse-pipe/benches/
    - Guest agent (fc-agent) with MMDS integration
 
 2. **Snapshot/Clone Workflow** (2025-11-11, verified 2025-11-12)
-   - Pause VM → Create Firecracker snapshot → Resume VM
+   - Pause VM → Create Firecracker snapshot → Copy disk via reflink (while paused) → Resume VM
    - UFFD memory server serves pages on-demand via Unix socket
    - Clone disk uses btrfs reflink (~3ms instant CoW copy)
    - Clone memory load time: ~2.3ms
