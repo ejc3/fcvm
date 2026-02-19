@@ -134,7 +134,10 @@ async fn fetch_latest_metadata(client: &reqwest::Client) -> Result<LatestMetadat
 }
 
 /// Watch for restore-epoch changes in MMDS and handle clone restore.
-pub async fn watch_restore_epoch(output: OutputHandle) {
+pub async fn watch_restore_epoch(
+    output: OutputHandle,
+    restore_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     let mut last_epoch: Option<String> = None;
 
     loop {
@@ -158,11 +161,16 @@ pub async fn watch_restore_epoch(output: OutputHandle) {
                         "[fc-agent] detected restore-epoch: {} (clone restore detected)",
                         current,
                     );
+                    // Signal notify_cache_ready_and_wait to stop waiting.
+                    // Must be set BEFORE handle_clone_restore so the poll loop
+                    // exits before output reconnect changes vsock state.
+                    restore_flag.store(true, std::sync::atomic::Ordering::Release);
                     crate::restore::handle_clone_restore(&output).await;
                     last_epoch = metadata.restore_epoch;
                 }
                 Some(prev) if prev != current => {
                     eprintln!("[fc-agent] restore-epoch changed: {} -> {}", prev, current,);
+                    restore_flag.store(true, std::sync::atomic::Ordering::Release);
                     crate::restore::handle_clone_restore(&output).await;
                     last_epoch = metadata.restore_epoch;
                 }
