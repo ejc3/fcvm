@@ -1,11 +1,11 @@
 use std::future::Future;
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Notify};
 
 use crate::vsock::{self, VsockStream};
 
 pub enum OutputMessage {
     Line { stream: String, content: String },
-    Reconnect,
     Shutdown,
 }
 
@@ -13,10 +13,12 @@ pub enum OutputMessage {
 #[derive(Clone)]
 pub struct OutputHandle {
     tx: mpsc::Sender<OutputMessage>,
+    reconnect: Arc<Notify>,
+    reconnect_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl OutputHandle {
-    /// Send a line of output. Awaits if channel is full.
+    /// Send a line of output. Awaits if channel is full (backpressure).
     pub async fn send_line(&self, stream: &str, line: &str) {
         let _ = self
             .tx
@@ -28,7 +30,6 @@ impl OutputHandle {
     }
 
     /// Send a line synchronously — drops if channel is full.
-    /// Used from non-async contexts (heartbeats, error log capture).
     pub fn try_send_line(&self, stream: &str, line: &str) {
         let _ = self.tx.try_send(OutputMessage::Line {
             stream: stream.into(),
@@ -38,10 +39,12 @@ impl OutputHandle {
 
     /// Signal the writer to reconnect vsock (after snapshot restore).
     pub fn reconnect(&self) {
-        let _ = self.tx.try_send(OutputMessage::Reconnect);
+        self.reconnect_flag
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.reconnect.notify_one();
     }
 
-    /// Signal shutdown — the writer task will exit after draining.
+    /// Signal shutdown.
     pub async fn shutdown(self) {
         let _ = self.tx.send(OutputMessage::Shutdown).await;
     }
@@ -50,53 +53,144 @@ impl OutputHandle {
 /// Create an (OutputHandle, writer future) pair. Spawn the future as a tokio task.
 pub fn create() -> (OutputHandle, impl Future<Output = ()>) {
     let (tx, rx) = mpsc::channel(4096);
-    let handle = OutputHandle { tx };
-    let writer = output_writer(rx);
+    let reconnect = Arc::new(Notify::new());
+    let reconnect_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = OutputHandle {
+        tx,
+        reconnect: reconnect.clone(),
+        reconnect_flag: reconnect_flag.clone(),
+    };
+    let writer = output_writer(rx, reconnect, reconnect_flag);
     (handle, writer)
 }
 
-/// The writer task — receives messages, writes to vsock, handles reconnect.
-async fn output_writer(mut rx: mpsc::Receiver<OutputMessage>) {
-    let mut stream = match VsockStream::connect(vsock::HOST_CID, vsock::OUTPUT_PORT) {
-        Ok(s) => {
-            eprintln!(
-                "[fc-agent] output vsock connected (port {})",
-                vsock::OUTPUT_PORT
-            );
-            Some(s)
+/// Try to write, racing against the reconnect signal.
+/// Returns true if written. Returns false if reconnect fired (write cancelled,
+/// no bytes sent — safe because dead vsock hangs in writable() before writing).
+async fn write_or_reconnect(stream: &VsockStream, data: &[u8], reconnect: &Arc<Notify>) -> bool {
+    tokio::select! {
+        result = stream.write_all(data) => result.is_ok(),
+        _ = reconnect.notified() => {
+            reconnect.notify_one(); // re-store for disconnected mode
+            false
         }
-        Err(e) => {
-            eprintln!("[fc-agent] output vsock connect failed: {}", e);
-            None
-        }
-    };
+    }
+}
 
-    while let Some(msg) = rx.recv().await {
-        match msg {
-            OutputMessage::Line { stream: s, content } => {
-                if let Some(ref conn) = stream {
-                    let data = format!("{}:{}\n", s, content);
-                    if let Err(e) = conn.write_all(data.as_bytes()).await {
-                        eprintln!("[fc-agent] output write failed: {}", e);
-                        stream = None; // Dead — wait for Reconnect
-                    }
-                }
-                // If no connection, line is dropped (transient during snapshot)
+/// The writer task.
+///
+/// Connected: read one message, write to vsock. Each write races against
+/// the reconnect signal so hung writes on dead vsock are interrupted.
+/// Cancellation is safe: dead vsock hangs in writable() (zero bytes sent).
+///
+/// Disconnected: stop reading channel (backpressure). Wait for reconnect.
+/// Zero messages lost — the in-flight message stays in `pending`.
+async fn output_writer(
+    mut rx: mpsc::Receiver<OutputMessage>,
+    reconnect_signal: Arc<Notify>,
+    reconnect_flag: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut stream: Option<VsockStream> =
+        match VsockStream::connect(vsock::HOST_CID, vsock::OUTPUT_PORT) {
+            Ok(s) => {
+                eprintln!(
+                    "[fc-agent] output vsock connected (port {})",
+                    vsock::OUTPUT_PORT
+                );
+                Some(s)
             }
-            OutputMessage::Reconnect => {
-                // Drop old connection (OwnedFd closes automatically), create new
-                stream = match VsockStream::connect(vsock::HOST_CID, vsock::OUTPUT_PORT) {
+            Err(e) => {
+                eprintln!("[fc-agent] output vsock connect failed: {}", e);
+                None
+            }
+        };
+
+    // Message that was popped from channel but couldn't be written.
+    // Retried first thing after reconnect. Zero message loss.
+    let mut pending: Option<String> = None;
+
+    loop {
+        // Check reconnect flag — catches signals lost by Notify drop in select!
+        if reconnect_flag.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            eprintln!("[fc-agent] output vsock reconnect (flag)");
+            stream = None;
+            // Reconnect immediately — don't wait for Notify
+            for attempt in 1..=30 {
+                match VsockStream::connect(vsock::HOST_CID, vsock::OUTPUT_PORT) {
                     Ok(s) => {
                         eprintln!("[fc-agent] output vsock reconnected");
-                        Some(s)
+                        stream = Some(s);
+                        break;
                     }
                     Err(e) => {
-                        eprintln!("[fc-agent] output vsock reconnect failed: {}", e);
-                        None
+                        if attempt == 30 {
+                            eprintln!("[fc-agent] output vsock reconnect failed: {}", e);
+                        } else {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
                     }
-                };
+                }
             }
-            OutputMessage::Shutdown => break,
+            continue;
+        }
+
+        if let Some(ref s) = stream {
+            // Retry pending message from previous failed write.
+            if let Some(ref data) = pending {
+                if write_or_reconnect(s, data.as_bytes(), &reconnect_signal).await {
+                    pending = None;
+                } else {
+                    // Reconnect signal fired — drop connection, keep pending.
+                    stream = None;
+                    continue;
+                }
+            }
+
+            // Wait for next message (or reconnect signal).
+            let msg = tokio::select! {
+                msg = rx.recv() => msg,
+                _ = reconnect_signal.notified() => {
+                    stream = None;
+                    reconnect_signal.notify_one();
+                    continue;
+                }
+            };
+
+            match msg {
+                Some(OutputMessage::Line {
+                    stream: name,
+                    content,
+                }) => {
+                    let data = format!("{}:{}\n", name, content);
+                    if !write_or_reconnect(s, data.as_bytes(), &reconnect_signal).await {
+                        pending = Some(data);
+                        stream = None;
+                    }
+                }
+                Some(OutputMessage::Shutdown) | None => break,
+            }
+        } else {
+            // Disconnected: backpressure. Wait for reconnect signal, then retry connect.
+            reconnect_signal.notified().await;
+            for attempt in 1..=30 {
+                match VsockStream::connect(vsock::HOST_CID, vsock::OUTPUT_PORT) {
+                    Ok(s) => {
+                        eprintln!("[fc-agent] output vsock reconnected");
+                        stream = Some(s);
+                        break;
+                    }
+                    Err(e) => {
+                        if attempt == 30 {
+                            eprintln!(
+                                "[fc-agent] output vsock reconnect failed after 30 attempts: {}",
+                                e
+                            );
+                        } else {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -108,10 +202,12 @@ mod tests {
     #[tokio::test]
     async fn test_output_handle_try_send() {
         let (tx, mut rx) = mpsc::channel(16);
-        let handle = OutputHandle { tx };
-
+        let handle = OutputHandle {
+            tx,
+            reconnect: Arc::new(Notify::new()),
+            reconnect_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
         handle.try_send_line("stdout", "hello world");
-
         match rx.recv().await.unwrap() {
             OutputMessage::Line { stream, content } => {
                 assert_eq!(stream, "stdout");
@@ -122,25 +218,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_output_handle_reconnect() {
-        let (tx, mut rx) = mpsc::channel(16);
-        let handle = OutputHandle { tx };
-
-        handle.reconnect();
-
-        match rx.recv().await.unwrap() {
-            OutputMessage::Reconnect => {}
-            _ => panic!("expected Reconnect message"),
-        }
-    }
-
-    #[tokio::test]
     async fn test_output_handle_shutdown() {
         let (tx, mut rx) = mpsc::channel(16);
-        let handle = OutputHandle { tx };
-
+        let handle = OutputHandle {
+            tx,
+            reconnect: Arc::new(Notify::new()),
+            reconnect_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
         handle.shutdown().await;
-
         match rx.recv().await.unwrap() {
             OutputMessage::Shutdown => {}
             _ => panic!("expected Shutdown message"),

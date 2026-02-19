@@ -638,7 +638,14 @@ pub async fn get_image_digest(image: &str, cmd_prefix: &[String]) -> Result<Stri
 }
 
 /// Notify host that image is cached, wait for snapshot ack.
-pub fn notify_cache_ready_and_wait(digest: &str) -> bool {
+///
+/// The `restore_flag` is set by the restore-epoch watcher when it detects
+/// a snapshot restore. This breaks the poll loop early when POLLHUP is not
+/// detected (e.g., after pre-start snapshot restore in rootless mode).
+pub fn notify_cache_ready_and_wait(
+    digest: &str,
+    restore_flag: &std::sync::atomic::AtomicBool,
+) -> bool {
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
     use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
     use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, VsockAddr};
@@ -696,40 +703,76 @@ pub fn notify_cache_ready_and_wait(digest: &str) -> bool {
     let mut buf = [0u8; 64];
     let mut total_read = 0;
 
+    // Use a 30s deadline with 500ms poll intervals.
+    // The host takes ~740ms between receiving cache-ready and reaching the
+    // Pause API (directory creation, flock acquisition, setup). A 100ms
+    // timeout caused fc-agent to give up before the snapshot could start,
+    // leading to the container launching and exiting while the host was
+    // still setting up the snapshot — killing the VM mid-pause.
+    //
+    // Valid exit conditions:
+    // 1. "cache-ack" received — host says no snapshot needed
+    // 2. POLLHUP / read returns 0 — vsock reset from snapshot pause/resume
+    //    (this is the SUCCESS case: VM was snapshotted, we're post-restore)
+    // 3. 30s deadline — failsafe timeout
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
     loop {
+        // Check if the restore-epoch watcher detected a snapshot restore.
+        // This breaks the loop when POLLHUP is not delivered (observed in
+        // rootless mode after pre-start snapshot restore).
+        if restore_flag.load(std::sync::atomic::Ordering::Acquire) {
+            eprintln!("[fc-agent] cache-ack: restore detected via epoch watcher, skipping wait");
+            return true;
+        }
+
+        let remaining_ms = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis();
+        if remaining_ms == 0 {
+            eprintln!("[fc-agent] cache-ack deadline expired (30s)");
+            return false;
+        }
+
+        // Poll with 500ms intervals (or remaining time, whichever is shorter)
+        let poll_ms = remaining_ms.min(500) as u16;
         let mut poll_fds = [PollFd::new(sock.as_fd(), PollFlags::POLLIN)];
 
-        match poll(&mut poll_fds, PollTimeout::from(100u16)) {
+        match poll(&mut poll_fds, PollTimeout::from(poll_ms)) {
             Err(e) => {
                 eprintln!("[fc-agent] cache-ack poll error: {}", e);
                 return false;
             }
             Ok(0) => {
-                eprintln!("[fc-agent] cache-ack poll timeout (restored from snapshot?)");
-                return false;
+                // Timeout on this poll interval — loop and check deadline
+                continue;
             }
             Ok(_) => {}
         }
 
         if let Some(revents) = poll_fds[0].revents() {
             if revents.contains(PollFlags::POLLHUP) || revents.contains(PollFlags::POLLERR) {
-                eprintln!("[fc-agent] cache-ack connection closed or error");
-                return false;
+                // vsock reset from snapshot pause/resume. This means the
+                // host successfully paused the VM for a snapshot. After
+                // resume, all vsock connections are reset (TRANSPORT_RESET).
+                eprintln!("[fc-agent] cache-ack connection reset (snapshot taken)");
+                return true;
             }
         }
 
         match read(sock.as_raw_fd(), &mut buf[total_read..]) as Result<usize, nix::errno::Errno> {
             Err(nix::errno::Errno::EAGAIN) => {
-                eprintln!("[fc-agent] cache-ack read would block (likely restored from snapshot)");
-                return false;
+                // Spurious wakeup, continue polling
+                continue;
             }
             Err(e) => {
                 eprintln!("[fc-agent] cache-ack read error: {}", e);
                 return false;
             }
             Ok(0) => {
-                eprintln!("[fc-agent] cache-ack connection closed");
-                return false;
+                // Connection closed — snapshot vsock reset
+                eprintln!("[fc-agent] cache-ack connection closed (snapshot taken)");
+                return true;
             }
             Ok(n) => {
                 total_read += n;
@@ -773,6 +816,12 @@ pub fn build_podman_args(
         "--ulimit".to_string(),
         "nofile=65536:65536".to_string(),
         "--pids-limit=-1".to_string(),
+        // Disable conmon log capture. fc-agent captures container output through
+        // podman's stdout/stderr pipes directly. conmon's default k8s-file log
+        // driver adds a redundant buffering layer that blocks under burst output
+        // with rootless podman (--user mode), causing the container to deadlock
+        // on stdout/stderr pipe write.
+        "--log-driver=none".to_string(),
     ]);
 
     if let Some((username, runtime_dir)) = user_info {
@@ -1117,45 +1166,10 @@ pub async fn run_async(podman_args: &[String], output: &OutputHandle) -> Result<
             status, exit_code
         );
 
-        // Capture podman logs on failure (use user prefix for rootless podman)
-        eprintln!("[fc-agent] capturing podman logs for failed container...");
-        let prefix = podman_cmd_prefix();
-        let logs_result = if prefix.is_empty() {
-            std::process::Command::new("podman")
-                .args(["logs", "fcvm-container"])
-                .output()
-        } else {
-            let mut c = std::process::Command::new(&prefix[0]);
-            c.args(&prefix[1..]);
-            c.args(["podman", "logs", "fcvm-container"]);
-            c.output()
-        };
-        match logs_result {
-            Ok(logs) => {
-                let stdout = String::from_utf8_lossy(&logs.stdout);
-                let stderr = String::from_utf8_lossy(&logs.stderr);
-                if !stdout.is_empty() {
-                    eprintln!("[fc-agent] === podman logs (stdout) ===");
-                    for line in stdout.lines() {
-                        eprintln!("[fc-agent] {}", line);
-                        output.try_send_line("stdout", line);
-                    }
-                }
-                if !stderr.is_empty() {
-                    eprintln!("[fc-agent] === podman logs (stderr) ===");
-                    for line in stderr.lines() {
-                        eprintln!("[fc-agent] {}", line);
-                        output.try_send_line("stderr", line);
-                    }
-                }
-                if stdout.is_empty() && stderr.is_empty() {
-                    eprintln!("[fc-agent] (no podman logs captured)");
-                }
-            }
-            Err(e) => {
-                eprintln!("[fc-agent] failed to get podman logs: {}", e);
-            }
-        }
+        // Note: podman logs are unavailable because we use --log-driver=none
+        // (required to prevent conmon deadlock under burst output).
+        // Container output was already captured through fc-agent's pipe-based
+        // output forwarding and sent to the host via vsock.
     }
 
     // Clean up the container (use user prefix for rootless podman)

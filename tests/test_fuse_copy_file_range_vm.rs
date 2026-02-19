@@ -117,6 +117,7 @@ echo "SUCCESS: copy_file_range works through FUSE!"
         "bridged",
         "--kernel-profile",
         "nested",
+        "--no-snapshot", // nested kernel snapshot takes 100s+ under parallel I/O
         "--map",
         &map_arg,
         "--cmd",

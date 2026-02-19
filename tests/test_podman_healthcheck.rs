@@ -59,8 +59,9 @@ async fn test_podman_healthcheck_healthy() -> Result<()> {
     println!("  fcvm process started (PID: {})", fcvm_pid);
     println!("  Waiting for VM to become healthy (includes podman healthcheck)...");
 
-    // Wait for health with 120s timeout (container needs to start + healthcheck must pass)
-    let health_result = common::poll_health_by_pid(fcvm_pid, 120).await;
+    // Wait for health with 240s timeout (snapshot creation + image load + healthcheck;
+    // x64 cold boot with localhost image takes ~185s under CI parallel load)
+    let health_result = common::poll_health_by_pid(fcvm_pid, 240).await;
 
     // Kill the VM
     println!("  Stopping VM...");
@@ -131,7 +132,8 @@ async fn test_podman_healthcheck_unhealthy() -> Result<()> {
     // So it should fail within a few seconds of the healthcheck running
     println!("  Polling health status (looking for Unhealthy)...");
     let result =
-        common::poll_health_status_by_pid(fcvm_pid, fcvm::state::HealthStatus::Unhealthy, 60).await;
+        common::poll_health_status_by_pid(fcvm_pid, fcvm::state::HealthStatus::Unhealthy, 120)
+            .await;
 
     // Kill the VM
     println!("  Stopping VM...");
@@ -173,8 +175,8 @@ async fn test_podman_healthcheck_none() -> Result<()> {
     println!("  fcvm process started (PID: {})", fcvm_pid);
     println!("  Waiting for VM to become healthy (HTTP check only)...");
 
-    // Should become healthy based on HTTP check alone
-    let health_result = common::poll_health_by_pid(fcvm_pid, 120).await;
+    // Should become healthy based on HTTP check alone (240s for snapshot + CI load on x64)
+    let health_result = common::poll_health_by_pid(fcvm_pid, 240).await;
 
     // Kill the VM
     println!("  Stopping VM...");
