@@ -44,23 +44,15 @@ fn setup_fuse_mounts(n: usize) -> (Vec<String>, Vec<String>, std::path::PathBuf)
 
 /// Build the fcvm args (identical for cold and warm — required for snapshot key match)
 fn build_fcvm_args<'a>(vm_name: &'a str, map_args: &'a [String], cmd: &'a str) -> Vec<&'a str> {
-    // Use the real user UID (not root) to match www container's --user mode.
-    // Under sudo, getuid() returns 0 but SUDO_UID has the real user.
-    let real_uid = std::env::var("SUDO_UID").unwrap_or_else(|_| "1000".to_string());
-    let real_gid = std::env::var("SUDO_GID").unwrap_or_else(|_| "100".to_string());
-    let user_spec = format!("{}:{}", real_uid, real_gid);
-    let user_spec: &'a str = Box::leak(user_spec.into_boxed_str());
-
     let mut args: Vec<&str> = vec![
         "podman",
         "run",
         "--name",
         vm_name,
+        "--network",
+        "bridged",
         "--kernel-profile",
         "btrfs",
-        "--user",
-        user_spec,
-        "--privileged",
     ];
     for m in map_args {
         args.push("--map");
