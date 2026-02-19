@@ -40,7 +40,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
 
         // Build the profile kernel
         let profile_kernel_path =
-            crate::setup::ensure_kernel(Some(profile_name), true, args.build_kernels)
+            crate::setup::ensure_kernel(profile_name, true, args.build_kernels)
                 .await
                 .context("building profile kernel")?;
         println!("  ✓ Kernel built: {}", profile_kernel_path.display());
@@ -65,7 +65,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
     println!("Setting up fcvm (this may take 5-10 minutes on first run)...");
 
     // Ensure default kernel exists (downloads from [kernel] section if missing)
-    let kernel_path = crate::setup::ensure_kernel(None, true, false)
+    let kernel_path = crate::setup::ensure_kernel("default", true, false)
         .await
         .context("setting up kernel")?;
     println!("  ✓ Kernel ready: {}", kernel_path.display());
@@ -84,7 +84,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
 
         // Download or build the profile kernel
         let profile_kernel_path =
-            crate::setup::ensure_kernel(Some(profile_name), true, args.build_kernels)
+            crate::setup::ensure_kernel(profile_name, true, args.build_kernels)
                 .await
                 .context("setting up profile kernel")?;
         println!(
@@ -101,7 +101,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
     // Resolve rootfs type: CLI override > kernel profile config > default (ext4)
     let rootfs_type = crate::setup::resolve_rootfs_type(
         args.rootfs_type.as_ref(),
-        args.kernel_profile.as_deref(),
+        args.kernel_profile.as_deref().unwrap_or("default"),
     );
 
     // Ensure rootfs exists (creates Layer 2 if missing)

@@ -8,7 +8,7 @@ use tokio::process::Command;
 use tracing::{debug, info, warn};
 
 use crate::paths;
-use crate::setup::rootfs::{get_kernel_profile, load_plan, KernelProfile};
+use crate::setup::rootfs::{get_kernel_profile, KernelProfile};
 use crate::utils::run_streaming;
 
 /// Compute SHA256 of bytes, return hex string (first 12 chars)
@@ -25,19 +25,41 @@ fn compute_sha256_short(data: &[u8]) -> String {
 
 /// Ensure kernel exists, downloading or building if needed.
 ///
-/// - If `profile` is None: uses default kernel from [kernel] section
-/// - If `profile` is Some("name"): uses [kernel_profiles.name] section
+/// Every kernel is a profile: "default" is the Kata kernel (URL-based),
+/// named profiles (nested, btrfs) build from source.
 ///
 /// If `allow_create` is false, bails if kernel doesn't exist.
 /// If `allow_build` is true, falls back to local build for custom profiles.
 pub async fn ensure_kernel(
-    profile: Option<&str>,
+    profile_name: &str,
     allow_create: bool,
     allow_build: bool,
 ) -> Result<PathBuf> {
-    match profile {
-        None => ensure_default_kernel(allow_create).await,
-        Some(name) => ensure_profile_kernel(name, allow_create, allow_build).await,
+    let profile = get_kernel_profile(profile_name)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "kernel profile '{}' not found in config. \
+             Add [kernel_profiles.{}] section to rootfs-config.toml",
+            profile_name,
+            profile_name
+        )
+    })?;
+
+    if profile.inherits_kernel() {
+        // Runtime-only profile — uses default kernel
+        if profile_name == "default" {
+            bail!(
+                "'default' kernel profile must define kernel_url or \
+                 kernel_version/kernel_repo — cannot inherit from itself"
+            );
+        }
+        debug!(profile = %profile_name, "profile inherits kernel from default");
+        return Box::pin(ensure_kernel("default", allow_create, allow_build)).await;
+    }
+
+    if profile.is_url_based() {
+        ensure_url_kernel(&profile, allow_create).await
+    } else {
+        ensure_custom_kernel(&profile, profile_name, allow_create, allow_build).await
     }
 }
 
@@ -45,38 +67,67 @@ pub async fn ensure_kernel(
 ///
 /// Returns the path where the kernel should exist.
 /// Used to check existence before running VM.
-pub fn get_kernel_path(profile: Option<&str>) -> Result<PathBuf> {
-    match profile {
-        None => get_default_kernel_path(),
-        Some(name) => get_profile_kernel_path(name),
+pub fn get_kernel_path(profile_name: &str) -> Result<PathBuf> {
+    let profile = get_kernel_profile(profile_name)?
+        .ok_or_else(|| anyhow::anyhow!("kernel profile '{}' not found in config", profile_name))?;
+
+    if profile.inherits_kernel() {
+        if profile_name == "default" {
+            bail!(
+                "'default' kernel profile must define kernel_url or \
+                 kernel_version/kernel_repo — cannot inherit from itself"
+            );
+        }
+        return get_kernel_path("default");
+    }
+
+    if profile.is_url_based() {
+        get_url_kernel_path(&profile)
+    } else {
+        get_custom_kernel_path(&profile, profile_name)
     }
 }
 
-/// Get the kernel URL hash for the default kernel.
-/// This is used to include in Layer 2 SHA calculation.
-pub fn get_kernel_url_hash() -> Result<String> {
-    let (plan, _, _) = load_plan()?;
-    let kernel_config = plan.kernel.current_arch()?;
-    Ok(compute_sha256_short(kernel_config.url.as_bytes()))
+/// Get the kernel identity hash for a profile.
+/// For URL-based profiles, this is the URL hash.
+/// Used to include in Layer 2 SHA calculation.
+pub fn get_kernel_url_hash(profile_name: &str) -> Result<String> {
+    let profile = get_kernel_profile(profile_name)?
+        .ok_or_else(|| anyhow::anyhow!("kernel profile '{}' not found in config", profile_name))?;
+
+    if profile.inherits_kernel() {
+        if profile_name == "default" {
+            bail!(
+                "'default' kernel profile must define kernel_url or \
+                 kernel_version/kernel_repo — cannot inherit from itself"
+            );
+        }
+        return get_kernel_url_hash("default");
+    }
+
+    if let Some(ref url) = profile.kernel_url {
+        Ok(compute_sha256_short(url.as_bytes()))
+    } else {
+        Ok(compute_profile_kernel_sha(&profile))
+    }
 }
 
 // ============================================================================
-// Default Kernel (from [kernel] section)
+// URL-Based Kernel (default profile — Kata releases)
 // ============================================================================
 
-fn get_default_kernel_path() -> Result<PathBuf> {
-    let (plan, _, _) = load_plan()?;
-    let kernel_config = plan.kernel.current_arch()?;
-    let url_hash = compute_sha256_short(kernel_config.url.as_bytes());
+fn get_url_kernel_path(profile: &KernelProfile) -> Result<PathBuf> {
+    let url = profile
+        .kernel_url
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("kernel profile missing kernel_url"))?;
+    let url_hash = compute_sha256_short(url.as_bytes());
     Ok(paths::kernel_dir().join(format!("vmlinux-{}.bin", url_hash)))
 }
 
-async fn ensure_default_kernel(allow_create: bool) -> Result<PathBuf> {
-    let (plan, _, _) = load_plan()?;
-    let kernel_config = plan.kernel.current_arch()?;
-
+async fn ensure_url_kernel(profile: &KernelProfile, allow_create: bool) -> Result<PathBuf> {
     // Check for local path first
-    if let Some(local_path) = &kernel_config.local_path {
+    if let Some(ref local_path) = profile.kernel_local_path {
         let path = PathBuf::from(local_path);
         if !path.exists() {
             bail!("Kernel local_path not found: {}", path.display());
@@ -85,12 +136,20 @@ async fn ensure_default_kernel(allow_create: bool) -> Result<PathBuf> {
         return Ok(path);
     }
 
-    if kernel_config.url.is_empty() {
-        bail!("Kernel config must specify 'url' or 'local_path'");
+    let url = profile.kernel_url.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("kernel profile must specify kernel_url or kernel_local_path")
+    })?;
+    let archive_path = profile
+        .kernel_archive_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("kernel profile must specify kernel_archive_path"))?;
+
+    if url.is_empty() {
+        bail!("Kernel config must specify 'kernel_url' or 'kernel_local_path'");
     }
 
     let kernel_dir = paths::kernel_dir();
-    let url_hash = compute_sha256_short(kernel_config.url.as_bytes());
+    let url_hash = compute_sha256_short(url.as_bytes());
     let kernel_path = kernel_dir.join(format!("vmlinux-{}.bin", url_hash));
 
     // Fast path: already exists
@@ -131,7 +190,7 @@ async fn ensure_default_kernel(allow_create: bool) -> Result<PathBuf> {
 
     // Download
     println!("⚙️  Downloading kernel...");
-    info!(url = %kernel_config.url, path_in_archive = %kernel_config.path, "downloading kernel");
+    info!(url = %url, path_in_archive = %archive_path, "downloading kernel");
 
     let cache_dir = paths::cache_dir();
     tokio::fs::create_dir_all(&cache_dir).await?;
@@ -146,7 +205,7 @@ async fn ensure_default_kernel(allow_create: bool) -> Result<PathBuf> {
         let _ = tokio::fs::remove_file(&tarball_temp).await;
 
         let output = Command::new("curl")
-            .args(["-fSL", &kernel_config.url, "-o"])
+            .args(["-fSL", url, "-o"])
             .arg(&tarball_temp)
             .output()
             .await
@@ -173,7 +232,7 @@ async fn ensure_default_kernel(allow_create: bool) -> Result<PathBuf> {
     let _ = tokio::fs::remove_dir_all(&extract_temp).await;
     tokio::fs::create_dir_all(&extract_temp).await?;
 
-    let extract_path = format!("./{}", kernel_config.path);
+    let extract_path = format!("./{}", archive_path);
     let output = Command::new("tar")
         .args(["--use-compress-program=zstd", "-xf"])
         .arg(&tarball_path)
@@ -194,7 +253,7 @@ async fn ensure_default_kernel(allow_create: bool) -> Result<PathBuf> {
     }
 
     // Move to final location
-    let extracted_path = extract_temp.join(&kernel_config.path);
+    let extracted_path = extract_temp.join(archive_path);
     if !extracted_path.exists() {
         let _ = tokio::fs::remove_dir_all(&extract_temp).await;
         let _ = flock.unlock();
@@ -219,47 +278,22 @@ async fn ensure_default_kernel(allow_create: bool) -> Result<PathBuf> {
 }
 
 // ============================================================================
-// Profile Kernel (from [kernel_profiles] section)
+// Custom Kernel (built from source — named profiles like nested, btrfs)
 // ============================================================================
 
-fn get_profile_kernel_path(profile_name: &str) -> Result<PathBuf> {
-    let profile = get_kernel_profile(profile_name)?
-        .ok_or_else(|| anyhow::anyhow!("kernel profile '{}' not found in config", profile_name))?;
-
-    // If profile doesn't specify custom kernel, use the default kernel
-    // This allows runtime-only profiles (boot_args, firecracker_args, etc.)
-    if !profile.is_custom() {
-        debug!(profile = %profile_name, "profile uses default kernel (no custom kernel configured)");
-        return get_default_kernel_path();
-    }
-
-    let sha = compute_profile_kernel_sha(&profile);
+fn get_custom_kernel_path(profile: &KernelProfile, profile_name: &str) -> Result<PathBuf> {
+    let sha = compute_profile_kernel_sha(profile);
     let filename = custom_kernel_filename(profile_name, &profile.kernel_version, &sha);
     Ok(paths::kernel_dir().join(filename))
 }
 
-async fn ensure_profile_kernel(
+async fn ensure_custom_kernel(
+    profile: &KernelProfile,
     profile_name: &str,
     allow_create: bool,
     allow_build: bool,
 ) -> Result<PathBuf> {
-    let profile = get_kernel_profile(profile_name)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "kernel profile '{}' not found in config. \
-             Add [kernel_profiles.{}] section to rootfs-config.toml",
-            profile_name,
-            profile_name
-        )
-    })?;
-
-    // If profile doesn't specify custom kernel, use the default kernel
-    // This allows runtime-only profiles (boot_args, firecracker_args, etc.)
-    if !profile.is_custom() {
-        info!(profile = %profile_name, "profile uses default kernel");
-        return ensure_default_kernel(allow_create).await;
-    }
-
-    let sha = compute_profile_kernel_sha(&profile);
+    let sha = compute_profile_kernel_sha(profile);
     let filename = custom_kernel_filename(profile_name, &profile.kernel_version, &sha);
     let kernel_dir = paths::kernel_dir();
     let kernel_path = kernel_dir.join(&filename);
@@ -341,7 +375,7 @@ async fn ensure_profile_kernel(
 
             if allow_build {
                 println!("  → Building locally (may take 10-20 minutes)...");
-                build_kernel_locally(&profile, profile_name, &kernel_path).await?;
+                build_kernel_locally(profile, profile_name, &kernel_path).await?;
                 println!("  ✓ Kernel built (profile: {})", profile_name);
                 flock.unlock().map_err(|(_, err)| err)?;
                 Ok(kernel_path)
