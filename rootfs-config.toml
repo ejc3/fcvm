@@ -181,10 +181,10 @@ patches_dir = "kernel/patches-arm64"
 # Base config for VM kernel (Firecracker's microvm config)
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-aarch64-6.1.config"
 
-# Firecracker NV2 fork with --enable-nv2 support
-# Binary is content-addressed: assets_dir/firecracker/firecracker-nested-{sha}.bin
+# Firecracker fork: diff snapshot fix + NV2 nested virt (ARM64)
+# PR: https://github.com/firecracker-microvm/firecracker/pull/5696
 firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "nv2-vhe-mode"
+firecracker_branch = "nv2-on-main"
 firecracker_args = "--enable-nv2"
 
 # Boot args for nested KVM
@@ -276,3 +276,8 @@ kernel_config = "kernel/btrfs-x86.conf"
 # No patches_dir — no FUSE patches needed for btrfs profile
 
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
+
+# Firecracker fork with diff snapshot fix for multi-slot VMs (>3GB RAM).
+# PR: https://github.com/firecracker-microvm/firecracker/pull/5696
+firecracker_repo = "ejc3/firecracker"
+firecracker_branch = "fix-dump-dirty-multi-slot-cursor"
