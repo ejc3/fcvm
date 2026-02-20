@@ -578,6 +578,12 @@ async fn test_route_replacement_on_clone_bridged() -> Result<()> {
     let fcvm_path = common::find_fcvm_binary()?;
 
     // Step 1: Start baseline with --health-check so clones inherit HTTP health checking
+    // Use --no-snapshot to ensure a fresh boot. Without this, in SnapshotEnabled CI mode:
+    // 1. Run 2 hits the startup snapshot cache and clones instead of booting fresh,
+    //    causing "VsockUnixBackend: Address in use" errors (stale vsock socket paths)
+    // 2. Even on Run 1, the pre-start snapshot clone creates a "double snapshot" scenario
+    //    where the test's snapshot is taken from a VM that was itself restored from snapshot,
+    //    which causes vsock reconnection failures in subsequent clones on x64
     println!("Step 1: Starting baseline VM with --health-check...");
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
         &[
@@ -587,6 +593,7 @@ async fn test_route_replacement_on_clone_bridged() -> Result<()> {
             &baseline_name,
             "--network",
             "bridged",
+            "--no-snapshot",
             "--health-check",
             "http://localhost/",
             common::TEST_IMAGE,
