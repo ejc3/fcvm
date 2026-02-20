@@ -14,9 +14,7 @@ mod types;
 mod vm_config;
 
 use types::VolumeMapping;
-pub use types::{
-    CacheRequest, LogLine, SnapshotCreationParams, SnapshotOutcome, VmContext, VmHandle,
-};
+pub use types::{CacheRequest, LogLine, SnapshotOutcome, VmContext, VmHandle};
 
 pub(crate) use listeners::run_output_listener;
 use listeners::run_status_listener;
@@ -841,10 +839,6 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
 
     let disk_path = data_dir.join("disks/rootfs.raw");
 
-    // No per-VM image disks needed — all image modes use read-only cache paths
-    // or btrfs loopback on rootfs.
-    let image_extra_disks = vec![];
-
     Ok(Some(VmContext {
         vm_id,
         vm_name,
@@ -868,7 +862,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         disk_path,
         log_tx,
         output_reconnect,
-        image_extra_disks,
+        vm_state,
     }))
 }
 
@@ -916,15 +910,11 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                 if let Some(ref key) = ctx.snapshot_key {
                     info!(snapshot_key = %key, digest = %cache_request.digest, "Creating pre-start snapshot");
 
-                    let mut params = SnapshotCreationParams::from_run_args(&ctx.args);
-                    params.extra_disks = ctx.image_extra_disks.clone();
                     let snap = CreateSnapshotParams {
                         vm_manager: &ctx.vm_manager,
                         snapshot_key: key,
-                        vm_id: &ctx.vm_id,
-                        params: &params,
+                        vm_state: &ctx.vm_state,
                         disk_path: &ctx.disk_path,
-                        network_config: &ctx.network_config,
                         volume_configs: &ctx.volume_configs,
                         parent_snapshot_key: None, // Pre-start is the first snapshot, no parent
                     };
@@ -970,8 +960,6 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                     } else {
                         info!(snapshot_key = %startup_key, "Creating startup snapshot (VM healthy)");
 
-                        let mut params = SnapshotCreationParams::from_run_args(&ctx.args);
-                        params.extra_disks = ctx.image_extra_disks.clone();
                         // Use select! so SIGTERM can abort startup snapshot immediately.
                         // This is safe: startup snapshots are optional (just caching), so
                         // if the VM is paused mid-snapshot when we cancel, cleanup will
@@ -979,10 +967,8 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         let snap = CreateSnapshotParams {
                             vm_manager: &ctx.vm_manager,
                             snapshot_key: &startup_key,
-                            vm_id: &ctx.vm_id,
-                            params: &params,
+                            vm_state: &ctx.vm_state,
                             disk_path: &ctx.disk_path,
-                            network_config: &ctx.network_config,
                             volume_configs: &ctx.volume_configs,
                             parent_snapshot_key: Some(key.as_str()), // Parent is pre-start snapshot
                         };

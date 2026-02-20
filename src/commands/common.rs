@@ -993,6 +993,103 @@ fn snapshot_semaphore() -> &'static Semaphore {
     })
 }
 
+/// Build a SnapshotConfig from VmState. Single source of truth for snapshot metadata.
+///
+/// Both user-triggered snapshots (`fcvm snapshot create`) and cache snapshots
+/// (pre-start/startup) use this to ensure consistent metadata. The key fields
+/// that must stay in sync — `original_vsock_vm_id`, network config, health check
+/// URL, etc. — all come from VmState.
+///
+/// Callers provide volume and extra_disk configs because those are stored in
+/// different formats (VolumeConfig vs SnapshotVolumeConfig, ExtraDisk vs
+/// SnapshotExtraDisk) and the conversion depends on context.
+pub fn build_snapshot_config(
+    vm_state: &VmState,
+    snapshot_key: &str,
+    snapshot_type: crate::storage::SnapshotType,
+    snapshot_dir: &std::path::Path,
+    volumes: Vec<crate::storage::SnapshotVolumeConfig>,
+    extra_disks: Vec<crate::storage::SnapshotExtraDisk>,
+) -> crate::storage::SnapshotConfig {
+    let original_vsock_vm_id = vm_state
+        .config
+        .original_vsock_vm_id
+        .clone()
+        .unwrap_or_else(|| vm_state.vm_id.clone());
+
+    crate::storage::SnapshotConfig {
+        name: snapshot_key.to_string(),
+        vm_id: vm_state.vm_id.clone(),
+        original_vsock_vm_id: Some(original_vsock_vm_id),
+        memory_path: snapshot_dir.join("memory.bin"),
+        vmstate_path: snapshot_dir.join("vmstate.bin"),
+        disk_path: snapshot_dir.join("disk.raw"),
+        created_at: chrono::Utc::now(),
+        snapshot_type,
+        metadata: crate::storage::SnapshotMetadata {
+            image: vm_state.config.image.clone(),
+            vcpu: vm_state.config.vcpu,
+            memory_mib: vm_state.config.memory_mib,
+            network_config: vm_state.config.network.clone(),
+            volumes,
+            health_check_url: vm_state.config.health_check_url.clone(),
+            hugepages: vm_state.config.hugepages,
+            extra_disks,
+            username: vm_state.config.username.clone(),
+            user: vm_state.config.user.clone(),
+        },
+    }
+}
+
+/// Convert VolumeConfig objects to SnapshotVolumeConfig for snapshot metadata.
+pub fn volume_configs_to_snapshot(
+    volume_configs: &[crate::volume::VolumeConfig],
+) -> Vec<crate::storage::SnapshotVolumeConfig> {
+    volume_configs
+        .iter()
+        .map(|v| crate::storage::SnapshotVolumeConfig {
+            host_path: v.host_path.clone(),
+            guest_path: v.guest_path.to_string_lossy().to_string(),
+            read_only: v.read_only,
+            vsock_port: v.port,
+            portable: v.portable,
+        })
+        .collect()
+}
+
+/// Convert VmState extra_disks to SnapshotExtraDisk for snapshot metadata.
+///
+/// Only includes disks inside the VM's data directory (disk-dir disks).
+/// External --disk files are at arbitrary host paths and don't need copying
+/// into the snapshot — clones access them directly.
+pub fn extra_disks_to_snapshot(vm_state: &VmState) -> Vec<crate::storage::SnapshotExtraDisk> {
+    let vm_data_dir = paths::vm_runtime_dir(&vm_state.vm_id);
+    let vm_data_prefix = vm_data_dir.to_string_lossy().to_string();
+    vm_state
+        .config
+        .extra_disks
+        .iter()
+        .filter(|disk| disk.path.starts_with(&vm_data_prefix))
+        .filter_map(|disk| {
+            let filename = std::path::Path::new(&disk.path)
+                .file_name()?
+                .to_str()?
+                .to_string();
+            let index = filename
+                .strip_prefix("disk-dir-")
+                .and_then(|s| s.strip_suffix(".raw"))
+                .unwrap_or("0");
+            let drive_id = format!("disk{}", index);
+            Some(crate::storage::SnapshotExtraDisk {
+                filename,
+                mount_path: disk.mount_path.clone(),
+                read_only: disk.read_only,
+                drive_id,
+            })
+        })
+        .collect()
+}
+
 /// # Arguments
 /// * `client` - Firecracker API client for the running VM
 /// * `snapshot_config` - Pre-built config with FINAL paths (after atomic rename)
@@ -1023,29 +1120,41 @@ pub async fn create_snapshot_core(
         .ok_or_else(|| anyhow::anyhow!("invalid memory_path in snapshot config"))?;
     let temp_snapshot_dir = snapshot_dir.with_extension("creating");
 
-    // Check if base snapshot exists (for diff support)
-    let base_memory_path = snapshot_dir.join("memory.bin");
-    let mut has_base = base_memory_path.exists();
-
-    // If no base but parent provided, copy parent's memory.bin as base (reflink = instant)
-    if !has_base {
-        if let Some(parent_dir) = parent_snapshot_dir {
+    // Determine base memory for diff snapshot support.
+    // CRITICAL: Never create files in snapshot_dir before the atomic rename.
+    // A stale memory.bin (from an aborted snapshot) in snapshot_dir without config.json
+    // would be used as the wrong base, producing a corrupt snapshot that kernel-panics
+    // on restore (memory/register mismatch → stack corruption in do_idle).
+    //
+    // Two valid sources of a base:
+    // 1. Complete existing snapshot (config.json + memory.bin) — re-creating a user snapshot
+    // 2. Parent snapshot's memory.bin — creating startup snapshot from pre-start
+    let (has_base, base_memory_source) =
+        if snapshot_dir.join("config.json").exists() && snapshot_dir.join("memory.bin").exists() {
+            // Existing complete snapshot — valid base for diff
+            (true, Some(snapshot_dir.join("memory.bin")))
+        } else if let Some(parent_dir) = parent_snapshot_dir {
             let parent_memory = parent_dir.join("memory.bin");
             if parent_memory.exists() {
                 info!(
                     snapshot = %snapshot_config.name,
                     parent = %parent_dir.display(),
-                    "copying parent memory.bin as base (reflink)"
+                    "using parent memory.bin as diff base"
                 );
-                // Create snapshot dir if needed
-                tokio::fs::create_dir_all(snapshot_dir)
-                    .await
-                    .context("creating snapshot directory")?;
-                // Reflink copy parent's memory.bin
-                reflink_copy(&parent_memory, &base_memory_path).await?;
-                has_base = true;
+                (true, Some(parent_memory))
+            } else {
+                (false, None)
             }
-        }
+        } else {
+            (false, None)
+        };
+
+    // Clean up stale snapshot directory (e.g., from a previous aborted attempt).
+    // A directory with memory.bin but no config.json is incomplete — remove it
+    // to prevent confusion and reclaim disk space.
+    if snapshot_dir.exists() && !snapshot_dir.join("config.json").exists() {
+        info!(snapshot = %snapshot_config.name, "cleaning up stale snapshot directory");
+        let _ = tokio::fs::remove_dir_all(snapshot_dir).await;
     }
 
     let snapshot_type = if has_base { "Diff" } else { "Full" };
@@ -1061,7 +1170,13 @@ pub async fn create_snapshot_core(
         } else {
             memory_bytes
         };
-        if let Ok(stat) = nix::sys::statvfs::statvfs(snapshot_dir) {
+        // Use parent directory for statvfs if snapshot_dir was cleaned up
+        let statvfs_path = if snapshot_dir.exists() {
+            snapshot_dir
+        } else {
+            snapshot_dir.parent().unwrap_or(snapshot_dir)
+        };
+        if let Ok(stat) = nix::sys::statvfs::statvfs(statvfs_path) {
             let available_bytes = stat.blocks_available() * stat.fragment_size();
             if available_bytes < required_bytes {
                 anyhow::bail!(
@@ -1219,19 +1334,23 @@ pub async fn create_snapshot_core(
         // Diff snapshot: copy base to temp, merge diff onto it, then atomic rename
         // At this point:
         //   - temp_memory_path = memory.diff (Firecracker wrote the sparse diff here)
-        //   - base_memory_path = existing memory.bin (copied from parent or previous snapshot)
+        //   - base_memory_source = parent or existing snapshot's memory.bin (never in snapshot_dir
+        //     without config.json — stale dirs were cleaned up above)
+        let base_source = base_memory_source
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("has_base=true but no base_memory_source"))?;
         let diff_file_path = temp_memory_path.clone(); // memory.diff
         let final_memory_path = temp_snapshot_dir.join("memory.bin");
 
         info!(
             snapshot = %snapshot_config.name,
-            base = %base_memory_path.display(),
+            base = %base_source.display(),
             diff = %diff_file_path.display(),
             "merging diff snapshot onto base copy"
         );
 
         // Copy base memory to temp dir as memory.bin (will merge diff into this copy)
-        tokio::fs::copy(&base_memory_path, &final_memory_path)
+        tokio::fs::copy(base_source, &final_memory_path)
             .await
             .context("copying base memory to temp for merge")?;
 
@@ -1245,25 +1364,24 @@ pub async fn create_snapshot_core(
                 .context("diff merge task panicked")?
                 .context("merging diff snapshot")?;
 
-        // Keep the diff file for debugging (renamed to memory.diff in final dir)
-        // The full-debug file (if present) is also preserved for comparison.
-
         info!(
             snapshot = %snapshot_config.name,
             bytes_merged = bytes_merged,
             "diff merge complete, building atomic update"
         );
+    }
 
-        // Disk was already copied while VM was paused (above).
-        // Write config.json to temp directory
-        let temp_config_path = temp_snapshot_dir.join("config.json");
-        let config_json = serde_json::to_string_pretty(&snapshot_config)
-            .context("serializing snapshot config")?;
-        tokio::fs::write(&temp_config_path, &config_json)
-            .await
-            .context("writing snapshot config")?;
+    // Write config.json to temp directory
+    let temp_config_path = temp_snapshot_dir.join("config.json");
+    let config_json =
+        serde_json::to_string_pretty(&snapshot_config).context("serializing snapshot config")?;
+    tokio::fs::write(&temp_config_path, &config_json)
+        .await
+        .context("writing snapshot config")?;
 
-        // Atomic replace: rename old out of the way, then rename new into place.
+    // Atomic replace: rename old out of the way, then rename new into place.
+    // Handles both cases: snapshot_dir exists (re-creating) or doesn't (first creation).
+    if snapshot_dir.exists() {
         let old_snapshot_dir = snapshot_dir.with_extension("old");
         let _ = tokio::fs::remove_dir_all(&old_snapshot_dir).await;
         tokio::fs::rename(snapshot_dir, &old_snapshot_dir)
@@ -1273,47 +1391,161 @@ pub async fn create_snapshot_core(
             .await
             .context("renaming temp snapshot to final location")?;
         let _ = tokio::fs::remove_dir_all(&old_snapshot_dir).await;
-
-        info!(
-            snapshot = %snapshot_config.name,
-            disk = %snapshot_config.disk_path.display(),
-            "diff snapshot merged successfully"
-        );
     } else {
-        // Full snapshot: disk already copied while VM was paused.
-        // Write config.json to temp directory
-        let config_path = temp_snapshot_dir.join("config.json");
-        let config_json = serde_json::to_string_pretty(&snapshot_config)
-            .context("serializing snapshot config")?;
-        tokio::fs::write(&config_path, &config_json)
+        tokio::fs::rename(&temp_snapshot_dir, snapshot_dir)
             .await
-            .context("writing snapshot config")?;
+            .context("renaming temp snapshot to final location")?;
+    }
 
-        // Atomic replace: rename old out of the way, then rename new into place.
-        // Same technique as the diff snapshot path above — avoids a window where
-        // no snapshot exists if we crash between remove and rename.
-        if snapshot_dir.exists() {
-            let old_snapshot_dir = snapshot_dir.with_extension("old");
-            let _ = tokio::fs::remove_dir_all(&old_snapshot_dir).await;
-            tokio::fs::rename(snapshot_dir, &old_snapshot_dir)
-                .await
-                .context("moving old snapshot out of the way")?;
-            tokio::fs::rename(&temp_snapshot_dir, snapshot_dir)
-                .await
-                .context("renaming temp snapshot to final location")?;
-            let _ = tokio::fs::remove_dir_all(&old_snapshot_dir).await;
-        } else {
-            tokio::fs::rename(&temp_snapshot_dir, snapshot_dir)
-                .await
-                .context("renaming temp snapshot to final location")?;
-        }
+    info!(
+        snapshot = %snapshot_config.name,
+        snapshot_type = snapshot_type,
+        disk = %snapshot_config.disk_path.display(),
+        "snapshot created successfully"
+    );
 
-        info!(
-            snapshot = %snapshot_config.name,
-            disk = %snapshot_config.disk_path.display(),
-            "full snapshot created successfully"
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::VmState;
+    use crate::storage::SnapshotType;
+    use std::path::Path;
+
+    fn make_vm_state(vm_id: &str, original_vsock: Option<&str>) -> VmState {
+        let mut state = VmState::new(vm_id.to_string(), "nginx:alpine".to_string(), 2, 1024);
+        state.config.network = NetworkConfig::default();
+        state.config.health_check_url = Some("http://localhost/".to_string());
+        state.config.hugepages = false;
+        state.config.username = Some("testuser".to_string());
+        state.config.user = Some("1000:1000".to_string());
+        state.config.original_vsock_vm_id = original_vsock.map(|s| s.to_string());
+        state
+    }
+
+    #[test]
+    fn test_build_snapshot_config_fresh_vm() {
+        // Fresh VM: no original_vsock_vm_id → falls back to vm_id
+        let state = make_vm_state("vm-AAA", None);
+        let config = build_snapshot_config(
+            &state,
+            "test-key",
+            SnapshotType::System,
+            Path::new("/tmp/snap"),
+            vec![],
+            vec![],
+        );
+        assert_eq!(config.vm_id, "vm-AAA");
+        assert_eq!(config.original_vsock_vm_id, Some("vm-AAA".to_string()));
+        assert_eq!(config.metadata.image, "nginx:alpine");
+        assert_eq!(config.metadata.memory_mib, 1024);
+        assert_eq!(
+            config.metadata.health_check_url,
+            Some("http://localhost/".to_string())
         );
     }
 
-    Ok(())
+    #[test]
+    fn test_build_snapshot_config_cache_restored_vm() {
+        // Cache-restored VM: original_vsock_vm_id set → preserved in config
+        let state = make_vm_state("vm-BBB", Some("vm-AAA"));
+        let config = build_snapshot_config(
+            &state,
+            "test-startup",
+            SnapshotType::System,
+            Path::new("/tmp/snap"),
+            vec![],
+            vec![],
+        );
+        assert_eq!(config.vm_id, "vm-BBB");
+        // Critical: original_vsock_vm_id must be vm-AAA (the ORIGINAL), not vm-BBB
+        assert_eq!(config.original_vsock_vm_id, Some("vm-AAA".to_string()));
+    }
+
+    #[test]
+    fn test_build_snapshot_config_user_snapshot() {
+        let state = make_vm_state("vm-CCC", Some("vm-AAA"));
+        let config = build_snapshot_config(
+            &state,
+            "my-snapshot",
+            SnapshotType::User,
+            Path::new("/tmp/snap"),
+            vec![],
+            vec![],
+        );
+        assert_eq!(config.vm_id, "vm-CCC");
+        assert_eq!(config.original_vsock_vm_id, Some("vm-AAA".to_string()));
+        assert!(matches!(config.snapshot_type, SnapshotType::User));
+    }
+
+    #[test]
+    fn test_build_snapshot_config_paths() {
+        let state = make_vm_state("vm-AAA", None);
+        let config = build_snapshot_config(
+            &state,
+            "key",
+            SnapshotType::System,
+            Path::new("/mnt/snap/key"),
+            vec![],
+            vec![],
+        );
+        assert_eq!(config.memory_path, Path::new("/mnt/snap/key/memory.bin"));
+        assert_eq!(config.vmstate_path, Path::new("/mnt/snap/key/vmstate.bin"));
+        assert_eq!(config.disk_path, Path::new("/mnt/snap/key/disk.raw"));
+    }
+
+    #[test]
+    fn test_extra_disks_to_snapshot_filters_external() {
+        // Only disks inside vm_runtime_dir should be included
+        let mut state = make_vm_state("vm-test123", None);
+        state.config.extra_disks = vec![
+            // Disk inside data dir → should be included
+            crate::state::types::ExtraDisk {
+                path: format!(
+                    "{}/disk-dir-0.raw",
+                    paths::vm_runtime_dir("vm-test123").display()
+                ),
+                mount_path: "/data".to_string(),
+                read_only: false,
+            },
+            // External disk → should be excluded
+            crate::state::types::ExtraDisk {
+                path: "/external/disk.raw".to_string(),
+                mount_path: "/ext".to_string(),
+                read_only: true,
+            },
+        ];
+        let result = extra_disks_to_snapshot(&state);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].filename, "disk-dir-0.raw");
+        assert_eq!(result[0].mount_path, "/data");
+        assert_eq!(result[0].drive_id, "disk0");
+    }
+
+    #[test]
+    fn test_extra_disks_to_snapshot_empty() {
+        let state = make_vm_state("vm-empty", None);
+        let result = extra_disks_to_snapshot(&state);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_volume_configs_to_snapshot() {
+        let configs = vec![crate::volume::VolumeConfig {
+            host_path: std::path::PathBuf::from("/host/data"),
+            guest_path: std::path::PathBuf::from("/guest/data"),
+            read_only: true,
+            port: 5000,
+            portable: false,
+        }];
+        let result = volume_configs_to_snapshot(&configs);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].host_path, Path::new("/host/data"));
+        assert_eq!(result[0].guest_path, "/guest/data");
+        assert!(result[0].read_only);
+        assert_eq!(result[0].vsock_port, 5000);
+        assert!(!result[0].portable);
+    }
 }
