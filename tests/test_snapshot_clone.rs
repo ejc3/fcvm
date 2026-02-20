@@ -578,6 +578,8 @@ async fn test_route_replacement_on_clone_bridged() -> Result<()> {
     let fcvm_path = common::find_fcvm_binary()?;
 
     // Step 1: Start baseline with --health-check so clones inherit HTTP health checking
+    // Use --no-snapshot to ensure a fresh boot (startup snapshot cache may have
+    // stale vsock paths that cause "Address in use" errors on Run 2 in CI)
     println!("Step 1: Starting baseline VM with --health-check...");
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
         &[
@@ -587,6 +589,7 @@ async fn test_route_replacement_on_clone_bridged() -> Result<()> {
             &baseline_name,
             "--network",
             "bridged",
+            "--no-snapshot",
             "--health-check",
             "http://localhost/",
             common::TEST_IMAGE,
