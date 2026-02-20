@@ -382,8 +382,70 @@ async fn check_podman_healthcheck(
         "healthy" => Some(true),
         "" => None, // No healthcheck defined - skip future checks
         "unhealthy" => Some(false),
-        "starting" => Some(false), // Still starting, keep polling
-        _ => Some(true),           // Unknown status, assume healthy
+        "starting" => {
+            // Rootless podman without a systemd user session doesn't run the
+            // periodic healthcheck timer. Trigger it manually.
+            debug!(target: "health-monitor", "podman health is 'starting', triggering healthcheck run");
+            run_podman_healthcheck(pid, username, user_spec).await;
+            Some(false)
+        }
+        _ => Some(true), // Unknown status, assume healthy
+    }
+}
+
+/// Trigger `podman healthcheck run` inside the VM.
+/// Rootless podman without systemd doesn't auto-run healthchecks.
+async fn run_podman_healthcheck(
+    pid: u32,
+    username: Option<&str>,
+    user_spec: Option<&str>,
+) {
+    let exe = match find_fcvm_binary() {
+        Some(e) => e,
+        None => return,
+    };
+
+    let mut cmd_args: Vec<String> = vec![
+        "exec".into(),
+        "--pid".into(),
+        pid.to_string(),
+        "--vm".into(),
+        "--".into(),
+    ];
+    if let Some(name) = username {
+        cmd_args.extend(user_cmd_prefix(name, user_spec));
+    }
+    cmd_args.extend([
+        "podman".into(),
+        "healthcheck".into(),
+        "run".into(),
+        "fcvm-container".into(),
+    ]);
+
+    let child = match tokio::process::Command::new(&exe)
+        .args(&cmd_args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(target: "health-monitor", error = %e, "podman healthcheck run spawn failed");
+            return;
+        }
+    };
+
+    match tokio::time::timeout(HEALTH_CHECK_EXEC_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(o)) => {
+            debug!(target: "health-monitor", exit = %o.status, "podman healthcheck run completed");
+        }
+        Ok(Err(e)) => {
+            debug!(target: "health-monitor", error = %e, "podman healthcheck run exec failed");
+        }
+        Err(_) => {
+            debug!(target: "health-monitor", "podman healthcheck run timed out");
+        }
     }
 }
 
