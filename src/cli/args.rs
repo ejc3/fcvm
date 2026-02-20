@@ -122,8 +122,8 @@ pub struct RunArgs {
     #[arg(long, default_value = "2", value_parser = parse_cpu)]
     pub cpu: u8,
 
-    /// Memory in MiB, or "unlimited" to use all host memory (default: 2048)
-    #[arg(long, default_value = "2048", value_parser = parse_mem)]
+    /// Memory in MiB, or "unlimited" to use all host memory (default: 1024)
+    #[arg(long, default_value = "1024", value_parser = parse_mem)]
     pub mem: u32,
 
     /// Enable 2MB hugepage-backed VM memory for improved TLB performance.

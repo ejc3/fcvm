@@ -5,10 +5,12 @@
 
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use nix::sys::uio::{pread, pwrite};
 use nix::unistd::{lseek, Whence};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -969,6 +971,28 @@ pub(crate) async fn reflink_copy(source: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Limit concurrent snapshot creation to prevent dirty_ratio writeback throttling.
+///
+/// Each Full snapshot writes the VM's entire configured memory to page cache.
+/// The Linux kernel throttles ALL writers when dirty pages exceed `dirty_ratio` (typically
+/// 20% of RAM). On a 125GB machine with default dirty_ratio=20%, that's 25GB.
+/// When 150 VMs snapshot simultaneously (CI SnapshotEnabled mode), total dirty pages
+/// cause the kernel to force synchronous writeback, stalling each snapshot for 100+ seconds.
+///
+/// With a semaphore of 10, peak dirty pages stay low enough that snapshots complete
+/// at memory speed (~1s each) without triggering kernel writeback throttling.
+static SNAPSHOT_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+
+fn snapshot_semaphore() -> &'static Semaphore {
+    SNAPSHOT_SEMAPHORE.get_or_init(|| {
+        let permits = std::env::var("FCVM_SNAPSHOT_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(10);
+        Semaphore::new(permits)
+    })
+}
+
 /// # Arguments
 /// * `client` - Firecracker API client for the running VM
 /// * `snapshot_config` - Pre-built config with FINAL paths (after atomic rename)
@@ -984,6 +1008,13 @@ pub async fn create_snapshot_core(
     parent_snapshot_dir: Option<&Path>,
 ) -> Result<()> {
     use crate::firecracker::api::{SnapshotCreate, VmState as ApiVmState};
+
+    // Acquire snapshot concurrency permit BEFORE pausing the VM.
+    // This prevents dirty_ratio throttling when many VMs snapshot simultaneously.
+    let _permit = snapshot_semaphore()
+        .acquire()
+        .await
+        .map_err(|e| anyhow::anyhow!("snapshot semaphore closed: {}", e))?;
 
     // Derive directories from snapshot config (memory_path's parent is the snapshot dir)
     let snapshot_dir = snapshot_config
