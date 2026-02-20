@@ -48,6 +48,7 @@ fn test_run_args(name: &str) -> RunArgs {
         image_mode: None,
         rootfs_type: None,
         label: vec![],
+        lossy_output: false,
         image: common::TEST_IMAGE.to_string(),
         command_args: vec![],
     }
