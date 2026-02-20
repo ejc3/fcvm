@@ -208,9 +208,7 @@ pub(super) fn build_firecracker_config(
     // image_identifier is the digest for localhost images (content-addressed cache key).
     // args.image is the original name (what the guest uses to find the image).
     // FirecrackerConfig stores both: container_image for cache key, container_image_name for MMDS.
-    use crate::firecracker::{
-        BootSource, Drive, FcNetworkMode, FirecrackerConfig, MachineConfig,
-    };
+    use crate::firecracker::{BootSource, Drive, FcNetworkMode, FirecrackerConfig, MachineConfig};
 
     let network_mode = match args.network {
         crate::cli::args::NetworkMode::Bridged => FcNetworkMode::Bridged,
