@@ -1214,6 +1214,7 @@ mod tests {
             firecracker_bin: Some("/opt/firecracker-profile".to_string()),
             firecracker_args: Some("--enable-nv2".to_string()),
             hugepages: None,
+            non_blocking_output: false,
         };
 
         let runtime = snapshot_restore_runtime_config(&args);
