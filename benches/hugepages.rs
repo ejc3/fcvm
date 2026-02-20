@@ -428,6 +428,14 @@ fn run_mode(mode: &str, mem_mb: u32, data_mb: u32, hugepages: bool) -> BenchResu
     let clone_elapsed = match poll_health(&fcvm, &mut child2, clone_timeout) {
         Ok(elapsed) => elapsed,
         Err(e) => {
+            // Dump log file for diagnostics before panicking
+            if let Ok(logs) = std::fs::read_to_string(&log_path2) {
+                let tail: Vec<&str> = logs.lines().rev().take(50).collect();
+                eprintln!("=== Last 50 lines of {} ===", log_path2);
+                for line in tail.into_iter().rev() {
+                    eprintln!("{}", line);
+                }
+            }
             graceful_kill(pid2, 5000);
             let _ = child2.wait();
             panic!("Clone failed: {}", e);
