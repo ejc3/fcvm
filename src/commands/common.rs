@@ -1120,29 +1120,41 @@ pub async fn create_snapshot_core(
         .ok_or_else(|| anyhow::anyhow!("invalid memory_path in snapshot config"))?;
     let temp_snapshot_dir = snapshot_dir.with_extension("creating");
 
-    // Check if base snapshot exists (for diff support)
-    let base_memory_path = snapshot_dir.join("memory.bin");
-    let mut has_base = base_memory_path.exists();
-
-    // If no base but parent provided, copy parent's memory.bin as base (reflink = instant)
-    if !has_base {
-        if let Some(parent_dir) = parent_snapshot_dir {
+    // Determine base memory for diff snapshot support.
+    // CRITICAL: Never create files in snapshot_dir before the atomic rename.
+    // A stale memory.bin (from an aborted snapshot) in snapshot_dir without config.json
+    // would be used as the wrong base, producing a corrupt snapshot that kernel-panics
+    // on restore (memory/register mismatch → stack corruption in do_idle).
+    //
+    // Two valid sources of a base:
+    // 1. Complete existing snapshot (config.json + memory.bin) — re-creating a user snapshot
+    // 2. Parent snapshot's memory.bin — creating startup snapshot from pre-start
+    let (has_base, base_memory_source) =
+        if snapshot_dir.join("config.json").exists() && snapshot_dir.join("memory.bin").exists() {
+            // Existing complete snapshot — valid base for diff
+            (true, Some(snapshot_dir.join("memory.bin")))
+        } else if let Some(parent_dir) = parent_snapshot_dir {
             let parent_memory = parent_dir.join("memory.bin");
             if parent_memory.exists() {
                 info!(
                     snapshot = %snapshot_config.name,
                     parent = %parent_dir.display(),
-                    "copying parent memory.bin as base (reflink)"
+                    "using parent memory.bin as diff base"
                 );
-                // Create snapshot dir if needed
-                tokio::fs::create_dir_all(snapshot_dir)
-                    .await
-                    .context("creating snapshot directory")?;
-                // Reflink copy parent's memory.bin
-                reflink_copy(&parent_memory, &base_memory_path).await?;
-                has_base = true;
+                (true, Some(parent_memory))
+            } else {
+                (false, None)
             }
-        }
+        } else {
+            (false, None)
+        };
+
+    // Clean up stale snapshot directory (e.g., from a previous aborted attempt).
+    // A directory with memory.bin but no config.json is incomplete — remove it
+    // to prevent confusion and reclaim disk space.
+    if snapshot_dir.exists() && !snapshot_dir.join("config.json").exists() {
+        info!(snapshot = %snapshot_config.name, "cleaning up stale snapshot directory");
+        let _ = tokio::fs::remove_dir_all(snapshot_dir).await;
     }
 
     let snapshot_type = if has_base { "Diff" } else { "Full" };
@@ -1158,7 +1170,13 @@ pub async fn create_snapshot_core(
         } else {
             memory_bytes
         };
-        if let Ok(stat) = nix::sys::statvfs::statvfs(snapshot_dir) {
+        // Use parent directory for statvfs if snapshot_dir was cleaned up
+        let statvfs_path = if snapshot_dir.exists() {
+            snapshot_dir
+        } else {
+            snapshot_dir.parent().unwrap_or(snapshot_dir)
+        };
+        if let Ok(stat) = nix::sys::statvfs::statvfs(statvfs_path) {
             let available_bytes = stat.blocks_available() * stat.fragment_size();
             if available_bytes < required_bytes {
                 anyhow::bail!(
@@ -1316,19 +1334,23 @@ pub async fn create_snapshot_core(
         // Diff snapshot: copy base to temp, merge diff onto it, then atomic rename
         // At this point:
         //   - temp_memory_path = memory.diff (Firecracker wrote the sparse diff here)
-        //   - base_memory_path = existing memory.bin (copied from parent or previous snapshot)
+        //   - base_memory_source = parent or existing snapshot's memory.bin (never in snapshot_dir
+        //     without config.json — stale dirs were cleaned up above)
+        let base_source = base_memory_source
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("has_base=true but no base_memory_source"))?;
         let diff_file_path = temp_memory_path.clone(); // memory.diff
         let final_memory_path = temp_snapshot_dir.join("memory.bin");
 
         info!(
             snapshot = %snapshot_config.name,
-            base = %base_memory_path.display(),
+            base = %base_source.display(),
             diff = %diff_file_path.display(),
             "merging diff snapshot onto base copy"
         );
 
         // Copy base memory to temp dir as memory.bin (will merge diff into this copy)
-        tokio::fs::copy(&base_memory_path, &final_memory_path)
+        tokio::fs::copy(base_source, &final_memory_path)
             .await
             .context("copying base memory to temp for merge")?;
 
@@ -1342,25 +1364,24 @@ pub async fn create_snapshot_core(
                 .context("diff merge task panicked")?
                 .context("merging diff snapshot")?;
 
-        // Keep the diff file for debugging (renamed to memory.diff in final dir)
-        // The full-debug file (if present) is also preserved for comparison.
-
         info!(
             snapshot = %snapshot_config.name,
             bytes_merged = bytes_merged,
             "diff merge complete, building atomic update"
         );
+    }
 
-        // Disk was already copied while VM was paused (above).
-        // Write config.json to temp directory
-        let temp_config_path = temp_snapshot_dir.join("config.json");
-        let config_json = serde_json::to_string_pretty(&snapshot_config)
-            .context("serializing snapshot config")?;
-        tokio::fs::write(&temp_config_path, &config_json)
-            .await
-            .context("writing snapshot config")?;
+    // Write config.json to temp directory
+    let temp_config_path = temp_snapshot_dir.join("config.json");
+    let config_json =
+        serde_json::to_string_pretty(&snapshot_config).context("serializing snapshot config")?;
+    tokio::fs::write(&temp_config_path, &config_json)
+        .await
+        .context("writing snapshot config")?;
 
-        // Atomic replace: rename old out of the way, then rename new into place.
+    // Atomic replace: rename old out of the way, then rename new into place.
+    // Handles both cases: snapshot_dir exists (re-creating) or doesn't (first creation).
+    if snapshot_dir.exists() {
         let old_snapshot_dir = snapshot_dir.with_extension("old");
         let _ = tokio::fs::remove_dir_all(&old_snapshot_dir).await;
         tokio::fs::rename(snapshot_dir, &old_snapshot_dir)
@@ -1370,47 +1391,18 @@ pub async fn create_snapshot_core(
             .await
             .context("renaming temp snapshot to final location")?;
         let _ = tokio::fs::remove_dir_all(&old_snapshot_dir).await;
-
-        info!(
-            snapshot = %snapshot_config.name,
-            disk = %snapshot_config.disk_path.display(),
-            "diff snapshot merged successfully"
-        );
     } else {
-        // Full snapshot: disk already copied while VM was paused.
-        // Write config.json to temp directory
-        let config_path = temp_snapshot_dir.join("config.json");
-        let config_json = serde_json::to_string_pretty(&snapshot_config)
-            .context("serializing snapshot config")?;
-        tokio::fs::write(&config_path, &config_json)
+        tokio::fs::rename(&temp_snapshot_dir, snapshot_dir)
             .await
-            .context("writing snapshot config")?;
-
-        // Atomic replace: rename old out of the way, then rename new into place.
-        // Same technique as the diff snapshot path above — avoids a window where
-        // no snapshot exists if we crash between remove and rename.
-        if snapshot_dir.exists() {
-            let old_snapshot_dir = snapshot_dir.with_extension("old");
-            let _ = tokio::fs::remove_dir_all(&old_snapshot_dir).await;
-            tokio::fs::rename(snapshot_dir, &old_snapshot_dir)
-                .await
-                .context("moving old snapshot out of the way")?;
-            tokio::fs::rename(&temp_snapshot_dir, snapshot_dir)
-                .await
-                .context("renaming temp snapshot to final location")?;
-            let _ = tokio::fs::remove_dir_all(&old_snapshot_dir).await;
-        } else {
-            tokio::fs::rename(&temp_snapshot_dir, snapshot_dir)
-                .await
-                .context("renaming temp snapshot to final location")?;
-        }
-
-        info!(
-            snapshot = %snapshot_config.name,
-            disk = %snapshot_config.disk_path.display(),
-            "full snapshot created successfully"
-        );
+            .context("renaming temp snapshot to final location")?;
     }
+
+    info!(
+        snapshot = %snapshot_config.name,
+        snapshot_type = snapshot_type,
+        disk = %snapshot_config.disk_path.display(),
+        "snapshot created successfully"
+    );
 
     Ok(())
 }
