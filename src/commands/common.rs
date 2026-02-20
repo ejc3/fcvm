@@ -993,6 +993,103 @@ fn snapshot_semaphore() -> &'static Semaphore {
     })
 }
 
+/// Build a SnapshotConfig from VmState. Single source of truth for snapshot metadata.
+///
+/// Both user-triggered snapshots (`fcvm snapshot create`) and cache snapshots
+/// (pre-start/startup) use this to ensure consistent metadata. The key fields
+/// that must stay in sync — `original_vsock_vm_id`, network config, health check
+/// URL, etc. — all come from VmState.
+///
+/// Callers provide volume and extra_disk configs because those are stored in
+/// different formats (VolumeConfig vs SnapshotVolumeConfig, ExtraDisk vs
+/// SnapshotExtraDisk) and the conversion depends on context.
+pub fn build_snapshot_config(
+    vm_state: &VmState,
+    snapshot_key: &str,
+    snapshot_type: crate::storage::SnapshotType,
+    snapshot_dir: &std::path::Path,
+    volumes: Vec<crate::storage::SnapshotVolumeConfig>,
+    extra_disks: Vec<crate::storage::SnapshotExtraDisk>,
+) -> crate::storage::SnapshotConfig {
+    let original_vsock_vm_id = vm_state
+        .config
+        .original_vsock_vm_id
+        .clone()
+        .unwrap_or_else(|| vm_state.vm_id.clone());
+
+    crate::storage::SnapshotConfig {
+        name: snapshot_key.to_string(),
+        vm_id: vm_state.vm_id.clone(),
+        original_vsock_vm_id: Some(original_vsock_vm_id),
+        memory_path: snapshot_dir.join("memory.bin"),
+        vmstate_path: snapshot_dir.join("vmstate.bin"),
+        disk_path: snapshot_dir.join("disk.raw"),
+        created_at: chrono::Utc::now(),
+        snapshot_type,
+        metadata: crate::storage::SnapshotMetadata {
+            image: vm_state.config.image.clone(),
+            vcpu: vm_state.config.vcpu,
+            memory_mib: vm_state.config.memory_mib,
+            network_config: vm_state.config.network.clone(),
+            volumes,
+            health_check_url: vm_state.config.health_check_url.clone(),
+            hugepages: vm_state.config.hugepages,
+            extra_disks,
+            username: vm_state.config.username.clone(),
+            user: vm_state.config.user.clone(),
+        },
+    }
+}
+
+/// Convert VolumeConfig objects to SnapshotVolumeConfig for snapshot metadata.
+pub fn volume_configs_to_snapshot(
+    volume_configs: &[crate::volume::VolumeConfig],
+) -> Vec<crate::storage::SnapshotVolumeConfig> {
+    volume_configs
+        .iter()
+        .map(|v| crate::storage::SnapshotVolumeConfig {
+            host_path: v.host_path.clone(),
+            guest_path: v.guest_path.to_string_lossy().to_string(),
+            read_only: v.read_only,
+            vsock_port: v.port,
+            portable: v.portable,
+        })
+        .collect()
+}
+
+/// Convert VmState extra_disks to SnapshotExtraDisk for snapshot metadata.
+///
+/// Only includes disks inside the VM's data directory (disk-dir disks).
+/// External --disk files are at arbitrary host paths and don't need copying
+/// into the snapshot — clones access them directly.
+pub fn extra_disks_to_snapshot(vm_state: &VmState) -> Vec<crate::storage::SnapshotExtraDisk> {
+    let vm_data_dir = paths::vm_runtime_dir(&vm_state.vm_id);
+    let vm_data_prefix = vm_data_dir.to_string_lossy().to_string();
+    vm_state
+        .config
+        .extra_disks
+        .iter()
+        .filter(|disk| disk.path.starts_with(&vm_data_prefix))
+        .filter_map(|disk| {
+            let filename = std::path::Path::new(&disk.path)
+                .file_name()?
+                .to_str()?
+                .to_string();
+            let index = filename
+                .strip_prefix("disk-dir-")
+                .and_then(|s| s.strip_suffix(".raw"))
+                .unwrap_or("0");
+            let drive_id = format!("disk{}", index);
+            Some(crate::storage::SnapshotExtraDisk {
+                filename,
+                mount_path: disk.mount_path.clone(),
+                read_only: disk.read_only,
+                drive_id,
+            })
+        })
+        .collect()
+}
+
 /// # Arguments
 /// * `client` - Firecracker API client for the running VM
 /// * `snapshot_config` - Pre-built config with FINAL paths (after atomic rename)
@@ -1316,4 +1413,147 @@ pub async fn create_snapshot_core(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::VmState;
+    use crate::storage::SnapshotType;
+    use std::path::Path;
+
+    fn make_vm_state(vm_id: &str, original_vsock: Option<&str>) -> VmState {
+        let mut state = VmState::new(vm_id.to_string(), "nginx:alpine".to_string(), 2, 1024);
+        state.config.network = NetworkConfig::default();
+        state.config.health_check_url = Some("http://localhost/".to_string());
+        state.config.hugepages = false;
+        state.config.username = Some("testuser".to_string());
+        state.config.user = Some("1000:1000".to_string());
+        state.config.original_vsock_vm_id = original_vsock.map(|s| s.to_string());
+        state
+    }
+
+    #[test]
+    fn test_build_snapshot_config_fresh_vm() {
+        // Fresh VM: no original_vsock_vm_id → falls back to vm_id
+        let state = make_vm_state("vm-AAA", None);
+        let config = build_snapshot_config(
+            &state,
+            "test-key",
+            SnapshotType::System,
+            Path::new("/tmp/snap"),
+            vec![],
+            vec![],
+        );
+        assert_eq!(config.vm_id, "vm-AAA");
+        assert_eq!(config.original_vsock_vm_id, Some("vm-AAA".to_string()));
+        assert_eq!(config.metadata.image, "nginx:alpine");
+        assert_eq!(config.metadata.memory_mib, 1024);
+        assert_eq!(
+            config.metadata.health_check_url,
+            Some("http://localhost/".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_snapshot_config_cache_restored_vm() {
+        // Cache-restored VM: original_vsock_vm_id set → preserved in config
+        let state = make_vm_state("vm-BBB", Some("vm-AAA"));
+        let config = build_snapshot_config(
+            &state,
+            "test-startup",
+            SnapshotType::System,
+            Path::new("/tmp/snap"),
+            vec![],
+            vec![],
+        );
+        assert_eq!(config.vm_id, "vm-BBB");
+        // Critical: original_vsock_vm_id must be vm-AAA (the ORIGINAL), not vm-BBB
+        assert_eq!(config.original_vsock_vm_id, Some("vm-AAA".to_string()));
+    }
+
+    #[test]
+    fn test_build_snapshot_config_user_snapshot() {
+        let state = make_vm_state("vm-CCC", Some("vm-AAA"));
+        let config = build_snapshot_config(
+            &state,
+            "my-snapshot",
+            SnapshotType::User,
+            Path::new("/tmp/snap"),
+            vec![],
+            vec![],
+        );
+        assert_eq!(config.vm_id, "vm-CCC");
+        assert_eq!(config.original_vsock_vm_id, Some("vm-AAA".to_string()));
+        assert!(matches!(config.snapshot_type, SnapshotType::User));
+    }
+
+    #[test]
+    fn test_build_snapshot_config_paths() {
+        let state = make_vm_state("vm-AAA", None);
+        let config = build_snapshot_config(
+            &state,
+            "key",
+            SnapshotType::System,
+            Path::new("/mnt/snap/key"),
+            vec![],
+            vec![],
+        );
+        assert_eq!(config.memory_path, Path::new("/mnt/snap/key/memory.bin"));
+        assert_eq!(config.vmstate_path, Path::new("/mnt/snap/key/vmstate.bin"));
+        assert_eq!(config.disk_path, Path::new("/mnt/snap/key/disk.raw"));
+    }
+
+    #[test]
+    fn test_extra_disks_to_snapshot_filters_external() {
+        // Only disks inside vm_runtime_dir should be included
+        let mut state = make_vm_state("vm-test123", None);
+        state.config.extra_disks = vec![
+            // Disk inside data dir → should be included
+            crate::state::types::ExtraDisk {
+                path: format!(
+                    "{}/disk-dir-0.raw",
+                    paths::vm_runtime_dir("vm-test123").display()
+                ),
+                mount_path: "/data".to_string(),
+                read_only: false,
+            },
+            // External disk → should be excluded
+            crate::state::types::ExtraDisk {
+                path: "/external/disk.raw".to_string(),
+                mount_path: "/ext".to_string(),
+                read_only: true,
+            },
+        ];
+        let result = extra_disks_to_snapshot(&state);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].filename, "disk-dir-0.raw");
+        assert_eq!(result[0].mount_path, "/data");
+        assert_eq!(result[0].drive_id, "disk0");
+    }
+
+    #[test]
+    fn test_extra_disks_to_snapshot_empty() {
+        let state = make_vm_state("vm-empty", None);
+        let result = extra_disks_to_snapshot(&state);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_volume_configs_to_snapshot() {
+        let configs = vec![crate::volume::VolumeConfig {
+            host_path: std::path::PathBuf::from("/host/data"),
+            guest_path: std::path::PathBuf::from("/guest/data"),
+            read_only: true,
+            port: 5000,
+            portable: false,
+        }];
+        let result = volume_configs_to_snapshot(&configs);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].host_path, Path::new("/host/data"));
+        assert_eq!(result[0].guest_path, "/guest/data");
+        assert!(result[0].read_only);
+        assert_eq!(result[0].vsock_port, 5000);
+        assert!(!result[0].portable);
+    }
 }
