@@ -1407,7 +1407,7 @@ This ensures automatic cache invalidation when any component changes.
   "config": {
     "image": "nginx:alpine",
     "vcpu": 2,
-    "memory_mib": 2048,
+    "memory_mib": 1024,
     "network": {
       "tap_device": "tap-abc123",
       "guest_ip": "172.16.29.2",
