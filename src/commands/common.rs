@@ -316,6 +316,16 @@ pub async fn save_vm_state_with_network(
     Ok(())
 }
 
+/// Owned resources for VM cleanup that can be moved into the cleanup call.
+pub struct CleanupContext {
+    pub vm_id: String,
+    pub volume_server_handles: Vec<JoinHandle<()>>,
+    pub data_dir: PathBuf,
+    pub health_cancel_token: Option<tokio_util::sync::CancellationToken>,
+    pub health_monitor_handle: Option<JoinHandle<()>>,
+    pub output_listener_handle: Option<JoinHandle<Vec<(String, String)>>>,
+}
+
 /// Cleanup resources for a VM (used by both podman and snapshot commands)
 ///
 /// This function handles the complete cleanup sequence:
@@ -326,19 +336,21 @@ pub async fn save_vm_state_with_network(
 /// 5. Cleanup network resources
 /// 6. Delete state file
 /// 7. Remove data directory
-#[allow(clippy::too_many_arguments)]
 pub async fn cleanup_vm(
-    vm_id: &str,
+    ctx: CleanupContext,
     vm_manager: &mut VmManager,
     holder_child: &mut Option<tokio::process::Child>,
-    volume_server_handles: Vec<JoinHandle<()>>,
     network: &mut dyn NetworkManager,
     state_manager: &StateManager,
-    data_dir: &Path,
-    health_cancel_token: Option<tokio_util::sync::CancellationToken>,
-    health_monitor_handle: Option<JoinHandle<()>>,
-    output_listener_handle: Option<JoinHandle<Vec<(String, String)>>>,
 ) {
+    let CleanupContext {
+        vm_id,
+        volume_server_handles,
+        data_dir,
+        health_cancel_token,
+        health_monitor_handle,
+        output_listener_handle,
+    } = ctx;
     info!("cleaning up resources");
 
     // Signal health monitor to stop gracefully, then wait briefly for it
@@ -384,7 +396,7 @@ pub async fn cleanup_vm(
     }
 
     // Delete state file
-    if let Err(e) = state_manager.delete_state(vm_id).await {
+    if let Err(e) = state_manager.delete_state(&vm_id).await {
         warn!("failed to delete state file: {}", e);
     }
 
@@ -400,7 +412,7 @@ pub async fn cleanup_vm(
     }
 
     // Cleanup VM data directory (includes disks, sockets, etc.)
-    if let Err(e) = tokio::fs::remove_dir_all(data_dir).await {
+    if let Err(e) = tokio::fs::remove_dir_all(&data_dir).await {
         warn!(vm_id = %vm_id, error = %e, "failed to cleanup VM data directory");
     } else {
         info!(vm_id = %vm_id, "cleaned up VM data directory");
