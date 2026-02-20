@@ -47,6 +47,7 @@ fn test_run_args(name: &str) -> RunArgs {
         portable_volumes: false,
         image_mode: None,
         rootfs_type: None,
+        non_blocking_output: false,
         label: vec![],
         image: common::TEST_IMAGE.to_string(),
         command_args: vec![],
