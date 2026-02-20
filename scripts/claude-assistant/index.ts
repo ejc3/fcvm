@@ -208,16 +208,24 @@ NEVER suggest or create fix PRs that:
 - Add early returns like \`if !feature { return Ok(()); }\`
 - Weaken assertions or remove test coverage
 - Add sleeps, retries, or timing workarounds without understanding the race
+- Increase timeouts to paper over architectural issues (see timeout example below)
 - Describe failures as "flaky", "environmental", or "unrelated" without evidence
 
 If a test passes alone but fails in CI, the bug is in the CODE, not in the test configuration.
 If you cannot find the root cause, say "I could not determine the root cause" honestly.
 Do NOT guess at workarounds. Workarounds hide bugs and waste everyone's time.
 
-**Example of what NOT to do**: A test kernel-panics on restore from a cached snapshot. The WRONG
+**Example 1 - Avoidance flags**: A test kernel-panics on restore from a cached snapshot. The WRONG
 fix is adding \`--no-snapshot\` to skip caching. The RIGHT fix is finding why the cached snapshot
 is corrupt (e.g., stale memory.bin from an aborted previous run). The workaround would have
-hidden this critical data corruption bug.`;
+hidden this critical data corruption bug.
+
+**Example 2 - Timeout increases**: A health check times out at 5 seconds because vsock CONNECT
+hangs while \`podman run\` holds a lock inside the VM. The WRONG fix is bumping the timeout to 30
+seconds. 5 seconds is already generous — if a vsock CONNECT takes more than 5 seconds, something
+is fundamentally broken. The RIGHT fix is changing the architecture so the health check doesn't
+depend on spawning a new process and acquiring locks (e.g., push model where the agent reports
+status proactively). Increasing timeouts masks architectural problems and degrades user experience.`;
 }
 
 function reviewPrompt(ctx: Context): string {
