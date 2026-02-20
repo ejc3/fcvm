@@ -979,16 +979,18 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         implicit_uffd_cancel.cancel();
 
         super::common::cleanup_vm(
-            &vm_id,
+            super::common::CleanupContext {
+                vm_id: vm_id.clone(),
+                volume_server_handles,
+                data_dir: data_dir.clone(),
+                health_cancel_token: None, // no health monitor in exec path
+                health_monitor_handle: None,
+                output_listener_handle: output_handle, // abort output listener task
+            },
             &mut vm_manager,
             &mut holder_child,
-            volume_server_handles,
             network.as_mut(),
             &state_manager,
-            &data_dir,
-            None, // no health monitor in exec path
-            None,
-            output_handle, // abort output listener task
         )
         .await;
 
@@ -1125,16 +1127,18 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Cleanup common resources
     super::common::cleanup_vm(
-        &vm_id,
+        super::common::CleanupContext {
+            vm_id: vm_id.clone(),
+            volume_server_handles,
+            data_dir: data_dir.clone(),
+            health_cancel_token: Some(health_cancel_token),
+            health_monitor_handle: Some(health_monitor_handle),
+            output_listener_handle: output_handle, // abort output listener task
+        },
         &mut vm_manager,
         &mut holder_child,
-        volume_server_handles,
         network.as_mut(),
         &state_manager,
-        &data_dir,
-        Some(health_cancel_token),
-        Some(health_monitor_handle),
-        output_handle, // abort output listener task
     )
     .await;
 

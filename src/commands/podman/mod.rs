@@ -23,7 +23,7 @@ use listeners::run_status_listener;
 
 use snapshot::{build_firecracker_config, snapshot_run_firecracker_overrides};
 pub use snapshot::{check_podman_snapshot, create_snapshot_interruptible, startup_snapshot_key};
-use vm_config::{cleanup_nfs_exports, run_vm_setup};
+use vm_config::{cleanup_nfs_exports, run_vm_setup, VmSetupParams};
 
 use crate::cli::{NetworkMode, PodmanArgs, PodmanCommands, RunArgs};
 use crate::commands::common::{
@@ -771,23 +771,25 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
 
     // Run the main VM setup in a helper to ensure cleanup on error
     let setup_result = run_vm_setup(
-        &args,
-        &vm_id,
-        &data_dir,
-        &base_rootfs,
-        &socket_path,
-        &kernel_path,
-        &initrd_path,
-        &network_config,
+        VmSetupParams {
+            args: &args,
+            vm_id: &vm_id,
+            data_dir: &data_dir,
+            base_rootfs: &base_rootfs,
+            socket_path: &socket_path,
+            kernel_path: &kernel_path,
+            initrd_path: &initrd_path,
+            network_config: &network_config,
+            cmd_args,
+            volume_mappings: &volume_mappings,
+            vsock_socket_path: &vsock_socket_path,
+            image_disk_path: image_disk_path.as_deref(),
+            fc_config,
+            runtime_config: &runtime_config,
+        },
         network.as_mut(),
-        cmd_args,
         &state_manager,
         &mut vm_state,
-        &volume_mappings,
-        &vsock_socket_path,
-        image_disk_path.as_deref(),
-        fc_config,
-        &runtime_config,
     )
     .await;
 
@@ -1012,16 +1014,18 @@ pub async fn cleanup_vm_context(mut ctx: VmContext) {
 
     // Cleanup common resources
     super::common::cleanup_vm(
-        &ctx.vm_id,
+        super::common::CleanupContext {
+            vm_id: ctx.vm_id,
+            volume_server_handles: ctx.volume_server_handles,
+            data_dir: ctx.data_dir,
+            health_cancel_token: Some(ctx.health_cancel_token),
+            health_monitor_handle: Some(ctx.health_monitor_handle),
+            output_listener_handle: ctx.output_handle,
+        },
         &mut ctx.vm_manager,
         &mut ctx.holder_child,
-        ctx.volume_server_handles,
         ctx.network.as_mut(),
         &ctx.state_manager,
-        &ctx.data_dir,
-        Some(ctx.health_cancel_token),
-        Some(ctx.health_monitor_handle),
-        ctx.output_handle,
     )
     .await;
 }
