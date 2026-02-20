@@ -30,6 +30,18 @@ pub fn startup_snapshot_key(base_key: &str) -> String {
     format!("{}-startup", base_key)
 }
 
+/// Parameters for snapshot creation, grouping the many read-only inputs.
+pub struct CreateSnapshotParams<'a> {
+    pub vm_manager: &'a VmManager,
+    pub snapshot_key: &'a str,
+    pub vm_id: &'a str,
+    pub params: &'a SnapshotCreationParams,
+    pub disk_path: &'a Path,
+    pub network_config: &'a NetworkConfig,
+    pub volume_configs: &'a [VolumeConfig],
+    pub parent_snapshot_key: Option<&'a str>,
+}
+
 /// Create a podman snapshot from a running VM.
 ///
 /// This pauses the VM, creates a Firecracker snapshot, copies the disk,
@@ -40,17 +52,17 @@ pub fn startup_snapshot_key(base_key: &str) -> String {
 ///
 /// If `parent_snapshot_key` is provided, the parent's memory.bin will be copied
 /// (via reflink) as a base, enabling diff snapshots for new directories.
-#[allow(clippy::too_many_arguments)]
-pub async fn create_podman_snapshot(
-    vm_manager: &VmManager,
-    snapshot_key: &str,
-    vm_id: &str,
-    params: &SnapshotCreationParams,
-    disk_path: &Path,
-    network_config: &NetworkConfig,
-    volume_configs: &[VolumeConfig],
-    parent_snapshot_key: Option<&str>,
-) -> Result<()> {
+pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<()> {
+    let CreateSnapshotParams {
+        vm_manager,
+        snapshot_key,
+        vm_id,
+        params,
+        disk_path,
+        network_config,
+        volume_configs,
+        parent_snapshot_key,
+    } = snap;
     // Snapshots stored in snapshot_dir with snapshot_key as name
     let snapshot_dir = paths::snapshot_dir().join(snapshot_key);
 
@@ -117,7 +129,7 @@ pub async fn create_podman_snapshot(
             image: params.image.clone(),
             vcpu: params.vcpu,
             memory_mib: params.memory_mib,
-            network_config: network_config.clone(),
+            network_config: (*network_config).clone(),
             volumes: snapshot_volumes,
             health_check_url: params.health_check_url.clone(),
             hugepages: params.hugepages,
@@ -146,16 +158,8 @@ pub async fn create_podman_snapshot(
 ///
 /// Returns `SnapshotOutcome::Interrupted` if a signal is received - caller
 /// should break their event loop and proceed to cleanup.
-#[allow(clippy::too_many_arguments)]
 pub async fn create_snapshot_interruptible(
-    vm_manager: &VmManager,
-    snapshot_key: &str,
-    vm_id: &str,
-    params: &SnapshotCreationParams,
-    disk_path: &Path,
-    network_config: &NetworkConfig,
-    volume_configs: &[VolumeConfig],
-    parent_snapshot_key: Option<&str>,
+    snap: &CreateSnapshotParams<'_>,
     cancel: &CancellationToken,
 ) -> SnapshotOutcome {
     // CRITICAL: Do NOT use tokio::select! to interrupt the snapshot future.
@@ -170,18 +174,7 @@ pub async fn create_snapshot_interruptible(
 
     // Run snapshot to completion. create_snapshot_core always resumes the VM
     // before returning, even on error, so this is safe.
-    match create_podman_snapshot(
-        vm_manager,
-        snapshot_key,
-        vm_id,
-        params,
-        disk_path,
-        network_config,
-        volume_configs,
-        parent_snapshot_key,
-    )
-    .await
-    {
+    match create_podman_snapshot(snap).await {
         Ok(()) => {
             if cancel.is_cancelled() {
                 // Snapshot succeeded but we're shutting down
