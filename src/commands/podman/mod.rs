@@ -303,6 +303,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 firecracker_bin,
                 firecracker_args,
                 hugepages: Some(args.hugepages),
+                non_blocking_output: args.non_blocking_output,
             };
             super::snapshot::cmd_snapshot_run(snapshot_args).await?;
             return Ok(None);
@@ -335,6 +336,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 firecracker_bin,
                 firecracker_args,
                 hugepages: Some(args.hugepages),
+                non_blocking_output: args.non_blocking_output,
             };
             super::snapshot::cmd_snapshot_run(snapshot_args).await?;
             return Ok(None);
