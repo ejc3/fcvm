@@ -1102,6 +1102,10 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                             network_config: &network_config,
                             volume_configs: &volume_configs,
                             parent_snapshot_key: Some(base_key.as_str()), // Parent is pre-start snapshot
+                            // Preserve vsock VM ID chain: vmstate.bin references the original
+                            // fresh boot VM's vsock paths, even after cache restore. Clones of
+                            // this startup snapshot need to redirect that original directory.
+                            original_vsock_vm_id: vm_state.config.original_vsock_vm_id.clone(),
                         };
                         tokio::select! {
                             outcome = create_snapshot_interruptible(&snap, &cancel) => {

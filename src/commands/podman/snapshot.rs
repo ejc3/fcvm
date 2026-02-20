@@ -40,6 +40,12 @@ pub struct CreateSnapshotParams<'a> {
     pub network_config: &'a NetworkConfig,
     pub volume_configs: &'a [VolumeConfig],
     pub parent_snapshot_key: Option<&'a str>,
+    /// Original VM ID whose vsock paths are baked into vmstate.bin.
+    /// When creating a snapshot from a cache-restored VM, the vmstate.bin references
+    /// vsock paths from the original (cached) VM, not the current vm_id. This must be
+    /// preserved so that clones of this snapshot redirect the correct directory.
+    /// None for fresh VMs (vm_id is the original).
+    pub original_vsock_vm_id: Option<String>,
 }
 
 /// Create a podman snapshot from a running VM.
@@ -62,6 +68,7 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
         network_config,
         volume_configs,
         parent_snapshot_key,
+        original_vsock_vm_id: _,
     } = snap;
     // Snapshots stored in snapshot_dir with snapshot_key as name
     let snapshot_dir = paths::snapshot_dir().join(snapshot_key);
@@ -119,7 +126,7 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
     let snapshot_config = SnapshotConfig {
         name: snapshot_key.to_string(),
         vm_id: vm_id.to_string(),
-        original_vsock_vm_id: None, // Fresh VM, no redirect needed
+        original_vsock_vm_id: snap.original_vsock_vm_id.clone(),
         memory_path: final_memory_path,
         vmstate_path: final_vmstate_path,
         disk_path: final_disk_path,
