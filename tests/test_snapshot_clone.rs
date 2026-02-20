@@ -577,7 +577,12 @@ async fn test_route_replacement_on_clone_bridged() -> Result<()> {
 
     let fcvm_path = common::find_fcvm_binary()?;
 
-    // Step 1: Start baseline with --health-check so clones inherit HTTP health checking
+    // Step 1: Start baseline with --health-check so clones inherit HTTP health checking.
+    // Use --no-snapshot to prevent the startup snapshot cache from interfering:
+    // in SnapshotEnabled CI mode, the baseline would otherwise hit the cache and
+    // clone from a stale snapshot instead of booting fresh, causing the Firecracker
+    // process to exit immediately (stale vsock/network resources from the original VM).
+    // This test manages its own snapshot lifecycle (Steps 2-4), so cache bypass is required.
     println!("Step 1: Starting baseline VM with --health-check...");
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
         &[
@@ -589,6 +594,7 @@ async fn test_route_replacement_on_clone_bridged() -> Result<()> {
             "bridged",
             "--health-check",
             "http://localhost/",
+            "--no-snapshot",
             common::TEST_IMAGE,
         ],
         &baseline_name,
