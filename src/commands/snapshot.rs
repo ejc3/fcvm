@@ -656,8 +656,17 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         let socket_path = output_socket_path.clone();
         let vm_id_clone = vm_id.clone();
         let reconnect = output_reconnect.clone();
+        let non_blocking_output = args.non_blocking_output;
         Some(tokio::spawn(async move {
-            match run_output_listener(&socket_path, &vm_id_clone, None, reconnect, false).await {
+            match run_output_listener(
+                &socket_path,
+                &vm_id_clone,
+                None,
+                reconnect,
+                non_blocking_output,
+            )
+            .await
+            {
                 Ok(lines) => lines,
                 Err(e) => {
                     tracing::warn!("Output listener error: {}", e);
@@ -1205,6 +1214,7 @@ mod tests {
             firecracker_bin: Some("/opt/firecracker-profile".to_string()),
             firecracker_args: Some("--enable-nv2".to_string()),
             hugepages: None,
+            non_blocking_output: false,
         };
 
         let runtime = snapshot_restore_runtime_config(&args);

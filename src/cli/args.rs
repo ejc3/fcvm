@@ -393,6 +393,11 @@ pub struct SnapshotRunArgs {
     /// Passed from podman run's --hugepages when restoring from a snapshot cache hit.
     #[arg(skip)]
     pub hugepages: Option<bool>,
+
+    /// Whether non-blocking output is enabled (internal use only).
+    /// Passed from podman run's --non-blocking-output when restoring from a snapshot cache hit.
+    #[arg(skip)]
+    pub non_blocking_output: bool,
 }
 
 // ============================================================================
