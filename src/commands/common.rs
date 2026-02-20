@@ -449,9 +449,6 @@ pub struct SnapshotRestoreConfig {
     pub snapshot_dir: Option<PathBuf>,
 }
 
-/// Restore a VM from a snapshot
-///
-/// This is the core snapshot restore logic shared by:
 /// Parameters for snapshot restore, grouping the many read-only inputs.
 pub struct RestoreParams<'a> {
     pub vm_id: &'a str,
@@ -463,6 +460,9 @@ pub struct RestoreParams<'a> {
     pub network_config: &'a NetworkConfig,
 }
 
+/// Restore a VM from a snapshot.
+///
+/// This is the core snapshot restore logic shared by:
 /// - `fcvm snapshot run` (clone with UFFD memory sharing)
 /// - `fcvm podman run` with cache hit (direct file load)
 ///
