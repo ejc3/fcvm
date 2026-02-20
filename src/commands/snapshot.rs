@@ -7,7 +7,7 @@ use tracing::{debug, info, warn};
 
 use super::podman::{
     check_podman_snapshot, create_snapshot_interruptible, startup_snapshot_key,
-    SnapshotCreationParams, SnapshotOutcome,
+    CreateSnapshotParams, SnapshotCreationParams, SnapshotOutcome,
 };
 use crate::cli::{
     NetworkMode, SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs,
@@ -23,7 +23,8 @@ use crate::uffd::UffdServer;
 use crate::volume::{spawn_volume_servers, VolumeConfig};
 
 use super::common::{
-    MemoryBackend, RuntimeConfig, SnapshotRestoreConfig, VSOCK_OUTPUT_PORT, VSOCK_TTY_PORT,
+    MemoryBackend, RestoreParams, RuntimeConfig, SnapshotRestoreConfig, VSOCK_OUTPUT_PORT,
+    VSOCK_TTY_PORT,
 };
 use super::podman::run_output_listener;
 
@@ -851,14 +852,17 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     };
 
     // Run clone setup using shared restore function
+    let restore_params = RestoreParams {
+        vm_id: &vm_id,
+        vm_name: &vm_name,
+        data_dir: &data_dir,
+        socket_path: &socket_path,
+        runtime_config: &runtime_config,
+        restore_config: &restore_config,
+        network_config: &network_config,
+    };
     let setup_result = super::common::restore_from_snapshot(
-        &vm_id,
-        &vm_name,
-        &data_dir,
-        &socket_path,
-        &runtime_config,
-        &restore_config,
-        &network_config,
+        restore_params,
         network.as_mut(),
         &state_manager,
         &mut vm_state,
@@ -1089,13 +1093,18 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                         // Use select! so SIGTERM can abort startup snapshot immediately.
                         // Startup snapshots are optional (just caching), so if the VM is
                         // paused mid-snapshot, cleanup will kill it via vm_manager.kill().
+                        let snap = CreateSnapshotParams {
+                            vm_manager: &vm_manager,
+                            snapshot_key: &startup_key,
+                            vm_id: &vm_id,
+                            params: &params,
+                            disk_path: &disk_path,
+                            network_config: &network_config,
+                            volume_configs: &volume_configs,
+                            parent_snapshot_key: Some(base_key.as_str()), // Parent is pre-start snapshot
+                        };
                         tokio::select! {
-                            outcome = create_snapshot_interruptible(
-                                &vm_manager, &startup_key, &vm_id, &params, &disk_path,
-                                &network_config, &volume_configs,
-                                Some(base_key.as_str()), // Parent is pre-start snapshot
-                                &cancel,
-                            ) => {
+                            outcome = create_snapshot_interruptible(&snap, &cancel) => {
                                 match outcome {
                                     SnapshotOutcome::Interrupted => {
                                         container_exit_code = None;

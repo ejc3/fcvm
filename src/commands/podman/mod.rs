@@ -22,7 +22,10 @@ pub(crate) use listeners::run_output_listener;
 use listeners::run_status_listener;
 
 use snapshot::{build_firecracker_config, snapshot_run_firecracker_overrides};
-pub use snapshot::{check_podman_snapshot, create_snapshot_interruptible, startup_snapshot_key};
+pub use snapshot::{
+    check_podman_snapshot, create_snapshot_interruptible, startup_snapshot_key,
+    CreateSnapshotParams,
+};
 use vm_config::{cleanup_nfs_exports, run_vm_setup, VmSetupParams};
 
 use crate::cli::{NetworkMode, PodmanArgs, PodmanCommands, RunArgs};
@@ -915,12 +918,17 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
 
                     let mut params = SnapshotCreationParams::from_run_args(&ctx.args);
                     params.extra_disks = ctx.image_extra_disks.clone();
-                    match create_snapshot_interruptible(
-                        &ctx.vm_manager, key, &ctx.vm_id, &params, &ctx.disk_path,
-                        &ctx.network_config, &ctx.volume_configs,
-                        None, // Pre-start is the first snapshot, no parent
-                        &cancel,
-                    ).await {
+                    let snap = CreateSnapshotParams {
+                        vm_manager: &ctx.vm_manager,
+                        snapshot_key: key,
+                        vm_id: &ctx.vm_id,
+                        params: &params,
+                        disk_path: &ctx.disk_path,
+                        network_config: &ctx.network_config,
+                        volume_configs: &ctx.volume_configs,
+                        parent_snapshot_key: None, // Pre-start is the first snapshot, no parent
+                    };
+                    match create_snapshot_interruptible(&snap, &cancel).await {
                         SnapshotOutcome::Interrupted => {
                             return Ok(None);
                         }
@@ -968,13 +976,18 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         // This is safe: startup snapshots are optional (just caching), so
                         // if the VM is paused mid-snapshot when we cancel, cleanup will
                         // kill the VM anyway via vm_manager.kill().
+                        let snap = CreateSnapshotParams {
+                            vm_manager: &ctx.vm_manager,
+                            snapshot_key: &startup_key,
+                            vm_id: &ctx.vm_id,
+                            params: &params,
+                            disk_path: &ctx.disk_path,
+                            network_config: &ctx.network_config,
+                            volume_configs: &ctx.volume_configs,
+                            parent_snapshot_key: Some(key.as_str()), // Parent is pre-start snapshot
+                        };
                         tokio::select! {
-                            outcome = create_snapshot_interruptible(
-                                &ctx.vm_manager, &startup_key, &ctx.vm_id, &params, &ctx.disk_path,
-                                &ctx.network_config, &ctx.volume_configs,
-                                Some(key.as_str()), // Parent is pre-start snapshot
-                                &cancel,
-                            ) => {
+                            outcome = create_snapshot_interruptible(&snap, &cancel) => {
                                 match outcome {
                                     SnapshotOutcome::Interrupted => {
                                         return Ok(None);

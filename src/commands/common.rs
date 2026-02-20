@@ -452,25 +452,38 @@ pub struct SnapshotRestoreConfig {
 /// Restore a VM from a snapshot
 ///
 /// This is the core snapshot restore logic shared by:
+/// Parameters for snapshot restore, grouping the many read-only inputs.
+pub struct RestoreParams<'a> {
+    pub vm_id: &'a str,
+    pub vm_name: &'a str,
+    pub data_dir: &'a Path,
+    pub socket_path: &'a Path,
+    pub runtime_config: &'a RuntimeConfig,
+    pub restore_config: &'a SnapshotRestoreConfig,
+    pub network_config: &'a NetworkConfig,
+}
+
 /// - `fcvm snapshot run` (clone with UFFD memory sharing)
 /// - `fcvm podman run` with cache hit (direct file load)
 ///
 /// Both paths use identical Firecracker setup, the only differences are:
 /// - Memory backend: UFFD vs File
 /// - Snapshot source: snapshots/{name} vs podman-cache/{hash}
-#[allow(clippy::too_many_arguments)]
 pub async fn restore_from_snapshot(
-    vm_id: &str,
-    vm_name: &str,
-    data_dir: &Path,
-    socket_path: &Path,
-    runtime_config: &RuntimeConfig,
-    restore_config: &SnapshotRestoreConfig,
-    network_config: &NetworkConfig,
+    params: RestoreParams<'_>,
     network: &mut dyn NetworkManager,
     state_manager: &StateManager,
     vm_state: &mut VmState,
 ) -> Result<(VmManager, Option<tokio::process::Child>)> {
+    let RestoreParams {
+        vm_id,
+        vm_name,
+        data_dir,
+        socket_path,
+        runtime_config,
+        restore_config,
+        network_config,
+    } = params;
     let vm_dir = data_dir.join("disks");
 
     // Configure namespace isolation if network provides one
