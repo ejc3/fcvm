@@ -354,7 +354,9 @@ mod tests {
         let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
         drop(read_fd);
 
-        let mut writer = unsafe { std::fs::File::from_raw_fd(std::os::unix::io::IntoRawFd::into_raw_fd(write_fd)) };
+        let mut writer = unsafe {
+            std::fs::File::from_raw_fd(std::os::unix::io::IntoRawFd::into_raw_fd(write_fd))
+        };
         let result = writeln!(writer, "test output");
 
         assert!(result.is_err(), "writeln! should return Err on broken pipe");
@@ -370,7 +372,10 @@ mod tests {
 
         let result = tx.try_send("msg2".to_string());
         assert!(result.is_err(), "channel should be full");
-        assert!(matches!(result.unwrap_err(), std::sync::mpsc::TrySendError::Full(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            std::sync::mpsc::TrySendError::Full(_)
+        ));
     }
 
     /// With --non-blocking-output: try_send drops messages when channel is full.
@@ -401,7 +406,9 @@ mod tests {
             run_output_listener(&socket_str, "test-vm", None, reconnect, lossy).await
         });
         for _ in 0..50 {
-            if socket_path.exists() { break; }
+            if socket_path.exists() {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(socket_path.exists(), "output socket not created");
@@ -418,7 +425,10 @@ mod tests {
 
         let mut stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
         for i in 0..100 {
-            stream.write_all(format!("stdout:lossy-line-{}\n", i).as_bytes()).await.unwrap();
+            stream
+                .write_all(format!("stdout:lossy-line-{}\n", i).as_bytes())
+                .await
+                .unwrap();
         }
         drop(stream);
 
@@ -426,7 +436,11 @@ mod tests {
 
         listener.abort();
         let err = listener.await.unwrap_err();
-        assert!(err.is_cancelled(), "lossy listener should be cancelled, not panicked: {:?}", err);
+        assert!(
+            err.is_cancelled(),
+            "lossy listener should be cancelled, not panicked: {:?}",
+            err
+        );
     }
 
     /// Default mode processes lines normally when stdout is healthy.
@@ -438,14 +452,21 @@ mod tests {
         let listener = spawn_listener(&socket_path, false).await;
 
         let mut stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
-        stream.write_all(b"stdout:hello\nstderr:world\n").await.unwrap();
+        stream
+            .write_all(b"stdout:hello\nstderr:world\n")
+            .await
+            .unwrap();
         drop(stream);
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         listener.abort();
         let err = listener.await.unwrap_err();
-        assert!(err.is_cancelled(), "default listener should be cancelled, not panicked: {:?}", err);
+        assert!(
+            err.is_cancelled(),
+            "default listener should be cancelled, not panicked: {:?}",
+            err
+        );
     }
 
     #[tokio::test]
