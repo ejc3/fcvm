@@ -849,6 +849,7 @@ See [DESIGN.md](DESIGN.md#guest-agent) for details.
 | `RUST_LOG` | `warn` | Logging level (quiet by default; use `info` or `debug` for verbose) |
 | `FCVM_NO_SNAPSHOT` | unset | Set to `1` to disable automatic snapshot creation (same as `--no-snapshot` flag) |
 | `FCVM_NO_WRITEBACK_CACHE` | unset | Set to `1` to disable FUSE writeback cache (see below) |
+| `FCVM_SNAPSHOT_CONCURRENCY` | `10` | Max concurrent snapshot creations (prevents dirty_ratio throttling in CI) |
 
 
 ### FUSE Writeback Cache
