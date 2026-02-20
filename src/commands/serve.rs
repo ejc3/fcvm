@@ -321,6 +321,7 @@ async fn create_sandbox(
         no_snapshot: true,
         image_mode: None,
         rootfs_type: None,
+        non_blocking_output: false,
         forward_localhost: vec![],
         user: None,
         hugepages: false,
