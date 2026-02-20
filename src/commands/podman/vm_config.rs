@@ -683,29 +683,49 @@ pub(super) async fn cleanup_nfs_exports(vm_id: &str) {
     }
 }
 
+/// Parameters for VM setup, grouping the many read-only inputs.
+pub(super) struct VmSetupParams<'a> {
+    pub args: &'a RunArgs,
+    pub vm_id: &'a str,
+    pub data_dir: &'a std::path::Path,
+    pub base_rootfs: &'a std::path::Path,
+    pub socket_path: &'a std::path::Path,
+    pub kernel_path: &'a std::path::Path,
+    pub initrd_path: &'a std::path::Path,
+    pub network_config: &'a crate::network::NetworkConfig,
+    pub cmd_args: Option<Vec<String>>,
+    pub volume_mappings: &'a [VolumeMapping],
+    pub vsock_socket_path: &'a std::path::Path,
+    pub image_disk_path: Option<&'a std::path::Path>,
+    pub fc_config: Option<crate::firecracker::FirecrackerConfig>,
+    pub runtime_config: &'a crate::commands::common::RuntimeConfig,
+}
+
 /// Helper function that runs VM setup and returns VmManager on success.
 /// This allows the caller to cleanup network resources on error.
 /// For rootless mode, also returns the holder process that keeps the namespace alive.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_vm_setup(
-    args: &RunArgs,
-    vm_id: &str,
-    data_dir: &std::path::Path,
-    base_rootfs: &std::path::Path,
-    socket_path: &std::path::Path,
-    kernel_path: &std::path::Path,
-    initrd_path: &std::path::Path,
-    network_config: &crate::network::NetworkConfig,
+    params: VmSetupParams<'_>,
     network: &mut dyn NetworkManager,
-    cmd_args: Option<Vec<String>>,
     state_manager: &StateManager,
     vm_state: &mut VmState,
-    volume_mappings: &[VolumeMapping],
-    vsock_socket_path: &std::path::Path,
-    image_disk_path: Option<&std::path::Path>,
-    fc_config: Option<crate::firecracker::FirecrackerConfig>,
-    runtime_config: &crate::commands::common::RuntimeConfig,
 ) -> Result<(VmManager, Option<tokio::process::Child>)> {
+    let VmSetupParams {
+        args,
+        vm_id,
+        data_dir,
+        base_rootfs,
+        socket_path,
+        kernel_path,
+        initrd_path,
+        network_config,
+        cmd_args,
+        volume_mappings,
+        vsock_socket_path,
+        image_disk_path,
+        fc_config,
+        runtime_config,
+    } = params;
     // Setup storage - just need CoW copy (fc-agent is injected via initrd at boot)
     let vm_dir = data_dir.join("disks");
     let disk_manager =
@@ -809,7 +829,9 @@ pub(super) async fn run_vm_setup(
     let launch_config = fc_config
         .map(|config| config.with_rootfs_path(rootfs_path.to_path_buf()))
         .unwrap_or_else(|| {
-            use crate::firecracker::FcNetworkMode;
+            use crate::firecracker::{
+                BootSource, Drive, FcNetworkMode, FirecrackerConfig, MachineConfig,
+            };
             let network_mode = match args.network {
                 crate::cli::args::NetworkMode::Bridged => FcNetworkMode::Bridged,
                 crate::cli::args::NetworkMode::Rootless => FcNetworkMode::Rootless,
@@ -819,37 +841,47 @@ pub(super) async fn run_vm_setup(
             extra_disks.extend(args.disk.iter().cloned());
             extra_disks.extend(args.disk_dir.iter().cloned());
             extra_disks.extend(args.nfs.iter().cloned());
-            // Collect env vars and volume mounts for cache key
-            let env_vars: Vec<String> = args.env.to_vec();
-            let volume_mounts: Vec<String> = args.map.to_vec();
-            let image_mode = super::resolve_image_mode(args);
-            let rootfs_type = super::resolve_rootfs_type(args);
 
-            crate::firecracker::FirecrackerConfig::new(
-                kernel_path.to_path_buf(),
-                initrd_path.to_path_buf(),
-                rootfs_path.to_path_buf(),
-                args.image.clone(),
-                cmd_args.clone(),
-                args.cpu,
-                args.mem,
+            FirecrackerConfig {
+                boot_source: BootSource {
+                    kernel_image_path: kernel_path.to_path_buf(),
+                    initrd_path: initrd_path.to_path_buf(),
+                    ..Default::default()
+                },
+                machine_config: MachineConfig {
+                    vcpu_count: args.cpu,
+                    mem_size_mib: args.mem,
+                    huge_pages: if args.hugepages {
+                        Some("2M".to_string())
+                    } else {
+                        None
+                    },
+                },
+                drives: vec![Drive {
+                    drive_id: "rootfs".to_string(),
+                    path_on_host: rootfs_path.to_path_buf(),
+                    is_root_device: true,
+                    is_read_only: false,
+                }],
+                container_image_name: args.image.clone(),
+                container_image: args.image.clone(),
+                container_cmd: cmd_args.clone(),
                 network_mode,
-                crate::paths::data_dir(),
+                data_dir: crate::paths::data_dir(),
                 extra_disks,
-                env_vars,
-                volume_mounts,
-                args.privileged,
-                args.tty,
-                args.interactive,
-                args.rootfs_size.clone(),
-                args.health_check.clone(),
-                args.hugepages,
-                args.user.clone(),
-                args.forward_localhost.clone(),
-                image_mode,
-                rootfs_type,
-                args.non_blocking_output,
-            )
+                env_vars: args.env.to_vec(),
+                volume_mounts: args.map.to_vec(),
+                privileged: args.privileged,
+                tty: args.tty,
+                interactive: args.interactive,
+                non_blocking_output: args.non_blocking_output,
+                rootfs_size: args.rootfs_size.clone(),
+                health_check_url: args.health_check.clone(),
+                user: args.user.clone(),
+                forward_localhost: args.forward_localhost.clone(),
+                image_mode: super::resolve_image_mode(args),
+                rootfs_type: super::resolve_rootfs_type(args),
+            }
         });
 
     // Build runtime boot args and apply FirecrackerConfig

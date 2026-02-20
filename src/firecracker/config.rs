@@ -96,6 +96,34 @@ pub struct FirecrackerConfig {
     pub rootfs_type: Option<String>,
 }
 
+impl Default for FirecrackerConfig {
+    fn default() -> Self {
+        Self {
+            boot_source: BootSource::default(),
+            machine_config: MachineConfig::default(),
+            drives: Vec::new(),
+            container_image: String::new(),
+            container_image_name: String::new(),
+            container_cmd: None,
+            network_mode: NetworkMode::default(),
+            data_dir: PathBuf::new(),
+            extra_disks: Vec::new(),
+            env_vars: Vec::new(),
+            volume_mounts: Vec::new(),
+            privileged: false,
+            tty: false,
+            interactive: false,
+            non_blocking_output: false,
+            rootfs_size: "10G".to_string(),
+            health_check_url: None,
+            user: None,
+            forward_localhost: Vec::new(),
+            image_mode: ImageMode::Overlay,
+            rootfs_type: None,
+        }
+    }
+}
+
 fn default_image_mode() -> ImageMode {
     ImageMode::Overlay
 }
@@ -114,7 +142,17 @@ pub struct BootSource {
     pub boot_args: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Default for BootSource {
+    fn default() -> Self {
+        Self {
+            kernel_image_path: PathBuf::new(),
+            initrd_path: PathBuf::new(),
+            boot_args: static_boot_args().to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MachineConfig {
     pub vcpu_count: u8,
     pub mem_size_mib: u32,
@@ -132,19 +170,21 @@ pub struct Drive {
     pub is_read_only: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum NetworkMode {
     Bridged,
+    #[default]
     Rootless,
 }
 
 /// How localhost container images are delivered to the guest VM.
 /// Part of snapshot cache key — different modes produce different VM states.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ImageMode {
     /// Pre-built overlay storage image as additionalImageStore (read-only, instant)
+    #[default]
     Overlay,
     /// Pre-built btrfs storage image with real subvolumes as graphroot (read-write, instant)
     Btrfs,
@@ -176,75 +216,6 @@ pub fn static_boot_args() -> &'static str {
 }
 
 impl FirecrackerConfig {
-    /// Create a new Firecracker config for a podman VM.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        kernel_path: PathBuf,
-        initrd_path: PathBuf,
-        rootfs_path: PathBuf,
-        container_image: String,
-        container_cmd: Option<Vec<String>>,
-        cpu: u8,
-        mem: u32,
-        network_mode: NetworkMode,
-        data_dir: PathBuf,
-        extra_disks: Vec<String>,
-        env_vars: Vec<String>,
-        volume_mounts: Vec<String>,
-        privileged: bool,
-        tty: bool,
-        interactive: bool,
-        rootfs_size: String,
-        health_check_url: Option<String>,
-        hugepages: bool,
-        user: Option<String>,
-        forward_localhost: Vec<u16>,
-        image_mode: ImageMode,
-        rootfs_type: Option<String>,
-        non_blocking_output: bool,
-    ) -> Self {
-        Self {
-            boot_source: BootSource {
-                kernel_image_path: kernel_path,
-                initrd_path,
-                boot_args: static_boot_args().to_string(),
-            },
-            machine_config: MachineConfig {
-                vcpu_count: cpu,
-                mem_size_mib: mem,
-                huge_pages: if hugepages {
-                    Some("2M".to_string())
-                } else {
-                    None
-                },
-            },
-            drives: vec![Drive {
-                drive_id: "rootfs".to_string(),
-                path_on_host: rootfs_path,
-                is_root_device: true,
-                is_read_only: false,
-            }],
-            container_image_name: container_image.clone(),
-            container_image,
-            container_cmd,
-            network_mode,
-            data_dir,
-            extra_disks,
-            env_vars,
-            volume_mounts,
-            privileged,
-            tty,
-            interactive,
-            rootfs_size,
-            health_check_url,
-            user,
-            forward_localhost,
-            non_blocking_output,
-            image_mode,
-            rootfs_type,
-        }
-    }
-
     /// Compute snapshot key by hashing the JSON representation.
     pub fn snapshot_key(&self) -> String {
         use crate::setup::rootfs::compute_sha256;
@@ -414,31 +385,29 @@ mod tests {
 
     /// Helper to create a default test config with optional overrides
     fn test_config() -> FirecrackerConfig {
-        FirecrackerConfig::new(
-            "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
-            "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
-            "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
-            "nginx:alpine".to_string(),
-            None,
-            2,
-            2048,
-            NetworkMode::Bridged,
-            "/mnt/fcvm-btrfs".into(),
-            vec![],
-            vec![],
-            vec![],
-            false,
-            false,
-            false,
-            "10G".to_string(),
-            None,
-            false,
-            None,
-            vec![],
-            ImageMode::Overlay,
-            None,
-            false,
-        )
+        FirecrackerConfig {
+            boot_source: BootSource {
+                kernel_image_path: "/mnt/fcvm-btrfs/kernels/vmlinux-abc123.bin".into(),
+                initrd_path: "/mnt/fcvm-btrfs/initrd/fc-agent-def456.initrd".into(),
+                ..Default::default()
+            },
+            machine_config: MachineConfig {
+                vcpu_count: 2,
+                mem_size_mib: 2048,
+                ..Default::default()
+            },
+            drives: vec![Drive {
+                drive_id: "rootfs".to_string(),
+                path_on_host: "/mnt/fcvm-btrfs/rootfs/layer2-789abc.raw".into(),
+                is_root_device: true,
+                is_read_only: false,
+            }],
+            container_image: "nginx:alpine".to_string(),
+            container_image_name: "nginx:alpine".to_string(),
+            network_mode: NetworkMode::Bridged,
+            data_dir: "/mnt/fcvm-btrfs".into(),
+            ..Default::default()
+        }
     }
 
     #[test]

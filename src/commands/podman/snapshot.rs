@@ -30,6 +30,18 @@ pub fn startup_snapshot_key(base_key: &str) -> String {
     format!("{}-startup", base_key)
 }
 
+/// Parameters for snapshot creation, grouping the many read-only inputs.
+pub struct CreateSnapshotParams<'a> {
+    pub vm_manager: &'a VmManager,
+    pub snapshot_key: &'a str,
+    pub vm_id: &'a str,
+    pub params: &'a SnapshotCreationParams,
+    pub disk_path: &'a Path,
+    pub network_config: &'a NetworkConfig,
+    pub volume_configs: &'a [VolumeConfig],
+    pub parent_snapshot_key: Option<&'a str>,
+}
+
 /// Create a podman snapshot from a running VM.
 ///
 /// This pauses the VM, creates a Firecracker snapshot, copies the disk,
@@ -40,17 +52,17 @@ pub fn startup_snapshot_key(base_key: &str) -> String {
 ///
 /// If `parent_snapshot_key` is provided, the parent's memory.bin will be copied
 /// (via reflink) as a base, enabling diff snapshots for new directories.
-#[allow(clippy::too_many_arguments)]
-pub async fn create_podman_snapshot(
-    vm_manager: &VmManager,
-    snapshot_key: &str,
-    vm_id: &str,
-    params: &SnapshotCreationParams,
-    disk_path: &Path,
-    network_config: &NetworkConfig,
-    volume_configs: &[VolumeConfig],
-    parent_snapshot_key: Option<&str>,
-) -> Result<()> {
+pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<()> {
+    let CreateSnapshotParams {
+        vm_manager,
+        snapshot_key,
+        vm_id,
+        params,
+        disk_path,
+        network_config,
+        volume_configs,
+        parent_snapshot_key,
+    } = snap;
     // Snapshots stored in snapshot_dir with snapshot_key as name
     let snapshot_dir = paths::snapshot_dir().join(snapshot_key);
 
@@ -117,7 +129,7 @@ pub async fn create_podman_snapshot(
             image: params.image.clone(),
             vcpu: params.vcpu,
             memory_mib: params.memory_mib,
-            network_config: network_config.clone(),
+            network_config: (*network_config).clone(),
             volumes: snapshot_volumes,
             health_check_url: params.health_check_url.clone(),
             hugepages: params.hugepages,
@@ -146,16 +158,8 @@ pub async fn create_podman_snapshot(
 ///
 /// Returns `SnapshotOutcome::Interrupted` if a signal is received - caller
 /// should break their event loop and proceed to cleanup.
-#[allow(clippy::too_many_arguments)]
 pub async fn create_snapshot_interruptible(
-    vm_manager: &VmManager,
-    snapshot_key: &str,
-    vm_id: &str,
-    params: &SnapshotCreationParams,
-    disk_path: &Path,
-    network_config: &NetworkConfig,
-    volume_configs: &[VolumeConfig],
-    parent_snapshot_key: Option<&str>,
+    snap: &CreateSnapshotParams<'_>,
     cancel: &CancellationToken,
 ) -> SnapshotOutcome {
     // CRITICAL: Do NOT use tokio::select! to interrupt the snapshot future.
@@ -170,18 +174,7 @@ pub async fn create_snapshot_interruptible(
 
     // Run snapshot to completion. create_snapshot_core always resumes the VM
     // before returning, even on error, so this is safe.
-    match create_podman_snapshot(
-        vm_manager,
-        snapshot_key,
-        vm_id,
-        params,
-        disk_path,
-        network_config,
-        volume_configs,
-        parent_snapshot_key,
-    )
-    .await
-    {
+    match create_podman_snapshot(snap).await {
         Ok(()) => {
             if cancel.is_cancelled() {
                 // Snapshot succeeded but we're shutting down
@@ -215,7 +208,7 @@ pub(super) fn build_firecracker_config(
     // image_identifier is the digest for localhost images (content-addressed cache key).
     // args.image is the original name (what the guest uses to find the image).
     // FirecrackerConfig stores both: container_image for cache key, container_image_name for MMDS.
-    use crate::firecracker::{FcNetworkMode, FirecrackerConfig};
+    use crate::firecracker::{BootSource, Drive, FcNetworkMode, FirecrackerConfig, MachineConfig};
 
     let network_mode = match args.network {
         crate::cli::args::NetworkMode::Bridged => FcNetworkMode::Bridged,
@@ -229,43 +222,47 @@ pub(super) fn build_firecracker_config(
     extra_disks.extend(args.disk_dir.iter().cloned());
     extra_disks.extend(args.nfs.iter().cloned());
 
-    // Collect env vars for cache key (affects container behavior)
-    let env_vars: Vec<String> = args.env.to_vec();
-
-    // Collect volume mounts for cache key (affects MMDS plan)
-    let volume_mounts: Vec<String> = args.map.to_vec();
-
-    // Resolve rootfs_type for cache key
-    let rootfs_type = super::resolve_rootfs_type(args);
-
-    let mut config = FirecrackerConfig::new(
-        kernel_path.to_path_buf(),
-        initrd_path.to_path_buf(),
-        rootfs_path.to_path_buf(),
-        image_identifier.to_string(),
-        cmd_args,
-        args.cpu,
-        args.mem,
+    FirecrackerConfig {
+        boot_source: BootSource {
+            kernel_image_path: kernel_path.to_path_buf(),
+            initrd_path: initrd_path.to_path_buf(),
+            ..Default::default()
+        },
+        machine_config: MachineConfig {
+            vcpu_count: args.cpu,
+            mem_size_mib: args.mem,
+            huge_pages: if args.hugepages {
+                Some("2M".to_string())
+            } else {
+                None
+            },
+        },
+        drives: vec![Drive {
+            drive_id: "rootfs".to_string(),
+            path_on_host: rootfs_path.to_path_buf(),
+            is_root_device: true,
+            is_read_only: false,
+        }],
+        container_image: image_identifier.to_string(),
+        // Set the original image name for MMDS (separate from cache key identifier)
+        container_image_name: args.image.clone(),
+        container_cmd: cmd_args,
         network_mode,
-        crate::paths::data_dir(),
+        data_dir: crate::paths::data_dir(),
         extra_disks,
-        env_vars,
-        volume_mounts,
-        args.privileged,
-        args.tty,
-        args.interactive,
-        args.rootfs_size.clone(),
-        args.health_check.clone(),
-        args.hugepages,
-        args.user.clone(),
-        args.forward_localhost.clone(),
+        env_vars: args.env.to_vec(),
+        volume_mounts: args.map.to_vec(),
+        privileged: args.privileged,
+        tty: args.tty,
+        interactive: args.interactive,
+        rootfs_size: args.rootfs_size.clone(),
+        health_check_url: args.health_check.clone(),
+        user: args.user.clone(),
+        forward_localhost: args.forward_localhost.clone(),
         image_mode,
-        rootfs_type,
-        args.non_blocking_output,
-    );
-    // Set the original image name for MMDS (separate from cache key identifier)
-    config.container_image_name = args.image.clone();
-    config
+        non_blocking_output: args.non_blocking_output,
+        rootfs_type: super::resolve_rootfs_type(args),
+    }
 }
 
 /// Extract Firecracker binary path and args from RuntimeConfig for snapshot restore.
