@@ -190,11 +190,11 @@ fcvm uses a two-tier snapshot system to reduce startup time:
 
 | Snapshot | When Created | Content | Size |
 |----------|--------------|---------|------|
-| **Pre-start** | After image pull, before container runs | VM with image loaded | Full (~2GB) |
+| **Pre-start** | After image pull, before container runs | VM with image loaded | Full (~1GB) |
 | **Startup** | After HTTP health check passes | VM with container fully initialized | Diff (~50MB) |
 
 **How diff snapshots work:**
-1. **First snapshot (pre-start)**: Creates a full memory snapshot (~2GB)
+1. **First snapshot (pre-start)**: Creates a full memory snapshot (~1GB)
 2. **Subsequent snapshots (startup)**: Reflink-copy parent `memory.bin`, create a diff, then merge
 3. **Result**: Each snapshot ends up with a complete `memory.bin`, equivalent to a full snapshot
 
@@ -209,7 +209,7 @@ Second run restores from that snapshot and skips container initialization.
 ```bash
 # First run: Creates pre-start (full) + startup (diff, merged)
 ./fcvm podman run --name web --health-check http://localhost/ nginx:alpine
-# → Pre-start snapshot: 2048MB (full)
+# → Pre-start snapshot: 1024MB (full)
 # → Startup snapshot: ~50MB (diff) → merged onto base
 
 # Second run: Restores from startup snapshot

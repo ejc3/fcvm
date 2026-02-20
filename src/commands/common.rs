@@ -948,14 +948,14 @@ pub(crate) async fn reflink_copy(source: &Path, dest: &Path) -> Result<()> {
 
 /// Limit concurrent snapshot creation to prevent dirty_ratio writeback throttling.
 ///
-/// Each Full snapshot writes ~2GB (the VM's entire configured memory) to page cache.
+/// Each Full snapshot writes ~1GB (the VM's entire configured memory) to page cache.
 /// The Linux kernel throttles ALL writers when dirty pages exceed `dirty_ratio` (typically
-/// 20% of RAM). On a 125GB machine, that's 25GB — just 12 concurrent Full snapshots.
-/// When 150 VMs snapshot simultaneously (CI SnapshotEnabled mode), 300GB of dirty pages
+/// 20% of RAM). On a 125GB machine, that's 25GB — just 25 concurrent Full snapshots.
+/// When 150 VMs snapshot simultaneously (CI SnapshotEnabled mode), 150GB of dirty pages
 /// causes the kernel to force synchronous writeback, stalling each snapshot for 100+ seconds.
 ///
-/// With a semaphore of 10, peak dirty pages stay at ~20GB (under the 25GB threshold),
-/// and each snapshot completes in ~3.5 seconds without throttling.
+/// With a semaphore of 10, peak dirty pages stay at ~10GB (well under the 25GB threshold),
+/// and each snapshot completes in ~1-2 seconds without throttling.
 static SNAPSHOT_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| {
     let permits = std::env::var("FCVM_SNAPSHOT_CONCURRENCY")
         .ok()
