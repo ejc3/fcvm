@@ -927,6 +927,7 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         network_config: &ctx.network_config,
                         volume_configs: &ctx.volume_configs,
                         parent_snapshot_key: None, // Pre-start is the first snapshot, no parent
+                        original_vsock_vm_id: None, // Fresh VM, vsock paths use vm_id
                     };
                     match create_snapshot_interruptible(&snap, &cancel).await {
                         SnapshotOutcome::Interrupted => {
@@ -985,6 +986,7 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                             network_config: &ctx.network_config,
                             volume_configs: &ctx.volume_configs,
                             parent_snapshot_key: Some(key.as_str()), // Parent is pre-start snapshot
+                            original_vsock_vm_id: None, // Fresh VM, vsock paths use vm_id
                         };
                         tokio::select! {
                             outcome = create_snapshot_interruptible(&snap, &cancel) => {
