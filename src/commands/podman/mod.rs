@@ -970,7 +970,12 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                             vm_state: &ctx.vm_state,
                             disk_path: &ctx.disk_path,
                             volume_configs: &ctx.volume_configs,
-                            parent_snapshot_key: Some(key.as_str()), // Parent is pre-start snapshot
+                            // Always use FULL snapshots for startup snapshots.
+                            // Diff snapshots rely on KVM dirty page tracking, which
+                            // is broken on x86_64: KVM reports only ~90KB of dirty
+                            // pages when 60-97MB are actually dirty, producing a
+                            // corrupt snapshot that triple-faults on restore.
+                            parent_snapshot_key: None,
                         };
                         tokio::select! {
                             outcome = create_snapshot_interruptible(&snap, &cancel) => {
