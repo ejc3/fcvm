@@ -48,7 +48,7 @@ async fn test_health_monitor_behaviors() {
         status: VmStatus::Running,
         health_status: HealthStatus::Unknown,
         exit_code: None,
-        pid: Some(99999), // Non-existent PID
+        pid: Some(4194305), // Non-existent PID (above /proc/sys/kernel/pid_max)
         holder_pid: None,
         created_at: now,
         last_updated: now,
@@ -90,10 +90,13 @@ async fn test_health_monitor_behaviors() {
     manager.save_state(&state).await.unwrap();
 
     // Run a single health check iteration
-    let status =
-        fcvm::health::run_health_check_once("health-test-vm", Some(99999), base_dir.join("state"))
-            .await
-            .expect("health check should complete");
+    let status = fcvm::health::run_health_check_once(
+        "health-test-vm",
+        Some(4194305),
+        base_dir.join("state"),
+    )
+    .await
+    .expect("health check should complete");
 
     // Since PID doesn't exist, health should be Unreachable (not Unknown)
     // The health monitor should have detected the missing PID

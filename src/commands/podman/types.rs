@@ -8,7 +8,6 @@ use crate::cli::RunArgs;
 use crate::firecracker::VmManager;
 use crate::network::{NetworkConfig, NetworkManager};
 use crate::state::{StateManager, VmState};
-use crate::storage::SnapshotMetadata;
 use crate::volume::VolumeConfig;
 
 /// All state accumulated during VM setup, bundled for the event loop and cleanup.
@@ -37,8 +36,9 @@ pub struct VmContext {
     /// Notify the output listener to drop its current connection and re-accept.
     /// Triggered after each snapshot (vsock connections reset during snapshot).
     pub output_reconnect: Arc<tokio::sync::Notify>,
-    /// Extra disk entries for the image disk (btrfs mode), included in snapshot metadata.
-    pub image_extra_disks: Vec<crate::storage::SnapshotExtraDisk>,
+    /// VM state snapshot for cache snapshot creation. Config fields (image, vcpu,
+    /// memory_mib, network, original_vsock_vm_id, etc.) are immutable after setup.
+    pub vm_state: crate::state::VmState,
 }
 
 /// A log line from the VM's container output.
@@ -126,65 +126,6 @@ pub struct CacheRequest {
     pub digest: String,
     /// Oneshot channel to signal completion back to status listener
     pub ack_tx: oneshot::Sender<()>,
-}
-
-/// Parameters for creating a snapshot, used by both podman run and snapshot run.
-/// This allows snapshot creation from both fresh VMs (using RunArgs) and
-/// restored VMs (using existing snapshot metadata).
-pub struct SnapshotCreationParams {
-    /// Container image name
-    pub image: String,
-    /// Number of vCPUs
-    pub vcpu: u8,
-    /// Memory in MiB
-    pub memory_mib: u32,
-    /// Health check URL from the baseline VM (None = no HTTP health check)
-    pub health_check_url: Option<String>,
-    /// Whether VM uses 2MB hugepage-backed memory
-    pub hugepages: bool,
-    /// Username for rootless container health checks
-    pub username: Option<String>,
-    /// User spec (UID:GID) for rootless podman
-    pub user: Option<String>,
-    /// Extra disks to include in snapshot (e.g., btrfs image disk)
-    pub extra_disks: Vec<crate::storage::SnapshotExtraDisk>,
-}
-
-impl SnapshotCreationParams {
-    /// Create from RunArgs (for fresh VMs).
-    /// Note: `extra_disks` must be set separately after VM setup (drive IDs are assigned then).
-    pub fn from_run_args(args: &RunArgs) -> Self {
-        // Resolve username from USER= env var (set during podman arg parsing)
-        let username = args
-            .env
-            .iter()
-            .find_map(|s| s.strip_prefix("USER="))
-            .map(|s| s.to_string());
-        Self {
-            image: args.image.clone(),
-            vcpu: args.cpu,
-            memory_mib: args.mem,
-            health_check_url: args.health_check.clone(),
-            hugepages: args.hugepages,
-            username,
-            user: args.user.clone(),
-            extra_disks: vec![],
-        }
-    }
-
-    /// Create from SnapshotMetadata (for restored VMs)
-    pub fn from_metadata(metadata: &SnapshotMetadata) -> Self {
-        Self {
-            image: metadata.image.clone(),
-            vcpu: metadata.vcpu,
-            memory_mib: metadata.memory_mib,
-            health_check_url: metadata.health_check_url.clone(),
-            hugepages: metadata.hugepages,
-            username: metadata.username.clone(),
-            user: metadata.user.clone(),
-            extra_disks: metadata.extra_disks.clone(),
-        }
-    }
 }
 
 /// Result of a snapshot creation attempt that can be interrupted by signals.
