@@ -197,6 +197,29 @@ function downloadLogs(ctx: Context): void {
   log(`Logs saved to ${ctx.logsDir} (${jobsDownloaded} job logs downloaded)`);
 }
 
+function noWorkaroundsRule(): string {
+  return `## ABSOLUTE RULE: NEVER SUGGEST OR CREATE WORKAROUNDS
+
+**If a test fails or something is broken, the ONLY acceptable fix is finding and fixing the actual root cause.**
+
+NEVER suggest or create fix PRs that:
+- Add \`--no-snapshot\`, \`--no-cache\`, or similar avoidance flags
+- Add \`#[ignore]\`, \`#[cfg(skip)]\`, or skip attributes to tests
+- Add early returns like \`if !feature { return Ok(()); }\`
+- Weaken assertions or remove test coverage
+- Add sleeps, retries, or timing workarounds without understanding the race
+- Describe failures as "flaky", "environmental", or "unrelated" without evidence
+
+If a test passes alone but fails in CI, the bug is in the CODE, not in the test configuration.
+If you cannot find the root cause, say "I could not determine the root cause" honestly.
+Do NOT guess at workarounds. Workarounds hide bugs and waste everyone's time.
+
+**Example of what NOT to do**: A test kernel-panics on restore from a cached snapshot. The WRONG
+fix is adding \`--no-snapshot\` to skip caching. The RIGHT fix is finding why the cached snapshot
+is corrupt (e.g., stale memory.bin from an aborted previous run). The workaround would have
+hidden this critical data corruption bug.`;
+}
+
 function reviewPrompt(ctx: Context): string {
   return `# Claude Code Review Task
 
@@ -449,6 +472,8 @@ Please review and merge the fix PR first, then this PR.
 5. Never skip steps
 6. **Do NOT repeat [LOW] issues** already mentioned in previous reviews - no value added
 
+${noWorkaroundsRule()}
+
 **BEGIN**: Get the PR context (step 1a).`;
 }
 
@@ -571,6 +596,8 @@ I analyzed [${ctx.workflowName} #${ctx.failedRunId}](${ctx.failedRunUrl}) but co
 ${ctx.prNumber ? `3. Status updates go to PR #${ctx.prNumber}` : ""}
 4. Fix PR base MUST be \`${ctx.headBranch}\`
 5. If environmental issue, report and STOP (don't make code changes)
+
+${noWorkaroundsRule()}
 
 **BEGIN**: Read the run summary log.`;
 }
