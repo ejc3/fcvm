@@ -549,6 +549,252 @@ async fn clone_while_baseline_running_impl(network_mode: &str) -> Result<()> {
     }
 }
 
+/// Test that the host route is replaced when a new clone spawns while an old clone is alive.
+///
+/// All bridged clones share the same guest IP (baked into snapshot memory). Each gets a unique
+/// veth with a unique /30 subnet. The host route `{guest_ip}/32 via {veth_inner_ip}` determines
+/// which clone is reachable from the host.
+///
+/// Without route replacement, the second clone's HTTP health check fails because:
+/// - SO_BINDTODEVICE constrains the packet to clone2's veth
+/// - But the host route says "via clone1's gateway" (wrong /30 subnet for clone2's veth)
+/// - ARP resolution fails → health check timeout
+///
+/// This test spawns two clones from the same serve and verifies:
+/// 1. Clone1's route is created
+/// 2. Clone2 replaces clone1's route and becomes healthy
+/// 3. Clone1's VM process is still alive (just not reachable via host route)
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_route_replacement_on_clone_bridged() -> Result<()> {
+    let (baseline_name, clone1_name, snapshot_name, serve_name) =
+        common::unique_names("route-repl");
+    let clone2_name = format!("{}-c2", clone1_name);
+
+    println!("\n╔═══════════════════════════════════════════════════════════════╗");
+    println!("║     Route Replacement on Clone Test (bridged)                ║");
+    println!("╚═══════════════════════════════════════════════════════════════╝\n");
+
+    let fcvm_path = common::find_fcvm_binary()?;
+
+    // Step 1: Start baseline with --health-check so clones inherit HTTP health checking
+    println!("Step 1: Starting baseline VM with --health-check...");
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "bridged",
+            "--health-check",
+            "http://localhost/",
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
+
+    println!("  Waiting for baseline VM to become healthy...");
+    common::poll_health_by_pid(baseline_pid, 120).await?;
+    println!("  ✓ Baseline VM healthy (PID: {})", baseline_pid);
+
+    // Step 2: Create snapshot
+    println!("\nStep 2: Creating snapshot...");
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
+        ])
+        .output()
+        .await
+        .context("running snapshot create")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Snapshot creation failed: {}", stderr);
+    }
+    println!("  ✓ Snapshot created");
+
+    // Step 3: Start memory server
+    println!("\nStep 3: Starting memory server...");
+    let (_serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], &serve_name)
+            .await
+            .context("spawning memory server")?;
+
+    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+    println!("  ✓ Memory server ready (PID: {})", serve_pid);
+
+    let serve_pid_str = serve_pid.to_string();
+
+    // Step 4: Spawn clone1
+    println!("\nStep 4: Spawning clone1...");
+    let (_clone1_child, clone1_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid_str,
+            "--name",
+            &clone1_name,
+            "--network",
+            "bridged",
+        ],
+        &clone1_name,
+    )
+    .await
+    .context("spawning clone1")?;
+
+    println!("  Waiting for clone1 to become healthy...");
+    common::poll_health_by_pid(clone1_pid, 120).await?;
+    println!("  ✓ Clone1 healthy (PID: {})", clone1_pid);
+
+    // Step 5: Get clone1's network info and verify host route
+    println!("\nStep 5: Verifying clone1's host route...");
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args(["ls", "--json", "--pid", &clone1_pid.to_string()])
+        .output()
+        .await
+        .context("getting clone1 state")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: Vec<serde_json::Value> =
+        serde_json::from_str(&stdout).context("parsing clone1 JSON")?;
+    let network = parsed.first().and_then(|v| v.get("config")?.get("network"));
+
+    let guest_ip = network
+        .and_then(|n| n.get("guest_ip")?.as_str())
+        .context("clone1 missing guest_ip")?
+        .to_string();
+    let clone1_host_veth = network
+        .and_then(|n| n.get("host_veth")?.as_str())
+        .context("clone1 missing host_veth")?
+        .to_string();
+
+    println!(
+        "  Clone1: guest_ip={}, host_veth={}",
+        guest_ip, clone1_host_veth
+    );
+
+    // Verify host route points to clone1's veth device
+    // Route format: "{guest_ip} via {veth_inner_ip} dev {host_veth}"
+    let route = format!("{}/32", guest_ip);
+    let route_output = tokio::process::Command::new("ip")
+        .args(["route", "show", &route])
+        .output()
+        .await
+        .context("checking route for clone1")?;
+    let route_str = String::from_utf8_lossy(&route_output.stdout);
+    println!("  Route: {}", route_str.trim());
+
+    assert!(
+        route_str.contains(&clone1_host_veth),
+        "Host route should use clone1's veth ({}), got: {}",
+        clone1_host_veth,
+        route_str.trim()
+    );
+    println!("  ✓ Route points to clone1");
+
+    // Step 6: Spawn clone2 while clone1 is still alive
+    println!("\nStep 6: Spawning clone2 while clone1 is still alive...");
+    let (_clone2_child, clone2_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid_str,
+            "--name",
+            &clone2_name,
+            "--network",
+            "bridged",
+        ],
+        &clone2_name,
+    )
+    .await
+    .context("spawning clone2")?;
+
+    // Clone2 becoming healthy PROVES route replacement worked:
+    // - Clone2's health monitor sends HTTP to guest_ip via clone2's veth (SO_BINDTODEVICE)
+    // - Without route replacement, ARP for clone1's gateway fails on clone2's veth
+    // - With route replacement, ARP for clone2's gateway succeeds
+    println!("  Waiting for clone2 to become healthy (proves route replacement)...");
+    common::poll_health_by_pid(clone2_pid, 120).await?;
+    println!("  ✓ Clone2 healthy (PID: {})", clone2_pid);
+
+    // Step 7: Verify host route now points to clone2
+    println!("\nStep 7: Verifying route was replaced...");
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args(["ls", "--json", "--pid", &clone2_pid.to_string()])
+        .output()
+        .await
+        .context("getting clone2 state")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: Vec<serde_json::Value> =
+        serde_json::from_str(&stdout).context("parsing clone2 JSON")?;
+    let clone2_host_veth = parsed
+        .first()
+        .and_then(|v| v.get("config")?.get("network")?.get("host_veth")?.as_str())
+        .context("clone2 missing host_veth")?
+        .to_string();
+
+    println!("  Clone2: host_veth={}", clone2_host_veth);
+
+    let route_output = tokio::process::Command::new("ip")
+        .args(["route", "show", &route])
+        .output()
+        .await
+        .context("checking route for clone2")?;
+    let route_str = String::from_utf8_lossy(&route_output.stdout);
+    println!("  Route: {}", route_str.trim());
+
+    assert!(
+        route_str.contains(&clone2_host_veth),
+        "Host route should now use clone2's veth ({}), got: {}",
+        clone2_host_veth,
+        route_str.trim()
+    );
+    assert!(
+        !route_str.contains(&clone1_host_veth),
+        "Host route should NOT use clone1's veth ({}), got: {}",
+        clone1_host_veth,
+        route_str.trim()
+    );
+    println!("  ✓ Route replaced: now points to clone2");
+
+    // Step 8: Verify clone1's VM process is still alive
+    println!("\nStep 8: Verifying clone1 process still alive...");
+    let alive = tokio::process::Command::new("kill")
+        .args(["-0", &clone1_pid.to_string()])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    assert!(alive, "Clone1 (PID {}) should still be alive", clone1_pid);
+    println!("  ✓ Clone1 process still running");
+
+    // Cleanup
+    println!("\nCleaning up...");
+    common::kill_process(clone2_pid).await;
+    println!("  Killed clone2");
+    common::kill_process(clone1_pid).await;
+    println!("  Killed clone1");
+    common::kill_process(serve_pid).await;
+    println!("  Killed memory server");
+    common::kill_process(baseline_pid).await;
+    println!("  Killed baseline");
+
+    println!("\n✅ ROUTE REPLACEMENT TEST PASSED!");
+    Ok(())
+}
+
 /// Test that clones can reach the internet in bridged mode
 ///
 /// This verifies that DNS resolution and outbound connectivity work after snapshot restore.
