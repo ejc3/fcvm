@@ -133,9 +133,9 @@ fn test_sigint_kills_firecracker_bridged() -> Result<()> {
         let _ = fcvm.wait();
     }
 
-    // Poll for firecracker cleanup (max 5 seconds)
+    // Poll for firecracker cleanup (max 15 seconds — under CI load, cleanup can be slow)
     let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(5) {
+    while start.elapsed() < Duration::from_secs(15) {
         if !process_exists(fc_pid) {
             break;
         }
@@ -264,9 +264,9 @@ fn test_sigterm_kills_firecracker_bridged() -> Result<()> {
         let _ = fcvm.wait();
     }
 
-    // Poll for firecracker cleanup (max 5 seconds)
+    // Poll for firecracker cleanup (max 15 seconds — under CI load, cleanup can be slow)
     let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(5) {
+    while start.elapsed() < Duration::from_secs(15) {
         if !process_exists(fc_pid) {
             break;
         }

@@ -186,78 +186,117 @@ pub(crate) async fn run_output_listener(
     info!(socket = %socket_path, "Output listener started");
 
     let mut output_lines: Vec<(String, String)> = Vec::new();
+    let mut connection_count: u64 = 0;
+    let mut lines_read = 0u64;
 
-    // Outer loop: accept connections repeatedly.
-    // Firecracker resets all vsock connections during snapshot creation, so fc-agent
-    // will reconnect after each snapshot. We must keep accepting new connections.
+    // Accept the first connection (no timeout — image import can take 10+ min)
+    let (initial_stream, _) = match listener.accept().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            warn!(vm_id = %vm_id, error = %e, "Error accepting initial output connection");
+            let _ = std::fs::remove_file(socket_path);
+            return Ok(output_lines);
+        }
+    };
+    connection_count += 1;
+    debug!(vm_id = %vm_id, connection_count, "Output connection established");
+
+    let mut reader = BufReader::new(initial_stream);
+    let mut line_buf = String::new();
+
+    // Read lines from the current connection.
+    // fc-agent may reconnect multiple times (snapshot create/restore cycles).
+    // Always prefer the newest connection — if a new connection arrives while
+    // reading from the current one, switch to it. The latest connection is
+    // always the right one because it's from fc-agent's latest vsock connect.
     loop {
-        // Accept connection from fc-agent (no timeout - image import can take 10+ min)
-        let (stream, _) = match listener.accept().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                warn!(vm_id = %vm_id, error = %e, "Error accepting output connection");
-                break;
-            }
-        };
+        line_buf.clear();
 
-        debug!(vm_id = %vm_id, "Output connection established");
-
-        let mut reader = BufReader::new(stream);
-        let mut line_buf = String::new();
-
-        // Read lines until connection closes or snapshot triggers reconnect.
-        // During snapshot, Firecracker resets vsock but the host-side Unix socket
-        // stays open (no EOF). The reconnect_notify signals us to drop this
-        // connection so fc-agent's new vsock connection can be accepted.
-        loop {
-            line_buf.clear();
-            let read_result = tokio::select! {
-                result = reader.read_line(&mut line_buf) => result,
-                _ = reconnect_notify.notified() => {
-                    info!(vm_id = %vm_id, "Snapshot reconnect signal, dropping old connection");
-                    break;
-                }
-            };
-            match read_result {
-                Ok(0) => {
-                    // EOF - connection closed (vsock reset from snapshot, or VM exit)
-                    info!(vm_id = %vm_id, "Output connection closed, waiting for reconnect");
-                    break;
-                }
-                Ok(_) => {
-                    // Parse raw line format: stream:content
-                    let line = line_buf.trim_end();
-                    if let Some((stream, content)) = line.split_once(':') {
-                        if stream == "heartbeat" {
-                            // Heartbeat from fc-agent during long operations (image import/pull)
-                            info!(vm_id = %vm_id, phase = %content, "VM heartbeat");
-                        } else {
-                            // Print container output directly (stdout to stdout, stderr to stderr)
-                            // No prefix - clean output for scripting
-                            if stream == "stdout" {
-                                println!("{}", content);
-                            } else {
-                                eprintln!("{}", content);
+        // Race: read data vs new connection vs reconnect signal
+        tokio::select! {
+            result = reader.read_line(&mut line_buf) => {
+                match result {
+                    Ok(0) => {
+                        // EOF — connection closed. Wait for next.
+                        info!(vm_id = %vm_id, lines_read, "Output connection EOF");
+                        match listener.accept().await {
+                            Ok((s, _)) => {
+                                connection_count += 1;
+                                lines_read = 0;
+                                debug!(vm_id = %vm_id, connection_count, "Output connection established (after EOF)");
+                                reader = BufReader::new(s);
+                                continue;
                             }
-                            output_lines.push((stream.to_string(), content.to_string()));
-                        }
-
-                        // Forward to broadcast channel for library consumers
-                        if let Some(ref tx) = log_tx {
-                            let _ = tx.send(LogLine {
-                                stream: stream.to_string(),
-                                content: content.to_string(),
-                            });
+                            Err(e) => {
+                                warn!(vm_id = %vm_id, error = %e, "Accept failed after EOF");
+                                break;
+                            }
                         }
                     }
+                    Ok(n) => {
+                        lines_read += 1;
+                        if lines_read <= 3 || lines_read % 1000 == 0 {
+                            debug!(vm_id = %vm_id, lines_read, bytes = n, "Output line received");
+                        }
+                        let line = line_buf.trim_end();
+                        if let Some((stream, content)) = line.split_once(':') {
+                            if stream == "heartbeat" {
+                                info!(vm_id = %vm_id, phase = %content, "VM heartbeat");
+                            } else {
+                                if stream == "stdout" {
+                                    println!("{}", content);
+                                } else {
+                                    eprintln!("{}", content);
+                                }
+                                output_lines.push((stream.to_string(), content.to_string()));
+                            }
+                            if let Some(ref tx) = log_tx {
+                                let _ = tx.send(LogLine {
+                                    stream: stream.to_string(),
+                                    content: content.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(vm_id = %vm_id, error = %e, "Read error on output connection");
+                        break;
+                    }
                 }
-                Err(e) => {
-                    warn!(vm_id = %vm_id, error = %e, "Error reading output, waiting for reconnect");
-                    break;
+            }
+            accept = listener.accept() => {
+                // New connection arrived while reading — switch to it.
+                // The latest connection is always from fc-agent's latest reconnect.
+                match accept {
+                    Ok((new_stream, _)) => {
+                        connection_count += 1;
+                        info!(vm_id = %vm_id, connection_count, lines_read, "Switching to newer output connection");
+                        reader = BufReader::new(new_stream);
+                        lines_read = 0;
+                    }
+                    Err(e) => {
+                        warn!(vm_id = %vm_id, error = %e, "Accept failed for new connection");
+                        break;
+                    }
+                }
+            }
+            _ = reconnect_notify.notified() => {
+                info!(vm_id = %vm_id, lines_read, "Reconnect signal, waiting for new connection");
+                match listener.accept().await {
+                    Ok((s, _)) => {
+                        connection_count += 1;
+                        lines_read = 0;
+                        debug!(vm_id = %vm_id, connection_count, "Output connection established (after signal)");
+                        reader = BufReader::new(s);
+                    }
+                    Err(e) => {
+                        warn!(vm_id = %vm_id, error = %e, "Accept failed after signal");
+                        break;
+                    }
                 }
             }
         }
-    } // outer accept loop
+    }
 
     // Clean up
     let _ = std::fs::remove_file(socket_path);

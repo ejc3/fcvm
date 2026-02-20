@@ -744,7 +744,26 @@ pub fn notify_cache_ready_and_wait(
                 return false;
             }
             Ok(0) => {
-                // Timeout on this poll interval — loop and check deadline
+                // Poll timeout — actively probe the vsock connection.
+                // After snapshot restore, the vsock transport is reset but the kernel
+                // may not deliver POLLHUP on the restored fd (observed in rootless mode).
+                // A write to a dead connection fails immediately with EPIPE or ECONNRESET,
+                // which reliably detects that a snapshot was taken and we've been restored.
+                match write(&sock, b"\n") {
+                    Err(nix::errno::Errno::EPIPE)
+                    | Err(nix::errno::Errno::ECONNRESET)
+                    | Err(nix::errno::Errno::ENOTCONN)
+                    | Err(nix::errno::Errno::ECONNREFUSED) => {
+                        eprintln!("[fc-agent] cache-ack connection dead (write probe), snapshot was taken");
+                        return true;
+                    }
+                    Err(nix::errno::Errno::EAGAIN) => {
+                        // Connection alive but can't write now — continue polling
+                    }
+                    _ => {
+                        // Write succeeded or other error — connection still alive, continue
+                    }
+                }
                 continue;
             }
             Ok(_) => {}

@@ -137,6 +137,7 @@ async fn fetch_latest_metadata(client: &reqwest::Client) -> Result<LatestMetadat
 pub async fn watch_restore_epoch(
     output: OutputHandle,
     restore_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    exec_rebind: std::sync::Arc<tokio::sync::Notify>,
 ) {
     let mut last_epoch: Option<String> = None;
 
@@ -165,13 +166,13 @@ pub async fn watch_restore_epoch(
                     // Must be set BEFORE handle_clone_restore so the poll loop
                     // exits before output reconnect changes vsock state.
                     restore_flag.store(true, std::sync::atomic::Ordering::Release);
-                    crate::restore::handle_clone_restore(&output).await;
+                    crate::restore::handle_clone_restore(&output, &exec_rebind).await;
                     last_epoch = metadata.restore_epoch;
                 }
                 Some(prev) if prev != current => {
                     eprintln!("[fc-agent] restore-epoch changed: {} -> {}", prev, current,);
                     restore_flag.store(true, std::sync::atomic::Ordering::Release);
-                    crate::restore::handle_clone_restore(&output).await;
+                    crate::restore::handle_clone_restore(&output, &exec_rebind).await;
                     last_epoch = metadata.restore_epoch;
                 }
                 _ => {}
