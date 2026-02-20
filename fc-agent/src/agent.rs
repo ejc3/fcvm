@@ -305,7 +305,7 @@ pub async fn run() -> Result<()> {
     }
 
     // Non-TTY mode: async
-    let exit_code = container::run_async(&podman_args, &output).await?;
+    let exit_code = container::run_async(&podman_args, &output, plan.non_blocking_output).await?;
 
     // Notify host of exit
     crate::vsock::notify_container_exit(exit_code);

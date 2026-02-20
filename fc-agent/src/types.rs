@@ -42,6 +42,11 @@ pub struct Plan {
     pub subuid_start: Option<u64>,
     #[serde(default)]
     pub subuid_count: Option<u64>,
+    /// Use non-blocking output: drop container stdout/stderr when the output
+    /// channel is full instead of blocking. Prevents backpressure from
+    /// deadlocking FUSE-based services in the container.
+    #[serde(default)]
+    pub non_blocking_output: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
