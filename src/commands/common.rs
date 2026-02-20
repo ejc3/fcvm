@@ -5,7 +5,7 @@
 
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
-use std::sync::LazyLock;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use nix::sys::uio::{pread, pwrite};
@@ -956,13 +956,17 @@ pub(crate) async fn reflink_copy(source: &Path, dest: &Path) -> Result<()> {
 ///
 /// With a semaphore of 10, peak dirty pages stay at ~20GB (under the 25GB threshold),
 /// and each snapshot completes in ~3.5 seconds without throttling.
-static SNAPSHOT_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| {
-    let permits = std::env::var("FCVM_SNAPSHOT_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(10);
-    Semaphore::new(permits)
-});
+static SNAPSHOT_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+
+fn snapshot_semaphore() -> &'static Semaphore {
+    SNAPSHOT_SEMAPHORE.get_or_init(|| {
+        let permits = std::env::var("FCVM_SNAPSHOT_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(10);
+        Semaphore::new(permits)
+    })
+}
 
 /// # Arguments
 /// * `client` - Firecracker API client for the running VM
@@ -982,7 +986,7 @@ pub async fn create_snapshot_core(
 
     // Acquire snapshot concurrency permit BEFORE pausing the VM.
     // This prevents dirty_ratio throttling when many VMs snapshot simultaneously.
-    let _permit = SNAPSHOT_SEMAPHORE
+    let _permit = snapshot_semaphore()
         .acquire()
         .await
         .map_err(|e| anyhow::anyhow!("snapshot semaphore closed: {}", e))?;
