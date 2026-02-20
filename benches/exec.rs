@@ -500,7 +500,22 @@ impl CloneFixture {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            panic!("clone exec failed: {}", stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Dump serve log for diagnostics
+            let serve_log = "/tmp/fcvm-bench-serve-clone-exec.log";
+            if let Ok(logs) = std::fs::read_to_string(serve_log) {
+                let tail: Vec<&str> = logs.lines().rev().take(30).collect();
+                eprintln!("=== Last 30 lines of serve log ===");
+                for line in tail.into_iter().rev() {
+                    eprintln!("{}", line);
+                }
+            }
+            panic!(
+                "clone exec failed after {:.1}s:\nstderr: {}\nstdout: {}",
+                elapsed.as_secs_f64(),
+                stderr,
+                stdout
+            );
         }
 
         elapsed
