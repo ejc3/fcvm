@@ -973,7 +973,7 @@ pub(crate) async fn reflink_copy(source: &Path, dest: &Path) -> Result<()> {
 
 /// Limit concurrent snapshot creation to prevent dirty_ratio writeback throttling.
 ///
-/// Each Full snapshot writes the VM's entire configured memory to page cache.
+/// Each full snapshot writes the VM's entire configured memory (default 1GB) to page cache.
 /// The Linux kernel throttles ALL writers when dirty pages exceed `dirty_ratio` (typically
 /// 20% of RAM). On a 125GB machine with default dirty_ratio=20%, that's 25GB.
 /// When 150 VMs snapshot simultaneously (CI SnapshotEnabled mode), total dirty pages
