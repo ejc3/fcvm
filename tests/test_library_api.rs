@@ -20,7 +20,7 @@ fn test_run_args(name: &str) -> RunArgs {
     RunArgs {
         name: name.to_string(),
         cpu: 2,
-        mem: 2048,
+        mem: 1024,
         rootfs_size: "10G".to_string(),
         map: vec![],
         disk: vec![],
