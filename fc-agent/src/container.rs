@@ -1134,7 +1134,11 @@ pub fn run_tty(podman_args: &[String], plan: &Plan, mounted_fuse_paths: &[String
 }
 
 /// Run container in non-TTY async mode. Returns exit code.
-pub async fn run_async(podman_args: &[String], output: &OutputHandle, non_blocking_output: bool) -> Result<i32> {
+pub async fn run_async(
+    podman_args: &[String],
+    output: &OutputHandle,
+    non_blocking_output: bool,
+) -> Result<i32> {
     let mut cmd = Command::new(&podman_args[0]);
     cmd.args(&podman_args[1..]);
     cmd.stdout(Stdio::piped());
