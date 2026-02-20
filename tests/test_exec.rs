@@ -1647,51 +1647,79 @@ async fn test_podman_run_interactive_tty() -> Result<()> {
 
             let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
 
-            // Wait for container to be ready
-            std::thread::sleep(Duration::from_secs(10));
-
-            // Write input to container
-            master
-                .write_all(b"hello-from-stdin\n")
-                .context("writing stdin")?;
-            master.flush()?;
-
-            // Read output with timeout
+            // Heartbeat strategy: periodically send stdin lines until the
+            // container is actually running and `head -1` consumes one.
+            // In SnapshotEnabled mode, the VM may pause for 20-30s during
+            // snapshot creation before the container starts. A fixed sleep
+            // before writing is unreliable. Instead, we send a line every
+            // 2 seconds and read output between sends. Once `head -1` reads
+            // a line, it exits, and we'll see it in the output.
+            //
+            // Use poll() with a timeout instead of non-blocking read to
+            // guarantee we always return after a bounded time — O_NONBLOCK
+            // via fcntl can silently fail on some platforms.
             let mut output = Vec::new();
             let mut buf = [0u8; 4096];
+            let deadline = std::time::Instant::now() + Duration::from_secs(180);
+            let mut next_heartbeat = std::time::Instant::now() + Duration::from_secs(10);
+            let mut heartbeats_sent = 0u32;
 
-            // Set non-blocking
-            unsafe {
-                let flags = libc::fcntl(master_fd, libc::F_GETFL);
-                libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
+            let mut poll_fd = [libc::pollfd {
+                fd: master_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            }];
 
-            let deadline = std::time::Instant::now() + Duration::from_secs(120);
             loop {
                 if std::time::Instant::now() > deadline {
+                    println!("  WARNING: timed out after 180s");
                     nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL).ok();
                     break;
+                }
+
+                // Send a heartbeat line every 2 seconds
+                if std::time::Instant::now() >= next_heartbeat {
+                    heartbeats_sent += 1;
+                    println!("  sending heartbeat #{}", heartbeats_sent);
+                    let _ = master.write_all(b"hello-from-stdin\n");
+                    let _ = master.flush();
+                    next_heartbeat = std::time::Instant::now() + Duration::from_secs(2);
+                }
+
+                // Poll with 200ms timeout — guarantees we return to check
+                // deadline and heartbeat timer even if no data arrives.
+                let ready = unsafe { libc::poll(poll_fd.as_mut_ptr(), 1, 200) };
+                if ready <= 0 {
+                    // Timeout or error — check if child exited
+                    match nix::sys::wait::waitpid(child, Some(nix::sys::wait::WaitPidFlag::WNOHANG))
+                    {
+                        Ok(nix::sys::wait::WaitStatus::Exited(_, _)) => break,
+                        Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
+                        _ => continue,
+                    }
                 }
 
                 use std::io::Read;
                 match master.read(&mut buf) {
                     Ok(0) => break,
-                    Ok(n) => output.extend_from_slice(&buf[..n]),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        match nix::sys::wait::waitpid(
-                            child,
-                            Some(nix::sys::wait::WaitPidFlag::WNOHANG),
-                        ) {
-                            Ok(nix::sys::wait::WaitStatus::Exited(_, _)) => break,
-                            Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
-                            _ => std::thread::sleep(Duration::from_millis(50)),
+                    Ok(n) => {
+                        output.extend_from_slice(&buf[..n]);
+                        // Check if we already got what we need
+                        let so_far = String::from_utf8_lossy(&output);
+                        if so_far.contains("hello-from-stdin") {
+                            break;
                         }
                     }
                     Err(_) => break,
                 }
             }
 
-            // Wait for child
+            println!("  heartbeats sent: {}", heartbeats_sent);
+
+            // Kill fcvm — we got what we need, don't wait for VM shutdown.
+            // Use SIGKILL to avoid blocking on graceful shutdown (which can
+            // take minutes if the VM is still booting).
+            nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL).ok();
             let _ = nix::sys::wait::waitpid(child, None);
 
             let output_str = String::from_utf8_lossy(&output);
@@ -1723,9 +1751,11 @@ async fn test_podman_run_no_tty() -> Result<()> {
     let fcvm_path = common::find_fcvm_binary()?;
     let (vm_name, _, _, _) = common::unique_names("run-no-tty");
 
-    // Run without -t, check tty command output
+    // Run without -t, check tty command output.
+    // 240s timeout: in SnapshotEnabled mode, first run creates a snapshot (20-30s extra)
+    // and CI parallel load can add further delays.
     let output = tokio::time::timeout(
-        Duration::from_secs(120),
+        Duration::from_secs(240),
         tokio::process::Command::new(&fcvm_path)
             .args([
                 "podman",
