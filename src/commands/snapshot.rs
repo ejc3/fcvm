@@ -7,7 +7,7 @@ use tracing::{debug, info, warn};
 
 use super::podman::{
     check_podman_snapshot, create_snapshot_interruptible, startup_snapshot_key,
-    CreateSnapshotParams, SnapshotCreationParams, SnapshotOutcome,
+    CreateSnapshotParams, SnapshotOutcome,
 };
 use crate::cli::{
     NetworkMode, SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs,
@@ -50,9 +50,7 @@ fn snapshot_restore_runtime_config(args: &SnapshotRunArgs) -> RuntimeConfig {
 /// Create snapshot from running VM
 async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     use super::common::VSOCK_VOLUME_PORT_BASE;
-    use crate::storage::snapshot::{
-        SnapshotConfig, SnapshotExtraDisk, SnapshotMetadata, SnapshotType, SnapshotVolumeConfig,
-    };
+    use crate::storage::snapshot::{SnapshotType, SnapshotVolumeConfig};
 
     // Determine which VM to snapshot
     let state_manager = StateManager::new(paths::state_dir());
@@ -116,11 +114,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     use crate::firecracker::FirecrackerClient;
     let client = FirecrackerClient::new(socket_path)?;
 
-    // Build final snapshot paths (used in config.json)
     let snapshot_dir = paths::snapshot_dir().join(&snapshot_name);
-    let final_memory_path = snapshot_dir.join("memory.bin");
-    let final_vmstate_path = snapshot_dir.join("vmstate.bin");
-    let final_disk_path = snapshot_dir.join("disk.raw");
 
     // Parse volume configs from VM state (format: HOST:GUEST[:ro])
     let volume_configs: Vec<SnapshotVolumeConfig> = vm_state
@@ -145,90 +139,17 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         })
         .collect();
 
-    if !volume_configs.is_empty() {
-        info!(
-            num_volumes = volume_configs.len(),
-            "saving {} volume config(s) to snapshot metadata",
-            volume_configs.len()
-        );
-    }
+    let extra_disk_configs = super::common::extra_disks_to_snapshot(&vm_state);
 
-    // Parse extra disk configs from VM state (RO disks only — RW already blocked above)
-    // Only include disk-dir disks (images inside VM data directory), not external --disk files.
-    // External --disk files are at arbitrary paths and don't need copying — the clone can
-    // access them directly at the same external path.
-    let vm_data_dir = paths::vm_runtime_dir(&vm_state.vm_id);
-    let vm_data_prefix = vm_data_dir.to_string_lossy().to_string();
-    let extra_disk_configs: Vec<SnapshotExtraDisk> = vm_state
-        .config
-        .extra_disks
-        .iter()
-        .filter(|disk| disk.path.starts_with(&vm_data_prefix))
-        .filter_map(|disk| {
-            let filename = std::path::Path::new(&disk.path)
-                .file_name()?
-                .to_str()?
-                .to_string();
-            // Derive drive_id from filename: "disk-dir-0.raw" → "disk0"
-            // Falls back to "disk0" if filename doesn't match the expected pattern.
-            let index = filename
-                .strip_prefix("disk-dir-")
-                .and_then(|s| s.strip_suffix(".raw"))
-                .unwrap_or("0");
-            let drive_id = format!("disk{}", index);
-            Some(SnapshotExtraDisk {
-                filename,
-                mount_path: disk.mount_path.clone(),
-                read_only: disk.read_only,
-                drive_id,
-            })
-        })
-        .collect();
-
-    if !extra_disk_configs.is_empty() {
-        info!(
-            num_disks = extra_disk_configs.len(),
-            "saving {} extra disk config(s) to snapshot metadata",
-            extra_disk_configs.len()
-        );
-    }
-
-    // Use original_vsock_vm_id from the VM state if available.
-    // When a VM is restored from cache, its vmstate.bin references vsock paths from the
-    // ORIGINAL (cached) VM. Taking a snapshot of this restored VM creates a NEW vmstate.bin,
-    // but Firecracker doesn't update vsock paths - they still reference the original VM ID.
-    // So we must preserve the original_vsock_vm_id through the chain:
-    // Cache(vm-AAA) → Restore(vm-BBB) → Snapshot → Clone(vm-CCC)
-    // The clone needs to redirect from vm-AAA's path, not vm-BBB's.
-    let original_vsock_vm_id = vm_state
-        .config
-        .original_vsock_vm_id
-        .clone()
-        .unwrap_or_else(|| vm_state.vm_id.clone());
-
-    // Build snapshot config with FINAL paths (create_snapshot_core handles temp dir)
-    let snapshot_config = SnapshotConfig {
-        name: snapshot_name.clone(),
-        vm_id: vm_state.vm_id.clone(),
-        original_vsock_vm_id: Some(original_vsock_vm_id),
-        memory_path: final_memory_path,
-        vmstate_path: final_vmstate_path,
-        disk_path: final_disk_path,
-        created_at: chrono::Utc::now(),
-        snapshot_type: SnapshotType::User, // Explicit user-created snapshot
-        metadata: SnapshotMetadata {
-            image: vm_state.config.image.clone(),
-            vcpu: vm_state.config.vcpu,
-            memory_mib: vm_state.config.memory_mib,
-            network_config: vm_state.config.network.clone(),
-            volumes: volume_configs,
-            health_check_url: vm_state.config.health_check_url.clone(),
-            hugepages: vm_state.config.hugepages,
-            extra_disks: extra_disk_configs,
-            username: vm_state.config.username.clone(),
-            user: vm_state.config.user.clone(),
-        },
-    };
+    // Build snapshot config from VmState (single source of truth)
+    let snapshot_config = super::common::build_snapshot_config(
+        &vm_state,
+        &snapshot_name,
+        SnapshotType::User,
+        &snapshot_dir,
+        volume_configs,
+        extra_disk_configs,
+    );
 
     // Use shared core function for snapshot creation
     // If the VM was restored from a snapshot, use that as parent for diff support
@@ -1089,23 +1010,16 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                     } else {
                         info!(snapshot_key = %startup_key, "Creating startup snapshot (VM healthy)");
 
-                        let params = SnapshotCreationParams::from_metadata(&snapshot_config.metadata);
                         // Use select! so SIGTERM can abort startup snapshot immediately.
                         // Startup snapshots are optional (just caching), so if the VM is
                         // paused mid-snapshot, cleanup will kill it via vm_manager.kill().
                         let snap = CreateSnapshotParams {
                             vm_manager: &vm_manager,
                             snapshot_key: &startup_key,
-                            vm_id: &vm_id,
-                            params: &params,
+                            vm_state: &vm_state,
                             disk_path: &disk_path,
-                            network_config: &network_config,
                             volume_configs: &volume_configs,
                             parent_snapshot_key: Some(base_key.as_str()), // Parent is pre-start snapshot
-                            // Preserve vsock VM ID chain: vmstate.bin references the original
-                            // fresh boot VM's vsock paths, even after cache restore. Clones of
-                            // this startup snapshot need to redirect that original directory.
-                            original_vsock_vm_id: vm_state.config.original_vsock_vm_id.clone(),
                         };
                         tokio::select! {
                             outcome = create_snapshot_interruptible(&snap, &cancel) => {

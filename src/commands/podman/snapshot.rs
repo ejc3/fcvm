@@ -6,14 +6,12 @@ use tracing::info;
 
 use crate::cli::RunArgs;
 use crate::firecracker::VmManager;
-use crate::network::NetworkConfig;
 use crate::paths;
-use crate::storage::{
-    SnapshotConfig, SnapshotManager, SnapshotMetadata, SnapshotType, SnapshotVolumeConfig,
-};
+use crate::state::VmState;
+use crate::storage::{SnapshotConfig, SnapshotManager, SnapshotType};
 use crate::volume::VolumeConfig;
 
-use super::types::{SnapshotCreationParams, SnapshotOutcome};
+use super::types::SnapshotOutcome;
 
 /// Check if a podman snapshot exists.
 /// Uses SnapshotManager to check for the snapshot with snapshot_key as name.
@@ -30,22 +28,17 @@ pub fn startup_snapshot_key(base_key: &str) -> String {
     format!("{}-startup", base_key)
 }
 
-/// Parameters for snapshot creation, grouping the many read-only inputs.
+/// Parameters for cache snapshot creation.
+///
+/// Uses VmState as the single source of truth for snapshot metadata,
+/// ensuring fields like `original_vsock_vm_id` are always preserved correctly.
 pub struct CreateSnapshotParams<'a> {
     pub vm_manager: &'a VmManager,
     pub snapshot_key: &'a str,
-    pub vm_id: &'a str,
-    pub params: &'a SnapshotCreationParams,
+    pub vm_state: &'a VmState,
     pub disk_path: &'a Path,
-    pub network_config: &'a NetworkConfig,
     pub volume_configs: &'a [VolumeConfig],
     pub parent_snapshot_key: Option<&'a str>,
-    /// Original VM ID whose vsock paths are baked into vmstate.bin.
-    /// When creating a snapshot from a cache-restored VM, the vmstate.bin references
-    /// vsock paths from the original (cached) VM, not the current vm_id. This must be
-    /// preserved so that clones of this snapshot redirect the correct directory.
-    /// None for fresh VMs (vm_id is the original).
-    pub original_vsock_vm_id: Option<String>,
 }
 
 /// Create a podman snapshot from a running VM.
@@ -62,13 +55,10 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
     let CreateSnapshotParams {
         vm_manager,
         snapshot_key,
-        vm_id,
-        params,
+        vm_state,
         disk_path,
-        network_config,
         volume_configs,
         parent_snapshot_key,
-        original_vsock_vm_id: _,
     } = snap;
     // Snapshots stored in snapshot_dir with snapshot_key as name
     let snapshot_dir = paths::snapshot_dir().join(snapshot_key);
@@ -105,46 +95,17 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
     // Get Firecracker client
     let client = vm_manager.client().context("VM not started")?;
 
-    // Convert VolumeConfig to SnapshotVolumeConfig for metadata
-    let snapshot_volumes: Vec<SnapshotVolumeConfig> = volume_configs
-        .iter()
-        .map(|v| SnapshotVolumeConfig {
-            host_path: v.host_path.clone(),
-            guest_path: v.guest_path.to_string_lossy().to_string(),
-            read_only: v.read_only,
-            vsock_port: v.port,
-            portable: v.portable,
-        })
-        .collect();
-
-    // Build final paths (create_snapshot_core handles temp dir)
-    let final_memory_path = snapshot_dir.join("memory.bin");
-    let final_vmstate_path = snapshot_dir.join("vmstate.bin");
-    let final_disk_path = snapshot_dir.join("disk.raw");
-
-    // Build snapshot config with final paths
-    let snapshot_config = SnapshotConfig {
-        name: snapshot_key.to_string(),
-        vm_id: vm_id.to_string(),
-        original_vsock_vm_id: snap.original_vsock_vm_id.clone(),
-        memory_path: final_memory_path,
-        vmstate_path: final_vmstate_path,
-        disk_path: final_disk_path,
-        created_at: chrono::Utc::now(),
-        snapshot_type: SnapshotType::System, // Auto-generated cache snapshot
-        metadata: SnapshotMetadata {
-            image: params.image.clone(),
-            vcpu: params.vcpu,
-            memory_mib: params.memory_mib,
-            network_config: (*network_config).clone(),
-            volumes: snapshot_volumes,
-            health_check_url: params.health_check_url.clone(),
-            hugepages: params.hugepages,
-            extra_disks: params.extra_disks.clone(),
-            username: params.username.clone(),
-            user: params.user.clone(),
-        },
-    };
+    // Build snapshot config from VmState (single source of truth)
+    let snapshot_volumes = crate::commands::common::volume_configs_to_snapshot(volume_configs);
+    let extra_disks = crate::commands::common::extra_disks_to_snapshot(vm_state);
+    let snapshot_config = crate::commands::common::build_snapshot_config(
+        vm_state,
+        snapshot_key,
+        SnapshotType::System,
+        &snapshot_dir,
+        snapshot_volumes,
+        extra_disks,
+    );
 
     // Use shared core function for snapshot creation
     // If parent key provided, resolve to directory path
