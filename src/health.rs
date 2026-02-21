@@ -477,6 +477,12 @@ async fn update_health_status_once(
                     let health_path = url.path();
                     let net = &state.config.network;
 
+                    // Extract Host header from the URL hostname.
+                    // The URL hostname is the virtual host the server routes by.
+                    // We override the connection IP with the guest IP but send
+                    // the original hostname as the Host header.
+                    let url_host = url.host_str();
+
                     // Rootless mode with holder_pid: use nsenter to curl guest directly
                     // This bypasses the complexity of slirp4netns port forwarding
                     if let Some(holder_pid) = state.holder_pid {
@@ -487,10 +493,16 @@ async fn update_health_status_once(
                             .map(|ip| ip.split('/').next().unwrap_or(ip))
                             .unwrap_or("192.168.1.2");
                         let port = url.port().unwrap_or(80);
-                        debug!(target: "health-monitor", holder_pid = holder_pid, guest_ip = %guest_ip, port = port, "HTTP health check via nsenter");
+                        debug!(target: "health-monitor", holder_pid = holder_pid, guest_ip = %guest_ip, port = port, host = ?url_host, "HTTP health check via nsenter");
 
-                        match check_http_health_nsenter(holder_pid, guest_ip, port, health_path)
-                            .await
+                        match check_http_health_nsenter(
+                            holder_pid,
+                            guest_ip,
+                            port,
+                            health_path,
+                            url_host,
+                        )
+                        .await
                         {
                             Ok(true) => {
                                 debug!(target: "health-monitor", "health check passed");
@@ -538,7 +550,8 @@ async fn update_health_status_once(
 
                         debug!(target: "health-monitor", original_url = %url_str, effective_url = %effective_url, veth = ?veth_device, "HTTP health check via veth");
 
-                        match check_http_health_bridged(&effective_url, veth_device).await {
+                        match check_http_health_bridged(&effective_url, veth_device, url_host).await
+                        {
                             Ok(true) => {
                                 debug!(target: "health-monitor", "health check passed");
                                 *last_failure_log = None;
@@ -640,6 +653,7 @@ async fn check_http_health_nsenter(
     guest_ip: &str,
     port: u16,
     health_path: &str,
+    host_header: Option<&str>,
 ) -> Result<bool> {
     let url = format!("http://{}:{}{}", guest_ip, port, health_path);
 
@@ -647,24 +661,10 @@ async fn check_http_health_nsenter(
 
     // Use nsenter to enter the namespace and curl the guest directly
     // --preserve-credentials keeps UID/GID mapping
+    let nsenter_args = build_nsenter_curl_args(holder_pid, &url, host_header);
+
     let output = tokio::process::Command::new("nsenter")
-        .args([
-            "-t",
-            &holder_pid.to_string(),
-            "-U",
-            "-n",
-            "--preserve-credentials",
-            "--",
-            "curl",
-            "-s",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            "--max-time",
-            "1",
-            &url,
-        ])
+        .args(&nsenter_args)
         .output()
         .await
         .context("failed to run nsenter curl")?;
@@ -727,7 +727,11 @@ async fn check_http_health_nsenter(
 ///
 /// We use reqwest's .interface() method (which uses SO_BINDTODEVICE on Linux)
 /// when a veth device is provided, ensuring traffic goes through that interface.
-async fn check_http_health_bridged(url: &str, veth_device: Option<&str>) -> Result<bool> {
+async fn check_http_health_bridged(
+    url: &str,
+    veth_device: Option<&str>,
+    host_header: Option<&str>,
+) -> Result<bool> {
     // Build a reqwest client, optionally bound to the veth device
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(1));
 
@@ -740,7 +744,12 @@ async fn check_http_health_bridged(url: &str, veth_device: Option<&str>) -> Resu
     let start = Instant::now();
     let iface_str = veth_device.unwrap_or("default");
 
-    match client.get(url).send().await {
+    let mut request = client.get(url);
+    if let Some(host) = host_header {
+        request = request.header("Host", host);
+    }
+
+    match request.send().await {
         Ok(response) => {
             let elapsed = start.elapsed();
             if response.status().is_success() {
@@ -771,5 +780,79 @@ async fn check_http_health_bridged(url: &str, veth_device: Option<&str>) -> Resu
                 anyhow::bail!("Failed to connect to {} via {}: {}", url, iface_str, e)
             }
         }
+    }
+}
+
+/// Build the nsenter + curl argument list for rootless health checks.
+///
+/// Separated from check_http_health_nsenter for testability.
+fn build_nsenter_curl_args(holder_pid: u32, url: &str, host_header: Option<&str>) -> Vec<String> {
+    let mut curl_args = vec![
+        "curl".to_string(),
+        "-s".to_string(),
+        "-o".to_string(),
+        "/dev/null".to_string(),
+        "-w".to_string(),
+        "%{http_code}".to_string(),
+        "--max-time".to_string(),
+        "1".to_string(),
+    ];
+    // Add Host header if specified (needed for servers that route by Host)
+    if let Some(host) = host_header {
+        curl_args.push("-H".to_string());
+        curl_args.push(format!("Host: {}", host));
+    }
+    curl_args.push(url.to_string());
+
+    let mut nsenter_args: Vec<String> = vec![
+        "-t".to_string(),
+        holder_pid.to_string(),
+        "-U".to_string(),
+        "-n".to_string(),
+        "--preserve-credentials".to_string(),
+        "--".to_string(),
+    ];
+    nsenter_args.extend(curl_args);
+
+    nsenter_args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_nsenter_curl_args_without_host_header() {
+        let args = build_nsenter_curl_args(12345, "http://10.0.2.100:80/health", None);
+        // Find --max-time and verify "1" immediately follows it
+        let max_time_pos = args.iter().position(|a| a == "--max-time").unwrap();
+        assert_eq!(
+            args[max_time_pos + 1],
+            "1",
+            "\"1\" must immediately follow \"--max-time\", got {:?}",
+            &args[max_time_pos..]
+        );
+    }
+
+    #[test]
+    fn test_nsenter_curl_args_with_host_header() {
+        let args =
+            build_nsenter_curl_args(12345, "http://10.0.2.100:80/health", Some("myapp.local"));
+
+        // --max-time must be immediately followed by "1"
+        let max_time_pos = args.iter().position(|a| a == "--max-time").unwrap();
+        assert_eq!(
+            args[max_time_pos + 1],
+            "1",
+            "\"1\" must immediately follow \"--max-time\", but got {:?}",
+            &args[max_time_pos..]
+        );
+
+        // Host header must be present
+        let h_pos = args.iter().position(|a| a == "-H").unwrap();
+        assert_eq!(args[h_pos + 1], "Host: myapp.local");
+
+        // URL must be last
+        assert_eq!(args.last().unwrap(), "http://10.0.2.100:80/health");
     }
 }
