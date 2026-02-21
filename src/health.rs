@@ -550,12 +550,7 @@ async fn update_health_status_once(
 
                         debug!(target: "health-monitor", original_url = %url_str, effective_url = %effective_url, veth = ?veth_device, "HTTP health check via veth");
 
-                        match check_http_health_bridged(
-                            &effective_url,
-                            veth_device,
-                            url_host,
-                        )
-                        .await
+                        match check_http_health_bridged(&effective_url, veth_device, url_host).await
                         {
                             Ok(true) => {
                                 debug!(target: "health-monitor", "health check passed");
@@ -666,32 +661,7 @@ async fn check_http_health_nsenter(
 
     // Use nsenter to enter the namespace and curl the guest directly
     // --preserve-credentials keeps UID/GID mapping
-    let mut curl_args = vec![
-        "curl".to_string(),
-        "-s".to_string(),
-        "-o".to_string(),
-        "/dev/null".to_string(),
-        "-w".to_string(),
-        "%{http_code}".to_string(),
-        "--max-time".to_string(),
-    ];
-    // Add Host header if specified (needed for servers that route by Host)
-    if let Some(host) = host_header {
-        curl_args.push("-H".to_string());
-        curl_args.push(format!("Host: {}", host));
-    }
-
-    let mut nsenter_args: Vec<String> = vec![
-        "-t".to_string(),
-        holder_pid.to_string(),
-        "-U".to_string(),
-        "-n".to_string(),
-        "--preserve-credentials".to_string(),
-        "--".to_string(),
-    ];
-    nsenter_args.extend(curl_args);
-    nsenter_args.push("1".to_string()); // --max-time value
-    nsenter_args.push(url.clone());
+    let nsenter_args = build_nsenter_curl_args(holder_pid, &url, host_header);
 
     let output = tokio::process::Command::new("nsenter")
         .args(&nsenter_args)
@@ -810,5 +780,79 @@ async fn check_http_health_bridged(
                 anyhow::bail!("Failed to connect to {} via {}: {}", url, iface_str, e)
             }
         }
+    }
+}
+
+/// Build the nsenter + curl argument list for rootless health checks.
+///
+/// Separated from check_http_health_nsenter for testability.
+fn build_nsenter_curl_args(holder_pid: u32, url: &str, host_header: Option<&str>) -> Vec<String> {
+    let mut curl_args = vec![
+        "curl".to_string(),
+        "-s".to_string(),
+        "-o".to_string(),
+        "/dev/null".to_string(),
+        "-w".to_string(),
+        "%{http_code}".to_string(),
+        "--max-time".to_string(),
+        "1".to_string(),
+    ];
+    // Add Host header if specified (needed for servers that route by Host)
+    if let Some(host) = host_header {
+        curl_args.push("-H".to_string());
+        curl_args.push(format!("Host: {}", host));
+    }
+    curl_args.push(url.to_string());
+
+    let mut nsenter_args: Vec<String> = vec![
+        "-t".to_string(),
+        holder_pid.to_string(),
+        "-U".to_string(),
+        "-n".to_string(),
+        "--preserve-credentials".to_string(),
+        "--".to_string(),
+    ];
+    nsenter_args.extend(curl_args);
+
+    nsenter_args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_nsenter_curl_args_without_host_header() {
+        let args = build_nsenter_curl_args(12345, "http://10.0.2.100:80/health", None);
+        // Find --max-time and verify "1" immediately follows it
+        let max_time_pos = args.iter().position(|a| a == "--max-time").unwrap();
+        assert_eq!(
+            args[max_time_pos + 1],
+            "1",
+            "\"1\" must immediately follow \"--max-time\", got {:?}",
+            &args[max_time_pos..]
+        );
+    }
+
+    #[test]
+    fn test_nsenter_curl_args_with_host_header() {
+        let args =
+            build_nsenter_curl_args(12345, "http://10.0.2.100:80/health", Some("myapp.local"));
+
+        // --max-time must be immediately followed by "1"
+        let max_time_pos = args.iter().position(|a| a == "--max-time").unwrap();
+        assert_eq!(
+            args[max_time_pos + 1],
+            "1",
+            "\"1\" must immediately follow \"--max-time\", but got {:?}",
+            &args[max_time_pos..]
+        );
+
+        // Host header must be present
+        let h_pos = args.iter().position(|a| a == "-H").unwrap();
+        assert_eq!(args[h_pos + 1], "Host: myapp.local");
+
+        // URL must be last
+        assert_eq!(args.last().unwrap(), "http://10.0.2.100:80/health");
     }
 }
