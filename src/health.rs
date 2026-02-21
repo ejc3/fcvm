@@ -613,7 +613,13 @@ async fn update_health_status_once(
 
                         debug!(target: "health-monitor", original_url = %url_str, effective_url = %effective_url, veth = ?veth_device, "HTTP health check via veth");
 
-                        match check_http_health_bridged(&effective_url, veth_device, url_host, health_timeout).await
+                        match check_http_health_bridged(
+                            &effective_url,
+                            veth_device,
+                            url_host,
+                            health_timeout,
+                        )
+                        .await
                         {
                             Ok(true) => {
                                 debug!(target: "health-monitor", "health check passed");
@@ -643,8 +649,15 @@ async fn update_health_status_once(
             };
 
             // If base health check passed, also check podman healthcheck (AND logic)
-            // Skip if we already know the container has no healthcheck
-            let final_status = if status == HealthStatus::Healthy && !*skip_podman_healthcheck {
+            // Skip if we already know the container has no healthcheck.
+            // Also skip when health_check_url is provided — the user explicitly specified
+            // their health check, and podman's internal HEALTHCHECK may not work (e.g.,
+            // rootless podman in VM without systemd can't schedule healthcheck timers).
+            let has_http_check = state.config.health_check_url.is_some();
+            let final_status = if status == HealthStatus::Healthy
+                && !*skip_podman_healthcheck
+                && !has_http_check
+            {
                 match check_podman_healthcheck(
                     pid,
                     state.config.username.as_deref(),

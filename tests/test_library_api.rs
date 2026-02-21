@@ -49,6 +49,7 @@ fn test_run_args(name: &str) -> RunArgs {
         rootfs_type: None,
         label: vec![],
         non_blocking_output: false,
+        health_check_timeout: 5,
         image: common::TEST_IMAGE.to_string(),
         command_args: vec![],
     }
