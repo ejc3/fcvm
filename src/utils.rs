@@ -228,9 +228,7 @@ pub async fn wait_for_namespace_ready(
                     .unwrap_or_default();
                 let gid_trimmed = gid_map.trim();
 
-                if !trimmed.is_empty()
-                    && !gid_trimmed.is_empty()
-                    && !content.contains("4294967295")
+                if !trimmed.is_empty() && !gid_trimmed.is_empty() && !content.contains("4294967295")
                 {
                     // Maps are written - now verify nsenter actually works
                     // Some kernel states require additional settling time
