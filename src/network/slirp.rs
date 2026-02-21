@@ -137,16 +137,20 @@ impl SlirpNetwork {
     /// The holder runs `sleep infinity` which blocks forever until killed.
     /// Note: We use sleep instead of cat because cat requires stdin management.
     ///
-    /// Uses --map-root-user for simple 1:1 UID mapping (current user → UID 0 inside namespace).
-    /// This works for both root and unprivileged users.
+    /// UID/GID mappings are NOT set here (no --map-root-user). Instead,
+    /// spawn_namespace_holder() writes the mappings externally via newuidmap/newgidmap.
+    /// This enables extended subordinate UID/GID ranges (from /etc/subuid, /etc/subgid)
+    /// which are required for podman image extraction in fc-mock mode, while preserving
+    /// the UID 0→current_user mapping needed for KVM access in Firecracker mode.
     ///
-    /// Note: --map-auto was considered but it maps to subordinate UIDs (100000+) which doesn't
-    /// include the current user's UID, causing permission issues with KVM and file access.
+    /// Note: --map-auto was rejected because it writes "deny" to /proc/PID/setgroups,
+    /// which prevents nsenter --preserve-credentials from keeping supplementary groups
+    /// (like the kvm group needed for /dev/kvm access). newuidmap/newgidmap don't have
+    /// this limitation since they run as setuid-root.
     pub fn build_holder_command(&self) -> Vec<String> {
         vec![
             "unshare".to_string(),
             "--user".to_string(),
-            "--map-root-user".to_string(),
             "--net".to_string(),
             "--".to_string(),
             "sleep".to_string(),
@@ -217,7 +221,7 @@ ip addr add {namespace_ip}/24 dev {bridge}
 
     /// Get a human-readable representation of the rootless networking flow
     pub fn rootless_flow_string(&self) -> String {
-        "holder(unshare --map-root-user) + nsenter for setup/firecracker".to_string()
+        "holder(unshare --user --net) + newuidmap/newgidmap + nsenter".to_string()
     }
 
     /// Detect host's global IPv6 address for slirp4netns outbound traffic

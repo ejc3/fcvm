@@ -170,6 +170,57 @@ jobs:
         working-directory: fcvm
         run: ./scripts/test-packaging.sh ./target/release/fcvm
 
+  # Runner 0c: fc-mock (default GitHub runner, no KVM needed)
+  # Tests fc-mock (Firecracker mock) which runs containers via podman
+  # instead of real Firecracker VMs. No KVM or btrfs required.
+  fc-mock:
+    name: fc-mock
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: fcvm
+      - uses: ./fcvm/.github/actions/checkout-deps
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Get dependency SHAs
+        id: deps
+        run: |
+          echo "fuser=$(git -C fuser rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "fuse-backend-rs=$(git -C fuse-backend-rs rev-parse HEAD)" >> $GITHUB_OUTPUT
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fcvm -> target
+          shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev libclang-dev clang podman
+      - name: Setup podman
+        run: |
+          # Disable AppArmor restriction on unprivileged user namespaces
+          # (needed for rootless podman on Ubuntu 24.04+)
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+      - name: Cache cargo tools
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin
+          key: cargo-nextest-0.9.115-${{ runner.os }}-${{ runner.arch }}
+      - name: Install cargo-nextest
+        run: which cargo-nextest || cargo install cargo-nextest@0.9.115 --locked
+      - name: Build fc-mock
+        working-directory: fcvm
+        run: |
+          cargo build --release -p fc-mock
+          sudo install -m 755 target/release/fc-mock /usr/local/bin/fc-mock
+      - name: Test fc-mock
+        working-directory: fcvm
+        env:
+          FCVM_FIRECRACKER_BIN: /usr/local/bin/fc-mock
+          RUST_LOG: "fcvm=debug,health-monitor=info,fuser=warn,fuse_backend_rs=warn,passthrough=warn"
+        run: |
+          cargo nextest run --release -p fcvm --profile fc-mock \
+            --features privileged-tests \
+            -E 'package(fcvm) & (test(/fc_mock/) | test(/state_manager/) | test(/health_monitor/) | test(/no_sudo/)) & not test(=test_fc_mock_sanity) & not test(=test_fc_mock_container_launch)'
+
   # Runner 1a: Host (bare metal with KVM)
   # Runs: test-unit → test-fast (quick tests, no privileged)
   # Self-hosted runners with nested virtualization (ARM64: c7g.metal, x86: c5.metal)
@@ -626,7 +677,7 @@ jobs:
   # Final summary job - runs after all test jobs
   summary:
     name: Summary
-    needs: [skip-check, lint, packaging, host, host-root, container]
+    needs: [skip-check, lint, packaging, fc-mock, host, host-root, container]
     if: always()
     runs-on: ubuntu-latest
     steps:

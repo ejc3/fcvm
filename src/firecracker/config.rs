@@ -94,6 +94,10 @@ pub struct FirecrackerConfig {
     /// Different rootfs types produce different VM states and must not share snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rootfs_type: Option<String>,
+    /// Firecracker binary name (e.g., "firecracker" or "fc-mock").
+    /// Different binaries produce incompatible snapshots and must not share cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firecracker_bin: Option<String>,
 }
 
 impl Default for FirecrackerConfig {
@@ -120,6 +124,7 @@ impl Default for FirecrackerConfig {
             forward_localhost: Vec::new(),
             image_mode: ImageMode::Overlay,
             rootfs_type: None,
+            firecracker_bin: None,
         }
     }
 }

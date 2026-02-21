@@ -69,8 +69,10 @@ pub const HOLDER_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from
 
 /// Spawn a namespace holder process and wait for it to be ready.
 ///
-/// Spawns `unshare --user --map-root-user --net -- sleep infinity` and waits for the
-/// namespace to become ready (uid_map/gid_map written, nsenter probe succeeds).
+/// Spawns `unshare --user --net -- sleep infinity` and sets up UID/GID mappings
+/// externally via newuidmap/newgidmap (for extended subordinate ranges) or falls
+/// back to simple single-mapping. Then waits for the namespace to become ready
+/// (uid_map/gid_map written, nsenter probe succeeds).
 ///
 /// Key design: gives the first holder the FULL retry deadline. Only spawns a new
 /// holder if the current one dies. Under heavy load, the `unshare` parent process
@@ -103,6 +105,24 @@ pub async fn spawn_namespace_holder(
             info!(holder_pid, attempt, "namespace holder started (retry)");
         } else {
             info!(holder_pid, "namespace holder started");
+        }
+
+        // Set up UID/GID mappings for the new namespace.
+        // The holder command does NOT use --map-root-user, so we write
+        // the mappings externally. This allows extended subordinate ranges
+        // needed for podman image extraction in fc-mock mode.
+        if let Err(e) = setup_namespace_mappings(holder_pid).await {
+            warn!(holder_pid, error = %e, "failed to set up UID/GID mappings");
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(holder_pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            if std::time::Instant::now() < deadline {
+                tokio::time::sleep(HOLDER_RETRY_INTERVAL).await;
+                continue;
+            } else {
+                return Err(e).context("setting up namespace UID/GID mappings");
+            }
         }
 
         // Give this holder the FULL remaining time to become ready.
@@ -151,6 +171,236 @@ pub async fn spawn_namespace_holder(
             }
         }
     }
+}
+
+/// Set up UID/GID mappings for a new user namespace.
+///
+/// Waits for the namespace to be created (uid_map transitions from identity mapping
+/// to empty), then configures mappings. Tries extended mappings first (current UID +
+/// subordinate ranges via newuidmap/newgidmap), falls back to simple single-mapping.
+///
+/// Extended mappings enable container image extraction (podman needs UIDs/GIDs beyond 0).
+/// Simple mappings (equivalent to --map-root-user) work for Firecracker-only mode.
+async fn setup_namespace_mappings(holder_pid: u32) -> Result<()> {
+    // Wait for namespace to be created.
+    // Before unshare(): uid_map shows identity mapping "0 0 4294967295"
+    // After unshare():  uid_map is empty (new namespace, no mappings yet)
+    let uid_map_path = format!("/proc/{}/uid_map", holder_pid);
+    let ns_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+    loop {
+        if let Ok(content) = tokio::fs::read_to_string(&uid_map_path).await {
+            if !content.contains("4294967295") {
+                // Namespace created — uid_map is now empty (ready for us to write)
+                break;
+            }
+        }
+        if std::time::Instant::now() >= ns_deadline {
+            anyhow::bail!(
+                "timeout waiting for namespace creation (holder PID {})",
+                holder_pid
+            );
+        }
+        if !crate::utils::is_process_alive(holder_pid) {
+            anyhow::bail!(
+                "holder process (PID {}) died before namespace was created",
+                holder_pid
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+
+    let euid = nix::unistd::geteuid().as_raw();
+    let egid = nix::unistd::getegid().as_raw();
+
+    // Try extended mappings (current UID + subordinate ranges)
+    if try_extended_uid_gid_mappings(holder_pid, euid, egid).await? {
+        return Ok(());
+    }
+
+    // Fallback: root can write an extended identity mapping directly (has
+    // CAP_SETUID/CAP_SETGID), no subordinate ranges needed. Non-root users
+    // get a simple single-mapping (equivalent to --map-root-user).
+    //
+    // Extended mapping (0 0 65536) is critical for fc-mock: crun needs UID/GID
+    // ranges beyond 0 to mount devpts and extract container image layers.
+    let is_root = euid == 0;
+    let mapping_count: u32 = if is_root { 65536 } else { 1 };
+
+    debug!(
+        holder_pid,
+        is_root, mapping_count, "using direct UID/GID mapping (no subordinate ranges)"
+    );
+
+    if !is_root {
+        // Must deny setgroups before writing gid_map (kernel requirement for
+        // unprivileged users without CAP_SETGID). Root doesn't need this.
+        let setgroups_path = format!("/proc/{}/setgroups", holder_pid);
+        tokio::fs::write(&setgroups_path, "deny")
+            .await
+            .context("denying setgroups for simple gid_map write")?;
+    }
+
+    tokio::fs::write(&uid_map_path, format!("0 {} {}\n", euid, mapping_count))
+        .await
+        .context("writing uid_map")?;
+
+    let gid_map_path = format!("/proc/{}/gid_map", holder_pid);
+    tokio::fs::write(&gid_map_path, format!("0 {} {}\n", egid, mapping_count))
+        .await
+        .context("writing gid_map")?;
+
+    info!(
+        holder_pid,
+        euid, egid, mapping_count, "direct UID/GID mapping configured"
+    );
+    Ok(())
+}
+
+/// Try to set up extended UID/GID mappings using newuidmap/newgidmap.
+///
+/// Extended mappings include:
+/// - UID/GID 0 inside → current user's UID/GID outside (preserves KVM access)
+/// - UIDs/GIDs 1-N inside → subordinate range outside (enables container image extraction)
+///
+/// Returns Ok(true) if extended mappings were set up, Ok(false) if not available.
+/// Returns Err only if mappings were partially written (inconsistent state).
+async fn try_extended_uid_gid_mappings(holder_pid: u32, euid: u32, egid: u32) -> Result<bool> {
+    // Get current username for /etc/subuid and /etc/subgid lookup
+    let username = match get_current_username() {
+        Some(u) => u,
+        None => {
+            debug!("could not determine username, skipping extended mappings");
+            return Ok(false);
+        }
+    };
+
+    // Check for subordinate UID/GID ranges
+    let (sub_uid_start, sub_uid_count) = match parse_subordinate_ids("/etc/subuid", &username) {
+        Some(r) => r,
+        None => {
+            debug!(
+                username = %username,
+                "no subordinate UIDs in /etc/subuid, skipping extended mappings"
+            );
+            return Ok(false);
+        }
+    };
+    let (sub_gid_start, sub_gid_count) = match parse_subordinate_ids("/etc/subgid", &username) {
+        Some(r) => r,
+        None => {
+            debug!(
+                username = %username,
+                "no subordinate GIDs in /etc/subgid, skipping extended mappings"
+            );
+            return Ok(false);
+        }
+    };
+
+    // Verify newuidmap/newgidmap exist before writing anything
+    // (once uid_map is written, it can't be undone)
+    for binary in &["newuidmap", "newgidmap"] {
+        if which::which(binary).is_err() {
+            debug!(binary, "not found in PATH, skipping extended mappings");
+            return Ok(false);
+        }
+    }
+
+    // Write uid_map via newuidmap (setuid helper, doesn't need CAP_SETUID)
+    let uid_output = tokio::process::Command::new("newuidmap")
+        .args([
+            &holder_pid.to_string(),
+            "0",
+            &euid.to_string(),
+            "1",
+            "1",
+            &sub_uid_start.to_string(),
+            &sub_uid_count.to_string(),
+        ])
+        .output()
+        .await
+        .context("running newuidmap")?;
+
+    if !uid_output.status.success() {
+        let stderr = String::from_utf8_lossy(&uid_output.stderr);
+        warn!(holder_pid, error = %stderr.trim(), "newuidmap failed");
+        return Ok(false);
+    }
+
+    // Write gid_map via newgidmap (setuid helper, doesn't deny setgroups)
+    // This preserves supplementary groups (like kvm) for nsenter --preserve-credentials
+    let gid_output = tokio::process::Command::new("newgidmap")
+        .args([
+            &holder_pid.to_string(),
+            "0",
+            &egid.to_string(),
+            "1",
+            "1",
+            &sub_gid_start.to_string(),
+            &sub_gid_count.to_string(),
+        ])
+        .output()
+        .await
+        .context("running newgidmap")?;
+
+    if !gid_output.status.success() {
+        let stderr = String::from_utf8_lossy(&gid_output.stderr);
+        // uid_map already written — namespace is in inconsistent state.
+        // Caller should kill the holder and retry.
+        anyhow::bail!(
+            "newgidmap failed after uid_map was written (holder PID {}): {}",
+            holder_pid,
+            stderr.trim()
+        );
+    }
+
+    info!(
+        holder_pid,
+        uid_mapping = %format!("0→{}, 1-{}→{}", euid, sub_uid_count, sub_uid_start),
+        gid_mapping = %format!("0→{}, 1-{}→{}", egid, sub_gid_count, sub_gid_start),
+        "extended UID/GID mappings configured"
+    );
+
+    Ok(true)
+}
+
+/// Get the current process's username.
+fn get_current_username() -> Option<String> {
+    std::env::var("USER")
+        .ok()
+        .or_else(|| std::env::var("LOGNAME").ok())
+        .or_else(|| {
+            // Fallback: look up UID in /etc/passwd
+            let uid = nix::unistd::getuid().as_raw();
+            std::fs::read_to_string("/etc/passwd")
+                .ok()
+                .and_then(|content| {
+                    content.lines().find_map(|line| {
+                        let parts: Vec<&str> = line.split(':').collect();
+                        if parts.len() >= 3 && parts[2].parse::<u32>().ok() == Some(uid) {
+                            Some(parts[0].to_string())
+                        } else {
+                            None
+                        }
+                    })
+                })
+        })
+}
+
+/// Parse subordinate UID/GID ranges from /etc/subuid or /etc/subgid.
+///
+/// Returns (start, count) for the given username, or None if not found.
+fn parse_subordinate_ids(path: &str, username: &str) -> Option<(u32, u32)> {
+    let content = std::fs::read_to_string(path).ok()?;
+    for line in content.lines() {
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() == 3 && parts[0] == username {
+            let start: u32 = parts[1].parse().ok()?;
+            let count: u32 = parts[2].parse().ok()?;
+            return Some((start, count));
+        }
+    }
+    None
 }
 
 /// Merge a diff snapshot onto a base memory file.

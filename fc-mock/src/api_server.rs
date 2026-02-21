@@ -20,6 +20,8 @@ struct MockState {
     mmds_data: Option<serde_json::Value>,
     /// Vsock config (contains uds_path)
     vsock_uds_path: Option<String>,
+    /// Boot args from PUT /boot-source (contains IP config, DNS)
+    boot_args: Option<String>,
     /// Whether InstanceStart has been called
     started: bool,
     /// Shutdown notifier (triggers when container exits)
@@ -31,6 +33,7 @@ impl SharedState {
         Self(Arc::new(Mutex::new(MockState {
             mmds_data: None,
             vsock_uds_path: None,
+            boot_args: None,
             started: false,
             shutdown: None,
         })))
@@ -110,8 +113,22 @@ async fn handle_request(
     let body_bytes = hyper::body::to_bytes(req.into_body()).await?;
 
     let result: Result<(), String> = match (method, path.as_str()) {
-        // Config endpoints - store and return 204
-        (Method::PUT, "/boot-source") => Ok(()),
+        // Boot source - extract boot_args for network config
+        (Method::PUT, "/boot-source") => {
+            #[derive(serde::Deserialize)]
+            struct BootSource {
+                #[serde(default)]
+                boot_args: Option<String>,
+            }
+            if let Ok(bs) = serde_json::from_slice::<BootSource>(&body_bytes) {
+                if let Some(args) = bs.boot_args {
+                    let mut s = state.0.lock().await;
+                    s.boot_args = Some(args);
+                    debug!("boot_args stored");
+                }
+            }
+            Ok(())
+        }
         (Method::PUT, "/machine-config") => Ok(()),
         (Method::PUT, p) if p.starts_with("/drives/") => Ok(()),
         (Method::PUT, p) if p.starts_with("/network-interfaces/") => Ok(()),
@@ -175,13 +192,18 @@ async fn handle_request(
 
                     let mmds_data = s.mmds_data.clone();
                     let vsock_uds_path = s.vsock_uds_path.clone();
+                    let boot_args = s.boot_args.clone();
                     let shutdown = s.shutdown.clone();
                     drop(s); // Release lock before spawning
 
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            crate::container::launch_container(mmds_data, vsock_uds_path, shutdown)
-                                .await
+                        if let Err(e) = crate::container::launch_container(
+                            mmds_data,
+                            vsock_uds_path,
+                            boot_args,
+                            shutdown,
+                        )
+                        .await
                         {
                             tracing::error!("container launch failed: {}", e);
                             // Still trigger shutdown so fcvm doesn't hang
