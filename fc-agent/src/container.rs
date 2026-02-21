@@ -72,6 +72,56 @@ pub fn mount_overlay_image(
         mount_path, conf_path
     );
 
+    // Discover the actual image reference in the overlay store.
+    // The overlay cache is keyed by digest (content-addressed), but the image
+    // inside is tagged with the name from the original `podman save`. When the
+    // same content is built under a different name, the cached overlay has the
+    // old name. We ask podman what's actually there instead of trusting the
+    // expected name from the Plan.
+    let discover_output = if let Some(name) = username {
+        let user_pw = nix::unistd::User::from_name(name).ok().flatten();
+        let uid = user_pw.map(|u| u.uid.as_raw()).unwrap_or(0);
+        std::process::Command::new("env")
+            .args([
+                &format!("HOME=/home/{}", name),
+                &format!("XDG_RUNTIME_DIR=/run/user/{}", uid),
+                "runuser",
+                "-u",
+                name,
+                "--",
+                "podman",
+                "images",
+                "--format",
+                "{{.Repository}}:{{.Tag}}",
+            ])
+            .output()
+    } else {
+        std::process::Command::new("podman")
+            .args(["images", "--format", "{{.Repository}}:{{.Tag}}"])
+            .output()
+    };
+
+    if let Ok(output) = discover_output {
+        if output.status.success() {
+            let images_out = String::from_utf8_lossy(&output.stdout);
+            // Find first image that isn't <none>
+            if let Some(actual_ref) = images_out
+                .lines()
+                .find(|line| !line.contains("<none>") && !line.trim().is_empty())
+            {
+                let actual_ref = actual_ref.trim().to_string();
+                if actual_ref != image_name {
+                    eprintln!(
+                        "[fc-agent] overlay store contains '{}' (expected '{}'), using discovered name",
+                        actual_ref, image_name
+                    );
+                }
+                return Ok(actual_ref);
+            }
+        }
+    }
+
+    // Fallback: return expected name (downstream will fail with clear error if wrong)
     Ok(image_name.to_string())
 }
 
