@@ -310,6 +310,7 @@ async fn create_sandbox(
         balloon: None,
         network: crate::cli::NetworkMode::Rootless,
         health_check: None,
+        health_check_timeout: 5,
         privileged: false,
         interactive: false,
         tty: false,

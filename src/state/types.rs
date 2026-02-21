@@ -88,6 +88,10 @@ pub struct NfsShare {
     pub read_only: bool,
 }
 
+fn default_health_check_timeout() -> u64 {
+    5
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmConfig {
     pub image: String,
@@ -105,6 +109,9 @@ pub struct VmConfig {
     pub nfs_shares: Vec<NfsShare>,
     /// HTTP health check URL. None means check container running status via fc-agent.
     pub health_check_url: Option<String>,
+    /// Timeout in seconds for HTTP health check requests.
+    #[serde(default = "default_health_check_timeout")]
+    pub health_check_timeout: u64,
     /// Which snapshot this process is serving or was cloned from
     pub snapshot_name: Option<String>,
     /// Process type: vm (podman run), serve (snapshot serve), clone (snapshot run)
@@ -168,6 +175,7 @@ impl VmState {
                 extra_disks: Vec::new(),
                 nfs_shares: Vec::new(),
                 health_check_url: None,
+                health_check_timeout: 5,
                 snapshot_name: None,
                 process_type: Some(ProcessType::Vm),
                 serve_pid: None,
