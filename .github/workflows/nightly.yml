@@ -90,6 +90,17 @@ jobs:
           podman system migrate || true
           # Fix lock file permissions from previous sudo runs (bench-vm runs as root)
           sudo chmod 666 /mnt/fcvm-btrfs/state/*.lock 2>/dev/null || true
+      - name: Clean stale state
+        run: |
+          # Kill any leftover fcvm processes from crashed previous runs
+          sudo pkill -9 -f "fcvm (podman|snapshot)" 2>/dev/null || true
+          sudo pkill -9 -f firecracker 2>/dev/null || true
+          sleep 2
+          # Remove stale state files and snapshots from previous benchmark runs
+          sudo rm -f /mnt/fcvm-btrfs/state/vm-*.json 2>/dev/null || true
+          sudo rm -rf /mnt/fcvm-btrfs/snapshots/bench-* 2>/dev/null || true
+          # Clean up old benchmark VM disks
+          sudo rm -rf /mnt/fcvm-btrfs/vm-disks/vm-* 2>/dev/null || true
       - name: Run VM benchmarks
         working-directory: fcvm
         env:

@@ -123,7 +123,8 @@ CONTAINER_RUN_BASE := podman run --rm --privileged \
 	$(TARGET_MOUNT) \
 	-v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs -v $(FUSER):/workspace/fuser \
 	--device /dev/fuse -v /dev/kvm:/dev/kvm -v /dev/userfaultfd:/dev/userfaultfd \
-	--ulimit nofile=65536:65536 -v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
+	--ulimit nofile=65536:65536 --ulimit nproc=-1:-1 \
+	-v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	-v $(TEST_LOG_DIR):$(TEST_LOG_DIR) $(CARGO_CACHE_MOUNT) \
 	-e FCVM_DATA_DIR=$(CONTAINER_DATA_DIR)
 
@@ -135,7 +136,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	_test-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all \
 	container-setup-fcvm container-shell container-clean container-bench \
-	setup-btrfs setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
+	setup-btrfs setup-default setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import \
 	lint fmt ssh test-serve-sdk
 
@@ -385,14 +386,16 @@ setup-btrfs:
 	@sudo mkdir -p $(CONTAINER_DATA_DIR)/{state,snapshots,vm-disks}
 	@sudo chown -R $$(id -un):$$(id -gn) $(CONTAINER_DATA_DIR)
 
-setup-fcvm: build setup-btrfs
+setup-default: build setup-btrfs
 	@FREE_GB=$$(df -BG /mnt/fcvm-btrfs 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \
 	if [ -n "$$FREE_GB" ] && [ "$$FREE_GB" -lt 15 ]; then \
 		echo "ERROR: Need 15GB on /mnt/fcvm-btrfs (have $${FREE_GB}GB)"; \
 		exit 1; \
 	fi
-	@echo "==> Running fcvm setup..."
+	@echo "==> Running fcvm setup (default kernel)..."
 	./target/release/fcvm setup
+
+setup-fcvm: setup-default
 	@echo "==> Running fcvm setup --kernel-profile nested..."
 	./target/release/fcvm setup --kernel-profile nested --build-kernels
 	@echo "==> Running fcvm setup --kernel-profile btrfs..."
@@ -441,7 +444,7 @@ bench: build
 	$(CARGO) bench -p fuse-pipe --bench protocol
 
 # VM benchmarks (exec, clone) - require KVM, Firecracker, setup
-bench-vm: build setup-fcvm
+bench-vm: build setup-default
 	@echo "==> Running VM benchmarks..."
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
@@ -456,7 +459,7 @@ bench-vm: build setup-fcvm
 HUGEPAGE_POOL_FULL := 17000
 HUGEPAGE_POOL_TEST := 1200
 
-bench-hugepages: build setup-fcvm
+bench-hugepages: build setup-default
 	@echo "==> Allocating hugepage pool ($(HUGEPAGE_POOL_FULL) pages = $$(( $(HUGEPAGE_POOL_FULL) * 2 ))MB)..."
 	sudo sh -c 'echo $(HUGEPAGE_POOL_FULL) > /proc/sys/vm/nr_hugepages'
 	@echo "==> Running hugepages benchmark (full)..."
@@ -466,7 +469,7 @@ bench-hugepages: build setup-fcvm
 	sudo sh -c 'echo 0 > /proc/sys/vm/nr_hugepages'; \
 	exit $$RC
 
-bench-hugepages-test: build setup-fcvm
+bench-hugepages-test: build setup-default
 	@echo "==> Allocating hugepage pool ($(HUGEPAGE_POOL_TEST) pages = $$(( $(HUGEPAGE_POOL_TEST) * 2 ))MB)..."
 	sudo sh -c 'echo $(HUGEPAGE_POOL_TEST) > /proc/sys/vm/nr_hugepages'
 	@echo "==> Running hugepages benchmark (test)..."
@@ -476,7 +479,7 @@ bench-hugepages-test: build setup-fcvm
 	sudo sh -c 'echo 0 > /proc/sys/vm/nr_hugepages'; \
 	exit $$RC
 
-bench-container-import: build setup-fcvm
+bench-container-import: build setup-default
 	@echo "==> Running container import benchmark..."
 	$(CARGO) bench --bench container_import
 
