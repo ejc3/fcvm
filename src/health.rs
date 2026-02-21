@@ -395,11 +395,7 @@ async fn check_podman_healthcheck(
 
 /// Trigger `podman healthcheck run` inside the VM.
 /// Rootless podman without systemd doesn't auto-run healthchecks.
-async fn run_podman_healthcheck(
-    pid: u32,
-    username: Option<&str>,
-    user_spec: Option<&str>,
-) {
+async fn run_podman_healthcheck(pid: u32, username: Option<&str>, user_spec: Option<&str>) {
     let exe = match find_fcvm_binary() {
         Some(e) => e,
         None => return,
