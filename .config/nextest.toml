@@ -78,3 +78,17 @@ slow-timeout = { period = "900s", terminate-after = 1 }
 filter = "package(fuse-pipe)"
 test-group = "@global"
 slow-timeout = { period = "120s", terminate-after = 1 }
+
+# fc-mock profile: container mode (no KVM required)
+# Uses fc-mock binary instead of Firecracker. Only runs tests
+# known to work without a real VM.
+[profile.fc-mock]
+test-threads = 1  # avoid container name conflicts (fcvm-container)
+slow-timeout = { period = "120s", terminate-after = 2 }
+fail-fast = false
+retries = 0
+status-level = "pass"
+final-status-level = "flaky"
+success-output = "immediate"
+failure-output = "immediate"
+
