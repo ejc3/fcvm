@@ -67,15 +67,84 @@ pub const NSENTER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from
 /// Retry interval between holder creation attempts (only used when holder dies)
 pub const HOLDER_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Set up UID/GID mappings for a process in a new user namespace.
+///
+/// Tries extended mappings (UIDs 0-65535) via newuidmap/newgidmap first, which
+/// enables OCI runtimes (crun) to mount devpts inside containers (needed by fc-mock).
+/// Falls back to single-UID mapping (like --map-root-user) when the helpers aren't
+/// available or lack permissions (e.g., inside containers).
+async fn setup_namespace_mappings(pid: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let uid = nix::unistd::getuid().as_raw();
+    let gid = nix::unistd::getgid().as_raw();
+    let pid_s = pid.to_string();
+    let uid_s = uid.to_string();
+    let gid_s = gid.to_string();
+
+    // Wait for unshare(2) to create the new user namespace.
+    // The namespace exists once /proc/PID/ns/user has a different inode than ours.
+    let self_ino = std::fs::metadata("/proc/self/ns/user")
+        .context("reading own user namespace inode")?
+        .ino();
+    let ns_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if std::fs::metadata(format!("/proc/{pid}/ns/user"))
+            .map(|m| m.ino() != self_ino)
+            .unwrap_or(false)
+        {
+            break;
+        }
+        if std::time::Instant::now() >= ns_deadline {
+            anyhow::bail!("timed out waiting for user namespace (PID {pid})");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+
+    // Try extended mappings (0-65535) via newuidmap/newgidmap (setuid helpers).
+    // These read /etc/subuid and /etc/subgid to authorize the mapping range.
+    let uid_ok = tokio::process::Command::new("newuidmap")
+        .args([&pid_s, "0", &uid_s, "1", "1", "100000", "65535"])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let gid_ok = uid_ok
+        && tokio::process::Command::new("newgidmap")
+            .args([&pid_s, "0", &gid_s, "1", "1", "100000", "65535"])
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+    if uid_ok && gid_ok {
+        info!(pid, "extended UID/GID mappings (0-65535)");
+        return Ok(());
+    }
+
+    // Fallback: write mappings directly (equivalent to --map-root-user).
+    // Must deny setgroups before writing gid_map as unprivileged user.
+    std::fs::write(format!("/proc/{pid}/setgroups"), "deny").context("denying setgroups")?;
+    if !uid_ok {
+        std::fs::write(format!("/proc/{pid}/uid_map"), format!("0 {uid} 1\n"))
+            .context("writing uid_map")?;
+    }
+    std::fs::write(format!("/proc/{pid}/gid_map"), format!("0 {gid} 1\n"))
+        .context("writing gid_map")?;
+    info!(pid, "single UID/GID mapping (fallback)");
+
+    Ok(())
+}
+
 /// Spawn a namespace holder process and wait for it to be ready.
 ///
-/// Spawns `unshare --user --map-root-user --net -- sleep infinity` and waits for the
-/// namespace to become ready (uid_map/gid_map written, nsenter probe succeeds).
+/// Spawns `unshare --user --net -- sleep infinity`, writes UID/GID mappings
+/// (extended if possible, single otherwise), and waits for nsenter to work.
 ///
 /// Key design: gives the first holder the FULL retry deadline. Only spawns a new
-/// holder if the current one dies. Under heavy load, the `unshare` parent process
-/// may be slow to write uid_map due to CPU scheduling pressure — killing and
-/// respawning wastes time since the new holder faces the same pressure.
+/// holder if the current one dies. Under heavy load, mapping setup may be slow
+/// due to CPU scheduling pressure — killing and respawning wastes time since
+/// the new holder faces the same pressure.
 pub async fn spawn_namespace_holder(
     holder_cmd: &[String],
 ) -> anyhow::Result<(tokio::process::Child, u32)> {
@@ -103,6 +172,21 @@ pub async fn spawn_namespace_holder(
             info!(holder_pid, attempt, "namespace holder started (retry)");
         } else {
             info!(holder_pid, "namespace holder started");
+        }
+
+        // Write UID/GID mappings for the new user namespace.
+        // Must happen before wait_for_namespace_ready which checks uid_map.
+        if let Err(e) = setup_namespace_mappings(holder_pid).await {
+            warn!(holder_pid, error = %e, "failed to set up namespace mappings");
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(holder_pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            if std::time::Instant::now() < deadline {
+                tokio::time::sleep(HOLDER_RETRY_INTERVAL).await;
+                continue;
+            }
+            return Err(e).context("setting up namespace mappings");
         }
 
         // Give this holder the FULL remaining time to become ready.

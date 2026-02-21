@@ -112,12 +112,15 @@ async fn handle_connection(stream: tokio::net::UnixStream) -> Result<()> {
     // Build the actual command to run
     let (program, args) = if request.in_container {
         // Run inside the container via podman exec
-        let mut exec_args = vec!["exec".to_string(), CONTAINER_NAME.to_string()];
+        // Include rootless storage args so podman can find the container
+        let storage_args = crate::container::rootless_storage_args();
+        let mut exec_args = storage_args;
+        exec_args.push("exec".to_string());
+        exec_args.push(CONTAINER_NAME.to_string());
         exec_args.extend(request.command.clone());
         ("podman".to_string(), exec_args)
     } else {
         // Run directly on the host (VM-level exec)
-        // First arg is the program, rest are arguments
         if request.command.is_empty() {
             let resp = ExecResponse::Error("empty command".to_string());
             let json = serde_json::to_string(&resp)?;
@@ -125,20 +128,33 @@ async fn handle_connection(stream: tokio::net::UnixStream) -> Result<()> {
             write_half.write_all(b"\n").await?;
             return Ok(());
         }
+        // If the command is podman, prepend rootless storage args
         let program = request.command[0].clone();
-        let args = request.command[1..].to_vec();
+        let args = if program == "podman" {
+            let mut storage_args = crate::container::rootless_storage_args();
+            storage_args.extend(request.command[1..].to_vec());
+            storage_args
+        } else {
+            request.command[1..].to_vec()
+        };
         (program, args)
     };
 
     debug!(program = %program, args = ?args, "executing command");
 
     // Spawn the command
-    let result = tokio::process::Command::new(&program)
-        .args(&args)
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(&args)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await;
+        .stderr(std::process::Stdio::piped());
+
+    // In user namespaces, podman needs HOME and XDG_RUNTIME_DIR overrides
+    // to avoid permission errors reading config/auth from the original user's dirs.
+    if program == "podman" {
+        crate::container::apply_user_ns_env(&mut cmd);
+    }
+
+    let result = cmd.output().await;
 
     match result {
         Ok(output) => {

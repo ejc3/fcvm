@@ -53,7 +53,7 @@ fn find_slirp4netns() -> String {
 ///
 /// Architecture (L2 Bridge - no NAT required):
 /// ```text
-/// Host                    | User Namespace (unshare --user --map-root-user --net)
+/// Host                    | User Namespace (unshare --user --net)
 ///                         |
 /// slirp4netns <-----------+-- slirp0 --+
 ///   (userspace NAT)       |            |
@@ -68,7 +68,8 @@ fn find_slirp4netns() -> String {
 /// The bridge forwards Ethernet frames directly, preserving MAC addresses.
 ///
 /// Setup sequence (3-phase with nsenter):
-/// 1. Spawn holder process: `unshare --user --map-root-user --net -- sleep infinity`
+/// 1. Spawn holder process: `unshare --user --net -- sleep infinity`
+///    (UID/GID mappings written externally by spawn_namespace_holder)
 /// 2. Run setup via nsenter: create bridge, TAPs, add TAPs to bridge
 /// 3. Start slirp4netns attached to holder's namespace
 /// 4. Run Firecracker via nsenter: `nsenter -t HOLDER_PID -U -n -- firecracker ...`
@@ -135,18 +136,16 @@ impl SlirpNetwork {
     ///
     /// Returns command to spawn a holder process that keeps the namespace alive.
     /// The holder runs `sleep infinity` which blocks forever until killed.
-    /// Note: We use sleep instead of cat because cat requires stdin management.
     ///
-    /// Uses --map-root-user for simple 1:1 UID mapping (current user → UID 0 inside namespace).
-    /// This works for both root and unprivileged users.
-    ///
-    /// Note: --map-auto was considered but it maps to subordinate UIDs (100000+) which doesn't
-    /// include the current user's UID, causing permission issues with KVM and file access.
+    /// UID/GID mappings are NOT set here — they're written externally by
+    /// spawn_namespace_holder() after the namespace is created. This allows
+    /// trying extended mappings (0-65535) via newuidmap/newgidmap first,
+    /// which OCI runtimes (crun) need to mount devpts inside containers.
+    /// Falls back to single-UID mapping if the helpers aren't available.
     pub fn build_holder_command(&self) -> Vec<String> {
         vec![
             "unshare".to_string(),
             "--user".to_string(),
-            "--map-root-user".to_string(),
             "--net".to_string(),
             "--".to_string(),
             "sleep".to_string(),
@@ -217,7 +216,7 @@ ip addr add {namespace_ip}/24 dev {bridge}
 
     /// Get a human-readable representation of the rootless networking flow
     pub fn rootless_flow_string(&self) -> String {
-        "holder(unshare --map-root-user) + nsenter for setup/firecracker".to_string()
+        "holder(unshare --user --net) + nsenter for setup/firecracker".to_string()
     }
 
     /// Detect host's global IPv6 address for slirp4netns outbound traffic
