@@ -114,10 +114,7 @@ pub(super) async fn setup_rootless_namespace(
                     nix::unistd::Pid::from_raw(retry_holder_pid as i32),
                     nix::sys::signal::Signal::SIGKILL,
                 );
-                bail!(
-                    "network setup failed on retry: {}",
-                    retry_stderr.trim(),
-                );
+                bail!("network setup failed on retry: {}", retry_stderr.trim(),);
             }
 
             // Success on retry - update variables for rest of function

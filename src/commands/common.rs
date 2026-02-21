@@ -91,7 +91,12 @@ pub async fn spawn_namespace_holder(
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .with_context(|| format!("spawning namespace holder (attempt {}): {:?}", attempt, holder_cmd))?;
+            .with_context(|| {
+                format!(
+                    "spawning namespace holder (attempt {}): {:?}",
+                    attempt, holder_cmd
+                )
+            })?;
 
         let holder_pid = child.id().context("getting holder process PID")?;
         if attempt > 1 {
@@ -117,9 +122,8 @@ pub async fn spawn_namespace_holder(
                     tokio::time::sleep(HOLDER_RETRY_INTERVAL).await;
                     continue;
                 } else {
-                    let max_user_ns =
-                        std::fs::read_to_string("/proc/sys/user/max_user_namespaces")
-                            .unwrap_or_else(|_| "unknown".to_string());
+                    let max_user_ns = std::fs::read_to_string("/proc/sys/user/max_user_namespaces")
+                        .unwrap_or_else(|_| "unknown".to_string());
                     anyhow::bail!(
                         "namespace holder died and no time remaining to retry \
                          (attempt {}, holder PID {}, max_user_namespaces={})",
