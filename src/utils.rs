@@ -171,6 +171,17 @@ pub async fn run_streaming(
     Ok(child.wait().await?)
 }
 
+/// Result of waiting for namespace readiness.
+#[derive(Debug, PartialEq)]
+pub enum NamespaceReadyResult {
+    /// Namespace is ready (uid_map/gid_map written, nsenter probe succeeded)
+    Ready,
+    /// Holder process died while waiting
+    HolderDied,
+    /// Deadline expired while holder was still alive
+    TimedOut,
+}
+
 /// Wait for a user namespace to be ready by checking uid_map.
 ///
 /// When `unshare --map-root-user` creates a namespace, the uid_map initially has
@@ -178,18 +189,21 @@ pub async fn run_streaming(
 /// setns() fails with EINVAL until the real mapping (e.g., "0 1000 1") is written.
 ///
 /// This function polls uid_map until it no longer contains the identity mapping,
-/// which is more efficient than repeatedly spawning nsenter processes.
+/// then verifies nsenter works. It checks holder liveness on each iteration to
+/// short-circuit if the holder dies.
 ///
 /// # Arguments
 /// * `holder_pid` - PID of the namespace holder process
-/// * `timeout` - Maximum time to wait for namespace readiness
+/// * `deadline` - Absolute deadline for readiness
 ///
 /// # Returns
-/// `true` if namespace became ready, `false` on timeout or error
-pub async fn wait_for_namespace_ready(holder_pid: u32, timeout: Duration) -> bool {
+/// `NamespaceReadyResult` indicating ready, holder died, or timed out
+pub async fn wait_for_namespace_ready(
+    holder_pid: u32,
+    deadline: std::time::Instant,
+) -> NamespaceReadyResult {
     use tracing::{debug, info, warn};
 
-    let deadline = std::time::Instant::now() + timeout;
     let uid_map_path = format!("/proc/{}/uid_map", holder_pid);
     let mut iterations = 0u32;
 
@@ -214,7 +228,9 @@ pub async fn wait_for_namespace_ready(holder_pid: u32, timeout: Duration) -> boo
                     .unwrap_or_default();
                 let gid_trimmed = gid_map.trim();
 
-                if !trimmed.is_empty() && !gid_trimmed.is_empty() && !content.contains("4294967295")
+                if !trimmed.is_empty()
+                    && !gid_trimmed.is_empty()
+                    && !content.contains("4294967295")
                 {
                     // Maps are written - now verify nsenter actually works
                     // Some kernel states require additional settling time
@@ -240,7 +256,7 @@ pub async fn wait_for_namespace_ready(holder_pid: u32, timeout: Duration) -> boo
                                 gid_map = %gid_trimmed,
                                 "namespace ready (nsenter probe succeeded)"
                             );
-                            return true;
+                            return NamespaceReadyResult::Ready;
                         }
                         Ok(output) => {
                             // nsenter failed even though maps are written - continue waiting
@@ -254,7 +270,7 @@ pub async fn wait_for_namespace_ready(holder_pid: u32, timeout: Duration) -> boo
                         }
                         Err(e) => {
                             warn!(holder_pid = holder_pid, error = %e, "nsenter probe spawn failed");
-                            return false;
+                            return NamespaceReadyResult::HolderDied;
                         }
                     }
                 }
@@ -272,18 +288,18 @@ pub async fn wait_for_namespace_ready(holder_pid: u32, timeout: Duration) -> boo
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Process might have died, check if still alive
+                // Process died — /proc/{pid} gone
                 if !is_process_alive(holder_pid) {
                     debug!(
                         holder_pid = holder_pid,
                         "holder process died while waiting for uid_map"
                     );
-                    return false;
+                    return NamespaceReadyResult::HolderDied;
                 }
             }
             Err(e) => {
                 warn!(holder_pid = holder_pid, error = %e, "failed to read uid_map");
-                return false;
+                return NamespaceReadyResult::HolderDied;
             }
         }
 
@@ -291,10 +307,9 @@ pub async fn wait_for_namespace_ready(holder_pid: u32, timeout: Duration) -> boo
             warn!(
                 holder_pid = holder_pid,
                 iterations = iterations,
-                "namespace not ready after {:?}",
-                timeout
+                "namespace not ready, deadline expired"
             );
-            return false;
+            return NamespaceReadyResult::TimedOut;
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
