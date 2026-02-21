@@ -83,6 +83,7 @@ async fn test_health_monitor_behaviors() {
             portable_volumes: false,
             user: None,
             username: None,
+            health_check_timeout: 5,
         },
     };
 
