@@ -881,6 +881,11 @@ pub(super) async fn run_vm_setup(
                 forward_localhost: args.forward_localhost.clone(),
                 image_mode: super::resolve_image_mode(args),
                 rootfs_type: super::resolve_rootfs_type(args),
+                firecracker_bin: std::env::var("FCVM_FIRECRACKER_BIN").ok().and_then(|p| {
+                    std::path::Path::new(&p)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                }),
             }
         });
 

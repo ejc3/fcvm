@@ -230,6 +230,13 @@ pub(super) fn build_firecracker_config(
         image_mode,
         non_blocking_output: args.non_blocking_output,
         rootfs_type: super::resolve_rootfs_type(args),
+        // Include firecracker binary name in cache key so fc-mock and real
+        // Firecracker never share snapshots (they're incompatible).
+        firecracker_bin: std::env::var("FCVM_FIRECRACKER_BIN").ok().and_then(|p| {
+            std::path::Path::new(&p)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+        }),
     }
 }
 

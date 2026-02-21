@@ -94,6 +94,10 @@ pub struct FirecrackerConfig {
     /// Different rootfs types produce different VM states and must not share snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rootfs_type: Option<String>,
+    /// Firecracker binary name (e.g., "firecracker" or "fc-mock").
+    /// Different binaries produce incompatible snapshots and must not share cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firecracker_bin: Option<String>,
 }
 
 impl Default for FirecrackerConfig {
@@ -120,6 +124,7 @@ impl Default for FirecrackerConfig {
             forward_localhost: Vec::new(),
             image_mode: ImageMode::Overlay,
             rootfs_type: None,
+            firecracker_bin: None,
         }
     }
 }
@@ -541,6 +546,14 @@ mod tests {
         let config1 = test_config();
         let mut config2 = test_config();
         config2.rootfs_type = Some("btrfs".to_string());
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    #[test]
+    fn test_snapshot_key_changes_with_firecracker_bin() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.firecracker_bin = Some("fc-mock".to_string());
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 }

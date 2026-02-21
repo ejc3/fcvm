@@ -134,7 +134,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 .PHONY: all help build clean clean-test-data check-disk \
 	test test-unit test-fast test-all test-root test-packaging \
 	_test-unit _test-fast _test-all _test-root _setup-fcvm _bench \
-	container-build container-test container-test-unit container-test-fast container-test-all \
+	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
 	setup-btrfs setup-default setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import \
@@ -161,6 +161,7 @@ help:
 	@echo "  container-test-unit    Unit tests in container"
 	@echo "  container-test-fast    + quick VM tests in container"
 	@echo "  container-test-all, container-test  + slow VM tests in container"
+	@echo "  container-test-fc-mock  fc-mock tests in container (no KVM)"
 	@echo ""
 	@echo "Container:"
 	@echo "  container-build    Build test container"
@@ -310,11 +311,11 @@ test: test-root
 # fc-mock: container-mode tests (no KVM required)
 # Uses fc-mock binary instead of Firecracker.
 # Only runs tests known to work with fc-mock (no KVM, no real Firecracker).
-FC_MOCK_FILTER := package(fcvm) & (test(=test_sanity_bridged) | test(/fc_mock/) | test(/state_manager/) | test(/health_monitor/) | test(/no_sudo/))
+FC_MOCK_FILTER := package(fcvm) & (test(=test_sanity_bridged) | test(=test_sanity_rootless) | test(/fc_mock/) | test(/state_manager/) | test(/health_monitor/) | test(/no_sudo/))
 _test-fc-mock:
 	@FCVM_FIRECRACKER_BIN=/usr/local/bin/fc-mock \
 	RUST_LOG="$(TEST_LOG)" \
-	FCVM_DATA_DIR=$(ROOT_DATA_DIR) \
+	FCVM_DATA_DIR=$${FCVM_DATA_DIR:-$(ROOT_DATA_DIR)} \
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
 	$(NEXTEST) $(NEXTEST_CAPTURE) --profile fc-mock --features privileged-tests -E '$(FC_MOCK_FILTER)' $(FILTER) || \
@@ -326,6 +327,20 @@ test-fc-mock: show-notes check-disk build build-fc-mock setup-fcvm _test-fc-mock
 # Container targets (setup on host where needed, run-only in container)
 # Container uses shadowed target/ mount to avoid permission conflicts
 # check-disk runs on host before container tests start
+
+# fc-mock in container (subset — networking tests excluded)
+# Rootless podman containers can't create nested user namespaces or TAP devices,
+# so only fc-mock unit tests run here. Full fc-mock tests run on bare metal (test-fc-mock).
+FC_MOCK_CONTAINER_FILTER := package(fcvm) & (test(/fc_mock/) | test(/state_manager/) | test(/health_monitor/) | test(/no_sudo/)) & not test(=test_fc_mock_sanity) & not test(=test_fc_mock_container_launch)
+container-test-fc-mock: check-disk container-build setup-btrfs
+	@echo "==> Running fc-mock tests in container (unit tests only)..."
+	$(CONTAINER_RUN) $(CONTAINER_TAG) bash -c '\
+		make build build-fc-mock && \
+		FCVM_FIRECRACKER_BIN=/usr/local/bin/fc-mock \
+		RUST_LOG="$(TEST_LOG)" \
+		$(NEXTEST) $(NEXTEST_CAPTURE) --profile fc-mock --features privileged-tests -E "$(FC_MOCK_CONTAINER_FILTER)" $(FILTER) || \
+		{ echo "TEST FAILED (fc-mock container mode)"; exit 1; }'
+
 container-test-unit: check-disk container-build
 	@echo "==> Running unit tests in container..."
 	$(CONTAINER_RUN) $(CONTAINER_TAG) make build _test-unit
