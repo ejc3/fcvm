@@ -24,10 +24,7 @@ async fn test_rootless_podman_healthcheck_becomes_healthy() -> Result<()> {
     // Build a container image with a HEALTHCHECK defined.
     // The healthcheck passes immediately (exit 0).
     // Use --format=docker to preserve HEALTHCHECK instruction.
-    let image_name = format!(
-        "localhost/test-rootless-hc-{}",
-        std::process::id() % 10000
-    );
+    let image_name = format!("localhost/test-rootless-hc-{}", std::process::id() % 10000);
 
     println!("  Building image with HEALTHCHECK: {}", image_name);
     let tmpdir = tempfile::tempdir()?;
@@ -66,15 +63,10 @@ async fn test_rootless_podman_healthcheck_becomes_healthy() -> Result<()> {
     let (vm_name, _, _, _) = common::unique_names("rootless-hc");
     println!("  Starting rootless VM: {}", vm_name);
 
-    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
-        "podman",
-        "run",
-        "--name",
-        &vm_name,
-        &image_name,
-    ])
-    .await
-    .context("spawning fcvm")?;
+    let (mut child, fcvm_pid) =
+        common::spawn_fcvm(&["podman", "run", "--name", &vm_name, &image_name])
+            .await
+            .context("spawning fcvm")?;
 
     println!("  fcvm PID: {}", fcvm_pid);
     println!("  Waiting for Healthy (fcvm must trigger podman healthcheck)...");
