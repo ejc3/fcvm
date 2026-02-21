@@ -191,33 +191,28 @@ fcvm uses a two-tier snapshot system to reduce startup time:
 | Snapshot | When Created | Content | Size |
 |----------|--------------|---------|------|
 | **Pre-start** | After image pull, before container runs | VM with image loaded | Full (~1GB) |
-| **Startup** | After HTTP health check passes | VM with container fully initialized | Diff (~50MB) |
+| **Startup** | After HTTP health check passes | VM with container fully initialized | Full (~512MB) |
 
-**How diff snapshots work:**
-1. **First snapshot (pre-start)**: Creates a full memory snapshot (~1GB)
-2. **Subsequent snapshots (startup)**: Reflink-copy parent `memory.bin`, create a diff, then merge
-3. **Result**: Each snapshot ends up with a complete `memory.bin`, equivalent to a full snapshot
-
-There are no persistent diff chains.
-Reflink copy is instant (btrfs CoW), and the diff is typically ~2% of pages.
-Merge produces a complete `memory.bin` with no parent dependency.
+Both snapshots are full memory dumps — startup snapshots do not use diff-based tracking.
+(KVM dirty page tracking is unreliable on x86_64, reporting only ~90KB of dirty pages when
+60-97MB are actually dirty, producing corrupt snapshots that triple-fault on restore.)
 
 The startup snapshot is triggered by `--health-check <url>`.
-After the check passes, fcvm creates a diff snapshot of the initialized app.
+After the check passes, fcvm creates a full snapshot of the initialized app.
 Second run restores from that snapshot and skips container initialization.
 
 ```bash
-# First run: Creates pre-start (full) + startup (diff, merged)
+# First run: Creates pre-start (full) + startup (full)
 ./fcvm podman run --name web --health-check http://localhost/ nginx:alpine
-# → Pre-start snapshot: 1024MB (full)
-# → Startup snapshot: ~50MB (diff) → merged onto base
+# → Pre-start snapshot: ~1024MB (full)
+# → Startup snapshot: ~512MB (full)
 
 # Second run: Restores from startup snapshot
 ./fcvm podman run --name web2 --health-check http://localhost/ nginx:alpine
 # → Restored from startup snapshot (application already running)
 ```
 
-Clone snapshots automatically use their source as parent, enabling diff-based optimization across the chain.
+Clone snapshots use their source as parent for diff-based optimization across the clone chain.
 
 ### Image Delivery Modes
 
@@ -348,22 +343,16 @@ sudo sh -c 'echo 0 > /proc/sys/vm/nr_hugepages'
 
 **How it works with snapshots:**
 
-The snapshot cache flow creates two snapshots on the initial VM:
+The snapshot cache flow creates two full snapshots on the initial VM:
 1. **Pre-start (Full)**: After container image import
-2. **Startup (Diff)**: After container is healthy
+2. **Startup (Full)**: After container is healthy
 
-KVM dirty page tracking is enabled on the initial VM so the startup diff snapshot
-captures only the pages that changed between pre-start and startup (~100MB for a
-typical nginx container, vs dumping the entire VM memory).
-
-Dirty tracking requires KVM to split ARM64 Stage 2 block mappings from 2MB to 4KB
-entries. This only affects the initial VM (runs once for cache creation). Restored
-VMs (clones) do not enable dirty tracking, so they get full 2MB Stage 2 block
-mappings and the TLB benefit of hugepages.
+Both are full memory dumps. Restored VMs (clones) with hugepages disabled
+enable KVM dirty page tracking for clone-of-clone diff snapshots.
 
 | VM role | Dirty tracking | Stage 2 mapping | Runs |
 |---------|---------------|-----------------|------|
-| Initial (cache creation) | Enabled | 4KB (split for tracking) | Once |
+| Initial (cache creation) | Disabled | 2MB blocks | Once |
 | Clone (hugepage) | Disabled | 2MB blocks (full TLB benefit) | Many times |
 | Clone (non-hugepage) | Enabled | 4KB (no hugepages anyway) | Many times |
 
