@@ -1055,16 +1055,17 @@ pub async fn ensure_nested_container(image_name: &str, containerfile: &str) -> a
     let fcvm_path = find_fcvm_binary()?;
     let fcvm_dir = fcvm_path.parent().unwrap();
 
-    // Serialize concurrent builds with a file lock. Multiple nextest processes
-    // may call this simultaneously; without locking, concurrent `podman build`
-    // races on overlay unmount and corrupts the build cache (x64-specific).
-    let lock_name = image_name.replace('/', "-");
-    let lock_path = format!("/tmp/fcvm-build-{}.lock", lock_name);
+    // Serialize ALL concurrent podman builds with a single global file lock.
+    // Per-image locks are insufficient: different images (e.g., localhost/nested-test
+    // and localhost/pjdfstest) share base layers (FROM ubuntu:24.04) in the same
+    // overlay storage. Concurrent builds race on shared layer cleanup, causing
+    // "error unmounting container: directory not empty" on x64.
+    let lock_path = "/tmp/fcvm-podman-build.lock";
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
-        .open(&lock_path)
+        .open(lock_path)
         .context("creating build lock file")?;
     lock_file.lock_exclusive().context("acquiring build lock")?;
 
