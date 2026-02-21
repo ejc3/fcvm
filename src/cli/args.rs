@@ -199,9 +199,14 @@ pub struct RunArgs {
     pub network: NetworkMode,
 
     /// HTTP health check URL. If not specified, health is based on container running status.
-    /// Example: --health-check http://localhost/health
+    /// The URL hostname is sent as the Host header; the connection goes to the guest IP.
+    /// Example: --health-check http://myapp.example.com/status
     #[arg(long)]
     pub health_check: Option<String>,
+
+    /// Timeout in seconds for HTTP health check requests. Default: 5.
+    #[arg(long, default_value = "5")]
+    pub health_check_timeout: u64,
 
     /// Run container as USER:GROUP (e.g., --user 1000:1000)
     /// Equivalent to podman run --userns=keep-id on the host
