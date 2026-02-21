@@ -550,12 +550,7 @@ async fn update_health_status_once(
 
                         debug!(target: "health-monitor", original_url = %url_str, effective_url = %effective_url, veth = ?veth_device, "HTTP health check via veth");
 
-                        match check_http_health_bridged(
-                            &effective_url,
-                            veth_device,
-                            url_host,
-                        )
-                        .await
+                        match check_http_health_bridged(&effective_url, veth_device, url_host).await
                         {
                             Ok(true) => {
                                 debug!(target: "health-monitor", "health check passed");
