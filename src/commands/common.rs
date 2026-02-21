@@ -58,17 +58,100 @@ const MIN_FIRECRACKER_VERSION: (u32, u32, u32) = (1, 13, 1);
 /// Timeout for namespace holder creation retries
 pub const HOLDER_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Timeout for waiting for namespace to be ready
-pub const NAMESPACE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
-
 /// Maximum wait time for namespace setup via nsenter
 pub const NSENTER_MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// Poll interval for namespace setup retries
 pub const NSENTER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 
-/// Retry interval between holder creation attempts
+/// Retry interval between holder creation attempts (only used when holder dies)
 pub const HOLDER_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Spawn a namespace holder process and wait for it to be ready.
+///
+/// Spawns `unshare --user --map-root-user --net -- sleep infinity` and waits for the
+/// namespace to become ready (uid_map/gid_map written, nsenter probe succeeds).
+///
+/// Key design: gives the first holder the FULL retry deadline. Only spawns a new
+/// holder if the current one dies. Under heavy load, the `unshare` parent process
+/// may be slow to write uid_map due to CPU scheduling pressure — killing and
+/// respawning wastes time since the new holder faces the same pressure.
+pub async fn spawn_namespace_holder(
+    holder_cmd: &[String],
+) -> anyhow::Result<(tokio::process::Child, u32)> {
+    let deadline = std::time::Instant::now() + HOLDER_RETRY_TIMEOUT;
+    let mut attempt = 0u32;
+
+    loop {
+        attempt += 1;
+
+        let child = tokio::process::Command::new(&holder_cmd[0])
+            .args(&holder_cmd[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "spawning namespace holder (attempt {}): {:?}",
+                    attempt, holder_cmd
+                )
+            })?;
+
+        let holder_pid = child.id().context("getting holder process PID")?;
+        if attempt > 1 {
+            info!(holder_pid, attempt, "namespace holder started (retry)");
+        } else {
+            info!(holder_pid, "namespace holder started");
+        }
+
+        // Give this holder the FULL remaining time to become ready.
+        // Don't kill on timeout — if it times out, the deadline is exceeded anyway.
+        let result = crate::utils::wait_for_namespace_ready(holder_pid, deadline).await;
+
+        match result {
+            crate::utils::NamespaceReadyResult::Ready => {
+                return Ok((child, holder_pid));
+            }
+            crate::utils::NamespaceReadyResult::HolderDied => {
+                if std::time::Instant::now() < deadline {
+                    warn!(
+                        holder_pid,
+                        attempt, "holder died before namespace ready, retrying..."
+                    );
+                    tokio::time::sleep(HOLDER_RETRY_INTERVAL).await;
+                    continue;
+                } else {
+                    let max_user_ns = std::fs::read_to_string("/proc/sys/user/max_user_namespaces")
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    anyhow::bail!(
+                        "namespace holder died and no time remaining to retry \
+                         (attempt {}, holder PID {}, max_user_namespaces={})",
+                        attempt,
+                        holder_pid,
+                        max_user_ns.trim()
+                    );
+                }
+            }
+            crate::utils::NamespaceReadyResult::TimedOut => {
+                // Holder is alive but maps not written within deadline.
+                // No point killing and retrying — deadline is exceeded.
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(holder_pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                anyhow::bail!(
+                    "namespace not ready within {:?} (holder PID {} alive, \
+                     uid_map not written — likely CPU scheduling pressure \
+                     with many concurrent VMs). Attempt {}.",
+                    HOLDER_RETRY_TIMEOUT,
+                    holder_pid,
+                    attempt
+                );
+            }
+        }
+    }
+}
 
 /// Merge a diff snapshot onto a base memory file.
 ///
@@ -533,55 +616,7 @@ pub async fn restore_from_snapshot(
         let holder_cmd = slirp_net.build_holder_command();
         info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
 
-        let retry_deadline = std::time::Instant::now() + HOLDER_RETRY_TIMEOUT;
-        let mut attempt = 0u32;
-
-        let (mut child, holder_pid) = loop {
-            attempt += 1;
-
-            let mut child = tokio::process::Command::new(&holder_cmd[0])
-                .args(&holder_cmd[1..])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .context("spawning namespace holder process")?;
-
-            let holder_pid = child.id().context("getting holder process PID")?;
-            if attempt > 1 {
-                info!(
-                    holder_pid = holder_pid,
-                    attempt = attempt,
-                    "namespace holder started (retry)"
-                );
-            } else {
-                info!(holder_pid = holder_pid, "namespace holder started");
-            }
-
-            // Wait for namespace to be ready by checking uid_map
-            let namespace_ready =
-                crate::utils::wait_for_namespace_ready(holder_pid, NAMESPACE_READY_TIMEOUT).await;
-
-            if namespace_ready {
-                break (child, holder_pid);
-            }
-
-            // Namespace not ready, kill holder and retry
-            let _ = child.kill().await;
-            if std::time::Instant::now() < retry_deadline {
-                warn!(
-                    holder_pid = holder_pid,
-                    attempt = attempt,
-                    "namespace not ready, retrying holder creation..."
-                );
-                tokio::time::sleep(HOLDER_RETRY_INTERVAL).await;
-            } else {
-                anyhow::bail!(
-                    "namespace not ready after {} attempts (holder PID {})",
-                    attempt,
-                    holder_pid
-                );
-            }
-        };
+        let (mut child, holder_pid) = spawn_namespace_holder(&holder_cmd).await?;
 
         // Step 2: Run disk creation and network setup IN PARALLEL
         let setup_script = slirp_net.build_setup_script();
