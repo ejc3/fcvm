@@ -550,12 +550,7 @@ async fn update_health_status_once(
 
                         debug!(target: "health-monitor", original_url = %url_str, effective_url = %effective_url, veth = ?veth_device, "HTTP health check via veth");
 
-                        match check_http_health_bridged(
-                            &effective_url,
-                            veth_device,
-                            url_host,
-                        )
-                        .await
+                        match check_http_health_bridged(&effective_url, veth_device, url_host).await
                         {
                             Ok(true) => {
                                 debug!(target: "health-monitor", "health check passed");
@@ -674,12 +669,14 @@ async fn check_http_health_nsenter(
         "-w".to_string(),
         "%{http_code}".to_string(),
         "--max-time".to_string(),
+        "1".to_string(),
     ];
     // Add Host header if specified (needed for servers that route by Host)
     if let Some(host) = host_header {
         curl_args.push("-H".to_string());
         curl_args.push(format!("Host: {}", host));
     }
+    curl_args.push(url.clone());
 
     let mut nsenter_args: Vec<String> = vec![
         "-t".to_string(),
@@ -690,8 +687,6 @@ async fn check_http_health_nsenter(
         "--".to_string(),
     ];
     nsenter_args.extend(curl_args);
-    nsenter_args.push("1".to_string()); // --max-time value
-    nsenter_args.push(url.clone());
 
     let output = tokio::process::Command::new("nsenter")
         .args(&nsenter_args)
