@@ -511,6 +511,7 @@ How it works:
 ```bash
 # Build
 make build        # Build fcvm + fc-agent
+make build-fc-mock  # Build fc-mock (Firecracker mock for container mode)
 make test         # Run fuse-pipe tests
 make setup-fcvm   # Download kernel and create rootfs
 
