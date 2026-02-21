@@ -56,6 +56,7 @@ async fn test_state_persistence() {
             portable_volumes: false,
             user: None,
             username: None,
+            health_check_timeout: 5,
         },
     };
 
@@ -128,6 +129,7 @@ async fn test_list_vms() {
                 portable_volumes: false,
                 user: None,
                 username: None,
+                health_check_timeout: 5,
             },
         };
         manager.save_state(&state).await.unwrap();
@@ -184,6 +186,7 @@ async fn test_load_state_by_name_duplicate_detection() {
                 portable_volumes: false,
                 user: None,
                 username: None,
+                health_check_timeout: 5,
             },
         };
         manager.save_state(&state).await.unwrap();
@@ -234,6 +237,7 @@ async fn test_load_state_by_name_duplicate_detection() {
             portable_volumes: false,
             user: None,
             username: None,
+            health_check_timeout: 5,
         },
     };
     manager.save_state(&state).await.unwrap();
