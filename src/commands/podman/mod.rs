@@ -182,21 +182,24 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     info!("VM memory: {} MiB", args.mem);
 
     // Build RuntimeConfig from kernel profile (replaces env var config passing)
+    // Uses explicit --kernel-profile if given, otherwise falls back to "default" profile
+    // for [firecracker] config (custom Firecracker binary from rootfs-config.toml).
     let mut runtime_config = super::common::RuntimeConfig::default();
-    if let Some(ref profile_name) = args.kernel_profile {
-        let profile = crate::setup::get_kernel_profile(profile_name)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "kernel profile '{}' not found for {} in config",
-                profile_name,
-                std::env::consts::ARCH
-            )
-        })?;
+    let effective_profile_name = args.kernel_profile.as_deref().unwrap_or("default");
+    if let Some(profile) = crate::setup::get_kernel_profile(effective_profile_name)? {
+        if args.kernel_profile.is_some() {
+            info!(profile = %effective_profile_name, "using kernel profile");
+        }
 
-        info!(profile = %profile_name, "using kernel profile");
-
-        let fc_path = crate::setup::get_firecracker_for_profile(&profile, profile_name).await?;
-        info!(firecracker_bin = %fc_path.display(), "from profile");
-        runtime_config.firecracker_bin = Some(fc_path);
+        // Check for custom Firecracker binary (from profile or [firecracker] config)
+        if profile.firecracker_repo.is_some() {
+            if let Ok(fc_path) =
+                crate::setup::get_firecracker_for_profile(&profile, effective_profile_name).await
+            {
+                info!(firecracker_bin = %fc_path.display(), "from profile");
+                runtime_config.firecracker_bin = Some(fc_path);
+            }
+        }
         if let Some(ref fc_args) = profile.firecracker_args {
             info!(firecracker_args = %fc_args, "from profile");
             runtime_config.firecracker_args = Some(fc_args.clone());

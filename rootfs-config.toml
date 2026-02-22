@@ -18,6 +18,15 @@ assets_dir = "/mnt/fcvm-btrfs"
 # Ignored if the host filesystem is already btrfs.
 btrfs_size = "60G"
 
+# Default Firecracker binary
+# Build from fork with diff snapshot fix for multi-slot VMs (>3GB RAM).
+# `fcvm setup` builds this automatically; `find_firecracker()` uses it.
+# Kernel profiles can override with their own firecracker_repo/branch.
+# Upstream PR: https://github.com/firecracker-microvm/firecracker/pull/5696
+[firecracker]
+repo = "ejc3/firecracker"
+branch = "fix-dump-dirty-multi-slot-cursor"
+
 # Rootfs Modification Plan
 #
 # The SHA256 of the generated setup script determines the image name: layer2-{sha}.raw
@@ -276,8 +285,3 @@ kernel_config = "kernel/btrfs-x86.conf"
 # No patches_dir — no FUSE patches needed for btrfs profile
 
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
-
-# Firecracker fork with diff snapshot fix for multi-slot VMs (>3GB RAM).
-# PR: https://github.com/firecracker-microvm/firecracker/pull/5696
-firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "fix-dump-dirty-multi-slot-cursor"
