@@ -77,12 +77,13 @@ impl VmManager {
     /// Set namespace holder PID for rootless networking
     ///
     /// When set, Firecracker will be launched inside an existing user+net namespace
-    /// via nsenter. The holder process (created by `unshare --user --map-root-user --net -- cat`)
+    /// via nsenter. The holder process (created by `unshare --user --net -- sleep infinity`)
     /// keeps the namespace alive while Firecracker runs.
     ///
-    /// With `--map-root-user`, the current user (UID 1000) is mapped to UID 0 inside the
-    /// namespace. Combined with `--preserve-credentials` when using nsenter, no chmod
-    /// is needed on sockets or files - the user has access both inside and outside.
+    /// UID/GID mappings are written externally by `setup_namespace_mappings()`, which
+    /// maps the current user (UID 1000) to UID 0 inside the namespace. Combined with
+    /// `--preserve-credentials` when using nsenter, no chmod is needed on sockets or
+    /// files - the user has access both inside and outside.
     pub fn set_holder_pid(&mut self, pid: u32) {
         self.holder_pid = Some(pid);
     }
@@ -342,8 +343,9 @@ impl VmManager {
 
                     // Step 0: Enter user namespace if specified (for rootless clones)
                     // This MUST be done first to get CAP_SYS_ADMIN for mount operations.
-                    // The user namespace was created by the holder process with --map-root-user,
-                    // so entering it gives us UID 0 with full capabilities inside the namespace.
+                    // The user namespace was created by the holder process (unshare --user --net)
+                    // with external UID/GID mappings, so entering it gives us UID 0 with full
+                    // capabilities inside the namespace.
                     if let Some(ref user_ns_path) = user_ns_cstr {
                         let ns_fd_raw = open(
                             user_ns_path.as_c_str(),
