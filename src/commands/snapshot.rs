@@ -1020,18 +1020,14 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                         // Use select! so SIGTERM can abort startup snapshot immediately.
                         // Startup snapshots are optional (just caching), so if the VM is
                         // paused mid-snapshot, cleanup will kill it via vm_manager.kill().
+                        let parent_key = vm_state.config.snapshot_name.clone();
                         let snap = CreateSnapshotParams {
                             vm_manager: &vm_manager,
                             snapshot_key: &startup_key,
                             vm_state: &vm_state,
                             disk_path: &disk_path,
                             volume_configs: &volume_configs,
-                            // Always use FULL snapshots for startup snapshots.
-                            // Diff snapshots rely on KVM dirty page tracking, which
-                            // is broken on x86_64: KVM reports only ~90KB of dirty
-                            // pages when 60-97MB are actually dirty, producing a
-                            // corrupt snapshot that triple-faults on restore.
-                            parent_snapshot_key: None,
+                            parent_snapshot_key: parent_key.as_deref(),
                         };
                         tokio::select! {
                             outcome = create_snapshot_interruptible(&snap, &cancel) => {
@@ -1042,6 +1038,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                                     }
                                     SnapshotOutcome::Created => {
                                         info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
+                                        vm_state.config.snapshot_name = Some(startup_key.clone());
+                                        let _ = state_manager.save_state(&vm_state).await;
                                     }
                                     SnapshotOutcome::Failed(e) => {
                                         warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");
