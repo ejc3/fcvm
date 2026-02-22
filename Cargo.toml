@@ -1,7 +1,7 @@
 [workspace]
-members = [".", "fuse-pipe", "fc-agent", "exec-proto"]
+members = [".", "fuse-pipe", "fc-agent", "exec-proto", "fc-mock"]
 # Build all members by default (not just the root package)
-default-members = [".", "fuse-pipe", "fc-agent", "exec-proto"]
+default-members = [".", "fuse-pipe", "fc-agent", "exec-proto", "fc-mock"]
 # Exclude sync-test (used only for Makefile sync verification)
 exclude = ["sync-test"]
 # Resolver v2 makes --no-default-features work across all workspace members

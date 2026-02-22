@@ -147,6 +147,7 @@ help:
 	@echo ""
 	@echo "Build:"
 	@echo "  build              Build fcvm + fc-agent"
+	@echo "  build-fc-mock      Build fc-mock (Firecracker mock for container mode)"
 	@echo "  clean              Remove target directory"
 	@echo ""
 	@echo "Test (host):"
@@ -154,6 +155,7 @@ help:
 	@echo "  test-fast          + quick VM tests (rootless, no sudo)"
 	@echo "  test-all           + slow VM tests (rootless, no sudo)"
 	@echo "  test-root, test    + privileged tests (bridged, pjdfstest, sudo)"
+	@echo "  test-fc-mock       Run tests with fc-mock (no KVM required)"
 	@echo ""
 	@echo "Test (container):"
 	@echo "  container-test-unit    Unit tests in container"
@@ -257,6 +259,13 @@ build:
 	@# Sync embedded config to user config dir (config is embedded at compile time)
 	@./target/release/fcvm setup --generate-config --force 2>/dev/null || true
 
+build-fc-mock:
+	@echo "==> Building fc-mock..."
+	CARGO_TARGET_DIR=target $(CARGO) build --release -p fc-mock
+	@# Install to /usr/local/bin so it's accessible from within user namespaces
+	@# (rootless networking uses nsenter which can't traverse /home/ubuntu/ with 750 perms)
+	sudo install -m 755 target/release/fc-mock /usr/local/bin/fc-mock
+
 # Test that the release binary works without source tree (simulates cargo install)
 test-packaging: build
 	@echo "==> Testing packaging (simulates cargo install)..."
@@ -297,6 +306,22 @@ test-fast: show-notes check-disk setup-fcvm _test-fast
 test-all: show-notes check-disk setup-fcvm _test-all
 test-root: show-notes check-disk setup-fcvm setup-pjdfstest setup-hugepages _test-root
 test: test-root
+
+# fc-mock: container-mode tests (no KVM required)
+# Uses fc-mock binary instead of Firecracker.
+# Only runs tests known to work with fc-mock (no KVM, no real Firecracker).
+FC_MOCK_FILTER := package(fcvm) & (test(=test_sanity_bridged) | test(/fc_mock/) | test(/state_manager/) | test(/health_monitor/) | test(/no_sudo/))
+_test-fc-mock:
+	@FCVM_FIRECRACKER_BIN=/usr/local/bin/fc-mock \
+	RUST_LOG="$(TEST_LOG)" \
+	FCVM_DATA_DIR=$(ROOT_DATA_DIR) \
+	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
+	$(NEXTEST) $(NEXTEST_CAPTURE) --profile fc-mock --features privileged-tests -E '$(FC_MOCK_FILTER)' $(FILTER) || \
+	{ echo ""; \
+	  echo "TEST FAILED (fc-mock mode)"; \
+	  exit 1; }
+test-fc-mock: show-notes check-disk build build-fc-mock setup-fcvm _test-fc-mock
 
 # Container targets (setup on host where needed, run-only in container)
 # Container uses shadowed target/ mount to avoid permission conflicts
