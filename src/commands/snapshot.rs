@@ -55,7 +55,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     // Determine which VM to snapshot
     let state_manager = StateManager::new(paths::state_dir());
 
-    let vm_state = if let Some(name) = &args.name {
+    let mut vm_state = if let Some(name) = &args.name {
         info!("Creating snapshot from VM: {}", name);
         state_manager
             .load_state_by_name(name)
@@ -165,6 +165,13 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         parent_dir.as_deref(),
     )
     .await?;
+
+    // Track this snapshot as the latest base for future diff snapshots
+    vm_state.config.snapshot_name = Some(snapshot_name.clone());
+    state_manager
+        .save_state(&vm_state)
+        .await
+        .context("saving snapshot name to VM state")?;
 
     // Print user-friendly output
     let vm_name = vm_state
