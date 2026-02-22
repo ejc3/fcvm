@@ -192,12 +192,28 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         }
 
         // Check for custom Firecracker binary (from profile or [firecracker] config)
+        // If the explicit profile has firecracker_repo, use it; otherwise fall back
+        // to the default profile (which inherits [firecracker] config). This ensures
+        // snapshot creation and restore use the same Firecracker binary.
         if profile.firecracker_repo.is_some() {
             if let Ok(fc_path) =
                 crate::setup::get_firecracker_for_profile(&profile, effective_profile_name).await
             {
                 info!(firecracker_bin = %fc_path.display(), "from profile");
                 runtime_config.firecracker_bin = Some(fc_path);
+            }
+        } else if effective_profile_name != "default" {
+            // Profile doesn't specify its own Firecracker — check if the default
+            // profile has one (from the [firecracker] section in rootfs-config.toml)
+            if let Ok(Some(default_profile)) = crate::setup::get_kernel_profile("default") {
+                if default_profile.firecracker_repo.is_some() {
+                    if let Ok(fc_path) =
+                        crate::setup::get_firecracker_for_profile(&default_profile, "default").await
+                    {
+                        info!(firecracker_bin = %fc_path.display(), "from default profile (fallback)");
+                        runtime_config.firecracker_bin = Some(fc_path);
+                    }
+                }
             }
         }
         if let Some(ref fc_args) = profile.firecracker_args {
