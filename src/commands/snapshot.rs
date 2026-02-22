@@ -38,13 +38,29 @@ pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
     }
 }
 
-fn snapshot_restore_runtime_config(args: &SnapshotRunArgs) -> RuntimeConfig {
-    RuntimeConfig {
+async fn snapshot_restore_runtime_config(args: &SnapshotRunArgs) -> RuntimeConfig {
+    let mut config = RuntimeConfig {
         firecracker_bin: args.firecracker_bin.as_ref().map(PathBuf::from),
         firecracker_args: args.firecracker_args.clone(),
         boot_args: None,
         fuse_readers: None,
+    };
+
+    // If no explicit firecracker_bin, check the default profile for custom Firecracker
+    // (matches podman run behavior — ensures snapshot restore uses same binary as create)
+    if config.firecracker_bin.is_none() {
+        if let Ok(Some(profile)) = crate::setup::get_kernel_profile("default") {
+            if profile.firecracker_repo.is_some() {
+                if let Ok(fc_path) =
+                    crate::setup::get_firecracker_for_profile(&profile, "default").await
+                {
+                    config.firecracker_bin = Some(fc_path);
+                }
+            }
+        }
     }
+
+    config
 }
 
 /// Create snapshot from running VM
@@ -473,7 +489,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Generate VM ID and name
     let vm_id = generate_vm_id();
-    let runtime_config = snapshot_restore_runtime_config(&args);
+    let runtime_config = snapshot_restore_runtime_config(&args).await;
     let vm_name = args.name.unwrap_or_else(|| {
         // Auto-generate: snapshot-name + random suffix
         format!("{}-{}", snapshot_name, &vm_id[..6])
@@ -1139,8 +1155,8 @@ async fn cmd_snapshot_ls() -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_snapshot_restore_runtime_config_preserves_firecracker_overrides() {
+    #[tokio::test]
+    async fn test_snapshot_restore_runtime_config_preserves_firecracker_overrides() {
         let args = SnapshotRunArgs {
             pid: None,
             snapshot: Some("snap".to_string()),
@@ -1159,7 +1175,7 @@ mod tests {
             non_blocking_output: false,
         };
 
-        let runtime = snapshot_restore_runtime_config(&args);
+        let runtime = snapshot_restore_runtime_config(&args).await;
         assert_eq!(
             runtime.firecracker_bin,
             Some(PathBuf::from("/opt/firecracker-profile"))
