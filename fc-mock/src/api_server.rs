@@ -179,13 +179,18 @@ async fn handle_request(
                     drop(s); // Release lock before spawning
 
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            crate::container::launch_container(mmds_data, vsock_uds_path, shutdown)
-                                .await
+                        if let Err(e) = crate::container::launch_container(
+                            mmds_data,
+                            vsock_uds_path,
+                            shutdown.clone(),
+                        )
+                        .await
                         {
                             tracing::error!("container launch failed: {}", e);
-                            // Still trigger shutdown so fcvm doesn't hang
-                            // The error is communicated via the exit code
+                            // Trigger shutdown so fcvm doesn't hang
+                            if let Some(s) = shutdown {
+                                s.notify_one();
+                            }
                         }
                     });
                 }
