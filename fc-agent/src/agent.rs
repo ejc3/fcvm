@@ -232,13 +232,10 @@ pub async fn run() -> Result<()> {
             eprintln!("[fc-agent] image digest: {}", digest);
             if container::notify_cache_ready_and_wait(&digest, &restore_flag) {
                 eprintln!("[fc-agent] cache ready notification acknowledged");
-                // Pre-start snapshot was taken and we've been restored into a new
-                // Firecracker instance. The vsock transport was reset, which
-                // invalidates the exec server's listener socket (stale AsyncFd epoll).
-                // Signal it to re-bind. Set flag BEFORE notify to prevent race where
-                // select! drops the Notified future (see exec.rs doc comment).
-                exec_rebind_needed.store(true, std::sync::atomic::Ordering::Release);
-                exec_rebind.notify_one();
+                // Exec rebind is handled by handle_clone_restore() (via the
+                // restore-epoch watcher). Do NOT signal a second rebind here —
+                // a double re-register leaves the listener in a broken state
+                // where it misses epoll events for ~150 seconds.
             } else {
                 eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing");
             }
