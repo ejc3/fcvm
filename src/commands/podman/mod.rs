@@ -924,6 +924,8 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         }
                         SnapshotOutcome::Created => {
                             info!(snapshot_key = %key, "Pre-start snapshot created successfully");
+                            ctx.vm_state.config.snapshot_name = Some(key.clone());
+                            let _ = ctx.state_manager.save_state(&ctx.vm_state).await;
                             // Signal output listener to re-accept (vsock reset during snapshot)
                             ctx.output_reconnect.notify_one();
                         }
@@ -964,18 +966,14 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         // This is safe: startup snapshots are optional (just caching), so
                         // if the VM is paused mid-snapshot when we cancel, cleanup will
                         // kill the VM anyway via vm_manager.kill().
+                        let parent_key = ctx.vm_state.config.snapshot_name.clone();
                         let snap = CreateSnapshotParams {
                             vm_manager: &ctx.vm_manager,
                             snapshot_key: &startup_key,
                             vm_state: &ctx.vm_state,
                             disk_path: &ctx.disk_path,
                             volume_configs: &ctx.volume_configs,
-                            // Always use FULL snapshots for startup snapshots.
-                            // Diff snapshots rely on KVM dirty page tracking, which
-                            // is broken on x86_64: KVM reports only ~90KB of dirty
-                            // pages when 60-97MB are actually dirty, producing a
-                            // corrupt snapshot that triple-faults on restore.
-                            parent_snapshot_key: None,
+                            parent_snapshot_key: parent_key.as_deref(),
                         };
                         tokio::select! {
                             outcome = create_snapshot_interruptible(&snap, &cancel) => {
@@ -985,6 +983,8 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                                     }
                                     SnapshotOutcome::Created => {
                                         info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
+                                        ctx.vm_state.config.snapshot_name = Some(startup_key.clone());
+                                        let _ = ctx.state_manager.save_state(&ctx.vm_state).await;
                                         // Signal output listener to re-accept (vsock reset during snapshot)
                                         ctx.output_reconnect.notify_one();
                                     }
