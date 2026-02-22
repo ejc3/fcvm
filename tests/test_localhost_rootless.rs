@@ -290,6 +290,8 @@ async fn test_localhost_rootless_btrfs_snapshot_restore() -> Result<()> {
         .context("spawning fcvm (second run)")?;
         println!("  fcvm PID: {}", fcvm_pid);
 
+        // Pre-start snapshot restore still needs to run `podman run` from scratch
+        // (container doesn't exist yet), so it needs the same timeout as a fresh boot.
         common::poll_health_by_pid(fcvm_pid, 120)
             .await
             .context("second run (from snapshot): VM failed to become healthy")?;
@@ -360,6 +362,74 @@ async fn test_localhost_rootless_btrfs_snapshot_restore() -> Result<()> {
             driver
         );
 
+        // Step 4: Exec stress test — fire 10 parallel exec calls with tight timeouts.
+        // Catches the double-rebind regression where exec hangs for ~150s after restore.
+        // Each call must complete within 10s (the bug caused 150s hangs).
+        println!("\n4. Post-restore exec stress test (10 parallel calls, 10s timeout each)...");
+        let stress_start = std::time::Instant::now();
+        let mut handles: Vec<tokio::task::JoinHandle<anyhow::Result<std::time::Duration>>> =
+            Vec::new();
+        for i in 0..10 {
+            let handle = tokio::spawn(async move {
+                let call_start = std::time::Instant::now();
+                let result = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(10),
+                    common::exec_in_vm(fcvm_pid, &["echo", &format!("stress-{}", i)]),
+                )
+                .await;
+                let elapsed = call_start.elapsed();
+                match result {
+                    Ok(Ok(output)) => {
+                        let output = output.trim().to_string();
+                        assert_eq!(
+                            output,
+                            format!("stress-{}", i),
+                            "exec call {} returned wrong output",
+                            i
+                        );
+                        println!(
+                            "    exec call {} completed in {:.1}ms",
+                            i,
+                            elapsed.as_secs_f64() * 1000.0
+                        );
+                        Ok(elapsed)
+                    }
+                    Ok(Err(e)) => {
+                        panic!("exec call {} failed: {}", i, e);
+                    }
+                    Err(_) => {
+                        panic!(
+                            "exec call {} timed out after 10s — exec server likely broken by double rebind",
+                            i
+                        );
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        let mut max_latency = std::time::Duration::ZERO;
+        for handle in handles {
+            let elapsed = handle.await.expect("exec stress task panicked")?;
+            if elapsed > max_latency {
+                max_latency = elapsed;
+            }
+        }
+        let total_elapsed = stress_start.elapsed();
+        println!(
+            "  All 10 exec calls completed in {:.1}ms (max single: {:.1}ms)",
+            total_elapsed.as_secs_f64() * 1000.0,
+            max_latency.as_secs_f64() * 1000.0
+        );
+        // Sanity check: all 10 parallel calls should finish in under 30s total.
+        // With the bug, they'd each timeout at 10s = 10s total (parallel), or
+        // if sequential would be 150s+ total.
+        assert!(
+            total_elapsed.as_secs() < 30,
+            "exec stress test took {}s — expected <30s for 10 parallel calls",
+            total_elapsed.as_secs()
+        );
+
         common::kill_process(fcvm_pid).await;
     }
 
@@ -367,6 +437,7 @@ async fn test_localhost_rootless_btrfs_snapshot_restore() -> Result<()> {
     println!("  - First run: fresh boot, btrfs image, snapshot created");
     println!("  - Second run: restored from snapshot, btrfs image isolated per-clone");
     println!("  - Username preserved across snapshot for health checks");
+    println!("  - Post-restore exec stress: 10 parallel calls completed within timeout");
 
     Ok(())
 }
