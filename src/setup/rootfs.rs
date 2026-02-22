@@ -861,8 +861,8 @@ pub fn load_config(explicit_path: Option<&str>) -> Result<(Plan, String, String)
 /// section in rootfs-config.toml stays as-is for backward compatibility.
 /// If a user explicitly defines [kernel_profiles.default], their definition wins.
 ///
-/// Also injects [firecracker] config into the default profile so `fcvm setup`
-/// and `find_firecracker()` use the custom Firecracker without special handling.
+/// Also injects [firecracker] config into profiles that don't have their own
+/// `firecracker_repo`, so all profiles use the custom Firecracker by default.
 fn synthesize_default_profile(plan: &mut Plan) {
     let arch = config_arch();
     if let Ok(kernel_config) = plan.kernel.current_arch() {
@@ -885,6 +885,21 @@ fn synthesize_default_profile(plan: &mut Plan) {
             .or_default()
             .entry(arch.into())
             .or_insert(default_profile);
+    }
+
+    // Inject [firecracker] config into existing profiles that don't have their
+    // own firecracker_repo. This ensures --kernel-profile btrfs (etc.) also uses
+    // the custom Firecracker binary when one is configured globally.
+    if let Some(ref fc) = plan.firecracker {
+        let arch = config_arch();
+        for (_name, arch_map) in plan.kernel_profiles.iter_mut() {
+            if let Some(profile) = arch_map.get_mut(arch) {
+                if profile.firecracker_repo.is_none() {
+                    profile.firecracker_repo = Some(fc.repo.clone());
+                    profile.firecracker_branch = Some(fc.branch.clone());
+                }
+            }
+        }
     }
 }
 

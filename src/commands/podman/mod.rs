@@ -193,11 +193,15 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
 
         // Check for custom Firecracker binary (from profile or [firecracker] config)
         if profile.firecracker_repo.is_some() {
-            if let Ok(fc_path) =
-                crate::setup::get_firecracker_for_profile(&profile, effective_profile_name).await
+            match crate::setup::get_firecracker_for_profile(&profile, effective_profile_name).await
             {
-                info!(firecracker_bin = %fc_path.display(), "from profile");
-                runtime_config.firecracker_bin = Some(fc_path);
+                Ok(fc_path) => {
+                    info!(firecracker_bin = %fc_path.display(), "from profile");
+                    runtime_config.firecracker_bin = Some(fc_path);
+                }
+                Err(e) => {
+                    warn!(profile = %effective_profile_name, error = %e, "custom Firecracker not found, falling back to system binary");
+                }
             }
         }
         if let Some(ref fc_args) = profile.firecracker_args {
