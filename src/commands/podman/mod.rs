@@ -182,21 +182,47 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     info!("VM memory: {} MiB", args.mem);
 
     // Build RuntimeConfig from kernel profile (replaces env var config passing)
+    // Uses explicit --kernel-profile if given, otherwise falls back to "default" profile
+    // for [firecracker] config (custom Firecracker binary from rootfs-config.toml).
     let mut runtime_config = super::common::RuntimeConfig::default();
-    if let Some(ref profile_name) = args.kernel_profile {
-        let profile = crate::setup::get_kernel_profile(profile_name)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "kernel profile '{}' not found for {} in config",
-                profile_name,
-                std::env::consts::ARCH
-            )
-        })?;
+    let effective_profile_name = args.kernel_profile.as_deref().unwrap_or("default");
+    if let Some(profile) = crate::setup::get_kernel_profile(effective_profile_name)? {
+        if args.kernel_profile.is_some() {
+            info!(profile = %effective_profile_name, "using kernel profile");
+        }
 
-        info!(profile = %profile_name, "using kernel profile");
-
-        let fc_path = crate::setup::get_firecracker_for_profile(&profile, profile_name).await?;
-        info!(firecracker_bin = %fc_path.display(), "from profile");
-        runtime_config.firecracker_bin = Some(fc_path);
+        // Check for custom Firecracker binary (from profile or [firecracker] config)
+        // If the explicit profile has its own firecracker_repo, use that.
+        // Otherwise fall back to the "default" profile (which inherits [firecracker] config).
+        if profile.firecracker_repo.is_some() {
+            match crate::setup::get_firecracker_for_profile(&profile, effective_profile_name).await
+            {
+                Ok(fc_path) => {
+                    info!(firecracker_bin = %fc_path.display(), "from profile");
+                    runtime_config.firecracker_bin = Some(fc_path);
+                }
+                Err(e) => {
+                    warn!(profile = %effective_profile_name, error = %e, "custom Firecracker not found, falling back to system binary");
+                }
+            }
+        } else if effective_profile_name != "default" {
+            // Explicit profile (e.g. "btrfs") doesn't have custom FC — check default profile
+            if let Ok(Some(default_profile)) = crate::setup::get_kernel_profile("default") {
+                if default_profile.firecracker_repo.is_some() {
+                    match crate::setup::get_firecracker_for_profile(&default_profile, "default")
+                        .await
+                    {
+                        Ok(fc_path) => {
+                            info!(firecracker_bin = %fc_path.display(), "from default profile");
+                            runtime_config.firecracker_bin = Some(fc_path);
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "custom Firecracker not found, falling back to system binary");
+                        }
+                    }
+                }
+            }
+        }
         if let Some(ref fc_args) = profile.firecracker_args {
             info!(firecracker_args = %fc_args, "from profile");
             runtime_config.firecracker_args = Some(fc_args.clone());
@@ -272,6 +298,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             &initrd_path,
             cmd_args.clone(),
             resolved_mode,
+            runtime_config.firecracker_bin.as_deref(),
         );
         let key = config.snapshot_key();
 
@@ -925,6 +952,8 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         }
                         SnapshotOutcome::Created => {
                             info!(snapshot_key = %key, "Pre-start snapshot created successfully");
+                            ctx.vm_state.config.snapshot_name = Some(key.clone());
+                            let _ = ctx.state_manager.save_state(&ctx.vm_state).await;
                             // Signal output listener to re-accept (vsock reset during snapshot)
                             ctx.output_reconnect.notify_one();
                         }
@@ -965,18 +994,14 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         // This is safe: startup snapshots are optional (just caching), so
                         // if the VM is paused mid-snapshot when we cancel, cleanup will
                         // kill the VM anyway via vm_manager.kill().
+                        let parent_key = ctx.vm_state.config.snapshot_name.clone();
                         let snap = CreateSnapshotParams {
                             vm_manager: &ctx.vm_manager,
                             snapshot_key: &startup_key,
                             vm_state: &ctx.vm_state,
                             disk_path: &ctx.disk_path,
                             volume_configs: &ctx.volume_configs,
-                            // Always use FULL snapshots for startup snapshots.
-                            // Diff snapshots rely on KVM dirty page tracking, which
-                            // is broken on x86_64: KVM reports only ~90KB of dirty
-                            // pages when 60-97MB are actually dirty, producing a
-                            // corrupt snapshot that triple-faults on restore.
-                            parent_snapshot_key: None,
+                            parent_snapshot_key: parent_key.as_deref(),
                         };
                         tokio::select! {
                             outcome = create_snapshot_interruptible(&snap, &cancel) => {
@@ -986,6 +1011,8 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                                     }
                                     SnapshotOutcome::Created => {
                                         info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
+                                        ctx.vm_state.config.snapshot_name = Some(startup_key.clone());
+                                        let _ = ctx.state_manager.save_state(&ctx.vm_state).await;
                                         // Signal output listener to re-accept (vsock reset during snapshot)
                                         ctx.output_reconnect.notify_one();
                                     }

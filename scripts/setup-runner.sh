@@ -83,15 +83,18 @@ ln -sf /home/ubuntu/.cargo/bin/cargo /usr/local/bin/cargo
 ln -sf /home/ubuntu/.cargo/bin/rustc /usr/local/bin/rustc
 ln -sf /home/ubuntu/.cargo/bin/rustup /usr/local/bin/rustup
 
-# Firecracker
+# Firecracker (upstream baseline - CI overrides with custom fork from rootfs-config.toml)
+# CI's "Install custom Firecracker" step builds from the btrfs profile's firecracker_repo
+# and installs the custom binary. This baseline is only used during initial setup.
 FIRECRACKER_VERSION="v1.14.0"
+ARCH=$(uname -m)
 curl -L -o /tmp/firecracker.tgz \
-  "https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}/firecracker-${FIRECRACKER_VERSION}-aarch64.tgz"
+  "https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}/firecracker-${FIRECRACKER_VERSION}-${ARCH}.tgz"
 tar -xzf /tmp/firecracker.tgz -C /usr/local/bin --strip-components=1 \
-  "release-${FIRECRACKER_VERSION}-aarch64/firecracker-${FIRECRACKER_VERSION}-aarch64" \
-  "release-${FIRECRACKER_VERSION}-aarch64/jailer-${FIRECRACKER_VERSION}-aarch64"
-mv "/usr/local/bin/firecracker-${FIRECRACKER_VERSION}-aarch64" /usr/local/bin/firecracker
-mv "/usr/local/bin/jailer-${FIRECRACKER_VERSION}-aarch64" /usr/local/bin/jailer
+  "release-${FIRECRACKER_VERSION}-${ARCH}/firecracker-${FIRECRACKER_VERSION}-${ARCH}" \
+  "release-${FIRECRACKER_VERSION}-${ARCH}/jailer-${FIRECRACKER_VERSION}-${ARCH}"
+mv "/usr/local/bin/firecracker-${FIRECRACKER_VERSION}-${ARCH}" /usr/local/bin/firecracker
+mv "/usr/local/bin/jailer-${FIRECRACKER_VERSION}-${ARCH}" /usr/local/bin/jailer
 rm -f /tmp/firecracker.tgz
 
 # Podman rootless

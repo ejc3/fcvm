@@ -35,10 +35,31 @@ pub struct Plan {
     pub fstab: FstabConfig,
     #[serde(default)]
     pub cleanup: CleanupConfig,
+    /// Default Firecracker configuration (repo + branch to build from)
+    /// Used when no kernel profile overrides it.
+    #[serde(default)]
+    pub firecracker: Option<FirecrackerConfig>,
     /// Kernel profiles: kernel_profiles.{name}.{arch} = KernelProfile
     /// E.g., kernel_profiles.nested.arm64 = { kernel_version = "6.18", ... }
     #[serde(default)]
     pub kernel_profiles: HashMap<String, HashMap<String, KernelProfile>>,
+}
+
+/// Default Firecracker build configuration.
+///
+/// When set, `fcvm setup` builds Firecracker from the specified fork
+/// and `find_firecracker()` uses it instead of the system binary.
+#[derive(Debug, Deserialize, Clone)]
+pub struct FirecrackerConfig {
+    /// GitHub repo (e.g., "ejc3/firecracker")
+    pub repo: String,
+    /// Branch to build from (default: "main")
+    #[serde(default = "default_branch")]
+    pub branch: String,
+}
+
+fn default_branch() -> String {
+    "main".to_string()
 }
 
 /// Kernel profile configuration
@@ -839,16 +860,26 @@ pub fn load_config(explicit_path: Option<&str>) -> Result<(Plan, String, String)
 /// This allows all kernel code to work with profiles uniformly. The [kernel]
 /// section in rootfs-config.toml stays as-is for backward compatibility.
 /// If a user explicitly defines [kernel_profiles.default], their definition wins.
+///
+/// Also injects [firecracker] config into the default profile so `fcvm setup`
+/// and `find_firecracker()` use the custom Firecracker without special handling.
 fn synthesize_default_profile(plan: &mut Plan) {
     let arch = config_arch();
     if let Ok(kernel_config) = plan.kernel.current_arch() {
-        let default_profile = KernelProfile {
+        let mut default_profile = KernelProfile {
             description: "Default kernel (Kata Containers)".into(),
             kernel_url: Some(kernel_config.url.clone()),
             kernel_archive_path: Some(kernel_config.path.clone()),
             kernel_local_path: kernel_config.local_path.clone(),
             ..Default::default()
         };
+
+        // Inject [firecracker] config into default profile
+        if let Some(ref fc) = plan.firecracker {
+            default_profile.firecracker_repo = Some(fc.repo.clone());
+            default_profile.firecracker_branch = Some(fc.branch.clone());
+        }
+
         plan.kernel_profiles
             .entry("default".into())
             .or_default()

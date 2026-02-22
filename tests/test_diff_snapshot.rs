@@ -54,6 +54,16 @@ async fn check_log_for_diff_snapshot(log_path: &str) -> (bool, bool, bool) {
 /// 4. Diff is merged onto base
 #[tokio::test]
 async fn test_diff_snapshot_prestart_full_startup_diff() -> Result<()> {
+    // This test verifies diff snapshot types (Full vs Diff), which requires
+    // snapshot creation to be enabled. Skip when FCVM_NO_SNAPSHOT is set.
+    if std::env::var("FCVM_NO_SNAPSHOT")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        println!("Skipping test: FCVM_NO_SNAPSHOT is set");
+        return Ok(());
+    }
+
     println!("\nDiff Snapshot: Pre-start Full, Startup Diff");
     println!("=============================================");
 
@@ -127,24 +137,23 @@ async fn test_diff_snapshot_prestart_full_startup_diff() -> Result<()> {
                     println!("  Startup = Diff snapshot (merged onto base)");
                     return Ok(());
                 } else {
-                    println!("\n⚠️  Expected both Full and Diff snapshots");
+                    let mut missing = vec![];
                     if !has_full {
-                        println!("    Missing: Full snapshot (pre-start)");
+                        missing.push("Full snapshot (pre-start)");
                     }
                     if !has_diff {
-                        println!("    Missing: Diff snapshot (startup)");
+                        missing.push("Diff snapshot (startup)");
                     }
                     if !has_merge {
-                        println!("    Missing: Diff merge");
+                        missing.push("Diff merge");
                     }
-                    // Still pass if workflow succeeded - log parsing may have issues
-                    println!("  (Test passed - workflow completed successfully)");
-                    return Ok(());
+                    anyhow::bail!(
+                        "Expected Full + Diff + Merge but missing: {}",
+                        missing.join(", ")
+                    );
                 }
             } else {
-                println!("  Could not find log file to verify diff snapshot types");
-                println!("  (Test passed - workflow completed successfully)");
-                return Ok(());
+                anyhow::bail!("Could not find log file to verify diff snapshot types");
             }
         }
         Ok(Err(e)) => {
@@ -377,40 +386,33 @@ async fn test_user_snapshot_from_clone_uses_parent() -> Result<()> {
     let used_parent =
         stderr.contains("copying parent memory.bin as base") || stderr.contains("parent=");
 
-    println!("\n  Snapshot analysis:");
-    println!("    Used parent lineage: {}", used_parent);
-    println!("    Created as Diff: {}", created_diff);
-
     // Cleanup
     println!("\nCleaning up...");
     common::kill_process(clone_pid).await;
     println!("  Killed clone");
 
-    // Results
-    println!("\n╔═══════════════════════════════════════════════════════════════╗");
-    println!("║                         RESULTS                               ║");
-    println!("╠═══════════════════════════════════════════════════════════════╣");
-    println!("║  User snapshot from clone:                                    ║");
-    if used_parent && created_diff {
-        println!("║    ✓ Used parent lineage (source snapshot)                   ║");
-        println!("║    ✓ Created as Diff snapshot                                ║");
-    } else if used_parent {
-        println!("║    ✓ Used parent lineage (source snapshot)                   ║");
-        println!("║    ? Diff status unknown (log parsing)                       ║");
-    } else {
-        println!("║    ? Parent lineage status unknown (log parsing)             ║");
-    }
-    println!("╚═══════════════════════════════════════════════════════════════╝");
-
     // Verify second snapshot exists
     let snapshot2_dir = snapshot_dir().join(&snapshot2_name);
-    if snapshot2_dir.join("memory.bin").exists() {
-        println!("\n✅ USER SNAPSHOT FROM CLONE TEST PASSED!");
-        println!("  Clone's snapshot_name field used as parent for diff support");
-        Ok(())
-    } else {
-        anyhow::bail!("Second snapshot not found at {}", snapshot2_dir.display())
-    }
+    assert!(
+        snapshot2_dir.join("memory.bin").exists(),
+        "Second snapshot not found at {}",
+        snapshot2_dir.display()
+    );
+
+    // Verify diff was actually used
+    assert!(
+        used_parent,
+        "User snapshot from clone should use parent lineage (stderr: {})",
+        stderr
+    );
+    assert!(
+        created_diff,
+        "User snapshot from clone should be Diff (stderr: {})",
+        stderr
+    );
+
+    println!("\n✅ USER SNAPSHOT FROM CLONE TEST PASSED!");
+    Ok(())
 }
 
 /// Test that memory.bin size is reasonable after diff merge
