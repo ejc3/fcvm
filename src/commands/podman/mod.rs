@@ -186,7 +186,16 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     // for [firecracker] config (custom Firecracker binary from rootfs-config.toml).
     let mut runtime_config = super::common::RuntimeConfig::default();
     let effective_profile_name = args.kernel_profile.as_deref().unwrap_or("default");
-    if let Some(profile) = crate::setup::get_kernel_profile(effective_profile_name)? {
+    if let Some(profile) = crate::setup::get_kernel_profile(effective_profile_name)
+        .unwrap_or_else(|e| {
+            // Don't fail if config file is missing (e.g., library API callers).
+            // Only warn if user explicitly requested a kernel profile.
+            if args.kernel_profile.is_some() {
+                warn!("failed to load kernel profile '{}': {}", effective_profile_name, e);
+            }
+            None
+        })
+    {
         if args.kernel_profile.is_some() {
             info!(profile = %effective_profile_name, "using kernel profile");
         }
