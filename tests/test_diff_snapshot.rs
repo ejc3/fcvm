@@ -54,6 +54,16 @@ async fn check_log_for_diff_snapshot(log_path: &str) -> (bool, bool, bool) {
 /// 4. Diff is merged onto base
 #[tokio::test]
 async fn test_diff_snapshot_prestart_full_startup_diff() -> Result<()> {
+    // This test verifies diff snapshot types (Full vs Diff), which requires
+    // snapshot creation to be enabled. Skip when FCVM_NO_SNAPSHOT is set.
+    if std::env::var("FCVM_NO_SNAPSHOT")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        println!("Skipping test: FCVM_NO_SNAPSHOT is set");
+        return Ok(());
+    }
+
     println!("\nDiff Snapshot: Pre-start Full, Startup Diff");
     println!("=============================================");
 
