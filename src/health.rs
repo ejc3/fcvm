@@ -11,15 +11,17 @@ use crate::paths;
 use crate::state::{truncate_id, HealthStatus, StateManager};
 
 /// Health check polling intervals.
-/// Startup interval is 5s (not 100ms) because nsenter health checks through
-/// slirp4netns can take 1-3s each.
-const HEALTH_POLL_STARTUP_INTERVAL: Duration = Duration::from_secs(5);
+/// During startup, the interval adapts to match how long each check takes
+/// (minimum 100ms). Fast checks (podman inspect ~100ms) poll fast; slow
+/// checks (nsenter+curl ~1-3s) poll slower to avoid hammering.
+const HEALTH_POLL_MIN_INTERVAL: Duration = Duration::from_millis(100);
+const HEALTH_POLL_MAX_INTERVAL: Duration = Duration::from_secs(5);
 const HEALTH_POLL_HEALTHY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Spawn a background health monitoring task for a VM
 ///
 /// The task polls the VM process health at adaptive intervals:
-/// - 5s during startup (until healthy)
+/// - Adaptive during startup (matches check duration, min 100ms)
 /// - 10s after VM is healthy
 ///
 /// Health check tests HTTP connectivity using reqwest to the guest IP.
@@ -70,15 +72,16 @@ pub fn spawn_health_monitor_full(
                 .clone()
                 .unwrap_or_else(|| truncate_id(&vm_id, 8).to_string())
         } else {
-            truncate_id(&vm_id, 8).to_string() // Fallback to short vm_id
+            truncate_id(&vm_id, 8).to_string()
         };
 
         // vm_name is already in the hierarchical target, so don't duplicate
         let _ = (&vm_name, &vm_id); // suppress unused warning
         info!(target: "health-monitor", pid = ?pid, "starting health monitor");
 
-        // Adaptive polling: fast during startup, slow after healthy
-        let mut poll_interval = HEALTH_POLL_STARTUP_INTERVAL;
+        // Adaptive polling: during startup, wait as long as the check took
+        // (min 100ms). Once healthy, switch to 10s.
+        let mut poll_interval = HEALTH_POLL_MIN_INTERVAL;
         let mut is_healthy = false;
 
         // Oneshot channel for startup snapshot notification (can only fire once)
@@ -118,6 +121,7 @@ pub fn spawn_health_monitor_full(
                 }
             }
 
+            let check_start = Instant::now();
             let health_status = match update_health_status_once(
                 &state_manager,
                 &vm_id,
@@ -133,8 +137,11 @@ pub fn spawn_health_monitor_full(
                     HealthStatus::Unknown
                 }
             };
+            let check_duration = check_start.elapsed();
 
-            // Adaptive polling: fast when unhealthy, slow when healthy
+            // Adaptive polling: once healthy use 10s. During startup, wait as
+            // long as the check took (min 100ms) — fast checks poll fast, slow
+            // checks (nsenter+curl) poll slower to avoid hammering.
             if health_status == HealthStatus::Healthy {
                 if !is_healthy {
                     is_healthy = true;
@@ -148,10 +155,15 @@ pub fn spawn_health_monitor_full(
                     }
                 }
             } else if is_healthy {
-                // VM was healthy but is no longer — revert to fast polling
+                // VM was healthy but is no longer — revert to adaptive polling
                 is_healthy = false;
-                poll_interval = HEALTH_POLL_STARTUP_INTERVAL;
-                warn!(target: "health-monitor", "VM no longer healthy, reverting to {:?} polling", HEALTH_POLL_STARTUP_INTERVAL);
+                poll_interval =
+                    check_duration.clamp(HEALTH_POLL_MIN_INTERVAL, HEALTH_POLL_MAX_INTERVAL);
+                warn!(target: "health-monitor", "VM no longer healthy, reverting to {:?} polling", poll_interval);
+            } else {
+                // Still unhealthy — adapt interval to check duration
+                poll_interval =
+                    check_duration.clamp(HEALTH_POLL_MIN_INTERVAL, HEALTH_POLL_MAX_INTERVAL);
             }
 
             // Stop monitoring if container has stopped
