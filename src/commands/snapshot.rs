@@ -51,10 +51,13 @@ async fn snapshot_restore_runtime_config(args: &SnapshotRunArgs) -> RuntimeConfi
     if config.firecracker_bin.is_none() {
         if let Ok(Some(profile)) = crate::setup::get_kernel_profile("default") {
             if profile.firecracker_repo.is_some() {
-                if let Ok(fc_path) =
-                    crate::setup::get_firecracker_for_profile(&profile, "default").await
-                {
-                    config.firecracker_bin = Some(fc_path);
+                match crate::setup::get_firecracker_for_profile(&profile, "default").await {
+                    Ok(fc_path) => {
+                        config.firecracker_bin = Some(fc_path);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "custom Firecracker not found for snapshot restore, falling back to system binary");
+                    }
                 }
             }
         }
