@@ -114,8 +114,8 @@ pub async fn launch_container(
         }
     }
 
-    // Rootless storage fix: use vfs on tmpfs to avoid btrfs remount failure.
-    // overlay driver also fails in user namespaces, so use vfs (simple file copies).
+    // Rootless storage fix: use overlay+fuse-overlayfs on tmpfs to avoid btrfs
+    // remount failure. fuse-overlayfs works in user namespaces and handles chown errors.
     let storage_args = rootless_storage_args();
     podman_args.extend(storage_args.clone());
 

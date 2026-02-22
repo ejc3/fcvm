@@ -548,4 +548,12 @@ mod tests {
         config2.rootfs_type = Some("btrfs".to_string());
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
+
+    #[test]
+    fn test_snapshot_key_changes_with_firecracker_bin() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.firecracker_bin = Some("fc-mock".to_string());
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
 }

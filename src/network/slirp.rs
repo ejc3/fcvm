@@ -53,7 +53,7 @@ fn find_slirp4netns() -> String {
 ///
 /// Architecture (L2 Bridge - no NAT required):
 /// ```text
-/// Host                    | User Namespace (unshare --user --map-root-user --net)
+/// Host                    | User Namespace (unshare --user --net + newuidmap/newgidmap)
 ///                         |
 /// slirp4netns <-----------+-- slirp0 --+
 ///   (userspace NAT)       |            |
@@ -68,7 +68,7 @@ fn find_slirp4netns() -> String {
 /// The bridge forwards Ethernet frames directly, preserving MAC addresses.
 ///
 /// Setup sequence (3-phase with nsenter):
-/// 1. Spawn holder process: `unshare --user --map-root-user --net -- sleep infinity`
+/// 1. Spawn holder process: `unshare --user --net -- sleep infinity` + external UID/GID mappings
 /// 2. Run setup via nsenter: create bridge, TAPs, add TAPs to bridge
 /// 3. Start slirp4netns attached to holder's namespace
 /// 4. Run Firecracker via nsenter: `nsenter -t HOLDER_PID -U -n -- firecracker ...`
