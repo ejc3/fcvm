@@ -298,6 +298,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             &initrd_path,
             cmd_args.clone(),
             resolved_mode,
+            runtime_config.firecracker_bin.as_deref(),
         );
         let key = config.snapshot_key();
 

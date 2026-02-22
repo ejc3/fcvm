@@ -94,6 +94,12 @@ pub struct FirecrackerConfig {
     /// Different rootfs types produce different VM states and must not share snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rootfs_type: Option<String>,
+    /// Firecracker binary path used to create this snapshot.
+    /// Content-addressed (e.g., firecracker-default-76c9e1236dab.bin), so changing
+    /// the binary automatically invalidates the cache. Required because snapshots
+    /// created by one FC version cannot be restored by another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firecracker_bin: Option<PathBuf>,
 }
 
 impl Default for FirecrackerConfig {
@@ -120,6 +126,7 @@ impl Default for FirecrackerConfig {
             forward_localhost: Vec::new(),
             image_mode: ImageMode::Overlay,
             rootfs_type: None,
+            firecracker_bin: None,
         }
     }
 }

@@ -881,6 +881,7 @@ pub(super) async fn run_vm_setup(
                 forward_localhost: args.forward_localhost.clone(),
                 image_mode: super::resolve_image_mode(args),
                 rootfs_type: super::resolve_rootfs_type(args),
+                firecracker_bin: runtime_config.firecracker_bin.clone(),
             }
         });
 
