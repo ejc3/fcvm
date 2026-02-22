@@ -225,27 +225,52 @@ async fn setup_namespace_mappings(holder_pid: u32) -> Result<()> {
     // Extended mapping (0 0 65536) is critical for fc-mock: crun needs UID/GID
     // ranges beyond 0 to mount devpts and extract container image layers.
     let is_root = euid == 0;
-    let mapping_count: u32 = if is_root { 65536 } else { 1 };
+    let mut mapping_count: u32 = if is_root { 65536 } else { 1 };
 
     debug!(
         holder_pid,
         is_root, mapping_count, "using direct UID/GID mapping (no subordinate ranges)"
     );
 
+    let setgroups_path = format!("/proc/{}/setgroups", holder_pid);
+    let gid_map_path = format!("/proc/{}/gid_map", holder_pid);
+
     if !is_root {
         // Must deny setgroups before writing gid_map (kernel requirement for
-        // unprivileged users without CAP_SETGID). Root doesn't need this.
-        let setgroups_path = format!("/proc/{}/setgroups", holder_pid);
+        // unprivileged users without CAP_SETGID). Root doesn't need this
+        // unless falling back to single mapping inside a container (see below).
         tokio::fs::write(&setgroups_path, "deny")
             .await
             .context("denying setgroups for simple gid_map write")?;
     }
 
-    tokio::fs::write(&uid_map_path, format!("0 {} {}\n", euid, mapping_count))
+    // Try writing uid_map. For root, we first try mapping_count=65536 which
+    // requires CAP_SETUID in the parent user namespace. If that fails (e.g.,
+    // running as root inside a container without full capabilities), fall back
+    // to mapping_count=1 which is always permitted.
+    if let Err(e) = tokio::fs::write(&uid_map_path, format!("0 {} {}\n", euid, mapping_count))
         .await
-        .context("writing uid_map")?;
+    {
+        if is_root && mapping_count > 1 {
+            warn!(
+                holder_pid,
+                error = %e,
+                "multi-UID mapping failed (no CAP_SETUID in parent namespace?), \
+                 falling back to single UID mapping"
+            );
+            mapping_count = 1;
+            // When falling back to single mapping, root also needs to deny
+            // setgroups (kernel requires this for non-privileged-in-parent-ns
+            // gid_map writes).
+            let _ = tokio::fs::write(&setgroups_path, "deny").await;
+            tokio::fs::write(&uid_map_path, format!("0 {} {}\n", euid, mapping_count))
+                .await
+                .context("writing uid_map (single mapping fallback)")?;
+        } else {
+            return Err(e).context("writing uid_map");
+        }
+    }
 
-    let gid_map_path = format!("/proc/{}/gid_map", holder_pid);
     tokio::fs::write(&gid_map_path, format!("0 {} {}\n", egid, mapping_count))
         .await
         .context("writing gid_map")?;
