@@ -186,7 +186,7 @@ pub enum NamespaceReadyResult {
 ///
 /// When `unshare --user` creates a namespace, the uid_map initially has
 /// an identity mapping "0 0 4294967295" before the actual mapping is written
-/// (externally by `setup_namespace_mappings()` or by `--map-root-user`).
+/// (externally by `setup_namespace_mappings()`).
 /// setns() fails with EINVAL until the real mapping (e.g., "0 1000 1") is written.
 ///
 /// This function polls uid_map until it no longer contains the identity mapping,
