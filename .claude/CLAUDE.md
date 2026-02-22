@@ -1169,7 +1169,7 @@ fuse-pipe/benches/
 3. **True Rootless Networking** (2025-11-25)
    - `--network rootless` (default): slirp4netns, no root required
    - `--network bridged`: Network namespace + iptables, requires root
-   - User namespace via `unshare --user --map-root-user --net`
+   - User namespace via `unshare --user --net` with external UID/GID mappings
    - Health checks use unique loopback IPs (127.x.y.z) per VM
 
 4. **Hierarchical Logging** (2025-11-15)
@@ -1209,7 +1209,7 @@ fuse-pipe/benches/
 | Bridged | `--network bridged` | Yes | Better | iptables DNAT |
 
 **Rootless Architecture:**
-- Firecracker starts with `unshare --user --map-root-user --net`
+- Holder process starts with `unshare --user --net`, UID/GID mappings written externally
 - Linux bridge (br0) connects slirp0 and tap-fc for L2 forwarding
 - Bridge preserves MAC addresses for proper slirp4netns ARP/NDP learning
 - Namespace IP (10.0.2.1) on bridge enables health checks via nsenter
