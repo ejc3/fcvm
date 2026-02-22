@@ -66,22 +66,34 @@ pub async fn run() -> Result<()> {
 
     // Exec server rebind signal — shared by restore-epoch watcher and cache-ready handshake.
     // After vsock transport reset, the listener's AsyncFd epoll becomes stale.
+    // We use BOTH Notify (to wake the select loop) and AtomicBool (to persist the signal).
+    // tokio::select! can lose Notify permits when accept() and notified() are both Ready
+    // simultaneously — the AtomicBool flag catches this race.
     let exec_rebind = std::sync::Arc::new(tokio::sync::Notify::new());
+    let exec_rebind_needed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Start restore-epoch watcher
     let watcher_output = output.clone();
     let watcher_restore_flag = restore_flag.clone();
     let watcher_exec_rebind = exec_rebind.clone();
+    let watcher_exec_rebind_needed = exec_rebind_needed.clone();
     tokio::spawn(async move {
         eprintln!("[fc-agent] starting restore-epoch watcher");
-        mmds::watch_restore_epoch(watcher_output, watcher_restore_flag, watcher_exec_rebind).await;
+        mmds::watch_restore_epoch(
+            watcher_output,
+            watcher_restore_flag,
+            watcher_exec_rebind,
+            watcher_exec_rebind_needed,
+        )
+        .await;
     });
 
     // Start exec server with rebind signal for vsock transport reset recovery
     let (exec_ready_tx, exec_ready_rx) = tokio::sync::oneshot::channel();
     let exec_rebind_clone = exec_rebind.clone();
+    let exec_rebind_needed_clone = exec_rebind_needed.clone();
     tokio::spawn(async move {
-        exec::run_server(exec_ready_tx, exec_rebind_clone).await;
+        exec::run_server(exec_ready_tx, exec_rebind_clone, exec_rebind_needed_clone).await;
     });
 
     match tokio::time::timeout(Duration::from_secs(5), exec_ready_rx).await {
@@ -223,7 +235,9 @@ pub async fn run() -> Result<()> {
                 // Pre-start snapshot was taken and we've been restored into a new
                 // Firecracker instance. The vsock transport was reset, which
                 // invalidates the exec server's listener socket (stale AsyncFd epoll).
-                // Signal it to re-bind.
+                // Signal it to re-bind. Set flag BEFORE notify to prevent race where
+                // select! drops the Notified future (see exec.rs doc comment).
+                exec_rebind_needed.store(true, std::sync::atomic::Ordering::Release);
                 exec_rebind.notify_one();
             } else {
                 eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing");
