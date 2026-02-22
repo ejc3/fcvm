@@ -283,8 +283,10 @@ pub fn merge_diff_snapshot(base_path: &Path, diff_path: &Path) -> Result<u64> {
 /// Returns the path to the Firecracker binary if it exists and meets minimum version requirements.
 /// Fails with a clear error if Firecracker is not found or version is too old.
 ///
-/// Checks `RuntimeConfig.firecracker_bin` first, then `FCVM_FIRECRACKER_BIN` env var,
-/// then falls back to PATH lookup.
+/// Resolution order:
+/// 1. `RuntimeConfig.firecracker_bin` (from kernel profile or [firecracker] config)
+/// 2. `FCVM_FIRECRACKER_BIN` env var
+/// 3. PATH lookup (system firecracker)
 pub fn find_firecracker(config: &RuntimeConfig) -> Result<std::path::PathBuf> {
     let firecracker_bin = if let Some(ref path) = config.firecracker_bin {
         if !path.exists() {
