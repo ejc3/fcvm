@@ -399,7 +399,7 @@ Each VM has:
 
 **Topology**:
 ```
-Host                     │ User Namespace (unshare --user --map-root-user --net)
+Host                     │ User Namespace (unshare --user --net)
                          │
 slirp4netns <────────────┼── slirp0 ─┐
   (userspace NAT)        │           │
@@ -419,7 +419,7 @@ slirp4netns <────────────┼── slirp0 ─┐
 - Bridge also enables IPv6 with proper NDP neighbor discovery
 
 **Setup Sequence** (3-phase with nsenter):
-1. Spawn holder process: `unshare --user --map-root-user --net -- sleep infinity`
+1. Spawn holder process: `unshare --user --net -- sleep infinity` (UID/GID mappings written externally)
 2. Run setup via nsenter: create bridge, TAPs, add namespace IP
 3. Start slirp4netns attached to holder's namespace (connects to slirp0)
 4. Run Firecracker via nsenter: `nsenter -t HOLDER_PID -U -n -- firecracker ...`

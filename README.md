@@ -398,7 +398,7 @@ Clone timing measured on c7g.metal ARM64 with `RUST_LOG=debug`:
 | Step | Time | Description |
 |------|------|-------------|
 | State lookup | ~1ms | Find serve process |
-| Namespace spawn | ~6ms | `unshare --user --map-root-user --net` |
+| Namespace spawn | ~6ms | `unshare --user --net` + UID/GID mappings |
 | CoW disk reflink | ~31ms | btrfs instant copy |
 | Network setup | ~35ms | TAP device, iptables rules |
 | Firecracker spawn | ~6ms | Start VM process |

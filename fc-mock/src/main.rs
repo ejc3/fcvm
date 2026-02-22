@@ -39,6 +39,15 @@ fn main() -> Result<()> {
 
     tracing::info!("fc-mock starting (api-sock: {})", api_sock);
 
+    // In user namespaces, create a private mount namespace so we can bind-mount
+    // a custom resolv.conf later. This must happen while single-threaded (before
+    // tokio spawns worker threads). Without this, podman can't resolve DNS for
+    // image pulls because /etc/resolv.conf points to 127.0.0.53 (systemd-resolved)
+    // which is unreachable in the new network namespace.
+    if container::in_user_namespace() {
+        setup_private_mount_namespace();
+    }
+
     // Run the async runtime
     let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
     rt.block_on(run(PathBuf::from(api_sock)))
@@ -93,4 +102,39 @@ fn parse_arg(args: &[String], name: &str) -> Option<String> {
         .position(|a| a == name)
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+/// Create a private mount namespace so we can later bind-mount a custom
+/// resolv.conf without affecting the host.
+fn setup_private_mount_namespace() {
+    // unshare(CLONE_NEWNS) must be called while single-threaded
+    let ret = unsafe { libc::unshare(libc::CLONE_NEWNS) };
+    if ret != 0 {
+        tracing::warn!(
+            "failed to create mount namespace: {} (DNS may not work for image pulls)",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+
+    // Make all mounts private so bind mounts don't propagate to host
+    let root = std::ffi::CString::new("/").unwrap();
+    let ret = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            root.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        tracing::warn!(
+            "failed to set mount propagation: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+
+    tracing::info!("created private mount namespace for DNS fix");
 }
