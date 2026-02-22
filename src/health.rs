@@ -20,7 +20,7 @@ const HEALTH_POLL_HEALTHY_INTERVAL: Duration = Duration::from_secs(10);
 /// Spawn a background health monitoring task for a VM
 ///
 /// The task polls the VM process health at adaptive intervals:
-/// - 100ms during startup (until healthy)
+/// - 5s during startup (until healthy)
 /// - 10s after VM is healthy
 ///
 /// Health check tests HTTP connectivity using reqwest to the guest IP.
@@ -851,7 +851,11 @@ async fn check_http_health_bridged(
         }
         Err(e) => {
             if e.is_timeout() {
-                anyhow::bail!("Health check timed out after 1 second via {}", iface_str)
+                anyhow::bail!(
+                    "Health check timed out after {}s via {}",
+                    timeout_secs,
+                    iface_str
+                )
             } else if e.is_connect() {
                 anyhow::bail!("Connection refused to {} via {}", url, iface_str)
             } else {
