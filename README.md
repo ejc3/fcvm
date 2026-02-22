@@ -191,21 +191,21 @@ fcvm uses a two-tier snapshot system to reduce startup time:
 | Snapshot | When Created | Content | Size |
 |----------|--------------|---------|------|
 | **Pre-start** | After image pull, before container runs | VM with image loaded | Full (~1GB) |
-| **Startup** | After HTTP health check passes | VM with container fully initialized | Full (~512MB) |
+| **Startup** | After HTTP health check passes | VM with container fully initialized | Diff (only dirty pages since pre-start) |
 
-Both snapshots are full memory dumps — startup snapshots do not use diff-based tracking.
-(KVM dirty page tracking is unreliable on x86_64, reporting only ~90KB of dirty pages when
-60-97MB are actually dirty, producing corrupt snapshots that triple-fault on restore.)
+The pre-start snapshot is a full memory dump. The startup snapshot uses the pre-start as a
+diff base, capturing only pages dirtied during container initialization. The diff is
+automatically merged onto the base to produce a self-contained `memory.bin`.
 
 The startup snapshot is triggered by `--health-check <url>`.
-After the check passes, fcvm creates a full snapshot of the initialized app.
-Second run restores from that snapshot and skips container initialization.
+After the check passes, fcvm creates a diff snapshot of the initialized app and merges it
+onto the pre-start base. Second run restores from that snapshot and skips container initialization.
 
 ```bash
-# First run: Creates pre-start (full) + startup (full)
+# First run: Creates pre-start (full) + startup (diff, merged onto base)
 ./fcvm podman run --name web --health-check http://localhost/ nginx:alpine
 # → Pre-start snapshot: ~1024MB (full)
-# → Startup snapshot: ~512MB (full)
+# → Startup snapshot: diff of dirty pages, merged onto pre-start base
 
 # Second run: Restores from startup snapshot
 ./fcvm podman run --name web2 --health-check http://localhost/ nginx:alpine
@@ -343,12 +343,13 @@ sudo sh -c 'echo 0 > /proc/sys/vm/nr_hugepages'
 
 **How it works with snapshots:**
 
-The snapshot cache flow creates two full snapshots on the initial VM:
+The snapshot cache flow creates two snapshots on the initial VM:
 1. **Pre-start (Full)**: After container image import
-2. **Startup (Full)**: After container is healthy
+2. **Startup (Diff)**: After container is healthy (uses pre-start as base, then merged)
 
-Both are full memory dumps. Restored VMs (clones) with hugepages disabled
-enable KVM dirty page tracking for clone-of-clone diff snapshots.
+The startup snapshot captures only dirty pages since pre-start and merges them onto the base.
+Restored VMs (clones) with hugepages disabled enable KVM dirty page tracking for
+clone-of-clone diff snapshots.
 
 | VM role | Dirty tracking | Stage 2 mapping | Runs |
 |---------|---------------|-----------------|------|
