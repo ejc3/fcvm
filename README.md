@@ -903,6 +903,7 @@ make test-fast   # + quick VM tests (rootless, no sudo)
 make test-all    # + slow VM tests (rootless, no sudo)
 make test-root   # + privileged tests (bridged, pjdfstest, sudo)
 make test        # Alias for test-root
+make test-fc-mock  # Container mode tests (no KVM required, uses fc-mock)
 ```
 
 Container equivalents:
