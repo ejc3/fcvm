@@ -6,6 +6,10 @@ use tracing::info;
 
 use crate::network::NetworkConfig;
 
+fn default_health_check_timeout() -> u64 {
+    5
+}
+
 /// Type of snapshot - distinguishes user-created from system-generated
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum SnapshotType {
@@ -61,6 +65,9 @@ pub struct SnapshotMetadata {
     /// Health check URL from the baseline VM (None = no HTTP health check)
     #[serde(default)]
     pub health_check_url: Option<String>,
+    /// Health check timeout in seconds (default 5)
+    #[serde(default = "default_health_check_timeout")]
+    pub health_check_timeout: u64,
     /// Whether VM uses 2MB hugepage-backed memory
     #[serde(default)]
     pub hugepages: bool,
@@ -245,6 +252,7 @@ mod tests {
                 },
                 volumes: vec![],
                 health_check_url: None,
+                health_check_timeout: 5,
                 hugepages: false,
                 extra_disks: vec![],
                 username: None,
@@ -362,6 +370,7 @@ mod tests {
                 },
                 volumes: vec![],
                 health_check_url: None,
+                health_check_timeout: 5,
                 hugepages: false,
                 extra_disks: vec![],
                 username: None,
@@ -423,6 +432,7 @@ mod tests {
                     },
                     volumes: vec![],
                     health_check_url: None,
+                    health_check_timeout: 5,
                     hugepages: false,
                     extra_disks: vec![],
                     username: None,
@@ -471,6 +481,7 @@ mod tests {
                 },
                 volumes: vec![],
                 health_check_url: None,
+                health_check_timeout: 5,
                 hugepages: false,
                 extra_disks: vec![],
                 username: None,
@@ -570,6 +581,7 @@ mod tests {
                 },
                 volumes: vec![],
                 health_check_url: None,
+                health_check_timeout: 5,
                 hugepages: false,
                 extra_disks: vec![],
                 username: None,

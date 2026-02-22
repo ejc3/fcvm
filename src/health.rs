@@ -12,6 +12,7 @@ use crate::state::{truncate_id, HealthStatus, StateManager};
 
 /// Health check polling intervals.
 /// Startup interval is 5s (not 100ms) because nsenter health checks through
+/// slirp4netns can take 1-3s each.
 const HEALTH_POLL_STARTUP_INTERVAL: Duration = Duration::from_secs(5);
 const HEALTH_POLL_HEALTHY_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -541,7 +542,7 @@ async fn update_health_status_once(
                     // We override the connection IP with the guest IP but send
                     // the original hostname as the Host header.
                     let url_host = url.host_str();
-                    let health_timeout = state.config.health_check_timeout;
+                    let health_timeout = state.config.health_check_timeout.max(1);
 
                     // Rootless mode with holder_pid: use nsenter to curl guest directly
                     // This bypasses the complexity of slirp4netns port forwarding
