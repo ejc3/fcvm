@@ -1289,6 +1289,14 @@ fcvm/
 │   └── src/
 │       └── main.rs         # MMDS + Podman orchestration
 │
+├── fc-mock/                # Firecracker mock (container mode, no KVM)
+│   ├── Cargo.toml
+│   └── src/
+│       ├── main.rs         # CLI entry point + signal handling
+│       ├── api_server.rs   # Firecracker REST API emulation
+│       ├── container.rs    # Podman container lifecycle
+│       └── vsock_exec.rs   # Vsock CONNECT exec protocol
+│
 ├── fuse-pipe/              # FUSE passthrough library
 │   ├── Cargo.toml
 │   ├── src/
@@ -1306,6 +1314,7 @@ fcvm/
     ├── test_health_monitor.rs
     ├── test_fuse_posix.rs
     ├── test_fuse_in_vm.rs
+    ├── test_fc_mock.rs        # fc-mock integration tests
     ├── test_localhost_image.rs
     └── test_snapshot_clone.rs
 ```
