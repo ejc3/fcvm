@@ -572,6 +572,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     vm_state.name = Some(vm_name.clone());
     vm_state.config.volumes = args.map.clone();
     vm_state.config.health_check_url = args.health_check.clone();
+    vm_state.config.health_check_timeout = args.health_check_timeout;
     vm_state.config.hugepages = args.hugepages;
     vm_state.config.portable_volumes = args.portable_volumes;
     vm_state.config.port_mappings = port_mappings.clone();
@@ -1088,6 +1089,7 @@ mod tests {
             balloon: None,
             network: NetworkMode::Rootless,
             health_check: None,
+            health_check_timeout: 5,
             privileged: false,
             interactive: false,
             tty: false,

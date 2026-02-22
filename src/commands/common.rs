@@ -1068,6 +1068,7 @@ pub fn build_snapshot_config(
             network_config: vm_state.config.network.clone(),
             volumes,
             health_check_url: vm_state.config.health_check_url.clone(),
+            health_check_timeout: vm_state.config.health_check_timeout,
             hugepages: vm_state.config.hugepages,
             extra_disks,
             username: vm_state.config.username.clone(),
