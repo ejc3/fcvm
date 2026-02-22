@@ -10,14 +10,18 @@ use tracing::{debug, info, warn};
 use crate::paths;
 use crate::state::{truncate_id, HealthStatus, StateManager};
 
-/// Health check polling intervals
-const HEALTH_POLL_STARTUP_INTERVAL: Duration = Duration::from_millis(100);
+/// Health check polling intervals.
+/// During startup, the interval adapts to match how long each check takes
+/// (minimum 100ms). Fast checks (podman inspect ~100ms) poll fast; slow
+/// checks (nsenter+curl ~1-3s) poll slower to avoid hammering.
+const HEALTH_POLL_MIN_INTERVAL: Duration = Duration::from_millis(100);
+const HEALTH_POLL_MAX_INTERVAL: Duration = Duration::from_secs(5);
 const HEALTH_POLL_HEALTHY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Spawn a background health monitoring task for a VM
 ///
 /// The task polls the VM process health at adaptive intervals:
-/// - 100ms during startup (until healthy)
+/// - Adaptive during startup (matches check duration, min 100ms)
 /// - 10s after VM is healthy
 ///
 /// Health check tests HTTP connectivity using reqwest to the guest IP.
@@ -68,15 +72,16 @@ pub fn spawn_health_monitor_full(
                 .clone()
                 .unwrap_or_else(|| truncate_id(&vm_id, 8).to_string())
         } else {
-            truncate_id(&vm_id, 8).to_string() // Fallback to short vm_id
+            truncate_id(&vm_id, 8).to_string()
         };
 
         // vm_name is already in the hierarchical target, so don't duplicate
         let _ = (&vm_name, &vm_id); // suppress unused warning
         info!(target: "health-monitor", pid = ?pid, "starting health monitor");
 
-        // Adaptive polling: fast during startup, slow after healthy
-        let mut poll_interval = HEALTH_POLL_STARTUP_INTERVAL;
+        // Adaptive polling: during startup, wait as long as the check took
+        // (min 100ms). Once healthy, switch to 10s.
+        let mut poll_interval = HEALTH_POLL_MIN_INTERVAL;
         let mut is_healthy = false;
 
         // Oneshot channel for startup snapshot notification (can only fire once)
@@ -116,6 +121,7 @@ pub fn spawn_health_monitor_full(
                 }
             }
 
+            let check_start = Instant::now();
             let health_status = match update_health_status_once(
                 &state_manager,
                 &vm_id,
@@ -131,8 +137,11 @@ pub fn spawn_health_monitor_full(
                     HealthStatus::Unknown
                 }
             };
+            let check_duration = check_start.elapsed();
 
-            // Adaptive polling: fast when unhealthy, slow when healthy
+            // Adaptive polling: once healthy use 10s. During startup, wait as
+            // long as the check took (min 100ms) — fast checks poll fast, slow
+            // checks (nsenter+curl) poll slower to avoid hammering.
             if health_status == HealthStatus::Healthy {
                 if !is_healthy {
                     is_healthy = true;
@@ -146,10 +155,15 @@ pub fn spawn_health_monitor_full(
                     }
                 }
             } else if is_healthy {
-                // VM was healthy but is no longer — revert to fast polling
+                // VM was healthy but is no longer — revert to adaptive polling
                 is_healthy = false;
-                poll_interval = HEALTH_POLL_STARTUP_INTERVAL;
-                warn!(target: "health-monitor", "VM no longer healthy, reverting to {:?} polling", HEALTH_POLL_STARTUP_INTERVAL);
+                poll_interval =
+                    check_duration.clamp(HEALTH_POLL_MIN_INTERVAL, HEALTH_POLL_MAX_INTERVAL);
+                warn!(target: "health-monitor", "VM no longer healthy, reverting to {:?} polling", poll_interval);
+            } else {
+                // Still unhealthy — adapt interval to check duration
+                poll_interval =
+                    check_duration.clamp(HEALTH_POLL_MIN_INTERVAL, HEALTH_POLL_MAX_INTERVAL);
             }
 
             // Stop monitoring if container has stopped
@@ -540,6 +554,7 @@ async fn update_health_status_once(
                     // We override the connection IP with the guest IP but send
                     // the original hostname as the Host header.
                     let url_host = url.host_str();
+                    let health_timeout = state.config.health_check_timeout.max(1);
 
                     // Rootless mode with holder_pid: use nsenter to curl guest directly
                     // This bypasses the complexity of slirp4netns port forwarding
@@ -559,6 +574,7 @@ async fn update_health_status_once(
                             port,
                             health_path,
                             url_host,
+                            health_timeout,
                         )
                         .await
                         {
@@ -608,7 +624,13 @@ async fn update_health_status_once(
 
                         debug!(target: "health-monitor", original_url = %url_str, effective_url = %effective_url, veth = ?veth_device, "HTTP health check via veth");
 
-                        match check_http_health_bridged(&effective_url, veth_device, url_host).await
+                        match check_http_health_bridged(
+                            &effective_url,
+                            veth_device,
+                            url_host,
+                            health_timeout,
+                        )
+                        .await
                         {
                             Ok(true) => {
                                 debug!(target: "health-monitor", "health check passed");
@@ -638,8 +660,15 @@ async fn update_health_status_once(
             };
 
             // If base health check passed, also check podman healthcheck (AND logic)
-            // Skip if we already know the container has no healthcheck
-            let final_status = if status == HealthStatus::Healthy && !*skip_podman_healthcheck {
+            // Skip if we already know the container has no healthcheck.
+            // Also skip when health_check_url is provided — the user explicitly specified
+            // their health check, and podman's internal HEALTHCHECK may not work (e.g.,
+            // rootless podman in VM without systemd can't schedule healthcheck timers).
+            let has_http_check = state.config.health_check_url.is_some();
+            let final_status = if status == HealthStatus::Healthy
+                && !*skip_podman_healthcheck
+                && !has_http_check
+            {
                 match check_podman_healthcheck(
                     pid,
                     state.config.username.as_deref(),
@@ -712,6 +741,7 @@ async fn check_http_health_nsenter(
     port: u16,
     health_path: &str,
     host_header: Option<&str>,
+    timeout_secs: u64,
 ) -> Result<bool> {
     let url = format!("http://{}:{}{}", guest_ip, port, health_path);
 
@@ -719,7 +749,7 @@ async fn check_http_health_nsenter(
 
     // Use nsenter to enter the namespace and curl the guest directly
     // --preserve-credentials keeps UID/GID mapping
-    let nsenter_args = build_nsenter_curl_args(holder_pid, &url, host_header);
+    let nsenter_args = build_nsenter_curl_args(holder_pid, &url, host_header, timeout_secs);
 
     let output = tokio::process::Command::new("nsenter")
         .args(&nsenter_args)
@@ -789,9 +819,10 @@ async fn check_http_health_bridged(
     url: &str,
     veth_device: Option<&str>,
     host_header: Option<&str>,
+    timeout_secs: u64,
 ) -> Result<bool> {
     // Build a reqwest client, optionally bound to the veth device
-    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(1));
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(timeout_secs));
 
     if let Some(veth) = veth_device {
         builder = builder.interface(veth);
@@ -831,7 +862,11 @@ async fn check_http_health_bridged(
         }
         Err(e) => {
             if e.is_timeout() {
-                anyhow::bail!("Health check timed out after 1 second via {}", iface_str)
+                anyhow::bail!(
+                    "Health check timed out after {}s via {}",
+                    timeout_secs,
+                    iface_str
+                )
             } else if e.is_connect() {
                 anyhow::bail!("Connection refused to {} via {}", url, iface_str)
             } else {
@@ -844,7 +879,12 @@ async fn check_http_health_bridged(
 /// Build the nsenter + curl argument list for rootless health checks.
 ///
 /// Separated from check_http_health_nsenter for testability.
-fn build_nsenter_curl_args(holder_pid: u32, url: &str, host_header: Option<&str>) -> Vec<String> {
+fn build_nsenter_curl_args(
+    holder_pid: u32,
+    url: &str,
+    host_header: Option<&str>,
+    timeout_secs: u64,
+) -> Vec<String> {
     let mut curl_args = vec![
         "curl".to_string(),
         "-s".to_string(),
@@ -853,7 +893,7 @@ fn build_nsenter_curl_args(holder_pid: u32, url: &str, host_header: Option<&str>
         "-w".to_string(),
         "%{http_code}".to_string(),
         "--max-time".to_string(),
-        "1".to_string(),
+        timeout_secs.to_string(),
     ];
     // Add Host header if specified (needed for servers that route by Host)
     if let Some(host) = host_header {
@@ -881,13 +921,13 @@ mod tests {
 
     #[test]
     fn test_nsenter_curl_args_without_host_header() {
-        let args = build_nsenter_curl_args(12345, "http://10.0.2.100:80/health", None);
-        // Find --max-time and verify "1" immediately follows it
+        let args = build_nsenter_curl_args(12345, "http://10.0.2.100:80/health", None, 5);
+        // Find --max-time and verify "5" immediately follows it
         let max_time_pos = args.iter().position(|a| a == "--max-time").unwrap();
         assert_eq!(
             args[max_time_pos + 1],
-            "1",
-            "\"1\" must immediately follow \"--max-time\", got {:?}",
+            "5",
+            "\"5\" must immediately follow \"--max-time\", got {:?}",
             &args[max_time_pos..]
         );
     }
@@ -895,14 +935,14 @@ mod tests {
     #[test]
     fn test_nsenter_curl_args_with_host_header() {
         let args =
-            build_nsenter_curl_args(12345, "http://10.0.2.100:80/health", Some("myapp.local"));
+            build_nsenter_curl_args(12345, "http://10.0.2.100:80/health", Some("myapp.local"), 5);
 
-        // --max-time must be immediately followed by "1"
+        // --max-time must be immediately followed by "5"
         let max_time_pos = args.iter().position(|a| a == "--max-time").unwrap();
         assert_eq!(
             args[max_time_pos + 1],
-            "1",
-            "\"1\" must immediately follow \"--max-time\", but got {:?}",
+            "5",
+            "\"5\" must immediately follow \"--max-time\", but got {:?}",
             &args[max_time_pos..]
         );
 
