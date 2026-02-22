@@ -38,13 +38,32 @@ pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
     }
 }
 
-fn snapshot_restore_runtime_config(args: &SnapshotRunArgs) -> RuntimeConfig {
-    RuntimeConfig {
+async fn snapshot_restore_runtime_config(args: &SnapshotRunArgs) -> RuntimeConfig {
+    let mut config = RuntimeConfig {
         firecracker_bin: args.firecracker_bin.as_ref().map(PathBuf::from),
         firecracker_args: args.firecracker_args.clone(),
         boot_args: None,
         fuse_readers: None,
+    };
+
+    // If no explicit firecracker_bin, check the default profile for custom Firecracker
+    // (matches podman run behavior — ensures snapshot restore uses same binary as create)
+    if config.firecracker_bin.is_none() {
+        if let Ok(Some(profile)) = crate::setup::get_kernel_profile("default") {
+            if profile.firecracker_repo.is_some() {
+                match crate::setup::get_firecracker_for_profile(&profile, "default").await {
+                    Ok(fc_path) => {
+                        config.firecracker_bin = Some(fc_path);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "custom Firecracker not found for snapshot restore, falling back to system binary");
+                    }
+                }
+            }
+        }
     }
+
+    config
 }
 
 /// Create snapshot from running VM
@@ -55,7 +74,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     // Determine which VM to snapshot
     let state_manager = StateManager::new(paths::state_dir());
 
-    let vm_state = if let Some(name) = &args.name {
+    let mut vm_state = if let Some(name) = &args.name {
         info!("Creating snapshot from VM: {}", name);
         state_manager
             .load_state_by_name(name)
@@ -165,6 +184,13 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         parent_dir.as_deref(),
     )
     .await?;
+
+    // Track this snapshot as the latest base for future diff snapshots
+    vm_state.config.snapshot_name = Some(snapshot_name.clone());
+    state_manager
+        .save_state(&vm_state)
+        .await
+        .context("saving snapshot name to VM state")?;
 
     // Print user-friendly output
     let vm_name = vm_state
@@ -466,7 +492,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Generate VM ID and name
     let vm_id = generate_vm_id();
-    let runtime_config = snapshot_restore_runtime_config(&args);
+    let runtime_config = snapshot_restore_runtime_config(&args).await;
     let vm_name = args.name.unwrap_or_else(|| {
         // Auto-generate: snapshot-name + random suffix
         format!("{}-{}", snapshot_name, &vm_id[..6])
@@ -1014,18 +1040,14 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                         // Use select! so SIGTERM can abort startup snapshot immediately.
                         // Startup snapshots are optional (just caching), so if the VM is
                         // paused mid-snapshot, cleanup will kill it via vm_manager.kill().
+                        let parent_key = vm_state.config.snapshot_name.clone();
                         let snap = CreateSnapshotParams {
                             vm_manager: &vm_manager,
                             snapshot_key: &startup_key,
                             vm_state: &vm_state,
                             disk_path: &disk_path,
                             volume_configs: &volume_configs,
-                            // Always use FULL snapshots for startup snapshots.
-                            // Diff snapshots rely on KVM dirty page tracking, which
-                            // is broken on x86_64: KVM reports only ~90KB of dirty
-                            // pages when 60-97MB are actually dirty, producing a
-                            // corrupt snapshot that triple-faults on restore.
-                            parent_snapshot_key: None,
+                            parent_snapshot_key: parent_key.as_deref(),
                         };
                         tokio::select! {
                             outcome = create_snapshot_interruptible(&snap, &cancel) => {
@@ -1036,6 +1058,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                                     }
                                     SnapshotOutcome::Created => {
                                         info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
+                                        vm_state.config.snapshot_name = Some(startup_key.clone());
+                                        let _ = state_manager.save_state(&vm_state).await;
                                     }
                                     SnapshotOutcome::Failed(e) => {
                                         warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");
@@ -1134,8 +1158,8 @@ async fn cmd_snapshot_ls() -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_snapshot_restore_runtime_config_preserves_firecracker_overrides() {
+    #[tokio::test]
+    async fn test_snapshot_restore_runtime_config_preserves_firecracker_overrides() {
         let args = SnapshotRunArgs {
             pid: None,
             snapshot: Some("snap".to_string()),
@@ -1154,7 +1178,7 @@ mod tests {
             non_blocking_output: false,
         };
 
-        let runtime = snapshot_restore_runtime_config(&args);
+        let runtime = snapshot_restore_runtime_config(&args).await;
         assert_eq!(
             runtime.firecracker_bin,
             Some(PathBuf::from("/opt/firecracker-profile"))

@@ -164,6 +164,7 @@ pub async fn create_snapshot_interruptible(
 
 /// Build FirecrackerConfig from run args.
 /// The config is the single source of truth for both cache key and VM launch.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_firecracker_config(
     args: &RunArgs,
     image_identifier: &str,
@@ -172,6 +173,7 @@ pub(super) fn build_firecracker_config(
     initrd_path: &Path,
     cmd_args: Option<Vec<String>>,
     image_mode: crate::firecracker::ImageMode,
+    firecracker_bin: Option<&Path>,
 ) -> crate::firecracker::FirecrackerConfig {
     // image_identifier is the digest for localhost images (content-addressed cache key).
     // args.image is the original name (what the guest uses to find the image).
@@ -230,6 +232,7 @@ pub(super) fn build_firecracker_config(
         image_mode,
         non_blocking_output: args.non_blocking_output,
         rootfs_type: super::resolve_rootfs_type(args),
+        firecracker_bin: firecracker_bin.map(|p| p.to_path_buf()),
     }
 }
 
