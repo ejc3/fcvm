@@ -200,6 +200,8 @@ Both snapshots are full memory dumps — startup snapshots do not use diff-based
 The startup snapshot is triggered by `--health-check <url>`.
 After the check passes, fcvm creates a full snapshot of the initialized app.
 Second run restores from that snapshot and skips container initialization.
+Use `--health-check-timeout <seconds>` to adjust the HTTP timeout (default: 5s).
+The URL hostname is sent as the Host header, so virtual-host-based routing works.
 
 ```bash
 # First run: Creates pre-start (full) + startup (full)
@@ -824,7 +826,7 @@ See [DESIGN.md](DESIGN.md#networking) for architecture details.
 
 - **Exit codes**: Container exit code forwarded to host via vsock
 - **Logs**: Container stdout goes to host stdout, stderr to host stderr (clean output for scripting)
-- **Health**: Default uses vsock ready signal; optional `--health-check` for HTTP
+- **Health**: Default uses vsock ready signal; optional `--health-check` for HTTP (with `--health-check-timeout` to configure timeout, default 5s)
 
 See [DESIGN.md](DESIGN.md#guest-agent) for details.
 
