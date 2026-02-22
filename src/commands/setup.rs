@@ -70,6 +70,16 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         .context("setting up kernel")?;
     println!("  ✓ Kernel ready: {}", kernel_path.display());
 
+    // Build default Firecracker if configured in [firecracker] section
+    // The [firecracker] config is injected into the "default" profile by synthesize_default_profile()
+    if config.firecracker.is_some() {
+        let default_profile = crate::setup::rootfs::get_kernel_profile("default")?
+            .ok_or_else(|| anyhow::anyhow!("default kernel profile not found in config"))?;
+        crate::setup::ensure_profile_firecracker(&default_profile, "default")
+            .await
+            .context("setting up default firecracker")?;
+    }
+
     // Setup kernel profile if requested — must happen BEFORE rootfs creation
     // because btrfs rootfs needs the profile kernel to boot the setup VM
     if let Some(profile_name) = &args.kernel_profile {
