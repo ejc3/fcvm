@@ -79,12 +79,21 @@ make test-root FILTER=sanity
 
 This is NOT optional. Comments contain critical information.
 
-### Step 1: ALWAYS Read Comments First
+### Step 1: ALWAYS Read Comments AND Inline Review Comments First
 
 ```bash
-# MANDATORY - Run this FIRST before any other PR operation
+# MANDATORY - Run BOTH of these FIRST before any other PR operation
+
+# 1. PR-level comments (general discussion, Claude review summaries)
 gh pr view <pr-number> --json comments --jq '.comments[] | "---\n" + .body'
+
+# 2. Inline code review comments (file-specific findings, often the most actionable)
+gh api repos/{owner}/{repo}/pulls/<pr-number>/comments --jq '.[] | "---\nfile: \(.path):\(.line // .original_line)\n\(.body)"'
 ```
+
+**Inline comments are often MORE important than PR-level comments.** They contain
+specific code-level findings that require investigation and response. Missing an
+inline comment means missing a real bug or design issue.
 
 ### Step 2: Check for Auto-Fix PRs
 
