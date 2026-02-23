@@ -64,7 +64,7 @@ pub async fn run() -> Result<()> {
     // Breaks the 30s poll loop when POLLHUP is not delivered after snapshot restore.
     let restore_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Exec server rebind signal — shared by restore-epoch watcher and cache-ready handshake.
+    // Exec server rebind signal — shared by restore-epoch watcher.
     // After vsock transport reset, the listener's AsyncFd epoll becomes stale.
     // We use BOTH Notify (to wake the select loop) and AtomicBool (to persist the signal).
     // tokio::select! can lose Notify permits when accept() and notified() are both Ready
@@ -72,11 +72,19 @@ pub async fn run() -> Result<()> {
     let exec_rebind = std::sync::Arc::new(tokio::sync::Notify::new());
     let exec_rebind_needed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Exec rebind confirmation — exec server signals after re_register() completes.
+    // handle_clone_restore waits on this before reconnecting output, ensuring exec is
+    // ready before the host starts health-checking via exec.
+    let exec_rebind_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let exec_rebind_done_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+
     // Start restore-epoch watcher
     let watcher_output = output.clone();
     let watcher_restore_flag = restore_flag.clone();
     let watcher_exec_rebind = exec_rebind.clone();
     let watcher_exec_rebind_needed = exec_rebind_needed.clone();
+    let watcher_exec_rebind_done = exec_rebind_done.clone();
+    let watcher_exec_rebind_done_notify = exec_rebind_done_notify.clone();
     tokio::spawn(async move {
         eprintln!("[fc-agent] starting restore-epoch watcher");
         mmds::watch_restore_epoch(
@@ -84,6 +92,8 @@ pub async fn run() -> Result<()> {
             watcher_restore_flag,
             watcher_exec_rebind,
             watcher_exec_rebind_needed,
+            watcher_exec_rebind_done,
+            watcher_exec_rebind_done_notify,
         )
         .await;
     });
@@ -92,8 +102,17 @@ pub async fn run() -> Result<()> {
     let (exec_ready_tx, exec_ready_rx) = tokio::sync::oneshot::channel();
     let exec_rebind_clone = exec_rebind.clone();
     let exec_rebind_needed_clone = exec_rebind_needed.clone();
+    let exec_rebind_done_clone = exec_rebind_done.clone();
+    let exec_rebind_done_notify_clone = exec_rebind_done_notify.clone();
     tokio::spawn(async move {
-        exec::run_server(exec_ready_tx, exec_rebind_clone, exec_rebind_needed_clone).await;
+        exec::run_server(
+            exec_ready_tx,
+            exec_rebind_clone,
+            exec_rebind_needed_clone,
+            exec_rebind_done_clone,
+            exec_rebind_done_notify_clone,
+        )
+        .await;
     });
 
     match tokio::time::timeout(Duration::from_secs(5), exec_ready_rx).await {
@@ -233,12 +252,11 @@ pub async fn run() -> Result<()> {
             if container::notify_cache_ready_and_wait(&digest, &restore_flag) {
                 eprintln!("[fc-agent] cache ready notification acknowledged");
                 // Pre-start snapshot was taken and we've been restored into a new
-                // Firecracker instance. The vsock transport was reset, which
-                // invalidates the exec server's listener socket (stale AsyncFd epoll).
-                // Signal it to re-bind. Set flag BEFORE notify to prevent race where
-                // select! drops the Notified future (see exec.rs doc comment).
-                exec_rebind_needed.store(true, std::sync::atomic::Ordering::Release);
-                exec_rebind.notify_one();
+                // Firecracker instance. Exec rebind + output reconnect are handled
+                // by handle_clone_restore() via the restore-epoch watcher.
+                // Do NOT signal exec rebind here — a duplicate re_register() corrupts
+                // the AsyncFd epoll registration, causing health checks to hang for ~60s
+                // (see plan trace evidence for the smoking gun vsock muxer logs).
             } else {
                 eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing");
             }

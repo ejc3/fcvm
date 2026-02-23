@@ -31,6 +31,8 @@ pub async fn run_server(
     ready_tx: tokio::sync::oneshot::Sender<()>,
     rebind_signal: Arc<Notify>,
     rebind_needed: Arc<AtomicBool>,
+    rebind_done: Arc<AtomicBool>,
+    rebind_done_notify: Arc<Notify>,
 ) {
     eprintln!(
         "[fc-agent] starting exec server on vsock port {}",
@@ -64,6 +66,8 @@ pub async fn run_server(
                 "[fc-agent] exec server: vsock transport reset (flag), re-registering listener"
             );
             listener = do_re_register(listener).await;
+            rebind_done.store(true, Ordering::Release);
+            rebind_done_notify.notify_one();
         }
 
         tokio::select! {
@@ -82,6 +86,8 @@ pub async fn run_server(
                 rebind_needed.store(false, Ordering::Release);
                 eprintln!("[fc-agent] exec server: vsock transport reset (notify), re-registering listener");
                 listener = do_re_register(listener).await;
+                rebind_done.store(true, Ordering::Release);
+                rebind_done_notify.notify_one();
             }
         }
     }
