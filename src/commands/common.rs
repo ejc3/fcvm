@@ -1444,14 +1444,17 @@ pub async fn create_snapshot_core(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    client
+    if let Err(e) = client
         .patch_mmds(serde_json::json!({
             "latest": {
                 "restore-epoch": restore_epoch.to_string()
             }
         }))
         .await
-        .context("bumping restore-epoch in MMDS after snapshot")?;
+    {
+        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+        return Err(e).context("bumping restore-epoch in MMDS after snapshot");
+    }
 
     if has_base {
         // Diff snapshot: copy base to temp, merge diff onto it, then atomic rename
