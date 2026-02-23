@@ -20,12 +20,6 @@ use crate::vsock;
 /// AsyncFd) without closing or rebinding the socket. Falls back to full rebind
 /// if re-register fails.
 ///
-/// IMPORTANT: Only ONE rebind signal should be sent per snapshot/restore event.
-/// A double re-register (from two concurrent signal sources) leaves the listener
-/// in a broken state where epoll events are not delivered for ~150 seconds.
-/// The signal comes from `handle_clone_restore()` only — agent.rs must NOT send
-/// a duplicate signal after `notify_cache_ready_and_wait()` returns.
-///
 /// CRITICAL: We use both a `Notify` (to wake up the select loop) and an `AtomicBool`
 /// flag (to persist the rebind request). `tokio::select!` polls all branches
 /// concurrently — if both `accept()` and `notified()` return Ready simultaneously,
@@ -37,6 +31,8 @@ pub async fn run_server(
     ready_tx: tokio::sync::oneshot::Sender<()>,
     rebind_signal: Arc<Notify>,
     rebind_needed: Arc<AtomicBool>,
+    rebind_done: Arc<AtomicBool>,
+    rebind_done_notify: Arc<Notify>,
 ) {
     eprintln!(
         "[fc-agent] starting exec server on vsock port {}",
@@ -70,6 +66,8 @@ pub async fn run_server(
                 "[fc-agent] exec server: vsock transport reset (flag), re-registering listener"
             );
             listener = do_re_register(listener).await;
+            rebind_done.store(true, Ordering::Release);
+            rebind_done_notify.notify_one();
         }
 
         tokio::select! {
@@ -88,20 +86,14 @@ pub async fn run_server(
                 rebind_needed.store(false, Ordering::Release);
                 eprintln!("[fc-agent] exec server: vsock transport reset (notify), re-registering listener");
                 listener = do_re_register(listener).await;
+                rebind_done.store(true, Ordering::Release);
+                rebind_done_notify.notify_one();
             }
         }
     }
 }
 
-/// Re-register the vsock listener with epoll after transport reset.
-///
-/// After snapshot restore, the vsock transport is reset and the listener's AsyncFd
-/// epoll registration becomes stale. Re-registering the same fd (extract from old
-/// AsyncFd, wrap in new AsyncFd) restores epoll event delivery without closing the
-/// socket. This avoids EADDRINUSE that would occur with close+rebind (active
-/// connections from handle_connection tasks keep the port busy).
-///
-/// Falls back to full close+rebind if re_register fails.
+/// Re-register or rebind the vsock listener after transport reset.
 async fn do_re_register(listener: vsock::VsockListener) -> vsock::VsockListener {
     match listener.re_register() {
         Ok(l) => {

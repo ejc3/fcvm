@@ -115,8 +115,8 @@ impl VsockListener {
     /// extracts the socket fd (deregistering from epoll) and re-wraps it in a new
     /// AsyncFd (re-registering with epoll), without closing or rebinding the socket.
     ///
-    /// This is preferred over drop+rebind because active connections from exec
-    /// handlers keep the port busy, causing bind() to fail with EADDRINUSE.
+    /// This is preferred over drop+rebind because active connections from before the
+    /// snapshot keep the port bound, causing bind() to fail with EADDRINUSE.
     pub fn re_register(self) -> Result<Self> {
         let fd = self.inner.into_inner();
         let inner = AsyncFd::new(fd).context("re-registering listener with AsyncFd")?;

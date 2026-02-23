@@ -175,6 +175,7 @@ pub(crate) async fn run_output_listener(
     log_tx: Option<tokio::sync::broadcast::Sender<LogLine>>,
     reconnect_notify: Arc<tokio::sync::Notify>,
     non_blocking_output: bool,
+    connected_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<Vec<(String, String)>> {
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::UnixListener;
@@ -225,6 +226,9 @@ pub(crate) async fn run_output_listener(
     };
     connection_count += 1;
     debug!(vm_id = %vm_id, connection_count, "Output connection established");
+    if let Some(tx) = connected_tx {
+        let _ = tx.send(());
+    }
 
     let mut reader = BufReader::new(initial_stream);
     let mut line_buf = String::new();
@@ -403,7 +407,7 @@ mod tests {
         let socket_str = socket_path.to_string_lossy().to_string();
         let reconnect = std::sync::Arc::new(tokio::sync::Notify::new());
         let handle = tokio::spawn(async move {
-            run_output_listener(&socket_str, "test-vm", None, reconnect, lossy).await
+            run_output_listener(&socket_str, "test-vm", None, reconnect, lossy, None).await
         });
         for _ in 0..50 {
             if socket_path.exists() {
