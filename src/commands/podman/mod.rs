@@ -784,6 +784,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 log_tx_clone,
                 reconnect,
                 non_blocking_output,
+                None,
             )
             .await
             {

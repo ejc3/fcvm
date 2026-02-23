@@ -601,6 +601,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // listener to drop its dead vsock stream and re-accept. Without this, the listener
     // stays stuck reading from the old (dead) connection after VM resume resets vsock.
     let output_reconnect = Arc::new(tokio::sync::Notify::new());
+    // Channel to know when fc-agent's output connection arrives (gates health monitor)
+    let (output_connected_tx, output_connected_rx) = tokio::sync::oneshot::channel();
     let output_handle = if !tty_mode {
         let socket_path = output_socket_path.clone();
         let vm_id_clone = vm_id.clone();
@@ -612,6 +614,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 None,
                 reconnect,
                 non_blocking_output,
+                Some(output_connected_tx),
             )
             .await
             {
@@ -857,14 +860,9 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     let (mut vm_manager, mut holder_child) = setup_result.unwrap();
 
-    // For startup snapshots (container already running), the output listener has an
-    // active connection from fc-agent that's now dead after VM resume. Signal it to
-    // drop the dead stream and re-accept. For pre-start snapshots (container not yet
-    // started), the listener is fresh with no connection — DON'T notify, or the
-    // stored permit will poison the first real connection by dropping it immediately.
-    if args.startup_snapshot_base_key.is_some() {
-        output_reconnect.notify_one();
-    }
+    // fc-agent's handle_clone_restore() now drives the output reconnect sequence:
+    // exec rebind → wait for confirmation → output.reconnect(). No host-side
+    // notify needed — the listener will accept fc-agent's new connection naturally.
 
     let is_uffd = use_uffd || std::env::var("FCVM_FORCE_UFFD").is_ok() || hugepages;
     if is_uffd {
@@ -971,6 +969,21 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     } else {
         (None, None)
     };
+
+    // Wait for fc-agent output connection before starting health monitor.
+    // This ensures the deterministic handshake chain is complete:
+    //   exec_rebind → exec_re_register → rebind_done → output.reconnect() → HERE
+    // Without this gate, the health monitor could start exec calls before
+    // the exec server has re-registered its AsyncFd after restore.
+    if !tty_mode {
+        match tokio::time::timeout(std::time::Duration::from_secs(30), output_connected_rx).await {
+            Ok(Ok(())) => info!(vm_id = %vm_id, "fc-agent output connected, exec server ready"),
+            Ok(Err(_)) => warn!(vm_id = %vm_id, "output connected_tx dropped"),
+            Err(_) => {
+                warn!(vm_id = %vm_id, "fc-agent did not connect within 30s, proceeding anyway")
+            }
+        }
+    }
 
     // Spawn health monitor task with startup snapshot trigger support
     let health_monitor_handle = crate::health::spawn_health_monitor_full(
