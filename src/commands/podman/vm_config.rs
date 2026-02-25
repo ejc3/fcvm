@@ -799,6 +799,13 @@ pub(super) async fn run_vm_setup(
             info!(namespace = %ns_id, "configuring VM to run in network namespace");
             vm_manager.set_namespace(ns_id.to_string());
         }
+    } else if let Some(routed_net) = network.as_any().downcast_ref::<crate::network::RoutedNetwork>() {
+        // Routed mode: use pre-created network namespace (like bridged)
+        holder_child = None;
+        if let Some(ns_id) = routed_net.namespace_id() {
+            info!(namespace = %ns_id, "configuring VM to run in routed network namespace");
+            vm_manager.set_namespace(ns_id.to_string());
+        }
     } else if let Some(pasta_net) = network.as_any().downcast_ref::<PastaNetwork>() {
         holder_child = Some(
             setup_rootless_namespace(pasta_net, network_config, &mut vm_manager, vm_state).await?,
@@ -843,7 +850,8 @@ pub(super) async fn run_vm_setup(
                 BootSource, Drive, FcNetworkMode, FirecrackerConfig, MachineConfig,
             };
             let network_mode = match args.network {
-                crate::cli::args::NetworkMode::Bridged => FcNetworkMode::Bridged,
+                crate::cli::args::NetworkMode::Bridged
+                | crate::cli::args::NetworkMode::Routed => FcNetworkMode::Bridged,
                 crate::cli::args::NetworkMode::Rootless => FcNetworkMode::Rootless,
             };
             // Collect extra disk specifications

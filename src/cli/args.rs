@@ -492,6 +492,8 @@ pub enum NetworkMode {
     Bridged,
     /// True rootless networking using pasta (no sudo required)
     Rootless,
+    /// Routed networking using veth + IPv6 routing (requires sudo, no NAT needed)
+    Routed,
 }
 
 /// Root filesystem type for the VM.

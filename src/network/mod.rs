@@ -3,11 +3,13 @@ pub mod egress_proxy;
 pub mod namespace;
 pub mod pasta;
 pub mod portmap;
+pub mod routed;
 pub mod types;
 pub mod veth;
 
 pub use bridged::BridgedNetwork;
 pub use pasta::PastaNetwork;
+pub use routed::RoutedNetwork;
 pub use types::*;
 
 use anyhow::Result;

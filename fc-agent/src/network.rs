@@ -289,12 +289,12 @@ pub fn configure_ipv6_from_cmdline() {
         }
     }
 
-    // Use "replace" not "add" — pasta RA may have already installed a default
-    // route. If accept_ra later gets disabled, the RA route expires but a
-    // static "replace" route persists.
+    // Use "replace" not "add" — RA may have already installed a default route.
+    // "onlink" skips NDP reachability check — needed when the bridge gateway's
+    // DAD hasn't completed yet at the time fc-agent runs.
     let route_output = std::process::Command::new("ip")
         .args([
-            "-6", "route", "replace", "default", "via", gateway, "dev", "eth0",
+            "-6", "route", "replace", "default", "via", gateway, "dev", "eth0", "onlink",
         ])
         .output();
 
