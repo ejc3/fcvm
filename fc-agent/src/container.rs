@@ -61,6 +61,14 @@ pub fn mount_overlay_image(
     };
     write_containers_conf(&containers_conf_path);
 
+    // Reset podman state after writing storage.conf to clear any stale db.sql
+    // that may have been created by health monitor's `podman inspect` racing
+    // with storage setup. Without this, the db.sql graph driver won't match
+    // the new storage.conf, causing "database graph driver does not match".
+    let _ = std::process::Command::new("podman")
+        .args(["system", "reset", "--force"])
+        .output();
+
     eprintln!(
         "[fc-agent] overlay image mounted at {}, configured as additional image store (conf: {})",
         mount_path, conf_path
