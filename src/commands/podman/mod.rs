@@ -955,13 +955,9 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                             info!(snapshot_key = %key, "Pre-start snapshot created successfully");
                             ctx.vm_state.config.snapshot_name = Some(key.clone());
                             let _ = ctx.state_manager.save_state(&ctx.vm_state).await;
-                            // Signal output listener to re-accept (vsock reset during snapshot)
-                            ctx.output_reconnect.notify_one();
                         }
                         SnapshotOutcome::Failed(e) => {
                             warn!(snapshot_key = %key, error = %e, "Failed to create pre-start snapshot");
-                            // Signal even on failure — vsock was still reset during the attempt
-                            ctx.output_reconnect.notify_one();
                         }
                     }
                     // Send ack back regardless of success (fc-agent should continue)
@@ -1014,13 +1010,9 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                                         info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
                                         ctx.vm_state.config.snapshot_name = Some(startup_key.clone());
                                         let _ = ctx.state_manager.save_state(&ctx.vm_state).await;
-                                        // Signal output listener to re-accept (vsock reset during snapshot)
-                                        ctx.output_reconnect.notify_one();
                                     }
                                     SnapshotOutcome::Failed(e) => {
                                         warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");
-                                        // Signal even on failure — vsock was still reset during the attempt
-                                        ctx.output_reconnect.notify_one();
                                     }
                                 }
                             }

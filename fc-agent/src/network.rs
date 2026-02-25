@@ -284,9 +284,12 @@ pub fn configure_ipv6_from_cmdline() {
         }
     }
 
+    // Use "replace" not "add" — pasta RA may have already installed a default
+    // route. If accept_ra later gets disabled, the RA route expires but a
+    // static "replace" route persists.
     let route_output = std::process::Command::new("ip")
         .args([
-            "-6", "route", "add", "default", "via", gateway, "dev", "eth0",
+            "-6", "route", "replace", "default", "via", gateway, "dev", "eth0",
         ])
         .output();
 
