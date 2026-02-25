@@ -1,18 +1,15 @@
 use anyhow::{Context, Result};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use super::namespace;
 use super::types::generate_mac;
 use super::veth;
 use super::{NetworkConfig, NetworkManager, PortMapping};
-use crate::paths;
 use crate::state::truncate_id;
 
 /// Guest network addressing (same as pasta/bridged for Firecracker compatibility)
 const GUEST_IP: &str = "10.0.2.100";
 const GUEST_GATEWAY: &str = "10.0.2.1";
-const GUEST_NETMASK: &str = "255.255.255.0";
-
 /// Bridge device name
 const BRIDGE_DEVICE: &str = "br0";
 
@@ -49,7 +46,6 @@ pub struct RoutedNetwork {
     guest_ip: Option<String>,
     vm_ipv6: Option<String>,
     host_ipv6_subnet: Option<String>,
-    port_mapping_rules: Vec<String>,
 }
 
 impl RoutedNetwork {
@@ -65,7 +61,6 @@ impl RoutedNetwork {
             guest_ip: None,
             vm_ipv6: None,
             host_ipv6_subnet: None,
-            port_mapping_rules: Vec::new(),
         }
     }
 
@@ -168,29 +163,27 @@ impl NetworkManager for RoutedNetwork {
         namespace::exec_in_namespace(
             &ns_name,
             &["ip", "link", "add", BRIDGE_DEVICE, "type", "bridge"],
-        ).await?;
+        )
+        .await?;
         namespace::exec_in_namespace(
             &ns_name,
-            &["ip", "link", "set", &self.tap_device, "master", BRIDGE_DEVICE],
-        ).await?;
-        namespace::exec_in_namespace(
-            &ns_name,
-            &["ip", "link", "set", BRIDGE_DEVICE, "up"],
-        ).await?;
-        namespace::exec_in_namespace(
-            &ns_name,
-            &["ip", "link", "set", &self.tap_device, "up"],
-        ).await?;
+            &[
+                "ip",
+                "link",
+                "set",
+                &self.tap_device,
+                "master",
+                BRIDGE_DEVICE,
+            ],
+        )
+        .await?;
+        namespace::exec_in_namespace(&ns_name, &["ip", "link", "set", BRIDGE_DEVICE, "up"]).await?;
+        namespace::exec_in_namespace(&ns_name, &["ip", "link", "set", &self.tap_device, "up"])
+            .await?;
 
         // 5. Bring up veth inside namespace (NOT on bridge — separate routed interface)
-        namespace::exec_in_namespace(
-            &ns_name,
-            &["ip", "link", "set", &guest_veth, "up"],
-        ).await?;
-        namespace::exec_in_namespace(
-            &ns_name,
-            &["ip", "link", "set", "lo", "up"],
-        ).await?;
+        namespace::exec_in_namespace(&ns_name, &["ip", "link", "set", &guest_veth, "up"]).await?;
+        namespace::exec_in_namespace(&ns_name, &["ip", "link", "set", "lo", "up"]).await?;
 
         // 6. Assign gateway IPs to bridge (VM connects here via TAP)
         let gw_cidr = format!("{}/24", GUEST_GATEWAY);
@@ -204,11 +197,20 @@ impl NetworkManager for RoutedNetwork {
         // drops all IPv6 packets to it — breaking the VM's default route via fd00::1.
         namespace::exec_in_namespace(
             &ns_name,
-            &["ip", "-6", "addr", "add", "fd00::1/64", "dev", BRIDGE_DEVICE, "nodad"],
+            &[
+                "ip",
+                "-6",
+                "addr",
+                "add",
+                "fd00::1/64",
+                "dev",
+                BRIDGE_DEVICE,
+                "nodad",
+            ],
         )
         .await?;
 
-        // 6. Bring up host veth and wait for link-local
+        // 7. Bring up host veth and wait for link-local
         let output = tokio::process::Command::new("ip")
             .args(["link", "set", &host_veth, "up"])
             .output()
@@ -221,50 +223,76 @@ impl NetworkManager for RoutedNetwork {
         // Give interfaces a moment for link-local auto-config
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        // 7. Enable IPv6 forwarding on host
+        // 8. Enable IPv6 forwarding on host
         let _ = tokio::process::Command::new("sysctl")
             .args(["-w", "net.ipv6.conf.all.forwarding=1"])
             .output()
             .await;
 
-        // 8. Get link-local addresses for routing (auto-assigned by kernel)
-        let host_ll = get_link_local_ipv6(&host_veth).await
+        // 9. Get link-local addresses for routing (auto-assigned by kernel)
+        let host_ll = get_link_local_ipv6(&host_veth)
+            .await
             .context("host veth has no link-local IPv6")?;
-        let ns_ll = get_link_local_ipv6_in_ns(&ns_name, &guest_veth).await
+        let ns_ll = get_link_local_ipv6_in_ns(&ns_name, &guest_veth)
+            .await
             .context("namespace veth has no link-local IPv6")?;
         info!(host_ll = %host_ll, ns_ll = %ns_ll, "veth link-local addresses");
 
-        // 9. In namespace: default route via host's link-local on veth.
+        // 10. In namespace: default route via host's link-local on veth.
         //    Do NOT assign the VM's IPv6 as a /128 on the veth — that causes the kernel
         //    to treat the VM's address as local, routing echo replies to loopback instead
         //    of back through the bridge/TAP to the VM.
         namespace::exec_in_namespace(
             &ns_name,
-            &["ip", "-6", "route", "add", "default", "via", &host_ll, "dev", &guest_veth],
-        ).await?;
+            &[
+                "ip",
+                "-6",
+                "route",
+                "add",
+                "default",
+                "via",
+                &host_ll,
+                "dev",
+                &guest_veth,
+            ],
+        )
+        .await?;
 
-        // 10. Enable IPv6 forwarding in namespace (bridge → veth)
+        // 11. Enable IPv6 forwarding in namespace (bridge → veth)
         namespace::exec_in_namespace(
             &ns_name,
             &["sysctl", "-w", "net.ipv6.conf.all.forwarding=1"],
-        ).await?;
+        )
+        .await?;
 
-        // 11. On host: route VM's IPv6 back through the veth via namespace's link-local
+        // 12. On host: route VM's IPv6 back through the veth via namespace's link-local
         let vm_route = format!("{}/128", vm_ipv6);
         let _ = tokio::process::Command::new("ip")
-            .args(["-6", "route", "replace", &vm_route, "via", &ns_ll, "dev", &host_veth])
+            .args([
+                "-6", "route", "replace", &vm_route, "via", &ns_ll, "dev", &host_veth,
+            ])
             .output()
             .await;
 
-        // 12. Add proxy NDP so the network fabric routes VM's IPv6 to this host
-        let default_iface = detect_default_ipv6_interface().await.unwrap_or_else(|| "eth0".to_string());
+        // 13. Add proxy NDP so the network fabric routes VM's IPv6 to this host
+        let default_iface = detect_default_ipv6_interface()
+            .await
+            .unwrap_or_else(|| "eth0".to_string());
         let _ = tokio::process::Command::new("ip")
-            .args(["-6", "neigh", "add", "proxy", &vm_ipv6, "dev", &default_iface])
+            .args([
+                "-6",
+                "neigh",
+                "add",
+                "proxy",
+                &vm_ipv6,
+                "dev",
+                &default_iface,
+            ])
             .output()
             .await;
         info!(vm_ipv6 = %vm_ipv6, iface = %default_iface, "added proxy NDP");
 
-        // 12. Set up port forwarding (iptables DNAT on host veth)
+        // 14. Set up port forwarding (iptables DNAT on host veth)
         // Use same portmap approach as bridged mode
         if !self.port_mappings.is_empty() {
             // For routed mode, port forwarding uses host veth as the target
@@ -307,9 +335,19 @@ impl NetworkManager for RoutedNetwork {
 
         // Remove proxy NDP
         if let Some(ref vm_ipv6) = self.vm_ipv6 {
-            let default_iface = detect_default_ipv6_interface().await.unwrap_or_else(|| "eth0".to_string());
+            let default_iface = detect_default_ipv6_interface()
+                .await
+                .unwrap_or_else(|| "eth0".to_string());
             let _ = tokio::process::Command::new("ip")
-                .args(["-6", "neigh", "del", "proxy", vm_ipv6, "dev", &default_iface])
+                .args([
+                    "-6",
+                    "neigh",
+                    "del",
+                    "proxy",
+                    vm_ipv6,
+                    "dev",
+                    &default_iface,
+                ])
                 .output()
                 .await;
 
