@@ -151,13 +151,20 @@ async fn handle_mux_session(vsock_stream: UnixStream) -> Result<()> {
             break;
         }
 
-        let stream_id = u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
+        let stream_id =
+            u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
         let frame_type = header_buf[4];
-        let payload_len = u32::from_le_bytes([header_buf[6], header_buf[7], header_buf[8], header_buf[9]]) as usize;
+        let payload_len =
+            u32::from_le_bytes([header_buf[6], header_buf[7], header_buf[8], header_buf[9]])
+                as usize;
 
         // Reject oversized payloads to prevent OOM from malformed frames
         if payload_len > MAX_FRAME_PAYLOAD {
-            warn!(payload_len, max = MAX_FRAME_PAYLOAD, "rejecting oversized frame");
+            warn!(
+                payload_len,
+                max = MAX_FRAME_PAYLOAD,
+                "rejecting oversized frame"
+            );
             break;
         }
 
@@ -276,7 +283,12 @@ async fn handle_stream(
 /// Serialize and send a frame via the bounded writer channel.
 /// Blocks when the channel is full, providing backpressure.
 /// Returns false if the channel is closed (vsock writer died).
-async fn send_frame(writer_tx: &mpsc::Sender<Vec<u8>>, stream_id: u32, frame_type: u8, payload: &[u8]) -> bool {
+async fn send_frame(
+    writer_tx: &mpsc::Sender<Vec<u8>>,
+    stream_id: u32,
+    frame_type: u8,
+    payload: &[u8],
+) -> bool {
     let mut frame = Vec::with_capacity(FRAME_HEADER_SIZE + payload.len());
     frame.extend_from_slice(&stream_id.to_le_bytes());
     frame.push(frame_type);
