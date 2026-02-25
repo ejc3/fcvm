@@ -232,7 +232,13 @@ async fn handle_stream(
     // Connect to real destination (works for both IPv4 and IPv6)
     let tcp = match TcpStream::connect((dest_ip, dest_port)).await {
         Ok(s) => s,
-        Err(_) => {
+        Err(e) => {
+            warn!(
+                stream_id,
+                dest = %format!("{}:{}", dest_ip, dest_port),
+                error = %e,
+                "egress proxy: TCP connect failed"
+            );
             send_frame(&writer_tx, stream_id, FRAME_OPEN_FAIL, &[]).await;
             return;
         }
