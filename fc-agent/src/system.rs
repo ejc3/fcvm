@@ -148,6 +148,24 @@ pub fn create_kvm_device() {
     }
 }
 
+/// Raise cgroup pids.max to remove systemd's DefaultTasksMax=15% limit.
+/// Without this, fc-agent.service is limited to ~4700 pids (15% of threads-max),
+/// which causes fork() failures under high-concurrency workloads (e.g., 8000 connections).
+pub fn raise_cgroup_pids_limit() {
+    let paths = [
+        "/sys/fs/cgroup/pids.max",
+        "/sys/fs/cgroup/system.slice/fc-agent.service/pids.max",
+    ];
+    for path in &paths {
+        if std::path::Path::new(path).exists() {
+            match std::fs::write(path, "max") {
+                Ok(()) => eprintln!("[fc-agent] raised pids.max in {}", path),
+                Err(e) => eprintln!("[fc-agent] WARNING: failed to raise {}: {}", path, e),
+            }
+        }
+    }
+}
+
 /// Raise RLIMIT_NOFILE to 65536.
 pub fn raise_resource_limits() {
     let new_limit = libc::rlimit {
