@@ -107,7 +107,7 @@ export HOME=/root
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source /root/.cargo/env
 
-# Build passt from source (distro version lacks --no-splice)
+# Build passt from source for consistent version across environments
 PASST_TAG="2025_01_20.386b5f5"
 git clone https://passt.top/passt /tmp/passt-build
 cd /tmp/passt-build

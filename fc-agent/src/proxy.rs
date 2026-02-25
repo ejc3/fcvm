@@ -238,10 +238,7 @@ async fn vsock_writer(
 }
 
 /// Reader task: reads frames from vsock and dispatches to per-stream handlers.
-async fn vsock_reader(
-    mut reader: tokio::io::ReadHalf<VsockStream>,
-    state: Arc<ProxyState>,
-) {
+async fn vsock_reader(mut reader: tokio::io::ReadHalf<VsockStream>, state: Arc<ProxyState>) {
     let mut header_buf = [0u8; FRAME_HEADER_SIZE];
 
     loop {
@@ -250,10 +247,13 @@ async fn vsock_reader(
             break;
         }
 
-        let stream_id = u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
+        let stream_id =
+            u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
         let frame_type = header_buf[4];
         // header_buf[5] = flags (reserved)
-        let payload_len = u32::from_le_bytes([header_buf[6], header_buf[7], header_buf[8], header_buf[9]]) as usize;
+        let payload_len =
+            u32::from_le_bytes([header_buf[6], header_buf[7], header_buf[8], header_buf[9]])
+                as usize;
 
         // Reject oversized payloads to prevent OOM from malformed frames
         if payload_len > MAX_FRAME_PAYLOAD {
@@ -333,16 +333,10 @@ async fn handle_redirected_connection(
             buf.to_vec()
         }
     };
-    state
-        .send_frame(stream_id, FRAME_OPEN, &open_payload)
-        .await;
+    state.send_frame(stream_id, FRAME_OPEN, &open_payload).await;
 
     // Wait for OPEN_OK or OPEN_FAIL
-    let response = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        stream_rx.recv(),
-    )
-    .await;
+    let response = tokio::time::timeout(std::time::Duration::from_secs(30), stream_rx.recv()).await;
 
     match response {
         Ok(Some((FRAME_OPEN_OK, _))) => {} // Connection succeeded
@@ -381,9 +375,7 @@ async fn handle_redirected_connection(
             }
         }
         // Client closed — send CLOSE (best-effort, channel may be dead)
-        writer_state
-            .send_frame(stream_id, FRAME_CLOSE, &[])
-            .await;
+        writer_state.send_frame(stream_id, FRAME_CLOSE, &[]).await;
     };
 
     // vsock → TCP: receive DATA frames from per-stream channel, write to client
@@ -416,15 +408,55 @@ fn setup_iptables_redirect() -> bool {
     let v4_rules: &[&[&str]] = &[
         // Don't redirect localhost traffic (proxy listens on 127.0.0.1)
         &[
-            "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "-d", "127.0.0.0/8", "-j", "RETURN",
+            "-t",
+            "nat",
+            "-A",
+            "OUTPUT",
+            "-p",
+            "tcp",
+            "-d",
+            "127.0.0.0/8",
+            "-j",
+            "RETURN",
         ],
         // Don't redirect local subnet (pasta gateway, DNS, health checks)
         &[
-            "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "-d", "10.0.2.0/24", "-j", "RETURN",
+            "-t",
+            "nat",
+            "-A",
+            "OUTPUT",
+            "-p",
+            "tcp",
+            "-d",
+            "10.0.2.0/24",
+            "-j",
+            "RETURN",
+        ],
+        // Don't redirect link-local traffic (169.254.0.0/16) — includes MMDS at 169.254.169.254
+        &[
+            "-t",
+            "nat",
+            "-A",
+            "OUTPUT",
+            "-p",
+            "tcp",
+            "-d",
+            "169.254.0.0/16",
+            "-j",
+            "RETURN",
         ],
         // Redirect all other outbound TCP to proxy
         &[
-            "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "-j", "REDIRECT", "--to-port", &port_str,
+            "-t",
+            "nat",
+            "-A",
+            "OUTPUT",
+            "-p",
+            "tcp",
+            "-j",
+            "REDIRECT",
+            "--to-port",
+            &port_str,
         ],
     ];
 
@@ -456,15 +488,42 @@ fn setup_iptables_redirect() -> bool {
         ],
         // Don't redirect link-local (fe80::/10)
         &[
-            "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "-d", "fe80::/10", "-j", "RETURN",
+            "-t",
+            "nat",
+            "-A",
+            "OUTPUT",
+            "-p",
+            "tcp",
+            "-d",
+            "fe80::/10",
+            "-j",
+            "RETURN",
         ],
         // Don't redirect pasta ULA subnet (fd00::/64)
         &[
-            "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "-d", "fd00::/64", "-j", "RETURN",
+            "-t",
+            "nat",
+            "-A",
+            "OUTPUT",
+            "-p",
+            "tcp",
+            "-d",
+            "fd00::/64",
+            "-j",
+            "RETURN",
         ],
         // Redirect all other outbound IPv6 TCP to proxy
         &[
-            "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "-j", "REDIRECT", "--to-port", &port_str,
+            "-t",
+            "nat",
+            "-A",
+            "OUTPUT",
+            "-p",
+            "tcp",
+            "-j",
+            "REDIRECT",
+            "--to-port",
+            &port_str,
         ],
     ];
 

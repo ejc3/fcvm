@@ -219,8 +219,8 @@ pub(super) fn build_runtime_boot_args(
     }
 
     // Pass DNS servers to guest for resolv.conf configuration
-    // Rootless/pasta: use pasta's DNS forwarder (10.0.2.3) — pasta translates to host DNS
-    // Bridged: use host DNS servers directly (reachable through bridge/NAT)
+    // Both rootless and bridged: use host DNS servers directly (reachable via
+    // pasta's L4 translation or bridge/NAT respectively)
     {
         let dns_servers = if let Some(ref dns) = network_config.dns_server {
             // Use the network-mode-specific DNS (pasta forwarder or host DNS)

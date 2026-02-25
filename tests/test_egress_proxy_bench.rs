@@ -13,7 +13,7 @@
 //! The IP 192.0.2.1 (RFC 5737 TEST-NET-1) is NOT in the iptables exemption
 //! ranges (127.0.0.0/8 and 10.0.2.0/24), so it gets caught by the REDIRECT rule.
 
-#![cfg(feature = "integration-slow")]
+#![cfg(feature = "bench")]
 
 mod common;
 
@@ -35,7 +35,10 @@ async fn test_egress_proxy_8000_concurrent_1mb() -> Result<()> {
     let (vm_name, _, _, _) = common::unique_names("proxy-bench");
 
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
-    println!("║  Egress Proxy Benchmark: {} concurrent × 1MB              ║", NUM_CONNECTIONS);
+    println!(
+        "║  Egress Proxy Benchmark: {} concurrent × 1MB              ║",
+        NUM_CONNECTIONS
+    );
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
     // Step 0: Add test IP to host loopback so host proxy can connect to it
@@ -57,7 +60,10 @@ async fn test_egress_proxy_8000_concurrent_1mb() -> Result<()> {
     // Step 1: Start a host-side TCP server that sends 1MB per connection
     // Bind on 0.0.0.0 so it's reachable via the test IP
     let server = start_1mb_server("0.0.0.0").await?;
-    println!("  Host TCP server on port {} (1MB per connection)", server.port);
+    println!(
+        "  Host TCP server on port {} (1MB per connection)",
+        server.port
+    );
 
     // Step 2: Start rootless VM with high resources
     println!("\nStep 1: Starting rootless VM with 16 vCPUs, 16GB RAM...");
@@ -92,7 +98,10 @@ async fn test_egress_proxy_8000_concurrent_1mb() -> Result<()> {
 
     // Step 3: Verify basic egress through the proxy works
     // Use the test IP — this MUST go through the proxy (not pasta)
-    println!("\nStep 2: Verifying egress through proxy ({}:{})...", TEST_IP, server.port);
+    println!(
+        "\nStep 2: Verifying egress through proxy ({}:{})...",
+        TEST_IP, server.port
+    );
     let fcvm_path = common::find_fcvm_binary()?;
 
     // Retry a few times — proxy vsock connection may take a moment
@@ -128,12 +137,19 @@ async fn test_egress_proxy_8000_concurrent_1mb() -> Result<()> {
         let port = server.port;
         server.stop();
         common::kill_process(vm_pid).await;
-        anyhow::bail!("Egress through proxy to {}:{} failed after 5 attempts", TEST_IP, port);
+        anyhow::bail!(
+            "Egress through proxy to {}:{} failed after 5 attempts",
+            TEST_IP,
+            port
+        );
     }
     println!("  ✓ Egress through proxy works");
 
     // Step 4: Write the benchmark script into the VM
-    println!("\nStep 3: Running {} concurrent 1MB downloads through proxy...", NUM_CONNECTIONS);
+    println!(
+        "\nStep 3: Running {} concurrent 1MB downloads through proxy...",
+        NUM_CONNECTIONS
+    );
 
     // Write a shell script into the VM that spawns parallel wget jobs
     // Uses TEST_IP so traffic goes through the proxy, NOT pasta
@@ -184,7 +200,10 @@ echo "RESULT:$OK/$COUNT"
             "--",
             "sh",
             "-c",
-            &format!("cat > /tmp/bench.sh << 'SCRIPT_EOF'\n{}\nSCRIPT_EOF\nchmod +x /tmp/bench.sh", script),
+            &format!(
+                "cat > /tmp/bench.sh << 'SCRIPT_EOF'\n{}\nSCRIPT_EOF\nchmod +x /tmp/bench.sh",
+                script
+            ),
         ])
         .output()
         .await?;
@@ -230,7 +249,10 @@ echo "RESULT:$OK/$COUNT"
         }
     } else {
         eprintln!("  stdout: {}", stdout);
-        eprintln!("  stderr: {}", stderr.lines().take(10).collect::<Vec<_>>().join("\n"));
+        eprintln!(
+            "  stderr: {}",
+            stderr.lines().take(10).collect::<Vec<_>>().join("\n")
+        );
         (0, NUM_CONNECTIONS)
     };
 
