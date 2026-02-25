@@ -119,13 +119,14 @@ impl PastaNetwork {
     /// Uses --map-root-user for simple 1:1 UID mapping (current user → UID 0 inside namespace).
     /// This works for both root and unprivileged users.
     ///
-    /// Note: --map-auto was considered but it maps to subordinate UIDs (100000+) which doesn't
-    /// include the current user's UID, causing permission issues with KVM and file access.
+    /// Note: No --map-root-user here — setup_namespace_mappings() in common.rs handles
+    /// UID/GID mapping after the namespace is created (tries newuidmap first, falls back
+    /// to single-UID mapping). This matches main's approach and avoids conflicts when
+    /// running as root (where --map-root-user writes mappings that then block the fallback).
     pub fn build_holder_command(&self) -> Vec<String> {
         vec![
             "unshare".to_string(),
             "--user".to_string(),
-            "--map-root-user".to_string(),
             "--net".to_string(),
             "--".to_string(),
             "sleep".to_string(),

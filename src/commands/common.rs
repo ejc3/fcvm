@@ -124,7 +124,10 @@ async fn setup_namespace_mappings(pid: u32) -> anyhow::Result<()> {
 
     // Fallback: write mappings directly (equivalent to --map-root-user).
     // Must deny setgroups before writing gid_map as unprivileged user.
-    std::fs::write(format!("/proc/{pid}/setgroups"), "deny").context("denying setgroups")?;
+    // Root (uid 0) can write gid_map directly and doesn't need (or can't) deny setgroups.
+    if uid != 0 {
+        std::fs::write(format!("/proc/{pid}/setgroups"), "deny").context("denying setgroups")?;
+    }
     if !uid_ok {
         std::fs::write(format!("/proc/{pid}/uid_map"), format!("0 {uid} 1\n"))
             .context("writing uid_map")?;
