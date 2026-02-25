@@ -22,6 +22,7 @@ pub async fn handle_clone_restore(
     exec_rebind_needed: &Arc<AtomicBool>,
     exec_rebind_done: &Arc<AtomicBool>,
     exec_rebind_done_notify: &Arc<Notify>,
+    egress_reconnect: &Arc<Notify>,
 ) {
     network::kill_stale_tcp_connections().await;
     network::flush_arp_cache().await;
@@ -52,5 +53,10 @@ pub async fn handle_clone_restore(
     // FUSE vsock reconnection is handled automatically by the reconnectable multiplexer.
     output.reconnect();
 
-    eprintln!("[fc-agent] signaled exec rebind + output reconnect after restore");
+    // FOURTH: Signal egress proxy to reconnect its vsock (stale after transport reset).
+    egress_reconnect.notify_waiters();
+
+    eprintln!(
+        "[fc-agent] signaled exec rebind + output reconnect + egress reconnect after restore"
+    );
 }

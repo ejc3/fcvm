@@ -23,7 +23,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use crate::vsock::{VsockStream, EGRESS_PROXY_PORT, HOST_CID};
 
@@ -95,7 +95,12 @@ impl ProxyState {
 }
 
 /// Set up iptables/ip6tables REDIRECT rules and start the transparent proxy listener.
-pub async fn run_egress_proxy() {
+///
+/// `reconnect` is signaled after snapshot restore (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET
+/// kills all vsock connections) to break the stale multiplexed session and reconnect.
+/// Without this, the proxy's stale AsyncFd epoll registration causes read_exact to
+/// hang indefinitely. Harmless on cold start (pause/resume doesn't break connections).
+pub async fn run_egress_proxy(reconnect: Arc<Notify>) {
     if !setup_iptables_redirect() {
         eprintln!(
             "[fc-agent] WARNING: failed to set up iptables REDIRECT rules, egress proxy disabled"
@@ -151,7 +156,7 @@ pub async fn run_egress_proxy() {
         };
         eprintln!("[fc-agent] egress proxy vsock connected");
 
-        run_mux_session(&listener_v4, listener_v6.as_ref(), vsock).await;
+        run_mux_session(&listener_v4, listener_v6.as_ref(), vsock, &reconnect).await;
 
         eprintln!("[fc-agent] egress proxy vsock disconnected, reconnecting...");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -159,11 +164,12 @@ pub async fn run_egress_proxy() {
 }
 
 /// Run a single multiplexed session over one vsock connection.
-/// Returns when the vsock connection dies.
+/// Returns when the vsock connection dies or a reconnect signal is received.
 async fn run_mux_session(
     listener_v4: &TcpListener,
     listener_v6: Option<&TcpListener>,
     vsock: VsockStream,
+    reconnect: &Notify,
 ) {
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(WRITER_CHANNEL_CAPACITY);
     let state = Arc::new(ProxyState {
@@ -211,11 +217,14 @@ async fn run_mux_session(
         }
     };
 
-    // Wait for reader or writer to finish (vsock died), cancelling accept loop
+    // Wait for reader/writer to finish (vsock died), reconnect signal, or accept loop
     tokio::select! {
         _ = reader_handle => {},
         _ = writer_handle => {},
         _ = accept_loop => {},
+        _ = reconnect.notified() => {
+            eprintln!("[fc-agent] egress proxy reconnect signaled (snapshot event)");
+        },
     }
 
     // RST all active streams

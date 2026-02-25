@@ -34,9 +34,14 @@ pub async fn run() -> Result<()> {
         network::setup_localhost_forwarding(&plan.forward_localhost);
     }
 
+    // Egress proxy reconnect signal — signaled after snapshot events (pause/resume
+    // or restore) to break the stale vsock session and reconnect immediately.
+    let egress_reconnect = std::sync::Arc::new(tokio::sync::Notify::new());
+
     if plan.egress_proxy {
         eprintln!("[fc-agent] starting vsock egress proxy");
-        tokio::spawn(proxy::run_egress_proxy());
+        let signal = egress_reconnect.clone();
+        tokio::spawn(proxy::run_egress_proxy(signal));
     }
 
     if let Err(e) = mmds::sync_clock_from_host().await {
@@ -73,6 +78,7 @@ pub async fn run() -> Result<()> {
     let watcher_exec_rebind_needed = exec_rebind_needed.clone();
     let watcher_exec_rebind_done = exec_rebind_done.clone();
     let watcher_exec_rebind_done_notify = exec_rebind_done_notify.clone();
+    let watcher_egress_reconnect = egress_reconnect.clone();
     tokio::spawn(async move {
         eprintln!("[fc-agent] starting restore-epoch watcher");
         mmds::watch_restore_epoch(
@@ -82,6 +88,7 @@ pub async fn run() -> Result<()> {
             watcher_exec_rebind_needed,
             watcher_exec_rebind_done,
             watcher_exec_rebind_done_notify,
+            watcher_egress_reconnect,
         )
         .await;
     });
@@ -278,6 +285,14 @@ pub async fn run() -> Result<()> {
                 // finishes. This explicit reconnect ensures the output writer has
                 // a live connection before the container starts.
                 output.reconnect();
+                // Signal egress proxy to reconnect its vsock. On warm start (restored
+                // from cached pre-start snapshot), VIRTIO_VSOCK_EVENT_TRANSPORT_RESET
+                // killed the proxy's vsock. handle_clone_restore() also signals this,
+                // but there's a race: restore_flag is set before handle_clone_restore
+                // completes. This explicit signal ensures the proxy reconnects before
+                // the container starts making TCP connections. Harmless on cold start
+                // (pause/resume doesn't break connections — proxy just cycles).
+                egress_reconnect.notify_waiters();
             } else {
                 eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing");
             }
