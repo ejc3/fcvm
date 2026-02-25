@@ -88,9 +88,6 @@ integration-slow = []        # Slow VM tests, > 30s each (clone, snapshot, fuse 
 # Privileged tests require sudo (bridged networking, pjdfstest, iptables)
 privileged-tests = []
 
-# Manual benchmarks (high resource requirements: 16 vCPUs, 16GB RAM, sudo)
-bench = []
-
 # libfuse remap_file_range container test (requires pre-built container)
 libfuse-test = []
 

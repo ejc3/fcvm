@@ -13,7 +13,7 @@
 //! The IP 192.0.2.1 (RFC 5737 TEST-NET-1) is NOT in the iptables exemption
 //! ranges (127.0.0.0/8 and 10.0.2.0/24), so it gets caught by the REDIRECT rule.
 
-#![cfg(feature = "bench")]
+#![cfg(feature = "integration-slow")]
 
 mod common;
 
