@@ -489,10 +489,7 @@ fn find_firecracker_for_fcvm(fcvm_pid: u32) -> Option<u32> {
 
 /// Find the pasta process spawned by a specific fcvm process
 fn find_pasta_for_fcvm(fcvm_pid: u32) -> Option<u32> {
-    let output = Command::new("pgrep")
-        .args(["-f", "pasta"])
-        .output()
-        .ok()?;
+    let output = Command::new("pgrep").args(["-f", "pasta"]).output().ok()?;
 
     if !output.status.success() {
         return None;

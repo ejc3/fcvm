@@ -13,7 +13,7 @@ use crate::cli::{
     NetworkMode, SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs,
     SnapshotServeArgs,
 };
-use crate::network::{BridgedNetwork, NetworkManager, PortMapping, PastaNetwork};
+use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, PortMapping};
 use crate::paths;
 use crate::state::{
     generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState, VmStatus,

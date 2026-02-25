@@ -83,6 +83,15 @@ ln -sf /home/ubuntu/.cargo/bin/cargo /usr/local/bin/cargo
 ln -sf /home/ubuntu/.cargo/bin/rustc /usr/local/bin/rustc
 ln -sf /home/ubuntu/.cargo/bin/rustup /usr/local/bin/rustup
 
+# Build passt from source (distro version lacks --no-splice)
+cd /tmp
+git clone https://passt.top/passt /tmp/passt-build
+cd /tmp/passt-build
+make -j"$(nproc)"
+cp pasta passt /usr/local/bin/
+rm -rf /tmp/passt-build
+cd /
+
 # Firecracker (upstream baseline - CI overrides with custom fork from rootfs-config.toml)
 # CI's "Install custom Firecracker" step builds from the btrfs profile's firecracker_repo
 # and installs the custom binary. This baseline is only used during initial setup.

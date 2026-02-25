@@ -107,6 +107,13 @@ export HOME=/root
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source /root/.cargo/env
 
+# Build passt from source (distro version lacks --no-splice)
+git clone https://passt.top/passt /tmp/passt-build
+cd /tmp/passt-build && make -j"$(nproc)"
+cp pasta passt /usr/local/bin/
+rm -rf /tmp/passt-build
+cd /
+
 # Clone fcvm and its dependencies
 git clone --depth 1 https://github.com/ejc3/fcvm.git /tmp/fcvm
 git clone --depth 1 https://github.com/ejc3/fuse-backend-rs.git /tmp/fuse-backend-rs
