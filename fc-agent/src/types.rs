@@ -47,6 +47,10 @@ pub struct Plan {
     /// deadlocking FUSE-based services in the container.
     #[serde(default)]
     pub non_blocking_output: bool,
+    /// Enable vsock egress proxy: transparent TCP proxy over vsock bypassing
+    /// the TAP/bridge/pasta data path for outbound connections.
+    #[serde(default)]
+    pub egress_proxy: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

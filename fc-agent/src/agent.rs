@@ -1,7 +1,7 @@
 use anyhow::Result;
 use tokio::time::{sleep, Duration};
 
-use crate::{container, exec, lock_test, mmds, mounts, network, output, system};
+use crate::{container, exec, lock_test, mmds, mounts, network, output, proxy, system};
 
 /// Main agent logic — fetches plan, runs container, triggers shutdown.
 pub async fn run() -> Result<()> {
@@ -31,6 +31,11 @@ pub async fn run() -> Result<()> {
 
     if !plan.forward_localhost.is_empty() {
         network::setup_localhost_forwarding(&plan.forward_localhost);
+    }
+
+    if plan.egress_proxy {
+        eprintln!("[fc-agent] starting vsock egress proxy");
+        tokio::spawn(proxy::run_egress_proxy());
     }
 
     if let Err(e) = mmds::sync_clock_from_host().await {

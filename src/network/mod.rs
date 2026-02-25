@@ -1,4 +1,5 @@
 pub mod bridged;
+pub mod egress_proxy;
 pub mod namespace;
 pub mod pasta;
 pub mod portmap;

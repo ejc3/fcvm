@@ -799,6 +799,18 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         None
     };
 
+    // Start egress proxy for rootless mode (bypasses TAP/bridge for outbound TCP)
+    let egress_proxy_handle = if matches!(args.network, NetworkMode::Rootless) {
+        let socket_path = vsock_socket_path.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) = crate::network::egress_proxy::run_egress_proxy(&socket_path).await {
+                tracing::warn!("Egress proxy error: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
+
     // Run the main VM setup in a helper to ensure cleanup on error
     let setup_result = run_vm_setup(
         VmSetupParams {
@@ -837,6 +849,11 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
 
         // Abort output listener task if still running
         if let Some(handle) = output_handle {
+            handle.abort();
+        }
+
+        // Abort egress proxy if running
+        if let Some(handle) = egress_proxy_handle {
             handle.abort();
         }
 
