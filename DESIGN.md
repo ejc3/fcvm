@@ -395,9 +395,9 @@ Each VM has:
 ### Rootless Mode (pasta with Bridge Architecture)
 
 **Key Insight**: pasta and Firecracker CANNOT share a TAP device (both need exclusive access).
-**Solution**: Use a Linux bridge (br0) for L2 forwarding between pasta and Firecracker inside a user namespace. pasta is started with `--no-splice` to force the L2 TAP path (required because the VM is behind a bridge).
+**Solution**: Use a Linux bridge (br0) for L2 forwarding between pasta and Firecracker inside a user namespace.
 
-**Architecture**: pasta uses splice(2) zero-copy L4 translation instead of a full userspace TCP/IP stack. With `--no-splice`, it falls back to the L2 TAP path needed for bridged VM networking.
+**Architecture**: pasta uses splice(2) zero-copy L4 translation instead of a full userspace TCP/IP stack. Inbound port forwarding uses splice for zero-copy socket-to-socket transfer; outbound traffic goes through pasta's L2 TAP path via the bridge.
 
 **Topology**:
 ```
@@ -420,35 +420,41 @@ pasta <──────────────────┼── pasta0 �
 - IP forwarding rewrites source MAC, breaking pasta's connection tracking
 - Bridge also enables IPv6 with proper NDP neighbor discovery
 
-**Setup Sequence** (3-phase with nsenter):
+**Setup Sequence** (4-phase with nsenter):
 1. Spawn holder process: `unshare --user --net -- sleep infinity` (UID/GID mappings written externally)
-2. Run setup via nsenter: create bridge, TAPs, add namespace IP
-3. Start pasta attached to holder's namespace (connects to pasta0)
-4. Run Firecracker via nsenter: `nsenter -t HOLDER_PID -U -n -- firecracker ...`
-5. Health checks via nsenter: `nsenter -t HOLDER_PID -U -n -- curl 10.0.2.100:80`
+2. Run pre-setup via nsenter: create Firecracker TAP only (`build_setup_script`)
+3. Start pasta: creates pasta0 TAP in namespace with L2↔L4 translation
+4. Run post-setup via nsenter: create bridge, add both TAPs, enable ip_forward (`build_bridge_script`)
+5. Run Firecracker via nsenter: `nsenter -t HOLDER_PID -U -n -- firecracker ...`
+6. Health checks via nsenter: `nsenter -t HOLDER_PID -U -n -- curl 10.0.2.100:80`
 
-**Network Setup Script** (executed via nsenter):
+**Pre-Setup Script** (step 2, creates Firecracker TAP before pasta starts):
 ```bash
-# Create bridge for L2 forwarding
-ip link add br0 type bridge
-ip link set br0 up
+# Create TAP device for Firecracker (pasta creates its own TAP separately)
+ip tuntap add tap-fc mode tap
+ip link set tap-fc up
+ip link set lo up
+```
 
-# Create pasta0 TAP for pasta
-ip tuntap add pasta0 mode tap
-ip link set pasta0 master br0
+**Bridge Setup Script** (step 4, after pasta creates pasta0):
+```bash
+# Wait for pasta0 to appear
+ip link show pasta0
+
+# Bring pasta0 up (pasta creates it but doesn't bring it up without --config-net)
 ip link set pasta0 up
 
-# Create tap-fc for Firecracker
-ip tuntap add tap-fc mode tap
+# Create L2 bridge — connects pasta0 and Firecracker TAP
+ip link add br0 type bridge
+ip link set br0 up
+ip link set pasta0 master br0
 ip link set tap-fc master br0
-ip link set tap-fc up
 
 # Add IP to bridge for health checks
-# This enables nsenter to route to guest via the 10.0.2.x subnet
 ip addr add 10.0.2.1/24 dev br0
 
-# Set default route via pasta gateway
-ip route add default via 10.0.2.2 dev br0
+# Enable IP forwarding
+echo 1 > /proc/sys/net/ipv4/ip_forward
 ```
 
 **Port Forwarding** (unique loopback IPs):
@@ -459,13 +465,15 @@ ip route add default via 10.0.2.2 dev br0
 #   -t <host_port>:<guest_port> for TCP
 #   -u <host_port>:<guest_port> for UDP
 pasta \
-  --no-splice \
-  -a 10.0.2.2 \
+  --foreground --quiet \
+  -P /tmp/pasta.pid \
+  --ns-ifname pasta0 \
+  -a 10.0.2.100 \
+  -n 255.255.255.0 \
   -g 10.0.2.2 \
-  -D 10.0.2.3 \
-  --mtu 65520 \
-  -t 8080:80 \
-  -I pasta0 \
+  --no-dhcp \
+  -t 127.0.0.2/8080:80 \
+  -T none -U none \
   <holder-pid>
 ```
 

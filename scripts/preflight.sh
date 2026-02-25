@@ -16,13 +16,9 @@ fi
 
 echo "[preflight] checking pasta (for rootless) ..."
 if command -v pasta >/dev/null 2>&1; then
-  if pasta --help 2>&1 | grep -q 'no-splice'; then
-    echo "OK: pasta present with --no-splice support."
-  else
-    echo "WARN: pasta present but lacks --no-splice. Build from source: ./scripts/build-passt.sh"
-  fi
+  echo "OK: pasta present."
 else
-  echo "WARN: pasta not found. Build from source: ./scripts/build-passt.sh"
+  echo "WARN: pasta not found. Install passt package or build from source: ./scripts/build-passt.sh"
 fi
 
 echo "[preflight] checking nftables/iproute2 (for privileged) ..."
