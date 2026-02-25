@@ -8,6 +8,7 @@ pub async fn run() -> Result<()> {
     eprintln!("[fc-agent] run_agent starting");
 
     system::raise_resource_limits();
+    system::raise_cgroup_pids_limit();
     system::create_kvm_device();
     network::configure_dns_from_cmdline();
     network::configure_ipv6_from_cmdline();
@@ -303,6 +304,7 @@ pub async fn run() -> Result<()> {
         "fs.file-max=2097152",
         "fs.nr_open=2097152",
         "net.ipv4.ip_unprivileged_port_start=0",
+        "kernel.threads-max=4194304",
     ] {
         let _ = std::process::Command::new("sysctl")
             .args(["-w", sysctl])
