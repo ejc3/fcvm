@@ -48,8 +48,9 @@ const PASTA_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// pasta provides near-native throughput via splice(2) zero-copy L4 translation,
 /// replacing slirp4netns's slower userspace TCP/IP stack.
 ///
-/// Port forwarding uses pasta's built-in host-side binding combined with
-/// iptables DNAT inside the user namespace to reach the VM through the bridge.
+/// Port forwarding uses pasta's built-in host-side binding with `--no-splice`
+/// to force L2 TAP path: pasta binds on host, creates L2 frames, sends through
+/// pasta0 TAP → bridge → tap-fc → VM. No iptables rules required.
 ///
 /// Setup sequence:
 /// 1. Spawn holder process: `unshare --user --net -- sleep infinity`
@@ -527,7 +528,7 @@ impl NetworkManager for PastaNetwork {
         // Phase 1: Start pasta (creates pasta0 TAP in namespace)
         self.start_pasta(holder_pid).await?;
 
-        // Phase 2: Create bridge connecting pasta0 and Firecracker's TAP, add DNAT rules
+        // Phase 2: Create bridge connecting pasta0 and Firecracker's TAP
         let bridge_script = self.build_bridge_script();
         let nsenter_prefix = self.build_nsenter_prefix(holder_pid);
 
