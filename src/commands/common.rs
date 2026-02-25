@@ -1437,27 +1437,13 @@ pub async fn create_snapshot_core(
 
     info!(snapshot = %snapshot_config.name, "VM resumed, processing snapshot");
 
-    // Firecracker resets all vsock connections during snapshot creation
-    // (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET). Bump restore-epoch in MMDS so fc-agent's
-    // background watcher detects this and triggers handle_clone_restore() which
-    // re-registers the exec server's AsyncFd (stale after transport reset) and
-    // reconnects the output vsock. This MUST succeed — if the epoch isn't bumped,
-    // the exec server stays stale and health checks hang for ~60s.
-    let restore_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if let Err(e) = client
-        .patch_mmds(serde_json::json!({
-            "latest": {
-                "restore-epoch": restore_epoch.to_string()
-            }
-        }))
-        .await
-    {
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-        return Err(e).context("bumping restore-epoch in MMDS after snapshot");
-    }
+    // NOTE: Do NOT bump restore-epoch here. Snapshot create (pause → dump → resume)
+    // does NOT reset vsock connections — empirically verified with scratch VMs.
+    // VIRTIO_VSOCK_EVENT_TRANSPORT_RESET only occurs on snapshot RESTORE (loading
+    // a new VM from snapshot files), not on create. Bumping restore-epoch here
+    // would trigger handle_clone_restore() in fc-agent, which kills TCP connections
+    // and reconnects FUSE/output vsock unnecessarily, crashing the running container.
+    // restore-epoch is bumped in the restore path (snapshot.rs) where it's needed.
 
     if has_base {
         // Diff snapshot: copy base to temp, merge diff onto it, then atomic rename
