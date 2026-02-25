@@ -1,17 +1,15 @@
 use anyhow::{Context, Result};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use super::namespace;
 use super::types::generate_mac;
 use super::veth;
 use super::{NetworkConfig, NetworkManager, PortMapping};
-use crate::paths;
 use crate::state::truncate_id;
 
 /// Guest network addressing (same as pasta/bridged for Firecracker compatibility)
 const GUEST_IP: &str = "10.0.2.100";
 const GUEST_GATEWAY: &str = "10.0.2.1";
-const GUEST_NETMASK: &str = "255.255.255.0";
 
 /// Bridge device name
 const BRIDGE_DEVICE: &str = "br0";
@@ -49,7 +47,7 @@ pub struct RoutedNetwork {
     guest_ip: Option<String>,
     vm_ipv6: Option<String>,
     host_ipv6_subnet: Option<String>,
-    port_mapping_rules: Vec<String>,
+    loopback_ip: Option<String>,
 }
 
 impl RoutedNetwork {
@@ -65,7 +63,7 @@ impl RoutedNetwork {
             guest_ip: None,
             vm_ipv6: None,
             host_ipv6_subnet: None,
-            port_mapping_rules: Vec::new(),
+            loopback_ip: None,
         }
     }
 
@@ -169,10 +167,11 @@ impl NetworkManager for RoutedNetwork {
         veth::connect_tap_to_veth(&ns_name, &self.tap_device, &guest_veth).await?;
         // Bring up all interfaces (connect_tap_to_veth only brings up the bridge)
         namespace::exec_in_namespace(&ns_name, &["ip", "link", "set", "lo", "up"]).await?;
-        namespace::exec_in_namespace(&ns_name, &["ip", "link", "set", &self.tap_device, "up"]).await?;
+        namespace::exec_in_namespace(&ns_name, &["ip", "link", "set", &self.tap_device, "up"])
+            .await?;
         namespace::exec_in_namespace(&ns_name, &["ip", "link", "set", &guest_veth, "up"]).await?;
 
-        // 6. Assign gateway IPs to bridge (VM connects here via TAP)
+        // 5. Assign gateway IPs to bridge (VM connects here via TAP)
         let gw_cidr = format!("{}/24", GUEST_GATEWAY);
         namespace::exec_in_namespace(
             &ns_name,
@@ -184,11 +183,20 @@ impl NetworkManager for RoutedNetwork {
         // drops all IPv6 packets to it — breaking the VM's default route via fd00::1.
         namespace::exec_in_namespace(
             &ns_name,
-            &["ip", "-6", "addr", "add", "fd00::1/64", "dev", BRIDGE_DEVICE, "nodad"],
+            &[
+                "ip",
+                "-6",
+                "addr",
+                "add",
+                "fd00::1/64",
+                "dev",
+                BRIDGE_DEVICE,
+                "nodad",
+            ],
         )
         .await?;
 
-        // 6. Bring up host veth and wait for link-local
+        // 6. Bring up host veth
         let output = tokio::process::Command::new("ip")
             .args(["link", "set", &host_veth, "up"])
             .output()
@@ -207,15 +215,25 @@ impl NetworkManager for RoutedNetwork {
 
         // 8. Assign link-local to host veth manually (auto-assignment fails when
         //    all.forwarding=1 from a previous run). Use EUI-64 from MAC + nodad.
-        let host_ll = generate_link_local_from_mac(&host_veth).await
+        let host_ll = generate_link_local_from_mac(&host_veth)
+            .await
             .context("failed to generate link-local for host veth")?;
         let host_ll_cidr = format!("{}/64", host_ll);
         let _ = tokio::process::Command::new("ip")
-            .args(["-6", "addr", "add", &host_ll_cidr, "dev", &host_veth, "scope", "link", "nodad"])
+            .args([
+                "-6",
+                "addr",
+                "add",
+                &host_ll_cidr,
+                "dev",
+                &host_veth,
+                "scope",
+                "link",
+                "nodad",
+            ])
             .output()
             .await;
         info!(host_ll = %host_ll, "assigned link-local to host veth");
-        info!(host_ll = %host_ll, "host veth link-local for routing");
 
         // 9. Add routable source IPv6 to bridge (for namespace-originated traffic).
         //    Uses a separate address from the VM's — the namespace needs its own
@@ -224,8 +242,18 @@ impl NetworkManager for RoutedNetwork {
         let ns_source_cidr = format!("{}/128", ns_source_ipv6);
         namespace::exec_in_namespace(
             &ns_name,
-            &["ip", "-6", "addr", "add", &ns_source_cidr, "dev", BRIDGE_DEVICE, "nodad"],
-        ).await?;
+            &[
+                "ip",
+                "-6",
+                "addr",
+                "add",
+                &ns_source_cidr,
+                "dev",
+                BRIDGE_DEVICE,
+                "nodad",
+            ],
+        )
+        .await?;
 
         // 10. In namespace: default IPv6 route goes through bridge → veth → host.
         //     The bridge forwards L2 frames from br0 to veth (bridge member).
@@ -233,14 +261,26 @@ impl NetworkManager for RoutedNetwork {
         //     Use the host veth's link-local as nexthop (reachable via NDP on bridge).
         namespace::exec_in_namespace(
             &ns_name,
-            &["ip", "-6", "route", "add", "default", "via", &host_ll, "dev", BRIDGE_DEVICE],
-        ).await?;
+            &[
+                "ip",
+                "-6",
+                "route",
+                "add",
+                "default",
+                "via",
+                &host_ll,
+                "dev",
+                BRIDGE_DEVICE,
+            ],
+        )
+        .await?;
 
         // 11. Enable IPv6 forwarding in namespace (for VM traffic forwarding)
         namespace::exec_in_namespace(
             &ns_name,
             &["sysctl", "-w", "net.ipv6.conf.all.forwarding=1"],
-        ).await?;
+        )
+        .await?;
 
         // 12. On host: route VM's IPv6 back through veth to the namespace
         let vm_route = format!("{}/128", vm_ipv6);
@@ -255,9 +295,19 @@ impl NetworkManager for RoutedNetwork {
             .await;
 
         // 13. Add proxy NDP so the network fabric routes VM's IPv6 to this host
-        let default_iface = detect_default_ipv6_interface().await.unwrap_or_else(|| "eth0".to_string());
+        let default_iface = detect_default_ipv6_interface()
+            .await
+            .unwrap_or_else(|| "eth0".to_string());
         let _ = tokio::process::Command::new("ip")
-            .args(["-6", "neigh", "add", "proxy", &vm_ipv6, "dev", &default_iface])
+            .args([
+                "-6",
+                "neigh",
+                "add",
+                "proxy",
+                &vm_ipv6,
+                "dev",
+                &default_iface,
+            ])
             .output()
             .await;
         info!(vm_ipv6 = %vm_ipv6, iface = %default_iface, "added proxy NDP");
@@ -275,7 +325,10 @@ impl NetworkManager for RoutedNetwork {
         //     The host route from step 14 makes 10.0.2.100 reachable.
         let loopback_ip = format!("127.0.0.{}", 2 + (std::process::id() % 252) as u8);
         for mapping in &self.port_mappings {
-            let listen = format!("TCP-LISTEN:{},bind={},fork,reuseaddr", mapping.host_port, loopback_ip);
+            let listen = format!(
+                "TCP-LISTEN:{},bind={},fork,reuseaddr",
+                mapping.host_port, loopback_ip
+            );
             let connect = format!("TCP:{}:{}", GUEST_IP, mapping.guest_port);
             let _child = tokio::process::Command::new("socat")
                 .args([&listen, &connect])
@@ -300,6 +353,11 @@ impl NetworkManager for RoutedNetwork {
         self.guest_ip = Some(GUEST_IP.to_string());
         self.vm_ipv6 = Some(vm_ipv6.clone());
         self.host_ipv6_subnet = Some(ipv6_prefix);
+        self.loopback_ip = if self.port_mappings.is_empty() {
+            None
+        } else {
+            Some(loopback_ip.clone())
+        };
 
         Ok(NetworkConfig {
             tap_device: self.tap_device.clone(),
@@ -307,7 +365,11 @@ impl NetworkManager for RoutedNetwork {
             guest_ip: Some(guest_ip),
             host_ip: Some(GUEST_GATEWAY.to_string()),
             host_veth: self.host_veth.clone(),
-            loopback_ip: if self.port_mappings.is_empty() { None } else { Some(loopback_ip) },
+            loopback_ip: if self.port_mappings.is_empty() {
+                None
+            } else {
+                Some(loopback_ip)
+            },
             dns_server: None, // Use host DNS servers directly (kernel-routed)
             guest_ipv6: Some(vm_ipv6),
             // fd00::1 is on the bridge inside the namespace. The VM uses it as IPv6 gateway.
@@ -322,11 +384,16 @@ impl NetworkManager for RoutedNetwork {
     async fn cleanup(&mut self) -> Result<()> {
         info!(vm_id = %self.vm_id, "cleaning up routed network resources");
 
-        // Kill socat port forwarders
-        let _ = tokio::process::Command::new("pkill")
-            .args(["-f", &format!("socat.*TCP:{}:", GUEST_IP)])
-            .output()
-            .await;
+        // Kill socat port forwarders for this VM only (match on bind address)
+        if let Some(ref loopback_ip) = self.loopback_ip {
+            let _ = tokio::process::Command::new("pkill")
+                .args([
+                    "-f",
+                    &format!("socat.*bind={}.*TCP:{}:", loopback_ip, GUEST_IP),
+                ])
+                .output()
+                .await;
+        }
 
         // Remove host IPv4 route to VM subnet
         let _ = tokio::process::Command::new("ip")
@@ -334,17 +401,36 @@ impl NetworkManager for RoutedNetwork {
             .output()
             .await;
 
-        // Remove proxy NDP
+        // Remove proxy NDP and host routes
         if let Some(ref vm_ipv6) = self.vm_ipv6 {
-            let default_iface = detect_default_ipv6_interface().await.unwrap_or_else(|| "eth0".to_string());
+            let default_iface = detect_default_ipv6_interface()
+                .await
+                .unwrap_or_else(|| "eth0".to_string());
             let _ = tokio::process::Command::new("ip")
-                .args(["-6", "neigh", "del", "proxy", vm_ipv6, "dev", &default_iface])
+                .args([
+                    "-6",
+                    "neigh",
+                    "del",
+                    "proxy",
+                    vm_ipv6,
+                    "dev",
+                    &default_iface,
+                ])
                 .output()
                 .await;
 
-            // Remove host route
+            // Remove VM host route
             let _ = tokio::process::Command::new("ip")
                 .args(["-6", "route", "del", &format!("{}/128", vm_ipv6)])
+                .output()
+                .await;
+        }
+
+        // Remove namespace source IPv6 host route
+        if let Some(ref prefix) = self.host_ipv6_subnet {
+            let ns_source_cidr = format!("{}::face:1/128", prefix);
+            let _ = tokio::process::Command::new("ip")
+                .args(["-6", "route", "del", &ns_source_cidr])
                 .output()
                 .await;
         }
@@ -395,49 +481,6 @@ async fn generate_link_local_from_mac(iface: &str) -> Option<String> {
                         "fe80::{:02x}{:02x}:{:02x}ff:fe{:02x}:{:02x}{:02x}",
                         b0, bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
                     ));
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Get link-local IPv6 address of a host interface
-async fn get_link_local_ipv6(iface: &str) -> Option<String> {
-    let output = tokio::process::Command::new("ip")
-        .args(["-6", "addr", "show", iface, "scope", "link"])
-        .output()
-        .await
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("inet6 ") {
-            if let Some(addr) = rest.split('/').next() {
-                if addr.starts_with("fe80") {
-                    return Some(addr.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Get link-local IPv6 address of an interface inside a namespace
-async fn get_link_local_ipv6_in_ns(ns_name: &str, iface: &str) -> Option<String> {
-    let output = namespace::exec_in_namespace(
-        ns_name,
-        &["ip", "-6", "addr", "show", iface, "scope", "link"],
-    )
-    .await
-    .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("inet6 ") {
-            if let Some(addr) = rest.split('/').next() {
-                if addr.starts_with("fe80") {
-                    return Some(addr.to_string());
                 }
             }
         }
