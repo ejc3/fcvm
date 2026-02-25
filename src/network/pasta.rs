@@ -160,6 +160,13 @@ ip link set lo up
             r#"
 set -e
 
+# Wait for pasta0 to appear (under load, PID file may be written before device is visible)
+for i in $(seq 1 50); do
+    ip link show {pasta_dev} >/dev/null 2>&1 && break
+    sleep 0.1
+done
+ip link show {pasta_dev} >/dev/null 2>&1 || {{ echo "Cannot find device \"{pasta_dev}\"" >&2; exit 1; }}
+
 # Bring pasta0 up (pasta creates it but doesn't bring it up without --config-net)
 ip link set {pasta_dev} up
 

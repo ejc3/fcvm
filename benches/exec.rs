@@ -594,14 +594,9 @@ impl CloneFixture {
                 std::thread::sleep(Duration::from_millis(200));
             }
             if let Ok(mut stream) = TcpStream::connect(&addr) {
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .ok();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(2)))
-                    .ok();
-                let request =
-                    "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+                let request = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
                 if stream.write_all(request.as_bytes()).is_ok() {
                     let mut response = Vec::new();
                     let _ = stream.read_to_end(&mut response);
