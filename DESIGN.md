@@ -507,6 +507,55 @@ Host (127.0.0.x:8080) → pasta → pasta0 → br0 (L2) → tap-fc → Guest (10
 - Works in nested VMs and restricted environments
 - Fully compatible with rootless Podman in guest
 
+### Egress Proxy (Rootless Outbound TCP)
+
+In rootless mode, pasta handles inbound port forwarding and DNS, but outbound TCP from the
+guest requires a transparent proxy because there is no NAT gateway. The egress proxy
+multiplexes all outbound TCP connections over a **single vsock connection** using a
+frame-based protocol.
+
+**Architecture**:
+```
+Guest VM                                          Host
+─────────                                         ────
+App connects to 93.184.216.34:80
+  ↓
+iptables REDIRECT → proxy (127.0.0.1:12345)
+  ↓
+SO_ORIGINAL_DST → 93.184.216.34:80
+  ↓
+Assign stream_id, send OPEN frame
+  ↓                                               ↓
+Single persistent vsock (port 52000)     ───→   UnixStream reader
+                                                  ↓ OPEN → spawn TCP to destination
+                                                  ↓ send OPEN_OK back
+  ↓ (OPEN_OK received)
+Bidirectional DATA frames              ←──→     DATA frames relayed to/from TCP
+  ↓
+CLOSE frame when done                  ───→     Close TCP, cleanup
+```
+
+**Frame Format** (10-byte header):
+- `stream_id` (u32 LE): unique per TCP connection
+- `frame_type` (u8): OPEN=1, DATA=2, CLOSE=3, RST=4, OPEN_OK=5, OPEN_FAIL=6
+- `flags` (u8): reserved
+- `payload_len` (u32 LE): payload length after header
+
+**Guest Side** (`fc-agent/src/proxy.rs`):
+- iptables REDIRECT captures outbound TCP (excluding local, link-local, MMDS)
+- Single writer task serializes frame writes to vsock
+- Reader task routes incoming frames to per-stream channels via `DashMap`
+- Per-connection handler: accept → SO_ORIGINAL_DST → OPEN → relay DATA
+
+**Host Side** (`src/network/egress_proxy.rs`):
+- Accepts vsock connections from guest
+- OPEN frames spawn TCP connections to real destinations
+- DATA frames relayed bidirectionally between vsock and TCP
+- CLOSE/RST frames trigger cleanup
+
+**Snapshot Restore**: After `VIRTIO_VSOCK_EVENT_TRANSPORT_RESET`, a `tokio::sync::Notify`
+signal breaks the stale mux session and triggers immediate vsock reconnection.
+
 ### Privileged Mode (Network Namespace + veth + iptables)
 
 **Topology**:
@@ -1266,7 +1315,8 @@ fcvm/
 │   │   ├── namespace.rs    # Network namespace management
 │   │   ├── veth.rs         # Veth pair management
 │   │   ├── types.rs        # Network types
-│   │   └── portmap.rs      # Port mapping utilities
+│   │   ├── portmap.rs      # Port mapping utilities
+│   │   └── egress_proxy.rs # Host-side multiplexed egress proxy
 │   │
 │   ├── storage/            # Storage & snapshots
 │   │   ├── mod.rs
@@ -1298,7 +1348,10 @@ fcvm/
 ├── fc-agent/               # Guest agent crate
 │   ├── Cargo.toml
 │   └── src/
-│       └── main.rs         # MMDS + Podman orchestration
+│       ├── main.rs         # Entry point
+│       ├── agent.rs        # MMDS + Podman orchestration
+│       ├── proxy.rs        # Guest-side multiplexed egress proxy
+│       └── restore.rs      # Snapshot restore handler
 │
 ├── fuse-pipe/              # FUSE passthrough library
 │   ├── Cargo.toml

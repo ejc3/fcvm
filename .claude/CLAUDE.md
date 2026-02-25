@@ -1111,7 +1111,7 @@ src/
 ├── commands/         # Command implementations
 ├── state/            # VM state management
 ├── firecracker/      # Firecracker API client
-├── network/          # Networking layer (bridged + pasta)
+├── network/          # Networking layer (bridged + pasta + egress proxy)
 ├── storage/          # Disk/snapshot management
 ├── uffd/             # UFFD memory sharing
 ├── volume/           # FUSE volume handling
@@ -1124,7 +1124,10 @@ tests/
 ├── test_health_monitor.rs     # Health monitoring tests
 ├── test_fuse_in_vm_matrix.rs  # In-VM pjdfstest (17 categories, parallel via nextest)
 ├── test_localhost_image.rs    # Local image tests
-└── test_snapshot_clone.rs     # Snapshot/clone workflow tests
+├── test_snapshot_clone.rs     # Snapshot/clone workflow tests
+├── test_egress.rs             # Egress proxy tests (rootless + bridged, fresh + clone)
+├── test_egress_stress.rs      # Egress proxy IPv4/IPv6 stress tests
+└── test_egress_proxy_bench.rs # 8000-connection concurrent benchmark
 
 fuse-pipe/tests/
 ├── integration.rs              # Basic FUSE operations (no root)
