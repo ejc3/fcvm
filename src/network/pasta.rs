@@ -36,7 +36,7 @@ const PASTA_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 ///
 /// Architecture (L2 Bridge + L4 translation):
 /// ```text
-/// Host                    | User Namespace (unshare --user --map-root-user --net)
+/// Host                    | User Namespace (unshare --user --net)
 ///                         |
 /// pasta  <----------------+-- pasta0 --+
 ///   (L2↔L4 translation,   |            |
@@ -115,9 +115,6 @@ impl PastaNetwork {
     /// Returns command to spawn a holder process that keeps the namespace alive.
     /// The holder runs `sleep infinity` which blocks forever until killed.
     /// Note: We use sleep instead of cat because cat requires stdin management.
-    ///
-    /// Uses --map-root-user for simple 1:1 UID mapping (current user → UID 0 inside namespace).
-    /// This works for both root and unprivileged users.
     ///
     /// Note: No --map-root-user here — setup_namespace_mappings() in common.rs handles
     /// UID/GID mapping after the namespace is created (tries newuidmap first, falls back
@@ -213,7 +210,7 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
 
     /// Get a human-readable representation of the rootless networking flow
     pub fn rootless_flow_string(&self) -> String {
-        "holder(unshare --map-root-user) + nsenter for setup/firecracker".to_string()
+        "holder(unshare --user --net) + nsenter for setup/firecracker".to_string()
     }
 
     /// Detect host's global IPv6 address for pasta outbound traffic
