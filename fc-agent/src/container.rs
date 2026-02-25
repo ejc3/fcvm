@@ -747,10 +747,11 @@ pub fn notify_cache_ready_and_wait(
     // still setting up the snapshot — killing the VM mid-pause.
     //
     // Valid exit conditions:
-    // 1. "cache-ack" received — host says no snapshot needed
-    // 2. POLLHUP / read returns 0 — vsock reset from snapshot pause/resume
-    //    (this is the SUCCESS case: VM was snapshotted, we're post-restore)
-    // 3. 30s deadline — failsafe timeout
+    // 1. "cache-ack" received — host says no snapshot needed (cold start)
+    // 2. POLLHUP / read returns 0 — vsock reset from snapshot RESTORE
+    //    (warm start: VM was restored from cached pre-start snapshot)
+    // 3. restore_flag set by restore-epoch watcher (warm start, POLLHUP not delivered)
+    // 4. 30s deadline — failsafe timeout
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 
     loop {
@@ -807,10 +808,10 @@ pub fn notify_cache_ready_and_wait(
 
         if let Some(revents) = poll_fds[0].revents() {
             if revents.contains(PollFlags::POLLHUP) || revents.contains(PollFlags::POLLERR) {
-                // vsock reset from snapshot pause/resume. This means the
-                // host successfully paused the VM for a snapshot. After
-                // resume, all vsock connections are reset (TRANSPORT_RESET).
-                eprintln!("[fc-agent] cache-ack connection reset (snapshot taken)");
+                // vsock reset from snapshot RESTORE. This happens on warm start:
+                // the host restored this VM from a cached pre-start snapshot, and
+                // VIRTIO_VSOCK_EVENT_TRANSPORT_RESET killed all connections.
+                eprintln!("[fc-agent] cache-ack connection reset (snapshot restore detected)");
                 return true;
             }
         }

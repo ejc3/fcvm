@@ -256,12 +256,22 @@ pub async fn run() -> Result<()> {
             eprintln!("[fc-agent] image digest: {}", digest);
             if container::notify_cache_ready_and_wait(&digest, &restore_flag) {
                 eprintln!("[fc-agent] cache ready notification acknowledged");
-                // Pre-start snapshot was taken and we've been restored into a new
-                // Firecracker instance. Exec rebind + output reconnect are handled
-                // by handle_clone_restore() via the restore-epoch watcher.
-                // Do NOT signal exec rebind here — a duplicate re_register() corrupts
-                // the AsyncFd epoll registration, causing health checks to hang for ~60s
-                // (see plan trace evidence for the smoking gun vsock muxer logs).
+                // Reconnect output vsock before starting the container.
+                //
+                // On COLD start (first run), pause/resume does NOT reset vsock —
+                // this reconnect is harmless (just cycles the connection).
+                //
+                // On WARM start (restored from cached pre-start snapshot), vsock
+                // IS dead (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET on restore). The
+                // restore-epoch watcher calls handle_clone_restore() which also
+                // reconnects output — but there's a race: restore_flag is set
+                // BEFORE handle_clone_restore completes, so notify_cache_ready_and_wait
+                // returns before output.reconnect() has been called. For fast-exit
+                // containers (echo + exit in ~200ms), the container runs and exits
+                // with output going to the dead vsock before handle_clone_restore
+                // finishes. This explicit reconnect ensures the output writer has
+                // a live connection before the container starts.
+                output.reconnect();
             } else {
                 eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing");
             }
@@ -270,14 +280,6 @@ pub async fn run() -> Result<()> {
             eprintln!("[fc-agent] WARNING: failed to get image digest: {:?}", e);
         }
     }
-
-    // After cache-ready handshake, Firecracker may have created a pre-start snapshot.
-    // Snapshot creation resets all vsock connections (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET).
-    // Output vsock reconnection is handled by handle_clone_restore() which is triggered
-    // by the restore-epoch watcher. Do NOT reconnect here — a second reconnect() call
-    // races with handle_clone_restore's reconnect and causes the output writer to cycle
-    // through multiple ghost connections (Notify stored-permit cascade), dropping data.
-    // FUSE mounts handle reconnection automatically via the reconnectable multiplexer.
 
     // VM-level setup: hostname and sysctl (runs as root before container starts).
     // When using --user, the container runs as non-root and can't do these.

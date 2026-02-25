@@ -311,33 +311,94 @@ pub fn configure_ipv6_from_cmdline() {
     }
 }
 
-/// Set up iptables DNAT to forward specific localhost ports to host gateway.
+/// Forward specific localhost ports to host gateway via TCP proxy.
+///
+/// iptables DNAT doesn't work with pasta networking: DNAT'd packets retain
+/// their 127.0.0.1 source address, which pasta's L4 translation can't handle
+/// (loopback source going through an external TAP device). Instead, we spawn
+/// a TCP proxy for each port: listen on 127.0.0.1:port inside the VM and
+/// forward connections to 10.0.2.2:port (the gateway). Pasta's default
+/// --map-host-loopback maps gateway traffic to the host's 127.0.0.1.
 pub fn setup_localhost_forwarding(ports: &[String]) {
-    let _ = std::process::Command::new("sysctl")
-        .args(["-w", "net.ipv4.conf.all.route_localnet=1"])
-        .output();
-    let _ = std::process::Command::new("sysctl")
-        .args(["-w", "net.ipv6.conf.lo.disable_ipv6=1"])
-        .output();
-    for port in ports {
-        let _ = std::process::Command::new("iptables")
-            .args([
-                "-t",
-                "nat",
-                "-A",
-                "OUTPUT",
-                "-d",
-                "127.0.0.0/8",
-                "-p",
-                "tcp",
-                "--dport",
-                port,
-                "-j",
-                "DNAT",
-                "--to-destination",
-                "10.0.2.2",
-            ])
-            .output();
+    for port_str in ports {
+        let port: u16 = match port_str.parse() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "[fc-agent] WARNING: invalid forward-localhost port '{}': {}",
+                    port_str, e
+                );
+                continue;
+            }
+        };
+
+        let listener = match std::net::TcpListener::bind(format!("127.0.0.1:{}", port)) {
+            Ok(l) => {
+                eprintln!("[fc-agent] localhost proxy listening on 127.0.0.1:{}", port);
+                l
+            }
+            Err(e) => {
+                eprintln!(
+                    "[fc-agent] WARNING: failed to bind 127.0.0.1:{}: {}",
+                    port, e
+                );
+                continue;
+            }
+        };
+
+        listener.set_nonblocking(true).ok();
+        let tokio_listener = match tokio::net::TcpListener::from_std(listener) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!(
+                    "[fc-agent] WARNING: failed to create async listener for port {}: {}",
+                    port, e
+                );
+                continue;
+            }
+        };
+
+        tokio::spawn(async move {
+            loop {
+                match tokio_listener.accept().await {
+                    Ok((client, _)) => {
+                        tokio::spawn(proxy_connection(client, port));
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[fc-agent] WARNING: accept failed on localhost:{}: {}",
+                            port, e
+                        );
+                    }
+                }
+            }
+        });
     }
-    eprintln!("[fc-agent] forwarding localhost ports to host: {:?}", ports);
+    if !ports.is_empty() {
+        eprintln!(
+            "[fc-agent] forwarding localhost ports to host gateway: {:?}",
+            ports
+        );
+    }
+}
+
+/// Proxy a single TCP connection from localhost to the gateway (10.0.2.2).
+async fn proxy_connection(mut client: tokio::net::TcpStream, port: u16) {
+    let mut upstream = match tokio::net::TcpStream::connect(format!("10.0.2.2:{}", port)).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "[fc-agent] WARNING: failed to connect to gateway 10.0.2.2:{}: {}",
+                port, e
+            );
+            return;
+        }
+    };
+    if let Err(e) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
+        if e.kind() != std::io::ErrorKind::ConnectionReset
+            && e.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            eprintln!("[fc-agent] localhost proxy port {}: {}", port, e);
+        }
+    }
 }
