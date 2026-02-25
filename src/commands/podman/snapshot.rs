@@ -181,7 +181,8 @@ pub(super) fn build_firecracker_config(
     use crate::firecracker::{BootSource, Drive, FcNetworkMode, FirecrackerConfig, MachineConfig};
 
     let network_mode = match args.network {
-        crate::cli::args::NetworkMode::Bridged => FcNetworkMode::Bridged,
+        crate::cli::args::NetworkMode::Bridged
+        | crate::cli::args::NetworkMode::Routed => FcNetworkMode::Bridged,
         crate::cli::args::NetworkMode::Rootless => FcNetworkMode::Rootless,
     };
 
