@@ -1,56 +1,12 @@
-//! Integration tests for slirp4netns IPv6 DNS support.
+//! Integration tests for rootless IPv6 networking.
 //!
-//! Tests behavior on hosts with IPv6-only DNS servers and old libslirp.
+//! Tests IPv6 DNS, connectivity, and egress in rootless mode (pasta networking).
 
 #![cfg(feature = "integration-fast")]
 
 mod common;
 
 use anyhow::{Context, Result};
-
-/// Test that libslirp version detection works correctly.
-#[tokio::test]
-async fn test_libslirp_version_detection() -> Result<()> {
-    let output = tokio::process::Command::new("slirp4netns")
-        .arg("--version")
-        .output()
-        .await
-        .context("slirp4netns --version")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    println!("slirp4netns --version output:\n{}", stdout);
-
-    // Extract libslirp version
-    let version_line = stdout
-        .lines()
-        .find(|l| l.starts_with("libslirp:"))
-        .context("libslirp version not in output")?;
-
-    let version_str = version_line.strip_prefix("libslirp: ").unwrap().trim();
-
-    // Parse and verify format
-    let parts: Vec<&str> = version_str.split('.').collect();
-    assert!(
-        parts.len() >= 2,
-        "Version should be X.Y or X.Y.Z, got: {}",
-        version_str
-    );
-
-    let major: u32 = parts[0].parse().context("major version")?;
-    let minor: u32 = parts[1].parse().context("minor version")?;
-
-    println!("System libslirp version: {}.{}", major, minor);
-
-    // Document what version we have and what that means
-    if major > 4 || (major == 4 && minor >= 7) {
-        println!("✓ libslirp >= 4.7.0 - native IPv6 DNS proxying supported");
-    } else {
-        println!("✓ libslirp < 4.7.0 - IPv6 DNS proxying NOT supported");
-        println!("  On IPv6-only hosts, DNS resolution in VMs will fail");
-    }
-
-    Ok(())
-}
 
 /// Test DNS resolution in a VM using a local DNS server.
 #[tokio::test]
@@ -145,7 +101,7 @@ async fn test_dns_resolution_in_vm() -> Result<()> {
 }
 
 /// Test IPv6 connectivity in a VM.
-/// Verifies that the guest has IPv6 configured and can reach the slirp IPv6 DNS server.
+/// Verifies that the guest has IPv6 configured and can reach the pasta IPv6 gateway.
 /// This proves the NDP Neighbor Advertisement mechanism works correctly.
 #[tokio::test]
 async fn test_ipv6_connectivity_in_vm() -> Result<()> {
@@ -362,22 +318,7 @@ with IPv6Server(('::', {}), handler) as httpd:
     common::kill_process(pid).await;
     let _ = child.wait().await;
 
-    match result {
-        Ok(output) => {
-            println!("✓ IPv6 egress works! Server response:\n{}", output);
-            Ok(())
-        }
-        Err(e) => {
-            println!("✗ IPv6 egress failed: {}", e);
-            println!();
-            println!("This is expected with current slirp4netns - it only provides IPv4 NAT.");
-            println!("IPv6 egress requires either:");
-            println!("  1. IPv6 NAT (not supported by slirp4netns)");
-            println!("  2. Bridged networking with IPv6 on the bridge");
-            println!("  3. A different networking solution like pasta");
-
-            // Don't fail the test - just document the limitation
-            Ok(())
-        }
-    }
+    let output = result.context("IPv6 egress failed - pasta should support native IPv6")?;
+    println!("✓ IPv6 egress works! Server response:\n{}", output);
+    Ok(())
 }

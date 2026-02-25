@@ -67,7 +67,7 @@ echo "Kernel: $(uname -r)"
 # System packages
 apt-get update
 apt-get install -y curl wget git jq build-essential \
-  podman uidmap slirp4netns fuse-overlayfs containernetworking-plugins \
+  podman uidmap passt fuse-overlayfs containernetworking-plugins \
   fuse3 libfuse3-dev libclang-dev clang musl-tools \
   iproute2 iptables dnsmasq qemu-utils e2fsprogs parted \
   skopeo busybox-static cpio zstd autoconf automake libtool

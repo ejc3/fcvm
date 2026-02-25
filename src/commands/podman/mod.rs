@@ -30,7 +30,7 @@ use crate::cli::{NetworkMode, PodmanArgs, PodmanCommands, RunArgs};
 use crate::commands::common::{
     VSOCK_OUTPUT_PORT, VSOCK_STATUS_PORT, VSOCK_TTY_PORT, VSOCK_VOLUME_PORT_BASE,
 };
-use crate::network::{BridgedNetwork, NetworkManager, PortMapping, SlirpNetwork};
+use crate::network::{BridgedNetwork, NetworkManager, PortMapping, PastaNetwork};
 use crate::paths;
 use crate::state::{generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState};
 use crate::volume::{spawn_volume_servers, VolumeConfig};
@@ -657,7 +657,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 .context("allocating loopback IP")?;
 
             Box::new(
-                SlirpNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
+                PastaNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
                     .with_loopback_ip(loopback_ip),
             )
         }

@@ -154,7 +154,7 @@ async fn test_clone_connection_reset_rootless() -> Result<()> {
     let _server_thread = server.run_in_background();
     println!("  Server listening on port {}", server_port);
 
-    // For rootless: 10.0.2.2 is the host from slirp4netns perspective
+    // For rootless: 10.0.2.2 is the host from pasta's perspective
     let host_ip = "10.0.2.2";
 
     // =========================================================================

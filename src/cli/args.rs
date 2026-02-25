@@ -490,7 +490,7 @@ pub enum NetworkMode {
     /// Bridged networking using network namespaces (requires sudo)
     #[default]
     Bridged,
-    /// True rootless networking using slirp4netns (no sudo required)
+    /// True rootless networking using pasta (no sudo required)
     Rootless,
 }
 

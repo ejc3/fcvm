@@ -9,10 +9,9 @@ RUST_BIN := $(shell command -v cargo >/dev/null 2>&1 && dirname $$(command -v ca
 export PATH := $(RUST_BIN):$(PATH)
 CARGO := cargo
 
-# Custom slirp4netns with newer libslirp (for IPv6 DNS support on RHEL9/CentOS9)
-# Build with: ./scripts/build-slirp4netns.sh
+# Custom dependencies bin directory
 CUSTOM_DEPS_BIN := /mnt/fcvm-btrfs/deps/bin
-ifneq ($(wildcard $(CUSTOM_DEPS_BIN)/slirp4netns),)
+ifneq ($(wildcard $(CUSTOM_DEPS_BIN)),)
 export PATH := $(CUSTOM_DEPS_BIN):$(PATH)
 endif
 
@@ -225,7 +224,7 @@ check-disk:
 # CRITICAL: Uses fcvm's proper cleanup commands to handle btrfs CoW correctly
 clean-test-data: build
 	@echo "==> Killing stale VM processes from previous runs..."
-	@sudo pkill -9 firecracker 2>/dev/null; sudo pkill -9 slirp4netns 2>/dev/null; sleep 1; true
+	@sudo pkill -9 firecracker 2>/dev/null; sudo pkill -9 pasta 2>/dev/null; sleep 1; true
 	@echo "==> Force unmounting stale FUSE mounts..."
 	@# Find and force unmount any FUSE mounts from previous test runs
 	@mount | grep fuse | grep -E '/tmp|/var/tmp' | cut -d' ' -f3 | xargs -r -I{} fusermount3 -u -z {} 2>/dev/null || true

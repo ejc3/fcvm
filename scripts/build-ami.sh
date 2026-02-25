@@ -92,7 +92,7 @@ fi
 apt-get install -y build-essential bc bison flex libssl-dev \
   libelf-dev libncurses-dev libdw-dev debhelper-compat rsync kmod cpio curl jq wget git \
   dwarves xz-utils \
-  podman uidmap slirp4netns fuse-overlayfs containernetworking-plugins \
+  podman uidmap passt fuse-overlayfs containernetworking-plugins \
   fuse3 libfuse3-dev libclang-dev clang musl-tools \
   iproute2 iptables dnsmasq qemu-utils e2fsprogs parted \
   skopeo busybox-static cpio zstd autoconf automake libtool \

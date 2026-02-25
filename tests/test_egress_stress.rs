@@ -77,7 +77,7 @@ async fn egress_stress_impl(
     // Determine the URL that VMs will use to test egress
     // For bridged mode, we use the host's primary network interface IP. Traffic to this IP
     // goes through NAT (MASQUERADE), so CONNMARK-based routing ensures correct return path.
-    // For rootless mode, slirp4netns handles all routing so local traffic works fine (10.0.2.2).
+    // For rootless mode, pasta handles all routing so local traffic works fine (10.0.2.2).
     let egress_url = match network {
         "rootless" => format!("http://10.0.2.2:{}/", http_server_port),
         "bridged" => {

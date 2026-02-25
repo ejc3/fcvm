@@ -544,7 +544,7 @@ impl StateManager {
         // Then 127.0.1.2, 127.0.1.3, ... etc.
         // Note: We rely on state file cleanup (cleanup_stale_state) to handle dead processes.
         // We don't check if port 8080 is available because wildcard binds (0.0.0.0:8080)
-        // would cause false negatives. Real port conflicts are detected at slirp4netns add_hostfwd time.
+        // would cause false negatives. Real port conflicts are detected at pasta bind time.
         let ip = (|| -> Result<String> {
             for b2 in 0..=255u8 {
                 for b3 in 2..=254u8 {

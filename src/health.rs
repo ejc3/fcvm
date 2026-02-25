@@ -557,7 +557,7 @@ async fn update_health_status_once(
                     let health_timeout = state.config.health_check_timeout.max(1);
 
                     // Rootless mode with holder_pid: use nsenter to curl guest directly
-                    // This bypasses the complexity of slirp4netns port forwarding
+                    // This bypasses the complexity of pasta port forwarding
                     if let Some(holder_pid) = state.holder_pid {
                         // Extract guest IP without CIDR suffix
                         let guest_ip = net
@@ -732,7 +732,7 @@ pub async fn run_health_check_once(
 /// Check if HTTP service is responding via nsenter into the network namespace (rootless mode)
 ///
 /// For rootless VMs, we use nsenter to enter the network namespace and curl
-/// the guest directly. This bypasses the complexity of slirp4netns port forwarding.
+/// the guest directly. This bypasses the complexity of pasta port forwarding.
 ///
 /// The holder_pid is the PID of the namespace holder process (sleep infinity).
 async fn check_http_health_nsenter(

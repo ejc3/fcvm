@@ -1,9 +1,9 @@
 //! Test that host DNS servers are passed to the guest for direct resolution.
 //!
-//! On IPv6-only hosts, slirp4netns's built-in DNS proxy (10.0.2.3) can't
-//! forward to IPv6 nameservers. This test verifies that fc-agent writes
-//! the host's real nameservers into /etc/resolv.conf via the fcvm_dns=
-//! boot parameter.
+//! In bridged mode, the host's real DNS servers are passed to the guest via the
+//! fcvm_dns= boot parameter. In rootless/pasta mode, DNS goes through pasta's
+//! forwarder (10.0.2.3) which forwards to the host resolver — that's tested
+//! implicitly by the sanity tests. This test verifies the bridged mode path.
 
 #![cfg(feature = "privileged-tests")]
 
@@ -11,7 +11,7 @@ mod common;
 
 use anyhow::{Context, Result};
 
-/// Verify the guest gets the host's real DNS servers (not slirp's 10.0.2.3)
+/// Verify the guest gets the host's real DNS servers (not the default 10.0.2.3)
 /// and can resolve hostnames directly through them.
 #[tokio::test]
 async fn test_guest_has_host_dns_servers() -> Result<()> {
@@ -43,6 +43,8 @@ async fn test_guest_has_host_dns_servers() -> Result<()> {
         "run",
         "--name",
         &vm_name,
+        "--network",
+        "bridged",
         "--no-snapshot",
         common::TEST_IMAGE,
     ])
@@ -59,7 +61,7 @@ async fn test_guest_has_host_dns_servers() -> Result<()> {
     // Verify guest has the host's nameservers (not 10.0.2.3)
     assert!(
         !guest_resolv.contains("10.0.2.3"),
-        "Guest should have host DNS servers, not slirp's 10.0.2.3"
+        "Guest should have host DNS servers, not the default 10.0.2.3"
     );
 
     for ns in &host_nameservers {
