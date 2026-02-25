@@ -629,6 +629,18 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         None
     };
 
+    // Start egress proxy for rootless mode (bypasses TAP/bridge for outbound TCP)
+    let _egress_proxy_handle = if matches!(args.network, NetworkMode::Rootless) {
+        let socket_path = clone_vsock_base.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) = crate::network::egress_proxy::run_egress_proxy(&socket_path).await {
+                tracing::warn!("Egress proxy error: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
+
     // Setup networking - use saved network config from snapshot
     let tap_device = format!("tap-{}", truncate_id(&vm_id, 8));
     let port_mappings: Vec<PortMapping> = args

@@ -1,11 +1,14 @@
 use anyhow::{bail, Context, Result};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::pin::Pin;
+use std::task::{ready, Poll};
 use tokio::io::unix::AsyncFd;
 
 pub const HOST_CID: u32 = 2;
 pub const STATUS_PORT: u32 = 4999;
 pub const EXEC_PORT: u32 = 4998;
 pub const OUTPUT_PORT: u32 = 4997;
+pub const EGRESS_PROXY_PORT: u32 = 52000;
 
 /// Async vsock stream — wraps an OwnedFd in AsyncFd for non-blocking I/O.
 pub struct VsockStream {
@@ -73,6 +76,75 @@ impl VsockStream {
             }
         }
         Ok(())
+    }
+}
+
+impl tokio::io::AsyncRead for VsockStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            let mut guard = ready!(self.inner.poll_read_ready(cx))?;
+            match guard.try_io(|inner| {
+                let n = unsafe {
+                    libc::read(
+                        inner.as_raw_fd(),
+                        buf.unfilled_mut().as_mut_ptr().cast(),
+                        buf.remaining(),
+                    )
+                };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    unsafe { buf.assume_init(n as usize) };
+                    buf.advance(n as usize);
+                    Ok(())
+                }
+            }) {
+                Ok(result) => return Poll::Ready(result),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for VsockStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        loop {
+            let mut guard = ready!(self.inner.poll_write_ready(cx))?;
+            match guard.try_io(|inner| {
+                let n = unsafe { libc::write(inner.as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }) {
+                Ok(result) => return Poll::Ready(result),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        unsafe { libc::shutdown(self.inner.get_ref().as_raw_fd(), libc::SHUT_WR) };
+        Poll::Ready(Ok(()))
     }
 }
 
