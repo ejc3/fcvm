@@ -310,12 +310,13 @@ pub async fn run() -> Result<()> {
     // because NDP for the fbwhoami address isn't configured on the namespace side.
     if let Some(ipv6) = plan.env.get("HOST_IPV6") {
         if !ipv6.is_empty() {
-            // Check if a routed IPv6 is configured (ipv6= boot param).
-            // If so, only add fbwhoami to lo (not eth0) to avoid source address conflicts.
-            let has_routed_ipv6 = std::fs::read_to_string("/proc/cmdline")
-                .map(|c| c.contains("ipv6="))
+            // Check if we're in routed mode (explicit network_mode=routed boot param).
+            // In routed mode, only add fbwhoami to lo (not eth0) to avoid source
+            // address conflicts — eth0 uses the VM's routed IPv6 instead.
+            let is_routed = std::fs::read_to_string("/proc/cmdline")
+                .map(|c| c.split_whitespace().any(|p| p == "network_mode=routed"))
                 .unwrap_or(false);
-            let devices: &[&str] = if has_routed_ipv6 { &["lo"] } else { &["lo", "eth0"] };
+            let devices: &[&str] = if is_routed { &["lo"] } else { &["lo", "eth0"] };
             for dev in devices {
                 let result = std::process::Command::new("ip")
                     .args(["addr", "add", &format!("{}/128", ipv6), "dev", dev])

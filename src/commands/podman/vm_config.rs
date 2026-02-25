@@ -206,7 +206,7 @@ pub(super) fn build_runtime_boot_args(
         ));
     }
 
-    // IPv6 configuration via kernel cmdline (for rootless networking)
+    // IPv6 configuration via kernel cmdline
     // Format: ipv6=<client>|<gateway> - parsed by fc-agent to configure eth0
     // Uses | as delimiter since : is part of IPv6 addresses
     if let (Some(guest_ipv6), Some(host_ipv6)) =
@@ -216,6 +216,15 @@ pub(super) fn build_runtime_boot_args(
             boot_args.push(' ');
         }
         boot_args.push_str(&format!("ipv6={}|{}", guest_ipv6, host_ipv6));
+    }
+
+    // Pass explicit network mode so fc-agent can distinguish routed from pasta
+    // (both pass ipv6= but need different HOST_IPV6 behavior)
+    if matches!(args.network, crate::cli::args::NetworkMode::Routed) {
+        if !boot_args.is_empty() {
+            boot_args.push(' ');
+        }
+        boot_args.push_str("network_mode=routed");
     }
 
     // Pass DNS servers to guest for resolv.conf configuration
@@ -799,7 +808,10 @@ pub(super) async fn run_vm_setup(
             info!(namespace = %ns_id, "configuring VM to run in network namespace");
             vm_manager.set_namespace(ns_id.to_string());
         }
-    } else if let Some(routed_net) = network.as_any().downcast_ref::<crate::network::RoutedNetwork>() {
+    } else if let Some(routed_net) = network
+        .as_any()
+        .downcast_ref::<crate::network::RoutedNetwork>()
+    {
         // Routed mode: use pre-created network namespace (like bridged)
         holder_child = None;
         if let Some(ns_id) = routed_net.namespace_id() {
@@ -850,8 +862,9 @@ pub(super) async fn run_vm_setup(
                 BootSource, Drive, FcNetworkMode, FirecrackerConfig, MachineConfig,
             };
             let network_mode = match args.network {
-                crate::cli::args::NetworkMode::Bridged
-                | crate::cli::args::NetworkMode::Routed => FcNetworkMode::Bridged,
+                crate::cli::args::NetworkMode::Bridged | crate::cli::args::NetworkMode::Routed => {
+                    FcNetworkMode::Bridged
+                }
                 crate::cli::args::NetworkMode::Rootless => FcNetworkMode::Rootless,
             };
             // Collect extra disk specifications
