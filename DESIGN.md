@@ -55,7 +55,7 @@
    - Creates independent VM with its own networking
 
 4. **Networking Modes**
-   - **Rootless**: Works without root privileges using slirp4netns
+   - **Rootless**: Works without root privileges using pasta (from passt)
    - **Privileged**: Uses iptables + TAP for better performance
    - **Port mapping**: `[HOSTIP:]HOSTPORT:GUESTPORT[/PROTO]` syntax
    - Support multiple ports, TCP/UDP protocols
@@ -218,14 +218,14 @@ impl VmManager {
 
 Two implementations based on execution mode.
 
-#### Rootless Networking (`slirp.rs`)
+#### Rootless Networking (`pasta.rs`)
 
-Uses `slirp4netns` for userspace networking.
+Uses `pasta` (from the passt project) for L4 splice-based networking.
 
 **Features**:
 - No root privileges required
-- Port forwarding via `slirp4netns --port`
-- Default guest IP: `10.0.2.15`
+- Port forwarding via pasta CLI flags (`-t` for TCP, `-u` for UDP)
+- Default guest IP: `10.0.2.100`
 - Default host IP: `10.0.2.2`
 
 **Implementation**:
@@ -234,13 +234,13 @@ struct RootlessNetwork {
     vm_id: String,
     tap_device: String,
     port_mappings: Vec<PortMapping>,
-    slirp_process: Option<Child>,
+    pasta_process: Option<Child>,
 }
 
 async fn setup() -> Result<NetworkConfig> {
     // TAP device created by Firecracker
-    // slirp4netns started after VM boots
-    // Port forwarding configured via hostfwd
+    // pasta started after VM boots
+    // Port forwarding configured via -t/-u CLI flags
 }
 ```
 
@@ -392,38 +392,40 @@ Each VM has:
 
 ## Networking
 
-### Rootless Mode (slirp4netns with Bridge Architecture)
+### Rootless Mode (pasta with Bridge Architecture)
 
-**Key Insight**: slirp4netns and Firecracker CANNOT share a TAP device (both need exclusive access).
-**Solution**: Use a Linux bridge (br0) for L2 forwarding between slirp4netns and Firecracker inside a user namespace.
+**Key Insight**: pasta and Firecracker CANNOT share a TAP device (both need exclusive access).
+**Solution**: Use a Linux bridge (br0) for L2 forwarding between pasta and Firecracker inside a user namespace. pasta is started with `--no-splice` to force the L2 TAP path (required because the VM is behind a bridge).
+
+**Architecture**: pasta uses splice(2) zero-copy L4 translation instead of a full userspace TCP/IP stack. With `--no-splice`, it falls back to the L2 TAP path needed for bridged VM networking.
 
 **Topology**:
 ```
 Host                     │ User Namespace (unshare --user --net)
                          │
-slirp4netns <────────────┼── slirp0 ─┐
-  (userspace NAT)        │           │
+pasta <──────────────────┼── pasta0 ─┐
+  (L4 splice/TAP)        │           │
                          │        br0 (10.0.2.1/24)  ← namespace IP for health checks
                          │           │
                          │   tap-fc ─┘
                          │      │
                          │      ▼
                          │   Firecracker VM
-                         │     eth0: 10.0.2.15
+                         │     eth0: 10.0.2.100
 ```
 
 **Why Bridge Instead of IP Forwarding?**
 - Bridge operates at L2 (MAC addresses) - preserves source MAC for proper ARP/NDP learning
-- slirp4netns expects traffic from specific MAC addresses for its internal NAT tables
-- IP forwarding rewrites source MAC, breaking slirp4netns's connection tracking
+- pasta expects traffic from specific MAC addresses for its internal NAT tables
+- IP forwarding rewrites source MAC, breaking pasta's connection tracking
 - Bridge also enables IPv6 with proper NDP neighbor discovery
 
 **Setup Sequence** (3-phase with nsenter):
 1. Spawn holder process: `unshare --user --net -- sleep infinity` (UID/GID mappings written externally)
 2. Run setup via nsenter: create bridge, TAPs, add namespace IP
-3. Start slirp4netns attached to holder's namespace (connects to slirp0)
+3. Start pasta attached to holder's namespace (connects to pasta0)
 4. Run Firecracker via nsenter: `nsenter -t HOLDER_PID -U -n -- firecracker ...`
-5. Health checks via nsenter: `nsenter -t HOLDER_PID -U -n -- curl 10.0.2.15:80`
+5. Health checks via nsenter: `nsenter -t HOLDER_PID -U -n -- curl 10.0.2.100:80`
 
 **Network Setup Script** (executed via nsenter):
 ```bash
@@ -431,10 +433,10 @@ slirp4netns <────────────┼── slirp0 ─┐
 ip link add br0 type bridge
 ip link set br0 up
 
-# Create slirp0 TAP for slirp4netns
-ip tuntap add slirp0 mode tap
-ip link set slirp0 master br0
-ip link set slirp0 up
+# Create pasta0 TAP for pasta
+ip tuntap add pasta0 mode tap
+ip link set pasta0 master br0
+ip link set pasta0 up
 
 # Create tap-fc for Firecracker
 ip tuntap add tap-fc mode tap
@@ -445,7 +447,7 @@ ip link set tap-fc up
 # This enables nsenter to route to guest via the 10.0.2.x subnet
 ip addr add 10.0.2.1/24 dev br0
 
-# Set default route via slirp4netns gateway
+# Set default route via pasta gateway
 ip route add default via 10.0.2.2 dev br0
 ```
 
@@ -453,46 +455,48 @@ ip route add default via 10.0.2.2 dev br0
 ```bash
 # Each VM gets a unique loopback IP (127.x.y.z) for port forwarding
 # No IP aliasing needed - Linux routes all 127.0.0.0/8 to loopback
-slirp4netns \
-  --configure \
-  --mtu=65520 \
-  --enable-ipv6 \
-  --api-socket /tmp/slirp-{vm_id}.sock \
-  <holder-pid> \
-  slirp0
-
-# Port forwarding via JSON-RPC API:
-echo '{"execute":"add_hostfwd","arguments":{"proto":"tcp","host_addr":"127.0.0.2","host_port":8080,"guest_addr":"10.0.2.15","guest_port":80}}' | nc -U /tmp/slirp-{vm_id}.sock
+# Port forwarding is configured via pasta CLI flags:
+#   -t <host_port>:<guest_port> for TCP
+#   -u <host_port>:<guest_port> for UDP
+pasta \
+  --no-splice \
+  -a 10.0.2.2 \
+  -g 10.0.2.2 \
+  -D 10.0.2.3 \
+  --mtu 65520 \
+  -t 8080:80 \
+  -I pasta0 \
+  <holder-pid>
 ```
 
 **Traffic Flow** (VM to Internet):
 ```
-Guest (10.0.2.15) → tap-fc → br0 (L2) → slirp0 → slirp4netns → Host → Internet
+Guest (10.0.2.100) → tap-fc → br0 (L2) → pasta0 → pasta → Host → Internet
 ```
 
 **Traffic Flow** (Health Check from namespace):
 ```
-nsenter curl → br0 (10.0.2.1) → L2 forward → tap-fc → Guest (10.0.2.15:80)
+nsenter curl → br0 (10.0.2.1) → L2 forward → tap-fc → Guest (10.0.2.100:80)
 ```
 
 **Traffic Flow** (Host to VM port forward):
 ```
-Host (127.0.0.2:8080) → slirp4netns → slirp0 → br0 (L2) → tap-fc → Guest (10.0.2.15:80)
+Host (127.0.0.x:8080) → pasta → pasta0 → br0 (L2) → tap-fc → Guest (10.0.2.100:80)
 ```
 
 **IPv6 Support**:
-- slirp4netns `--enable-ipv6` provides IPv6 connectivity
-- Guest uses fd00::2 (slirp's IPv6 gateway) and fd00::3 (IPv6 DNS)
+- pasta has native IPv6 support (no custom build needed)
+- Guest uses fd00::2 (IPv6 gateway), fd00::100 (guest IPv6), and fd00::3 (IPv6 DNS)
 - fc-agent sends gratuitous NDP NA at boot for MAC learning
-- On snapshot restore, fc-agent re-sends NDP NA to teach new slirp process
+- On snapshot restore, fc-agent re-sends NDP NA to teach new pasta process
 
 **Characteristics**:
 - No root required (runs entirely in user namespace)
 - All VMs use same 10.0.2.x subnet (isolated by user namespace)
 - Unique loopback IP per VM enables same port on multiple VMs
-- Bridge-based L2 preserves MAC addresses for proper slirp4netns operation
+- Bridge-based L2 preserves MAC addresses for proper pasta ARP/NDP learning
 - Namespace IP (10.0.2.1) enables health checks via nsenter
-- IPv6 support with native slirp4netns IPv6 DNS proxying
+- IPv6 support with native pasta IPv6 DNS proxying
 - Works in nested VMs and restricted environments
 - Fully compatible with rootless Podman in guest
 
@@ -576,7 +580,7 @@ curl http://172.30.x.1:8080
                  ▼
 ┌─────────────────────────────────────────────────────────┐
 │ 3. Setup networking                                      │
-│    - Create TAP device (privileged) or prepare slirp    │
+│    - Create TAP device (privileged) or prepare pasta    │
 │    - Parse port mappings                                │
 │    - Generate MAC address                               │
 └────────────────┬────────────────────────────────────────┘
@@ -710,7 +714,7 @@ curl http://172.30.x.1:8080
 ┌─────────────────────────────────────────────────────────┐
 │ 2. Setup new networking                                  │
 │    - Generate new MAC address                           │
-│    - Create TAP device (bridged) or slirp (rootless)    │
+│    - Create TAP device (bridged) or pasta (rootless)    │
 │    - Allocate loopback IP for health checks             │
 └────────────────┬────────────────────────────────────────┘
                  ▼
@@ -1251,7 +1255,7 @@ fcvm/
 │   ├── network/            # Networking
 │   │   ├── mod.rs
 │   │   ├── bridged.rs      # Bridged networking (iptables)
-│   │   ├── slirp.rs        # Rootless networking (slirp4netns)
+│   │   ├── pasta.rs        # Rootless networking (pasta)
 │   │   ├── namespace.rs    # Network namespace management
 │   │   ├── veth.rs         # Veth pair management
 │   │   ├── types.rs        # Network types
@@ -1576,7 +1580,7 @@ curl http://localhost:9090  # Should return nginx page in <2s
 kill $CLONE_PID $SERVE_PID $BASELINE_PID
 ```
 
-**Note**: `--network rootless` (default) uses slirp4netns (no root required). `--network bridged` uses iptables/TAP devices (requires sudo).
+**Note**: `--network rootless` (default) uses pasta (no root required). `--network bridged` uses iptables/TAP devices (requires sudo).
 
 ### POSIX Compliance (pjdfstest)
 
@@ -1664,7 +1668,7 @@ The fuse-pipe library passes the pjdfstest POSIX compliance suite. Tests run via
 ### Rootless Mode
 
 - **No root required**: Entire stack runs as regular user
-- **User namespaces**: slirp4netns uses user namespaces
+- **User namespaces**: pasta uses user namespaces
 - **No privileged operations**: No sudo, no CAP_NET_ADMIN
 
 ### Privileged Mode
@@ -1836,7 +1840,7 @@ Snapshots are disabled when `--map` volumes are present because the FUSE-over-vs
 - **KVM**: Kernel-based Virtual Machine, Linux's hypervisor
 - **MMDS**: Micro Metadata Service, Firecracker's metadata API
 - **TAP device**: Virtual network interface (TUN/TAP)
-- **slirp4netns**: User-mode networking for rootless containers
+- **pasta**: L4 splice-based networking from the passt project for rootless containers
 - **CoW**: Copy-on-Write, disk strategy for fast cloning
 - **iptables**: Linux firewall/NAT configuration tool
 - **vsock**: Virtual socket for host-guest communication
@@ -1886,7 +1890,7 @@ The 64 CPUs help within each crate (LLVM codegen), but crate-level parallelism i
 - [Firecracker Documentation](https://github.com/firecracker-microvm/firecracker/tree/main/docs)
 - [Firecracker API Specification](https://github.com/firecracker-microvm/firecracker/blob/main/src/api_server/swagger/firecracker.yaml)
 - [Podman Documentation](https://docs.podman.io/)
-- [slirp4netns](https://github.com/rootless-containers/slirp4netns)
+- [passt/pasta](https://passt.top/)
 - [iptables Documentation](https://netfilter.org/documentation/)
 - [KVM Documentation](https://www.linux-kvm.org/page/Documents)
 

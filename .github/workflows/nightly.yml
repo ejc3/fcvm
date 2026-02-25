@@ -60,6 +60,9 @@ jobs:
             iproute2 iptables passt dnsmasq qemu-utils e2fsprogs parted \
             podman skopeo busybox-static cpio zstd autoconf automake libtool cmake \
             libseccomp-dev
+      - name: Build passt from source
+        # Distro passt lacks --no-splice (required for bridge architecture)
+        run: ./scripts/build-passt.sh
       - name: Install Firecracker
         run: |
           ARCH=$(uname -m)

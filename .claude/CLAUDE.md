@@ -1111,7 +1111,7 @@ src/
 ├── commands/         # Command implementations
 ├── state/            # VM state management
 ├── firecracker/      # Firecracker API client
-├── network/          # Networking layer (bridged + slirp)
+├── network/          # Networking layer (bridged + pasta)
 ├── storage/          # Disk/snapshot management
 ├── uffd/             # UFFD memory sharing
 ├── volume/           # FUSE volume handling
@@ -1153,7 +1153,7 @@ fuse-pipe/benches/
 
 1. **Core Implementation** (2025-11-09)
    - Firecracker API client using hyper + hyperlocal (Unix sockets)
-   - Dual networking modes: bridged (iptables) + rootless (slirp4netns)
+   - Dual networking modes: bridged (iptables) + rootless (pasta)
    - Storage layer with btrfs CoW disk management
    - VM state persistence
    - Guest agent (fc-agent) with MMDS integration
@@ -1167,7 +1167,7 @@ fuse-pipe/benches/
    - **Performance**: Original VM + 2 clones = ~512MB RAM total (not 1.5GB!)
 
 3. **True Rootless Networking** (2025-11-25)
-   - `--network rootless` (default): slirp4netns, no root required
+   - `--network rootless` (default): pasta, no root required
    - `--network bridged`: Network namespace + iptables, requires root
    - User namespace via `unshare --user --net` with external UID/GID mappings
    - Health checks use unique loopback IPs (127.x.y.z) per VM
@@ -1205,16 +1205,16 @@ fuse-pipe/benches/
 
 | Mode | Flag | Requires Root | Performance | Port Forwarding |
 |------|------|---------------|-------------|-----------------|
-| Rootless (default) | `--network rootless` | No | Good | slirp4netns API |
+| Rootless (default) | `--network rootless` | No | Good | pasta CLI flags (-t/-u) |
 | Bridged | `--network bridged` | Yes | Better | iptables DNAT |
 
 **Rootless Architecture:**
 - Holder process starts with `unshare --user --net`, UID/GID mappings written externally
-- Linux bridge (br0) connects slirp0 and tap-fc for L2 forwarding
-- Bridge preserves MAC addresses for proper slirp4netns ARP/NDP learning
+- Linux bridge (br0) connects pasta0 and tap-fc for L2 forwarding
+- Bridge preserves MAC addresses for proper pasta ARP/NDP learning
 - Namespace IP (10.0.2.1) on bridge enables health checks via nsenter
-- Guest uses slirp4netns network directly (10.0.2.15)
-- Port forwarding via slirp4netns JSON-RPC API socket
+- Guest uses pasta network (10.0.2.100)
+- Port forwarding via pasta CLI flags (-t/-u)
 - IPv6 supported with `--enable-ipv6` and native DNS proxying
 
 **Loopback IP Allocation** (`src/state/manager.rs`):
