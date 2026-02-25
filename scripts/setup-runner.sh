@@ -84,9 +84,12 @@ ln -sf /home/ubuntu/.cargo/bin/rustc /usr/local/bin/rustc
 ln -sf /home/ubuntu/.cargo/bin/rustup /usr/local/bin/rustup
 
 # Build passt from source (distro version lacks --no-splice)
+PASST_TAG="2025_01_20.386b5f5"
 cd /tmp
 git clone https://passt.top/passt /tmp/passt-build
 cd /tmp/passt-build
+git fetch --tags
+git checkout "$PASST_TAG" 2>/dev/null || git checkout origin/master
 make -j"$(nproc)"
 cp pasta passt /usr/local/bin/
 rm -rf /tmp/passt-build

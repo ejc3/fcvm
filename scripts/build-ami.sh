@@ -108,8 +108,12 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source /root/.cargo/env
 
 # Build passt from source (distro version lacks --no-splice)
+PASST_TAG="2025_01_20.386b5f5"
 git clone https://passt.top/passt /tmp/passt-build
-cd /tmp/passt-build && make -j"$(nproc)"
+cd /tmp/passt-build
+git fetch --tags
+git checkout "$PASST_TAG" 2>/dev/null || git checkout origin/master
+make -j"$(nproc)"
 cp pasta passt /usr/local/bin/
 rm -rf /tmp/passt-build
 cd /
