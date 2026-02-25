@@ -315,7 +315,11 @@ pub async fn run() -> Result<()> {
             let has_routed_ipv6 = std::fs::read_to_string("/proc/cmdline")
                 .map(|c| c.contains("ipv6="))
                 .unwrap_or(false);
-            let devices: &[&str] = if has_routed_ipv6 { &["lo"] } else { &["lo", "eth0"] };
+            let devices: &[&str] = if has_routed_ipv6 {
+                &["lo"]
+            } else {
+                &["lo", "eth0"]
+            };
             for dev in devices {
                 let result = std::process::Command::new("ip")
                     .args(["addr", "add", &format!("{}/128", ipv6), "dev", dev])
