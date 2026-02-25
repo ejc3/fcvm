@@ -14,11 +14,11 @@ else
   echo "WARN: user not in 'kvm' group. Rootless may fail. You can run: sudo usermod -aG kvm $USER && newgrp kvm"
 fi
 
-echo "[preflight] checking slirp4netns (for rootless) ..."
-if command -v slirp4netns >/dev/null 2>&1; then
-  echo "OK: slirp4netns present."
+echo "[preflight] checking pasta (for rootless) ..."
+if command -v pasta >/dev/null 2>&1; then
+  echo "OK: pasta present."
 else
-  echo "WARN: slirp4netns not found. Rootless networking will be unavailable."
+  echo "WARN: pasta not found. Install passt package. Rootless networking will be unavailable."
 fi
 
 echo "[preflight] checking nftables/iproute2 (for privileged) ..."

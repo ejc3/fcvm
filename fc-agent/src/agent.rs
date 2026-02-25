@@ -38,24 +38,6 @@ pub async fn run() -> Result<()> {
         eprintln!("[fc-agent] continuing anyway (will rely on chronyd)");
     }
 
-    // Configure podman storage BEFORE starting the exec server.
-    // The host health monitor connects via exec to run `podman inspect`.
-    // If storage.conf isn't written yet, podman creates db.sql with the wrong
-    // graph driver, causing "database graph driver does not match" errors later.
-    match plan.image_mode.as_deref() {
-        Some("overlay") => {
-            eprintln!("[fc-agent] skipping btrfs loopback setup (image_mode=overlay)");
-            // Write storage.conf with overlay driver now so any early `podman`
-            // commands (e.g. health monitor's `podman inspect`) create db.sql
-            // with the correct driver.  mount_overlay_image() will overwrite
-            // this later with the full config including additionalimagestores.
-            container::write_overlay_storage_conf(plan.user.as_deref());
-        }
-        _ => {
-            container::setup_btrfs_storage_if_available();
-        }
-    }
-
     // Create output channel — the writer task handles all vsock writes
     let (output, output_writer) = output::create();
     tokio::spawn(output_writer);
@@ -178,6 +160,20 @@ pub async fn run() -> Result<()> {
         });
     }
 
+    // Set up btrfs storage if kernel supports it (avoids overlay idmap issues).
+    // Skip for overlay mode — it manages its own storage.
+    // For btrfs/archive/pull: creates loopback btrfs if kernel supports it.
+    match plan.image_mode.as_deref() {
+        Some("overlay") => {
+            eprintln!("[fc-agent] skipping btrfs loopback setup (image_mode=overlay)");
+        }
+        _ => {
+            // Btrfs, archive, and pull modes all use btrfs loopback on rootfs.
+            // The btrfs kernel module must be available (CONFIG_BTRFS_FS=y in btrfs profile).
+            container::setup_btrfs_storage_if_available();
+        }
+    }
+
     // If --user is specified with a non-root UID, create the VM user BEFORE image import
     // so podman load runs as the target user (rootless podman has separate storage).
     // uid 0 is root — no user mapping needed, podman runs as root directly.
@@ -218,6 +214,15 @@ pub async fn run() -> Result<()> {
 
     // Store prefix globally so exec server and health checks can use it
     container::set_podman_cmd_prefix(cmd_prefix.clone());
+
+    // Reset root podman state to match storage.conf. The health monitor may have
+    // run `podman inspect` via the exec server during setup, creating a stale
+    // db.sql with the wrong graph driver. Only needed for root podman — user mode
+    // already resets in create_vm_user(), and a root reset would destroy the
+    // user's storage directory.
+    if cmd_prefix.is_empty() {
+        container::reset_podman_state();
+    }
 
     // Prepare image based on delivery mode
     let image_ref = match (plan.image_mode.as_deref(), &plan.image_device) {

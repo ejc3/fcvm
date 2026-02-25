@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use crate::{
     firecracker::VmManager,
-    network::{BridgedNetwork, NetworkConfig, NetworkManager, SlirpNetwork},
+    network::{BridgedNetwork, NetworkConfig, NetworkManager, PastaNetwork},
     paths,
     state::{StateManager, VmState, VmStatus},
     storage::DiskManager,
@@ -694,19 +694,19 @@ pub async fn restore_from_snapshot(
             source_disk = %restore_config.source_disk_path.display(),
             "CoW disk prepared from snapshot"
         );
-    } else if let Some(slirp_net) = network.as_any().downcast_ref::<SlirpNetwork>() {
+    } else if let Some(pasta_net) = network.as_any().downcast_ref::<PastaNetwork>() {
         // Rootless mode: spawn holder process and set up namespace via nsenter
         // OPTIMIZATION: Parallelize disk creation with network setup
 
         // Step 1: Spawn holder process (keeps namespace alive)
-        let holder_cmd = slirp_net.build_holder_command();
+        let holder_cmd = pasta_net.build_holder_command();
         info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
 
         let (mut child, holder_pid) = spawn_namespace_holder(&holder_cmd).await?;
 
         // Step 2: Run disk creation and network setup IN PARALLEL
-        let setup_script = slirp_net.build_setup_script();
-        let nsenter_prefix = slirp_net.build_nsenter_prefix(holder_pid);
+        let setup_script = pasta_net.build_setup_script();
+        let nsenter_prefix = pasta_net.build_nsenter_prefix(holder_pid);
         let tap_device = network_config.tap_device.clone();
 
         // Disk creation task
@@ -831,7 +831,7 @@ pub async fn restore_from_snapshot(
         holder_child = Some(child);
     } else {
         // Unknown network type - should not happen
-        anyhow::bail!("Unknown network type - must be either BridgedNetwork or SlirpNetwork");
+        anyhow::bail!("Unknown network type - must be either BridgedNetwork or PastaNetwork");
     }
 
     // Configure mount namespace isolation for path redirects
@@ -882,7 +882,7 @@ pub async fn restore_from_snapshot(
         .await
         .context("starting Firecracker")?;
 
-    // For rootless mode with slirp4netns: post_start starts slirp4netns in the namespace
+    // For rootless mode with pasta: post_start starts pasta + bridge in the namespace
     let vm_pid = vm_manager.pid()?;
     let post_start_pid = holder_pid_for_post_start.unwrap_or(vm_pid);
     network

@@ -25,7 +25,7 @@ pub async fn flush_arp_cache() {
     }
 }
 
-/// Send gratuitous ARP via ping to teach new slirp4netns our MAC address.
+/// Send gratuitous ARP via ping to teach new pasta instance our MAC address.
 pub async fn send_gratuitous_arp() {
     let route_output = Command::new("ip")
         .args(["route", "show", "default"])

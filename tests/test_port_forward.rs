@@ -185,7 +185,7 @@ fn test_port_forward_bridged() -> Result<()> {
     Ok(())
 }
 
-/// Test port forwarding with rootless (slirp4netns) networking
+/// Test port forwarding with rootless (pasta) networking
 ///
 /// Rootless mode uses unique loopback IPs (127.x.y.z) for each VM,
 /// allowing multiple VMs to all forward the same port.

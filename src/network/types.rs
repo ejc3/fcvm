@@ -18,7 +18,7 @@ pub struct NetworkConfig {
     pub loopback_ip: Option<String>,
     /// DNS server for the guest to use
     /// Bridged: host_ip (dnsmasq on veth)
-    /// Rootless: 10.0.2.3 (slirp4netns built-in DNS)
+    /// Rootless: 10.0.2.3 (pasta DNS forwarding to host resolver)
     #[serde(default)]
     pub dns_server: Option<String>,
     /// Guest IPv6 address (for rootless networking with IPv6)

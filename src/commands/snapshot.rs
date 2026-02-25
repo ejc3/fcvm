@@ -13,7 +13,7 @@ use crate::cli::{
     NetworkMode, SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs,
     SnapshotServeArgs,
 };
-use crate::network::{BridgedNetwork, NetworkManager, PortMapping, SlirpNetwork};
+use crate::network::{BridgedNetwork, NetworkManager, PortMapping, PastaNetwork};
 use crate::paths;
 use crate::state::{
     generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState, VmStatus,
@@ -680,9 +680,9 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 .await
                 .context("allocating loopback IP")?;
 
-            // With bridge mode, guest IP is always 10.0.2.100 on slirp network
+            // With bridge mode, guest IP is always 10.0.2.100 on pasta network
             // Each clone runs in its own namespace, so no IP conflict
-            let net = SlirpNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
+            let net = PastaNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
                 .with_loopback_ip(loopback_ip);
             Box::new(net)
         }

@@ -1,12 +1,12 @@
 pub mod bridged;
 pub mod namespace;
 pub mod portmap;
-pub mod slirp;
+pub mod pasta;
 pub mod types;
 pub mod veth;
 
 pub use bridged::BridgedNetwork;
-pub use slirp::SlirpNetwork;
+pub use pasta::PastaNetwork;
 pub use types::*;
 
 use anyhow::Result;
@@ -18,7 +18,7 @@ pub trait NetworkManager: Send + Sync {
     /// Setup network before VM start
     async fn setup(&mut self) -> Result<NetworkConfig>;
 
-    /// Post-VM-start setup (e.g., start slirp4netns after Firecracker creates namespace)
+    /// Post-VM-start setup (e.g., start pasta after Firecracker creates namespace)
     /// Called with the PID of the VM process (Firecracker or unshare wrapper).
     /// Default implementation does nothing.
     async fn post_start(&mut self, _vm_pid: u32) -> Result<()> {

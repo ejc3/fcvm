@@ -856,7 +856,7 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
         .await
         .context("starting local DNS test server")?;
 
-    // For rootless, we know the slirp gateway address upfront.
+    // For rootless, we know the pasta gateway address upfront.
     // For bridged, we need to get the veth host IP from the clone's state after it starts,
     // since the VM can only reach the host through the veth pair, not the host's primary IP.
     let dns_server_addr_for_rootless = if network == "rootless" {
@@ -1383,7 +1383,7 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
 /// Test port forwarding on clones with rootless networking
 ///
 /// This is the key test - rootless clones with port forwarding.
-/// Port forwarding is done via slirp4netns API, accessing via unique loopback IP.
+/// Port forwarding is done via pasta CLI flags, accessing via unique loopback IP.
 #[tokio::test]
 async fn test_clone_port_forward_rootless() -> Result<()> {
     let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("pf-rootless");
