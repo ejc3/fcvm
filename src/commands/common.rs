@@ -832,9 +832,31 @@ pub async fn restore_from_snapshot(
         holder_pid_for_post_start = Some(holder_pid);
 
         holder_child = Some(child);
+    } else if let Some(routed_net) = network.as_any().downcast_ref::<crate::network::RoutedNetwork>() {
+        // Routed mode: like bridged but with veth+IPv6 routing instead of iptables NAT
+        if let Some(ns_id) = routed_net.namespace_id() {
+            info!(namespace = %ns_id, "configuring VM to run in routed network namespace");
+            vm_manager.set_namespace(ns_id.to_string());
+        }
+
+        let disk_manager = DiskManager::new(
+            vm_id.to_string(),
+            restore_config.source_disk_path.clone(),
+            vm_dir.clone(),
+        );
+
+        rootfs_path = disk_manager
+            .create_cow_disk()
+            .await
+            .context("creating CoW disk from snapshot")?;
+
+        info!(
+            rootfs = %rootfs_path.display(),
+            source_disk = %restore_config.source_disk_path.display(),
+            "CoW disk prepared from snapshot (routed)"
+        );
     } else {
-        // Unknown network type - should not happen
-        anyhow::bail!("Unknown network type - must be either BridgedNetwork or PastaNetwork");
+        anyhow::bail!("Unknown network type");
     }
 
     // Configure mount namespace isolation for path redirects
