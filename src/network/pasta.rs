@@ -45,11 +45,11 @@ const PASTA_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 ///                         |                      (guest: 10.0.2.100)
 /// ```
 ///
-/// pasta provides near-native throughput via splice(2) zero-copy L4 translation,
-/// replacing slirp4netns's slower userspace TCP/IP stack.
-///
-/// Port forwarding uses pasta's built-in host-side binding combined with
-/// iptables DNAT inside the user namespace to reach the VM through the bridge.
+/// pasta replaces slirp4netns's slower userspace TCP/IP stack with L4 translation.
+/// Outbound traffic goes through pasta's L2 TAP path (userspace processing).
+/// Inbound port forwarding uses splice(2) for zero-copy socket-to-socket transfer:
+/// pasta binds on the host, splices directly into the namespace, where the kernel
+/// routes to the VM via br0 → tap-fc.
 ///
 /// Setup sequence:
 /// 1. Spawn holder process: `unshare --user --net -- sleep infinity`
@@ -152,9 +152,9 @@ ip link set lo up
     /// Build the post-pasta setup script that creates the bridge after pasta is ready
     ///
     /// Connects pasta's TAP and Firecracker's TAP via an L2 bridge.
-    /// Port forwarding works via pasta's L2 translation (--no-splice forces this):
-    /// pasta binds on the host, creates L2 frames, sends through pasta0 TAP →
-    /// bridge → tap-fc → VM. No iptables required.
+    /// Port forwarding: pasta splices inbound loopback connections directly into the
+    /// namespace, where they route via br0 → tap-fc → VM. Outbound traffic goes
+    /// through pasta's L2 translation: tap-fc → br0 → pasta0 → pasta → host.
     pub fn build_bridge_script(&self) -> String {
         let script = format!(
             r#"
@@ -321,12 +321,7 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
             .arg("255.255.255.0")
             .arg("-g")
             .arg(GUEST_GATEWAY) // Gateway — pasta responds to ARP for this
-            .arg("--no-dhcp")
-            // Disable splice bypass: pasta's default L4 socket bypass creates
-            // connections directly in the namespace, but the VM is behind a bridge.
-            // --no-splice forces all traffic (including port forwarding) through
-            // the L2 TAP path: pasta → pasta0 → br0 → tap-fc → VM.
-            .arg("--no-splice");
+            .arg("--no-dhcp");
 
         // If host has global IPv6, configure pasta for IPv6 outbound
         if let Some(ref ipv6) = host_ipv6 {

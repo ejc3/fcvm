@@ -217,20 +217,24 @@ async fn test_ipv6_egress_to_host() -> Result<()> {
     let stdout = String::from_utf8_lossy(&ip_output.stdout);
 
     // Parse out the IPv6 address (format: "inet6 2600:1f1c:.../128 scope global")
+    // Filter out ULA (fd00::/7) and link-local (fe80::) — same logic as
+    // PastaNetwork::detect_host_ipv6() in pasta.rs. ULA addresses have "global"
+    // scope in the kernel but aren't routable through pasta's L4 translation.
     let host_ipv6 = stdout
         .lines()
-        .find(|l| l.contains("inet6") && l.contains("scope global"))
-        .and_then(|l| {
+        .filter(|l| l.contains("inet6") && l.contains("scope global"))
+        .filter_map(|l| {
             l.split_whitespace()
-                .nth(1) // Get the address part
+                .nth(1)
                 .map(|addr| addr.split('/').next().unwrap_or(addr))
+                .map(|s| s.to_string())
         })
-        .map(|s| s.to_string());
+        .find(|addr| !addr.starts_with("fe80:") && !addr.starts_with("fd"));
 
     let host_ipv6 = match host_ipv6 {
         Some(ip) => ip,
         None => {
-            println!("SKIP: Host has no global IPv6 address");
+            println!("SKIP: Host has no globally-routable IPv6 address (ULA/link-local only)");
             return Ok(());
         }
     };
