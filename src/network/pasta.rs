@@ -529,7 +529,7 @@ impl NetworkManager for PastaNetwork {
         // Phase 1: Start pasta (creates pasta0 TAP in namespace)
         self.start_pasta(holder_pid).await?;
 
-        // Phase 2: Create bridge connecting pasta0 and Firecracker's TAP, add DNAT rules
+        // Phase 2: Create bridge connecting pasta0 and Firecracker's TAP
         let bridge_script = self.build_bridge_script();
         let nsenter_prefix = self.build_nsenter_prefix(holder_pid);
 

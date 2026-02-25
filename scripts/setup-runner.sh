@@ -83,7 +83,7 @@ ln -sf /home/ubuntu/.cargo/bin/cargo /usr/local/bin/cargo
 ln -sf /home/ubuntu/.cargo/bin/rustc /usr/local/bin/rustc
 ln -sf /home/ubuntu/.cargo/bin/rustup /usr/local/bin/rustup
 
-# Build passt from source (distro version lacks --no-splice)
+# Build passt from source for consistent version across environments
 PASST_TAG="2025_01_20.386b5f5"
 cd /tmp
 git clone https://passt.top/passt /tmp/passt-build
