@@ -267,6 +267,9 @@ jobs:
             podman skopeo busybox-static cpio zstd autoconf automake libtool cmake \
             libseccomp-dev nfs-kernel-server \
             flex bison bc libelf-dev libssl-dev
+      - name: Build passt from source
+        working-directory: fcvm
+        run: ./scripts/build-passt.sh
       - name: Install Firecracker
         run: |
           ARCH=$(uname -m)
@@ -469,6 +472,9 @@ jobs:
             podman skopeo busybox-static cpio zstd autoconf automake libtool cmake \
             libseccomp-dev nfs-kernel-server \
             flex bison bc libelf-dev libssl-dev
+      - name: Build passt from source
+        working-directory: fcvm
+        run: ./scripts/build-passt.sh
       - name: Install Firecracker
         run: |
           ARCH=$(uname -m)

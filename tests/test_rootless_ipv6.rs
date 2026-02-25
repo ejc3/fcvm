@@ -147,9 +147,9 @@ async fn test_ipv6_connectivity_in_vm() -> Result<()> {
 
     println!("IPv6 addresses on eth0:\n{}", ip_output);
 
-    // Check if IPv6 is configured (fd00:1::2 is the expected guest address)
+    // Check if IPv6 is configured (fd00::100 is the expected guest address)
     // fc-agent configures this from the ipv6= kernel boot parameter
-    let has_ipv6 = ip_output.contains("fd00:1::2") || ip_output.contains("inet6 fd00:1::");
+    let has_ipv6 = ip_output.contains("fd00::100") || ip_output.contains("inet6 fd00::");
 
     if !has_ipv6 {
         // IPv6 might not be configured if host doesn't have global IPv6
@@ -160,15 +160,15 @@ async fn test_ipv6_connectivity_in_vm() -> Result<()> {
         return Ok(());
     }
 
-    println!("✓ IPv6 address fd00:1::2 configured on eth0");
+    println!("✓ IPv6 address fd00::100 configured on eth0");
 
-    // Check 2: Verify we can ping the gateway (fd00:1::1)
+    // Check 2: Verify we can ping the gateway (fd00::2)
     // This proves:
     // - IPv6 routing is working
-    // - NDP Neighbor Advertisement works (tap knows guest MAC)
+    // - NDP Neighbor Advertisement works (pasta responds to neighbor solicitations)
     // - The namespace tap device is responding to IPv6 traffic
     let ping_result =
-        common::exec_in_vm(pid, &["ping", "-6", "-c", "1", "-W", "5", "fd00:1::1"]).await;
+        common::exec_in_vm(pid, &["ping", "-6", "-c", "1", "-W", "5", "fd00::2"]).await;
 
     // Clean up VM
     common::kill_process(pid).await;
@@ -176,13 +176,13 @@ async fn test_ipv6_connectivity_in_vm() -> Result<()> {
 
     match ping_result {
         Ok(output) => {
-            println!("Ping fd00:1::1 output:\n{}", output);
+            println!("Ping fd00::2 output:\n{}", output);
             assert!(
                 output.contains("1 packets received") || output.contains("1 received"),
                 "IPv6 ping to gateway failed.\noutput: {}",
                 output
             );
-            println!("✓ IPv6 connectivity to gateway (fd00:1::1) works");
+            println!("✓ IPv6 connectivity to gateway (fd00::2) works");
         }
         Err(e) => {
             // Ping might fail if namespace doesn't respond to ICMP, but IPv6 could still work

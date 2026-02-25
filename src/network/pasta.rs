@@ -61,8 +61,8 @@ const PASTA_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// 6. Health checks via nsenter: `nsenter -t HOLDER_PID -U -n -- curl guest_ip:80`
 pub struct PastaNetwork {
     vm_id: String,
-    tap_device: String,    // TAP device for Firecracker (tap-fc)
-    pasta_device: String,  // TAP device created by pasta (pasta0)
+    tap_device: String,   // TAP device for Firecracker (tap-fc)
+    pasta_device: String, // TAP device created by pasta (pasta0)
     port_mappings: Vec<PortMapping>,
 
     // Network addressing (IPv4) — guest uses 10.0.2.x via bridge
@@ -156,10 +156,12 @@ ip link set lo up
 
     /// Build the post-pasta setup script that creates the bridge after pasta is ready
     ///
-    /// Connects pasta's TAP and Firecracker's TAP via an L2 bridge, and sets up
-    /// iptables DNAT for port forwarding from pasta's address to the VM.
+    /// Connects pasta's TAP and Firecracker's TAP via an L2 bridge.
+    /// Port forwarding works via pasta's L2 translation (--no-splice forces this):
+    /// pasta binds on the host, creates L2 frames, sends through pasta0 TAP →
+    /// bridge → tap-fc → VM. No iptables required.
     pub fn build_bridge_script(&self) -> String {
-        let mut script = format!(
+        let script = format!(
             r#"
 set -e
 
@@ -179,7 +181,7 @@ ip link set {fc_tap} master {bridge}
 # Add IP to bridge for health checks (namespace needs route to reach guest)
 ip addr add {namespace_ip}/24 dev {bridge}
 
-# Enable IP forwarding (needed for DNAT port forwarding to VM)
+# Enable IP forwarding
 echo 1 > /proc/sys/net/ipv4/ip_forward
 "#,
             bridge = BRIDGE_DEVICE,
@@ -187,24 +189,6 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
             fc_tap = self.tap_device,
             namespace_ip = NAMESPACE_IP,
         );
-
-        // Add iptables DNAT rules for port forwarding
-        // pasta sends traffic to pasta0's address (GUEST_GATEWAY/10.0.2.2),
-        // DNAT redirects it to the VM (GUEST_IP/10.0.2.100) via the bridge
-        for mapping in &self.port_mappings {
-            let proto = match mapping.proto {
-                Protocol::Tcp => "tcp",
-                Protocol::Udp => "udp",
-            };
-            script.push_str(&format!(
-                "iptables -t nat -A PREROUTING -d {gateway} -p {proto} --dport {ns_port} -j DNAT --to-destination {guest}:{guest_port}\n",
-                gateway = GUEST_GATEWAY,
-                proto = proto,
-                ns_port = mapping.guest_port,
-                guest = GUEST_IP,
-                guest_port = mapping.guest_port,
-            ));
-        }
 
         script
     }
@@ -297,8 +281,7 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
     /// pasta creates its own TAP device (pasta0) in the namespace and provides
     /// L2↔L4 translation to the host. Uses PID file for readiness signaling.
     pub async fn start_pasta(&mut self, namespace_pid: u32) -> Result<()> {
-        let pid_file =
-            paths::data_dir().join(format!("pasta-{}.pid", truncate_id(&self.vm_id, 8)));
+        let pid_file = paths::data_dir().join(format!("pasta-{}.pid", truncate_id(&self.vm_id, 8)));
 
         if pid_file.exists() {
             tokio::fs::remove_file(&pid_file).await?;
@@ -346,19 +329,38 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
             .arg("--dns-forward")
             .arg(GUEST_DNS) // Forward DNS queries sent to 10.0.2.3 to host resolver
             .arg("--no-dhcp")
-            .arg("--no-ndp")
-            .arg("--no-dhcpv6")
-            .arg("--no-ra");
+            // Disable splice bypass: pasta's default L4 socket bypass creates
+            // connections directly in the namespace, but the VM is behind a bridge.
+            // --no-splice forces all traffic (including port forwarding) through
+            // the L2 TAP path: pasta → pasta0 → br0 → tap-fc → VM.
+            .arg("--no-splice");
 
         // If host has global IPv6, configure pasta for IPv6 outbound
         if let Some(ref ipv6) = host_ipv6 {
-            cmd.arg("-o").arg(ipv6);
+            // Add IPv6 guest address and gateway so pasta handles IPv6 L2↔L4 translation.
+            // -a/-g can each be specified twice (once IPv4, once IPv6).
+            cmd.arg("-a")
+                .arg(GUEST_IPV6) // Guest IPv6 address — pasta ignores NDP for this
+                .arg("-g")
+                .arg(GUEST_IPV6_GATEWAY) // IPv6 gateway — pasta responds to NDP for this
+                .arg("-o")
+                .arg(ipv6); // Outbound source address for IPv6
+
+            // Keep NDP enabled: the guest needs NDP Neighbor Solicitation/Advertisement
+            // to resolve the IPv6 gateway's MAC address (like ARP for IPv4).
+            // Disable only RA (router advertisements) and DHCPv6 — we configure the
+            // guest's IPv6 address statically via kernel cmdline, not SLAAC.
+            cmd.arg("--no-ra").arg("--no-dhcpv6");
         } else {
-            // No host IPv6 — disable IPv6 in pasta to avoid spurious errors
-            cmd.arg("--ipv4-only");
+            // No host IPv6 — disable IPv6 entirely
+            cmd.arg("--ipv4-only")
+                // NDP/RA/DHCPv6 are moot with --ipv4-only, but be explicit
+                .arg("--no-ndp")
+                .arg("--no-dhcpv6")
+                .arg("--no-ra");
         }
 
-        // Port forwarding: pasta binds on the host, DNAT in namespace redirects to VM
+        // Port forwarding: pasta binds on host, L2 frames go through bridge to VM
         if self.port_mappings.is_empty() {
             cmd.arg("-t").arg("none").arg("-u").arg("none");
         } else {
@@ -372,10 +374,7 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
                 };
 
                 // pasta spec: "bind_addr/host_port:guest_port"
-                let spec = format!(
-                    "{}/{}:{}",
-                    bind_addr, mapping.host_port, mapping.guest_port
-                );
+                let spec = format!("{}/{}:{}", bind_addr, mapping.host_port, mapping.guest_port);
 
                 match mapping.proto {
                     Protocol::Tcp => tcp_specs.push(spec),
@@ -434,10 +433,7 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     let stderr = stderr.trim();
                     if stderr.is_empty() {
-                        anyhow::bail!(
-                            "pasta exited before becoming ready (status: {})",
-                            status
-                        );
+                        anyhow::bail!("pasta exited before becoming ready (status: {})", status);
                     } else {
                         anyhow::bail!(
                             "pasta exited before becoming ready (status: {}): {}",
