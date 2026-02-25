@@ -11,7 +11,6 @@ use crate::state::truncate_id;
 /// Guest network addressing — pasta provides L2↔L4 translation via bridge
 const GUEST_IP: &str = "10.0.2.100";
 const GUEST_GATEWAY: &str = "10.0.2.2";
-const GUEST_DNS: &str = "10.0.2.3";
 /// Namespace IP on bridge — enables nsenter health checks to route to guest
 const NAMESPACE_IP: &str = "10.0.2.1";
 
