@@ -327,8 +327,6 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
             .arg("255.255.255.0")
             .arg("-g")
             .arg(GUEST_GATEWAY) // Gateway — pasta responds to ARP for this
-            .arg("--dns-forward")
-            .arg(GUEST_DNS) // Forward DNS queries sent to 10.0.2.3 to host resolver
             .arg("--no-dhcp")
             // Disable splice bypass: pasta's default L4 socket bypass creates
             // connections directly in the namespace, but the VM is behind a bridge.
@@ -393,12 +391,16 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
             if tcp_specs.is_empty() {
                 cmd.arg("-t").arg("none");
             } else {
-                cmd.arg("-t").arg(tcp_specs.join(","));
+                for spec in &tcp_specs {
+                    cmd.arg("-t").arg(spec);
+                }
             }
             if udp_specs.is_empty() {
                 cmd.arg("-u").arg("none");
             } else {
-                cmd.arg("-u").arg(udp_specs.join(","));
+                for spec in &udp_specs {
+                    cmd.arg("-u").arg(spec);
+                }
             }
         }
 
@@ -511,7 +513,10 @@ impl NetworkManager for PastaNetwork {
             host_ip: Some(GUEST_GATEWAY.to_string()),
             host_veth: None,
             loopback_ip: self.loopback_ip.clone(),
-            dns_server: Some(GUEST_DNS.to_string()),
+            // Don't use pasta's DNS forwarder (10.0.2.3) — it's unreachable from the VM
+            // through the bridge. Instead, pass host DNS servers directly; the guest
+            // reaches them via pasta's L4 translation (same path as all other traffic).
+            dns_server: None,
             guest_ipv6,
             host_ipv6,
             dns_search: None,
