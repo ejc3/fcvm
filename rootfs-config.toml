@@ -25,7 +25,7 @@ btrfs_size = "60G"
 # Upstream PR: https://github.com/firecracker-microvm/firecracker/pull/5696
 [firecracker]
 repo = "ejc3/firecracker"
-branch = "fix-dump-dirty-multi-slot-cursor"
+branch = "bump-vsock-max-connections"
 
 # Rootfs Modification Plan
 #
