@@ -584,30 +584,39 @@ impl CloneFixture {
             std::thread::sleep(Duration::from_millis(50));
         };
 
-        // Make HTTP request to nginx
+        // Make HTTP request to nginx (retry briefly — pasta networking may need
+        // a moment after clone restore to establish L4 translation)
         let addr = format!("{}:{}", loopback_ip, health_port);
-        let mut stream = TcpStream::connect(&addr).expect("failed to connect to nginx");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-
-        let request = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-        stream
-            .write_all(request.as_bytes())
-            .expect("failed to send HTTP request");
-
-        let mut response = Vec::new();
-        let _ = stream.read_to_end(&mut response);
-
-        // Verify we got a valid response
-        let response_str = String::from_utf8_lossy(&response);
-        if !response_str.contains("200 OK") {
+        let mut last_response = String::new();
+        let mut http_ok = false;
+        for attempt in 0..5 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            if let Ok(mut stream) = TcpStream::connect(&addr) {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .ok();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .ok();
+                let request =
+                    "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+                if stream.write_all(request.as_bytes()).is_ok() {
+                    let mut response = Vec::new();
+                    let _ = stream.read_to_end(&mut response);
+                    last_response = String::from_utf8_lossy(&response).to_string();
+                    if last_response.contains("200 OK") {
+                        http_ok = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !http_ok {
             panic!(
-                "unexpected HTTP response: {}",
-                &response_str[..std::cmp::min(200, response_str.len())]
+                "unexpected HTTP response after 5 attempts: {}",
+                &last_response[..std::cmp::min(200, last_response.len())]
             );
         }
 
