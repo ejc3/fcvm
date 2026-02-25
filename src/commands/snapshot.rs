@@ -13,7 +13,7 @@ use crate::cli::{
     NetworkMode, SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs,
     SnapshotServeArgs,
 };
-use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, PortMapping};
+use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, PortMapping, RoutedNetwork};
 use crate::paths;
 use crate::state::{
     generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState, VmStatus,
@@ -641,10 +641,12 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Extract guest_ip from snapshot metadata for network config reuse
     let saved_network = &snapshot_config.metadata.network_config;
 
-    // Bridged mode requires root for iptables and network namespace setup
-    if matches!(args.network, NetworkMode::Bridged) && !nix::unistd::geteuid().is_root() {
+    // Bridged/routed mode requires root for iptables and network namespace setup
+    if matches!(args.network, NetworkMode::Bridged | NetworkMode::Routed)
+        && !nix::unistd::geteuid().is_root()
+    {
         bail!(
-            "Bridged networking requires root. Either:\n  \
+            "Bridged/routed networking requires root. Either:\n  \
              - Run with sudo: sudo fcvm snapshot run ...\n  \
              - Use rootless mode: fcvm snapshot run --network rootless ..."
         );
@@ -653,7 +655,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     if matches!(args.network, NetworkMode::Rootless) && nix::unistd::geteuid().is_root() {
         warn!(
             "Running rootless mode as root is unnecessary. \
-             Consider using --network bridged for better performance."
+             Consider using --network bridged or --network routed for better performance."
         );
     }
 
@@ -672,6 +674,11 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             }
             Box::new(net)
         }
+        NetworkMode::Routed => Box::new(RoutedNetwork::new(
+            vm_id.clone(),
+            tap_device.clone(),
+            port_mappings.clone(),
+        )),
         NetworkMode::Rootless => {
             // For rootless mode, allocate loopback IP atomically with state persistence
             // This prevents race conditions when starting multiple clones concurrently
@@ -689,6 +696,22 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     };
 
     let network_config = network.setup().await.context("setting up network")?;
+
+    // For routed mode: the snapshot's guest IPv6 (from the original VM's boot params) may
+    // differ from the newly generated one (different VM IDs). Add a host route for the
+    // snapshot's IPv6 so return traffic can reach the restored VM.
+    if let Some(routed_net) = network.as_any().downcast_ref::<crate::network::RoutedNetwork>() {
+        if let Some(ref old_ipv6) = saved_network.guest_ipv6 {
+            if network_config.guest_ipv6.as_ref() != Some(old_ipv6) {
+                info!(
+                    old_ipv6 = %old_ipv6,
+                    new_ipv6 = ?network_config.guest_ipv6,
+                    "adding host route for snapshot's guest IPv6"
+                );
+                routed_net.add_guest_route(old_ipv6).await;
+            }
+        }
+    }
 
     // Health check URL comes from snapshot metadata — it's a property of the VM image.
     // The cache key includes health_check_url, so each config gets its own snapshot.
