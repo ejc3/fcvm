@@ -29,6 +29,9 @@ if ! ./pasta --help 2>&1 | grep -q 'no-splice'; then
     exit 1
 fi
 
-# Install
-sudo cp pasta passt /usr/local/bin/
+# Install (atomic rename avoids ETXTBSY when pasta/passt are running)
+for bin in pasta passt; do
+    sudo cp "$bin" "/usr/local/bin/${bin}.tmp.$$"
+    sudo mv -f "/usr/local/bin/${bin}.tmp.$$" "/usr/local/bin/${bin}"
+done
 echo "==> Installed pasta $(./pasta --version 2>&1 | head -1) to /usr/local/bin/"

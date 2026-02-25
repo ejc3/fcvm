@@ -11,7 +11,6 @@ use crate::state::truncate_id;
 /// Guest network addressing — pasta provides L2↔L4 translation via bridge
 const GUEST_IP: &str = "10.0.2.100";
 const GUEST_GATEWAY: &str = "10.0.2.2";
-const GUEST_DNS: &str = "10.0.2.3";
 /// Namespace IP on bridge — enables nsenter health checks to route to guest
 const NAMESPACE_IP: &str = "10.0.2.1";
 
@@ -36,7 +35,7 @@ const PASTA_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 ///
 /// Architecture (L2 Bridge + L4 translation):
 /// ```text
-/// Host                    | User Namespace (unshare --user --map-root-user --net)
+/// Host                    | User Namespace (unshare --user --net)
 ///                         |
 /// pasta  <----------------+-- pasta0 --+
 ///   (L2↔L4 translation,   |            |
@@ -53,7 +52,7 @@ const PASTA_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// iptables DNAT inside the user namespace to reach the VM through the bridge.
 ///
 /// Setup sequence:
-/// 1. Spawn holder process: `unshare --user --map-root-user --net -- sleep infinity`
+/// 1. Spawn holder process: `unshare --user --net -- sleep infinity`
 /// 2. Run pre-setup via nsenter: create Firecracker TAP only
 /// 3. Start pasta: creates pasta0 TAP in namespace with L2↔L4 translation
 /// 4. Run post-setup via nsenter: create bridge, add both TAPs, enable ip_forward
@@ -116,13 +115,8 @@ impl PastaNetwork {
     /// The holder runs `sleep infinity` which blocks forever until killed.
     /// Note: We use sleep instead of cat because cat requires stdin management.
     ///
-    /// Uses --map-root-user for simple 1:1 UID mapping (current user → UID 0 inside namespace).
-    /// This works for both root and unprivileged users.
-    ///
-    /// Note: No --map-root-user here — setup_namespace_mappings() in common.rs handles
-    /// UID/GID mapping after the namespace is created (tries newuidmap first, falls back
-    /// to single-UID mapping). This matches main's approach and avoids conflicts when
-    /// running as root (where --map-root-user writes mappings that then block the fallback).
+    /// UID/GID mapping is handled by setup_namespace_mappings() in common.rs after
+    /// the namespace is created (tries newuidmap first, falls back to single-UID mapping).
     pub fn build_holder_command(&self) -> Vec<String> {
         vec![
             "unshare".to_string(),
@@ -213,7 +207,7 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
 
     /// Get a human-readable representation of the rootless networking flow
     pub fn rootless_flow_string(&self) -> String {
-        "holder(unshare --map-root-user) + nsenter for setup/firecracker".to_string()
+        "holder(unshare --user --net) + nsenter for setup/firecracker".to_string()
     }
 
     /// Detect host's global IPv6 address for pasta outbound traffic

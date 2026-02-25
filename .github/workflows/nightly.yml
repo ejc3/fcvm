@@ -62,6 +62,7 @@ jobs:
             libseccomp-dev
       - name: Build passt from source
         # Distro passt lacks --no-splice (required for bridge architecture)
+        working-directory: fcvm
         run: ./scripts/build-passt.sh
       - name: Install Firecracker
         run: |

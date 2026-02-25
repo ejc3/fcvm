@@ -113,7 +113,7 @@ git clone https://passt.top/passt /tmp/passt-build
 cd /tmp/passt-build
 git checkout "$PASST_TAG"
 make -j"$(nproc)"
-cp pasta passt /usr/local/bin/
+for bin in pasta passt; do cp "$bin" "/usr/local/bin/${bin}.tmp.$$" && mv -f "/usr/local/bin/${bin}.tmp.$$" "/usr/local/bin/${bin}"; done
 rm -rf /tmp/passt-build
 cd /
 
