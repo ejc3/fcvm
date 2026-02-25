@@ -832,7 +832,10 @@ pub async fn restore_from_snapshot(
         holder_pid_for_post_start = Some(holder_pid);
 
         holder_child = Some(child);
-    } else if let Some(routed_net) = network.as_any().downcast_ref::<crate::network::RoutedNetwork>() {
+    } else if let Some(routed_net) = network
+        .as_any()
+        .downcast_ref::<crate::network::RoutedNetwork>()
+    {
         // Routed mode: like bridged but with veth+IPv6 routing instead of iptables NAT
         if let Some(ns_id) = routed_net.namespace_id() {
             info!(namespace = %ns_id, "configuring VM to run in routed network namespace");
