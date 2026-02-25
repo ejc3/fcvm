@@ -141,6 +141,7 @@ pub async fn watch_restore_epoch(
     exec_rebind_needed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     exec_rebind_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     exec_rebind_done_notify: std::sync::Arc<tokio::sync::Notify>,
+    egress_reconnect: std::sync::Arc<tokio::sync::Notify>,
 ) {
     let mut last_epoch: Option<String> = None;
 
@@ -175,6 +176,7 @@ pub async fn watch_restore_epoch(
                         &exec_rebind_needed,
                         &exec_rebind_done,
                         &exec_rebind_done_notify,
+                        &egress_reconnect,
                     )
                     .await;
                     last_epoch = metadata.restore_epoch;
@@ -188,6 +190,7 @@ pub async fn watch_restore_epoch(
                         &exec_rebind_needed,
                         &exec_rebind_done,
                         &exec_rebind_done_notify,
+                        &egress_reconnect,
                     )
                     .await;
                     last_epoch = metadata.restore_epoch;
