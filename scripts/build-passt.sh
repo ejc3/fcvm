@@ -1,7 +1,5 @@
 #!/bin/bash
 # Build passt/pasta from source
-# The distro-packaged version lacks --no-splice which is required
-# for fcvm's bridge architecture (L2 frames through TAP).
 set -euo pipefail
 
 PASST_REPO="https://passt.top/passt"
@@ -22,12 +20,6 @@ git checkout "$PASST_TAG" 2>/dev/null || git checkout origin/master
 # Build
 make clean 2>/dev/null || true
 make -j"$(nproc)"
-
-# Verify --no-splice support
-if ! ./pasta --help 2>&1 | grep -q 'no-splice'; then
-    echo "ERROR: Built pasta binary does not support --no-splice"
-    exit 1
-fi
 
 # Install (atomic rename avoids ETXTBSY when pasta/passt are running)
 for bin in pasta passt; do
