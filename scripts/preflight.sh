@@ -18,7 +18,7 @@ echo "[preflight] checking pasta (for rootless) ..."
 if command -v pasta >/dev/null 2>&1; then
   echo "OK: pasta present ($(pasta --version 2>&1 | head -1))."
 else
-  echo "WARN: pasta not found. Install passt package or build from source: ./scripts/build-passt.sh"
+  echo "WARN: pasta not found. Install passt package: sudo apt-get install passt"
 fi
 
 echo "[preflight] checking nftables/iproute2 (for privileged) ..."

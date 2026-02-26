@@ -60,10 +60,6 @@ jobs:
             iproute2 iptables passt dnsmasq qemu-utils e2fsprogs parted \
             podman skopeo busybox-static cpio zstd autoconf automake libtool cmake \
             libseccomp-dev
-      - name: Build passt from source
-        # Build passt from source for consistent version across environments
-        working-directory: fcvm
-        run: ./scripts/build-passt.sh
       - name: Install Firecracker
         run: |
           ARCH=$(uname -m)

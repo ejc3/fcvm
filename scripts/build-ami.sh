@@ -107,15 +107,6 @@ export HOME=/root
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source /root/.cargo/env
 
-# Build passt from source for consistent version across environments
-PASST_TAG="2025_01_20.386b5f5"
-git clone https://passt.top/passt /tmp/passt-build
-cd /tmp/passt-build
-git checkout "$PASST_TAG"
-make -j"$(nproc)"
-for bin in pasta passt; do cp "$bin" "/usr/local/bin/${bin}.tmp.$$" && mv -f "/usr/local/bin/${bin}.tmp.$$" "/usr/local/bin/${bin}"; done
-rm -rf /tmp/passt-build
-cd /
 
 # Clone fcvm and its dependencies
 git clone --depth 1 https://github.com/ejc3/fcvm.git /tmp/fcvm

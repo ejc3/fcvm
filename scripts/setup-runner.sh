@@ -83,16 +83,6 @@ ln -sf /home/ubuntu/.cargo/bin/cargo /usr/local/bin/cargo
 ln -sf /home/ubuntu/.cargo/bin/rustc /usr/local/bin/rustc
 ln -sf /home/ubuntu/.cargo/bin/rustup /usr/local/bin/rustup
 
-# Build passt from source for consistent version across environments
-PASST_TAG="2025_01_20.386b5f5"
-cd /tmp
-git clone https://passt.top/passt /tmp/passt-build
-cd /tmp/passt-build
-git checkout "$PASST_TAG"
-make -j"$(nproc)"
-for bin in pasta passt; do cp "$bin" "/usr/local/bin/${bin}.tmp.$$" && mv -f "/usr/local/bin/${bin}.tmp.$$" "/usr/local/bin/${bin}"; done
-rm -rf /tmp/passt-build
-cd /
 
 # Firecracker (upstream baseline - CI overrides with custom fork from rootfs-config.toml)
 # CI's "Install custom Firecracker" step builds from the btrfs profile's firecracker_repo

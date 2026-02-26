@@ -19,10 +19,6 @@ RUN apt-get update && apt-get install -y \
     flex bison bc libelf-dev libssl-dev libseccomp-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Build passt from source for consistent version across environments
-COPY scripts/build-passt.sh /tmp/build-passt.sh
-RUN /tmp/build-passt.sh && rm -rf /tmp/passt-build /tmp/build-passt.sh
-
 # Install Firecracker
 ARG ARCH=aarch64
 RUN curl -fsSL -o /tmp/fc.tgz \
