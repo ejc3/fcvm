@@ -601,6 +601,49 @@ async fn update_health_status_once(
                                 HealthStatus::Unhealthy
                             }
                         }
+                    } else if let Some(ref ns_name) = net.namespace_name {
+                        // Routed mode with named namespace: use `ip netns exec` to curl guest
+                        let guest_ip = net
+                            .guest_ip
+                            .as_ref()
+                            .map(|ip| ip.split('/').next().unwrap_or(ip))
+                            .unwrap_or("10.0.2.100");
+                        let port = url.port().unwrap_or(80);
+                        debug!(target: "health-monitor", ns_name = ns_name, guest_ip = %guest_ip, port = port, host = ?url_host, "HTTP health check via ip netns exec");
+
+                        match check_http_health_netns(
+                            ns_name,
+                            guest_ip,
+                            port,
+                            health_path,
+                            url_host,
+                            health_timeout,
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                debug!(target: "health-monitor", "health check passed (netns)");
+                                *last_failure_log = None;
+                                HealthStatus::Healthy
+                            }
+                            Ok(false) => {
+                                warn!(target: "health-monitor", "health check returned false (netns)");
+                                HealthStatus::Unhealthy
+                            }
+                            Err(e) => {
+                                let should_log = match last_failure_log {
+                                    None => true,
+                                    Some(last_time) => {
+                                        last_time.elapsed() >= Duration::from_secs(1)
+                                    }
+                                };
+                                if should_log {
+                                    debug!(target: "health-monitor", error = %e, "HTTP health check failed (netns)");
+                                    *last_failure_log = Some(Instant::now());
+                                }
+                                HealthStatus::Unhealthy
+                            }
+                        }
                     } else {
                         // Bridged mode: transform URL to use guest IP if localhost is specified
                         // "localhost" from the host doesn't reach the VM - we need the guest's IP
@@ -801,6 +844,73 @@ async fn check_http_health_nsenter(
                 stderr.trim()
             )
         }
+    }
+}
+
+/// Check if HTTP service is responding via `ip netns exec` (routed mode)
+///
+/// For routed VMs, the guest IP is only reachable from inside the named
+/// network namespace. We use `ip netns exec <name> curl ...` to reach it.
+async fn check_http_health_netns(
+    ns_name: &str,
+    guest_ip: &str,
+    port: u16,
+    health_path: &str,
+    host_header: Option<&str>,
+    timeout_secs: u64,
+) -> Result<bool> {
+    let url = format!("http://{}:{}{}", guest_ip, port, health_path);
+    let timeout_str = timeout_secs.to_string();
+    let start = Instant::now();
+
+    let mut args = vec![
+        "ip", "netns", "exec", ns_name,
+        "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+        "-m", &timeout_str,
+        "--noproxy", "*",
+    ];
+    let host_arg;
+    if let Some(host) = host_header {
+        host_arg = format!("Host: {}", host);
+        args.push("-H");
+        args.push(&host_arg);
+    }
+    args.push(&url);
+
+    // ip netns exec requires root (or CAP_SYS_ADMIN)
+    let output = tokio::process::Command::new("sudo")
+        .args(&args)
+        .output()
+        .await
+        .context("failed to run ip netns exec curl")?;
+
+    let elapsed = start.elapsed();
+
+    if output.status.success() {
+        let status_code = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if status_code.starts_with('2') || status_code.starts_with('3') {
+            debug!(
+                target: "health-monitor",
+                ns_name = ns_name,
+                guest_ip = guest_ip,
+                port = port,
+                status = %status_code,
+                elapsed_ms = elapsed.as_millis(),
+                "health check succeeded (netns)"
+            );
+            Ok(true)
+        } else {
+            anyhow::bail!(
+                "Health check failed with status {} via netns {} to {}:{} ({}ms)",
+                status_code, ns_name, guest_ip, port, elapsed.as_millis()
+            )
+        }
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to connect to {}:{} via netns {}: {}",
+            guest_ip, port, ns_name, stderr.trim()
+        )
     }
 }
 
