@@ -82,7 +82,38 @@ impl RoutedNetwork {
 
     /// Detect host's global IPv6 address and /64 subnet.
     /// Returns (host_ip, subnet_prefix) e.g. ("2803:6084:2900:2534::1", "2803:6084:2900:2534")
+    ///
+    /// If no global /64 is found, auto-provisions a ULA prefix (fd00:fc00::1/64)
+    /// on the default interface so routed mode works on any host without manual setup.
     fn detect_host_ipv6() -> Option<(String, String)> {
+        if let Some(result) = Self::find_host_ipv6() {
+            return Some(result);
+        }
+
+        // No /64 found — auto-provision a ULA prefix on the default interface
+        let iface = Self::detect_default_interface().unwrap_or_else(|| "eth0".to_string());
+        info!(
+            iface = %iface,
+            "no global IPv6 /64 detected, auto-provisioning fd00:fc00::1/64"
+        );
+        let output = std::process::Command::new("ip")
+            .args(["-6", "addr", "add", "fd00:fc00::1/64", "dev", &iface])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // EEXIST is fine — already provisioned
+            if !stderr.contains("RTNETLINK answers: File exists") {
+                warn!(error = %stderr, "failed to add ULA /64 prefix");
+                return None;
+            }
+        }
+
+        Self::find_host_ipv6()
+    }
+
+    /// Find a global IPv6 /64 address on the host.
+    fn find_host_ipv6() -> Option<(String, String)> {
         let output = std::process::Command::new("ip")
             .args(["-6", "addr", "show", "scope", "global"])
             .output()
@@ -109,6 +140,22 @@ impl RoutedNetwork {
                         }
                     }
                 }
+            }
+        }
+        None
+    }
+
+    /// Detect the default network interface (from IPv4 default route).
+    fn detect_default_interface() -> Option<String> {
+        let output = std::process::Command::new("ip")
+            .args(["route", "show", "default"])
+            .output()
+            .ok()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if let Some(idx) = parts.iter().position(|&p| p == "dev") {
+                return parts.get(idx + 1).map(|s| s.to_string());
             }
         }
         None

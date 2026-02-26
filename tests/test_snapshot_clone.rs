@@ -42,6 +42,13 @@ async fn test_snapshot_clone_stress_100_bridged() -> Result<()> {
     snapshot_clone_test_impl("bridged", 100).await
 }
 
+/// Full snapshot/clone workflow test with routed networking (10 clones)
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_snapshot_clone_routed_10() -> Result<()> {
+    snapshot_clone_test_impl("routed", 10).await
+}
+
 /// Result of spawning and health-checking a single clone
 struct CloneResult {
     name: String,
@@ -397,6 +404,13 @@ async fn test_clone_while_baseline_running_rootless() -> Result<()> {
 #[tokio::test]
 async fn test_clone_while_baseline_running_bridged() -> Result<()> {
     clone_while_baseline_running_impl("bridged").await
+}
+
+/// Test cloning while baseline VM is still running (routed)
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_clone_while_baseline_running_routed() -> Result<()> {
+    clone_while_baseline_running_impl("routed").await
 }
 
 /// Implementation for clone-while-baseline-running test
@@ -809,6 +823,13 @@ async fn test_clone_internet_bridged() -> Result<()> {
 #[tokio::test]
 async fn test_clone_internet_rootless() -> Result<()> {
     clone_internet_test_impl("rootless").await
+}
+
+/// Test that clones can reach the internet in routed mode
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_clone_internet_routed() -> Result<()> {
+    clone_internet_test_impl("routed").await
 }
 
 async fn clone_internet_test_impl(network: &str) -> Result<()> {
@@ -1567,6 +1588,190 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
     }
 }
 
+/// Test port forwarding on clones with routed networking
+///
+/// Routed mode uses socat + unique loopback IPs (like rootless).
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_clone_port_forward_routed() -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("pf-routed");
+
+    println!("\n╔═══════════════════════════════════════════════════════════════╗");
+    println!("║     Clone Port Forwarding Test (routed)                       ║");
+    println!("╚═══════════════════════════════════════════════════════════════╝\n");
+
+    let fcvm_path = common::find_fcvm_binary()?;
+
+    // Step 1: Start baseline VM with nginx (routed)
+    println!("Step 1: Starting baseline VM with nginx (routed)...");
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "routed",
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
+
+    println!("  Waiting for baseline VM to become healthy...");
+    common::poll_health_by_pid(baseline_pid, 120).await?;
+    println!("  ✓ Baseline VM healthy (PID: {})", baseline_pid);
+
+    // Step 2: Create snapshot
+    println!("\nStep 2: Creating snapshot...");
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
+        ])
+        .output()
+        .await
+        .context("running snapshot create")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Snapshot creation failed: {}", stderr);
+    }
+    println!("  ✓ Snapshot created");
+
+    // Kill baseline - we only need the snapshot for clones
+    common::kill_process(baseline_pid).await;
+    println!("  Killed baseline VM (only need snapshot)");
+
+    // Step 3: Start memory server
+    println!("\nStep 3: Starting memory server...");
+    let (_serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server")
+            .await
+            .context("spawning memory server")?;
+
+    // Wait for serve to be ready (poll for socket)
+    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+    println!("  ✓ Memory server ready (PID: {})", serve_pid);
+
+    // Step 4: Spawn clone WITH port forwarding (routed)
+    let host_port = common::find_available_high_port().context("finding available port")?;
+    let publish_arg = format!("{}:80", host_port);
+    println!(
+        "\nStep 4: Spawning clone with --publish {} (routed)...",
+        publish_arg
+    );
+    let serve_pid_str = serve_pid.to_string();
+    let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid_str,
+            "--name",
+            &clone_name,
+            "--network",
+            "routed",
+            "--publish",
+            &publish_arg,
+        ],
+        &clone_name,
+    )
+    .await
+    .context("spawning clone with port forward")?;
+
+    // Wait for clone to become healthy
+    println!("  Waiting for clone to become healthy...");
+    common::poll_health_by_pid(clone_pid, 120).await?;
+    println!("  ✓ Clone is healthy (PID: {})", clone_pid);
+
+    // Step 5: Test port forwarding via loopback IP
+    println!("\nStep 5: Testing port forwarding...");
+
+    // Get clone's loopback IP from state (routed uses socat + loopback like rootless)
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args(["ls", "--json", "--pid", &clone_pid.to_string()])
+        .output()
+        .await
+        .context("getting clone state")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let loopback_ip: String = serde_json::from_str::<Vec<serde_json::Value>>(&stdout)
+        .ok()
+        .and_then(|v| v.first().cloned())
+        .and_then(|v| {
+            v.get("config")?
+                .get("network")?
+                .get("loopback_ip")?
+                .as_str()
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default();
+
+    println!("  Clone loopback IP: {}", loopback_ip);
+
+    // Test: Access via loopback IP and forwarded port
+    println!(
+        "  Testing access via loopback {}:{}...",
+        loopback_ip, host_port
+    );
+    let loopback_result = tokio::process::Command::new("curl")
+        .args([
+            "-s",
+            "--max-time",
+            "5",
+            &format!("http://{}:{}", loopback_ip, host_port),
+        ])
+        .output()
+        .await
+        .context("curl loopback port forward")?;
+
+    let loopback_works = loopback_result.status.success() && !loopback_result.stdout.is_empty();
+    if loopback_works {
+        let response = String::from_utf8_lossy(&loopback_result.stdout);
+        println!("    Loopback access: ✓ OK ({} bytes)", response.len());
+    } else {
+        println!("    Loopback access: ✗ FAIL");
+        println!(
+            "    stderr: {}",
+            String::from_utf8_lossy(&loopback_result.stderr)
+        );
+    }
+
+    // Cleanup
+    println!("\nCleaning up...");
+    common::kill_process(clone_pid).await;
+    println!("  Killed clone");
+    common::kill_process(serve_pid).await;
+    println!("  Killed memory server");
+
+    // Results
+    println!("\n╔═══════════════════════════════════════════════════════════════╗");
+    println!("║                         RESULTS                               ║");
+    println!("╠═══════════════════════════════════════════════════════════════╣");
+    println!(
+        "║  Loopback port forward: {}                                    ║",
+        if loopback_works {
+            "✓ PASSED"
+        } else {
+            "✗ FAILED"
+        }
+    );
+    println!("╚═══════════════════════════════════════════════════════════════╝");
+
+    if loopback_works {
+        println!("\n✅ ROUTED CLONE PORT FORWARDING TEST PASSED!");
+        Ok(())
+    } else {
+        anyhow::bail!("Routed clone port forwarding test failed")
+    }
+}
+
 /// Test direct file-based snapshot run (--snapshot flag) with rootless networking
 ///
 /// This tests the new --snapshot flag which restores directly from disk
@@ -1581,6 +1786,13 @@ async fn test_snapshot_run_direct_rootless() -> Result<()> {
 #[tokio::test]
 async fn test_snapshot_run_direct_bridged() -> Result<()> {
     snapshot_run_direct_test_impl("bridged").await
+}
+
+/// Test direct file-based snapshot run (--snapshot flag) with routed networking
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_snapshot_run_direct_routed() -> Result<()> {
+    snapshot_run_direct_test_impl("routed").await
 }
 
 /// Implementation of direct file-based snapshot run test
@@ -1723,6 +1935,13 @@ async fn test_snapshot_run_exec_bridged() -> Result<()> {
 #[tokio::test]
 async fn test_snapshot_run_exec_rootless() -> Result<()> {
     snapshot_run_exec_test_impl("rootless").await
+}
+
+/// Test snapshot run --exec with routed networking
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_snapshot_run_exec_routed() -> Result<()> {
+    snapshot_run_exec_test_impl("routed").await
 }
 
 /// Implementation of snapshot run --exec test

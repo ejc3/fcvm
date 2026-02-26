@@ -43,6 +43,13 @@ async fn test_egress_stress_rootless() -> Result<()> {
     egress_stress_impl("rootless", NUM_CLONES, REQUESTS_PER_CLONE).await
 }
 
+/// Test egress stress with routed networking using local HTTP server
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_egress_stress_routed() -> Result<()> {
+    egress_stress_impl("routed", NUM_CLONES, REQUESTS_PER_CLONE).await
+}
+
 async fn egress_stress_impl(
     network: &str,
     num_clones: usize,
@@ -80,9 +87,8 @@ async fn egress_stress_impl(
     // For rootless mode, pasta handles all routing so local traffic works fine (10.0.2.2).
     let egress_url = match network {
         "rootless" => format!("http://10.0.2.2:{}/", http_server_port),
-        "bridged" => {
+        "bridged" | "routed" => {
             // Get host's primary interface IP (the IP used to reach external networks)
-            // Traffic to this IP from VMs goes through NAT, so CONNMARK works
             let host_ip = get_host_primary_ip().await?;
             format!("http://{}:{}/", host_ip, http_server_port)
         }

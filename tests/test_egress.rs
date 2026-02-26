@@ -40,6 +40,20 @@ async fn test_egress_clone_rootless() -> Result<()> {
     egress_clone_test_impl("rootless").await
 }
 
+/// Test egress connectivity for fresh VM with routed networking
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_egress_fresh_routed() -> Result<()> {
+    egress_fresh_test_impl("routed").await
+}
+
+/// Test egress connectivity for cloned VM with routed networking
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_egress_clone_routed() -> Result<()> {
+    egress_clone_test_impl("routed").await
+}
+
 /// Get the host's primary network interface IP (used for reaching external networks)
 /// For bridged mode, VMs can reach this IP via NAT
 async fn get_host_primary_ip() -> Result<String> {
@@ -69,8 +83,8 @@ async fn get_egress_url(network: &str, port: u16) -> Result<String> {
             // For rootless, pasta gateway is 10.0.2.2
             Ok(format!("http://10.0.2.2:{}/", port))
         }
-        "bridged" => {
-            // For bridged, use host's primary IP (reachable via NAT)
+        "bridged" | "routed" => {
+            // For bridged/routed, use host's primary IP (reachable via NAT or direct routing)
             let host_ip = get_host_primary_ip().await?;
             Ok(format!("http://{}:{}/", host_ip, port))
         }
