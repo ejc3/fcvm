@@ -272,48 +272,31 @@ impl CloneFixture {
         };
 
         // Make HTTP request to nginx
-        // Retry loop: pasta port forwarding may not be ready immediately after
-        // health check passes (health check uses bridge/nsenter, not pasta).
+        // pasta's post_start() verifies port forwarding is ready before returning,
+        // so this should work immediately after health check.
         let addr = format!("{}:{}", loopback_ip, health_port);
-        let http_start = Instant::now();
-        let mut last_err = String::new();
-        loop {
-            if http_start.elapsed() > Duration::from_secs(10) {
-                panic!(
-                    "failed to get HTTP 200 from clone within 10s, last: {}",
-                    last_err
-                );
-            }
-            match TcpStream::connect(&addr) {
-                Ok(mut stream) => {
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(5)))
-                        .unwrap();
-                    stream
-                        .set_write_timeout(Some(Duration::from_secs(5)))
-                        .unwrap();
-                    let request =
-                        "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-                    if stream.write_all(request.as_bytes()).is_ok() {
-                        let mut response = Vec::new();
-                        let _ = stream.read_to_end(&mut response);
-                        let response_str = String::from_utf8_lossy(&response);
-                        if response_str.contains("200 OK") {
-                            break;
-                        }
-                        last_err = format!(
-                            "unexpected response: {}",
-                            &response_str[..std::cmp::min(200, response_str.len())]
-                        );
-                    } else {
-                        last_err = "write failed".to_string();
-                    }
-                }
-                Err(e) => {
-                    last_err = format!("connect failed: {}", e);
-                }
-            }
-            std::thread::sleep(Duration::from_millis(200));
+        let mut stream = TcpStream::connect(&addr).expect("failed to connect to nginx");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let request = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        stream
+            .write_all(request.as_bytes())
+            .expect("failed to send HTTP request");
+
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+
+        let response_str = String::from_utf8_lossy(&response);
+        if !response_str.contains("200 OK") {
+            panic!(
+                "unexpected HTTP response: {}",
+                &response_str[..std::cmp::min(200, response_str.len())]
+            );
         }
 
         // Kill the clone
