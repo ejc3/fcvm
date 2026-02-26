@@ -43,6 +43,7 @@ pub struct RoutedNetwork {
     namespace_id: Option<String>,
     host_veth: Option<String>,
     vm_ipv6: Option<String>,
+    ns_source_ipv6: Option<String>,
     socat_children: Vec<tokio::process::Child>,
 }
 
@@ -55,6 +56,7 @@ impl RoutedNetwork {
             namespace_id: None,
             host_veth: None,
             vm_ipv6: None,
+            ns_source_ipv6: None,
             socat_children: Vec::new(),
         }
     }
@@ -244,9 +246,10 @@ impl NetworkManager for RoutedNetwork {
         info!(host_ll = %host_ll, "assigned link-local to host veth");
 
         // 9. Add routable source IPv6 to bridge (for namespace-originated traffic).
-        //    Uses a separate address from the VM's — the namespace needs its own
-        //    routable source so return traffic can find it.
-        let ns_source_ipv6 = format!("{}::face:1", ipv6_prefix);
+        //    Uses a per-VM address (not the VM's own) — the namespace needs its own
+        //    routable source so return traffic can find it. Derived from vm_id with
+        //    a different salt to avoid collision with the VM's IPv6.
+        let ns_source_ipv6 = Self::generate_vm_ipv6(&ipv6_prefix, &format!("ns-{}", self.vm_id));
         let ns_source_cidr = format!("{}/128", ns_source_ipv6);
         namespace::exec_in_namespace(
             &ns_name,
@@ -344,7 +347,21 @@ impl NetworkManager for RoutedNetwork {
         //     inside the namespace (via `ip netns exec`). The veth is a bridge member
         //     so host-side IPv4 routing to 10.0.2.100 doesn't work — socat must run
         //     the connect side inside the namespace where the bridge is directly reachable.
-        let loopback_ip = format!("127.0.0.{}", 2 + (std::process::id() % 252) as u8);
+        //     Use a hash of vm_id over the 127.0.0.2–127.255.255.254 range (~16M addresses)
+        //     to avoid collision between concurrent VMs (PID % 252 only had 252 slots).
+        let loopback_ip = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            self.vm_id.hash(&mut hasher);
+            let hash = hasher.finish() as u32;
+            // Map to 127.0.0.2–127.255.255.254 (avoid .0.0.0 network and .255.255.255 broadcast)
+            let offset = (hash % (0xFF_FF_FD)) + 2; // 2..=16777214
+            let b1 = ((offset >> 16) & 0xFF) as u8;
+            let b2 = ((offset >> 8) & 0xFF) as u8;
+            let b3 = (offset & 0xFF) as u8;
+            format!("127.{}.{}.{}", b1, b2, b3)
+        };
         for mapping in &self.port_mappings {
             // Shell script: socat listens on host, connects inside namespace
             let script = format!(
@@ -375,6 +392,7 @@ impl NetworkManager for RoutedNetwork {
         self.namespace_id = Some(ns_name);
         self.host_veth = Some(host_veth);
         self.vm_ipv6 = Some(vm_ipv6.clone());
+        self.ns_source_ipv6 = Some(ns_source_ipv6);
 
         Ok(NetworkConfig {
             tap_device: self.tap_device.clone(),
@@ -433,9 +451,17 @@ impl NetworkManager for RoutedNetwork {
                 .output()
                 .await;
 
-            // Remove host route
+            // Remove host route for VM IPv6
             let _ = tokio::process::Command::new("ip")
                 .args(["-6", "route", "del", &format!("{}/128", vm_ipv6)])
+                .output()
+                .await;
+        }
+
+        // Remove host route for namespace source IPv6
+        if let Some(ref ns_source_ipv6) = self.ns_source_ipv6 {
+            let _ = tokio::process::Command::new("ip")
+                .args(["-6", "route", "del", &format!("{}/128", ns_source_ipv6)])
                 .output()
                 .await;
         }

@@ -218,6 +218,15 @@ pub(super) fn build_runtime_boot_args(
         boot_args.push_str(&format!("ipv6={}|{}", guest_ipv6, host_ipv6));
     }
 
+    // Routed mode indicator: tells fc-agent to only add HOST_IPV6 to lo (not eth0).
+    // Without this, fc-agent can't distinguish routed from pasta mode since both pass ipv6=.
+    if network_config.namespace_name.is_some() {
+        if !boot_args.is_empty() {
+            boot_args.push(' ');
+        }
+        boot_args.push_str("network_mode=routed");
+    }
+
     // Pass DNS servers to guest for resolv.conf configuration
     // Both rootless and bridged: use host DNS servers directly (reachable via
     // pasta's L4 translation or bridge/NAT respectively)

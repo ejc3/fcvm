@@ -335,10 +335,11 @@ pub async fn run() -> Result<()> {
     // because NDP for the fbwhoami address isn't configured on the namespace side.
     if let Some(ipv6) = plan.env.get("HOST_IPV6") {
         if !ipv6.is_empty() {
-            // Check if a routed IPv6 is configured (ipv6= boot param).
+            // Check if this is routed mode (network_mode=routed boot param).
             // If so, only add fbwhoami to lo (not eth0) to avoid source address conflicts.
+            // We use an explicit boot param because both pasta and routed pass ipv6=.
             let has_routed_ipv6 = std::fs::read_to_string("/proc/cmdline")
-                .map(|c| c.contains("ipv6="))
+                .map(|c| c.contains("network_mode=routed"))
                 .unwrap_or(false);
             let devices: &[&str] = if has_routed_ipv6 {
                 &["lo"]
