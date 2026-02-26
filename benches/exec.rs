@@ -589,9 +589,9 @@ impl CloneFixture {
         let addr = format!("{}:{}", loopback_ip, health_port);
         let mut last_response = String::new();
         let mut http_ok = false;
-        for attempt in 0..5 {
+        for attempt in 0..10 {
             if attempt > 0 {
-                std::thread::sleep(Duration::from_millis(200));
+                std::thread::sleep(Duration::from_millis(500));
             }
             if let Ok(mut stream) = TcpStream::connect(&addr) {
                 stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
@@ -610,7 +610,7 @@ impl CloneFixture {
         }
         if !http_ok {
             panic!(
-                "unexpected HTTP response after 5 attempts: {}",
+                "unexpected HTTP response after 10 attempts: {}",
                 &last_response[..std::cmp::min(200, last_response.len())]
             );
         }
