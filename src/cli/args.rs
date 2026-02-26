@@ -213,7 +213,7 @@ pub struct RunArgs {
     #[arg(long)]
     pub user: Option<String>,
 
-    /// Forward specific localhost ports to the host gateway via iptables DNAT.
+    /// Forward specific localhost ports to the host gateway via TCP proxy.
     /// Enables containers to reach host-only services via localhost.
     /// Comma-separated port list, e.g., --forward-localhost 1421,9099
     #[arg(long, value_delimiter = ',')]
