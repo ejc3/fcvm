@@ -700,7 +700,10 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // For routed mode: the snapshot's guest IPv6 (from the original VM's boot params) may
     // differ from the newly generated one (different VM IDs). Add a host route for the
     // snapshot's IPv6 so return traffic can reach the restored VM.
-    if let Some(routed_net) = network.as_any().downcast_ref::<crate::network::RoutedNetwork>() {
+    if let Some(routed_net) = network
+        .as_any()
+        .downcast_ref::<crate::network::RoutedNetwork>()
+    {
         if let Some(ref old_ipv6) = saved_network.guest_ipv6 {
             if network_config.guest_ipv6.as_ref() != Some(old_ipv6) {
                 info!(
