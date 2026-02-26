@@ -113,10 +113,14 @@ pub async fn run_egress_proxy(reconnect: Arc<Notify>, reconnect_done: Arc<Notify
 
     // Bind on both IPv4 and IPv6 loopback so we catch redirected traffic from both stacks.
     // ip6tables REDIRECT sends IPv6 traffic to [::1]:PROXY_LISTEN_PORT.
-    let listener_v4 = match TcpListener::bind(("127.0.0.1", PROXY_LISTEN_PORT)).await {
+    //
+    // Use TcpSocket to set a large listen backlog (8192 instead of default 128).
+    // With 8000+ concurrent connections, the default backlog causes accept queue
+    // overflow and connection drops under load.
+    let listener_v4 = match bind_with_backlog("127.0.0.1", PROXY_LISTEN_PORT, false).await {
         Ok(l) => {
             eprintln!(
-                "[fc-agent] egress proxy listening on 127.0.0.1:{}",
+                "[fc-agent] egress proxy listening on 127.0.0.1:{} (backlog=8192)",
                 PROXY_LISTEN_PORT
             );
             l
@@ -130,10 +134,10 @@ pub async fn run_egress_proxy(reconnect: Arc<Notify>, reconnect_done: Arc<Notify
         }
     };
 
-    let listener_v6 = match TcpListener::bind(("::1", PROXY_LISTEN_PORT)).await {
+    let listener_v6 = match bind_with_backlog("::1", PROXY_LISTEN_PORT, true).await {
         Ok(l) => {
             eprintln!(
-                "[fc-agent] egress proxy listening on [::1]:{}",
+                "[fc-agent] egress proxy listening on [::1]:{} (backlog=8192)",
                 PROXY_LISTEN_PORT
             );
             Some(l)
@@ -410,6 +414,31 @@ async fn handle_redirected_connection(
 
     state.streams.remove(&stream_id);
     Ok(())
+}
+
+/// Listen backlog for the proxy listener. With 8000+ concurrent connections,
+/// the default backlog of 128 causes accept queue overflow under load.
+const LISTEN_BACKLOG: u32 = 8192;
+
+/// Bind a TCP listener with a large backlog.
+/// Uses TcpSocket to control the listen() backlog parameter, which
+/// TcpListener::bind() hardcodes to 128.
+async fn bind_with_backlog(
+    addr: &str,
+    port: u16,
+    ipv6: bool,
+) -> Result<TcpListener, std::io::Error> {
+    let socket = if ipv6 {
+        tokio::net::TcpSocket::new_v6()?
+    } else {
+        tokio::net::TcpSocket::new_v4()?
+    };
+    socket.set_reuseaddr(true)?;
+    let bind_addr: std::net::SocketAddr = format!("{}:{}", addr, port).parse().map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("bad addr: {}", e))
+    })?;
+    socket.bind(bind_addr)?;
+    socket.listen(LISTEN_BACKLOG)
 }
 
 /// Set up iptables and ip6tables NAT OUTPUT REDIRECT rules.
