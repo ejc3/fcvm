@@ -362,10 +362,10 @@ async fn start_1mb_server(bind_addr: &str) -> Result<OneMbServer> {
     // With 8000 concurrent connections, the default backlog causes accept queue
     // overflow under CI load (many parallel tests competing for CPU).
     let addr: std::net::SocketAddr = format!("{}:0", bind_addr).parse()?;
-    let socket = std::net::TcpSocket::new_v4()?;
+    let socket = tokio::net::TcpSocket::new_v4()?;
     socket.set_reuseaddr(true)?;
     socket.bind(addr)?;
-    let listener = socket.listen(8192)?;
+    let listener = socket.listen(8192)?.into_std()?;
     let port = listener.local_addr()?.port();
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let conn_count = Arc::new(AtomicU32::new(0));
