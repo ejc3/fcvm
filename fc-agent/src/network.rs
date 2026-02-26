@@ -108,9 +108,7 @@ pub async fn kill_stale_tcp_connections() {
             continue;
         }
         let peer = fields[3];
-        if peer.starts_with("127.0.0.1:")
-            || peer.starts_with("[::1]:")
-            || peer.starts_with("::1:")
+        if peer.starts_with("127.0.0.1:") || peer.starts_with("[::1]:") || peer.starts_with("::1:")
         {
             local_count += 1;
         } else {
@@ -155,9 +153,7 @@ pub async fn kill_stale_tcp_connections() {
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            if stderr.contains("INET_DIAG_DESTROY")
-                || stderr.contains("Operation not supported")
-            {
+            if stderr.contains("INET_DIAG_DESTROY") || stderr.contains("Operation not supported") {
                 eprintln!("[fc-agent] ss -K not supported, trying conntrack");
                 kill_connections_via_conntrack().await;
             } else {
