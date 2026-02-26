@@ -7,7 +7,8 @@ Run Podman containers in Firecracker microVMs with fast cloning via UFFD memory 
 > - **~6x faster startup** with container image cache (540ms vs 3100ms)
 > - VM cloning via UFFD memory server + btrfs reflinks (~10ms restore, ~610ms with exec)
 > - Multiple VMs share memory via kernel page cache (50 VMs = ~512MB, not 25GB)
-> - Dual networking: bridged (iptables) or rootless (slirp4netns)
+> - Dual networking: bridged (iptables) or rootless (pasta)
+> - Transparent egress proxy for outbound internet (243 MB/s, 8000 concurrent connections)
 > - Port forwarding for both regular VMs and clones
 > - FUSE-based host directory mapping via fuse-pipe
 > - Container exit code forwarding
@@ -27,7 +28,7 @@ Run Podman containers in Firecracker microVMs with fast cloning via UFFD memory 
 - musl target: `rustup target add $(uname -m)-unknown-linux-musl`
 - Firecracker binary in PATH
 - For bridged networking: sudo, iptables, iproute2
-- For rootless networking: slirp4netns
+- For rootless networking: passt (provides the `pasta` binary)
 - For building rootfs: qemu-utils, e2fsprogs
 
 **Storage**
@@ -53,7 +54,7 @@ See [CLAUDE.md](.claude/CLAUDE.md#makefile-targets) for all Makefile targets.
 | pjdfstest build | autoconf, automake, libtool |
 | pjdfstest runtime | perl |
 | bindgen (userfaultfd-sys) | libclang-dev, clang |
-| VM tests | iproute2, iptables, slirp4netns |
+| VM tests | iproute2, iptables, passt |
 | Rootfs build | qemu-utils, e2fsprogs |
 | User namespaces | uidmap (for newuidmap/newgidmap) |
 
@@ -69,7 +70,7 @@ sudo apt-get update && sudo apt-get install -y \
     fuse3 libfuse3-dev \
     autoconf automake libtool perl \
     libclang-dev clang \
-    iproute2 iptables slirp4netns \
+    iproute2 iptables passt \
     qemu-utils e2fsprogs \
     uidmap
 ```
@@ -763,15 +764,40 @@ curl -s -X DELETE localhost:8090/v1/sandboxes/<id> | jq .
 
 | Mode | Flag | Root | Notes |
 |------|------|------|-------|
-| Rootless | `--network rootless` (default) | No | slirp4netns with bridge, IPv6 support |
+| Rootless | `--network rootless` (default) | No | pasta with bridge, IPv6 support |
 | Bridged | `--network bridged` | Yes | iptables NAT, better performance |
 
-**Rootless architecture**: Uses a Linux bridge (br0) for L2 forwarding between slirp4netns and Firecracker.
+**Rootless architecture**: Uses pasta (from the passt project) with a Linux bridge (br0) for L2 forwarding between pasta and Firecracker.
+Pasta uses splice(2) zero-copy L4 translation for near-native performance.
 The bridge preserves MAC addresses for proper ARP/NDP learning, enabling IPv6 support.
+
+### Egress Proxy (Outbound Internet)
+
+In rootless mode, VMs can make outbound TCP connections (e.g., `curl`, `wget`, `apt-get`) via a transparent egress proxy. The proxy is enabled by default and requires no configuration.
+
+**How it works:**
+1. Guest iptables REDIRECT captures all outbound TCP to a local proxy
+2. Proxy extracts the original destination via `SO_ORIGINAL_DST`
+3. Sends an OPEN frame over a single multiplexed vsock connection to the host
+4. Host connects to the real destination and relays data bidirectionally
+
+All TCP connections share one vsock — no per-connection overhead. The protocol uses 10-byte framed messages with stream IDs for multiplexing.
+
+**Performance:** 243 MB/s throughput, tested with 8000 concurrent connections.
+
+```bash
+# Egress works automatically in rootless mode
+./fcvm podman run --name web alpine:latest -- wget -q -O /dev/null http://example.com
+
+# Test from inside a running VM
+./fcvm exec --name web -- wget -q -O /dev/null http://example.com
+```
+
+See [DESIGN.md](DESIGN.md#egress-proxy-rootless-outbound-tcp) for architecture details.
 
 ### Host Service Access (Rootless Mode)
 
-In rootless mode, VMs can reach services on the host via slirp4netns gateways:
+In rootless mode, VMs can reach services on the host via pasta gateways:
 
 | Host Address | VM Uses | Description |
 |--------------|---------|-------------|
@@ -780,7 +806,7 @@ In rootless mode, VMs can reach services on the host via slirp4netns gateways:
 
 #### IPv6 from Inside VMs
 
-VMs have full IPv6 support via slirp4netns. To reach host services bound to `::1`:
+VMs have full IPv6 support via pasta. To reach host services bound to `::1`:
 
 ```bash
 # From inside the VM/container, use fd00::2 to reach host's ::1
@@ -788,7 +814,7 @@ wget http://[fd00::2]:8080/    # Reaches host's [::1]:8080
 curl http://[fd00::2]:3000/    # Reaches host's [::1]:3000
 ```
 
-The VM's internal IPv6 address is `fd00:1::2` on the `fd00:1::/64` network.
+The VM's internal IPv6 address is `fd00::100` on the `fd00::/64` network.
 
 #### Using HTTP Proxies
 

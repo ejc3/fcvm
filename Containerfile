@@ -14,10 +14,14 @@ RUN cargo install cargo-nextest cargo-audit cargo-deny --locked
 # Install system dependencies (including kernel build tools: flex, bison, bc, libelf-dev, libssl-dev)
 RUN apt-get update && apt-get install -y \
     fuse3 libfuse3-dev autoconf automake libtool perl libclang-dev clang cmake \
-    musl-tools iproute2 iptables slirp4netns dnsmasq qemu-utils e2fsprogs btrfs-progs \
+    musl-tools iproute2 iptables passt dnsmasq qemu-utils e2fsprogs btrfs-progs \
     parted fdisk podman skopeo git curl sudo procps zstd busybox-static cpio uidmap \
     flex bison bc libelf-dev libssl-dev libseccomp-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Build passt from source for consistent version across environments
+COPY scripts/build-passt.sh /tmp/build-passt.sh
+RUN /tmp/build-passt.sh && rm -rf /tmp/passt-build /tmp/build-passt.sh
 
 # Install Firecracker
 ARG ARCH=aarch64

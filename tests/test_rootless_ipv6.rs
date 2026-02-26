@@ -1,56 +1,12 @@
-//! Integration tests for slirp4netns IPv6 DNS support.
+//! Integration tests for rootless IPv6 networking.
 //!
-//! Tests behavior on hosts with IPv6-only DNS servers and old libslirp.
+//! Tests IPv6 DNS, connectivity, and egress in rootless mode (pasta networking).
 
 #![cfg(feature = "integration-fast")]
 
 mod common;
 
 use anyhow::{Context, Result};
-
-/// Test that libslirp version detection works correctly.
-#[tokio::test]
-async fn test_libslirp_version_detection() -> Result<()> {
-    let output = tokio::process::Command::new("slirp4netns")
-        .arg("--version")
-        .output()
-        .await
-        .context("slirp4netns --version")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    println!("slirp4netns --version output:\n{}", stdout);
-
-    // Extract libslirp version
-    let version_line = stdout
-        .lines()
-        .find(|l| l.starts_with("libslirp:"))
-        .context("libslirp version not in output")?;
-
-    let version_str = version_line.strip_prefix("libslirp: ").unwrap().trim();
-
-    // Parse and verify format
-    let parts: Vec<&str> = version_str.split('.').collect();
-    assert!(
-        parts.len() >= 2,
-        "Version should be X.Y or X.Y.Z, got: {}",
-        version_str
-    );
-
-    let major: u32 = parts[0].parse().context("major version")?;
-    let minor: u32 = parts[1].parse().context("minor version")?;
-
-    println!("System libslirp version: {}.{}", major, minor);
-
-    // Document what version we have and what that means
-    if major > 4 || (major == 4 && minor >= 7) {
-        println!("✓ libslirp >= 4.7.0 - native IPv6 DNS proxying supported");
-    } else {
-        println!("✓ libslirp < 4.7.0 - IPv6 DNS proxying NOT supported");
-        println!("  On IPv6-only hosts, DNS resolution in VMs will fail");
-    }
-
-    Ok(())
-}
 
 /// Test DNS resolution in a VM using a local DNS server.
 #[tokio::test]
@@ -145,7 +101,7 @@ async fn test_dns_resolution_in_vm() -> Result<()> {
 }
 
 /// Test IPv6 connectivity in a VM.
-/// Verifies that the guest has IPv6 configured and can reach the slirp IPv6 DNS server.
+/// Verifies that the guest has IPv6 configured and can reach the pasta IPv6 gateway.
 /// This proves the NDP Neighbor Advertisement mechanism works correctly.
 #[tokio::test]
 async fn test_ipv6_connectivity_in_vm() -> Result<()> {
@@ -191,9 +147,9 @@ async fn test_ipv6_connectivity_in_vm() -> Result<()> {
 
     println!("IPv6 addresses on eth0:\n{}", ip_output);
 
-    // Check if IPv6 is configured (fd00:1::2 is the expected guest address)
+    // Check if IPv6 is configured (fd00::100 is the expected guest address)
     // fc-agent configures this from the ipv6= kernel boot parameter
-    let has_ipv6 = ip_output.contains("fd00:1::2") || ip_output.contains("inet6 fd00:1::");
+    let has_ipv6 = ip_output.contains("fd00::100") || ip_output.contains("inet6 fd00::");
 
     if !has_ipv6 {
         // IPv6 might not be configured if host doesn't have global IPv6
@@ -204,15 +160,15 @@ async fn test_ipv6_connectivity_in_vm() -> Result<()> {
         return Ok(());
     }
 
-    println!("✓ IPv6 address fd00:1::2 configured on eth0");
+    println!("✓ IPv6 address fd00::100 configured on eth0");
 
-    // Check 2: Verify we can ping the gateway (fd00:1::1)
+    // Check 2: Verify we can ping the gateway (fd00::2)
     // This proves:
     // - IPv6 routing is working
-    // - NDP Neighbor Advertisement works (tap knows guest MAC)
+    // - NDP Neighbor Advertisement works (pasta responds to neighbor solicitations)
     // - The namespace tap device is responding to IPv6 traffic
     let ping_result =
-        common::exec_in_vm(pid, &["ping", "-6", "-c", "1", "-W", "5", "fd00:1::1"]).await;
+        common::exec_in_vm(pid, &["ping", "-6", "-c", "1", "-W", "5", "fd00::2"]).await;
 
     // Clean up VM
     common::kill_process(pid).await;
@@ -220,13 +176,13 @@ async fn test_ipv6_connectivity_in_vm() -> Result<()> {
 
     match ping_result {
         Ok(output) => {
-            println!("Ping fd00:1::1 output:\n{}", output);
+            println!("Ping fd00::2 output:\n{}", output);
             assert!(
                 output.contains("1 packets received") || output.contains("1 received"),
                 "IPv6 ping to gateway failed.\noutput: {}",
                 output
             );
-            println!("✓ IPv6 connectivity to gateway (fd00:1::1) works");
+            println!("✓ IPv6 connectivity to gateway (fd00::2) works");
         }
         Err(e) => {
             // Ping might fail if namespace doesn't respond to ICMP, but IPv6 could still work
@@ -261,20 +217,24 @@ async fn test_ipv6_egress_to_host() -> Result<()> {
     let stdout = String::from_utf8_lossy(&ip_output.stdout);
 
     // Parse out the IPv6 address (format: "inet6 2600:1f1c:.../128 scope global")
+    // Filter out ULA (fd00::/7) and link-local (fe80::) — same logic as
+    // PastaNetwork::detect_host_ipv6() in pasta.rs. ULA addresses have "global"
+    // scope in the kernel but aren't routable through pasta's L4 translation.
     let host_ipv6 = stdout
         .lines()
-        .find(|l| l.contains("inet6") && l.contains("scope global"))
-        .and_then(|l| {
+        .filter(|l| l.contains("inet6") && l.contains("scope global"))
+        .filter_map(|l| {
             l.split_whitespace()
-                .nth(1) // Get the address part
+                .nth(1)
                 .map(|addr| addr.split('/').next().unwrap_or(addr))
+                .map(|s| s.to_string())
         })
-        .map(|s| s.to_string());
+        .find(|addr| !addr.starts_with("fe80:") && !addr.starts_with("fd"));
 
     let host_ipv6 = match host_ipv6 {
         Some(ip) => ip,
         None => {
-            println!("SKIP: Host has no global IPv6 address");
+            println!("SKIP: Host has no globally-routable IPv6 address (ULA/link-local only)");
             return Ok(());
         }
     };
@@ -362,22 +322,7 @@ with IPv6Server(('::', {}), handler) as httpd:
     common::kill_process(pid).await;
     let _ = child.wait().await;
 
-    match result {
-        Ok(output) => {
-            println!("✓ IPv6 egress works! Server response:\n{}", output);
-            Ok(())
-        }
-        Err(e) => {
-            println!("✗ IPv6 egress failed: {}", e);
-            println!();
-            println!("This is expected with current slirp4netns - it only provides IPv4 NAT.");
-            println!("IPv6 egress requires either:");
-            println!("  1. IPv6 NAT (not supported by slirp4netns)");
-            println!("  2. Bridged networking with IPv6 on the bridge");
-            println!("  3. A different networking solution like pasta");
-
-            // Don't fail the test - just document the limitation
-            Ok(())
-        }
-    }
+    let output = result.context("IPv6 egress failed - pasta should support native IPv6")?;
+    println!("✓ IPv6 egress works! Server response:\n{}", output);
+    Ok(())
 }

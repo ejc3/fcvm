@@ -51,7 +51,7 @@ async fn is_ip_in_use_on_veth(ip: &str) -> bool {
 /// Bridged networking using network namespace isolation with veth pairs
 ///
 /// This mode requires sudo/root for network namespace and iptables setup.
-/// For true rootless operation (no sudo), use SlirpNetwork instead.
+/// For true rootless operation (no sudo), use PastaNetwork instead.
 ///
 /// Architecture for baseline VMs:
 /// - Each VM runs in dedicated network namespace (fcvm-{vm_id})

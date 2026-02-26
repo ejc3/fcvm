@@ -272,6 +272,8 @@ impl CloneFixture {
         };
 
         // Make HTTP request to nginx
+        // verify_port_forwarding() runs after snapshot restore and confirms end-to-end
+        // data flow through pasta before health monitor starts.
         let addr = format!("{}:{}", loopback_ip, health_port);
         let mut stream = TcpStream::connect(&addr).expect("failed to connect to nginx");
         stream
@@ -289,7 +291,6 @@ impl CloneFixture {
         let mut response = Vec::new();
         let _ = stream.read_to_end(&mut response);
 
-        // Verify we got a valid response
         let response_str = String::from_utf8_lossy(&response);
         if !response_str.contains("200 OK") {
             panic!(

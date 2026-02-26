@@ -1,12 +1,13 @@
 pub mod bridged;
+pub mod egress_proxy;
 pub mod namespace;
+pub mod pasta;
 pub mod portmap;
-pub mod slirp;
 pub mod types;
 pub mod veth;
 
 pub use bridged::BridgedNetwork;
-pub use slirp::SlirpNetwork;
+pub use pasta::PastaNetwork;
 pub use types::*;
 
 use anyhow::Result;
@@ -18,7 +19,7 @@ pub trait NetworkManager: Send + Sync {
     /// Setup network before VM start
     async fn setup(&mut self) -> Result<NetworkConfig>;
 
-    /// Post-VM-start setup (e.g., start slirp4netns after Firecracker creates namespace)
+    /// Post-VM-start setup (e.g., start pasta after Firecracker creates namespace)
     /// Called with the PID of the VM process (Firecracker or unshare wrapper).
     /// Default implementation does nothing.
     async fn post_start(&mut self, _vm_pid: u32) -> Result<()> {
@@ -30,6 +31,16 @@ pub trait NetworkManager: Send + Sync {
 
     /// Get the TAP device name
     fn tap_device(&self) -> &str;
+
+    /// Verify port forwarding works end-to-end after VM is running.
+    ///
+    /// Called after snapshot restore when the guest is active and fc-agent has reconnected.
+    /// Verifies that data actually flows through the forwarding path, not just that
+    /// the listening socket exists. Default implementation does nothing (bridged DNAT
+    /// is kernel-level and works immediately).
+    async fn verify_port_forwarding(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// Get a reference to Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;

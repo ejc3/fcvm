@@ -185,7 +185,7 @@ fn test_port_forward_bridged() -> Result<()> {
     Ok(())
 }
 
-/// Test port forwarding with rootless (slirp4netns) networking
+/// Test port forwarding with rootless (pasta) networking
 ///
 /// Rootless mode uses unique loopback IPs (127.x.y.z) for each VM,
 /// allowing multiple VMs to all forward the same port.
@@ -270,41 +270,34 @@ fn test_port_forward_rootless() -> Result<()> {
 
     // Test: Access via loopback IP and forwarded port
     // In rootless mode, each VM gets a unique 127.x.y.z IP
-    // Retry loop: Container is marked healthy when it starts, but nginx needs a moment to bind to port 80
+    // post_start() verifies pasta bound the port; for fresh VMs, the 30+ second
+    // boot time gives pasta plenty of time to initialize L2 forwarding.
     println!(
         "Testing access via loopback IP {}:{}...",
         loopback_ip, host_port
     );
-    let mut loopback_works = false;
-    let retry_start = std::time::Instant::now();
-    while retry_start.elapsed() < Duration::from_secs(30) {
-        let output = Command::new("curl")
-            .args([
-                "-s",
-                "--max-time",
-                "2",
-                &format!("http://{}:{}", loopback_ip, host_port),
-            ])
-            .output()
-            .context("curl to loopback")?;
+    let output = Command::new("curl")
+        .args([
+            "-s",
+            "--max-time",
+            "5",
+            &format!("http://{}:{}", loopback_ip, host_port),
+        ])
+        .output()
+        .context("curl to loopback")?;
 
-        if output.status.success() && !output.stdout.is_empty() {
-            loopback_works = true;
-            println!("Loopback access: OK");
-            println!(
-                "Response: {}",
-                String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-            );
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-
-    if !loopback_works {
-        println!("Loopback access: FAIL (timed out after 30s)");
+    let loopback_works = output.status.success() && !output.stdout.is_empty();
+    if loopback_works {
+        println!("Loopback access: OK");
+        println!(
+            "Response: {}",
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+        );
+    } else {
+        println!("Loopback access: FAIL");
     }
 
     // Cleanup

@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use tracing::{debug, info, warn};
 
 use crate::firecracker::VmManager;
-use crate::network::SlirpNetwork;
+use crate::network::PastaNetwork;
 use crate::state::VmState;
 
 /// Set up rootless namespace for VM networking.
@@ -10,7 +10,7 @@ use crate::state::VmState;
 /// Spawns a holder process with retry logic, runs network setup via nsenter,
 /// and verifies TAP device creation. Returns the holder child process and PID.
 pub(super) async fn setup_rootless_namespace(
-    slirp_net: &SlirpNetwork,
+    pasta_net: &PastaNetwork,
     network_config: &crate::network::NetworkConfig,
     vm_manager: &mut VmManager,
     vm_state: &mut VmState,
@@ -18,7 +18,7 @@ pub(super) async fn setup_rootless_namespace(
     // Step 1: Spawn holder process (keeps namespace alive)
     // Uses shared function that gives the holder the full retry deadline,
     // only respawning if the holder actually dies (not on timeout).
-    let holder_cmd = slirp_net.build_holder_command();
+    let holder_cmd = pasta_net.build_holder_command();
     info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
 
     let (mut child, mut holder_pid) =
@@ -29,8 +29,8 @@ pub(super) async fn setup_rootless_namespace(
 
     // Step 2: Run setup script via nsenter (creates TAPs, iptables, etc.)
     // This is also inside retry logic - if holder dies during nsenter, retry everything
-    let setup_script = slirp_net.build_setup_script();
-    let mut nsenter_prefix = slirp_net.build_nsenter_prefix(holder_pid);
+    let setup_script = pasta_net.build_setup_script();
+    let mut nsenter_prefix = pasta_net.build_nsenter_prefix(holder_pid);
 
     // Debug: Check if holder is still alive and namespace files exist
     let proc_dir = format!("/proc/{}", holder_pid);
@@ -98,7 +98,7 @@ pub(super) async fn setup_rootless_namespace(
                 crate::commands::common::spawn_namespace_holder(&holder_cmd).await?;
 
             // Retry nsenter with new holder
-            let retry_nsenter_prefix = slirp_net.build_nsenter_prefix(retry_holder_pid);
+            let retry_nsenter_prefix = pasta_net.build_nsenter_prefix(retry_holder_pid);
             let retry_output = tokio::process::Command::new(&retry_nsenter_prefix[0])
                 .args(&retry_nsenter_prefix[1..])
                 .arg("bash")
@@ -120,7 +120,7 @@ pub(super) async fn setup_rootless_namespace(
             // Success on retry - update variables for rest of function
             child = retry_child;
             holder_pid = retry_holder_pid;
-            nsenter_prefix = slirp_net.build_nsenter_prefix(holder_pid);
+            nsenter_prefix = pasta_net.build_nsenter_prefix(holder_pid);
             info!(
                 holder_pid = holder_pid,
                 "network setup succeeded after retry"

@@ -6,7 +6,7 @@ use url::Url;
 
 use crate::cli::RunArgs;
 use crate::firecracker::VmManager;
-use crate::network::{BridgedNetwork, NetworkManager, SlirpNetwork};
+use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork};
 use crate::state::{StateManager, VmState};
 use crate::storage::DiskManager;
 
@@ -47,7 +47,7 @@ fn parse_subid_file(path: &str) -> Option<(u64, u64)> {
 
 /// Resolve a proxy URL's hostname to an IP address.
 ///
-/// VMs using slirp4netns with --enable-ipv6 can reach both IPv4 (via 10.0.2.2 gateway)
+/// VMs using pasta with IPv6 can reach both IPv4 (via 10.0.2.2 gateway)
 /// and IPv6 (via fd00::2 gateway) addresses. We prefer IPv4 but fall back to IPv6.
 /// Returns None only if the hostname can't be resolved at all.
 fn resolve_proxy_url(url: &str) -> Option<String> {
@@ -199,7 +199,7 @@ pub(super) fn build_runtime_boot_args(
             .as_ref()
             .map(|dns| format!(":{}", dns))
             .unwrap_or_default();
-        // Use /24 netmask for slirp4netns (10.0.2.0/24) or bridged (172.30.x.0/24)
+        // Use /24 netmask for rootless pasta (10.0.2.0/24) or bridged (172.30.x.0/24)
         boot_args.push_str(&format!(
             "ip={}::{}:255.255.255.0::eth0:off{}",
             guest_ip_clean, host_ip_clean, dns_suffix
@@ -218,16 +218,26 @@ pub(super) fn build_runtime_boot_args(
         boot_args.push_str(&format!("ipv6={}|{}", guest_ipv6, host_ipv6));
     }
 
-    // Pass host DNS servers to guest for direct resolution (bypasses slirp's DNS proxy)
-    // This is needed on IPv6-only hosts where slirp's 10.0.2.3 can't forward to IPv6 nameservers
-    if let Ok(dns_servers) = crate::network::get_host_dns_servers() {
-        if !boot_args.is_empty() {
-            boot_args.push(' ');
-        }
-        // Use | delimiter since : is part of IPv6 addresses
-        boot_args.push_str(&format!("fcvm_dns={}", dns_servers.join("|")));
+    // Pass DNS servers to guest for resolv.conf configuration
+    // Both rootless and bridged: use host DNS servers directly (reachable via
+    // pasta's L4 translation or bridge/NAT respectively)
+    {
+        let dns_servers = if let Some(ref dns) = network_config.dns_server {
+            // Use the network-mode-specific DNS (pasta forwarder or host DNS)
+            vec![dns.clone()]
+        } else {
+            crate::network::get_host_dns_servers().unwrap_or_default()
+        };
 
-        // Pass search domains for short hostname resolution (only when DNS servers are available)
+        if !dns_servers.is_empty() {
+            if !boot_args.is_empty() {
+                boot_args.push(' ');
+            }
+            // Use | delimiter since : is part of IPv6 addresses
+            boot_args.push_str(&format!("fcvm_dns={}", dns_servers.join("|")));
+        }
+
+        // Pass search domains for short hostname resolution
         if let Ok(content) = std::fs::read_to_string("/run/systemd/resolve/resolv.conf")
             .or_else(|_| std::fs::read_to_string("/etc/resolv.conf"))
         {
@@ -557,7 +567,7 @@ pub(super) async fn build_and_send_mmds(
 
     // Resolve proxy URLs — runtime behavior, not part of cache key.
     // Use network-provided proxy, or fall back to environment variables.
-    // Resolve hostname to IPv4 since slirp VMs can only reach IPv4 addresses.
+    // Resolve hostname to IP since VMs reach external addresses via pasta gateway.
     let http_proxy = network_config
         .http_proxy
         .clone()
@@ -789,9 +799,9 @@ pub(super) async fn run_vm_setup(
             info!(namespace = %ns_id, "configuring VM to run in network namespace");
             vm_manager.set_namespace(ns_id.to_string());
         }
-    } else if let Some(slirp_net) = network.as_any().downcast_ref::<SlirpNetwork>() {
+    } else if let Some(pasta_net) = network.as_any().downcast_ref::<PastaNetwork>() {
         holder_child = Some(
-            setup_rootless_namespace(slirp_net, network_config, &mut vm_manager, vm_state).await?,
+            setup_rootless_namespace(pasta_net, network_config, &mut vm_manager, vm_state).await?,
         );
     } else {
         holder_child = None;
@@ -968,9 +978,9 @@ pub(super) async fn run_vm_setup(
     }
     vm_state.config.nfs_shares = nfs_shares;
 
-    // For rootless mode with slirp4netns: post_start starts slirp4netns in the namespace
+    // For rootless mode with pasta: post_start starts pasta + bridge in the namespace
     // For bridged mode: post_start is a no-op (TAP already created by BridgedNetwork)
-    // Use holder_pid for rootless (slirp4netns attaches to holder's namespace)
+    // Use holder_pid for rootless (pasta attaches to holder's namespace)
     let post_start_pid = vm_state.holder_pid.unwrap_or(vm_pid);
     network
         .post_start(post_start_pid)
@@ -978,7 +988,7 @@ pub(super) async fn run_vm_setup(
         .context("post-start network setup")?;
 
     // Network interface - required for MMDS V2 in all modes
-    // For rootless: slirp4netns already created TAP, Firecracker attaches to it
+    // For rootless: pasta already created TAP, Firecracker attaches to it
     // For bridged: TAP is created by BridgedNetwork and added to bridge
     client
         .add_network_interface(

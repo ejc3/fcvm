@@ -13,7 +13,7 @@ use crate::cli::{
     NetworkMode, SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs,
     SnapshotServeArgs,
 };
-use crate::network::{BridgedNetwork, NetworkManager, PortMapping, SlirpNetwork};
+use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, PortMapping};
 use crate::paths;
 use crate::state::{
     generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState, VmStatus,
@@ -629,6 +629,18 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         None
     };
 
+    // Start egress proxy for rootless mode (bypasses TAP/bridge for outbound TCP)
+    let _egress_proxy_handle = if matches!(args.network, NetworkMode::Rootless) {
+        let socket_path = clone_vsock_base.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) = crate::network::egress_proxy::run_egress_proxy(&socket_path).await {
+                tracing::warn!("Egress proxy error: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
+
     // Setup networking - use saved network config from snapshot
     let tap_device = format!("tap-{}", truncate_id(&vm_id, 8));
     let port_mappings: Vec<PortMapping> = args
@@ -680,9 +692,9 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 .await
                 .context("allocating loopback IP")?;
 
-            // With bridge mode, guest IP is always 10.0.2.100 on slirp network
+            // With bridge mode, guest IP is always 10.0.2.100 on pasta network
             // Each clone runs in its own namespace, so no IP conflict
-            let net = SlirpNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
+            let net = PastaNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
                 .with_loopback_ip(loopback_ip);
             Box::new(net)
         }
@@ -983,6 +995,14 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 warn!(vm_id = %vm_id, "fc-agent did not connect within 30s, proceeding anyway")
             }
         }
+    }
+
+    // Verify pasta's L2 forwarding path has ARP resolved before starting health monitor.
+    // After snapshot restore, pasta may not have learned the guest's MAC yet.
+    // This probes each forwarded port to trigger and verify ARP resolution —
+    // no guest service needs to be running, just the guest's kernel.
+    if let Err(e) = network.verify_port_forwarding().await {
+        warn!(vm_id = %vm_id, error = %e, "port forwarding verification failed");
     }
 
     // Spawn health monitor task with startup snapshot trigger support

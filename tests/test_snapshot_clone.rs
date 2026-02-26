@@ -856,7 +856,7 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
         .await
         .context("starting local DNS test server")?;
 
-    // For rootless, we know the slirp gateway address upfront.
+    // For rootless, we know the pasta gateway address upfront.
     // For bridged, we need to get the veth host IP from the clone's state after it starts,
     // since the VM can only reach the host through the veth pair, not the host's primary IP.
     let dns_server_addr_for_rootless = if network == "rootless" {
@@ -1383,7 +1383,7 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
 /// Test port forwarding on clones with rootless networking
 ///
 /// This is the key test - rootless clones with port forwarding.
-/// Port forwarding is done via slirp4netns API, accessing via unique loopback IP.
+/// Port forwarding is done via pasta CLI flags, accessing via unique loopback IP.
 #[tokio::test]
 async fn test_clone_port_forward_rootless() -> Result<()> {
     let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("pf-rootless");
@@ -1509,6 +1509,8 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
     println!("  Clone loopback IP: {}", loopback_ip);
 
     // Test: Access via loopback IP and forwarded port
+    // verify_port_forwarding() runs after snapshot restore and confirms end-to-end
+    // data flow through pasta's loopback → bridge → guest path before health monitor.
     println!(
         "  Testing access via loopback {}:{}...",
         loopback_ip, host_port
@@ -1517,31 +1519,23 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
         .args([
             "-s",
             "--max-time",
-            "10",
+            "5",
             &format!("http://{}:{}", loopback_ip, host_port),
         ])
         .output()
-        .await;
+        .await
+        .context("curl loopback port forward")?;
 
-    let loopback_works = loopback_result
-        .as_ref()
-        .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(false);
-
-    if let Ok(ref out) = loopback_result {
-        if loopback_works {
-            println!("    Loopback access: ✓ OK");
-            let response = String::from_utf8_lossy(&out.stdout);
-            println!(
-                "    Response: {} bytes (nginx welcome page)",
-                response.len()
-            );
-        } else {
-            println!("    Loopback access: ✗ FAIL");
-            println!("    stderr: {}", String::from_utf8_lossy(&out.stderr));
-        }
+    let loopback_works = loopback_result.status.success() && !loopback_result.stdout.is_empty();
+    if loopback_works {
+        let response = String::from_utf8_lossy(&loopback_result.stdout);
+        println!("    Loopback access: ✓ OK ({} bytes)", response.len());
     } else {
-        println!("    Loopback access: ✗ FAIL (request error)");
+        println!("    Loopback access: ✗ FAIL");
+        println!(
+            "    stderr: {}",
+            String::from_utf8_lossy(&loopback_result.stderr)
+        );
     }
 
     // Cleanup

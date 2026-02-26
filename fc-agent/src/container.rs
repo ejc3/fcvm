@@ -52,12 +52,6 @@ pub fn mount_overlay_image(
     );
     std::fs::write(&conf_path, &storage_conf).context("writing storage.conf")?;
 
-    // Reset stale podman state from rootfs build (apt post-install may create
-    // db.sql with empty driver before storage.conf exists).
-    let _ = std::process::Command::new("podman")
-        .args(["system", "reset", "--force"])
-        .output();
-
     // Write containers.conf to disable netavark (VM uses --network=host)
     let containers_conf_path = if username.is_some() {
         // User-level containers.conf lives alongside storage.conf
@@ -66,6 +60,14 @@ pub fn mount_overlay_image(
         "/etc/containers/containers.conf".to_string()
     };
     write_containers_conf(&containers_conf_path);
+
+    // Reset podman state after writing storage.conf to clear any stale db.sql
+    // that may have been created by health monitor's `podman inspect` racing
+    // with storage setup. Without this, the db.sql graph driver won't match
+    // the new storage.conf, causing "database graph driver does not match".
+    let _ = std::process::Command::new("podman")
+        .args(["system", "reset", "--force"])
+        .output();
 
     eprintln!(
         "[fc-agent] overlay image mounted at {}, configured as additional image store (conf: {})",
@@ -142,46 +144,6 @@ fn wait_for_device(device: &str) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
     Ok(())
-}
-
-/// Write a minimal storage.conf with driver="overlay" so that any early
-/// `podman` commands create db.sql with the correct graph driver.
-/// Called before the exec server starts to prevent the race where health
-/// monitor's `podman inspect` creates db.sql with an empty driver.
-/// `mount_overlay_image()` later overwrites this with the full config
-/// (including additionalimagestores).
-pub fn write_overlay_storage_conf(user_spec: Option<&str>) {
-    // At this early stage the user may not be created yet (create_vm_user
-    // runs later).  Write root-level storage.conf which is what early
-    // health monitor exec commands will use.
-    let (conf_path, runroot, graphroot) = storage_paths(None);
-    let storage_conf = format!(
-        "[storage]\ndriver = \"overlay\"\nrunroot = \"{runroot}\"\ngraphroot = \"{graphroot}\"\n"
-    );
-    if let Err(e) = std::fs::write(&conf_path, &storage_conf) {
-        eprintln!(
-            "[fc-agent] WARNING: failed to write early overlay storage.conf at {}: {}",
-            conf_path, e
-        );
-    } else {
-        eprintln!(
-            "[fc-agent] wrote early overlay storage.conf (driver=overlay) at {}",
-            conf_path
-        );
-    }
-    // Reset stale podman state from rootfs build (apt post-install may create
-    // db.sql with empty driver before storage.conf exists).
-    let _ = std::process::Command::new("podman")
-        .args(["system", "reset", "--force"])
-        .output();
-
-    // Also write containers.conf to prevent netavark errors
-    write_containers_conf("/etc/containers/containers.conf");
-
-    // If there's a user spec, we can't write user-level config yet since
-    // the user doesn't exist.  mount_overlay_image() handles that later
-    // after create_vm_user().
-    let _ = user_spec; // acknowledge parameter
 }
 
 /// Get storage.conf path, runroot, and graphroot for the given user.
@@ -335,11 +297,6 @@ pub fn setup_btrfs_storage_if_available() {
             storage_dir,
             "/run/containers/storage",
         );
-        // Reset stale podman state from rootfs build (apt post-install may create
-        // db.sql with empty driver before storage.conf exists).
-        let _ = std::process::Command::new("podman")
-            .args(["system", "reset", "--force"])
-            .output();
         return;
     }
 
@@ -455,6 +412,35 @@ pub fn setup_btrfs_storage_if_available() {
         "[fc-agent] btrfs storage configured at {} ({} sparse loopback)",
         storage_dir, loopback_size
     );
+}
+
+/// Reset root podman state to match the current storage.conf.
+///
+/// Fixes "database graph driver does not match" errors caused by the health
+/// monitor running `podman inspect` via exec before storage setup completes,
+/// creating db.sql with an empty or wrong driver.
+///
+/// Only call for root podman (empty cmd_prefix). User-mode podman already
+/// resets in create_vm_user(). A root reset would destroy the user's btrfs
+/// storage subdirectory at /var/lib/containers/storage/user-{uid}.
+pub fn reset_podman_state() {
+    match std::process::Command::new("podman")
+        .args(["system", "reset", "--force"])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            eprintln!("[fc-agent] podman state reset to match storage.conf");
+        }
+        Ok(o) => {
+            eprintln!(
+                "[fc-agent] WARNING: podman system reset failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: podman system reset error: {}", e);
+        }
+    }
 }
 
 /// Import a Docker archive into podman storage. Returns image reference.
@@ -761,10 +747,11 @@ pub fn notify_cache_ready_and_wait(
     // still setting up the snapshot — killing the VM mid-pause.
     //
     // Valid exit conditions:
-    // 1. "cache-ack" received — host says no snapshot needed
-    // 2. POLLHUP / read returns 0 — vsock reset from snapshot pause/resume
-    //    (this is the SUCCESS case: VM was snapshotted, we're post-restore)
-    // 3. 30s deadline — failsafe timeout
+    // 1. "cache-ack" received — host says no snapshot needed (cold start)
+    // 2. POLLHUP / read returns 0 — vsock reset from snapshot RESTORE
+    //    (warm start: VM was restored from cached pre-start snapshot)
+    // 3. restore_flag set by restore-epoch watcher (warm start, POLLHUP not delivered)
+    // 4. 30s deadline — failsafe timeout
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
 
     loop {
@@ -821,10 +808,10 @@ pub fn notify_cache_ready_and_wait(
 
         if let Some(revents) = poll_fds[0].revents() {
             if revents.contains(PollFlags::POLLHUP) || revents.contains(PollFlags::POLLERR) {
-                // vsock reset from snapshot pause/resume. This means the
-                // host successfully paused the VM for a snapshot. After
-                // resume, all vsock connections are reset (TRANSPORT_RESET).
-                eprintln!("[fc-agent] cache-ack connection reset (snapshot taken)");
+                // vsock reset from snapshot RESTORE. This happens on warm start:
+                // the host restored this VM from a cached pre-start snapshot, and
+                // VIRTIO_VSOCK_EVENT_TRANSPORT_RESET killed all connections.
+                eprintln!("[fc-agent] cache-ack connection reset (snapshot restore detected)");
                 return true;
             }
         }
@@ -876,7 +863,7 @@ pub fn build_podman_args(
     ];
 
     // Always use host networking inside the VM. The VM already has its own
-    // network namespace (via slirp4netns). Pasta inside the VM would create
+    // network namespace (via pasta). A second pasta inside the VM would create
     // double-NAT that breaks port forwarding and health checks.
     args.push("--network=host".to_string());
 

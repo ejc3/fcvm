@@ -213,7 +213,7 @@ pub struct RunArgs {
     #[arg(long)]
     pub user: Option<String>,
 
-    /// Forward specific localhost ports to the host gateway via iptables DNAT.
+    /// Forward specific localhost ports to the host gateway via TCP proxy.
     /// Enables containers to reach host-only services via localhost.
     /// Comma-separated port list, e.g., --forward-localhost 1421,9099
     #[arg(long, value_delimiter = ',')]
@@ -490,7 +490,7 @@ pub enum NetworkMode {
     /// Bridged networking using network namespaces (requires sudo)
     #[default]
     Bridged,
-    /// True rootless networking using slirp4netns (no sudo required)
+    /// True rootless networking using pasta (no sudo required)
     Rootless,
 }
 
