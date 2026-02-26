@@ -642,9 +642,18 @@ impl NetworkManager for PastaNetwork {
     /// After snapshot restore, pasta needs the guest's MAC address to forward
     /// L2 frames. fc-agent sends a gratuitous ARP (ping to gateway) during
     /// restore, which broadcasts the guest's MAC to all bridge ports including
-    /// pasta0. We verify this by checking the namespace's ARP table — if the
-    /// namespace kernel learned the guest's MAC, pasta received the same
-    /// broadcast frame.
+    /// pasta0.
+    ///
+    /// Two-phase verification:
+    /// 1. ARP check: Verify the namespace kernel learned the guest's MAC via
+    ///    `ip neigh show`. This confirms the broadcast ARP reached the bridge.
+    /// 2. Loopback TCP probe: Verify data actually flows through pasta's
+    ///    loopback splice path (host → pasta L4 splice → namespace → bridge →
+    ///    tap → VM). The ARP check alone is insufficient because pasta processes
+    ///    ARP broadcasts asynchronously through its TAP interface — there's a
+    ///    window where the namespace kernel has the MAC but pasta hasn't updated
+    ///    its internal forwarding state yet, causing connections to get accepted
+    ///    at L4 but return empty responses.
     ///
     /// This runs after fc-agent's output vsock reconnects, so the gratuitous
     /// ARP has already been sent. Typically resolves on the first check.
@@ -661,6 +670,7 @@ impl NetworkManager for PastaNetwork {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let nsenter_prefix = self.build_nsenter_prefix(holder_pid);
 
+        // Phase 1: Wait for ARP resolution in namespace
         loop {
             let output = Command::new(&nsenter_prefix[0])
                 .args(&nsenter_prefix[1..])
@@ -675,8 +685,8 @@ impl NetworkManager for PastaNetwork {
             // Entry looks like: "10.0.2.100 lladdr aa:bb:cc:dd:ee:ff REACHABLE"
             // If lladdr is present, the guest's MAC is known.
             if stdout.contains("lladdr") {
-                info!(guest_ip = GUEST_IP, arp = %stdout.trim(), "ARP resolved, port forwarding ready");
-                return Ok(());
+                info!(guest_ip = GUEST_IP, arp = %stdout.trim(), "ARP resolved");
+                break;
             }
 
             if std::time::Instant::now() > deadline {
@@ -690,6 +700,90 @@ impl NetworkManager for PastaNetwork {
             debug!(guest_ip = GUEST_IP, "ARP not yet resolved, waiting");
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+
+        // Phase 2: Verify data flows through pasta's loopback splice path.
+        // ARP resolution in the namespace doesn't guarantee pasta has processed
+        // the same broadcast through its TAP — verify with an actual TCP data
+        // exchange through the loopback IP (the path users/benchmarks use).
+        //
+        // After snapshot restore, pasta may accept TCP connections at its L4
+        // splice layer before its L2 forwarding is fully ready. Connections
+        // succeed (SYN/SYN-ACK via namespace kernel) but return empty responses
+        // because data frames can't traverse pasta's TAP. We probe each port
+        // with a short write+read through the loopback to confirm the full path:
+        // host → pasta L4 → namespace → br0 → tap-fc → VM → (back).
+        let loopback = self.loopback_ip.as_deref().unwrap_or("127.0.0.1");
+        for mapping in &self.port_mappings {
+            if mapping.proto != Protocol::Tcp {
+                continue;
+            }
+
+            let bind_addr = match &mapping.host_ip {
+                Some(ip) => ip.as_str(),
+                None => loopback,
+            };
+            let addr = format!("{}:{}", bind_addr, mapping.host_port);
+
+            loop {
+                // Try a full TCP data exchange through pasta's loopback path.
+                // Send a minimal HTTP/1.0 request — most forwarded ports serve
+                // HTTP (nginx, app servers). For non-HTTP services the probe may
+                // not get a valid HTTP response, but any bytes back confirm L2
+                // forwarding works. The key failure mode is 0 bytes returned.
+                let probe_ok = async {
+                    let stream = tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        tokio::net::TcpStream::connect(&addr),
+                    )
+                    .await
+                    .map_err(|_| std::io::Error::other("connect timeout"))?
+                    .map_err(|e| std::io::Error::other(format!("connect: {}", e)))?;
+
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    stream
+                        .writable()
+                        .await
+                        .map_err(|e| std::io::Error::other(format!("writable: {}", e)))?;
+                    let (mut reader, mut writer) = stream.into_split();
+                    writer
+                        .write_all(b"GET / HTTP/1.0\r\nHost: probe\r\nConnection: close\r\n\r\n")
+                        .await?;
+
+                    let mut buf = [0u8; 1];
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        reader.read(&mut buf),
+                    )
+                    .await
+                    .map_err(|_| std::io::Error::other("read timeout"))?
+                    .map(|n| n > 0)
+                }
+                .await;
+
+                match probe_ok {
+                    Ok(true) => {
+                        info!(addr = %addr, "loopback data probe succeeded, port forwarding verified");
+                        break;
+                    }
+                    Ok(false) => {
+                        debug!(addr = %addr, "loopback probe: connection closed with no data, retrying");
+                    }
+                    Err(e) => {
+                        debug!(addr = %addr, error = %e, "loopback data probe failed, retrying");
+                    }
+                }
+
+                if std::time::Instant::now() > deadline {
+                    anyhow::bail!(
+                        "pasta loopback data probe failed within deadline: {}",
+                        addr
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        Ok(())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

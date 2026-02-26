@@ -997,10 +997,11 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         }
     }
 
-    // Verify pasta's L2 forwarding path has ARP resolved before starting health monitor.
-    // After snapshot restore, pasta may not have learned the guest's MAC yet.
-    // This probes each forwarded port to trigger and verify ARP resolution —
-    // no guest service needs to be running, just the guest's kernel.
+    // Verify pasta's port forwarding path is fully ready before starting health monitor.
+    // Two-phase check: (1) ARP resolution in namespace, (2) end-to-end TCP data probe
+    // through pasta's loopback splice path. The data probe catches the race where ARP
+    // is resolved in the namespace kernel but pasta hasn't updated its internal L2
+    // forwarding state yet (connections accepted at L4 but return empty responses).
     if let Err(e) = network.verify_port_forwarding().await {
         warn!(vm_id = %vm_id, error = %e, "port forwarding verification failed");
     }
