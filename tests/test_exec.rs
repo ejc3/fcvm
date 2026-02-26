@@ -25,6 +25,12 @@ async fn test_exec_rootless() -> Result<()> {
     exec_test_impl("rootless").await
 }
 
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_exec_routed() -> Result<()> {
+    exec_test_impl("routed").await
+}
+
 async fn exec_test_impl(network: &str) -> Result<()> {
     println!("\nfcvm exec test (network: {})", network);
     println!("================================");
