@@ -135,7 +135,7 @@
 3. **fc-agent** (Rust, runs in guest)
    - Fetches container configuration from MMDS
    - Launches Podman with correct parameters
-   - Streams container logs to serial console
+   - Streams container logs to host via vsock
    - Signals readiness to host
 
 ---
@@ -230,7 +230,7 @@ Uses `pasta` (from the passt project) for L4 splice-based networking.
 
 **Implementation**:
 ```rust
-struct RootlessNetwork {
+struct PastaNetwork {
     vm_id: String,
     tap_device: String,
     port_mappings: Vec<PortMapping>,
@@ -493,7 +493,8 @@ Host (127.0.0.x:8080) → pasta → pasta0 → br0 (L2) → tap-fc → Guest (10
 
 **IPv6 Support**:
 - pasta has native IPv6 support (no custom build needed)
-- Guest uses fd00::2 (IPv6 gateway), fd00::100 (guest IPv6), and fd00::3 (IPv6 DNS)
+- Guest uses fd00::2 (IPv6 gateway), fd00::100 (guest IPv6)
+- Guest DNS uses host DNS servers directly (via `fcvm_dns=` kernel cmdline parameter)
 - fc-agent sends gratuitous NDP NA at boot for MAC learning
 - On snapshot restore, fc-agent re-sends NDP NA to teach new pasta process
 
@@ -503,7 +504,7 @@ Host (127.0.0.x:8080) → pasta → pasta0 → br0 (L2) → tap-fc → Guest (10
 - Unique loopback IP per VM enables same port on multiple VMs
 - Bridge-based L2 preserves MAC addresses for proper pasta ARP/NDP learning
 - Namespace IP (10.0.2.1) enables health checks via nsenter
-- IPv6 support with native pasta IPv6 DNS proxying
+- IPv6 support with native pasta IPv6 forwarding
 - Works in nested VMs and restricted environments
 - Fully compatible with rootless Podman in guest
 
@@ -1350,8 +1351,18 @@ fcvm/
 │   └── src/
 │       ├── main.rs         # Entry point
 │       ├── agent.rs        # MMDS + Podman orchestration
+│       ├── container.rs    # Container lifecycle management
+│       ├── exec.rs         # Exec command handler
+│       ├── mmds.rs         # MMDS client + restore-epoch watcher
+│       ├── mounts.rs       # Mount setup (overlayfs, volumes)
+│       ├── network.rs      # ARP/NDP, TCP cleanup, localhost forwarding
+│       ├── output.rs       # Container log streaming via vsock
 │       ├── proxy.rs        # Guest-side multiplexed egress proxy
-│       └── restore.rs      # Snapshot restore handler
+│       ├── restore.rs      # Snapshot restore handler
+│       ├── system.rs       # System setup (sysctl, cgroups)
+│       ├── tty.rs          # TTY/PTY handling
+│       ├── types.rs        # Shared types (MMDS config)
+│       └── vsock.rs        # Vsock connection utilities
 │
 ├── fuse-pipe/              # FUSE passthrough library
 │   ├── Cargo.toml
@@ -1365,13 +1376,19 @@ fcvm/
 │
 └── tests/                  # fcvm integration tests
     ├── common/mod.rs       # Shared test utilities
-    ├── test_sanity.rs      # VM sanity tests
+    ├── test_sanity.rs      # VM sanity tests (rootless + bridged)
+    ├── test_snapshot_clone.rs # Snapshot/clone workflow tests
+    ├── test_egress.rs      # Egress proxy tests (rootless + bridged)
+    ├── test_egress_stress.rs  # Egress proxy stress tests
+    ├── test_egress_proxy_bench.rs # 8000-connection benchmark
+    ├── test_port_forward.rs   # Port forwarding tests
+    ├── test_rootless_ipv6.rs  # IPv6 networking tests
+    ├── test_exec.rs        # Exec command tests
+    ├── test_fuse_in_vm_matrix.rs # In-VM pjdfstest
+    ├── test_localhost_image.rs
     ├── test_state_manager.rs
     ├── test_health_monitor.rs
-    ├── test_fuse_posix.rs
-    ├── test_fuse_in_vm.rs
-    ├── test_localhost_image.rs
-    └── test_snapshot_clone.rs
+    └── ...                 # 35+ additional test files
 ```
 
 ### Dependencies
