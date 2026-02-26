@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 
-use crate::output::OutputHandle;
 use crate::types::{LatestMetadata, Plan};
 
 /// Fetch the container plan from MMDS with retry.
@@ -134,18 +133,7 @@ async fn fetch_latest_metadata(client: &reqwest::Client) -> Result<LatestMetadat
 }
 
 /// Watch for restore-epoch changes in MMDS and handle clone restore.
-#[allow(clippy::too_many_arguments)]
-pub async fn watch_restore_epoch(
-    output: OutputHandle,
-    restore_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    exec_rebind: std::sync::Arc<tokio::sync::Notify>,
-    exec_rebind_needed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    exec_rebind_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    exec_rebind_done_notify: std::sync::Arc<tokio::sync::Notify>,
-    egress_reconnect: std::sync::Arc<tokio::sync::Notify>,
-    egress_reconnect_done: std::sync::Arc<tokio::sync::Notify>,
-    has_egress_proxy: bool,
-) {
+pub async fn watch_restore_epoch(signals: crate::restore::RestoreSignals) {
     let mut last_epoch: Option<String> = None;
 
     loop {
@@ -170,7 +158,10 @@ pub async fn watch_restore_epoch(
                     // 2. Warm start: notify_cache_ready_and_wait already handled reconnection
                     //    and set restore_flag. Skip handle_clone_restore to avoid tearing down
                     //    the already-working egress proxy session mid-use.
-                    if restore_flag.load(std::sync::atomic::Ordering::Acquire) {
+                    if signals
+                        .restore_flag
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
                         eprintln!(
                             "[fc-agent] restore-epoch: {} (warm start, reconnection already handled)",
                             current,
@@ -183,35 +174,19 @@ pub async fn watch_restore_epoch(
                         // Signal notify_cache_ready_and_wait to stop waiting.
                         // Must be set BEFORE handle_clone_restore so the poll loop
                         // exits before output reconnect changes vsock state.
-                        restore_flag.store(true, std::sync::atomic::Ordering::Release);
-                        crate::restore::handle_clone_restore(
-                            &output,
-                            &exec_rebind,
-                            &exec_rebind_needed,
-                            &exec_rebind_done,
-                            &exec_rebind_done_notify,
-                            &egress_reconnect,
-                            &egress_reconnect_done,
-                            has_egress_proxy,
-                        )
-                        .await;
+                        signals
+                            .restore_flag
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        crate::restore::handle_clone_restore(&signals).await;
                     }
                     last_epoch = metadata.restore_epoch;
                 }
                 Some(prev) if prev != current => {
                     eprintln!("[fc-agent] restore-epoch changed: {} -> {}", prev, current,);
-                    restore_flag.store(true, std::sync::atomic::Ordering::Release);
-                    crate::restore::handle_clone_restore(
-                        &output,
-                        &exec_rebind,
-                        &exec_rebind_needed,
-                        &exec_rebind_done,
-                        &exec_rebind_done_notify,
-                        &egress_reconnect,
-                        &egress_reconnect_done,
-                        has_egress_proxy,
-                    )
-                    .await;
+                    signals
+                        .restore_flag
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    crate::restore::handle_clone_restore(&signals).await;
                     last_epoch = metadata.restore_epoch;
                 }
                 _ => {}

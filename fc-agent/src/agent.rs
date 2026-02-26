@@ -77,29 +77,20 @@ pub async fn run() -> Result<()> {
     let exec_rebind_done_notify = std::sync::Arc::new(tokio::sync::Notify::new());
 
     // Start restore-epoch watcher
-    let watcher_output = output.clone();
-    let watcher_restore_flag = restore_flag.clone();
-    let watcher_exec_rebind = exec_rebind.clone();
-    let watcher_exec_rebind_needed = exec_rebind_needed.clone();
-    let watcher_exec_rebind_done = exec_rebind_done.clone();
-    let watcher_exec_rebind_done_notify = exec_rebind_done_notify.clone();
-    let watcher_egress_reconnect = egress_reconnect.clone();
-    let watcher_egress_reconnect_done = egress_reconnect_done.clone();
-    let watcher_has_egress_proxy = plan.egress_proxy;
+    let restore_signals = crate::restore::RestoreSignals {
+        output: output.clone(),
+        restore_flag: restore_flag.clone(),
+        exec_rebind: exec_rebind.clone(),
+        exec_rebind_needed: exec_rebind_needed.clone(),
+        exec_rebind_done: exec_rebind_done.clone(),
+        exec_rebind_done_notify: exec_rebind_done_notify.clone(),
+        egress_reconnect: egress_reconnect.clone(),
+        egress_reconnect_done: egress_reconnect_done.clone(),
+        has_egress_proxy: plan.egress_proxy,
+    };
     tokio::spawn(async move {
         eprintln!("[fc-agent] starting restore-epoch watcher");
-        mmds::watch_restore_epoch(
-            watcher_output,
-            watcher_restore_flag,
-            watcher_exec_rebind,
-            watcher_exec_rebind_needed,
-            watcher_exec_rebind_done,
-            watcher_exec_rebind_done_notify,
-            watcher_egress_reconnect,
-            watcher_egress_reconnect_done,
-            watcher_has_egress_proxy,
-        )
-        .await;
+        mmds::watch_restore_epoch(restore_signals).await;
     });
 
     // Start exec server with rebind signal for vsock transport reset recovery
