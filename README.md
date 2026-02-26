@@ -8,6 +8,7 @@ Run Podman containers in Firecracker microVMs with fast cloning via UFFD memory 
 > - VM cloning via UFFD memory server + btrfs reflinks (~10ms restore, ~610ms with exec)
 > - Multiple VMs share memory via kernel page cache (50 VMs = ~512MB, not 25GB)
 > - Dual networking: bridged (iptables) or rootless (pasta)
+> - Transparent egress proxy for outbound internet (243 MB/s, 8000 concurrent connections)
 > - Port forwarding for both regular VMs and clones
 > - FUSE-based host directory mapping via fuse-pipe
 > - Container exit code forwarding
@@ -769,6 +770,30 @@ curl -s -X DELETE localhost:8090/v1/sandboxes/<id> | jq .
 **Rootless architecture**: Uses pasta (from the passt project) with a Linux bridge (br0) for L2 forwarding between pasta and Firecracker.
 Pasta uses splice(2) zero-copy L4 translation for near-native performance.
 The bridge preserves MAC addresses for proper ARP/NDP learning, enabling IPv6 support.
+
+### Egress Proxy (Outbound Internet)
+
+In rootless mode, VMs can make outbound TCP connections (e.g., `curl`, `wget`, `apt-get`) via a transparent egress proxy. The proxy is enabled by default and requires no configuration.
+
+**How it works:**
+1. Guest iptables REDIRECT captures all outbound TCP to a local proxy
+2. Proxy extracts the original destination via `SO_ORIGINAL_DST`
+3. Sends an OPEN frame over a single multiplexed vsock connection to the host
+4. Host connects to the real destination and relays data bidirectionally
+
+All TCP connections share one vsock — no per-connection overhead. The protocol uses 10-byte framed messages with stream IDs for multiplexing.
+
+**Performance:** 243 MB/s throughput, tested with 8000 concurrent connections.
+
+```bash
+# Egress works automatically in rootless mode
+./fcvm podman run --name web alpine:latest -- wget -q -O /dev/null http://example.com
+
+# Test from inside a running VM
+./fcvm exec --name web -- wget -q -O /dev/null http://example.com
+```
+
+See [DESIGN.md](DESIGN.md#egress-proxy-rootless-outbound-tcp) for architecture details.
 
 ### Host Service Access (Rootless Mode)
 
