@@ -272,8 +272,8 @@ impl CloneFixture {
         };
 
         // Make HTTP request to nginx
-        // pasta's post_start() verifies port forwarding is ready before returning,
-        // so this should work immediately after health check.
+        // verify_port_forwarding() runs after snapshot restore and confirms end-to-end
+        // data flow through pasta before health monitor starts.
         let addr = format!("{}:{}", loopback_ip, health_port);
         let mut stream = TcpStream::connect(&addr).expect("failed to connect to nginx");
         stream

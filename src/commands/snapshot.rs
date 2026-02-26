@@ -997,6 +997,14 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         }
     }
 
+    // Verify pasta's L2 forwarding path has ARP resolved before starting health monitor.
+    // After snapshot restore, pasta may not have learned the guest's MAC yet.
+    // This probes each forwarded port to trigger and verify ARP resolution —
+    // no guest service needs to be running, just the guest's kernel.
+    if let Err(e) = network.verify_port_forwarding().await {
+        warn!(vm_id = %vm_id, error = %e, "port forwarding verification failed");
+    }
+
     // Spawn health monitor task with startup snapshot trigger support
     let health_monitor_handle = crate::health::spawn_health_monitor_full(
         vm_id.clone(),

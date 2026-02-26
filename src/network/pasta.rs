@@ -74,6 +74,7 @@ pub struct PastaNetwork {
     pasta_process: Option<Child>,
     pid_file: Option<PathBuf>,
     loopback_ip: Option<String>, // Unique loopback IP for port forwarding (127.x.y.z)
+    holder_pid: Option<u32>,     // Namespace PID (set in post_start)
 }
 
 impl PastaNetwork {
@@ -88,6 +89,7 @@ impl PastaNetwork {
             pasta_process: None,
             pid_file: None,
             loopback_ip: None,
+            holder_pid: None,
         }
     }
 
@@ -563,6 +565,8 @@ impl NetworkManager for PastaNetwork {
     }
 
     async fn post_start(&mut self, holder_pid: u32) -> Result<()> {
+        self.holder_pid = Some(holder_pid);
+
         info!(
             holder_pid = holder_pid,
             "starting pasta for rootless networking"
@@ -631,6 +635,61 @@ impl NetworkManager for PastaNetwork {
 
     fn tap_device(&self) -> &str {
         &self.tap_device
+    }
+
+    /// Verify pasta's L2 forwarding path is ready after snapshot restore.
+    ///
+    /// After snapshot restore, pasta needs the guest's MAC address to forward
+    /// L2 frames. fc-agent sends a gratuitous ARP (ping to gateway) during
+    /// restore, which broadcasts the guest's MAC to all bridge ports including
+    /// pasta0. We verify this by checking the namespace's ARP table — if the
+    /// namespace kernel learned the guest's MAC, pasta received the same
+    /// broadcast frame.
+    ///
+    /// This runs after fc-agent's output vsock reconnects, so the gratuitous
+    /// ARP has already been sent. Typically resolves on the first check.
+    async fn verify_port_forwarding(&self) -> Result<()> {
+        if self.port_mappings.is_empty() {
+            return Ok(());
+        }
+
+        let holder_pid = match self.holder_pid {
+            Some(pid) => pid,
+            None => return Ok(()),
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let nsenter_prefix = self.build_nsenter_prefix(holder_pid);
+
+        loop {
+            let output = Command::new(&nsenter_prefix[0])
+                .args(&nsenter_prefix[1..])
+                .args(["ip", "neigh", "show", GUEST_IP, "dev", BRIDGE_DEVICE])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output()
+                .await
+                .context("checking ARP table in namespace")?;
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Entry looks like: "10.0.2.100 lladdr aa:bb:cc:dd:ee:ff REACHABLE"
+            // If lladdr is present, the guest's MAC is known.
+            if stdout.contains("lladdr") {
+                info!(guest_ip = GUEST_IP, arp = %stdout.trim(), "ARP resolved, port forwarding ready");
+                return Ok(());
+            }
+
+            if std::time::Instant::now() > deadline {
+                anyhow::bail!(
+                    "ARP for guest {} not resolved within 5s on {}",
+                    GUEST_IP,
+                    BRIDGE_DEVICE
+                );
+            }
+
+            debug!(guest_ip = GUEST_IP, "ARP not yet resolved, waiting");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
