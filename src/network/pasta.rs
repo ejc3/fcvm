@@ -561,6 +561,7 @@ impl NetworkManager for PastaNetwork {
             host_ipv6,
             dns_search: None,
             http_proxy,
+            namespace_name: None,
         })
     }
 

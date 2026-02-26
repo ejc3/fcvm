@@ -318,6 +318,7 @@ impl NetworkManager for RoutedNetwork {
             host_ipv6: Some("fd00::1".to_string()),
             dns_search: None,
             http_proxy: None,
+            namespace_name: self.namespace_id.clone(),
         })
     }
 
