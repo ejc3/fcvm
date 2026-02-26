@@ -87,7 +87,7 @@ async fn setup_namespace_mappings(pid: u32) -> anyhow::Result<()> {
     let self_ino = std::fs::metadata("/proc/self/ns/user")
         .context("reading own user namespace inode")?
         .ino();
-    let ns_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let ns_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         if std::fs::metadata(format!("/proc/{pid}/ns/user"))
             .map(|m| m.ino() != self_ino)
@@ -98,7 +98,7 @@ async fn setup_namespace_mappings(pid: u32) -> anyhow::Result<()> {
         if std::time::Instant::now() >= ns_deadline {
             anyhow::bail!("timed out waiting for user namespace (PID {pid})");
         }
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 
     // Try extended mappings (0-65535) via newuidmap/newgidmap (setuid helpers).
