@@ -134,6 +134,7 @@ async fn fetch_latest_metadata(client: &reqwest::Client) -> Result<LatestMetadat
 }
 
 /// Watch for restore-epoch changes in MMDS and handle clone restore.
+#[allow(clippy::too_many_arguments)]
 pub async fn watch_restore_epoch(
     output: OutputHandle,
     restore_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,

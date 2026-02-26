@@ -17,6 +17,7 @@ use crate::output::OutputHandle;
 /// FUSE volumes are NOT remounted here. The reconnectable multiplexer
 /// detects the dead vsock and auto-reconnects to the clone's VolumeServer.
 /// The kernel FUSE session stays alive — processes see a brief hang, not errors.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_clone_restore(
     output: &OutputHandle,
     exec_rebind: &Arc<Notify>,
