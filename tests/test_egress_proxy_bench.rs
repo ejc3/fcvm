@@ -18,6 +18,7 @@
 mod common;
 
 use anyhow::{Context, Result};
+use std::os::fd::FromRawFd;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -167,11 +168,12 @@ TMPDIR=$(mktemp -d)
 # Spawn all connections in parallel
 for i in $(seq 1 $COUNT); do
     (
-        if wget -q -O /dev/null --timeout=60 "http://$IP:$PORT/" 2>/dev/null; then
+        if wget -q -O /dev/null --timeout=60 "http://$IP:$PORT/" 2>"$TMPDIR/err_$i"; then
             echo ok > "$TMPDIR/$i"
         else
-            echo fail > "$TMPDIR/$i"
+            echo "fail:$(cat $TMPDIR/err_$i)" > "$TMPDIR/$i"
         fi
+        rm -f "$TMPDIR/err_$i"
     ) &
     # Batch spawning to avoid overwhelming the shell
     if [ $((i % 500)) -eq 0 ]; then
@@ -182,11 +184,27 @@ done
 wait
 
 # Count results
-OK=$(grep -rl ok "$TMPDIR" | wc -l)
-FAIL=$(grep -rl fail "$TMPDIR" | wc -l)
+OK=$(grep -c '^ok$' "$TMPDIR"/* 2>/dev/null | grep ':1$' | wc -l)
+FAIL_COUNT=0
+FAIL_SAMPLES=""
+for f in "$TMPDIR"/*; do
+    content=$(cat "$f" 2>/dev/null)
+    case "$content" in
+        fail:*)
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            if [ $FAIL_COUNT -le 5 ]; then
+                FAIL_SAMPLES="$FAIL_SAMPLES|$content"
+            fi
+            ;;
+    esac
+done
+
 rm -rf "$TMPDIR"
 
 echo "RESULT:$OK/$COUNT"
+if [ -n "$FAIL_SAMPLES" ]; then
+    echo "ERRORS:$FAIL_SAMPLES"
+fi
 "#,
         TEST_IP, server.port, NUM_CONNECTIONS
     );
@@ -255,6 +273,15 @@ echo "RESULT:$OK/$COUNT"
         );
         (0, NUM_CONNECTIONS)
     };
+
+    // Print error samples if any connections failed
+    if let Some(line) = stdout.lines().find(|l| l.starts_with("ERRORS:")) {
+        let errors = line.trim_start_matches("ERRORS:");
+        println!("  Error samples:");
+        for err in errors.split('|').filter(|s| !s.is_empty()).take(5) {
+            println!("    {}", err);
+        }
+    }
 
     let fail_count = total - ok_count;
     let total_bytes = ok_count as u64 * PAYLOAD_SIZE as u64;
@@ -332,7 +359,46 @@ impl OneMbServer {
 }
 
 async fn start_1mb_server(bind_addr: &str) -> Result<OneMbServer> {
-    let listener = std::net::TcpListener::bind(format!("{}:0", bind_addr))?;
+    // Use socket2 to create listener with large backlog (8192 instead of default 128).
+    // With 8000 concurrent connections, the default backlog causes accept queue
+    // overflow under CI load (many parallel tests competing for CPU).
+    let addr: std::net::SocketAddr = format!("{}:0", bind_addr).parse()?;
+    let socket = unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let optval: libc::c_int = 1;
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &optval as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        let sockaddr = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: addr.port().to_be(),
+            sin_addr: libc::in_addr { s_addr: 0 }, // INADDR_ANY
+            sin_zero: [0; 8],
+        };
+        let ret = libc::bind(
+            fd,
+            &sockaddr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        );
+        if ret < 0 {
+            libc::close(fd);
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let ret = libc::listen(fd, 8192);
+        if ret < 0 {
+            libc::close(fd);
+            return Err(std::io::Error::last_os_error().into());
+        }
+        std::net::TcpListener::from_raw_fd(fd)
+    };
+    let listener = socket;
     let port = listener.local_addr()?.port();
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let conn_count = Arc::new(AtomicU32::new(0));
@@ -351,7 +417,6 @@ async fn start_1mb_server(bind_addr: &str) -> Result<OneMbServer> {
     let stop = stop_flag.clone();
     let count = conn_count.clone();
 
-    // Set SO_REUSEADDR and non-blocking accept timeout
     listener.set_nonblocking(false)?;
 
     let handle = std::thread::spawn(move || {
