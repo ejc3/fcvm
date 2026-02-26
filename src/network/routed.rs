@@ -147,9 +147,15 @@ impl NetworkManager for RoutedNetwork {
             "setting up routed networking"
         );
 
-        // Detect host IPv6 subnet
+        // Detect host IPv6 subnet, fall back to ULA prefix for IPv4-only hosts.
+        // On hosts with global IPv6, VMs get globally-routable IPv6 addresses from
+        // the host's /64 subnet. On IPv4-only hosts, VMs get ULA addresses (fd00:fcvm::)
+        // that work within the namespace for the fd00::1 gateway; egress uses IPv4.
         let (host_ipv6, ipv6_prefix) = Self::detect_host_ipv6()
-            .context("routed mode requires a host with a global IPv6 /64 subnet")?;
+            .unwrap_or_else(|| {
+                warn!("no global IPv6 /64 subnet detected, using ULA prefix (IPv4-only egress)");
+                ("fd00:fc00::1".to_string(), "fd00:fc00:0:0".to_string())
+            });
 
         let vm_ipv6 = Self::generate_vm_ipv6(&ipv6_prefix, &self.vm_id);
         info!(
