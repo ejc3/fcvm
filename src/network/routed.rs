@@ -64,19 +64,30 @@ impl RoutedNetwork {
         self.namespace_id.as_deref()
     }
 
-    /// Add a host route for a guest IPv6 address.
+    /// Add a host route and NDP proxy for a guest IPv6 address.
     ///
     /// Called during snapshot restore when the snapshot's guest IPv6 differs from
     /// the newly generated one (different VM IDs produce different IPv6 addresses,
-    /// but the snapshot's boot params have the original).
+    /// but the snapshot's boot params have the original). Without BOTH the route
+    /// and the NDP proxy, return traffic from external hosts (like DNS servers)
+    /// can't reach the VM — the host won't answer NDP queries for the address.
     pub async fn add_guest_route(&self, guest_ipv6: &str) {
         if let Some(ref host_veth) = self.host_veth {
+            // Add host route so the kernel forwards packets to the right veth
             let route = format!("{}/128", guest_ipv6);
             let _ = tokio::process::Command::new("ip")
                 .args(["-6", "route", "replace", &route, "dev", host_veth])
                 .output()
                 .await;
-            info!(guest_ipv6 = %guest_ipv6, veth = %host_veth, "added host route for snapshot guest IPv6");
+
+            // Add NDP proxy so the host answers neighbor solicitations for this address.
+            // Without this, external hosts can't discover where to send reply packets.
+            let _ = tokio::process::Command::new("ip")
+                .args(["-6", "neigh", "add", "proxy", guest_ipv6, "dev", "eth0"])
+                .output()
+                .await;
+
+            info!(guest_ipv6 = %guest_ipv6, veth = %host_veth, "added host route + NDP proxy for snapshot guest IPv6");
         }
     }
 
