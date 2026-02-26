@@ -434,7 +434,13 @@ async fn bind_with_backlog(
         tokio::net::TcpSocket::new_v4()?
     };
     socket.set_reuseaddr(true)?;
-    let bind_addr: std::net::SocketAddr = format!("{}:{}", addr, port).parse().map_err(|e| {
+    let bind_addr: std::net::SocketAddr = if ipv6 {
+        format!("[{}]:{}", addr, port)
+    } else {
+        format!("{}:{}", addr, port)
+    }
+    .parse()
+    .map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("bad addr: {}", e))
     })?;
     socket.bind(bind_addr)?;
