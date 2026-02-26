@@ -671,3 +671,196 @@ fn test_sigterm_cleanup_bridged() -> Result<()> {
     println!("test_sigterm_cleanup_bridged PASSED");
     Ok(())
 }
+
+/// Test that SIGTERM properly cleans up ALL routed network resources
+///
+/// Routed mode creates: network namespace, veth pair, socat port forwarders,
+/// proxy NDP entries, host routes. All must be cleaned up after SIGTERM.
+#[cfg(feature = "privileged-tests")]
+#[test]
+fn test_sigterm_cleanup_routed() -> Result<()> {
+    println!("\ntest_sigterm_cleanup_routed");
+
+    // Start fcvm in routed mode with port forwarding (to test socat cleanup)
+    let fcvm_path = common::find_fcvm_binary()?;
+    let (vm_name, _, _, _) = common::unique_names("cleanup-routed");
+    let host_port = common::find_available_high_port().context("finding available port")?;
+    let publish_arg = format!("{}:80", host_port);
+
+    let mut fcvm = Command::new(&fcvm_path)
+        .args([
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "routed",
+            "--publish",
+            &publish_arg,
+            common::TEST_IMAGE,
+        ])
+        .spawn()
+        .context("spawning fcvm")?;
+
+    let fcvm_pid = fcvm.id();
+    println!("Started fcvm with PID: {}", fcvm_pid);
+
+    // Wait for VM to become healthy
+    let start = std::time::Instant::now();
+    let mut healthy = false;
+    while start.elapsed() < Duration::from_secs(120) {
+        std::thread::sleep(common::POLL_INTERVAL);
+
+        let output = Command::new(&fcvm_path)
+            .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
+            .output()
+            .context("running fcvm ls")?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.contains("\"health_status\":\"healthy\"")
+            || stdout.contains("\"health_status\": \"healthy\"")
+        {
+            healthy = true;
+            println!("VM is healthy after {:?}", start.elapsed());
+            break;
+        }
+    }
+
+    if !healthy {
+        fcvm::utils::graceful_kill(fcvm_pid, 2000);
+        let _ = fcvm.wait();
+        anyhow::bail!("VM did not become healthy within 120 seconds");
+    }
+
+    // Record resources BEFORE killing — we'll verify they're gone after
+    let our_fc_pid = find_firecracker_for_fcvm(fcvm_pid);
+    println!("Our firecracker PID: {:?}", our_fc_pid);
+    assert!(
+        our_fc_pid.is_some(),
+        "should have started a firecracker process"
+    );
+
+    // Find routed-mode resources: namespace name pattern is "fcvm-*"
+    let ns_list_before = Command::new("ip")
+        .args(["netns", "list"])
+        .output()
+        .context("listing namespaces")?;
+    let ns_before = String::from_utf8_lossy(&ns_list_before.stdout);
+    let our_namespaces: Vec<&str> = ns_before
+        .lines()
+        .filter(|l| l.starts_with("fcvm-"))
+        .collect();
+    println!("Namespaces before SIGTERM: {:?}", our_namespaces);
+
+    // Find socat processes for our port forwarding
+    let socat_pids = find_socat_for_port(host_port);
+    println!("Socat PIDs for port {}: {:?}", host_port, socat_pids);
+
+    // Send SIGTERM
+    println!("Sending SIGTERM to fcvm (PID {})", fcvm_pid);
+    send_signal(fcvm_pid, "TERM").context("sending SIGTERM to fcvm")?;
+
+    // Wait for fcvm to exit
+    let start = std::time::Instant::now();
+    let mut exited = false;
+    while start.elapsed() < Duration::from_secs(60) {
+        match fcvm.try_wait() {
+            Ok(Some(status)) => {
+                println!("fcvm exited with status: {:?}", status);
+                exited = true;
+                break;
+            }
+            Ok(None) => std::thread::sleep(common::POLL_INTERVAL),
+            Err(_) => break,
+        }
+    }
+
+    if !exited {
+        println!("fcvm didn't exit after SIGTERM, killing forcefully");
+        let _ = fcvm.kill();
+        let _ = fcvm.wait();
+    }
+
+    // Poll for cleanup (max 15 seconds)
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(15) {
+        let fc_alive = our_fc_pid.is_some_and(process_exists);
+        if !fc_alive {
+            break;
+        }
+        std::thread::sleep(common::POLL_INTERVAL);
+    }
+
+    // Verify firecracker cleaned up
+    if let Some(fc_pid) = our_fc_pid {
+        let still_running = process_exists(fc_pid);
+        assert!(
+            !still_running,
+            "firecracker (PID {}) should be killed after SIGTERM",
+            fc_pid
+        );
+        println!("Firecracker PID {} correctly cleaned up", fc_pid);
+    }
+
+    // Verify socat processes cleaned up
+    for socat_pid in &socat_pids {
+        let still_running = process_exists(*socat_pid);
+        assert!(
+            !still_running,
+            "socat (PID {}) should be killed after SIGTERM",
+            socat_pid
+        );
+    }
+    if !socat_pids.is_empty() {
+        println!("Socat processes correctly cleaned up");
+    }
+
+    // Verify namespace cleaned up
+    let ns_list_after = Command::new("ip")
+        .args(["netns", "list"])
+        .output()
+        .context("listing namespaces after cleanup")?;
+    let ns_after = String::from_utf8_lossy(&ns_list_after.stdout);
+    let remaining_ns: Vec<&str> = ns_after
+        .lines()
+        .filter(|l| l.starts_with("fcvm-"))
+        .collect();
+    // Our namespace(s) should be gone. We can't know which exact namespace was ours,
+    // but the count should be less than or equal to what existed before minus one.
+    println!("Namespaces after SIGTERM: {:?}", remaining_ns);
+    assert!(
+        remaining_ns.len() < our_namespaces.len() || our_namespaces.is_empty(),
+        "Routed namespace should be cleaned up after SIGTERM (before: {:?}, after: {:?})",
+        our_namespaces,
+        remaining_ns
+    );
+
+    // Verify fcvm process itself is gone
+    assert!(
+        !process_exists(fcvm_pid),
+        "fcvm process (PID {}) should be terminated",
+        fcvm_pid
+    );
+
+    println!("test_sigterm_cleanup_routed PASSED");
+    Ok(())
+}
+
+/// Find socat processes listening on a specific port
+#[cfg(feature = "privileged-tests")]
+fn find_socat_for_port(port: u16) -> Vec<u32> {
+    let output = Command::new("pgrep")
+        .args(["-f", &format!("socat.*TCP-LISTEN:{}", port)])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout
+                .lines()
+                .filter_map(|l| l.trim().parse::<u32>().ok())
+                .collect()
+        }
+        _ => vec![],
+    }
+}

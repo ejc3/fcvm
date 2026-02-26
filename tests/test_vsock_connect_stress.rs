@@ -188,6 +188,12 @@ async fn test_vsock_connect_lifecycle_stress_rootless() -> Result<()> {
     vsock_connect_lifecycle_stress("rootless").await
 }
 
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_vsock_connect_lifecycle_stress_routed() -> Result<()> {
+    vsock_connect_lifecycle_stress("routed").await
+}
+
 async fn vsock_connect_lifecycle_stress(network: &str) -> Result<()> {
     let (baseline_name, clone1_name, snapshot_name, _serve_name) =
         common::unique_names(&format!("vsock-{}", network));
