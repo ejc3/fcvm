@@ -37,11 +37,16 @@ pub async fn run() -> Result<()> {
     // Egress proxy reconnect signal — signaled after snapshot events (pause/resume
     // or restore) to break the stale vsock session and reconnect immediately.
     let egress_reconnect = std::sync::Arc::new(tokio::sync::Notify::new());
+    // Egress proxy reconnect confirmation — proxy signals after vsock reconnect succeeds.
+    // handle_clone_restore waits on this before reconnecting output, ensuring egress is
+    // ready before the host considers the VM "ready" and tests start using egress.
+    let egress_reconnect_done = std::sync::Arc::new(tokio::sync::Notify::new());
 
     if plan.egress_proxy {
         eprintln!("[fc-agent] starting vsock egress proxy");
         let signal = egress_reconnect.clone();
-        tokio::spawn(proxy::run_egress_proxy(signal));
+        let done = egress_reconnect_done.clone();
+        tokio::spawn(proxy::run_egress_proxy(signal, done));
     }
 
     if let Err(e) = mmds::sync_clock_from_host().await {
@@ -79,6 +84,8 @@ pub async fn run() -> Result<()> {
     let watcher_exec_rebind_done = exec_rebind_done.clone();
     let watcher_exec_rebind_done_notify = exec_rebind_done_notify.clone();
     let watcher_egress_reconnect = egress_reconnect.clone();
+    let watcher_egress_reconnect_done = egress_reconnect_done.clone();
+    let watcher_has_egress_proxy = plan.egress_proxy;
     tokio::spawn(async move {
         eprintln!("[fc-agent] starting restore-epoch watcher");
         mmds::watch_restore_epoch(
@@ -89,6 +96,8 @@ pub async fn run() -> Result<()> {
             watcher_exec_rebind_done,
             watcher_exec_rebind_done_notify,
             watcher_egress_reconnect,
+            watcher_egress_reconnect_done,
+            watcher_has_egress_proxy,
         )
         .await;
     });

@@ -142,6 +142,8 @@ pub async fn watch_restore_epoch(
     exec_rebind_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     exec_rebind_done_notify: std::sync::Arc<tokio::sync::Notify>,
     egress_reconnect: std::sync::Arc<tokio::sync::Notify>,
+    egress_reconnect_done: std::sync::Arc<tokio::sync::Notify>,
+    has_egress_proxy: bool,
 ) {
     let mut last_epoch: Option<String> = None;
 
@@ -162,23 +164,37 @@ pub async fn watch_restore_epoch(
         if let Some(ref current) = metadata.restore_epoch {
             match &last_epoch {
                 None => {
-                    eprintln!(
-                        "[fc-agent] detected restore-epoch: {} (clone restore detected)",
-                        current,
-                    );
-                    // Signal notify_cache_ready_and_wait to stop waiting.
-                    // Must be set BEFORE handle_clone_restore so the poll loop
-                    // exits before output reconnect changes vsock state.
-                    restore_flag.store(true, std::sync::atomic::Ordering::Release);
-                    crate::restore::handle_clone_restore(
-                        &output,
-                        &exec_rebind,
-                        &exec_rebind_needed,
-                        &exec_rebind_done,
-                        &exec_rebind_done_notify,
-                        &egress_reconnect,
-                    )
-                    .await;
+                    // First time seeing an epoch. Two cases:
+                    // 1. Clone restore: we're the first to detect it, run handle_clone_restore
+                    // 2. Warm start: notify_cache_ready_and_wait already handled reconnection
+                    //    and set restore_flag. Skip handle_clone_restore to avoid tearing down
+                    //    the already-working egress proxy session mid-use.
+                    if restore_flag.load(std::sync::atomic::Ordering::Acquire) {
+                        eprintln!(
+                            "[fc-agent] restore-epoch: {} (warm start, reconnection already handled)",
+                            current,
+                        );
+                    } else {
+                        eprintln!(
+                            "[fc-agent] detected restore-epoch: {} (clone restore detected)",
+                            current,
+                        );
+                        // Signal notify_cache_ready_and_wait to stop waiting.
+                        // Must be set BEFORE handle_clone_restore so the poll loop
+                        // exits before output reconnect changes vsock state.
+                        restore_flag.store(true, std::sync::atomic::Ordering::Release);
+                        crate::restore::handle_clone_restore(
+                            &output,
+                            &exec_rebind,
+                            &exec_rebind_needed,
+                            &exec_rebind_done,
+                            &exec_rebind_done_notify,
+                            &egress_reconnect,
+                            &egress_reconnect_done,
+                            has_egress_proxy,
+                        )
+                        .await;
+                    }
                     last_epoch = metadata.restore_epoch;
                 }
                 Some(prev) if prev != current => {
@@ -191,6 +207,8 @@ pub async fn watch_restore_epoch(
                         &exec_rebind_done,
                         &exec_rebind_done_notify,
                         &egress_reconnect,
+                        &egress_reconnect_done,
+                        has_egress_proxy,
                     )
                     .await;
                     last_epoch = metadata.restore_epoch;

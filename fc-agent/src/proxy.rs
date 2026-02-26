@@ -100,7 +100,10 @@ impl ProxyState {
 /// kills all vsock connections) to break the stale multiplexed session and reconnect.
 /// Without this, the proxy's stale AsyncFd epoll registration causes read_exact to
 /// hang indefinitely. Harmless on cold start (pause/resume doesn't break connections).
-pub async fn run_egress_proxy(reconnect: Arc<Notify>) {
+///
+/// `reconnect_done` is signaled after the proxy successfully reconnects its vsock,
+/// so restore.rs can wait for egress to be ready before signaling "VM ready" to the host.
+pub async fn run_egress_proxy(reconnect: Arc<Notify>, reconnect_done: Arc<Notify>) {
     if !setup_iptables_redirect() {
         eprintln!(
             "[fc-agent] WARNING: failed to set up iptables REDIRECT rules, egress proxy disabled"
@@ -155,11 +158,11 @@ pub async fn run_egress_proxy(reconnect: Arc<Notify>) {
             }
         };
         eprintln!("[fc-agent] egress proxy vsock connected");
+        reconnect_done.notify_waiters();
 
         run_mux_session(&listener_v4, listener_v6.as_ref(), vsock, &reconnect).await;
 
         eprintln!("[fc-agent] egress proxy vsock disconnected, reconnecting...");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
