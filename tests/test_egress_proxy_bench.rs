@@ -18,7 +18,6 @@
 mod common;
 
 use anyhow::{Context, Result};
-use std::os::fd::FromRawFd;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -359,46 +358,14 @@ impl OneMbServer {
 }
 
 async fn start_1mb_server(bind_addr: &str) -> Result<OneMbServer> {
-    // Use socket2 to create listener with large backlog (8192 instead of default 128).
+    // Use TcpSocket for large backlog (8192 instead of default 128).
     // With 8000 concurrent connections, the default backlog causes accept queue
     // overflow under CI load (many parallel tests competing for CPU).
     let addr: std::net::SocketAddr = format!("{}:0", bind_addr).parse()?;
-    let socket = unsafe {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let optval: libc::c_int = 1;
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_REUSEADDR,
-            &optval as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        let sockaddr = libc::sockaddr_in {
-            sin_family: libc::AF_INET as libc::sa_family_t,
-            sin_port: addr.port().to_be(),
-            sin_addr: libc::in_addr { s_addr: 0 }, // INADDR_ANY
-            sin_zero: [0; 8],
-        };
-        let ret = libc::bind(
-            fd,
-            &sockaddr as *const _ as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        );
-        if ret < 0 {
-            libc::close(fd);
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let ret = libc::listen(fd, 8192);
-        if ret < 0 {
-            libc::close(fd);
-            return Err(std::io::Error::last_os_error().into());
-        }
-        std::net::TcpListener::from_raw_fd(fd)
-    };
-    let listener = socket;
+    let socket = std::net::TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    let listener = socket.listen(8192)?;
     let port = listener.local_addr()?.port();
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let conn_count = Arc::new(AtomicU32::new(0));
