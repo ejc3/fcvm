@@ -1690,7 +1690,7 @@ impl LocalDnsServer {
 ///
 /// Proxies HTTP requests to their destination.
 /// Supports both IPv4 and IPv6 binding.
-/// Used to test that VMs can route through proxies via slirp4netns gateways.
+/// Used to test that VMs can route through proxies via pasta gateways.
 pub struct LocalProxyServer {
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,

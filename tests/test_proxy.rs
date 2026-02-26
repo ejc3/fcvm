@@ -185,7 +185,7 @@ async fn test_proxy_ipv6() -> Result<()> {
         );
         return Ok(());
     }
-    // Note: We use :: (all interfaces) instead of ::1 because slirp4netns IPv6
+    // Note: We use :: (all interfaces) instead of ::1 because pasta IPv6
     // doesn't have host loopback translation like IPv4's 10.0.2.2 → 127.0.0.1
     test_proxy_to_addr("::", "fd00::2", "ipv6").await
 }
@@ -199,11 +199,11 @@ async fn test_proxy_ipv4() -> Result<()> {
 /// Helper to test VM egress to a specific bind address.
 ///
 /// The test binds to `bind_addr` on the host, but the VM must use the
-/// appropriate slirp4netns gateway to reach it:
+/// appropriate pasta gateway to reach it:
 /// - 127.0.0.1 → VM uses 10.0.2.2 (IPv4 host loopback)
 /// - ::1       → VM uses fd00::2 (IPv6 host loopback)
 /// - 0.0.0.0   → VM uses 10.0.2.2 (all interfaces, reached via IPv4 gateway)
-/// - IPv6 global → VM can reach directly via slirp IPv6 NAT
+/// - IPv6 global → VM can reach directly via pasta IPv6 NAT
 async fn test_egress_to_addr(bind_addr: &str, vm_target_addr: &str, addr_type: &str) -> Result<()> {
     let test_server = common::LocalTestServer::start_on_available_port(bind_addr)
         .await
@@ -289,23 +289,23 @@ async fn test_egress_to_addr(bind_addr: &str, vm_target_addr: &str, addr_type: &
 }
 
 /// Test VM egress to IPv4 loopback (127.0.0.1)
-/// Server binds to 127.0.0.1, VM connects via 10.0.2.2 (slirp IPv4 gateway)
+/// Server binds to 127.0.0.1, VM connects via 10.0.2.2 (pasta IPv4 gateway)
 #[tokio::test]
 async fn test_egress_ipv4_local() -> Result<()> {
-    // slirp4netns translates 10.0.2.2 → host's 127.0.0.1
+    // pasta translates 10.0.2.2 → host's 127.0.0.1
     test_egress_to_addr("127.0.0.1", "10.0.2.2", "ipv4-local").await
 }
 
 /// Test VM egress to IPv4 all interfaces (0.0.0.0)
-/// Server binds to 0.0.0.0, VM connects via 10.0.2.2 (slirp IPv4 gateway)
+/// Server binds to 0.0.0.0, VM connects via 10.0.2.2 (pasta IPv4 gateway)
 #[tokio::test]
 async fn test_egress_ipv4_global() -> Result<()> {
-    // 0.0.0.0 accepts from all interfaces including from slirp4netns
+    // 0.0.0.0 accepts from all interfaces including from pasta
     test_egress_to_addr("0.0.0.0", "10.0.2.2", "ipv4-global").await
 }
 
 /// Test VM egress to IPv6 all interfaces (::)
-/// Server binds to ::, VM connects via fd00::2 (slirp IPv6 gateway)
+/// Server binds to ::, VM connects via fd00::2 (pasta IPv6 gateway)
 #[tokio::test]
 async fn test_egress_ipv6_local() -> Result<()> {
     if is_running_in_container() {
@@ -314,13 +314,13 @@ async fn test_egress_ipv6_local() -> Result<()> {
         );
         return Ok(());
     }
-    // Note: We use :: (all interfaces) instead of ::1 because slirp4netns IPv6
+    // Note: We use :: (all interfaces) instead of ::1 because pasta IPv6
     // doesn't have host loopback translation like IPv4's 10.0.2.2 → 127.0.0.1
     test_egress_to_addr("::", "fd00::2", "ipv6-local").await
 }
 
 /// Test VM egress to IPv6 global (host's public IPv6 address)
-/// Server binds to host's global IPv6, VM connects directly via slirp IPv6 NAT
+/// Server binds to host's global IPv6, VM connects directly via pasta IPv6 NAT
 #[tokio::test]
 async fn test_egress_ipv6_global() -> Result<()> {
     if is_running_in_container() {
@@ -336,7 +336,7 @@ async fn test_egress_ipv6_global() -> Result<()> {
             return Ok(());
         }
     };
-    // VM can reach host's global IPv6 directly through slirp4netns IPv6 NAT
+    // VM can reach host's global IPv6 directly through pasta IPv6 NAT
     test_egress_to_addr(&host_ipv6, &host_ipv6, "ipv6-global").await
 }
 

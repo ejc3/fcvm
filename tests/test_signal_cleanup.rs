@@ -1,7 +1,7 @@
 //! Tests for signal handling and cleanup
 //!
 //! Verifies that when fcvm receives SIGINT/SIGTERM, it properly cleans up
-//! child processes (firecracker, slirp4netns, etc.)
+//! child processes (firecracker, pasta, etc.)
 
 #![cfg(feature = "integration-fast")]
 
@@ -300,7 +300,7 @@ fn test_sigterm_kills_firecracker_bridged() -> Result<()> {
 }
 
 /// Test that SIGTERM properly kills the VM and cleans up ALL resources in rootless mode
-/// This includes: firecracker, slirp4netns, namespace holder, and state files
+/// This includes: firecracker, pasta, namespace holder, and state files
 ///
 /// NOTE: This test tracks SPECIFIC PIDs rather than global process counts to work
 /// correctly when running in parallel with other tests.
@@ -358,10 +358,10 @@ fn test_sigterm_cleanup_rootless() -> Result<()> {
     // Find the specific firecracker process for THIS VM by looking for our VM name pattern
     // The VM ID contains the unique name prefix, so we can find our specific process
     let our_fc_pid = find_firecracker_for_fcvm(fcvm_pid);
-    let our_slirp_pid = find_slirp_for_fcvm(fcvm_pid);
+    let our_pasta_pid = find_pasta_for_fcvm(fcvm_pid);
     println!(
-        "Our processes: firecracker={:?}, slirp4netns={:?}",
-        our_fc_pid, our_slirp_pid
+        "Our processes: firecracker={:?}, pasta={:?}",
+        our_fc_pid, our_pasta_pid
     );
 
     // Verify we found our firecracker process
@@ -403,8 +403,8 @@ fn test_sigterm_cleanup_rootless() -> Result<()> {
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(15) {
         let fc_alive = our_fc_pid.is_some_and(process_exists);
-        let slirp_alive = our_slirp_pid.is_some_and(process_exists);
-        if !fc_alive && !slirp_alive {
+        let pasta_alive = our_pasta_pid.is_some_and(process_exists);
+        if !fc_alive && !pasta_alive {
             break;
         }
         std::thread::sleep(common::POLL_INTERVAL);
@@ -421,14 +421,14 @@ fn test_sigterm_cleanup_rootless() -> Result<()> {
         println!("Firecracker PID {} correctly cleaned up", fc_pid);
     }
 
-    if let Some(slirp_pid) = our_slirp_pid {
-        let still_running = process_exists(slirp_pid);
+    if let Some(pasta_pid) = our_pasta_pid {
+        let still_running = process_exists(pasta_pid);
         assert!(
             !still_running,
-            "our slirp4netns (PID {}) should be killed after SIGTERM",
-            slirp_pid
+            "our pasta (PID {}) should be killed after SIGTERM",
+            pasta_pid
         );
-        println!("slirp4netns PID {} correctly cleaned up", slirp_pid);
+        println!("pasta PID {} correctly cleaned up", pasta_pid);
     }
 
     // Verify fcvm process itself is gone
@@ -487,12 +487,9 @@ fn find_firecracker_for_fcvm(fcvm_pid: u32) -> Option<u32> {
     None
 }
 
-/// Find the slirp4netns process spawned by a specific fcvm process
-fn find_slirp_for_fcvm(fcvm_pid: u32) -> Option<u32> {
-    let output = Command::new("pgrep")
-        .args(["-f", "slirp4netns"])
-        .output()
-        .ok()?;
+/// Find the pasta process spawned by a specific fcvm process
+fn find_pasta_for_fcvm(fcvm_pid: u32) -> Option<u32> {
+    let output = Command::new("pgrep").args(["-f", "pasta"]).output().ok()?;
 
     if !output.status.success() {
         return None;
@@ -500,10 +497,10 @@ fn find_slirp_for_fcvm(fcvm_pid: u32) -> Option<u32> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
-        if let Ok(slirp_pid) = line.trim().parse::<u32>() {
-            // Check if this slirp4netns's parent chain includes our fcvm PID
-            if is_descendant_of(slirp_pid, fcvm_pid) {
-                return Some(slirp_pid);
+        if let Ok(pasta_pid) = line.trim().parse::<u32>() {
+            // Check if this pasta's parent chain includes our fcvm PID
+            if is_descendant_of(pasta_pid, fcvm_pid) {
+                return Some(pasta_pid);
             }
         }
     }

@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use crate::{
     firecracker::VmManager,
-    network::{BridgedNetwork, NetworkConfig, NetworkManager, SlirpNetwork},
+    network::{BridgedNetwork, NetworkConfig, NetworkManager, PastaNetwork},
     paths,
     state::{StateManager, VmState, VmStatus},
     storage::DiskManager,
@@ -87,7 +87,7 @@ async fn setup_namespace_mappings(pid: u32) -> anyhow::Result<()> {
     let self_ino = std::fs::metadata("/proc/self/ns/user")
         .context("reading own user namespace inode")?
         .ino();
-    let ns_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let ns_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         if std::fs::metadata(format!("/proc/{pid}/ns/user"))
             .map(|m| m.ino() != self_ino)
@@ -98,7 +98,7 @@ async fn setup_namespace_mappings(pid: u32) -> anyhow::Result<()> {
         if std::time::Instant::now() >= ns_deadline {
             anyhow::bail!("timed out waiting for user namespace (PID {pid})");
         }
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 
     // Try extended mappings (0-65535) via newuidmap/newgidmap (setuid helpers).
@@ -124,7 +124,10 @@ async fn setup_namespace_mappings(pid: u32) -> anyhow::Result<()> {
 
     // Fallback: write mappings directly (equivalent to --map-root-user).
     // Must deny setgroups before writing gid_map as unprivileged user.
-    std::fs::write(format!("/proc/{pid}/setgroups"), "deny").context("denying setgroups")?;
+    // Root (uid 0) can write gid_map directly and doesn't need (or can't) deny setgroups.
+    if uid != 0 {
+        std::fs::write(format!("/proc/{pid}/setgroups"), "deny").context("denying setgroups")?;
+    }
     if !uid_ok {
         std::fs::write(format!("/proc/{pid}/uid_map"), format!("0 {uid} 1\n"))
             .context("writing uid_map")?;
@@ -694,19 +697,19 @@ pub async fn restore_from_snapshot(
             source_disk = %restore_config.source_disk_path.display(),
             "CoW disk prepared from snapshot"
         );
-    } else if let Some(slirp_net) = network.as_any().downcast_ref::<SlirpNetwork>() {
+    } else if let Some(pasta_net) = network.as_any().downcast_ref::<PastaNetwork>() {
         // Rootless mode: spawn holder process and set up namespace via nsenter
         // OPTIMIZATION: Parallelize disk creation with network setup
 
         // Step 1: Spawn holder process (keeps namespace alive)
-        let holder_cmd = slirp_net.build_holder_command();
+        let holder_cmd = pasta_net.build_holder_command();
         info!(cmd = ?holder_cmd, "spawning namespace holder for rootless networking");
 
         let (mut child, holder_pid) = spawn_namespace_holder(&holder_cmd).await?;
 
         // Step 2: Run disk creation and network setup IN PARALLEL
-        let setup_script = slirp_net.build_setup_script();
-        let nsenter_prefix = slirp_net.build_nsenter_prefix(holder_pid);
+        let setup_script = pasta_net.build_setup_script();
+        let nsenter_prefix = pasta_net.build_nsenter_prefix(holder_pid);
         let tap_device = network_config.tap_device.clone();
 
         // Disk creation task
@@ -831,7 +834,7 @@ pub async fn restore_from_snapshot(
         holder_child = Some(child);
     } else {
         // Unknown network type - should not happen
-        anyhow::bail!("Unknown network type - must be either BridgedNetwork or SlirpNetwork");
+        anyhow::bail!("Unknown network type - must be either BridgedNetwork or PastaNetwork");
     }
 
     // Configure mount namespace isolation for path redirects
@@ -882,7 +885,7 @@ pub async fn restore_from_snapshot(
         .await
         .context("starting Firecracker")?;
 
-    // For rootless mode with slirp4netns: post_start starts slirp4netns in the namespace
+    // For rootless mode with pasta: post_start starts pasta + bridge in the namespace
     let vm_pid = vm_manager.pid()?;
     let post_start_pid = holder_pid_for_post_start.unwrap_or(vm_pid);
     network
@@ -1434,27 +1437,13 @@ pub async fn create_snapshot_core(
 
     info!(snapshot = %snapshot_config.name, "VM resumed, processing snapshot");
 
-    // Firecracker resets all vsock connections during snapshot creation
-    // (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET). Bump restore-epoch in MMDS so fc-agent's
-    // background watcher detects this and triggers handle_clone_restore() which
-    // re-registers the exec server's AsyncFd (stale after transport reset) and
-    // reconnects the output vsock. This MUST succeed — if the epoch isn't bumped,
-    // the exec server stays stale and health checks hang for ~60s.
-    let restore_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if let Err(e) = client
-        .patch_mmds(serde_json::json!({
-            "latest": {
-                "restore-epoch": restore_epoch.to_string()
-            }
-        }))
-        .await
-    {
-        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
-        return Err(e).context("bumping restore-epoch in MMDS after snapshot");
-    }
+    // NOTE: Do NOT bump restore-epoch here. Snapshot create (pause → dump → resume)
+    // does NOT reset vsock connections — empirically verified with scratch VMs.
+    // VIRTIO_VSOCK_EVENT_TRANSPORT_RESET only occurs on snapshot RESTORE (loading
+    // a new VM from snapshot files), not on create. Bumping restore-epoch here
+    // would trigger handle_clone_restore() in fc-agent, which kills TCP connections
+    // and reconnects FUSE/output vsock unnecessarily, crashing the running container.
+    // restore-epoch is bumped in the restore path (snapshot.rs) where it's needed.
 
     if has_base {
         // Diff snapshot: copy base to temp, merge diff onto it, then atomic rename

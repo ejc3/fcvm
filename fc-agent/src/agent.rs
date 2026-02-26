@@ -1,13 +1,14 @@
 use anyhow::Result;
 use tokio::time::{sleep, Duration};
 
-use crate::{container, exec, lock_test, mmds, mounts, network, output, system};
+use crate::{container, exec, lock_test, mmds, mounts, network, output, proxy, system};
 
 /// Main agent logic — fetches plan, runs container, triggers shutdown.
 pub async fn run() -> Result<()> {
     eprintln!("[fc-agent] run_agent starting");
 
     system::raise_resource_limits();
+    system::raise_cgroup_pids_limit();
     system::create_kvm_device();
     network::configure_dns_from_cmdline();
     network::configure_ipv6_from_cmdline();
@@ -33,27 +34,24 @@ pub async fn run() -> Result<()> {
         network::setup_localhost_forwarding(&plan.forward_localhost);
     }
 
+    // Egress proxy reconnect signal — signaled after snapshot events (pause/resume
+    // or restore) to break the stale vsock session and reconnect immediately.
+    let egress_reconnect = std::sync::Arc::new(tokio::sync::Notify::new());
+    // Egress proxy reconnect confirmation — proxy signals after vsock reconnect succeeds.
+    // handle_clone_restore waits on this before reconnecting output, ensuring egress is
+    // ready before the host considers the VM "ready" and tests start using egress.
+    let egress_reconnect_done = std::sync::Arc::new(tokio::sync::Notify::new());
+
+    if plan.egress_proxy {
+        eprintln!("[fc-agent] starting vsock egress proxy");
+        let signal = egress_reconnect.clone();
+        let done = egress_reconnect_done.clone();
+        tokio::spawn(proxy::run_egress_proxy(signal, done));
+    }
+
     if let Err(e) = mmds::sync_clock_from_host().await {
         eprintln!("[fc-agent] WARNING: clock sync failed: {:?}", e);
         eprintln!("[fc-agent] continuing anyway (will rely on chronyd)");
-    }
-
-    // Configure podman storage BEFORE starting the exec server.
-    // The host health monitor connects via exec to run `podman inspect`.
-    // If storage.conf isn't written yet, podman creates db.sql with the wrong
-    // graph driver, causing "database graph driver does not match" errors later.
-    match plan.image_mode.as_deref() {
-        Some("overlay") => {
-            eprintln!("[fc-agent] skipping btrfs loopback setup (image_mode=overlay)");
-            // Write storage.conf with overlay driver now so any early `podman`
-            // commands (e.g. health monitor's `podman inspect`) create db.sql
-            // with the correct driver.  mount_overlay_image() will overwrite
-            // this later with the full config including additionalimagestores.
-            container::write_overlay_storage_conf(plan.user.as_deref());
-        }
-        _ => {
-            container::setup_btrfs_storage_if_available();
-        }
     }
 
     // Create output channel — the writer task handles all vsock writes
@@ -79,23 +77,20 @@ pub async fn run() -> Result<()> {
     let exec_rebind_done_notify = std::sync::Arc::new(tokio::sync::Notify::new());
 
     // Start restore-epoch watcher
-    let watcher_output = output.clone();
-    let watcher_restore_flag = restore_flag.clone();
-    let watcher_exec_rebind = exec_rebind.clone();
-    let watcher_exec_rebind_needed = exec_rebind_needed.clone();
-    let watcher_exec_rebind_done = exec_rebind_done.clone();
-    let watcher_exec_rebind_done_notify = exec_rebind_done_notify.clone();
+    let restore_signals = crate::restore::RestoreSignals {
+        output: output.clone(),
+        restore_flag: restore_flag.clone(),
+        exec_rebind: exec_rebind.clone(),
+        exec_rebind_needed: exec_rebind_needed.clone(),
+        exec_rebind_done: exec_rebind_done.clone(),
+        exec_rebind_done_notify: exec_rebind_done_notify.clone(),
+        egress_reconnect: egress_reconnect.clone(),
+        egress_reconnect_done: egress_reconnect_done.clone(),
+        has_egress_proxy: plan.egress_proxy,
+    };
     tokio::spawn(async move {
         eprintln!("[fc-agent] starting restore-epoch watcher");
-        mmds::watch_restore_epoch(
-            watcher_output,
-            watcher_restore_flag,
-            watcher_exec_rebind,
-            watcher_exec_rebind_needed,
-            watcher_exec_rebind_done,
-            watcher_exec_rebind_done_notify,
-        )
-        .await;
+        mmds::watch_restore_epoch(restore_signals).await;
     });
 
     // Start exec server with rebind signal for vsock transport reset recovery
@@ -178,6 +173,20 @@ pub async fn run() -> Result<()> {
         });
     }
 
+    // Set up btrfs storage if kernel supports it (avoids overlay idmap issues).
+    // Skip for overlay mode — it manages its own storage.
+    // For btrfs/archive/pull: creates loopback btrfs if kernel supports it.
+    match plan.image_mode.as_deref() {
+        Some("overlay") => {
+            eprintln!("[fc-agent] skipping btrfs loopback setup (image_mode=overlay)");
+        }
+        _ => {
+            // Btrfs, archive, and pull modes all use btrfs loopback on rootfs.
+            // The btrfs kernel module must be available (CONFIG_BTRFS_FS=y in btrfs profile).
+            container::setup_btrfs_storage_if_available();
+        }
+    }
+
     // If --user is specified with a non-root UID, create the VM user BEFORE image import
     // so podman load runs as the target user (rootless podman has separate storage).
     // uid 0 is root — no user mapping needed, podman runs as root directly.
@@ -219,6 +228,15 @@ pub async fn run() -> Result<()> {
     // Store prefix globally so exec server and health checks can use it
     container::set_podman_cmd_prefix(cmd_prefix.clone());
 
+    // Reset root podman state to match storage.conf. The health monitor may have
+    // run `podman inspect` via the exec server during setup, creating a stale
+    // db.sql with the wrong graph driver. Only needed for root podman — user mode
+    // already resets in create_vm_user(), and a root reset would destroy the
+    // user's storage directory.
+    if cmd_prefix.is_empty() {
+        container::reset_podman_state();
+    }
+
     // Prepare image based on delivery mode
     let image_ref = match (plan.image_mode.as_deref(), &plan.image_device) {
         (Some("overlay"), Some(device)) => {
@@ -251,12 +269,30 @@ pub async fn run() -> Result<()> {
             eprintln!("[fc-agent] image digest: {}", digest);
             if container::notify_cache_ready_and_wait(&digest, &restore_flag) {
                 eprintln!("[fc-agent] cache ready notification acknowledged");
-                // Pre-start snapshot was taken and we've been restored into a new
-                // Firecracker instance. Exec rebind + output reconnect are handled
-                // by handle_clone_restore() via the restore-epoch watcher.
-                // Do NOT signal exec rebind here — a duplicate re_register() corrupts
-                // the AsyncFd epoll registration, causing health checks to hang for ~60s
-                // (see plan trace evidence for the smoking gun vsock muxer logs).
+                // Reconnect output vsock before starting the container.
+                //
+                // On COLD start (first run), pause/resume does NOT reset vsock —
+                // this reconnect is harmless (just cycles the connection).
+                //
+                // On WARM start (restored from cached pre-start snapshot), vsock
+                // IS dead (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET on restore). The
+                // restore-epoch watcher calls handle_clone_restore() which also
+                // reconnects output — but there's a race: restore_flag is set
+                // BEFORE handle_clone_restore completes, so notify_cache_ready_and_wait
+                // returns before output.reconnect() has been called. For fast-exit
+                // containers (echo + exit in ~200ms), the container runs and exits
+                // with output going to the dead vsock before handle_clone_restore
+                // finishes. This explicit reconnect ensures the output writer has
+                // a live connection before the container starts.
+                output.reconnect();
+                // Signal egress proxy to reconnect its vsock. On warm start (restored
+                // from cached pre-start snapshot), VIRTIO_VSOCK_EVENT_TRANSPORT_RESET
+                // killed the proxy's vsock. handle_clone_restore() also signals this,
+                // but there's a race: restore_flag is set before handle_clone_restore
+                // completes. This explicit signal ensures the proxy reconnects before
+                // the container starts making TCP connections. Harmless on cold start
+                // (pause/resume doesn't break connections — proxy just cycles).
+                egress_reconnect.notify_waiters();
             } else {
                 eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing");
             }
@@ -265,14 +301,6 @@ pub async fn run() -> Result<()> {
             eprintln!("[fc-agent] WARNING: failed to get image digest: {:?}", e);
         }
     }
-
-    // After cache-ready handshake, Firecracker may have created a pre-start snapshot.
-    // Snapshot creation resets all vsock connections (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET).
-    // Output vsock reconnection is handled by handle_clone_restore() which is triggered
-    // by the restore-epoch watcher. Do NOT reconnect here — a second reconnect() call
-    // races with handle_clone_restore's reconnect and causes the output writer to cycle
-    // through multiple ghost connections (Notify stored-permit cascade), dropping data.
-    // FUSE mounts handle reconnection automatically via the reconnectable multiplexer.
 
     // VM-level setup: hostname and sysctl (runs as root before container starts).
     // When using --user, the container runs as non-root and can't do these.
@@ -291,6 +319,8 @@ pub async fn run() -> Result<()> {
         "fs.file-max=2097152",
         "fs.nr_open=2097152",
         "net.ipv4.ip_unprivileged_port_start=0",
+        "kernel.threads-max=4194304",
+        "net.core.somaxconn=65535",
     ] {
         let _ = std::process::Command::new("sysctl")
             .args(["-w", sysctl])

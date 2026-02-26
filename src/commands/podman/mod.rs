@@ -30,7 +30,7 @@ use crate::cli::{NetworkMode, PodmanArgs, PodmanCommands, RunArgs};
 use crate::commands::common::{
     VSOCK_OUTPUT_PORT, VSOCK_STATUS_PORT, VSOCK_TTY_PORT, VSOCK_VOLUME_PORT_BASE,
 };
-use crate::network::{BridgedNetwork, NetworkManager, PortMapping, SlirpNetwork};
+use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, PortMapping};
 use crate::paths;
 use crate::state::{generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState};
 use crate::volume::{spawn_volume_servers, VolumeConfig};
@@ -657,7 +657,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 .context("allocating loopback IP")?;
 
             Box::new(
-                SlirpNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
+                PastaNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
                     .with_loopback_ip(loopback_ip),
             )
         }
@@ -799,6 +799,18 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         None
     };
 
+    // Start egress proxy for rootless mode (bypasses TAP/bridge for outbound TCP)
+    let egress_proxy_handle = if matches!(args.network, NetworkMode::Rootless) {
+        let socket_path = vsock_socket_path.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) = crate::network::egress_proxy::run_egress_proxy(&socket_path).await {
+                tracing::warn!("Egress proxy error: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
+
     // Run the main VM setup in a helper to ensure cleanup on error
     let setup_result = run_vm_setup(
         VmSetupParams {
@@ -837,6 +849,11 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
 
         // Abort output listener task if still running
         if let Some(handle) = output_handle {
+            handle.abort();
+        }
+
+        // Abort egress proxy if running
+        if let Some(handle) = egress_proxy_handle {
             handle.abort();
         }
 
@@ -955,13 +972,9 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                             info!(snapshot_key = %key, "Pre-start snapshot created successfully");
                             ctx.vm_state.config.snapshot_name = Some(key.clone());
                             let _ = ctx.state_manager.save_state(&ctx.vm_state).await;
-                            // Signal output listener to re-accept (vsock reset during snapshot)
-                            ctx.output_reconnect.notify_one();
                         }
                         SnapshotOutcome::Failed(e) => {
                             warn!(snapshot_key = %key, error = %e, "Failed to create pre-start snapshot");
-                            // Signal even on failure — vsock was still reset during the attempt
-                            ctx.output_reconnect.notify_one();
                         }
                     }
                     // Send ack back regardless of success (fc-agent should continue)
@@ -1014,13 +1027,9 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                                         info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
                                         ctx.vm_state.config.snapshot_name = Some(startup_key.clone());
                                         let _ = ctx.state_manager.save_state(&ctx.vm_state).await;
-                                        // Signal output listener to re-accept (vsock reset during snapshot)
-                                        ctx.output_reconnect.notify_one();
                                     }
                                     SnapshotOutcome::Failed(e) => {
                                         warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");
-                                        // Signal even on failure — vsock was still reset during the attempt
-                                        ctx.output_reconnect.notify_one();
                                     }
                                 }
                             }

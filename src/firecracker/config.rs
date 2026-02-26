@@ -349,6 +349,7 @@ impl FirecrackerConfig {
                     "subuid_count": runtime.subuid_count,
                     "non_blocking_output": self.non_blocking_output,
                     "forward_localhost": self.forward_localhost.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+                    "egress_proxy": matches!(self.network_mode, NetworkMode::Rootless),
                     "interactive": self.interactive,
                     "tty": self.tty,
                     "http_proxy": runtime.http_proxy,

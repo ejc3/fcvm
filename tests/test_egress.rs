@@ -66,7 +66,7 @@ async fn get_host_primary_ip() -> Result<String> {
 async fn get_egress_url(network: &str, port: u16) -> Result<String> {
     match network {
         "rootless" => {
-            // For rootless, slirp4netns gateway is 10.0.2.2
+            // For rootless, pasta gateway is 10.0.2.2
             Ok(format!("http://10.0.2.2:{}/", port))
         }
         "bridged" => {

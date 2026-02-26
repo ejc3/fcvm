@@ -57,9 +57,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y fuse3 libfuse3-dev libclang-dev clang musl-tools \
-            iproute2 iptables slirp4netns dnsmasq qemu-utils e2fsprogs parted \
+            iproute2 iptables passt dnsmasq qemu-utils e2fsprogs parted \
             podman skopeo busybox-static cpio zstd autoconf automake libtool cmake \
             libseccomp-dev
+      - name: Build passt from source
+        # Build passt from source for consistent version across environments
+        working-directory: fcvm
+        run: ./scripts/build-passt.sh
       - name: Install Firecracker
         run: |
           ARCH=$(uname -m)

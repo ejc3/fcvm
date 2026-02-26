@@ -7,6 +7,7 @@ mod mmds;
 mod mounts;
 mod network;
 mod output;
+mod proxy;
 mod restore;
 mod system;
 mod tty;

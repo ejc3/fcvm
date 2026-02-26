@@ -946,7 +946,7 @@ echo "=== BENCHMARK L${LEVEL} ==="
 
 # Test 1: Egress - can we reach the gateway?
 echo "--- Egress Test ---"
-# Test by pinging the gateway (10.0.2.2 for rootless via slirp4netns)
+# Test by pinging the gateway (10.0.2.2 for rootless via pasta)
 # This validates network connectivity without external dependencies
 if ping -c 1 -W 5 10.0.2.2 > /dev/null 2>&1; then
     echo "EGRESS_L${LEVEL}=OK gateway=10.0.2.2"
