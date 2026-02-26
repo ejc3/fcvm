@@ -1371,7 +1371,11 @@ fcvm/
     ├── test_fuse_posix.rs
     ├── test_fuse_in_vm.rs
     ├── test_localhost_image.rs
-    └── test_snapshot_clone.rs
+    ├── test_snapshot_clone.rs
+    ├── test_egress.rs             # Egress proxy tests (rootless + bridged, fresh + clone)
+    ├── test_egress_stress.rs      # Egress proxy IPv4/IPv6 stress tests
+    ├── test_egress_proxy_bench.rs # 8000-connection concurrent benchmark
+    └── test_rootless_ipv6.rs      # IPv6 networking tests
 ```
 
 ### Dependencies
