@@ -270,8 +270,8 @@ fn test_port_forward_rootless() -> Result<()> {
 
     // Test: Access via loopback IP and forwarded port
     // In rootless mode, each VM gets a unique 127.x.y.z IP
-    // pasta's post_start() verifies port forwarding is ready before returning,
-    // and --health-check waits for nginx, so this should work immediately.
+    // post_start() verifies pasta bound the port; for fresh VMs, the 30+ second
+    // boot time gives pasta plenty of time to initialize L2 forwarding.
     println!(
         "Testing access via loopback IP {}:{}...",
         loopback_ip, host_port

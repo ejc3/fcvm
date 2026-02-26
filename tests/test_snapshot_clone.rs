@@ -1509,8 +1509,8 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
     println!("  Clone loopback IP: {}", loopback_ip);
 
     // Test: Access via loopback IP and forwarded port
-    // pasta's post_start() verifies port forwarding is ready before returning,
-    // so this should work immediately after health check.
+    // verify_port_forwarding() runs after snapshot restore and confirms end-to-end
+    // data flow through pasta's loopback → bridge → guest path before health monitor.
     println!(
         "  Testing access via loopback {}:{}...",
         loopback_ip, host_port

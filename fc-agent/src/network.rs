@@ -26,6 +26,11 @@ pub async fn flush_arp_cache() {
 }
 
 /// Send gratuitous ARP via ping to teach new pasta instance our MAC address.
+///
+/// Spawns `ping -c 1` to the default gateway in the background and returns
+/// immediately. The kernel sends an ARP REQUEST broadcast as the first step
+/// of resolving the gateway — that broadcast is what teaches pasta the guest's
+/// MAC. We don't need to wait for the ICMP echo reply.
 pub async fn send_gratuitous_arp() {
     let route_output = Command::new("ip")
         .args(["route", "show", "default"])
@@ -51,28 +56,31 @@ pub async fn send_gratuitous_arp() {
 
     eprintln!("[fc-agent] sending gratuitous ARP to gateway {}", gateway);
 
-    let ping_output = Command::new("ping")
+    // Fire-and-forget: spawn ping in background, don't await completion.
+    // The ARP request goes out immediately when the kernel resolves the gateway.
+    match Command::new("ping")
         .args(["-c", "1", "-W", "1", &gateway])
-        .output()
-        .await;
-
-    match ping_output {
-        Ok(o) if o.status.success() => {
-            eprintln!("[fc-agent] gratuitous ARP sent (pinged gateway)");
-        }
-        Ok(o) => {
-            eprintln!(
-                "[fc-agent] gratuitous ARP sent (ping returned: {})",
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(_child) => {
+            eprintln!("[fc-agent] gratuitous ARP: ping spawned (not waiting for reply)");
         }
         Err(e) => {
-            eprintln!("[fc-agent] WARNING: failed to send gratuitous ARP: {}", e);
+            eprintln!(
+                "[fc-agent] WARNING: failed to spawn gratuitous ARP ping: {}",
+                e
+            );
         }
     }
 }
 
-/// Kill all established TCP connections — dead after snapshot restore.
+/// Kill all established TCP connections — stale after snapshot restore.
+///
+/// Runs as the FIRST step of restore, before gratuitous ARP or output reconnect.
+/// At this point no new connections from pasta can exist (pasta doesn't know our
+/// MAC yet), so every ESTABLISHED connection is stale from before the snapshot.
 pub async fn kill_stale_tcp_connections() {
     let list_output = Command::new("ss")
         .args(["-tn", "state", "established"])
@@ -83,15 +91,12 @@ pub async fn kill_stale_tcp_connections() {
         let connections = String::from_utf8_lossy(&o.stdout);
         let count = connections.lines().count().saturating_sub(1);
         if count > 0 {
-            eprintln!(
-                "[fc-agent] found {} established TCP connection(s) to kill",
-                count
-            );
+            eprintln!("[fc-agent] found {} stale TCP connection(s) to kill", count);
             for line in connections.lines().skip(1) {
                 eprintln!("[fc-agent]   {}", line);
             }
         } else {
-            eprintln!("[fc-agent] no established TCP connections to kill");
+            eprintln!("[fc-agent] no stale TCP connections to kill");
             return;
         }
     }
@@ -103,7 +108,7 @@ pub async fn kill_stale_tcp_connections() {
 
     match kill_output {
         Ok(o) if o.status.success() => {
-            eprintln!("[fc-agent] killed all established TCP connections");
+            eprintln!("[fc-agent] killed stale TCP connections");
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);

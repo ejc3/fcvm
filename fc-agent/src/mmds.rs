@@ -137,7 +137,7 @@ pub async fn watch_restore_epoch(signals: crate::restore::RestoreSignals) {
     let mut last_epoch: Option<String> = None;
 
     loop {
-        sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(50)).await;
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(500))
