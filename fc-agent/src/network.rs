@@ -290,13 +290,19 @@ pub fn configure_ipv6_from_cmdline() {
     }
 
     // Use "replace" not "add" — RA may have already installed a default route.
-    // "onlink" skips NDP reachability check — needed when the bridge gateway's
-    // DAD hasn't completed yet at the time fc-agent runs.
-    let route_output = std::process::Command::new("ip")
-        .args([
-            "-6", "route", "replace", "default", "via", gateway, "dev", "eth0", "onlink",
-        ])
-        .output();
+    // "onlink" skips NDP reachability check — needed in routed mode when the
+    // bridge gateway's DAD hasn't completed yet at the time fc-agent runs.
+    // Only use onlink for routed mode; pasta mode should do normal NDP.
+    let is_routed = cmdline
+        .split_whitespace()
+        .any(|p| p == "network_mode=routed");
+    let mut route_args = vec![
+        "-6", "route", "replace", "default", "via", gateway, "dev", "eth0",
+    ];
+    if is_routed {
+        route_args.push("onlink");
+    }
+    let route_output = std::process::Command::new("ip").args(&route_args).output();
 
     match route_output {
         Ok(output) if output.status.success() => {

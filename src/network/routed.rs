@@ -178,6 +178,24 @@ impl RoutedNetwork {
         let w4 = (hash & 0xFFFF) as u16;
         format!("{}:{:x}:{:x}:{:x}:{:x}", prefix, w1, w2, w3, w4)
     }
+
+    /// Generate a per-VM unique namespace source IPv6 (for namespace-originated traffic).
+    /// Uses a different hash seed than generate_vm_ipv6 to guarantee distinct addresses.
+    fn generate_ns_source_ipv6(prefix: &str, vm_id: &str) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        "ns-source:".hash(&mut hasher);
+        vm_id.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        let w1 = ((hash >> 48) & 0xFFFF) as u16;
+        let w2 = ((hash >> 32) & 0xFFFF) as u16;
+        let w3 = ((hash >> 16) & 0xFFFF) as u16;
+        let w4 = (hash & 0xFFFF) as u16;
+        format!("{}:{:x}:{:x}:{:x}:{:x}", prefix, w1, w2, w3, w4)
+    }
 }
 
 #[async_trait::async_trait]
@@ -293,7 +311,9 @@ impl NetworkManager for RoutedNetwork {
         // 9. Add routable source IPv6 to bridge (for namespace-originated traffic).
         //    Uses a separate address from the VM's — the namespace needs its own
         //    routable source so return traffic can find it.
-        let ns_source_ipv6 = format!("{}::face:1", ipv6_prefix);
+        //    Per-VM unique address derived from vm_id hash (avoids collision when
+        //    multiple routed VMs share the same /64 prefix on the same host).
+        let ns_source_ipv6 = Self::generate_ns_source_ipv6(&ipv6_prefix, &self.vm_id);
         let ns_source_cidr = format!("{}/128", ns_source_ipv6);
         namespace::exec_in_namespace(
             &ns_name,
@@ -391,7 +411,20 @@ impl NetworkManager for RoutedNetwork {
         //     inside the namespace (via `ip netns exec`). The veth is a bridge member
         //     so host-side IPv4 routing to 10.0.2.100 doesn't work — socat must run
         //     the connect side inside the namespace where the bridge is directly reachable.
-        let loopback_ip = format!("127.0.0.{}", 2 + (std::process::id() % 252) as u8);
+        //     Use a vm_id-based hash for the loopback IP to avoid collisions between VMs
+        //     (PID % 252 has birthday-paradox collision risk at ~19 concurrent VMs).
+        let loopback_ip = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            self.vm_id.hash(&mut hasher);
+            let hash = hasher.finish();
+            // Use 127.x.y.z where x,y,z are derived from hash (avoiding 127.0.0.0 and 127.0.0.1)
+            let b1 = ((hash >> 16) & 0xFF) as u8;
+            let b2 = ((hash >> 8) & 0xFF) as u8;
+            let b3 = std::cmp::max(2, (hash & 0xFF) as u8); // avoid .0 and .1
+            format!("127.{}.{}.{}", b1, b2, b3)
+        };
         for mapping in &self.port_mappings {
             // Shell script: socat listens on host, connects inside namespace
             let script = format!(

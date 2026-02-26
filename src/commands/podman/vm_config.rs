@@ -256,6 +256,17 @@ pub(super) fn build_runtime_boot_args(
         }
     }
 
+    // Signal routed networking mode to fc-agent via boot param.
+    // fc-agent uses this to conditionally skip adding HOST_IPV6 to eth0
+    // (in routed mode, adding to eth0 causes source-address conflicts)
+    // and to use `onlink` for the default IPv6 route (needed for bridge DAD).
+    if network_config.namespace_name.is_some() {
+        if !boot_args.is_empty() {
+            boot_args.push(' ');
+        }
+        boot_args.push_str("network_mode=routed");
+    }
+
     // Enable fc-agent strace debugging if requested
     if args.strace_agent {
         if !boot_args.is_empty() {
