@@ -103,6 +103,12 @@ async fn try_reconnect() -> Option<VsockStream> {
 /// is only used to wake the writer from blocking waits — the flag is the
 /// single source of truth. This makes multiple rapid reconnect() calls
 /// safe: they collapse into one reconnection cycle.
+///
+/// IMPORTANT: After a successful connection, the writer only reconnects
+/// via explicit `output.reconnect()` calls. No auto-reconnect on disconnect.
+/// The host gates health monitoring on the output connection (snapshot.rs),
+/// so auto-reconnecting before handle_clone_restore finishes ARP/exec setup
+/// causes pasta port forwarding failures in clones.
 async fn output_writer(
     mut rx: mpsc::Receiver<OutputMessage>,
     reconnect_signal: Arc<Notify>,
@@ -123,6 +129,11 @@ async fn output_writer(
             }
         };
 
+    // Track whether we've ever had a connection. Distinguishes initial
+    // startup (retry aggressively) from snapshot restore (wait for explicit
+    // reconnect signal from handle_clone_restore).
+    let mut ever_connected = stream.is_some();
+
     // Message that was popped from channel but couldn't be written.
     // Retried first thing after reconnect. Zero message loss.
     let mut pending: Option<String> = None;
@@ -134,6 +145,9 @@ async fn output_writer(
             eprintln!("[fc-agent] output vsock reconnect (flag)");
             drop(stream.take()); // close old connection before reconnecting
             stream = try_reconnect().await;
+            if stream.is_some() {
+                ever_connected = true;
+            }
             continue;
         }
 
@@ -197,20 +211,30 @@ async fn output_writer(
                 }
                 Some(OutputMessage::Shutdown) | None => break,
             }
+        } else if ever_connected {
+            // Previously connected, now disconnected (snapshot restore).
+            // Wait for EXPLICIT reconnect from handle_clone_restore only.
+            // Don't auto-reconnect: the host gates health monitoring on the
+            // output connection, so reconnecting before ARP/exec setup
+            // completes causes pasta port forwarding failures in clones.
+            tokio::select! {
+                _ = reconnect_signal.notified() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+            }
+            if reconnect_flag.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                stream = try_reconnect().await;
+            }
         } else {
-            // Disconnected: backpressure. Wait for reconnect signal OR check
-            // periodically (in case Notify permit was consumed by select!
-            // without setting the flag — e.g., during the connected → disconnected
-            // transition when the select! reconnect branch fires but the flag was
-            // already swapped to false).
+            // Never connected — initial startup. Auto-reconnect with backoff.
             tokio::select! {
                 _ = reconnect_signal.notified() => {}
                 _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
             }
-            // Consume flag if set, then reconnect regardless — we're disconnected
-            // and need a connection to make progress.
             reconnect_flag.swap(false, std::sync::atomic::Ordering::AcqRel);
             stream = try_reconnect().await;
+            if stream.is_some() {
+                ever_connected = true;
+            }
         }
     }
 }

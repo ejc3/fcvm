@@ -1517,31 +1517,23 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
         .args([
             "-s",
             "--max-time",
-            "10",
+            "5",
             &format!("http://{}:{}", loopback_ip, host_port),
         ])
         .output()
-        .await;
+        .await
+        .context("curl loopback port forward")?;
 
-    let loopback_works = loopback_result
-        .as_ref()
-        .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(false);
-
-    if let Ok(ref out) = loopback_result {
-        if loopback_works {
-            println!("    Loopback access: ✓ OK");
-            let response = String::from_utf8_lossy(&out.stdout);
-            println!(
-                "    Response: {} bytes (nginx welcome page)",
-                response.len()
-            );
-        } else {
-            println!("    Loopback access: ✗ FAIL");
-            println!("    stderr: {}", String::from_utf8_lossy(&out.stderr));
-        }
+    let loopback_works = loopback_result.status.success() && !loopback_result.stdout.is_empty();
+    if loopback_works {
+        let response = String::from_utf8_lossy(&loopback_result.stdout);
+        println!("    Loopback access: ✓ OK ({} bytes)", response.len());
     } else {
-        println!("    Loopback access: ✗ FAIL (request error)");
+        println!("    Loopback access: ✗ FAIL");
+        println!(
+            "    stderr: {}",
+            String::from_utf8_lossy(&loopback_result.stderr)
+        );
     }
 
     // Cleanup
