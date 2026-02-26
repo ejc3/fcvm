@@ -79,7 +79,5 @@ pub async fn handle_clone_restore(
     // FUSE vsock reconnection is handled automatically by the reconnectable multiplexer.
     output.reconnect();
 
-    eprintln!(
-        "[fc-agent] restore complete: exec + egress + output reconnected"
-    );
+    eprintln!("[fc-agent] restore complete: exec + egress + output reconnected");
 }
