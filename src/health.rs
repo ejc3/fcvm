@@ -864,10 +864,20 @@ async fn check_http_health_netns(
     let start = Instant::now();
 
     let mut args = vec![
-        "ip", "netns", "exec", ns_name,
-        "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-        "-m", &timeout_str,
-        "--noproxy", "*",
+        "ip",
+        "netns",
+        "exec",
+        ns_name,
+        "curl",
+        "-s",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "-m",
+        &timeout_str,
+        "--noproxy",
+        "*",
     ];
     let host_arg;
     if let Some(host) = host_header {
@@ -902,14 +912,21 @@ async fn check_http_health_netns(
         } else {
             anyhow::bail!(
                 "Health check failed with status {} via netns {} to {}:{} ({}ms)",
-                status_code, ns_name, guest_ip, port, elapsed.as_millis()
+                status_code,
+                ns_name,
+                guest_ip,
+                port,
+                elapsed.as_millis()
             )
         }
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
             "Failed to connect to {}:{} via netns {}: {}",
-            guest_ip, port, ns_name, stderr.trim()
+            guest_ip,
+            port,
+            ns_name,
+            stderr.trim()
         )
     }
 }
