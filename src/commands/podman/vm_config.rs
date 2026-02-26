@@ -118,7 +118,7 @@ fn resolve_proxy_url(url: &str) -> Option<String> {
             }
 
             // Second pass: use IPv6 if no IPv4 available
-            // With --enable-ipv6 and --outbound-addr6, VM can reach IPv6 via fd00::2 gateway
+            // With pasta IPv6 support (-a/-g/-o flags), VM can reach IPv6 via fd00::2 gateway
             for addr in &addrs {
                 if addr.is_ipv6() {
                     info!(

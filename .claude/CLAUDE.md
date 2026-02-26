@@ -1218,7 +1218,7 @@ fuse-pipe/benches/
 - Namespace IP (10.0.2.1) on bridge enables health checks via nsenter
 - Guest uses pasta network (10.0.2.100)
 - Port forwarding via pasta CLI flags (-t/-u)
-- IPv6 supported with `--enable-ipv6` and native DNS proxying
+- IPv6 auto-detected from host and configured via pasta `-a`/`-g`/`-o` flags
 
 **Loopback IP Allocation** (`src/state/manager.rs`):
 - Sequential allocation: 127.0.0.2, 127.0.0.3, ..., 127.0.0.254, then 127.0.1.2, etc.
