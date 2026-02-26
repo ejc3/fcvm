@@ -76,43 +76,88 @@ pub async fn send_gratuitous_arp() {
     }
 }
 
-/// Kill all established TCP connections — stale after snapshot restore.
+/// Kill stale EXTERNAL TCP connections after snapshot restore.
 ///
-/// Runs as the FIRST step of restore, before gratuitous ARP or output reconnect.
-/// At this point no new connections from pasta can exist (pasta doesn't know our
-/// MAC yet), so every ESTABLISHED connection is stale from before the snapshot.
+/// Only kills connections to non-local addresses. Local connections
+/// (127.0.0.1, ::1) between services in the same VM (e.g., HHVM → mcrouter)
+/// are preserved — they're still valid after restore since both endpoints
+/// resumed from the same snapshot.
+///
+/// Killing local connections causes a reconnection storm: mcrouter drops
+/// HHVM's connections, HHVM retries, TAO/ucache lookups fail, status.php
+/// blocks for minutes waiting for services to re-establish.
 pub async fn kill_stale_tcp_connections() {
     let list_output = Command::new("ss")
         .args(["-tn", "state", "established"])
         .output()
         .await;
 
-    if let Ok(o) = &list_output {
-        let connections = String::from_utf8_lossy(&o.stdout);
-        let count = connections.lines().count().saturating_sub(1);
-        if count > 0 {
-            eprintln!("[fc-agent] found {} stale TCP connection(s) to kill", count);
-            for line in connections.lines().skip(1) {
-                eprintln!("[fc-agent]   {}", line);
-            }
+    let Ok(o) = list_output else {
+        eprintln!("[fc-agent] WARNING: failed to list TCP connections");
+        return;
+    };
+
+    let connections = String::from_utf8_lossy(&o.stdout);
+    let mut external_count = 0;
+    let mut local_count = 0;
+
+    for line in connections.lines().skip(1) {
+        // ss output: Recv-Q Send-Q Local_Address:Port Peer_Address:Port
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 4 {
+            continue;
+        }
+        let peer = fields[3];
+        if peer.starts_with("127.0.0.1:")
+            || peer.starts_with("[::1]:")
+            || peer.starts_with("::1:")
+        {
+            local_count += 1;
         } else {
-            eprintln!("[fc-agent] no stale TCP connections to kill");
-            return;
+            external_count += 1;
         }
     }
 
+    eprintln!(
+        "[fc-agent] TCP connections: {} external (will kill), {} local (preserving)",
+        external_count, local_count
+    );
+
+    if external_count == 0 {
+        eprintln!("[fc-agent] no external TCP connections to kill");
+        return;
+    }
+
+    // Kill only non-local connections using ss filter
+    // "! dst 127.0.0.1" excludes IPv4 loopback; "! dst [::1]" excludes IPv6 loopback
     let kill_output = Command::new("ss")
-        .args(["-K", "state", "established"])
+        .args([
+            "-K",
+            "state",
+            "established",
+            "dst",
+            "not",
+            "127.0.0.1",
+            "and",
+            "dst",
+            "not",
+            "::1",
+        ])
         .output()
         .await;
 
     match kill_output {
         Ok(o) if o.status.success() => {
-            eprintln!("[fc-agent] killed stale TCP connections");
+            eprintln!(
+                "[fc-agent] killed {} external TCP connections",
+                external_count
+            );
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            if stderr.contains("INET_DIAG_DESTROY") || stderr.contains("Operation not supported") {
+            if stderr.contains("INET_DIAG_DESTROY")
+                || stderr.contains("Operation not supported")
+            {
                 eprintln!("[fc-agent] ss -K not supported, trying conntrack");
                 kill_connections_via_conntrack().await;
             } else {
