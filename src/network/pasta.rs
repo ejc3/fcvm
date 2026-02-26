@@ -471,6 +471,48 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
     pub fn gateway_ip(&self) -> &str {
         GUEST_GATEWAY
     }
+
+    /// Wait for pasta port forwarding to be ready by probing each mapped port.
+    ///
+    /// Pasta binds ports asynchronously after startup. The PID file just means
+    /// the process is running, not that ports are listening. Without this check,
+    /// the health monitor may declare the VM "healthy" (via nsenter/bridge) before
+    /// port forwarding actually works.
+    async fn wait_for_port_forwarding(&self) -> Result<()> {
+        use tokio::net::TcpStream;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let loopback = self.loopback_ip.as_deref().unwrap_or("127.0.0.1");
+
+        for mapping in &self.port_mappings {
+            if mapping.proto != Protocol::Tcp {
+                continue;
+            }
+
+            let bind_addr = match &mapping.host_ip {
+                Some(ip) => ip.as_str(),
+                None => loopback,
+            };
+            let addr = format!("{}:{}", bind_addr, mapping.host_port);
+
+            loop {
+                match TcpStream::connect(&addr).await {
+                    Ok(_) => {
+                        debug!(addr = %addr, "port forward ready");
+                        break;
+                    }
+                    Err(_) => {
+                        if std::time::Instant::now() > deadline {
+                            anyhow::bail!("pasta port forward not ready within 5s: {}", addr);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -551,6 +593,14 @@ impl NetworkManager for PastaNetwork {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("bridge setup failed: {}", stderr.trim());
+        }
+
+        // Phase 3: Verify port forwarding is actually working
+        // The PID file only means pasta spawned, not that ports are bound.
+        // Health checks use nsenter (bridge path), so without this check
+        // "healthy" doesn't mean port forwarding works.
+        if !self.port_mappings.is_empty() {
+            self.wait_for_port_forwarding().await?;
         }
 
         info!(holder_pid = holder_pid, "pasta + bridge setup complete");
