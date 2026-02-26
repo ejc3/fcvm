@@ -21,7 +21,7 @@ const GUEST_IPV6_GATEWAY: &str = "fd00::2";
 /// Bridge device name
 const BRIDGE_DEVICE: &str = "br0";
 
-/// TAP device name for pasta (replaces slirp0)
+/// TAP device name for pasta
 const PASTA_DEVICE_NAME: &str = "pasta0";
 
 /// Timeout for waiting for pasta PID file (readiness signal)
@@ -45,7 +45,7 @@ const PASTA_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 ///                         |                      (guest: 10.0.2.100)
 /// ```
 ///
-/// pasta replaces slirp4netns's slower userspace TCP/IP stack with L4 translation.
+/// pasta uses L4 translation for efficient networking without a userspace TCP/IP stack.
 /// Outbound traffic goes through pasta's L2 TAP path (userspace processing).
 /// Inbound port forwarding uses splice(2) for zero-copy socket-to-socket transfer:
 /// pasta binds on the host, splices directly into the namespace, where the kernel
