@@ -1509,31 +1509,37 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
     println!("  Clone loopback IP: {}", loopback_ip);
 
     // Test: Access via loopback IP and forwarded port
+    // Retry loop: pasta port forwarding may need a moment after clone restore.
+    // The health check passes via bridge/nsenter (not pasta), so port forwarding
+    // through pasta's loopback IP may not be ready immediately.
     println!(
         "  Testing access via loopback {}:{}...",
         loopback_ip, host_port
     );
-    let loopback_result = tokio::process::Command::new("curl")
-        .args([
-            "-s",
-            "--max-time",
-            "5",
-            &format!("http://{}:{}", loopback_ip, host_port),
-        ])
-        .output()
-        .await
-        .context("curl loopback port forward")?;
+    let mut loopback_works = false;
+    let retry_start = std::time::Instant::now();
+    while retry_start.elapsed() < std::time::Duration::from_secs(30) {
+        let loopback_result = tokio::process::Command::new("curl")
+            .args([
+                "-s",
+                "--max-time",
+                "2",
+                &format!("http://{}:{}", loopback_ip, host_port),
+            ])
+            .output()
+            .await
+            .context("curl loopback port forward")?;
 
-    let loopback_works = loopback_result.status.success() && !loopback_result.stdout.is_empty();
-    if loopback_works {
-        let response = String::from_utf8_lossy(&loopback_result.stdout);
-        println!("    Loopback access: ✓ OK ({} bytes)", response.len());
-    } else {
-        println!("    Loopback access: ✗ FAIL");
-        println!(
-            "    stderr: {}",
-            String::from_utf8_lossy(&loopback_result.stderr)
-        );
+        if loopback_result.status.success() && !loopback_result.stdout.is_empty() {
+            let response = String::from_utf8_lossy(&loopback_result.stdout);
+            println!("    Loopback access: ✓ OK ({} bytes)", response.len());
+            loopback_works = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    if !loopback_works {
+        println!("    Loopback access: ✗ FAIL (timed out after 30s)");
     }
 
     // Cleanup
