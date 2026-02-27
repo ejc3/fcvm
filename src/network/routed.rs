@@ -422,7 +422,10 @@ impl NetworkManager for RoutedNetwork {
         // Enable proxy NDP on the interface so the kernel actually responds
         // to neighbor solicitations for our proxy entries.
         let _ = tokio::process::Command::new("sysctl")
-            .args(["-w", &format!("net.ipv6.conf.{}.proxy_ndp=1", default_iface)])
+            .args([
+                "-w",
+                &format!("net.ipv6.conf.{}.proxy_ndp=1", default_iface),
+            ])
             .output()
             .await;
         let _ = tokio::process::Command::new("ip")
@@ -580,7 +583,9 @@ impl NetworkManager for RoutedNetwork {
             dns_search: None,
             // Override proxy to use the gateway relay (socat on host side
             // goes through BPF hooks for client cert injection).
-            http_proxy: if std::env::var("HTTPS_PROXY").is_ok() || std::env::var("https_proxy").is_ok() {
+            http_proxy: if std::env::var("HTTPS_PROXY").is_ok()
+                || std::env::var("https_proxy").is_ok()
+            {
                 Some(format!("http://{}:8080", GUEST_GATEWAY))
             } else {
                 None
