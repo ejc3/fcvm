@@ -46,6 +46,7 @@ async fn test_snapshot_clone_stress_100_bridged() -> Result<()> {
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_snapshot_clone_routed_10() -> Result<()> {
+    skip_if_no_ipv6!();
     snapshot_clone_test_impl("routed", 10).await
 }
 
@@ -410,6 +411,7 @@ async fn test_clone_while_baseline_running_bridged() -> Result<()> {
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_clone_while_baseline_running_routed() -> Result<()> {
+    skip_if_no_ipv6!();
     clone_while_baseline_running_impl("routed").await
 }
 
@@ -829,6 +831,7 @@ async fn test_clone_internet_rootless() -> Result<()> {
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_clone_internet_routed() -> Result<()> {
+    skip_if_no_ipv6!();
     clone_internet_test_impl("routed").await
 }
 
@@ -1599,6 +1602,7 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_clone_port_forward_routed() -> Result<()> {
+    skip_if_no_ipv6!();
     let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("pf-routed");
 
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
@@ -1797,6 +1801,7 @@ async fn test_snapshot_run_direct_bridged() -> Result<()> {
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_snapshot_run_direct_routed() -> Result<()> {
+    skip_if_no_ipv6!();
     snapshot_run_direct_test_impl("routed").await
 }
 
@@ -1946,6 +1951,7 @@ async fn test_snapshot_run_exec_rootless() -> Result<()> {
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_snapshot_run_exec_routed() -> Result<()> {
+    skip_if_no_ipv6!();
     snapshot_run_exec_test_impl("routed").await
 }
 

@@ -326,6 +326,11 @@ fn test_port_forward_rootless() -> Result<()> {
 #[cfg(feature = "privileged-tests")]
 #[test]
 fn test_port_forward_routed() -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    if !rt.block_on(common::has_global_ipv6()) {
+        println!("SKIP: Host has no global IPv6 address (required for routed networking)");
+        return Ok(());
+    }
     println!("\ntest_port_forward_routed");
 
     let fcvm_path = common::find_fcvm_binary()?;
