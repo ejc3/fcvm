@@ -345,7 +345,11 @@ jobs:
           # Enable IPv6 forwarding for routed networking mode (veth + IPv6 routing)
           sudo sysctl -w net.ipv6.conf.all.forwarding=1
           sudo sysctl -w net.ipv6.conf.default.forwarding=1
-          # Keep accepting Router Advertisements with forwarding enabled (otherwise default route expires)
+          # Keep accepting Router Advertisements with forwarding enabled (otherwise default route expires).
+          # all/default: ensures new interfaces (pasta's virtual devices) accept RAs despite forwarding=1.
+          # Per-interface: ensures the host's primary interface keeps its default route.
+          sudo sysctl -w net.ipv6.conf.all.accept_ra=2
+          sudo sysctl -w net.ipv6.conf.default.accept_ra=2
           DEFAULT_IFACE=$(ip route show default | awk '/dev/{print $5; exit}')
           sudo sysctl -w "net.ipv6.conf.${DEFAULT_IFACE}.accept_ra=2" 2>/dev/null || true
           # Enable FUSE allow_other for tests
@@ -522,7 +526,11 @@ jobs:
           # Enable IPv6 forwarding for routed networking mode (veth + IPv6 routing)
           sudo sysctl -w net.ipv6.conf.all.forwarding=1
           sudo sysctl -w net.ipv6.conf.default.forwarding=1
-          # Keep accepting Router Advertisements with forwarding enabled (otherwise default route expires)
+          # Keep accepting Router Advertisements with forwarding enabled (otherwise default route expires).
+          # all/default: ensures new interfaces (pasta's virtual devices) accept RAs despite forwarding=1.
+          # Per-interface: ensures the host's primary interface keeps its default route.
+          sudo sysctl -w net.ipv6.conf.all.accept_ra=2
+          sudo sysctl -w net.ipv6.conf.default.accept_ra=2
           DEFAULT_IFACE=$(ip route show default | awk '/dev/{print $5; exit}')
           sudo sysctl -w "net.ipv6.conf.${DEFAULT_IFACE}.accept_ra=2" 2>/dev/null || true
           echo "user_allow_other" | sudo tee /etc/fuse.conf
@@ -646,7 +654,11 @@ jobs:
           # Enable IPv6 forwarding for routed networking mode (veth + IPv6 routing)
           sudo sysctl -w net.ipv6.conf.all.forwarding=1
           sudo sysctl -w net.ipv6.conf.default.forwarding=1
-          # Keep accepting Router Advertisements with forwarding enabled (otherwise default route expires)
+          # Keep accepting Router Advertisements with forwarding enabled (otherwise default route expires).
+          # all/default: ensures new interfaces (pasta's virtual devices) accept RAs despite forwarding=1.
+          # Per-interface: ensures the host's primary interface keeps its default route.
+          sudo sysctl -w net.ipv6.conf.all.accept_ra=2
+          sudo sysctl -w net.ipv6.conf.default.accept_ra=2
           DEFAULT_IFACE=$(ip route show default | awk '/dev/{print $5; exit}')
           sudo sysctl -w "net.ipv6.conf.${DEFAULT_IFACE}.accept_ra=2" 2>/dev/null || true
           # Configure rootless podman to use cgroupfs (no systemd session on CI)

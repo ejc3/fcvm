@@ -191,6 +191,7 @@ async fn test_vsock_connect_lifecycle_stress_rootless() -> Result<()> {
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_vsock_connect_lifecycle_stress_routed() -> Result<()> {
+    skip_if_no_ipv6!();
     vsock_connect_lifecycle_stress("routed").await
 }
 

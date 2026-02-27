@@ -28,6 +28,7 @@ async fn test_exec_rootless() -> Result<()> {
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_exec_routed() -> Result<()> {
+    skip_if_no_ipv6!();
     exec_test_impl("routed").await
 }
 

@@ -689,6 +689,11 @@ fn test_sigterm_cleanup_bridged() -> Result<()> {
 #[cfg(feature = "privileged-tests")]
 #[test]
 fn test_sigterm_cleanup_routed() -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    if !rt.block_on(common::has_global_ipv6()) {
+        println!("SKIP: Host has no global IPv6 address (required for routed networking)");
+        return Ok(());
+    }
     println!("\ntest_sigterm_cleanup_routed");
 
     // Start fcvm in routed mode with port forwarding (to test socat cleanup)

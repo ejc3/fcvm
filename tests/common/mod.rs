@@ -1945,3 +1945,21 @@ pub async fn get_host_ipv6() -> anyhow::Result<String> {
 
     anyhow::bail!("No global IPv6 address found on host")
 }
+
+/// Check if the host has a global IPv6 address (required for routed networking).
+/// Returns true if available, false otherwise.
+pub async fn has_global_ipv6() -> bool {
+    get_host_ipv6().await.is_ok()
+}
+
+/// Skip a routed test if the host has no global IPv6 address.
+/// Routed mode requires IPv6 — tests should skip gracefully on hosts without it.
+#[macro_export]
+macro_rules! skip_if_no_ipv6 {
+    () => {
+        if !common::has_global_ipv6().await {
+            println!("SKIP: Host has no global IPv6 address (required for routed networking)");
+            return Ok(());
+        }
+    };
+}
