@@ -501,6 +501,25 @@ impl VmManager {
         }
     }
 
+    /// Non-blocking check if the VM process has exited.
+    /// Returns Some(ExitStatus) if the process has exited, None if still running.
+    pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        if let Some(ref mut process) = self.process {
+            match process
+                .try_wait()
+                .context("checking Firecracker process status")?
+            {
+                Some(status) => {
+                    self.process = None;
+                    Ok(Some(status))
+                }
+                None => Ok(None),
+            }
+        } else {
+            bail!("VM process not running")
+        }
+    }
+
     /// Wait for the VM process to exit
     ///
     /// NOTE: This does NOT take ownership of the process handle.
