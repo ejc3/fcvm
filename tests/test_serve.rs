@@ -5,6 +5,7 @@
 
 mod common;
 
+#[cfg(feature = "integration-slow")]
 use std::time::Duration;
 
 #[cfg(feature = "integration-slow")]

@@ -469,6 +469,8 @@ async fn test_fc_mock_exec_connect_protocol() -> Result<()> {
 ///
 /// Uses FCVM_FIRECRACKER_BIN to substitute fc-mock for real Firecracker.
 /// Runs a container that exits immediately to verify the full lifecycle.
+/// Requires root because bridged networking needs iptables and TAP devices.
+#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_fc_mock_container_launch() -> Result<()> {
     let fc_mock = match find_fc_mock_binary() {
@@ -535,6 +537,8 @@ async fn test_fc_mock_container_launch() -> Result<()> {
 /// 3. Health monitor detects container as healthy
 /// 4. Container exec works (via podman exec fcvm-container)
 /// 5. VM-level exec works (direct command execution)
+/// Requires root because bridged networking needs iptables and TAP devices.
+#[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_fc_mock_sanity() -> Result<()> {
     let fc_mock = match find_fc_mock_binary() {
