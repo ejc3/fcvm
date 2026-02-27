@@ -1211,7 +1211,7 @@ fuse-pipe/benches/
 |------|------|---------------|-------------|-----------------|
 | Rootless (default) | `--network rootless` | No | Good | pasta CLI flags (-t/-u) |
 | Bridged | `--network bridged` | Yes | Better | iptables DNAT |
-| Routed | `--network routed` | Yes (+ IPv6 host) | Best (kernel line rate) | socat + loopback IP |
+| Routed | `--network routed` | Yes (+ IPv6 host) | Best (kernel line rate) | TCP proxy + loopback IP |
 
 **Rootless Architecture:**
 - Holder process starts with `unshare --user --net`, UID/GID mappings written externally
@@ -1228,7 +1228,7 @@ fuse-pipe/benches/
 - Network namespace with bridge (br0) connecting TAP and veth for L2 forwarding
 - Proxy NDP on default interface makes VM IPv6 routable from network fabric
 - ip6tables MASQUERADE for AWS VPC source/dest checks
-- Port forwarding via socat on unique loopback IP (same allocation as rootless)
+- Port forwarding via built-in TCP proxy (setns + tokio relay) on unique loopback IP (same allocation as rootless)
 - IPv4 stays internal to namespace (health checks only); all external traffic uses IPv6
 - Egress proxy is NOT used — IPv6 goes natively through the kernel stack
 

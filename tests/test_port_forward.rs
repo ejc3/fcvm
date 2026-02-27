@@ -321,7 +321,7 @@ fn test_port_forward_rootless() -> Result<()> {
 
 /// Test port forwarding with routed networking
 ///
-/// Routed mode uses socat + unique loopback IPs (like rootless),
+/// Routed mode uses TCP proxy + unique loopback IPs (like rootless),
 /// so the test follows the same pattern.
 #[cfg(feature = "privileged-tests")]
 #[test]
@@ -336,7 +336,7 @@ fn test_port_forward_routed() -> Result<()> {
     let publish_arg = format!("{}:80", host_port);
 
     // Start VM with routed networking and port forwarding
-    // Routed uses socat + unique loopback IPs (like rootless)
+    // Routed uses TCP proxy + unique loopback IPs (like rootless)
     let mut fcvm = Command::new(&fcvm_path)
         .args([
             "podman",
@@ -400,7 +400,7 @@ fn test_port_forward_routed() -> Result<()> {
     }
 
     // Test: Access via loopback IP and forwarded port
-    // Routed mode uses socat to forward: host loopback → ip netns exec → guest
+    // Routed mode uses TCP proxy to forward: host loopback → ip netns exec → guest
     println!(
         "Testing access via loopback IP {}:{}...",
         loopback_ip, host_port
