@@ -419,6 +419,12 @@ impl NetworkManager for RoutedNetwork {
         let default_iface = detect_default_ipv6_interface()
             .await
             .unwrap_or_else(|| "eth0".to_string());
+        // Enable proxy NDP on the interface so the kernel actually responds
+        // to neighbor solicitations for our proxy entries.
+        let _ = tokio::process::Command::new("sysctl")
+            .args(["-w", &format!("net.ipv6.conf.{}.proxy_ndp=1", default_iface)])
+            .output()
+            .await;
         let _ = tokio::process::Command::new("ip")
             .args([
                 "-6",
@@ -487,6 +493,45 @@ impl NetworkManager for RoutedNetwork {
             }
         }
 
+        // 15. Reverse proxy relay: socat listens inside the namespace on the
+        //     gateway and forwards to the actual proxy FROM THE HOST process.
+        //     Host-side BPF programs intercept connect() syscalls and inject
+        //     client certs for proxy auth. Without this relay, the VM's direct
+        //     connections bypass these hooks and get rejected (407).
+        if let Some(proxy) = std::env::var("HTTPS_PROXY")
+            .ok()
+            .or_else(|| std::env::var("https_proxy").ok())
+        {
+            let proxy_addr = proxy
+                .trim_start_matches("http://")
+                .trim_start_matches("https://");
+            // Listen in namespace (VM reaches gateway IP), connect from HOST
+            // network namespace (where BPF hooks inject client certs).
+            // nsenter -n -t 1 switches back to the host's network namespace.
+            let script = format!(
+                "exec ip netns exec {ns} socat \
+                 TCP-LISTEN:8080,bind={gw},fork,reuseaddr \
+                 EXEC:'nsenter -n -t 1 socat STDIO TCP\\:{proxy}'",
+                ns = ns_name,
+                gw = GUEST_GATEWAY,
+                proxy = proxy_addr.replace(':', "\\:"),
+            );
+            match tokio::process::Command::new("sh")
+                .args(["-c", &script])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(child) => {
+                    info!(proxy = %proxy, bind = %GUEST_GATEWAY, "reverse proxy relay for host-side auth");
+                    self.socat_children.push(child);
+                }
+                Err(e) => {
+                    warn!(proxy = %proxy, error = %e, "failed to start reverse proxy relay");
+                }
+            }
+        }
+
         // Brief pause then check socat processes didn't crash immediately
         // (e.g., port already in use, binary not found)
         if !self.socat_children.is_empty() {
@@ -533,7 +578,13 @@ impl NetworkManager for RoutedNetwork {
             // The namespace kernel then forwards to the veth → host.
             host_ipv6: Some("fd00::1".to_string()),
             dns_search: None,
-            http_proxy: None,
+            // Override proxy to use the gateway relay (socat on host side
+            // goes through BPF hooks for client cert injection).
+            http_proxy: if std::env::var("HTTPS_PROXY").is_ok() || std::env::var("https_proxy").is_ok() {
+                Some(format!("http://{}:8080", GUEST_GATEWAY))
+            } else {
+                None
+            },
             namespace_name: self.namespace_id.clone(),
         })
     }
