@@ -1623,7 +1623,7 @@ pub async fn create_snapshot_core(
             .context("renaming temp snapshot to final location")?;
     }
 
-    let actual_type = if use_diff { "Diff" } else { snapshot_type };
+    let actual_type = if use_diff { "Diff" } else { "Full" };
     info!(
         snapshot = %snapshot_config.name,
         snapshot_type = actual_type,
