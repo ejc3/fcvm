@@ -225,19 +225,72 @@ pub async fn start_proxy_relay(
 }
 
 /// Parse a proxy URL like "http://host:port" or "host:port" into a SocketAddr.
+///
+/// Supports both IP addresses and hostnames (resolved via DNS).
+/// Strips scheme prefixes, trailing slashes, and URL paths.
 pub fn parse_proxy_addr(proxy: &str) -> Result<SocketAddr> {
     let addr_str = proxy
         .trim_start_matches("http://")
         .trim_start_matches("https://");
+    // Strip trailing path/slash (e.g. "10.0.0.1:8080/" → "10.0.0.1:8080")
+    let addr_str = addr_str.split('/').next().unwrap_or(addr_str);
+    // Use ToSocketAddrs to support both IP addresses and hostnames.
+    // This performs DNS resolution for hostnames, matching the old socat behavior
+    // which resolved hostnames natively via its TCP address type.
+    use std::net::ToSocketAddrs;
     addr_str
-        .parse::<SocketAddr>()
-        .with_context(|| format!("parsing proxy address: {addr_str}"))
+        .to_socket_addrs()
+        .with_context(|| format!("resolving proxy address: {addr_str}"))?
+        .next()
+        .with_context(|| format!("no addresses resolved for proxy: {addr_str}"))
 }
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "privileged-tests")]
     use super::*;
+
+    #[test]
+    fn test_parse_proxy_addr_ip_port() {
+        let addr = parse_proxy_addr("http://10.0.0.1:8080").unwrap();
+        assert_eq!(addr.to_string(), "10.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_parse_proxy_addr_bare_ip_port() {
+        let addr = parse_proxy_addr("10.0.0.1:8080").unwrap();
+        assert_eq!(addr.to_string(), "10.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_parse_proxy_addr_trailing_slash() {
+        let addr = parse_proxy_addr("http://10.0.0.1:8080/").unwrap();
+        assert_eq!(addr.to_string(), "10.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_parse_proxy_addr_with_path() {
+        let addr = parse_proxy_addr("http://10.0.0.1:8080/proxy/path").unwrap();
+        assert_eq!(addr.to_string(), "10.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_parse_proxy_addr_https_scheme() {
+        let addr = parse_proxy_addr("https://10.0.0.1:3128").unwrap();
+        assert_eq!(addr.to_string(), "10.0.0.1:3128");
+    }
+
+    #[test]
+    fn test_parse_proxy_addr_localhost() {
+        // localhost should resolve (tests hostname resolution path)
+        let addr = parse_proxy_addr("http://localhost:8080").unwrap();
+        assert!(addr.port() == 8080);
+    }
+
+    #[test]
+    fn test_parse_proxy_addr_ipv6() {
+        let addr = parse_proxy_addr("http://[::1]:8080").unwrap();
+        assert_eq!(addr.port(), 8080);
+    }
 
     /// Test that connect_in_namespace can reach a listener inside a namespace.
     ///
