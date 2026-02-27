@@ -43,6 +43,7 @@ pub struct RoutedNetwork {
     namespace_id: Option<String>,
     host_veth: Option<String>,
     vm_ipv6: Option<String>,
+    default_iface: Option<String>,
     socat_children: Vec<tokio::process::Child>,
 }
 
@@ -55,6 +56,7 @@ impl RoutedNetwork {
             namespace_id: None,
             host_veth: None,
             vm_ipv6: None,
+            default_iface: None,
             socat_children: Vec::new(),
         }
     }
@@ -92,39 +94,13 @@ impl RoutedNetwork {
     }
 
     /// Detect host's global IPv6 address and /64 subnet.
-    /// Returns (host_ip, subnet_prefix) e.g. ("2803:6084:2900:2534::1", "2803:6084:2900:2534")
+    /// Returns (host_ip, subnet_prefix) e.g. ("2600:1f1c:494:201::1", "2600:1f1c:494:201")
     ///
-    /// If no global /64 is found, auto-provisions a ULA prefix (fd00:fc00::1/64)
-    /// on the default interface so routed mode works on any host without manual setup.
+    /// Supports two common configurations:
+    /// - Direct /64: host has an address with /64 prefix length (e.g. home/colo servers)
+    /// - AWS-style /128: host has a /128 address but the kernel has a /64 on-link route
+    ///   from Router Advertisements (standard AWS VPC behavior)
     fn detect_host_ipv6() -> Option<(String, String)> {
-        if let Some(result) = Self::find_host_ipv6() {
-            return Some(result);
-        }
-
-        // No /64 found — auto-provision a ULA prefix on the default interface
-        let iface = Self::detect_default_interface().unwrap_or_else(|| "eth0".to_string());
-        info!(
-            iface = %iface,
-            "no global IPv6 /64 detected, auto-provisioning fd00:fc00::1/64"
-        );
-        let output = std::process::Command::new("ip")
-            .args(["-6", "addr", "add", "fd00:fc00::1/64", "dev", &iface])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // EEXIST is fine — already provisioned
-            if !stderr.contains("RTNETLINK answers: File exists") {
-                warn!(error = %stderr, "failed to add ULA /64 prefix");
-                return None;
-            }
-        }
-
-        Self::find_host_ipv6()
-    }
-
-    /// Find a global IPv6 /64 address on the host.
-    fn find_host_ipv6() -> Option<(String, String)> {
         let output = std::process::Command::new("ip")
             .args(["-6", "addr", "show", "scope", "global"])
             .output()
@@ -134,19 +110,32 @@ impl RoutedNetwork {
         for line in stdout.lines() {
             let line = line.trim();
             if let Some(addr) = line.strip_prefix("inet6 ") {
-                // Parse "addr/prefix scope global ..."
                 if let Some(addr_cidr) = addr.split_whitespace().next() {
                     if let Some((addr, prefix_len)) = addr_cidr.split_once('/') {
-                        if prefix_len == "64" && !addr.starts_with("fe80") {
-                            // Extract /64 prefix (first 4 groups)
-                            // Expand the address to get the prefix
-                            if let Ok(ip) = addr.parse::<std::net::Ipv6Addr>() {
-                                let segments = ip.segments();
-                                let prefix = format!(
-                                    "{:x}:{:x}:{:x}:{:x}",
-                                    segments[0], segments[1], segments[2], segments[3]
-                                );
+                        if addr.starts_with("fe80") || addr.starts_with("fd") {
+                            continue; // Skip link-local and ULA
+                        }
+                        if let Ok(ip) = addr.parse::<std::net::Ipv6Addr>() {
+                            let segments = ip.segments();
+                            let prefix = format!(
+                                "{:x}:{:x}:{:x}:{:x}",
+                                segments[0], segments[1], segments[2], segments[3]
+                            );
+
+                            if prefix_len == "64" {
+                                // Direct /64 — use as-is
                                 return Some((addr.to_string(), prefix));
+                            }
+                            if prefix_len == "128" {
+                                // AWS-style: /128 address, check for /64 on-link route
+                                if Self::has_onlink_64_route(&prefix) {
+                                    info!(
+                                        addr = %addr,
+                                        prefix = %prefix,
+                                        "using /128 address with /64 on-link route"
+                                    );
+                                    return Some((addr.to_string(), prefix));
+                                }
                             }
                         }
                     }
@@ -156,20 +145,20 @@ impl RoutedNetwork {
         None
     }
 
-    /// Detect the default network interface (from IPv4 default route).
-    fn detect_default_interface() -> Option<String> {
+    /// Check if the kernel has a /64 on-link route for the given prefix.
+    /// AWS VPC configures this via Router Advertisements.
+    fn has_onlink_64_route(prefix: &str) -> bool {
+        let route_prefix = format!("{prefix}::/64");
         let output = std::process::Command::new("ip")
-            .args(["route", "show", "default"])
-            .output()
-            .ok()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if let Some(idx) = parts.iter().position(|&p| p == "dev") {
-                return parts.get(idx + 1).map(|s| s.to_string());
+            .args(["-6", "route", "show", &route_prefix])
+            .output();
+        match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                !stdout.trim().is_empty()
             }
+            Err(_) => false,
         }
-        None
     }
 
     /// Generate a deterministic IPv6 for the VM from the host's /64 subnet.
@@ -350,12 +339,26 @@ impl NetworkManager for RoutedNetwork {
 
         // 11b. Enable IPv4 forwarding in namespace (for VM → host traffic)
         namespace::exec_in_namespace(&ns_name, &["sysctl", "-w", "net.ipv4.ip_forward=1"]).await?;
-        // 11c. Default IPv4 route in namespace: traffic exits via veth to the host.
-        //      The bridge forwards L2 frames from br0 to the namespace side of the veth,
-        //      which the host kernel receives on the host_veth and routes locally.
+        // 11c. Default IPv4 route in namespace via the host veth.
+        //      The host_veth is a bridge port, so we can't route directly through it.
+        //      Instead, give host_veth an IPv4 address (10.0.2.2) and use it as nexthop
+        //      via br0. ARP resolves 10.0.2.2 → host_veth MAC across the bridge.
+        let _ = tokio::process::Command::new("ip")
+            .args(["addr", "add", "10.0.2.2/32", "dev", &host_veth])
+            .output()
+            .await;
         namespace::exec_in_namespace(
             &ns_name,
-            &["ip", "route", "add", "default", "dev", &guest_veth],
+            &[
+                "ip",
+                "route",
+                "add",
+                "default",
+                "via",
+                "10.0.2.2",
+                "dev",
+                BRIDGE_DEVICE,
+            ],
         )
         .await?;
 
@@ -398,15 +401,40 @@ impl NetworkManager for RoutedNetwork {
             .await;
         info!(vm_ipv6 = %vm_ipv6, iface = %default_iface, "added proxy NDP");
 
-        // 14. Port forwarding: socat listens on host loopback, connects to VM
+        // 14. MASQUERADE outbound traffic from the namespace.
+        //     On AWS, source/dest check drops packets with unassigned source IPs.
+        //     MASQUERADE rewrites the source to the host's IP so the VPC fabric
+        //     accepts the traffic. Without this, DNS and image pulls fail.
+        let _ = tokio::process::Command::new("iptables")
+            .args([
+                "-t", "nat", "-A", "POSTROUTING",
+                "-s", "10.0.2.0/24",
+                "-o", &default_iface,
+                "-j", "MASQUERADE",
+            ])
+            .output()
+            .await;
+        let _ = tokio::process::Command::new("ip6tables")
+            .args([
+                "-t", "nat", "-A", "POSTROUTING",
+                "-o", &default_iface,
+                "-s", &format!("{}/128", vm_ipv6),
+                "-j", "MASQUERADE",
+            ])
+            .output()
+            .await;
+        info!(iface = %default_iface, "added MASQUERADE for outbound traffic");
+
+        // 15. Port forwarding: socat listens on host loopback, connects to VM
         //     inside the namespace (via `ip netns exec`). The veth is a bridge member
         //     so host-side IPv4 routing to 10.0.2.100 doesn't work — socat must run
         //     the connect side inside the namespace where the bridge is directly reachable.
         let loopback_ip = format!("127.0.0.{}", 2 + (std::process::id() % 252) as u8);
         for mapping in &self.port_mappings {
-            // Shell script: socat listens on host, connects inside namespace
+            // Shell script: socat listens on host, connects inside namespace.
+            // `exec` replaces the shell process so child.kill() kills socat directly.
             let script = format!(
-                "socat TCP-LISTEN:{},bind={},fork,reuseaddr \
+                "exec socat TCP-LISTEN:{},bind={},fork,reuseaddr \
                  EXEC:'ip netns exec {} socat STDIO TCP\\:{}\\:{}'",
                 mapping.host_port, loopback_ip, ns_name, GUEST_IP, mapping.guest_port
             );
@@ -433,6 +461,7 @@ impl NetworkManager for RoutedNetwork {
         self.namespace_id = Some(ns_name);
         self.host_veth = Some(host_veth);
         self.vm_ipv6 = Some(vm_ipv6.clone());
+        self.default_iface = Some(default_iface);
 
         Ok(NetworkConfig {
             tap_device: self.tap_device.clone(),
@@ -445,7 +474,9 @@ impl NetworkManager for RoutedNetwork {
             } else {
                 Some(loopback_ip)
             },
-            dns_server: None, // Use host DNS servers directly (kernel-routed)
+            // IPv4 DNS (e.g. VPC's 10.0.0.2) is unreachable without MASQUERADE.
+            // Detect an IPv6 DNS server reachable via native routed IPv6.
+            dns_server: detect_ipv6_dns(),
             guest_ipv6: Some(vm_ipv6),
             // fd00::1 is on the bridge inside the namespace. The VM uses it as IPv6 gateway.
             // NDP resolves it on the VM's local link (TAP → bridge → fd00::1 responds).
@@ -473,11 +504,34 @@ impl NetworkManager for RoutedNetwork {
                 .await;
         }
 
-        // Remove proxy NDP
+        // Remove MASQUERADE rules and proxy NDP
         if let Some(ref vm_ipv6) = self.vm_ipv6 {
-            let default_iface = detect_default_ipv6_interface()
-                .await
-                .unwrap_or_else(|| "eth0".to_string());
+            let default_iface = self
+                .default_iface
+                .as_deref()
+                .unwrap_or("eth0");
+
+            // Remove MASQUERADE rules
+            let _ = tokio::process::Command::new("iptables")
+                .args([
+                    "-t", "nat", "-D", "POSTROUTING",
+                    "-s", "10.0.2.0/24",
+                    "-o", default_iface,
+                    "-j", "MASQUERADE",
+                ])
+                .output()
+                .await;
+            let _ = tokio::process::Command::new("ip6tables")
+                .args([
+                    "-t", "nat", "-D", "POSTROUTING",
+                    "-o", default_iface,
+                    "-s", &format!("{}/128", vm_ipv6),
+                    "-j", "MASQUERADE",
+                ])
+                .output()
+                .await;
+
+            // Remove proxy NDP
             let _ = tokio::process::Command::new("ip")
                 .args([
                     "-6",
@@ -486,7 +540,7 @@ impl NetworkManager for RoutedNetwork {
                     "proxy",
                     vm_ipv6,
                     "dev",
-                    &default_iface,
+                    default_iface,
                 ])
                 .output()
                 .await;
@@ -551,6 +605,42 @@ async fn generate_link_local_from_mac(iface: &str) -> Option<String> {
     None
 }
 
+/// Find a DNS server reachable over IPv6 for routed mode.
+///
+/// IPv4 DNS (e.g. VPC's 10.0.0.2) is unreachable from the VM without MASQUERADE.
+/// This function discovers an IPv6 DNS server by:
+/// 1. Checking host resolv.conf for existing IPv6 nameservers
+/// 2. Probing known cloud IPv6 DNS endpoints (e.g. AWS fd00:ec2::253)
+fn detect_ipv6_dns() -> Option<String> {
+    // Check host DNS config for IPv6 nameservers
+    let resolv = std::fs::read_to_string("/run/systemd/resolve/resolv.conf")
+        .or_else(|_| std::fs::read_to_string("/etc/resolv.conf"))
+        .ok()?;
+
+    for line in resolv.lines() {
+        if let Some(server) = line.strip_prefix("nameserver ") {
+            let server = server.trim();
+            if server.contains(':') {
+                return Some(server.to_string());
+            }
+        }
+    }
+
+    // No IPv6 nameserver in resolv.conf. Probe known cloud IPv6 DNS endpoints.
+    // AWS VPCs provide dual-stack DNS at fd00:ec2::253.
+    let probe = std::process::Command::new("dig")
+        .args(["+short", "+timeout=2", "+tries=1", "@fd00:ec2::253", "example.com"])
+        .output()
+        .ok()?;
+
+    if probe.status.success() && !String::from_utf8_lossy(&probe.stdout).trim().is_empty() {
+        info!("detected IPv6 DNS at fd00:ec2::253 (AWS VPC)");
+        return Some("fd00:ec2::253".to_string());
+    }
+
+    None
+}
+
 /// Detect the default IPv6 outgoing interface
 async fn detect_default_ipv6_interface() -> Option<String> {
     let output = tokio::process::Command::new("ip")
@@ -569,3 +659,4 @@ async fn detect_default_ipv6_interface() -> Option<String> {
     }
     None
 }
+
