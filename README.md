@@ -270,7 +270,7 @@ fcvm auto-forwards `http_proxy`/`https_proxy` from host to VM via MMDS.
 - Firecracker binary in PATH
 - For rootless: `passt` package (provides `pasta`)
 - For bridged: sudo, iptables, iproute2
-- For routed: sudo, ip6tables, iproute2, socat, host with global IPv6 /64
+- For routed: sudo, ip6tables, iproute2, host with global IPv6 /64
 - For rootfs build: qemu-utils, e2fsprogs
 
 **Storage:** btrfs at `/mnt/fcvm-btrfs` (auto-created as loopback on non-btrfs hosts)
@@ -282,7 +282,7 @@ fcvm auto-forwards `http_proxy`/`https_proxy` from host to VM via MMDS.
 # Install dependencies
 sudo apt-get update && sudo apt-get install -y \
     fuse3 libfuse3-dev libclang-dev clang musl-tools \
-    iproute2 iptables passt socat qemu-utils e2fsprogs uidmap
+    iproute2 iptables passt qemu-utils e2fsprogs uidmap
 
 # Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
