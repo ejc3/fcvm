@@ -4,6 +4,7 @@ pub mod namespace;
 pub mod pasta;
 pub mod portmap;
 pub mod routed;
+pub mod tcp_proxy;
 pub mod types;
 pub mod veth;
 

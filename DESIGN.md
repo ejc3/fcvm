@@ -293,7 +293,7 @@ Uses veth pairs + IPv6 routing for kernel line-rate networking without userspace
 - Requires root and a host with a global IPv6 /64 subnet
 - Native IPv6 routing through the kernel stack (no userspace L4 translation)
 - Each VM gets a unique IPv6 derived from the host's /64 prefix
-- Port forwarding via socat + loopback IP (same as rootless)
+- Port forwarding via built-in TCP proxy (`setns` + tokio relay) on loopback IP (same as rootless)
 - Parallel-safe: per-VM routes, proxy NDP, ip6tables rules
 
 **Implementation**:
@@ -307,7 +307,7 @@ struct RoutedNetwork {
     host_veth: Option<String>,
     vm_ipv6: Option<String>,
     default_iface: Option<String>,
-    socat_children: Vec<Child>,
+    proxy_handles: Vec<JoinHandle<()>>,
 }
 
 async fn setup() -> Result<NetworkConfig> {
@@ -324,7 +324,7 @@ async fn setup() -> Result<NetworkConfig> {
     // Host: /128 route to VM IPv6 via host veth
     // Proxy NDP on default interface
     // ip6tables MASQUERADE for outbound
-    // socat port forwarding on loopback IP
+    // TCP proxy port forwarding on loopback IP (setns + tokio relay)
 }
 ```
 
@@ -560,7 +560,7 @@ a **single vsock connection** using a frame-based protocol.
 
 Note: Routed mode does **not** use the egress proxy. All external traffic in routed mode
 goes natively through the kernel's IPv6 routing stack at line rate. IPv4 stays internal
-to the namespace (for health checks and socat port forwarding only).
+to the namespace (for health checks and port forwarding only).
 
 **Architecture**:
 ```
@@ -713,13 +713,13 @@ curl http://172.30.x.1:8080
 11. Host: route `vm_ipv6/128` via host veth
 12. Proxy NDP for vm_ipv6 on default interface (so network fabric routes to this host)
 13. ip6tables MASQUERADE on outbound interface (required for AWS source/dest check)
-14. socat port forwarding on unique loopback IP (127.x.y.z)
+14. TCP proxy port forwarding on unique loopback IP (127.x.y.z)
 
-**Port Forwarding** (socat + loopback IP, same as rootless):
-```bash
-# socat listens on host loopback, connects inside namespace via ip netns exec
-socat TCP-LISTEN:8080,bind=127.0.0.2,fork,reuseaddr \
-  EXEC:'ip netns exec fcvm-XXXX socat STDIO TCP:10.0.2.100:80'
+**Port Forwarding** (built-in TCP proxy + loopback IP, same as rootless):
+```
+# Rust TCP proxy: bind on host loopback, connect inside namespace via setns(2)
+Host 127.0.0.2:8080 → tcp_proxy → setns(namespace) → connect 10.0.2.100:80
+# Bidirectional relay via tokio::io::copy_bidirectional
 ```
 
 **Traffic Flow** (VM to Internet, IPv6):
@@ -734,7 +734,7 @@ Internet → eth0 → proxy NDP → host kernel → route vm_ipv6/128 via veth-h
 
 **Traffic Flow** (Host to VM port forward):
 ```
-Host (127.0.0.x:8080) → socat → ip netns exec → socat → 10.0.2.100:80 → br0 → TAP → Guest
+Host (127.0.0.x:8080) → tcp_proxy (setns) → 10.0.2.100:80 → br0 → TAP → Guest
 ```
 
 **Traffic Flow** (Health check):
@@ -749,7 +749,7 @@ ip netns exec curl → br0 (10.0.2.1) → L2 forward → TAP → Guest (10.0.2.1
 - Proxy NDP advertises the VM's IPv6 on the host's physical interface
 
 **Cleanup** (on VM exit):
-1. Kill socat port forwarders
+1. Abort TCP proxy tasks (in-process, no external PIDs)
 2. Remove ip6tables MASQUERADE rule (scoped to vm_ipv6/128)
 3. Remove proxy NDP entry
 4. Remove host route (uses `dev` qualifier for parallel safety)
@@ -761,7 +761,7 @@ ip netns exec curl → br0 (10.0.2.1) → L2 forward → TAP → Guest (10.0.2.1
 - Kernel line-rate IPv6 (no userspace proxy for traffic forwarding)
 - Each VM gets unique /128 IPv6 — parallel clones route correctly without NAT
 - IPv4 internal only (10.0.2.x for health checks, no external IPv4 routing)
-- Port forwarding via socat + loopback IP (same model as rootless)
+- Port forwarding via built-in TCP proxy + loopback IP (same model as rootless)
 - All resources per-VM: no shared state, clean parallel operation
 
 ---
