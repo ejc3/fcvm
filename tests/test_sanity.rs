@@ -23,7 +23,6 @@ async fn test_sanity_rootless() -> Result<()> {
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_sanity_routed() -> Result<()> {
-    skip_if_no_ipv6!();
     sanity_test_impl("routed").await
 }
 

@@ -47,7 +47,6 @@ async fn test_egress_stress_rootless() -> Result<()> {
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_egress_stress_routed() -> Result<()> {
-    skip_if_no_ipv6!();
     egress_stress_impl("routed", NUM_CLONES, REQUESTS_PER_CLONE).await
 }
 
