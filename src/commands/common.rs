@@ -632,6 +632,9 @@ pub struct RestoreParams<'a> {
     pub runtime_config: &'a RuntimeConfig,
     pub restore_config: &'a SnapshotRestoreConfig,
     pub network_config: &'a NetworkConfig,
+    /// For routed mode clones: the unique per-clone IPv6 that fc-agent should
+    /// configure on eth0, replacing the snapshot's shared guest IPv6.
+    pub clone_ipv6: Option<String>,
 }
 
 /// Restore a VM from a snapshot.
@@ -657,6 +660,7 @@ pub async fn restore_from_snapshot(
         runtime_config,
         restore_config,
         network_config,
+        clone_ipv6,
     } = params;
     let vm_dir = data_dir.join("disks");
 
@@ -832,9 +836,34 @@ pub async fn restore_from_snapshot(
         holder_pid_for_post_start = Some(holder_pid);
 
         holder_child = Some(child);
+    } else if let Some(routed_net) = network
+        .as_any()
+        .downcast_ref::<crate::network::RoutedNetwork>()
+    {
+        // Routed mode: like bridged but with veth+IPv6 routing instead of iptables NAT
+        if let Some(ns_id) = routed_net.namespace_id() {
+            info!(namespace = %ns_id, "configuring VM to run in routed network namespace");
+            vm_manager.set_namespace(ns_id.to_string());
+        }
+
+        let disk_manager = DiskManager::new(
+            vm_id.to_string(),
+            restore_config.source_disk_path.clone(),
+            vm_dir.clone(),
+        );
+
+        rootfs_path = disk_manager
+            .create_cow_disk()
+            .await
+            .context("creating CoW disk from snapshot")?;
+
+        info!(
+            rootfs = %rootfs_path.display(),
+            source_disk = %restore_config.source_disk_path.display(),
+            "CoW disk prepared from snapshot (routed)"
+        );
     } else {
-        // Unknown network type - should not happen
-        anyhow::bail!("Unknown network type - must be either BridgedNetwork or PastaNetwork");
+        anyhow::bail!("Unknown network type");
     }
 
     // Configure mount namespace isolation for path redirects
@@ -1006,18 +1035,21 @@ pub async fn restore_from_snapshot(
         .context("system time before Unix epoch")?
         .as_secs();
 
+    let mut mmds_latest = serde_json::json!({
+        "host-time": chrono::Utc::now().timestamp().to_string(),
+        "restore-epoch": restore_epoch.to_string()
+    });
+    if let Some(ref ipv6) = clone_ipv6 {
+        mmds_latest["clone-ipv6"] = serde_json::Value::String(ipv6.clone());
+    }
     client
-        .put_mmds(serde_json::json!({
-            "latest": {
-                "host-time": chrono::Utc::now().timestamp().to_string(),
-                "restore-epoch": restore_epoch.to_string()
-            }
-        }))
+        .put_mmds(serde_json::json!({ "latest": mmds_latest }))
         .await
         .context("updating MMDS with restore-epoch")?;
     info!(
         restore_epoch = restore_epoch,
-        "signaled fc-agent to flush ARP via MMDS"
+        clone_ipv6 = ?clone_ipv6,
+        "signaled fc-agent via MMDS"
     );
 
     // Stop KVM trace and dump results (captures resume + early VM execution)

@@ -57,6 +57,7 @@
 4. **Networking Modes**
    - **Rootless**: Works without root privileges using pasta (from passt)
    - **Privileged**: Uses iptables + TAP for better performance
+   - **Routed**: IPv6 veth pairs with kernel routing at line rate (no userspace proxy)
    - **Port mapping**: `[HOSTIP:]HOSTPORT:GUESTPORT[/PROTO]` syntax
    - Support multiple ports, TCP/UDP protocols
 
@@ -216,7 +217,7 @@ impl VmManager {
 
 **Location**: `fcvm/src/network/`
 
-Two implementations based on execution mode.
+Three implementations based on execution mode.
 
 #### Rootless Networking (`pasta.rs`)
 
@@ -282,6 +283,49 @@ async fn setup() -> Result<NetworkConfig> {
 **NAT Rule Example** (scoped to veth IP):
 ```bash
 iptables -t nat -A PREROUTING -d 172.30.x.1 -p tcp --dport 8080 -j DNAT --to-destination 172.30.x.2:80
+```
+
+#### Routed Networking (`routed.rs`)
+
+Uses veth pairs + IPv6 routing for kernel line-rate networking without userspace proxies.
+
+**Features**:
+- Requires root and a host with a global IPv6 /64 subnet
+- Native IPv6 routing through the kernel stack (no userspace L4 translation)
+- Each VM gets a unique IPv6 derived from the host's /64 prefix
+- Port forwarding via socat + loopback IP (same as rootless)
+- Parallel-safe: per-VM routes, proxy NDP, ip6tables rules
+
+**Implementation**:
+```rust
+struct RoutedNetwork {
+    vm_id: String,
+    tap_device: String,
+    port_mappings: Vec<PortMapping>,
+    loopback_ip: Option<String>,
+    namespace_id: Option<String>,
+    host_veth: Option<String>,
+    vm_ipv6: Option<String>,
+    default_iface: Option<String>,
+    socat_children: Vec<Child>,
+}
+
+async fn setup() -> Result<NetworkConfig> {
+    preflight_check()                  // root, IPv6, ip6tables
+    detect_host_ipv6()                 // find /64 subnet (or /128 with on-link /64)
+    generate_vm_ipv6(prefix, vm_id)    // deterministic IPv6 from hash
+    create_namespace(ns_name)
+    create_veth_pair(host_veth, guest_veth)
+    create_tap_in_ns(ns_name, tap)
+    connect_tap_to_veth(ns_name, tap, guest_veth)  // bridge for L2
+    // Assign bridge IPs: 10.0.2.1/24 + fd00::1/64
+    // Host veth: enable forwarding, assign link-local
+    // Namespace: default IPv6 route via host veth link-local
+    // Host: /128 route to VM IPv6 via host veth
+    // Proxy NDP on default interface
+    // ip6tables MASQUERADE for outbound
+    // socat port forwarding on loopback IP
+}
 ```
 
 #### Port Mapping Format
@@ -508,12 +552,15 @@ Host (127.0.0.x:8080) → pasta → pasta0 → br0 (L2) → tap-fc → Guest (10
 - Works in nested VMs and restricted environments
 - Fully compatible with rootless Podman in guest
 
-### Egress Proxy (Rootless Outbound TCP)
+### Egress Proxy (Outbound IPv4 TCP)
 
-In rootless mode, pasta handles inbound port forwarding and DNS, but outbound TCP from the
-guest requires a transparent proxy because there is no NAT gateway. The egress proxy
-multiplexes all outbound TCP connections over a **single vsock connection** using a
-frame-based protocol.
+In rootless mode, outbound IPv4 TCP from the guest requires a transparent proxy because
+there is no NAT gateway. The egress proxy multiplexes all outbound TCP connections over
+a **single vsock connection** using a frame-based protocol.
+
+Note: Routed mode does **not** use the egress proxy. All external traffic in routed mode
+goes natively through the kernel's IPv6 routing stack at line rate. IPv4 stays internal
+to the namespace (for health checks and socat port forwarding only).
 
 **Architecture**:
 ```
@@ -617,6 +664,106 @@ curl http://172.30.x.1:8080
 - Veth host IP: `172.30.{x}.{y}` (used for port forwarding)
 - Guest IP: `172.30.{x}.{y+1}`
 
+### Routed Mode (veth + IPv6 Kernel Routing)
+
+**Key Insight**: pasta's userspace L4 translation adds latency and doesn't scale to many parallel clones.
+**Solution**: Use veth pairs with native IPv6 routing through the kernel stack at line rate.
+
+**Topology**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Host Namespace                                                   │
+│  ┌──────────────┐        veth pair         ┌──────────────────┐ │
+│  │ veth-host    │◄─────────────────────────►│ Namespace        │ │
+│  │ (link-local) │                          │ (fcvm-xxxxxxxx)  │ │
+│  └──────────────┘                          │                  │ │
+│        │                                   │  veth-ns         │ │
+│  proxy NDP on eth0                         │       │          │ │
+│  ip6tables MASQUERADE                      │  ┌────▼───────┐  │ │
+│  route: vm_ipv6/128 via veth-host          │  │ br0        │  │ │
+│                                            │  │ 10.0.2.1   │  │ │
+│                                            │  │ fd00::1    │  │ │
+│                                            │  └────┬───────┘  │ │
+│                                            │       │          │ │
+│                                            │  ┌────▼─────┐    │ │
+│                                            │  │ TAP      │    │ │
+│                                            │  └────┬─────┘    │ │
+│                                            │       │          │ │
+│                                            │  ┌────▼─────┐    │ │
+│                                            │  │Firecracker│   │ │
+│                                            │  │eth0:      │   │ │
+│                                            │  │10.0.2.100 │   │ │
+│                                            │  │vm_ipv6/128│   │ │
+│                                            │  └───────────┘   │ │
+│                                            └──────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Setup Sequence** (14 steps):
+1. Preflight: verify root, global IPv6, ip6tables
+2. Detect host IPv6 /64 subnet (supports direct /64 or AWS-style /128 with on-link /64 route)
+3. Generate deterministic VM IPv6 from host prefix + hash of vm_id (with collision detection)
+4. Create network namespace (`ip netns add fcvm-XXXX`)
+5. Create veth pair, move guest side to namespace
+6. Create TAP device in namespace, connect to bridge (br0) with veth
+7. Assign bridge IPs: `10.0.2.1/24` (IPv4 gateway) + `fd00::1/64` (IPv6 gateway, nodad)
+8. Bring up host veth, enable per-interface IPv6 forwarding
+9. Assign EUI-64 link-local to host veth (auto-assignment fails when `all.forwarding=1`)
+10. Namespace default IPv6 route: via host veth link-local through bridge
+11. Host: route `vm_ipv6/128` via host veth
+12. Proxy NDP for vm_ipv6 on default interface (so network fabric routes to this host)
+13. ip6tables MASQUERADE on outbound interface (required for AWS source/dest check)
+14. socat port forwarding on unique loopback IP (127.x.y.z)
+
+**Port Forwarding** (socat + loopback IP, same as rootless):
+```bash
+# socat listens on host loopback, connects inside namespace via ip netns exec
+socat TCP-LISTEN:8080,bind=127.0.0.2,fork,reuseaddr \
+  EXEC:'ip netns exec fcvm-XXXX socat STDIO TCP:10.0.2.100:80'
+```
+
+**Traffic Flow** (VM to Internet, IPv6):
+```
+Guest → TAP → br0 → veth-ns → veth-host → host kernel → ip6tables MASQUERADE → eth0 → Internet
+```
+
+**Traffic Flow** (Internet to VM, IPv6):
+```
+Internet → eth0 → proxy NDP → host kernel → route vm_ipv6/128 via veth-host → veth-ns → br0 → TAP → Guest
+```
+
+**Traffic Flow** (Host to VM port forward):
+```
+Host (127.0.0.x:8080) → socat → ip netns exec → socat → 10.0.2.100:80 → br0 → TAP → Guest
+```
+
+**Traffic Flow** (Health check):
+```
+ip netns exec curl → br0 (10.0.2.1) → L2 forward → TAP → Guest (10.0.2.100:80)
+```
+
+**IPv6 Addressing**:
+- Each VM gets a deterministic IPv6 from the host's /64 subnet (hash of vm_id)
+- VM uses /128 prefix (fc-agent configures via boot parameter) to prevent on-link NDP for other subnet addresses
+- fd00::1 on the bridge serves as the VM's IPv6 gateway
+- Proxy NDP advertises the VM's IPv6 on the host's physical interface
+
+**Cleanup** (on VM exit):
+1. Kill socat port forwarders
+2. Remove ip6tables MASQUERADE rule (scoped to vm_ipv6/128)
+3. Remove proxy NDP entry
+4. Remove host route (uses `dev` qualifier for parallel safety)
+5. Delete veth pair (auto-deletes peer)
+6. Delete namespace
+
+**Characteristics**:
+- Requires root and global IPv6 on host
+- Kernel line-rate IPv6 (no userspace proxy for traffic forwarding)
+- Each VM gets unique /128 IPv6 — parallel clones route correctly without NAT
+- IPv4 internal only (10.0.2.x for health checks, no external IPv4 routing)
+- Port forwarding via socat + loopback IP (same model as rootless)
+- All resources per-VM: no shared state, clean parallel operation
+
 ---
 
 ## VM Lifecycle
@@ -630,14 +777,14 @@ curl http://172.30.x.1:8080
 └────────────────┬────────────────────────────────────────┘
                  ▼
 ┌─────────────────────────────────────────────────────────┐
-│ 2. Detect execution mode (auto/rootless/privileged)     │
+│ 2. Detect execution mode (rootless/bridged/routed)      │
 │    - Check for root privileges                          │
 │    - Check for /dev/kvm access                          │
 └────────────────┬────────────────────────────────────────┘
                  ▼
 ┌─────────────────────────────────────────────────────────┐
 │ 3. Setup networking                                      │
-│    - Create TAP device (privileged) or prepare pasta    │
+│    - Create TAP device (bridged/routed) or prepare pasta│
 │    - Parse port mappings                                │
 │    - Generate MAC address                               │
 └────────────────┬────────────────────────────────────────┘
@@ -1155,7 +1302,7 @@ match fork() {
    - `-t`: Allocate PTY
    - `-it`: Both (interactive shell)
 
-4. **Network modes**: `--network rootless` (default, no sudo) or `--network bridged` (sudo required)
+4. **Network modes**: `--network rootless` (default, no sudo), `--network bridged` (sudo), or `--network routed` (sudo + IPv6)
 
 #### `fcvm snapshot create`
 
@@ -1216,7 +1363,7 @@ fcvm snapshot run --pid <SERVE_PID> [OPTIONS]
 ```
 --pid <SERVE_PID>         Memory server PID (required)
 --name <NAME>             Clone VM name (auto-generated if not provided)
---network <MODE>          Network mode: bridged|rootless
+--network <MODE>          Network mode: bridged|rootless|routed
 --publish <MAPPING>       Port mappings (can differ from original)
 ```
 
@@ -1313,6 +1460,7 @@ fcvm/
 │   │   ├── mod.rs
 │   │   ├── bridged.rs      # Bridged networking (iptables)
 │   │   ├── pasta.rs        # Rootless networking (pasta)
+│   │   ├── routed.rs       # Routed networking (IPv6 veth)
 │   │   ├── namespace.rs    # Network namespace management
 │   │   ├── veth.rs         # Veth pair management
 │   │   ├── types.rs        # Network types

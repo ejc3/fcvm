@@ -30,7 +30,7 @@ use crate::cli::{NetworkMode, PodmanArgs, PodmanCommands, RunArgs};
 use crate::commands::common::{
     VSOCK_OUTPUT_PORT, VSOCK_STATUS_PORT, VSOCK_TTY_PORT, VSOCK_VOLUME_PORT_BASE,
 };
-use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, PortMapping};
+use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, PortMapping, RoutedNetwork};
 use crate::paths;
 use crate::state::{generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState};
 use crate::volume::{spawn_volume_servers, VolumeConfig};
@@ -626,9 +626,11 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
 
     // Setup networking based on mode
     // Bridged mode requires root for iptables and network namespace setup
-    if matches!(args.network, NetworkMode::Bridged) && !nix::unistd::geteuid().is_root() {
+    if matches!(args.network, NetworkMode::Bridged | NetworkMode::Routed)
+        && !nix::unistd::geteuid().is_root()
+    {
         bail!(
-            "Bridged networking requires root. Either:\n  \
+            "Bridged/routed networking requires root. Either:\n  \
              - Run with sudo: sudo fcvm podman run ...\n  \
              - Use rootless mode: fcvm podman run --network rootless ..."
         );
@@ -637,7 +639,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     if matches!(args.network, NetworkMode::Rootless) && nix::unistd::geteuid().is_root() {
         warn!(
             "Running rootless mode as root is unnecessary. \
-             Consider using --network bridged for better performance."
+             Consider using --network bridged or --network routed for better performance."
         );
     }
 
@@ -648,6 +650,19 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             tap_device.clone(),
             port_mappings.clone(),
         )),
+        NetworkMode::Routed => {
+            RoutedNetwork::preflight_check().context("routed mode preflight check failed")?;
+            let mut net =
+                RoutedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
+            if !port_mappings.is_empty() {
+                let loopback_ip = state_manager
+                    .allocate_loopback_ip(&mut vm_state)
+                    .await
+                    .context("allocating loopback IP for routed mode")?;
+                net = net.with_loopback_ip(loopback_ip);
+            }
+            Box::new(net)
+        }
         NetworkMode::Rootless => {
             // For rootless mode, allocate loopback IP atomically with state persistence
             // This prevents race conditions when starting multiple VMs concurrently

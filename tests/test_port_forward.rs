@@ -318,3 +318,140 @@ fn test_port_forward_rootless() -> Result<()> {
     println!("test_port_forward_rootless PASSED");
     Ok(())
 }
+
+/// Test port forwarding with routed networking
+///
+/// Routed mode uses socat + unique loopback IPs (like rootless),
+/// so the test follows the same pattern.
+#[cfg(feature = "privileged-tests")]
+#[test]
+fn test_port_forward_routed() -> Result<()> {
+    println!("\ntest_port_forward_routed");
+
+    let fcvm_path = common::find_fcvm_binary()?;
+    let vm_name = format!("port-routed-{}", std::process::id());
+
+    // Use dynamic port to avoid conflicts with system services
+    let host_port = common::find_available_high_port().context("finding available port")?;
+    let publish_arg = format!("{}:80", host_port);
+
+    // Start VM with routed networking and port forwarding
+    // Routed uses socat + unique loopback IPs (like rootless)
+    let mut fcvm = Command::new(&fcvm_path)
+        .args([
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "routed",
+            "--publish",
+            &publish_arg,
+            "--health-check",
+            "http://localhost/",
+            common::TEST_IMAGE,
+        ])
+        .spawn()
+        .context("spawning fcvm")?;
+
+    let fcvm_pid = fcvm.id();
+    println!("Started fcvm with PID: {}", fcvm_pid);
+
+    // Wait for VM to become healthy
+    let start = std::time::Instant::now();
+    let mut healthy = false;
+    let mut loopback_ip = String::new();
+
+    while start.elapsed() < Duration::from_secs(120) {
+        std::thread::sleep(common::POLL_INTERVAL);
+
+        let output = Command::new(&fcvm_path)
+            .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
+            .output()
+            .context("running fcvm ls")?;
+
+        if !output.status.success() {
+            continue;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let vms: Vec<VmDisplay> = match serde_json::from_str(&stdout) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if let Some(display) = vms.first() {
+            if matches!(display.vm.health_status, fcvm::state::HealthStatus::Healthy) {
+                if let Some(ref ip) = display.vm.config.network.loopback_ip {
+                    loopback_ip = ip.clone();
+                }
+                healthy = true;
+                println!("VM is healthy, loopback_ip: {}", loopback_ip);
+                break;
+            }
+        }
+    }
+
+    if !healthy {
+        fcvm::utils::graceful_kill(fcvm_pid, 2000);
+        let _ = fcvm.wait();
+        anyhow::bail!("VM did not become healthy within 120 seconds");
+    }
+
+    // Test: Access via loopback IP and forwarded port
+    // Routed mode uses socat to forward: host loopback → ip netns exec → guest
+    println!(
+        "Testing access via loopback IP {}:{}...",
+        loopback_ip, host_port
+    );
+    let mut loopback_works = false;
+    let retry_start = std::time::Instant::now();
+    while retry_start.elapsed() < Duration::from_secs(30) {
+        let output = Command::new("curl")
+            .args([
+                "-s",
+                "--max-time",
+                "5",
+                &format!("http://{}:{}", loopback_ip, host_port),
+            ])
+            .output()
+            .context("curl to loopback")?;
+
+        if output.status.success() && !output.stdout.is_empty() {
+            loopback_works = true;
+            println!("Loopback access: OK");
+            println!(
+                "Response: {}",
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+            );
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    if !loopback_works {
+        println!("Loopback access: FAIL (timed out after 30s)");
+    }
+
+    // Cleanup
+    println!("Cleaning up...");
+    let _ = Command::new("kill")
+        .args(["-TERM", &fcvm_pid.to_string()])
+        .output();
+
+    std::thread::sleep(common::POLL_INTERVAL);
+    let _ = fcvm.wait();
+
+    // Assertions
+    assert!(
+        loopback_works,
+        "Routed port forwarding via loopback IP should work"
+    );
+
+    println!("test_port_forward_routed PASSED");
+    Ok(())
+}

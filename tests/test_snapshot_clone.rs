@@ -42,6 +42,13 @@ async fn test_snapshot_clone_stress_100_bridged() -> Result<()> {
     snapshot_clone_test_impl("bridged", 100).await
 }
 
+/// Full snapshot/clone workflow test with routed networking (10 clones)
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_snapshot_clone_routed_10() -> Result<()> {
+    snapshot_clone_test_impl("routed", 10).await
+}
+
 /// Result of spawning and health-checking a single clone
 struct CloneResult {
     name: String,
@@ -397,6 +404,13 @@ async fn test_clone_while_baseline_running_rootless() -> Result<()> {
 #[tokio::test]
 async fn test_clone_while_baseline_running_bridged() -> Result<()> {
     clone_while_baseline_running_impl("bridged").await
+}
+
+/// Test cloning while baseline VM is still running (routed)
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_clone_while_baseline_running_routed() -> Result<()> {
+    clone_while_baseline_running_impl("routed").await
 }
 
 /// Implementation for clone-while-baseline-running test
@@ -811,6 +825,13 @@ async fn test_clone_internet_rootless() -> Result<()> {
     clone_internet_test_impl("rootless").await
 }
 
+/// Test that clones can reach the internet in routed mode
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_clone_internet_routed() -> Result<()> {
+    clone_internet_test_impl("routed").await
+}
+
 async fn clone_internet_test_impl(network: &str) -> Result<()> {
     let (baseline_name, clone_name, snapshot_name, _) =
         common::unique_names(&format!("inet-{}", network));
@@ -823,10 +844,11 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
     // Start local test servers on host
-    let bind_addr = if network == "rootless" {
-        "127.0.0.1"
-    } else {
-        "0.0.0.0" // Bridged needs to bind to all interfaces
+    // Routed uses IPv6 (each clone has unique IPv6), so bind on :: (dual-stack).
+    let bind_addr = match network {
+        "rootless" => "127.0.0.1",
+        "routed" => "::",
+        _ => "0.0.0.0",
     };
 
     // HTTP test server
@@ -834,17 +856,21 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
         .await
         .context("starting local HTTP test server")?;
 
-    // For rootless, we know the egress URL upfront (10.0.2.2).
-    // For bridged, we'll use the veth host IP from clone's state (same as DNS).
-    let egress_url_for_rootless = if network == "rootless" {
-        Some(format!("http://10.0.2.2:{}/", test_server.port))
-    } else {
-        None // Will use veth host IP from state
+    // For rootless, the VM reaches the host via pasta gateway (10.0.2.2).
+    // For routed, the VM reaches the host via IPv6 (unique per clone, no ECMP issues).
+    // For bridged, we'll use the veth host IP from clone's state.
+    let egress_url_known = match network {
+        "rootless" => Some(format!("http://10.0.2.2:{}/", test_server.port)),
+        "routed" => {
+            let host_ipv6 = common::get_host_ipv6().await?;
+            Some(format!("http://[{}]:{}/", host_ipv6, test_server.port))
+        }
+        _ => None, // Bridged: will use veth host IP from state
     };
     println!(
         "  Local HTTP server: {} (VM will connect via {})",
         test_server.url,
-        egress_url_for_rootless
+        egress_url_known
             .as_deref()
             .unwrap_or("veth host IP from state")
     );
@@ -856,19 +882,19 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
         .await
         .context("starting local DNS test server")?;
 
-    // For rootless, we know the pasta gateway address upfront.
-    // For bridged, we need to get the veth host IP from the clone's state after it starts,
-    // since the VM can only reach the host through the veth pair, not the host's primary IP.
-    let dns_server_addr_for_rootless = if network == "rootless" {
-        Some("10.0.2.2".to_string())
-    } else {
-        None // Will be determined from clone's state
+    // For rootless, the VM reaches host via pasta gateway (10.0.2.2).
+    // For routed, the VM reaches host via IPv6 (unique per clone).
+    // For bridged, we need the veth host IP from clone's state after it starts.
+    let dns_server_addr_known = match network {
+        "rootless" => Some("10.0.2.2".to_string()),
+        "routed" => Some(common::get_host_ipv6().await?),
+        _ => None, // Bridged: determined from clone's state
     };
     println!(
         "  Local DNS server: {}:{} (VM will query via {})",
         bind_addr,
         dns_server.port,
-        dns_server_addr_for_rootless
+        dns_server_addr_known
             .as_deref()
             .unwrap_or("veth host IP from state")
     );
@@ -986,7 +1012,7 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
     println!("\nStep 5: Testing connectivity from clone...");
 
     // Get the DNS server address for this network mode
-    let dns_server_addr = if let Some(addr) = dns_server_addr_for_rootless.as_ref() {
+    let dns_server_addr = if let Some(addr) = dns_server_addr_known.as_ref() {
         addr.clone()
     } else {
         // For bridged mode, get the veth host IP from clone's state
@@ -1022,7 +1048,7 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
 
     // Test 2: HTTP connectivity to local test server
     println!("  Testing HTTP connectivity to local server...");
-    let egress_url = if let Some(url) = egress_url_for_rootless.as_ref() {
+    let egress_url = if let Some(url) = egress_url_known.as_ref() {
         url.clone()
     } else {
         // For bridged mode, use the same veth host IP we determined for DNS
@@ -1069,10 +1095,10 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
 
     println!("╚═══════════════════════════════════════════════════════════════╝");
 
-    // For bridged mode, HTTP is the critical test (DNS over UDP has NAT issues with clones)
+    // For bridged/routed, HTTP is the critical test (DNS over UDP has routing issues with clones)
     // For rootless mode, both should work
-    let required_tests_pass = if network == "bridged" {
-        // In bridged mode with clones, DNS over UDP may fail due to In-Namespace NAT
+    let required_tests_pass = if network == "bridged" || network == "routed" {
+        // In bridged/routed mode with clones, DNS over UDP may fail due to namespace routing
         // HTTP connectivity is sufficient to prove networking works
         http_ok
     } else {
@@ -1567,6 +1593,190 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
     }
 }
 
+/// Test port forwarding on clones with routed networking
+///
+/// Routed mode uses socat + unique loopback IPs (like rootless).
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_clone_port_forward_routed() -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("pf-routed");
+
+    println!("\n╔═══════════════════════════════════════════════════════════════╗");
+    println!("║     Clone Port Forwarding Test (routed)                       ║");
+    println!("╚═══════════════════════════════════════════════════════════════╝\n");
+
+    let fcvm_path = common::find_fcvm_binary()?;
+
+    // Step 1: Start baseline VM with nginx (routed)
+    println!("Step 1: Starting baseline VM with nginx (routed)...");
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "routed",
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
+
+    println!("  Waiting for baseline VM to become healthy...");
+    common::poll_health_by_pid(baseline_pid, 120).await?;
+    println!("  ✓ Baseline VM healthy (PID: {})", baseline_pid);
+
+    // Step 2: Create snapshot
+    println!("\nStep 2: Creating snapshot...");
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
+        ])
+        .output()
+        .await
+        .context("running snapshot create")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Snapshot creation failed: {}", stderr);
+    }
+    println!("  ✓ Snapshot created");
+
+    // Kill baseline - we only need the snapshot for clones
+    common::kill_process(baseline_pid).await;
+    println!("  Killed baseline VM (only need snapshot)");
+
+    // Step 3: Start memory server
+    println!("\nStep 3: Starting memory server...");
+    let (_serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server")
+            .await
+            .context("spawning memory server")?;
+
+    // Wait for serve to be ready (poll for socket)
+    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+    println!("  ✓ Memory server ready (PID: {})", serve_pid);
+
+    // Step 4: Spawn clone WITH port forwarding (routed)
+    let host_port = common::find_available_high_port().context("finding available port")?;
+    let publish_arg = format!("{}:80", host_port);
+    println!(
+        "\nStep 4: Spawning clone with --publish {} (routed)...",
+        publish_arg
+    );
+    let serve_pid_str = serve_pid.to_string();
+    let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid_str,
+            "--name",
+            &clone_name,
+            "--network",
+            "routed",
+            "--publish",
+            &publish_arg,
+        ],
+        &clone_name,
+    )
+    .await
+    .context("spawning clone with port forward")?;
+
+    // Wait for clone to become healthy
+    println!("  Waiting for clone to become healthy...");
+    common::poll_health_by_pid(clone_pid, 120).await?;
+    println!("  ✓ Clone is healthy (PID: {})", clone_pid);
+
+    // Step 5: Test port forwarding via loopback IP
+    println!("\nStep 5: Testing port forwarding...");
+
+    // Get clone's loopback IP from state (routed uses socat + loopback like rootless)
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args(["ls", "--json", "--pid", &clone_pid.to_string()])
+        .output()
+        .await
+        .context("getting clone state")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let loopback_ip: String = serde_json::from_str::<Vec<serde_json::Value>>(&stdout)
+        .ok()
+        .and_then(|v| v.first().cloned())
+        .and_then(|v| {
+            v.get("config")?
+                .get("network")?
+                .get("loopback_ip")?
+                .as_str()
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default();
+
+    println!("  Clone loopback IP: {}", loopback_ip);
+
+    // Test: Access via loopback IP and forwarded port
+    println!(
+        "  Testing access via loopback {}:{}...",
+        loopback_ip, host_port
+    );
+    let loopback_result = tokio::process::Command::new("curl")
+        .args([
+            "-s",
+            "--max-time",
+            "5",
+            &format!("http://{}:{}", loopback_ip, host_port),
+        ])
+        .output()
+        .await
+        .context("curl loopback port forward")?;
+
+    let loopback_works = loopback_result.status.success() && !loopback_result.stdout.is_empty();
+    if loopback_works {
+        let response = String::from_utf8_lossy(&loopback_result.stdout);
+        println!("    Loopback access: ✓ OK ({} bytes)", response.len());
+    } else {
+        println!("    Loopback access: ✗ FAIL");
+        println!(
+            "    stderr: {}",
+            String::from_utf8_lossy(&loopback_result.stderr)
+        );
+    }
+
+    // Cleanup
+    println!("\nCleaning up...");
+    common::kill_process(clone_pid).await;
+    println!("  Killed clone");
+    common::kill_process(serve_pid).await;
+    println!("  Killed memory server");
+
+    // Results
+    println!("\n╔═══════════════════════════════════════════════════════════════╗");
+    println!("║                         RESULTS                               ║");
+    println!("╠═══════════════════════════════════════════════════════════════╣");
+    println!(
+        "║  Loopback port forward: {}                                    ║",
+        if loopback_works {
+            "✓ PASSED"
+        } else {
+            "✗ FAILED"
+        }
+    );
+    println!("╚═══════════════════════════════════════════════════════════════╝");
+
+    if loopback_works {
+        println!("\n✅ ROUTED CLONE PORT FORWARDING TEST PASSED!");
+        Ok(())
+    } else {
+        anyhow::bail!("Routed clone port forwarding test failed")
+    }
+}
+
 /// Test direct file-based snapshot run (--snapshot flag) with rootless networking
 ///
 /// This tests the new --snapshot flag which restores directly from disk
@@ -1581,6 +1791,13 @@ async fn test_snapshot_run_direct_rootless() -> Result<()> {
 #[tokio::test]
 async fn test_snapshot_run_direct_bridged() -> Result<()> {
     snapshot_run_direct_test_impl("bridged").await
+}
+
+/// Test direct file-based snapshot run (--snapshot flag) with routed networking
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_snapshot_run_direct_routed() -> Result<()> {
+    snapshot_run_direct_test_impl("routed").await
 }
 
 /// Implementation of direct file-based snapshot run test
@@ -1723,6 +1940,13 @@ async fn test_snapshot_run_exec_bridged() -> Result<()> {
 #[tokio::test]
 async fn test_snapshot_run_exec_rootless() -> Result<()> {
     snapshot_run_exec_test_impl("rootless").await
+}
+
+/// Test snapshot run --exec with routed networking
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_snapshot_run_exec_routed() -> Result<()> {
+    snapshot_run_exec_test_impl("routed").await
 }
 
 /// Implementation of snapshot run --exec test

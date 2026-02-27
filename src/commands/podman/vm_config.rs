@@ -194,9 +194,13 @@ pub(super) fn build_runtime_boot_args(
     if let (Some(guest_ip), Some(host_ip)) = (&network_config.guest_ip, &network_config.host_ip) {
         let guest_ip_clean = guest_ip.split('/').next().unwrap_or(guest_ip);
         let host_ip_clean = host_ip.split('/').next().unwrap_or(host_ip);
+        // Only append DNS to ip= when it's IPv4. IPv6 addresses contain ':'
+        // which conflicts with the ip= field delimiter, corrupting the address.
+        // IPv6 DNS is passed separately via fcvm_dns= (uses '|' delimiter).
         let dns_suffix = network_config
             .dns_server
             .as_ref()
+            .filter(|dns| !dns.contains(':'))
             .map(|dns| format!(":{}", dns))
             .unwrap_or_default();
         // Use /24 netmask for rootless pasta (10.0.2.0/24) or bridged (172.30.x.0/24)
@@ -799,6 +803,16 @@ pub(super) async fn run_vm_setup(
             info!(namespace = %ns_id, "configuring VM to run in network namespace");
             vm_manager.set_namespace(ns_id.to_string());
         }
+    } else if let Some(routed_net) = network
+        .as_any()
+        .downcast_ref::<crate::network::RoutedNetwork>()
+    {
+        // Routed mode: use pre-created network namespace (like bridged)
+        holder_child = None;
+        if let Some(ns_id) = routed_net.namespace_id() {
+            info!(namespace = %ns_id, "configuring VM to run in routed network namespace");
+            vm_manager.set_namespace(ns_id.to_string());
+        }
     } else if let Some(pasta_net) = network.as_any().downcast_ref::<PastaNetwork>() {
         holder_child = Some(
             setup_rootless_namespace(pasta_net, network_config, &mut vm_manager, vm_state).await?,
@@ -845,6 +859,7 @@ pub(super) async fn run_vm_setup(
             let network_mode = match args.network {
                 crate::cli::args::NetworkMode::Bridged => FcNetworkMode::Bridged,
                 crate::cli::args::NetworkMode::Rootless => FcNetworkMode::Rootless,
+                crate::cli::args::NetworkMode::Routed => FcNetworkMode::Routed,
             };
             // Collect extra disk specifications
             let mut extra_disks: Vec<String> = Vec::new();

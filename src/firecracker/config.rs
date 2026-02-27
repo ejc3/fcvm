@@ -183,6 +183,7 @@ pub enum NetworkMode {
     Bridged,
     #[default]
     Rootless,
+    Routed,
 }
 
 /// How localhost container images are delivered to the guest VM.

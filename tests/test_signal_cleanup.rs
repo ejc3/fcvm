@@ -11,6 +11,20 @@ use anyhow::{Context, Result};
 use std::process::Command;
 use std::time::Duration;
 
+/// Check if fcvm ls JSON output indicates a healthy VM (proper JSON parsing, not string matching)
+fn is_vm_healthy(json_str: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json_str)
+        .ok()
+        .and_then(|v| {
+            v.as_array()?
+                .first()?
+                .get("health_status")?
+                .as_str()
+                .map(|s| s == "healthy")
+        })
+        .unwrap_or(false)
+}
+
 /// Check if a process with the given PID exists
 fn process_exists(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{}", pid)).exists()
@@ -72,9 +86,7 @@ fn test_sigint_kills_firecracker_bridged() -> Result<()> {
             .context("running fcvm ls")?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.contains("\"health_status\":\"healthy\"")
-            || stdout.contains("\"health_status\": \"healthy\"")
-        {
+        if is_vm_healthy(&stdout) {
             healthy = true;
             println!("VM is healthy after {:?}", start.elapsed());
             break;
@@ -211,9 +223,7 @@ fn test_sigterm_kills_firecracker_bridged() -> Result<()> {
             .context("running fcvm ls")?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.contains("\"health_status\":\"healthy\"")
-            || stdout.contains("\"health_status\": \"healthy\"")
-        {
+        if is_vm_healthy(&stdout) {
             healthy = true;
             println!("VM is healthy after {:?}", start.elapsed());
             break;
@@ -340,9 +350,7 @@ fn test_sigterm_cleanup_rootless() -> Result<()> {
             .context("running fcvm ls")?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.contains("\"health_status\":\"healthy\"")
-            || stdout.contains("\"health_status\": \"healthy\"")
-        {
+        if is_vm_healthy(&stdout) {
             healthy = true;
             println!("VM is healthy after {:?}", start.elapsed());
             break;
@@ -590,9 +598,7 @@ fn test_sigterm_cleanup_bridged() -> Result<()> {
             .context("running fcvm ls")?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.contains("\"health_status\":\"healthy\"")
-            || stdout.contains("\"health_status\": \"healthy\"")
-        {
+        if is_vm_healthy(&stdout) {
             healthy = true;
             println!("VM is healthy after {:?}", start.elapsed());
             break;
@@ -670,4 +676,282 @@ fn test_sigterm_cleanup_bridged() -> Result<()> {
 
     println!("test_sigterm_cleanup_bridged PASSED");
     Ok(())
+}
+
+/// Test that SIGTERM properly cleans up ALL routed network resources.
+///
+/// Routed mode creates: network namespace, veth pair, host IPv6 route,
+/// proxy NDP entry, ip6tables MASQUERADE rule, socat port forwarders.
+/// After SIGTERM, every one of these must be gone.
+///
+/// This test extracts the exact namespace name, veth name, and VM IPv6
+/// from fcvm's JSON state so it checks specific resources — not counts.
+#[cfg(feature = "privileged-tests")]
+#[test]
+fn test_sigterm_cleanup_routed() -> Result<()> {
+    println!("\ntest_sigterm_cleanup_routed");
+
+    // Start fcvm in routed mode with port forwarding (to test socat cleanup)
+    let fcvm_path = common::find_fcvm_binary()?;
+    let (vm_name, _, _, _) = common::unique_names("cleanup-routed");
+    let host_port = common::find_available_high_port().context("finding available port")?;
+    let publish_arg = format!("{}:80", host_port);
+
+    let mut fcvm = Command::new(&fcvm_path)
+        .args([
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "routed",
+            "--publish",
+            &publish_arg,
+            common::TEST_IMAGE,
+        ])
+        .spawn()
+        .context("spawning fcvm")?;
+
+    let fcvm_pid = fcvm.id();
+    println!("Started fcvm with PID: {}", fcvm_pid);
+
+    // Wait for VM to become healthy and extract state JSON
+    let start = std::time::Instant::now();
+    let mut state_json = String::new();
+    let mut healthy = false;
+    while start.elapsed() < Duration::from_secs(120) {
+        std::thread::sleep(common::POLL_INTERVAL);
+
+        let output = Command::new(&fcvm_path)
+            .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
+            .output()
+            .context("running fcvm ls")?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        if is_vm_healthy(&stdout) {
+            healthy = true;
+            state_json = stdout;
+            println!("VM is healthy after {:?}", start.elapsed());
+            break;
+        }
+    }
+
+    if !healthy {
+        fcvm::utils::graceful_kill(fcvm_pid, 2000);
+        let _ = fcvm.wait();
+        anyhow::bail!("VM did not become healthy within 120 seconds");
+    }
+
+    // Parse state to get exact resource names
+    let state: serde_json::Value =
+        serde_json::from_str(&state_json).context("parsing fcvm ls JSON")?;
+    let vm = &state[0];
+    let network = &vm["config"]["network"];
+    let ns_name = network["namespace_name"]
+        .as_str()
+        .context("namespace_name missing from state")?;
+    let host_veth = network["host_veth"]
+        .as_str()
+        .context("host_veth missing from state")?;
+    let vm_ipv6 = network["guest_ipv6"]
+        .as_str()
+        .context("guest_ipv6 missing from state")?;
+    println!(
+        "Resources: namespace={}, host_veth={}, vm_ipv6={}",
+        ns_name, host_veth, vm_ipv6
+    );
+
+    // Record processes BEFORE killing
+    let our_fc_pid = find_firecracker_for_fcvm(fcvm_pid);
+    println!("Our firecracker PID: {:?}", our_fc_pid);
+    assert!(
+        our_fc_pid.is_some(),
+        "should have started a firecracker process"
+    );
+
+    let socat_pids = find_socat_for_port(host_port);
+    println!("Socat PIDs for port {}: {:?}", host_port, socat_pids);
+
+    // Verify resources exist BEFORE cleanup
+    assert!(
+        std::path::Path::new(&format!("/var/run/netns/{}", ns_name)).exists(),
+        "namespace {} should exist before SIGTERM",
+        ns_name
+    );
+    let link_output = Command::new("ip")
+        .args(["link", "show", host_veth])
+        .output()
+        .context("checking host veth")?;
+    assert!(
+        link_output.status.success(),
+        "host veth {} should exist before SIGTERM",
+        host_veth
+    );
+    println!("Verified resources exist before SIGTERM");
+
+    // Send SIGTERM
+    println!("Sending SIGTERM to fcvm (PID {})", fcvm_pid);
+    send_signal(fcvm_pid, "TERM").context("sending SIGTERM to fcvm")?;
+
+    // Wait for fcvm to exit
+    let start = std::time::Instant::now();
+    let mut exited = false;
+    while start.elapsed() < Duration::from_secs(60) {
+        match fcvm.try_wait() {
+            Ok(Some(status)) => {
+                println!("fcvm exited with status: {:?}", status);
+                exited = true;
+                break;
+            }
+            Ok(None) => std::thread::sleep(common::POLL_INTERVAL),
+            Err(_) => break,
+        }
+    }
+
+    if !exited {
+        println!("fcvm didn't exit after SIGTERM, killing forcefully");
+        let _ = fcvm.kill();
+        let _ = fcvm.wait();
+    }
+
+    // Poll for child process cleanup (max 15 seconds)
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(15) {
+        let fc_alive = our_fc_pid.is_some_and(process_exists);
+        if !fc_alive {
+            break;
+        }
+        std::thread::sleep(common::POLL_INTERVAL);
+    }
+
+    // === Verify ALL resources are cleaned up ===
+
+    // 1. Firecracker process
+    if let Some(fc_pid) = our_fc_pid {
+        assert!(
+            !process_exists(fc_pid),
+            "firecracker (PID {}) should be killed after SIGTERM",
+            fc_pid
+        );
+        println!("  [OK] Firecracker process cleaned up");
+    }
+
+    // 2. Socat port-forwarder processes
+    for socat_pid in &socat_pids {
+        assert!(
+            !process_exists(*socat_pid),
+            "socat (PID {}) should be killed after SIGTERM",
+            socat_pid
+        );
+    }
+    if !socat_pids.is_empty() {
+        println!("  [OK] Socat processes cleaned up");
+    }
+
+    // 3. Network namespace deleted
+    assert!(
+        !std::path::Path::new(&format!("/var/run/netns/{}", ns_name)).exists(),
+        "namespace {} should be deleted after SIGTERM",
+        ns_name
+    );
+    println!("  [OK] Network namespace {} deleted", ns_name);
+
+    // 4. Host veth interface deleted
+    let link_output = Command::new("ip")
+        .args(["link", "show", host_veth])
+        .output()
+        .context("checking host veth after cleanup")?;
+    assert!(
+        !link_output.status.success(),
+        "host veth {} should be deleted after SIGTERM",
+        host_veth
+    );
+    println!("  [OK] Host veth {} deleted", host_veth);
+
+    // 5. Host IPv6 route for VM removed
+    let route_output = Command::new("ip")
+        .args(["-6", "route", "show", &format!("{}/128", vm_ipv6)])
+        .output()
+        .context("checking IPv6 route after cleanup")?;
+    let route_stdout = String::from_utf8_lossy(&route_output.stdout);
+    assert!(
+        route_stdout.trim().is_empty(),
+        "host route for {}/128 should be removed after SIGTERM, got: {}",
+        vm_ipv6,
+        route_stdout.trim()
+    );
+    println!("  [OK] Host IPv6 route for {} removed", vm_ipv6);
+
+    // 6. Proxy NDP entry removed
+    let neigh_output = Command::new("ip")
+        .args(["-6", "neigh", "show", "proxy"])
+        .output()
+        .context("checking proxy NDP after cleanup")?;
+    let neigh_stdout = String::from_utf8_lossy(&neigh_output.stdout);
+    assert!(
+        !neigh_stdout.contains(vm_ipv6),
+        "proxy NDP entry for {} should be removed after SIGTERM, found in: {}",
+        vm_ipv6,
+        neigh_stdout.trim()
+    );
+    println!("  [OK] Proxy NDP entry for {} removed", vm_ipv6);
+
+    // 7. ip6tables MASQUERADE rule removed
+    let ip6t_output = Command::new("ip6tables")
+        .args(["-t", "nat", "-S", "POSTROUTING"])
+        .output()
+        .context("checking ip6tables after cleanup")?;
+    let ip6t_stdout = String::from_utf8_lossy(&ip6t_output.stdout);
+    assert!(
+        !ip6t_stdout.contains(vm_ipv6),
+        "ip6tables MASQUERADE for {} should be removed after SIGTERM, found in: {}",
+        vm_ipv6,
+        ip6t_stdout.trim()
+    );
+    println!("  [OK] ip6tables MASQUERADE rule for {} removed", vm_ipv6);
+
+    // 8. fcvm process itself is gone
+    assert!(
+        !process_exists(fcvm_pid),
+        "fcvm process (PID {}) should be terminated",
+        fcvm_pid
+    );
+    println!("  [OK] fcvm process terminated");
+
+    // 9. State file cleaned up
+    let ls_output = Command::new(&fcvm_path)
+        .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
+        .output()
+        .context("running fcvm ls after cleanup")?;
+    let ls_stdout = String::from_utf8_lossy(&ls_output.stdout);
+    let post_state: serde_json::Value =
+        serde_json::from_str(&ls_stdout).unwrap_or(serde_json::Value::Array(vec![]));
+    assert!(
+        post_state.as_array().map(|a| a.is_empty()).unwrap_or(true),
+        "state file should be cleaned up after SIGTERM, got: {}",
+        ls_stdout.trim()
+    );
+    println!("  [OK] State file cleaned up");
+
+    println!("test_sigterm_cleanup_routed PASSED");
+    Ok(())
+}
+
+/// Find socat processes listening on a specific port
+#[cfg(feature = "privileged-tests")]
+fn find_socat_for_port(port: u16) -> Vec<u32> {
+    let output = Command::new("pgrep")
+        .args(["-f", &format!("socat.*TCP-LISTEN:{}", port)])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout
+                .lines()
+                .filter_map(|l| l.trim().parse::<u32>().ok())
+                .collect()
+        }
+        _ => vec![],
+    }
 }

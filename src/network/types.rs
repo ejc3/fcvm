@@ -31,6 +31,9 @@ pub struct NetworkConfig {
     /// Needed for resolving short hostnames in enterprise networks
     #[serde(default)]
     pub dns_search: Option<String>,
+    /// Named network namespace (for routed mode health checks via `ip netns exec`)
+    #[serde(default)]
+    pub namespace_name: Option<String>,
     /// HTTP proxy URL for the guest to use
     /// Passed to fc-agent via MMDS for container pulls and exec
     #[serde(default)]

@@ -329,9 +329,28 @@ pub async fn run() -> Result<()> {
 
     // Add host identity IPv6 to loopback and eth0 (requires root, can't do from
     // rootless container). Pass the address via HOST_IPV6 env var in the Plan.
+    //
+    // In routed mode, only add to lo — adding to eth0 causes the kernel to use it
+    // as source address for outbound IPv6, but the bridge can't deliver replies
+    // because NDP for the fbwhoami address isn't configured on the namespace side.
     if let Some(ipv6) = plan.env.get("HOST_IPV6") {
         if !ipv6.is_empty() {
-            for dev in &["lo", "eth0"] {
+            // Check if routed mode: guest_ipv6 includes /128 prefix in the boot param.
+            // In routed mode, only add fbwhoami to lo — not eth0 — to avoid source
+            // address conflicts (NDP for fbwhoami isn't configured on the namespace side).
+            // Pasta mode uses /64 (or no prefix) and is fine with fbwhoami on eth0.
+            let is_routed_mode = std::fs::read_to_string("/proc/cmdline")
+                .map(|c| {
+                    c.split_whitespace()
+                        .any(|p| p.starts_with("ipv6=") && p.contains("/128"))
+                })
+                .unwrap_or(false);
+            let devices: &[&str] = if is_routed_mode {
+                &["lo"]
+            } else {
+                &["lo", "eth0"]
+            };
+            for dev in devices {
                 let result = std::process::Command::new("ip")
                     .args(["addr", "add", &format!("{}/128", ipv6), "dev", dev])
                     .output();

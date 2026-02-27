@@ -448,6 +448,9 @@ install-host-kernel: build setup-btrfs
 # Run setup inside container (for CI - container has Firecracker)
 container-setup-fcvm: container-build setup-btrfs
 	@echo "==> Running fcvm setup in container..."
+	@# Fix ownership for rootless podman: container UID 0 maps to host user,
+	@# so /mnt/fcvm-btrfs/firecracker must be writable by current user (not root)
+	@sudo chown -R $$(id -un):$$(id -gn) /mnt/fcvm-btrfs/firecracker 2>/dev/null || true
 	$(CONTAINER_RUN) $(CONTAINER_TAG) make build _setup-fcvm
 
 _setup-fcvm:
