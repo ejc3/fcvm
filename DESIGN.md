@@ -2183,11 +2183,9 @@ In `create_snapshot_core()`, after creating the diff snapshot but before resumin
 
 This is a detection + recovery approach because the bug is in KVM kernel code we don't control.
 
-Additional defenses:
+Additional defense:
 - **Post-resume liveness check**: After restoring a snapshot, wait 200ms and `try_wait()` to
-  detect immediate kernel panics. Returns error so caller can fall back.
-- **Startup snapshot fallback**: If startup snapshot restore fails, fall back to pre-start
-  snapshot (slower boot but still cached).
+  detect immediate kernel panics. Returns error so the snapshot is known to be bad.
 
 ---
 
