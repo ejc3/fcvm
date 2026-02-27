@@ -546,9 +546,9 @@ impl NetworkManager for RoutedNetwork {
                     } else {
                         "port may already be in use"
                     };
-                    warn!(
-                        exit_code = ?status.code(),
-                        "socat exited immediately — {hint}"
+                    anyhow::bail!(
+                        "socat exited immediately (exit code {:?}) — {hint}",
+                        status.code()
                     );
                 }
             }
