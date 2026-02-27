@@ -2,14 +2,14 @@
 
 VM-level isolation with a container workflow. fcvm runs Podman containers inside Firecracker microVMs — same images, same registries, but each container gets its own kernel.
 
-- ~540ms cached startup via snapshot restore (vs ~3s cold — see [Container Image Cache](#container-image-cache))
-- ~10ms VM cloning via UFFD memory sharing + btrfs reflinks (see [PERFORMANCE.md](PERFORMANCE.md) for breakdown)
+- ~540ms cached startup via snapshot restore, vs ~3s cold (see [Container Image Cache](#container-image-cache))
+- ~10ms VM cloning via UFFD memory sharing + btrfs reflinks
 - 50 clones share physical pages through kernel page cache (~512MB total, not 25GB)
 - Rootless, bridged, and routed networking
 - Full `-it` support (vim, colors, Ctrl+C)
 - HTTP API (`fcvm serve`) for programmatic sandbox management
 
-All benchmarks measured on c7g.metal ARM64. See [PERFORMANCE.md](PERFORMANCE.md) for methodology and detailed results.
+All benchmarks on c7g.metal ARM64. See [PERFORMANCE.md](PERFORMANCE.md) for methodology and results.
 
 ---
 
@@ -270,7 +270,7 @@ fcvm auto-forwards `http_proxy`/`https_proxy` from host to VM via MMDS.
 - Firecracker binary in PATH
 - For rootless: `passt` package (provides `pasta`)
 - For bridged: sudo, iptables, iproute2
-- For routed: sudo, ip6tables, iproute2, host with global IPv6 /64
+- For routed: sudo, ip6tables, iproute2, socat, host with global IPv6 /64
 - For rootfs build: qemu-utils, e2fsprogs
 
 **Storage:** btrfs at `/mnt/fcvm-btrfs` (auto-created as loopback on non-btrfs hosts)
@@ -282,7 +282,7 @@ fcvm auto-forwards `http_proxy`/`https_proxy` from host to VM via MMDS.
 # Install dependencies
 sudo apt-get update && sudo apt-get install -y \
     fuse3 libfuse3-dev libclang-dev clang musl-tools \
-    iproute2 iptables passt qemu-utils e2fsprogs uidmap
+    iproute2 iptables passt socat qemu-utils e2fsprogs uidmap
 
 # Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
