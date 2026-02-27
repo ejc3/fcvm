@@ -74,7 +74,7 @@ async fn test_diff_snapshot_prestart_full_startup_diff() -> Result<()> {
 
     // Start VM with health check URL to trigger both pre-start and startup snapshots
     println!("Starting VM with --health-check (triggers both pre-start and startup)...");
-    let (mut child, fcvm_pid) = common::spawn_fcvm_with_logs(
+    let (mut child, fcvm_pid, log_path) = common::spawn_fcvm_with_log_path(
         &[
             "podman",
             "run",
@@ -92,6 +92,7 @@ async fn test_diff_snapshot_prestart_full_startup_diff() -> Result<()> {
     .context("spawning fcvm")?;
 
     println!("  fcvm PID: {}", fcvm_pid);
+    println!("  Log file: {}", log_path.display());
     println!("  Waiting for VM to become healthy (creates pre-start, then startup)...");
 
     // Wait for healthy status (triggers startup snapshot creation)
@@ -114,46 +115,47 @@ async fn test_diff_snapshot_prestart_full_startup_diff() -> Result<()> {
         Ok(Ok(_)) => {
             println!("  VM became healthy");
 
-            // Check the log file for diff snapshot indicators
-            let log_path = format!("/tmp/fcvm-test-logs/{}-*.log", vm_name);
-            let logs = glob::glob(&log_path)
-                .ok()
-                .and_then(|mut paths| paths.next())
-                .and_then(|p| p.ok());
+            let (has_full, has_diff, has_merge) =
+                check_log_for_diff_snapshot(log_path.to_str().unwrap()).await;
 
-            if let Some(log_file) = logs {
-                let (has_full, has_diff, has_merge) =
-                    check_log_for_diff_snapshot(log_file.to_str().unwrap()).await;
+            println!("\n  Log analysis (from {}):", log_path.display());
+            println!("    Full snapshot created: {}", has_full);
+            println!("    Diff snapshot created: {}", has_diff);
+            println!("    Diff merge performed:  {}", has_merge);
 
-                println!("\n  Log analysis:");
-                println!("    Full snapshot created: {}", has_full);
-                println!("    Diff snapshot created: {}", has_diff);
-                println!("    Diff merge performed:  {}", has_merge);
-
-                // Both Full (pre-start) and Diff (startup) should be created
-                if has_full && has_diff && has_merge {
-                    println!("\n✅ DIFF SNAPSHOT TEST PASSED!");
-                    println!("  Pre-start = Full snapshot");
-                    println!("  Startup = Diff snapshot (merged onto base)");
-                    return Ok(());
-                } else {
-                    let mut missing = vec![];
-                    if !has_full {
-                        missing.push("Full snapshot (pre-start)");
-                    }
-                    if !has_diff {
-                        missing.push("Diff snapshot (startup)");
-                    }
-                    if !has_merge {
-                        missing.push("Diff merge");
-                    }
-                    anyhow::bail!(
-                        "Expected Full + Diff + Merge but missing: {}",
-                        missing.join(", ")
-                    );
-                }
+            // Both Full (pre-start) and Diff (startup) should be created
+            if has_full && has_diff && has_merge {
+                println!("\n✅ DIFF SNAPSHOT TEST PASSED!");
+                println!("  Pre-start = Full snapshot");
+                println!("  Startup = Diff snapshot (merged onto base)");
+                return Ok(());
             } else {
-                anyhow::bail!("Could not find log file to verify diff snapshot types");
+                let mut missing = vec![];
+                if !has_full {
+                    missing.push("Full snapshot (pre-start)");
+                }
+                if !has_diff {
+                    missing.push("Diff snapshot (startup)");
+                }
+                if !has_merge {
+                    missing.push("Diff merge");
+                }
+                // Print log content for debugging
+                let log_content = tokio::fs::read_to_string(&log_path)
+                    .await
+                    .unwrap_or_else(|e| format!("(failed to read log: {})", e));
+                let snapshot_lines: Vec<&str> = log_content
+                    .lines()
+                    .filter(|l| l.contains("snapshot") && !l.contains("Snapshot miss"))
+                    .collect();
+                println!("\n  Snapshot-related log lines:");
+                for line in &snapshot_lines {
+                    println!("    {}", line);
+                }
+                anyhow::bail!(
+                    "Expected Full + Diff + Merge but missing: {}",
+                    missing.join(", ")
+                );
             }
         }
         Ok(Err(e)) => {
