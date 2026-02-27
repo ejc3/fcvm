@@ -82,18 +82,31 @@ pub async fn start_port_forwards(
     ns_name: &str,
     guest_ip: &str,
 ) -> Result<Vec<JoinHandle<()>>> {
-    let mut handles = Vec::new();
+    let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
     for mapping in mappings {
-        let bind_addr: SocketAddr = format!("{}:{}", loopback_ip, mapping.host_port)
-            .parse()
-            .with_context(|| {
-                format!("invalid bind address {}:{}", loopback_ip, mapping.host_port)
-            })?;
+        let bind_addr: SocketAddr = match format!("{}:{}", loopback_ip, mapping.host_port).parse() {
+            Ok(addr) => addr,
+            Err(e) => {
+                for h in &handles {
+                    h.abort();
+                }
+                return Err(anyhow::anyhow!(e)).with_context(|| {
+                    format!("invalid bind address {}:{}", loopback_ip, mapping.host_port)
+                });
+            }
+        };
 
-        let listener = tokio::net::TcpListener::bind(bind_addr)
-            .await
-            .with_context(|| format!("binding port forward on {bind_addr}"))?;
+        let listener = match tokio::net::TcpListener::bind(bind_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                for h in &handles {
+                    h.abort();
+                }
+                return Err(anyhow::anyhow!(e))
+                    .with_context(|| format!("binding port forward on {bind_addr}"));
+            }
+        };
 
         info!(
             host_port = mapping.host_port,
@@ -103,11 +116,17 @@ pub async fn start_port_forwards(
         );
 
         let ns_name = ns_name.to_string();
-        let guest_addr: SocketAddr = format!("{}:{}", guest_ip, mapping.guest_port)
-            .parse()
-            .with_context(|| {
-                format!("invalid guest address {}:{}", guest_ip, mapping.guest_port)
-            })?;
+        let guest_addr: SocketAddr = match format!("{}:{}", guest_ip, mapping.guest_port).parse() {
+            Ok(addr) => addr,
+            Err(e) => {
+                for h in &handles {
+                    h.abort();
+                }
+                return Err(anyhow::anyhow!(e)).with_context(|| {
+                    format!("invalid guest address {}:{}", guest_ip, mapping.guest_port)
+                });
+            }
+        };
 
         let handle = tokio::spawn(async move {
             loop {
