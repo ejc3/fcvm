@@ -524,7 +524,10 @@ impl NetworkManager for RoutedNetwork {
             // IPv4 DNS (e.g. VPC's 10.0.0.2) is unreachable without MASQUERADE.
             // Detect an IPv6 DNS server reachable via native routed IPv6.
             dns_server: detect_ipv6_dns().await,
-            guest_ipv6: Some(vm_ipv6),
+            // Include /128 prefix so fc-agent uses a host route instead of /64 on-link.
+            // With /64, the VM would try NDP for other addresses in the host's subnet
+            // directly on eth0, which fails (they're behind the veth + physical network).
+            guest_ipv6: Some(format!("{}/128", vm_ipv6)),
             // fd00::1 is on the bridge inside the namespace. The VM uses it as IPv6 gateway.
             // NDP resolves it on the VM's local link (TAP → bridge → fd00::1 responds).
             // The namespace kernel then forwards to the veth → host.

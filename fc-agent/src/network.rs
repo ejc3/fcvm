@@ -297,33 +297,33 @@ pub fn configure_ipv6_from_cmdline() {
         eprintln!("[fc-agent] WARNING: invalid ipv6= format, expected <client>|<gateway>");
         return;
     }
-    let client = parts[0];
+    let client_raw = parts[0];
     let gateway = parts[1];
 
-    eprintln!("[fc-agent] IPv6: client={}, gateway={}", client, gateway);
+    // Parse optional prefix length from client address (e.g., "addr/128" or just "addr").
+    // Routed mode passes /128 (VM's only neighbor is the bridge, no on-link /64 needed).
+    // Pasta mode omits the prefix, defaulting to /64 (needed for on-link NDP to fd00::2).
+    let (client, prefix_len) = if let Some((addr, pfx)) = client_raw.split_once('/') {
+        (addr, pfx)
+    } else {
+        (client_raw, "64")
+    };
 
-    // Use /128 prefix — the VM's only neighbor on eth0 is the bridge (gateway).
-    // A /64 on-link route would cause the VM to try NDP for other addresses in
-    // the subnet directly on eth0, which fails since they're on the physical
-    // network behind the veth pair. All external traffic goes via the default
-    // route (which uses `onlink` so it works without a matching on-link prefix).
+    eprintln!(
+        "[fc-agent] IPv6: client={}, prefix=/{}, gateway={}",
+        client, prefix_len, gateway
+    );
+
     // nodad: DAD is pointless on a Firecracker TAP (single endpoint) and adds
     // 1-2s of "tentative" state that blocks IPv6 traffic.
+    let addr_cidr = format!("{}/{}", client, prefix_len);
     let addr_output = std::process::Command::new("ip")
-        .args([
-            "-6",
-            "addr",
-            "add",
-            &format!("{}/128", client),
-            "dev",
-            "eth0",
-            "nodad",
-        ])
+        .args(["-6", "addr", "add", &addr_cidr, "dev", "eth0", "nodad"])
         .output();
 
     match addr_output {
         Ok(output) if output.status.success() => {
-            eprintln!("[fc-agent] added IPv6 address {}/128 to eth0", client);
+            eprintln!("[fc-agent] added IPv6 address {} to eth0", addr_cidr);
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
