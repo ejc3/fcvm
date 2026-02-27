@@ -2110,6 +2110,87 @@ The 64 CPUs help within each crate (LLVM codegen), but crate-level parallelism i
 
 ---
 
+## KVM ARM64 Dirty Page Tracking Bug (2026-02)
+
+### Problem
+
+Under parallel test load on ARM64, diff snapshots occasionally capture only ~94 KB of dirty
+pages instead of the expected ~37-43 MB. Restoring the merged snapshot kernel-panics with:
+
+```
+stack-protector: Kernel stack is corrupted in: do_idle
+Kernel panic - not syncing: stack-protector: Kernel stack is corrupted in: do_idle
+```
+
+### Snapshot Workflow
+
+1. Load pre-start snapshot with `track_dirty_pages: true`
+2. Resume VM — VM boots, container initializes until healthy
+3. Pause VM — Create diff snapshot
+4. Merge diff into pre-start base → startup snapshot
+
+### Root Cause
+
+KVM ARM64's `KVM_GET_DIRTY_LOG` silently returns a nearly-empty bitmap. The diff snapshot
+captures only device-emulation pages (virtio queue pages marked by Firecracker's internal
+`AtomicBitmap` via `mark_virtio_queue_memory_dirty()`), while missing ALL guest OS memory
+writes tracked by KVM's Stage-2 page tables.
+
+**CI data showing the failure:**
+
+| Round | bytes_merged | data_regions | Result |
+|-------|-------------|-------------|--------|
+| 07:54 | 37,834,752 | 2,824 | OK |
+| 08:34 | 43,225,088 | 3,648 | OK |
+| 15:20 | 40,157,184 | 3,039 | OK |
+| **17:35** | **94,208** | **9** | **KERNEL PANIC** |
+
+Both rootless AND routed snapshots created at the same time had EXACTLY 94,208 bytes —
+a systematic KVM dirty tracking failure, not random corruption.
+
+### Firecracker Is Correct
+
+Investigated the Firecracker source (`ejc3/firecracker`, branch `bump-vsock-max-connections`):
+
+- `KVM_MEM_LOG_DIRTY_PAGES` is correctly set on memory regions during `load_snapshot`
+  (via `KVM_SET_USER_MEMORY_REGION` in `vstate/memory.rs`)
+- No code path resets or discards the dirty bitmap between load and diff creation
+- vCPU pause is properly synchronized before `KVM_GET_DIRTY_LOG`
+- The ~94 KB corresponds to virtio queue pages marked by Firecracker's internal bitmap
+  after the previous snapshot — these don't rely on KVM tracking
+
+### Likely KVM-Level Causes
+
+1. **UFFD + dirty tracking interaction** (highest suspicion): Pages populated via `UFFD_COPY`
+   during snapshot restore may get Stage-2 mappings created without write-protection when
+   dirty logging was enabled before the host PTE existed. Under load, delayed UFFD faults
+   mean pages fault in after VM resumes, bypassing dirty tracking entirely.
+
+2. **Stage-2 TLB stale entries**: Incomplete TLB invalidation after enabling dirty logging
+   under heavy load (IPI delays) allows writes through stale entries that bypass tracking.
+
+3. **Block mapping coalescing**: KVM ARM64 can create 2 MB block mappings in Stage-2. If
+   splitting into 4 KB write-protected pages is delayed, writes bypass per-page tracking.
+
+### Fix: Diff Validation + Full Retry
+
+In `create_snapshot_core()`, after creating the diff snapshot but before resuming the VM:
+
+1. Check diff file's actual disk usage (`meta.blocks() * 512`)
+2. If `diff_allocated < memory_bytes / 1024` (0.1% of VM memory), the diff is corrupt
+3. Retry as Full snapshot while VM is still paused
+4. Skip the merge step and use the full snapshot directly
+
+This is a detection + recovery approach because the bug is in KVM kernel code we don't control.
+
+Additional defenses:
+- **Post-resume liveness check**: After restoring a snapshot, wait 200ms and `try_wait()` to
+  detect immediate kernel panics. Returns error so caller can fall back.
+- **Startup snapshot fallback**: If startup snapshot restore fails, fall back to pre-start
+  snapshot (slower boot but still cached).
+
+---
+
 ## References
 
 - [Firecracker Documentation](https://github.com/firecracker-microvm/firecracker/tree/main/docs)

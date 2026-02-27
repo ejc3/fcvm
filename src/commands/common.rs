@@ -7,7 +7,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use nix::sys::uio::{pread, pwrite};
 use nix::unistd::{lseek, Whence};
 use tokio::sync::Semaphore;
@@ -1083,6 +1083,19 @@ pub async fn restore_from_snapshot(
             .collect();
     }
 
+    // Post-resume liveness check: verify VM didn't crash immediately.
+    // Under heavy I/O load, snapshot restore can corrupt guest memory (e.g., stack
+    // canary in do_idle), causing an immediate kernel panic + reboot. Detecting this
+    // early allows the caller to fall back to a different snapshot or cold boot.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    if let Some(status) = vm_manager.try_wait()? {
+        bail!(
+            "VM crashed immediately after snapshot restore (exit status: {:?}). \
+             This can happen under heavy I/O load due to memory corruption during restore.",
+            status
+        );
+    }
+
     // Save VM state with complete network configuration
     save_vm_state_with_network(state_manager, vm_state, network_config).await?;
 
@@ -1395,6 +1408,7 @@ pub async fn create_snapshot_core(
     }
 
     // VM is now paused — we MUST resume it before returning, no matter what.
+    let mut use_diff = has_base;
     let snapshot_result = snapshot_client
         .create_snapshot(SnapshotCreate {
             snapshot_type: Some(snapshot_type.to_string()),
@@ -1402,6 +1416,71 @@ pub async fn create_snapshot_core(
             mem_file_path: temp_memory_path.display().to_string(),
         })
         .await;
+
+    // Validate diff snapshot: detect KVM dirty page tracking failure.
+    //
+    // On ARM64 under load, KVM can silently lose the dirty bitmap — the diff snapshot
+    // captures only device-emulation pages (~94 KB) while missing all guest OS writes
+    // (~37-43 MB). Restoring such a snapshot kernel-panics with:
+    //   "stack-protector: Kernel stack is corrupted in: do_idle"
+    // because the vmstate has startup-time registers but memory has pre-start content.
+    //
+    // Detection: check the diff file's actual disk usage. A VM that ran from pre-start
+    // to healthy MUST have dirtied at least 0.1% of memory (~1 MB for a 1 GB VM).
+    // If the diff is smaller, retry as Full while the VM is still paused.
+    if snapshot_result.is_ok() && has_base {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = std::fs::metadata(&temp_memory_path) {
+            let diff_allocated = meta.blocks() * 512;
+            let memory_bytes = (snapshot_config.metadata.memory_mib as u64) * 1024 * 1024;
+            // 0.1% of VM memory — a VM that started a container must dirty at least this much.
+            // Empirically, pre-start → startup diffs are 36-43 MB for a 1 GB VM (3.5-4.1%).
+            let min_diff_bytes = memory_bytes / 1024;
+
+            if diff_allocated < min_diff_bytes {
+                error!(
+                    snapshot = %snapshot_config.name,
+                    diff_allocated_bytes = diff_allocated,
+                    diff_file_size = meta.len(),
+                    min_expected_bytes = min_diff_bytes,
+                    memory_mib = snapshot_config.metadata.memory_mib,
+                    "diff snapshot too small — KVM dirty page tracking lost guest writes. \
+                     Retrying as Full snapshot (VM still paused)."
+                );
+
+                // Remove bad diff file and retry as Full
+                let _ = std::fs::remove_file(&temp_memory_path);
+                let full_memory_path = temp_snapshot_dir.join("memory.bin");
+                match snapshot_client
+                    .create_snapshot(SnapshotCreate {
+                        snapshot_type: Some("Full".to_string()),
+                        snapshot_path: temp_vmstate_path.display().to_string(),
+                        mem_file_path: full_memory_path.display().to_string(),
+                    })
+                    .await
+                {
+                    Ok(()) => {
+                        use_diff = false;
+                        info!(
+                            snapshot = %snapshot_config.name,
+                            "Full snapshot retry succeeded"
+                        );
+                    }
+                    Err(e) => {
+                        // Full retry failed — resume VM and abort
+                        let _ = snapshot_client
+                            .patch_vm_state(ApiVmState {
+                                state: "Resumed".to_string(),
+                            })
+                            .await;
+                        let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+                        return Err(e)
+                            .context("Full snapshot retry failed after diff tracking failure");
+                    }
+                }
+            }
+        }
+    }
 
     // Copy disk while VM is still paused to maintain memory/disk consistency.
     // If we copy after resume, the disk may have post-resume writes that don't
@@ -1477,7 +1556,7 @@ pub async fn create_snapshot_core(
     // and reconnects FUSE/output vsock unnecessarily, crashing the running container.
     // restore-epoch is bumped in the restore path (snapshot.rs) where it's needed.
 
-    if has_base {
+    if use_diff {
         // Diff snapshot: copy base to temp, merge diff onto it, then atomic rename
         // At this point:
         //   - temp_memory_path = memory.diff (Firecracker wrote the sparse diff here)
@@ -1544,9 +1623,10 @@ pub async fn create_snapshot_core(
             .context("renaming temp snapshot to final location")?;
     }
 
+    let actual_type = if use_diff { "Diff" } else { snapshot_type };
     info!(
         snapshot = %snapshot_config.name,
-        snapshot_type = snapshot_type,
+        snapshot_type = actual_type,
         disk = %snapshot_config.disk_path.display(),
         "snapshot created successfully"
     );
@@ -1694,5 +1774,92 @@ mod tests {
         assert!(result[0].read_only);
         assert_eq!(result[0].vsock_port, 5000);
         assert!(!result[0].portable);
+    }
+
+    #[test]
+    fn test_merge_diff_snapshot_applies_dirty_pages() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Create a base memory file (64 KB)
+        let mut base = NamedTempFile::new().unwrap();
+        let base_data = vec![0xAAu8; 65536];
+        base.write_all(&base_data).unwrap();
+        base.flush().unwrap();
+
+        // Create a diff file: sparse, with data only at offset 4096 and 8192
+        let diff = NamedTempFile::new().unwrap();
+        let diff_path = diff.path().to_path_buf();
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = diff.as_file().as_raw_fd();
+
+            // Set file size to match base (sparse)
+            nix::unistd::ftruncate(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }, 65536)
+                .unwrap();
+
+            // Write dirty page at offset 4096 (page 1)
+            let dirty_page = vec![0xBBu8; 4096];
+            nix::sys::uio::pwrite(diff.as_file(), &dirty_page, 4096).unwrap();
+
+            // Write dirty page at offset 8192 (page 2)
+            let dirty_page2 = vec![0xCCu8; 4096];
+            nix::sys::uio::pwrite(diff.as_file(), &dirty_page2, 8192).unwrap();
+        }
+
+        // Merge diff onto base
+        let bytes = merge_diff_snapshot(base.path(), &diff_path).unwrap();
+        assert_eq!(bytes, 8192, "should merge exactly 2 pages (8192 bytes)");
+
+        // Verify: base[0..4096] = 0xAA (unchanged)
+        //         base[4096..8192] = 0xBB (from diff)
+        //         base[8192..12288] = 0xCC (from diff)
+        //         base[12288..] = 0xAA (unchanged)
+        let result = std::fs::read(base.path()).unwrap();
+        assert_eq!(result.len(), 65536);
+        assert!(
+            result[..4096].iter().all(|&b| b == 0xAA),
+            "page 0 should be unchanged"
+        );
+        assert!(
+            result[4096..8192].iter().all(|&b| b == 0xBB),
+            "page 1 should be 0xBB from diff"
+        );
+        assert!(
+            result[8192..12288].iter().all(|&b| b == 0xCC),
+            "page 2 should be 0xCC from diff"
+        );
+        assert!(
+            result[12288..].iter().all(|&b| b == 0xAA),
+            "remaining pages should be unchanged"
+        );
+    }
+
+    #[test]
+    fn test_merge_diff_snapshot_empty_diff_returns_zero() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Create base and empty sparse diff
+        let mut base = NamedTempFile::new().unwrap();
+        base.write_all(&vec![0xAAu8; 4096]).unwrap();
+        base.flush().unwrap();
+
+        let diff = NamedTempFile::new().unwrap();
+        let diff_path = diff.path().to_path_buf();
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = diff.as_file().as_raw_fd();
+            nix::unistd::ftruncate(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }, 4096)
+                .unwrap();
+        }
+
+        // Empty diff → zero bytes merged
+        let bytes = merge_diff_snapshot(base.path(), &diff_path).unwrap();
+        assert_eq!(bytes, 0, "empty diff should merge zero bytes");
+
+        // Base should be unchanged
+        let result = std::fs::read(base.path()).unwrap();
+        assert!(result.iter().all(|&b| b == 0xAA));
     }
 }

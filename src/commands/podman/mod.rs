@@ -333,8 +333,16 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 hugepages: Some(args.hugepages),
                 non_blocking_output: args.non_blocking_output,
             };
-            super::snapshot::cmd_snapshot_run(snapshot_args).await?;
-            return Ok(None);
+            match super::snapshot::cmd_snapshot_run(snapshot_args).await {
+                Ok(()) => return Ok(None),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "Startup snapshot restore failed, falling back to pre-start snapshot"
+                    );
+                    // Fall through to pre-start snapshot or cold boot below
+                }
+            }
         }
 
         // Check for pre-start snapshot (container loaded but not initialized)
