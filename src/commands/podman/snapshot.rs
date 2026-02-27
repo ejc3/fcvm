@@ -183,6 +183,7 @@ pub(super) fn build_firecracker_config(
     let network_mode = match args.network {
         crate::cli::args::NetworkMode::Bridged => FcNetworkMode::Bridged,
         crate::cli::args::NetworkMode::Rootless => FcNetworkMode::Rootless,
+        crate::cli::args::NetworkMode::Routed => FcNetworkMode::Routed,
     };
 
     // Collect extra disk specifications for cache key.

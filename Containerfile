@@ -15,7 +15,7 @@ RUN cargo install cargo-nextest cargo-audit cargo-deny --locked
 RUN apt-get update && apt-get install -y \
     fuse3 libfuse3-dev autoconf automake libtool perl libclang-dev clang cmake \
     musl-tools iproute2 iptables passt dnsmasq qemu-utils e2fsprogs btrfs-progs \
-    parted fdisk podman skopeo git curl sudo procps zstd busybox-static cpio uidmap \
+    parted fdisk podman skopeo git curl sudo procps zstd busybox-static cpio uidmap socat \
     flex bison bc libelf-dev libssl-dev libseccomp-dev \
     && rm -rf /var/lib/apt/lists/*
 

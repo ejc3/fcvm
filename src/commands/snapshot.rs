@@ -13,7 +13,7 @@ use crate::cli::{
     NetworkMode, SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs,
     SnapshotServeArgs,
 };
-use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, PortMapping};
+use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, PortMapping, RoutedNetwork};
 use crate::paths;
 use crate::state::{
     generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState, VmStatus,
@@ -653,10 +653,12 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Extract guest_ip from snapshot metadata for network config reuse
     let saved_network = &snapshot_config.metadata.network_config;
 
-    // Bridged mode requires root for iptables and network namespace setup
-    if matches!(args.network, NetworkMode::Bridged) && !nix::unistd::geteuid().is_root() {
+    // Bridged/routed mode requires root for iptables and network namespace setup
+    if matches!(args.network, NetworkMode::Bridged | NetworkMode::Routed)
+        && !nix::unistd::geteuid().is_root()
+    {
         bail!(
-            "Bridged networking requires root. Either:\n  \
+            "Bridged/routed networking requires root. Either:\n  \
              - Run with sudo: sudo fcvm snapshot run ...\n  \
              - Use rootless mode: fcvm snapshot run --network rootless ..."
         );
@@ -665,7 +667,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     if matches!(args.network, NetworkMode::Rootless) && nix::unistd::geteuid().is_root() {
         warn!(
             "Running rootless mode as root is unnecessary. \
-             Consider using --network bridged for better performance."
+             Consider using --network bridged or --network routed for better performance."
         );
     }
 
@@ -681,6 +683,19 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                     guest_ip = %guest_ip,
                     "clone will use same network config as snapshot"
                 );
+            }
+            Box::new(net)
+        }
+        NetworkMode::Routed => {
+            RoutedNetwork::preflight_check().context("routed mode preflight check failed")?;
+            let mut net =
+                RoutedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
+            if !port_mappings.is_empty() {
+                let loopback_ip = state_manager
+                    .allocate_loopback_ip(&mut vm_state)
+                    .await
+                    .context("allocating loopback IP for routed clone")?;
+                net = net.with_loopback_ip(loopback_ip);
             }
             Box::new(net)
         }
@@ -701,6 +716,29 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     };
 
     let network_config = network.setup().await.context("setting up network")?;
+
+    // For routed mode clones: the snapshot's guest IPv6 (baked into boot params) is shared
+    // across all clones. After restore, fc-agent will be told to swap it to the unique
+    // per-clone vm_ipv6. Store the new vm_ipv6 so the exec reconfigure command can use it.
+    let clone_ipv6_swap: Option<(String, String)> = if let Some(routed_net) =
+        network
+            .as_any()
+            .downcast_ref::<crate::network::RoutedNetwork>()
+    {
+        match (&saved_network.guest_ipv6, routed_net.vm_ipv6()) {
+            (Some(old), Some(new)) if old != new => {
+                info!(
+                    old_ipv6 = %old,
+                    new_ipv6 = %new,
+                    "will reconfigure guest IPv6 after restore"
+                );
+                Some((old.clone(), new.to_string()))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
 
     // Health check URL comes from snapshot metadata — it's a property of the VM image.
     // The cache key includes health_check_url, so each config gets its own snapshot.
@@ -823,6 +861,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         runtime_config: &runtime_config,
         restore_config: &restore_config,
         network_config: &network_config,
+        clone_ipv6: clone_ipv6_swap.as_ref().map(|(_, new)| new.clone()),
     };
     let setup_result = super::common::restore_from_snapshot(
         restore_params,
@@ -871,6 +910,10 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     }
 
     let (mut vm_manager, mut holder_child) = setup_result.unwrap();
+
+    // For routed mode clones: fc-agent reconfigures eth0 with the new vm_ipv6 via MMDS.
+    // The state already has the correct guest_ipv6 = vm_ipv6 (set by restore_from_snapshot).
+    // Subsequent snapshots from this clone will record the vm_ipv6 that the guest actually uses.
 
     // fc-agent's handle_clone_restore() now drives the output reconnect sequence:
     // exec rebind → wait for confirmation → output.reconnect(). No host-side

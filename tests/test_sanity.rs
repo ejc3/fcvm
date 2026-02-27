@@ -20,6 +20,12 @@ async fn test_sanity_rootless() -> Result<()> {
     sanity_test_impl("rootless").await
 }
 
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_sanity_routed() -> Result<()> {
+    sanity_test_impl("routed").await
+}
+
 async fn sanity_test_impl(network: &str) -> Result<()> {
     use std::time::Duration;
 

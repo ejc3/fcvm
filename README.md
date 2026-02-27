@@ -1,607 +1,394 @@
-# fcvm - Firecracker VM Manager
+# fcvm
 
-Run Podman containers in Firecracker microVMs with fast cloning via UFFD memory sharing and btrfs CoW snapshots.
+VM-level isolation with a container workflow. fcvm runs Podman containers inside Firecracker microVMs — same images, same registries, but each container gets its own kernel.
 
-> **Features**
-> - Run OCI containers in isolated Firecracker microVMs
-> - **~6x faster startup** with container image cache (540ms vs 3100ms)
-> - VM cloning via UFFD memory server + btrfs reflinks (~10ms restore, ~610ms with exec)
-> - Multiple VMs share memory via kernel page cache (50 VMs = ~512MB, not 25GB)
-> - Dual networking: bridged (iptables) or rootless (pasta)
-> - Transparent egress proxy for outbound internet (243 MB/s, 8000 concurrent connections)
-> - Port forwarding for both regular VMs and clones
-> - FUSE-based host directory mapping via fuse-pipe
-> - Container exit code forwarding
-> - Interactive shell support (`-it`) with full TTY (vim, editors, colors)
-> - HTTP API server (`fcvm serve`) — ComputeSDK-compatible gateway for programmatic sandbox management
+- ~540ms cached startup via snapshot restore, vs ~3s cold (see [Container Image Cache](#container-image-cache))
+- ~10ms VM cloning via UFFD memory sharing + btrfs reflinks
+- 50 clones share physical pages through kernel page cache (~512MB total, not 25GB)
+- Rootless, bridged, and routed networking
+- Full `-it` support (vim, colors, Ctrl+C)
+- HTTP API (`fcvm serve`) for programmatic sandbox management
 
----
-
-## Prerequisites
-
-**Hardware**
-- Linux with `/dev/kvm` (bare-metal or nested virtualization)
-- For AWS: c6g.metal (ARM64) or c5.metal (x86_64) - NOT regular instances
-
-**Runtime Dependencies**
-- Rust 1.83+ with cargo ([rustup.rs](https://rustup.rs))
-- musl target: `rustup target add $(uname -m)-unknown-linux-musl`
-- Firecracker binary in PATH
-- For bridged networking: sudo, iptables, iproute2
-- For rootless networking: passt (provides the `pasta` binary)
-- For building rootfs: qemu-utils, e2fsprogs
-
-**Storage**
-- btrfs filesystem at `/mnt/fcvm-btrfs` (native btrfs used directly; loopback created on non-btrfs hosts)
-- Kernel auto-downloaded from Kata Containers release on first run
-
----
-
-## Test Requirements
-
-**Container Testing (Recommended)** - All dependencies bundled:
-```bash
-make container-test  # All tests in container (just needs podman + /dev/kvm)
-```
-
-See [CLAUDE.md](.claude/CLAUDE.md#makefile-targets) for all Makefile targets.
-
-**Native Testing** - Additional dependencies required:
-
-| Category | Packages |
-|----------|----------|
-| FUSE | fuse3, libfuse3-dev |
-| pjdfstest build | autoconf, automake, libtool |
-| pjdfstest runtime | perl |
-| bindgen (userfaultfd-sys) | libclang-dev, clang |
-| VM tests | iproute2, iptables, passt |
-| Rootfs build | qemu-utils, e2fsprogs |
-| User namespaces | uidmap (for newuidmap/newgidmap) |
-
-**pjdfstest Setup** (for POSIX compliance tests):
-```bash
-git clone --depth 1 https://github.com/pjd/pjdfstest /tmp/pjdfstest-check
-cd /tmp/pjdfstest-check && autoreconf -ifs && ./configure && make
-```
-
-**Ubuntu/Debian Install**:
-```bash
-sudo apt-get update && sudo apt-get install -y \
-    fuse3 libfuse3-dev \
-    autoconf automake libtool perl \
-    libclang-dev clang \
-    iproute2 iptables passt \
-    qemu-utils e2fsprogs \
-    uidmap
-```
-
-See [`Containerfile`](Containerfile) for the full dependency list used in CI.
-
-**Host system configuration**:
-```bash
-# KVM access
-sudo chmod 666 /dev/kvm
-
-# Userfaultfd for snapshot cloning
-sudo mknod /dev/userfaultfd c 10 126 2>/dev/null || true
-sudo chmod 666 /dev/userfaultfd
-sudo sysctl -w vm.unprivileged_userfaultfd=1
-
-# FUSE allow_other
-echo "user_allow_other" | sudo tee -a /etc/fuse.conf
-
-# Ubuntu 24.04+: allow unprivileged user namespaces
-sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-
-# IP forwarding for container networking (e.g., podman builds)
-sudo sysctl -w net.ipv4.conf.all.forwarding=1
-sudo sysctl -w net.ipv4.conf.default.forwarding=1
-
-# Bridged networking only (not needed for --network rootless):
-sudo mkdir -p /var/run/netns
-sudo iptables -P FORWARD ACCEPT
-# NAT rule is set up automatically by fcvm
-
-# If running fcvm inside a container, set NAT on the HOST (container iptables don't persist):
-# sudo iptables -t nat -A POSTROUTING -s 172.30.0.0/16 -o eth0 -j MASQUERADE
-```
+All benchmarks on c7g.metal ARM64. See [PERFORMANCE.md](PERFORMANCE.md) for methodology and results.
 
 ---
 
 ## Quick Start
 
-fcvm runs containers inside Firecracker microVMs:
-
-```
-You → fcvm → Firecracker VM → Podman → Container
-```
-
-Each `podman run` boots a VM, pulls the image, and starts the container in an isolated microVM.
-First run is ~3s. Cached runs with the same image are ~540ms.
-
 ```bash
-# Install Rust (if not already installed)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source ~/.cargo/env
-
-# Install musl toolchain (for static linking fc-agent binary)
-sudo apt install musl-tools
-rustup target add $(uname -m)-unknown-linux-musl
-
-# Clone and build fcvm + fc-agent binaries (~2 min)
-git clone https://github.com/ejc3/fcvm
-cd fcvm
+# Build (~2 min)
+git clone https://github.com/ejc3/fcvm && cd fcvm
 make build
-# → "Finished release profile [optimized] target(s)"
-
-# Create symlink for convenience (works with sudo)
-ln -sf target/release/fcvm ./fcvm
 
 # Download kernel + build rootfs (~5 min first time, then cached)
 sudo ./fcvm setup
-# → "Setup complete"
 
-# One-shot command (runs, prints output, exits)
+# Run a container in a microVM
 ./fcvm podman run --name hello alpine:latest -- echo "Hello from microVM"
-# → Hello from microVM
 
-# Run a long-lived service (stays in foreground, or add & to background)
+# Run a long-lived service
 ./fcvm podman run --name web nginx:alpine
-# → Logs show VM booting, then "healthy" when nginx is ready
+# → VM boots, image loads, nginx starts. Ctrl+C to stop.
 
 # In another terminal:
-./fcvm ls
-# → Shows "web" with PID, health status, network info
-
-./fcvm exec --name web -- cat /etc/os-release
-# → Shows Alpine Linux info
-
-# Bridged networking (for full network access, requires sudo)
-sudo ./fcvm podman run --name web-bridged --network bridged nginx:alpine
+./fcvm ls                                        # List running VMs
+./fcvm exec --name web -- cat /etc/os-release    # Exec into container
 ```
 
-### Container Image Cache (~6x Faster Startup)
-
-fcvm caches container images after the first pull. Subsequent runs with the same image are ~6x faster (540ms vs 3100ms).
+### Network Modes
 
 ```bash
-# First run: pulls image, creates cache (~3s)
-./fcvm podman run --name web1 nginx:alpine
-# → Cache created for nginx:alpine
+# Rootless (default) — no sudo needed
+./fcvm podman run --name web nginx:alpine
 
-# Second run: restores from cache (~540ms)
-./fcvm podman run --name web2 nginx:alpine
-# → Restored from snapshot
+# Bridged — better performance, requires sudo
+sudo ./fcvm podman run --name web --network bridged nginx:alpine
 
-# Disable snapshot for testing
-./fcvm podman run --name web3 --no-snapshot nginx:alpine
+# Routed — IPv6 native at kernel line rate, requires sudo + IPv6 host
+sudo ./fcvm podman run --name web --network routed nginx:alpine
 ```
 
-**How it works:**
-1. First run: fc-agent pulls image, host takes Firecracker snapshot
-2. Cache key: SHA256 of (image, tag, cmd, env, config)
-3. Subsequent runs: Restore snapshot, fc-agent starts container (image already pulled)
+| Mode | Flag | Root | How It Works |
+|------|------|------|-------------|
+| Rootless | `--network rootless` (default) | No | pasta L4 translation with bridge |
+| Bridged | `--network bridged` | Yes | iptables NAT, network namespace |
+| Routed | `--network routed` | Yes | veth + IPv6 routing, no userspace proxy |
 
-The snapshot captures VM state **after image pull and before container start**.
-On restore, fc-agent runs `podman run` with the already-pulled image, so pull/export is skipped.
-
-### Two-Tier Snapshot System
-
-fcvm uses a two-tier snapshot system to reduce startup time:
-
-| Snapshot | When Created | Content | Size |
-|----------|--------------|---------|------|
-| **Pre-start** | After image pull, before container runs | VM with image loaded | Full (~1GB) |
-| **Startup** | After HTTP health check passes | VM with container fully initialized | Diff (only dirty pages since pre-start) |
-
-The pre-start snapshot is a full memory dump. The startup snapshot uses the pre-start as a
-diff base, capturing only pages dirtied during container initialization. The diff is
-automatically merged onto the base to produce a self-contained `memory.bin`.
-
-The startup snapshot is triggered by `--health-check <url>`.
-After the check passes, fcvm creates a diff snapshot of the initialized app and merges it
-onto the pre-start base. The URL hostname is sent as the Host header. Use `--health-check-timeout <seconds>` to adjust the per-request timeout (default: 5s).
-Second run restores from that snapshot and skips container initialization.
+### Common Options
 
 ```bash
-# First run: Creates pre-start (full) + startup (diff, merged onto base)
-./fcvm podman run --name web --health-check http://localhost/ nginx:alpine
-# → Pre-start snapshot: ~1024MB (full)
-# → Startup snapshot: diff of dirty pages, merged onto pre-start base
-
-# Second run: Restores from startup snapshot
-./fcvm podman run --name web2 --health-check http://localhost/ nginx:alpine
-# → Restored from startup snapshot (application already running)
-```
-
-Clone snapshots use their source as parent for diff-based optimization across the clone chain.
-
-### Image Delivery Modes
-
-fcvm supports three modes for delivering container images to VMs:
-
-| Mode | Flag | Description | Speed |
-|------|------|-------------|-------|
-| **Overlay** (default) | `--image-mode overlay` | Pre-built ext4 image, mounted read-only as `additionalImageStore` | Fast (~540ms cached) |
-| **Btrfs** | `--image-mode btrfs` | Pre-built btrfs image with native subvolumes, reflink-copied per VM | Fast (~540ms cached) |
-| **Archive** | `--image-mode archive` | Docker tar archive, `podman load` at boot | Slow (~3s) |
-
-The mode is auto-detected from the kernel profile (btrfs profile → btrfs mode) or can be set explicitly:
-
-```bash
-# Auto-detect from kernel profile
-./fcvm podman run --name web --kernel-profile btrfs nginx:alpine
-
-# Explicit mode
-./fcvm podman run --name web --image-mode btrfs nginx:alpine
-
-# Archive mode (fallback, no pre-built image needed)
-./fcvm podman run --name web --image-mode archive nginx:alpine
-```
-
-**Btrfs mode** is designed for rootless podman with `--user`. It builds the btrfs storage image as the target user on the host, so file ownership matches what rootless podman expects — no chown needed at boot:
-
-```bash
-# Rootless podman in VM with btrfs storage (no sudo needed)
-./fcvm podman run --name app \
-    --user 1000:1000 \
-    --kernel-profile btrfs \
-    localhost/myimage
-```
-
-**How btrfs mode works:**
-1. Host exports container as Docker archive (`podman save`)
-2. Docker archive is attached to the VM as a read-only block device
-3. VM rootfs is natively btrfs — fc-agent runs `podman load` directly on the btrfs root filesystem (no loopback)
-4. Snapshot caches the post-load state for instant subsequent boots
-
-**Requirements for btrfs mode:**
-- A btrfs kernel profile with `CONFIG_BTRFS_FS=y`: `./fcvm setup --kernel-profile btrfs --build-kernels`
-
-### More Options
-
-```bash
-# Port forwarding (8080 on host -> 80 in container)
+# Port forwarding (host:guest)
 ./fcvm podman run --name web --publish 8080:80 nginx:alpine
-# In rootless: curl the assigned loopback IP (e.g., curl 127.0.0.2:8080)
-# In bridged: curl the veth host IP (see ./fcvm ls --json)
 
-# Mount host directory into container
+# Mount host directory
 ./fcvm podman run --name app --map /host/data:/data alpine:latest
 
 # Custom CPU/memory
 ./fcvm podman run --name big --cpu 4 --mem 4096 alpine:latest
 
-# Interactive shell (-it like docker/podman)
-./fcvm podman run --name shell -it alpine:latest sh
-
-# JSON output for scripting
-./fcvm ls --json
-./fcvm ls --pid 12345    # Filter by PID
-
-# Execute in guest VM instead of container
-./fcvm exec --name web --vm -- hostname
-
-# Interactive shell in container
-./fcvm exec --name web -it -- sh
-
-# TTY for colors (no stdin)
-./fcvm exec --name web -t -- ls -la --color=always
-```
-
-### Snapshot & Clone Workflow
-
-Two modes for restoring from snapshots:
-- **UFFD mode** (`--pid`): Memory served on-demand via UFFD server. Use for many concurrent clones.
-- **Direct mode** (`--snapshot`): Memory loaded directly from file. Use for simpler single-clone flows.
-
-```bash
-# 1. Start baseline VM (using bridged, or omit --network for rootless)
-sudo ./fcvm podman run --name baseline --network bridged public.ecr.aws/nginx/nginx:alpine
-
-# 2. Create snapshot (pauses VM briefly, then resumes)
-sudo ./fcvm snapshot create baseline --tag nginx-warm
-
-# === Direct Mode (simpler, for single clones) ===
-# Clone directly from snapshot files - no server needed
-sudo ./fcvm snapshot run --snapshot nginx-warm --name clone1 --network bridged
-
-# === UFFD Mode (for multiple concurrent clones) ===
-# 3. Start UFFD memory server (serves pages on-demand, memory shared via page cache)
-sudo ./fcvm snapshot serve nginx-warm
-
-# 4. Clone from snapshot (~10ms restore, ~610ms with exec)
-sudo ./fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
-sudo ./fcvm snapshot run --pid <serve_pid> --name clone2 --network bridged
-
-# 5. Clone with port forwarding (each clone can have unique ports)
-sudo ./fcvm snapshot run --pid <serve_pid> --name web1 --network bridged --publish 8081:80
-sudo ./fcvm snapshot run --pid <serve_pid> --name web2 --network bridged --publish 8082:80
-# Get the host IP from fcvm ls --json, then curl it:
-#   curl $(./fcvm ls --json | jq -r '.[] | select(.name=="web1") | .config.network.host_ip'):8081
-
-# 6. Clone and execute command (auto-cleans up after)
-sudo ./fcvm snapshot run --pid <serve_pid> --network bridged --exec "curl localhost"
-# Or in direct mode:
-sudo ./fcvm snapshot run --snapshot nginx-warm --network bridged --exec "curl localhost"
-```
-
-### Hugepages (2MB Pages)
-
-Use `--hugepages` to back VM memory with 2MB hugepages instead of 4KB pages.
-Hugepages reduce TLB pressure for memory-intensive workloads by mapping guest memory
-with 2MB Stage 2 block entries instead of 4KB page table entries.
-
-```bash
-# Allocate hugepage pool (must cover VM memory)
-sudo sh -c 'echo 1200 > /proc/sys/vm/nr_hugepages'  # 2400MB for a 2GB VM
-
-# Run with hugepages
-./fcvm podman run --name web --hugepages --health-check http://localhost/ nginx:alpine
-
-# Release hugepage pool when done
-sudo sh -c 'echo 0 > /proc/sys/vm/nr_hugepages'
-```
-
-**How it works with snapshots:**
-
-The snapshot cache flow creates two snapshots on the initial VM:
-1. **Pre-start (Full)**: After container image import
-2. **Startup (Diff)**: After container is healthy (uses pre-start as base, then merged)
-
-The startup snapshot captures only dirty pages since pre-start and merges them onto the base.
-Restored VMs (clones) with hugepages disabled enable KVM dirty page tracking for
-clone-of-clone diff snapshots.
-
-| VM role | Dirty tracking | Stage 2 mapping | Runs |
-|---------|---------------|-----------------|------|
-| Initial (cache creation) | Disabled | 2MB blocks | Once |
-| Clone (hugepage) | Disabled | 2MB blocks (full TLB benefit) | Many times |
-| Clone (non-hugepage) | Enabled | 4KB (no hugepages anyway) | Many times |
-
-**Benchmark results** (c7gd.metal ARM64, 2GB VM, 256MB dirty data):
-
-```
-Phase                       Standard (4KB)   Hugepages (2MB)    Ratio
---------------------------------------------------------------------
-First Run (cold)                     10.1s              8.6s    0.85x
-Diff Size (dirty)                   95 MB              98 MB    1.03x
-Clone Restore                        0.5s              1.0s    1.99x
-```
-
-**Limitations:**
-- Hugepage pool must be pre-allocated (`/proc/sys/vm/nr_hugepages`)
-- Hugepage VMs require UFFD for snapshot restore (file-based restore is not supported by Firecracker with hugepages)
-- Clone restore is ~2x slower with hugepages due to UFFD page fault handling at 2MB granularity
-- Diff snapshots from hugepage clones use `mincore(2)` fallback (reports in-core pages, not dirty pages), so they may be larger than necessary
-
-**When to use hugepages:** Workloads where the TLB benefit of 2MB mappings on clones
-outweighs the ~2x slower clone restore. Best for long-running VMs with large working sets
-where TLB misses dominate performance.
-
----
-
-## Examples
-
-| Example | Purpose |
-|------|----------------|
-| **Clone Speed** | ~10ms memory restore, ~610ms full cycle |
-| **Memory Sharing** | 10 clones use ~1.5GB extra, not 20GB |
-| **Scale-Out** | 50+ VMs with ~7GB memory, not 100GB |
-| **Privileged Container** | mknod and device access work |
-| **Multiple Ports** | Comma-separated port mappings |
-| **Multiple Volumes** | Comma-separated volume mappings with :ro |
-
-### Clone Speed Breakdown
-
-Clone timing measured on c7g.metal ARM64 with `RUST_LOG=debug`:
-
-| Step | Time | Description |
-|------|------|-------------|
-| State lookup | ~1ms | Find serve process |
-| Namespace spawn | ~6ms | `unshare --user --net` + UID/GID mappings |
-| CoW disk reflink | ~31ms | btrfs instant copy |
-| Network setup | ~35ms | TAP device, iptables rules |
-| Firecracker spawn | ~6ms | Start VM process |
-| **Snapshot load (UFFD)** | **~9ms** | Load memory from server |
-| Disk patch | <1ms | Point to CoW disk |
-| **VM resume** | **<1ms** | Resume vCPUs |
-| fc-agent recovery | ~100ms | ARP flush, kill stale TCP |
-| Exec connect | ~20ms | Connect to guest vsock |
-| Command + cleanup | ~300ms | Run echo + shutdown |
-| **Total** | **~610ms** | Full clone cycle with exec |
-
-Core VM restore (snapshot load + resume) is ~10ms.
-Remaining time is network setup, agent recovery, and cleanup.
-10 parallel clones complete in ~1s wall clock.
-See [PERFORMANCE.md](PERFORMANCE.md) for detailed benchmarks.
-
-**Demo: Time a clone cycle**
-
-```bash
-# Setup: Create baseline and snapshot (rootless mode)
-./fcvm podman run --name baseline nginx:alpine
-./fcvm snapshot create baseline --tag nginx-warm
-./fcvm snapshot serve nginx-warm  # Note the serve PID
-
-# Time a clone startup (includes exec and cleanup)
-time ./fcvm snapshot run --pid <serve_pid> --exec "echo ready"
-# real 0m0.610s  ← 610ms total, ~10ms for VM restore
-```
-
-### Memory Sharing Example
-
-Show that multiple clones share memory via kernel page cache:
-
-```bash
-# Check baseline memory
-free -m | grep Mem
-
-# Start 10 clones from same snapshot
-for i in {1..10}; do
-  ./fcvm snapshot run --pid <serve_pid> --name clone$i &
-done
-wait
-
-# Memory increased only slightly. Clones share pages through the kernel page cache.
-free -m | grep Mem
-```
-
-### Scale-Out Demo (50 VMs in ~3s)
-
-Start 50 web servers in parallel:
-
-```bash
-# Create warm nginx snapshot (one-time, in another terminal)
-./fcvm podman run --name baseline --publish 8080:80 nginx:alpine
-# Once healthy, in another terminal:
-./fcvm snapshot create baseline --tag nginx-warm
-./fcvm snapshot serve nginx-warm  # Note serve PID
-
-# Spin up 50 nginx instances in parallel
-time for i in {1..50}; do
-  ./fcvm snapshot run --pid <serve_pid> --name web$i --publish $((8080+i)):80 &
-done
-wait
-# real 0m3.1s  ← 50 VMs in ~3 seconds
-
-# Verify all running
-./fcvm ls | wc -l  # 51 (50 clones + 1 baseline)
-
-# Test a clone (use loopback IP from ./fcvm ls --json)
-curl -s 127.0.0.10:8090 | head -5
-```
-
-### Privileged Container (Device Access)
-
-Run containers that need mknod or device access:
-
-```bash
-# Privileged mode allows mknod, /dev access, etc.
-sudo ./fcvm podman run --name dev --privileged \
-  --cmd "sh -c 'mknod /dev/null2 c 1 3 && ls -la /dev/null2'" \
-  public.ecr.aws/docker/library/alpine:latest
-# Output: crw-r--r-- 1 root root 1,3 /dev/null2
-```
-
-### Multiple Ports and Volumes
-
-Expose multiple ports and mount multiple volumes in one command:
-
-```bash
-# Multiple port mappings (comma-separated)
-./fcvm podman run --name multi-port \
-  --publish 8080:80,8443:443 \
-  nginx:alpine
-
-# Multiple volume mappings (comma-separated, with read-only)
-./fcvm podman run --name multi-vol \
-  --map /tmp/logs:/logs,/tmp/data:/data:ro \
-  nginx:alpine
-
-# Combined
+# Multiple ports and volumes
 ./fcvm podman run --name full \
   --publish 8080:80,8443:443 \
   --map /tmp/html:/usr/share/nginx/html:ro \
-  --env NGINX_HOST=localhost,NGINX_PORT=80 \
+  --env NGINX_HOST=localhost \
   nginx:alpine
+
+# JSON output for scripting
+./fcvm ls --json
 ```
 
-### Portable Volumes
+---
 
-Use `--portable-volumes` to enable deterministic inode numbering for FUSE volumes. This allows snapshots with mounted volumes to be restored on a different machine:
+## Snapshot & Clone Workflow
+
+Snapshot a running VM and restore clones from it. Two modes: UFFD (memory server, many concurrent clones) or direct (simpler, single clone from file).
 
 ```bash
-# Standard mode (host inodes, same-machine clones only)
-./fcvm podman run --name app --map /data:/data:ro alpine:latest
+# 1. Start a baseline VM
+./fcvm podman run --name baseline nginx:alpine
 
-# Portable mode (path-hash inodes, cross-machine snapshot/restore)
-./fcvm podman run --name app --portable-volumes --map /data:/data:ro alpine:latest
+# 2. Snapshot it (pauses briefly, then resumes)
+./fcvm snapshot create baseline --tag nginx-warm
+
+# 3. Start memory server (serves pages on demand)
+./fcvm snapshot serve nginx-warm
+
+# 4. Clone — each takes ~10ms for VM restore, ~610ms end-to-end
+./fcvm snapshot run --pid <serve_pid> --name clone1
+./fcvm snapshot run --pid <serve_pid> --name clone2 --publish 8082:80
+
+# Or clone directly from file (simpler, no server needed)
+./fcvm snapshot run --snapshot nginx-warm --name clone3
+
+# One-shot: clone, run command, cleanup
+./fcvm snapshot run --pid <serve_pid> --exec "curl localhost"
 ```
 
-When `--portable-volumes` is set, volumes use a `RemapFs` wrapper that translates between stable path-based inodes and host-specific inodes. The flag applies to all `--map` volumes on the VM and is persisted in snapshot metadata so clones inherit it automatically.
+### Container Image Cache
+
+After the first run with a given image, fcvm snapshots the VM state post-image-pull. Subsequent runs restore from snapshot instead of re-pulling — ~6x faster (540ms vs 3100ms).
+
+```bash
+./fcvm podman run --name web1 nginx:alpine   # First run: pulls image, creates cache
+./fcvm podman run --name web2 nginx:alpine   # Second run: restores from cache
+```
+
+### Startup Snapshots
+
+Use `--health-check` to snapshot the fully initialized application, not just the pulled image:
+
+```bash
+./fcvm podman run --name web --health-check http://localhost/ nginx:alpine
+# First run: waits for health check, then snapshots the warm app
+# Second run: restores with app already running
+```
 
 ---
 
 ## Interactive Mode & TTY
 
-fcvm supports interactive terminal sessions, matching docker/podman's `-i` and `-t` flags:
-
-| Flag | Meaning | Use Case |
-|------|---------|----------|
-| `-i` | Keep stdin open | Pipe data to container |
-| `-t` | Allocate pseudo-TTY | Colors, line editing |
-| `-it` | Both | Interactive shell |
-
-### Interactive Shell Examples
+fcvm supports `-i` and `-t` flags just like docker/podman:
 
 ```bash
-# Run interactive shell in container
-./fcvm podman run --name shell -it alpine:latest sh
-
-# Run vim (full TTY - arrow keys, escape sequences work)
-./fcvm podman run --name editor -it alpine:latest vi /tmp/test.txt
-
-# Run shell in existing VM
-./fcvm exec --name web1 -it -- sh
-
-# Pipe data (use -i without -t)
-echo "hello" | ./fcvm podman run --name pipe -i alpine:latest cat
+./fcvm podman run --name shell -it alpine:latest sh          # Interactive shell
+./fcvm podman run --name editor -it alpine:latest vi /tmp/x   # Full-screen apps work
+./fcvm exec --name web -it -- bash                            # Shell in running VM
+echo "data" | ./fcvm podman run --name pipe -i alpine:latest cat  # Pipe stdin
 ```
-
-### How It Works
-
-1. **Host side**: Sets terminal to raw mode, captures all input
-2. **Protocol**: Binary framed protocol over vsock (handles escape sequences, control chars)
-3. **Guest side**: Allocates PTY, connects container stdin/stdout
-
-**Supported**:
-- Escape sequences (colors, cursor movement)
-- Control characters (Ctrl+C, Ctrl+D, Ctrl+Z)
-- Line editing in shells
-- Full-screen apps (vim, htop, less)
-
-**Not yet implemented**:
-- Window resize (SIGWINCH) - terminal size is fixed at session start
 
 ---
 
 ## Nested Virtualization
 
-fcvm supports VMs inside VMs using ARM64 FEAT_NV2.
-Host → L1 → L2 works.
-L3+ is currently limited by FUSE-over-FUSE latency (~5x per level).
-
-| Requirement | Details |
-|-------------|---------|
-| **Hardware** | ARM64 with FEAT_NV2 (Graviton3+: c7g.metal) |
-| **Host kernel** | 6.18+ with `kvm-arm.mode=nested` |
-| **Nested kernel** | `fcvm setup --kernel-profile nested` |
+fcvm supports VMs inside VMs on ARM64 with FEAT_NV2 (Graviton3+).
 
 ```bash
-# Setup host kernel (one-time)
-sudo ./fcvm setup --kernel-profile nested --install-host-kernel
-sudo reboot
+# Setup (one-time)
+sudo ./fcvm setup --kernel-profile nested --install-host-kernel && sudo reboot
 
-# Start outer VM with nested kernel
-sudo ./fcvm podman run \
-    --name outer --network bridged \
+# Outer VM with nested kernel
+sudo ./fcvm podman run --name outer --network bridged \
     --kernel-profile nested --privileged \
-    --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
-    nginx:alpine
+    --map /mnt/fcvm-btrfs:/mnt/fcvm-btrfs nginx:alpine
 
-# Run inner VM (inside outer)
+# Inner VM (inside outer)
 ./fcvm exec --pid <outer_pid> --vm -- \
     /opt/fcvm/fcvm podman run --name inner --network bridged alpine:latest echo "nested!"
 ```
 
-**Performance**: L2 has ~5-7x FUSE overhead, and local disk is ~4x slower.
-L2 VMs are limited to one vCPU due to NV2 multi-vCPU interrupt issues.
-See [PERFORMANCE.md](PERFORMANCE.md#nested-virtualization) and [NESTED.md](NESTED.md).
+L2 VMs have ~5-7x FUSE overhead and are limited to one vCPU. See [NESTED.md](NESTED.md) for details.
+
+---
+
+## ComputeSDK API
+
+`fcvm serve` starts an HTTP server implementing the ComputeSDK gateway protocol:
 
 ```bash
-make test-root FILTER=kvm   # Run nested virtualization tests
+./fcvm serve --port 8090
 ```
+
+```typescript
+import { ComputeSDK } from 'computesdk';
+
+const sdk = new ComputeSDK({ provider: 'fcvm', apiKey: 'local', gatewayUrl: 'http://localhost:8090' });
+const sandbox = await sdk.sandbox.create({ runtime: 'python' });
+const result = await sandbox.runCode('print("hello")');
+await sandbox.destroy();
+```
+
+<details>
+<summary>API endpoints and curl examples</summary>
+
+**Gateway** (sandbox lifecycle):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/v1/sandboxes` | Create sandbox |
+| `GET` | `/v1/sandboxes` | List sandboxes |
+| `GET` | `/v1/sandboxes/{id}` | Get sandbox |
+| `DELETE` | `/v1/sandboxes/{id}` | Destroy sandbox |
+
+**Sandbox daemon** (per-sandbox):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/s/{id}/run/code` | Run code |
+| `POST` | `/s/{id}/run/command` | Run shell command |
+| `GET/POST/DELETE` | `/s/{id}/files/*` | File operations |
+| `POST` | `/s/{id}/terminals` | Create terminal |
+| `GET` | `/s/{id}` | WebSocket terminal |
+
+```bash
+# Create sandbox, run code, destroy
+curl -s -X POST localhost:8090/v1/sandboxes -H 'Content-Type: application/json' -d '{"runtime":"python"}' | jq .
+curl -s -X POST localhost:8090/s/<id>/run/code -H 'Content-Type: application/json' -d '{"code":"print(42)"}' | jq .
+curl -s -X DELETE localhost:8090/v1/sandboxes/<id> | jq .
+```
+
+Supported runtimes: `python`, `node`, `ruby`, `go`, or any custom image name.
+
+</details>
+
+---
+
+## Network Details
+
+### Rootless Architecture
+
+Uses [pasta](https://passt.top/) (from the passt project) with a Linux bridge for L2 forwarding between pasta and Firecracker. Pasta uses splice(2) zero-copy L4 translation. IPv6 supported with `--enable-ipv6`.
+
+Host services are reachable from VMs via pasta gateways: `10.0.2.2` (IPv4) and `fd00::2` (IPv6).
+
+### Routed Architecture
+
+Connects VMs directly to the host via a veth pair with native IPv6 routing — no userspace proxy. Each VM gets a unique IPv6 derived from the host's /64 subnet. Requires a host with a global IPv6 address (e.g., AWS VPC with IPv6 enabled).
+
+```
+Host                            Namespace
+eth0 (/64 subnet)
+  |
+veth-host ←──veth pair──→ veth-ns
+  (proxy NDP)                 |
+                           br0 (10.0.2.1/24, fd00::1/64)
+                               |
+                           tap-vm → Firecracker VM (10.0.2.100, unique IPv6)
+```
+
+### Egress Proxy
+
+In rootless mode, outbound IPv4 TCP goes through a transparent egress proxy that multiplexes all connections over a single vsock. No configuration needed. In routed mode, all traffic goes native IPv6 — no proxy.
+
+### Host Service Access
+
+VMs can reach host services via gateway addresses (not `127.0.0.1`, which is the VM's own loopback):
+
+| From VM | Reaches Host | Mode |
+|---------|-------------|------|
+| `10.0.2.2` | `127.0.0.1` (IPv4) | Rootless |
+| `fd00::2` | `::1` (IPv6) | Rootless |
+
+fcvm auto-forwards `http_proxy`/`https_proxy` from host to VM via MMDS.
+
+### Port Forwarding
+
+`--publish` binds to a per-VM IP, not `0.0.0.0`. Use `./fcvm ls --json` to find the IP:
+- **Rootless**: `config.network.loopback_ip` (e.g., `curl 127.0.0.2:8080`)
+- **Bridged**: `config.network.host_ip` (e.g., `curl 172.30.0.1:8080`)
+- **Routed**: `config.network.loopback_ip` (same as rootless)
+
+---
+
+## Prerequisites
+
+**Hardware:**
+- Linux with `/dev/kvm` — bare-metal or nested virtualization
+- AWS: c6g.metal (ARM64) or c5.metal (x86_64)
+
+**Dependencies:**
+- Rust 1.83+ with musl target: `rustup target add $(uname -m)-unknown-linux-musl`
+- Firecracker binary in PATH
+- For rootless: `passt` package (provides `pasta`)
+- For bridged: sudo, iptables, iproute2
+- For routed: sudo, ip6tables, iproute2, socat, host with global IPv6 /64
+- For rootfs build: qemu-utils, e2fsprogs
+
+**Storage:** btrfs at `/mnt/fcvm-btrfs` (auto-created as loopback on non-btrfs hosts)
+
+<details>
+<summary>Full setup for Ubuntu/Debian</summary>
+
+```bash
+# Install dependencies
+sudo apt-get update && sudo apt-get install -y \
+    fuse3 libfuse3-dev libclang-dev clang musl-tools \
+    iproute2 iptables passt socat qemu-utils e2fsprogs uidmap
+
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup target add $(uname -m)-unknown-linux-musl
+
+# System configuration
+sudo chmod 666 /dev/kvm
+sudo sysctl -w vm.unprivileged_userfaultfd=1
+echo "user_allow_other" | sudo tee -a /etc/fuse.conf
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0  # Ubuntu 24.04+
+sudo sysctl -w net.ipv4.conf.all.forwarding=1
+
+# For bridged networking only:
+sudo mkdir -p /var/run/netns
+sudo iptables -P FORWARD ACCEPT
+```
+
+See [`Containerfile`](Containerfile) for the complete dependency list used in CI.
+
+</details>
+
+---
+
+## CLI Reference
+
+| Command | Description |
+|---------|-------------|
+| `fcvm setup` | Download kernel and create rootfs (5-10 min first run, then cached) |
+| `fcvm podman run` | Run container in Firecracker VM |
+| `fcvm exec` | Execute command in running VM/container |
+| `fcvm ls` | List running VMs (`--json` for JSON) |
+| `fcvm snapshot create` | Snapshot a running VM |
+| `fcvm snapshot serve` | Start UFFD memory server for cloning |
+| `fcvm snapshot run` | Clone from snapshot |
+| `fcvm serve` | Start HTTP API server |
+
+**Key `podman run` flags:**
+```
+--name <NAME>         VM name (required)
+--network <MODE>      rootless (default), bridged, or routed
+--publish <H:G>       Port forward (e.g., 8080:80)
+--map <H:G[:ro]>      Volume mount (e.g., /data:/data:ro)
+--env <K=V>           Environment variable
+-i / -t / -it         Interactive / TTY / both
+--setup               Auto-setup if assets missing (rootless only)
+--health-check <URL>  Create startup snapshot after health passes
+--cpu <N> --mem <MB>  CPU count and memory
+--hugepages           Use 2MB hugepages (pre-allocate pool first)
+--privileged          Allow device access and mknod in container
+--image-mode <MODE>   overlay (default), btrfs, or archive
+--portable-volumes    Path-hash inodes for cross-machine snapshot/restore
+--rootfs-size <SIZE>  Minimum free space on rootfs (default: 10G)
+--no-snapshot         Disable automatic snapshot creation
+```
+
+Run `fcvm --help` or `fcvm <command> --help` for full options.
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FCVM_BASE_DIR` | `/mnt/fcvm-btrfs` | Base directory for all data |
+| `FCVM_NO_SNAPSHOT` | unset | `1` to disable snapshot creation (same as `--no-snapshot`) |
+| `FCVM_NO_WRITEBACK_CACHE` | unset | `1` to disable FUSE writeback cache |
+| `FCVM_SNAPSHOT_CONCURRENCY` | `10` | Max concurrent snapshot creations |
+| `RUST_LOG` | `warn` | Logging level (`info`, `debug` for verbose) |
+
+### Image Delivery Modes
+
+| Mode | Flag | Description |
+|------|------|-------------|
+| **Overlay** (default) | `--image-mode overlay` | Pre-built ext4 image, mounted as `additionalImageStore` |
+| **Btrfs** | `--image-mode btrfs` | Native btrfs subvolumes, reflink-copied per VM |
+| **Archive** | `--image-mode archive` | Docker tar archive, `podman load` at boot (slowest) |
+
+Btrfs mode requires a btrfs kernel profile: `./fcvm setup --kernel-profile btrfs --build-kernels`
+
+### Guest OS and Kernel
+
+Guest VMs run Ubuntu 24.04 LTS with Podman, crun, and fuse-overlayfs. The default kernel is from [Kata Containers](https://github.com/kata-containers/kata-containers) (6.12.x, `CONFIG_FUSE_FS=y`). Both are built during `fcvm setup` and content-addressed — changing config triggers a rebuild. Custom kernels via `--kernel-profile`; see [DESIGN.md](DESIGN.md#kernel-profiles).
+
+---
+
+## Testing
+
+```bash
+make test-root                       # All tests (requires sudo + KVM)
+make test-root FILTER=sanity         # Filter by name
+make test-root FILTER=exec STREAM=1  # Live output
+make container-test                  # All tests in container (just needs podman + KVM)
+```
+
+<details>
+<summary>Test tiers and CI details</summary>
+
+```bash
+make test-unit       # Unit tests (no VMs, no sudo)
+make test-fast       # + quick VM tests (rootless)
+make test-all        # + slow VM tests (rootless)
+make test-root       # + privileged tests (bridged, pjdfstest, sudo)
+make test-fc-mock    # Container mode tests (no KVM, uses fc-mock)
+```
+
+CI runs on every PR across ARM64 and x64 with both snapshot-enabled and snapshot-disabled modes. Tests include POSIX compliance (pjdfstest), VM lifecycle, networking, snapshot/clone workflows, and egress connectivity.
+
+</details>
 
 ---
 
@@ -612,549 +399,36 @@ fcvm/
 ├── src/           # Host CLI (fcvm binary)
 ├── fc-agent/      # Guest agent (runs inside VM)
 ├── fuse-pipe/     # FUSE passthrough library
-└── tests/         # Integration tests (16 files)
+└── tests/         # Integration tests
 ```
 
-See [DESIGN.md](DESIGN.md#directory-structure) for detailed structure.
-
----
-
-## CLI Reference
-
-Run `fcvm --help` or `fcvm <command> --help` for full options.
-
-### Commands
-
-| Command | Description |
-|---------|-------------|
-| `fcvm setup` | Download kernel (~15MB) and create rootfs (~10GB). Takes 5-10 min first run |
-| `fcvm podman run` | Run container in Firecracker VM |
-| `fcvm exec` | Execute command in running VM/container |
-| `fcvm ls` | List running VMs (`--json` for JSON output) |
-| `fcvm snapshot create` | Create snapshot from running VM |
-| `fcvm snapshot serve` | Start UFFD memory server for cloning |
-| `fcvm snapshot run` | Clone from snapshot (`--pid` for UFFD, `--snapshot` for direct) |
-| `fcvm serve` | Start HTTP API server (ComputeSDK gateway) |
-| `fcvm snapshots` | List available snapshots |
-
-See [DESIGN.md](DESIGN.md#cli-interface) for architecture and design decisions.
-
-### Key Options
-
-**`fcvm podman run`** - Essential options:
-```
---name <NAME>       VM name (required)
---network <MODE>    rootless (default) or bridged (needs sudo)
---publish <H:G>     Port forward host:guest (e.g., 8080:80)
---map <H:G[:ro]>    Volume mount host:guest (optional :ro for read-only)
---env <K=V>         Environment variable
--i, --interactive   Keep stdin open (for piping input)
--t, --tty           Allocate pseudo-TTY (for vim, colors, etc.)
---setup             Auto-setup if kernel/rootfs missing (rootless only)
---no-snapshot       Disable automatic snapshot creation (for testing)
---hugepages         Use 2MB hugepages for VM memory (requires pre-allocated pool)
---forward-localhost <PORTS>  Forward localhost ports to host (e.g., 1421,9099)
---rootfs-size <SIZE> Minimum free space on rootfs (default: 10G)
-```
-
-**`fcvm exec`** - Execute in VM/container:
-```bash
-./fcvm exec --name my-vm -- cat /etc/os-release     # In container
-./fcvm exec --name my-vm --vm -- curl -s ifconfig.me # In guest OS
-./fcvm exec --name my-vm -it -- bash                 # Interactive shell
-```
-
----
-
-## ComputeSDK API (`fcvm serve`)
-
-`fcvm serve` starts an HTTP server that implements the ComputeSDK gateway + sandbox daemon protocol.
-Use it from the TypeScript `computesdk` package or any HTTP client.
-
-```bash
-# Start the API server
-./fcvm serve --port 8090
-```
-
-### TypeScript SDK
-
-```typescript
-import { ComputeSDK } from 'computesdk';
-
-const sdk = new ComputeSDK({
-  provider: 'fcvm',
-  apiKey: 'local',
-  gatewayUrl: 'http://localhost:8090'
-});
-
-const sandbox = await sdk.sandbox.create({ runtime: 'python' });
-const result = await sandbox.runCode('print("hello")');
-console.log(result.output);  // "hello\n"
-await sandbox.destroy();
-```
-
-### API Endpoints
-
-**Gateway** (sandbox lifecycle):
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/sandboxes` | Create sandbox (`{ runtime: "python" }`) |
-| `GET` | `/v1/sandboxes` | List all sandboxes |
-| `GET` | `/v1/sandboxes/{id}` | Get sandbox details |
-| `DELETE` | `/v1/sandboxes/{id}` | Destroy sandbox |
-
-**Sandbox daemon** (per-sandbox operations):
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/s/{id}/health` | Health check |
-| `GET` | `/s/{id}/ready` | Readiness check |
-| `POST` | `/s/{id}/run/code` | Run code (`{ code, language? }`) |
-| `POST` | `/s/{id}/run/command` | Run shell command (`{ command, cwd?, env? }`) |
-| `GET` | `/s/{id}/files?path=` | List directory |
-| `POST` | `/s/{id}/files` | Create file (`{ path, content }`) |
-| `GET` | `/s/{id}/files/*path` | Read file |
-| `HEAD` | `/s/{id}/files/*path` | Check file exists |
-| `DELETE` | `/s/{id}/files/*path` | Delete file |
-| `POST` | `/s/{id}/terminals` | Create terminal session |
-| `GET` | `/s/{id}` | WebSocket terminal connection |
-
-### curl Examples
-
-```bash
-# Create a Python sandbox
-curl -s -X POST localhost:8090/v1/sandboxes \
-  -H 'Content-Type: application/json' \
-  -d '{"runtime":"python"}' | jq .
-
-# Run code (use sandboxId from create response)
-curl -s -X POST localhost:8090/s/<id>/run/code \
-  -H 'Content-Type: application/json' \
-  -d '{"code":"print(42)"}' | jq .
-
-# Run a shell command
-curl -s -X POST localhost:8090/s/<id>/run/command \
-  -H 'Content-Type: application/json' \
-  -d '{"command":"ls -la /"}' | jq .
-
-# Write and read a file
-curl -s -X POST localhost:8090/s/<id>/files \
-  -H 'Content-Type: application/json' \
-  -d '{"path":"/tmp/hello.txt","content":"hello world"}'
-curl -s localhost:8090/s/<id>/files/tmp/hello.txt | jq .
-
-# Destroy sandbox
-curl -s -X DELETE localhost:8090/v1/sandboxes/<id> | jq .
-```
-
-### Supported Runtimes
-
-| Runtime | Image |
-|---------|-------|
-| `python` | `python:3.12-slim` |
-| `node` | `node:22-slim` |
-| `ruby` | `ruby:3.3-slim` |
-| `go` | `golang:1.23-alpine` |
-| Custom | Pass any image name directly |
-
----
-
-## Network Modes
-
-| Mode | Flag | Root | Notes |
-|------|------|------|-------|
-| Rootless | `--network rootless` (default) | No | pasta with bridge, IPv6 support |
-| Bridged | `--network bridged` | Yes | iptables NAT, better performance |
-
-**Rootless architecture**: Uses pasta (from the passt project) with a Linux bridge (br0) for L2 forwarding between pasta and Firecracker.
-Pasta uses splice(2) zero-copy L4 translation for near-native performance.
-The bridge preserves MAC addresses for proper ARP/NDP learning, enabling IPv6 support.
-
-### Egress Proxy (Outbound Internet)
-
-In rootless mode, VMs can make outbound TCP connections (e.g., `curl`, `wget`, `apt-get`) via a transparent egress proxy. The proxy is enabled by default and requires no configuration.
-
-**How it works:**
-1. Guest iptables REDIRECT captures all outbound TCP to a local proxy
-2. Proxy extracts the original destination via `SO_ORIGINAL_DST`
-3. Sends an OPEN frame over a single multiplexed vsock connection to the host
-4. Host connects to the real destination and relays data bidirectionally
-
-All TCP connections share one vsock — no per-connection overhead. The protocol uses 10-byte framed messages with stream IDs for multiplexing.
-
-**Performance:** 243 MB/s throughput, tested with 8000 concurrent connections.
-
-```bash
-# Egress works automatically in rootless mode
-./fcvm podman run --name web alpine:latest -- wget -q -O /dev/null http://example.com
-
-# Test from inside a running VM
-./fcvm exec --name web -- wget -q -O /dev/null http://example.com
-```
-
-See [DESIGN.md](DESIGN.md#egress-proxy-rootless-outbound-tcp) for architecture details.
-
-### Host Service Access (Rootless Mode)
-
-In rootless mode, VMs can reach services on the host via pasta gateways:
-
-| Host Address | VM Uses | Description |
-|--------------|---------|-------------|
-| `127.0.0.1` | `10.0.2.2` | IPv4 loopback gateway |
-| `::1` | `fd00::2` | IPv6 loopback gateway |
-
-#### IPv6 from Inside VMs
-
-VMs have full IPv6 support via pasta. To reach host services bound to `::1`:
-
-```bash
-# From inside the VM/container, use fd00::2 to reach host's ::1
-wget http://[fd00::2]:8080/    # Reaches host's [::1]:8080
-curl http://[fd00::2]:3000/    # Reaches host's [::1]:3000
-```
-
-The VM's internal IPv6 address is `fd00::100` on the `fd00::/64` network.
-
-#### Using HTTP Proxies
-
-fcvm forwards `http_proxy` and `https_proxy` from host to VM via MMDS:
-
-```bash
-# Set proxy on host - fcvm passes it to VM automatically
-export http_proxy=http://[fd00::2]:8080
-export https_proxy=http://[fd00::2]:8080
-fcvm podman run --name myvm alpine:latest
-# Image pulls inside VM will use the proxy
-```
-
-Manual configuration (proxy on host loopback, VM connects via gateway):
-
-```bash
-# On host: start proxy listening on ::1:8080 (or 127.0.0.1:8080)
-
-# Inside VM: configure proxy using gateway address
-export http_proxy=http://[fd00::2]:8080   # For IPv6 proxy
-export http_proxy=http://10.0.2.2:8080    # For IPv4 proxy
-
-# Now HTTP requests go through the proxy
-wget http://example.com/
-```
-
-**Note**: The VM uses `fd00::2` or `10.0.2.2` (gateway addresses), not `::1` or `127.0.0.1`
-(which would be the VM's own loopback).
-
-See [DESIGN.md](DESIGN.md#networking) for architecture details.
-
----
-
-## Container Behavior
-
-- **Exit codes**: Container exit code forwarded to host via vsock
-- **Logs**: Container stdout goes to host stdout, stderr to host stderr (clean output for scripting)
-- **Health**: Default uses vsock ready signal; optional `--health-check` for HTTP (timeout configurable via `--health-check-timeout`, default 5s)
-
-See [DESIGN.md](DESIGN.md#guest-agent) for details.
-
----
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `FCVM_BASE_DIR` | `/mnt/fcvm-btrfs` | Base directory for all data |
-| `RUST_LOG` | `warn` | Logging level (quiet by default; use `info` or `debug` for verbose) |
-| `FCVM_NO_SNAPSHOT` | unset | Set to `1` to disable automatic snapshot creation (same as `--no-snapshot` flag) |
-| `FCVM_NO_WRITEBACK_CACHE` | unset | Set to `1` to disable FUSE writeback cache (see below) |
-| `FCVM_SNAPSHOT_CONCURRENCY` | `10` | Max concurrent snapshot creations (prevents dirty_ratio throttling) |
-
-
-### FUSE Writeback Cache
-
-FUSE writeback cache is **enabled by default** for ~9x write performance.
-The kernel batches writes and flushes them asynchronously.
-
-**Known POSIX edge cases** (disabled in pjdfstest):
-
-| Test | Issue | Workaround |
-|------|-------|------------|
-| `open` (3/144 fail) | O_WRONLY promoted to O_RDWR, requires read permission | Use `0644` instead of `0200` for write-only files |
-| `utimensat` (1/122 fail) | Needs kernel patch with `default_permissions` | Use nested kernel profile which has the patch |
-
-To disable writeback cache for debugging:
-```bash
-FCVM_NO_WRITEBACK_CACHE=1 ./fcvm podman run --name test alpine:latest
-```
-
----
-
-## Testing
-
-### CI Summary
-
-CI covers the full stack:
-
-| Metric | Count |
-|--------|-------|
-| **Total Tests** | 9,290 |
-| **Nextest Functions** | 501 |
-| **POSIX Compliance (pjdfstest)** | 8,789 |
-| **VMs Spawned** | 331 (92 base + 239 clones) |
-| **UFFD Memory Servers** | 28 |
-| **pjdfstest Categories** | 17 |
-
-Performance (on c7g.metal ARM64):
-- **Clone to healthy**: 0.67s average (see [Clone Speed Breakdown](#clone-speed-breakdown))
-- **Snapshot creation**: 40.7s average
-- **Total test time**: ~13 minutes (parallel jobs)
-
-### Test Categories
-
-| Category | Description | VMs | Tests |
-|----------|-------------|-----|-------|
-| **Unit Tests** | CLI parsing, state manager, protocol serialization | 0 | ~50 |
-| **FUSE Tests** | fuse-pipe passthrough, permissions, mount/unmount | 0 | ~80 |
-| **VM Sanity** | Basic VM lifecycle, networking, exec | ~20 | ~30 |
-| **Snapshot/Clone** | UFFD memory sharing, btrfs reflinks, 100-clone scaling | ~230 | ~20 |
-| **pjdfstest** | POSIX filesystem compliance in VMs | 17 | 8,789 |
-| **Egress/Port Forward** | Network connectivity, port mapping | ~30 | ~40 |
-| **Disk Mounts** | RO/RW disks, directory mapping, NFS | ~10 | ~15 |
-| **Nested KVM** | L1→L2 virtualization (ARM64 NV2) | 2 | ~5 |
-
-### Test Tiers
-
-Tests are organized into tiers by privilege requirements:
-
-```bash
-make test-unit   # Unit tests only (no VMs, no sudo)
-make test-fast   # + quick VM tests (rootless, no sudo)
-make test-all    # + slow VM tests (rootless, no sudo)
-make test-root   # + privileged tests (bridged, pjdfstest, sudo)
-make test        # Alias for test-root
-make test-fc-mock  # Container mode tests (no KVM required, uses fc-mock)
-```
-
-Container equivalents:
-```bash
-make container-test-unit   # Unit tests in container
-make container-test        # All tests in container (recommended)
-```
-
-### Running Tests
-
-```bash
-# Build first
-make build
-
-# Run all tests (requires sudo + KVM)
-make test-root
-
-# Filter by name pattern
-make test-root FILTER=exec
-
-# Live output (stream as tests run)
-make test-root FILTER=sanity STREAM=1
-
-# Single test with debug logging
-RUST_LOG=debug make test-root FILTER=test_exec_basic STREAM=1
-```
-
-### CI Workflow
-
-Tests run automatically on PRs and pushes to main:
-
-| Job | Runner | Tests |
-|-----|--------|-------|
-| **Host** | Self-hosted ARM64 | Unit tests, quick VM tests (rootless) |
-| **Host-Root-SnapshotDisabled** | Self-hosted ARM64 | Privileged tests with `FCVM_NO_SNAPSHOT=1` |
-| **Host-Root-SnapshotEnabled** | Self-hosted ARM64 | Privileged tests run **twice** to verify snapshot hit |
-| **Container** | Self-hosted ARM64 | All tests in container |
-
-The **SnapshotEnabled** job runs the same suite twice on one runner:
-- **Run 1**: Creates snapshots (cache miss path)
-- **Run 2**: Uses existing snapshots (cache hit path - should be faster)
-
-This validates snapshot creation, persistence, and restore paths.
-
-Latest results: [CI Workflow](.github/workflows/ci.yml) → Actions tab
-
-Analyze any CI run locally:
-```bash
-python3 scripts/analyze_ci_vms.py              # Latest run
-python3 scripts/analyze_ci_vms.py <run_id>     # Specific run
-```
-
-### Debugging Tests
-
-Enable tracing:
-```bash
-RUST_LOG="passthrough=debug,fuse_pipe=info" sudo -E cargo test ...
-```
-
-Check running VMs:
-```bash
-./fcvm ls
-```
-
-Manual cleanup:
-```bash
-# Kill test VMs
-ps aux | grep fcvm | grep test | awk '{print $2}' | xargs sudo kill 2>/dev/null
-
-# Remove test directories
-rm -rf /tmp/fcvm-test-*
-
-# Force unmount stale FUSE mounts
-sudo fusermount3 -u /tmp/fuse-*-mount*
-```
-
----
-
-## Data Layout
-
-All data is stored under `/mnt/fcvm-btrfs/` (btrfs CoW reflinks). See [DESIGN.md](DESIGN.md#data-directory).
-
-```bash
-# Setup btrfs (done automatically by make setup-btrfs)
-make setup-btrfs
-make setup-fcvm   # Download kernel, create rootfs
-```
-
----
-
-## Kernels and Base Images
-
-fcvm uses a config-driven approach for kernels and base images. All configuration is in `rootfs-config.toml`.
-
-### Default Kernel
-
-The default kernel is from [Kata Containers](https://github.com/kata-containers/kata-containers):
-
-| Property | Value |
-|----------|-------|
-| **Version** | 6.12.47 |
-| **Source** | Kata 3.24.0 release |
-| **Key Config** | `CONFIG_FUSE_FS=y` (required for volume mounts) |
-| **Architectures** | arm64, amd64 |
-
-The kernel is downloaded during `fcvm setup` and cached by URL hash. Changing the URL in config triggers a re-download.
-
-### Base Image
-
-The guest OS is Ubuntu 24.04 LTS (Noble Numbat):
-
-| Property | Value |
-|----------|-------|
-| **Version** | 24.04 LTS |
-| **Source** | Ubuntu cloud images |
-| **Packages** | podman, crun, fuse-overlayfs, skopeo, fuse3, haveged, chrony |
-
-The rootfs is built during `fcvm setup` and cached by script SHA.
-Changing packages, services, or files in config triggers a rebuild.
-
-### Kernel Profiles
-
-fcvm supports custom kernel profiles for advanced use cases (for example nested virtualization).
-Profiles define kernel config, optional Firecracker binary, and boot args.
-Current profile: `nested` (arm64, CONFIG_KVM=y).
-
-```bash
-./fcvm setup --kernel-profile nested                     # Download pre-built
-./fcvm setup --kernel-profile nested --build-kernels     # Or build locally
-sudo ./fcvm podman run --name vm1 --kernel-profile nested --privileged nginx:alpine
-```
-
-To add custom profiles or customize the base image, edit `rootfs-config.toml`.
-See [DESIGN.md](DESIGN.md#kernel-profiles) for the profile config reference.
+## Documentation
+
+| Document | Content |
+|----------|---------|
+| [DESIGN.md](DESIGN.md) | Architecture, internals, configuration reference |
+| [PERFORMANCE.md](PERFORMANCE.md) | Benchmarks, tuning, tracing |
+| [NESTED.md](NESTED.md) | Nested virtualization setup |
 
 ---
 
 ## Troubleshooting
 
-### "fcvm binary not found"
-- Build fcvm first: `make build`
-- Or set PATH: `export PATH=$PATH:./target/release`
+**VM won't start?** Check `./fcvm ls --json` for logs, verify `/mnt/fcvm-btrfs/` exists with kernel and rootfs.
 
-### "timeout waiting for VM to become healthy"
-- Check VM logs: `./fcvm ls --json`
-- Verify kernel and rootfs exist: `ls -la /mnt/fcvm-btrfs/`
-- Check networking: VMs use host DNS servers directly (no dnsmasq needed)
+**Tests hang?** Kill test VMs: `ps aux | grep fcvm | grep test | awk '{print $2}' | xargs sudo kill`
 
-### Tests hang indefinitely
-- VMs may not be cleaning up properly
-- Manual cleanup: `ps aux | grep fcvm | grep test | awk '{print $2}' | xargs sudo kill`
+**KVM not available?** Firecracker requires bare-metal or nested virt. On AWS, use `.metal` instances.
 
-### Debugging Network Issues
-
-Spawn quick one-off VMs with inline commands to diagnose network problems:
-
+**Network issues?** Test incrementally inside a VM:
 ```bash
-# Test connectivity incrementally: gateway → DNS → external
-./target/release/fcvm podman run --name net-debug-$(date +%s) --privileged alpine:latest sh -c "
-echo '=== Network config ==='
-ip addr show eth0
-ip route
-cat /etc/resolv.conf
-echo ''
-echo '=== Gateway ==='
-ping -c 2 -W 3 10.0.2.2 || echo 'gateway failed'
-echo ''
-echo '=== DNS ==='
-nslookup example.com || echo 'DNS failed'
-echo ''
-echo '=== External ==='
-wget -q -O - --timeout=10 http://ifconfig.me || echo 'external failed'
-" 2>&1 &
-sleep 60  # Wait for VM to boot and run commands
+./fcvm exec --name web -- ping -c1 10.0.2.2        # Gateway
+./fcvm exec --name web -- nslookup example.com      # DNS
+./fcvm exec --name web -- wget -qO- http://ifconfig.me  # External
 ```
-
-**Inspect namespace for running VM:**
-```bash
-HOLDER_PID=$(cat /mnt/fcvm-btrfs/state/*.json | jq -r '.holder_pid')
-sudo nsenter --net=/proc/$HOLDER_PID/ns/net ip addr
-sudo nsenter --net=/proc/$HOLDER_PID/ns/net bridge link  # Show bridge ports
-```
-
-### KVM not available
-- Firecracker requires `/dev/kvm`
-- On AWS: use c6g.metal or c5.metal (NOT c5.large or other regular instances)
-- On other clouds: use bare-metal instances or hosts with nested virtualization
-
----
-
-## Documentation
-
-- `DESIGN.md` - Architecture, configuration reference, design decisions
-- `PERFORMANCE.md` - Benchmarks, tuning, and tracing
-- `NESTED.md` - Nested virtualization setup and details
-- `.claude/CLAUDE.md` - Development notes, debugging tips
-- `LICENSE` - MIT License
-
----
-
-## CI Infrastructure
-
-CI runs on self-hosted ARM64 runners (c7g.metal spot instances) managed by
-[ejc3/aws-setup](https://github.com/ejc3/aws-setup).
-
-- **Auto-scaling**: Runners launch on demand, stop after 30 mins idle
-- **Hardware**: c7g.metal with /dev/kvm for VM tests
-- **Cost**: ~$0.50/hr spot pricing, $0 when idle
-
-### Claude Code Review
-
-PRs are reviewed automatically by Claude. Findings prefixed with `BLOCKING:` fail the check.
-
-| Trigger | Description |
-|---------|-------------|
-| **Auto** | PRs from org members are reviewed automatically |
-| `/claude-review` | Comment on any PR to trigger manual review |
-| `@claude ...` | Ask Claude questions in PR comments |
-
-Reviews check for security issues, bugs, and breaking changes.
 
 ---
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE).

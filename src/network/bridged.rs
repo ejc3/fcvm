@@ -417,6 +417,7 @@ impl NetworkManager for BridgedNetwork {
             host_ipv6: None,
             dns_search: None,
             http_proxy: None,
+            namespace_name: None,
         })
     }
 

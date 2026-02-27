@@ -7,10 +7,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// Default test image - use AWS ECR to avoid Docker Hub rate limits
-pub const TEST_IMAGE: &str = "public.ecr.aws/nginx/nginx:alpine";
+// ecr-public.aws.com is dual-stack (has AAAA records), unlike public.ecr.aws (IPv4-only).
+// This enables routed mode VMs to pull images over native IPv6 without MASQUERADE.
+pub const TEST_IMAGE: &str = "ecr-public.aws.com/nginx/nginx:alpine";
 
 /// Alpine test image - use AWS ECR to avoid Docker Hub rate limits
-pub const ALPINE_IMAGE: &str = "public.ecr.aws/docker/library/alpine:latest";
+pub const ALPINE_IMAGE: &str = "ecr-public.aws.com/docker/library/alpine:latest";
 
 /// Standard log directory for test logs
 const TEST_LOG_DIR: &str = "/tmp/fcvm-test-logs";
@@ -1571,7 +1573,12 @@ impl LocalDnsServer {
         port: u16,
         response_ip: std::net::Ipv4Addr,
     ) -> anyhow::Result<Self> {
-        let socket_addr: std::net::SocketAddr = format!("{}:{}", bind_addr, port).parse()?;
+        let is_ipv6 = bind_addr.contains(':');
+        let socket_addr: std::net::SocketAddr = if is_ipv6 {
+            format!("[{}]:{}", bind_addr, port).parse()?
+        } else {
+            format!("{}:{}", bind_addr, port).parse()?
+        };
         let socket = tokio::net::UdpSocket::bind(socket_addr).await?;
         let actual_port = socket.local_addr()?.port();
 
@@ -1891,4 +1898,50 @@ impl LocalProxyServer {
         let _ = self.shutdown_tx.send(());
         let _ = self.task.await;
     }
+}
+
+/// Get the host's primary IPv4 address (the one used for external traffic).
+/// Uses `ip route get 8.8.8.8` to determine the source IP.
+pub async fn get_host_primary_ip() -> anyhow::Result<String> {
+    let output = tokio::process::Command::new("ip")
+        .args(["route", "get", "8.8.8.8"])
+        .output()
+        .await
+        .context("running ip route get")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Output: "8.8.8.8 via 172.31.0.1 dev enp3s0 src 172.31.15.123 uid 0"
+    for part in stdout.split_whitespace().collect::<Vec<_>>().windows(2) {
+        if part[0] == "src" {
+            return Ok(part[1].to_string());
+        }
+    }
+
+    anyhow::bail!("Could not determine host primary IP from: {}", stdout)
+}
+
+/// Get the host's global IPv6 address.
+/// Uses `ip -6 addr show scope global` and returns the first non-link-local address.
+pub async fn get_host_ipv6() -> anyhow::Result<String> {
+    let output = tokio::process::Command::new("ip")
+        .args(["-6", "addr", "show", "scope", "global"])
+        .output()
+        .await
+        .context("running ip -6 addr show")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("inet6 ") {
+            if let Some(addr_cidr) = rest.split_whitespace().next() {
+                if let Some((addr, _prefix)) = addr_cidr.split_once('/') {
+                    if !addr.starts_with("fe80") && !addr.starts_with("fd") {
+                        return Ok(addr.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    anyhow::bail!("No global IPv6 address found on host")
 }

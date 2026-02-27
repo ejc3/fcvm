@@ -84,6 +84,9 @@ pub struct LatestMetadata {
     pub host_time: String,
     #[serde(rename = "restore-epoch")]
     pub restore_epoch: Option<String>,
+    /// For routed mode clones: unique IPv6 to replace the snapshot's shared guest IPv6.
+    #[serde(rename = "clone-ipv6", default)]
+    pub clone_ipv6: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
