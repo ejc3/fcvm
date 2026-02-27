@@ -648,7 +648,7 @@ See [DESIGN.md](DESIGN.md#cli-interface) for architecture and design decisions.
 **`fcvm podman run`** - Essential options:
 ```
 --name <NAME>       VM name (required)
---network <MODE>    rootless (default) or bridged (needs sudo)
+--network <MODE>    rootless (default), bridged, or routed (needs sudo)
 --publish <H:G>     Port forward host:guest (e.g., 8080:80)
 --map <H:G[:ro]>    Volume mount host:guest (optional :ro for read-only)
 --env <K=V>         Environment variable
@@ -793,7 +793,7 @@ veth-host ←──veth pair──→ veth-ns
 
 ### Egress Proxy (Outbound Internet)
 
-In rootless mode, VMs can make outbound TCP connections (e.g., `curl`, `wget`, `apt-get`) via a transparent egress proxy. The proxy is enabled by default and requires no configuration.
+In rootless and routed modes, VMs can make outbound IPv4 TCP connections (e.g., `curl`, `wget`, `apt-get`) via a transparent egress proxy. The proxy is enabled by default and requires no configuration. In routed mode, IPv6 traffic goes natively through the kernel stack — the egress proxy only handles IPv4 TCP.
 
 **How it works:**
 1. Guest iptables REDIRECT captures all outbound TCP to a local proxy
