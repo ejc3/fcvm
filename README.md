@@ -1,20 +1,15 @@
-# fcvm — Run containers in Firecracker microVMs
+# fcvm
 
-fcvm wraps Podman containers in Firecracker microVMs. Each `podman run` boots a VM, pulls the image, and starts the container — isolated by hardware virtualization instead of just namespaces.
+VM-level isolation with a container workflow. fcvm runs Podman containers inside Firecracker microVMs — same images, same registries, but each container gets its own kernel.
 
-```
-You → fcvm podman run → Firecracker VM → Podman → Your Container
-```
+- ~540ms cached startup via snapshot restore (vs ~3s cold — see [Container Image Cache](#container-image-cache))
+- ~10ms VM cloning via UFFD memory sharing + btrfs reflinks (see [PERFORMANCE.md](PERFORMANCE.md) for breakdown)
+- 50 clones share physical pages through kernel page cache (~512MB total, not 25GB)
+- Rootless, bridged, and routed networking
+- Full `-it` support (vim, colors, Ctrl+C)
+- HTTP API (`fcvm serve`) for programmatic sandbox management
 
-**Why?** Containers share a kernel. VMs don't. fcvm gives you VM-level isolation with a container-like workflow: same images, same registries, familiar CLI.
-
-**Key capabilities:**
-- **Fast startup** — ~540ms cached (container image snapshots avoid re-pulling)
-- **Instant cloning** — ~10ms VM restore via UFFD memory sharing + btrfs reflinks
-- **Memory efficient** — 50 clones share physical pages via kernel page cache
-- **Three network modes** — rootless (no sudo), bridged (iptables NAT), routed (IPv6 kernel line rate)
-- **Full TTY** — `-it` works like docker/podman (vim, colors, Ctrl+C)
-- **HTTP API** — `fcvm serve` for programmatic sandbox management
+All benchmarks measured on c7g.metal ARM64. See [PERFORMANCE.md](PERFORMANCE.md) for methodology and detailed results.
 
 ---
 
@@ -38,7 +33,6 @@ sudo ./fcvm setup
 # In another terminal:
 ./fcvm ls                                        # List running VMs
 ./fcvm exec --name web -- cat /etc/os-release    # Exec into container
-./fcvm exec --name web -it -- sh                 # Interactive shell
 ```
 
 ### Network Modes
@@ -87,7 +81,7 @@ sudo ./fcvm podman run --name web --network routed nginx:alpine
 
 ## Snapshot & Clone Workflow
 
-fcvm can snapshot a running VM and clone it in ~10ms. Clones share memory via the kernel page cache — 50 clones of a 512MB VM use ~512MB physical RAM, not 25GB.
+Snapshot a running VM and restore clones from it. Two modes: UFFD (memory server, many concurrent clones) or direct (simpler, single clone from file).
 
 ```bash
 # 1. Start a baseline VM
@@ -245,15 +239,23 @@ veth-host ←──veth pair──→ veth-ns
 
 In rootless mode, outbound IPv4 TCP goes through a transparent egress proxy that multiplexes all connections over a single vsock. No configuration needed. In routed mode, all traffic goes native IPv6 — no proxy.
 
+### Host Service Access
+
+VMs can reach host services via gateway addresses (not `127.0.0.1`, which is the VM's own loopback):
+
+| From VM | Reaches Host | Mode |
+|---------|-------------|------|
+| `10.0.2.2` | `127.0.0.1` (IPv4) | Rootless |
+| `fd00::2` | `::1` (IPv6) | Rootless |
+
+fcvm auto-forwards `http_proxy`/`https_proxy` from host to VM via MMDS.
+
 ### Port Forwarding
 
-```bash
-# Rootless: curl the assigned loopback IP (see ./fcvm ls --json)
-./fcvm podman run --name web --publish 8080:80 nginx:alpine
-
-# Bridged: curl the veth host IP (see ./fcvm ls --json)
-sudo ./fcvm podman run --name web --network bridged --publish 8080:80 nginx:alpine
-```
+`--publish` binds to a per-VM IP, not `0.0.0.0`. Use `./fcvm ls --json` to find the IP:
+- **Rootless**: `config.network.loopback_ip` (e.g., `curl 127.0.0.2:8080`)
+- **Bridged**: `config.network.host_ip` (e.g., `curl 172.30.0.1:8080`)
+- **Routed**: `config.network.loopback_ip` (same as rootless)
 
 ---
 
@@ -328,11 +330,39 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 --setup               Auto-setup if assets missing (rootless only)
 --health-check <URL>  Create startup snapshot after health passes
 --cpu <N> --mem <MB>  CPU count and memory
---hugepages           Use 2MB hugepages for VM memory
+--hugepages           Use 2MB hugepages (pre-allocate pool first)
 --privileged          Allow device access and mknod in container
+--image-mode <MODE>   overlay (default), btrfs, or archive
+--portable-volumes    Path-hash inodes for cross-machine snapshot/restore
+--rootfs-size <SIZE>  Minimum free space on rootfs (default: 10G)
+--no-snapshot         Disable automatic snapshot creation
 ```
 
 Run `fcvm --help` or `fcvm <command> --help` for full options.
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FCVM_BASE_DIR` | `/mnt/fcvm-btrfs` | Base directory for all data |
+| `FCVM_NO_SNAPSHOT` | unset | `1` to disable snapshot creation (same as `--no-snapshot`) |
+| `FCVM_NO_WRITEBACK_CACHE` | unset | `1` to disable FUSE writeback cache |
+| `FCVM_SNAPSHOT_CONCURRENCY` | `10` | Max concurrent snapshot creations |
+| `RUST_LOG` | `warn` | Logging level (`info`, `debug` for verbose) |
+
+### Image Delivery Modes
+
+| Mode | Flag | Description |
+|------|------|-------------|
+| **Overlay** (default) | `--image-mode overlay` | Pre-built ext4 image, mounted as `additionalImageStore` |
+| **Btrfs** | `--image-mode btrfs` | Native btrfs subvolumes, reflink-copied per VM |
+| **Archive** | `--image-mode archive` | Docker tar archive, `podman load` at boot (slowest) |
+
+Btrfs mode requires a btrfs kernel profile: `./fcvm setup --kernel-profile btrfs --build-kernels`
+
+### Guest OS and Kernel
+
+Guest VMs run Ubuntu 24.04 LTS with Podman, crun, and fuse-overlayfs. The default kernel is from [Kata Containers](https://github.com/kata-containers/kata-containers) (6.12.x, `CONFIG_FUSE_FS=y`). Both are built during `fcvm setup` and content-addressed — changing config triggers a rebuild. Custom kernels via `--kernel-profile`; see [DESIGN.md](DESIGN.md#kernel-profiles).
 
 ---
 
