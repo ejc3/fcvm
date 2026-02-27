@@ -793,7 +793,7 @@ veth-host ←──veth pair──→ veth-ns
 
 ### Egress Proxy (Outbound Internet)
 
-In rootless and routed modes, VMs can make outbound IPv4 TCP connections (e.g., `curl`, `wget`, `apt-get`) via a transparent egress proxy. The proxy is enabled by default and requires no configuration. In routed mode, IPv6 traffic goes natively through the kernel stack — the egress proxy only handles IPv4 TCP.
+In rootless mode, VMs can make outbound IPv4 TCP connections (e.g., `curl`, `wget`, `apt-get`) via a transparent egress proxy. The proxy is enabled by default and requires no configuration. In routed mode, all external traffic uses native IPv6 through the kernel stack — the egress proxy is not used.
 
 **How it works:**
 1. Guest iptables REDIRECT captures all outbound TCP to a local proxy
