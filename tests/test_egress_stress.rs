@@ -81,16 +81,18 @@ async fn egress_stress_impl(
         http_server.id().unwrap_or(0)
     );
 
-    // Determine the URL that VMs will use to test egress
-    // For bridged mode, we use the host's primary network interface IP. Traffic to this IP
-    // goes through NAT (MASQUERADE), so CONNMARK-based routing ensures correct return path.
-    // For rootless mode, pasta handles all routing so local traffic works fine (10.0.2.2).
+    // Determine the URL that VMs will use to test egress.
+    // Routed mode uses IPv6 — each clone has a unique IPv6, so return routing
+    // works naturally without CONNMARK (unlike IPv4 where clones share 10.0.2.100).
     let egress_url = match network {
         "rootless" => format!("http://10.0.2.2:{}/", http_server_port),
-        "bridged" | "routed" => {
-            // Get host's primary interface IP (the IP used to reach external networks)
-            let host_ip = get_host_primary_ip().await?;
+        "bridged" => {
+            let host_ip = common::get_host_primary_ip().await?;
             format!("http://{}:{}/", host_ip, http_server_port)
+        }
+        "routed" => {
+            let host_ipv6 = common::get_host_ipv6().await?;
+            format!("http://[{}]:{}/", host_ipv6, http_server_port)
         }
         _ => anyhow::bail!("Unknown network type: {}", network),
     };
@@ -424,19 +426,19 @@ async fn egress_stress_impl(
 
 /// Find a free port for the HTTP server (parallel test isolation)
 fn find_free_port() -> Result<u16> {
-    // Bind to port 0 to let the OS allocate a free port
-    let listener = TcpListener::bind("0.0.0.0:0").context("binding to find free port")?;
+    // Bind to [::]:0 for dual-stack port allocation
+    let listener = TcpListener::bind("[::]:0").context("binding to find free port")?;
     let port = listener.local_addr()?.port();
     // Drop the listener - there's a tiny race window but it's acceptable for tests
     drop(listener);
     Ok(port)
 }
 
-/// Start a simple HTTP server using Python
+/// Start a simple HTTP server using Python (dual-stack: IPv4 + IPv6)
 async fn start_http_server(port: u16) -> Result<tokio::process::Child> {
-    // Use Python's built-in HTTP server
+    // Bind on :: for dual-stack (IPv4 via ::ffff: mapping + native IPv6)
     let child = tokio::process::Command::new("python3")
-        .args(["-m", "http.server", &port.to_string(), "--bind", "0.0.0.0"])
+        .args(["-m", "http.server", &port.to_string(), "--bind", "::"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -453,7 +455,7 @@ async fn start_http_server(port: u16) -> Result<tokio::process::Child> {
                 "/dev/null",
                 "-w",
                 "%{http_code}",
-                &format!("http://127.0.0.1:{}/", port),
+                &format!("http://[::1]:{}/", port),
             ])
             .output()
             .await?;
@@ -479,27 +481,7 @@ async fn stop_http_server(mut server: tokio::process::Child) {
     let _ = server.kill().await;
 }
 
-/// Get the host's primary network interface IP (used for reaching external networks)
-/// This is the IP that VMs can reach via NAT
-async fn get_host_primary_ip() -> Result<String> {
-    // Use "ip route get 8.8.8.8" to find which interface/IP is used for external traffic
-    let output = tokio::process::Command::new("ip")
-        .args(["route", "get", "8.8.8.8"])
-        .output()
-        .await
-        .context("running ip route get")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Output looks like: "8.8.8.8 via 172.31.0.1 dev enp3s0 src 172.31.15.123 uid 0"
-    // We want the IP after "src"
-    for part in stdout.split_whitespace().collect::<Vec<_>>().windows(2) {
-        if part[0] == "src" {
-            return Ok(part[1].to_string());
-        }
-    }
-
-    anyhow::bail!("Could not determine host primary IP from: {}", stdout)
-}
+// get_host_primary_ip() is now in common::get_host_primary_ip()
 
 /// Get host_ip from VM state for bridged networking
 #[allow(dead_code)]

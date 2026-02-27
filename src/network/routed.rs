@@ -38,6 +38,7 @@ pub struct RoutedNetwork {
     vm_id: String,
     tap_device: String,
     port_mappings: Vec<PortMapping>,
+    loopback_ip: Option<String>,
 
     // Network state (populated during setup)
     namespace_id: Option<String>,
@@ -53,6 +54,7 @@ impl RoutedNetwork {
             vm_id,
             tap_device,
             port_mappings,
+            loopback_ip: None,
             namespace_id: None,
             host_veth: None,
             vm_ipv6: None,
@@ -66,31 +68,59 @@ impl RoutedNetwork {
         self.namespace_id.as_deref()
     }
 
-    /// Add a host route and NDP proxy for a guest IPv6 address.
+    /// Set a unique loopback IP for port forwarding (127.x.y.z)
     ///
-    /// Called during snapshot restore when the snapshot's guest IPv6 differs from
-    /// the newly generated one (different VM IDs produce different IPv6 addresses,
-    /// but the snapshot's boot params have the original). Without BOTH the route
-    /// and the NDP proxy, return traffic from external hosts (like DNS servers)
-    /// can't reach the VM — the host won't answer NDP queries for the address.
-    pub async fn add_guest_route(&self, guest_ipv6: &str) {
-        if let Some(ref host_veth) = self.host_veth {
-            // Add host route so the kernel forwards packets to the right veth
-            let route = format!("{}/128", guest_ipv6);
-            let _ = tokio::process::Command::new("ip")
-                .args(["-6", "route", "replace", &route, "dev", host_veth])
-                .output()
-                .await;
+    /// Allocated by StateManager::allocate_loopback_ip() with lock-based
+    /// coordination to prevent collisions across concurrent VM starts.
+    pub fn with_loopback_ip(mut self, loopback_ip: String) -> Self {
+        self.loopback_ip = Some(loopback_ip);
+        self
+    }
 
-            // Add NDP proxy so the host answers neighbor solicitations for this address.
-            // Without this, external hosts can't discover where to send reply packets.
-            let _ = tokio::process::Command::new("ip")
-                .args(["-6", "neigh", "add", "proxy", guest_ipv6, "dev", "eth0"])
-                .output()
-                .await;
-
-            info!(guest_ipv6 = %guest_ipv6, veth = %host_veth, "added host route + NDP proxy for snapshot guest IPv6");
+    /// Validate that the host meets requirements for routed networking.
+    ///
+    /// Checks:
+    /// - Running as root (required for network namespaces and veth pairs)
+    /// - Host has a global IPv6 address with a /64 subnet
+    /// - ip6tables is available (for MASQUERADE)
+    ///
+    /// Call this early (before VM setup) to give clear error messages.
+    pub fn preflight_check() -> Result<()> {
+        // Must be root
+        if !nix::unistd::getuid().is_root() {
+            anyhow::bail!(
+                "routed networking requires root (creates network namespaces and veth pairs). \
+                 Run with sudo or use --network rootless instead."
+            );
         }
+
+        // Must have global IPv6
+        if Self::detect_host_ipv6().is_none() {
+            anyhow::bail!(
+                "routed networking requires a host with a global IPv6 address.\n\
+                 The host needs a /64 subnet (or a /128 with a /64 on-link route, e.g. AWS VPC).\n\
+                 Check with: ip -6 addr show scope global\n\
+                 If using AWS, ensure the instance has an IPv6 address assigned."
+            );
+        }
+
+        // ip6tables must be available
+        let ip6tables = std::process::Command::new("ip6tables")
+            .args(["--version"])
+            .output();
+        if ip6tables.is_err() || !ip6tables.unwrap().status.success() {
+            anyhow::bail!(
+                "routed networking requires ip6tables for IPv6 MASQUERADE.\n\
+                 Install with: apt-get install iptables"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Get the unique per-clone vm_ipv6 address.
+    pub fn vm_ipv6(&self) -> Option<&str> {
+        self.vm_ipv6.as_deref()
     }
 
     /// Detect host's global IPv6 address and /64 subnet.
@@ -183,10 +213,43 @@ impl RoutedNetwork {
 #[async_trait::async_trait]
 impl NetworkManager for RoutedNetwork {
     async fn setup(&mut self) -> Result<NetworkConfig> {
-        let vm_id_short = truncate_id(&self.vm_id, 5);
-        let ns_name = format!("fcvm-{}", vm_id_short);
-        let host_veth = format!("veth-{}", vm_id_short);
-        let guest_veth = format!("vns-{}", vm_id_short);
+        // Generate unique namespace/veth names. Use hash-based short ID with
+        // collision detection: if the namespace already exists, bump a counter.
+        // Linux interface names are max 15 chars, so we use 5-char suffixes.
+        let (ns_name, host_veth, guest_veth) = {
+            let base = truncate_id(&self.vm_id, 8);
+            let mut ns = format!("fcvm-{}", base);
+            let mut hv = format!("veth-{}", base);
+            let mut gv = format!("vns-{}", base);
+
+            // Check for collision (another VM with same truncated ID).
+            // Bounded to 100 iterations to prevent infinite loops.
+            let mut found = !std::path::Path::new(&format!("/var/run/netns/{}", ns)).exists();
+            if !found {
+                for i in 1u32..=100 {
+                    warn!(namespace = %ns, "namespace collision, retrying with suffix");
+                    let suffix = format!("{}{}", base, i);
+                    // Truncate to keep within IFNAMSIZ (15 chars)
+                    let short = &suffix[..suffix.len().min(10)];
+                    ns = format!("fcvm-{}", short);
+                    hv = format!("veth-{}", short);
+                    gv = format!("vns-{}", short);
+                    if !std::path::Path::new(&format!("/var/run/netns/{}", ns)).exists() {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if !found {
+                anyhow::bail!(
+                    "could not find a free namespace name after 100 attempts \
+                     (base={}, last tried={}). Check for stale namespaces with: ip netns list",
+                    base,
+                    ns
+                );
+            }
+            (ns, hv, gv)
+        };
 
         info!(
             vm_id = %self.vm_id,
@@ -198,7 +261,31 @@ impl NetworkManager for RoutedNetwork {
         let (host_ipv6, ipv6_prefix) = Self::detect_host_ipv6()
             .context("routed mode requires a host with a global IPv6 /64 subnet")?;
 
-        let vm_ipv6 = Self::generate_vm_ipv6(&ipv6_prefix, &self.vm_id);
+        // Generate a unique IPv6 for this VM. Check for route collisions
+        // (astronomically unlikely with 64-bit hash, but defend against it).
+        let vm_ipv6 = {
+            let mut candidate = Self::generate_vm_ipv6(&ipv6_prefix, &self.vm_id);
+            for attempt in 0..10 {
+                let route_check = tokio::process::Command::new("ip")
+                    .args(["-6", "route", "show", &format!("{}/128", candidate)])
+                    .output()
+                    .await;
+                let route_exists = route_check
+                    .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+                    .unwrap_or(false);
+                if !route_exists {
+                    break;
+                }
+                warn!(
+                    ipv6 = %candidate, attempt,
+                    "IPv6 route collision detected, trying alternative"
+                );
+                // Mix in the attempt counter for a different hash
+                candidate =
+                    Self::generate_vm_ipv6(&ipv6_prefix, &format!("{}:{}", self.vm_id, attempt));
+            }
+            candidate
+        };
         info!(
             host_ipv6 = %host_ipv6,
             vm_ipv6 = %vm_ipv6,
@@ -290,27 +377,7 @@ impl NetworkManager for RoutedNetwork {
             .await;
         info!(host_ll = %host_ll, "assigned link-local to host veth");
 
-        // 9. Add routable source IPv6 to bridge (for namespace-originated traffic).
-        //    Uses a separate address from the VM's — the namespace needs its own
-        //    routable source so return traffic can find it.
-        let ns_source_ipv6 = format!("{}::face:1", ipv6_prefix);
-        let ns_source_cidr = format!("{}/128", ns_source_ipv6);
-        namespace::exec_in_namespace(
-            &ns_name,
-            &[
-                "ip",
-                "-6",
-                "addr",
-                "add",
-                &ns_source_cidr,
-                "dev",
-                BRIDGE_DEVICE,
-                "nodad",
-            ],
-        )
-        .await?;
-
-        // 10. In namespace: default IPv6 route goes through bridge → veth → host.
+        // 9. In namespace: default IPv6 route goes through bridge → veth → host.
         //     The bridge forwards L2 frames from br0 to veth (bridge member).
         //     The host veth receives them and the host kernel routes to eth0.
         //     Use the host veth's link-local as nexthop (reachable via NDP on bridge).
@@ -330,60 +397,25 @@ impl NetworkManager for RoutedNetwork {
         )
         .await?;
 
-        // 11. Enable IPv6 forwarding in namespace (for VM traffic forwarding)
+        // 10. Enable IPv6 forwarding in namespace (for VM traffic forwarding)
         namespace::exec_in_namespace(
             &ns_name,
             &["sysctl", "-w", "net.ipv6.conf.all.forwarding=1"],
         )
         .await?;
 
-        // 11b. Enable IPv4 forwarding in namespace (for VM → host traffic)
-        namespace::exec_in_namespace(&ns_name, &["sysctl", "-w", "net.ipv4.ip_forward=1"]).await?;
-        // 11c. Default IPv4 route in namespace via the host veth.
-        //      The host_veth is a bridge port, so we can't route directly through it.
-        //      Instead, give host_veth an IPv4 address (10.0.2.2) and use it as nexthop
-        //      via br0. ARP resolves 10.0.2.2 → host_veth MAC across the bridge.
-        let _ = tokio::process::Command::new("ip")
-            .args(["addr", "add", "10.0.2.2/32", "dev", &host_veth])
-            .output()
-            .await;
-        namespace::exec_in_namespace(
-            &ns_name,
-            &[
-                "ip",
-                "route",
-                "add",
-                "default",
-                "via",
-                "10.0.2.2",
-                "dev",
-                BRIDGE_DEVICE,
-            ],
-        )
-        .await?;
+        // IPv4 stays internal to the namespace (bridge at 10.0.2.1 for health checks).
+        // All external traffic uses IPv6 — each clone gets a unique IPv6 address,
+        // so return routing works naturally without CONNMARK or ECMP workarounds.
 
-        // 12. On host: route VM's IPv6 back through veth to the namespace
+        // 11. On host: route VM's IPv6 back through veth to the namespace (per-VM, no collision)
         let vm_route = format!("{}/128", vm_ipv6);
         let _ = tokio::process::Command::new("ip")
             .args(["-6", "route", "replace", &vm_route, "dev", &host_veth])
             .output()
             .await;
-        // Also route the namespace's source address
-        let _ = tokio::process::Command::new("ip")
-            .args(["-6", "route", "replace", &ns_source_cidr, "dev", &host_veth])
-            .output()
-            .await;
 
-        // 12b. On host: route VM's IPv4 subnet back through veth to the namespace.
-        //      Uses `dev <host_veth>` qualifier so multiple routed VMs can coexist
-        //      (each gets its own route entry via a different veth device).
-        let _ = tokio::process::Command::new("ip")
-            .args(["route", "add", "10.0.2.0/24", "dev", &host_veth])
-            .output()
-            .await;
-        info!(host_veth = %host_veth, "added IPv4 return route via host veth");
-
-        // 13. Add proxy NDP so the network fabric routes VM's IPv6 to this host
+        // 12. Add proxy NDP so the network fabric routes VM's IPv6 to this host
         let default_iface = detect_default_ipv6_interface()
             .await
             .unwrap_or_else(|| "eth0".to_string());
@@ -401,35 +433,36 @@ impl NetworkManager for RoutedNetwork {
             .await;
         info!(vm_ipv6 = %vm_ipv6, iface = %default_iface, "added proxy NDP");
 
-        // 14. MASQUERADE outbound traffic from the namespace.
+        // 13. MASQUERADE outbound IPv6 traffic from the namespace.
         //     On AWS, source/dest check drops packets with unassigned source IPs.
         //     MASQUERADE rewrites the source to the host's IP so the VPC fabric
-        //     accepts the traffic. Without this, DNS and image pulls fail.
-        let _ = tokio::process::Command::new("iptables")
-            .args([
-                "-t", "nat", "-A", "POSTROUTING",
-                "-s", "10.0.2.0/24",
-                "-o", &default_iface,
-                "-j", "MASQUERADE",
-            ])
-            .output()
-            .await;
+        //     accepts the traffic. IPv4 is not routed externally — only IPv6.
         let _ = tokio::process::Command::new("ip6tables")
             .args([
-                "-t", "nat", "-A", "POSTROUTING",
-                "-o", &default_iface,
-                "-s", &format!("{}/128", vm_ipv6),
-                "-j", "MASQUERADE",
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-o",
+                &default_iface,
+                "-s",
+                &format!("{}/128", vm_ipv6),
+                "-j",
+                "MASQUERADE",
             ])
             .output()
             .await;
-        info!(iface = %default_iface, "added MASQUERADE for outbound traffic");
+        info!(iface = %default_iface, "added IPv6 MASQUERADE for outbound traffic");
 
-        // 15. Port forwarding: socat listens on host loopback, connects to VM
+        // 14. Port forwarding: socat listens on host loopback, connects to VM
         //     inside the namespace (via `ip netns exec`). The veth is a bridge member
         //     so host-side IPv4 routing to 10.0.2.100 doesn't work — socat must run
         //     the connect side inside the namespace where the bridge is directly reachable.
-        let loopback_ip = format!("127.0.0.{}", 2 + (std::process::id() % 252) as u8);
+        //     Loopback IP is allocated by StateManager with lock-based coordination.
+        let loopback_ip = self
+            .loopback_ip
+            .clone()
+            .unwrap_or_else(|| "127.0.0.2".to_string());
         for mapping in &self.port_mappings {
             // Shell script: socat listens on host, connects inside namespace.
             // `exec` replaces the shell process so child.kill() kills socat directly.
@@ -450,6 +483,20 @@ impl NetworkManager for RoutedNetwork {
                 }
                 Err(e) => {
                     warn!(host_port = mapping.host_port, guest_port = mapping.guest_port, error = %e, "failed to start socat port forwarder");
+                }
+            }
+        }
+
+        // Brief pause then check socat processes didn't crash immediately
+        // (e.g., port already in use, binary not found)
+        if !self.socat_children.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            for child in &mut self.socat_children {
+                if let Ok(Some(status)) = child.try_wait() {
+                    warn!(
+                        exit_code = ?status.code(),
+                        "socat exited immediately — port may already be in use"
+                    );
                 }
             }
         }
@@ -476,7 +523,7 @@ impl NetworkManager for RoutedNetwork {
             },
             // IPv4 DNS (e.g. VPC's 10.0.0.2) is unreachable without MASQUERADE.
             // Detect an IPv6 DNS server reachable via native routed IPv6.
-            dns_server: detect_ipv6_dns(),
+            dns_server: detect_ipv6_dns().await,
             guest_ipv6: Some(vm_ipv6),
             // fd00::1 is on the bridge inside the namespace. The VM uses it as IPv6 gateway.
             // NDP resolves it on the VM's local link (TAP → bridge → fd00::1 responds).
@@ -496,70 +543,82 @@ impl NetworkManager for RoutedNetwork {
             let _ = child.kill().await;
         }
 
-        // Remove host IPv4 route to VM subnet (qualified by dev for parallel safety)
-        if let Some(ref host_veth) = self.host_veth {
-            let _ = tokio::process::Command::new("ip")
-                .args(["route", "del", "10.0.2.0/24", "dev", host_veth])
-                .output()
-                .await;
-        }
-
-        // Remove MASQUERADE rules and proxy NDP
+        // Remove IPv6 MASQUERADE and proxy NDP
         if let Some(ref vm_ipv6) = self.vm_ipv6 {
-            let default_iface = self
-                .default_iface
-                .as_deref()
-                .unwrap_or("eth0");
+            let default_iface = self.default_iface.as_deref().unwrap_or("eth0");
 
-            // Remove MASQUERADE rules
-            let _ = tokio::process::Command::new("iptables")
+            // Remove IPv6 MASQUERADE rule
+            match tokio::process::Command::new("ip6tables")
                 .args([
-                    "-t", "nat", "-D", "POSTROUTING",
-                    "-s", "10.0.2.0/24",
-                    "-o", default_iface,
-                    "-j", "MASQUERADE",
+                    "-t",
+                    "nat",
+                    "-D",
+                    "POSTROUTING",
+                    "-o",
+                    default_iface,
+                    "-s",
+                    &format!("{}/128", vm_ipv6),
+                    "-j",
+                    "MASQUERADE",
                 ])
                 .output()
-                .await;
-            let _ = tokio::process::Command::new("ip6tables")
-                .args([
-                    "-t", "nat", "-D", "POSTROUTING",
-                    "-o", default_iface,
-                    "-s", &format!("{}/128", vm_ipv6),
-                    "-j", "MASQUERADE",
-                ])
-                .output()
-                .await;
+                .await
+            {
+                Ok(o) if !o.status.success() => {
+                    warn!(stderr = %String::from_utf8_lossy(&o.stderr).trim(), "ip6tables MASQUERADE cleanup failed");
+                }
+                Err(e) => warn!(error = %e, "ip6tables command failed"),
+                _ => {}
+            }
 
             // Remove proxy NDP
-            let _ = tokio::process::Command::new("ip")
-                .args([
-                    "-6",
-                    "neigh",
-                    "del",
-                    "proxy",
-                    vm_ipv6,
-                    "dev",
-                    default_iface,
-                ])
+            match tokio::process::Command::new("ip")
+                .args(["-6", "neigh", "del", "proxy", vm_ipv6, "dev", default_iface])
                 .output()
-                .await;
+                .await
+            {
+                Ok(o) if !o.status.success() => {
+                    warn!(stderr = %String::from_utf8_lossy(&o.stderr).trim(), "proxy NDP cleanup failed");
+                }
+                Err(e) => warn!(error = %e, "proxy NDP command failed"),
+                _ => {}
+            }
 
-            // Remove host route
-            let _ = tokio::process::Command::new("ip")
-                .args(["-6", "route", "del", &format!("{}/128", vm_ipv6)])
-                .output()
-                .await;
+            // Remove host route (use dev qualifier for parallel safety)
+            if let Some(ref host_veth) = self.host_veth {
+                match tokio::process::Command::new("ip")
+                    .args([
+                        "-6",
+                        "route",
+                        "del",
+                        &format!("{}/128", vm_ipv6),
+                        "dev",
+                        host_veth,
+                    ])
+                    .output()
+                    .await
+                {
+                    Ok(o) if !o.status.success() => {
+                        warn!(stderr = %String::from_utf8_lossy(&o.stderr).trim(), "host route cleanup failed");
+                    }
+                    Err(e) => warn!(error = %e, "host route cleanup command failed"),
+                    _ => {}
+                }
+            }
         }
 
         // Delete veth pair (auto-deletes peer)
         if let Some(ref host_veth) = self.host_veth {
-            let _ = veth::delete_veth_pair(host_veth).await;
+            if let Err(e) = veth::delete_veth_pair(host_veth).await {
+                warn!(error = %e, host_veth = %host_veth, "veth pair cleanup failed");
+            }
         }
 
         // Delete namespace
         if let Some(ref ns_name) = self.namespace_id {
-            let _ = namespace::delete_namespace(ns_name).await;
+            if let Err(e) = namespace::delete_namespace(ns_name).await {
+                warn!(error = %e, namespace = %ns_name, "namespace cleanup failed");
+            }
         }
 
         Ok(())
@@ -611,7 +670,7 @@ async fn generate_link_local_from_mac(iface: &str) -> Option<String> {
 /// This function discovers an IPv6 DNS server by:
 /// 1. Checking host resolv.conf for existing IPv6 nameservers
 /// 2. Probing known cloud IPv6 DNS endpoints (e.g. AWS fd00:ec2::253)
-fn detect_ipv6_dns() -> Option<String> {
+async fn detect_ipv6_dns() -> Option<String> {
     // Check host DNS config for IPv6 nameservers
     let resolv = std::fs::read_to_string("/run/systemd/resolve/resolv.conf")
         .or_else(|_| std::fs::read_to_string("/etc/resolv.conf"))
@@ -628,9 +687,16 @@ fn detect_ipv6_dns() -> Option<String> {
 
     // No IPv6 nameserver in resolv.conf. Probe known cloud IPv6 DNS endpoints.
     // AWS VPCs provide dual-stack DNS at fd00:ec2::253.
-    let probe = std::process::Command::new("dig")
-        .args(["+short", "+timeout=2", "+tries=1", "@fd00:ec2::253", "example.com"])
+    let probe = tokio::process::Command::new("dig")
+        .args([
+            "+short",
+            "+timeout=2",
+            "+tries=1",
+            "@fd00:ec2::253",
+            "example.com",
+        ])
         .output()
+        .await
         .ok()?;
 
     if probe.status.success() && !String::from_utf8_lossy(&probe.stdout).trim().is_empty() {
@@ -659,4 +725,3 @@ async fn detect_default_ipv6_interface() -> Option<String> {
     }
     None
 }
-

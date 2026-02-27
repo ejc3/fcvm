@@ -7,7 +7,7 @@ Run Podman containers in Firecracker microVMs with fast cloning via UFFD memory 
 > - **~6x faster startup** with container image cache (540ms vs 3100ms)
 > - VM cloning via UFFD memory server + btrfs reflinks (~10ms restore, ~610ms with exec)
 > - Multiple VMs share memory via kernel page cache (50 VMs = ~512MB, not 25GB)
-> - Dual networking: bridged (iptables) or rootless (pasta)
+> - Three networking modes: bridged (iptables), rootless (pasta), or routed (IPv6 veth)
 > - Transparent egress proxy for outbound internet (243 MB/s, 8000 concurrent connections)
 > - Port forwarding for both regular VMs and clones
 > - FUSE-based host directory mapping via fuse-pipe
@@ -28,6 +28,7 @@ Run Podman containers in Firecracker microVMs with fast cloning via UFFD memory 
 - musl target: `rustup target add $(uname -m)-unknown-linux-musl`
 - Firecracker binary in PATH
 - For bridged networking: sudo, iptables, iproute2
+- For routed networking: sudo, ip6tables, iproute2, host with global IPv6 /64 subnet
 - For rootless networking: passt (provides the `pasta` binary)
 - For building rootfs: qemu-utils, e2fsprogs
 
@@ -158,6 +159,9 @@ sudo ./fcvm setup
 
 # Bridged networking (for full network access, requires sudo)
 sudo ./fcvm podman run --name web-bridged --network bridged nginx:alpine
+
+# Routed networking (IPv6 native, kernel line rate, requires sudo + IPv6 host)
+sudo ./fcvm podman run --name web-routed --network routed nginx:alpine
 ```
 
 ### Container Image Cache (~6x Faster Startup)
@@ -766,10 +770,26 @@ curl -s -X DELETE localhost:8090/v1/sandboxes/<id> | jq .
 |------|------|------|-------|
 | Rootless | `--network rootless` (default) | No | pasta with bridge, IPv6 support |
 | Bridged | `--network bridged` | Yes | iptables NAT, better performance |
+| Routed | `--network routed` | Yes | IPv6 veth, kernel line rate, no userspace proxy |
 
 **Rootless architecture**: Uses pasta (from the passt project) with a Linux bridge (br0) for L2 forwarding between pasta and Firecracker.
 Pasta uses splice(2) zero-copy L4 translation for near-native performance.
 The bridge preserves MAC addresses for proper ARP/NDP learning, enabling IPv6 support.
+
+**Routed architecture**: Connects VMs directly to the host via a veth pair with native IPv6 routing through the kernel stack — no userspace proxy, no iptables for traffic forwarding. Each VM gets a unique IPv6 address derived from the host's /64 subnet, enabling correct return routing even with many parallel clones.
+
+Requirements: host must have a global IPv6 address (e.g., AWS VPC with IPv6 enabled). IPv4 stays internal to the namespace (for health checks); all external traffic uses IPv6. Uses ip6tables only for MASQUERADE on AWS (source/dest check).
+
+```
+Host                            Namespace (ip netns)
+eth0 (/64 subnet)
+  |
+veth-host ←──veth pair──→ veth-ns
+  (proxy NDP)                 |
+                           br0 (10.0.2.1/24, fd00::1/64)
+                               |
+                           tap-vm → Firecracker VM (10.0.2.100, unique IPv6)
+```
 
 ### Egress Proxy (Outbound Internet)
 

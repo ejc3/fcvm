@@ -155,9 +155,9 @@ pub async fn run_exec_in_vm(
     // Connect to the exec server with retry logic
     let mut stream = connect_to_exec_server_with_retry(vsock_socket)?;
 
-    // No read timeout — commands like phps cookie gen can take >10 min
-    // EAGAIN is handled by retrying the read in the loop below
-    stream.set_read_timeout(None)?;
+    // Long timeout — commands like phps cookie gen can take >10 min.
+    // Use 1 hour as a safety net against permanent hangs (not None/infinite).
+    stream.set_read_timeout(Some(Duration::from_secs(3600)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
 
     debug!("connected to guest exec server");
@@ -218,9 +218,10 @@ pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
     // Connect to the exec server with retry logic
     let mut stream = connect_to_exec_server_with_retry(&vsock_socket)?;
 
-    // No read timeout — commands like phps cookie gen can take >10 min.
-    // TTY mode uses select/poll for multiplexing, so no timeout needed.
-    stream.set_read_timeout(None)?;
+    // Long timeout — commands like phps cookie gen can take >10 min.
+    // Use 1 hour as a safety net against permanent hangs (not None/infinite).
+    // TTY mode uses select/poll for multiplexing but still benefits from a timeout.
+    stream.set_read_timeout(Some(Duration::from_secs(3600)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
 
     if !quiet {
@@ -403,7 +404,8 @@ pub async fn run_exec_in_vm_captured(
     tokio::task::spawn_blocking(move || {
         let mut stream = connect_to_exec_server_with_retry(&vsock_socket)?;
 
-        stream.set_read_timeout(None)?;
+        // Long timeout as safety net (not None/infinite)
+        stream.set_read_timeout(Some(Duration::from_secs(3600)))?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
 
         let request = ExecRequest {

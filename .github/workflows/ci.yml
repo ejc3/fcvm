@@ -342,6 +342,12 @@ jobs:
           # This fixes podman container networking - without this, containers can't reach the internet
           sudo sysctl -w net.ipv4.conf.all.forwarding=1
           sudo sysctl -w net.ipv4.conf.default.forwarding=1
+          # Enable IPv6 forwarding for routed networking mode (veth + IPv6 routing)
+          sudo sysctl -w net.ipv6.conf.all.forwarding=1
+          sudo sysctl -w net.ipv6.conf.default.forwarding=1
+          # Keep accepting Router Advertisements with forwarding enabled (otherwise default route expires)
+          DEFAULT_IFACE=$(ip route show default | awk '/dev/{print $5; exit}')
+          sudo sysctl -w "net.ipv6.conf.${DEFAULT_IFACE}.accept_ra=2" 2>/dev/null || true
           # Enable FUSE allow_other for tests
           echo "user_allow_other" | sudo tee /etc/fuse.conf
           # Move podman storage to btrfs (more space for large container images)
@@ -513,6 +519,12 @@ jobs:
           # This fixes podman container networking - without this, containers can't reach the internet
           sudo sysctl -w net.ipv4.conf.all.forwarding=1
           sudo sysctl -w net.ipv4.conf.default.forwarding=1
+          # Enable IPv6 forwarding for routed networking mode (veth + IPv6 routing)
+          sudo sysctl -w net.ipv6.conf.all.forwarding=1
+          sudo sysctl -w net.ipv6.conf.default.forwarding=1
+          # Keep accepting Router Advertisements with forwarding enabled (otherwise default route expires)
+          DEFAULT_IFACE=$(ip route show default | awk '/dev/{print $5; exit}')
+          sudo sysctl -w "net.ipv6.conf.${DEFAULT_IFACE}.accept_ra=2" 2>/dev/null || true
           echo "user_allow_other" | sudo tee /etc/fuse.conf
           # Move podman storage to btrfs (more space for large container images)
           mkdir -p ~/.config/containers
@@ -631,6 +643,12 @@ jobs:
           # This fixes podman container networking - without this, containers can't reach the internet
           sudo sysctl -w net.ipv4.conf.all.forwarding=1
           sudo sysctl -w net.ipv4.conf.default.forwarding=1
+          # Enable IPv6 forwarding for routed networking mode (veth + IPv6 routing)
+          sudo sysctl -w net.ipv6.conf.all.forwarding=1
+          sudo sysctl -w net.ipv6.conf.default.forwarding=1
+          # Keep accepting Router Advertisements with forwarding enabled (otherwise default route expires)
+          DEFAULT_IFACE=$(ip route show default | awk '/dev/{print $5; exit}')
+          sudo sysctl -w "net.ipv6.conf.${DEFAULT_IFACE}.accept_ra=2" 2>/dev/null || true
           # Configure rootless podman to use cgroupfs (no systemd session on CI)
           mkdir -p ~/.config/containers
           printf '[engine]\ncgroup_manager = "cgroupfs"\nevents_logger = "file"\n' > ~/.config/containers/containers.conf

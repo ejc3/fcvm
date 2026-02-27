@@ -844,10 +844,11 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
     // Start local test servers on host
-    let bind_addr = if network == "rootless" {
-        "127.0.0.1"
-    } else {
-        "0.0.0.0" // Bridged needs to bind to all interfaces
+    // Routed uses IPv6 (each clone has unique IPv6), so bind on :: (dual-stack).
+    let bind_addr = match network {
+        "rootless" => "127.0.0.1",
+        "routed" => "::",
+        _ => "0.0.0.0",
     };
 
     // HTTP test server
@@ -855,17 +856,21 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
         .await
         .context("starting local HTTP test server")?;
 
-    // For rootless, we know the egress URL upfront (10.0.2.2).
-    // For bridged, we'll use the veth host IP from clone's state (same as DNS).
-    let egress_url_for_rootless = if network == "rootless" {
-        Some(format!("http://10.0.2.2:{}/", test_server.port))
-    } else {
-        None // Will use veth host IP from state
+    // For rootless, the VM reaches the host via pasta gateway (10.0.2.2).
+    // For routed, the VM reaches the host via IPv6 (unique per clone, no ECMP issues).
+    // For bridged, we'll use the veth host IP from clone's state.
+    let egress_url_known = match network {
+        "rootless" => Some(format!("http://10.0.2.2:{}/", test_server.port)),
+        "routed" => {
+            let host_ipv6 = common::get_host_ipv6().await?;
+            Some(format!("http://[{}]:{}/", host_ipv6, test_server.port))
+        }
+        _ => None, // Bridged: will use veth host IP from state
     };
     println!(
         "  Local HTTP server: {} (VM will connect via {})",
         test_server.url,
-        egress_url_for_rootless
+        egress_url_known
             .as_deref()
             .unwrap_or("veth host IP from state")
     );
@@ -877,19 +882,19 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
         .await
         .context("starting local DNS test server")?;
 
-    // For rootless, we know the pasta gateway address upfront.
-    // For bridged, we need to get the veth host IP from the clone's state after it starts,
-    // since the VM can only reach the host through the veth pair, not the host's primary IP.
-    let dns_server_addr_for_rootless = if network == "rootless" {
-        Some("10.0.2.2".to_string())
-    } else {
-        None // Will be determined from clone's state
+    // For rootless, the VM reaches host via pasta gateway (10.0.2.2).
+    // For routed, the VM reaches host via IPv6 (unique per clone).
+    // For bridged, we need the veth host IP from clone's state after it starts.
+    let dns_server_addr_known = match network {
+        "rootless" => Some("10.0.2.2".to_string()),
+        "routed" => Some(common::get_host_ipv6().await?),
+        _ => None, // Bridged: determined from clone's state
     };
     println!(
         "  Local DNS server: {}:{} (VM will query via {})",
         bind_addr,
         dns_server.port,
-        dns_server_addr_for_rootless
+        dns_server_addr_known
             .as_deref()
             .unwrap_or("veth host IP from state")
     );
@@ -1007,7 +1012,7 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
     println!("\nStep 5: Testing connectivity from clone...");
 
     // Get the DNS server address for this network mode
-    let dns_server_addr = if let Some(addr) = dns_server_addr_for_rootless.as_ref() {
+    let dns_server_addr = if let Some(addr) = dns_server_addr_known.as_ref() {
         addr.clone()
     } else {
         // For bridged mode, get the veth host IP from clone's state
@@ -1043,7 +1048,7 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
 
     // Test 2: HTTP connectivity to local test server
     println!("  Testing HTTP connectivity to local server...");
-    let egress_url = if let Some(url) = egress_url_for_rootless.as_ref() {
+    let egress_url = if let Some(url) = egress_url_known.as_ref() {
         url.clone()
     } else {
         // For bridged mode, use the same veth host IP we determined for DNS
@@ -1090,10 +1095,10 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
 
     println!("╚═══════════════════════════════════════════════════════════════╝");
 
-    // For bridged mode, HTTP is the critical test (DNS over UDP has NAT issues with clones)
+    // For bridged/routed, HTTP is the critical test (DNS over UDP has routing issues with clones)
     // For rootless mode, both should work
-    let required_tests_pass = if network == "bridged" {
-        // In bridged mode with clones, DNS over UDP may fail due to In-Namespace NAT
+    let required_tests_pass = if network == "bridged" || network == "routed" {
+        // In bridged/routed mode with clones, DNS over UDP may fail due to namespace routing
         // HTTP connectivity is sufficient to prove networking works
         http_ok
     } else {

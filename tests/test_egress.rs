@@ -54,28 +54,6 @@ async fn test_egress_clone_routed() -> Result<()> {
     egress_clone_test_impl("routed").await
 }
 
-/// Get the host's primary network interface IP (used for reaching external networks)
-/// For bridged mode, VMs can reach this IP via NAT
-async fn get_host_primary_ip() -> Result<String> {
-    // Use "ip route get 8.8.8.8" to find which interface/IP is used for external traffic
-    let output = tokio::process::Command::new("ip")
-        .args(["route", "get", "8.8.8.8"])
-        .output()
-        .await
-        .context("running ip route get")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Output looks like: "8.8.8.8 via 172.31.0.1 dev enp3s0 src 172.31.15.123 uid 0"
-    // We want the IP after "src"
-    for part in stdout.split_whitespace().collect::<Vec<_>>().windows(2) {
-        if part[0] == "src" {
-            return Ok(part[1].to_string());
-        }
-    }
-
-    anyhow::bail!("Could not determine host primary IP from: {}", stdout)
-}
-
 /// Calculate the URL a VM should use to reach a test server on the host
 async fn get_egress_url(network: &str, port: u16) -> Result<String> {
     match network {
@@ -83,10 +61,16 @@ async fn get_egress_url(network: &str, port: u16) -> Result<String> {
             // For rootless, pasta gateway is 10.0.2.2
             Ok(format!("http://10.0.2.2:{}/", port))
         }
-        "bridged" | "routed" => {
-            // For bridged/routed, use host's primary IP (reachable via NAT or direct routing)
-            let host_ip = get_host_primary_ip().await?;
+        "bridged" => {
+            // For bridged, use host's primary IPv4 (reachable via CONNMARK routing)
+            let host_ip = common::get_host_primary_ip().await?;
             Ok(format!("http://{}:{}/", host_ip, port))
+        }
+        "routed" => {
+            // For routed, use host's IPv6. Each clone has a unique IPv6,
+            // so return routing works naturally (no CONNMARK needed).
+            let host_ipv6 = common::get_host_ipv6().await?;
+            Ok(format!("http://[{}]:{}/", host_ipv6, port))
         }
         _ => anyhow::bail!("Unknown network type: {}", network),
     }
@@ -104,10 +88,11 @@ async fn egress_fresh_test_impl(network: &str) -> Result<()> {
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
     // Start local test server on host
-    let bind_addr = if network == "rootless" {
-        "127.0.0.1"
-    } else {
-        "0.0.0.0" // Bridged needs to bind to all interfaces
+    // Routed uses IPv6, so bind on :: (dual-stack). Bridged uses IPv4 on all interfaces.
+    let bind_addr = match network {
+        "rootless" => "127.0.0.1",
+        "routed" => "::",
+        _ => "0.0.0.0",
     };
 
     let test_server = common::LocalTestServer::start_on_available_port(bind_addr)
@@ -184,10 +169,11 @@ async fn egress_clone_test_impl(network: &str) -> Result<()> {
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
     // Start local test server on host
-    let bind_addr = if network == "rootless" {
-        "127.0.0.1"
-    } else {
-        "0.0.0.0" // Bridged needs to bind to all interfaces
+    // Routed uses IPv6, so bind on :: (dual-stack). Bridged uses IPv4 on all interfaces.
+    let bind_addr = match network {
+        "rootless" => "127.0.0.1",
+        "routed" => "::",
+        _ => "0.0.0.0",
     };
 
     let test_server = common::LocalTestServer::start_on_available_port(bind_addr)

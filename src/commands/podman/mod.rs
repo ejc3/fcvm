@@ -650,11 +650,19 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             tap_device.clone(),
             port_mappings.clone(),
         )),
-        NetworkMode::Routed => Box::new(RoutedNetwork::new(
-            vm_id.clone(),
-            tap_device.clone(),
-            port_mappings.clone(),
-        )),
+        NetworkMode::Routed => {
+            RoutedNetwork::preflight_check().context("routed mode preflight check failed")?;
+            let mut net =
+                RoutedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
+            if !port_mappings.is_empty() {
+                let loopback_ip = state_manager
+                    .allocate_loopback_ip(&mut vm_state)
+                    .await
+                    .context("allocating loopback IP for routed mode")?;
+                net = net.with_loopback_ip(loopback_ip);
+            }
+            Box::new(net)
+        }
         NetworkMode::Rootless => {
             // For rootless mode, allocate loopback IP atomically with state persistence
             // This prevents race conditions when starting multiple VMs concurrently
