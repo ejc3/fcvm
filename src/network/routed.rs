@@ -541,9 +541,14 @@ impl NetworkManager for RoutedNetwork {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             for child in &mut self.socat_children {
                 if let Ok(Some(status)) = child.try_wait() {
+                    let hint = if status.code() == Some(127) {
+                        "socat not found — install with: apt-get install socat"
+                    } else {
+                        "port may already be in use"
+                    };
                     warn!(
                         exit_code = ?status.code(),
-                        "socat exited immediately — port may already be in use"
+                        "socat exited immediately — {hint}"
                     );
                 }
             }
