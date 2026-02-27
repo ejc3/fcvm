@@ -177,7 +177,11 @@ pub async fn watch_restore_epoch(signals: crate::restore::RestoreSignals) {
                         signals
                             .restore_flag
                             .store(true, std::sync::atomic::Ordering::Release);
-                        crate::restore::handle_clone_restore(&signals).await;
+                        crate::restore::handle_clone_restore(
+                            &signals,
+                            metadata.clone_ipv6.as_deref(),
+                        )
+                        .await;
                     }
                     last_epoch = metadata.restore_epoch;
                 }
@@ -186,7 +190,8 @@ pub async fn watch_restore_epoch(signals: crate::restore::RestoreSignals) {
                     signals
                         .restore_flag
                         .store(true, std::sync::atomic::Ordering::Release);
-                    crate::restore::handle_clone_restore(&signals).await;
+                    crate::restore::handle_clone_restore(&signals, metadata.clone_ipv6.as_deref())
+                        .await;
                     last_epoch = metadata.restore_epoch;
                 }
                 _ => {}

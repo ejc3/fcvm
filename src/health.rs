@@ -887,12 +887,21 @@ async fn check_http_health_netns(
     }
     args.push(&url);
 
-    // ip netns exec requires root (or CAP_SYS_ADMIN)
-    let output = tokio::process::Command::new("sudo")
-        .args(&args)
-        .output()
-        .await
-        .context("failed to run ip netns exec curl")?;
+    // ip netns exec requires root (or CAP_SYS_ADMIN).
+    // Skip sudo when already running as root (routed mode always runs as root).
+    let output = if nix::unistd::getuid().is_root() {
+        tokio::process::Command::new(args[0])
+            .args(&args[1..])
+            .output()
+            .await
+            .context("failed to run ip netns exec curl")?
+    } else {
+        tokio::process::Command::new("sudo")
+            .args(&args)
+            .output()
+            .await
+            .context("failed to run sudo ip netns exec curl")?
+    };
 
     let elapsed = start.elapsed();
 

@@ -108,9 +108,7 @@ pub async fn kill_stale_tcp_connections() {
             continue;
         }
         let peer = fields[3];
-        if peer.starts_with("127.0.0.1:")
-            || peer.starts_with("[::1]:")
-            || peer.starts_with("::1:")
+        if peer.starts_with("127.0.0.1:") || peer.starts_with("[::1]:") || peer.starts_with("::1:")
         {
             local_count += 1;
         } else {
@@ -155,9 +153,7 @@ pub async fn kill_stale_tcp_connections() {
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            if stderr.contains("INET_DIAG_DESTROY")
-                || stderr.contains("Operation not supported")
-            {
+            if stderr.contains("INET_DIAG_DESTROY") || stderr.contains("Operation not supported") {
                 eprintln!("[fc-agent] ss -K not supported, trying conntrack");
                 kill_connections_via_conntrack().await;
             } else {
@@ -306,20 +302,28 @@ pub fn configure_ipv6_from_cmdline() {
 
     eprintln!("[fc-agent] IPv6: client={}, gateway={}", client, gateway);
 
+    // Use /128 prefix — the VM's only neighbor on eth0 is the bridge (gateway).
+    // A /64 on-link route would cause the VM to try NDP for other addresses in
+    // the subnet directly on eth0, which fails since they're on the physical
+    // network behind the veth pair. All external traffic goes via the default
+    // route (which uses `onlink` so it works without a matching on-link prefix).
+    // nodad: DAD is pointless on a Firecracker TAP (single endpoint) and adds
+    // 1-2s of "tentative" state that blocks IPv6 traffic.
     let addr_output = std::process::Command::new("ip")
         .args([
             "-6",
             "addr",
             "add",
-            &format!("{}/64", client),
+            &format!("{}/128", client),
             "dev",
             "eth0",
+            "nodad",
         ])
         .output();
 
     match addr_output {
         Ok(output) if output.status.success() => {
-            eprintln!("[fc-agent] added IPv6 address {}/64 to eth0", client);
+            eprintln!("[fc-agent] added IPv6 address {}/128 to eth0", client);
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -357,6 +361,86 @@ pub fn configure_ipv6_from_cmdline() {
         }
         Err(e) => {
             eprintln!("[fc-agent] WARNING: failed to run ip -6 route add: {}", e);
+        }
+    }
+}
+
+/// Reconfigure the guest's IPv6 address on eth0 after snapshot restore.
+///
+/// Replaces the snapshot's shared guest IPv6 with the unique per-clone address.
+/// This is called during handle_clone_restore(), BEFORE any network traffic
+/// can use the old address. Uses `ip addr replace` semantics: find the current
+/// IPv6, remove it, add the new one.
+pub async fn reconfigure_ipv6(new_ipv6: &str) {
+    eprintln!("[fc-agent] reconfiguring IPv6: new address = {}", new_ipv6);
+
+    // Find current global IPv6 on eth0
+    let output = tokio::process::Command::new("ip")
+        .args(["-6", "addr", "show", "dev", "eth0", "scope", "global"])
+        .output()
+        .await;
+
+    let old_addr = match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // Parse "inet6 <addr>/<prefix> scope global" line
+            stdout.lines().find_map(|line| {
+                let line = line.trim();
+                line.strip_prefix("inet6 ")
+                    .and_then(|rest| rest.split_whitespace().next().map(|s| s.to_string()))
+            })
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: failed to list IPv6 addrs: {}", e);
+            None
+        }
+    };
+
+    // Remove old address if found
+    if let Some(ref old) = old_addr {
+        let del = tokio::process::Command::new("ip")
+            .args(["-6", "addr", "del", old, "dev", "eth0"])
+            .output()
+            .await;
+        match del {
+            Ok(out) if out.status.success() => {
+                eprintln!("[fc-agent] removed old IPv6 {} from eth0", old);
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                eprintln!("[fc-agent] WARNING: failed to remove old IPv6: {}", stderr);
+            }
+            Err(e) => {
+                eprintln!("[fc-agent] WARNING: ip addr del failed: {}", e);
+            }
+        }
+    }
+
+    // Add new address with nodad — DAD is pointless on a Firecracker TAP (only
+    // one endpoint) and the 1-2s tentative period prevents the VM from using
+    // the address, causing IPv6 connectivity failures in tests.
+    let add = tokio::process::Command::new("ip")
+        .args([
+            "-6",
+            "addr",
+            "add",
+            &format!("{}/128", new_ipv6),
+            "dev",
+            "eth0",
+            "nodad",
+        ])
+        .output()
+        .await;
+    match add {
+        Ok(out) if out.status.success() => {
+            eprintln!("[fc-agent] added new IPv6 {}/128 to eth0", new_ipv6);
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!("[fc-agent] WARNING: failed to add new IPv6: {}", stderr);
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: ip addr add failed: {}", e);
         }
     }
 }

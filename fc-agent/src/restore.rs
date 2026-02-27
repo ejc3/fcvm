@@ -33,7 +33,16 @@ pub struct RestoreSignals {
 /// FUSE volumes are NOT remounted here. The reconnectable multiplexer
 /// detects the dead vsock and auto-reconnects to the clone's VolumeServer.
 /// The kernel FUSE session stays alive — processes see a brief hang, not errors.
-pub async fn handle_clone_restore(signals: &RestoreSignals) {
+///
+/// `clone_ipv6`: For routed mode, the unique per-clone IPv6 that replaces the
+/// snapshot's shared guest IPv6 on eth0. Without this, all clones share the same
+/// IPv6 and return traffic gets ECMP-routed to the wrong clone.
+pub async fn handle_clone_restore(signals: &RestoreSignals, clone_ipv6: Option<&str>) {
+    // Reconfigure IPv6 FIRST — before any network traffic can use the old address.
+    if let Some(new_ipv6) = clone_ipv6 {
+        network::reconfigure_ipv6(new_ipv6).await;
+    }
+
     network::kill_stale_tcp_connections().await;
     network::flush_arp_cache().await;
     network::send_gratuitous_arp().await;

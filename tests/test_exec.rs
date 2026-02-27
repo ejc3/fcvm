@@ -93,39 +93,39 @@ async fn exec_test_impl(network: &str) -> Result<()> {
         "should get nginx version or empty (stderr)"
     );
 
-    // Test 5: VM internet connectivity - curl AWS public ECR (use --vm flag)
-    println!("\nTest 5: VM internet connectivity - curl public.ecr.aws");
-    let output = run_exec(
-        &fcvm_path,
-        fcvm_pid,
-        true,
-        &[
-            "curl",
-            "-s",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            "--max-time",
-            "10",
-            "https://public.ecr.aws/",
-        ],
-    )
-    .await?;
+    // Test 5: VM internet connectivity (use --vm flag)
+    // ecr-public.aws.com is dual-stack. Routed mode forces -6 to prove native IPv6 veth routing.
+    let ipv6_flag: &[&str] = if network == "routed" { &["-6"] } else { &[] };
+    println!(
+        "\nTest 5: VM internet connectivity ({})",
+        if network == "routed" { "IPv6" } else { "IPv4" }
+    );
+    let mut args = vec![
+        "curl",
+        "-s",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "--max-time",
+        "15",
+    ];
+    args.extend_from_slice(ipv6_flag);
+    args.push("https://ecr-public.aws.com/");
+    let output = run_exec(&fcvm_path, fcvm_pid, true, &args).await?;
     let http_code = output.trim();
     println!("  HTTP status code: {}", http_code);
-    // Should get 2xx success or 3xx redirect (AWS ECR returns 308)
     assert!(
         http_code.starts_with('2') || http_code.starts_with('3'),
         "should get HTTP 2xx/3xx, got: {}",
         http_code
     );
 
-    // Test 6: Container internet connectivity - curl AWS public ECR (default, no flag needed)
-    // Note: We use curl because busybox wget doesn't properly support HTTPS through HTTP proxy
-    println!("\nTest 6: Container internet - curl public.ecr.aws");
-
-    // First install curl in the container
+    // Test 6: Container internet connectivity
+    println!(
+        "\nTest 6: Container internet ({})",
+        if network == "routed" { "IPv6" } else { "IPv4" }
+    );
     let _ = run_exec(
         &fcvm_path,
         fcvm_pid,
@@ -133,31 +133,25 @@ async fn exec_test_impl(network: &str) -> Result<()> {
         &["apk", "add", "--no-cache", "curl"],
     )
     .await?;
-
-    // Now test with curl
-    let output = run_exec(
-        &fcvm_path,
-        fcvm_pid,
-        false,
-        &[
-            "curl",
-            "-s",
-            "--max-time",
-            "10",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            "https://public.ecr.aws/",
-        ],
-    )
-    .await?;
-    println!("  curl HTTP status: {}", output.trim());
-    // public.ecr.aws returns 308 redirect or 200
+    let mut args = vec![
+        "curl",
+        "-s",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "--max-time",
+        "15",
+    ];
+    args.extend_from_slice(ipv6_flag);
+    args.push("https://ecr-public.aws.com/");
+    let output = run_exec(&fcvm_path, fcvm_pid, false, &args).await?;
+    let http_code = output.trim();
+    println!("  curl HTTP status: {}", http_code);
     assert!(
-        output.contains("200") || output.contains("308"),
-        "curl should get 200 or 308, got: {}",
-        output
+        http_code.starts_with('2') || http_code.starts_with('3'),
+        "curl should get 2xx/3xx, got: {}",
+        http_code
     );
 
     // Test 7: TTY NOT allocated without -t flag (VM exec)
