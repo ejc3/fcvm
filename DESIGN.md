@@ -554,11 +554,13 @@ Host (127.0.0.x:8080) → pasta → pasta0 → br0 (L2) → tap-fc → Guest (10
 
 ### Egress Proxy (Outbound IPv4 TCP)
 
-In rootless mode and routed mode, outbound IPv4 TCP from the guest requires a transparent
-proxy (rootless has no NAT gateway; routed mode doesn't route IPv4 externally). The egress
-proxy multiplexes all outbound TCP connections over a **single vsock connection** using a
-frame-based protocol. In routed mode, IPv6 traffic goes natively through the kernel stack,
-so the egress proxy only handles IPv4 TCP.
+In rootless mode, outbound IPv4 TCP from the guest requires a transparent proxy because
+there is no NAT gateway. The egress proxy multiplexes all outbound TCP connections over
+a **single vsock connection** using a frame-based protocol.
+
+Note: Routed mode does **not** use the egress proxy. All external traffic in routed mode
+goes natively through the kernel's IPv6 routing stack at line rate. IPv4 stays internal
+to the namespace (for health checks and socat port forwarding only).
 
 **Architecture**:
 ```

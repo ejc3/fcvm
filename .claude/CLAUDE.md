@@ -1111,7 +1111,7 @@ src/
 ├── commands/         # Command implementations
 ├── state/            # VM state management
 ├── firecracker/      # Firecracker API client
-├── network/          # Networking layer (bridged + pasta + egress proxy)
+├── network/          # Networking layer (bridged + pasta + routed + egress proxy)
 ├── storage/          # Disk/snapshot management
 ├── uffd/             # UFFD memory sharing
 ├── volume/           # FUSE volume handling
@@ -1172,6 +1172,7 @@ fuse-pipe/benches/
 3. **True Rootless Networking** (2025-11-25)
    - `--network rootless` (default): pasta, no root required
    - `--network bridged`: Network namespace + iptables, requires root
+   - `--network routed`: veth + IPv6 kernel routing, requires root + IPv6 host
    - User namespace via `unshare --user --net` with external UID/GID mappings
    - Health checks use unique loopback IPs (127.x.y.z) per VM
 
@@ -1210,6 +1211,7 @@ fuse-pipe/benches/
 |------|------|---------------|-------------|-----------------|
 | Rootless (default) | `--network rootless` | No | Good | pasta CLI flags (-t/-u) |
 | Bridged | `--network bridged` | Yes | Better | iptables DNAT |
+| Routed | `--network routed` | Yes (+ IPv6 host) | Best (kernel line rate) | socat + loopback IP |
 
 **Rootless Architecture:**
 - Holder process starts with `unshare --user --net`, UID/GID mappings written externally
@@ -1219,6 +1221,16 @@ fuse-pipe/benches/
 - Guest uses pasta network (10.0.2.100)
 - Port forwarding via pasta CLI flags (-t/-u)
 - IPv6 supported with `--enable-ipv6` and native DNS proxying
+
+**Routed Architecture** (`src/network/routed.rs`):
+- veth pair connects VM namespace to host with native IPv6 kernel routing (no userspace proxy)
+- Each VM gets a unique IPv6 derived from host's /64 subnet via hash of vm_id
+- Network namespace with bridge (br0) connecting TAP and veth for L2 forwarding
+- Proxy NDP on default interface makes VM IPv6 routable from network fabric
+- ip6tables MASQUERADE for AWS VPC source/dest checks
+- Port forwarding via socat on unique loopback IP (same allocation as rootless)
+- IPv4 stays internal to namespace (health checks only); all external traffic uses IPv6
+- Egress proxy is NOT used — IPv6 goes natively through the kernel stack
 
 **Loopback IP Allocation** (`src/state/manager.rs`):
 - Sequential allocation: 127.0.0.2, 127.0.0.3, ..., 127.0.0.254, then 127.0.1.2, etc.
