@@ -44,7 +44,6 @@ async fn test_egress_clone_rootless() -> Result<()> {
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_egress_fresh_routed() -> Result<()> {
-    skip_if_no_ipv6!();
     egress_fresh_test_impl("routed").await
 }
 
@@ -52,7 +51,6 @@ async fn test_egress_fresh_routed() -> Result<()> {
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_egress_clone_routed() -> Result<()> {
-    skip_if_no_ipv6!();
     egress_clone_test_impl("routed").await
 }
 
