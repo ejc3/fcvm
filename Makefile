@@ -1,5 +1,14 @@
 SHELL := /bin/bash
 
+# Guard: never run make as root (except clean). Running cargo as root
+# leaves root-owned files in target/ that break subsequent user builds
+# with BrokenPipe errors from nextest finding stale binaries.
+ifeq ($(shell id -u),0)
+ifeq ($(filter clean,$(MAKECMDGOALS)),)
+$(error Do not run make as root. Use 'make test-root' as your normal user — it uses sudo only for the test runner)
+endif
+endif
+
 # Find Rust toolchain bin directory and set PATH
 # Prefer stable (has musl target), fall back to any toolchain
 RUST_BIN := $(shell command -v cargo >/dev/null 2>&1 && dirname $$(command -v cargo) || \
@@ -287,6 +296,10 @@ _test-all:
 	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_RETRIES) $(FILTER)
 
 _test-root:
+	@if find target/ -user root -print -quit 2>/dev/null | grep -q .; then \
+		echo "==> WARNING: root-owned files in target/ (from sudo cargo?). Fixing ownership..."; \
+		sudo chown -R $$(id -u):$$(id -g) target/; \
+	fi
 	@RUST_LOG="$(TEST_LOG)" \
 	FCVM_DATA_DIR=$(ROOT_DATA_DIR) \
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
