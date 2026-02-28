@@ -7,500 +7,327 @@ user-invocable: true
 
 # Pull Request Workflow for Rust Projects
 
-Follow this workflow when creating, updating, or merging pull requests.
+## Quick Reference
 
-## Before Creating/Pushing ANY Code
+| Task | Command |
+|------|---------|
+| CI status (non-blocking) | `gh pr view <N> --json statusCheckRollup --jq '.statusCheckRollup[] \| "\(.name): \(.conclusion // "pending")"'` |
+| CI status (blocking) | `gh pr checks <N>` |
+| Read PR comments | `gh pr view <N> --json comments --jq '.comments[] \| "---\n" + .body'` |
+| Read inline review comments | `gh api repos/$REPO/pulls/<N>/comments --jq '.[] \| "---\nfile: \(.path):\(.line // .original_line)\n\(.body)"'` |
+| Create PR | `git push -u origin <branch> && gh pr create --fill` |
+| Merge standalone PR | `gh pr merge <N> --merge --delete-branch` |
+| Merge stacked PR (base) | `gh pr merge <N> --merge` (NO `--delete-branch`!) |
+| List my PRs | `gh pr list --author @me` |
 
-Run these checks locally - CI is for validation, not discovery:
+**Setup** — run this once per session to avoid placeholder issues:
+```bash
+REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
+```
+
+---
+
+## CI Failed — What Do I Do?
+
+This is the most common use of this skill. Follow this decision tree:
+
+### Step 1: Get the run ID and identify failures
 
 ```bash
-# 1. Format check (REQUIRED)
-cargo fmt --check
-# If it fails: cargo fmt
+REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
 
-# 2. Lint check (REQUIRED)
-cargo clippy --all-targets -- -D warnings
+# Get latest run ID for current branch
+RUN_ID=$(gh run list --branch "$(git branch --show-current)" --limit 1 --json databaseId --jq '.[0].databaseId')
 
-# 3. Sanity tests (RECOMMENDED)
-make test-root FILTER=sanity
-# Or run tests relevant to your changes
+# Show all failed jobs and which step failed
+gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
+  --jq '.jobs[] | select(.conclusion == "failure") | "\(.id) \(.name): \([.steps[] | select(.conclusion == "failure") | .name] | join(", "))"'
 ```
+
+### Step 2: Is it your fault?
+
+```bash
+# Check if main is green
+gh run list --branch main --limit 3 --json conclusion --jq '.[].conclusion'
+```
+
+- **Main green, PR red** → Your PR caused it. Fix it.
+- **Main also red** → Pre-existing. Note in PR, but still investigate.
+
+### Step 3: Get logs for the failed job
+
+`gh run view --job --log` blocks until the ENTIRE run finishes. Use the Jobs API instead:
+
+```bash
+JOB_ID=<from step 1>
+
+# Get full log (works immediately for completed jobs)
+gh api "repos/$REPO/actions/jobs/$JOB_ID/logs" 2>&1 | tail -100
+
+# Search for errors
+gh api "repos/$REPO/actions/jobs/$JOB_ID/logs" 2>&1 | grep -E "error|FAIL|panicked" | head -20
+
+# Get context around failures
+gh api "repos/$REPO/actions/jobs/$JOB_ID/logs" 2>&1 | grep -B5 "Error" | head -30
+```
+
+### Step 4: Fix and push
+
+```bash
+# Fix the code, then:
+cargo fmt
+cargo clippy --all-targets -- -D warnings
+git add <files> && git commit -m "fix: ..."
+git push
+```
+
+### Common failure patterns
+
+- **Short failure (<30s) in build step** → Compilation error. Get logs immediately.
+- **"container-test-unit" failure** → Often Makefile or compilation issue inside container.
+- **Test timeout (600s+)** → Test hang. Check for pipe deadlock or missing stdin EOF.
+
+---
+
+## Before Merging: Read ALL PR Comments
+
+**MANDATORY before any merge, push, or PR update.** Run BOTH commands:
+
+```bash
+REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
+
+# PR-level comments
+gh pr view <N> --json comments --jq '.comments[] | "---\n" + .body'
+
+# Inline code review comments (often more actionable)
+gh api "repos/$REPO/pulls/<N>/comments" --jq '.[] | "---\nfile: \(.path):\(.line // .original_line)\n\(.body)"'
+```
+
+### Check for auto-fix PRs
+
+```bash
+gh pr list --search "base:$(git branch --show-current)"
+```
+
+**Decision tree for auto-fix PRs:**
+
+```
+Auto-fix PR exists?
+ → Run the failing test locally WITHOUT the auto-fix
+   PASSES → Close the auto-fix (your branch already fixes it)
+            gh pr close <fix-pr> --comment "Not needed - <explain>"
+   FAILS  → Read the auto-fix diff
+            Adds skip/ignore/early-return? → Close it, find real fix
+            Fixes a real gap?              → Cherry-pick, push, close auto-fix
+```
+
+Fix ALL review findings (including low severity) before merging.
+
+---
+
+## Merging a PR
+
+### Standalone PR (base is main)
+
+```bash
+gh pr merge <N> --merge --delete-branch
+```
+
+### Stacked PR (base is another branch)
+
+**NEVER use `--delete-branch` on the base PR of a stack.** It deletes the branch before
+GitHub retargets dependent PRs, causing them to auto-close.
+
+```bash
+# Step 1: Merge WITHOUT --delete-branch
+gh pr merge <base-pr> --merge
+
+# Step 2: Retarget dependent PR
+gh pr edit <dependent-pr> --base main
+
+# Step 3: Verify retarget
+gh pr view <dependent-pr> --json baseRefName
+# Must show: {"baseRefName":"main"}
+
+# Step 4: NOW delete the old branch
+git push origin --delete <base-branch-name>
+```
+
+**Recovery if you accidentally used `--delete-branch`:**
+```bash
+git push origin <dependent-branch>  # Re-push (still exists locally)
+gh pr create --base main --title "..." --body "..."
+```
+
+---
 
 ## Creating a Pull Request
 
-1. **Review your changes first**:
-   ```bash
-   git diff --stat              # What files changed
-   git diff                     # Actual changes
-   git log main..HEAD --oneline # All commits in this branch
-   ```
-
-2. **Push and create PR**:
-   ```bash
-   git push -u origin <branch-name>
-   gh pr create --fill
-   ```
-
-3. **Verify PR description matches commits** (also do this after pushing new commits):
-   ```bash
-   # Read ALL commits in the branch
-   git log --oneline origin/main..HEAD
-
-   # Read the current PR description
-   gh pr view <pr-number> --json body --jq '.body'
-
-   # Compare: every commit's changes must be reflected in the description
-   # If commits were added/removed since the PR was created, UPDATE the description
-   gh pr edit <pr-number> --body "$(cat <<'EOF'
-   ...updated description covering ALL commits...
-   EOF
-   )"
-   ```
-   **Anti-patterns to catch:**
-   - Description only mentions the first or last commit (ignores the rest)
-   - Description mentions changes that were reverted or amended away
-   - Description claims functionality that no commit actually implements
-   - Stacked PR description includes parent branch commits (only describe YOUR commits)
-
-4. **Wait for CI** - Do NOT proceed until all checks pass:
-   ```bash
-   gh pr checks <pr-number>
-   # All checks must show "pass" before proceeding
-   ```
-
-## MANDATORY: Read PR Comments Before ANY PR Operation
-
-**YOU MUST READ ALL PR COMMENTS** before:
-- Checking PR status
-- Pushing new commits
-- Merging
-- Closing
-- ANY interaction with the PR
-
-This is NOT optional. Comments contain critical information.
-
-### Step 1: ALWAYS Read Comments AND Inline Review Comments First
+### 1. Run pre-push checks
 
 ```bash
-# MANDATORY - Run BOTH of these FIRST before any other PR operation
-
-# 1. PR-level comments (general discussion, Claude review summaries)
-gh pr view <pr-number> --json comments --jq '.comments[] | "---\n" + .body'
-
-# 2. Inline code review comments (file-specific findings, often the most actionable)
-gh api repos/{owner}/{repo}/pulls/<pr-number>/comments --jq '.[] | "---\nfile: \(.path):\(.line // .original_line)\n\(.body)"'
+cargo fmt --check    # Fix: cargo fmt
+cargo clippy --all-targets -- -D warnings
+make test-root FILTER=sanity  # Or tests relevant to your changes
 ```
 
-**Inline comments are often MORE important than PR-level comments.** They contain
-specific code-level findings that require investigation and response. Missing an
-inline comment means missing a real bug or design issue.
-
-### Step 2: Check for Auto-Fix PRs
-
-CI may have created fix PRs targeting your branch. You MUST handle these **critically**:
+### 2. Review and push
 
 ```bash
-# Check for fix PRs
-gh pr list --search "base:<your-branch>"
+git diff --stat                       # What files changed
+git log main..HEAD --oneline          # All commits in this branch
+git push -u origin <branch-name>
+gh pr create --fill                   # For single-commit PRs
 ```
 
-**CRITICAL: Think deeply before cherry-picking ANY auto-fix.**
+For multi-commit PRs, write a structured description:
+```bash
+gh pr create --title "..." --body "$(cat <<'EOF'
+## Summary
+- Change 1
+- Change 2
 
-Auto-fix PRs are generated by CI bots that see symptoms, not root causes. Before applying:
+## Test Results
+$ make test-root FILTER=sanity
+<actual output>
+EOF
+)"
+```
 
-1. **Understand WHY the CI failed** — Read the full error, not just the fix
-2. **Check if YOUR branch already fixes the root cause** — The auto-fix may address a symptom
-   that your code changes already solved. Example: CI fails with EADDRINUSE, bot adds
-   `--no-snapshot` to avoid the code path, but your PR already fixed the vsock ID chain
-   that caused EADDRINUSE. The bot's fix is a workaround for a bug you already fixed.
-3. **Reproduce locally** — Run the test in the same conditions (e.g., twice for SnapshotEnabled
-   mode) WITHOUT the auto-fix. If it passes, the auto-fix is unnecessary.
-4. **Only cherry-pick if the fix addresses a REAL gap** — Not every CI failure needs a code change.
-   Some are infrastructure issues, some are already fixed by other commits in your branch.
+### 3. Verify description matches ALL commits
+
+Do this on creation AND after pushing new commits:
 
 ```bash
-# If fix PR is needed after investigation:
-# 1. Cherry-pick: git cherry-pick <commit>
-# 2. Push to your branch
-# 3. Close the fix PR: gh pr close <fix-pr> --comment "Cherry-picked into PR #<your-pr>"
+# For PRs targeting main:
+git log --oneline origin/main..HEAD
 
-# If fix PR is NOT needed (your branch already fixes the root cause):
-gh pr close <fix-pr> --comment "Not needed - <explain which commit fixes the root cause>"
+# For stacked PRs (targeting another branch):
+BASE=$(gh pr view --json baseRefName --jq '.baseRefName')
+git log --oneline "origin/$BASE..HEAD"
+
+# Update if needed:
+gh pr edit <N> --body "$(cat <<'EOF'
+...updated description covering ALL commits...
+EOF
+)"
 ```
 
-**The worst outcome is cherry-picking a workaround that masks a bug your PR already fixed.**
-This adds unnecessary code and hides the fact that your fix works correctly.
+**Anti-patterns:** Description only covers first/last commit, mentions reverted changes,
+or (for stacked PRs) includes parent branch commits.
 
-### Step 3: Address Review Findings
-
-Comments may contain:
-- **Code review findings** - Fix these before merging
-- **Auto-fix PRs** - Cherry-pick ACTUAL FIXES only (see below)
-- **CI failure analysis** - Re-run if infra issue, fix if code issue
-- **Security concerns** - Must address before merge
-
-**Fix ALL severity levels.** Low-severity findings (naming inconsistencies, minor
-code quality issues, pattern mismatches) should still be fixed before merging.
-They're quick to address and prevent technical debt from accumulating. Only skip
-a finding if you have a concrete reason to disagree with it — not because it's low severity.
-
-**CRITICAL: Never Apply Skip Conditions!**
-
-When reviewing auto-fix PRs or suggested fixes:
-- **NEVER** apply `#[ignore]`, `#[cfg(skip)]`, or similar skip attributes
-- **NEVER** apply early returns like `if !has_feature { return Ok(()); }`
-- **NEVER** weaken assertions or remove test coverage
-- **ALWAYS** find and apply the ACTUAL FIX that makes the test pass
-
-If an auto-fix PR adds skip logic, CLOSE IT and find the real fix:
-```bash
-# Example: Auto-fix PR adds skip condition
-# WRONG: gh pr merge <skip-pr>
-# RIGHT: Close the skip PR, find and apply the actual fix
-gh pr close <skip-pr> --comment "Skip conditions are not acceptable - finding actual fix"
-```
-
-The rule is simple: **Tests must PASS, not be SKIPPED.**
-
-### Step 4: Verify CI is Green
+### 4. Wait for CI
 
 ```bash
-gh pr checks <pr-number>
-# ALL checks must show "pass"
-# If Lint fails: run cargo fmt && cargo clippy, commit, push
+gh pr checks <N>
+# All checks must show "pass" before proceeding
 ```
 
-### Then Merge
-
-For standalone PRs (not part of a stack):
-```bash
-gh pr merge <pr-number> --merge --delete-branch
-```
-
-For stacked PRs, see the stacked PR merge procedure below.
+---
 
 ## Stacked PRs (Branch of Branch)
 
-When your work builds on an unmerged PR:
-
 ```bash
-# Create PR #2 based on PR #1's branch (not main!)
 git checkout pr1-branch
 git checkout -b pr2-branch
 # ... make changes ...
 git push -u origin pr2-branch
-gh pr create --base pr1-branch  # Target the parent branch!
-
-# Verify the chain
-git log --oneline origin/main..HEAD  # Should show both PR's commits
+gh pr create --base pr1-branch
 ```
 
-### Merging Stacked PRs
+### Rebasing after base PR merges
 
-**CRITICAL: Never use `--delete-branch` when merging the base PR of a stack.**
-
-`gh pr merge --delete-branch` deletes the branch immediately, before GitHub's server-side
-retargeting can update dependent PRs. This causes dependent PRs to auto-close because their
-base branch no longer exists. See: https://github.com/cli/cli/issues/1168
-
-**Correct procedure:**
-```bash
-# Step 1: Merge base PR WITHOUT --delete-branch
-gh pr merge <base-pr> --merge
-
-# Step 2: Retarget dependent PR to main
-gh pr edit <dependent-pr> --base main
-
-# Step 3: Verify the retarget worked
-gh pr view <dependent-pr> --json baseRefName
-# Must show: {"baseRefName":"main"}
-
-# Step 4: NOW safe to delete the old branch
-git push origin --delete <base-branch-name>
-```
-
-**If you accidentally used `--delete-branch` and the dependent PR was closed:**
-```bash
-# Push the branch again (it still exists locally)
-git push origin <dependent-branch>
-
-# Create a new PR targeting main
-gh pr create --base main --title "..." --body "..."
-```
-
-### Rebasing Stacked PRs After Base Merges
-
-**CRITICAL: Never use plain `git rebase origin/main` on stacked branches.**
-
-When a base PR merges to main, the dependent branch contains copies of the base PR's commits
-(same content, different SHAs due to merge). A plain `git rebase origin/main` tries to replay
-these already-merged commits, causing **false conflicts** that look real but aren't.
-
-**Diagnosis:** If `git rebase origin/main` produces conflicts in files you didn't touch in YOUR
-commits, you're probably replaying already-merged commits.
-
-**Correct approach — use `--onto` to skip already-merged commits:**
+**Never use plain `git rebase origin/main`** — it replays already-merged commits, causing
+false conflicts in files you didn't touch.
 
 ```bash
-# Step 1: Identify which commits are yours vs already-merged
+# Step 1: Find which commits are yours vs already-merged
 git log --oneline origin/main..your-branch
 
-# Step 2: Check which commits have equivalents in main
+# Step 2: Find the old base tip (last already-merged commit)
 for commit in $(git log --format="%h" origin/main..your-branch); do
   subject=$(git log --format="%s" -1 $commit)
   match=$(git log --oneline origin/main --grep="$subject" | head -1)
-  echo "$commit: $subject"
-  echo "  main match: ${match:-NONE (unique)}"
+  echo "$commit: $subject → ${match:-UNIQUE}"
 done
 
-# Step 3: Find the last already-merged commit (the old base tip)
-# This is the commit AFTER which your unique commits begin.
-# Example: if commits are A B C D E F and A B C are in main:
-#   C is the old base tip, D E F are your unique commits
-
-# Step 4: Rebase only unique commits onto main
+# Step 3: Rebase only YOUR commits onto main
 git rebase --onto origin/main <old-base-tip> your-branch
-# This replays only D E F onto origin/main, skipping A B C
 
-# Step 5: Force push
+# Step 4: Force push
 git push origin your-branch --force-with-lease
 ```
 
-**For deeper stacks (PR #3 depends on PR #2 depends on PR #1):**
-Rebase from bottom up. After rebasing PR #2's branch, rebase PR #3 using PR #2's
-old tip as the skip point:
-
+For deeper stacks, rebase bottom-up:
 ```bash
-# After rebasing pr2-branch onto main:
 git rebase --onto pr2-branch <pr2-old-tip> pr3-branch
 git push origin pr3-branch --force-with-lease
 ```
 
-**Why this works:** `--onto` tells git "replay commits AFTER `<old-base-tip>` onto `<new-base>`".
-Commits before `<old-base-tip>` (the already-merged ones) are skipped entirely, so there are
-no false conflicts from replaying content that's already in main.
+---
 
-**Why plain rebase fails:** Without `--onto`, git replays ALL commits from the branch's
-merge-base with main. If the branch was based on `pr1-branch` which is now merged, those
-commits have different SHAs in main (merge commits, squashes, etc.), so git sees them as
-"new" changes and tries to apply them, hitting conflicts with the identical content already in main.
+## CI Not Starting?
 
-## Rust Code Quality Checklist
-
-Before considering code "done":
-
-- [ ] No `unwrap()` in production code (use `?` or proper error handling)
-- [ ] No `clone()` without justification (prefer references)
-- [ ] Feature-gated tests have matching `#[cfg(feature = "...")]` on imports
-- [ ] Test names are descriptive: `test_<what>_<scenario>`
-- [ ] Error messages include context (use `.context("what failed")`)
-- [ ] No `println!` in library code (use `tracing::debug!` etc.)
-- [ ] Public APIs have doc comments
-
-## When Tests Fail
-
-**NEVER skip, ignore, or weaken assertions.** Find and fix the root cause.
-
-1. Read the error message completely
-2. Check test logs: `/tmp/fcvm-test-logs/*.log`
-3. Run the specific test with more output:
-   ```bash
-   RUST_LOG=debug make test-root FILTER=<failing_test> STREAM=1
-   ```
-4. Fix the CODE, not the test
-
-**Examples of UNACCEPTABLE "fixes":**
-- Adding `#[ignore]` to a failing test
-- Adding `if condition { return Ok(()); }` to skip functionality
-- Changing `assert!(x)` to `if !x { println!("NOTE: known issue"); }`
-- Removing test coverage because it's "flaky"
-
-**The ONLY acceptable fix:** Change the actual code so the test passes.
-
-## Getting CI Logs Quickly
-
-**`gh run view --job --log` blocks until the ENTIRE run finishes**, even if the specific job
-already completed. Use the Jobs API instead for immediate access to completed job logs:
+Most common cause: PR branch not based on main.
 
 ```bash
-# Step 1: Get job IDs and identify failures (works immediately)
-gh api repos/{owner}/{repo}/actions/runs/{run_id}/jobs \
-  --jq '.jobs[] | select(.conclusion == "failure") | {name: .name, id: .id, steps: [.steps[] | select(.conclusion == "failure") | .name]}'
-
-# Step 2: Get logs for a COMPLETED job (works even while other jobs are still running)
-gh api "repos/{owner}/{repo}/actions/jobs/{job_id}/logs" 2>&1 | tail -50
-
-# Step 3: Search for specific errors in the logs
-gh api "repos/{owner}/{repo}/actions/jobs/{job_id}/logs" 2>&1 | grep -E "error|FAIL|panicked" | head -20
-
-# Step 4: Get context around the failure
-gh api "repos/{owner}/{repo}/actions/jobs/{job_id}/logs" 2>&1 | grep -B5 "Error" | head -30
+gh pr view <N> --json baseRefName           # Check target branch
+git fetch origin && git rebase origin/main  # Rebase if stale
+git push --force-with-lease
+gh pr edit <N> --base main                  # Fix wrong target
 ```
 
-**Quick failure triage** — run this first to understand all failures at once:
-```bash
-RUN_ID=<run_id>
-REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
-
-# Show all failed jobs and which step failed
-gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
-  --jq '.jobs[] | select(.conclusion == "failure") | "\(.name): \([.steps[] | select(.conclusion == "failure") | .name] | join(", "))"'
-```
-
-**Common patterns:**
-- **Short failure (<30s) in build steps** → check if main has same failure. If main is green, it's your PR.
-- **"container-test-unit" failure** → often a compilation error inside container. Get logs via API immediately.
-- **Test timeout (600s+)** → test hang. Check for pipe deadlock or missing stdin EOF.
-
-**DON'T do this:**
-```bash
-# WRONG - blocks until ALL jobs finish, wastes minutes
-gh run view <run_id> --job <job_id> --log
-
-# WRONG - sleeping and polling
-sleep 120 && gh pr checks <pr-number>
-```
-
-## Evaluating CI Failures
-
-**NEVER assume failures are "unrelated" or "pre-existing" without evidence.**
-
-Before claiming a test failure is unrelated to your PR:
-
-1. **Check if main is green:**
-   ```bash
-   gh run list --branch main --limit 3 --json conclusion --jq '.[].conclusion'
-   ```
-2. **If main is green and your PR is red, the failure IS your fault.** Period.
-   - Don't say "pre-existing failure" — main proves otherwise
-   - Don't say "unrelated to this PR" — the evidence says otherwise
-   - The PR introduced or exposed the bug. Fix it.
-
-3. **Only call a failure "pre-existing" if main is ALSO failing the same test:**
-   ```bash
-   # Check main's latest run for the same test
-   gh run view <main-run-id> --log 2>&1 | grep "<test_name>"
-   ```
-
-**The rule:** Green main + red PR = PR caused it. No exceptions, no excuses.
+---
 
 ## SSH into CI Runners
 
-When you need to reproduce a CI failure on the actual runner hardware:
-
 ```bash
-# 1. Find runner names and status
-gh api repos/ejc3/fcvm/actions/runners --jq '.runners[] | "\(.name) busy=\(.busy) labels=\(.labels | map(.name) | join(","))"'
+# Find runners
+gh api repos/ejc3/fcvm/actions/runners \
+  --jq '.runners[] | "\(.name) busy=\(.busy) labels=\(.labels | map(.name) | join(","))"'
 
-# 2. Get runner public IPs (filter by architecture)
-# x64 runners:
-aws ec2 describe-instances \
-  --filters "Name=tag:Name,Values=*runner*" "Name=architecture,Values=x86_64" \
-  --query 'Reservations[*].Instances[*].[InstanceId,PublicIpAddress,State.Name]' \
-  --output text
-
-# arm64 runners:
+# Get runner IPs (change architecture filter as needed: x86_64 or arm64)
 aws ec2 describe-instances \
   --filters "Name=tag:Name,Values=*runner*" "Name=architecture,Values=arm64" \
-  --query 'Reservations[*].Instances[*].[InstanceId,PublicIpAddress,State.Name]' \
-  --output text
+  --query 'Reservations[*].Instances[*].[InstanceId,PublicIpAddress,State.Name]' --output text
 
-# 3. SSH using the runner key
-ssh -i ~/.ssh/runner_key -o StrictHostKeyChecking=no ubuntu@<public-ip>
-
-# 4. On the runner, the repo is at ~/fcvm
-# Build and run specific tests:
+# SSH in
+ssh -i ~/.ssh/runner_key -o StrictHostKeyChecking=no ubuntu@<ip>
 cd ~/fcvm && git fetch && git checkout <branch>
-make build
-sudo make test-root FILTER=<test_name> STREAM=1 2>&1 | tee /tmp/test.log
+make build && sudo make test-root FILTER=<test> STREAM=1 2>&1 | tee /tmp/test.log
 ```
 
-**Important:**
-- Runner key is at `~/.ssh/runner_key` on the dev machine
-- Runners may be busy with CI jobs - check `busy=` status first
-- Don't interfere with running CI jobs on busy runners
-- Tests on runners may cause resource contention with concurrent CI runs
+Don't interfere with busy runners (check `busy=` status first).
 
-## CI Not Starting? Check Your Branch Base
+---
 
-If CI checks don't start automatically after pushing a PR, it likely means the PR branch
-is not based on main (or its target base branch). GitHub Actions CI triggers are configured
-to run on PRs targeting specific branches.
+## Downloading Test Log Artifacts
 
-**Common causes:**
-- Branch was created from an old commit, not from current main
-- Branch diverged significantly and GitHub can't compute the diff
-- PR targets a non-default base branch that doesn't have CI workflows
-
-**How to fix:**
-```bash
-# 1. Check what branch your PR targets
-gh pr view <pr-number> --json baseRefName
-
-# 2. Check if your branch is actually based on that branch
-git log --oneline origin/main..HEAD | tail -5   # Should show only YOUR commits
-
-# 3. If the branch is stale or incorrectly based, rebase onto main
-git fetch origin
-git rebase origin/main
-git push --force-with-lease
-
-# 4. If the PR targets wrong base, update it
-gh pr edit <pr-number> --base main
-```
-
-**Prevention:** Always create branches from current main:
-```bash
-git fetch origin
-git checkout origin/main -b my-feature
-```
-
-## Investigating CI Failures with Test Log Artifacts
-
-CI uploads test logs to `/tmp/fcvm-test-logs/` as artifacts (14 day retention). When tests fail,
-**always download and read the full logs** before drawing conclusions.
-
-### Download Artifacts
+CI uploads test logs as artifacts (14 day retention). Use when you need full debug logs
+beyond what the job log provides.
 
 ```bash
-# 1. Find the run ID for the failing CI run
-gh run list --branch <branch-name> --limit 5 --json databaseId,conclusion,startedTime \
-  --jq '.[] | "\(.databaseId) \(.conclusion) \(.startedTime)"'
+REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
+RUN_ID=<run_id>
 
-# 2. List artifacts for that run
-gh api "repos/{owner}/{repo}/actions/runs/{run_id}/artifacts" \
+# List artifacts
+gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts" \
   --jq '.artifacts[] | "\(.id) \(.name) \(.size_in_bytes)"'
 
-# 3. Download a specific artifact (e.g., test-logs-host-root-arm64-SnapshotDisabled)
-gh api "repos/{owner}/{repo}/actions/runs/{run_id}/artifacts/{artifact_id}/zip" > /tmp/artifact.zip
+# Download a specific artifact
+gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts/<artifact_id>/zip" > /tmp/artifact.zip
 unzip -o /tmp/artifact.zip -d /tmp/ci-logs/
 
-# 4. Read the full debug logs
-ls /tmp/ci-logs/
-cat /tmp/ci-logs/<test-name>-*.log
-```
-
-### Quick Artifact Download Script
-
-```bash
-# Download ALL test log artifacts for a run
-RUN_ID=<run_id>
-REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
+# Download ALL test log artifacts
 for artifact in $(gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts" \
   --jq '.artifacts[] | select(.name | startswith("test-logs")) | "\(.id):\(.name)"'); do
-  ID=${artifact%%:*}
-  NAME=${artifact#*:}
+  ID=${artifact%%:*}; NAME=${artifact#*:}
   echo "Downloading $NAME..."
   gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts/$ID/zip" > "/tmp/$NAME.zip"
   mkdir -p "/tmp/ci-logs/$NAME"
   unzip -o "/tmp/$NAME.zip" -d "/tmp/ci-logs/$NAME"
 done
-echo "All logs in /tmp/ci-logs/"
 ```
 
-### What to Look For
-
-- **Full error messages**: CI test output truncates stderr; the log files have everything
-- **Timestamps**: Compare failing vs passing test timings to identify contention
-- **Boot sequence**: fc-agent logs show exactly where startup stalled
-- **dmesg**: `dmesg-filtered.log` artifact has KVM/UFFD/OOM kernel messages
+**What to look for:** Full error messages (CI truncates stderr), timestamps (compare failing
+vs passing for contention), boot sequence (fc-agent startup stalls), dmesg artifacts.
