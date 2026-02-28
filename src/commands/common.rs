@@ -1283,6 +1283,40 @@ pub async fn create_snapshot_core(
         .await
         .map_err(|e| anyhow::anyhow!("snapshot semaphore closed: {}", e))?;
 
+    // Per-VM lock: serialize snapshot operations on the same Firecracker VM.
+    // Without this, the internal startup snapshot (health monitor trigger) and an
+    // external `fcvm snapshot create` can race — one resumes the VM while the other
+    // is mid-snapshot, causing "save/restore unavailable while running" errors.
+    // disk_path is like .../vm-disks/{vm_id}/disks/rootfs.raw — lock in the VM dir.
+    let vm_dir = disk_path
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("cannot derive VM directory from disk path"))?;
+    let lock_path = vm_dir.join("snapshot.lock");
+    let lock_file = std::fs::File::create(&lock_path)
+        .with_context(|| format!("creating snapshot lock: {}", lock_path.display()))?;
+    use fs2::FileExt;
+    loop {
+        match lock_file.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                debug!(
+                    snapshot = %snapshot_config.name,
+                    "waiting for per-VM snapshot lock"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("acquiring per-VM snapshot lock: {}", e));
+            }
+        }
+    }
+    debug!(
+        snapshot = %snapshot_config.name,
+        lock = %lock_path.display(),
+        "acquired per-VM snapshot lock"
+    );
+
     // Derive directories from snapshot config (memory_path's parent is the snapshot dir)
     let snapshot_dir = snapshot_config
         .memory_path
