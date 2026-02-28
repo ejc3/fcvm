@@ -140,6 +140,12 @@ pub struct VmConfig {
     /// as this user via rootless podman. Health checks use this to set
     /// XDG_RUNTIME_DIR=/run/user/<uid>.
     ///
+    /// IMPORTANT: When adding fields here that affect snapshot restore behavior,
+    /// also add them to SnapshotMetadata (storage/snapshot.rs) and update
+    /// snapshot.rs to restore them from metadata. Otherwise warm starts will
+    /// have missing config.
+    #[serde(default)]
+    pub user: Option<String>,
     /// Network mode used for this VM (bridged, rootless, routed).
     /// Stored so clones inherit the same networking mode from snapshots.
     #[serde(default)]
@@ -150,12 +156,6 @@ pub struct VmConfig {
     /// Whether stdin is forwarded to the container.
     #[serde(default)]
     pub interactive: bool,
-    /// IMPORTANT: When adding fields here that affect snapshot restore behavior,
-    /// also add them to SnapshotMetadata (storage/snapshot.rs) and update
-    /// snapshot.rs to restore them from metadata. Otherwise warm starts will
-    /// have missing config.
-    #[serde(default)]
-    pub user: Option<String>,
     /// Username created in the VM for rootless podman.
     /// Used by health checks to run `runuser -u <username> -- podman inspect`.
     #[serde(default)]

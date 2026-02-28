@@ -681,7 +681,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     if matches!(network_mode, FcNetworkMode::Rootless) && nix::unistd::geteuid().is_root() {
         warn!(
             "Running rootless mode as root is unnecessary. \
-             Consider using --network bridged or --network routed for better performance."
+             Consider creating the baseline with --network bridged or --network routed for better performance."
         );
     }
 
