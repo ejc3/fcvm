@@ -81,10 +81,19 @@ git add <files> && git commit -m "fix: ..."
 git push
 ```
 
+### Step 5: Report with evidence, not speculation
+
+**NEVER say "likely", "probably", or "may be caused by".** Always find the actual root cause.
+
+- Read the diff (`git diff main..HEAD`) to understand what changed
+- Match log errors to specific lines in the diff
+- If a CI step name is misleading (e.g., "container-test" runs host builds first), read the full log to find where the error actually occurs
+- State what the error IS, not what it "might be"
+
 ### Common failure patterns
 
 - **Short failure (<30s) in build step** → Compilation error. Get logs immediately.
-- **"container-test-unit" failure** → Often Makefile or compilation issue inside container.
+- **"container-test" failure** → Check whether error is in host build (runs first) or container build/test (runs after). Read the log.
 - **Test timeout (600s+)** → Test hang. Check for pipe deadlock or missing stdin EOF.
 
 ---
