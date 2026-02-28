@@ -341,7 +341,7 @@ fn bench_clone_exec(c: &mut Criterion) {
     eprintln!("\n=== Setting up snapshot for clone exec benchmarks ===");
 
     // Only test rootless - bridged clones have dnsmasq binding issues under rapid iteration
-    let fixture = CloneFixture::setup("clone-exec", "rootless", &[]);
+    let fixture = CloneFixture::setup("clone2-exec", "rootless", &[]);
 
     let mut group = c.benchmark_group("clone");
     group.sample_size(10);
@@ -368,7 +368,7 @@ fn bench_clone_http(c: &mut Criterion) {
     eprintln!("\n=== Setting up snapshot for clone HTTP benchmarks ===");
 
     // Port mappings are baked into the snapshot from the baseline VM
-    let fixture = CloneFixture::setup("clone-http", "rootless", &["--publish", "8080:80"]);
+    let fixture = CloneFixture::setup("clone2-http", "rootless", &["--publish", "8080:80"]);
 
     let mut group = c.benchmark_group("clone");
     group.sample_size(10);
