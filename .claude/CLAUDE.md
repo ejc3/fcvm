@@ -533,7 +533,7 @@ sudo fcvm podman run --name my-vm --rootfs-size 50G nginx:alpine
 # Snapshot workflow
 fcvm snapshot create --pid <vm_pid> --tag my-snapshot
 fcvm snapshot serve my-snapshot      # Start UFFD server (prints serve PID)
-fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
+fcvm snapshot run --pid <serve_pid> --name clone1
 ```
 
 ### Local Test Containers
@@ -1375,7 +1375,7 @@ fcvm snapshot create --pid <baseline_pid> --tag my-snapshot
 fcvm snapshot serve my-snapshot    # Creates /mnt/fcvm-btrfs/uffd-my-snapshot-<pid>.sock
 
 # 4. Spawn clones from the memory server
-fcvm snapshot run --pid <serve_pid> --name clone1 --network bridged
+fcvm snapshot run --pid <serve_pid> --name clone1
 ```
 
 **How it works:**

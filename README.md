@@ -95,7 +95,7 @@ Snapshot a running VM and restore clones from it. Two modes: UFFD (memory server
 
 # 4. Clone — each takes ~10ms for VM restore, ~610ms end-to-end
 ./fcvm snapshot run --pid <serve_pid> --name clone1
-./fcvm snapshot run --pid <serve_pid> --name clone2 --publish 8082:80
+./fcvm snapshot run --pid <serve_pid> --name clone2
 
 # Or clone directly from file (simpler, no server needed)
 ./fcvm snapshot run --snapshot nginx-warm --name clone3
