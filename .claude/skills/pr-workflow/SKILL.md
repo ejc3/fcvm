@@ -317,6 +317,50 @@ Before considering code "done":
 
 **The ONLY acceptable fix:** Change the actual code so the test passes.
 
+## Getting CI Logs Quickly
+
+**`gh run view --job --log` blocks until the ENTIRE run finishes**, even if the specific job
+already completed. Use the Jobs API instead for immediate access to completed job logs:
+
+```bash
+# Step 1: Get job IDs and identify failures (works immediately)
+gh api repos/{owner}/{repo}/actions/runs/{run_id}/jobs \
+  --jq '.jobs[] | select(.conclusion == "failure") | {name: .name, id: .id, steps: [.steps[] | select(.conclusion == "failure") | .name]}'
+
+# Step 2: Get logs for a COMPLETED job (works even while other jobs are still running)
+gh api "repos/{owner}/{repo}/actions/jobs/{job_id}/logs" 2>&1 | tail -50
+
+# Step 3: Search for specific errors in the logs
+gh api "repos/{owner}/{repo}/actions/jobs/{job_id}/logs" 2>&1 | grep -E "error|FAIL|panicked" | head -20
+
+# Step 4: Get context around the failure
+gh api "repos/{owner}/{repo}/actions/jobs/{job_id}/logs" 2>&1 | grep -B5 "Error" | head -30
+```
+
+**Quick failure triage** — run this first to understand all failures at once:
+```bash
+RUN_ID=<run_id>
+REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
+
+# Show all failed jobs and which step failed
+gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
+  --jq '.jobs[] | select(.conclusion == "failure") | "\(.name): \([.steps[] | select(.conclusion == "failure") | .name] | join(", "))"'
+```
+
+**Common patterns:**
+- **Short failure (<30s) in build steps** → check if main has same failure. If main is green, it's your PR.
+- **"container-test-unit" failure** → often a compilation error inside container. Get logs via API immediately.
+- **Test timeout (600s+)** → test hang. Check for pipe deadlock or missing stdin EOF.
+
+**DON'T do this:**
+```bash
+# WRONG - blocks until ALL jobs finish, wastes minutes
+gh run view <run_id> --job <job_id> --log
+
+# WRONG - sleeping and polling
+sleep 120 && gh pr checks <pr-number>
+```
+
 ## Evaluating CI Failures
 
 **NEVER assume failures are "unrelated" or "pre-existing" without evidence.**
