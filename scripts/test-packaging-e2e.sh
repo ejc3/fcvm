@@ -125,9 +125,10 @@ for i in $(seq 1 $TIMEOUT); do
         echo "  [$i s] $STATUS"
     fi
 
-    # Check for errors in log
-    if grep -q "ERROR\|Error:" /tmp/pkg-test-vm.log 2>/dev/null; then
-        echo "FAIL: VM startup error detected"
+    # Check if background process exited (VM failed)
+    if ! kill -0 "$SUDO_PID" 2>/dev/null; then
+        wait "$SUDO_PID" 2>/dev/null || true
+        echo "FAIL: VM process exited unexpectedly"
         cat /tmp/pkg-test-vm.log
         exit 1
     fi
