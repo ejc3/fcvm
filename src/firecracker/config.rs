@@ -82,6 +82,10 @@ pub struct FirecrackerConfig {
     /// it changes how podman sets up user namespaces and storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// Published port mappings (host:guest forwarding).
+    /// Part of VM identity — clones inherit these from snapshot metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub port_mappings: Vec<crate::network::PortMapping>,
     /// Ports to forward from guest localhost to host localhost.
     /// Affects fc-agent's iptables setup, must be in cache key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -123,6 +127,7 @@ impl Default for FirecrackerConfig {
             rootfs_size: "10G".to_string(),
             health_check_url: None,
             user: None,
+            port_mappings: Vec::new(),
             forward_localhost: Vec::new(),
             image_mode: ImageMode::Overlay,
             rootfs_type: None,
