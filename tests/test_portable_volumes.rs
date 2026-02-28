@@ -225,7 +225,7 @@ async fn test_remap_fs_snapshot_clone() -> Result<()> {
 
     // Start clone
     let (_serve, serve_pid) = common::start_memory_server(&snap_name).await?;
-    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name, "rootless").await?;
+    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
     common::poll_health_by_pid(clone_pid, 180).await?;
     println!("  Clone healthy (PID: {})", clone_pid);
 
@@ -522,7 +522,7 @@ async fn test_remap_fs_snapshot_file_replace() -> Result<()> {
 
     // Start clone from snapshot — the reader process resumes automatically
     let (_serve, serve_pid) = common::start_memory_server(&snap_name).await?;
-    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name, "rootless").await?;
+    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
     common::poll_health_by_pid(clone_pid, 180).await?;
     println!("  Clone healthy (PID: {})", clone_pid);
 

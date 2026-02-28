@@ -952,17 +952,16 @@ pub async fn start_memory_server(
 /// # Arguments
 /// * `serve_pid` - PID of the memory server process
 /// * `clone_name` - Name for the clone VM
-/// * `network` - Network mode ("bridged" or "rootless")
 ///
 /// # Returns
 /// The spawned process handle and its PID
 pub async fn spawn_clone(
     serve_pid: u32,
     clone_name: &str,
-    network: &str,
 ) -> anyhow::Result<(tokio::process::Child, u32)> {
     let serve_pid_str = serve_pid.to_string();
     // Use spawn_fcvm helper to avoid pipe buffer deadlock
+    // Network mode is baked into snapshot metadata, no --network flag needed
     spawn_fcvm(&[
         "snapshot",
         "run",
@@ -970,8 +969,6 @@ pub async fn spawn_clone(
         &serve_pid_str,
         "--name",
         clone_name,
-        "--network",
-        network,
     ])
     .await
 }
