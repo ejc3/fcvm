@@ -967,6 +967,21 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         let cmd_args: Vec<String> = shell_words::split(exec_cmd)
             .with_context(|| format!("parsing --exec argument: {}", exec_cmd))?;
 
+        // Wait for fc-agent output connection before connecting to exec server.
+        // This ensures the deterministic handshake chain is complete:
+        //   exec_rebind → exec_re_register → rebind_done → output.reconnect() → HERE
+        // Without this gate, the exec CONNECT gets buffered by Firecracker but never
+        // accepted because fc-agent's AsyncFd is still stale from snapshot restore.
+        if !tty_mode {
+            match tokio::time::timeout(std::time::Duration::from_secs(30), output_connected_rx).await {
+                Ok(Ok(())) => info!(vm_id = %vm_id, "fc-agent output connected, exec server ready"),
+                Ok(Err(_)) => warn!(vm_id = %vm_id, "output connected_tx dropped"),
+                Err(_) => {
+                    warn!(vm_id = %vm_id, "fc-agent did not connect within 30s, proceeding anyway")
+                }
+            }
+        }
+
         // Wait for vsock socket to be ready (poll instead of blind sleep)
         let vsock_socket = data_dir.join("vsock.sock");
         let poll_start = std::time::Instant::now();
