@@ -1343,7 +1343,9 @@ pub async fn create_snapshot_core(
         if let Some(parent_dir) = parent_snapshot_dir {
             let parent_memory = parent_dir.join("memory.bin");
             if parent_memory.exists() {
-                let parent_name = parent_dir.file_name().map(|n| n.to_string_lossy().to_string())
+                let parent_name = parent_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| parent_dir.display().to_string());
                 info!(
                     snapshot = %snapshot_config.name,
@@ -1639,11 +1641,7 @@ pub async fn create_snapshot_core(
     // Record parent snapshot for the diff chain.
     // Full snapshots: parent = None (self-contained).
     // Diff snapshots: parent = name of snapshot whose memory.bin was the merge base.
-    snapshot_config.parent_snapshot = if use_diff {
-        diff_parent_name
-    } else {
-        None
-    };
+    snapshot_config.parent_snapshot = if use_diff { diff_parent_name } else { None };
 
     // Write config.json to temp directory
     let temp_config_path = temp_snapshot_dir.join("config.json");
@@ -1941,8 +1939,7 @@ mod tests {
         config.parent_snapshot = Some("pre-start-abc123".to_string());
 
         let json = serde_json::to_string(&config).unwrap();
-        let deserialized: crate::storage::SnapshotConfig =
-            serde_json::from_str(&json).unwrap();
+        let deserialized: crate::storage::SnapshotConfig = serde_json::from_str(&json).unwrap();
 
         assert_eq!(
             deserialized.parent_snapshot,
@@ -1983,7 +1980,10 @@ mod tests {
         }"#;
 
         let config: crate::storage::SnapshotConfig = serde_json::from_str(json).unwrap();
-        assert!(config.parent_snapshot.is_none(), "missing field should default to None");
+        assert!(
+            config.parent_snapshot.is_none(),
+            "missing field should default to None"
+        );
     }
 
     #[test]
@@ -1999,14 +1999,8 @@ mod tests {
             let dir = snap_root.join(name);
             std::fs::create_dir_all(&dir).unwrap();
             let state = make_vm_state(vm_id, None);
-            let mut config = build_snapshot_config(
-                &state,
-                name,
-                SnapshotType::System,
-                &dir,
-                vec![],
-                vec![],
-            );
+            let mut config =
+                build_snapshot_config(&state, name, SnapshotType::System, &dir, vec![], vec![]);
             config.parent_snapshot = parent.map(|s| s.to_string());
             let json = serde_json::to_string_pretty(&config).unwrap();
             std::fs::write(dir.join("config.json"), &json).unwrap();
