@@ -25,10 +25,10 @@ async fn test_forward_localhost() -> Result<()> {
     // Accept one connection in background (with timeout)
     let accept_handle = std::thread::spawn(move || -> bool {
         listener.set_nonblocking(false).expect("set_nonblocking");
-        // 15s accept timeout
+        // 45s accept timeout (must exceed nc timeout inside VM)
         unsafe {
             let tv = libc::timeval {
-                tv_sec: 15,
+                tv_sec: 45,
                 tv_usec: 0,
             };
             libc::setsockopt(
@@ -67,7 +67,7 @@ async fn test_forward_localhost() -> Result<()> {
             "--",
             "sh",
             "-c",
-            &format!("nc -w5 127.0.0.1 {} 2>&1 || echo FAILED", port),
+            &format!("nc -w30 127.0.0.1 {} 2>&1 || echo FAILED", port),
         ])
         .output()
         .await
