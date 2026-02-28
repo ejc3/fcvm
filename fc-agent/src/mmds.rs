@@ -152,13 +152,9 @@ pub async fn watch_restore_epoch(signals: crate::restore::RestoreSignals) {
                 // but still surface persistent errors after snapshot restore.
                 static FAIL_COUNT: std::sync::atomic::AtomicU64 =
                     std::sync::atomic::AtomicU64::new(0);
-                let count =
-                    FAIL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let count = FAIL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if count < 5 || count % 200 == 0 {
-                    eprintln!(
-                        "[fc-agent] MMDS fetch failed (count={}): {:?}",
-                        count, e
-                    );
+                    eprintln!("[fc-agent] MMDS fetch failed (count={}): {:?}", count, e);
                 }
                 continue;
             }
