@@ -1086,7 +1086,7 @@ pub async fn restore_from_snapshot(
     // Post-resume liveness check: verify VM didn't crash immediately.
     // Under heavy I/O load, snapshot restore can corrupt guest memory (e.g., stack
     // canary in do_idle), causing an immediate kernel panic + reboot. Detecting this
-    // early allows the caller to fall back to a different snapshot or cold boot.
+    // early surfaces the error instead of silently serving a crashed VM.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     if let Some(status) = vm_manager.try_wait()? {
         bail!(
