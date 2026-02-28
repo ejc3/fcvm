@@ -133,12 +133,12 @@ CLONE1="mem-clone1-$SUFFIX"
 CLONE2="mem-clone2-$SUFFIX"
 
 echo "--- Step 6: Starting clone 1 ---"
-$FCVM snapshot run --pid "$SERVE_PID" --name "$CLONE1" --network rootless &
+$FCVM snapshot run --pid "$SERVE_PID" --name "$CLONE1" &
 CLONE1_BG=$!
 cleanup_pids+=("$CLONE1_BG")
 
 echo "--- Step 7: Starting clone 2 ---"
-$FCVM snapshot run --pid "$SERVE_PID" --name "$CLONE2" --network rootless &
+$FCVM snapshot run --pid "$SERVE_PID" --name "$CLONE2" &
 CLONE2_BG=$!
 cleanup_pids+=("$CLONE2_BG")
 
