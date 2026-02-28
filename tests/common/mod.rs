@@ -3,6 +3,7 @@
 
 use fs2::FileExt;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -47,20 +48,29 @@ impl TestLogger {
             TEST_LOG_DIR, test_name, timestamp, pid
         ));
 
-        // Try to create the file, fall back to /tmp if log dir has permission issues
-        let (file, log_path) = match std::fs::File::create(&log_path) {
-            Ok(f) => (f, log_path),
-            Err(_) => {
-                // Fall back to /tmp with a unique name
-                let fallback = PathBuf::from(format!(
-                    "/tmp/fcvm-test-{}-{}-{}.log",
-                    test_name, timestamp, pid
-                ));
-                let f = std::fs::File::create(&fallback)
-                    .expect("Failed to create test log file even in /tmp");
-                (f, fallback)
-            }
-        };
+        // Create the file — panic immediately if directory isn't writable.
+        // Silent fallbacks hide bugs (this exact failure broke CI for 2 days).
+        let file = std::fs::File::create(&log_path).unwrap_or_else(|e| {
+            let dir_meta = std::fs::metadata(TEST_LOG_DIR)
+                .map(|m| {
+                    format!(
+                        "mode={:o} uid={}",
+                        m.permissions().mode(),
+                        std::os::unix::fs::MetadataExt::uid(&m)
+                    )
+                })
+                .unwrap_or_else(|_| "directory does not exist".to_string());
+            panic!(
+                "Cannot create test log file: {}\n  path: {}\n  dir:  {} ({})\n  \
+                 Fix: sudo rm -rf {} && mkdir -p {} (or: make clean-test-data)",
+                e,
+                log_path.display(),
+                TEST_LOG_DIR,
+                dir_meta,
+                TEST_LOG_DIR,
+                TEST_LOG_DIR
+            );
+        });
 
         let logger = Self {
             test_name: test_name.to_string(),

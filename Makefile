@@ -260,7 +260,8 @@ clean-test-data: build
 	sudo rm -f /mnt/fcvm-btrfs/uffd-*.sock
 	sudo rm -f $(ROOT_DATA_DIR)/uffd-*.sock $(CONTAINER_DATA_DIR)/uffd-*.sock
 	@echo "==> Cleaning test logs..."
-	rm -rf /tmp/fcvm-test-logs/*
+	sudo rm -rf /tmp/fcvm-test-logs
+	mkdir -p /tmp/fcvm-test-logs
 	@echo "==> Cleaned test data (preserved cached assets)"
 
 build:
