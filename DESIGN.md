@@ -293,7 +293,7 @@ Uses veth pairs + IPv6 routing for kernel line-rate networking without userspace
 - Requires root and a host with a global IPv6 /64 subnet
 - Native IPv6 routing through the kernel stack (no userspace L4 translation)
 - Each VM gets a unique IPv6 derived from the host's /64 prefix
-- Port forwarding via socat + loopback IP (same as rootless)
+- Port forwarding via built-in TCP proxy (`setns` + tokio relay) on loopback IP (same as rootless)
 - Parallel-safe: per-VM routes, proxy NDP, ip6tables rules
 
 **Implementation**:
@@ -307,7 +307,7 @@ struct RoutedNetwork {
     host_veth: Option<String>,
     vm_ipv6: Option<String>,
     default_iface: Option<String>,
-    socat_children: Vec<Child>,
+    proxy_handles: Vec<JoinHandle<()>>,
 }
 
 async fn setup() -> Result<NetworkConfig> {
@@ -324,7 +324,7 @@ async fn setup() -> Result<NetworkConfig> {
     // Host: /128 route to VM IPv6 via host veth
     // Proxy NDP on default interface
     // ip6tables MASQUERADE for outbound
-    // socat port forwarding on loopback IP
+    // TCP proxy port forwarding on loopback IP (setns + tokio relay)
 }
 ```
 
@@ -560,7 +560,7 @@ a **single vsock connection** using a frame-based protocol.
 
 Note: Routed mode does **not** use the egress proxy. All external traffic in routed mode
 goes natively through the kernel's IPv6 routing stack at line rate. IPv4 stays internal
-to the namespace (for health checks and socat port forwarding only).
+to the namespace (for health checks and port forwarding only).
 
 **Architecture**:
 ```
@@ -713,13 +713,13 @@ curl http://172.30.x.1:8080
 11. Host: route `vm_ipv6/128` via host veth
 12. Proxy NDP for vm_ipv6 on default interface (so network fabric routes to this host)
 13. ip6tables MASQUERADE on outbound interface (required for AWS source/dest check)
-14. socat port forwarding on unique loopback IP (127.x.y.z)
+14. TCP proxy port forwarding on unique loopback IP (127.x.y.z)
 
-**Port Forwarding** (socat + loopback IP, same as rootless):
-```bash
-# socat listens on host loopback, connects inside namespace via ip netns exec
-socat TCP-LISTEN:8080,bind=127.0.0.2,fork,reuseaddr \
-  EXEC:'ip netns exec fcvm-XXXX socat STDIO TCP:10.0.2.100:80'
+**Port Forwarding** (built-in TCP proxy + loopback IP, same as rootless):
+```
+# Rust TCP proxy: bind on host loopback, connect inside namespace via setns(2)
+Host 127.0.0.2:8080 → tcp_proxy → setns(namespace) → connect 10.0.2.100:80
+# Bidirectional relay via tokio::io::copy_bidirectional
 ```
 
 **Traffic Flow** (VM to Internet, IPv6):
@@ -734,7 +734,7 @@ Internet → eth0 → proxy NDP → host kernel → route vm_ipv6/128 via veth-h
 
 **Traffic Flow** (Host to VM port forward):
 ```
-Host (127.0.0.x:8080) → socat → ip netns exec → socat → 10.0.2.100:80 → br0 → TAP → Guest
+Host (127.0.0.x:8080) → tcp_proxy (setns) → 10.0.2.100:80 → br0 → TAP → Guest
 ```
 
 **Traffic Flow** (Health check):
@@ -749,7 +749,7 @@ ip netns exec curl → br0 (10.0.2.1) → L2 forward → TAP → Guest (10.0.2.1
 - Proxy NDP advertises the VM's IPv6 on the host's physical interface
 
 **Cleanup** (on VM exit):
-1. Kill socat port forwarders
+1. Abort TCP proxy tasks (in-process, no external PIDs)
 2. Remove ip6tables MASQUERADE rule (scoped to vm_ipv6/128)
 3. Remove proxy NDP entry
 4. Remove host route (uses `dev` qualifier for parallel safety)
@@ -761,7 +761,7 @@ ip netns exec curl → br0 (10.0.2.1) → L2 forward → TAP → Guest (10.0.2.1
 - Kernel line-rate IPv6 (no userspace proxy for traffic forwarding)
 - Each VM gets unique /128 IPv6 — parallel clones route correctly without NAT
 - IPv4 internal only (10.0.2.x for health checks, no external IPv4 routing)
-- Port forwarding via socat + loopback IP (same model as rootless)
+- Port forwarding via built-in TCP proxy + loopback IP (same model as rootless)
 - All resources per-VM: no shared state, clean parallel operation
 
 ---
@@ -2107,6 +2107,85 @@ The 64 CPUs help within each crate (LLVM codegen), but crate-level parallelism i
 - **Local dev**: Use defaults. Incremental builds are fast (13s).
 - **CI**: Consider sccache if rebuilding from scratch frequently.
 - **mold**: Not worth it - linking is not the bottleneck.
+
+---
+
+## KVM ARM64 Dirty Page Tracking Bug (2026-02)
+
+### Problem
+
+Under parallel test load on ARM64, diff snapshots occasionally capture only ~94 KB of dirty
+pages instead of the expected ~37-43 MB. Restoring the merged snapshot kernel-panics with:
+
+```
+stack-protector: Kernel stack is corrupted in: do_idle
+Kernel panic - not syncing: stack-protector: Kernel stack is corrupted in: do_idle
+```
+
+### Snapshot Workflow
+
+1. Load pre-start snapshot with `track_dirty_pages: true`
+2. Resume VM — VM boots, container initializes until healthy
+3. Pause VM — Create diff snapshot
+4. Merge diff into pre-start base → startup snapshot
+
+### Root Cause
+
+KVM ARM64's `KVM_GET_DIRTY_LOG` silently returns a nearly-empty bitmap. The diff snapshot
+captures only device-emulation pages (virtio queue pages marked by Firecracker's internal
+`AtomicBitmap` via `mark_virtio_queue_memory_dirty()`), while missing ALL guest OS memory
+writes tracked by KVM's Stage-2 page tables.
+
+**CI data showing the failure:**
+
+| Round | bytes_merged | data_regions | Result |
+|-------|-------------|-------------|--------|
+| 07:54 | 37,834,752 | 2,824 | OK |
+| 08:34 | 43,225,088 | 3,648 | OK |
+| 15:20 | 40,157,184 | 3,039 | OK |
+| **17:35** | **94,208** | **9** | **KERNEL PANIC** |
+
+Both rootless AND routed snapshots created at the same time had EXACTLY 94,208 bytes —
+a systematic KVM dirty tracking failure, not random corruption.
+
+### Firecracker Is Correct
+
+Investigated the Firecracker source (`ejc3/firecracker`, branch `bump-vsock-max-connections`):
+
+- `KVM_MEM_LOG_DIRTY_PAGES` is correctly set on memory regions during `load_snapshot`
+  (via `KVM_SET_USER_MEMORY_REGION` in `vstate/memory.rs`)
+- No code path resets or discards the dirty bitmap between load and diff creation
+- vCPU pause is properly synchronized before `KVM_GET_DIRTY_LOG`
+- The ~94 KB corresponds to virtio queue pages marked by Firecracker's internal bitmap
+  after the previous snapshot — these don't rely on KVM tracking
+
+### Likely KVM-Level Causes
+
+1. **UFFD + dirty tracking interaction** (highest suspicion): Pages populated via `UFFD_COPY`
+   during snapshot restore may get Stage-2 mappings created without write-protection when
+   dirty logging was enabled before the host PTE existed. Under load, delayed UFFD faults
+   mean pages fault in after VM resumes, bypassing dirty tracking entirely.
+
+2. **Stage-2 TLB stale entries**: Incomplete TLB invalidation after enabling dirty logging
+   under heavy load (IPI delays) allows writes through stale entries that bypass tracking.
+
+3. **Block mapping coalescing**: KVM ARM64 can create 2 MB block mappings in Stage-2. If
+   splitting into 4 KB write-protected pages is delayed, writes bypass per-page tracking.
+
+### Fix: Diff Validation + Full Retry
+
+In `create_snapshot_core()`, after creating the diff snapshot but before resuming the VM:
+
+1. Check diff file's actual disk usage (`meta.blocks() * 512`)
+2. If `diff_allocated < memory_bytes / 1024` (0.1% of VM memory), the diff is corrupt
+3. Retry as Full snapshot while VM is still paused
+4. Skip the merge step and use the full snapshot directly
+
+This is a detection + recovery approach because the bug is in KVM kernel code we don't control.
+
+Additional defense:
+- **Post-resume liveness check**: After restoring a snapshot, wait 200ms and `try_wait()` to
+  detect immediate kernel panics. Returns error so the snapshot is known to be bad.
 
 ---
 

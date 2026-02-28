@@ -488,6 +488,18 @@ pub async fn spawn_fcvm_with_logs(
     args: &[&str],
     name: &str,
 ) -> anyhow::Result<(tokio::process::Child, u32)> {
+    let (child, pid, _log_path) = spawn_fcvm_with_log_path(args, name).await?;
+    Ok((child, pid))
+}
+
+/// Spawn fcvm with piped IO and automatic log consumers, returning the log path.
+///
+/// Same as `spawn_fcvm_with_logs` but also returns the path to the debug log file,
+/// useful for tests that need to analyze log content.
+pub async fn spawn_fcvm_with_log_path(
+    args: &[&str],
+    name: &str,
+) -> anyhow::Result<(tokio::process::Child, u32, PathBuf)> {
     // Ensure config exists (runs once per test process)
     ensure_config_exists();
 
@@ -496,6 +508,7 @@ pub async fn spawn_fcvm_with_logs(
 
     // Always create logger for debug output to file
     let logger = TestLogger::new(name);
+    let log_path = logger.path().clone();
 
     let mut cmd = tokio::process::Command::new(&fcvm_path);
     cmd.args(&final_args)
@@ -517,7 +530,7 @@ pub async fn spawn_fcvm_with_logs(
     spawn_log_consumer_to_file(child.stdout.take(), name, Some(logger.clone()), false);
     spawn_log_consumer_to_file(child.stderr.take(), name, Some(logger), true);
 
-    Ok((child, pid))
+    Ok((child, pid, log_path))
 }
 
 /// Spawn a task to consume stdout and print with `[name]` prefix

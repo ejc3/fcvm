@@ -681,7 +681,7 @@ fn test_sigterm_cleanup_bridged() -> Result<()> {
 /// Test that SIGTERM properly cleans up ALL routed network resources.
 ///
 /// Routed mode creates: network namespace, veth pair, host IPv6 route,
-/// proxy NDP entry, ip6tables MASQUERADE rule, socat port forwarders.
+/// proxy NDP entry, ip6tables MASQUERADE rule, TCP proxy tasks.
 /// After SIGTERM, every one of these must be gone.
 ///
 /// This test extracts the exact namespace name, veth name, and VM IPv6
@@ -691,7 +691,7 @@ fn test_sigterm_cleanup_bridged() -> Result<()> {
 fn test_sigterm_cleanup_routed() -> Result<()> {
     println!("\ntest_sigterm_cleanup_routed");
 
-    // Start fcvm in routed mode with port forwarding (to test socat cleanup)
+    // Start fcvm in routed mode with port forwarding
     let fcvm_path = common::find_fcvm_binary()?;
     let (vm_name, _, _, _) = common::unique_names("cleanup-routed");
     let host_port = common::find_available_high_port().context("finding available port")?;
@@ -769,9 +769,6 @@ fn test_sigterm_cleanup_routed() -> Result<()> {
         "should have started a firecracker process"
     );
 
-    let socat_pids = find_socat_for_port(host_port);
-    println!("Socat PIDs for port {}: {:?}", host_port, socat_pids);
-
     // Verify resources exist BEFORE cleanup
     assert!(
         std::path::Path::new(&format!("/var/run/netns/{}", ns_name)).exists(),
@@ -836,17 +833,7 @@ fn test_sigterm_cleanup_routed() -> Result<()> {
         println!("  [OK] Firecracker process cleaned up");
     }
 
-    // 2. Socat port-forwarder processes
-    for socat_pid in &socat_pids {
-        assert!(
-            !process_exists(*socat_pid),
-            "socat (PID {}) should be killed after SIGTERM",
-            socat_pid
-        );
-    }
-    if !socat_pids.is_empty() {
-        println!("  [OK] Socat processes cleaned up");
-    }
+    // 2. TCP proxy tasks are in-process (killed with fcvm), no external PIDs to check.
 
     // 3. Network namespace deleted
     assert!(
@@ -935,23 +922,4 @@ fn test_sigterm_cleanup_routed() -> Result<()> {
 
     println!("test_sigterm_cleanup_routed PASSED");
     Ok(())
-}
-
-/// Find socat processes listening on a specific port
-#[cfg(feature = "privileged-tests")]
-fn find_socat_for_port(port: u16) -> Vec<u32> {
-    let output = Command::new("pgrep")
-        .args(["-f", &format!("socat.*TCP-LISTEN:{}", port)])
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            stdout
-                .lines()
-                .filter_map(|l| l.trim().parse::<u32>().ok())
-                .collect()
-        }
-        _ => vec![],
-    }
 }

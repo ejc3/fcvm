@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use super::namespace;
+use super::tcp_proxy;
 use super::types::generate_mac;
 use super::veth;
 use super::{NetworkConfig, NetworkManager, PortMapping};
@@ -45,7 +46,7 @@ pub struct RoutedNetwork {
     host_veth: Option<String>,
     vm_ipv6: Option<String>,
     default_iface: Option<String>,
-    socat_children: Vec<tokio::process::Child>,
+    proxy_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl RoutedNetwork {
@@ -59,7 +60,7 @@ impl RoutedNetwork {
             host_veth: None,
             vm_ipv6: None,
             default_iface: None,
-            socat_children: Vec::new(),
+            proxy_handles: Vec::new(),
         }
     }
 
@@ -463,41 +464,29 @@ impl NetworkManager for RoutedNetwork {
             .await;
         info!(iface = %default_iface, "added IPv6 MASQUERADE for outbound traffic");
 
-        // 14. Port forwarding: socat listens on host loopback, connects to VM
-        //     inside the namespace (via `ip netns exec`). The veth is a bridge member
-        //     so host-side IPv4 routing to 10.0.2.100 doesn't work — socat must run
-        //     the connect side inside the namespace where the bridge is directly reachable.
+        // 14. Port forwarding: TCP proxy listens on host loopback, connects to VM
+        //     inside the namespace via setns(2). The veth is a bridge member so
+        //     host-side IPv4 routing to 10.0.2.100 doesn't work — the connect side
+        //     must run inside the namespace where the bridge is directly reachable.
         //     Loopback IP is allocated by StateManager with lock-based coordination.
         let loopback_ip = self
             .loopback_ip
             .clone()
             .unwrap_or_else(|| "127.0.0.2".to_string());
-        for mapping in &self.port_mappings {
-            // Shell script: socat listens on host, connects inside namespace.
-            // `exec` replaces the shell process so child.kill() kills socat directly.
-            let script = format!(
-                "exec socat TCP-LISTEN:{},bind={},fork,reuseaddr \
-                 EXEC:'ip netns exec {} socat STDIO TCP\\:{}\\:{}'",
-                mapping.host_port, loopback_ip, ns_name, GUEST_IP, mapping.guest_port
-            );
-            match tokio::process::Command::new("sh")
-                .args(["-c", &script])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
-                Ok(child) => {
-                    info!(host_port = mapping.host_port, guest_port = mapping.guest_port, bind = %loopback_ip, "port forwarding via socat");
-                    self.socat_children.push(child);
-                }
-                Err(e) => {
-                    warn!(host_port = mapping.host_port, guest_port = mapping.guest_port, error = %e, "failed to start socat port forwarder");
-                }
-            }
+        if !self.port_mappings.is_empty() {
+            let handles = tcp_proxy::start_port_forwards(
+                &loopback_ip,
+                &self.port_mappings,
+                &ns_name,
+                GUEST_IP,
+            )
+            .await
+            .context("starting port forward proxies")?;
+            self.proxy_handles.extend(handles);
         }
 
-        // 15. Reverse proxy relay: socat listens inside the namespace on the
-        //     gateway and forwards to the actual proxy FROM THE HOST process.
+        // 15. Reverse proxy relay: TCP proxy listens inside the namespace on the
+        //     gateway and connects to the actual proxy from the HOST namespace.
         //     Host-side BPF programs intercept connect() syscalls and inject
         //     client certs for proxy auth. Without this relay, the VM's direct
         //     connections bypass these hooks and get rejected (407).
@@ -505,51 +494,15 @@ impl NetworkManager for RoutedNetwork {
             .ok()
             .or_else(|| std::env::var("https_proxy").ok())
         {
-            let proxy_addr = proxy
-                .trim_start_matches("http://")
-                .trim_start_matches("https://");
-            // Listen in namespace (VM reaches gateway IP), connect from HOST
-            // network namespace (where BPF hooks inject client certs).
-            // nsenter -n -t 1 switches back to the host's network namespace.
-            let script = format!(
-                "exec ip netns exec {ns} socat \
-                 TCP-LISTEN:8080,bind={gw},fork,reuseaddr \
-                 EXEC:'nsenter -n -t 1 socat STDIO TCP\\:{proxy}'",
-                ns = ns_name,
-                gw = GUEST_GATEWAY,
-                proxy = proxy_addr.replace(':', "\\:"),
-            );
-            match tokio::process::Command::new("sh")
-                .args(["-c", &script])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
-                Ok(child) => {
-                    info!(proxy = %proxy, bind = %GUEST_GATEWAY, "reverse proxy relay for host-side auth");
-                    self.socat_children.push(child);
+            match tcp_proxy::parse_proxy_addr(&proxy) {
+                Ok(proxy_addr) => {
+                    let handle = tcp_proxy::start_proxy_relay(&ns_name, GUEST_GATEWAY, proxy_addr)
+                        .await
+                        .context("starting proxy relay")?;
+                    self.proxy_handles.push(handle);
                 }
                 Err(e) => {
-                    warn!(proxy = %proxy, error = %e, "failed to start reverse proxy relay");
-                }
-            }
-        }
-
-        // Brief pause then check socat processes didn't crash immediately
-        // (e.g., port already in use, binary not found)
-        if !self.socat_children.is_empty() {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            for child in &mut self.socat_children {
-                if let Ok(Some(status)) = child.try_wait() {
-                    let hint = if status.code() == Some(127) {
-                        "socat not found — install with: apt-get install socat"
-                    } else {
-                        "port may already be in use"
-                    };
-                    anyhow::bail!(
-                        "socat exited immediately (exit code {:?}) — {hint}",
-                        status.code()
-                    );
+                    warn!(proxy = %proxy, error = %e, "failed to parse proxy address, skipping relay");
                 }
             }
         }
@@ -586,7 +539,7 @@ impl NetworkManager for RoutedNetwork {
             // The namespace kernel then forwards to the veth → host.
             host_ipv6: Some("fd00::1".to_string()),
             dns_search: None,
-            // Override proxy to use the gateway relay (socat on host side
+            // Override proxy to use the gateway relay (TCP proxy on host side
             // goes through BPF hooks for client cert injection).
             http_proxy: if std::env::var("HTTPS_PROXY").is_ok()
                 || std::env::var("https_proxy").is_ok()
@@ -602,9 +555,9 @@ impl NetworkManager for RoutedNetwork {
     async fn cleanup(&mut self) -> Result<()> {
         info!(vm_id = %self.vm_id, "cleaning up routed network resources");
 
-        // Kill socat port forwarders
-        for mut child in self.socat_children.drain(..) {
-            let _ = child.kill().await;
+        // Abort TCP proxy tasks (port forwarders + proxy relay)
+        for handle in self.proxy_handles.drain(..) {
+            handle.abort();
         }
 
         // Remove IPv6 MASQUERADE and proxy NDP
