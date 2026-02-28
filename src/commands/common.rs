@@ -1207,6 +1207,10 @@ pub fn build_snapshot_config(
             extra_disks,
             username: vm_state.config.username.clone(),
             user: vm_state.config.user.clone(),
+            port_mappings: vm_state.config.port_mappings.clone(),
+            network_mode: vm_state.config.network_mode,
+            tty: vm_state.config.tty,
+            interactive: vm_state.config.interactive,
         },
     }
 }

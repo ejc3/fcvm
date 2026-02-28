@@ -189,6 +189,13 @@ pub(super) fn build_firecracker_config(
         crate::cli::args::NetworkMode::Routed => FcNetworkMode::Routed,
     };
 
+    // Parse port mappings for cache key.
+    let port_mappings: Vec<crate::network::PortMapping> = args
+        .publish
+        .iter()
+        .filter_map(|s| crate::network::PortMapping::parse(s).ok())
+        .collect();
+
     // Collect extra disk specifications for cache key.
     // These are block devices that must match between cache create and restore.
     let mut extra_disks: Vec<String> = Vec::new();
@@ -232,6 +239,7 @@ pub(super) fn build_firecracker_config(
         rootfs_size: args.rootfs_size.clone(),
         health_check_url: args.health_check.clone(),
         user: args.user.clone(),
+        port_mappings,
         forward_localhost: args.forward_localhost.clone(),
         image_mode,
         non_blocking_output: args.non_blocking_output,
