@@ -345,34 +345,52 @@ async fn test_output_survives_snapshot() -> Result<()> {
     // Check the debug log for our marker in actual container output lines.
     // The marker must appear as stdout from the output listener (prefixed "[name]"),
     // NOT just in the command args or plan response body.
+    //
+    // Poll the log file because spawn_log_consumer_to_file runs as a separate
+    // tokio task that drains the child's pipe asynchronously. child.wait()
+    // returns as soon as the process exits, but the log consumer may still be
+    // writing buffered lines to the file. Polling lets the task finish.
     let log_dir = "/tmp/fcvm-test-logs";
     let mut found_marker = false;
-    if let Ok(entries) = std::fs::read_dir(log_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            if name.contains("output-snap") {
-                if let Ok(contents) = std::fs::read_to_string(&path) {
-                    // Look for the marker in stdout lines (output listener forwards as
-                    // "[name] content" for stdout). Exclude lines containing "args=",
-                    // "plan response", or "cmd" which just echo the command, not output.
-                    for line in contents.lines() {
-                        if line.contains(&marker)
-                            && !line.contains("args=")
-                            && !line.contains("plan response")
-                            && !line.contains("\"cmd\"")
-                        {
-                            println!("  Found marker in container output: {}", line.trim());
-                            found_marker = true;
-                            break;
+    let mut found_done = false;
+    let poll_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < poll_deadline && (!found_marker || !found_done) {
+        if let Ok(entries) = std::fs::read_dir(log_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                if name.contains("output-snap") {
+                    if let Ok(contents) = std::fs::read_to_string(&path) {
+                        // Look for the marker in stdout lines (output listener forwards as
+                        // "[name] content" for stdout). Exclude lines containing "args=",
+                        // "plan response", or "cmd" which just echo the command, not output.
+                        if !found_marker {
+                            for line in contents.lines() {
+                                if line.contains(&marker)
+                                    && !line.contains("args=")
+                                    && !line.contains("plan response")
+                                    && !line.contains("\"cmd\"")
+                                {
+                                    println!(
+                                        "  Found marker in container output: {}",
+                                        line.trim()
+                                    );
+                                    found_marker = true;
+                                    break;
+                                }
+                            }
                         }
-                    }
-                    if found_marker {
-                        break;
+                        if !found_done && contents.contains("ALL-OUTPUT-DONE") {
+                            found_done = true;
+                        }
                     }
                 }
             }
         }
+        if found_marker && found_done {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     assert!(
@@ -383,21 +401,6 @@ async fn test_output_survives_snapshot() -> Result<()> {
     );
 
     // Also verify the bulk output didn't get stuck (pipe buffer deadlock)
-    let mut found_done = false;
-    if let Ok(entries) = std::fs::read_dir(log_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            if name.contains("output-snap") {
-                if let Ok(contents) = std::fs::read_to_string(&path) {
-                    if contents.contains("ALL-OUTPUT-DONE") {
-                        found_done = true;
-                        break;
-                    }
-                }
-            }
-        }
-    }
     assert!(
         found_done,
         "ALL-OUTPUT-DONE sentinel not found — pipe buffer deadlock after snapshot"
