@@ -1247,6 +1247,8 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
             &baseline_name,
             "--network",
             "bridged",
+            "--health-check",
+            "http://localhost:80",
             common::TEST_IMAGE,
         ],
         &baseline_name,
@@ -1430,6 +1432,8 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
             &baseline_name,
             "--network",
             "rootless",
+            "--health-check",
+            "http://localhost:80",
             common::TEST_IMAGE,
         ],
         &baseline_name,
@@ -1595,7 +1599,7 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
 
 /// Test port forwarding on clones with routed networking
 ///
-/// Routed mode uses socat + unique loopback IPs (like rootless).
+/// Routed mode uses TCP proxy + unique loopback IPs (like rootless).
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_clone_port_forward_routed() -> Result<()> {
@@ -1617,6 +1621,8 @@ async fn test_clone_port_forward_routed() -> Result<()> {
             &baseline_name,
             "--network",
             "routed",
+            "--health-check",
+            "http://localhost:80",
             common::TEST_IMAGE,
         ],
         &baseline_name,
@@ -1698,7 +1704,7 @@ async fn test_clone_port_forward_routed() -> Result<()> {
     // Step 5: Test port forwarding via loopback IP
     println!("\nStep 5: Testing port forwarding...");
 
-    // Get clone's loopback IP from state (routed uses socat + loopback like rootless)
+    // Get clone's loopback IP from state (routed uses TCP proxy + loopback like rootless)
     let output = tokio::process::Command::new(&fcvm_path)
         .args(["ls", "--json", "--pid", &clone_pid.to_string()])
         .output()

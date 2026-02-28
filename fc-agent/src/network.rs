@@ -128,18 +128,19 @@ pub async fn kill_stale_tcp_connections() {
 
     // Kill only non-local connections using ss filter
     // "! dst 127.0.0.1" excludes IPv4 loopback; "! dst [::1]" excludes IPv6 loopback
+    // Note: ss filter syntax uses "!" (not "not") as the negation operator,
+    // and IPv6 addresses must be bracketed as "[::1]" to avoid parse errors.
     let kill_output = Command::new("ss")
         .args([
             "-K",
             "state",
             "established",
+            "!",
             "dst",
-            "not",
             "127.0.0.1",
-            "and",
+            "!",
             "dst",
-            "not",
-            "::1",
+            "[::1]",
         ])
         .output()
         .await;
