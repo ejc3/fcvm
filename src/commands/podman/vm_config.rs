@@ -867,6 +867,12 @@ pub(super) async fn run_vm_setup(
             extra_disks.extend(args.disk_dir.iter().cloned());
             extra_disks.extend(args.nfs.iter().cloned());
 
+            let port_mappings: Vec<crate::network::PortMapping> = args
+                .publish
+                .iter()
+                .filter_map(|s| crate::network::PortMapping::parse(s).ok())
+                .collect();
+
             FirecrackerConfig {
                 boot_source: BootSource {
                     kernel_image_path: kernel_path.to_path_buf(),
@@ -906,6 +912,7 @@ pub(super) async fn run_vm_setup(
                 forward_localhost: args.forward_localhost.clone(),
                 image_mode: super::resolve_image_mode(args),
                 rootfs_type: super::resolve_rootfs_type(args),
+                port_mappings,
                 firecracker_bin: runtime_config.firecracker_bin.clone(),
             }
         });

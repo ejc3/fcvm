@@ -347,24 +347,9 @@ pub struct SnapshotRunArgs {
     #[arg(long)]
     pub name: Option<String>,
 
-    #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
-    pub publish: Vec<String>,
-
-    /// Network mode: bridged (requires sudo) or rootless (no sudo)
-    #[arg(long, value_enum, default_value_t = NetworkMode::Rootless)]
-    pub network: NetworkMode,
-
     /// Execute command in container after clone is healthy (like fcvm exec -c)
     #[arg(long)]
     pub exec: Option<String>,
-
-    /// Allocate a pseudo-TTY for the container
-    #[arg(short, long)]
-    pub tty: bool,
-
-    /// Keep STDIN open for interactive mode
-    #[arg(short, long)]
-    pub interactive: bool,
 
     // ========================================================================
     // Internal fields - not exposed via CLI, used for startup snapshot support

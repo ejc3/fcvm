@@ -80,6 +80,18 @@ pub struct SnapshotMetadata {
     /// User spec (UID:GID) for rootless podman in the VM
     #[serde(default)]
     pub user: Option<String>,
+    /// Published port mappings inherited by clones
+    #[serde(default)]
+    pub port_mappings: Vec<crate::network::PortMapping>,
+    /// Network mode (bridged, rootless, routed) inherited by clones
+    #[serde(default)]
+    pub network_mode: crate::firecracker::FcNetworkMode,
+    /// Whether PTY is allocated for the container
+    #[serde(default)]
+    pub tty: bool,
+    /// Whether stdin is forwarded to the container
+    #[serde(default)]
+    pub interactive: bool,
 }
 
 /// Extra disk configuration saved in snapshot metadata.
@@ -258,6 +270,10 @@ mod tests {
                 extra_disks: vec![],
                 username: None,
                 user: None,
+                port_mappings: vec![],
+                network_mode: Default::default(),
+                tty: false,
+                interactive: false,
             },
         };
 
@@ -377,6 +393,10 @@ mod tests {
                 extra_disks: vec![],
                 username: None,
                 user: None,
+                port_mappings: vec![],
+                network_mode: Default::default(),
+                tty: false,
+                interactive: false,
             },
         };
 
@@ -440,6 +460,10 @@ mod tests {
                     extra_disks: vec![],
                     username: None,
                     user: None,
+                    port_mappings: vec![],
+                    network_mode: Default::default(),
+                    tty: false,
+                    interactive: false,
                 },
             };
             manager.save_snapshot(config).await.unwrap();
@@ -490,6 +514,10 @@ mod tests {
                 extra_disks: vec![],
                 username: None,
                 user: None,
+                port_mappings: vec![],
+                network_mode: Default::default(),
+                tty: false,
+                interactive: false,
             },
         };
         manager.save_snapshot(config).await.unwrap();
@@ -591,6 +619,10 @@ mod tests {
                 extra_disks: vec![],
                 username: None,
                 user: None,
+                port_mappings: vec![],
+                network_mode: Default::default(),
+                tty: false,
+                interactive: false,
             },
         };
 
