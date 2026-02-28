@@ -92,6 +92,9 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
 
     info!(snapshot_key = %snapshot_key, "Creating podman snapshot");
 
+    // Per-VM lock: serialize with external `fcvm snapshot create` calls.
+    let _vm_lock = crate::commands::common::acquire_vm_snapshot_lock(disk_path).await?;
+
     // Get Firecracker client
     let client = vm_manager.client().context("VM not started")?;
 

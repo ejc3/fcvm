@@ -1260,11 +1260,46 @@ pub fn extra_disks_to_snapshot(vm_state: &VmState) -> Vec<crate::storage::Snapsh
         .collect()
 }
 
-/// # Arguments
-/// * `client` - Firecracker API client for the running VM
-/// * `snapshot_config` - Pre-built config with FINAL paths (after atomic rename)
-/// * `disk_path` - Source disk to copy to snapshot
-/// * `parent_snapshot_dir` - Optional parent snapshot to copy memory.bin from (enables diff for new dirs)
+/// Acquire per-VM snapshot lock.
+///
+/// Serializes all snapshot operations on the same Firecracker VM.
+/// Callers MUST hold this lock across the entire snapshot operation (including
+/// reading the VM state to determine the parent snapshot key — otherwise a
+/// concurrent startup snapshot can reset the KVM dirty bitmap while we hold
+/// a stale parent reference, producing a corrupt merged snapshot).
+///
+/// disk_path is like `.../vm-disks/{vm_id}/disks/rootfs.raw` — lock is placed
+/// in the vm_id directory.
+pub async fn acquire_vm_snapshot_lock(disk_path: &Path) -> Result<std::fs::File> {
+    let vm_dir = disk_path
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("cannot derive VM directory from disk path"))?;
+    let lock_path = vm_dir.join("snapshot.lock");
+    let lock_file = std::fs::File::create(&lock_path)
+        .with_context(|| format!("creating snapshot lock: {}", lock_path.display()))?;
+    use fs2::FileExt;
+    loop {
+        match lock_file.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                debug!("waiting for per-VM snapshot lock");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("acquiring per-VM snapshot lock: {}", e));
+            }
+        }
+    }
+    debug!(lock = %lock_path.display(), "acquired per-VM snapshot lock");
+    Ok(lock_file)
+}
+
+/// Create a snapshot of the running VM.
+///
+/// # Locking
+/// Caller MUST hold the per-VM snapshot lock (via `acquire_vm_snapshot_lock`)
+/// before calling this function.
 ///
 /// # Returns
 /// Ok(()) on success, Err on failure. VM is resumed regardless of success/failure.
@@ -1282,40 +1317,6 @@ pub async fn create_snapshot_core(
         .acquire()
         .await
         .map_err(|e| anyhow::anyhow!("snapshot semaphore closed: {}", e))?;
-
-    // Per-VM lock: serialize snapshot operations on the same Firecracker VM.
-    // Without this, the internal startup snapshot (health monitor trigger) and an
-    // external `fcvm snapshot create` can race — one resumes the VM while the other
-    // is mid-snapshot, causing "save/restore unavailable while running" errors.
-    // disk_path is like .../vm-disks/{vm_id}/disks/rootfs.raw — lock in the VM dir.
-    let vm_dir = disk_path
-        .parent()
-        .and_then(|p| p.parent())
-        .ok_or_else(|| anyhow::anyhow!("cannot derive VM directory from disk path"))?;
-    let lock_path = vm_dir.join("snapshot.lock");
-    let lock_file = std::fs::File::create(&lock_path)
-        .with_context(|| format!("creating snapshot lock: {}", lock_path.display()))?;
-    use fs2::FileExt;
-    loop {
-        match lock_file.try_lock_exclusive() {
-            Ok(()) => break,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                debug!(
-                    snapshot = %snapshot_config.name,
-                    "waiting for per-VM snapshot lock"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!("acquiring per-VM snapshot lock: {}", e));
-            }
-        }
-    }
-    debug!(
-        snapshot = %snapshot_config.name,
-        lock = %lock_path.display(),
-        "acquired per-VM snapshot lock"
-    );
 
     // Derive directories from snapshot config (memory_path's parent is the snapshot dir)
     let snapshot_dir = snapshot_config

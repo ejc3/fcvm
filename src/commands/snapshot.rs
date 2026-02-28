@@ -170,13 +170,29 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         extra_disk_configs,
     );
 
-    // Use shared core function for snapshot creation
-    // If the VM was restored from a snapshot, use that as parent for diff support
-    let parent_dir = vm_state
+    // Acquire per-VM lock BEFORE reading the parent snapshot key.
+    // Without this, a concurrent startup snapshot can complete between our state read
+    // and the actual Firecracker snapshot — resetting the KVM dirty bitmap while we
+    // hold a stale parent reference. The merged result would be missing all boot-time
+    // memory changes, causing kernel panics on clone restore.
+    let _vm_lock = super::common::acquire_vm_snapshot_lock(&vm_disk_path).await?;
+
+    // Re-read state under lock to get the current parent snapshot key.
+    // The startup snapshot may have updated snapshot_name since our initial read.
+    let fresh_state = if let Some(name) = &args.name {
+        state_manager.load_state_by_name(name).await
+    } else if let Some(pid) = args.pid {
+        state_manager.load_state_by_pid(pid).await
+    } else {
+        unreachable!()
+    }
+    .context("re-reading VM state under lock")?;
+    let parent_dir = fresh_state
         .config
         .snapshot_name
         .as_ref()
         .map(|name| paths::snapshot_dir().join(name));
+
     super::common::create_snapshot_core(
         &client,
         snapshot_config.clone(),
