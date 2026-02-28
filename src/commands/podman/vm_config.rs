@@ -856,23 +856,14 @@ pub(super) async fn run_vm_setup(
             use crate::firecracker::{
                 BootSource, Drive, FcNetworkMode, FirecrackerConfig, MachineConfig,
             };
-            let network_mode = match args.network {
-                crate::cli::args::NetworkMode::Bridged => FcNetworkMode::Bridged,
-                crate::cli::args::NetworkMode::Rootless => FcNetworkMode::Rootless,
-                crate::cli::args::NetworkMode::Routed => FcNetworkMode::Routed,
-            };
+            let network_mode: FcNetworkMode = args.network.into();
             // Collect extra disk specifications
             let mut extra_disks: Vec<String> = Vec::new();
             extra_disks.extend(args.disk.iter().cloned());
             extra_disks.extend(args.disk_dir.iter().cloned());
             extra_disks.extend(args.nfs.iter().cloned());
 
-            // Parse port mappings for cache key (invalid values are caught later in podman/mod.rs).
-            let port_mappings: Vec<crate::network::PortMapping> = args
-                .publish
-                .iter()
-                .filter_map(|s| crate::network::PortMapping::parse(s).ok())
-                .collect();
+            let port_mappings = crate::network::PortMapping::parse_all_lenient(&args.publish);
 
             FirecrackerConfig {
                 boot_source: BootSource {
