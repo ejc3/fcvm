@@ -450,6 +450,115 @@ fn test_sigterm_cleanup_rootless() -> Result<()> {
     Ok(())
 }
 
+/// Test that SIGKILL on fcvm also kills Firecracker via PR_SET_PDEATHSIG.
+///
+/// Unlike SIGTERM/SIGINT, SIGKILL cannot be caught — fcvm gets no chance to run
+/// cleanup code. The Firecracker child dies because pre_exec sets
+/// PR_SET_PDEATHSIG(SIGKILL), which makes the kernel automatically send SIGKILL
+/// to the child when its parent dies.
+#[test]
+fn test_sigkill_kills_firecracker_rootless() -> Result<()> {
+    println!("\ntest_sigkill_kills_firecracker_rootless");
+
+    let fcvm_path = common::find_fcvm_binary()?;
+    let (vm_name, _, _, _) = common::unique_names("sigkill-rootless");
+    let mut fcvm = Command::new(&fcvm_path)
+        .args([
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "rootless",
+            common::TEST_IMAGE,
+        ])
+        .spawn()
+        .context("spawning fcvm")?;
+
+    let fcvm_pid = fcvm.id();
+    println!("Started fcvm with PID: {}", fcvm_pid);
+
+    // Wait for VM to become healthy
+    let start = std::time::Instant::now();
+    let mut healthy = false;
+    while start.elapsed() < Duration::from_secs(120) {
+        std::thread::sleep(common::POLL_INTERVAL);
+
+        let output = Command::new(&fcvm_path)
+            .args(["ls", "--json", "--pid", &fcvm_pid.to_string()])
+            .output()
+            .context("running fcvm ls")?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if is_vm_healthy(&stdout) {
+            healthy = true;
+            println!("VM is healthy after {:?}", start.elapsed());
+            break;
+        }
+    }
+
+    if !healthy {
+        fcvm::utils::graceful_kill(fcvm_pid, 2000);
+        let _ = fcvm.wait();
+        anyhow::bail!("VM did not become healthy within 120 seconds");
+    }
+
+    // Find the specific firecracker process for THIS VM
+    let our_fc_pid = find_firecracker_for_fcvm(fcvm_pid);
+    println!("Our firecracker PID: {:?}", our_fc_pid);
+
+    assert!(
+        our_fc_pid.is_some(),
+        "should have started a firecracker process"
+    );
+    let fc_pid = our_fc_pid.unwrap();
+    assert!(
+        process_exists(fc_pid),
+        "firecracker should be running before SIGKILL"
+    );
+
+    // Send SIGKILL to fcvm — no cleanup handler runs
+    println!("Sending SIGKILL to fcvm (PID {})", fcvm_pid);
+    send_signal(fcvm_pid, "KILL").context("sending SIGKILL to fcvm")?;
+
+    // Wait for fcvm to be reaped
+    let _ = fcvm.wait();
+    println!("fcvm process reaped");
+
+    // PR_SET_PDEATHSIG delivers SIGKILL to Firecracker immediately when parent dies.
+    // Poll briefly in case of scheduling delay.
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        if !process_exists(fc_pid) {
+            break;
+        }
+        std::thread::sleep(common::POLL_INTERVAL);
+    }
+
+    let still_running = process_exists(fc_pid);
+    if still_running {
+        println!(
+            "BUG: firecracker (PID {}) still running after fcvm SIGKILL!",
+            fc_pid
+        );
+        let _ = send_signal(fc_pid, "KILL");
+    }
+    assert!(
+        !still_running,
+        "firecracker (PID {}) should die via PR_SET_PDEATHSIG when fcvm is SIGKILL'd",
+        fc_pid
+    );
+
+    assert!(
+        !process_exists(fcvm_pid),
+        "fcvm process (PID {}) should be dead",
+        fcvm_pid
+    );
+
+    println!("test_sigkill_kills_firecracker_rootless PASSED");
+    Ok(())
+}
+
 /// Find the firecracker process spawned by a specific fcvm process
 /// by looking at the parent PID chain
 fn find_firecracker_for_fcvm(fcvm_pid: u32) -> Option<u32> {
