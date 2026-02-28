@@ -109,8 +109,6 @@ async fn egress_stress_impl(
             "run",
             "--name",
             &baseline_name,
-            "--network",
-            network,
             common::TEST_IMAGE,
         ],
         &baseline_name,
@@ -210,21 +208,11 @@ async fn egress_stress_impl(
     let mut clone_handles = Vec::new();
     for i in 0..num_clones {
         let name = format!("{}-clone-{}", test_name, i);
-        let net = network.to_string();
         let spid_str = serve_pid.to_string();
 
         let handle = tokio::spawn(async move {
             let (_child, pid) = common::spawn_fcvm_with_logs(
-                &[
-                    "snapshot",
-                    "run",
-                    "--pid",
-                    &spid_str,
-                    "--name",
-                    &name,
-                    "--network",
-                    &net,
-                ],
+                &["snapshot", "run", "--pid", &spid_str, "--name", &name],
                 &name,
             )
             .await?;

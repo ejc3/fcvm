@@ -867,6 +867,7 @@ pub(super) async fn run_vm_setup(
             extra_disks.extend(args.disk_dir.iter().cloned());
             extra_disks.extend(args.nfs.iter().cloned());
 
+            // Parse port mappings for cache key (invalid values are caught later in podman/mod.rs).
             let port_mappings: Vec<crate::network::PortMapping> = args
                 .publish
                 .iter()

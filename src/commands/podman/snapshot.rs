@@ -189,7 +189,7 @@ pub(super) fn build_firecracker_config(
         crate::cli::args::NetworkMode::Routed => FcNetworkMode::Routed,
     };
 
-    // Parse port mappings for cache key.
+    // Parse port mappings for cache key (invalid values are caught later in podman/mod.rs).
     let port_mappings: Vec<crate::network::PortMapping> = args
         .publish
         .iter()
