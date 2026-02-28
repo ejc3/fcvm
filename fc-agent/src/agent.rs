@@ -93,6 +93,12 @@ pub async fn run() -> Result<()> {
         mmds::watch_restore_epoch(restore_signals).await;
     });
 
+    // Write storage.conf with driver = "overlay" before starting the exec server.
+    // The health monitor runs `podman inspect` as soon as exec accepts connections.
+    // Without this, podman initializes its BoltDB with driver = "" (auto-detect),
+    // which mismatches when mount_overlay_image() later writes driver = "overlay".
+    container::write_early_storage_conf();
+
     // Start exec server with rebind signal for vsock transport reset recovery
     let (exec_ready_tx, exec_ready_rx) = tokio::sync::oneshot::channel();
     let exec_rebind_clone = exec_rebind.clone();
