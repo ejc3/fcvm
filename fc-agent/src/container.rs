@@ -174,6 +174,28 @@ fn storage_paths(username: Option<&str>) -> (String, String, String) {
     }
 }
 
+/// Write a minimal storage.conf with the correct graph driver.
+///
+/// Must be called BEFORE the exec server starts. The health monitor runs
+/// `podman inspect` inside the VM as soon as the exec server accepts connections.
+/// Any `podman` invocation initializes the BoltDB with whatever driver is in
+/// storage.conf. If the default storage.conf has `driver = ""` (auto-detect),
+/// the BoltDB may be initialized with an empty or wrong driver. When
+/// `mount_overlay_image()` later writes `driver = "overlay"`, podman sees a
+/// mismatch: "database graph driver '' does not match our graph driver 'overlay'".
+///
+/// By writing `driver = "overlay"` early, all podman invocations before the full
+/// storage setup create a BoltDB that matches the final config.
+pub fn write_early_storage_conf() {
+    let conf = "[storage]\ndriver = \"overlay\"\n";
+    if let Err(e) = std::fs::write("/etc/containers/storage.conf", conf) {
+        eprintln!(
+            "[fc-agent] WARNING: failed to write early storage.conf: {}",
+            e
+        );
+    }
+}
+
 /// Write containers.conf to disable netavark requirement.
 ///
 /// The VM always uses `--network=host` for containers, so podman never needs

@@ -187,8 +187,8 @@ pub struct Drive {
 pub enum NetworkMode {
     Bridged,
     /// Default for FcNetworkMode is Rootless (safest — no root required).
-    /// Note: the CLI enum `cli::args::NetworkMode` defaults to Bridged (most common
-    /// for sudo users). Use `.into()` to convert between them.
+    /// The CLI also defaults to Rootless (`--network rootless`).
+    /// Use `.into()` to convert from `cli::args::NetworkMode`.
     #[default]
     Rootless,
     Routed,
@@ -576,6 +576,19 @@ mod tests {
         let config1 = test_config();
         let mut config2 = test_config();
         config2.firecracker_bin = Some(PathBuf::from("/path/to/firecracker"));
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    #[test]
+    fn test_snapshot_key_changes_with_port_mappings() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.port_mappings = vec![crate::network::PortMapping {
+            host_ip: None,
+            host_port: 8080,
+            guest_port: 80,
+            proto: crate::network::types::Protocol::Tcp,
+        }];
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 }

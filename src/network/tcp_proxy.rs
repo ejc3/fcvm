@@ -5,12 +5,41 @@
 
 use std::net::SocketAddr;
 use std::os::fd::AsFd;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use super::PortMapping;
+
+/// Port the proxy relay binds on inside the VM's network namespace.
+/// fc-agent connects to `gateway:<this_port>` for HTTP proxy access.
+/// Uses a high port to avoid colliding with common application ports (8080, 3128, etc.)
+/// that container processes might try to reach on the gateway.
+pub const PROXY_RELAY_PORT: u16 = 41480;
+
+/// Run a closure inside a network namespace, restoring the original namespace afterward.
+///
+/// Handles the setns enter/restore boilerplate: saves current namespace,
+/// enters the target, runs the operation, then always restores.
+fn run_in_namespace<T>(ns_path: &str, f: impl FnOnce() -> std::io::Result<T>) -> Result<T> {
+    let old_ns =
+        std::fs::File::open("/proc/self/ns/net").context("opening current network namespace")?;
+    let new_ns =
+        std::fs::File::open(ns_path).with_context(|| format!("opening namespace {ns_path}"))?;
+
+    nix::sched::setns(new_ns.as_fd(), nix::sched::CloneFlags::CLONE_NEWNET)
+        .context("entering network namespace")?;
+
+    let result = f();
+
+    // ALWAYS restore original namespace, even on failure.
+    nix::sched::setns(old_ns.as_fd(), nix::sched::CloneFlags::CLONE_NEWNET)
+        .expect("failed to restore network namespace — thread is in wrong namespace");
+
+    result.with_context(|| format!("operation in namespace {ns_path}"))
+}
 
 /// Connect a TCP stream inside a network namespace.
 ///
@@ -19,22 +48,8 @@ use super::PortMapping;
 async fn connect_in_namespace(ns_name: &str, addr: SocketAddr) -> Result<tokio::net::TcpStream> {
     let ns_path = format!("/var/run/netns/{}", ns_name);
 
-    let std_stream = tokio::task::spawn_blocking(move || -> Result<std::net::TcpStream> {
-        let old_ns = std::fs::File::open("/proc/self/ns/net")
-            .context("opening current network namespace")?;
-        let new_ns = std::fs::File::open(&ns_path)
-            .with_context(|| format!("opening namespace {ns_path}"))?;
-
-        nix::sched::setns(new_ns.as_fd(), nix::sched::CloneFlags::CLONE_NEWNET)
-            .context("entering network namespace")?;
-
-        let result = std::net::TcpStream::connect(addr);
-
-        // ALWAYS restore original namespace, even on connect failure.
-        nix::sched::setns(old_ns.as_fd(), nix::sched::CloneFlags::CLONE_NEWNET)
-            .expect("failed to restore network namespace — thread is in wrong namespace");
-
-        result.with_context(|| format!("connecting to {addr} in namespace"))
+    let std_stream = tokio::task::spawn_blocking(move || {
+        run_in_namespace(&ns_path, || std::net::TcpStream::connect(addr))
     })
     .await
     .context("spawn_blocking panicked")??;
@@ -50,27 +65,67 @@ async fn connect_in_namespace(ns_name: &str, addr: SocketAddr) -> Result<tokio::
 async fn bind_in_namespace(ns_name: &str, addr: SocketAddr) -> Result<tokio::net::TcpListener> {
     let ns_path = format!("/var/run/netns/{}", ns_name);
 
-    let std_listener = tokio::task::spawn_blocking(move || -> Result<std::net::TcpListener> {
-        let old_ns = std::fs::File::open("/proc/self/ns/net")
-            .context("opening current network namespace")?;
-        let new_ns = std::fs::File::open(&ns_path)
-            .with_context(|| format!("opening namespace {ns_path}"))?;
-
-        nix::sched::setns(new_ns.as_fd(), nix::sched::CloneFlags::CLONE_NEWNET)
-            .context("entering network namespace")?;
-
-        let result = std::net::TcpListener::bind(addr);
-
-        nix::sched::setns(old_ns.as_fd(), nix::sched::CloneFlags::CLONE_NEWNET)
-            .expect("failed to restore network namespace — thread is in wrong namespace");
-
-        result.with_context(|| format!("binding {addr} in namespace"))
+    let std_listener = tokio::task::spawn_blocking(move || {
+        run_in_namespace(&ns_path, || std::net::TcpListener::bind(addr))
     })
     .await
     .context("spawn_blocking panicked")??;
 
     std_listener.set_nonblocking(true)?;
     Ok(tokio::net::TcpListener::from_std(std_listener)?)
+}
+
+/// Accept connections on `listener` and relay each to an upstream via `connect`.
+///
+/// Shared relay loop used by both port forwarding and proxy relay.
+fn spawn_relay_loop<F, Fut>(
+    listener: tokio::net::TcpListener,
+    connect: F,
+    label: &'static str,
+) -> JoinHandle<()>
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<tokio::net::TcpStream>> + Send,
+{
+    let connect = Arc::new(connect);
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((client, peer)) => {
+                    let connect = Arc::clone(&connect);
+                    tokio::spawn(async move {
+                        match connect().await {
+                            Ok(mut upstream) => {
+                                let mut client = client;
+                                match tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                                    .await
+                                {
+                                    Ok((c2u, u2c)) => {
+                                        debug!(
+                                            client_to_upstream = c2u,
+                                            upstream_to_client = u2c,
+                                            %peer,
+                                            "{label} relay completed"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        debug!(error = %e, %peer, "{label} relay error");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!(error = %e, %peer, "{label} connect failed");
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    warn!(error = %e, "{label} accept error");
+                    break;
+                }
+            }
+        }
+    })
 }
 
 /// Start port forwarding: listen on host loopback, relay to guest inside namespace.
@@ -84,13 +139,18 @@ pub async fn start_port_forwards(
 ) -> Result<Vec<JoinHandle<()>>> {
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
+    // Helper: abort all started handles on error.
+    let abort_all = |handles: &[JoinHandle<()>]| {
+        for h in handles {
+            h.abort();
+        }
+    };
+
     for mapping in mappings {
         let bind_addr: SocketAddr = match format!("{}:{}", loopback_ip, mapping.host_port).parse() {
             Ok(addr) => addr,
             Err(e) => {
-                for h in &handles {
-                    h.abort();
-                }
+                abort_all(&handles);
                 return Err(anyhow::anyhow!(e)).with_context(|| {
                     format!("invalid bind address {}:{}", loopback_ip, mapping.host_port)
                 });
@@ -100,9 +160,7 @@ pub async fn start_port_forwards(
         let listener = match tokio::net::TcpListener::bind(bind_addr).await {
             Ok(l) => l,
             Err(e) => {
-                for h in &handles {
-                    h.abort();
-                }
+                abort_all(&handles);
                 return Err(anyhow::anyhow!(e))
                     .with_context(|| format!("binding port forward on {bind_addr}"));
             }
@@ -115,61 +173,25 @@ pub async fn start_port_forwards(
             "port forwarding via TCP proxy"
         );
 
-        let ns_name = ns_name.to_string();
+        let ns_name: Arc<str> = ns_name.into();
         let guest_addr: SocketAddr = match format!("{}:{}", guest_ip, mapping.guest_port).parse() {
             Ok(addr) => addr,
             Err(e) => {
-                for h in &handles {
-                    h.abort();
-                }
+                abort_all(&handles);
                 return Err(anyhow::anyhow!(e)).with_context(|| {
                     format!("invalid guest address {}:{}", guest_ip, mapping.guest_port)
                 });
             }
         };
 
-        let handle = tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((client, peer)) => {
-                        let ns = ns_name.clone();
-                        tokio::spawn(async move {
-                            match connect_in_namespace(&ns, guest_addr).await {
-                                Ok(mut guest) => {
-                                    let mut client = client;
-                                    match tokio::io::copy_bidirectional(&mut client, &mut guest)
-                                        .await
-                                    {
-                                        Ok((c2g, g2c)) => {
-                                            debug!(
-                                                client_to_guest = c2g,
-                                                guest_to_client = g2c,
-                                                %peer,
-                                                "port forward relay completed"
-                                            );
-                                        }
-                                        Err(e) => {
-                                            debug!(error = %e, %peer, "port forward relay error");
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    debug!(
-                                        error = %e,
-                                        %peer,
-                                        "failed to connect to guest in namespace"
-                                    );
-                                }
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "port forward accept error");
-                        break;
-                    }
-                }
-            }
-        });
+        let handle = spawn_relay_loop(
+            listener,
+            move || {
+                let ns = Arc::clone(&ns_name);
+                async move { connect_in_namespace(&ns, guest_addr).await }
+            },
+            "port forward",
+        );
 
         handles.push(handle);
     }
@@ -187,9 +209,14 @@ pub async fn start_proxy_relay(
     gateway_ip: &str,
     proxy_addr: SocketAddr,
 ) -> Result<JoinHandle<()>> {
-    let bind_addr: SocketAddr = format!("{}:8080", gateway_ip)
+    let bind_addr: SocketAddr = format!("{}:{}", gateway_ip, PROXY_RELAY_PORT)
         .parse()
-        .with_context(|| format!("invalid proxy relay bind address {}:8080", gateway_ip))?;
+        .with_context(|| {
+            format!(
+                "invalid proxy relay bind address {}:{}",
+                gateway_ip, PROXY_RELAY_PORT
+            )
+        })?;
 
     let listener = bind_in_namespace(ns_name, bind_addr)
         .await
@@ -201,44 +228,15 @@ pub async fn start_proxy_relay(
         "reverse proxy relay via TCP proxy"
     );
 
-    let handle = tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((client, peer)) => {
-                    tokio::spawn(async move {
-                        // Connect to the real proxy in the HOST namespace (default).
-                        match tokio::net::TcpStream::connect(proxy_addr).await {
-                            Ok(mut upstream) => {
-                                let mut client = client;
-                                match tokio::io::copy_bidirectional(&mut client, &mut upstream)
-                                    .await
-                                {
-                                    Ok((c2u, u2c)) => {
-                                        debug!(
-                                            client_to_upstream = c2u,
-                                            upstream_to_client = u2c,
-                                            %peer,
-                                            "proxy relay completed"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        debug!(error = %e, %peer, "proxy relay error");
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                debug!(error = %e, %peer, "failed to connect to proxy");
-                            }
-                        }
-                    });
-                }
-                Err(e) => {
-                    warn!(error = %e, "proxy relay accept error");
-                    break;
-                }
-            }
-        }
-    });
+    let handle = spawn_relay_loop(
+        listener,
+        move || async move {
+            tokio::net::TcpStream::connect(proxy_addr)
+                .await
+                .context("connecting to proxy")
+        },
+        "proxy",
+    );
 
     Ok(handle)
 }

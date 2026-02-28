@@ -91,20 +91,12 @@ fn count_container_output_in_log(log_path: &std::path::Path) -> usize {
 /// Poll a log file for container output (COUNT:/BURST: lines).
 /// This is used instead of exec-based health monitoring because the exec
 /// server's vsock listener sometimes fails after snapshot restore.
-async fn poll_for_container_output(log_path: &std::path::Path, timeout: Duration) -> Result<usize> {
-    let start = std::time::Instant::now();
+/// Caller should wrap this with `tokio::time::timeout` for deadline enforcement.
+async fn poll_for_container_output(log_path: &std::path::Path) -> usize {
     loop {
-        if start.elapsed() > timeout {
-            anyhow::bail!(
-                "timeout after {:?} waiting for container output in log: {}",
-                timeout,
-                log_path.display()
-            );
-        }
-
         let count = count_container_output_in_log(log_path);
         if count > 0 {
-            return Ok(count);
+            return count;
         }
 
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -201,7 +193,7 @@ async fn test_heavy_output_after_snapshot_restore() -> Result<()> {
     let warm_start_timer = std::time::Instant::now();
     let initial_count = tokio::time::timeout(
         Duration::from_secs(120),
-        poll_for_container_output(&warm_log_path, Duration::from_secs(120)),
+        poll_for_container_output(&warm_log_path),
     )
     .await
     .map_err(|_| {
@@ -209,8 +201,7 @@ async fn test_heavy_output_after_snapshot_restore() -> Result<()> {
             "warm start timed out after 120s — no container output in logs. \
              Output pipeline broken after snapshot restore."
         )
-    })?
-    .context("polling for container output")?;
+    })?;
 
     let warm_start_secs = warm_start_timer.elapsed().as_secs();
     println!(
