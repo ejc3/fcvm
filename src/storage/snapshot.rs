@@ -42,6 +42,16 @@ pub struct SnapshotConfig {
     /// Defaults to vm_id if not set (for snapshots of fresh VMs).
     #[serde(default)]
     pub original_vsock_vm_id: Option<String>,
+    /// Parent snapshot name used as the diff base for this snapshot's memory.
+    /// - Full snapshots: None (no diff base needed)
+    /// - Diff snapshots: Some("parent-name") — memory.bin was created by merging
+    ///   the diff onto parent's memory.bin
+    ///
+    /// This creates a walkable chain: startup → pre-start → None.
+    /// Used for validation: the diff base must come from the same VM or its
+    /// restore-source to avoid memory corruption.
+    #[serde(default)]
+    pub parent_snapshot: Option<String>,
     pub memory_path: PathBuf,
     pub vmstate_path: PathBuf,
     pub disk_path: PathBuf,
@@ -240,6 +250,7 @@ mod tests {
             name: "test-snapshot".to_string(),
             vm_id: "abc123".to_string(),
             original_vsock_vm_id: None,
+            parent_snapshot: None,
             memory_path: PathBuf::from("/path/to/memory.bin"),
             vmstate_path: PathBuf::from("/path/to/vmstate.bin"),
             disk_path: PathBuf::from("/path/to/disk.raw"),
@@ -363,6 +374,7 @@ mod tests {
             name: "test-snap".to_string(),
             vm_id: "test123".to_string(),
             original_vsock_vm_id: None,
+            parent_snapshot: None,
             memory_path: PathBuf::from("/memory.bin"),
             vmstate_path: PathBuf::from("/vmstate.bin"),
             disk_path: PathBuf::from("/disk.raw"),
@@ -430,6 +442,7 @@ mod tests {
                 name: name.to_string(),
                 vm_id: format!("vm-{}", name),
                 original_vsock_vm_id: None,
+                parent_snapshot: None,
                 memory_path: PathBuf::from("/memory.bin"),
                 vmstate_path: PathBuf::from("/vmstate.bin"),
                 disk_path: PathBuf::from("/disk.raw"),
@@ -484,6 +497,7 @@ mod tests {
             name: "to-delete".to_string(),
             vm_id: "vm123".to_string(),
             original_vsock_vm_id: None,
+            parent_snapshot: None,
             memory_path: PathBuf::from("/memory.bin"),
             vmstate_path: PathBuf::from("/vmstate.bin"),
             disk_path: PathBuf::from("/disk.raw"),
@@ -589,6 +603,7 @@ mod tests {
             name: "user-snapshot".to_string(),
             vm_id: "user123".to_string(),
             original_vsock_vm_id: None,
+            parent_snapshot: None,
             memory_path: PathBuf::from("/memory.bin"),
             vmstate_path: PathBuf::from("/vmstate.bin"),
             disk_path: PathBuf::from("/disk.raw"),

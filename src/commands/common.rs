@@ -1190,6 +1190,7 @@ pub fn build_snapshot_config(
         name: snapshot_key.to_string(),
         vm_id: vm_state.vm_id.clone(),
         original_vsock_vm_id: Some(original_vsock_vm_id),
+        parent_snapshot: None, // Set by create_snapshot_core after determining diff base
         memory_path: snapshot_dir.join("memory.bin"),
         vmstate_path: snapshot_dir.join("vmstate.bin"),
         disk_path: snapshot_dir.join("disk.raw"),
@@ -1309,7 +1310,7 @@ pub async fn acquire_vm_snapshot_lock(disk_path: &Path) -> Result<std::fs::File>
 /// Ok(()) on success, Err on failure. VM is resumed regardless of success/failure.
 pub async fn create_snapshot_core(
     client: &crate::firecracker::FirecrackerClient,
-    snapshot_config: crate::storage::snapshot::SnapshotConfig,
+    mut snapshot_config: crate::storage::snapshot::SnapshotConfig,
     disk_path: &Path,
     parent_snapshot_dir: Option<&Path>,
 ) -> Result<()> {
@@ -1330,32 +1331,31 @@ pub async fn create_snapshot_core(
     let temp_snapshot_dir = snapshot_dir.with_extension("creating");
 
     // Determine base memory for diff snapshot support.
-    // CRITICAL: Never create files in snapshot_dir before the atomic rename.
-    // A stale memory.bin (from an aborted snapshot) in snapshot_dir without config.json
-    // would be used as the wrong base, producing a corrupt snapshot that kernel-panics
-    // on restore (memory/register mismatch → stack corruption in do_idle).
     //
-    // Two valid sources of a base:
-    // 1. Complete existing snapshot (config.json + memory.bin) — re-creating a user snapshot
-    // 2. Parent snapshot's memory.bin — creating startup snapshot from pre-start
-    let (has_base, base_memory_source) =
-        if snapshot_dir.join("config.json").exists() && snapshot_dir.join("memory.bin").exists() {
-            // Existing complete snapshot — valid base for diff
-            (true, Some(snapshot_dir.join("memory.bin")))
-        } else if let Some(parent_dir) = parent_snapshot_dir {
+    // Firecracker resets the dirty bitmap after each snapshot, so the diff only
+    // contains pages dirtied since the LAST snapshot (not the original restore).
+    // The merge base MUST be the immediate parent — skipping levels corrupts memory.
+    //
+    // The caller provides parent_snapshot_dir from VmState.config.snapshot_name,
+    // which tracks the last snapshot created from (or restored into) this VM.
+    // This is always the correct diff base.
+    let (has_base, base_memory_source, diff_parent_name) =
+        if let Some(parent_dir) = parent_snapshot_dir {
             let parent_memory = parent_dir.join("memory.bin");
             if parent_memory.exists() {
+                let parent_name = parent_dir.file_name().map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| parent_dir.display().to_string());
                 info!(
                     snapshot = %snapshot_config.name,
                     parent = %parent_dir.display(),
                     "using parent memory.bin as diff base"
                 );
-                (true, Some(parent_memory))
+                (true, Some(parent_memory), Some(parent_name))
             } else {
-                (false, None)
+                (false, None, None)
             }
         } else {
-            (false, None)
+            (false, None, None)
         };
 
     // Clean up stale snapshot directory (e.g., from a previous aborted attempt).
@@ -1636,6 +1636,15 @@ pub async fn create_snapshot_core(
         );
     }
 
+    // Record parent snapshot for the diff chain.
+    // Full snapshots: parent = None (self-contained).
+    // Diff snapshots: parent = name of snapshot whose memory.bin was the merge base.
+    snapshot_config.parent_snapshot = if use_diff {
+        diff_parent_name
+    } else {
+        None
+    };
+
     // Write config.json to temp directory
     let temp_config_path = temp_snapshot_dir.join("config.json");
     let config_json =
@@ -1900,5 +1909,125 @@ mod tests {
         // Base should be unchanged
         let result = std::fs::read(base.path()).unwrap();
         assert!(result.iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn test_parent_snapshot_set_on_full() {
+        // Full snapshots should have parent_snapshot = None
+        let state = make_vm_state("vm-AAA", None);
+        let config = build_snapshot_config(
+            &state,
+            "my-snap",
+            SnapshotType::User,
+            Path::new("/tmp/snap"),
+            vec![],
+            vec![],
+        );
+        assert!(config.parent_snapshot.is_none());
+    }
+
+    #[test]
+    fn test_parent_snapshot_serialization_roundtrip() {
+        // parent_snapshot should survive JSON serialization
+        let state = make_vm_state("vm-AAA", None);
+        let mut config = build_snapshot_config(
+            &state,
+            "startup",
+            SnapshotType::System,
+            Path::new("/tmp/snap"),
+            vec![],
+            vec![],
+        );
+        config.parent_snapshot = Some("pre-start-abc123".to_string());
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: crate::storage::SnapshotConfig =
+            serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            deserialized.parent_snapshot,
+            Some("pre-start-abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parent_snapshot_backward_compatible() {
+        // Old config.json without parent_snapshot should deserialize with None
+        let json = r#"{
+            "name": "old-snap",
+            "vm_id": "vm-OLD",
+            "memory_path": "/tmp/memory.bin",
+            "vmstate_path": "/tmp/vmstate.bin",
+            "disk_path": "/tmp/disk.raw",
+            "created_at": "2026-01-01T00:00:00Z",
+            "metadata": {
+                "image": "nginx:alpine",
+                "vcpu": 2,
+                "memory_mib": 1024,
+                "network_config": {
+                    "tap_device": "tap0",
+                    "guest_mac": "02:00:00:00:00:00",
+                    "guest_ip": "10.0.2.100/24",
+                    "host_ip": "10.0.2.2"
+                },
+                "volumes": [],
+                "health_check_url": null,
+                "health_check_timeout": 5,
+                "hugepages": false,
+                "extra_disks": [],
+                "port_mappings": [],
+                "network_mode": "rootless",
+                "tty": false,
+                "interactive": false
+            }
+        }"#;
+
+        let config: crate::storage::SnapshotConfig = serde_json::from_str(json).unwrap();
+        assert!(config.parent_snapshot.is_none(), "missing field should default to None");
+    }
+
+    #[test]
+    fn test_parent_chain_walkable() {
+        // Simulate a chain: pre-start (Full) → startup (Diff) → user-snap (Diff)
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let snap_root = tmp.path();
+
+        // Helper to write a snapshot config to disk
+        let write_config = |name: &str, parent: Option<&str>, vm_id: &str| {
+            let dir = snap_root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let state = make_vm_state(vm_id, None);
+            let mut config = build_snapshot_config(
+                &state,
+                name,
+                SnapshotType::System,
+                &dir,
+                vec![],
+                vec![],
+            );
+            config.parent_snapshot = parent.map(|s| s.to_string());
+            let json = serde_json::to_string_pretty(&config).unwrap();
+            std::fs::write(dir.join("config.json"), &json).unwrap();
+        };
+
+        write_config("pre-start-abc", None, "vm-AAA");
+        write_config("startup-def", Some("pre-start-abc"), "vm-AAA");
+        write_config("my-snap", Some("startup-def"), "vm-BBB");
+
+        // Walk the chain from user_snap back to root
+        let mut chain = vec![];
+        let mut current_name = Some("my-snap".to_string());
+        while let Some(name) = current_name {
+            let dir = snap_root.join(&name);
+            let config_json = std::fs::read_to_string(dir.join("config.json")).unwrap();
+            let config: crate::storage::SnapshotConfig =
+                serde_json::from_str(&config_json).unwrap();
+            chain.push(config.name.clone());
+            current_name = config.parent_snapshot.clone();
+        }
+
+        assert_eq!(chain, vec!["my-snap", "startup-def", "pre-start-abc"]);
     }
 }
