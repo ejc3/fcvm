@@ -187,8 +187,11 @@ fn storage_paths(username: Option<&str>) -> (String, String, String) {
 /// By writing `driver = "overlay"` early, all podman invocations before the full
 /// storage setup create a BoltDB that matches the final config.
 pub fn write_early_storage_conf() {
-    let conf = "[storage]\ndriver = \"overlay\"\n";
-    if let Err(e) = std::fs::write("/etc/containers/storage.conf", conf) {
+    let (conf_path, runroot, graphroot) = storage_paths(None);
+    let conf = format!(
+        "[storage]\ndriver = \"overlay\"\nrunroot = \"{runroot}\"\ngraphroot = \"{graphroot}\"\n"
+    );
+    if let Err(e) = std::fs::write(&conf_path, conf) {
         eprintln!(
             "[fc-agent] WARNING: failed to write early storage.conf: {}",
             e
