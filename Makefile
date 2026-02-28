@@ -1,11 +1,14 @@
 SHELL := /bin/bash
 
-# Guard: never run make as root (except clean). Running cargo as root
-# leaves root-owned files in target/ that break subsequent user builds
+# Guard: never run make as root on the host (except clean). Running cargo
+# as root leaves root-owned files in target/ that break subsequent user builds
 # with BrokenPipe errors from nextest finding stale binaries.
+# Skip this guard inside containers (where root is normal).
 ifeq ($(shell id -u),0)
 ifeq ($(filter clean,$(MAKECMDGOALS)),)
+ifeq ($(wildcard /.dockerenv /run/.containerenv),)
 $(error Do not run make as root. Use 'make test-root' as your normal user — it uses sudo only for the test runner)
+endif
 endif
 endif
 
