@@ -762,7 +762,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Restore username for rootless health checks (runuser -u <username>).
     vm_state.config.username = snapshot_config.metadata.username.clone();
     vm_state.config.user = snapshot_config.metadata.user.clone();
-    vm_state.config.port_mappings = port_mappings.clone();
+    vm_state.config.port_mappings = port_mappings;
     vm_state.config.network_mode = network_mode;
     vm_state.config.tty = tty_mode;
     vm_state.config.interactive = interactive;

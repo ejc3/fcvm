@@ -186,9 +186,22 @@ pub struct Drive {
 #[serde(rename_all = "lowercase")]
 pub enum NetworkMode {
     Bridged,
+    /// Default for FcNetworkMode is Rootless (safest — no root required).
+    /// Note: the CLI enum `cli::args::NetworkMode` defaults to Bridged (most common
+    /// for sudo users). Use `.into()` to convert between them.
     #[default]
     Rootless,
     Routed,
+}
+
+impl From<crate::cli::args::NetworkMode> for NetworkMode {
+    fn from(mode: crate::cli::args::NetworkMode) -> Self {
+        match mode {
+            crate::cli::args::NetworkMode::Bridged => NetworkMode::Bridged,
+            crate::cli::args::NetworkMode::Rootless => NetworkMode::Rootless,
+            crate::cli::args::NetworkMode::Routed => NetworkMode::Routed,
+        }
+    }
 }
 
 /// How localhost container images are delivered to the guest VM.

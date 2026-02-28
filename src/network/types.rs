@@ -65,6 +65,13 @@ impl std::fmt::Display for Protocol {
 }
 
 impl PortMapping {
+    /// Parse port mappings leniently, skipping invalid values.
+    /// Used for cache key computation where invalid mappings are caught
+    /// later during actual network setup in `podman/mod.rs`.
+    pub fn parse_all_lenient(specs: &[String]) -> Vec<Self> {
+        specs.iter().filter_map(|s| Self::parse(s).ok()).collect()
+    }
+
     /// Parse port mapping from string: [HOSTIP:]HOSTPORT:GUESTPORT[/PROTO]
     pub fn parse(s: &str) -> anyhow::Result<Self> {
         let parts: Vec<&str> = s.split(':').collect();

@@ -595,11 +595,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     vm_state.config.hugepages = args.hugepages;
     vm_state.config.portable_volumes = args.portable_volumes;
     vm_state.config.port_mappings = port_mappings.clone();
-    vm_state.config.network_mode = match args.network {
-        crate::cli::args::NetworkMode::Bridged => crate::firecracker::FcNetworkMode::Bridged,
-        crate::cli::args::NetworkMode::Rootless => crate::firecracker::FcNetworkMode::Rootless,
-        crate::cli::args::NetworkMode::Routed => crate::firecracker::FcNetworkMode::Routed,
-    };
+    vm_state.config.network_mode = args.network.into();
     vm_state.config.tty = args.tty;
     vm_state.config.interactive = args.interactive;
     vm_state.config.user = args.user.clone();
