@@ -110,7 +110,15 @@ async fn egress_fresh_test_impl(network: &str) -> Result<()> {
     // Step 1: Start VM
     println!("\nStep 1: Starting fresh VM '{}'...", vm_name);
     let (_child, vm_pid) = common::spawn_fcvm_with_logs(
-        &["podman", "run", "--name", &vm_name, common::TEST_IMAGE],
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            network,
+            common::TEST_IMAGE,
+        ],
         &vm_name,
     )
     .await
@@ -188,6 +196,8 @@ async fn egress_clone_test_impl(network: &str) -> Result<()> {
             "run",
             "--name",
             &baseline_name,
+            "--network",
+            network,
             common::TEST_IMAGE,
         ],
         &baseline_name,

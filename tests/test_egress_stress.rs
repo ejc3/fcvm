@@ -109,6 +109,8 @@ async fn egress_stress_impl(
             "run",
             "--name",
             &baseline_name,
+            "--network",
+            network,
             common::TEST_IMAGE,
         ],
         &baseline_name,
