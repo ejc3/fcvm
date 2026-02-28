@@ -676,7 +676,11 @@ impl NetworkManager for PastaNetwork {
             // Entry looks like: "10.0.2.100 lladdr aa:bb:cc:dd:ee:ff REACHABLE"
             // If lladdr is present, the guest's MAC is known.
             if stdout.contains("lladdr") {
-                info!(guest_ip = GUEST_IP, arp = %stdout.trim(), "ARP resolved, port forwarding ready");
+                info!(guest_ip = GUEST_IP, arp = %stdout.trim(), "ARP resolved");
+                // ARP is resolved but pasta's loopback port forwarding may not be
+                // ready yet. Probe each mapped port on the loopback IP to confirm
+                // end-to-end forwarding works before declaring ready.
+                self.wait_for_port_forwarding().await?;
                 return Ok(());
             }
 
