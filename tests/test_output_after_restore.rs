@@ -75,47 +75,34 @@ fn build_fcvm_args<'a>(
     args
 }
 
-/// Count container output lines (COUNT:/BURST:) in log files matching a pattern.
-fn count_container_output_in_logs(log_dir: &std::path::Path, pattern: &str) -> usize {
-    let mut count = 0;
-    if let Ok(entries) = std::fs::read_dir(log_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.contains(pattern) {
-                let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
-                count += content
-                    .lines()
-                    .filter(|line| {
-                        (line.contains("COUNT:") || line.contains("BURST:"))
-                            && !line.contains("args=")
-                            && !line.contains("Spawned")
-                    })
-                    .count();
-            }
-        }
-    }
-    count
+/// Count container output lines (COUNT:/BURST:) in a log file.
+fn count_container_output_in_log(log_path: &std::path::Path) -> usize {
+    let content = std::fs::read_to_string(log_path).unwrap_or_default();
+    content
+        .lines()
+        .filter(|line| {
+            (line.contains("COUNT:") || line.contains("BURST:"))
+                && !line.contains("args=")
+                && !line.contains("Spawned")
+        })
+        .count()
 }
 
-/// Poll warm start log for container output (COUNT:/BURST: lines).
+/// Poll a log file for container output (COUNT:/BURST: lines).
 /// This is used instead of exec-based health monitoring because the exec
 /// server's vsock listener sometimes fails after snapshot restore.
-async fn poll_for_container_output(
-    log_dir: &std::path::Path,
-    pattern: &str,
-    timeout: Duration,
-) -> Result<usize> {
+async fn poll_for_container_output(log_path: &std::path::Path, timeout: Duration) -> Result<usize> {
     let start = std::time::Instant::now();
     loop {
         if start.elapsed() > timeout {
             anyhow::bail!(
-                "timeout after {:?} waiting for container output in logs matching '{}'",
+                "timeout after {:?} waiting for container output in log: {}",
                 timeout,
-                pattern
+                log_path.display()
             );
         }
 
-        let count = count_container_output_in_logs(log_dir, pattern);
+        let count = count_container_output_in_log(log_path);
         if count > 0 {
             return Ok(count);
         }
@@ -162,13 +149,12 @@ async fn test_heavy_output_after_snapshot_restore() -> Result<()> {
     let user_spec = format!("{}:{}", uid, gid);
     let fcvm_args = build_fcvm_args(&vm_name, &map_args, &cmd, &user_spec);
 
-    let log_dir = std::path::Path::new("/tmp/fcvm-test-logs");
-
     // Phase 1: Cold boot
     println!("Phase 1: Cold boot with {NUM_FUSE_MOUNTS} FUSE mounts...");
-    let (mut child, fcvm_pid) = common::spawn_fcvm_with_logs(&fcvm_args, &vm_name)
-        .await
-        .context("spawning cold boot VM")?;
+    let (mut child, fcvm_pid, _cold_log_path) =
+        common::spawn_fcvm_with_log_path(&fcvm_args, &vm_name)
+            .await
+            .context("spawning cold boot VM")?;
 
     println!("  fcvm PID: {}", fcvm_pid);
 
@@ -202,18 +188,20 @@ async fn test_heavy_output_after_snapshot_restore() -> Result<()> {
     // a different vsock connection that the guest establishes proactively.
     println!("\nPhase 2: Warm start from snapshot...");
     let warm_log_name = format!("{}-warm", vm_name);
-    let (mut child2, fcvm_pid2) = common::spawn_fcvm_with_logs(&fcvm_args, &warm_log_name)
-        .await
-        .context("spawning warm start VM")?;
+    let (mut child2, fcvm_pid2, warm_log_path) =
+        common::spawn_fcvm_with_log_path(&fcvm_args, &warm_log_name)
+            .await
+            .context("spawning warm start VM")?;
 
     println!("  fcvm PID: {}", fcvm_pid2);
+    println!("  Warm log: {}", warm_log_path.display());
 
     // Poll for container output in the warm start log instead of using exec.
     // This directly tests what we care about: does output reach the host?
     let warm_start_timer = std::time::Instant::now();
     let initial_count = tokio::time::timeout(
         Duration::from_secs(120),
-        poll_for_container_output(log_dir, &warm_log_name, Duration::from_secs(120)),
+        poll_for_container_output(&warm_log_path, Duration::from_secs(120)),
     )
     .await
     .map_err(|_| {
@@ -246,7 +234,7 @@ async fn test_heavy_output_after_snapshot_restore() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(15)).await;
 
     // Verify output is still flowing (not just initial burst)
-    let final_count = count_container_output_in_logs(log_dir, &warm_log_name);
+    let final_count = count_container_output_in_log(&warm_log_path);
     println!(
         "  Container output after 15s: {} lines (was {} at start)",
         final_count, initial_count
@@ -259,21 +247,13 @@ async fn test_heavy_output_after_snapshot_restore() -> Result<()> {
     );
 
     // Verify warm start log shows snapshot was used
-    let mut snapshot_used = false;
-    if let Ok(entries) = std::fs::read_dir(log_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.contains("output-restore") && name.contains("warm") {
-                let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
-                if content.contains("snapshot hit")
-                    || content.contains("Cloning VM directly from snapshot")
-                    || content.contains("Pre-start snapshot hit")
-                {
-                    snapshot_used = true;
-                    println!("  Verified: warm start used snapshot");
-                }
-            }
-        }
+    let warm_content = std::fs::read_to_string(&warm_log_path)
+        .with_context(|| format!("reading warm log: {}", warm_log_path.display()))?;
+    let snapshot_used = warm_content.contains("snapshot hit")
+        || warm_content.contains("Cloning VM directly from snapshot")
+        || warm_content.contains("Pre-start snapshot hit");
+    if snapshot_used {
+        println!("  Verified: warm start used snapshot");
     }
     assert!(
         snapshot_used,
@@ -281,24 +261,15 @@ async fn test_heavy_output_after_snapshot_restore() -> Result<()> {
     );
 
     // Show first container output line for diagnostics
-    if let Ok(entries) = std::fs::read_dir(log_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.contains(&warm_log_name) {
-                let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
-                if let Some(first) = content.lines().find(|line| {
-                    (line.contains("COUNT:") || line.contains("BURST:"))
-                        && !line.contains("args=")
-                        && !line.contains("Spawned")
-                }) {
-                    println!(
-                        "  First output: {}",
-                        first.trim().chars().take(100).collect::<String>()
-                    );
-                    break;
-                }
-            }
-        }
+    if let Some(first) = warm_content.lines().find(|line| {
+        (line.contains("COUNT:") || line.contains("BURST:"))
+            && !line.contains("args=")
+            && !line.contains("Spawned")
+    }) {
+        println!(
+            "  First output: {}",
+            first.trim().chars().take(100).collect::<String>()
+        );
     }
 
     // Cleanup
