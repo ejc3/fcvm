@@ -217,7 +217,7 @@ async fn test_fuse_snapshot_matrix_rw_clone() -> Result<()> {
     // Step 5: Start serve + clone
     println!("Step 5: Starting memory server and clone...");
     let (_serve, serve_pid) = common::start_memory_server(&snap_name).await?;
-    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name, "rootless").await?;
+    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
     common::poll_health_by_pid(clone_pid, 180).await?;
     println!("  Clone healthy (PID: {})", clone_pid);
 
@@ -295,7 +295,7 @@ async fn test_fuse_snapshot_matrix_ro_clone() -> Result<()> {
     // Snapshot, serve, clone
     common::create_snapshot_by_pid(pid, &snap_name).await?;
     let (_serve, serve_pid) = common::start_memory_server(&snap_name).await?;
-    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name, "rootless").await?;
+    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
     common::poll_health_by_pid(clone_pid, 180).await?;
     println!("  Clone healthy");
 
@@ -491,7 +491,7 @@ async fn test_fuse_snapshot_matrix_multi_vol() -> Result<()> {
     // Snapshot + clone
     common::create_snapshot_by_pid(pid, &snap_name).await?;
     let (_serve, serve_pid) = common::start_memory_server(&snap_name).await?;
-    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name, "rootless").await?;
+    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
     common::poll_health_by_pid(clone_pid, 180).await?;
     println!("  Clone healthy");
 
@@ -565,7 +565,7 @@ async fn test_fuse_snapshot_matrix_multi_clone() -> Result<()> {
     let mut clone_pids = Vec::new();
     for i in 0..3 {
         let clone_name = format!("{}-clone-{}", vm_name, i);
-        let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name, "rootless").await?;
+        let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
         common::poll_health_by_pid(clone_pid, 180).await?;
         println!("  Clone {} healthy (PID: {})", i, clone_pid);
         clone_pids.push(clone_pid);
@@ -642,7 +642,7 @@ async fn test_fuse_snapshot_matrix_large_file() -> Result<()> {
     // Snapshot + clone
     common::create_snapshot_by_pid(pid, &snap_name).await?;
     let (_serve, serve_pid) = common::start_memory_server(&snap_name).await?;
-    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name, "rootless").await?;
+    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
     common::poll_health_by_pid(clone_pid, 180).await?;
     println!("  Clone healthy");
 
@@ -738,7 +738,7 @@ async fn test_fuse_snapshot_matrix_plus_disk() -> Result<()> {
     // Snapshot + clone
     common::create_snapshot_by_pid(pid, &snap_name).await?;
     let (_serve, serve_pid) = common::start_memory_server(&snap_name).await?;
-    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name, "bridged").await?;
+    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
     common::poll_health_by_pid(clone_pid, 180).await?;
     println!("  Clone healthy");
 
@@ -992,7 +992,7 @@ async fn test_fuse_snapshot_matrix_plus_diskdir() -> Result<()> {
     // Snapshot + clone
     common::create_snapshot_by_pid(pid, &snap_name).await?;
     let (_serve, serve_pid) = common::start_memory_server(&snap_name).await?;
-    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name, "bridged").await?;
+    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
     common::poll_health_by_pid(clone_pid, 180).await?;
     println!("  Clone healthy");
 
@@ -1068,7 +1068,7 @@ async fn test_fuse_snapshot_matrix_diskdir_only() -> Result<()> {
     // Snapshot + clone
     common::create_snapshot_by_pid(pid, &snap_name).await?;
     let (_serve, serve_pid) = common::start_memory_server(&snap_name).await?;
-    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name, "bridged").await?;
+    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
     common::poll_health_by_pid(clone_pid, 180).await?;
     println!("  Clone healthy");
 

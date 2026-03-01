@@ -82,6 +82,10 @@ pub struct FirecrackerConfig {
     /// it changes how podman sets up user namespaces and storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// Published port mappings (host:guest forwarding).
+    /// Part of VM identity — clones inherit these from snapshot metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub port_mappings: Vec<crate::network::PortMapping>,
     /// Ports to forward from guest localhost to host localhost.
     /// Affects fc-agent's iptables setup, must be in cache key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -123,6 +127,7 @@ impl Default for FirecrackerConfig {
             rootfs_size: "10G".to_string(),
             health_check_url: None,
             user: None,
+            port_mappings: Vec::new(),
             forward_localhost: Vec::new(),
             image_mode: ImageMode::Overlay,
             rootfs_type: None,
@@ -181,9 +186,22 @@ pub struct Drive {
 #[serde(rename_all = "lowercase")]
 pub enum NetworkMode {
     Bridged,
+    /// Default for FcNetworkMode is Rootless (safest — no root required).
+    /// The CLI also defaults to Rootless (`--network rootless`).
+    /// Use `.into()` to convert from `cli::args::NetworkMode`.
     #[default]
     Rootless,
     Routed,
+}
+
+impl From<crate::cli::args::NetworkMode> for NetworkMode {
+    fn from(mode: crate::cli::args::NetworkMode) -> Self {
+        match mode {
+            crate::cli::args::NetworkMode::Bridged => NetworkMode::Bridged,
+            crate::cli::args::NetworkMode::Rootless => NetworkMode::Rootless,
+            crate::cli::args::NetworkMode::Routed => NetworkMode::Routed,
+        }
+    }
 }
 
 /// How localhost container images are delivered to the guest VM.
@@ -558,6 +576,19 @@ mod tests {
         let config1 = test_config();
         let mut config2 = test_config();
         config2.firecracker_bin = Some(PathBuf::from("/path/to/firecracker"));
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    #[test]
+    fn test_snapshot_key_changes_with_port_mappings() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.port_mappings = vec![crate::network::PortMapping {
+            host_ip: None,
+            host_port: 8080,
+            guest_port: 80,
+            proto: crate::network::types::Protocol::Tcp,
+        }];
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 }

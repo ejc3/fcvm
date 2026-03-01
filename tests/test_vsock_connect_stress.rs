@@ -244,7 +244,7 @@ async fn vsock_connect_lifecycle_stress(network: &str) -> Result<()> {
     let (_serve_child, serve_pid) = common::start_memory_server(&snapshot_name).await?;
     println!("  Memory server ready (PID: {})", serve_pid);
 
-    let (_clone1_child, clone1_pid) = common::spawn_clone(serve_pid, &clone1_name, network).await?;
+    let (_clone1_child, clone1_pid) = common::spawn_clone(serve_pid, &clone1_name).await?;
     common::poll_health_by_pid(clone1_pid, 120).await?;
     println!("  Clone1 healthy (PID: {})", clone1_pid);
 
@@ -262,8 +262,7 @@ async fn vsock_connect_lifecycle_stress(network: &str) -> Result<()> {
     let (_serve2_child, serve2_pid) = common::start_memory_server(&snap2_name).await?;
     println!("  Memory server 2 ready (PID: {})", serve2_pid);
 
-    let (_clone2_child, clone2_pid) =
-        common::spawn_clone(serve2_pid, &clone2_name, network).await?;
+    let (_clone2_child, clone2_pid) = common::spawn_clone(serve2_pid, &clone2_name).await?;
     common::poll_health_by_pid(clone2_pid, 120).await?;
     println!("  Clone-of-clone healthy (PID: {})", clone2_pid);
 
@@ -274,7 +273,7 @@ async fn vsock_connect_lifecycle_stress(network: &str) -> Result<()> {
     // STAGE 4: Parallel clone from same serve
     // ========================================================================
     println!("\n=== STAGE 4: Parallel clone from same serve ===");
-    let (_clone3_child, clone3_pid) = common::spawn_clone(serve_pid, &clone3_name, network).await?;
+    let (_clone3_child, clone3_pid) = common::spawn_clone(serve_pid, &clone3_name).await?;
     common::poll_health_by_pid(clone3_pid, 120).await?;
     println!("  Clone3 healthy (PID: {})", clone3_pid);
 

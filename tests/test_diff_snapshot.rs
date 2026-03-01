@@ -348,8 +348,6 @@ async fn test_user_snapshot_from_clone_uses_parent() -> Result<()> {
             &snapshot1_name,
             "--name",
             &clone_name,
-            "--network",
-            "rootless",
         ],
         &clone_name,
     )
@@ -584,8 +582,6 @@ async fn test_snapshot_clone_inherits_no_health_check() -> Result<()> {
             &snapshot_name,
             "--name",
             &clone_name,
-            "--network",
-            "rootless",
         ],
         &clone_name,
     )

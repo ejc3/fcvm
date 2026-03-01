@@ -59,7 +59,7 @@ struct CloneFixture {
 
 impl CloneFixture {
     /// Create a baseline VM, snapshot it, and start serve process
-    fn setup(name: &str, network: &str) -> Self {
+    fn setup(name: &str, network: &str, extra_baseline_args: &[&str]) -> Self {
         let fcvm = find_fcvm_binary();
         let snapshot_name = format!("bench-snap-{}", name);
         let baseline_name = format!("bench-baseline-{}", name);
@@ -70,16 +70,18 @@ impl CloneFixture {
         let log_file =
             File::create(&log_path).unwrap_or_else(|e| panic!("create {}: {}", log_path, e));
         let log_err = log_file.try_clone().expect("clone log file");
+        let mut args = vec![
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            network,
+        ];
+        args.extend_from_slice(extra_baseline_args);
+        args.push(TEST_IMAGE);
         let baseline_child = Command::new(&fcvm)
-            .args([
-                "podman",
-                "run",
-                "--name",
-                &baseline_name,
-                "--network",
-                network,
-                TEST_IMAGE,
-            ])
+            .args(&args)
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_err))
             .spawn()
@@ -181,7 +183,7 @@ impl CloneFixture {
     }
 
     /// Run a clone with --exec and measure total time
-    fn clone_exec(&self, cmd: &str, network: &str) -> Duration {
+    fn clone_exec(&self, cmd: &str) -> Duration {
         let fcvm = find_fcvm_binary();
         let start = Instant::now();
 
@@ -191,8 +193,6 @@ impl CloneFixture {
                 "run",
                 "--pid",
                 &self.serve_pid.to_string(),
-                "--network",
-                network,
                 "--exec",
                 cmd,
             ])
@@ -210,27 +210,19 @@ impl CloneFixture {
     }
 
     /// Spawn a clone, wait for healthy, hit nginx via HTTP, kill clone
-    fn clone_http(&self, network: &str) -> Duration {
+    fn clone_http(&self) -> Duration {
         let fcvm = find_fcvm_binary();
         let start = Instant::now();
 
         // Spawn clone (without --exec so it stays running)
+        // Port mappings are inherited from the baseline VM's snapshot metadata
         let health_port = 8080;
-        let clone_log_path = format!("/tmp/fcvm-bench-clone-http-{}.log", network);
+        let clone_log_path = "/tmp/fcvm-bench-clone-http.log".to_string();
         let clone_log = File::create(&clone_log_path)
             .unwrap_or_else(|e| panic!("create {}: {}", clone_log_path, e));
         let clone_log_err = clone_log.try_clone().expect("clone log file");
         let mut child = Command::new(&fcvm)
-            .args([
-                "snapshot",
-                "run",
-                "--pid",
-                &self.serve_pid.to_string(),
-                "--network",
-                network,
-                "--publish",
-                &format!("{}:80", health_port),
-            ])
+            .args(["snapshot", "run", "--pid", &self.serve_pid.to_string()])
             .stdout(Stdio::from(clone_log))
             .stderr(Stdio::from(clone_log_err))
             .spawn()
@@ -343,12 +335,13 @@ impl Drop for CloneFixture {
     }
 }
 
-/// Benchmark clone latency with both exec and HTTP workloads
-fn bench_clone(c: &mut Criterion) {
-    eprintln!("\n=== Setting up snapshot for clone benchmarks ===");
+/// Benchmark clone exec latency: spawn clone + exec + cleanup
+/// Uses rootless networking only (bridged has dnsmasq binding issues under load)
+fn bench_clone_exec(c: &mut Criterion) {
+    eprintln!("\n=== Setting up snapshot for clone exec benchmarks ===");
 
     // Only test rootless - bridged clones have dnsmasq binding issues under rapid iteration
-    let fixture = CloneFixture::setup("clone", "rootless");
+    let fixture = CloneFixture::setup("clone2-exec", "rootless", &[]);
 
     let mut group = c.benchmark_group("clone");
     group.sample_size(10);
@@ -359,26 +352,42 @@ fn bench_clone(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                total += fixture.clone_exec("echo hello", "rootless");
-            }
-            total
-        })
-    });
-
-    // Clone + wait healthy + HTTP GET + cleanup
-    group.bench_function("http/nginx", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                total += fixture.clone_http("rootless");
+                total += fixture.clone_exec("echo hello");
             }
             total
         })
     });
 
     group.finish();
-    eprintln!("\n=== Cleaning up clone fixtures ===");
+    eprintln!("\n=== Cleaning up clone exec fixtures ===");
 }
 
-criterion_group!(benches, bench_clone);
+/// Benchmark clone HTTP latency: spawn clone + wait healthy + HTTP request + cleanup
+/// Measures raw network latency without exec overhead
+fn bench_clone_http(c: &mut Criterion) {
+    eprintln!("\n=== Setting up snapshot for clone HTTP benchmarks ===");
+
+    // Port mappings are baked into the snapshot from the baseline VM
+    let fixture = CloneFixture::setup("clone2-http", "rootless", &["--publish", "8080:80"]);
+
+    let mut group = c.benchmark_group("clone");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(30));
+
+    // Clone + wait healthy + HTTP GET + cleanup
+    group.bench_function("http/nginx", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                total += fixture.clone_http();
+            }
+            total
+        })
+    });
+
+    group.finish();
+    eprintln!("\n=== Cleaning up clone HTTP fixtures ===");
+}
+
+criterion_group!(benches, bench_clone_exec, bench_clone_http);
 criterion_main!(benches);

@@ -172,8 +172,6 @@ async fn test_extra_disk_ro_clone() -> Result<()> {
             &serve_pid.to_string(),
             "--name",
             &clone_name,
-            "--network",
-            "bridged",
         ],
         &clone_name,
     )

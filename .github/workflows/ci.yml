@@ -360,7 +360,7 @@ jobs:
           # Reset podman state if corrupted from previous runs
           podman system migrate || true
       - name: Create test log directory
-        run: mkdir -p /tmp/fcvm-test-logs
+        run: sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
       - name: Clean test data
         working-directory: fcvm
         run: make clean-test-data || true
@@ -541,7 +541,7 @@ jobs:
           # Install iperf3 for network benchmarks
           sudo apt-get update && sudo apt-get install -y iperf3 || true
       - name: Create test log directory
-        run: mkdir -p /tmp/fcvm-test-logs
+        run: sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
       - name: Clean test data
         working-directory: fcvm
         run: make clean-test-data || true
@@ -677,7 +677,7 @@ jobs:
           key: container-cargo-${{ hashFiles('fcvm/Cargo.lock') }}
           restore-keys: container-cargo-
       - name: Create test log directory
-        run: mkdir -p /tmp/fcvm-test-logs
+        run: sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
       - name: Clean test data
         working-directory: fcvm
         run: make clean-test-data || true

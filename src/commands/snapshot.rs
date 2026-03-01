@@ -10,10 +10,10 @@ use super::podman::{
     CreateSnapshotParams, SnapshotOutcome,
 };
 use crate::cli::{
-    NetworkMode, SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs,
-    SnapshotServeArgs,
+    SnapshotArgs, SnapshotCommands, SnapshotCreateArgs, SnapshotRunArgs, SnapshotServeArgs,
 };
-use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, PortMapping, RoutedNetwork};
+use crate::firecracker::FcNetworkMode;
+use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, RoutedNetwork};
 use crate::paths;
 use crate::state::{
     generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState, VmStatus,
@@ -594,9 +594,9 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         .await
         .context("spawning VolumeServers for clone")?;
 
-    // Setup TTY/output socket paths
-    let tty_mode = args.tty;
-    let interactive = args.interactive;
+    // Setup TTY/output socket paths (inherited from snapshot metadata)
+    let tty_mode = snapshot_config.metadata.tty;
+    let interactive = snapshot_config.metadata.interactive;
     let non_blocking_output = args.non_blocking_output;
     let tty_socket_path = format!("{}_{}", clone_vsock_base.display(), VSOCK_TTY_PORT);
     let output_socket_path = format!("{}_{}", clone_vsock_base.display(), VSOCK_OUTPUT_PORT);
@@ -645,8 +645,11 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         None
     };
 
+    // Network mode inherited from snapshot metadata
+    let network_mode = snapshot_config.metadata.network_mode;
+
     // Start egress proxy for rootless mode (bypasses TAP/bridge for outbound TCP)
-    let _egress_proxy_handle = if matches!(args.network, NetworkMode::Rootless) {
+    let _egress_proxy_handle = if matches!(network_mode, FcNetworkMode::Rootless) {
         let socket_path = clone_vsock_base.clone();
         Some(tokio::spawn(async move {
             if let Err(e) = crate::network::egress_proxy::run_egress_proxy(&socket_path).await {
@@ -659,37 +662,32 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
 
     // Setup networking - use saved network config from snapshot
     let tap_device = format!("tap-{}", truncate_id(&vm_id, 8));
-    let port_mappings: Vec<PortMapping> = args
-        .publish
-        .iter()
-        .map(|s| PortMapping::parse(s))
-        .collect::<Result<Vec<_>>>()
-        .context("parsing port mappings")?;
+    let port_mappings = snapshot_config.metadata.port_mappings.clone();
 
     // Extract guest_ip from snapshot metadata for network config reuse
     let saved_network = &snapshot_config.metadata.network_config;
 
     // Bridged/routed mode requires root for iptables and network namespace setup
-    if matches!(args.network, NetworkMode::Bridged | NetworkMode::Routed)
+    if matches!(network_mode, FcNetworkMode::Bridged | FcNetworkMode::Routed)
         && !nix::unistd::geteuid().is_root()
     {
         bail!(
             "Bridged/routed networking requires root. Either:\n  \
              - Run with sudo: sudo fcvm snapshot run ...\n  \
-             - Use rootless mode: fcvm snapshot run --network rootless ..."
+             - Use rootless mode (create baseline with --network rootless)"
         );
     }
     // Rootless with sudo is pointless - bridged would be faster
-    if matches!(args.network, NetworkMode::Rootless) && nix::unistd::geteuid().is_root() {
+    if matches!(network_mode, FcNetworkMode::Rootless) && nix::unistd::geteuid().is_root() {
         warn!(
             "Running rootless mode as root is unnecessary. \
-             Consider using --network bridged or --network routed for better performance."
+             Consider creating the baseline with --network bridged or --network routed for better performance."
         );
     }
 
     // Setup networking based on mode - reuse guest_ip from snapshot if available
-    let mut network: Box<dyn NetworkManager> = match args.network {
-        NetworkMode::Bridged => {
+    let mut network: Box<dyn NetworkManager> = match network_mode {
+        FcNetworkMode::Bridged => {
             let mut net =
                 BridgedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
             // If snapshot has saved network config with guest_ip, use it
@@ -702,7 +700,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             }
             Box::new(net)
         }
-        NetworkMode::Routed => {
+        FcNetworkMode::Routed => {
             RoutedNetwork::preflight_check().context("routed mode preflight check failed")?;
             let mut net =
                 RoutedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
@@ -715,7 +713,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             }
             Box::new(net)
         }
-        NetworkMode::Rootless => {
+        FcNetworkMode::Rootless => {
             // For rootless mode, allocate loopback IP atomically with state persistence
             // This prevents race conditions when starting multiple clones concurrently
             let loopback_ip = state_manager
@@ -764,6 +762,10 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Restore username for rootless health checks (runuser -u <username>).
     vm_state.config.username = snapshot_config.metadata.username.clone();
     vm_state.config.user = snapshot_config.metadata.user.clone();
+    vm_state.config.port_mappings = port_mappings;
+    vm_state.config.network_mode = network_mode;
+    vm_state.config.tty = tty_mode;
+    vm_state.config.interactive = interactive;
 
     info!(
         tap = %network_config.tap_device,
@@ -1256,11 +1258,7 @@ mod tests {
             pid: None,
             snapshot: Some("snap".to_string()),
             name: Some("clone".to_string()),
-            publish: vec![],
-            network: NetworkMode::Rootless,
             exec: None,
-            tty: false,
-            interactive: false,
             startup_snapshot_base_key: None,
             cpu: None,
             mem: None,

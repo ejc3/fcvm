@@ -113,12 +113,12 @@ CLONE1="memf-clone1-$SUFFIX"
 CLONE2="memf-clone2-$SUFFIX"
 
 echo "--- Step 5: Starting clone 1 (file backend) ---"
-$FCVM snapshot run --snapshot "$SNAP" --name "$CLONE1" --network rootless &
+$FCVM snapshot run --snapshot "$SNAP" --name "$CLONE1" &
 CLONE1_BG=$!
 cleanup_pids+=("$CLONE1_BG")
 
 echo "--- Step 6: Starting clone 2 (file backend) ---"
-$FCVM snapshot run --snapshot "$SNAP" --name "$CLONE2" --network rootless &
+$FCVM snapshot run --snapshot "$SNAP" --name "$CLONE2" &
 CLONE2_BG=$!
 cleanup_pids+=("$CLONE2_BG")
 

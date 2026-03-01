@@ -436,6 +436,19 @@ impl VmManager {
             }
         }
 
+        // Kill Firecracker if parent (fcvm) dies, even from SIGKILL.
+        // This is unconditional — applies to all code paths (nsenter, pre_exec setns, direct).
+        // Must be the LAST pre_exec so it runs AFTER setns(CLONE_NEWUSER), which clears
+        // pdeath_signal in the kernel (credential changes zero task->pdeath_signal).
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
         // Spawn process with streaming output
         let child = spawn_streaming(cmd, |line, is_stderr| {
             let clean = strip_firecracker_prefix(line);

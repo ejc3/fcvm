@@ -176,33 +176,3 @@ fn test_repeated_publish_works() {
         stderr
     );
 }
-
-#[test]
-fn test_snapshot_run_publish_does_not_consume_name() {
-    let fcvm_path = common::find_fcvm_binary().expect("fcvm binary not found");
-
-    // snapshot run --pid X --publish Y --name Z should work
-    let output = Command::new(&fcvm_path)
-        .args([
-            "snapshot",
-            "run",
-            "--pid",
-            "12345",
-            "--publish",
-            "8080:80",
-            "--name",
-            "clone1",
-            "--help",
-        ])
-        .output()
-        .expect("failed to run fcvm");
-
-    // Just verify it doesn't error on parsing
-    // The actual error would be about the PID not existing, not about parsing
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !stderr.contains("required arguments were not provided"),
-        "snapshot run --publish should parse correctly. stderr: {}",
-        stderr
-    );
-}

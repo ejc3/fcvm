@@ -147,7 +147,17 @@ pub async fn watch_restore_epoch(signals: crate::restore::RestoreSignals) {
 
         let metadata = match fetch_latest_metadata(&client).await {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => {
+                // Log every 200th failure (~10s at 50ms poll interval) to avoid spam
+                // but still surface persistent errors after snapshot restore.
+                static FAIL_COUNT: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let count = FAIL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if count < 5 || count.is_multiple_of(200) {
+                    eprintln!("[fc-agent] MMDS fetch failed (count={}): {:?}", count, e);
+                }
+                continue;
+            }
         };
 
         if let Some(ref current) = metadata.restore_epoch {

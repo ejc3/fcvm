@@ -317,16 +317,19 @@ async fn test_output_survives_snapshot() -> Result<()> {
         marker
     );
     println!("  Starting VM with marker: {}", marker);
-    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
-        "podman",
-        "run",
-        "--name",
+    let (mut child, fcvm_pid, log_path) = common::spawn_fcvm_with_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            common::ALPINE_IMAGE,
+            "sh",
+            "-c",
+            &script,
+        ],
         &vm_name,
-        common::ALPINE_IMAGE,
-        "sh",
-        "-c",
-        &script,
-    ])
+    )
     .await
     .context("spawning fcvm")?;
 
@@ -345,33 +348,23 @@ async fn test_output_survives_snapshot() -> Result<()> {
     // Check the debug log for our marker in actual container output lines.
     // The marker must appear as stdout from the output listener (prefixed "[name]"),
     // NOT just in the command args or plan response body.
-    let log_dir = "/tmp/fcvm-test-logs";
+    println!("  Log path: {}", log_path.display());
+    let contents = std::fs::read_to_string(&log_path)
+        .with_context(|| format!("reading log file: {}", log_path.display()))?;
+
     let mut found_marker = false;
-    if let Ok(entries) = std::fs::read_dir(log_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            if name.contains("output-snap") {
-                if let Ok(contents) = std::fs::read_to_string(&path) {
-                    // Look for the marker in stdout lines (output listener forwards as
-                    // "[name] content" for stdout). Exclude lines containing "args=",
-                    // "plan response", or "cmd" which just echo the command, not output.
-                    for line in contents.lines() {
-                        if line.contains(&marker)
-                            && !line.contains("args=")
-                            && !line.contains("plan response")
-                            && !line.contains("\"cmd\"")
-                        {
-                            println!("  Found marker in container output: {}", line.trim());
-                            found_marker = true;
-                            break;
-                        }
-                    }
-                    if found_marker {
-                        break;
-                    }
-                }
-            }
+    for line in contents.lines() {
+        // Look for the marker in stdout lines (output listener forwards as
+        // "[name] content" for stdout). Exclude lines containing "args=",
+        // "plan response", or "cmd" which just echo the command, not output.
+        if line.contains(&marker)
+            && !line.contains("args=")
+            && !line.contains("plan response")
+            && !line.contains("\"cmd\"")
+        {
+            println!("  Found marker in container output: {}", line.trim());
+            found_marker = true;
+            break;
         }
     }
 
@@ -383,23 +376,8 @@ async fn test_output_survives_snapshot() -> Result<()> {
     );
 
     // Also verify the bulk output didn't get stuck (pipe buffer deadlock)
-    let mut found_done = false;
-    if let Ok(entries) = std::fs::read_dir(log_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            if name.contains("output-snap") {
-                if let Ok(contents) = std::fs::read_to_string(&path) {
-                    if contents.contains("ALL-OUTPUT-DONE") {
-                        found_done = true;
-                        break;
-                    }
-                }
-            }
-        }
-    }
     assert!(
-        found_done,
+        contents.contains("ALL-OUTPUT-DONE"),
         "ALL-OUTPUT-DONE sentinel not found — pipe buffer deadlock after snapshot"
     );
 
