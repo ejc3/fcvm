@@ -804,7 +804,15 @@ pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
         }
     }
 
-    // 5. Check CARGO_MANIFEST_DIR for development builds (debug only)
+    // 5b. Current working directory (for test runners like nextest)
+    if let Ok(cwd) = std::env::current_dir() {
+        let p = cwd.join(CONFIG_FILE);
+        if p.exists() {
+            return p.canonicalize().context("canonicalizing config path");
+        }
+    }
+
+    // 5c. Check CARGO_MANIFEST_DIR for development builds (debug only)
     // In release builds (cargo install), this path would be stale and misleading
     #[cfg(debug_assertions)]
     {
@@ -820,9 +828,11 @@ pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
          Searched:\n  \
          ~/.config/fcvm/{}\n  \
          /etc/fcvm/{}\n  \
-         <binary-dir>/{}\n\n\
+         <binary-dir>/{}\n  \
+         <cwd>/{}\n\n\
          Generate the default config with:\n  \
          fcvm setup --generate-config",
+        CONFIG_FILE,
         CONFIG_FILE,
         CONFIG_FILE,
         CONFIG_FILE
