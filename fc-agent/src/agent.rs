@@ -293,13 +293,18 @@ pub async fn run() -> Result<()> {
                 container::CacheResult::WarmStart => {
                     eprintln!("[fc-agent] cache ready: warm start (snapshot restore detected)");
                     // Vsock IS dead (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET on restore).
-                    // Reconnect output before starting the container — for fast-exit
-                    // containers (echo + exit in ~200ms), output must be live or the
-                    // container's stdout/stderr goes to the dead vsock.
-                    output.reconnect();
-                    // Signal egress proxy to reconnect and wait. The MMDS watcher
-                    // may or may not have run handle_clone_restore yet — if it did,
-                    // the two-counter state machine deduplicates the signal.
+                    // Signal egress proxy to reconnect and wait BEFORE output reconnect.
+                    // The MMDS watcher may or may not have run handle_clone_restore
+                    // yet — if it did, the two-counter state machine deduplicates
+                    // the signal.
+                    //
+                    // CRITICAL: egress MUST reconnect before output. The host uses
+                    // the output connection as a readiness signal — once connected,
+                    // it starts the health monitor and tests may immediately use
+                    // egress. If output reconnects first, the host can start sending
+                    // work before egress is ready, causing "connection closed
+                    // prematurely" errors under high concurrency.
+                    // (Same ordering as restore.rs handle_clone_restore.)
                     if plan.egress_proxy {
                         let egress_done = egress_reconnect.done.notified();
                         egress_reconnect
@@ -319,6 +324,9 @@ pub async fn run() -> Result<()> {
                             }
                         }
                     }
+                    // Reconnect output LAST — this tells the host the VM is ready.
+                    // The container hasn't started yet, so no stdout/stderr to lose.
+                    output.reconnect();
                 }
                 container::CacheResult::Failed => {
                     eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing");
