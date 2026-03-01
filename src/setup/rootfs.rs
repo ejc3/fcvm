@@ -741,10 +741,9 @@ pub fn generate_config(force: bool) -> Result<PathBuf> {
 /// 2. SUDO_USER's config (when running with sudo, use invoking user's config)
 /// 3. XDG user config (~/.config/fcvm/rootfs-config.toml)
 /// 4. System config (/etc/fcvm/rootfs-config.toml)
-/// 5. Next to binary (development)
-/// 5b. Current working directory (for test runners like nextest)
-/// 5c. CARGO_MANIFEST_DIR (debug builds only)
-/// 6. ERROR (no embedded fallback)
+/// 5. Next to binary and parent directories (development/test)
+/// 6. CARGO_MANIFEST_DIR (debug builds only)
+/// 7. ERROR (no embedded fallback)
 pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
     // 1. Explicit --config
     if let Some(path) = explicit_path {
@@ -788,7 +787,10 @@ pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
         return Ok(system);
     }
 
-    // 5. Next to binary (development)
+    // 5. Next to binary and parent directories (development/test)
+    // Traverses up to 3 parent levels to handle:
+    //   - target/release/fcvm (2 levels: target/release/ -> target/ -> repo root)
+    //   - target/release/deps/test_binary (3 levels: deps/ -> release/ -> target/ -> repo root)
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
             // Check next to binary
@@ -797,7 +799,7 @@ pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
                 return Ok(p);
             }
             // Check parent directories (for development)
-            for parent in &[".", "..", "../.."] {
+            for parent in &[".", "..", "../..", "../../.."] {
                 let p = exe_dir.join(parent).join(CONFIG_FILE);
                 if p.exists() {
                     return p.canonicalize().context("canonicalizing config path");
@@ -806,16 +808,8 @@ pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
         }
     }
 
-    // 5b. Current working directory (for test runners like nextest)
-    if let Ok(cwd) = std::env::current_dir() {
-        let p = cwd.join(CONFIG_FILE);
-        if p.exists() {
-            return p.canonicalize().context("canonicalizing config path");
-        }
-    }
-
-    // 5c. Check CARGO_MANIFEST_DIR for development builds (debug only)
-    // In release builds (cargo install), this path would be stale and misleading
+    // 6. Check CARGO_MANIFEST_DIR for development builds (debug only)
+    // In release builds (cargo install), this compile-time path would be stale
     #[cfg(debug_assertions)]
     {
         let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(CONFIG_FILE);
@@ -824,17 +818,15 @@ pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
         }
     }
 
-    // 6. Error with helpful message
+    // 7. Error with helpful message
     bail!(
         "No rootfs config found.\n\n\
          Searched:\n  \
          ~/.config/fcvm/{}\n  \
          /etc/fcvm/{}\n  \
-         <binary-dir>/{}\n  \
-         <cwd>/{}\n\n\
+         <binary-dir>/{}\n\n\
          Generate the default config with:\n  \
          fcvm setup --generate-config",
-        CONFIG_FILE,
         CONFIG_FILE,
         CONFIG_FILE,
         CONFIG_FILE
