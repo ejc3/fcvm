@@ -300,16 +300,13 @@ pub async fn run() -> Result<()> {
                 // finishes. This explicit reconnect ensures the output writer has
                 // a live connection before the container starts.
                 output.reconnect();
-                // Signal egress proxy to reconnect and wait for it. On warm start
-                // (restored from cached pre-start snapshot), vsock is dead. The MMDS
-                // watcher skips handle_clone_restore on warm start (restore_flag already
+                // On warm start (restore_flag=true), vsock is dead — signal the
+                // egress proxy to reconnect and wait for it. The MMDS watcher
+                // skips handle_clone_restore on warm start (restore_flag already
                 // set), so this is the only place that coordinates egress reconnection.
-                // The two-counter state machine (epoch/generation) makes this safe:
-                // if the proxy already reconnected via reader error, generation caught
-                // up to epoch and the stale signal is ignored.
-                // On cold start (pause/resume), vsock is NOT dead — the signal fires
-                // but the proxy ignores it (epoch == generation after no-op cycle).
-                if plan.egress_proxy {
+                // On cold start (restore_flag=false), pause/resume doesn't reset
+                // vsock — egress proxy is still connected, nothing to do.
+                if plan.egress_proxy && restore_flag.load(std::sync::atomic::Ordering::Acquire) {
                     // Register notified() BEFORE signaling to avoid race: if the
                     // proxy already reconnected (reader error), done.notify_waiters()
                     // fires immediately — without a registered waiter, the permit is
