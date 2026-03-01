@@ -54,8 +54,18 @@ pub async fn handle_clone_restore(signals: &RestoreSignals, clone_ipv6: Option<&
     signals.exec_rebind_needed.store(true, Ordering::Release);
     signals.exec_rebind.notify_one();
 
-    // SECOND: Signal egress proxy to reconnect its vsock.
-    // Do this in parallel with exec rebind wait — no reason to serialize.
+    // SECOND: Register egress notified() BEFORE signaling to avoid race.
+    // The proxy reconnects quickly (vsock CONNECT is fast), and the exec rebind
+    // wait below takes up to 5s. If we signal first and register notified() after
+    // the exec wait, the proxy's notify_waiters() fires before the future exists
+    // and the notification is lost (same pattern as agent.rs:50).
+    let egress_reconnected = if signals.has_egress_proxy {
+        Some(signals.egress_reconnect_done.notified())
+    } else {
+        None
+    };
+
+    // Now signal the proxy to reconnect (in parallel with exec rebind wait).
     if signals.has_egress_proxy {
         signals.egress_reconnect.notify_waiters();
     }
@@ -77,13 +87,8 @@ pub async fn handle_clone_restore(signals: &RestoreSignals, clone_ipv6: Option<&
     // FOURTH: Wait for egress proxy to confirm vsock reconnected.
     // The host gates health monitoring on the output connection — once connected,
     // tests may immediately use egress. We must ensure egress is ready first.
-    if signals.has_egress_proxy {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            signals.egress_reconnect_done.notified(),
-        )
-        .await
-        {
+    if let Some(egress_done) = egress_reconnected {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), egress_done).await {
             Ok(()) => {
                 eprintln!("[fc-agent] egress proxy reconnected after restore")
             }
