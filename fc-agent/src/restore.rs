@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::Notify;
@@ -18,6 +18,7 @@ pub struct RestoreSignals {
     pub exec_rebind_done: Arc<AtomicBool>,
     pub exec_rebind_done_notify: Arc<Notify>,
     pub egress_reconnect: Arc<Notify>,
+    pub egress_reconnect_epoch: Arc<AtomicU64>,
     pub egress_reconnect_done: Arc<Notify>,
     pub has_egress_proxy: bool,
 }
@@ -55,8 +56,12 @@ pub async fn handle_clone_restore(signals: &RestoreSignals, clone_ipv6: Option<&
     signals.exec_rebind.notify_one();
 
     // SECOND: Signal egress proxy to reconnect its vsock.
-    // Do this in parallel with exec rebind wait — no reason to serialize.
+    // Increment epoch BEFORE notifying so the proxy's two-counter check works:
+    // epoch (requested) vs proxy_generation (completed). If the proxy already
+    // reconnected (reader detected transport reset), its generation caught up
+    // to this epoch and the stale signal is ignored.
     if signals.has_egress_proxy {
+        signals.egress_reconnect_epoch.fetch_add(1, Ordering::Release);
         signals.egress_reconnect.notify_waiters();
     }
 
