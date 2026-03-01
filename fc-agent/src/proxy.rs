@@ -94,9 +94,7 @@ impl ProxyState {
     }
 }
 
-/// Set up iptables/ip6tables REDIRECT rules and start the transparent proxy listener.
-///
-/// Reconnect mechanism (two-counter state machine):
+/// Reconnection coordination via two-counter state machine.
 ///
 /// After snapshot restore, two things can trigger reconnection:
 /// 1. Transport reset kills the vsock → reader detects error → session exits → reconnects
@@ -104,17 +102,23 @@ impl ProxyState {
 ///
 /// Without coordination, both triggers cause separate reconnections, killing the
 /// second session mid-use. Two counters prevent this:
-/// - `reconnect_epoch`: incremented by handle_clone_restore (reconnects REQUESTED)
-/// - `proxy_generation`: incremented by proxy between sessions (reconnects COMPLETED)
+/// - `epoch`: incremented by handle_clone_restore (reconnects REQUESTED).
+///   Write uses Release to ensure visibility before notify.
+/// - `generation`: incremented by proxy between sessions (reconnects COMPLETED).
+///   Read uses Acquire to synchronize with Release writes.
 ///
 /// The signal only kills a session if epoch > generation (more requested than completed).
 /// When the reader detects a dead vsock and the proxy reconnects on its own, generation
 /// catches up to epoch, so the stale signal from handle_clone_restore is correctly ignored.
-pub async fn run_egress_proxy(
-    reconnect: Arc<Notify>,
-    reconnect_epoch: Arc<AtomicU64>,
-    reconnect_done: Arc<Notify>,
-) {
+#[derive(Clone)]
+pub struct ReconnectState {
+    pub signal: Arc<Notify>,
+    pub epoch: Arc<AtomicU64>,
+    pub done: Arc<Notify>,
+}
+
+/// Set up iptables/ip6tables REDIRECT rules and start the transparent proxy listener.
+pub async fn run_egress_proxy(reconnect: ReconnectState) {
     if !setup_iptables_redirect() {
         eprintln!(
             "[fc-agent] WARNING: failed to set up iptables REDIRECT rules, egress proxy disabled"
@@ -163,8 +167,8 @@ pub async fn run_egress_proxy(
     };
 
     // Tracks how many times the proxy has reconnected (completed reconnects).
-    // Compared against reconnect_epoch (requested reconnects) to detect stale signals.
-    let proxy_generation = AtomicU64::new(0);
+    // Compared against reconnect.epoch (requested reconnects) to detect stale signals.
+    let generation = AtomicU64::new(0);
 
     loop {
         // Connect vsock and run multiplexed proxy until connection dies
@@ -177,15 +181,14 @@ pub async fn run_egress_proxy(
             }
         };
         eprintln!("[fc-agent] egress proxy vsock connected");
-        reconnect_done.notify_waiters();
+        reconnect.done.notify_waiters();
 
         run_mux_session(
             &listener_v4,
             listener_v6.as_ref(),
             vsock,
             &reconnect,
-            &reconnect_epoch,
-            &proxy_generation,
+            &generation,
         )
         .await;
 
@@ -193,7 +196,7 @@ pub async fn run_egress_proxy(
         // This prevents handle_clone_restore's signal from killing the NEXT session:
         // if the reader already detected a dead vsock and we're reconnecting,
         // generation catches up to epoch, so the stale signal is ignored.
-        proxy_generation.fetch_add(1, Ordering::Release);
+        generation.fetch_add(1, Ordering::Release);
 
         eprintln!("[fc-agent] egress proxy vsock disconnected, reconnecting...");
     }
@@ -206,9 +209,8 @@ async fn run_mux_session(
     listener_v4: &TcpListener,
     listener_v6: Option<&TcpListener>,
     vsock: VsockStream,
-    reconnect: &Notify,
-    reconnect_epoch: &AtomicU64,
-    proxy_generation: &AtomicU64,
+    reconnect: &ReconnectState,
+    generation: &AtomicU64,
 ) {
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(WRITER_CHANNEL_CAPACITY);
     let state = Arc::new(ProxyState {
@@ -275,8 +277,8 @@ async fn run_mux_session(
             // 1. handle_clone_restore increments epoch (0→1) and notifies
             // 2. Here: epoch(1) > generation(0) → TRUE → kill session ✓
             loop {
-                reconnect.notified().await;
-                if reconnect_epoch.load(Ordering::Acquire) > proxy_generation.load(Ordering::Acquire) {
+                reconnect.signal.notified().await;
+                if reconnect.epoch.load(Ordering::Acquire) > generation.load(Ordering::Acquire) {
                     break;
                 }
             }
