@@ -402,7 +402,7 @@ jobs:
           npx tsx tests/test_serve_sdk.ts
       - name: Upload test logs
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: test-logs-host-${{ matrix.arch }}
           path: /tmp/fcvm-test-logs/
@@ -599,7 +599,7 @@ jobs:
           sudo dmesg | grep -iE 'userfault|uffd|kvm|firecracker|oom|killed|segfault|page.fault' > /tmp/fcvm-test-logs/dmesg-filtered.log || true
       - name: Upload test logs
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: test-logs-host-root-${{ matrix.arch }}-${{ matrix.mode }}
           path: /tmp/fcvm-test-logs/
@@ -703,7 +703,7 @@ jobs:
           sudo dmesg | grep -iE 'userfault|uffd|kvm|firecracker|oom|killed|segfault|page.fault' > /tmp/fcvm-test-logs/dmesg-filtered.log || true
       - name: Upload test logs
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: test-logs-container-${{ matrix.arch }}
           path: /tmp/fcvm-test-logs/
