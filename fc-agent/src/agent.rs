@@ -46,7 +46,18 @@ pub async fn run() -> Result<()> {
         eprintln!("[fc-agent] starting vsock egress proxy");
         let signal = egress_reconnect.clone();
         let done = egress_reconnect_done.clone();
+        // Register notified() BEFORE spawn to avoid race with notify_waiters()
+        let egress_connected = egress_reconnect_done.notified();
         tokio::spawn(proxy::run_egress_proxy(signal, done));
+
+        // Wait for initial vsock connection — ensures egress path is operational
+        // before the container starts and health check reports "healthy".
+        match tokio::time::timeout(std::time::Duration::from_secs(10), egress_connected).await {
+            Ok(()) => eprintln!("[fc-agent] egress proxy vsock connected"),
+            Err(_) => {
+                eprintln!("[fc-agent] WARNING: egress proxy vsock connect timed out (10s)")
+            }
+        }
     }
 
     if let Err(e) = mmds::sync_clock_from_host().await {
