@@ -300,13 +300,34 @@ pub async fn run() -> Result<()> {
                 // finishes. This explicit reconnect ensures the output writer has
                 // a live connection before the container starts.
                 output.reconnect();
-                // Do NOT signal egress proxy here. handle_clone_restore() already
-                // signals it on warm start, and signaling twice causes the proxy to
-                // tear down its first reconnected session mid-use (the second signal
-                // fires after the proxy has already reconnected and is serving traffic).
-                // On cold start, pause/resume doesn't break vsock connections, so no
-                // reconnect is needed. The proxy detects dead connections via read errors
-                // and reconnects automatically.
+                // Signal egress proxy to reconnect and wait for it. On warm start
+                // (restored from cached pre-start snapshot), vsock is dead. The MMDS
+                // watcher skips handle_clone_restore on warm start (restore_flag already
+                // set), so this is the only place that coordinates egress reconnection.
+                // The two-counter state machine (epoch/generation) makes this safe:
+                // if the proxy already reconnected via reader error, generation caught
+                // up to epoch and the stale signal is ignored.
+                // On cold start (pause/resume), vsock is NOT dead — the signal fires
+                // but the proxy ignores it (epoch == generation after no-op cycle).
+                if plan.egress_proxy {
+                    egress_reconnect
+                        .epoch
+                        .fetch_add(1, std::sync::atomic::Ordering::Release);
+                    egress_reconnect.signal.notify_waiters();
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        egress_reconnect.done.notified(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            eprintln!("[fc-agent] egress proxy reconnected after warm start")
+                        }
+                        Err(_) => {
+                            eprintln!("[fc-agent] WARNING: egress proxy reconnect timed out (5s)")
+                        }
+                    }
+                }
             } else {
                 eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing");
             }
