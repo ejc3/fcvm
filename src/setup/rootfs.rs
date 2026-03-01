@@ -742,6 +742,8 @@ pub fn generate_config(force: bool) -> Result<PathBuf> {
 /// 3. XDG user config (~/.config/fcvm/rootfs-config.toml)
 /// 4. System config (/etc/fcvm/rootfs-config.toml)
 /// 5. Next to binary (development)
+/// 5b. Current working directory (for test runners like nextest)
+/// 5c. CARGO_MANIFEST_DIR (debug builds only)
 /// 6. ERROR (no embedded fallback)
 pub fn find_config_file(explicit_path: Option<&str>) -> Result<PathBuf> {
     // 1. Explicit --config
