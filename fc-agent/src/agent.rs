@@ -282,52 +282,47 @@ pub async fn run() -> Result<()> {
     match container::get_image_digest(&image_ref, &cmd_prefix).await {
         Ok(digest) => {
             eprintln!("[fc-agent] image digest: {}", digest);
-            if container::notify_cache_ready_and_wait(&digest, &restore_flag) {
-                eprintln!("[fc-agent] cache ready notification acknowledged");
-                // Reconnect output vsock before starting the container.
-                //
-                // On COLD start (first run), pause/resume does NOT reset vsock —
-                // this reconnect is harmless (just cycles the connection).
-                //
-                // On WARM start (restored from cached pre-start snapshot), vsock
-                // IS dead (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET on restore). The
-                // restore-epoch watcher calls handle_clone_restore() which also
-                // reconnects output — but there's a race: restore_flag is set
-                // BEFORE handle_clone_restore completes, so notify_cache_ready_and_wait
-                // returns before output.reconnect() has been called. For fast-exit
-                // containers (echo + exit in ~200ms), the container runs and exits
-                // with output going to the dead vsock before handle_clone_restore
-                // finishes. This explicit reconnect ensures the output writer has
-                // a live connection before the container starts.
-                output.reconnect();
-                // On warm start (restore_flag=true), vsock is dead — signal the
-                // egress proxy to reconnect and wait for it. The MMDS watcher
-                // skips handle_clone_restore on warm start (restore_flag already
-                // set), so this is the only place that coordinates egress reconnection.
-                // On cold start (restore_flag=false), pause/resume doesn't reset
-                // vsock — egress proxy is still connected, nothing to do.
-                if plan.egress_proxy && restore_flag.load(std::sync::atomic::Ordering::Acquire) {
-                    // Register notified() BEFORE signaling to avoid race: if the
-                    // proxy already reconnected (reader error), done.notify_waiters()
-                    // fires immediately — without a registered waiter, the permit is
-                    // lost and our wait times out (5s unnecessary delay).
-                    let egress_done = egress_reconnect.done.notified();
-                    egress_reconnect
-                        .epoch
-                        .fetch_add(1, std::sync::atomic::Ordering::Release);
-                    egress_reconnect.signal.notify_waiters();
-                    match tokio::time::timeout(std::time::Duration::from_secs(5), egress_done).await
-                    {
-                        Ok(()) => {
-                            eprintln!("[fc-agent] egress proxy reconnected after warm start")
-                        }
-                        Err(_) => {
-                            eprintln!("[fc-agent] WARNING: egress proxy reconnect timed out (5s)")
+            let cache_result = container::notify_cache_ready_and_wait(&digest, &restore_flag);
+            match cache_result {
+                container::CacheResult::ColdStart => {
+                    eprintln!("[fc-agent] cache ready: cold start (cache-ack received)");
+                    // Pause/resume does NOT reset vsock — reconnect is harmless
+                    // (just cycles the connection). No egress signal needed.
+                    output.reconnect();
+                }
+                container::CacheResult::WarmStart => {
+                    eprintln!("[fc-agent] cache ready: warm start (snapshot restore detected)");
+                    // Vsock IS dead (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET on restore).
+                    // Reconnect output before starting the container — for fast-exit
+                    // containers (echo + exit in ~200ms), output must be live or the
+                    // container's stdout/stderr goes to the dead vsock.
+                    output.reconnect();
+                    // Signal egress proxy to reconnect and wait. The MMDS watcher
+                    // may or may not have run handle_clone_restore yet — if it did,
+                    // the two-counter state machine deduplicates the signal.
+                    if plan.egress_proxy {
+                        let egress_done = egress_reconnect.done.notified();
+                        egress_reconnect
+                            .epoch
+                            .fetch_add(1, std::sync::atomic::Ordering::Release);
+                        egress_reconnect.signal.notify_waiters();
+                        match tokio::time::timeout(std::time::Duration::from_secs(5), egress_done)
+                            .await
+                        {
+                            Ok(()) => {
+                                eprintln!("[fc-agent] egress proxy reconnected after warm start")
+                            }
+                            Err(_) => {
+                                eprintln!(
+                                    "[fc-agent] WARNING: egress proxy reconnect timed out (5s)"
+                                )
+                            }
                         }
                     }
                 }
-            } else {
-                eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing");
+                container::CacheResult::Failed => {
+                    eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing");
+                }
             }
         }
         Err(e) => {
