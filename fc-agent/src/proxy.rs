@@ -98,18 +98,19 @@ impl ProxyState {
 ///
 /// After snapshot restore, two things can trigger reconnection:
 /// 1. Transport reset kills the vsock → reader detects error → session exits → reconnects
-/// 2. handle_clone_restore fires reconnect signal (for stale AsyncFd case where reader hangs)
+/// 2. Restore handler fires reconnect signal (for stale AsyncFd case where reader hangs)
 ///
 /// Without coordination, both triggers cause separate reconnections, killing the
 /// second session mid-use. Two counters prevent this:
-/// - `epoch`: incremented by handle_clone_restore (reconnects REQUESTED).
+/// - `epoch`: incremented by restore handlers (reconnects REQUESTED).
+///   Written by: agent.rs (warm start) and restore.rs (clone restore).
 ///   Write uses Release to ensure visibility before notify.
 /// - `generation`: incremented by proxy between sessions (reconnects COMPLETED).
 ///   Read uses Acquire to synchronize with Release writes.
 ///
 /// The signal only kills a session if epoch > generation (more requested than completed).
 /// When the reader detects a dead vsock and the proxy reconnects on its own, generation
-/// catches up to epoch, so the stale signal from handle_clone_restore is correctly ignored.
+/// catches up to epoch, so the stale signal is correctly ignored.
 #[derive(Clone)]
 pub struct ReconnectState {
     pub signal: Arc<Notify>,
