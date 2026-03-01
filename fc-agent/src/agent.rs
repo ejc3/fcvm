@@ -37,6 +37,8 @@ pub async fn run() -> Result<()> {
     // Egress proxy reconnect signal — signaled after snapshot events (pause/resume
     // or restore) to break the stale vsock session and reconnect immediately.
     let egress_reconnect = std::sync::Arc::new(tokio::sync::Notify::new());
+    let egress_reconnect_epoch =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Egress proxy reconnect confirmation — proxy signals after vsock reconnect succeeds.
     // handle_clone_restore waits on this before reconnecting output, ensuring egress is
     // ready before the host considers the VM "ready" and tests start using egress.
@@ -45,10 +47,11 @@ pub async fn run() -> Result<()> {
     if plan.egress_proxy {
         eprintln!("[fc-agent] starting vsock egress proxy");
         let signal = egress_reconnect.clone();
+        let epoch = egress_reconnect_epoch.clone();
         let done = egress_reconnect_done.clone();
         // Register notified() BEFORE spawn to avoid race with notify_waiters()
         let egress_connected = egress_reconnect_done.notified();
-        tokio::spawn(proxy::run_egress_proxy(signal, done));
+        tokio::spawn(proxy::run_egress_proxy(signal, epoch, done));
 
         // Wait for initial vsock connection — ensures egress path is operational
         // before the container starts and health check reports "healthy".
@@ -96,6 +99,7 @@ pub async fn run() -> Result<()> {
         exec_rebind_done: exec_rebind_done.clone(),
         exec_rebind_done_notify: exec_rebind_done_notify.clone(),
         egress_reconnect: egress_reconnect.clone(),
+        egress_reconnect_epoch: egress_reconnect_epoch.clone(),
         egress_reconnect_done: egress_reconnect_done.clone(),
         has_egress_proxy: plan.egress_proxy,
     };
@@ -302,14 +306,13 @@ pub async fn run() -> Result<()> {
                 // finishes. This explicit reconnect ensures the output writer has
                 // a live connection before the container starts.
                 output.reconnect();
-                // Signal egress proxy to reconnect its vsock. On warm start (restored
-                // from cached pre-start snapshot), VIRTIO_VSOCK_EVENT_TRANSPORT_RESET
-                // killed the proxy's vsock. handle_clone_restore() also signals this,
-                // but there's a race: restore_flag is set before handle_clone_restore
-                // completes. This explicit signal ensures the proxy reconnects before
-                // the container starts making TCP connections. Harmless on cold start
-                // (pause/resume doesn't break connections — proxy just cycles).
-                egress_reconnect.notify_waiters();
+                // Do NOT signal egress proxy here. handle_clone_restore() already
+                // signals it on warm start, and signaling twice causes the proxy to
+                // tear down its first reconnected session mid-use (the second signal
+                // fires after the proxy has already reconnected and is serving traffic).
+                // On cold start, pause/resume doesn't break vsock connections, so no
+                // reconnect is needed. The proxy detects dead connections via read errors
+                // and reconnects automatically.
             } else {
                 eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing");
             }

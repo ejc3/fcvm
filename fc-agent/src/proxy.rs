@@ -17,7 +17,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -96,14 +96,25 @@ impl ProxyState {
 
 /// Set up iptables/ip6tables REDIRECT rules and start the transparent proxy listener.
 ///
-/// `reconnect` is signaled after snapshot restore (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET
-/// kills all vsock connections) to break the stale multiplexed session and reconnect.
-/// Without this, the proxy's stale AsyncFd epoll registration causes read_exact to
-/// hang indefinitely. Harmless on cold start (pause/resume doesn't break connections).
+/// Reconnect mechanism (two-counter state machine):
 ///
-/// `reconnect_done` is signaled after the proxy successfully reconnects its vsock,
-/// so restore.rs can wait for egress to be ready before signaling "VM ready" to the host.
-pub async fn run_egress_proxy(reconnect: Arc<Notify>, reconnect_done: Arc<Notify>) {
+/// After snapshot restore, two things can trigger reconnection:
+/// 1. Transport reset kills the vsock → reader detects error → session exits → reconnects
+/// 2. handle_clone_restore fires reconnect signal (for stale AsyncFd case where reader hangs)
+///
+/// Without coordination, both triggers cause separate reconnections, killing the
+/// second session mid-use. Two counters prevent this:
+/// - `reconnect_epoch`: incremented by handle_clone_restore (reconnects REQUESTED)
+/// - `proxy_generation`: incremented by proxy between sessions (reconnects COMPLETED)
+///
+/// The signal only kills a session if epoch > generation (more requested than completed).
+/// When the reader detects a dead vsock and the proxy reconnects on its own, generation
+/// catches up to epoch, so the stale signal from handle_clone_restore is correctly ignored.
+pub async fn run_egress_proxy(
+    reconnect: Arc<Notify>,
+    reconnect_epoch: Arc<AtomicU64>,
+    reconnect_done: Arc<Notify>,
+) {
     if !setup_iptables_redirect() {
         eprintln!(
             "[fc-agent] WARNING: failed to set up iptables REDIRECT rules, egress proxy disabled"
@@ -151,6 +162,10 @@ pub async fn run_egress_proxy(reconnect: Arc<Notify>, reconnect_done: Arc<Notify
         }
     };
 
+    // Tracks how many times the proxy has reconnected (completed reconnects).
+    // Compared against reconnect_epoch (requested reconnects) to detect stale signals.
+    let proxy_generation = AtomicU64::new(0);
+
     loop {
         // Connect vsock and run multiplexed proxy until connection dies
         let vsock = match VsockStream::connect(HOST_CID, EGRESS_PROXY_PORT) {
@@ -164,19 +179,36 @@ pub async fn run_egress_proxy(reconnect: Arc<Notify>, reconnect_done: Arc<Notify
         eprintln!("[fc-agent] egress proxy vsock connected");
         reconnect_done.notify_waiters();
 
-        run_mux_session(&listener_v4, listener_v6.as_ref(), vsock, &reconnect).await;
+        run_mux_session(
+            &listener_v4,
+            listener_v6.as_ref(),
+            vsock,
+            &reconnect,
+            &reconnect_epoch,
+            &proxy_generation,
+        )
+        .await;
+
+        // Session died — increment generation to mark this disconnect as handled.
+        // This prevents handle_clone_restore's signal from killing the NEXT session:
+        // if the reader already detected a dead vsock and we're reconnecting,
+        // generation catches up to epoch, so the stale signal is ignored.
+        proxy_generation.fetch_add(1, Ordering::Release);
 
         eprintln!("[fc-agent] egress proxy vsock disconnected, reconnecting...");
     }
 }
 
 /// Run a single multiplexed session over one vsock connection.
-/// Returns when the vsock connection dies or a reconnect signal is received.
+/// Returns when the vsock connection dies or a reconnect signal fires
+/// with more requested reconnects than completed.
 async fn run_mux_session(
     listener_v4: &TcpListener,
     listener_v6: Option<&TcpListener>,
     vsock: VsockStream,
     reconnect: &Notify,
+    reconnect_epoch: &AtomicU64,
+    proxy_generation: &AtomicU64,
 ) {
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(WRITER_CHANNEL_CAPACITY);
     let state = Arc::new(ProxyState {
@@ -229,7 +261,26 @@ async fn run_mux_session(
         _ = reader_handle => {},
         _ = writer_handle => {},
         _ = accept_loop => {},
-        _ = reconnect.notified() => {
+        _ = async {
+            // Only exit if there are more REQUESTED reconnects (epoch) than COMPLETED
+            // reconnects (generation). This prevents double-reconnect after transport reset:
+            //
+            // Timeline when reader detects dead vsock first:
+            // 1. Reader dies → session exits → generation increments (0→1)
+            // 2. Proxy connects new session (this one)
+            // 3. handle_clone_restore increments epoch (0→1) and notifies
+            // 4. Here: epoch(1) > generation(1) → FALSE → stale signal ignored ✓
+            //
+            // Timeline when signal fires first (reader hung on stale AsyncFd):
+            // 1. handle_clone_restore increments epoch (0→1) and notifies
+            // 2. Here: epoch(1) > generation(0) → TRUE → kill session ✓
+            loop {
+                reconnect.notified().await;
+                if reconnect_epoch.load(Ordering::Acquire) > proxy_generation.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+        } => {
             eprintln!("[fc-agent] egress proxy reconnect signaled (snapshot event)");
         },
     }
