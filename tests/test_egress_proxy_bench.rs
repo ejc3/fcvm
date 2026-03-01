@@ -2,7 +2,7 @@
 //!
 //! Verifies the multiplexed vsock egress proxy handles high concurrency:
 //! 1. Adds a test IP (192.0.2.1) to host loopback so traffic goes through the proxy
-//! 2. Starts a rootless VM with 16 vCPUs and 16GB RAM
+//! 2. Starts a rootless VM with 4 vCPUs and 4GB RAM
 //! 3. Starts a host-side TCP server on 0.0.0.0 that sends 1MB per connection
 //! 4. Runs 8000 parallel connections from inside the VM to 192.0.2.1
 //! 5. Verifies all connections succeed and measures throughput
@@ -67,8 +67,8 @@ async fn test_egress_proxy_8000_concurrent_1mb() -> Result<()> {
         server.port
     );
 
-    // Step 2: Start rootless VM with high resources
-    println!("\nStep 1: Starting rootless VM with 16 vCPUs, 16GB RAM...");
+    // Step 2: Start rootless VM (4 vCPUs, 4GB RAM — bottleneck is proxy, not VM compute)
+    println!("\nStep 1: Starting rootless VM with 4 vCPUs, 4GB RAM...");
     let (_child, vm_pid) = common::spawn_fcvm_with_logs(
         &[
             "podman",
@@ -78,9 +78,9 @@ async fn test_egress_proxy_8000_concurrent_1mb() -> Result<()> {
             "--network",
             "rootless",
             "--cpu",
-            "16",
+            "4",
             "--mem",
-            "16384",
+            "4096",
             common::ALPINE_IMAGE,
             "sleep",
             "infinity",
