@@ -320,11 +320,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 pid: None,
                 snapshot: Some(startup_key.clone()),
                 name: Some(args.name.clone()),
-                publish: args.publish.clone(),
-                network: args.network,
                 exec: None,
-                tty: args.tty,
-                interactive: args.interactive,
                 startup_snapshot_base_key: None, // Already using startup snapshot
                 cpu: Some(args.cpu),
                 mem: Some(args.mem),
@@ -352,11 +348,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 pid: None,
                 snapshot: Some(key.clone()),
                 name: Some(args.name.clone()),
-                publish: args.publish.clone(),
-                network: args.network,
                 exec: None,
-                tty: args.tty,
-                interactive: args.interactive,
                 // Create startup snapshot if this config has a health check URL
                 startup_snapshot_base_key: args.health_check.as_ref().map(|_| key.clone()),
                 cpu: Some(args.cpu),
@@ -603,6 +595,9 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     vm_state.config.hugepages = args.hugepages;
     vm_state.config.portable_volumes = args.portable_volumes;
     vm_state.config.port_mappings = port_mappings.clone();
+    vm_state.config.network_mode = args.network.into();
+    vm_state.config.tty = args.tty;
+    vm_state.config.interactive = args.interactive;
     vm_state.config.user = args.user.clone();
     // Store the username for health checks (runuser -u <username>).
     // USER env var was resolved from host /etc/passwd above (or explicitly passed).

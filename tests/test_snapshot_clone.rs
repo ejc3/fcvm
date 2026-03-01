@@ -168,7 +168,6 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
 
     for i in 0..num_clones {
         let clone_name = format!("{}-{}", baseline_name.replace("-base-", "-clone-"), i);
-        let network = network.to_string();
         let results = Arc::clone(&results);
         let clone_pids = Arc::clone(&clone_pids);
         let serve_pid_str = serve_pid.to_string();
@@ -184,8 +183,6 @@ async fn snapshot_clone_test_impl(network: &str, num_clones: usize) -> Result<()
                     &serve_pid_str,
                     "--name",
                     &clone_name,
-                    "--network",
-                    &network,
                 ],
                 &clone_name,
             )
@@ -501,8 +498,6 @@ async fn clone_while_baseline_running_impl(network_mode: &str) -> Result<()> {
             &serve_pid_str,
             "--name",
             &clone_name,
-            "--network",
-            network_mode,
         ],
         &clone_name,
     )
@@ -657,8 +652,6 @@ async fn test_route_replacement_on_clone_bridged() -> Result<()> {
             &serve_pid_str,
             "--name",
             &clone1_name,
-            "--network",
-            "bridged",
         ],
         &clone1_name,
     )
@@ -725,8 +718,6 @@ async fn test_route_replacement_on_clone_bridged() -> Result<()> {
             &serve_pid_str,
             "--name",
             &clone2_name,
-            "--network",
-            "bridged",
         ],
         &clone2_name,
     )
@@ -969,8 +960,6 @@ async fn clone_internet_test_impl(network: &str) -> Result<()> {
             &serve_pid_str,
             "--name",
             &clone_name,
-            "--network",
-            network,
         ],
         &clone_name,
     )
@@ -1239,6 +1228,7 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
 
     // Step 1: Start baseline VM with nginx
     println!("Step 1: Starting baseline VM with nginx...");
+    let publish_arg = format!("{}:80", host_port);
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
         &[
             "podman",
@@ -1247,6 +1237,8 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
             &baseline_name,
             "--network",
             "bridged",
+            "--publish",
+            &publish_arg,
             "--health-check",
             "http://localhost:80",
             common::TEST_IMAGE,
@@ -1296,9 +1288,8 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
     common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
     println!("  ✓ Memory server ready (PID: {})", serve_pid);
 
-    // Step 4: Spawn clone WITH port forwarding
-    let publish_arg = format!("{}:80", host_port);
-    println!("\nStep 4: Spawning clone with --publish {}...", publish_arg);
+    // Step 4: Spawn clone (port forwarding inherited from snapshot)
+    println!("\nStep 4: Spawning clone (ports inherited from snapshot)...");
     let serve_pid_str = serve_pid.to_string();
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
         &[
@@ -1308,10 +1299,6 @@ async fn test_clone_port_forward_bridged() -> Result<()> {
             &serve_pid_str,
             "--name",
             &clone_name,
-            "--network",
-            "bridged",
-            "--publish",
-            &publish_arg,
         ],
         &clone_name,
     )
@@ -1422,8 +1409,15 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
 
     let fcvm_path = common::find_fcvm_binary()?;
 
-    // Step 1: Start baseline VM with nginx (rootless)
-    println!("Step 1: Starting baseline VM with nginx (rootless)...");
+    // Allocate port before baseline so it's baked into the snapshot
+    let host_port = common::find_available_high_port().context("finding available port")?;
+    let publish_arg = format!("{}:80", host_port);
+
+    // Step 1: Start baseline VM with nginx (rootless) and port forwarding
+    println!(
+        "Step 1: Starting baseline VM with nginx (rootless, --publish {})...",
+        publish_arg
+    );
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
         &[
             "podman",
@@ -1432,6 +1426,8 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
             &baseline_name,
             "--network",
             "rootless",
+            "--publish",
+            &publish_arg,
             "--health-check",
             "http://localhost:80",
             common::TEST_IMAGE,
@@ -1481,14 +1477,8 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
     common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
     println!("  ✓ Memory server ready (PID: {})", serve_pid);
 
-    // Step 4: Spawn clone WITH port forwarding (rootless)
-    // Use dynamic port to avoid conflicts with system services
-    let host_port = common::find_available_high_port().context("finding available port")?;
-    let publish_arg = format!("{}:80", host_port);
-    println!(
-        "\nStep 4: Spawning clone with --publish {} (rootless)...",
-        publish_arg
-    );
+    // Step 4: Spawn clone (port forwarding + network mode inherited from snapshot)
+    println!("\nStep 4: Spawning clone (ports inherited from snapshot)...");
     let serve_pid_str = serve_pid.to_string();
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
         &[
@@ -1498,10 +1488,6 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
             &serve_pid_str,
             "--name",
             &clone_name,
-            "--network",
-            "rootless",
-            "--publish",
-            &publish_arg,
         ],
         &clone_name,
     )
@@ -1611,8 +1597,15 @@ async fn test_clone_port_forward_routed() -> Result<()> {
 
     let fcvm_path = common::find_fcvm_binary()?;
 
-    // Step 1: Start baseline VM with nginx (routed)
-    println!("Step 1: Starting baseline VM with nginx (routed)...");
+    // Allocate port before baseline so it's baked into the snapshot
+    let host_port = common::find_available_high_port().context("finding available port")?;
+    let publish_arg = format!("{}:80", host_port);
+
+    // Step 1: Start baseline VM with nginx (routed) and port forwarding
+    println!(
+        "Step 1: Starting baseline VM with nginx (routed, --publish {})...",
+        publish_arg
+    );
     let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
         &[
             "podman",
@@ -1621,6 +1614,8 @@ async fn test_clone_port_forward_routed() -> Result<()> {
             &baseline_name,
             "--network",
             "routed",
+            "--publish",
+            &publish_arg,
             "--health-check",
             "http://localhost:80",
             common::TEST_IMAGE,
@@ -1670,13 +1665,8 @@ async fn test_clone_port_forward_routed() -> Result<()> {
     common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
     println!("  ✓ Memory server ready (PID: {})", serve_pid);
 
-    // Step 4: Spawn clone WITH port forwarding (routed)
-    let host_port = common::find_available_high_port().context("finding available port")?;
-    let publish_arg = format!("{}:80", host_port);
-    println!(
-        "\nStep 4: Spawning clone with --publish {} (routed)...",
-        publish_arg
-    );
+    // Step 4: Spawn clone (port forwarding + network mode inherited from snapshot)
+    println!("\nStep 4: Spawning clone (ports inherited from snapshot)...");
     let serve_pid_str = serve_pid.to_string();
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
         &[
@@ -1686,10 +1676,6 @@ async fn test_clone_port_forward_routed() -> Result<()> {
             &serve_pid_str,
             "--name",
             &clone_name,
-            "--network",
-            "routed",
-            "--publish",
-            &publish_arg,
         ],
         &clone_name,
     )
@@ -1880,8 +1866,6 @@ async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
             &snapshot_name,
             "--name",
             &clone_name,
-            "--network",
-            network,
         ],
         &clone_name,
     )
@@ -2030,8 +2014,6 @@ async fn snapshot_run_exec_test_impl(network: &str) -> Result<()> {
             "run",
             "--pid",
             &serve_pid_str,
-            "--network",
-            network,
             "--exec",
             "echo EXEC_TEST_SUCCESS",
         ])

@@ -276,8 +276,6 @@ async fn egress_clone_test_impl(network: &str) -> Result<()> {
             &serve_pid_str,
             "--name",
             &clone_name,
-            "--network",
-            network,
         ],
         &clone_name,
     )

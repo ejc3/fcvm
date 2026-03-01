@@ -81,9 +81,9 @@ wait "$BASELINE_BG" 2>/dev/null || true
 echo "  Baseline killed"
 
 # Clone twice via file backend
-$FCVM snapshot run --snapshot "$SNAP" --name "$CLONE1" --network rootless &
+$FCVM snapshot run --snapshot "$SNAP" --name "$CLONE1" &
 C1_BG=$!; cleanup_pids+=("$C1_BG")
-$FCVM snapshot run --snapshot "$SNAP" --name "$CLONE2" --network rootless &
+$FCVM snapshot run --snapshot "$SNAP" --name "$CLONE2" &
 C2_BG=$!; cleanup_pids+=("$C2_BG")
 
 wait_healthy "$CLONE1"

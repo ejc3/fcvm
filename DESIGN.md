@@ -1363,18 +1363,20 @@ fcvm snapshot run --pid <SERVE_PID> [OPTIONS]
 ```
 --pid <SERVE_PID>         Memory server PID (required)
 --name <NAME>             Clone VM name (auto-generated if not provided)
---network <MODE>          Network mode: bridged|rootless|routed
---publish <MAPPING>       Port mappings (can differ from original)
+--exec <CMD>              Execute command in container after clone is healthy
 ```
+
+Network mode, port mappings, TTY, and interactive flags are inherited from the snapshot
+metadata automatically — no need to re-specify them on clone.
 
 **Examples**:
 ```bash
-# Spawn a clone
-fcvm snapshot run --pid 12345 --name clone1 --network bridged
+# Spawn a clone (inherits network/ports from snapshot)
+fcvm snapshot run --pid 12345 --name clone1
 
 # Multiple clones in parallel
 for i in {1..10}; do
-  fcvm snapshot run --pid 12345 --name clone$i --publish $((8000+i)):80 &
+  fcvm snapshot run --pid 12345 --name clone$i &
 done
 wait  # Lightning fast: all start in <1 second each
 ```
@@ -1783,8 +1785,8 @@ sleep 5
 curl http://localhost:8080  # Should return nginx page
 kill $PID
 
-# Test snapshot & clone (rootless)
-fcvm podman run --name baseline --network rootless nginx:alpine &
+# Test snapshot & clone (rootless with port forwarding)
+fcvm podman run --name baseline --network rootless --publish 9090:80 nginx:alpine &
 BASELINE_PID=$!
 sleep 5  # Wait for VM to be healthy
 
@@ -1796,8 +1798,8 @@ fcvm snapshot serve warm &
 SERVE_PID=$!
 sleep 2
 
-# Spawn clone
-fcvm snapshot run --pid $SERVE_PID --name clone1 --network rootless --publish 9090:80 &
+# Spawn clone (inherits network mode + port mappings from snapshot)
+fcvm snapshot run --pid $SERVE_PID --name clone1 &
 CLONE_PID=$!
 sleep 2
 curl http://localhost:9090  # Should return nginx page in <2s
@@ -1805,7 +1807,7 @@ curl http://localhost:9090  # Should return nginx page in <2s
 kill $CLONE_PID $SERVE_PID $BASELINE_PID
 ```
 
-**Note**: `--network rootless` (default) uses pasta (no root required). `--network bridged` uses iptables/TAP devices (requires sudo).
+**Note**: Network mode is set on the baseline VM: `--network rootless` (default, no root required) or `--network bridged` (iptables/TAP, requires sudo). Clones inherit the network mode and port mappings from the snapshot automatically.
 
 ### POSIX Compliance (pjdfstest)
 

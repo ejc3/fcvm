@@ -146,6 +146,16 @@ pub struct VmConfig {
     /// have missing config.
     #[serde(default)]
     pub user: Option<String>,
+    /// Network mode used for this VM (bridged, rootless, routed).
+    /// Stored so clones inherit the same networking mode from snapshots.
+    #[serde(default)]
+    pub network_mode: crate::firecracker::FcNetworkMode,
+    /// Whether a PTY is allocated for the container.
+    #[serde(default)]
+    pub tty: bool,
+    /// Whether stdin is forwarded to the container.
+    #[serde(default)]
+    pub interactive: bool,
     /// Username created in the VM for rootless podman.
     /// Used by health checks to run `runuser -u <username> -- podman inspect`.
     #[serde(default)]
@@ -181,6 +191,9 @@ impl VmState {
                 serve_pid: None,
                 original_vsock_vm_id: None,
                 port_mappings: Vec::new(),
+                network_mode: crate::firecracker::FcNetworkMode::default(),
+                tty: false,
+                interactive: false,
                 labels: HashMap::new(),
                 hugepages: false,
                 portable_volumes: false,

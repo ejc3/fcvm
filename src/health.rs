@@ -307,8 +307,15 @@ async fn check_container_running(
         };
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        debug!(target: "health-monitor", stderr = %stderr, "podman inspect failed");
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        // Exit code 125 = container not found (expected during startup).
+        // Any other failure is unexpected and worth warning about.
+        let code = output.status.code().unwrap_or(-1);
+        if code == 125 {
+            debug!(target: "health-monitor", "waiting for container to be created");
+        } else {
+            warn!(target: "health-monitor", stderr = %stderr, code, "podman inspect failed");
+        }
         return false;
     }
 
@@ -384,8 +391,13 @@ async fn check_podman_healthcheck(
 
     if !output.status.success() {
         // Container may not be running yet, don't assume healthy - keep checking
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        debug!(target: "health-monitor", stderr = %stderr, "podman inspect failed, will retry");
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let code = output.status.code().unwrap_or(-1);
+        if code == 125 {
+            debug!(target: "health-monitor", "waiting for container to be created");
+        } else {
+            warn!(target: "health-monitor", stderr = %stderr, code, "podman healthcheck inspect failed");
+        }
         return Some(false);
     }
 

@@ -544,7 +544,11 @@ impl NetworkManager for RoutedNetwork {
             http_proxy: if std::env::var("HTTPS_PROXY").is_ok()
                 || std::env::var("https_proxy").is_ok()
             {
-                Some(format!("http://{}:8080", GUEST_GATEWAY))
+                Some(format!(
+                    "http://{}:{}",
+                    GUEST_GATEWAY,
+                    super::tcp_proxy::PROXY_RELAY_PORT
+                ))
             } else {
                 None
             },

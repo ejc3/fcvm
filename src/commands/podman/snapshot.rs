@@ -183,11 +183,9 @@ pub(super) fn build_firecracker_config(
     // FirecrackerConfig stores both: container_image for cache key, container_image_name for MMDS.
     use crate::firecracker::{BootSource, Drive, FcNetworkMode, FirecrackerConfig, MachineConfig};
 
-    let network_mode = match args.network {
-        crate::cli::args::NetworkMode::Bridged => FcNetworkMode::Bridged,
-        crate::cli::args::NetworkMode::Rootless => FcNetworkMode::Rootless,
-        crate::cli::args::NetworkMode::Routed => FcNetworkMode::Routed,
-    };
+    let network_mode: FcNetworkMode = args.network.into();
+
+    let port_mappings = crate::network::PortMapping::parse_all_lenient(&args.publish);
 
     // Collect extra disk specifications for cache key.
     // These are block devices that must match between cache create and restore.
@@ -232,6 +230,7 @@ pub(super) fn build_firecracker_config(
         rootfs_size: args.rootfs_size.clone(),
         health_check_url: args.health_check.clone(),
         user: args.user.clone(),
+        port_mappings,
         forward_localhost: args.forward_localhost.clone(),
         image_mode,
         non_blocking_output: args.non_blocking_output,

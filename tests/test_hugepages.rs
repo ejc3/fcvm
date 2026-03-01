@@ -349,8 +349,6 @@ async fn test_hugepage_snapshot_clone() -> Result<()> {
         &serve_pid.to_string(),
         "--name",
         &clone_name,
-        "--network",
-        "bridged",
     ])
     .await
     .context("spawning clone")?;
