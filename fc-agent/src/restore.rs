@@ -1,7 +1,7 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 
 use crate::network;
 use crate::output::OutputHandle;
@@ -17,10 +17,33 @@ pub struct RestoreSignals {
     pub exec_rebind_needed: Arc<AtomicBool>,
     pub exec_rebind_done: Arc<AtomicBool>,
     pub exec_rebind_done_notify: Arc<Notify>,
-    pub egress_reconnect: Arc<Notify>,
-    pub egress_reconnect_epoch: Arc<AtomicU64>,
-    pub egress_reconnect_done: Arc<Notify>,
-    pub has_egress_proxy: bool,
+    pub egress_gen_rx: Option<watch::Receiver<u64>>,
+}
+
+/// Redirect stderr (fd 2) to /dev/console for direct serial console output.
+///
+/// systemd's `journal+console` routes output through journald, which writes to
+/// /dev/console. After snapshot restore, journald crashes because its journal file
+/// was mid-write during the snapshot ("corrupted or uncleanly shut down"). With
+/// journald dead, stderr goes nowhere and serial output stops.
+///
+/// Fix: open /dev/console directly and dup2 it to stderr. This bypasses journald
+/// entirely — eprintln!() writes go straight to /dev/console → ttyS0 → Firecracker
+/// serial → host stdout. The console write path uses polled I/O (busy-wait on THRE),
+/// so it works even after snapshot restore when the UART IER register is stale.
+pub fn redirect_stderr_to_console() {
+    use std::os::unix::io::AsRawFd;
+
+    let console = match std::fs::OpenOptions::new().write(true).open("/dev/console") {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    unsafe {
+        libc::dup2(console.as_raw_fd(), 2);
+        libc::dup2(console.as_raw_fd(), 1);
+    }
+    // console fd is closed when dropped, but fd 1 and 2 remain open (dup'd)
 }
 
 /// Handle clone restore: kill stale sockets, flush ARP, re-register exec, reconnect output.
@@ -38,7 +61,14 @@ pub struct RestoreSignals {
 /// `clone_ipv6`: For routed mode, the unique per-clone IPv6 that replaces the
 /// snapshot's shared guest IPv6 on eth0. Without this, all clones share the same
 /// IPv6 and return traffic gets ECMP-routed to the wrong clone.
-pub async fn handle_clone_restore(signals: &RestoreSignals, clone_ipv6: Option<&str>) {
+pub async fn handle_clone_restore(
+    signals: &RestoreSignals,
+    clone_ipv6: Option<&str>,
+    egress_gen_before: Option<u64>,
+    restore_epoch: &str,
+) {
+    eprintln!("[fc-agent] handling restore (epoch={})", restore_epoch);
+
     // Reconfigure IPv6 FIRST — before any network traffic can use the old address.
     if let Some(new_ipv6) = clone_ipv6 {
         network::reconfigure_ipv6(new_ipv6).await;
@@ -55,24 +85,7 @@ pub async fn handle_clone_restore(signals: &RestoreSignals, clone_ipv6: Option<&
     signals.exec_rebind_needed.store(true, Ordering::Release);
     signals.exec_rebind.notify_one();
 
-    // SECOND: Signal egress proxy to reconnect its vsock.
-    // Register notified() BEFORE signaling to avoid race: if the proxy already
-    // reconnected (reader detected transport reset), done.notify_waiters() fires
-    // immediately — without a registered waiter, the permit is lost and we'd
-    // time out (5s unnecessary delay). Increment epoch BEFORE notifying so the
-    // proxy's two-counter check works: epoch (requested) vs generation (completed).
-    let egress_done = if signals.has_egress_proxy {
-        let done = signals.egress_reconnect_done.notified();
-        signals
-            .egress_reconnect_epoch
-            .fetch_add(1, Ordering::Release);
-        signals.egress_reconnect.notify_waiters();
-        Some(done)
-    } else {
-        None
-    };
-
-    // THIRD: Wait for exec server to confirm re-register completed.
+    // SECOND: Wait for exec server to confirm re-register completed.
     // This ensures accept() works before the host can reach the exec server.
     match tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -86,21 +99,58 @@ pub async fn handle_clone_restore(signals: &RestoreSignals, clone_ipv6: Option<&
         Err(_) => eprintln!("[fc-agent] WARNING: exec re-register timed out (5s)"),
     }
 
-    // FOURTH: Wait for egress proxy to confirm vsock reconnected.
-    // The host gates health monitoring on the output connection — once connected,
-    // tests may immediately use egress. We must ensure egress is ready first.
-    if let Some(egress_done) = egress_done {
-        match tokio::time::timeout(std::time::Duration::from_secs(5), egress_done).await {
-            Ok(()) => {
-                eprintln!("[fc-agent] egress proxy reconnected after restore")
-            }
-            Err(_) => eprintln!("[fc-agent] WARNING: egress proxy reconnect timed out (5s)"),
-        }
+    // THIRD: Wait for egress proxy to reconnect (watch channel incremented after vsock connect).
+    // No explicit signal needed — the proxy detects the dead vsock fd natively via
+    // Interest::ERROR (EPOLLERR fires instantly after transport reset). The proxy's
+    // select! arm fires, the session exits, and the reconnect loop connects a new vsock.
+    // If proxy already reconnected, wait_for returns immediately (watch retains latest value).
+    if let (Some(rx), Some(gen_before)) = (&signals.egress_gen_rx, egress_gen_before) {
+        crate::proxy::wait_for_egress_gen(
+            rx,
+            gen_before,
+            std::time::Duration::from_secs(5),
+            "reconnected after restore",
+        )
+        .await;
     }
 
-    // FIFTH: Reconnect output vsock (tells host we're alive + exec + egress are ready).
+    // FOURTH: Reconnect output vsock (tells host we're alive + exec + egress are ready).
     // FUSE vsock reconnection is handled automatically by the reconnectable multiplexer.
     signals.output.reconnect();
 
-    eprintln!("[fc-agent] restore complete: exec + egress + output reconnected");
+    // FIFTH: Restart journald. The journal file was mid-write when the snapshot
+    // was taken, so the restored journald finds a corrupted file and gets stuck.
+    // systemd's watchdog would kill it after 3 min, but we restart it immediately
+    // so other services can log via journald right away.
+    restart_journald().await;
+
+    eprintln!(
+        "[fc-agent] restore complete (epoch={}): exec + egress + output reconnected",
+        restore_epoch
+    );
+}
+
+/// Restart systemd-journald after snapshot restore.
+///
+/// The journal file is corrupted because journald was mid-write when the snapshot
+/// was taken. On restart, journald renames the corrupt file and creates a fresh one.
+async fn restart_journald() {
+    match tokio::process::Command::new("systemctl")
+        .args(["restart", "systemd-journald"])
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            eprintln!("[fc-agent] journald restarted after restore");
+        }
+        Ok(output) => {
+            eprintln!(
+                "[fc-agent] WARNING: journald restart failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: failed to restart journald: {}", e);
+        }
+    }
 }
