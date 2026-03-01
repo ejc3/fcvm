@@ -100,9 +100,6 @@ pub(super) async fn run_status_listener(
                 std::fs::write(&ready_file, "ready\n")
                     .with_context(|| format!("writing ready file: {:?}", ready_file))?;
                 info!(vm_id = %vm_id, "Container ready notification received");
-            } else if let Some(debug_msg) = msg.strip_prefix("debug:") {
-                // Debug message from fc-agent (useful when serial console is broken after restore)
-                info!(vm_id = %vm_id, debug = %debug_msg, "fc-agent debug message");
             } else if let Some(code_str) = msg.strip_prefix("exit:") {
                 // Write exit code to file
                 std::fs::write(&exit_file, format!("{}\n", code_str))
