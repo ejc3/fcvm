@@ -23,42 +23,59 @@ const HP_TEST_MEM_MIB: u32 = 512;
 
 /// Ensure enough FREE hugepages are available for the test VM.
 ///
-/// Checks free_hugepages (not nr_hugepages) because stale Firecracker processes
-/// from previous test runs may still be consuming hugepages from the pool.
+/// Waits up to 60s for hugepages to become free, since other parallel tests
+/// may be releasing hugepages as they shut down their VMs.
 async fn ensure_hugepages(mem_mib: u32) -> Result<()> {
+    let needed = (mem_mib as u64) / 2; // Each hugepage is 2MB
+
     let nr = tokio::fs::read_to_string("/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages")
         .await
         .context("reading nr_hugepages")?;
     let total: u64 = nr.trim().parse().context("parsing nr_hugepages")?;
-
-    let free =
-        tokio::fs::read_to_string("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages")
-            .await
-            .context("reading free_hugepages")?;
-    let free: u64 = free.trim().parse().context("parsing free_hugepages")?;
-
-    let needed = (mem_mib as u64) / 2; // Each hugepage is 2MB
-    let in_use = total - free;
-
-    println!(
-        "  Hugepages: {} total, {} free, {} in use (need {} for {}MB VM)",
-        total, free, in_use, needed, mem_mib
-    );
-
     anyhow::ensure!(
         total > 0,
         "No hugepages allocated. Run: echo 512 | sudo tee /proc/sys/vm/nr_hugepages"
     );
-    anyhow::ensure!(
-        free >= needed,
-        "Not enough free hugepages: need {} but only {} free ({} in use by other processes). \
-         Kill stale VMs or increase pool: echo {} | sudo tee /proc/sys/vm/nr_hugepages",
-        needed,
-        free,
-        in_use,
-        needed * 2
-    );
-    Ok(())
+
+    // Wait for enough free hugepages (other tests may be releasing them)
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(60);
+    loop {
+        let free =
+            tokio::fs::read_to_string("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages")
+                .await
+                .context("reading free_hugepages")?;
+        let free: u64 = free.trim().parse().context("parsing free_hugepages")?;
+        let in_use = total - free;
+
+        if free >= needed {
+            println!(
+                "  Hugepages: {} total, {} free, {} in use (need {} for {}MB VM)",
+                total, free, in_use, needed, mem_mib
+            );
+            return Ok(());
+        }
+
+        if start.elapsed() > timeout {
+            anyhow::bail!(
+                "Not enough free hugepages after {}s: need {} but only {} free ({} in use). \
+                 Kill stale VMs or increase pool: echo {} | sudo tee /proc/sys/vm/nr_hugepages",
+                timeout.as_secs(),
+                needed,
+                free,
+                in_use,
+                needed * 2
+            );
+        }
+
+        if start.elapsed().as_secs() % 10 == 0 && start.elapsed().as_secs() > 0 {
+            println!(
+                "  Waiting for hugepages: {} free, need {} ({} in use)...",
+                free, needed, in_use
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 /// Wait for hugepages to become free after killing a VM.

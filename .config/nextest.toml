@@ -38,8 +38,12 @@ slow-timeout = { period = "30s", terminate-after = 1 }
 fail-fast = true
 retries = 0
 
-# Stress tests need exclusive access (100 VMs at once)
+# Stress tests need exclusive access (100 VMs at once, 8000 connections)
 [test-groups.stress-tests]
+max-threads = 1
+
+# Hugepage tests share a finite hugepage pool (512 pages = 1GB, each VM needs 256)
+[test-groups.hugepage-tests]
 max-threads = 1
 
 # Snapshot tests limited to 3 concurrent (each snapshot is ~5.6GB on disk)
@@ -51,8 +55,14 @@ max-threads = 3
 max-threads = "num-cpus"
 
 [[profile.default.overrides]]
-filter = "package(fcvm) & test(/stress_100/)"
+filter = "package(fcvm) & (test(/stress_100/) | test(/8000_concurrent/))"
 test-group = "stress-tests"
+slow-timeout = { period = "600s", terminate-after = 1 }
+
+# Hugepage tests must run sequentially (shared hugepage pool: 512 pages, each VM needs 256)
+[[profile.default.overrides]]
+filter = "package(fcvm) & test(/hugepage/)"
+test-group = "hugepage-tests"
 slow-timeout = { period = "600s", terminate-after = 1 }
 
 # Snapshot tests: limited to 3 concurrent (each creates ~5.6GB snapshot on disk)
