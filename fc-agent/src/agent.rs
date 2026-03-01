@@ -310,15 +310,16 @@ pub async fn run() -> Result<()> {
                 // On cold start (pause/resume), vsock is NOT dead — the signal fires
                 // but the proxy ignores it (epoch == generation after no-op cycle).
                 if plan.egress_proxy {
+                    // Register notified() BEFORE signaling to avoid race: if the
+                    // proxy already reconnected (reader error), done.notify_waiters()
+                    // fires immediately — without a registered waiter, the permit is
+                    // lost and our wait times out (5s unnecessary delay).
+                    let egress_done = egress_reconnect.done.notified();
                     egress_reconnect
                         .epoch
                         .fetch_add(1, std::sync::atomic::Ordering::Release);
                     egress_reconnect.signal.notify_waiters();
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        egress_reconnect.done.notified(),
-                    )
-                    .await
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), egress_done).await
                     {
                         Ok(()) => {
                             eprintln!("[fc-agent] egress proxy reconnected after warm start")

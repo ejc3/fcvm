@@ -56,16 +56,21 @@ pub async fn handle_clone_restore(signals: &RestoreSignals, clone_ipv6: Option<&
     signals.exec_rebind.notify_one();
 
     // SECOND: Signal egress proxy to reconnect its vsock.
-    // Increment epoch BEFORE notifying so the proxy's two-counter check works:
-    // epoch (requested) vs proxy_generation (completed). If the proxy already
-    // reconnected (reader detected transport reset), its generation caught up
-    // to this epoch and the stale signal is ignored.
-    if signals.has_egress_proxy {
+    // Register notified() BEFORE signaling to avoid race: if the proxy already
+    // reconnected (reader detected transport reset), done.notify_waiters() fires
+    // immediately — without a registered waiter, the permit is lost and we'd
+    // time out (5s unnecessary delay). Increment epoch BEFORE notifying so the
+    // proxy's two-counter check works: epoch (requested) vs generation (completed).
+    let egress_done = if signals.has_egress_proxy {
+        let done = signals.egress_reconnect_done.notified();
         signals
             .egress_reconnect_epoch
             .fetch_add(1, Ordering::Release);
         signals.egress_reconnect.notify_waiters();
-    }
+        Some(done)
+    } else {
+        None
+    };
 
     // THIRD: Wait for exec server to confirm re-register completed.
     // This ensures accept() works before the host can reach the exec server.
@@ -84,13 +89,8 @@ pub async fn handle_clone_restore(signals: &RestoreSignals, clone_ipv6: Option<&
     // FOURTH: Wait for egress proxy to confirm vsock reconnected.
     // The host gates health monitoring on the output connection — once connected,
     // tests may immediately use egress. We must ensure egress is ready first.
-    if signals.has_egress_proxy {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            signals.egress_reconnect_done.notified(),
-        )
-        .await
-        {
+    if let Some(egress_done) = egress_done {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), egress_done).await {
             Ok(()) => {
                 eprintln!("[fc-agent] egress proxy reconnected after restore")
             }
