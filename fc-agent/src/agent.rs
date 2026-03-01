@@ -37,8 +37,7 @@ pub async fn run() -> Result<()> {
     // Egress proxy reconnect signal — signaled after snapshot events (pause/resume
     // or restore) to break the stale vsock session and reconnect immediately.
     let egress_reconnect = std::sync::Arc::new(tokio::sync::Notify::new());
-    let egress_reconnect_epoch =
-        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let egress_reconnect_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Egress proxy reconnect confirmation — proxy signals after vsock reconnect succeeds.
     // handle_clone_restore waits on this before reconnecting output, ensuring egress is
     // ready before the host considers the VM "ready" and tests start using egress.

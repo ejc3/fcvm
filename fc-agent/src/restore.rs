@@ -61,7 +61,9 @@ pub async fn handle_clone_restore(signals: &RestoreSignals, clone_ipv6: Option<&
     // reconnected (reader detected transport reset), its generation caught up
     // to this epoch and the stale signal is ignored.
     if signals.has_egress_proxy {
-        signals.egress_reconnect_epoch.fetch_add(1, Ordering::Release);
+        signals
+            .egress_reconnect_epoch
+            .fetch_add(1, Ordering::Release);
         signals.egress_reconnect.notify_waiters();
     }
 
