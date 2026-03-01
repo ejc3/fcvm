@@ -42,15 +42,17 @@ async fn test_egress_proxy_8000_concurrent_1mb() -> Result<()> {
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
     // Step 0: Add test IP to host loopback so host proxy can connect to it
+    // First, clean up any stale IP from a previous failed run
     println!("Step 0: Adding {} to host loopback...", TEST_IP);
+    let _ = std::process::Command::new("sudo")
+        .args(["ip", "addr", "del", &format!("{}/32", TEST_IP), "dev", "lo"])
+        .output();
     let add_ip = std::process::Command::new("sudo")
         .args(["ip", "addr", "add", &format!("{}/32", TEST_IP), "dev", "lo"])
         .output()?;
     if !add_ip.status.success() {
         let stderr = String::from_utf8_lossy(&add_ip.stderr);
-        if !stderr.contains("File exists") {
-            anyhow::bail!("Failed to add {} to loopback: {}", TEST_IP, stderr);
-        }
+        anyhow::bail!("Failed to add {} to loopback: {}", TEST_IP, stderr);
     }
     println!("  ✓ {} added to lo", TEST_IP);
 
