@@ -67,8 +67,9 @@ async fn test_egress_proxy_8000_concurrent_1mb() -> Result<()> {
         server.port
     );
 
-    // Step 2: Start rootless VM (4 vCPUs, 4GB RAM — bottleneck is proxy, not VM compute)
-    println!("\nStep 1: Starting rootless VM with 4 vCPUs, 4GB RAM...");
+    // Step 2: Start rootless VM (16 vCPUs, 16GB RAM)
+    // 16GB needed: 8000 concurrent wget processes can use significant memory
+    println!("\nStep 1: Starting rootless VM with 16 vCPUs, 16GB RAM...");
     let (_child, vm_pid) = common::spawn_fcvm_with_logs(
         &[
             "podman",
@@ -78,9 +79,9 @@ async fn test_egress_proxy_8000_concurrent_1mb() -> Result<()> {
             "--network",
             "rootless",
             "--cpu",
-            "4",
+            "16",
             "--mem",
-            "4096",
+            "16384",
             common::ALPINE_IMAGE,
             "sleep",
             "infinity",
