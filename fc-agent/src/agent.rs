@@ -5,6 +5,12 @@ use crate::{container, exec, lock_test, mmds, mounts, network, output, proxy, sy
 
 /// Main agent logic — fetches plan, runs container, triggers shutdown.
 pub async fn run() -> Result<()> {
+    // Redirect stderr to /dev/console for direct serial output, bypassing journald.
+    // After snapshot restore, journald crashes (journal corrupted mid-write), which
+    // kills the journal+console output path. Direct /dev/console writes use polled
+    // I/O and work even with stale UART IER register after restore.
+    crate::restore::redirect_stderr_to_console();
+
     eprintln!("[fc-agent] run_agent starting");
 
     system::raise_resource_limits();
@@ -34,28 +40,28 @@ pub async fn run() -> Result<()> {
         network::setup_localhost_forwarding(&plan.forward_localhost);
     }
 
-    // Egress proxy reconnect coordination — see proxy::ReconnectState for details.
-    let egress_reconnect = proxy::ReconnectState {
-        signal: std::sync::Arc::new(tokio::sync::Notify::new()),
-        epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        done: std::sync::Arc::new(tokio::sync::Notify::new()),
-    };
-
-    if plan.egress_proxy {
+    // Egress proxy watch channel — proxy increments after each successful vsock connect.
+    // Waiters use wait_for(|&v| v > captured) to detect reconnection.
+    // No Notify needed: the proxy detects transport reset natively via Interest::ERROR
+    // on the vsock fd (EPOLLERR fires instantly after snapshot restore).
+    let egress_gen_rx = if plan.egress_proxy {
+        let (gen_tx, gen_rx) = tokio::sync::watch::channel(0u64);
         eprintln!("[fc-agent] starting vsock egress proxy");
-        // Register notified() BEFORE spawn to avoid race with notify_waiters()
-        let egress_connected = egress_reconnect.done.notified();
-        tokio::spawn(proxy::run_egress_proxy(egress_reconnect.clone()));
+        tokio::spawn(proxy::run_egress_proxy(gen_tx));
 
         // Wait for initial vsock connection — ensures egress path is operational
         // before the container starts and health check reports "healthy".
-        match tokio::time::timeout(std::time::Duration::from_secs(10), egress_connected).await {
-            Ok(()) => eprintln!("[fc-agent] egress proxy vsock connected"),
-            Err(_) => {
-                eprintln!("[fc-agent] WARNING: egress proxy vsock connect timed out (10s)")
-            }
-        }
-    }
+        proxy::wait_for_egress_gen(
+            &gen_rx,
+            0,
+            std::time::Duration::from_secs(10),
+            "vsock connected",
+        )
+        .await;
+        Some(gen_rx)
+    } else {
+        None
+    };
 
     if let Err(e) = mmds::sync_clock_from_host().await {
         eprintln!("[fc-agent] WARNING: clock sync failed: {:?}", e);
@@ -92,10 +98,7 @@ pub async fn run() -> Result<()> {
         exec_rebind_needed: exec_rebind_needed.clone(),
         exec_rebind_done: exec_rebind_done.clone(),
         exec_rebind_done_notify: exec_rebind_done_notify.clone(),
-        egress_reconnect: egress_reconnect.signal.clone(),
-        egress_reconnect_epoch: egress_reconnect.epoch.clone(),
-        egress_reconnect_done: egress_reconnect.done.clone(),
-        has_egress_proxy: plan.egress_proxy,
+        egress_gen_rx: egress_gen_rx.clone(),
     };
     tokio::spawn(async move {
         eprintln!("[fc-agent] starting restore-epoch watcher");
@@ -278,6 +281,11 @@ pub async fn run() -> Result<()> {
         }
     };
 
+    // Capture egress generation before cache handshake — used to detect reconnection
+    // after snapshot restore (warm start). If proxy already reconnected by the time
+    // we check, wait_for returns immediately because watch retains the latest value.
+    let egress_gen_before = egress_gen_rx.as_ref().map(|rx| *rx.borrow());
+
     // Notify host for cache snapshot
     match container::get_image_digest(&image_ref, &cmd_prefix).await {
         Ok(digest) => {
@@ -287,7 +295,7 @@ pub async fn run() -> Result<()> {
                 container::CacheResult::ColdStart => {
                     eprintln!("[fc-agent] cache ready: cold start (cache-ack received)");
                     // Pause/resume does NOT reset vsock — reconnect is harmless
-                    // (just cycles the connection). No egress signal needed.
+                    // (just cycles the connection). No egress wait needed.
                     output.reconnect();
                 }
                 container::CacheResult::WarmStart => {
@@ -297,27 +305,17 @@ pub async fn run() -> Result<()> {
                     // containers (echo + exit in ~200ms), output must be live or the
                     // container's stdout/stderr goes to the dead vsock.
                     output.reconnect();
-                    // Signal egress proxy to reconnect and wait. The MMDS watcher
-                    // may or may not have run handle_clone_restore yet — if it did,
-                    // the two-counter state machine deduplicates the signal.
-                    if plan.egress_proxy {
-                        let egress_done = egress_reconnect.done.notified();
-                        egress_reconnect
-                            .epoch
-                            .fetch_add(1, std::sync::atomic::Ordering::Release);
-                        egress_reconnect.signal.notify_waiters();
-                        match tokio::time::timeout(std::time::Duration::from_secs(5), egress_done)
-                            .await
-                        {
-                            Ok(()) => {
-                                eprintln!("[fc-agent] egress proxy reconnected after warm start")
-                            }
-                            Err(_) => {
-                                eprintln!(
-                                    "[fc-agent] WARNING: egress proxy reconnect timed out (5s)"
-                                )
-                            }
-                        }
+                    // No explicit signal to proxy needed — it detects the dead vsock fd
+                    // natively via Interest::ERROR (EPOLLERR fires instantly after restore).
+                    // Just wait for the watch channel to confirm reconnection.
+                    if let (Some(rx), Some(gen_before)) = (&egress_gen_rx, egress_gen_before) {
+                        proxy::wait_for_egress_gen(
+                            rx,
+                            gen_before,
+                            std::time::Duration::from_secs(5),
+                            "reconnected after warm start",
+                        )
+                        .await;
                     }
                 }
                 container::CacheResult::Failed => {

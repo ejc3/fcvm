@@ -14,7 +14,36 @@ mod tty;
 mod types;
 mod vsock;
 
+use std::fmt;
+
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::EnvFilter;
+
+/// Format tracing events as `[fc-agent] message` — no timestamp, level, or target.
+///
+/// The host reads these lines from Firecracker's serial console and adds its own
+/// timestamp and level. Including `[fc-agent]` ensures the host logs them at INFO
+/// (the host checks `contains("fc-agent")` to distinguish important lines).
+struct FcAgentFormat;
+
+impl<S, N> FormatEvent<S, N> for FcAgentFormat
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> fmt::Result {
+        write!(writer, "[fc-agent] ")?;
+        ctx.format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -30,8 +59,7 @@ async fn main() {
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("fc_agent=info,warn")),
         )
-        .with_target(true)
-        .with_ansi(false)
+        .event_format(FcAgentFormat)
         .with_writer(non_blocking)
         .init();
 

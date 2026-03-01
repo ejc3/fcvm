@@ -1,8 +1,10 @@
 use anyhow::{bail, Context, Result};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{ready, Poll};
 use tokio::io::unix::AsyncFd;
+use tokio::io::Interest;
 
 pub const HOST_CID: u32 = 2;
 pub const STATUS_PORT: u32 = 4999;
@@ -10,9 +12,95 @@ pub const EXEC_PORT: u32 = 4998;
 pub const OUTPUT_PORT: u32 = 4997;
 pub const EGRESS_PROXY_PORT: u32 = 52000;
 
-/// Async vsock stream — wraps an OwnedFd in AsyncFd for non-blocking I/O.
+/// Implement AsyncRead for a type with `inner: Arc<AsyncFd<OwnedFd>>`.
+macro_rules! impl_async_read {
+    ($Type:ty) => {
+        impl tokio::io::AsyncRead for $Type {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                loop {
+                    let mut guard = ready!(self.inner.poll_read_ready(cx))?;
+                    match guard.try_io(|inner| {
+                        let n = unsafe {
+                            libc::read(
+                                inner.as_raw_fd(),
+                                buf.unfilled_mut().as_mut_ptr().cast(),
+                                buf.remaining(),
+                            )
+                        };
+                        if n < 0 {
+                            Err(std::io::Error::last_os_error())
+                        } else {
+                            unsafe { buf.assume_init(n as usize) };
+                            buf.advance(n as usize);
+                            Ok(())
+                        }
+                    }) {
+                        Ok(result) => return Poll::Ready(result),
+                        Err(_would_block) => continue,
+                    }
+                }
+            }
+        }
+    };
+}
+
+/// Implement AsyncWrite for a type with `inner: Arc<AsyncFd<OwnedFd>>`.
+macro_rules! impl_async_write {
+    ($Type:ty) => {
+        impl tokio::io::AsyncWrite for $Type {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                loop {
+                    let mut guard = ready!(self.inner.poll_write_ready(cx))?;
+                    match guard.try_io(|inner| {
+                        let n = unsafe {
+                            libc::write(inner.as_raw_fd(), buf.as_ptr().cast(), buf.len())
+                        };
+                        if n < 0 {
+                            Err(std::io::Error::last_os_error())
+                        } else {
+                            Ok(n as usize)
+                        }
+                    }) {
+                        Ok(result) => return Poll::Ready(result),
+                        Err(_would_block) => continue,
+                    }
+                }
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                unsafe { libc::shutdown(self.inner.get_ref().as_raw_fd(), libc::SHUT_WR) };
+                Poll::Ready(Ok(()))
+            }
+        }
+    };
+}
+
+/// Async vsock stream — wraps an OwnedFd in Arc<AsyncFd> for non-blocking I/O.
+///
+/// Uses Arc internally so the fd can be shared between read/write halves
+/// (via `split()`) and an error watcher (via `wait_for_error()`). This enables
+/// the egress proxy to detect vsock transport reset (EPOLLERR) natively via
+/// tokio's Interest::ERROR, without external Notify signals.
 pub struct VsockStream {
-    inner: AsyncFd<OwnedFd>,
+    inner: Arc<AsyncFd<OwnedFd>>,
 }
 
 impl VsockStream {
@@ -42,8 +130,36 @@ impl VsockStream {
         )
         .context("setting O_NONBLOCK on vsock")?;
 
-        let inner = AsyncFd::new(fd).context("wrapping vsock in AsyncFd")?;
+        let inner = Arc::new(AsyncFd::new(fd).context("wrapping vsock in AsyncFd")?);
         Ok(Self { inner })
+    }
+
+    /// Split into read and write halves for concurrent use.
+    ///
+    /// The original VsockStream remains valid after split — use `wait_for_error()`
+    /// on it to detect vsock transport reset while the halves are in use.
+    pub fn split(&self) -> (VsockReadHalf, VsockWriteHalf) {
+        (
+            VsockReadHalf {
+                inner: self.inner.clone(),
+            },
+            VsockWriteHalf {
+                inner: self.inner.clone(),
+            },
+        )
+    }
+
+    /// Wait for EPOLLERR on this fd (vsock transport reset after snapshot restore).
+    ///
+    /// After VIRTIO_VSOCK_EVENT_TRANSPORT_RESET, the kernel sets EPOLLERR on all
+    /// vsock fds. Tokio's `poll_read_ready`/`poll_write_ready` miss this because
+    /// `Direction::Read.mask()` = `READABLE | READ_CLOSED` (no ERROR bit), so tasks
+    /// blocked in AsyncRead::poll_read are never woken. But `AsyncFd::ready()` with
+    /// `Interest::ERROR` detects it natively — the readiness intersection check in
+    /// tokio's `Readiness` future matches the stored ERROR state.
+    pub async fn wait_for_error(&self) -> std::io::Result<()> {
+        let _guard = self.inner.ready(Interest::ERROR).await?;
+        Ok(())
     }
 
     /// Async write_all — waits for writability via epoll, then writes.
@@ -79,74 +195,22 @@ impl VsockStream {
     }
 }
 
-impl tokio::io::AsyncRead for VsockStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        loop {
-            let mut guard = ready!(self.inner.poll_read_ready(cx))?;
-            match guard.try_io(|inner| {
-                let n = unsafe {
-                    libc::read(
-                        inner.as_raw_fd(),
-                        buf.unfilled_mut().as_mut_ptr().cast(),
-                        buf.remaining(),
-                    )
-                };
-                if n < 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    unsafe { buf.assume_init(n as usize) };
-                    buf.advance(n as usize);
-                    Ok(())
-                }
-            }) {
-                Ok(result) => return Poll::Ready(result),
-                Err(_would_block) => continue,
-            }
-        }
-    }
+impl_async_read!(VsockStream);
+impl_async_write!(VsockStream);
+
+/// Read half of a VsockStream, produced by `VsockStream::split()`.
+pub struct VsockReadHalf {
+    inner: Arc<AsyncFd<OwnedFd>>,
 }
 
-impl tokio::io::AsyncWrite for VsockStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        loop {
-            let mut guard = ready!(self.inner.poll_write_ready(cx))?;
-            match guard.try_io(|inner| {
-                let n = unsafe { libc::write(inner.as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
-                if n < 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(n as usize)
-                }
-            }) {
-                Ok(result) => return Poll::Ready(result),
-                Err(_would_block) => continue,
-            }
-        }
-    }
+impl_async_read!(VsockReadHalf);
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        unsafe { libc::shutdown(self.inner.get_ref().as_raw_fd(), libc::SHUT_WR) };
-        Poll::Ready(Ok(()))
-    }
+/// Write half of a VsockStream, produced by `VsockStream::split()`.
+pub struct VsockWriteHalf {
+    inner: Arc<AsyncFd<OwnedFd>>,
 }
+
+impl_async_write!(VsockWriteHalf);
 
 /// Async vsock listener for accept loops (exec server).
 pub struct VsockListener {
