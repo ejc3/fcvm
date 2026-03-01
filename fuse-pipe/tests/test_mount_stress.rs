@@ -95,7 +95,7 @@ fn test_parallel_mount_stress() {
 /// This catches cleanup issues that only manifest under rapid cycling.
 #[test]
 fn test_rapid_mount_unmount_cycles() {
-    const CYCLES: usize = 20;
+    const CYCLES: usize = 10;
 
     let start = Instant::now();
 

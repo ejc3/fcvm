@@ -281,6 +281,44 @@ async fn egress_stress_impl(
         anyhow::bail!("No clones became healthy");
     }
 
+    // Warmup: probe each clone's egress once before the stress phase.
+    // After a clone becomes "healthy" (nginx responding), the egress proxy
+    // vsock connection may still be initializing. A single warmup request
+    // per clone ensures the egress path is fully established.
+    println!("\n  Warming up egress on each clone...");
+    for (pid, name) in &healthy_clones {
+        let output = tokio::process::Command::new(&fcvm_path)
+            .args([
+                "exec",
+                "--pid",
+                &pid.to_string(),
+                "--vm",
+                "--",
+                "curl",
+                "-s",
+                "--noproxy",
+                "*",
+                "--max-time",
+                "15",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                &egress_url,
+            ])
+            .output()
+            .await;
+        match output {
+            Ok(out) => {
+                let code = String::from_utf8_lossy(&out.stdout);
+                println!("  warmup {}: HTTP {}", name, code.trim());
+            }
+            Err(e) => {
+                println!("  warmup {} failed: {}", name, e);
+            }
+        }
+    }
+
     // Step 6: Run parallel egress requests
     println!(
         "\nStep 6: Running {} parallel requests from {} clones...",
