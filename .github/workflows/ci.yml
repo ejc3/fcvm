@@ -234,10 +234,10 @@ jobs:
       matrix:
         arch: [arm64, x64]
     steps:
-      # Clean up root-owned files from previous test runs before checkout
-      - name: Clean workspace (pre-checkout)
+      # Fix ownership of root-owned files from previous test runs (sudo cargo test)
+      - name: Fix workspace permissions (pre-checkout)
         run: |
-          sudo rm -rf ${{ github.workspace }}/fcvm/target/* ${{ github.workspace }}/fcvm/artifacts || true
+          sudo chown -R $USER:$USER ${{ github.workspace }}/fcvm/target 2>/dev/null || true
           # Fix cargo advisory-db permissions (can become read-only from previous runs)
           sudo chmod -R u+w ~/.cargo/advisory-db* 2>/dev/null || true
           sudo chown -R $USER:$USER ~/.cargo/advisory-db* 2>/dev/null || true
@@ -449,10 +449,10 @@ jobs:
     env:
       FCVM_NO_SNAPSHOT: ${{ matrix.fcvm_no_snapshot }}
     steps:
-      # Clean up root-owned files from previous test runs before checkout
-      - name: Clean workspace (pre-checkout)
+      # Fix ownership of root-owned files from previous test runs (sudo cargo test)
+      - name: Fix workspace permissions (pre-checkout)
         run: |
-          sudo rm -rf ${{ github.workspace }}/fcvm/target/* ${{ github.workspace }}/fcvm/artifacts || true
+          sudo chown -R $USER:$USER ${{ github.workspace }}/fcvm/target 2>/dev/null || true
           # Fix cargo advisory-db permissions (can become read-only from previous runs)
           sudo chmod -R u+w ~/.cargo/advisory-db* 2>/dev/null || true
           sudo chown -R $USER:$USER ~/.cargo/advisory-db* 2>/dev/null || true
@@ -629,10 +629,10 @@ jobs:
     env:
       CONTAINER_ARCH: ${{ matrix.arch == 'arm64' && 'aarch64' || 'x86_64' }}
     steps:
-      # Clean up root-owned files from previous test runs before checkout
-      - name: Clean workspace (pre-checkout)
+      # Fix ownership of root-owned files from previous test runs (sudo cargo test)
+      - name: Fix workspace permissions (pre-checkout)
         run: |
-          sudo rm -rf ${{ github.workspace }}/fcvm/target/* ${{ github.workspace }}/fcvm/artifacts || true
+          sudo chown -R $USER:$USER ${{ github.workspace }}/fcvm/target 2>/dev/null || true
           # Fix cargo advisory-db permissions (can become read-only from previous runs)
           sudo chmod -R u+w ~/.cargo/advisory-db* 2>/dev/null || true
           sudo chown -R $USER:$USER ~/.cargo/advisory-db* 2>/dev/null || true
