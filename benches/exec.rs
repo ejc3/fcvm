@@ -601,29 +601,73 @@ impl CloneFixture {
             }
         }
         if !http_ok {
-            // Dump clone log for diagnostics
+            // Comprehensive diagnostics for CI debugging
             let clone_log = std::fs::read_to_string(&clone_log_path).unwrap_or_default();
-            let port_fwd_lines: Vec<&str> = clone_log
+
+            // Check if pasta is running for this clone
+            let pasta_check = Command::new("pgrep")
+                .args(["-af", "pasta"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_else(|e| format!("pgrep failed: {}", e));
+
+            // Check listening sockets on the loopback IP
+            let ss_check = Command::new("ss")
+                .args(["-tlnp", "src", &loopback_ip])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_else(|e| format!("ss failed: {}", e));
+
+            // Try connecting and report exact error
+            let connect_err = TcpStream::connect_timeout(
+                &format!("{}:{}", loopback_ip, health_port).parse().unwrap(),
+                Duration::from_secs(2),
+            )
+            .err()
+            .map(|e| format!("{}", e))
+            .unwrap_or_else(|| "connect succeeded".to_string());
+
+            // Check stale sleep/pasta/fc processes
+            let stale_check = Command::new("sh")
+                .args([
+                    "-c",
+                    "echo 'sleep:' $(pgrep -cx sleep); echo 'pasta:' $(pgrep -cx pasta); echo 'firecracker:' $(pgrep -cf firecracker)",
+                ])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+
+            // Last 30 lines of clone log (full, not filtered)
+            let log_tail: String = clone_log
                 .lines()
-                .filter(|l| {
-                    l.contains("port forward")
-                        || l.contains("ARP")
-                        || l.contains("pasta")
-                        || l.contains("verify")
-                        || l.contains("loopback")
-                })
-                .collect();
+                .rev()
+                .take(30)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+
             panic!(
-                "clone HTTP failed after 10 attempts to {}:{}\n\
-                 last_response({} bytes): {}\n\
+                "clone HTTP failed after 10 attempts\n\
+                 addr: {}:{}\n\
+                 last_response: {} bytes\n\
                  clone_pid: {}\n\
-                 clone log port-forward lines:\n{}",
+                 connect_err: {}\n\
+                 \n=== listening sockets on {} ===\n{}\
+                 \n=== pasta processes ===\n{}\
+                 \n=== stale process counts ===\n{}\
+                 \n=== clone log (last 30 lines) ===\n{}",
                 loopback_ip,
                 health_port,
                 last_response.len(),
-                &last_response[..std::cmp::min(200, last_response.len())],
                 clone_pid,
-                port_fwd_lines.join("\n")
+                connect_err,
+                loopback_ip,
+                ss_check,
+                pasta_check,
+                stale_check,
+                log_tail,
             );
         }
 
