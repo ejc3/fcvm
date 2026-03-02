@@ -212,7 +212,20 @@ pub(super) async fn setup_rootless_namespace(
     }
     debug!(tap_device = %tap_device, "TAP device verified");
 
-    // Set holder_pid so VmManager uses nsenter
+    // Use pre_exec setns path (not nsenter) for rootless baselines.
+    // nsenter enters the user namespace internally, which clears PR_SET_PDEATHSIG
+    // (kernel zeros task->pdeath_signal on credential changes). The pre_exec setns
+    // path sets pdeathsig AFTER entering the user namespace, so Firecracker gets
+    // SIGKILL when fcvm dies.
+    vm_manager.set_user_namespace_path(std::path::PathBuf::from(format!(
+        "/proc/{}/ns/user",
+        holder_pid
+    )));
+    vm_manager.set_net_namespace_path(std::path::PathBuf::from(format!(
+        "/proc/{}/ns/net",
+        holder_pid
+    )));
+    // Still track holder_pid for health checks (nsenter curl) and cleanup
     vm_manager.set_holder_pid(holder_pid);
 
     // Store holder_pid in state for health checks and cleanup

@@ -154,9 +154,11 @@ impl VmManager {
         // because pre_exec runs BEFORE nsenter would enter the namespace, and we need CAP_SYS_ADMIN
         // from the user namespace to do mount operations.
         let mut cmd = if self.user_namespace_path.is_some() {
-            // Use direct Firecracker - namespaces will be entered via setns in pre_exec
-            // This is required for rootless clones that need mount namespace isolation
-            info!(target: "vm", vm_id = %self.vm_id, "using pre_exec setns for rootless clone");
+            // Use direct Firecracker - namespaces will be entered via setns in pre_exec.
+            // Used for ALL rootless VMs (baselines + clones) because nsenter's internal
+            // setns(CLONE_NEWUSER) clears PR_SET_PDEATHSIG, leaving Firecracker orphaned
+            // if fcvm is SIGKILL'd. The pre_exec path sets pdeathsig AFTER setns.
+            info!(target: "vm", vm_id = %self.vm_id, "using pre_exec setns for rootless VM");
             let mut c = Command::new(firecracker_bin);
             c.arg("--api-sock").arg(&self.socket_path);
             c

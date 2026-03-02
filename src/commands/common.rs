@@ -87,7 +87,7 @@ async fn setup_namespace_mappings(pid: u32) -> anyhow::Result<()> {
     let self_ino = std::fs::metadata("/proc/self/ns/user")
         .context("reading own user namespace inode")?
         .ino();
-    let ns_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let ns_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         if std::fs::metadata(format!("/proc/{pid}/ns/user"))
             .map(|m| m.ino() != self_ino)
