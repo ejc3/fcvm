@@ -671,9 +671,12 @@ mod tests {
 
         let reader_task = tokio::spawn(request_reader(read_half, handler, tx));
 
+        // Wire format: [4 bytes: CRC][4 bytes: length][N bytes: body]
         // 16-byte invalid bincode payload.
         let bad_payload = [0xffu8; 16];
         let bad_len = (bad_payload.len() as u32).to_be_bytes();
+        let dummy_crc = 0u32.to_be_bytes();
+        client.write_all(&dummy_crc).await.unwrap();
         client.write_all(&bad_len).await.unwrap();
         client.write_all(&bad_payload).await.unwrap();
 

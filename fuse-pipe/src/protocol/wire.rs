@@ -2,6 +2,16 @@
 //!
 //! # Frame Format
 //!
+//! Requests use a CRC-prefixed format for corruption detection:
+//! ```text
+//! +----------+----------+---------+
+//! |   CRC    |  length  | payload |
+//! | (4 bytes)| (4 bytes)| (N bytes)|
+//! +----------+----------+---------+
+//! ```
+//! - CRC is a big-endian u32 CRC32 checksum over (length + payload)
+//!
+//! Responses use the original format (no CRC prefix):
 //! ```text
 //! +----------+---------+
 //! |  length  | payload |

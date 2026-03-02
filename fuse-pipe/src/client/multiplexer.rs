@@ -316,7 +316,7 @@ impl Multiplexer {
     pub fn send_request_no_reply(&self, request: VolumeRequest) {
         let unique = self.next_id.fetch_add(1, Ordering::Relaxed);
 
-        let wire = WireRequest::with_groups(unique, 0, request, Vec::new());
+        let wire = WireRequest::with_groups(unique, 0, request, Vec::new()).with_checksum();
 
         let body = match bincode::serialize(&wire) {
             Ok(b) => b,
@@ -540,9 +540,13 @@ fn writer_loop_reconnectable(
                     );
                 }
 
-                // Try to write
+                // Compute CRC32 and write CRC header + message
+                // Wire format: [4 bytes: CRC][4 bytes: length][N bytes: body]
+                let send_crc = crc32fast::hash(&req.data);
+                let crc_bytes = send_crc.to_be_bytes();
                 let write_ok = writer_socket
-                    .write_all(&req.data)
+                    .write_all(&crc_bytes)
+                    .and_then(|_| writer_socket.write_all(&req.data))
                     .and_then(|_| writer_socket.flush())
                     .is_ok();
 
@@ -689,8 +693,13 @@ fn do_reconnect(
     let mut resend_failed = 0;
     for key in &keys {
         if let Some(entry) = pending.get(key) {
+            // Compute CRC32 and write CRC header + message
+            // Wire format: [4 bytes: CRC][4 bytes: length][N bytes: body]
+            let send_crc = crc32fast::hash(&entry.data);
+            let crc_bytes = send_crc.to_be_bytes();
             if writer_socket
-                .write_all(&entry.data)
+                .write_all(&crc_bytes)
+                .and_then(|_| writer_socket.write_all(&entry.data))
                 .and_then(|_| writer_socket.flush())
                 .is_err()
             {
