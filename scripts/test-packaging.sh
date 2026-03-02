@@ -33,7 +33,8 @@ FCVM="$INSTALL_DIR/fcvm"
 echo ""
 echo "Step 1: Run setup without config (should fail with helpful message)"
 set +e
-OUTPUT=$(XDG_CONFIG_HOME="$CONFIG_DIR" HOME="$CONFIG_DIR" "$FCVM" setup 2>&1)
+# Run from temp dir so CWD search won't find repo's rootfs-config.toml
+OUTPUT=$(cd "$INSTALL_DIR" && XDG_CONFIG_HOME="$CONFIG_DIR" HOME="$CONFIG_DIR" "$FCVM" setup 2>&1)
 EXIT_CODE=$?
 set -e
 

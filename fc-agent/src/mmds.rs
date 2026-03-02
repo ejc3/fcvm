@@ -136,6 +136,11 @@ async fn fetch_latest_metadata(client: &reqwest::Client) -> Result<LatestMetadat
 pub async fn watch_restore_epoch(signals: crate::restore::RestoreSignals) {
     let mut last_epoch: Option<String> = None;
 
+    // Track the egress proxy generation at the last stable point.
+    // Updated after each handle_clone_restore completes successfully.
+    let mut egress_gen_at_last_stable: Option<u64> =
+        signals.egress_gen_rx.as_ref().map(|rx| *rx.borrow());
+
     loop {
         sleep(Duration::from_millis(50)).await;
 
@@ -163,36 +168,23 @@ pub async fn watch_restore_epoch(signals: crate::restore::RestoreSignals) {
         if let Some(ref current) = metadata.restore_epoch {
             match &last_epoch {
                 None => {
-                    // First time seeing an epoch. Two cases:
-                    // 1. Clone restore: we're the first to detect it, run handle_clone_restore
-                    // 2. Warm start: notify_cache_ready_and_wait already handled reconnection
-                    //    and set restore_flag. Skip handle_clone_restore to avoid tearing down
-                    //    the already-working egress proxy session mid-use.
-                    if signals
+                    eprintln!("[fc-agent] detected restore-epoch: {}", current,);
+                    // Signal notify_cache_ready_and_wait to stop waiting.
+                    // Must be set BEFORE handle_clone_restore so the poll loop
+                    // exits before output reconnect changes vsock state.
+                    signals
                         .restore_flag
-                        .load(std::sync::atomic::Ordering::Acquire)
-                    {
-                        eprintln!(
-                            "[fc-agent] restore-epoch: {} (warm start, reconnection already handled)",
-                            current,
-                        );
-                    } else {
-                        eprintln!(
-                            "[fc-agent] detected restore-epoch: {} (clone restore detected)",
-                            current,
-                        );
-                        // Signal notify_cache_ready_and_wait to stop waiting.
-                        // Must be set BEFORE handle_clone_restore so the poll loop
-                        // exits before output reconnect changes vsock state.
-                        signals
-                            .restore_flag
-                            .store(true, std::sync::atomic::Ordering::Release);
-                        crate::restore::handle_clone_restore(
-                            &signals,
-                            metadata.clone_ipv6.as_deref(),
-                        )
-                        .await;
-                    }
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    crate::restore::handle_clone_restore(
+                        &signals,
+                        metadata.clone_ipv6.as_deref(),
+                        egress_gen_at_last_stable,
+                        current,
+                    )
+                    .await;
+                    // Update stable generation after successful restore handling
+                    egress_gen_at_last_stable =
+                        signals.egress_gen_rx.as_ref().map(|rx| *rx.borrow());
                     last_epoch = metadata.restore_epoch;
                 }
                 Some(prev) if prev != current => {
@@ -200,8 +192,16 @@ pub async fn watch_restore_epoch(signals: crate::restore::RestoreSignals) {
                     signals
                         .restore_flag
                         .store(true, std::sync::atomic::Ordering::Release);
-                    crate::restore::handle_clone_restore(&signals, metadata.clone_ipv6.as_deref())
-                        .await;
+                    crate::restore::handle_clone_restore(
+                        &signals,
+                        metadata.clone_ipv6.as_deref(),
+                        egress_gen_at_last_stable,
+                        current,
+                    )
+                    .await;
+                    // Update stable generation after successful restore handling
+                    egress_gen_at_last_stable =
+                        signals.egress_gen_rx.as_ref().map(|rx| *rx.borrow());
                     last_epoch = metadata.restore_epoch;
                 }
                 _ => {}

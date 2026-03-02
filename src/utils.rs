@@ -98,10 +98,14 @@ pub fn strip_firecracker_prefix(line: &str) -> &str {
         }
     }
 
-    // Strip [anonymous-instance:xxx] prefix if present
+    // Strip [anonymous-instance:xxx] prefix if present.
+    // Only strip brackets containing ':' (Firecracker format is [instance:thread]).
+    // This preserves guest-originated prefixes like [fc-agent] which have no colon.
     if result.starts_with('[') {
         if let Some(end_pos) = result.find("] ") {
-            result = &result[end_pos + 2..];
+            if result[1..end_pos].contains(':') {
+                result = &result[end_pos + 2..];
+            }
         }
     }
 
@@ -334,5 +338,40 @@ mod tests {
     fn test_is_process_alive_init() {
         // PID 1 (init/systemd) should always exist on Linux
         assert!(is_process_alive(1));
+    }
+
+    #[test]
+    fn test_strip_firecracker_prefix_full() {
+        assert_eq!(
+            strip_firecracker_prefix(
+                "2025-11-15T17:18:55.027478889 [anonymous-instance:main] Running Firecracker"
+            ),
+            "Running Firecracker"
+        );
+    }
+
+    #[test]
+    fn test_strip_firecracker_prefix_preserves_fc_agent() {
+        // Guest serial output without Firecracker prefix — [fc-agent] must NOT be stripped
+        assert_eq!(
+            strip_firecracker_prefix("[fc-agent] handling restore (epoch=1)"),
+            "[fc-agent] handling restore (epoch=1)"
+        );
+    }
+
+    #[test]
+    fn test_strip_firecracker_prefix_fc_agent_with_instance() {
+        // Guest serial output WITH Firecracker prefix — strip instance, keep [fc-agent]
+        assert_eq!(
+            strip_firecracker_prefix(
+                "2025-11-15T17:18:55.027 [anonymous-instance:main] [fc-agent] handling restore"
+            ),
+            "[fc-agent] handling restore"
+        );
+    }
+
+    #[test]
+    fn test_strip_firecracker_prefix_plain() {
+        assert_eq!(strip_firecracker_prefix("plain message"), "plain message");
     }
 }

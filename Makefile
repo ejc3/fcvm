@@ -217,19 +217,25 @@ check-disk:
 	@# Fix advisory-db ownership (sudo/non-sudo mixing corrupts it)
 	@sudo chown -R $$(id -u):$$(id -g) "$$HOME/.cargo/advisory-db" 2>/dev/null || true
 	@sudo chown -R $$(id -u):$$(id -g) "$$HOME/.cargo/advisory-dbs" 2>/dev/null || true
-	@ROOT_FREE=$$(df -BG / 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \
-	BTRFS_FREE=$$(df -BG /mnt/fcvm-btrfs 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \
-	if [ -n "$$ROOT_FREE" ] && [ "$$ROOT_FREE" -lt 10 ]; then \
-		echo "ERROR: Need 10GB free on / (have $${ROOT_FREE}GB)"; \
-		echo "Try: make clean"; \
-		exit 1; \
-	fi; \
+	@# Symlink target/ to btrfs so cargo builds don't fill root filesystem
+	@if [ -d /mnt/fcvm-btrfs ] && ! [ -L target ]; then \
+		if [ -d target ]; then \
+			echo "==> Moving existing target/ to /mnt/fcvm-btrfs/cargo-target..."; \
+			sudo rm -rf /mnt/fcvm-btrfs/cargo-target; \
+			mv target /mnt/fcvm-btrfs/cargo-target; \
+		else \
+			mkdir -p /mnt/fcvm-btrfs/cargo-target; \
+		fi; \
+		ln -s /mnt/fcvm-btrfs/cargo-target target; \
+		echo "==> Symlinked target/ → /mnt/fcvm-btrfs/cargo-target"; \
+	fi
+	@BTRFS_FREE=$$(df -BG /mnt/fcvm-btrfs 2>/dev/null | awk 'NR==2 {gsub("G",""); print $$4}'); \
 	if [ -n "$$BTRFS_FREE" ] && [ "$$BTRFS_FREE" -lt 15 ]; then \
 		echo "ERROR: Need 15GB free on /mnt/fcvm-btrfs (have $${BTRFS_FREE}GB)"; \
 		echo "Try: make clean-test-data"; \
 		exit 1; \
 	fi; \
-	echo "Disk check passed: / has $${ROOT_FREE}GB, /mnt/fcvm-btrfs has $${BTRFS_FREE}GB"
+	echo "Disk check passed: /mnt/fcvm-btrfs has $${BTRFS_FREE}GB free"
 
 # Clean leftover test data (VM disks, snapshots, state files)
 # Preserves cached assets (kernels, rootfs, initrd, image-cache)
@@ -285,7 +291,7 @@ test-packaging: build
 	./scripts/test-packaging.sh target/release/fcvm
 
 clean:
-	sudo rm -rf target
+	sudo rm -rf target/*
 
 # Run-only targets (no setup deps, used by container)
 _test-unit:

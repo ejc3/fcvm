@@ -25,12 +25,14 @@ pub async fn flush_arp_cache() {
     }
 }
 
-/// Send gratuitous ARP via ping to teach new pasta instance our MAC address.
+/// Send gratuitous ARP and verify gateway reachability.
 ///
-/// Spawns `ping -c 1` to the default gateway in the background and returns
-/// immediately. The kernel sends an ARP REQUEST broadcast as the first step
-/// of resolving the gateway — that broadcast is what teaches pasta the guest's
-/// MAC. We don't need to wait for the ICMP echo reply.
+/// Pings the default gateway and WAITS for a reply. This serves two purposes:
+/// 1. The ARP REQUEST broadcast teaches the network (pasta/bridge) our MAC address
+/// 2. Waiting for the reply ensures the egress path is fully operational
+///
+/// Must complete before signaling "ready" to the host, otherwise the host may
+/// start sending egress traffic before ARP resolution is complete.
 pub async fn send_gratuitous_arp() {
     let route_output = Command::new("ip")
         .args(["route", "show", "default"])
@@ -54,23 +56,34 @@ pub async fn send_gratuitous_arp() {
         return;
     };
 
-    eprintln!("[fc-agent] sending gratuitous ARP to gateway {}", gateway);
+    eprintln!(
+        "[fc-agent] pinging gateway {} (ARP + verify egress path)",
+        gateway
+    );
 
-    // Fire-and-forget: spawn ping in background, don't await completion.
-    // The ARP request goes out immediately when the kernel resolves the gateway.
+    // Wait for ping to complete — ensures ARP is resolved and gateway is reachable
+    // before the host starts sending egress traffic.
     match Command::new("ping")
-        .args(["-c", "1", "-W", "1", &gateway])
+        .args(["-c", "1", "-W", "3", &gateway])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn()
+        .output()
+        .await
     {
-        Ok(_child) => {
-            eprintln!("[fc-agent] gratuitous ARP: ping spawned (not waiting for reply)");
+        Ok(output) if output.status.success() => {
+            eprintln!("[fc-agent] gateway {} reachable", gateway);
+        }
+        Ok(output) => {
+            eprintln!(
+                "[fc-agent] WARNING: gateway {} ping failed (exit {})",
+                gateway,
+                output.status.code().unwrap_or(-1)
+            );
         }
         Err(e) => {
             eprintln!(
-                "[fc-agent] WARNING: failed to spawn gratuitous ARP ping: {}",
-                e
+                "[fc-agent] WARNING: failed to ping gateway {}: {}",
+                gateway, e
             );
         }
     }

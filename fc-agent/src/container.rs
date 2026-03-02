@@ -698,6 +698,18 @@ pub async fn get_image_digest(image: &str, cmd_prefix: &[String]) -> Result<Stri
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Result of notify_cache_ready_and_wait: distinguishes cold start from warm start.
+#[derive(Debug, PartialEq)]
+pub enum CacheResult {
+    /// Host sent "cache-ack" — cold start, vsock connections are alive.
+    ColdStart,
+    /// POLLHUP, write-probe, or restore-epoch detected — warm start,
+    /// vsock connections are dead (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET).
+    WarmStart,
+    /// Handshake failed (connect error, send error, timeout, etc.).
+    Failed,
+}
+
 /// Notify host that image is cached, wait for snapshot ack.
 ///
 /// The `restore_flag` is set by the restore-epoch watcher when it detects
@@ -706,7 +718,7 @@ pub async fn get_image_digest(image: &str, cmd_prefix: &[String]) -> Result<Stri
 pub fn notify_cache_ready_and_wait(
     digest: &str,
     restore_flag: &std::sync::atomic::AtomicBool,
-) -> bool {
+) -> CacheResult {
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
     use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
     use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, VsockAddr};
@@ -725,7 +737,7 @@ pub fn notify_cache_ready_and_wait(
                 "[fc-agent] WARNING: failed to create vsock socket for cache: {}",
                 e
             );
-            return false;
+            return CacheResult::Failed;
         }
     };
 
@@ -735,7 +747,7 @@ pub fn notify_cache_ready_and_wait(
             "[fc-agent] WARNING: failed to connect vsock for cache: {}",
             e
         );
-        return false;
+        return CacheResult::Failed;
     }
 
     let msg = format!("cache-ready:{}\n", digest);
@@ -743,14 +755,14 @@ pub fn notify_cache_ready_and_wait(
         Ok(n) if n == msg.len() => {}
         Ok(_) => {
             eprintln!("[fc-agent] WARNING: failed to send complete cache-ready message");
-            return false;
+            return CacheResult::Failed;
         }
         Err(e) => {
             eprintln!(
                 "[fc-agent] WARNING: failed to send cache-ready message: {}",
                 e
             );
-            return false;
+            return CacheResult::Failed;
         }
     }
 
@@ -785,7 +797,7 @@ pub fn notify_cache_ready_and_wait(
         // rootless mode after pre-start snapshot restore).
         if restore_flag.load(std::sync::atomic::Ordering::Acquire) {
             eprintln!("[fc-agent] cache-ack: restore detected via epoch watcher, skipping wait");
-            return true;
+            return CacheResult::WarmStart;
         }
 
         let remaining_ms = deadline
@@ -793,7 +805,7 @@ pub fn notify_cache_ready_and_wait(
             .as_millis();
         if remaining_ms == 0 {
             eprintln!("[fc-agent] cache-ack deadline expired (30s)");
-            return false;
+            return CacheResult::Failed;
         }
 
         // Poll with 500ms intervals (or remaining time, whichever is shorter)
@@ -803,7 +815,7 @@ pub fn notify_cache_ready_and_wait(
         match poll(&mut poll_fds, PollTimeout::from(poll_ms)) {
             Err(e) => {
                 eprintln!("[fc-agent] cache-ack poll error: {}", e);
-                return false;
+                return CacheResult::Failed;
             }
             Ok(0) => {
                 // Poll timeout — actively probe the vsock connection.
@@ -817,7 +829,7 @@ pub fn notify_cache_ready_and_wait(
                     | Err(nix::errno::Errno::ENOTCONN)
                     | Err(nix::errno::Errno::ECONNREFUSED) => {
                         eprintln!("[fc-agent] cache-ack connection dead (write probe), snapshot was taken");
-                        return true;
+                        return CacheResult::WarmStart;
                     }
                     Err(nix::errno::Errno::EAGAIN) => {
                         // Connection alive but can't write now — continue polling
@@ -837,7 +849,7 @@ pub fn notify_cache_ready_and_wait(
                 // the host restored this VM from a cached pre-start snapshot, and
                 // VIRTIO_VSOCK_EVENT_TRANSPORT_RESET killed all connections.
                 eprintln!("[fc-agent] cache-ack connection reset (snapshot restore detected)");
-                return true;
+                return CacheResult::WarmStart;
             }
         }
 
@@ -848,12 +860,12 @@ pub fn notify_cache_ready_and_wait(
             }
             Err(e) => {
                 eprintln!("[fc-agent] cache-ack read error: {}", e);
-                return false;
+                return CacheResult::Failed;
             }
             Ok(0) => {
                 // Connection closed — snapshot vsock reset
                 eprintln!("[fc-agent] cache-ack connection closed (snapshot taken)");
-                return true;
+                return CacheResult::WarmStart;
             }
             Ok(n) => {
                 total_read += n;
@@ -863,12 +875,12 @@ pub fn notify_cache_ready_and_wait(
         let received = std::str::from_utf8(&buf[..total_read]).unwrap_or("");
         if received.contains("cache-ack") {
             eprintln!("[fc-agent] received cache-ack from host");
-            return true;
+            return CacheResult::ColdStart;
         }
 
         if total_read >= buf.len() {
             eprintln!("[fc-agent] cache-ack buffer overflow, giving up");
-            return false;
+            return CacheResult::Failed;
         }
     }
 }
