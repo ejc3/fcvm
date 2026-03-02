@@ -78,6 +78,27 @@ async fn test_serial_console_after_restore() -> Result<()> {
     common::poll_health_by_pid(pid2, 120).await?;
     println!("  Phase 2 VM healthy (PID: {})", pid2);
 
+    // Wait for restore to complete — poll the log until "restore complete" appears.
+    // The restore path includes clock sync + chronyc + gateway ping which can take
+    // several seconds, so poll rather than sleep a fixed duration.
+    println!("  Waiting for restore to complete...");
+    let restore_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if tokio::time::Instant::now() > restore_deadline {
+            anyhow::bail!(
+                "timeout waiting for restore complete in log: {}",
+                log_path.display()
+            );
+        }
+        if let Ok(contents) = std::fs::read_to_string(&log_path) {
+            if contents.contains("[fc-agent] restore complete") {
+                println!("  Restore complete detected in log");
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
     // Write a unique marker to /dev/ttyS0 from inside the VM.
     // If UART works, the marker flows through:
     //   echo → /dev/ttyS0 → Firecracker UART → Firecracker stdout → host log
@@ -86,14 +107,14 @@ async fn test_serial_console_after_restore() -> Result<()> {
         .await
         .context("writing marker to /dev/ttyS0")?;
 
-    // Give time for the serial output to flow through the pipeline
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Brief pause for serial output to flush through the pipeline
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Stop the VM
     common::kill_process(pid2).await;
     let _ = child2.wait().await;
 
-    // Wait a moment for the log consumers to flush
+    // Wait for log consumers to flush
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Analyze the log file
