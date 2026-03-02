@@ -245,6 +245,9 @@ clean-test-data: build
 	@sudo pkill -9 firecracker 2>/dev/null; sudo pkill -9 pasta 2>/dev/null; sudo kill -9 $$(pgrep -x sleep -P 1) 2>/dev/null; sleep 1; true
 	@echo "==> Cleaning stale network namespaces..."
 	@for ns in $$(sudo ip netns list 2>/dev/null | grep '^fcvm-' | awk '{print $$1}'); do sudo ip netns del "$$ns" 2>/dev/null && echo "  deleted $$ns"; done; true
+	@echo "==> Cleaning stale iptables rules from fcvm VMs..."
+	@sudo iptables-save -t nat 2>/dev/null | grep -E 'MASQUERADE.*(172\.30\.|10\.0\.)' | sed 's/^-A//' | while read rule; do sudo iptables -t nat -D $$rule 2>/dev/null; done; true
+	@sudo ip6tables-save -t nat 2>/dev/null | grep 'MASQUERADE' | grep -v NETAVARK | sed 's/^-A//' | while read rule; do sudo ip6tables -t nat -D $$rule 2>/dev/null; done; true
 	@echo "==> Force unmounting stale FUSE mounts..."
 	@# Find and force unmount any FUSE mounts from previous test runs
 	@mount | grep fuse | grep -E '/tmp|/var/tmp' | cut -d' ' -f3 | xargs -r -I{} fusermount3 -u -z {} 2>/dev/null || true
@@ -273,14 +276,6 @@ clean-test-data: build
 	@echo "==> Cleaned test data (preserved cached assets)"
 
 build:
-	@# Detect stale cargo cache: if build script output is missing, the cache is
-	@# corrupt (e.g., from force-push rewriting history or toolchain change).
-	@# cargo won't rebuild in this state — it silently uses stale fingerprints.
-	@if ls target/release/build/fcvm-*/output >/dev/null 2>&1; then true; \
-	elif [ -d target/release/build ]; then \
-		echo "==> Stale cargo cache detected (missing build script output), cleaning..."; \
-		rm -rf target/release/build target/release/deps target/release/.fingerprint; \
-	fi
 	@echo "==> Building..."
 	CARGO_TARGET_DIR=target $(CARGO) build --release -p fcvm
 	CARGO_TARGET_DIR=target $(CARGO) build --release -p fc-agent --target $(MUSL_TARGET)

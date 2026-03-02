@@ -163,10 +163,10 @@ impl VmManager {
             c.arg("--api-sock").arg(&self.socket_path);
             c
         } else if let Some(holder_pid) = self.holder_pid {
-            // Use nsenter to enter user+network namespace with preserved credentials
-            // --preserve-credentials keeps UID, GID, and supplementary groups (including kvm)
-            // This allows KVM access while being in the isolated network namespace
-            // NOTE: This path is for baseline VMs that don't need mount namespace isolation
+            // Fallback: nsenter to enter user+network namespace.
+            // NOTE: This path is not normally reached — rootless VMs now use pre_exec
+            // setns (above) which correctly preserves PR_SET_PDEATHSIG. nsenter's
+            // internal setns(CLONE_NEWUSER) clears pdeathsig. Kept as safety net.
             info!(target: "vm", vm_id = %self.vm_id, holder_pid = holder_pid, "using nsenter for rootless networking");
             let mut c = Command::new("nsenter");
             c.args([
