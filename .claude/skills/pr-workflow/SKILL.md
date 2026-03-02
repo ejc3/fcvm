@@ -13,8 +13,9 @@ user-invocable: true
 |------|---------|
 | CI status (non-blocking) | `gh pr view <N> --json statusCheckRollup --jq '.statusCheckRollup[] \| "\(.name): \(.conclusion // "pending")"'` |
 | CI status (blocking) | `gh pr checks <N>` |
-| Read PR comments | `gh pr view <N> --json comments --jq '.comments[] \| "---\n" + .body'` |
-| Read inline review comments | `gh api repos/$REPO/pulls/<N>/comments --jq '.[] \| "---\nfile: \(.path):\(.line // .original_line)\n\(.body)"'` |
+| Read PR comments (Claude) | `gh pr view <N> --json comments --jq '.comments[] \| "---\n" + .body'` |
+| Read inline comments (Codex) | `gh api repos/$REPO/pulls/<N>/comments --jq '.[] \| select(.user.login \| test("codex")) \| "---\nfile: \(.path):\(.line // .original_line)\n\(.body)"'` |
+| Read all inline comments | `gh api repos/$REPO/pulls/<N>/comments --jq '.[] \| "---\nfile: \(.path):\(.line // .original_line)\n\(.body)"'` |
 | Create PR | `git push -u origin <branch> && gh pr create --fill` |
 | Merge standalone PR | `gh pr merge <N> --merge --delete-branch` |
 | Merge stacked PR (base) | `gh pr merge <N> --merge` (NO `--delete-branch`!) |
@@ -100,16 +101,41 @@ git push
 
 ## Before Merging: Read ALL PR Comments
 
-**MANDATORY before any merge, push, or PR update.** Run BOTH commands:
+**MANDATORY before any merge, push, or PR update.** Run ALL THREE commands:
 
 ```bash
 REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
 
-# PR-level comments
+# PR-level comments (Claude review posts here)
 gh pr view <N> --json comments --jq '.comments[] | "---\n" + .body'
 
-# Inline code review comments (often more actionable)
+# Inline code review comments (Codex review posts here)
 gh api "repos/$REPO/pulls/<N>/comments" --jq '.[] | "---\nfile: \(.path):\(.line // .original_line)\n\(.body)"'
+
+# PR reviews with body text (Codex review summary lives here)
+gh api "repos/$REPO/pulls/<N>/reviews" --jq '.[] | select(.body != "") | "---\nauthor: \(.user.login)\n\(.body)"'
+```
+
+### Two Automated Reviewers
+
+This repo has **two** automated code reviewers. Read findings from BOTH before merging.
+
+**Claude Review** (`claude-claude` bot):
+- Posts as a **PR-level comment** (visible via `gh pr view --json comments`)
+- Runs as a GitHub Actions workflow on every push
+- Severity levels: LOW, MEDIUM, HIGH
+
+**Codex Review** (`chatgpt-codex-connector[bot]`):
+- Posts a **PR review** with inline comments on specific lines
+- Review summary: `gh api repos/$REPO/pulls/<N>/reviews` (look for `chatgpt-codex-connector`)
+- Inline suggestions: `gh api repos/$REPO/pulls/<N>/comments` (filter by codex author)
+- Priority badges: P0 (critical), P1 (important), P2 (suggestion)
+
+**Read Codex inline comments specifically:**
+```bash
+# Codex inline review comments only
+gh api "repos/$REPO/pulls/<N>/comments" \
+  --jq '.[] | select(.user.login | test("codex")) | "---\nfile: \(.path):\(.line // .original_line)\n\(.body)"'
 ```
 
 ### Check for auto-fix PRs
