@@ -5,6 +5,7 @@
 //! - --no-dirty-tracking passes track_dirty_pages=false
 
 #![cfg(feature = "integration-slow")]
+#![cfg_attr(not(feature = "privileged-tests"), allow(unused_imports))]
 
 mod common;
 
@@ -17,35 +18,17 @@ use std::time::Duration;
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_clock_synced_after_clone_restore() -> Result<()> {
-    let (baseline, clone, snap, _) = common::unique_names("clocksync");
-
-    // Start baseline
-    println!("Starting baseline...");
-    let (_child, baseline_pid) = common::spawn_fcvm_with_logs(
-        &["podman", "run", "--name", &baseline, "--network", "bridged", common::TEST_IMAGE],
-        &baseline,
-    )
-    .await?;
-    common::poll_health_by_pid(baseline_pid, 120).await?;
-    println!("  ✓ Baseline healthy (PID: {})", baseline_pid);
-
-    // Snapshot
-    common::create_snapshot_by_pid(baseline_pid, &snap).await?;
-
-    // Serve
-    let (_serve_child, serve_pid) =
-        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snap], &format!("{}-serve", snap))
-            .await?;
-    common::poll_serve_ready(&snap, serve_pid, 30).await?;
+    let fixture = common::SnapshotFixture::new("clocksync", "bridged").await?;
 
     // Wait 3 seconds so snapshot time drifts from real time
     println!("  Waiting 3s for clock drift...");
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Clone
+    let (_, clone_name, _, _) = common::unique_names("clocksync-c");
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "run", "--pid", &serve_pid.to_string(), "--name", &clone],
-        &clone,
+        &["snapshot", "run", "--pid", &fixture.serve_pid.to_string(), "--name", &clone_name],
+        &clone_name,
     )
     .await?;
     common::poll_health_by_pid(clone_pid, 120).await?;
@@ -70,8 +53,7 @@ async fn test_clock_synced_after_clone_restore() -> Result<()> {
 
     // Cleanup
     common::kill_process(clone_pid).await;
-    common::kill_process(serve_pid).await;
-    common::kill_process(baseline_pid).await;
+    fixture.cleanup().await;
     Ok(())
 }
 
@@ -81,28 +63,12 @@ async fn test_clock_synced_after_clone_restore() -> Result<()> {
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_ss_filter_preserves_gateway_after_restore() -> Result<()> {
-    let (baseline, clone, snap, _) = common::unique_names("ssfilter");
+    let fixture = common::SnapshotFixture::new("ssfilter", "bridged").await?;
 
-    // Start baseline
-    println!("Starting baseline...");
-    let (_child, baseline_pid) = common::spawn_fcvm_with_logs(
-        &["podman", "run", "--name", &baseline, "--network", "bridged", common::TEST_IMAGE],
-        &baseline,
-    )
-    .await?;
-    common::poll_health_by_pid(baseline_pid, 120).await?;
-
-    // Snapshot + Serve + Clone
-    common::create_snapshot_by_pid(baseline_pid, &snap).await?;
-
-    let (_serve_child, serve_pid) =
-        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snap], &format!("{}-serve", snap))
-            .await?;
-    common::poll_serve_ready(&snap, serve_pid, 30).await?;
-
+    let (_, clone_name, _, _) = common::unique_names("ssfilter-c");
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "run", "--pid", &serve_pid.to_string(), "--name", &clone],
-        &clone,
+        &["snapshot", "run", "--pid", &fixture.serve_pid.to_string(), "--name", &clone_name],
+        &clone_name,
     )
     .await?;
     common::poll_health_by_pid(clone_pid, 120).await?;
@@ -131,8 +97,7 @@ async fn test_ss_filter_preserves_gateway_after_restore() -> Result<()> {
 
     // Cleanup
     common::kill_process(clone_pid).await;
-    common::kill_process(serve_pid).await;
-    common::kill_process(baseline_pid).await;
+    fixture.cleanup().await;
     Ok(())
 }
 
@@ -141,37 +106,19 @@ async fn test_ss_filter_preserves_gateway_after_restore() -> Result<()> {
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_no_swap_creates_cgroup() -> Result<()> {
-    let (baseline, clone, snap, _) = common::unique_names("noswap");
-
-    // Start baseline
-    let (_child, baseline_pid) = common::spawn_fcvm_with_logs(
-        &["podman", "run", "--name", &baseline, "--network", "bridged", common::TEST_IMAGE],
-        &baseline,
-    )
-    .await?;
-    common::poll_health_by_pid(baseline_pid, 120).await?;
-
-    // Snapshot + Serve
-    common::create_snapshot_by_pid(baseline_pid, &snap).await?;
-
-    let (_serve_child, serve_pid) =
-        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snap], &format!("{}-serve", snap))
-            .await?;
-    common::poll_serve_ready(&snap, serve_pid, 30).await?;
+    let fixture = common::SnapshotFixture::new("noswap", "bridged").await?;
 
     // Clone WITH --no-swap
+    let (_, clone_name, _, _) = common::unique_names("noswap-c");
     println!("  Spawning clone with --no-swap...");
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
         &[
-            "snapshot",
-            "run",
-            "--pid",
-            &serve_pid.to_string(),
-            "--name",
-            &clone,
+            "snapshot", "run",
+            "--pid", &fixture.serve_pid.to_string(),
+            "--name", &clone_name,
             "--no-swap",
         ],
-        &clone,
+        &clone_name,
     )
     .await?;
     common::poll_health_by_pid(clone_pid, 120).await?;
@@ -205,22 +152,15 @@ async fn test_no_swap_creates_cgroup() -> Result<()> {
     );
 
     let swap_max = std::fs::read_to_string(format!(
-        "/sys/fs/cgroup{}/memory.swap.max",
-        cgroup_path
+        "/sys/fs/cgroup{}/memory.swap.max", cgroup_path
     ))
     .context("reading memory.swap.max")?;
-    assert_eq!(
-        swap_max.trim(),
-        "0",
-        "memory.swap.max should be 0, got: {}",
-        swap_max.trim()
-    );
+    assert_eq!(swap_max.trim(), "0", "memory.swap.max should be 0, got: {}", swap_max.trim());
     println!("  ✓ Firecracker in fcvm.slice with memory.swap.max=0");
 
     // Cleanup
     common::kill_process(clone_pid).await;
-    common::kill_process(serve_pid).await;
-    common::kill_process(baseline_pid).await;
+    fixture.cleanup().await;
     Ok(())
 }
 
@@ -229,37 +169,19 @@ async fn test_no_swap_creates_cgroup() -> Result<()> {
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_no_dirty_tracking_clone() -> Result<()> {
-    let (baseline, clone, snap, _) = common::unique_names("nodirty");
-
-    // Start baseline
-    let (_child, baseline_pid) = common::spawn_fcvm_with_logs(
-        &["podman", "run", "--name", &baseline, "--network", "bridged", common::TEST_IMAGE],
-        &baseline,
-    )
-    .await?;
-    common::poll_health_by_pid(baseline_pid, 120).await?;
-
-    // Snapshot + Serve
-    common::create_snapshot_by_pid(baseline_pid, &snap).await?;
-
-    let (_serve_child, serve_pid) =
-        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snap], &format!("{}-serve", snap))
-            .await?;
-    common::poll_serve_ready(&snap, serve_pid, 30).await?;
+    let fixture = common::SnapshotFixture::new("nodirty", "bridged").await?;
 
     // Clone WITH --no-dirty-tracking
+    let (_, clone_name, _, _) = common::unique_names("nodirty-c");
     println!("  Spawning clone with --no-dirty-tracking...");
     let (_clone_child, clone_pid, log_path) = common::spawn_fcvm_with_log_path(
         &[
-            "snapshot",
-            "run",
-            "--pid",
-            &serve_pid.to_string(),
-            "--name",
-            &clone,
+            "snapshot", "run",
+            "--pid", &fixture.serve_pid.to_string(),
+            "--name", &clone_name,
             "--no-dirty-tracking",
         ],
-        &clone,
+        &clone_name,
     )
     .await?;
     common::poll_health_by_pid(clone_pid, 120).await?;
@@ -288,7 +210,6 @@ async fn test_no_dirty_tracking_clone() -> Result<()> {
 
     // Cleanup
     common::kill_process(clone_pid).await;
-    common::kill_process(serve_pid).await;
-    common::kill_process(baseline_pid).await;
+    fixture.cleanup().await;
     Ok(())
 }
