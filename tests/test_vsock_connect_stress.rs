@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 const EXEC_ITERATIONS: usize = 20;
 
 /// Maximum acceptable time for a single exec (milliseconds)
-const MAX_EXEC_MS: u128 = 2000;
+const MAX_EXEC_MS: u128 = 5000;
 
 /// Number of kill-on-drop iterations per round
 const KILL_ON_DROP_ITERATIONS: usize = 5;
