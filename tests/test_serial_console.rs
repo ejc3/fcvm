@@ -29,6 +29,15 @@ use std::time::Duration;
 ///          Write a marker to /dev/ttyS0 and verify it appears in host log.
 #[tokio::test]
 async fn test_serial_console_after_restore() -> Result<()> {
+    // This test requires snapshot support for the warm start path.
+    if std::env::var("FCVM_NO_SNAPSHOT")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        println!("Skipping test: FCVM_NO_SNAPSHOT is set");
+        return Ok(());
+    }
+
     println!("\nSerial console after restore test");
     println!("==================================");
 
