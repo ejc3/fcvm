@@ -36,9 +36,9 @@ pub struct VmManager {
     socket_path: PathBuf,
     log_path: Option<PathBuf>,
     namespace_id: Option<String>,
-    holder_pid: Option<u32>, // namespace holder PID for rootless mode (use nsenter to run FC)
-    user_namespace_path: Option<PathBuf>, // User namespace path for rootless clones (enter via setns in pre_exec)
-    net_namespace_path: Option<PathBuf>, // Net namespace path for rootless clones (enter via setns in pre_exec)
+    holder_pid: Option<u32>, // namespace holder PID for rootless mode (health checks + cleanup)
+    user_namespace_path: Option<PathBuf>, // User namespace path for rootless VMs (enter via setns in pre_exec)
+    net_namespace_path: Option<PathBuf>, // Net namespace path for rootless VMs (enter via setns in pre_exec)
     mount_redirects: Option<(Vec<PathBuf>, PathBuf)>, // (baseline_dirs, clone_dir) for mount namespace isolation
     process: Option<Child>,
     client: Option<FirecrackerClient>,
@@ -76,35 +76,33 @@ impl VmManager {
 
     /// Set namespace holder PID for rootless networking
     ///
-    /// When set, Firecracker will be launched inside an existing user+net namespace
-    /// via nsenter. The holder process (created by `unshare --user --net -- sleep infinity`)
-    /// keeps the namespace alive while Firecracker runs.
-    ///
-    /// UID/GID mappings are written externally by `setup_namespace_mappings()`, which
-    /// maps the current user (UID 1000) to UID 0 inside the namespace. Combined with
-    /// `--preserve-credentials` when using nsenter, no chmod is needed on sockets or
-    /// files - the user has access both inside and outside.
+    /// The holder process (created by `unshare --user --net -- sleep infinity`)
+    /// keeps the namespace alive while Firecracker runs. The holder PID is used
+    /// for health checks (nsenter curl) and cleanup, not for launching Firecracker
+    /// (which uses pre_exec setns via set_user_namespace_path/set_net_namespace_path).
     pub fn set_holder_pid(&mut self, pid: u32) {
         self.holder_pid = Some(pid);
     }
 
-    /// Set user namespace path for rootless clones
+    /// Set user namespace path for rootless VMs (baselines + clones)
     ///
-    /// When set along with mount_redirects, pre_exec will enter this user namespace
-    /// first (via setns) before doing mount operations. This gives CAP_SYS_ADMIN
-    /// inside the user namespace, allowing unshare(CLONE_NEWNS) to succeed.
+    /// When set, pre_exec will enter this user namespace (via setns) before
+    /// launching Firecracker. This is used for ALL rootless VMs because nsenter's
+    /// internal setns(CLONE_NEWUSER) clears PR_SET_PDEATHSIG (kernel zeros
+    /// task->pdeath_signal on credential changes). The pre_exec path sets
+    /// pdeathsig AFTER entering the namespace, ensuring Firecracker is killed
+    /// when fcvm dies.
     ///
-    /// Use this instead of set_holder_pid when mount namespace isolation is needed,
-    /// since nsenter wrapper runs AFTER pre_exec.
+    /// For clones with mount_redirects, pre_exec also enters the user namespace
+    /// first to get CAP_SYS_ADMIN for mount operations.
     pub fn set_user_namespace_path(&mut self, path: PathBuf) {
         self.user_namespace_path = Some(path);
     }
 
-    /// Set network namespace path for rootless clones
+    /// Set network namespace path for rootless VMs (baselines + clones)
     ///
     /// When set, pre_exec will enter this network namespace (via setns) after
-    /// completing mount operations. Use with set_user_namespace_path for
-    /// rootless clones that need mount namespace isolation.
+    /// entering the user namespace and completing any mount operations.
     pub fn set_net_namespace_path(&mut self, path: PathBuf) {
         self.net_namespace_path = Some(path);
     }
@@ -147,42 +145,19 @@ impl VmManager {
 
         // Build command based on mode:
         // 1. user_namespace_path set: direct Firecracker (namespaces entered via pre_exec setns)
-        // 2. holder_pid set (no user_namespace_path): use nsenter to enter existing namespace (rootless baseline)
-        // 3. neither: direct Firecracker (privileged/bridged mode)
-        //
-        // For rootless clones with mount_redirects, we MUST use pre_exec setns instead of nsenter,
-        // because pre_exec runs BEFORE nsenter would enter the namespace, and we need CAP_SYS_ADMIN
-        // from the user namespace to do mount operations.
+        //    Used for ALL rootless VMs (baselines + clones) because nsenter's internal
+        //    setns(CLONE_NEWUSER) clears PR_SET_PDEATHSIG (kernel zeros task->pdeath_signal
+        //    on credential changes). The pre_exec path sets pdeathsig AFTER setns.
+        //    For clones with mount_redirects, pre_exec also handles mount namespace isolation.
+        // 2. neither: direct Firecracker (privileged/bridged mode)
         let mut cmd = if self.user_namespace_path.is_some() {
             // Use direct Firecracker - namespaces will be entered via setns in pre_exec.
-            // Used for ALL rootless VMs (baselines + clones) because nsenter's internal
-            // setns(CLONE_NEWUSER) clears PR_SET_PDEATHSIG, leaving Firecracker orphaned
-            // if fcvm is SIGKILL'd. The pre_exec path sets pdeathsig AFTER setns.
             info!(target: "vm", vm_id = %self.vm_id, "using pre_exec setns for rootless VM");
             let mut c = Command::new(firecracker_bin);
             c.arg("--api-sock").arg(&self.socket_path);
             c
-        } else if let Some(holder_pid) = self.holder_pid {
-            // Use nsenter to enter user+network namespace with preserved credentials
-            // --preserve-credentials keeps UID, GID, and supplementary groups (including kvm)
-            // This allows KVM access while being in the isolated network namespace
-            // NOTE: This path is for baseline VMs that don't need mount namespace isolation
-            info!(target: "vm", vm_id = %self.vm_id, holder_pid = holder_pid, "using nsenter for rootless networking");
-            let mut c = Command::new("nsenter");
-            c.args([
-                "-t",
-                &holder_pid.to_string(),
-                "-U",
-                "-n",
-                "--preserve-credentials",
-                "--",
-            ]);
-            c.arg(firecracker_bin)
-                .arg("--api-sock")
-                .arg(&self.socket_path);
-            c
         } else {
-            // Direct Firecracker invocation (privileged mode)
+            // Direct Firecracker invocation (privileged/bridged mode)
             let mut c = Command::new(firecracker_bin);
             c.arg("--api-sock").arg(&self.socket_path);
             c

@@ -469,7 +469,7 @@ pasta <──────────────────┼── pasta0 �
 2. Pre-pasta setup via nsenter: create Firecracker TAP device only
 3. Start pasta attached to holder's namespace (creates pasta0 TAP)
 4. Post-pasta setup via nsenter: create bridge, attach pasta0 + tap-fc, add namespace IP
-5. Run Firecracker via nsenter: `nsenter -t HOLDER_PID -U -n -- firecracker ...`
+5. Run Firecracker via pre_exec setns (enters user+net namespace, then sets PR_SET_PDEATHSIG)
 6. Health checks via nsenter: `nsenter -t HOLDER_PID -U -n -- curl 10.0.2.100:80`
 
 **Pre-Pasta Setup Script** (Phase 2, executed via nsenter):
