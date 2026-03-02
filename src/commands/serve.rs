@@ -320,7 +320,6 @@ async fn create_sandbox(
         kernel_profile: None,
         vsock_dir: None,
         no_snapshot: true,
-        mlock: false,
         image_mode: None,
         rootfs_type: None,
         non_blocking_output: false,

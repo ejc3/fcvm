@@ -892,7 +892,6 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         network_config: &network_config,
         clone_ipv6: clone_ipv6_swap.as_ref().map(|(_, new)| new.clone()),
         track_dirty_pages: needs_dirty_tracking,
-        mlock: args.mlock,
     };
     let setup_result = super::common::restore_from_snapshot(
         restore_params,
@@ -941,6 +940,13 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     }
 
     let (mut vm_manager, mut holder_child) = setup_result.unwrap();
+
+    // Disable swap for Firecracker if requested via --no-swap
+    if args.no_swap {
+        if let Ok(pid) = vm_manager.pid() {
+            super::common::disable_cgroup_swap(pid);
+        }
+    }
 
     // For routed mode clones: fc-agent reconfigures eth0 with the new vm_ipv6 via MMDS.
     // The state already has the correct guest_ipv6 = vm_ipv6 (set by restore_from_snapshot).
@@ -1279,6 +1285,8 @@ mod tests {
             firecracker_args: Some("--enable-nv2".to_string()),
             hugepages: None,
             non_blocking_output: false,
+            no_dirty_tracking: false,
+            no_swap: false,
         };
 
         let runtime = snapshot_restore_runtime_config(&args).await;

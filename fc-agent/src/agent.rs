@@ -444,12 +444,6 @@ pub async fn run() -> Result<()> {
 /// then starts chronyd as a daemon. `makestep 1 -1` allows stepping the clock at
 /// any time, which is critical after snapshot restore when the drift can be hours.
 async fn start_chronyd() {
-    let chronyd = std::path::Path::new("/usr/sbin/chronyd");
-    if !chronyd.exists() {
-        eprintln!("[fc-agent] chronyd not found, NTP sync disabled");
-        return;
-    }
-
     // Read NTP server addresses from host's chrony.conf
     let host_conf = std::path::Path::new("/etc-host/chrony.conf");
     let mut server_addrs = Vec::new();
@@ -476,7 +470,7 @@ async fn start_chronyd() {
     let _ = tokio::process::Command::new("pkill").args(["-x", "chronyd"]).output().await;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    match tokio::process::Command::new(chronyd).args(["-u", "root"]).output().await {
+    match tokio::process::Command::new("/usr/sbin/chronyd").args(["-u", "root"]).output().await {
         Ok(out) if out.status.success() => {
             eprintln!("[fc-agent] chronyd started (NTP time sync)");
         }
