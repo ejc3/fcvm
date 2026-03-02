@@ -1060,7 +1060,7 @@ pub async fn poll_serve_ready(
 }
 
 /// Snapshot test fixture: starts a baseline VM, creates a snapshot, and starts
-/// a memory server. Cleans up all processes on drop.
+/// a memory server. Call `cleanup()` to kill all fixture processes.
 ///
 /// Use this to avoid repeating the baseline→snapshot→serve boilerplate in every
 /// snapshot/clone integration test.

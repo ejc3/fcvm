@@ -877,7 +877,11 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // clones from the same snapshot share physical memory.
     // CLI: --no-dirty-tracking disables it for clones.
     // Internal: startup_snapshot_base_key forces it on (needs diff snapshot).
-    let needs_dirty_tracking = if args.startup_snapshot_base_key.is_some() {
+    // Hugepages: always disable — KVM splits 2MB Stage 2 block mappings to 4K
+    // for dirty tracking, negating the TLB benefit of hugepages.
+    let needs_dirty_tracking = if hugepages {
+        false // hugepage VMs must not split 2MB TLB entries
+    } else if args.startup_snapshot_base_key.is_some() {
         true // podman path — needs dirty tracking for startup snapshot
     } else {
         !args.no_dirty_tracking // CLI default: on. --no-dirty-tracking: off.

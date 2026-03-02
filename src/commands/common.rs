@@ -690,7 +690,8 @@ pub struct RestoreParams<'a> {
     /// Enable KVM dirty page tracking. When true, KVM CoW-copies file-backed
     /// pages for dirty tracking (needed for subsequent diff snapshots from this VM).
     /// When false, pages stay shared through page cache — multiple clones from
-    /// the same snapshot share physical memory pages. Default: false for clones.
+    /// the same snapshot share physical memory pages. Disabled for hugepage VMs
+    /// (KVM would split 2MB TLB entries to 4K).
     pub track_dirty_pages: bool,
 }
 
