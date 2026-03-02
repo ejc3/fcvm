@@ -152,6 +152,11 @@ pub async fn run() -> Result<()> {
     };
     let has_shared_volume = mounted_fuse_paths.iter().any(|p| p == "/mnt/shared");
 
+    // Start chronyd for ongoing NTP time sync.
+    // Must be after FUSE mounts so /etc-host/chrony.conf is readable.
+    // makestep 1 -1 allows stepping the clock at any time (critical after snapshot restore).
+    start_chronyd().await;
+
     let mounted_disk_paths = if !plan.extra_disks.is_empty() {
         eprintln!(
             "[fc-agent] mounting {} extra disk(s)",
@@ -431,4 +436,70 @@ pub async fn run() -> Result<()> {
     output.shutdown().await;
 
     system::shutdown_vm(exit_code).await
+}
+
+/// Start chronyd for NTP time sync.
+///
+/// Writes a chrony config using the host's NTP servers (from /etc-host/chrony.conf),
+/// then starts chronyd as a daemon. `makestep 1 -1` allows stepping the clock at
+/// any time, which is critical after snapshot restore when the drift can be hours.
+async fn start_chronyd() {
+    let chronyd = std::path::Path::new("/usr/sbin/chronyd");
+    if !chronyd.exists() {
+        eprintln!("[fc-agent] chronyd not found, NTP sync disabled");
+        return;
+    }
+
+    // Read NTP server addresses from host's chrony.conf
+    let host_conf = std::path::Path::new("/etc-host/chrony.conf");
+    let mut server_addrs = Vec::new();
+    if let Ok(content) = tokio::fs::read_to_string(host_conf).await {
+        for line in content.lines() {
+            if line.starts_with("server ") {
+                if let Some(addr) = line.split_whitespace().nth(1) {
+                    server_addrs.push(addr.to_string());
+                }
+            }
+        }
+    }
+
+    // Write minimal config — servers are added dynamically via chronyc because
+    // chronyd's config parser doesn't handle bare IPv6 addresses correctly.
+    let config = "makestep 1 -1\ndriftfile /var/lib/chrony/drift\ncmdallow 127.0.0.1\n";
+
+    let _ = tokio::fs::create_dir_all("/var/lib/chrony").await;
+    let _ = tokio::fs::create_dir_all("/var/run/chrony").await;
+    let _ = tokio::fs::write("/etc/chrony.conf", config).await;
+
+    // Kill any existing chronyd (systemd may have started one as _chrony user,
+    // which can't send UDP in this VM). Then restart as root.
+    let _ = tokio::process::Command::new("pkill").args(["-x", "chronyd"]).output().await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    match tokio::process::Command::new(chronyd).args(["-u", "root"]).output().await {
+        Ok(out) if out.status.success() => {
+            eprintln!("[fc-agent] chronyd started (NTP time sync)");
+        }
+        Ok(out) => {
+            eprintln!(
+                "[fc-agent] WARNING: chronyd failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("[fc-agent] WARNING: failed to start chronyd: {}", e);
+            return;
+        }
+    }
+
+    // Add servers dynamically via chronyc (works reliably with IPv6)
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    for addr in &server_addrs {
+        let _ = tokio::process::Command::new("/usr/bin/chronyc")
+            .args(["add", "server", addr, "iburst"])
+            .output()
+            .await;
+    }
+    eprintln!("[fc-agent] added {} NTP servers via chronyc", server_addrs.len());
 }

@@ -367,6 +367,64 @@ pub fn merge_diff_snapshot(base_path: &Path, diff_path: &Path) -> Result<u64> {
 
 /// Find and validate Firecracker binary
 ///
+/// Disable swap for a process by setting memory.swap.max=0 on its cgroup.
+///
+/// VM anon pages are expensive to swap out and fault back in (random I/O, blocks
+/// guest threads). File cache pages (e.g. memory.bin) are cheap to re-fault
+/// (sequential btrfs reads with zstd decompression). With default swappiness=60,
+/// the kernel prefers swapping VM anon pages over evicting file cache, which
+/// causes severe I/O pressure and degraded VM performance.
+///
+/// Setting memory.swap.max=0 on the VM's cgroup prevents any of its pages from
+/// being swapped. The kernel will instead evict file cache pages when under
+/// memory pressure, which is the correct tradeoff for snapshot-restored VMs.
+fn disable_cgroup_swap(pid: u32) {
+    let cgroup_path = format!("/proc/{}/cgroup", pid);
+    let cgroup = match std::fs::read_to_string(&cgroup_path) {
+        Ok(content) => {
+            // cgroup v2 format: "0::/path/to/cgroup"
+            content
+                .lines()
+                .find_map(|line| line.strip_prefix("0::"))
+                .map(|s| s.to_string())
+        }
+        Err(e) => {
+            warn!(pid, error = %e, "failed to read cgroup for swap control");
+            None
+        }
+    };
+
+    if let Some(cgroup_rel) = cgroup {
+        // Extract the systemd scope/slice name from the cgroup path.
+        // e.g. "/user.slice/user-666007.slice/session-35238.scope" -> "session-35238.scope"
+        let scope_name = cgroup_rel.rsplit('/').next().unwrap_or("");
+        if !scope_name.is_empty() && scope_name.contains('.') {
+            // Use systemctl set-property so systemd tracks the setting and won't reset it.
+            // Direct writes to memory.swap.max get overridden by systemd on reload/refresh.
+            match std::process::Command::new("systemctl")
+                .args(["set-property", scope_name, "MemorySwapMax=0"])
+                .output()
+            {
+                Ok(out) if out.status.success() => {
+                    info!(pid, scope = scope_name, "disabled cgroup swap via systemctl");
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    warn!(pid, scope = scope_name, error = %stderr.trim(), "systemctl set-property failed, falling back to direct write");
+                    // Fallback: write directly (may get overridden by systemd)
+                    let swap_max_path = format!("/sys/fs/cgroup{}/memory.swap.max", cgroup_rel);
+                    let _ = std::fs::write(&swap_max_path, "0");
+                }
+                Err(e) => {
+                    warn!(pid, error = %e, "failed to run systemctl, falling back to direct write");
+                    let swap_max_path = format!("/sys/fs/cgroup{}/memory.swap.max", cgroup_rel);
+                    let _ = std::fs::write(&swap_max_path, "0");
+                }
+            }
+        }
+    }
+}
+
 /// Returns the path to the Firecracker binary if it exists and meets minimum version requirements.
 /// Fails with a clear error if Firecracker is not found or version is too old.
 ///
@@ -635,6 +693,14 @@ pub struct RestoreParams<'a> {
     /// For routed mode clones: the unique per-clone IPv6 that fc-agent should
     /// configure on eth0, replacing the snapshot's shared guest IPv6.
     pub clone_ipv6: Option<String>,
+    /// Enable KVM dirty page tracking. When true, KVM CoW-copies file-backed
+    /// pages for dirty tracking (needed for subsequent diff snapshots from this VM).
+    /// When false, pages stay shared through page cache — multiple clones from
+    /// the same snapshot share physical memory pages. Default: false for clones.
+    pub track_dirty_pages: bool,
+    /// Lock VM memory in RAM via mlockall(MCL_FUTURE) before spawning Firecracker.
+    /// Prevents kernel from swapping guest pages. Requires root or CAP_IPC_LOCK.
+    pub mlock: bool,
 }
 
 /// Restore a VM from a snapshot.
@@ -661,6 +727,8 @@ pub async fn restore_from_snapshot(
         restore_config,
         network_config,
         clone_ipv6,
+        track_dirty_pages,
+        mlock,
     } = params;
     let vm_dir = data_dir.join("disks");
 
@@ -909,10 +977,28 @@ pub async fn restore_from_snapshot(
         .clone()
         .or_else(|| std::env::var("FCVM_FIRECRACKER_ARGS").ok());
 
+    // Lock memory before spawning Firecracker. MCL_FUTURE ensures the child
+    // process inherits the lock — all guest memory pages will be pinned in RAM,
+    // preventing the kernel from swapping them. We unlock after spawn so the
+    // fcvm process itself doesn't stay locked.
+    if mlock {
+        let ret = unsafe { libc::mlockall(libc::MCL_FUTURE) };
+        if ret == 0 {
+            info!("mlockall(MCL_FUTURE) set — Firecracker will inherit memory lock");
+        } else {
+            warn!(errno = std::io::Error::last_os_error().raw_os_error(), "mlockall failed — VM pages may be swapped");
+        }
+    }
+
     vm_manager
         .start(&firecracker_bin, None, firecracker_args.as_deref())
         .await
         .context("starting Firecracker")?;
+
+    // Unlock the fcvm process now that Firecracker has inherited the lock
+    if mlock {
+        unsafe { libc::munlockall() };
+    }
 
     // For rootless mode with pasta: post_start starts pasta + bridge in the namespace
     let vm_pid = vm_manager.pid()?;
@@ -958,11 +1044,7 @@ pub async fn restore_from_snapshot(
         .load_snapshot(SnapshotLoad {
             snapshot_path: restore_config.vmstate_path.display().to_string(),
             mem_backend,
-            // Enable dirty tracking on non-hugepage VMs so subsequent snapshots
-            // from clones produce accurate diffs. Skip for hugepage VMs because
-            // KVM splits 2MB Stage 2 block mappings to 4K for dirty tracking,
-            // negating the TLB benefit of hugepages.
-            track_dirty_pages: Some(!restore_config.hugepages),
+            track_dirty_pages: Some(params.track_dirty_pages),
             resume_vm: Some(false), // Update devices before resume
             network_overrides: Some(vec![NetworkOverride {
                 iface_id: "eth0".to_string(),

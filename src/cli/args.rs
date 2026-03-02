@@ -262,6 +262,12 @@ pub struct RunArgs {
     #[arg(long)]
     pub no_snapshot: bool,
 
+    /// Lock VM memory in RAM (mlockall). Prevents the kernel from swapping
+    /// guest pages to disk. Requires root or CAP_IPC_LOCK + sufficient
+    /// RLIMIT_MEMLOCK.
+    #[arg(long)]
+    pub mlock: bool,
+
     /// Use non-blocking writes for container stdout/stderr on the host side.
     /// Without this flag, a slow or broken pipe reader (e.g., `fcvm ... | slow-consumer`)
     /// backpressures the entire output pipeline into the container, potentially deadlocking
@@ -350,6 +356,18 @@ pub struct SnapshotRunArgs {
     /// Execute command in container after clone is healthy (like fcvm exec -c)
     #[arg(long)]
     pub exec: Option<String>,
+
+    /// Disable KVM dirty page tracking. File-backed pages stay shared through
+    /// the host page cache — multiple clones from the same snapshot share
+    /// physical memory pages. Tradeoff: diff snapshots from this VM won't work.
+    #[arg(long)]
+    pub no_dirty_tracking: bool,
+
+    /// Lock VM memory in RAM (mlockall). Prevents the kernel from swapping
+    /// guest pages to disk. Requires root or CAP_IPC_LOCK + sufficient
+    /// RLIMIT_MEMLOCK.
+    #[arg(long)]
+    pub mlock: bool,
 
     // ========================================================================
     // Internal fields - not exposed via CLI, used for startup snapshot support

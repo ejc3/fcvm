@@ -321,6 +321,8 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 snapshot: Some(startup_key.clone()),
                 name: Some(args.name.clone()),
                 exec: None,
+                no_dirty_tracking: false, // podman needs dirty tracking for future snapshots
+                mlock: args.mlock,
                 startup_snapshot_base_key: None, // Already using startup snapshot
                 cpu: Some(args.cpu),
                 mem: Some(args.mem),
@@ -349,6 +351,8 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 snapshot: Some(key.clone()),
                 name: Some(args.name.clone()),
                 exec: None,
+                no_dirty_tracking: false, // podman needs dirty tracking for startup snapshot
+                mlock: args.mlock,
                 // Create startup snapshot if this config has a health check URL
                 startup_snapshot_base_key: args.health_check.as_ref().map(|_| key.clone()),
                 cpu: Some(args.cpu),

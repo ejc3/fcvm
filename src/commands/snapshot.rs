@@ -871,6 +871,17 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     };
 
     // Run clone setup using shared restore function
+    // Dirty tracking: KVM CoW-copies file-backed pages so it can track which
+    // pages are modified (needed for diff snapshots from this VM).
+    // Without it, pages stay shared through the host page cache — multiple
+    // clones from the same snapshot share physical memory.
+    // CLI: --no-dirty-tracking disables it for clones.
+    // Internal: startup_snapshot_base_key forces it on (needs diff snapshot).
+    let needs_dirty_tracking = if args.startup_snapshot_base_key.is_some() {
+        true // podman path — needs dirty tracking for startup snapshot
+    } else {
+        !args.no_dirty_tracking // CLI default: on. --no-dirty-tracking: off.
+    };
     let restore_params = RestoreParams {
         vm_id: &vm_id,
         vm_name: &vm_name,
@@ -880,6 +891,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         restore_config: &restore_config,
         network_config: &network_config,
         clone_ipv6: clone_ipv6_swap.as_ref().map(|(_, new)| new.clone()),
+        track_dirty_pages: needs_dirty_tracking,
+        mlock: args.mlock,
     };
     let setup_result = super::common::restore_from_snapshot(
         restore_params,
