@@ -144,9 +144,9 @@ pub async fn kill_stale_tcp_connections() {
     }
 
     // Kill only external connections using ss filter.
-    // Preserve: loopback (127.0.0.0/8, [::1]), VM gateway (10.0.2.0/24).
-    // Note: ss doesn't support IPv6 CIDR in brackets — [fd00::]/64 fails.
-    // fd00:: traffic goes through the gateway anyway (preserved by 10.0.2.0/24 rule).
+    // Preserve: loopback (127.0.0.0/8, [::1]), VM gateway IPv4 (10.0.2.0/24),
+    // and pasta ULA IPv6 (fd00::/64 — gateway fd00::2, guest fd00::100).
+    // Note: ss IPv6 CIDR uses bare prefix (fd00::/64), not bracketed ([fd00::]/64).
     let kill_output = Command::new("ss")
         .args([
             "-K",
@@ -164,6 +164,10 @@ pub async fn kill_stale_tcp_connections() {
             "!",
             "dst",
             "10.0.2.0/24",
+            "and",
+            "!",
+            "dst",
+            "fd00::/64",
             ")",
         ])
         .output()

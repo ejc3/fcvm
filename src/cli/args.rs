@@ -351,9 +351,10 @@ pub struct SnapshotRunArgs {
     #[arg(long)]
     pub exec: Option<String>,
 
-    /// Disable KVM dirty page tracking. File-backed pages stay shared through
-    /// the host page cache — multiple clones from the same snapshot share
-    /// physical memory pages. Tradeoff: diff snapshots from this VM won't work.
+    /// Disable KVM dirty page tracking. Reduces KVM overhead by not maintaining
+    /// dirty bitmaps, but diff snapshots from this VM won't work. Note: this
+    /// does NOT enable page sharing — MAP_PRIVATE CoW still copies pages to
+    /// Private_Clean on access (see DESIGN.md Clone Memory Sharing).
     #[arg(long)]
     pub no_dirty_tracking: bool,
 

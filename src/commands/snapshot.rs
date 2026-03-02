@@ -871,10 +871,9 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     };
 
     // Run clone setup using shared restore function
-    // Dirty tracking: KVM CoW-copies file-backed pages so it can track which
-    // pages are modified (needed for diff snapshots from this VM).
-    // Without it, pages stay shared through the host page cache — multiple
-    // clones from the same snapshot share physical memory.
+    // Dirty tracking: KVM maintains a dirty bitmap to track which pages are
+    // modified (needed for diff snapshots from this VM). Disabling it reduces
+    // KVM overhead but prevents subsequent diff snapshots.
     // CLI: --no-dirty-tracking disables it for clones.
     // Internal: startup_snapshot_base_key forces it on (needs diff snapshot).
     // Hugepages: always disable — KVM splits 2MB Stage 2 block mappings to 4K

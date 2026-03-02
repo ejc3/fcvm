@@ -687,11 +687,12 @@ pub struct RestoreParams<'a> {
     /// For routed mode clones: the unique per-clone IPv6 that fc-agent should
     /// configure on eth0, replacing the snapshot's shared guest IPv6.
     pub clone_ipv6: Option<String>,
-    /// Enable KVM dirty page tracking. When true, KVM CoW-copies file-backed
-    /// pages for dirty tracking (needed for subsequent diff snapshots from this VM).
-    /// When false, pages stay shared through page cache — multiple clones from
-    /// the same snapshot share physical memory pages. Disabled for hugepage VMs
-    /// (KVM would split 2MB TLB entries to 4K).
+    /// Enable KVM dirty page tracking. When true, KVM maintains dirty bitmaps
+    /// to track modified pages (needed for subsequent diff snapshots from this VM).
+    /// When false, reduces KVM overhead but diff snapshots won't work.
+    /// Note: disabling dirty tracking does NOT enable page sharing — MAP_PRIVATE
+    /// CoW still copies pages to Private_Clean on access (see DESIGN.md).
+    /// Disabled for hugepage VMs (KVM would split 2MB TLB entries to 4K).
     pub track_dirty_pages: bool,
 }
 
