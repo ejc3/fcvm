@@ -601,9 +601,29 @@ impl CloneFixture {
             }
         }
         if !http_ok {
+            // Dump clone log for diagnostics
+            let clone_log = std::fs::read_to_string(&clone_log_path).unwrap_or_default();
+            let port_fwd_lines: Vec<&str> = clone_log
+                .lines()
+                .filter(|l| {
+                    l.contains("port forward")
+                        || l.contains("ARP")
+                        || l.contains("pasta")
+                        || l.contains("verify")
+                        || l.contains("loopback")
+                })
+                .collect();
             panic!(
-                "unexpected HTTP response after 10 attempts: {}",
-                &last_response[..std::cmp::min(200, last_response.len())]
+                "clone HTTP failed after 10 attempts to {}:{}\n\
+                 last_response({} bytes): {}\n\
+                 clone_pid: {}\n\
+                 clone log port-forward lines:\n{}",
+                loopback_ip,
+                health_port,
+                last_response.len(),
+                &last_response[..std::cmp::min(200, last_response.len())],
+                clone_pid,
+                port_fwd_lines.join("\n")
             );
         }
 
