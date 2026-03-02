@@ -356,6 +356,31 @@ impl NetworkManager for RoutedNetwork {
             .output()
             .await;
 
+        // 7a. Ensure the default interface keeps accepting Router Advertisements.
+        //     Setting forwarding=1 on ANY interface causes the kernel to stop accepting
+        //     RAs (net.ipv6.conf.*.accept_ra default behavior changes from 1→0 when
+        //     forwarding is enabled). accept_ra=2 overrides this: accept RAs even with
+        //     forwarding enabled. Without this, the host's default IPv6 route expires
+        //     after reboot and all VM IPv6 traffic fails.
+        let default_iface = detect_default_ipv6_interface()
+            .await
+            .unwrap_or_else(|| "eth0".to_string());
+        let _ = tokio::process::Command::new("sysctl")
+            .args([
+                "-w",
+                &format!("net.ipv6.conf.{}.accept_ra=2", default_iface),
+            ])
+            .output()
+            .await;
+        let _ = tokio::process::Command::new("sysctl")
+            .args(["-w", "net.ipv6.conf.all.forwarding=1"])
+            .output()
+            .await;
+        let _ = tokio::process::Command::new("sysctl")
+            .args(["-w", "net.ipv6.conf.default.forwarding=1"])
+            .output()
+            .await;
+
         // 8. Assign link-local to host veth manually (auto-assignment fails when
         //    all.forwarding=1 from a previous run). Use EUI-64 from MAC + nodad.
         let host_ll = generate_link_local_from_mac(&host_veth)
