@@ -449,7 +449,8 @@ async fn start_chronyd() {
     let mut server_addrs = Vec::new();
     if let Ok(content) = tokio::fs::read_to_string(host_conf).await {
         for line in content.lines() {
-            if line.starts_with("server ") {
+            // Parse both "server" and "pool" directives (some distros only use pool)
+            if line.starts_with("server ") || line.starts_with("pool ") {
                 if let Some(addr) = line.split_whitespace().nth(1) {
                     server_addrs.push(addr.to_string());
                 }
