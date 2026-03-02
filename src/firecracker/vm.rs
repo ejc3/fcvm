@@ -36,9 +36,9 @@ pub struct VmManager {
     socket_path: PathBuf,
     log_path: Option<PathBuf>,
     namespace_id: Option<String>,
-    holder_pid: Option<u32>, // namespace holder PID for rootless mode (use nsenter to run FC)
-    user_namespace_path: Option<PathBuf>, // User namespace path for rootless clones (enter via setns in pre_exec)
-    net_namespace_path: Option<PathBuf>, // Net namespace path for rootless clones (enter via setns in pre_exec)
+    holder_pid: Option<u32>, // namespace holder PID for rootless mode (health checks, cleanup)
+    user_namespace_path: Option<PathBuf>, // User namespace path for rootless VMs (enter via setns in pre_exec)
+    net_namespace_path: Option<PathBuf>, // Net namespace path for rootless VMs (enter via setns in pre_exec)
     mount_redirects: Option<(Vec<PathBuf>, PathBuf)>, // (baseline_dirs, clone_dir) for mount namespace isolation
     process: Option<Child>,
     client: Option<FirecrackerClient>,
@@ -88,14 +88,11 @@ impl VmManager {
         self.holder_pid = Some(pid);
     }
 
-    /// Set user namespace path for rootless clones
+    /// Set user namespace path for rootless VMs (baselines + clones)
     ///
-    /// When set along with mount_redirects, pre_exec will enter this user namespace
-    /// first (via setns) before doing mount operations. This gives CAP_SYS_ADMIN
-    /// inside the user namespace, allowing unshare(CLONE_NEWNS) to succeed.
-    ///
-    /// Use this instead of set_holder_pid when mount namespace isolation is needed,
-    /// since nsenter wrapper runs AFTER pre_exec.
+    /// Pre_exec will enter this user namespace via setns before starting Firecracker.
+    /// This preserves PR_SET_PDEATHSIG (nsenter's internal setns clears it) and gives
+    /// CAP_SYS_ADMIN for mount operations when mount_redirects are set.
     pub fn set_user_namespace_path(&mut self, path: PathBuf) {
         self.user_namespace_path = Some(path);
     }
@@ -147,12 +144,9 @@ impl VmManager {
 
         // Build command based on mode:
         // 1. user_namespace_path set: direct Firecracker (namespaces entered via pre_exec setns)
-        // 2. holder_pid set (no user_namespace_path): use nsenter to enter existing namespace (rootless baseline)
+        //    — used for ALL rootless VMs to preserve PR_SET_PDEATHSIG
+        // 2. holder_pid set (no user_namespace_path): nsenter fallback (not normally reached)
         // 3. neither: direct Firecracker (privileged/bridged mode)
-        //
-        // For rootless clones with mount_redirects, we MUST use pre_exec setns instead of nsenter,
-        // because pre_exec runs BEFORE nsenter would enter the namespace, and we need CAP_SYS_ADMIN
-        // from the user namespace to do mount operations.
         let mut cmd = if self.user_namespace_path.is_some() {
             // Use direct Firecracker - namespaces will be entered via setns in pre_exec.
             // Used for ALL rootless VMs (baselines + clones) because nsenter's internal
