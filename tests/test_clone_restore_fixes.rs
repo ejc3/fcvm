@@ -27,7 +27,14 @@ async fn test_clock_synced_after_clone_restore() -> Result<()> {
     // Clone
     let (_, clone_name, _, _) = common::unique_names("clocksync-c");
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "run", "--pid", &fixture.serve_pid.to_string(), "--name", &clone_name],
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &fixture.serve_pid.to_string(),
+            "--name",
+            &clone_name,
+        ],
         &clone_name,
     )
     .await?;
@@ -43,7 +50,10 @@ async fn test_clock_synced_after_clone_restore() -> Result<()> {
     let vm_epoch: u64 = vm_time.trim().parse().context("parsing VM epoch")?;
     let drift = (host_epoch as i64 - vm_epoch as i64).unsigned_abs();
 
-    println!("  Host epoch: {}, VM epoch: {}, drift: {}s", host_epoch, vm_epoch, drift);
+    println!(
+        "  Host epoch: {}, VM epoch: {}, drift: {}s",
+        host_epoch, vm_epoch, drift
+    );
     assert!(
         drift < 5,
         "VM clock drifted {}s from host after restore — clock sync failed",
@@ -67,7 +77,14 @@ async fn test_ss_filter_preserves_gateway_after_restore() -> Result<()> {
 
     let (_, clone_name, _, _) = common::unique_names("ssfilter-c");
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "run", "--pid", &fixture.serve_pid.to_string(), "--name", &clone_name],
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &fixture.serve_pid.to_string(),
+            "--name",
+            &clone_name,
+        ],
         &clone_name,
     )
     .await?;
@@ -85,10 +102,19 @@ async fn test_ss_filter_preserves_gateway_after_restore() -> Result<()> {
     // Verify container networking works — nginx must respond on localhost
     let container_out = common::exec_in_container(
         clone_pid,
-        &["wget", "-q", "-O", "-", "--timeout=5", "http://127.0.0.1:80/"],
+        &[
+            "wget",
+            "-q",
+            "-O",
+            "-",
+            "--timeout=5",
+            "http://127.0.0.1:80/",
+        ],
     )
     .await
-    .context("nginx should be reachable after restore — ss -K may have killed gateway connections")?;
+    .context(
+        "nginx should be reachable after restore — ss -K may have killed gateway connections",
+    )?;
     assert!(
         container_out.contains("nginx") || container_out.contains("Welcome"),
         "nginx should respond after restore"
@@ -113,9 +139,12 @@ async fn test_no_swap_creates_cgroup() -> Result<()> {
     println!("  Spawning clone with --no-swap...");
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
         &[
-            "snapshot", "run",
-            "--pid", &fixture.serve_pid.to_string(),
-            "--name", &clone_name,
+            "snapshot",
+            "run",
+            "--pid",
+            &fixture.serve_pid.to_string(),
+            "--name",
+            &clone_name,
             "--no-swap",
         ],
         &clone_name,
@@ -126,11 +155,19 @@ async fn test_no_swap_creates_cgroup() -> Result<()> {
 
     // Find the Firecracker process (child of the clone fcvm process)
     let fc_pid_out = tokio::process::Command::new("pgrep")
-        .args(["-f", "firecracker.*api-sock", "--parent", &clone_pid.to_string()])
+        .args([
+            "-f",
+            "firecracker.*api-sock",
+            "--parent",
+            &clone_pid.to_string(),
+        ])
         .output()
         .await?;
     let fc_pid_str = String::from_utf8_lossy(&fc_pid_out.stdout);
-    let fc_pid: u32 = fc_pid_str.trim().lines().next()
+    let fc_pid: u32 = fc_pid_str
+        .trim()
+        .lines()
+        .next()
         .context("no firecracker child found")?
         .parse()
         .context("parse fc pid")?;
@@ -151,11 +188,15 @@ async fn test_no_swap_creates_cgroup() -> Result<()> {
         cgroup_path
     );
 
-    let swap_max = std::fs::read_to_string(format!(
-        "/sys/fs/cgroup{}/memory.swap.max", cgroup_path
-    ))
-    .context("reading memory.swap.max")?;
-    assert_eq!(swap_max.trim(), "0", "memory.swap.max should be 0, got: {}", swap_max.trim());
+    let swap_max =
+        std::fs::read_to_string(format!("/sys/fs/cgroup{}/memory.swap.max", cgroup_path))
+            .context("reading memory.swap.max")?;
+    assert_eq!(
+        swap_max.trim(),
+        "0",
+        "memory.swap.max should be 0, got: {}",
+        swap_max.trim()
+    );
     println!("  ✓ Firecracker in fcvm.slice with memory.swap.max=0");
 
     // Cleanup
@@ -176,24 +217,35 @@ async fn test_no_dirty_tracking_clone() -> Result<()> {
     println!("  Spawning clone with --no-dirty-tracking...");
     let (_clone_child, clone_pid, log_path) = common::spawn_fcvm_with_log_path(
         &[
-            "snapshot", "run",
-            "--pid", &fixture.serve_pid.to_string(),
-            "--name", &clone_name,
+            "snapshot",
+            "run",
+            "--pid",
+            &fixture.serve_pid.to_string(),
+            "--name",
+            &clone_name,
             "--no-dirty-tracking",
         ],
         &clone_name,
     )
     .await?;
     common::poll_health_by_pid(clone_pid, 120).await?;
-    println!("  ✓ Clone healthy with --no-dirty-tracking (PID: {})", clone_pid);
+    println!(
+        "  ✓ Clone healthy with --no-dirty-tracking (PID: {})",
+        clone_pid
+    );
 
     // Verify the clone actually works (exec something)
     let out = common::exec_in_container(clone_pid, &["echo", "no-dirty-works"]).await?;
-    assert!(out.contains("no-dirty-works"), "exec should work on no-dirty-tracking clone");
+    assert!(
+        out.contains("no-dirty-works"),
+        "exec should work on no-dirty-tracking clone"
+    );
     println!("  ✓ Container exec works");
 
     // Verify track_dirty_pages=false in the Firecracker debug log
-    let log_content = tokio::fs::read_to_string(&log_path).await.unwrap_or_default();
+    let log_content = tokio::fs::read_to_string(&log_path)
+        .await
+        .unwrap_or_default();
     assert!(
         log_content.contains("track_dirty_pages\":false")
             || log_content.contains("track_dirty_pages: false")
@@ -202,7 +254,9 @@ async fn test_no_dirty_tracking_clone() -> Result<()> {
         "log should show track_dirty_pages=false. Log snippet: {}",
         log_content
             .lines()
-            .filter(|l| l.contains("track_dirty") || l.contains("load_snapshot") || l.contains("snapshot load"))
+            .filter(|l| l.contains("track_dirty")
+                || l.contains("load_snapshot")
+                || l.contains("snapshot load"))
             .collect::<Vec<_>>()
             .join("\n")
     );

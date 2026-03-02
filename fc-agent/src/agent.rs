@@ -467,10 +467,17 @@ async fn start_chronyd() {
 
     // Kill any existing chronyd (systemd may have started one as _chrony user,
     // which can't send UDP in this VM). Then restart as root.
-    let _ = tokio::process::Command::new("pkill").args(["-x", "chronyd"]).output().await;
+    let _ = tokio::process::Command::new("pkill")
+        .args(["-x", "chronyd"])
+        .output()
+        .await;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    match tokio::process::Command::new("/usr/sbin/chronyd").args(["-u", "root"]).output().await {
+    match tokio::process::Command::new("/usr/sbin/chronyd")
+        .args(["-u", "root"])
+        .output()
+        .await
+    {
         Ok(out) if out.status.success() => {
             eprintln!("[fc-agent] chronyd started (NTP time sync)");
         }
@@ -495,5 +502,8 @@ async fn start_chronyd() {
             .output()
             .await;
     }
-    eprintln!("[fc-agent] added {} NTP servers via chronyc", server_addrs.len());
+    eprintln!(
+        "[fc-agent] added {} NTP servers via chronyc",
+        server_addrs.len()
+    );
 }

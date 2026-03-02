@@ -150,10 +150,20 @@ pub async fn kill_stale_tcp_connections() {
     let kill_output = Command::new("ss")
         .args([
             "-K",
-            "state", "established",
-            "(", "!", "dst", "127.0.0.0/8",
-            "and", "!", "dst", "[::1]",
-            "and", "!", "dst", "10.0.2.0/24",
+            "state",
+            "established",
+            "(",
+            "!",
+            "dst",
+            "127.0.0.0/8",
+            "and",
+            "!",
+            "dst",
+            "[::1]",
+            "and",
+            "!",
+            "dst",
+            "10.0.2.0/24",
             ")",
         ])
         .output()

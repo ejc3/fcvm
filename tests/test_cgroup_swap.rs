@@ -47,11 +47,9 @@ mod tests {
         );
 
         // Verify memory.swap.max=0
-        let swap_max = std::fs::read_to_string(format!(
-            "/sys/fs/cgroup{}/memory.swap.max",
-            new_path
-        ))
-        .expect("failed to read memory.swap.max");
+        let swap_max =
+            std::fs::read_to_string(format!("/sys/fs/cgroup{}/memory.swap.max", new_path))
+                .expect("failed to read memory.swap.max");
         assert_eq!(swap_max.trim(), "0", "swap should be disabled");
 
         // Cleanup
@@ -78,10 +76,8 @@ mod tests {
         fcvm::commands::common::disable_cgroup_swap(pid1);
         fcvm::commands::common::disable_cgroup_swap(pid2);
 
-        let cg1 = std::fs::read_to_string(format!("/proc/{}/cgroup", pid1))
-            .expect("read cgroup 1");
-        let cg2 = std::fs::read_to_string(format!("/proc/{}/cgroup", pid2))
-            .expect("read cgroup 2");
+        let cg1 = std::fs::read_to_string(format!("/proc/{}/cgroup", pid1)).expect("read cgroup 1");
+        let cg2 = std::fs::read_to_string(format!("/proc/{}/cgroup", pid2)).expect("read cgroup 2");
         let path1 = cg1.lines().find_map(|l| l.strip_prefix("0::")).unwrap();
         let path2 = cg2.lines().find_map(|l| l.strip_prefix("0::")).unwrap();
 
@@ -91,11 +87,8 @@ mod tests {
 
         // Both should have swap disabled
         for (path, pid) in [(path1, pid1), (path2, pid2)] {
-            let swap = std::fs::read_to_string(format!(
-                "/sys/fs/cgroup{}/memory.swap.max",
-                path
-            ))
-            .unwrap_or_else(|e| panic!("failed to read swap for pid {}: {}", pid, e));
+            let swap = std::fs::read_to_string(format!("/sys/fs/cgroup{}/memory.swap.max", path))
+                .unwrap_or_else(|e| panic!("failed to read swap for pid {}: {}", pid, e));
             assert_eq!(swap.trim(), "0", "swap should be 0 for pid {}", pid);
         }
 
