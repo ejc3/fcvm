@@ -271,6 +271,14 @@ clean-test-data: build
 	@echo "==> Cleaned test data (preserved cached assets)"
 
 build:
+	@# Detect stale cargo cache: if build script output is missing, the cache is
+	@# corrupt (e.g., from force-push rewriting history or toolchain change).
+	@# cargo won't rebuild in this state — it silently uses stale fingerprints.
+	@if ls target/release/build/fcvm-*/output >/dev/null 2>&1; then true; \
+	elif [ -d target/release/build ]; then \
+		echo "==> Stale cargo cache detected (missing build script output), cleaning..."; \
+		rm -rf target/release/build target/release/deps target/release/.fingerprint; \
+	fi
 	@echo "==> Building..."
 	CARGO_TARGET_DIR=target $(CARGO) build --release -p fcvm
 	CARGO_TARGET_DIR=target $(CARGO) build --release -p fc-agent --target $(MUSL_TARGET)
