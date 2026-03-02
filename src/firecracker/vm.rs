@@ -154,17 +154,19 @@ impl VmManager {
         // because pre_exec runs BEFORE nsenter would enter the namespace, and we need CAP_SYS_ADMIN
         // from the user namespace to do mount operations.
         let mut cmd = if self.user_namespace_path.is_some() {
-            // Use direct Firecracker - namespaces will be entered via setns in pre_exec
-            // This is required for rootless clones that need mount namespace isolation
-            info!(target: "vm", vm_id = %self.vm_id, "using pre_exec setns for rootless clone");
+            // Use direct Firecracker - namespaces will be entered via setns in pre_exec.
+            // Used for ALL rootless VMs (baselines + clones) because nsenter's internal
+            // setns(CLONE_NEWUSER) clears PR_SET_PDEATHSIG, leaving Firecracker orphaned
+            // if fcvm is SIGKILL'd. The pre_exec path sets pdeathsig AFTER setns.
+            info!(target: "vm", vm_id = %self.vm_id, "using pre_exec setns for rootless VM");
             let mut c = Command::new(firecracker_bin);
             c.arg("--api-sock").arg(&self.socket_path);
             c
         } else if let Some(holder_pid) = self.holder_pid {
-            // Use nsenter to enter user+network namespace with preserved credentials
-            // --preserve-credentials keeps UID, GID, and supplementary groups (including kvm)
-            // This allows KVM access while being in the isolated network namespace
-            // NOTE: This path is for baseline VMs that don't need mount namespace isolation
+            // Fallback: nsenter to enter user+network namespace.
+            // NOTE: This path is not normally reached — rootless VMs now use pre_exec
+            // setns (above) which correctly preserves PR_SET_PDEATHSIG. nsenter's
+            // internal setns(CLONE_NEWUSER) clears pdeathsig. Kept as safety net.
             info!(target: "vm", vm_id = %self.vm_id, holder_pid = holder_pid, "using nsenter for rootless networking");
             let mut c = Command::new("nsenter");
             c.args([

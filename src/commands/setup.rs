@@ -126,8 +126,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         .context("setting up fc-agent initrd")?;
     println!("  ✓ Initrd ready: {}", initrd_path.display());
 
-    if args.kernel_profile.is_some() {
-        let profile_name = args.kernel_profile.as_ref().unwrap();
+    if let Some(profile_name) = &args.kernel_profile {
         println!("\nFor '{}' profile, use:", profile_name);
         println!(
             "  fcvm podman run --kernel-profile {} --privileged ...",

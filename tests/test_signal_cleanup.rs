@@ -503,9 +503,13 @@ fn test_sigkill_kills_firecracker_rootless() -> Result<()> {
         anyhow::bail!("VM did not become healthy within 120 seconds");
     }
 
-    // Find the specific firecracker process for THIS VM
+    // Find the specific child processes for THIS VM
     let our_fc_pid = find_firecracker_for_fcvm(fcvm_pid);
-    println!("Our firecracker PID: {:?}", our_fc_pid);
+    let our_holder_pid = find_holder_for_fcvm(fcvm_pid);
+    println!(
+        "Our firecracker PID: {:?}, holder PID: {:?}",
+        our_fc_pid, our_holder_pid
+    );
 
     assert!(
         our_fc_pid.is_some(),
@@ -525,18 +529,20 @@ fn test_sigkill_kills_firecracker_rootless() -> Result<()> {
     let _ = fcvm.wait();
     println!("fcvm process reaped");
 
-    // PR_SET_PDEATHSIG delivers SIGKILL to Firecracker immediately when parent dies.
+    // PR_SET_PDEATHSIG delivers SIGKILL to child processes when parent dies.
     // Poll briefly in case of scheduling delay.
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
-        if !process_exists(fc_pid) {
+        let fc_alive = process_exists(fc_pid);
+        let holder_alive = our_holder_pid.is_some_and(process_exists);
+        if !fc_alive && !holder_alive {
             break;
         }
         std::thread::sleep(common::POLL_INTERVAL);
     }
 
-    let still_running = process_exists(fc_pid);
-    if still_running {
+    let fc_still_running = process_exists(fc_pid);
+    if fc_still_running {
         println!(
             "BUG: firecracker (PID {}) still running after fcvm SIGKILL!",
             fc_pid
@@ -544,10 +550,27 @@ fn test_sigkill_kills_firecracker_rootless() -> Result<()> {
         let _ = send_signal(fc_pid, "KILL");
     }
     assert!(
-        !still_running,
+        !fc_still_running,
         "firecracker (PID {}) should die via PR_SET_PDEATHSIG when fcvm is SIGKILL'd",
         fc_pid
     );
+
+    if let Some(holder_pid) = our_holder_pid {
+        let holder_still_running = process_exists(holder_pid);
+        if holder_still_running {
+            println!(
+                "BUG: namespace holder (PID {}) still running after fcvm SIGKILL!",
+                holder_pid
+            );
+            let _ = send_signal(holder_pid, "KILL");
+        }
+        assert!(
+            !holder_still_running,
+            "namespace holder (PID {}) should die via PR_SET_PDEATHSIG when fcvm is SIGKILL'd",
+            holder_pid
+        );
+        println!("Holder PID {} correctly cleaned up", holder_pid);
+    }
 
     assert!(
         !process_exists(fcvm_pid),
@@ -618,6 +641,27 @@ fn find_pasta_for_fcvm(fcvm_pid: u32) -> Option<u32> {
             // Check if this pasta's parent chain includes our fcvm PID
             if is_descendant_of(pasta_pid, fcvm_pid) {
                 return Some(pasta_pid);
+            }
+        }
+    }
+    None
+}
+
+fn find_holder_for_fcvm(fcvm_pid: u32) -> Option<u32> {
+    let output = Command::new("pgrep")
+        .args(["-f", "sleep infinity"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Ok(pid) = line.trim().parse::<u32>() {
+            if is_descendant_of(pid, fcvm_pid) {
+                return Some(pid);
             }
         }
     }

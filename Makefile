@@ -242,7 +242,12 @@ check-disk:
 # CRITICAL: Uses fcvm's proper cleanup commands to handle btrfs CoW correctly
 clean-test-data: build
 	@echo "==> Killing stale VM processes from previous runs..."
-	@sudo pkill -9 firecracker 2>/dev/null; sudo pkill -9 pasta 2>/dev/null; sleep 1; true
+	@sudo pkill -9 firecracker 2>/dev/null; sudo pkill -9 pasta 2>/dev/null; sudo kill -9 $$(pgrep -x sleep -P 1) 2>/dev/null; sleep 1; true
+	@echo "==> Cleaning stale network namespaces..."
+	@for ns in $$(sudo ip netns list 2>/dev/null | grep '^fcvm-' | awk '{print $$1}'); do sudo ip netns del "$$ns" 2>/dev/null && echo "  deleted $$ns"; done; true
+	@echo "==> Cleaning stale iptables rules from fcvm VMs..."
+	@sudo iptables-save -t nat 2>/dev/null | grep -E 'MASQUERADE.*(172\.30\.|10\.0\.)' | sed 's/^-A//' | while read rule; do sudo iptables -t nat -D $$rule 2>/dev/null; done; true
+	@sudo ip6tables-save -t nat 2>/dev/null | grep 'MASQUERADE' | grep -v NETAVARK | sed 's/^-A//' | while read rule; do sudo ip6tables -t nat -D $$rule 2>/dev/null; done; true
 	@echo "==> Force unmounting stale FUSE mounts..."
 	@# Find and force unmount any FUSE mounts from previous test runs
 	@mount | grep fuse | grep -E '/tmp|/var/tmp' | cut -d' ' -f3 | xargs -r -I{} fusermount3 -u -z {} 2>/dev/null || true

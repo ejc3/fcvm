@@ -104,9 +104,7 @@ jobs:
           path: fcvm
       - uses: ./fcvm/.github/actions/checkout-deps
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+        uses: dtolnay/rust-toolchain@1.93.0
       - name: Get dependency SHAs
         id: deps
         run: |
@@ -151,7 +149,7 @@ jobs:
           path: fcvm
       - uses: ./fcvm/.github/actions/checkout-deps
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.93.0
       - name: Get dependency SHAs
         id: deps
         run: |
@@ -182,7 +180,7 @@ jobs:
           path: fcvm
       - uses: ./fcvm/.github/actions/checkout-deps
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.93.0
       - name: Get dependency SHAs
         id: deps
         run: |
@@ -247,8 +245,10 @@ jobs:
       - uses: ./fcvm/.github/actions/checkout-deps
       - name: Install Rust
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs | sh -s -- --default-toolchain none -y
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          # rust-toolchain.toml handles version + components; just trigger install
+          rustup show active-toolchain || true
       - name: Get dependency SHAs
         id: deps
         run: |
@@ -462,8 +462,10 @@ jobs:
       - uses: ./fcvm/.github/actions/checkout-deps
       - name: Install Rust
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs | sh -s -- --default-toolchain none -y
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          # rust-toolchain.toml handles version + components; just trigger install
+          rustup show active-toolchain || true
       - name: Get dependency SHAs
         id: deps
         run: |

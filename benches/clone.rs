@@ -295,9 +295,48 @@ impl CloneFixture {
         }
 
         if !last_response.contains("200 OK") {
+            let clone_log = std::fs::read_to_string(&clone_log_path).unwrap_or_default();
+
+            let ss_check = Command::new("ss")
+                .args(["-tlnp", "src", &loopback_ip])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+
+            let connect_err = TcpStream::connect_timeout(
+                &format!("{}:{}", loopback_ip, health_port).parse().unwrap(),
+                Duration::from_secs(2),
+            )
+            .err()
+            .map(|e| format!("{}", e))
+            .unwrap_or_else(|| "connect succeeded".to_string());
+
+            let log_tail: String = clone_log
+                .lines()
+                .rev()
+                .take(30)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+
             panic!(
-                "unexpected HTTP response after 3 attempts: {}",
-                &last_response[..std::cmp::min(200, last_response.len())]
+                "clone HTTP failed after 3 attempts\n\
+                 addr: {}:{}\n\
+                 last_response: {} bytes\n\
+                 clone_pid: {}\n\
+                 connect_err: {}\n\
+                 \n=== listening sockets on {} ===\n{}\
+                 \n=== clone log (last 30 lines) ===\n{}",
+                loopback_ip,
+                health_port,
+                last_response.len(),
+                clone_pid,
+                connect_err,
+                loopback_ip,
+                ss_check,
+                log_tail,
             );
         }
 

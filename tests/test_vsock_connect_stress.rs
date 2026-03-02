@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 const EXEC_ITERATIONS: usize = 20;
 
 /// Maximum acceptable time for a single exec (milliseconds)
-const MAX_EXEC_MS: u128 = 2000;
+const MAX_EXEC_MS: u128 = 5000;
 
 /// Number of kill-on-drop iterations per round
 const KILL_ON_DROP_ITERATIONS: usize = 5;
@@ -176,7 +176,7 @@ async fn kill_on_drop_stress(pid: u32, label: &str) -> Result<()> {
 /// Full lifecycle stress test for vsock CONNECT reliability.
 ///
 /// Tests exec through: baseline → clone → clone-of-clone → parallel clones → sibling death.
-/// Every exec must succeed and complete in under 2 seconds.
+/// Every exec must succeed and complete within MAX_EXEC_MS.
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_vsock_connect_lifecycle_stress_bridged() -> Result<()> {

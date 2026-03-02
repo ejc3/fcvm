@@ -87,7 +87,7 @@ async fn setup_namespace_mappings(pid: u32) -> anyhow::Result<()> {
     let self_ino = std::fs::metadata("/proc/self/ns/user")
         .context("reading own user namespace inode")?
         .ino();
-    let ns_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let ns_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         if std::fs::metadata(format!("/proc/{pid}/ns/user"))
             .map(|m| m.ino() != self_ino)
@@ -157,18 +157,29 @@ pub async fn spawn_namespace_holder(
     loop {
         attempt += 1;
 
-        let child = tokio::process::Command::new(&holder_cmd[0])
-            .args(&holder_cmd[1..])
+        let mut cmd = tokio::process::Command::new(&holder_cmd[0]);
+        cmd.args(&holder_cmd[1..])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "spawning namespace holder (attempt {}): {:?}",
-                    attempt, holder_cmd
-                )
-            })?;
+            .stderr(std::process::Stdio::piped());
+
+        // Kill holder if parent (fcvm) dies. Without this, holders orphan to init
+        // and accumulate when fcvm is SIGKILL'd or crashes.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let child = cmd.spawn().with_context(|| {
+            format!(
+                "spawning namespace holder (attempt {}): {:?}",
+                attempt, holder_cmd
+            )
+        })?;
 
         let holder_pid = child.id().context("getting holder process PID")?;
         if attempt > 1 {
