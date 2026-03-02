@@ -25,14 +25,16 @@ pub async fn flush_arp_cache() {
     }
 }
 
-/// Send gratuitous ARP and verify gateway reachability.
+/// Send ARP to the gateway and verify layer 2 reachability.
 ///
-/// Pings the default gateway and WAITS for a reply. This serves two purposes:
-/// 1. The ARP REQUEST broadcast teaches the network (pasta/bridge) our MAC address
-/// 2. Waiting for the reply ensures the egress path is fully operational
+/// After snapshot restore, the bridge/network has stale MAC→port mappings from
+/// the baseline VM. Sending an ARP request to the gateway accomplishes:
+/// 1. The ARP REQUEST broadcast teaches the network (bridge/pasta) our MAC
+/// 2. Waiting for the ARP REPLY ensures the L2 path is operational
 ///
-/// Must complete before signaling "ready" to the host, otherwise the host may
-/// start sending egress traffic before ARP resolution is complete.
+/// Uses `arping` instead of `ping` because ping requires ICMP raw sockets which
+/// fail in rootless mode (pasta doesn't respond to ICMP), causing a 3s timeout.
+/// `arping` operates at layer 2 — pasta responds to ARP even in rootless mode.
 pub async fn send_gratuitous_arp() {
     let route_output = Command::new("ip")
         .args(["route", "show", "default"])
@@ -52,38 +54,34 @@ pub async fn send_gratuitous_arp() {
     };
 
     let Some(gateway) = gateway else {
-        eprintln!("[fc-agent] WARNING: could not determine gateway for gratuitous ARP");
+        eprintln!("[fc-agent] WARNING: could not determine gateway for ARP");
         return;
     };
 
-    eprintln!(
-        "[fc-agent] pinging gateway {} (ARP + verify egress path)",
-        gateway
-    );
-
-    // Wait for ping to complete — ensures ARP is resolved and gateway is reachable
-    // before the host starts sending egress traffic.
-    match Command::new("ping")
-        .args(["-c", "1", "-W", "3", &gateway])
+    // arping -c 1 -w 1 -I eth0 <gateway>
+    // Sends an ARP request and waits for a reply. This verifies L2 connectivity
+    // and teaches the bridge/pasta our MAC→port mapping via the request's source.
+    match Command::new("arping")
+        .args(["-c", "1", "-w", "1", "-I", "eth0", &gateway])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
         .await
     {
         Ok(output) if output.status.success() => {
-            eprintln!("[fc-agent] gateway {} reachable", gateway);
+            eprintln!("[fc-agent] gateway {} ARP resolved", gateway);
         }
         Ok(output) => {
             eprintln!(
-                "[fc-agent] WARNING: gateway {} ping failed (exit {})",
+                "[fc-agent] WARNING: gateway {} arping failed (exit {})",
                 gateway,
                 output.status.code().unwrap_or(-1)
             );
         }
         Err(e) => {
             eprintln!(
-                "[fc-agent] WARNING: failed to ping gateway {}: {}",
-                gateway, e
+                "[fc-agent] WARNING: arping not available ({}), skipping ARP",
+                e
             );
         }
     }
@@ -121,7 +119,11 @@ pub async fn kill_stale_tcp_connections() {
             continue;
         }
         let peer = fields[3];
-        if peer.starts_with("127.0.0.1:") || peer.starts_with("[::1]:") || peer.starts_with("::1:")
+        if peer.starts_with("127.")
+            || peer.starts_with("[::1]:")
+            || peer.starts_with("::1:")
+            || peer.starts_with("10.0.2.")
+            || peer.starts_with("[fd00:")
         {
             local_count += 1;
         } else {
@@ -139,21 +141,28 @@ pub async fn kill_stale_tcp_connections() {
         return;
     }
 
-    // Kill only non-local connections using ss filter
-    // "! dst 127.0.0.1" excludes IPv4 loopback; "! dst [::1]" excludes IPv6 loopback
-    // Note: ss filter syntax uses "!" (not "not") as the negation operator,
-    // and IPv6 addresses must be bracketed as "[::1]" to avoid parse errors.
+    // Kill only external connections using ss filter.
+    // Preserve: loopback (127.0.0.0/8, [::1]), VM gateway (10.0.2.0/24).
+    // Note: ss doesn't support IPv6 CIDR in brackets — [fd00::]/64 fails.
+    // fd00:: traffic goes through the gateway anyway (preserved by 10.0.2.0/24 rule).
     let kill_output = Command::new("ss")
         .args([
             "-K",
             "state",
             "established",
+            "(",
             "!",
             "dst",
-            "127.0.0.1",
+            "127.0.0.0/8",
+            "and",
             "!",
             "dst",
             "[::1]",
+            "and",
+            "!",
+            "dst",
+            "10.0.2.0/24",
+            ")",
         ])
         .output()
         .await;

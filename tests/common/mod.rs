@@ -1059,6 +1059,76 @@ pub async fn poll_serve_ready(
     }
 }
 
+/// Snapshot test fixture: starts a baseline VM, creates a snapshot, and starts
+/// a memory server. Call `cleanup()` to kill all fixture processes.
+///
+/// Use this to avoid repeating the baseline→snapshot→serve boilerplate in every
+/// snapshot/clone integration test.
+///
+/// # Example
+/// ```rust
+/// let fixture = SnapshotFixture::new("mytest", "bridged").await?;
+/// let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+///     &["snapshot", "run", "--pid", &fixture.serve_pid.to_string(), "--name", "clone1"],
+///     "clone1",
+/// ).await?;
+/// common::poll_health_by_pid(clone_pid, 120).await?;
+/// // fixture drops and kills baseline + serve processes
+/// ```
+pub struct SnapshotFixture {
+    pub baseline_pid: u32,
+    pub serve_pid: u32,
+    pub snapshot_name: String,
+    pids_to_kill: Vec<u32>,
+}
+
+impl SnapshotFixture {
+    /// Create a new snapshot fixture with a baseline VM, snapshot, and memory server.
+    pub async fn new(prefix: &str, network: &str) -> anyhow::Result<Self> {
+        let (baseline_name, _, snapshot_name, _) = unique_names(prefix);
+
+        // Start baseline
+        let (_child, baseline_pid) = spawn_fcvm_with_logs(
+            &[
+                "podman",
+                "run",
+                "--name",
+                &baseline_name,
+                "--network",
+                network,
+                TEST_IMAGE,
+            ],
+            &baseline_name,
+        )
+        .await?;
+        poll_health_by_pid(baseline_pid, 120).await?;
+
+        // Snapshot
+        create_snapshot_by_pid(baseline_pid, &snapshot_name).await?;
+
+        // Serve
+        let serve_log_name = format!("{}-serve", snapshot_name);
+        let (_serve_child, serve_pid) =
+            spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], &serve_log_name).await?;
+        poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+
+        Ok(Self {
+            baseline_pid,
+            serve_pid,
+            snapshot_name,
+            pids_to_kill: vec![serve_pid, baseline_pid],
+        })
+    }
+
+    /// Kill all fixture processes (serve + baseline). Call this before killing clones
+    /// if you want clones to exit first, or after if you want graceful clone shutdown.
+    pub async fn cleanup(&self) {
+        for &pid in &self.pids_to_kill {
+            kill_process(pid).await;
+        }
+    }
+}
+
 /// Build localhost/nested-test image (convenience wrapper)
 pub async fn ensure_nested_image() -> anyhow::Result<()> {
     ensure_nested_container("localhost/nested-test", "Containerfile.nested").await

@@ -2191,6 +2191,101 @@ Additional defense:
 
 ---
 
+## Clone Memory Sharing
+
+### Problem
+
+Multiple clones from the same snapshot should share physical memory pages for read-only data.
+A large container VM may have 131 GB of guest memory, but most of it is identical across clones
+(kernel, application code, page cache). Only pages each clone writes to should be unique
+(Private_Dirty).
+
+### Current State (2026-02-28)
+
+Three memory backends were tested. Results for two 131 GB clones:
+
+| Backend | Per-clone RSS | Shared | Private_Clean | Pressure | Status |
+|---------|--------------|--------|---------------|----------|--------|
+| **File** (`MAP_PRIVATE` on memory.bin) | 44 GB | 1.8 MB | 33.6 GB | 40% | Broken — KVM CoW-copies pages into Private_Clean even for reads |
+| **UFFD MISSING+COPY** | 21 GB | 0 | 0 | 11% | Works but no sharing — each fault copies data to fresh anon page |
+| **UFFD MINOR+CONTINUE** (not implemented) | ~5 GB (est.) | ~80 GB (est.) | 0 | ~2% (est.) | True sharing via shared memfd |
+
+**File backend**: Firecracker maps memory.bin with `MAP_PRIVATE | PROT_READ | PROT_WRITE`.
+When KVM handles a guest page fault, even for a read, the page becomes Private_Clean in the
+process's address space. This happens because the kernel creates a private copy of the
+file-backed page when setting up writable EPT mappings. The `track_dirty_pages` flag
+(`--no-dirty-tracking` CLI) controls KVM's dirty bitmap tracking but does NOT prevent
+the Private_Clean CoW behavior — that's inherent to MAP_PRIVATE with writable mappings.
+
+**UFFD MISSING+COPY**: Firecracker creates anonymous memory (`MAP_PRIVATE | MAP_ANONYMOUS`)
+and registers it with UFFD in MISSING mode. On each page fault, the UFFD server reads from
+memory.bin and calls `UFFDIO_COPY` to fill the page. Each clone gets its own physical copy.
+No Private_Clean bloat (no file-backed mapping), but no sharing either.
+RSS is lower than File mode because only faulted pages are populated (lazy loading).
+
+**KSM**: Disabled (`/sys/kernel/mm/ksm/run=0`). Firecracker doesn't mark guest memory
+with `MADV_MERGEABLE`. Even if enabled, KSM is after-the-fact dedup with scanning overhead.
+
+### Proposed: UFFD MINOR Mode with Shared Memfd
+
+The kernel (6.13+) supports `UFFD_FEATURE_MINOR_SHMEM` — verified on our host.
+The `userfaultfd` crate (0.9.0) supports `register_with_mode()` with raw bits.
+
+**Architecture:**
+
+```
+┌─────────────────────────────────────────────────────┐
+│  fcvm snapshot serve                                │
+│                                                     │
+│  1. memfd_create("snapshot", 131 GB)                │
+│  2. Populate memfd from memory.bin                  │
+│  3. Accept clone connections via UDS                 │
+│  4. Send memfd fd + UFFD fd to each clone           │
+│                                                     │
+│  On MINOR fault from clone:                         │
+│    UFFDIO_CONTINUE → maps existing memfd page       │
+│    (zero-copy, page shared across all clones)       │
+└─────────────────────────────────────────────────────┘
+         │ memfd fd shared via UDS
+         ▼
+┌──────────────────────┐  ┌──────────────────────┐
+│  Clone 1 (Firecracker) │  │  Clone 2 (Firecracker) │
+│                        │  │                        │
+│  Guest memory:         │  │  Guest memory:         │
+│  MAP_SHARED on memfd   │  │  MAP_SHARED on memfd   │
+│  + UFFD MINOR mode     │  │  + UFFD MINOR mode     │
+│                        │  │                        │
+│  Read → shared page    │  │  Read → shared page    │
+│  Write → kernel CoW    │  │  Write → kernel CoW    │
+└──────────────────────┘  └──────────────────────┘
+```
+
+**Changes required:**
+
+1. **Firecracker** (`persist.rs`):
+   - `guest_memory_from_uffd()`: Use `memfd_backed()` instead of `anonymous()` for guest memory
+   - Pass memfd fd from the UFFD server (received via UDS alongside the UFFD fd)
+   - `uffd.register_with_mode(ptr, size, RegisterMode::from_bits_truncate(4))` for MINOR mode
+
+2. **fcvm UFFD server** (`src/uffd/server.rs`):
+   - Create memfd, populate from memory.bin (one-time cost at serve start)
+   - Send memfd fd to each clone via UDS handshake
+   - On MINOR fault: `UFFDIO_CONTINUE` (maps existing page) instead of `UFFDIO_COPY` (copies data)
+
+3. **fcvm serve** (`src/commands/snapshot.rs`):
+   - `snapshot serve` creates and populates the memfd once
+   - Each clone receives the same memfd fd
+
+**Why this works:** With `MAP_SHARED` on the memfd, all clones' page tables can point to the
+same physical pages. `UFFDIO_CONTINUE` resolves a MINOR fault by installing a PTE pointing to
+the already-populated memfd page — no data copy. Writes trigger kernel-level CoW (the page gets
+copied to anonymous memory for that process only). This is the same mechanism used by CRIU for
+lazy migration and by cloud providers for VM density.
+
+**Kernel support:** Verified `UFFD_FEATURE_MINOR_SHMEM` (bit 10) is available on our
+kernel 6.13. The `userfaultfd` crate 0.9.0 doesn't export a `MINOR` constant but
+`RegisterMode::from_bits_truncate(4)` works since it's a bitflags struct.
+
 ## References
 
 - [Firecracker Documentation](https://github.com/firecracker-microvm/firecracker/tree/main/docs)
@@ -2199,11 +2294,12 @@ Additional defense:
 - [passt/pasta](https://passt.top/)
 - [iptables Documentation](https://netfilter.org/documentation/)
 - [KVM Documentation](https://www.linux-kvm.org/page/Documents)
+- [Linux UFFD Documentation](https://docs.kernel.org/admin-guide/mm/userfaultfd.html)
 
 ---
 
 **End of Design Specification**
 
-*Version: 2.3*
-*Date: 2025-12-25*
+*Version: 2.4*
+*Date: 2026-02-28*
 *Author: fcvm project*

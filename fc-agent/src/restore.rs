@@ -69,7 +69,21 @@ pub async fn handle_clone_restore(
 ) {
     eprintln!("[fc-agent] handling restore (epoch={})", restore_epoch);
 
-    // Reconfigure IPv6 FIRST — before any network traffic can use the old address.
+    // Sync clock FIRST — snapshot restore leaves the VM clock frozen at snapshot time.
+    // Services that validate timestamps (auth, TLS, sessions) will fail with stale time.
+    if let Err(e) = crate::mmds::sync_clock_from_host().await {
+        eprintln!("[fc-agent] WARNING: clock sync on restore failed: {:?}", e);
+    }
+
+    // Reset chrony after clock jump so it doesn't lose its sources.
+    // The MMDS sync above stepped the clock, which confuses chrony's
+    // offset tracking. `makestep` forces it to accept the new time.
+    let _ = tokio::process::Command::new("chronyc")
+        .args(["makestep"])
+        .output()
+        .await;
+
+    // Reconfigure IPv6 — before any network traffic can use the old address.
     if let Some(new_ipv6) = clone_ipv6 {
         network::reconfigure_ipv6(new_ipv6).await;
     }

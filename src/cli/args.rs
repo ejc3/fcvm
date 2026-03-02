@@ -351,6 +351,19 @@ pub struct SnapshotRunArgs {
     #[arg(long)]
     pub exec: Option<String>,
 
+    /// Disable KVM dirty page tracking. File-backed pages stay shared through
+    /// the host page cache — multiple clones from the same snapshot share
+    /// physical memory pages. Tradeoff: diff snapshots from this VM won't work.
+    #[arg(long)]
+    pub no_dirty_tracking: bool,
+
+    /// Disable swap for the Firecracker process (sets memory.swap.max=0 on its
+    /// cgroup). Prevents the kernel from swapping guest memory pages, forcing it
+    /// to evict file cache instead. Useful for large VMs where swap I/O would
+    /// degrade performance.
+    #[arg(long)]
+    pub no_swap: bool,
+
     // ========================================================================
     // Internal fields - not exposed via CLI, used for startup snapshot support
     // ========================================================================

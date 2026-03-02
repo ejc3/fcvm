@@ -884,6 +884,8 @@ assert!(localhost_works, "Localhost port forwarding should work (requires route_
 - No feature flag: Unprivileged tests run by default
 - Features are compile-time gates - tests won't exist unless the feature is enabled
 - Use `FILTER=` to further filter by name pattern: `make test-root FILTER=exec`
+- For multiple tests or regex: `make test-root FILTER="-E 'test(/pattern1|pattern2/)'" STREAM=1`
+- FILTER is a nextest substring match on test function name, NOT file name. Use `-E` for expressions.
 
 **Common parallel test pitfalls and fixes:**
 

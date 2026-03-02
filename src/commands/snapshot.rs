@@ -871,6 +871,21 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     };
 
     // Run clone setup using shared restore function
+    // Dirty tracking: KVM CoW-copies file-backed pages so it can track which
+    // pages are modified (needed for diff snapshots from this VM).
+    // Without it, pages stay shared through the host page cache — multiple
+    // clones from the same snapshot share physical memory.
+    // CLI: --no-dirty-tracking disables it for clones.
+    // Internal: startup_snapshot_base_key forces it on (needs diff snapshot).
+    // Hugepages: always disable — KVM splits 2MB Stage 2 block mappings to 4K
+    // for dirty tracking, negating the TLB benefit of hugepages.
+    let needs_dirty_tracking = if hugepages {
+        false // hugepage VMs must not split 2MB TLB entries
+    } else if args.startup_snapshot_base_key.is_some() {
+        true // podman path — needs dirty tracking for startup snapshot
+    } else {
+        !args.no_dirty_tracking // CLI default: on. --no-dirty-tracking: off.
+    };
     let restore_params = RestoreParams {
         vm_id: &vm_id,
         vm_name: &vm_name,
@@ -880,6 +895,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         restore_config: &restore_config,
         network_config: &network_config,
         clone_ipv6: clone_ipv6_swap.as_ref().map(|(_, new)| new.clone()),
+        track_dirty_pages: needs_dirty_tracking,
     };
     let setup_result = super::common::restore_from_snapshot(
         restore_params,
@@ -928,6 +944,13 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     }
 
     let (mut vm_manager, mut holder_child) = setup_result.unwrap();
+
+    // Disable swap for Firecracker if requested via --no-swap
+    if args.no_swap {
+        if let Ok(pid) = vm_manager.pid() {
+            super::common::disable_cgroup_swap(pid);
+        }
+    }
 
     // For routed mode clones: fc-agent reconfigures eth0 with the new vm_ipv6 via MMDS.
     // The state already has the correct guest_ipv6 = vm_ipv6 (set by restore_from_snapshot).
@@ -1266,6 +1289,8 @@ mod tests {
             firecracker_args: Some("--enable-nv2".to_string()),
             hugepages: None,
             non_blocking_output: false,
+            no_dirty_tracking: false,
+            no_swap: false,
         };
 
         let runtime = snapshot_restore_runtime_config(&args).await;
