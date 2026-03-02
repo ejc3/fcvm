@@ -263,31 +263,41 @@ impl CloneFixture {
             std::thread::sleep(Duration::from_millis(50));
         };
 
-        // Make HTTP request to nginx
-        // verify_port_forwarding() runs after snapshot restore and confirms end-to-end
-        // data flow through pasta before health monitor starts.
+        // Make HTTP request to nginx via loopback port forward (pasta).
+        // verify_port_forwarding() already confirmed the port works, but under
+        // heavy CI load the first request can get an empty response if pasta's
+        // internal forwarding state is briefly inconsistent. Retry up to 3 times.
         let addr = format!("{}:{}", loopback_ip, health_port);
-        let mut stream = TcpStream::connect(&addr).expect("failed to connect to nginx");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-
         let request = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-        stream
-            .write_all(request.as_bytes())
-            .expect("failed to send HTTP request");
 
-        let mut response = Vec::new();
-        let _ = stream.read_to_end(&mut response);
+        let mut last_response = String::new();
+        for attempt in 0..3 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            let Ok(mut stream) = TcpStream::connect(&addr) else {
+                continue;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
-        let response_str = String::from_utf8_lossy(&response);
-        if !response_str.contains("200 OK") {
+            if stream.write_all(request.as_bytes()).is_err() {
+                continue;
+            }
+
+            let mut response = Vec::new();
+            let _ = stream.read_to_end(&mut response);
+            last_response = String::from_utf8_lossy(&response).to_string();
+
+            if last_response.contains("200 OK") {
+                break;
+            }
+        }
+
+        if !last_response.contains("200 OK") {
             panic!(
-                "unexpected HTTP response: {}",
-                &response_str[..std::cmp::min(200, response_str.len())]
+                "unexpected HTTP response after 3 attempts: {}",
+                &last_response[..std::cmp::min(200, last_response.len())]
             );
         }
 
