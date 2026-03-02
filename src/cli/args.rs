@@ -262,12 +262,6 @@ pub struct RunArgs {
     #[arg(long)]
     pub no_snapshot: bool,
 
-    /// Lock VM memory in RAM (mlockall). Prevents the kernel from swapping
-    /// guest pages to disk. Requires root or CAP_IPC_LOCK + sufficient
-    /// RLIMIT_MEMLOCK.
-    #[arg(long)]
-    pub mlock: bool,
-
     /// Use non-blocking writes for container stdout/stderr on the host side.
     /// Without this flag, a slow or broken pipe reader (e.g., `fcvm ... | slow-consumer`)
     /// backpressures the entire output pipeline into the container, potentially deadlocking
@@ -363,11 +357,12 @@ pub struct SnapshotRunArgs {
     #[arg(long)]
     pub no_dirty_tracking: bool,
 
-    /// Lock VM memory in RAM (mlockall). Prevents the kernel from swapping
-    /// guest pages to disk. Requires root or CAP_IPC_LOCK + sufficient
-    /// RLIMIT_MEMLOCK.
+    /// Disable swap for the Firecracker process (sets memory.swap.max=0 on its
+    /// cgroup). Prevents the kernel from swapping guest memory pages, forcing it
+    /// to evict file cache instead. Useful for large VMs where swap I/O would
+    /// degrade performance.
     #[arg(long)]
-    pub mlock: bool,
+    pub no_swap: bool,
 
     // ========================================================================
     // Internal fields - not exposed via CLI, used for startup snapshot support
