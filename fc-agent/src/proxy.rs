@@ -23,9 +23,35 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, watch};
 
-use crate::vsock::{VsockStream, EGRESS_PROXY_PORT, HOST_CID};
+use crate::vsock::{VsockReadHalf, VsockStream, VsockWriteHalf, EGRESS_PROXY_PORT, HOST_CID};
+
+/// Wait for egress proxy generation to exceed `threshold`, with timeout.
+///
+/// Used after snapshot restore to confirm the proxy has reconnected its vsock.
+/// If the proxy already reconnected, `wait_for` returns immediately (watch retains value).
+pub async fn wait_for_egress_gen(
+    rx: &watch::Receiver<u64>,
+    threshold: u64,
+    timeout: std::time::Duration,
+    context: &str,
+) {
+    let mut rx = rx.clone();
+    match tokio::time::timeout(timeout, async {
+        rx.wait_for(|&v| v > threshold).await.map(|_| ())
+    })
+    .await
+    {
+        Ok(Ok(())) => eprintln!("[fc-agent] egress proxy {} (gen={})", context, *rx.borrow()),
+        Ok(Err(_)) => eprintln!("[fc-agent] WARNING: egress proxy gen_tx dropped"),
+        Err(_) => eprintln!(
+            "[fc-agent] WARNING: egress proxy {} timed out ({}s)",
+            context,
+            timeout.as_secs()
+        ),
+    }
+}
 
 /// Guest-side iptables REDIRECT target port.
 const PROXY_LISTEN_PORT: u16 = 12345;
@@ -96,14 +122,14 @@ impl ProxyState {
 
 /// Set up iptables/ip6tables REDIRECT rules and start the transparent proxy listener.
 ///
-/// `reconnect` is signaled after snapshot restore (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET
-/// kills all vsock connections) to break the stale multiplexed session and reconnect.
-/// Without this, the proxy's stale AsyncFd epoll registration causes read_exact to
-/// hang indefinitely. Harmless on cold start (pause/resume doesn't break connections).
+/// `gen_tx` is a watch channel sender incremented after each successful vsock connect.
+/// Waiters use `wait_for(|&v| v > captured)` to detect reconnection — if the proxy
+/// already reconnected, the check returns immediately (watch retains latest value).
 ///
-/// `reconnect_done` is signaled after the proxy successfully reconnects its vsock,
-/// so restore.rs can wait for egress to be ready before signaling "VM ready" to the host.
-pub async fn run_egress_proxy(reconnect: Arc<Notify>, reconnect_done: Arc<Notify>) {
+/// No external reconnect signal is needed: after snapshot restore, the kernel sets
+/// EPOLLERR on all vsock fds. `VsockStream::wait_for_error()` detects this via
+/// `Interest::ERROR`, which fires the select! arm and ends the session naturally.
+pub async fn run_egress_proxy(gen_tx: watch::Sender<u64>) {
     if !setup_iptables_redirect() {
         eprintln!(
             "[fc-agent] WARNING: failed to set up iptables REDIRECT rules, egress proxy disabled"
@@ -151,6 +177,8 @@ pub async fn run_egress_proxy(reconnect: Arc<Notify>, reconnect_done: Arc<Notify
         }
     };
 
+    let mut count: u64 = 0;
+
     loop {
         // Connect vsock and run multiplexed proxy until connection dies
         let vsock = match VsockStream::connect(HOST_CID, EGRESS_PROXY_PORT) {
@@ -161,22 +189,22 @@ pub async fn run_egress_proxy(reconnect: Arc<Notify>, reconnect_done: Arc<Notify
                 continue;
             }
         };
-        eprintln!("[fc-agent] egress proxy vsock connected");
-        reconnect_done.notify_waiters();
+        count += 1;
+        eprintln!("[fc-agent] egress proxy vsock connected (gen={})", count);
+        let _ = gen_tx.send(count);
 
-        run_mux_session(&listener_v4, listener_v6.as_ref(), vsock, &reconnect).await;
+        run_mux_session(&listener_v4, listener_v6.as_ref(), vsock).await;
 
         eprintln!("[fc-agent] egress proxy vsock disconnected, reconnecting...");
     }
 }
 
 /// Run a single multiplexed session over one vsock connection.
-/// Returns when the vsock connection dies or a reconnect signal is received.
+/// Returns when the vsock connection dies (reader/writer error or EPOLLERR).
 async fn run_mux_session(
     listener_v4: &TcpListener,
     listener_v6: Option<&TcpListener>,
     vsock: VsockStream,
-    reconnect: &Notify,
 ) {
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(WRITER_CHANNEL_CAPACITY);
     let state = Arc::new(ProxyState {
@@ -185,7 +213,7 @@ async fn run_mux_session(
         next_stream_id: AtomicU32::new(1),
     });
 
-    let (vsock_read, vsock_write) = tokio::io::split(vsock);
+    let (vsock_read, vsock_write) = vsock.split();
 
     // Writer task: drains channel and writes frames to vsock
     let writer_handle = tokio::spawn(vsock_writer(writer_rx, vsock_write));
@@ -224,13 +252,25 @@ async fn run_mux_session(
         }
     };
 
-    // Wait for reader/writer to finish (vsock died), reconnect signal, or accept loop
+    // Wait for reader/writer to finish (vsock died) or EPOLLERR (transport reset).
+    // After snapshot restore, the kernel sets EPOLLERR on all vsock fds.
+    // wait_for_error() detects this via Interest::ERROR — tokio's poll_read_ready
+    // misses EPOLLERR (Direction::Read mask excludes ERROR), but Interest::ERROR
+    // catches it natively. This fires before the reader/writer notice, providing
+    // instant session teardown without external signals.
+    let session_start = std::time::Instant::now();
     tokio::select! {
-        _ = reader_handle => {},
-        _ = writer_handle => {},
-        _ = accept_loop => {},
-        _ = reconnect.notified() => {
-            eprintln!("[fc-agent] egress proxy reconnect signaled (snapshot event)");
+        _ = reader_handle => {
+            eprintln!("[fc-agent] egress proxy session ended: reader exited ({}ms since session start)", session_start.elapsed().as_millis());
+        },
+        _ = writer_handle => {
+            eprintln!("[fc-agent] egress proxy session ended: writer exited ({}ms since session start)", session_start.elapsed().as_millis());
+        },
+        _ = accept_loop => {
+            eprintln!("[fc-agent] egress proxy session ended: accept loop exited ({}ms since session start)", session_start.elapsed().as_millis());
+        },
+        _ = vsock.wait_for_error() => {
+            eprintln!("[fc-agent] egress proxy session ended: vsock EPOLLERR (transport reset) ({}ms since session start)", session_start.elapsed().as_millis());
         },
     }
 
@@ -242,24 +282,23 @@ async fn run_mux_session(
 }
 
 /// Writer task: reads serialized frames from channel and writes to vsock.
-async fn vsock_writer(
-    mut rx: mpsc::Receiver<Vec<u8>>,
-    mut writer: tokio::io::WriteHalf<VsockStream>,
-) {
+async fn vsock_writer(mut rx: mpsc::Receiver<Vec<u8>>, mut writer: VsockWriteHalf) {
     while let Some(frame) = rx.recv().await {
-        if let Err(_e) = writer.write_all(&frame).await {
+        if let Err(e) = writer.write_all(&frame).await {
+            eprintln!("[fc-agent] egress proxy writer error: {}", e);
             break;
         }
     }
 }
 
 /// Reader task: reads frames from vsock and dispatches to per-stream handlers.
-async fn vsock_reader(mut reader: tokio::io::ReadHalf<VsockStream>, state: Arc<ProxyState>) {
+async fn vsock_reader(mut reader: VsockReadHalf, state: Arc<ProxyState>) {
     let mut header_buf = [0u8; FRAME_HEADER_SIZE];
 
     loop {
         // Read frame header
-        if reader.read_exact(&mut header_buf).await.is_err() {
+        if let Err(e) = reader.read_exact(&mut header_buf).await {
+            eprintln!("[fc-agent] egress proxy reader error: {}", e);
             break;
         }
 

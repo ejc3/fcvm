@@ -107,11 +107,11 @@ async fn test_btrfs_rw_after_snapshot_restore() -> Result<()> {
     // Wait for snapshot
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    // Kill cold boot VM
+    // Kill cold boot VM and wait for OS resource cleanup (KVM, net namespaces, etc.)
     println!("  Killing cold boot VM...");
     common::kill_process(fcvm_pid).await;
     let _ = child.wait().await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     // Phase 2: Warm start — restores from snapshot
     println!("\nPhase 2: Warm start from snapshot...");
