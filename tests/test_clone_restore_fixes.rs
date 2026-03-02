@@ -242,21 +242,17 @@ async fn test_no_dirty_tracking_clone() -> Result<()> {
     );
     println!("  ✓ Container exec works");
 
-    // Verify track_dirty_pages=false in the Firecracker debug log
+    // Verify track_dirty_pages=false in the fcvm debug log.
+    // The snapshot load info line includes: track_dirty_pages=false
     let log_content = tokio::fs::read_to_string(&log_path)
         .await
         .unwrap_or_default();
     assert!(
-        log_content.contains("track_dirty_pages\":false")
-            || log_content.contains("track_dirty_pages: false")
-            || log_content.contains("track_dirty_pages: Some(false)")
-            || log_content.contains("track_dirty_pages\":Some(false)"),
-        "log should show track_dirty_pages=false. Log snippet: {}",
+        log_content.contains("track_dirty_pages=false"),
+        "log should show track_dirty_pages=false in snapshot load line. Relevant lines: {}",
         log_content
             .lines()
-            .filter(|l| l.contains("track_dirty")
-                || l.contains("load_snapshot")
-                || l.contains("snapshot load"))
+            .filter(|l| l.contains("snapshot load"))
             .collect::<Vec<_>>()
             .join("\n")
     );

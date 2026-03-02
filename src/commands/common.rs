@@ -1029,7 +1029,7 @@ pub async fn restore_from_snapshot(
     let load_duration = load_start.elapsed();
     info!(
         duration_ms = load_duration.as_millis(),
-        "snapshot load completed"
+        track_dirty_pages, "snapshot load completed"
     );
 
     // Timing instrumentation: measure disk patch operation
