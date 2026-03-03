@@ -634,29 +634,13 @@ impl<T: FilesystemHandler> RemapFs<T> {
                 pid: 0,
             })
         } else {
-            // Try O_RDWR first, fall back to O_RDONLY
-            let resp = self.inner.handle_request(&VolumeRequest::Open {
+            self.inner.handle_request(&VolumeRequest::Open {
                 ino: inner_ino,
                 flags: libc::O_RDWR as u32,
                 uid: 0,
                 gid: 0,
                 pid: 0,
-            });
-            if resp.is_ebadf() || resp.errno() == Some(libc::EACCES) {
-                debug!(
-                    stable_ino,
-                    inner_ino, "O_RDWR reopen failed, falling back to O_RDONLY"
-                );
-                self.inner.handle_request(&VolumeRequest::Open {
-                    ino: inner_ino,
-                    flags: libc::O_RDONLY as u32,
-                    uid: 0,
-                    gid: 0,
-                    pid: 0,
-                })
-            } else {
-                resp
-            }
+            })
         };
 
         let new_fh = match &resp {
