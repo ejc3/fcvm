@@ -624,7 +624,11 @@ async fn test_open_handle_survives_snapshot_restore() -> Result<()> {
 
     // Read file to populate RemapFs inode table before snapshot
     let content = fuse_read(pid, "/mnt/test/watched.txt", 30).await?;
-    assert!(content.contains("line1"), "initial read: {}", content.trim());
+    assert!(
+        content.contains("line1"),
+        "initial read: {}",
+        content.trim()
+    );
     println!("  Initial read: '{}'", content.trim());
 
     // Take snapshot
