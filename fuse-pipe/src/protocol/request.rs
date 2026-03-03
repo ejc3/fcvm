@@ -463,6 +463,38 @@ impl VolumeRequest {
         cloned
     }
 
+    /// Extract the output file handle (fh_out) for operations that have one.
+    pub fn fh_out(&self) -> Option<u64> {
+        match self {
+            Self::CopyFileRange { fh_out, .. } | Self::RemapFileRange { fh_out, .. } => {
+                Some(*fh_out)
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract the output inode (ino_out) for operations that have one.
+    pub fn ino_out(&self) -> Option<u64> {
+        match self {
+            Self::CopyFileRange { ino_out, .. } | Self::RemapFileRange { ino_out, .. } => {
+                Some(*ino_out)
+            }
+            _ => None,
+        }
+    }
+
+    /// Clone this request with a different output file handle.
+    pub fn with_fh_out(&self, new_fh_out: u64) -> Self {
+        let mut cloned = self.clone();
+        match &mut cloned {
+            Self::CopyFileRange { fh_out, .. } | Self::RemapFileRange { fh_out, .. } => {
+                *fh_out = new_fh_out
+            }
+            _ => {}
+        }
+        cloned
+    }
+
     /// Check if this is a directory handle operation.
     pub fn is_dir_handle_op(&self) -> bool {
         matches!(

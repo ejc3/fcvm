@@ -137,7 +137,7 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
             } else {
                 tracing::info!(
                     port,
-                    entries = json.len(),
+                    bytes = json.len(),
                     "serialized inode table to snapshot"
                 );
             }

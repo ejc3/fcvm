@@ -661,10 +661,28 @@ impl<T: FilesystemHandler> RemapFs<T> {
             _ => return None,
         };
 
-        // Atomic insert — handles concurrent reopen races
+        // Atomic insert — handles concurrent reopen races.
+        // If another thread already inserted a mapping for this old_fh,
+        // release the fd we just opened to avoid leaking it.
         use dashmap::mapref::entry::Entry;
         match self.handle_remap.entry(old_fh) {
-            Entry::Occupied(e) => Some(*e.get()),
+            Entry::Occupied(e) => {
+                let winner_fh = *e.get();
+                // Release the fd we opened — another thread won the race
+                let release_req = if is_dir {
+                    VolumeRequest::Releasedir {
+                        ino: inner_ino,
+                        fh: new_fh,
+                    }
+                } else {
+                    VolumeRequest::Release {
+                        ino: inner_ino,
+                        fh: new_fh,
+                    }
+                };
+                self.inner.handle_request(&release_req);
+                Some(winner_fh)
+            }
             Entry::Vacant(e) => {
                 debug!(
                     old_fh,
@@ -696,6 +714,12 @@ impl<T: FilesystemHandler> FilesystemHandler for RemapFs<T> {
                 remapped = remapped.with_fh(*new_fh);
             }
         }
+        // Also remap fh_out for CopyFileRange/RemapFileRange
+        if let Some(old_fh_out) = remapped.fh_out() {
+            if let Some(new_fh_out) = self.handle_remap.get(&old_fh_out) {
+                remapped = remapped.with_fh_out(*new_fh_out);
+            }
+        }
 
         // Delegate to inner handler
         let response = self
@@ -704,19 +728,38 @@ impl<T: FilesystemHandler> FilesystemHandler for RemapFs<T> {
 
         // If EBADF and this request uses a file handle, try lazy re-open
         if response.is_ebadf() {
+            let mut retry = remapped.clone();
+            let mut reopened = false;
+
+            // Try reopening fh (fh_in for CopyFileRange/RemapFileRange)
             if let Some(old_fh) = request.fh() {
                 if let Some(stable_ino) = request.ino() {
                     if let Some(new_fh) =
                         self.try_reopen_handle(stable_ino, old_fh, request.is_dir_handle_op())
                     {
-                        // Retry with the reopened handle
-                        let retry = remapped.with_fh(new_fh);
-                        let retry_resp = self
-                            .inner
-                            .handle_request_with_groups(&retry, supplementary_groups);
-                        return self.remap_response(request, retry_resp);
+                        retry = retry.with_fh(new_fh);
+                        reopened = true;
                     }
                 }
+            }
+
+            // Try reopening fh_out for CopyFileRange/RemapFileRange
+            if let Some(old_fh_out) = request.fh_out() {
+                if let Some(stable_ino_out) = request.ino_out() {
+                    if let Some(new_fh_out) =
+                        self.try_reopen_handle(stable_ino_out, old_fh_out, false)
+                    {
+                        retry = retry.with_fh_out(new_fh_out);
+                        reopened = true;
+                    }
+                }
+            }
+
+            if reopened {
+                let retry_resp = self
+                    .inner
+                    .handle_request_with_groups(&retry, supplementary_groups);
+                return self.remap_response(request, retry_resp);
             }
         }
 

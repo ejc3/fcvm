@@ -592,8 +592,8 @@ async fn test_remap_fs_snapshot_file_replace() -> Result<()> {
 // Test 18: Open file handles survive snapshot/clone restore
 // =============================================================================
 
-/// Verify that --non-blocking-output delivers lines best-effort through
-/// the portable volumes snapshot/clone pipeline.
+/// Verify that file handles survive snapshot/clone restore through
+/// the portable volumes pipeline.
 ///
 /// Tests:
 /// 1. Clone can read files that existed at snapshot time
