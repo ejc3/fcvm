@@ -661,10 +661,26 @@ impl<T: FilesystemHandler> RemapFs<T> {
             _ => return None,
         };
 
-        // Atomic insert — handles concurrent reopen races
+        // Atomic insert — handles concurrent reopen races.
+        // If another thread won the race, release our fd to avoid leaking it.
         use dashmap::mapref::entry::Entry;
         match self.handle_remap.entry(old_fh) {
-            Entry::Occupied(e) => Some(*e.get()),
+            Entry::Occupied(e) => {
+                // Another thread already reopened this handle — release ours
+                let release_req = if is_dir {
+                    VolumeRequest::Releasedir {
+                        ino: inner_ino,
+                        fh: new_fh,
+                    }
+                } else {
+                    VolumeRequest::Release {
+                        ino: inner_ino,
+                        fh: new_fh,
+                    }
+                };
+                self.inner.handle_request(&release_req);
+                Some(*e.get())
+            }
             Entry::Vacant(e) => {
                 debug!(
                     old_fh,

@@ -434,6 +434,7 @@ impl VolumeRequest {
             | Self::Getlk { fh, .. }
             | Self::Setlk { fh, .. }
             | Self::Readdirplus { fh, .. } => Some(*fh),
+            Self::Setattr { fh, .. } => *fh,
             Self::CopyFileRange { fh_in, .. } | Self::RemapFileRange { fh_in, .. } => Some(*fh_in),
             _ => None,
         }
@@ -455,8 +456,11 @@ impl VolumeRequest {
             | Self::Getlk { fh, .. }
             | Self::Setlk { fh, .. }
             | Self::Readdirplus { fh, .. } => *fh = new_fh,
-            Self::CopyFileRange { fh_in, .. } | Self::RemapFileRange { fh_in, .. } => {
-                *fh_in = new_fh
+            Self::Setattr { fh, .. } => *fh = Some(new_fh),
+            Self::CopyFileRange { fh_in, fh_out, .. }
+            | Self::RemapFileRange { fh_in, fh_out, .. } => {
+                *fh_in = new_fh;
+                *fh_out = new_fh;
             }
             _ => {}
         }
