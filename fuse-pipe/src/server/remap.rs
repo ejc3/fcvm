@@ -539,7 +539,10 @@ impl<T: FilesystemHandler> RemapFs<T> {
         let table: std::collections::BTreeMap<u64, String> = match serde_json::from_str(json) {
             Ok(t) => t,
             Err(e) => {
-                error!("failed to parse inode table JSON, starting with empty table: {}", e);
+                error!(
+                    "failed to parse inode table JSON, starting with empty table: {}",
+                    e
+                );
                 std::collections::BTreeMap::new()
             }
         };

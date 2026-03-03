@@ -457,9 +457,10 @@ impl VolumeRequest {
             | Self::Setlk { fh, .. }
             | Self::Readdirplus { fh, .. } => *fh = new_fh,
             Self::Setattr { fh, .. } => *fh = Some(new_fh),
-            // Only remap fh_in; fh_out references a different file and must be
-            // remapped separately if it's also stale (the EBADF retry in RemapFs
-            // handles one handle at a time via fh()).
+            // Only remap fh_in; fh_out references a different file and is NOT
+            // currently remapped after snapshot restore. This is a known limitation:
+            // copy_file_range/remap_file_range with a stale fh_out will fail.
+            // TODO: add fh_out()/with_fh_out() helpers for independent remapping.
             Self::CopyFileRange { fh_in, .. } | Self::RemapFileRange { fh_in, .. } => {
                 *fh_in = new_fh;
             }
