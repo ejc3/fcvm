@@ -14,7 +14,6 @@
 mod common;
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
 use std::time::Duration;
 
 #[tokio::test]
@@ -90,6 +89,11 @@ async fn test_non_blocking_output_delivers_lines() -> Result<()> {
         }
     }
 
+    // Verify they arrived in order (no reordering in the pipeline).
+    // Must check before sort/dedup, otherwise the assertion is vacuous.
+    let is_sorted = found_lines.windows(2).all(|w| w[0] <= w[1]);
+    assert!(is_sorted, "output lines should be in order");
+
     found_lines.sort();
     found_lines.dedup();
 
@@ -111,10 +115,6 @@ async fn test_non_blocking_output_delivers_lines() -> Result<()> {
         found_done,
         "NB_DONE marker should appear in output (container completed)"
     );
-
-    // Verify they arrived in order (no reordering in the pipeline)
-    let is_sorted = found_lines.windows(2).all(|w| w[0] <= w[1]);
-    assert!(is_sorted, "output lines should be in order");
 
     println!(
         "  PASSED: {}/100 lines delivered in non-blocking mode",
