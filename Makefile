@@ -217,7 +217,24 @@ check-disk:
 	@# Fix advisory-db ownership (sudo/non-sudo mixing corrupts it)
 	@sudo chown -R $$(id -u):$$(id -g) "$$HOME/.cargo/advisory-db" 2>/dev/null || true
 	@sudo chown -R $$(id -u):$$(id -g) "$$HOME/.cargo/advisory-dbs" 2>/dev/null || true
-	@# Symlink target/ to btrfs so cargo builds don't fill root filesystem
+	@# Symlink ~/.cargo and target/ to btrfs so cargo builds don't fill root filesystem
+	@if [ -d /mnt/fcvm-btrfs ] && ! [ -L "$$HOME/.cargo" ]; then \
+		if [ -d "$$HOME/.cargo" ]; then \
+			echo "==> Moving existing ~/.cargo to /mnt/fcvm-btrfs/cargo..."; \
+			sudo rm -rf /mnt/fcvm-btrfs/cargo; \
+			mv "$$HOME/.cargo" /mnt/fcvm-btrfs/cargo; \
+		elif [ ! -e "$$HOME/.cargo" ]; then \
+			mkdir -p /mnt/fcvm-btrfs/cargo; \
+		fi; \
+		ln -sf /mnt/fcvm-btrfs/cargo "$$HOME/.cargo"; \
+		echo "==> Symlinked ~/.cargo → /mnt/fcvm-btrfs/cargo"; \
+	fi
+	@# Fix broken ~/.cargo symlink (target dir was cleaned up)
+	@if [ -L "$$HOME/.cargo" ] && ! [ -e "$$HOME/.cargo" ]; then \
+		echo "==> Fixing broken ~/.cargo symlink..."; \
+		mkdir -p /mnt/fcvm-btrfs/cargo; \
+		echo "==> Restored /mnt/fcvm-btrfs/cargo"; \
+	fi
 	@if [ -d /mnt/fcvm-btrfs ] && ! [ -L target ]; then \
 		if [ -d target ]; then \
 			echo "==> Moving existing target/ to /mnt/fcvm-btrfs/cargo-target..."; \
