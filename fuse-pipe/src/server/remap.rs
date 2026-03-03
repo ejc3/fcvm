@@ -27,6 +27,8 @@ pub struct RemapFs<T: FilesystemHandler> {
     stable_to_inner: DashMap<u64, u64>,
     /// stable_ino → relative path from mount root (for serialization)
     paths: DashMap<u64, String>,
+    /// old_fh → new_fh (stale handles lazily reopened after snapshot restore)
+    handle_remap: DashMap<u64, u64>,
 }
 
 impl<T: FilesystemHandler> RemapFs<T> {
@@ -48,6 +50,7 @@ impl<T: FilesystemHandler> RemapFs<T> {
             inner_to_stable,
             stable_to_inner,
             paths,
+            handle_remap: DashMap::new(),
         }
     }
 
@@ -599,12 +602,78 @@ impl<T: FilesystemHandler> RemapFs<T> {
             inner_to_stable,
             stable_to_inner,
             paths,
+            handle_remap: DashMap::new(),
         }
     }
 
     /// Get a reference to the inner handler.
     pub fn inner(&self) -> &T {
         &self.inner
+    }
+
+    /// Lazily reopen a stale file handle after snapshot restore.
+    ///
+    /// When a clone restores from snapshot, old file handles reference the previous
+    /// VolumeServer's handle table (now gone). This method opens the file by inode
+    /// on the new server and caches the mapping so subsequent operations on the same
+    /// stale handle work without re-opening.
+    fn try_reopen_handle(&self, stable_ino: u64, old_fh: u64, is_dir: bool) -> Option<u64> {
+        // Check if already remapped (concurrent threads may race here)
+        if let Some(new_fh) = self.handle_remap.get(&old_fh) {
+            return Some(*new_fh);
+        }
+
+        let inner_ino = self.to_inner(stable_ino)?;
+
+        let resp = if is_dir {
+            self.inner.handle_request(&VolumeRequest::Opendir {
+                ino: inner_ino,
+                flags: 0,
+                uid: 0,
+                gid: 0,
+                pid: 0,
+            })
+        } else {
+            // Try O_RDWR first, fall back to O_RDONLY
+            let resp = self.inner.handle_request(&VolumeRequest::Open {
+                ino: inner_ino,
+                flags: libc::O_RDWR as u32,
+                uid: 0,
+                gid: 0,
+                pid: 0,
+            });
+            if resp.is_ebadf() || resp.errno() == Some(libc::EACCES) {
+                self.inner.handle_request(&VolumeRequest::Open {
+                    ino: inner_ino,
+                    flags: libc::O_RDONLY as u32,
+                    uid: 0,
+                    gid: 0,
+                    pid: 0,
+                })
+            } else {
+                resp
+            }
+        };
+
+        let new_fh = match &resp {
+            VolumeResponse::Opened { fh, .. } => *fh,
+            VolumeResponse::Created { fh, .. } => *fh,
+            _ => return None,
+        };
+
+        // Atomic insert — handles concurrent reopen races
+        use dashmap::mapref::entry::Entry;
+        match self.handle_remap.entry(old_fh) {
+            Entry::Occupied(e) => Some(*e.get()),
+            Entry::Vacant(e) => {
+                debug!(
+                    old_fh,
+                    new_fh, stable_ino, inner_ino, is_dir, "reopened stale handle after restore"
+                );
+                e.insert(new_fh);
+                Some(new_fh)
+            }
+        }
     }
 }
 
@@ -621,10 +690,45 @@ impl<T: FilesystemHandler> FilesystemHandler for RemapFs<T> {
             return VolumeResponse::io_error();
         }
 
+        // Translate stale file handles from snapshot restore
+        if let Some(old_fh) = remapped.fh() {
+            if let Some(new_fh) = self.handle_remap.get(&old_fh) {
+                remapped = remapped.with_fh(*new_fh);
+            }
+        }
+
         // Delegate to inner handler
         let response = self
             .inner
             .handle_request_with_groups(&remapped, supplementary_groups);
+
+        // If EBADF and this request uses a file handle, try lazy re-open
+        if response.is_ebadf() {
+            if let Some(old_fh) = request.fh() {
+                if let Some(stable_ino) = request.ino() {
+                    if let Some(new_fh) =
+                        self.try_reopen_handle(stable_ino, old_fh, request.is_dir_handle_op())
+                    {
+                        // Retry with the reopened handle
+                        let retry = remapped.with_fh(new_fh);
+                        let retry_resp = self
+                            .inner
+                            .handle_request_with_groups(&retry, supplementary_groups);
+                        return self.remap_response(request, retry_resp);
+                    }
+                }
+            }
+        }
+
+        // Handle Release/Releasedir: clean up handle_remap entry
+        if matches!(
+            request,
+            VolumeRequest::Release { .. } | VolumeRequest::Releasedir { .. }
+        ) {
+            if let Some(old_fh) = request.fh() {
+                self.handle_remap.remove(&old_fh);
+            }
+        }
 
         // Remap response inodes (inner → stable) and register new mappings
         // Use ORIGINAL request (stable inodes) for path computation

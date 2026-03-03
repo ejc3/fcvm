@@ -709,7 +709,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         })
         .collect();
 
-    let volume_server_handles = spawn_volume_servers(&volume_configs, &vsock_socket_path)
+    let volume_servers = spawn_volume_servers(&volume_configs, &vsock_socket_path)
         .await
         .context("spawning VolumeServers")?;
 
@@ -854,7 +854,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         warn!("VM setup failed, cleaning up resources");
 
         // Abort VolumeServer tasks
-        for handle in volume_server_handles {
+        for handle in volume_servers.handles {
             handle.abort();
         }
 
@@ -905,7 +905,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         data_dir,
         vm_manager,
         holder_child,
-        volume_server_handles,
+        volume_servers,
         network,
         network_config,
         state_manager,
@@ -977,6 +977,7 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         disk_path: &ctx.disk_path,
                         volume_configs: &ctx.volume_configs,
                         parent_snapshot_key: None, // Pre-start is the first snapshot, no parent
+                        remap_refs: &ctx.volume_servers.remap_refs,
                     };
                     match create_snapshot_interruptible(&snap, &cancel).await {
                         SnapshotOutcome::Interrupted => {
@@ -1030,6 +1031,7 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                             disk_path: &ctx.disk_path,
                             volume_configs: &ctx.volume_configs,
                             parent_snapshot_key: parent_key.as_deref(),
+                            remap_refs: &ctx.volume_servers.remap_refs,
                         };
                         tokio::select! {
                             outcome = create_snapshot_interruptible(&snap, &cancel) => {
@@ -1072,7 +1074,8 @@ pub async fn cleanup_vm_context(mut ctx: VmContext) {
     super::common::cleanup_vm(
         super::common::CleanupContext {
             vm_id: ctx.vm_id,
-            volume_server_handles: ctx.volume_server_handles,
+            volume_server_handles: ctx.volume_servers.handles,
+            remap_refs: ctx.volume_servers.remap_refs,
             data_dir: ctx.data_dir,
             health_cancel_token: Some(ctx.health_cancel_token),
             health_monitor_handle: Some(ctx.health_monitor_handle),

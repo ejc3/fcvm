@@ -119,6 +119,11 @@ impl VolumeResponse {
         matches!(self, VolumeResponse::Error { .. })
     }
 
+    /// Check if this is a bad file descriptor error (stale handle after restore).
+    pub fn is_ebadf(&self) -> bool {
+        self.errno() == Some(libc::EBADF)
+    }
+
     /// Check if this is a success response.
     pub fn is_ok(&self) -> bool {
         !self.is_error()

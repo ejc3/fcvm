@@ -39,6 +39,8 @@ pub struct CreateSnapshotParams<'a> {
     pub disk_path: &'a Path,
     pub volume_configs: &'a [VolumeConfig],
     pub parent_snapshot_key: Option<&'a str>,
+    /// RemapFs references for portable volumes — used to serialize inode tables at snapshot time.
+    pub remap_refs: &'a [Option<std::sync::Arc<fuse_pipe::RemapFs<fuse_pipe::PassthroughFs>>>],
 }
 
 /// Create a podman snapshot from a running VM.
@@ -59,6 +61,7 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
         disk_path,
         volume_configs,
         parent_snapshot_key,
+        remap_refs: _,
     } = snap;
     // Snapshots stored in snapshot_dir with snapshot_key as name
     let snapshot_dir = paths::snapshot_dir().join(snapshot_key);
@@ -119,7 +122,29 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
         disk_path,
         parent_dir.as_deref(),
     )
-    .await
+    .await?;
+
+    // Serialize inode tables for portable volumes into the snapshot directory.
+    // These are loaded by clone VolumeServers via restore_from_table() to preserve
+    // inode numbering across snapshot/restore — eliminating the TTL glitch window.
+    for (idx, remap_ref) in snap.remap_refs.iter().enumerate() {
+        if let Some(remap) = remap_ref {
+            let port = snap.volume_configs.get(idx).map(|c| c.port).unwrap_or(0);
+            let json = remap.serialize_table();
+            let table_path = snapshot_dir.join(format!("volume-{}-inode-table.json", port));
+            if let Err(e) = tokio::fs::write(&table_path, &json).await {
+                tracing::warn!(port, error = %e, "failed to serialize inode table");
+            } else {
+                tracing::info!(
+                    port,
+                    entries = json.len(),
+                    "serialized inode table to snapshot"
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Create a snapshot with signal interruption support.
