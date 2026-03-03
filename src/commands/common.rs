@@ -559,7 +559,8 @@ pub struct CleanupContext {
     pub volume_server_handles: Vec<JoinHandle<()>>,
     /// RemapFs references for portable volumes (for inode table serialization).
     /// One entry per volume; `Some` for portable volumes, `None` for plain.
-    #[allow(dead_code)]
+    /// Dropped during cleanup — the Arc prevents the RemapFs from being freed
+    /// while the VolumeServer task still holds a reference.
     pub remap_refs: Vec<Option<std::sync::Arc<fuse_pipe::RemapFs<fuse_pipe::PassthroughFs>>>>,
     pub data_dir: PathBuf,
     pub health_cancel_token: Option<tokio_util::sync::CancellationToken>,

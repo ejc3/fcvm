@@ -643,6 +643,10 @@ impl<T: FilesystemHandler> RemapFs<T> {
                 pid: 0,
             });
             if resp.is_ebadf() || resp.errno() == Some(libc::EACCES) {
+                debug!(
+                    stable_ino,
+                    inner_ino, "O_RDWR reopen failed, falling back to O_RDONLY"
+                );
                 self.inner.handle_request(&VolumeRequest::Open {
                     ino: inner_ino,
                     flags: libc::O_RDONLY as u32,

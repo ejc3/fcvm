@@ -59,18 +59,24 @@ pub struct VolumeServer {
     host_path: PathBuf,
 }
 
+/// Resolve and validate a volume host path (canonicalize + check is_dir).
+fn resolve_volume_path(config: &VolumeConfig) -> Result<PathBuf> {
+    let host_path = config
+        .host_path
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve path: {:?}", config.host_path))?;
+
+    if !host_path.is_dir() {
+        anyhow::bail!("Volume path is not a directory: {:?}", host_path);
+    }
+
+    Ok(host_path)
+}
+
 impl VolumeServer {
     /// Create a new volume server.
     pub fn new(config: VolumeConfig) -> Result<Self> {
-        let host_path = config
-            .host_path
-            .canonicalize()
-            .with_context(|| format!("Failed to resolve path: {:?}", config.host_path))?;
-
-        if !host_path.is_dir() {
-            anyhow::bail!("Volume path is not a directory: {:?}", host_path);
-        }
-
+        let host_path = resolve_volume_path(&config)?;
         Ok(Self { config, host_path })
     }
 
@@ -231,14 +237,7 @@ pub async fn spawn_volume_servers_with_tables(
     let mut ready_receivers = Vec::with_capacity(configs.len());
 
     for (idx, config) in configs.iter().enumerate() {
-        let host_path = config
-            .host_path
-            .canonicalize()
-            .with_context(|| format!("Failed to resolve path: {:?}", config.host_path))?;
-
-        if !host_path.is_dir() {
-            anyhow::bail!("Volume path is not a directory: {:?}", host_path);
-        }
+        let host_path = resolve_volume_path(config)?;
 
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         ready_receivers.push(ready_rx);

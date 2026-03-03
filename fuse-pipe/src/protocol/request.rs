@@ -457,10 +457,11 @@ impl VolumeRequest {
             | Self::Setlk { fh, .. }
             | Self::Readdirplus { fh, .. } => *fh = new_fh,
             Self::Setattr { fh, .. } => *fh = Some(new_fh),
-            Self::CopyFileRange { fh_in, fh_out, .. }
-            | Self::RemapFileRange { fh_in, fh_out, .. } => {
+            // Only remap fh_in; fh_out references a different file and must be
+            // remapped separately if it's also stale (the EBADF retry in RemapFs
+            // handles one handle at a time via fh()).
+            Self::CopyFileRange { fh_in, .. } | Self::RemapFileRange { fh_in, .. } => {
                 *fh_in = new_fh;
-                *fh_out = new_fh;
             }
             _ => {}
         }
