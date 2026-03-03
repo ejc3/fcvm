@@ -230,7 +230,7 @@ check-disk:
 		echo "==> Symlinked ~/.cargo → /mnt/fcvm-btrfs/cargo"; \
 	fi
 	@# Fix broken ~/.cargo symlink (target dir was cleaned up)
-	@if [ -L "$$HOME/.cargo" ] && ! [ -e "$$HOME/.cargo" ]; then \
+	@if [ -L "$$HOME/.cargo" ] && ! [ -e "$$HOME/.cargo" ] && [ -d /mnt/fcvm-btrfs ]; then \
 		echo "==> Fixing broken ~/.cargo symlink..."; \
 		mkdir -p /mnt/fcvm-btrfs/cargo; \
 		echo "==> Restored /mnt/fcvm-btrfs/cargo"; \
