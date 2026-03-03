@@ -536,8 +536,13 @@ impl<T: FilesystemHandler> RemapFs<T> {
     ///
     /// Paths that no longer exist on the host are skipped (logged as warnings).
     pub fn restore_from_table(inner: T, json: &str) -> Self {
-        let table: std::collections::BTreeMap<u64, String> =
-            serde_json::from_str(json).unwrap_or_default();
+        let table: std::collections::BTreeMap<u64, String> = match serde_json::from_str(json) {
+            Ok(t) => t,
+            Err(e) => {
+                error!("failed to parse inode table JSON, starting with empty table: {}", e);
+                std::collections::BTreeMap::new()
+            }
+        };
 
         let inner_to_stable = DashMap::new();
         let stable_to_inner = DashMap::new();
