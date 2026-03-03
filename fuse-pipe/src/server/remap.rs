@@ -9,7 +9,7 @@
 //! numbers regardless of which host they run on.
 
 use dashmap::DashMap;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::protocol::{VolumeRequest, VolumeResponse};
 
@@ -536,8 +536,13 @@ impl<T: FilesystemHandler> RemapFs<T> {
     ///
     /// Paths that no longer exist on the host are skipped (logged as warnings).
     pub fn restore_from_table(inner: T, json: &str) -> Self {
-        let table: std::collections::BTreeMap<u64, String> =
-            serde_json::from_str(json).unwrap_or_default();
+        let table: std::collections::BTreeMap<u64, String> = match serde_json::from_str(json) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("failed to parse inode table JSON, starting with empty table: {e}");
+                std::collections::BTreeMap::new()
+            }
+        };
 
         let inner_to_stable = DashMap::new();
         let stable_to_inner = DashMap::new();
@@ -706,10 +711,17 @@ impl<T: FilesystemHandler> FilesystemHandler for RemapFs<T> {
             return VolumeResponse::io_error();
         }
 
-        // Translate stale file handles from snapshot restore
+        // Translate stale file handles from snapshot restore.
+        // Handle fh (or fh_in for dual-handle ops) and fh_out independently
+        // so CopyFileRange/RemapFileRange don't corrupt the other handle.
         if let Some(old_fh) = remapped.fh() {
             if let Some(new_fh) = self.handle_remap.get(&old_fh) {
                 remapped = remapped.with_fh(*new_fh);
+            }
+        }
+        if let Some(old_fh_out) = remapped.fh_out() {
+            if let Some(new_fh) = self.handle_remap.get(&old_fh_out) {
+                remapped = remapped.with_fh_out(*new_fh);
             }
         }
 
@@ -725,8 +737,20 @@ impl<T: FilesystemHandler> FilesystemHandler for RemapFs<T> {
                     if let Some(new_fh) =
                         self.try_reopen_handle(stable_ino, old_fh, request.is_dir_handle_op())
                     {
-                        // Retry with the reopened handle
-                        let retry = remapped.with_fh(new_fh);
+                        // Retry with the reopened handle (fh_in for dual-handle ops)
+                        let mut retry = remapped.with_fh(new_fh);
+
+                        // For dual-handle ops, also reopen fh_out independently
+                        if let (Some(old_fh_out), Some(stable_ino_out)) =
+                            (request.fh_out(), request.ino_out())
+                        {
+                            if let Some(new_fh_out) =
+                                self.try_reopen_handle(stable_ino_out, old_fh_out, false)
+                            {
+                                retry = retry.with_fh_out(new_fh_out);
+                            }
+                        }
+
                         let retry_resp = self
                             .inner
                             .handle_request_with_groups(&retry, supplementary_groups);

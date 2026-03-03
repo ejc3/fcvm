@@ -457,9 +457,43 @@ impl VolumeRequest {
             | Self::Setlk { fh, .. }
             | Self::Readdirplus { fh, .. } => *fh = new_fh,
             Self::Setattr { fh, .. } => *fh = Some(new_fh),
-            Self::CopyFileRange { fh_in, fh_out, .. }
-            | Self::RemapFileRange { fh_in, fh_out, .. } => {
+            Self::CopyFileRange { fh_in, .. } | Self::RemapFileRange { fh_in, .. } => {
                 *fh_in = new_fh;
+            }
+            _ => {}
+        }
+        cloned
+    }
+
+    /// Extract the output file handle (`fh_out`) for dual-handle operations.
+    ///
+    /// Returns `Some(fh_out)` for `CopyFileRange` and `RemapFileRange`, `None` otherwise.
+    pub fn fh_out(&self) -> Option<u64> {
+        match self {
+            Self::CopyFileRange { fh_out, .. } | Self::RemapFileRange { fh_out, .. } => {
+                Some(*fh_out)
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract the output inode (`ino_out`) for dual-handle operations.
+    pub fn ino_out(&self) -> Option<u64> {
+        match self {
+            Self::CopyFileRange { ino_out, .. } | Self::RemapFileRange { ino_out, .. } => {
+                Some(*ino_out)
+            }
+            _ => None,
+        }
+    }
+
+    /// Clone this request with a different output file handle.
+    ///
+    /// Only affects `CopyFileRange` and `RemapFileRange`; no-op for other variants.
+    pub fn with_fh_out(&self, new_fh: u64) -> Self {
+        let mut cloned = self.clone();
+        match &mut cloned {
+            Self::CopyFileRange { fh_out, .. } | Self::RemapFileRange { fh_out, .. } => {
                 *fh_out = new_fh;
             }
             _ => {}
