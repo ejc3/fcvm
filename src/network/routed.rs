@@ -40,6 +40,8 @@ pub struct RoutedNetwork {
     tap_device: String,
     port_mappings: Vec<PortMapping>,
     loopback_ip: Option<String>,
+    /// Explicit routable /64 prefix. Skips auto-detect and MASQUERADE.
+    ipv6_prefix: Option<String>,
 
     // Network state (populated during setup)
     namespace_id: Option<String>,
@@ -56,12 +58,18 @@ impl RoutedNetwork {
             tap_device,
             port_mappings,
             loopback_ip: None,
+            ipv6_prefix: None,
             namespace_id: None,
             host_veth: None,
             vm_ipv6: None,
             default_iface: None,
             proxy_handles: Vec::new(),
         }
+    }
+
+    pub fn with_ipv6_prefix(mut self, prefix: String) -> Self {
+        self.ipv6_prefix = Some(prefix);
+        self
     }
 
     /// Get the network namespace ID (for setting Firecracker's namespace).
@@ -80,13 +88,10 @@ impl RoutedNetwork {
 
     /// Validate that the host meets requirements for routed networking.
     ///
-    /// Checks:
-    /// - Running as root (required for network namespaces and veth pairs)
-    /// - Host has a global IPv6 address with a /64 subnet
-    /// - ip6tables is available (for MASQUERADE)
-    ///
     /// Call this early (before VM setup) to give clear error messages.
-    pub fn preflight_check() -> Result<()> {
+    /// When `--ipv6-prefix` was set (via `with_ipv6_prefix`), auto-detect and
+    /// ip6tables checks are skipped.
+    pub fn preflight_check(&self) -> Result<()> {
         // Must be root
         if !nix::unistd::getuid().is_root() {
             anyhow::bail!(
@@ -95,23 +100,28 @@ impl RoutedNetwork {
             );
         }
 
+        if self.ipv6_prefix.is_some() {
+            return Ok(()); // Explicit prefix — no auto-detect or ip6tables needed
+        }
+
         // Must have global IPv6
         if Self::detect_host_ipv6().is_none() {
             anyhow::bail!(
                 "routed networking requires a host with a global IPv6 address.\n\
-                 The host needs a /64 subnet (or a /128 with a /64 on-link route, e.g. AWS VPC).\n\
-                 Check with: ip -6 addr show scope global\n\
-                 If using AWS, ensure the instance has an IPv6 address assigned."
+                 The host needs a non-deprecated /64 (or a /128 with a /64 on-link route).\n\
+                 Use --ipv6-prefix to specify a routable /64 prefix explicitly.\n\
+                 Check with: ip -6 addr show scope global"
             );
         }
 
-        // ip6tables must be available
+        // ip6tables must be available (for MASQUERADE)
         let ip6tables = std::process::Command::new("ip6tables")
             .args(["--version"])
             .output();
         if ip6tables.is_err() || !ip6tables.unwrap().status.success() {
             anyhow::bail!(
                 "routed networking requires ip6tables for IPv6 MASQUERADE.\n\
+                 Use --ipv6-prefix to specify a routable prefix (skips MASQUERADE).\n\
                  Install with: apt-get install iptables"
             );
         }
@@ -124,13 +134,15 @@ impl RoutedNetwork {
         self.vm_ipv6.as_deref()
     }
 
-    /// Detect host's global IPv6 address and /64 subnet.
+    /// Detect host's global IPv6 address and /64 subnet for VM addressing.
     /// Returns (host_ip, subnet_prefix) e.g. ("2600:1f1c:494:201::1", "2600:1f1c:494:201")
     ///
-    /// Supports two common configurations:
-    /// - Direct /64: host has an address with /64 prefix length (e.g. home/colo servers)
-    /// - AWS-style /128: host has a /128 address but the kernel has a /64 on-link route
-    ///   from Router Advertisements (standard AWS VPC behavior)
+    /// Skips deprecated addresses (preferred_lft 0). Supports:
+    /// - Direct /64: host has an active address with /64 prefix length
+    /// - /128 with on-link /64 route: AWS VPC, service networks
+    ///
+    /// For hosts where auto-detect fails (e.g. only deprecated /64s), use
+    /// --ipv6-prefix to specify the routable prefix explicitly.
     fn detect_host_ipv6() -> Option<(String, String)> {
         let output = std::process::Command::new("ip")
             .args(["-6", "addr", "show", "scope", "global"])
@@ -141,6 +153,9 @@ impl RoutedNetwork {
         for line in stdout.lines() {
             let line = line.trim();
             if let Some(addr) = line.strip_prefix("inet6 ") {
+                if line.contains("deprecated") {
+                    continue;
+                }
                 if let Some(addr_cidr) = addr.split_whitespace().next() {
                     if let Some((addr, prefix_len)) = addr_cidr.split_once('/') {
                         if addr.starts_with("fe80") || addr.starts_with("fd") {
@@ -154,11 +169,9 @@ impl RoutedNetwork {
                             );
 
                             if prefix_len == "64" {
-                                // Direct /64 — use as-is
                                 return Some((addr.to_string(), prefix));
                             }
                             if prefix_len == "128" {
-                                // AWS-style: /128 address, check for /64 on-link route
                                 if Self::has_onlink_64_route(&prefix) {
                                     info!(
                                         addr = %addr,
@@ -258,9 +271,16 @@ impl NetworkManager for RoutedNetwork {
             "setting up routed networking"
         );
 
-        // Detect host IPv6 subnet
-        let (host_ipv6, ipv6_prefix) = Self::detect_host_ipv6()
-            .context("routed mode requires a host with a global IPv6 /64 subnet")?;
+        // Resolve IPv6 /64 prefix: explicit --ipv6-prefix or auto-detect from interfaces
+        let (host_ipv6, ipv6_prefix) = if let Some(ref prefix) = self.ipv6_prefix {
+            let host_addr = format!("{}::1", prefix);
+            info!(prefix = %prefix, "using explicit --ipv6-prefix (routable, no MASQUERADE)");
+            (host_addr, prefix.clone())
+        } else {
+            Self::detect_host_ipv6()
+                .context("routed mode requires a global IPv6 /64 subnet. \
+                          Use --ipv6-prefix to specify one explicitly.")?
+        };
 
         // Generate a unique IPv6 for this VM. Check for route collisions
         // (astronomically unlikely with 64-bit hash, but defend against it).
@@ -356,6 +376,50 @@ impl NetworkManager for RoutedNetwork {
             .output()
             .await;
 
+        // Detect default interface early — used for sysctl checks AND proxy NDP below.
+        let default_iface = detect_default_ipv6_interface()
+            .await
+            .unwrap_or_else(|| "eth0".to_string());
+
+        // Verify host routing is set up correctly. These sysctls are the user's
+        // responsibility (host sysctl configuration), not fcvm's — but warn
+        // loudly if they're wrong because IPv6 egress silently fails without them.
+        if self.ipv6_prefix.is_none() {
+            if let Ok(val) =
+                tokio::fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding").await
+            {
+                if val.trim() != "1" {
+                    warn!(
+                        "net.ipv6.conf.all.forwarding={} (need 1) — fix host sysctls",
+                        val.trim()
+                    );
+                }
+            }
+            if let Ok(val) = tokio::fs::read_to_string(format!(
+                "/proc/sys/net/ipv6/conf/{}/accept_ra",
+                default_iface
+            ))
+            .await
+            {
+                if val.trim() != "2" {
+                    warn!(
+                        "net.ipv6.conf.{}.accept_ra={} (need 2) — IPv6 routing may fail after reboot",
+                        default_iface,
+                        val.trim()
+                    );
+                }
+            }
+            let route_check = tokio::process::Command::new("ip")
+                .args(["-6", "route", "show", "default"])
+                .output()
+                .await;
+            if let Ok(out) = route_check {
+                if !String::from_utf8_lossy(&out.stdout).contains("default via") {
+                    warn!("no default IPv6 route — fix host sysctls to fix accept_ra");
+                }
+            }
+        }
+
         // 8. Assign link-local to host veth manually (auto-assignment fails when
         //    all.forwarding=1 from a previous run). Use EUI-64 from MAC + nodad.
         let host_ll = generate_link_local_from_mac(&host_veth)
@@ -417,9 +481,7 @@ impl NetworkManager for RoutedNetwork {
             .await;
 
         // 12. Add proxy NDP so the network fabric routes VM's IPv6 to this host
-        let default_iface = detect_default_ipv6_interface()
-            .await
-            .unwrap_or_else(|| "eth0".to_string());
+        // (default_iface already detected above)
         // Enable proxy NDP on the interface so the kernel actually responds
         // to neighbor solicitations for our proxy entries.
         let _ = tokio::process::Command::new("sysctl")
@@ -447,22 +509,28 @@ impl NetworkManager for RoutedNetwork {
         //     On AWS, source/dest check drops packets with unassigned source IPs.
         //     MASQUERADE rewrites the source to the host's IP so the VPC fabric
         //     accepts the traffic. IPv4 is not routed externally — only IPv6.
-        let _ = tokio::process::Command::new("ip6tables")
-            .args([
-                "-t",
-                "nat",
-                "-A",
-                "POSTROUTING",
-                "-o",
-                &default_iface,
-                "-s",
-                &format!("{}/128", vm_ipv6),
-                "-j",
-                "MASQUERADE",
-            ])
-            .output()
-            .await;
-        info!(iface = %default_iface, "added IPv6 MASQUERADE for outbound traffic");
+        //     Skipped when --ipv6-prefix is set: the prefix is directly routable
+        //     and the VM's source IP matches the cert's IP SANs.
+        if self.ipv6_prefix.is_some() {
+            info!(iface = %default_iface, "skipping MASQUERADE (--ipv6-prefix is routable)");
+        } else {
+            let _ = tokio::process::Command::new("ip6tables")
+                .args([
+                    "-t",
+                    "nat",
+                    "-A",
+                    "POSTROUTING",
+                    "-o",
+                    &default_iface,
+                    "-s",
+                    &format!("{}/128", vm_ipv6),
+                    "-j",
+                    "MASQUERADE",
+                ])
+                .output()
+                .await;
+            info!(iface = %default_iface, "added IPv6 MASQUERADE for outbound traffic");
+        }
 
         // 14. Port forwarding: TCP proxy listens on host loopback, connects to VM
         //     inside the namespace via setns(2). The veth is a bridge member so
@@ -568,28 +636,30 @@ impl NetworkManager for RoutedNetwork {
         if let Some(ref vm_ipv6) = self.vm_ipv6 {
             let default_iface = self.default_iface.as_deref().unwrap_or("eth0");
 
-            // Remove IPv6 MASQUERADE rule
-            match tokio::process::Command::new("ip6tables")
-                .args([
-                    "-t",
-                    "nat",
-                    "-D",
-                    "POSTROUTING",
-                    "-o",
-                    default_iface,
-                    "-s",
-                    &format!("{}/128", vm_ipv6),
-                    "-j",
-                    "MASQUERADE",
-                ])
-                .output()
-                .await
-            {
-                Ok(o) if !o.status.success() => {
-                    warn!(stderr = %String::from_utf8_lossy(&o.stderr).trim(), "ip6tables MASQUERADE cleanup failed");
+            // Remove IPv6 MASQUERADE rule (only if we set one — skipped with --ipv6-prefix)
+            if self.ipv6_prefix.is_none() {
+                match tokio::process::Command::new("ip6tables")
+                    .args([
+                        "-t",
+                        "nat",
+                        "-D",
+                        "POSTROUTING",
+                        "-o",
+                        default_iface,
+                        "-s",
+                        &format!("{}/128", vm_ipv6),
+                        "-j",
+                        "MASQUERADE",
+                    ])
+                    .output()
+                    .await
+                {
+                    Ok(o) if !o.status.success() => {
+                        warn!(stderr = %String::from_utf8_lossy(&o.stderr).trim(), "ip6tables MASQUERADE cleanup failed");
+                    }
+                    Err(e) => warn!(error = %e, "ip6tables command failed"),
+                    _ => {}
                 }
-                Err(e) => warn!(error = %e, "ip6tables command failed"),
-                _ => {}
             }
 
             // Remove proxy NDP

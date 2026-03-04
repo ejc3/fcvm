@@ -728,6 +728,15 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         FcNetworkMode::Routed => {
             let mut net =
                 RoutedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
+            // Inherit ipv6 prefix from snapshot's guest_ipv6 (e.g. "2803:6084:7058:46f6:xx/128")
+            if let Some(ref guest_ipv6) = snapshot_config.metadata.network_config.guest_ipv6 {
+                let addr_part = guest_ipv6.split('/').next().unwrap_or(guest_ipv6);
+                if let Ok(ip) = addr_part.parse::<std::net::Ipv6Addr>() {
+                    let s = ip.segments();
+                    let prefix = format!("{:x}:{:x}:{:x}:{:x}", s[0], s[1], s[2], s[3]);
+                    net = net.with_ipv6_prefix(prefix);
+                }
+            }
             net.preflight_check().context("routed mode preflight check failed")?;
             if !port_mappings.is_empty() {
                 let loopback_ip = state_manager
