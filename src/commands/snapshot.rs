@@ -724,7 +724,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             // With bridge mode, guest IP is always 10.0.2.100 on pasta network
             // Each clone runs in its own namespace, so no IP conflict
             let net = PastaNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
-                .with_loopback_ip(loopback_ip);
+                .with_loopback_ip(loopback_ip)
+                .with_restore_mode();
             Box::new(net)
         }
     };
