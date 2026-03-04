@@ -154,6 +154,15 @@ impl VolumeServer {
         ready: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<()> {
         let base_path = vsock_socket_path.to_string_lossy();
+
+        info!(
+            port = config.port,
+            host_path = %host_path.display(),
+            read_only = config.read_only,
+            socket = format!("{}_{}", base_path, config.port),
+            "VolumeServer starting (portable, Arc)"
+        );
+
         let server = fuse_pipe::AsyncServer::from_arc(remap);
         server
             .serve_vsock_forwarded_with_ready_signal(&base_path, config.port, ready)
