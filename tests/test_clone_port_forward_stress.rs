@@ -179,9 +179,26 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
         });
     }
 
-    // Step 5: Concurrent HTTP requests to all clones simultaneously
+    // Step 5: Verify each clone's port forwarding before the stress storm
+    println!("\nStep 5: Pre-storm verification of each clone...");
+    for clone in &clones {
+        let check = common::curl_check(&clone.loopback_ip, host_port, 5).await;
+        println!(
+            "  Clone {} ({}:{}): {} ({} bytes, err={})",
+            clone.name, clone.loopback_ip, host_port,
+            if check.success { "OK" } else { "FAIL" },
+            check.body_len, check.error
+        );
+        assert!(
+            check.success && check.body_len > 0,
+            "Pre-storm curl to clone {} failed: {}",
+            clone.name, check.error
+        );
+    }
+
+    // Step 6: Concurrent HTTP requests to all clones simultaneously
     println!(
-        "\nStep 5: Sending {} HTTP requests to each of {} clones (concurrently)...",
+        "\nStep 6: Sending {} HTTP requests to each of {} clones (concurrently)...",
         REQUESTS_PER_CLONE, NUM_CLONES
     );
 
@@ -220,9 +237,43 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
                     errors.fetch_add(1, Ordering::Relaxed);
                     if clone_error <= 3 {
                         println!(
-                            "    ✗ Clone {} request {}: error ({})",
-                            name, req, result.error
+                            "    ✗ Clone {} request {} to {}:{}: error ({})",
+                            name, req, ip, host_port, result.error
                         );
+                    }
+                    // On first error, dump diagnostics
+                    if clone_error == 1 {
+                        let ss = tokio::process::Command::new("ss")
+                            .args(["-tlnp"])
+                            .output()
+                            .await;
+                        if let Ok(out) = ss {
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            // Filter for our port
+                            let port_str = host_port.to_string();
+                            let matching: Vec<&str> = stdout
+                                .lines()
+                                .filter(|l| l.contains(&port_str) || l.starts_with("State"))
+                                .collect();
+                            println!(
+                                "    DIAG clone {} port {} ss output: {:?}",
+                                name, host_port, matching
+                            );
+                        }
+                        // Also try a verbose curl
+                        let verbose = tokio::process::Command::new("curl")
+                            .args(["-v", "--max-time", "2",
+                                   &format!("http://{}:{}", ip, host_port)])
+                            .output()
+                            .await;
+                        if let Ok(out) = verbose {
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            println!(
+                                "    DIAG clone {} verbose curl stderr: {}",
+                                name,
+                                stderr.chars().take(500).collect::<String>()
+                            );
+                        }
                     }
                 }
             }

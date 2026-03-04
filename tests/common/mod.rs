@@ -1560,7 +1560,7 @@ pub struct CurlResult {
 pub async fn curl_check(ip: &str, port: u16, timeout_secs: u32) -> CurlResult {
     let url = format!("http://{}:{}", ip, port);
     match tokio::process::Command::new("curl")
-        .args(["-s", "--max-time", &timeout_secs.to_string(), &url])
+        .args(["-sS", "--max-time", &timeout_secs.to_string(), &url])
         .output()
         .await
     {
