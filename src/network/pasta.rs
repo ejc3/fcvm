@@ -75,6 +75,7 @@ pub struct PastaNetwork {
     pid_file: Option<PathBuf>,
     loopback_ip: Option<String>, // Unique loopback IP for port forwarding (127.x.y.z)
     holder_pid: Option<u32>,     // Namespace PID (set in post_start)
+    restore_mode: bool,          // Skip port probe in post_start (VM not loaded yet)
 }
 
 impl PastaNetwork {
@@ -90,6 +91,7 @@ impl PastaNetwork {
             pid_file: None,
             loopback_ip: None,
             holder_pid: None,
+            restore_mode: false,
         }
     }
 
@@ -103,6 +105,20 @@ impl PastaNetwork {
     /// This is fully rootless!
     pub fn with_loopback_ip(mut self, loopback_ip: String) -> Self {
         self.loopback_ip = Some(loopback_ip);
+        self
+    }
+
+    /// Skip port forwarding probe in post_start() for snapshot restore.
+    ///
+    /// During snapshot restore, post_start() runs BEFORE the VM snapshot is loaded
+    /// into Firecracker. Probing ports at that point forces pasta to attempt L2
+    /// forwarding to a non-existent guest, which can poison pasta's internal
+    /// connection tracking and cause subsequent data-bearing connections to fail
+    /// (TCP connect succeeds but 0 bytes returned). The proper verification happens
+    /// later via verify_port_forwarding() after the VM is resumed and fc-agent has
+    /// sent its gratuitous ARP.
+    pub fn with_restore_mode(mut self) -> Self {
+        self.restore_mode = true;
         self
     }
 
@@ -604,7 +620,13 @@ impl NetworkManager for PastaNetwork {
         // The PID file only means pasta spawned, not that ports are bound.
         // Health checks use nsenter (bridge path), so without this check
         // "healthy" doesn't mean port forwarding works.
-        if !self.port_mappings.is_empty() {
+        //
+        // Skip in restore mode: during snapshot restore, post_start() runs BEFORE
+        // the VM snapshot is loaded. Probing ports now forces pasta to attempt L2
+        // forwarding to a non-existent guest, poisoning its connection state and
+        // causing subsequent connections to return 0 bytes. The port check happens
+        // later via verify_port_forwarding() after the VM is actually running.
+        if !self.restore_mode && !self.port_mappings.is_empty() {
             self.wait_for_port_forwarding().await?;
         }
 
