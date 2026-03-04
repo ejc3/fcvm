@@ -180,21 +180,23 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
     }
 
     // Step 5: Verify each clone's port forwarding before the stress storm
-    println!("\nStep 5: Pre-storm verification of each clone...");
+    // Use curl_check_retry: the L2 channel is ready (verify_port_forwarding passed)
+    // but the guest application may need a moment after snapshot restore.
+    println!("\nStep 5: Pre-storm verification of each clone (with retries)...");
     for clone in &clones {
-        let check = common::curl_check(&clone.loopback_ip, host_port, 5).await;
+        let check =
+            common::curl_check_retry(&clone.loopback_ip, host_port, 10, Some(clone.pid)).await;
         println!(
-            "  Clone {} ({}:{}): {} ({} bytes, err={})",
+            "  Clone {} ({}:{}): {} ({} bytes)",
             clone.name,
             clone.loopback_ip,
             host_port,
             if check.success { "OK" } else { "FAIL" },
             check.body_len,
-            check.error
         );
         assert!(
             check.success && check.body_len > 0,
-            "Pre-storm curl to clone {} failed: {}",
+            "Pre-storm curl to clone {} failed after retries: {}",
             clone.name,
             check.error
         );

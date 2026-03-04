@@ -691,7 +691,7 @@ impl NetworkManager for PastaNetwork {
                 .args(&nsenter_prefix[1..])
                 .args(["ping", "-c", "1", "-W", "0.2", GUEST_IP])
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .output()
                 .await
                 .context("running ping via nsenter in namespace")?;
@@ -706,10 +706,13 @@ impl NetworkManager for PastaNetwork {
             }
 
             if std::time::Instant::now() > deadline {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr = stderr.trim();
                 anyhow::bail!(
-                    "ARP for guest {} not resolved within 5s on {}",
+                    "ARP for guest {} not resolved within 5s on {}: ping stderr: {}",
                     GUEST_IP,
-                    BRIDGE_DEVICE
+                    BRIDGE_DEVICE,
+                    if stderr.is_empty() { "(empty)" } else { stderr }
                 );
             }
 
