@@ -650,9 +650,12 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             port_mappings.clone(),
         )),
         NetworkMode::Routed => {
-            RoutedNetwork::preflight_check().context("routed mode preflight check failed")?;
             let mut net =
                 RoutedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
+            if let Some(ref prefix) = args.ipv6_prefix {
+                net = net.with_ipv6_prefix(prefix.clone());
+            }
+            net.preflight_check().context("routed mode preflight check failed")?;
             if !port_mappings.is_empty() {
                 let loopback_ip = state_manager
                     .allocate_loopback_ip(&mut vm_state)
@@ -813,7 +816,9 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         None
     };
 
-    // Start egress proxy for rootless mode (bypasses TAP/bridge for outbound TCP)
+    // Start egress proxy for rootless mode only.
+    // Routed mode uses native IPv6 kernel routing — no proxy needed.
+    // Services use mutual TLS with client certs, not source IP matching.
     let egress_proxy_handle = if matches!(args.network, NetworkMode::Rootless) {
         let socket_path = vsock_socket_path.clone();
         Some(tokio::spawn(async move {
