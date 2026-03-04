@@ -673,7 +673,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Network mode inherited from snapshot metadata
     let network_mode = snapshot_config.metadata.network_mode;
 
-    // Start egress proxy for rootless mode (bypasses TAP/bridge for outbound TCP)
+    // Start egress proxy for rootless mode only
     let _egress_proxy_handle = if matches!(network_mode, FcNetworkMode::Rootless) {
         let socket_path = clone_vsock_base.clone();
         Some(tokio::spawn(async move {
@@ -726,9 +726,9 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             Box::new(net)
         }
         FcNetworkMode::Routed => {
-            RoutedNetwork::preflight_check().context("routed mode preflight check failed")?;
             let mut net =
                 RoutedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
+            net.preflight_check().context("routed mode preflight check failed")?;
             if !port_mappings.is_empty() {
                 let loopback_ip = state_manager
                     .allocate_loopback_ip(&mut vm_state)
@@ -1098,13 +1098,13 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     //   exec_rebind → exec_re_register → rebind_done → output.reconnect() → HERE
     // Without this gate, the health monitor could start exec calls before
     // the exec server has re-registered its AsyncFd after restore.
+    // No timeout — after snapshot restore, the VM may be CPU-starved (HHVM, EdenFS,
+    // falcon all resume simultaneously) and fc-agent's MMDS poll + restore handler
+    // can take minutes. Proceeding early causes exec failures; waiting is correct.
     if !tty_mode {
-        match tokio::time::timeout(std::time::Duration::from_secs(30), output_connected_rx).await {
-            Ok(Ok(())) => info!(vm_id = %vm_id, "fc-agent output connected, exec server ready"),
-            Ok(Err(_)) => warn!(vm_id = %vm_id, "output connected_tx dropped"),
-            Err(_) => {
-                warn!(vm_id = %vm_id, "fc-agent did not connect within 30s, proceeding anyway")
-            }
+        match output_connected_rx.await {
+            Ok(()) => info!(vm_id = %vm_id, "fc-agent output connected, exec server ready"),
+            Err(_) => warn!(vm_id = %vm_id, "output connected_tx dropped"),
         }
     }
 
