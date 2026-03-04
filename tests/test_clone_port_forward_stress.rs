@@ -247,14 +247,15 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
                     }
                     // On first error, dump diagnostics
                     if clone_error == 1 {
+                        let port_str = host_port.to_string();
+
+                        // 1. Check listening sockets for our port
                         let ss = tokio::process::Command::new("ss")
                             .args(["-tlnp"])
                             .output()
                             .await;
                         if let Ok(out) = ss {
                             let stdout = String::from_utf8_lossy(&out.stdout);
-                            // Filter for our port
-                            let port_str = host_port.to_string();
                             let matching: Vec<&str> = stdout
                                 .lines()
                                 .filter(|l| l.contains(&port_str) || l.starts_with("State"))
@@ -264,7 +265,8 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
                                 name, host_port, matching
                             );
                         }
-                        // Also try a verbose curl
+
+                        // 2. Verbose curl to see connection details
                         let verbose = tokio::process::Command::new("curl")
                             .args([
                                 "-v",
@@ -280,6 +282,43 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
                                 "    DIAG clone {} verbose curl stderr: {}",
                                 name,
                                 stderr.chars().take(500).collect::<String>()
+                            );
+                        }
+
+                        // 3. Check if pasta is still alive (look for pasta process)
+                        let pgrep = tokio::process::Command::new("pgrep")
+                            .args(["-a", "pasta"])
+                            .output()
+                            .await;
+                        if let Ok(out) = pgrep {
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            let matching: Vec<&str> = stdout
+                                .lines()
+                                .filter(|l| l.contains(&ip) || l.contains(&port_str))
+                                .collect();
+                            println!(
+                                "    DIAG clone {} pasta processes matching {}:{}: {:?}",
+                                name, ip, host_port, matching
+                            );
+                            // Also show all pasta processes for context
+                            let all: Vec<&str> = stdout.lines().collect();
+                            println!("    DIAG clone {} all pasta processes: {:?}", name, all);
+                        }
+
+                        // 4. Check connections (not just listening)
+                        let ss_all = tokio::process::Command::new("ss")
+                            .args(["-tnp"])
+                            .output()
+                            .await;
+                        if let Ok(out) = ss_all {
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            let matching: Vec<&str> = stdout
+                                .lines()
+                                .filter(|l| l.contains(&ip) || l.starts_with("State"))
+                                .collect();
+                            println!(
+                                "    DIAG clone {} connections to {}: {:?}",
+                                name, ip, matching
                             );
                         }
                     }
