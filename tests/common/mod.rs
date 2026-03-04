@@ -1526,6 +1526,61 @@ pub fn find_available_high_port() -> anyhow::Result<u16> {
     find_available_port(10000 + offset, 50000 - offset)
 }
 
+/// Get the loopback IP for a VM by PID (from `fcvm ls --json`).
+pub async fn get_loopback_ip(pid: u32) -> anyhow::Result<String> {
+    let fcvm_path = find_fcvm_binary()?;
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args(["ls", "--json", "--pid", &pid.to_string()])
+        .output()
+        .await
+        .context("getting VM state for loopback IP")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str::<Vec<serde_json::Value>>(&stdout)
+        .ok()
+        .and_then(|v| v.first().cloned())
+        .and_then(|v| {
+            v.get("config")?
+                .get("network")?
+                .get("loopback_ip")?
+                .as_str()
+                .map(|s| s.to_string())
+        })
+        .ok_or_else(|| anyhow::anyhow!("loopback_ip not found for VM PID {}", pid))
+}
+
+/// Result of a single HTTP check via curl.
+pub struct CurlResult {
+    pub success: bool,
+    pub body_len: usize,
+    pub error: String,
+}
+
+/// Make a single HTTP request via curl and return the result.
+pub async fn curl_check(ip: &str, port: u16, timeout_secs: u32) -> CurlResult {
+    let url = format!("http://{}:{}", ip, port);
+    match tokio::process::Command::new("curl")
+        .args(["-s", "--max-time", &timeout_secs.to_string(), &url])
+        .output()
+        .await
+    {
+        Ok(output) => CurlResult {
+            success: output.status.success(),
+            body_len: output.stdout.len(),
+            error: if output.status.success() {
+                String::new()
+            } else {
+                String::from_utf8_lossy(&output.stderr).to_string()
+            },
+        },
+        Err(e) => CurlResult {
+            success: false,
+            body_len: 0,
+            error: format!("curl failed: {}", e),
+        },
+    }
+}
+
 /// Wait for a TCP server to be ready by attempting to connect.
 ///
 /// # Arguments

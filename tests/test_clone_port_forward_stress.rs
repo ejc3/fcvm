@@ -2,7 +2,7 @@
 //!
 //! This test exercises the pasta port forwarding path under stress:
 //! - Multiple clones spawned from the same snapshot
-//! - Rapid repeated HTTP requests to each clone
+//! - Concurrent rapid HTTP requests to all clones simultaneously
 //! - Checks for 0-byte responses (pasta connection tracking poisoning)
 //!
 //! Background: During snapshot restore, `post_start()` calls
@@ -17,7 +17,9 @@
 mod common;
 
 use anyhow::{Context, Result};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 
 /// Number of clones to spawn
 const NUM_CLONES: usize = 3;
@@ -25,7 +27,7 @@ const NUM_CLONES: usize = 3;
 /// Number of HTTP requests per clone
 const REQUESTS_PER_CLONE: usize = 20;
 
-/// Stress test: multiple clones with port forwarding, rapid HTTP requests
+/// Stress test: multiple clones with port forwarding, concurrent HTTP requests
 ///
 /// Reproduces the "connect succeeded but 0 bytes" pattern seen in CI bench-vm
 /// failures. The hypothesis: pasta's `wait_for_port_forwarding()` probe during
@@ -37,7 +39,7 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
     println!("║     Clone Port Forward Stress Test (rootless)                ║");
     println!(
-        "║     {} clones × {} requests each                           ║",
+        "║     {} clones × {} requests each (concurrent)              ║",
         NUM_CLONES, REQUESTS_PER_CLONE
     );
     println!("╚═══════════════════════════════════════════════════════════════╝\n");
@@ -77,29 +79,10 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
     println!("  ✓ Baseline VM healthy (PID: {})", baseline_pid);
 
     // Verify baseline port forwarding works before snapshotting
-    let output = tokio::process::Command::new(&fcvm_path)
-        .args(["ls", "--json", "--pid", &baseline_pid.to_string()])
-        .output()
-        .await
-        .context("getting baseline state")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let baseline_ip: String = serde_json::from_str::<Vec<serde_json::Value>>(&stdout)
-        .ok()
-        .and_then(|v| v.first().cloned())
-        .and_then(|v| {
-            v.get("config")?
-                .get("network")?
-                .get("loopback_ip")?
-                .as_str()
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_default();
-
+    let baseline_ip = common::get_loopback_ip(baseline_pid).await?;
     println!("  Baseline loopback IP: {}", baseline_ip);
 
-    // Verify baseline nginx responds
-    let baseline_check = curl_check(&baseline_ip, host_port, 5).await;
+    let baseline_check = common::curl_check(&baseline_ip, host_port, 5).await;
     println!(
         "  Baseline HTTP check: {} ({} bytes)",
         if baseline_check.success {
@@ -149,8 +132,8 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
     common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
     println!("  ✓ Memory server ready (PID: {})", serve_pid);
 
-    // Step 4: Spawn clones sequentially (each gets unique loopback IP)
-    println!("\nStep 4: Spawning {} clones...", NUM_CLONES);
+    // Step 4: Spawn all clones concurrently
+    println!("\nStep 4: Spawning {} clones concurrently...", NUM_CLONES);
     let serve_pid_str = serve_pid.to_string();
 
     struct CloneInfo {
@@ -160,120 +143,109 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
         _child: tokio::process::Child,
     }
 
-    let mut clones: Vec<CloneInfo> = Vec::new();
+    // Spawn all clones concurrently using JoinSet
+    let mut spawn_set = tokio::task::JoinSet::new();
 
     for i in 0..NUM_CLONES {
         let clone_name = format!("pf-stress-clone-{}-{}", i, std::process::id());
         println!("  Spawning clone {} ({})...", i, clone_name);
-
-        let (child, clone_pid) = common::spawn_fcvm_with_logs(
-            &[
-                "snapshot",
-                "run",
-                "--pid",
-                &serve_pid_str,
-                "--name",
+        let pid_str = serve_pid_str.clone();
+        spawn_set.spawn(async move {
+            let (child, clone_pid) = common::spawn_fcvm_with_logs(
+                &["snapshot", "run", "--pid", &pid_str, "--name", &clone_name],
                 &clone_name,
-            ],
-            &clone_name,
-        )
-        .await
-        .context(format!("spawning clone {}", i))?;
-
-        // Wait for healthy
-        common::poll_health_by_pid(clone_pid, 120).await?;
-        println!("  ✓ Clone {} healthy (PID: {})", i, clone_pid);
-
-        // Get loopback IP
-        let output = tokio::process::Command::new(&fcvm_path)
-            .args(["ls", "--json", "--pid", &clone_pid.to_string()])
-            .output()
+            )
             .await
-            .context("getting clone state")?;
+            .context(format!("spawning clone {}", clone_name))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let loopback_ip: String = serde_json::from_str::<Vec<serde_json::Value>>(&stdout)
-            .ok()
-            .and_then(|v| v.first().cloned())
-            .and_then(|v| {
-                v.get("config")?
-                    .get("network")?
-                    .get("loopback_ip")?
-                    .as_str()
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_default();
+            common::poll_health_by_pid(clone_pid, 120).await?;
+            let loopback_ip = common::get_loopback_ip(clone_pid).await?;
+            Ok::<_, anyhow::Error>((clone_name, clone_pid, loopback_ip, child))
+        });
+    }
 
-        println!("    Loopback IP: {}", loopback_ip);
-
+    let mut clones: Vec<CloneInfo> = Vec::new();
+    while let Some(result) = spawn_set.join_next().await {
+        let (name, pid, loopback_ip, child) = result??;
+        println!(
+            "  ✓ Clone {} healthy (PID: {}, IP: {})",
+            name, pid, loopback_ip
+        );
         clones.push(CloneInfo {
-            name: clone_name,
-            pid: clone_pid,
+            name,
+            pid,
             loopback_ip,
             _child: child,
         });
     }
 
-    // Step 5: Rapid HTTP requests to all clones
+    // Step 5: Concurrent HTTP requests to all clones simultaneously
     println!(
-        "\nStep 5: Sending {} HTTP requests to each of {} clones...",
+        "\nStep 5: Sending {} HTTP requests to each of {} clones (concurrently)...",
         REQUESTS_PER_CLONE, NUM_CLONES
     );
 
-    let mut total_requests = 0u32;
-    let mut total_success = 0u32;
-    let mut total_zero_bytes = 0u32;
-    let mut total_errors = 0u32;
+    let total_success = Arc::new(AtomicU32::new(0));
+    let total_zero_bytes = Arc::new(AtomicU32::new(0));
+    let total_errors = Arc::new(AtomicU32::new(0));
 
+    let start = Instant::now();
+
+    // Spawn concurrent tasks for all clones
+    let mut handles = Vec::new();
     for clone in &clones {
-        let mut clone_success = 0u32;
-        let mut clone_zero = 0u32;
-        let mut clone_error = 0u32;
+        let ip = clone.loopback_ip.clone();
+        let name = clone.name.clone();
+        let success = Arc::clone(&total_success);
+        let zero = Arc::clone(&total_zero_bytes);
+        let errors = Arc::clone(&total_errors);
 
-        let start = Instant::now();
+        let handle = tokio::spawn(async move {
+            let mut clone_success = 0u32;
+            let mut clone_zero = 0u32;
+            let mut clone_error = 0u32;
 
-        for req in 0..REQUESTS_PER_CLONE {
-            let result = curl_check(&clone.loopback_ip, host_port, 5).await;
-            total_requests += 1;
+            for req in 0..REQUESTS_PER_CLONE {
+                let result = common::curl_check(&ip, host_port, 5).await;
 
-            if result.success && result.body_len > 0 {
-                clone_success += 1;
-                total_success += 1;
-            } else if result.success && result.body_len == 0 {
-                // This is the pasta poisoning pattern: connect succeeds but 0 bytes
-                clone_zero += 1;
-                total_zero_bytes += 1;
-                println!(
-                    "    ⚠ Clone {} request {}: 0-byte response!",
-                    clone.name, req
-                );
-            } else {
-                clone_error += 1;
-                total_errors += 1;
-                if clone_error <= 3 {
-                    println!(
-                        "    ✗ Clone {} request {}: error ({})",
-                        clone.name, req, result.error
-                    );
+                if result.success && result.body_len > 0 {
+                    clone_success += 1;
+                    success.fetch_add(1, Ordering::Relaxed);
+                } else if result.success && result.body_len == 0 {
+                    clone_zero += 1;
+                    zero.fetch_add(1, Ordering::Relaxed);
+                    println!("    ⚠ Clone {} request {}: 0-byte response!", name, req);
+                } else {
+                    clone_error += 1;
+                    errors.fetch_add(1, Ordering::Relaxed);
+                    if clone_error <= 3 {
+                        println!(
+                            "    ✗ Clone {} request {}: error ({})",
+                            name, req, result.error
+                        );
+                    }
                 }
             }
 
-            // Brief pause between requests (not too long - we want stress)
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+            (name, clone_success, clone_zero, clone_error)
+        });
+        handles.push(handle);
+    }
 
-        let elapsed = start.elapsed();
+    // Wait for all concurrent tasks to complete
+    for handle in handles {
+        let (name, ok, zero, err) = handle.await?;
         println!(
-            "  Clone {} ({}): {}/{} OK, {} zero-byte, {} errors ({:.1}s)",
-            clone.name,
-            clone.loopback_ip,
-            clone_success,
-            REQUESTS_PER_CLONE,
-            clone_zero,
-            clone_error,
-            elapsed.as_secs_f64()
+            "  Clone {}: {}/{} OK, {} zero-byte, {} errors",
+            name, ok, REQUESTS_PER_CLONE, zero, err
         );
     }
+
+    let elapsed = start.elapsed();
+    let total_requests = (NUM_CLONES * REQUESTS_PER_CLONE) as u32;
+    let success = total_success.load(Ordering::Relaxed);
+    let zero_bytes = total_zero_bytes.load(Ordering::Relaxed);
+    let errs = total_errors.load(Ordering::Relaxed);
 
     // Cleanup
     println!("\nCleaning up...");
@@ -288,37 +260,38 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
     println!("║                         RESULTS                               ║");
     println!("╠═══════════════════════════════════════════════════════════════╣");
     println!(
-        "║  Total requests:    {:4}                                      ║",
-        total_requests
+        "║  Total requests:    {:4}  ({:.1}s concurrent)                ║",
+        total_requests,
+        elapsed.as_secs_f64()
     );
     println!(
         "║  Successful:        {:4}                                      ║",
-        total_success
+        success
     );
     println!(
         "║  Zero-byte:         {:4}  (pasta poisoning pattern)           ║",
-        total_zero_bytes
+        zero_bytes
     );
     println!(
         "║  Errors:            {:4}                                      ║",
-        total_errors
+        errs
     );
     println!("╚═══════════════════════════════════════════════════════════════╝");
 
-    if total_zero_bytes > 0 {
+    if zero_bytes > 0 {
         anyhow::bail!(
             "PASTA POISONING DETECTED: {} out of {} requests returned 0 bytes. \
              This confirms that wait_for_port_forwarding() during restore \
              (before guest exists) corrupts pasta's forwarding state.",
-            total_zero_bytes,
+            zero_bytes,
             total_requests
         );
     }
 
-    if total_errors > 0 {
+    if errs > 0 {
         anyhow::bail!(
             "Port forwarding errors: {} out of {} requests failed",
-            total_errors,
+            errs,
             total_requests
         );
     }
@@ -329,36 +302,4 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
         total_requests, NUM_CLONES
     );
     Ok(())
-}
-
-/// Result of a single HTTP check
-struct CurlResult {
-    success: bool,
-    body_len: usize,
-    error: String,
-}
-
-/// Make a single HTTP request and return the result
-async fn curl_check(ip: &str, port: u16, timeout_secs: u32) -> CurlResult {
-    let url = format!("http://{}:{}", ip, port);
-    match tokio::process::Command::new("curl")
-        .args(["-s", "--max-time", &timeout_secs.to_string(), &url])
-        .output()
-        .await
-    {
-        Ok(output) => CurlResult {
-            success: output.status.success(),
-            body_len: output.stdout.len(),
-            error: if output.status.success() {
-                String::new()
-            } else {
-                String::from_utf8_lossy(&output.stderr).to_string()
-            },
-        },
-        Err(e) => CurlResult {
-            success: false,
-            body_len: 0,
-            error: format!("curl failed: {}", e),
-        },
-    }
 }

@@ -1503,24 +1503,7 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
     println!("\nStep 5: Testing port forwarding...");
 
     // Get clone's loopback IP from state (rootless uses 127.x.y.z)
-    let output = tokio::process::Command::new(&fcvm_path)
-        .args(["ls", "--json", "--pid", &clone_pid.to_string()])
-        .output()
-        .await
-        .context("getting clone state")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let loopback_ip: String = serde_json::from_str::<Vec<serde_json::Value>>(&stdout)
-        .ok()
-        .and_then(|v| v.first().cloned())
-        .and_then(|v| {
-            v.get("config")?
-                .get("network")?
-                .get("loopback_ip")?
-                .as_str()
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_default();
+    let loopback_ip = common::get_loopback_ip(clone_pid).await?;
 
     println!("  Clone loopback IP: {}", loopback_ip);
 
@@ -1691,24 +1674,7 @@ async fn test_clone_port_forward_routed() -> Result<()> {
     println!("\nStep 5: Testing port forwarding...");
 
     // Get clone's loopback IP from state (routed uses TCP proxy + loopback like rootless)
-    let output = tokio::process::Command::new(&fcvm_path)
-        .args(["ls", "--json", "--pid", &clone_pid.to_string()])
-        .output()
-        .await
-        .context("getting clone state")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let loopback_ip: String = serde_json::from_str::<Vec<serde_json::Value>>(&stdout)
-        .ok()
-        .and_then(|v| v.first().cloned())
-        .and_then(|v| {
-            v.get("config")?
-                .get("network")?
-                .get("loopback_ip")?
-                .as_str()
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_default();
+    let loopback_ip = common::get_loopback_ip(clone_pid).await?;
 
     println!("  Clone loopback IP: {}", loopback_ip);
 
