@@ -662,14 +662,14 @@ impl NetworkManager for PastaNetwork {
     /// Verify pasta's L2 forwarding path is ready after snapshot restore.
     ///
     /// After snapshot restore, pasta needs the guest's MAC address to forward
-    /// L2 frames. fc-agent sends a gratuitous ARP (ping to gateway) during
-    /// restore, which broadcasts the guest's MAC to all bridge ports including
-    /// pasta0. We verify this by checking the namespace's ARP table — if the
-    /// namespace kernel learned the guest's MAC, pasta received the same
-    /// broadcast frame.
+    /// L2 frames. We actively ping the guest from the namespace to trigger a
+    /// normal ARP exchange. With arp_accept=0 (Linux default), the guest's
+    /// gratuitous arping does NOT create neighbor entries — only updates
+    /// existing ones. The active ping forces the namespace kernel to send an
+    /// ARP request that the guest replies to, creating a REACHABLE entry.
     ///
-    /// This runs after fc-agent's output vsock reconnects, so the gratuitous
-    /// ARP has already been sent. Typically resolves on the first check.
+    /// Once ARP is resolved, we probe each forwarded port to confirm pasta's
+    /// loopback port forwarding is end-to-end functional.
     async fn verify_port_forwarding(&self) -> Result<()> {
         if self.port_mappings.is_empty() {
             return Ok(());
@@ -684,25 +684,23 @@ impl NetworkManager for PastaNetwork {
         let nsenter_prefix = self.build_nsenter_prefix(holder_pid);
 
         loop {
-            let output = Command::new(&nsenter_prefix[0])
+            // Ping the guest to trigger ARP resolution. A successful ping (exit 0)
+            // proves ARP resolved AND the guest is reachable — skip the ip neigh check.
+            // Use 200ms timeout for ~16 retries within the 5s deadline.
+            let ping_result = Command::new(&nsenter_prefix[0])
                 .args(&nsenter_prefix[1..])
-                .args(["ip", "neigh", "show", GUEST_IP, "dev", BRIDGE_DEVICE])
-                .stdout(Stdio::piped())
+                .args(["ping", "-c", "1", "-W", "0.2", GUEST_IP])
+                .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .output()
-                .await
-                .context("checking ARP table in namespace")?;
+                .await;
 
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Entry looks like: "10.0.2.100 lladdr aa:bb:cc:dd:ee:ff REACHABLE"
-            // If lladdr is present, the guest's MAC is known.
-            if stdout.contains("lladdr") {
-                info!(guest_ip = GUEST_IP, arp = %stdout.trim(), "ARP resolved");
-                // ARP is resolved but pasta's loopback port forwarding may not be
-                // ready yet. Probe each mapped port on the loopback IP to confirm
-                // end-to-end forwarding works before declaring ready.
-                self.wait_for_port_forwarding().await?;
-                return Ok(());
+            if let Ok(ref out) = ping_result {
+                if out.status.success() {
+                    info!(guest_ip = GUEST_IP, "guest reachable via ping, ARP resolved");
+                    self.wait_for_port_forwarding().await?;
+                    return Ok(());
+                }
             }
 
             if std::time::Instant::now() > deadline {
@@ -713,8 +711,7 @@ impl NetworkManager for PastaNetwork {
                 );
             }
 
-            debug!(guest_ip = GUEST_IP, "ARP not yet resolved, waiting");
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            debug!(guest_ip = GUEST_IP, "ping to guest failed, retrying");
         }
     }
 
