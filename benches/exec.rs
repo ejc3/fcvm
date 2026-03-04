@@ -501,20 +501,18 @@ impl CloneFixture {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
-            // Dump serve log for diagnostics
-            let serve_log = "/tmp/fcvm-bench-serve-clone-exec.log";
-            if let Ok(logs) = std::fs::read_to_string(serve_log) {
-                let tail: Vec<&str> = logs.lines().rev().take(30).collect();
-                eprintln!("=== Last 30 lines of serve log ===");
-                for line in tail.into_iter().rev() {
-                    eprintln!("{}", line);
-                }
-            }
+            let serve_log_path = "/tmp/fcvm-bench-serve-clone-exec.log";
+            let serve_log_content = std::fs::read_to_string(serve_log_path).unwrap_or_default();
             panic!(
-                "clone exec failed after {:.1}s:\nstderr: {}\nstdout: {}",
+                "clone exec failed after {:.1}s:\n\
+                 stderr: {}\n\
+                 stdout: {}\n\
+                 \n=== full serve log ({}) ===\n{}",
                 elapsed.as_secs_f64(),
                 stderr,
-                stdout
+                stdout,
+                serve_log_path,
+                serve_log_content,
             );
         }
 
@@ -637,16 +635,69 @@ impl CloneFixture {
                 .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
                 .unwrap_or_default();
 
-            // Last 30 lines of clone log (full, not filtered)
-            let log_tail: String = clone_log
-                .lines()
-                .rev()
-                .take(30)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n");
+            // Get holder PID for namespace diagnostics
+            let holder_diag = Command::new(&fcvm)
+                .args(["ls", "--json", "--pid", &clone_pid.to_string()])
+                .output()
+                .ok()
+                .and_then(|o| {
+                    let stdout = String::from_utf8_lossy(&o.stdout);
+                    serde_json::from_str::<Vec<serde_json::Value>>(&stdout).ok()
+                })
+                .and_then(|vms| {
+                    vms.first()
+                        .and_then(|v| v["holder_pid"].as_u64())
+                        .map(|hp| {
+                            let hp_str = hp.to_string();
+                            let mut diag = String::new();
+
+                            // ARP cache in namespace
+                            if let Ok(o) = Command::new("nsenter")
+                                .args(["-t", &hp_str, "-n", "ip", "neigh", "show"])
+                                .output()
+                            {
+                                diag.push_str(&format!(
+                                    "\n=== ARP cache (ns {}) ===\n{}",
+                                    hp,
+                                    String::from_utf8_lossy(&o.stdout)
+                                ));
+                            }
+
+                            // Namespace sockets
+                            if let Ok(o) = Command::new("nsenter")
+                                .args(["-t", &hp_str, "-n", "ss", "-tnp"])
+                                .output()
+                            {
+                                diag.push_str(&format!(
+                                    "\n=== namespace sockets (ns {}) ===\n{}",
+                                    hp,
+                                    String::from_utf8_lossy(&o.stdout)
+                                ));
+                            }
+
+                            // Bridge links
+                            if let Ok(o) = Command::new("nsenter")
+                                .args(["-t", &hp_str, "-n", "bridge", "link"])
+                                .output()
+                            {
+                                diag.push_str(&format!(
+                                    "\n=== bridge links (ns {}) ===\n{}",
+                                    hp,
+                                    String::from_utf8_lossy(&o.stdout)
+                                ));
+                            }
+
+                            diag
+                        })
+                })
+                .unwrap_or_default();
+
+            // VM listening sockets
+            let vm_ss = Command::new(&fcvm)
+                .args(["exec", "--pid", &clone_pid.to_string(), "--", "ss", "-tnl"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_else(|e| format!("exec ss failed: {}", e));
 
             panic!(
                 "clone HTTP failed after 10 attempts\n\
@@ -657,7 +708,9 @@ impl CloneFixture {
                  \n=== listening sockets on {} ===\n{}\
                  \n=== pasta processes ===\n{}\
                  \n=== stale process counts ===\n{}\
-                 \n=== clone log (last 30 lines) ===\n{}",
+                 {}\
+                 \n=== VM listening sockets ===\n{}\
+                 \n=== full clone log ({}) ===\n{}",
                 loopback_ip,
                 health_port,
                 last_response.len(),
@@ -667,7 +720,10 @@ impl CloneFixture {
                 ss_check,
                 pasta_check,
                 stale_check,
-                log_tail,
+                holder_diag,
+                vm_ss,
+                clone_log_path,
+                clone_log,
             );
         }
 
