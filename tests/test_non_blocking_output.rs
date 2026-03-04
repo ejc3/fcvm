@@ -14,7 +14,6 @@
 mod common;
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
 use std::time::Duration;
 
 #[tokio::test]
