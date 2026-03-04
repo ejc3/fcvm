@@ -683,10 +683,10 @@ impl NetworkManager for PastaNetwork {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let nsenter_prefix = self.build_nsenter_prefix(holder_pid);
 
+        // Ping the guest from inside the namespace to trigger ARP resolution.
+        // A successful ping proves ARP resolved AND the guest is reachable.
+        // Use 200ms timeout for ~16 retries within the 5s deadline.
         loop {
-            // Ping the guest to trigger ARP resolution. A successful ping (exit 0)
-            // proves ARP resolved AND the guest is reachable — skip the ip neigh check.
-            // Use 200ms timeout for ~16 retries within the 5s deadline.
             let output = Command::new(&nsenter_prefix[0])
                 .args(&nsenter_prefix[1..])
                 .args(["ping", "-c", "1", "-W", "0.2", GUEST_IP])
@@ -697,10 +697,7 @@ impl NetworkManager for PastaNetwork {
                 .context("running ping via nsenter in namespace")?;
 
             if output.status.success() {
-                info!(
-                    guest_ip = GUEST_IP,
-                    "guest reachable via ping, ARP resolved"
-                );
+                info!(guest_ip = GUEST_IP, "guest reachable via ping, ARP resolved");
                 self.wait_for_port_forwarding().await?;
                 return Ok(());
             }

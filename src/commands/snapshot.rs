@@ -1085,8 +1085,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Verify pasta's L2 forwarding path is ready before starting health monitor.
     // After snapshot restore, pasta may not have learned the guest's MAC yet.
     // This pings the guest to trigger ARP resolution, then probes each forwarded
-    // port to confirm end-to-end forwarding works. Only the guest kernel needs
-    // to be running (no guest services required for the ARP/ping step).
+    // port to confirm end-to-end forwarding works.
     network
         .verify_port_forwarding()
         .await
