@@ -724,7 +724,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             // With bridge mode, guest IP is always 10.0.2.100 on pasta network
             // Each clone runs in its own namespace, so no IP conflict
             let net = PastaNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
-                .with_loopback_ip(loopback_ip);
+                .with_loopback_ip(loopback_ip)
+                .with_restore_mode();
             Box::new(net)
         }
     };
@@ -1081,13 +1082,14 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         }
     }
 
-    // Verify pasta's L2 forwarding path has ARP resolved before starting health monitor.
+    // Verify pasta's L2 forwarding path is ready before starting health monitor.
     // After snapshot restore, pasta may not have learned the guest's MAC yet.
-    // This probes each forwarded port to trigger and verify ARP resolution —
-    // no guest service needs to be running, just the guest's kernel.
-    if let Err(e) = network.verify_port_forwarding().await {
-        warn!(vm_id = %vm_id, error = %e, "port forwarding verification failed");
-    }
+    // This pings the guest to trigger ARP resolution, then probes each forwarded
+    // port to confirm end-to-end forwarding works.
+    network
+        .verify_port_forwarding()
+        .await
+        .context("port forwarding verification failed after snapshot restore")?;
 
     // Spawn health monitor task with startup snapshot trigger support
     let health_monitor_handle = crate::health::spawn_health_monitor_full(

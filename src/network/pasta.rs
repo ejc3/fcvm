@@ -75,6 +75,7 @@ pub struct PastaNetwork {
     pid_file: Option<PathBuf>,
     loopback_ip: Option<String>, // Unique loopback IP for port forwarding (127.x.y.z)
     holder_pid: Option<u32>,     // Namespace PID (set in post_start)
+    restore_mode: bool,          // Skip port probe in post_start (VM not loaded yet)
 }
 
 impl PastaNetwork {
@@ -90,6 +91,7 @@ impl PastaNetwork {
             pid_file: None,
             loopback_ip: None,
             holder_pid: None,
+            restore_mode: false,
         }
     }
 
@@ -103,6 +105,19 @@ impl PastaNetwork {
     /// This is fully rootless!
     pub fn with_loopback_ip(mut self, loopback_ip: String) -> Self {
         self.loopback_ip = Some(loopback_ip);
+        self
+    }
+
+    /// Skip port forwarding probe in post_start() for snapshot restore.
+    ///
+    /// During snapshot restore, post_start() runs BEFORE the VM snapshot is loaded
+    /// into Firecracker. Probing ports at that point forces pasta to attempt L2
+    /// forwarding to a non-existent guest, which can poison pasta's internal
+    /// connection tracking and cause subsequent connections to return 0 bytes.
+    /// The proper verification happens later via verify_port_forwarding() after
+    /// the VM is resumed and fc-agent has sent its gratuitous ARP.
+    pub fn with_restore_mode(mut self) -> Self {
+        self.restore_mode = true;
         self
     }
 
@@ -604,7 +619,13 @@ impl NetworkManager for PastaNetwork {
         // The PID file only means pasta spawned, not that ports are bound.
         // Health checks use nsenter (bridge path), so without this check
         // "healthy" doesn't mean port forwarding works.
-        if !self.port_mappings.is_empty() {
+        //
+        // Skip in restore mode: during snapshot restore, post_start() runs BEFORE
+        // the VM snapshot is loaded. Probing ports now forces pasta to attempt L2
+        // forwarding to a non-existent guest, poisoning its connection state and
+        // causing subsequent connections to return 0 bytes. The port check happens
+        // later via verify_port_forwarding() after the VM is actually running.
+        if !self.restore_mode && !self.port_mappings.is_empty() {
             self.wait_for_port_forwarding().await?;
         }
 
@@ -641,14 +662,14 @@ impl NetworkManager for PastaNetwork {
     /// Verify pasta's L2 forwarding path is ready after snapshot restore.
     ///
     /// After snapshot restore, pasta needs the guest's MAC address to forward
-    /// L2 frames. fc-agent sends a gratuitous ARP (ping to gateway) during
-    /// restore, which broadcasts the guest's MAC to all bridge ports including
-    /// pasta0. We verify this by checking the namespace's ARP table — if the
-    /// namespace kernel learned the guest's MAC, pasta received the same
-    /// broadcast frame.
+    /// L2 frames. We actively ping the guest from the namespace to trigger a
+    /// normal ARP exchange. With arp_accept=0 (Linux default), the guest's
+    /// gratuitous arping does NOT create neighbor entries — only updates
+    /// existing ones. The active ping forces the namespace kernel to send an
+    /// ARP request that the guest replies to, creating a REACHABLE entry.
     ///
-    /// This runs after fc-agent's output vsock reconnects, so the gratuitous
-    /// ARP has already been sent. Typically resolves on the first check.
+    /// Once ARP is resolved, we probe each forwarded port to confirm pasta's
+    /// loopback port forwarding is end-to-end functional.
     async fn verify_port_forwarding(&self) -> Result<()> {
         if self.port_mappings.is_empty() {
             return Ok(());
@@ -662,38 +683,40 @@ impl NetworkManager for PastaNetwork {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let nsenter_prefix = self.build_nsenter_prefix(holder_pid);
 
+        // Ping the guest from inside the namespace to trigger ARP resolution.
+        // A successful ping proves ARP resolved AND the guest is reachable.
+        // Use 200ms timeout for ~16 retries within the 5s deadline.
         loop {
             let output = Command::new(&nsenter_prefix[0])
                 .args(&nsenter_prefix[1..])
-                .args(["ip", "neigh", "show", GUEST_IP, "dev", BRIDGE_DEVICE])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .args(["ping", "-c", "1", "-W", "0.2", GUEST_IP])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
                 .output()
                 .await
-                .context("checking ARP table in namespace")?;
+                .context("running ping via nsenter in namespace")?;
 
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Entry looks like: "10.0.2.100 lladdr aa:bb:cc:dd:ee:ff REACHABLE"
-            // If lladdr is present, the guest's MAC is known.
-            if stdout.contains("lladdr") {
-                info!(guest_ip = GUEST_IP, arp = %stdout.trim(), "ARP resolved");
-                // ARP is resolved but pasta's loopback port forwarding may not be
-                // ready yet. Probe each mapped port on the loopback IP to confirm
-                // end-to-end forwarding works before declaring ready.
+            if output.status.success() {
+                info!(
+                    guest_ip = GUEST_IP,
+                    "guest reachable via ping, ARP resolved"
+                );
                 self.wait_for_port_forwarding().await?;
                 return Ok(());
             }
 
             if std::time::Instant::now() > deadline {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr = stderr.trim();
                 anyhow::bail!(
-                    "ARP for guest {} not resolved within 5s on {}",
+                    "ARP for guest {} not resolved within 5s on {}: ping stderr: {}",
                     GUEST_IP,
-                    BRIDGE_DEVICE
+                    BRIDGE_DEVICE,
+                    if stderr.is_empty() { "(empty)" } else { stderr }
                 );
             }
 
-            debug!(guest_ip = GUEST_IP, "ARP not yet resolved, waiting");
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            debug!(guest_ip = GUEST_IP, "ping to guest failed, retrying");
         }
     }
 

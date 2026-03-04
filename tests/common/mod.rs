@@ -1526,6 +1526,188 @@ pub fn find_available_high_port() -> anyhow::Result<u16> {
     find_available_port(10000 + offset, 50000 - offset)
 }
 
+/// Get the loopback IP for a VM by PID (from `fcvm ls --json`).
+pub async fn get_loopback_ip(pid: u32) -> anyhow::Result<String> {
+    let fcvm_path = find_fcvm_binary()?;
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args(["ls", "--json", "--pid", &pid.to_string()])
+        .output()
+        .await
+        .context("getting VM state for loopback IP")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str::<Vec<serde_json::Value>>(&stdout)
+        .ok()
+        .and_then(|v| v.first().cloned())
+        .and_then(|v| {
+            v.get("config")?
+                .get("network")?
+                .get("loopback_ip")?
+                .as_str()
+                .map(|s| s.to_string())
+        })
+        .ok_or_else(|| anyhow::anyhow!("loopback_ip not found for VM PID {}", pid))
+}
+
+/// Result of a single HTTP check via curl.
+pub struct CurlResult {
+    pub success: bool,
+    pub body_len: usize,
+    pub error: String,
+}
+
+/// Make a single HTTP request via curl and return the result.
+pub async fn curl_check(ip: &str, port: u16, timeout_secs: u32) -> CurlResult {
+    let url = format!("http://{}:{}", ip, port);
+    match tokio::process::Command::new("curl")
+        .args(["-sS", "--max-time", &timeout_secs.to_string(), &url])
+        .output()
+        .await
+    {
+        Ok(output) => CurlResult {
+            success: output.status.success(),
+            body_len: output.stdout.len(),
+            error: if output.status.success() {
+                String::new()
+            } else {
+                String::from_utf8_lossy(&output.stderr).to_string()
+            },
+        },
+        Err(e) => CurlResult {
+            success: false,
+            body_len: 0,
+            error: format!("curl failed: {}", e),
+        },
+    }
+}
+
+/// Make HTTP requests via curl with retries until success or deadline.
+///
+/// After snapshot restore, the network channel (L2 + pasta) is ready but the
+/// guest application may need a moment. This retries with 500ms backoff
+/// and prints extensive diagnostics on failure.
+pub async fn curl_check_retry(
+    ip: &str,
+    port: u16,
+    timeout_secs: u32,
+    clone_pid: Option<u32>,
+) -> CurlResult {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
+    let mut attempt = 0u32;
+    let mut last_result = CurlResult {
+        success: false,
+        body_len: 0,
+        error: "no attempt made".to_string(),
+    };
+
+    while std::time::Instant::now() < deadline {
+        attempt += 1;
+        last_result = curl_check(ip, port, 1).await;
+        if last_result.success && last_result.body_len > 0 {
+            if attempt > 1 {
+                println!(
+                    "    curl_check_retry: succeeded on attempt {} after retries",
+                    attempt
+                );
+            }
+            return last_result;
+        }
+        println!(
+            "    curl_check_retry attempt {}: {}:{} -> success={} body={} err={}",
+            attempt, ip, port, last_result.success, last_result.body_len, last_result.error
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // All retries exhausted — dump diagnostics
+    println!(
+        "\n    curl_check_retry FAILED after {} attempts to {}:{}",
+        attempt, ip, port
+    );
+    println!("    last error: {}", last_result.error);
+
+    // Verbose curl to see exactly what happens at TCP level
+    let url = format!("http://{}:{}", ip, port);
+    if let Ok(verbose) = tokio::process::Command::new("curl")
+        .args(["-v", "--max-time", "2", &url])
+        .output()
+        .await
+    {
+        let stderr = String::from_utf8_lossy(&verbose.stderr);
+        println!("    curl -v output:");
+        for line in stderr.lines() {
+            println!("      {}", line);
+        }
+    }
+
+    if let Some(pid) = clone_pid {
+        dump_clone_network_diagnostics(pid).await;
+    }
+
+    last_result
+}
+
+/// Dump network diagnostics for a clone VM: pasta processes, ARP cache,
+/// namespace sockets, bridge state, and VM listening sockets.
+pub async fn dump_clone_network_diagnostics(pid: u32) {
+    println!("    --- Network diagnostics for clone PID {} ---", pid);
+
+    // Check if pasta is still running
+    run_cmd_diagnostic("pasta processes", "pgrep", &["-a", "pasta"]).await;
+
+    // Get holder PID from state for nsenter
+    let fcvm_path = find_fcvm_binary().unwrap_or_default();
+    let holder_pid = get_holder_pid(&fcvm_path, pid).await;
+
+    if let Some(hp) = holder_pid {
+        let hp_str = hp.to_string();
+        run_nsenter_diagnostic(&hp_str, &["ip", "neigh", "show"], "ARP cache").await;
+        run_nsenter_diagnostic(&hp_str, &["ss", "-tnp"], "namespace sockets").await;
+        run_nsenter_diagnostic(&hp_str, &["bridge", "link"], "bridge links").await;
+    }
+
+    // Check what the VM sees (listening sockets)
+    let pid_str = pid.to_string();
+    run_cmd_diagnostic(
+        "VM listening sockets",
+        &fcvm_path.to_string_lossy(),
+        &["exec", "--pid", &pid_str, "--", "ss", "-tnl"],
+    )
+    .await;
+}
+
+async fn get_holder_pid(fcvm_path: &std::path::PathBuf, pid: u32) -> Option<u64> {
+    let out = tokio::process::Command::new(fcvm_path)
+        .args(["ls", "--json"])
+        .output()
+        .await
+        .ok()?;
+    let json_str = String::from_utf8_lossy(&out.stdout);
+    let vms: Vec<serde_json::Value> = serde_json::from_str(&json_str).ok()?;
+    let vm = vms.iter().find(|v| v["pid"].as_u64() == Some(pid as u64))?;
+    vm["holder_pid"].as_u64()
+}
+
+async fn run_nsenter_diagnostic(holder_pid: &str, cmd: &[&str], label: &str) {
+    let mut args = vec!["-t", holder_pid, "--net"];
+    args.extend(cmd);
+    run_cmd_diagnostic(label, "nsenter", &args).await;
+}
+
+async fn run_cmd_diagnostic(label: &str, program: &str, args: &[&str]) {
+    if let Ok(out) = tokio::process::Command::new(program)
+        .args(args)
+        .output()
+        .await
+    {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        println!("    {}:", label);
+        for line in stdout.lines() {
+            println!("      {}", line);
+        }
+    }
+}
+
 /// Wait for a TCP server to be ready by attempting to connect.
 ///
 /// # Arguments

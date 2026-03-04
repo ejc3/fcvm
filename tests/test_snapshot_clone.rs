@@ -1503,55 +1503,27 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
     println!("\nStep 5: Testing port forwarding...");
 
     // Get clone's loopback IP from state (rootless uses 127.x.y.z)
-    let output = tokio::process::Command::new(&fcvm_path)
-        .args(["ls", "--json", "--pid", &clone_pid.to_string()])
-        .output()
-        .await
-        .context("getting clone state")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let loopback_ip: String = serde_json::from_str::<Vec<serde_json::Value>>(&stdout)
-        .ok()
-        .and_then(|v| v.first().cloned())
-        .and_then(|v| {
-            v.get("config")?
-                .get("network")?
-                .get("loopback_ip")?
-                .as_str()
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_default();
+    let loopback_ip = common::get_loopback_ip(clone_pid).await?;
 
     println!("  Clone loopback IP: {}", loopback_ip);
 
     // Test: Access via loopback IP and forwarded port
-    // verify_port_forwarding() runs after snapshot restore and confirms end-to-end
-    // data flow through pasta's loopback → bridge → guest path before health monitor.
+    // verify_port_forwarding() confirmed the L2 channel is ready (ping + TCP connect).
+    // Use retry because the guest application may need a moment after restore.
     println!(
-        "  Testing access via loopback {}:{}...",
+        "  Testing access via loopback {}:{} (with retries)...",
         loopback_ip, host_port
     );
-    let loopback_result = tokio::process::Command::new("curl")
-        .args([
-            "-s",
-            "--max-time",
-            "5",
-            &format!("http://{}:{}", loopback_ip, host_port),
-        ])
-        .output()
-        .await
-        .context("curl loopback port forward")?;
-
-    let loopback_works = loopback_result.status.success() && !loopback_result.stdout.is_empty();
+    let loopback_check =
+        common::curl_check_retry(&loopback_ip, host_port, 10, Some(clone_pid)).await;
+    let loopback_works = loopback_check.success && loopback_check.body_len > 0;
     if loopback_works {
-        let response = String::from_utf8_lossy(&loopback_result.stdout);
-        println!("    Loopback access: ✓ OK ({} bytes)", response.len());
-    } else {
-        println!("    Loopback access: ✗ FAIL");
         println!(
-            "    stderr: {}",
-            String::from_utf8_lossy(&loopback_result.stderr)
+            "    Loopback access: ✓ OK ({} bytes)",
+            loopback_check.body_len
         );
+    } else {
+        println!("    Loopback access: ✗ FAIL ({})", loopback_check.error);
     }
 
     // Cleanup
@@ -1691,53 +1663,26 @@ async fn test_clone_port_forward_routed() -> Result<()> {
     println!("\nStep 5: Testing port forwarding...");
 
     // Get clone's loopback IP from state (routed uses TCP proxy + loopback like rootless)
-    let output = tokio::process::Command::new(&fcvm_path)
-        .args(["ls", "--json", "--pid", &clone_pid.to_string()])
-        .output()
-        .await
-        .context("getting clone state")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let loopback_ip: String = serde_json::from_str::<Vec<serde_json::Value>>(&stdout)
-        .ok()
-        .and_then(|v| v.first().cloned())
-        .and_then(|v| {
-            v.get("config")?
-                .get("network")?
-                .get("loopback_ip")?
-                .as_str()
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_default();
+    let loopback_ip = common::get_loopback_ip(clone_pid).await?;
 
     println!("  Clone loopback IP: {}", loopback_ip);
 
     // Test: Access via loopback IP and forwarded port
+    // Use retry because the guest application may need a moment after restore.
     println!(
-        "  Testing access via loopback {}:{}...",
+        "  Testing access via loopback {}:{} (with retries)...",
         loopback_ip, host_port
     );
-    let loopback_result = tokio::process::Command::new("curl")
-        .args([
-            "-s",
-            "--max-time",
-            "5",
-            &format!("http://{}:{}", loopback_ip, host_port),
-        ])
-        .output()
-        .await
-        .context("curl loopback port forward")?;
-
-    let loopback_works = loopback_result.status.success() && !loopback_result.stdout.is_empty();
+    let loopback_check =
+        common::curl_check_retry(&loopback_ip, host_port, 10, Some(clone_pid)).await;
+    let loopback_works = loopback_check.success && loopback_check.body_len > 0;
     if loopback_works {
-        let response = String::from_utf8_lossy(&loopback_result.stdout);
-        println!("    Loopback access: ✓ OK ({} bytes)", response.len());
-    } else {
-        println!("    Loopback access: ✗ FAIL");
         println!(
-            "    stderr: {}",
-            String::from_utf8_lossy(&loopback_result.stderr)
+            "    Loopback access: ✓ OK ({} bytes)",
+            loopback_check.body_len
         );
+    } else {
+        println!("    Loopback access: ✗ FAIL ({})", loopback_check.error);
     }
 
     // Cleanup
