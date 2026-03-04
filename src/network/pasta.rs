@@ -697,7 +697,10 @@ impl NetworkManager for PastaNetwork {
                 .context("running ping via nsenter in namespace")?;
 
             if output.status.success() {
-                info!(guest_ip = GUEST_IP, "guest reachable via ping, ARP resolved");
+                info!(
+                    guest_ip = GUEST_IP,
+                    "guest reachable via ping, ARP resolved"
+                );
                 self.wait_for_port_forwarding().await?;
                 return Ok(());
             }

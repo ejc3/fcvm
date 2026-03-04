@@ -185,14 +185,18 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
         let check = common::curl_check(&clone.loopback_ip, host_port, 5).await;
         println!(
             "  Clone {} ({}:{}): {} ({} bytes, err={})",
-            clone.name, clone.loopback_ip, host_port,
+            clone.name,
+            clone.loopback_ip,
+            host_port,
             if check.success { "OK" } else { "FAIL" },
-            check.body_len, check.error
+            check.body_len,
+            check.error
         );
         assert!(
             check.success && check.body_len > 0,
             "Pre-storm curl to clone {} failed: {}",
-            clone.name, check.error
+            clone.name,
+            check.error
         );
     }
 
@@ -262,8 +266,12 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
                         }
                         // Also try a verbose curl
                         let verbose = tokio::process::Command::new("curl")
-                            .args(["-v", "--max-time", "2",
-                                   &format!("http://{}:{}", ip, host_port)])
+                            .args([
+                                "-v",
+                                "--max-time",
+                                "2",
+                                &format!("http://{}:{}", ip, host_port),
+                            ])
                             .output()
                             .await;
                         if let Ok(out) = verbose {
