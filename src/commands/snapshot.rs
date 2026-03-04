@@ -20,7 +20,7 @@ use crate::state::{
 };
 use crate::storage::SnapshotManager;
 use crate::uffd::UffdServer;
-use crate::volume::{spawn_volume_servers, VolumeConfig};
+use crate::volume::VolumeConfig;
 
 use super::common::{
     MemoryBackend, RestoreParams, RuntimeConfig, SnapshotRestoreConfig, VSOCK_OUTPUT_PORT,
@@ -590,9 +590,34 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         })
         .collect();
 
-    let volume_server_handles = spawn_volume_servers(&volume_configs, &clone_vsock_base)
-        .await
-        .context("spawning VolumeServers for clone")?;
+    // Load serialized inode tables from snapshot (if available) for portable volumes.
+    // This restores the RemapFs inode mappings so clones see the same inodes as the baseline,
+    // avoiding the 1s TTL glitch window where old inodes return EIO.
+    let snap_dir = snapshot_config
+        .memory_path
+        .parent()
+        .expect("snapshot memory_path must have parent");
+    let mut inode_tables: Vec<Option<String>> = Vec::with_capacity(volume_configs.len());
+    for vol in &snapshot_config.metadata.volumes {
+        if vol.portable {
+            let table_path = snap_dir.join(format!("volume-{}-inode-table.json", vol.vsock_port));
+            let table = tokio::fs::read_to_string(&table_path).await.ok();
+            if table.is_some() {
+                info!(port = vol.vsock_port, "loaded inode table from snapshot");
+            }
+            inode_tables.push(table);
+        } else {
+            inode_tables.push(None);
+        }
+    }
+
+    let volume_servers = crate::volume::spawn_volume_servers_with_tables(
+        &volume_configs,
+        &clone_vsock_base,
+        &inode_tables,
+    )
+    .await
+    .context("spawning VolumeServers for clone")?;
 
     // Setup TTY/output socket paths (inherited from snapshot metadata)
     let tty_mode = snapshot_config.metadata.tty;
@@ -914,7 +939,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         implicit_uffd_cancel.cancel();
 
         // Abort VolumeServer tasks
-        for handle in volume_server_handles {
+        for handle in volume_servers.handles {
             handle.abort();
         }
 
@@ -1028,7 +1053,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         super::common::cleanup_vm(
             super::common::CleanupContext {
                 vm_id: vm_id.clone(),
-                volume_server_handles,
+                volume_server_handles: volume_servers.handles,
+                remap_refs: volume_servers.remap_refs,
                 data_dir: data_dir.clone(),
                 health_cancel_token: None, // no health monitor in exec path
                 health_monitor_handle: None,
@@ -1167,6 +1193,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                             disk_path: &disk_path,
                             volume_configs: &volume_configs,
                             parent_snapshot_key: parent_key.as_deref(),
+                            remap_refs: &volume_servers.remap_refs,
                         };
                         tokio::select! {
                             outcome = create_snapshot_interruptible(&snap, &cancel) => {
@@ -1205,7 +1232,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     super::common::cleanup_vm(
         super::common::CleanupContext {
             vm_id: vm_id.clone(),
-            volume_server_handles,
+            volume_server_handles: volume_servers.handles,
+            remap_refs: volume_servers.remap_refs,
             data_dir: data_dir.clone(),
             health_cancel_token: Some(health_cancel_token),
             health_monitor_handle: Some(health_monitor_handle),

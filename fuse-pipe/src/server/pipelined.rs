@@ -47,6 +47,17 @@ impl<H: FilesystemHandler + 'static> AsyncServer<H> {
         }
     }
 
+    /// Create a server from a pre-wrapped `Arc<H>`.
+    ///
+    /// Use this when the caller needs to retain a reference to the handler
+    /// (e.g., to call `RemapFs::serialize_table()` while the server is running).
+    pub fn from_arc(handler: Arc<H>) -> Self {
+        Self {
+            handler,
+            config: ServerConfig::default(),
+        }
+    }
+
     /// Serve on a Unix socket.
     ///
     /// This function blocks forever, accepting and handling connections.

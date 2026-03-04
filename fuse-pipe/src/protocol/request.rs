@@ -418,6 +418,108 @@ impl VolumeRequest {
             VolumeRequest::Forget { .. } | VolumeRequest::BatchForget { .. }
         )
     }
+
+    /// Extract the file handle (fh) if this operation uses one.
+    pub fn fh(&self) -> Option<u64> {
+        match self {
+            Self::Read { fh, .. }
+            | Self::Write { fh, .. }
+            | Self::Release { fh, .. }
+            | Self::Flush { fh, .. }
+            | Self::Fsync { fh, .. }
+            | Self::Releasedir { fh, .. }
+            | Self::Fsyncdir { fh, .. }
+            | Self::Fallocate { fh, .. }
+            | Self::Lseek { fh, .. }
+            | Self::Getlk { fh, .. }
+            | Self::Setlk { fh, .. }
+            | Self::Readdirplus { fh, .. } => Some(*fh),
+            Self::Setattr { fh, .. } => *fh,
+            Self::CopyFileRange { fh_in, .. } | Self::RemapFileRange { fh_in, .. } => Some(*fh_in),
+            _ => None,
+        }
+    }
+
+    /// Clone this request with a different file handle.
+    pub fn with_fh(&self, new_fh: u64) -> Self {
+        let mut cloned = self.clone();
+        match &mut cloned {
+            Self::Read { fh, .. }
+            | Self::Write { fh, .. }
+            | Self::Release { fh, .. }
+            | Self::Flush { fh, .. }
+            | Self::Fsync { fh, .. }
+            | Self::Releasedir { fh, .. }
+            | Self::Fsyncdir { fh, .. }
+            | Self::Fallocate { fh, .. }
+            | Self::Lseek { fh, .. }
+            | Self::Getlk { fh, .. }
+            | Self::Setlk { fh, .. }
+            | Self::Readdirplus { fh, .. } => *fh = new_fh,
+            Self::Setattr { fh, .. } => *fh = Some(new_fh),
+            // Only remap fh_in; fh_out references a different file and is NOT
+            // currently remapped after snapshot restore. This is a known limitation:
+            // copy_file_range/remap_file_range with a stale fh_out will fail.
+            // TODO: add fh_out()/with_fh_out() helpers for independent remapping.
+            Self::CopyFileRange { fh_in, .. } | Self::RemapFileRange { fh_in, .. } => {
+                *fh_in = new_fh;
+            }
+            _ => {}
+        }
+        cloned
+    }
+
+    /// Check if this is a directory handle operation.
+    pub fn is_dir_handle_op(&self) -> bool {
+        matches!(
+            self,
+            Self::Readdirplus { .. } | Self::Releasedir { .. } | Self::Fsyncdir { .. }
+        )
+    }
+
+    /// Extract the inode from this request (if present).
+    pub fn ino(&self) -> Option<u64> {
+        match self {
+            Self::Getattr { ino }
+            | Self::Readlink { ino }
+            | Self::Statfs { ino }
+            | Self::Read { ino, .. }
+            | Self::Write { ino, .. }
+            | Self::Release { ino, .. }
+            | Self::Flush { ino, .. }
+            | Self::Fsync { ino, .. }
+            | Self::Open { ino, .. }
+            | Self::Opendir { ino, .. }
+            | Self::Releasedir { ino, .. }
+            | Self::Fsyncdir { ino, .. }
+            | Self::Fallocate { ino, .. }
+            | Self::Lseek { ino, .. }
+            | Self::Getlk { ino, .. }
+            | Self::Setlk { ino, .. }
+            | Self::Readdirplus { ino, .. }
+            | Self::Access { ino, .. }
+            | Self::Forget { ino, .. } => Some(*ino),
+            Self::CopyFileRange { ino_in, .. } | Self::RemapFileRange { ino_in, .. } => {
+                Some(*ino_in)
+            }
+            Self::Lookup { parent, .. }
+            | Self::Readdir { ino: parent, .. }
+            | Self::Mkdir { parent, .. }
+            | Self::Mknod { parent, .. }
+            | Self::Rmdir { parent, .. }
+            | Self::Create { parent, .. }
+            | Self::Unlink { parent, .. }
+            | Self::Rename { parent, .. }
+            | Self::Symlink { parent, .. }
+            | Self::Link { ino: parent, .. } => Some(*parent),
+            Self::Setattr { ino, .. } => Some(*ino),
+            Self::Setxattr { ino, .. }
+            | Self::Getxattr { ino, .. }
+            | Self::Listxattr { ino, .. }
+            | Self::Removexattr { ino, .. } => Some(*ino),
+            Self::BatchForget { .. } => None,
+        }
+    }
 }
 
 #[cfg(test)]

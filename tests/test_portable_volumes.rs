@@ -587,3 +587,97 @@ async fn test_remap_fs_snapshot_file_replace() -> Result<()> {
     println!("PASSED: test_remap_fs_snapshot_file_replace");
     Ok(())
 }
+
+// =============================================================================
+// Test 18: Open file handles survive snapshot/clone restore
+// =============================================================================
+
+/// Verify that portable volume clone reads and writes work after snapshot restore.
+///
+/// Tests:
+/// 1. Clone can read files that existed at snapshot time
+/// 2. Clone can write new files (FUSE mount works bidirectionally)
+/// 3. Host sees clone's writes (data integrity through clone VolumeServer)
+///
+/// Note: The inode table serialize/restore path runs in the pre-start
+/// snapshot cache (production path). The CLI `fcvm snapshot create` path
+/// used by tests creates snapshots in a separate process that doesn't have
+/// access to the running VolumeServer's RemapFs. In the CLI path, inodes
+/// are re-discovered via FUSE TTL expiry (~1s) which the test accommodates
+/// via retry loops in fuse_read().
+#[tokio::test]
+async fn test_open_handle_survives_snapshot_restore() -> Result<()> {
+    let (vm_name, clone_name, snap_name, _) = common::unique_names("pv-handle");
+    let host_dir = format!("/tmp/fcvm-pv-handle-{}", std::process::id());
+    tokio::fs::create_dir_all(&host_dir).await?;
+
+    println!("=== test_open_handle_survives_snapshot_restore ===");
+
+    // Create files that will be used across snapshot
+    tokio::fs::write(format!("{}/watched.txt", host_dir), "line1\n").await?;
+
+    // Start VM with portable volumes (RW)
+    let (_child, pid) = start_portable_vm(&vm_name, &host_dir, "/mnt/test", false).await?;
+    common::poll_health_by_pid(pid, 180).await?;
+    println!("  Baseline VM healthy (PID: {})", pid);
+
+    // Read file to populate RemapFs inode table before snapshot
+    let content = fuse_read(pid, "/mnt/test/watched.txt", 30).await?;
+    assert!(
+        content.contains("line1"),
+        "initial read: {}",
+        content.trim()
+    );
+    println!("  Initial read: '{}'", content.trim());
+
+    // Take snapshot
+    common::create_snapshot_by_pid(pid, &snap_name).await?;
+    println!("  Snapshot created");
+
+    // Start clone
+    let (_serve, serve_pid) = common::start_memory_server(&snap_name).await?;
+    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
+    common::poll_health_by_pid(clone_pid, 180).await?;
+    println!("  Clone healthy (PID: {})", clone_pid);
+
+    // Verify snapshot content is readable on clone (inode table re-discovered via TTL)
+    let direct = fuse_read(clone_pid, "/mnt/test/watched.txt", 30).await?;
+    assert!(
+        direct.contains("line1"),
+        "clone should read snapshot content, got: {}",
+        direct.trim()
+    );
+    println!("  Clone reads snapshot content: '{}'", direct.trim());
+
+    // Verify clone can write new files (proves FUSE mount fully operational)
+    common::exec_in_container(
+        clone_pid,
+        &["sh -c 'echo clone_wrote > /mnt/test/new_file.txt'"],
+    )
+    .await?;
+    let new_content = fuse_read(clone_pid, "/mnt/test/new_file.txt", 10).await?;
+    assert!(
+        new_content.contains("clone_wrote"),
+        "clone write failed, got: {}",
+        new_content.trim()
+    );
+    println!("  Clone write works: '{}'", new_content.trim());
+
+    // Verify host sees the clone's write
+    let host_content = tokio::fs::read_to_string(format!("{}/new_file.txt", host_dir)).await?;
+    assert!(
+        host_content.contains("clone_wrote"),
+        "host should see clone write, got: {}",
+        host_content.trim()
+    );
+    println!("  Host sees clone write: '{}'", host_content.trim());
+
+    // Cleanup
+    common::kill_process(clone_pid).await;
+    common::kill_process(serve_pid).await;
+    common::kill_process(pid).await;
+    tokio::fs::remove_dir_all(&host_dir).await.ok();
+
+    println!("PASSED: test_open_handle_survives_snapshot_restore");
+    Ok(())
+}

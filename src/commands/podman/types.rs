@@ -17,7 +17,7 @@ pub struct VmContext {
     pub data_dir: PathBuf,
     pub vm_manager: VmManager,
     pub holder_child: Option<tokio::process::Child>,
-    pub volume_server_handles: Vec<tokio::task::JoinHandle<()>>,
+    pub volume_servers: crate::volume::SpawnedVolumes,
     pub network: Box<dyn NetworkManager>,
     pub network_config: NetworkConfig,
     pub state_manager: StateManager,
