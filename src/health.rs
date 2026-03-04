@@ -92,6 +92,8 @@ pub fn spawn_health_monitor_full(
         let mut first_check = true;
         // Track if container has no HEALTHCHECK - skip exec if so
         let mut skip_podman_healthcheck = false;
+        // Track consecutive failures for escalated logging
+        let mut consecutive_failures: u32 = 0;
 
         loop {
             // Check for cancellation before sleeping
@@ -138,6 +140,29 @@ pub fn spawn_health_monitor_full(
                 }
             };
             let check_duration = check_start.elapsed();
+
+            // Track consecutive failures for escalated logging
+            if health_status == HealthStatus::Healthy {
+                if consecutive_failures > 0 {
+                    info!(target: "health-monitor",
+                        consecutive_failures,
+                        "health check recovered after {} consecutive failures",
+                        consecutive_failures
+                    );
+                }
+                consecutive_failures = 0;
+            } else {
+                consecutive_failures += 1;
+                // Log at WARN every 10 failures (~30-50s) so CI logs show something
+                if consecutive_failures == 10 || consecutive_failures % 30 == 0 {
+                    warn!(target: "health-monitor",
+                        consecutive_failures,
+                        status = ?health_status,
+                        check_ms = check_duration.as_millis() as u64,
+                        "health check still failing"
+                    );
+                }
+            }
 
             // Adaptive polling: once healthy use 10s. During startup, wait as
             // long as the check took (min 100ms) — fast checks poll fast, slow
@@ -578,7 +603,7 @@ async fn update_health_status_once(
                             .map(|ip| ip.split('/').next().unwrap_or(ip))
                             .unwrap_or("192.168.1.2");
                         let port = url.port().unwrap_or(80);
-                        debug!(target: "health-monitor", holder_pid = holder_pid, guest_ip = %guest_ip, port = port, host = ?url_host, "HTTP health check via nsenter");
+                        debug!(target: "health-monitor", holder_pid, guest_ip = %guest_ip, port, host = ?url_host, "HTTP health check via nsenter");
 
                         match check_http_health_nsenter(
                             holder_pid,
@@ -607,7 +632,7 @@ async fn update_health_status_once(
                                     }
                                 };
                                 if should_log {
-                                    debug!(target: "health-monitor", error = %e, "HTTP health check failed (nsenter)");
+                                    warn!(target: "health-monitor", error = %e, "HTTP health check failed (nsenter)");
                                     *last_failure_log = Some(Instant::now());
                                 }
                                 HealthStatus::Unhealthy
@@ -650,7 +675,7 @@ async fn update_health_status_once(
                                     }
                                 };
                                 if should_log {
-                                    debug!(target: "health-monitor", error = %e, "HTTP health check failed (netns)");
+                                    warn!(target: "health-monitor", error = %e, "HTTP health check failed (netns)");
                                     *last_failure_log = Some(Instant::now());
                                 }
                                 HealthStatus::Unhealthy
@@ -704,7 +729,7 @@ async fn update_health_status_once(
                                     }
                                 };
                                 if should_log {
-                                    debug!(target: "health-monitor", error = %e, "HTTP health check failed");
+                                    warn!(target: "health-monitor", error = %e, "HTTP health check failed");
                                     *last_failure_log = Some(Instant::now());
                                 }
                                 HealthStatus::Unhealthy
