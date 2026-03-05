@@ -317,35 +317,41 @@ impl StateManager {
             );
         }
 
-        match vms.into_iter().find(|vm| vm.pid == Some(pid)) {
-            Some(vm) => {
-                tracing::debug!(
-                    pid = pid,
-                    vm_id = %vm.vm_id,
-                    vm_name = ?vm.name,
-                    "load_state_by_pid: found matching VM"
-                );
-                Ok(vm)
-            }
-            None => {
-                // Log all available PIDs to help debug
-                let available_pids: Vec<u32> = self
-                    .list_vms()
-                    .await
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|v| v.pid)
-                    .collect();
-
-                tracing::error!(
-                    search_pid = pid,
-                    available_pids = ?available_pids,
-                    state_dir = %self.state_dir.display(),
-                    "load_state_by_pid: VM not found - no state file has this PID"
-                );
-                Err(anyhow::anyhow!("No VM found with PID: {}", pid))
-            }
+        if let Some(vm) = vms.into_iter().find(|vm| vm.pid == Some(pid)) {
+            tracing::debug!(
+                pid = pid,
+                vm_id = %vm.vm_id,
+                vm_name = ?vm.name,
+                "load_state_by_pid: found matching VM"
+            );
+            return Ok(vm);
         }
+
+        // PID not found. Clean stale state files (dead PIDs) and retry once.
+        // Stale files from killed VMs can shadow the target if the stale PID
+        // was reused by the OS — save_state deletes the collision, but
+        // cleanup_stale_state handles the general case.
+        self.cleanup_stale_state().await;
+        let vms = self.list_vms().await?;
+        let available_pids: Vec<u32> = vms.iter().filter_map(|v| v.pid).collect();
+        if let Some(vm) = vms.into_iter().find(|vm| vm.pid == Some(pid)) {
+            tracing::debug!(
+                pid = pid,
+                vm_id = %vm.vm_id,
+                "load_state_by_pid: found VM after stale cleanup"
+            );
+            return Ok(vm);
+        }
+
+        // Still not found after cleanup
+
+        tracing::error!(
+            search_pid = pid,
+            available_pids = ?available_pids,
+            state_dir = %self.state_dir.display(),
+            "load_state_by_pid: VM not found - no state file has this PID"
+        );
+        Err(anyhow::anyhow!("No VM found with PID: {}", pid))
     }
 
     /// List all VMs

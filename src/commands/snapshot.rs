@@ -643,7 +643,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // stays stuck reading from the old (dead) connection after VM resume resets vsock.
     let output_reconnect = Arc::new(tokio::sync::Notify::new());
     // Channel to know when fc-agent's output connection arrives (gates health monitor)
-    let (output_connected_tx, output_connected_rx) = tokio::sync::oneshot::channel();
+    let (output_connected_tx, mut output_connected_rx) = tokio::sync::oneshot::channel();
     let output_handle = if !tty_mode {
         let socket_path = output_socket_path.clone();
         let vm_id_clone = vm_id.clone();
@@ -673,7 +673,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // Network mode inherited from snapshot metadata
     let network_mode = snapshot_config.metadata.network_mode;
 
-    // Start egress proxy for rootless mode (bypasses TAP/bridge for outbound TCP)
+    // Start egress proxy for rootless mode only
     let _egress_proxy_handle = if matches!(network_mode, FcNetworkMode::Rootless) {
         let socket_path = clone_vsock_base.clone();
         Some(tokio::spawn(async move {
@@ -726,9 +726,13 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             Box::new(net)
         }
         FcNetworkMode::Routed => {
-            RoutedNetwork::preflight_check().context("routed mode preflight check failed")?;
             let mut net =
                 RoutedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
+            if let Some(ref prefix) = snapshot_config.metadata.ipv6_prefix {
+                net = net.with_ipv6_prefix(prefix.clone());
+            }
+            net.preflight_check()
+                .context("routed mode preflight check failed")?;
             if !port_mappings.is_empty() {
                 let loopback_ip = state_manager
                     .allocate_loopback_ip(&mut vm_state)
@@ -790,6 +794,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     vm_state.config.user = snapshot_config.metadata.user.clone();
     vm_state.config.port_mappings = port_mappings;
     vm_state.config.network_mode = network_mode;
+    vm_state.config.ipv6_prefix = snapshot_config.metadata.ipv6_prefix.clone();
     vm_state.config.tty = tty_mode;
     vm_state.config.interactive = interactive;
 
@@ -1098,12 +1103,35 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     //   exec_rebind → exec_re_register → rebind_done → output.reconnect() → HERE
     // Without this gate, the health monitor could start exec calls before
     // the exec server has re-registered its AsyncFd after restore.
+    // No timeout — after snapshot restore, the VM may be CPU-starved (HHVM, EdenFS,
+    // falcon all resume simultaneously) and fc-agent's MMDS poll + restore handler
+    // can take minutes. Proceeding early causes exec failures; waiting is correct.
+    // But poll VM liveness to avoid hanging forever if Firecracker crashes.
     if !tty_mode {
-        match tokio::time::timeout(std::time::Duration::from_secs(30), output_connected_rx).await {
-            Ok(Ok(())) => info!(vm_id = %vm_id, "fc-agent output connected, exec server ready"),
-            Ok(Err(_)) => warn!(vm_id = %vm_id, "output connected_tx dropped"),
-            Err(_) => {
-                warn!(vm_id = %vm_id, "fc-agent did not connect within 30s, proceeding anyway")
+        let mut liveness_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        liveness_interval.tick().await; // consume immediate first tick
+        loop {
+            tokio::select! {
+                result = &mut output_connected_rx => {
+                    match result {
+                        Ok(()) => info!(vm_id = %vm_id, "fc-agent output connected, exec server ready"),
+                        Err(_) => warn!(vm_id = %vm_id, "output connected_tx dropped"),
+                    }
+                    break;
+                }
+                _ = liveness_interval.tick() => {
+                    match vm_manager.try_wait() {
+                        Ok(Some(status)) => {
+                            warn!(vm_id = %vm_id, ?status, "VM exited before fc-agent connected");
+                            break;
+                        }
+                        Ok(None) => {} // still running
+                        Err(e) => {
+                            warn!(vm_id = %vm_id, error = %e, "VM liveness check failed");
+                            break;
+                        }
+                    }
+                }
             }
         }
     }

@@ -1676,6 +1676,10 @@ pub async fn dump_clone_network_diagnostics(pid: u32) {
     .await;
 }
 
+pub async fn get_holder_pid_for_diag(fcvm_path: &std::path::PathBuf, pid: u32) -> Option<u64> {
+    get_holder_pid(fcvm_path, pid).await
+}
+
 async fn get_holder_pid(fcvm_path: &std::path::PathBuf, pid: u32) -> Option<u64> {
     let out = tokio::process::Command::new(fcvm_path)
         .args(["ls", "--json"])

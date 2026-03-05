@@ -198,6 +198,14 @@ pub struct RunArgs {
     #[arg(long, value_enum, default_value_t = NetworkMode::Rootless)]
     pub network: NetworkMode,
 
+    /// Routable IPv6 /64 prefix for routed mode VM addressing.
+    /// Each VM gets a unique address in this prefix via NDP proxy.
+    /// When set, MASQUERADE is skipped (the prefix is directly routable).
+    /// When not set, auto-detected from host interfaces.
+    /// Example: --ipv6-prefix 2803:6084:7058:46f6
+    #[arg(long)]
+    pub ipv6_prefix: Option<String>,
+
     /// HTTP health check URL. If not specified, health is based on container running status.
     /// The URL hostname is sent as the Host header; the connection goes to the guest IP.
     /// Example: --health-check http://myapp.example.com/status

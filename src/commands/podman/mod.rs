@@ -600,6 +600,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     vm_state.config.portable_volumes = args.portable_volumes;
     vm_state.config.port_mappings = port_mappings.clone();
     vm_state.config.network_mode = args.network.into();
+    vm_state.config.ipv6_prefix = args.ipv6_prefix.clone();
     vm_state.config.tty = args.tty;
     vm_state.config.interactive = args.interactive;
     vm_state.config.user = args.user.clone();
@@ -650,9 +651,13 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             port_mappings.clone(),
         )),
         NetworkMode::Routed => {
-            RoutedNetwork::preflight_check().context("routed mode preflight check failed")?;
             let mut net =
                 RoutedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
+            if let Some(ref prefix) = args.ipv6_prefix {
+                net = net.with_ipv6_prefix(prefix.clone());
+            }
+            net.preflight_check()
+                .context("routed mode preflight check failed")?;
             if !port_mappings.is_empty() {
                 let loopback_ip = state_manager
                     .allocate_loopback_ip(&mut vm_state)
@@ -813,7 +818,9 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         None
     };
 
-    // Start egress proxy for rootless mode (bypasses TAP/bridge for outbound TCP)
+    // Start egress proxy for rootless mode only.
+    // Routed mode uses native IPv6 kernel routing — no proxy needed.
+    // Services use mutual TLS with client certs, not source IP matching.
     let egress_proxy_handle = if matches!(args.network, NetworkMode::Rootless) {
         let socket_path = vsock_socket_path.clone();
         Some(tokio::spawn(async move {
@@ -1161,6 +1168,7 @@ mod tests {
             rootfs_type: None,
             non_blocking_output: false,
             label: vec![],
+            ipv6_prefix: None,
             image: "alpine:latest".to_string(),
             command_args: vec![],
         }

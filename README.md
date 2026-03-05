@@ -270,7 +270,7 @@ fcvm auto-forwards `http_proxy`/`https_proxy` from host to VM via MMDS.
 - Firecracker binary in PATH
 - For rootless: `passt` package (provides `pasta`)
 - For bridged: sudo, iptables, iproute2
-- For routed: sudo, ip6tables, iproute2, host with global IPv6 /64
+- For routed: sudo, iproute2, host with global IPv6 /64 (ip6tables also needed unless `--ipv6-prefix` is set)
 - For rootfs build: qemu-utils, e2fsprogs
 
 **Storage:** btrfs at `/mnt/fcvm-btrfs` (auto-created as loopback on non-btrfs hosts)
@@ -336,6 +336,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 --portable-volumes    Path-hash inodes for cross-machine snapshot/restore
 --rootfs-size <SIZE>  Minimum free space on rootfs (default: 10G)
 --no-snapshot         Disable automatic snapshot creation
+--ipv6-prefix <PREFIX>  Use explicit /64 prefix for routed mode (skips auto-detect and MASQUERADE)
 ```
 
 Run `fcvm --help` or `fcvm <command> --help` for full options.

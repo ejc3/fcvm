@@ -309,6 +309,7 @@ async fn create_sandbox(
         publish: vec![],
         balloon: None,
         network: crate::cli::NetworkMode::Rootless,
+        ipv6_prefix: None,
         health_check: None,
         health_check_timeout: 5,
         privileged: false,

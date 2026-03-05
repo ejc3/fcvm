@@ -96,6 +96,9 @@ pub struct SnapshotMetadata {
     /// Network mode (bridged, rootless, routed) inherited by clones
     #[serde(default)]
     pub network_mode: crate::firecracker::FcNetworkMode,
+    /// Explicit routable IPv6 /64 prefix for routed mode (skips auto-detect and MASQUERADE)
+    #[serde(default)]
+    pub ipv6_prefix: Option<String>,
     /// Whether PTY is allocated for the container
     #[serde(default)]
     pub tty: bool,
@@ -283,6 +286,7 @@ mod tests {
                 user: None,
                 port_mappings: vec![],
                 network_mode: Default::default(),
+                ipv6_prefix: None,
                 tty: false,
                 interactive: false,
             },
@@ -407,6 +411,7 @@ mod tests {
                 user: None,
                 port_mappings: vec![],
                 network_mode: Default::default(),
+                ipv6_prefix: None,
                 tty: false,
                 interactive: false,
             },
@@ -475,6 +480,7 @@ mod tests {
                     user: None,
                     port_mappings: vec![],
                     network_mode: Default::default(),
+                    ipv6_prefix: None,
                     tty: false,
                     interactive: false,
                 },
@@ -530,6 +536,7 @@ mod tests {
                 user: None,
                 port_mappings: vec![],
                 network_mode: Default::default(),
+                ipv6_prefix: None,
                 tty: false,
                 interactive: false,
             },
@@ -636,6 +643,7 @@ mod tests {
                 user: None,
                 port_mappings: vec![],
                 network_mode: Default::default(),
+                ipv6_prefix: None,
                 tty: false,
                 interactive: false,
             },
@@ -654,5 +662,59 @@ mod tests {
         let json = serde_json::to_string(&system_config).unwrap();
         let parsed: SnapshotConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.snapshot_type, SnapshotType::System);
+    }
+
+    #[test]
+    fn test_snapshot_metadata_ipv6_prefix_roundtrip() {
+        let metadata = SnapshotMetadata {
+            image: "nginx:alpine".to_string(),
+            vcpu: 2,
+            memory_mib: 512,
+            network_config: NetworkConfig::default(),
+            volumes: vec![],
+            health_check_url: None,
+            health_check_timeout: 5,
+            hugepages: false,
+            extra_disks: vec![],
+            username: None,
+            user: None,
+            port_mappings: vec![],
+            network_mode: Default::default(),
+            ipv6_prefix: Some("2600:1f1c:494:201".to_string()),
+            tty: false,
+            interactive: false,
+        };
+
+        let json = serde_json::to_string(&metadata).unwrap();
+        assert!(json.contains("2600:1f1c:494:201"));
+
+        let parsed: SnapshotMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.ipv6_prefix,
+            Some("2600:1f1c:494:201".to_string()),
+            "ipv6_prefix must survive serialization roundtrip"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_metadata_ipv6_prefix_backward_compat() {
+        // Old snapshots won't have ipv6_prefix — must deserialize to None
+        let json = r#"{
+            "image": "nginx:alpine",
+            "vcpu": 2,
+            "memory_mib": 512,
+            "network_config": {
+                "tap_device": "tap-old",
+                "guest_mac": "AA:BB:CC:DD:EE:FF"
+            }
+        }"#;
+
+        let metadata: SnapshotMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            metadata.ipv6_prefix, None,
+            "missing ipv6_prefix must default to None for backward compat"
+        );
+        assert_eq!(metadata.image, "nginx:alpine");
+        assert_eq!(metadata.vcpu, 2);
     }
 }

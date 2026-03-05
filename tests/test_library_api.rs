@@ -50,6 +50,7 @@ fn test_run_args(name: &str) -> RunArgs {
         label: vec![],
         non_blocking_output: false,
         health_check_timeout: 5,
+        ipv6_prefix: None,
         image: common::TEST_IMAGE.to_string(),
         command_args: vec![],
     }

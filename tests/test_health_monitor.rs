@@ -80,6 +80,7 @@ async fn test_health_monitor_behaviors() {
             original_vsock_vm_id: None,
             port_mappings: vec![],
             network_mode: Default::default(),
+            ipv6_prefix: None,
             tty: false,
             interactive: false,
             labels: std::collections::HashMap::new(),
