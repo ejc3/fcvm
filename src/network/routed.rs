@@ -67,7 +67,6 @@ impl RoutedNetwork {
         }
     }
 
-    /// Set an explicit routable /64 prefix. Validates format (4 colon-separated hex groups).
     pub fn with_ipv6_prefix(mut self, prefix: String) -> Self {
         self.ipv6_prefix = Some(prefix);
         self
