@@ -259,180 +259,182 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
                             name, req, ip, host_port, result.error
                         );
                     }
-                    // On first error (or forced via FCVM_FORCE_DIAG), dump extensive diagnostics
-                    if clone_error == 1 || (force_diag && req == 3 && clone_error == 0) {
-                        let port_str = host_port.to_string();
-                        let pid_str = clone_pid.to_string();
+                }
 
+                // On first error (or forced via FCVM_FORCE_DIAG at req 3), dump extensive diagnostics
+                let run_diag = clone_error == 1 || (force_diag && req == 3 && clone_error == 0);
+                if run_diag {
+                    let port_str = host_port.to_string();
+                    let pid_str = clone_pid.to_string();
+
+                    println!(
+                        "    DIAG === clone {} (pid={}) first failure diagnostics ===",
+                        name, clone_pid
+                    );
+
+                    // 1. Verbose curl to see exact failure point
+                    if let Ok(out) = tokio::process::Command::new("curl")
+                        .args([
+                            "-v",
+                            "--max-time",
+                            "2",
+                            &format!("http://{}:{}", ip, host_port),
+                        ])
+                        .output()
+                        .await
+                    {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
                         println!(
-                            "    DIAG === clone {} (pid={}) first failure diagnostics ===",
-                            name, clone_pid
+                            "    DIAG [verbose curl via pasta]:\n      {}",
+                            stderr.lines().collect::<Vec<_>>().join("\n      ")
                         );
+                    }
 
-                        // 1. Verbose curl to see exact failure point
-                        if let Ok(out) = tokio::process::Command::new("curl")
+                    // 2. Listening sockets for our port
+                    if let Ok(out) = tokio::process::Command::new("ss")
+                        .args(["-tlnp"])
+                        .output()
+                        .await
+                    {
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        let matching: Vec<&str> = stdout
+                            .lines()
+                            .filter(|l| l.contains(&port_str) || l.starts_with("State"))
+                            .collect();
+                        println!("    DIAG [ss -tlnp]: {:?}", matching);
+                    }
+
+                    // 3. ALL TCP sockets (ESTABLISHED, TIME_WAIT, etc.)
+                    if let Ok(out) = tokio::process::Command::new("ss")
+                        .args(["-tanp"])
+                        .output()
+                        .await
+                    {
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        let matching: Vec<&str> = stdout
+                            .lines()
+                            .filter(|l| {
+                                l.contains(&port_str)
+                                    || l.contains(&ip)
+                                    || l.starts_with("State")
+                                    || l.contains("TIME-WAIT")
+                            })
+                            .collect();
+                        println!("    DIAG [ss -tanp relevant]: {:?}", matching);
+                    }
+
+                    // 4. pasta process check
+                    if let Ok(out) = tokio::process::Command::new("pgrep")
+                        .args(["-a", "pasta"])
+                        .output()
+                        .await
+                    {
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        let matching: Vec<&str> = stdout
+                            .lines()
+                            .filter(|l| l.contains(&ip) || l.contains(&port_str))
+                            .collect();
+                        println!("    DIAG [pasta for this clone]: {:?}", matching);
+                    }
+
+                    // 5. Get holder_pid for nsenter diagnostics
+                    let fcvm_path = common::find_fcvm_binary().unwrap();
+                    let holder_pid = common::get_holder_pid_for_diag(&fcvm_path, clone_pid).await;
+                    if let Some(hpid) = holder_pid {
+                        let hpid_str = hpid.to_string();
+
+                        // 6. nsenter curl — bypass pasta, curl guest directly through namespace
+                        if let Ok(out) = tokio::process::Command::new("nsenter")
                             .args([
-                                "-v",
+                                "-t",
+                                &hpid_str,
+                                "--net",
+                                "curl",
+                                "-sS",
                                 "--max-time",
                                 "2",
-                                &format!("http://{}:{}", ip, host_port),
+                                "http://10.0.2.100:80",
                             ])
                             .output()
                             .await
                         {
+                            let body_len = out.stdout.len();
                             let stderr = String::from_utf8_lossy(&out.stderr);
+                            let status = out.status;
+                            println!("    DIAG [nsenter curl 10.0.2.100:80]: status={} body={} bytes stderr={}", status, body_len, stderr.trim());
+                        }
+
+                        // 7. ARP table in namespace
+                        if let Ok(out) = tokio::process::Command::new("nsenter")
+                            .args(["-t", &hpid_str, "--net", "ip", "neigh"])
+                            .output()
+                            .await
+                        {
+                            let stdout = String::from_utf8_lossy(&out.stdout);
                             println!(
-                                "    DIAG [verbose curl via pasta]:\n      {}",
-                                stderr.lines().collect::<Vec<_>>().join("\n      ")
+                                "    DIAG [nsenter ip neigh]: {}",
+                                stdout.lines().collect::<Vec<_>>().join(" | ")
                             );
                         }
 
-                        // 2. Listening sockets for our port
-                        if let Ok(out) = tokio::process::Command::new("ss")
-                            .args(["-tlnp"])
+                        // 8. Bridge state in namespace
+                        if let Ok(out) = tokio::process::Command::new("nsenter")
+                            .args(["-t", &hpid_str, "--net", "bridge", "link"])
                             .output()
                             .await
                         {
                             let stdout = String::from_utf8_lossy(&out.stdout);
-                            let matching: Vec<&str> = stdout
-                                .lines()
-                                .filter(|l| l.contains(&port_str) || l.starts_with("State"))
-                                .collect();
-                            println!("    DIAG [ss -tlnp]: {:?}", matching);
-                        }
-
-                        // 3. ALL TCP sockets (ESTABLISHED, TIME_WAIT, etc.)
-                        if let Ok(out) = tokio::process::Command::new("ss")
-                            .args(["-tanp"])
-                            .output()
-                            .await
-                        {
-                            let stdout = String::from_utf8_lossy(&out.stdout);
-                            let matching: Vec<&str> = stdout
-                                .lines()
-                                .filter(|l| {
-                                    l.contains(&port_str)
-                                        || l.contains(&ip)
-                                        || l.starts_with("State")
-                                        || l.contains("TIME-WAIT")
-                                })
-                                .collect();
-                            println!("    DIAG [ss -tanp relevant]: {:?}", matching);
-                        }
-
-                        // 4. pasta process check
-                        if let Ok(out) = tokio::process::Command::new("pgrep")
-                            .args(["-a", "pasta"])
-                            .output()
-                            .await
-                        {
-                            let stdout = String::from_utf8_lossy(&out.stdout);
-                            let matching: Vec<&str> = stdout
-                                .lines()
-                                .filter(|l| l.contains(&ip) || l.contains(&port_str))
-                                .collect();
-                            println!("    DIAG [pasta for this clone]: {:?}", matching);
-                        }
-
-                        // 5. Get holder_pid for nsenter diagnostics
-                        let fcvm_path = common::find_fcvm_binary().unwrap();
-                        let holder_pid =
-                            common::get_holder_pid_for_diag(&fcvm_path, clone_pid).await;
-                        if let Some(hpid) = holder_pid {
-                            let hpid_str = hpid.to_string();
-
-                            // 6. nsenter curl — bypass pasta, curl guest directly through namespace
-                            if let Ok(out) = tokio::process::Command::new("nsenter")
-                                .args([
-                                    "-t",
-                                    &hpid_str,
-                                    "--net",
-                                    "curl",
-                                    "-sS",
-                                    "--max-time",
-                                    "2",
-                                    "http://10.0.2.100:80",
-                                ])
-                                .output()
-                                .await
-                            {
-                                let body_len = out.stdout.len();
-                                let stderr = String::from_utf8_lossy(&out.stderr);
-                                let status = out.status;
-                                println!("    DIAG [nsenter curl 10.0.2.100:80]: status={} body={} bytes stderr={}", status, body_len, stderr.trim());
-                            }
-
-                            // 7. ARP table in namespace
-                            if let Ok(out) = tokio::process::Command::new("nsenter")
-                                .args(["-t", &hpid_str, "--net", "ip", "neigh"])
-                                .output()
-                                .await
-                            {
-                                let stdout = String::from_utf8_lossy(&out.stdout);
-                                println!(
-                                    "    DIAG [nsenter ip neigh]: {}",
-                                    stdout.lines().collect::<Vec<_>>().join(" | ")
-                                );
-                            }
-
-                            // 8. Bridge state in namespace
-                            if let Ok(out) = tokio::process::Command::new("nsenter")
-                                .args(["-t", &hpid_str, "--net", "bridge", "link"])
-                                .output()
-                                .await
-                            {
-                                let stdout = String::from_utf8_lossy(&out.stdout);
-                                println!(
-                                    "    DIAG [nsenter bridge link]: {}",
-                                    stdout.lines().collect::<Vec<_>>().join(" | ")
-                                );
-                            }
-
-                            // 9. All TCP sockets inside the namespace (TIME_WAIT from pasta splice)
-                            if let Ok(out) = tokio::process::Command::new("nsenter")
-                                .args(["-t", &hpid_str, "--net", "ss", "-tanp"])
-                                .output()
-                                .await
-                            {
-                                let stdout = String::from_utf8_lossy(&out.stdout);
-                                println!("    DIAG [nsenter ss -tanp (namespace)]:");
-                                for line in stdout.lines() {
-                                    println!("      {}", line);
-                                }
-                            }
-
-                            // 10. Ping guest from namespace
-                            if let Ok(out) = tokio::process::Command::new("nsenter")
-                                .args([
-                                    "-t",
-                                    &hpid_str,
-                                    "--net",
-                                    "ping",
-                                    "-c",
-                                    "1",
-                                    "-W",
-                                    "1",
-                                    "10.0.2.100",
-                                ])
-                                .output()
-                                .await
-                            {
-                                let stdout = String::from_utf8_lossy(&out.stdout);
-                                let status = out.status;
-                                println!(
-                                    "    DIAG [nsenter ping 10.0.2.100]: status={} {}",
-                                    status,
-                                    stdout.lines().last().unwrap_or("")
-                                );
-                            }
-                        } else {
                             println!(
-                                "    DIAG [holder_pid]: could not determine holder PID for nsenter"
+                                "    DIAG [nsenter bridge link]: {}",
+                                stdout.lines().collect::<Vec<_>>().join(" | ")
                             );
                         }
 
-                        // 11. Check nginx inside the VM via exec
-                        if let Ok(out) = tokio::process::Command::new(&fcvm_path)
+                        // 9. All TCP sockets inside the namespace (TIME_WAIT from pasta splice)
+                        if let Ok(out) = tokio::process::Command::new("nsenter")
+                            .args(["-t", &hpid_str, "--net", "ss", "-tanp"])
+                            .output()
+                            .await
+                        {
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            println!("    DIAG [nsenter ss -tanp (namespace)]:");
+                            for line in stdout.lines() {
+                                println!("      {}", line);
+                            }
+                        }
+
+                        // 10. Ping guest from namespace
+                        if let Ok(out) = tokio::process::Command::new("nsenter")
+                            .args([
+                                "-t",
+                                &hpid_str,
+                                "--net",
+                                "ping",
+                                "-c",
+                                "1",
+                                "-W",
+                                "1",
+                                "10.0.2.100",
+                            ])
+                            .output()
+                            .await
+                        {
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            let status = out.status;
+                            println!(
+                                "    DIAG [nsenter ping 10.0.2.100]: status={} {}",
+                                status,
+                                stdout.lines().last().unwrap_or("")
+                            );
+                        }
+                    } else {
+                        println!(
+                            "    DIAG [holder_pid]: could not determine holder PID for nsenter"
+                        );
+                    }
+
+                    // 11. Check nginx inside the VM via exec
+                    if let Ok(out) = tokio::process::Command::new(&fcvm_path)
                             .args(["exec", "--pid", &pid_str, "--vm", "--", "sh", "-c",
                                    "echo nginx_pids=$(pgrep nginx | tr '\\n' ','); curl -sS --max-time 2 http://localhost:80 | wc -c; echo nginx_conns=$(ss -tn | grep ':80 ' | wc -l)"])
                             .output().await
@@ -442,8 +444,8 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
                             println!("    DIAG [exec in VM — nginx check]: stdout={} stderr={}", stdout.trim(), stderr.trim());
                         }
 
-                        // 12. Check guest's conntrack / iptables
-                        if let Ok(out) = tokio::process::Command::new(&fcvm_path)
+                    // 12. Check guest's conntrack / iptables
+                    if let Ok(out) = tokio::process::Command::new(&fcvm_path)
                             .args(["exec", "--pid", &pid_str, "--vm", "--", "sh", "-c",
                                    "ss -tan | head -20; echo '---'; ip neigh; echo '---'; cat /proc/sys/net/ipv4/tcp_max_syn_backlog 2>/dev/null; echo '---'; cat /proc/sys/net/core/somaxconn 2>/dev/null"])
                             .output().await
@@ -455,8 +457,8 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
                             }
                         }
 
-                        // 13. dmesg inside VM for TCP errors
-                        if let Ok(out) = tokio::process::Command::new(&fcvm_path)
+                    // 13. dmesg inside VM for TCP errors
+                    if let Ok(out) = tokio::process::Command::new(&fcvm_path)
                             .args(["exec", "--pid", &pid_str, "--vm", "--", "sh", "-c",
                                    "dmesg 2>/dev/null | grep -iE 'tcp|conntrack|drop|reset|syn|nf_' | tail -10 || echo 'no dmesg access'"])
                             .output().await
@@ -467,10 +469,10 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
                             }
                         }
 
-                        // 14. Raw TCP test from namespace via nc (bypasses HTTP)
-                        if let Some(hpid) = holder_pid {
-                            let hpid_str = hpid.to_string();
-                            if let Ok(out) = tokio::process::Command::new("nsenter")
+                    // 14. Raw TCP test from namespace via nc (bypasses HTTP)
+                    if let Some(hpid) = holder_pid {
+                        let hpid_str = hpid.to_string();
+                        if let Ok(out) = tokio::process::Command::new("nsenter")
                                 .args([
                                     "-t",
                                     &hpid_str,
@@ -491,132 +493,131 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
                                 );
                             }
 
-                            // 14b. /proc/net/sockstat inside namespace (socket counts)
-                            if let Ok(out) = tokio::process::Command::new("nsenter")
-                                .args(["-t", &hpid_str, "--net", "cat", "/proc/net/sockstat"])
-                                .output()
-                                .await
-                            {
-                                let stdout = String::from_utf8_lossy(&out.stdout);
-                                println!(
-                                    "    DIAG [nsenter /proc/net/sockstat]: {}",
-                                    stdout.trim()
-                                );
-                            }
-                        }
-
-                        // 15. Pasta fd count, /proc status, and memory (are fds/memory leaking?)
-                        if let Ok(out) = tokio::process::Command::new("pgrep")
-                            .args(["-a", "pasta"])
+                        // 14b. /proc/net/sockstat inside namespace (socket counts)
+                        if let Ok(out) = tokio::process::Command::new("nsenter")
+                            .args(["-t", &hpid_str, "--net", "cat", "/proc/net/sockstat"])
                             .output()
                             .await
                         {
                             let stdout = String::from_utf8_lossy(&out.stdout);
-                            for line in stdout.lines() {
-                                if line.contains(&ip) {
-                                    if let Some(pasta_pid) = line.split_whitespace().next() {
-                                        // fd count
-                                        if let Ok(fds) = tokio::process::Command::new("ls")
-                                            .args([&format!("/proc/{}/fd", pasta_pid)])
-                                            .output()
-                                            .await
-                                        {
-                                            let fd_count = String::from_utf8_lossy(&fds.stdout)
-                                                .lines()
-                                                .count();
-                                            println!(
-                                                "    DIAG [pasta pid={} fd count]: {}",
-                                                pasta_pid, fd_count
-                                            );
-                                        }
-                                        // VmRSS and threads
-                                        if let Ok(status) = tokio::process::Command::new("sh")
-                                            .args([
-                                                "-c",
-                                                &format!(
-                                                    "grep -E 'VmRSS|Threads|FDSize' /proc/{}/status",
-                                                    pasta_pid
-                                                ),
-                                            ])
-                                            .output()
-                                            .await
-                                        {
-                                            let stdout = String::from_utf8_lossy(&status.stdout);
-                                            println!(
-                                                "    DIAG [pasta pid={} status]: {}",
-                                                pasta_pid,
-                                                stdout.lines().collect::<Vec<_>>().join(" | ")
-                                            );
-                                        }
+                            println!("    DIAG [nsenter /proc/net/sockstat]: {}", stdout.trim());
+                        }
+                    }
+
+                    // 15. Pasta fd count, /proc status, and memory (are fds/memory leaking?)
+                    if let Ok(out) = tokio::process::Command::new("pgrep")
+                        .args(["-a", "pasta"])
+                        .output()
+                        .await
+                    {
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        for line in stdout.lines() {
+                            if line.contains(&ip) {
+                                if let Some(pasta_pid) = line.split_whitespace().next() {
+                                    // fd count
+                                    if let Ok(fds) = tokio::process::Command::new("ls")
+                                        .args([&format!("/proc/{}/fd", pasta_pid)])
+                                        .output()
+                                        .await
+                                    {
+                                        let fd_count =
+                                            String::from_utf8_lossy(&fds.stdout).lines().count();
+                                        println!(
+                                            "    DIAG [pasta pid={} fd count]: {}",
+                                            pasta_pid, fd_count
+                                        );
+                                    }
+                                    // VmRSS and threads
+                                    if let Ok(status) = tokio::process::Command::new("sh")
+                                        .args([
+                                            "-c",
+                                            &format!(
+                                                "grep -E 'VmRSS|Threads|FDSize' /proc/{}/status",
+                                                pasta_pid
+                                            ),
+                                        ])
+                                        .output()
+                                        .await
+                                    {
+                                        let stdout = String::from_utf8_lossy(&status.stdout);
+                                        println!(
+                                            "    DIAG [pasta pid={} status]: {}",
+                                            pasta_pid,
+                                            stdout.lines().collect::<Vec<_>>().join(" | ")
+                                        );
                                     }
                                 }
                             }
                         }
+                    }
 
-                        // 15. tcpdump in namespace while doing a curl — capture the actual RST
-                        if let Some(hpid) = holder_pid {
-                            let hpid_str = hpid.to_string();
-                            // Start tcpdump in background, do a curl via pasta, then collect
-                            let tcpdump_hpid = hpid_str.clone();
-                            let tcpdump_handle = tokio::spawn(async move {
-                                tokio::process::Command::new("nsenter")
-                                    .args([
-                                        "-t",
-                                        &tcpdump_hpid,
-                                        "--net",
-                                        "timeout",
-                                        "3",
-                                        "tcpdump",
-                                        "-i",
-                                        "br0",
-                                        "-c",
-                                        "20",
-                                        "-nn",
-                                        "port",
-                                        "80",
-                                    ])
-                                    .output()
-                                    .await
-                            });
-                            // Brief pause to let tcpdump start
-                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                            // Now do a curl via pasta (this should fail and tcpdump captures it)
-                            let pasta_retry = common::curl_check(&ip, host_port, 2).await;
-                            println!(
-                                "    DIAG [pasta curl during tcpdump]: success={} body={} err={}",
-                                pasta_retry.success,
-                                pasta_retry.body_len,
-                                pasta_retry.error.trim()
-                            );
-                            // Also try nsenter curl during tcpdump
-                            if let Ok(out) = tokio::process::Command::new("nsenter")
+                    // 15. tcpdump in namespace while doing a curl — capture the actual RST
+                    if let Some(hpid) = holder_pid {
+                        let hpid_str = hpid.to_string();
+                        // Start tcpdump in background, do a curl via pasta, then collect
+                        let tcpdump_hpid = hpid_str.clone();
+                        let tcpdump_handle = tokio::spawn(async move {
+                            tokio::process::Command::new("nsenter")
                                 .args([
                                     "-t",
-                                    &hpid_str,
+                                    &tcpdump_hpid,
                                     "--net",
-                                    "curl",
-                                    "-sS",
-                                    "--max-time",
-                                    "2",
-                                    "http://10.0.2.100:80",
+                                    "timeout",
+                                    "3",
+                                    "tcpdump",
+                                    "-i",
+                                    "br0",
+                                    "-c",
+                                    "20",
+                                    "-nn",
+                                    "port",
+                                    "80",
                                 ])
                                 .output()
                                 .await
-                            {
-                                println!("    DIAG [nsenter curl during tcpdump]: status={} body={} bytes",
-                                    out.status, out.stdout.len());
+                        });
+                        // Brief pause to let tcpdump start
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        // Now do a curl via pasta (this should fail and tcpdump captures it)
+                        let pasta_retry = common::curl_check(&ip, host_port, 2).await;
+                        println!(
+                            "    DIAG [pasta curl during tcpdump]: success={} body={} err={}",
+                            pasta_retry.success,
+                            pasta_retry.body_len,
+                            pasta_retry.error.trim()
+                        );
+                        // Also try nsenter curl during tcpdump
+                        if let Ok(out) = tokio::process::Command::new("nsenter")
+                            .args([
+                                "-t",
+                                &hpid_str,
+                                "--net",
+                                "curl",
+                                "-sS",
+                                "--max-time",
+                                "2",
+                                "http://10.0.2.100:80",
+                            ])
+                            .output()
+                            .await
+                        {
+                            println!(
+                                "    DIAG [nsenter curl during tcpdump]: status={} body={} bytes",
+                                out.status,
+                                out.stdout.len()
+                            );
+                        }
+                        // Collect tcpdump output
+                        if let Ok(Ok(out)) = tcpdump_handle.await {
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            println!("    DIAG [tcpdump br0 port 80]:");
+                            for line in stderr.lines() {
+                                println!("      {}", line);
                             }
-                            // Collect tcpdump output
-                            if let Ok(Ok(out)) = tcpdump_handle.await {
-                                let stderr = String::from_utf8_lossy(&out.stderr);
-                                println!("    DIAG [tcpdump br0 port 80]:");
-                                for line in stderr.lines() {
-                                    println!("      {}", line);
-                                }
-                            }
+                        }
 
-                            // 16. conntrack entries in namespace
-                            if let Ok(out) = tokio::process::Command::new("nsenter")
+                        // 16. conntrack entries in namespace
+                        if let Ok(out) = tokio::process::Command::new("nsenter")
                                 .args(["-t", &hpid_str, "--net", "sh", "-c",
                                        "cat /proc/net/nf_conntrack 2>/dev/null | grep ':0050 ' | head -10 || echo 'no conntrack'"])
                                 .output().await
@@ -626,10 +627,9 @@ async fn test_clone_port_forward_stress_rootless() -> Result<()> {
                                     println!("    DIAG [nsenter conntrack port 80]: {}", stdout.trim());
                                 }
                             }
-                        }
-
-                        println!("    DIAG === end diagnostics for clone {} ===", name);
                     }
+
+                    println!("    DIAG === end diagnostics for clone {} ===", name);
                 }
             }
 
