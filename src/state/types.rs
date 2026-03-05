@@ -150,6 +150,10 @@ pub struct VmConfig {
     /// Stored so clones inherit the same networking mode from snapshots.
     #[serde(default)]
     pub network_mode: crate::firecracker::FcNetworkMode,
+    /// Explicit routable IPv6 /64 prefix for routed mode.
+    /// When set, MASQUERADE is skipped and auto-detect is bypassed.
+    #[serde(default)]
+    pub ipv6_prefix: Option<String>,
     /// Whether a PTY is allocated for the container.
     #[serde(default)]
     pub tty: bool,
@@ -199,6 +203,7 @@ impl VmState {
                 portable_volumes: false,
                 user: None,
                 username: None,
+                ipv6_prefix: None,
             },
         }
     }

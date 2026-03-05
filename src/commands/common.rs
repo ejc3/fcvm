@@ -1282,6 +1282,7 @@ pub fn build_snapshot_config(
             user: vm_state.config.user.clone(),
             port_mappings: vm_state.config.port_mappings.clone(),
             network_mode: vm_state.config.network_mode,
+            ipv6_prefix: vm_state.config.ipv6_prefix.clone(),
             tty: vm_state.config.tty,
             interactive: vm_state.config.interactive,
         },

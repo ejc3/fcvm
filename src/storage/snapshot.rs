@@ -96,6 +96,9 @@ pub struct SnapshotMetadata {
     /// Network mode (bridged, rootless, routed) inherited by clones
     #[serde(default)]
     pub network_mode: crate::firecracker::FcNetworkMode,
+    /// Explicit routable IPv6 /64 prefix for routed mode (skips auto-detect and MASQUERADE)
+    #[serde(default)]
+    pub ipv6_prefix: Option<String>,
     /// Whether PTY is allocated for the container
     #[serde(default)]
     pub tty: bool,
@@ -283,6 +286,7 @@ mod tests {
                 user: None,
                 port_mappings: vec![],
                 network_mode: Default::default(),
+                ipv6_prefix: None,
                 tty: false,
                 interactive: false,
             },
@@ -407,6 +411,7 @@ mod tests {
                 user: None,
                 port_mappings: vec![],
                 network_mode: Default::default(),
+                ipv6_prefix: None,
                 tty: false,
                 interactive: false,
             },
@@ -475,6 +480,7 @@ mod tests {
                     user: None,
                     port_mappings: vec![],
                     network_mode: Default::default(),
+                    ipv6_prefix: None,
                     tty: false,
                     interactive: false,
                 },
@@ -530,6 +536,7 @@ mod tests {
                 user: None,
                 port_mappings: vec![],
                 network_mode: Default::default(),
+                ipv6_prefix: None,
                 tty: false,
                 interactive: false,
             },
@@ -636,6 +643,7 @@ mod tests {
                 user: None,
                 port_mappings: vec![],
                 network_mode: Default::default(),
+                ipv6_prefix: None,
                 tty: false,
                 interactive: false,
             },

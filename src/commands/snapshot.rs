@@ -643,7 +643,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // stays stuck reading from the old (dead) connection after VM resume resets vsock.
     let output_reconnect = Arc::new(tokio::sync::Notify::new());
     // Channel to know when fc-agent's output connection arrives (gates health monitor)
-    let (output_connected_tx, output_connected_rx) = tokio::sync::oneshot::channel();
+    let (output_connected_tx, mut output_connected_rx) = tokio::sync::oneshot::channel();
     let output_handle = if !tty_mode {
         let socket_path = output_socket_path.clone();
         let vm_id_clone = vm_id.clone();
@@ -728,6 +728,9 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         FcNetworkMode::Routed => {
             let mut net =
                 RoutedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
+            if let Some(ref prefix) = snapshot_config.metadata.ipv6_prefix {
+                net = net.with_ipv6_prefix(prefix.clone());
+            }
             net.preflight_check()
                 .context("routed mode preflight check failed")?;
             if !port_mappings.is_empty() {
@@ -1102,10 +1105,33 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // No timeout — after snapshot restore, the VM may be CPU-starved (HHVM, EdenFS,
     // falcon all resume simultaneously) and fc-agent's MMDS poll + restore handler
     // can take minutes. Proceeding early causes exec failures; waiting is correct.
+    // But poll VM liveness to avoid hanging forever if Firecracker crashes.
     if !tty_mode {
-        match output_connected_rx.await {
-            Ok(()) => info!(vm_id = %vm_id, "fc-agent output connected, exec server ready"),
-            Err(_) => warn!(vm_id = %vm_id, "output connected_tx dropped"),
+        let mut liveness_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        liveness_interval.tick().await; // consume immediate first tick
+        loop {
+            tokio::select! {
+                result = &mut output_connected_rx => {
+                    match result {
+                        Ok(()) => info!(vm_id = %vm_id, "fc-agent output connected, exec server ready"),
+                        Err(_) => warn!(vm_id = %vm_id, "output connected_tx dropped"),
+                    }
+                    break;
+                }
+                _ = liveness_interval.tick() => {
+                    match vm_manager.try_wait() {
+                        Ok(Some(status)) => {
+                            warn!(vm_id = %vm_id, ?status, "VM exited before fc-agent connected");
+                            break;
+                        }
+                        Ok(None) => {} // still running
+                        Err(e) => {
+                            warn!(vm_id = %vm_id, error = %e, "VM liveness check failed");
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
 

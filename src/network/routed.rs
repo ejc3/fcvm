@@ -67,9 +67,39 @@ impl RoutedNetwork {
         }
     }
 
+    /// Set an explicit routable /64 prefix. Validates format (4 colon-separated hex groups).
     pub fn with_ipv6_prefix(mut self, prefix: String) -> Self {
         self.ipv6_prefix = Some(prefix);
         self
+    }
+
+    /// Validate that a prefix string looks like a valid IPv6 /64 prefix
+    /// (4 colon-separated groups of 1-4 hex digits, e.g. "2600:1f1c:494:201").
+    fn validate_ipv6_prefix(prefix: &str) -> Result<()> {
+        let groups: Vec<&str> = prefix.split(':').collect();
+        if groups.len() != 4 {
+            anyhow::bail!(
+                "invalid --ipv6-prefix '{}': expected 4 colon-separated hex groups \
+                 (e.g. 2600:1f1c:494:201)",
+                prefix
+            );
+        }
+        for group in &groups {
+            if group.is_empty() || group.len() > 4 {
+                anyhow::bail!(
+                    "invalid --ipv6-prefix '{}': each group must be 1-4 hex digits",
+                    prefix
+                );
+            }
+            if u16::from_str_radix(group, 16).is_err() {
+                anyhow::bail!(
+                    "invalid --ipv6-prefix '{}': '{}' is not valid hex",
+                    prefix,
+                    group
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Get the network namespace ID (for setting Firecracker's namespace).
@@ -100,7 +130,8 @@ impl RoutedNetwork {
             );
         }
 
-        if self.ipv6_prefix.is_some() {
+        if let Some(ref prefix) = self.ipv6_prefix {
+            Self::validate_ipv6_prefix(prefix)?;
             return Ok(()); // Explicit prefix — no auto-detect or ip6tables needed
         }
 
