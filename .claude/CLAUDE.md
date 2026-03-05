@@ -1229,7 +1229,7 @@ fuse-pipe/benches/
 - Each VM gets a unique IPv6 derived from host's /64 subnet via hash of vm_id
 - Network namespace with bridge (br0) connecting TAP and veth for L2 forwarding
 - Proxy NDP on default interface makes VM IPv6 routable from network fabric
-- ip6tables MASQUERADE for AWS VPC source/dest checks
+- ip6tables MASQUERADE for AWS VPC source/dest checks (skipped when `--ipv6-prefix` is set)
 - Port forwarding via built-in TCP proxy (setns + tokio relay) on unique loopback IP (same allocation as rootless)
 - IPv4 stays internal to namespace (health checks only); all external traffic uses IPv6
 - Egress proxy is NOT used — IPv6 goes natively through the kernel stack

@@ -290,7 +290,7 @@ iptables -t nat -A PREROUTING -d 172.30.x.1 -p tcp --dport 8080 -j DNAT --to-des
 Uses veth pairs + IPv6 routing for kernel line-rate networking without userspace proxies.
 
 **Features**:
-- Requires root and a host with a global IPv6 /64 subnet
+- Requires root and a host with a global IPv6 /64 subnet (or `--ipv6-prefix` to specify one explicitly)
 - Native IPv6 routing through the kernel stack (no userspace L4 translation)
 - Each VM gets a unique IPv6 derived from the host's /64 prefix
 - Port forwarding via built-in TCP proxy (`setns` + tokio relay) on loopback IP (same as rootless)
@@ -308,11 +308,12 @@ struct RoutedNetwork {
     vm_ipv6: Option<String>,
     default_iface: Option<String>,
     proxy_handles: Vec<JoinHandle<()>>,
+    ipv6_prefix: Option<String>,       // explicit /64 prefix (skips auto-detect + MASQUERADE)
 }
 
 async fn setup() -> Result<NetworkConfig> {
-    preflight_check()                  // root, IPv6, ip6tables
-    detect_host_ipv6()                 // find /64 subnet (or /128 with on-link /64)
+    self.preflight_check()             // root, IPv6, ip6tables (ip6tables skipped if --ipv6-prefix)
+    detect_host_ipv6()                 // find /64 subnet (or /128 with on-link /64); skipped if --ipv6-prefix
     generate_vm_ipv6(prefix, vm_id)    // deterministic IPv6 from hash
     create_namespace(ns_name)
     create_veth_pair(host_veth, guest_veth)
@@ -323,7 +324,7 @@ async fn setup() -> Result<NetworkConfig> {
     // Namespace: default IPv6 route via host veth link-local
     // Host: /128 route to VM IPv6 via host veth
     // Proxy NDP on default interface
-    // ip6tables MASQUERADE for outbound
+    // ip6tables MASQUERADE for outbound (skipped if --ipv6-prefix is set)
     // TCP proxy port forwarding on loopback IP (setns + tokio relay)
 }
 ```
@@ -1366,7 +1367,7 @@ fcvm snapshot run --pid <SERVE_PID> [OPTIONS]
 --exec <CMD>              Execute command in container after clone is healthy
 ```
 
-Network mode, port mappings, TTY, and interactive flags are inherited from the snapshot
+Network mode, port mappings, TTY, interactive flags, and `--ipv6-prefix` are inherited from the snapshot
 metadata automatically — no need to re-specify them on clone.
 
 **Examples**:
