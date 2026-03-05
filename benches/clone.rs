@@ -263,38 +263,32 @@ impl CloneFixture {
             std::thread::sleep(Duration::from_millis(50));
         };
 
-        // Make HTTP request to nginx via loopback port forward (pasta).
-        // verify_port_forwarding() already confirmed the port works, but under
-        // heavy CI load the first request can get an empty response if pasta's
-        // internal forwarding state is briefly inconsistent. Retry up to 3 times.
+        // Make HTTP request to nginx (retry briefly — pasta networking may need
+        // a moment after clone restore to establish L4 translation)
         let addr = format!("{}:{}", loopback_ip, health_port);
-        let request = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-
         let mut last_response = String::new();
-        for attempt in 0..3 {
+        let mut http_ok = false;
+        for attempt in 0..10 {
             if attempt > 0 {
                 std::thread::sleep(Duration::from_millis(500));
             }
-            let Ok(mut stream) = TcpStream::connect(&addr) else {
-                continue;
-            };
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-
-            if stream.write_all(request.as_bytes()).is_err() {
-                continue;
-            }
-
-            let mut response = Vec::new();
-            let _ = stream.read_to_end(&mut response);
-            last_response = String::from_utf8_lossy(&response).to_string();
-
-            if last_response.contains("200 OK") {
-                break;
+            if let Ok(mut stream) = TcpStream::connect(&addr) {
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+                let request = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+                if stream.write_all(request.as_bytes()).is_ok() {
+                    let mut response = Vec::new();
+                    let _ = stream.read_to_end(&mut response);
+                    last_response = String::from_utf8_lossy(&response).to_string();
+                    if last_response.contains("200 OK") {
+                        http_ok = true;
+                        break;
+                    }
+                }
             }
         }
 
-        if !last_response.contains("200 OK") {
+        if !http_ok {
             let clone_log = std::fs::read_to_string(&clone_log_path).unwrap_or_default();
 
             let ss_check = Command::new("ss")
@@ -322,7 +316,7 @@ impl CloneFixture {
                 .join("\n");
 
             panic!(
-                "clone HTTP failed after 3 attempts\n\
+                "clone HTTP failed after 10 attempts\n\
                  addr: {}:{}\n\
                  last_response: {} bytes\n\
                  clone_pid: {}\n\

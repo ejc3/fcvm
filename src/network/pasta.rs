@@ -495,6 +495,11 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
     /// the process is running, not that ports are listening. Without this check,
     /// the health monitor may declare the VM "healthy" (via nsenter/bridge) before
     /// port forwarding actually works.
+    ///
+    /// After snapshot restore, pasta may accept TCP connections (it's listening on
+    /// loopback) but its L4 forwarding state hasn't fully stabilized, causing
+    /// connections to return 0 bytes. We verify end-to-end readiness by checking
+    /// that connected sockets stay open (not immediately closed with EOF).
     async fn wait_for_port_forwarding(&self) -> Result<()> {
         use tokio::net::TcpStream;
 
@@ -513,18 +518,64 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
             let addr = format!("{}:{}", bind_addr, mapping.host_port);
 
             loop {
-                match TcpStream::connect(&addr).await {
-                    Ok(_) => {
-                        debug!(addr = %addr, "port forward ready");
-                        break;
-                    }
-                    Err(_) => {
-                        if std::time::Instant::now() > deadline {
-                            anyhow::bail!("pasta port forward not ready within 5s: {}", addr);
+                if let Ok(stream) = TcpStream::connect(&addr).await {
+                    // Verify the connection is truly forwarding by checking it
+                    // stays open. When pasta's L4 translation isn't ready, it
+                    // accepts the connection but immediately closes it with 0
+                    // bytes (EOF). A healthy forwarded connection stays open
+                    // waiting for data from the guest service (e.g. nginx
+                    // waits for an HTTP request before responding).
+                    //
+                    // Wait for the socket to become readable, then read. If
+                    // readable() completes within 100ms AND read returns 0,
+                    // that's an immediate EOF from pasta — forwarding broken.
+                    // If readable() times out, the connection is held open by
+                    // the guest — forwarding works.
+                    let mut buf = [0u8; 1];
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        stream.readable(),
+                    )
+                    .await
+                    {
+                        Err(_) => {
+                            // Timeout: connection stayed open — forwarding works.
+                            // The guest service is waiting for input, proving
+                            // pasta's L4 path is fully established.
+                            debug!(addr = %addr, "port forward ready (connection held)");
+                            break;
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        Ok(Ok(())) => {
+                            // Socket became readable quickly — check if it's data or EOF
+                            match stream.try_read(&mut buf) {
+                                Ok(0) => {
+                                    // Immediate EOF: pasta closed the connection,
+                                    // L4 forwarding not ready yet
+                                    debug!(addr = %addr, "port forward returned EOF, retrying");
+                                }
+                                Ok(_) => {
+                                    // Got data: service is responding, definitely ready
+                                    debug!(addr = %addr, "port forward ready (got data)");
+                                    break;
+                                }
+                                Err(_) => {
+                                    // WouldBlock: connection is alive, not really readable
+                                    debug!(addr = %addr, "port forward ready (would block)");
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(Err(_)) => {
+                            // readable() itself failed — unusual, retry
+                            debug!(addr = %addr, "readable check failed, retrying");
+                        }
                     }
                 }
+
+                if std::time::Instant::now() > deadline {
+                    anyhow::bail!("pasta port forward not ready within 5s: {}", addr);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
 
