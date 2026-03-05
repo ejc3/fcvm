@@ -171,15 +171,13 @@ impl RoutedNetwork {
                             if prefix_len == "64" {
                                 return Some((addr.to_string(), prefix));
                             }
-                            if prefix_len == "128" {
-                                if Self::has_onlink_64_route(&prefix) {
-                                    info!(
-                                        addr = %addr,
-                                        prefix = %prefix,
-                                        "using /128 address with /64 on-link route"
-                                    );
-                                    return Some((addr.to_string(), prefix));
-                                }
+                            if prefix_len == "128" && Self::has_onlink_64_route(&prefix) {
+                                info!(
+                                    addr = %addr,
+                                    prefix = %prefix,
+                                    "using /128 address with /64 on-link route"
+                                );
+                                return Some((addr.to_string(), prefix));
                             }
                         }
                     }
@@ -277,9 +275,10 @@ impl NetworkManager for RoutedNetwork {
             info!(prefix = %prefix, "using explicit --ipv6-prefix (routable, no MASQUERADE)");
             (host_addr, prefix.clone())
         } else {
-            Self::detect_host_ipv6()
-                .context("routed mode requires a global IPv6 /64 subnet. \
-                          Use --ipv6-prefix to specify one explicitly.")?
+            Self::detect_host_ipv6().context(
+                "routed mode requires a global IPv6 /64 subnet. \
+                          Use --ipv6-prefix to specify one explicitly.",
+            )?
         };
 
         // Generate a unique IPv6 for this VM. Check for route collisions

@@ -655,7 +655,8 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
             if let Some(ref prefix) = args.ipv6_prefix {
                 net = net.with_ipv6_prefix(prefix.clone());
             }
-            net.preflight_check().context("routed mode preflight check failed")?;
+            net.preflight_check()
+                .context("routed mode preflight check failed")?;
             if !port_mappings.is_empty() {
                 let loopback_ip = state_manager
                     .allocate_loopback_ip(&mut vm_state)
@@ -1166,6 +1167,7 @@ mod tests {
             rootfs_type: None,
             non_blocking_output: false,
             label: vec![],
+            ipv6_prefix: None,
             image: "alpine:latest".to_string(),
             command_args: vec![],
         }

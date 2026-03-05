@@ -728,7 +728,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         FcNetworkMode::Routed => {
             let mut net =
                 RoutedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
-            net.preflight_check().context("routed mode preflight check failed")?;
+            net.preflight_check()
+                .context("routed mode preflight check failed")?;
             if !port_mappings.is_empty() {
                 let loopback_ip = state_manager
                     .allocate_loopback_ip(&mut vm_state)
