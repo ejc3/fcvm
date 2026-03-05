@@ -794,6 +794,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     vm_state.config.user = snapshot_config.metadata.user.clone();
     vm_state.config.port_mappings = port_mappings;
     vm_state.config.network_mode = network_mode;
+    vm_state.config.ipv6_prefix = snapshot_config.metadata.ipv6_prefix.clone();
     vm_state.config.tty = tty_mode;
     vm_state.config.interactive = interactive;
 
