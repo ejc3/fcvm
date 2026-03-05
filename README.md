@@ -336,7 +336,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 --portable-volumes    Path-hash inodes for cross-machine snapshot/restore
 --rootfs-size <SIZE>  Minimum free space on rootfs (default: 10G)
 --no-snapshot         Disable automatic snapshot creation
---ipv6-prefix <CIDR>  Use explicit /64 prefix for routed mode (skips auto-detect and MASQUERADE)
+--ipv6-prefix <PREFIX>  Use explicit /64 prefix for routed mode (skips auto-detect and MASQUERADE)
 ```
 
 Run `fcvm --help` or `fcvm <command> --help` for full options.
