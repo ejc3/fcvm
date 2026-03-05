@@ -180,7 +180,20 @@ impl RoutedNetwork {
             .ok()?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
+        // First pass: look for /64 addresses (preferred over /128)
+        if let Some(result) = Self::parse_host_ipv6(&stdout, false) {
+            return Some(result);
+        }
+        // Second pass: check /128 addresses with on-link /64 routes
+        Self::parse_host_ipv6(&stdout, true)
+    }
+
+    /// Parse `ip -6 addr show` output to find a usable global IPv6 address.
+    /// When `check_onlink` is false, only returns /64 addresses.
+    /// When `check_onlink` is true, returns /128 addresses that have on-link /64 routes.
+    /// Skips deprecated, link-local, and ULA addresses.
+    fn parse_host_ipv6(output: &str, check_onlink: bool) -> Option<(String, String)> {
+        for line in output.lines() {
             let line = line.trim();
             if let Some(addr) = line.strip_prefix("inet6 ") {
                 if line.contains("deprecated") {
@@ -198,10 +211,13 @@ impl RoutedNetwork {
                                 segments[0], segments[1], segments[2], segments[3]
                             );
 
-                            if prefix_len == "64" {
+                            if !check_onlink && prefix_len == "64" {
                                 return Some((addr.to_string(), prefix));
                             }
-                            if prefix_len == "128" && Self::has_onlink_64_route(&prefix) {
+                            if check_onlink
+                                && prefix_len == "128"
+                                && Self::has_onlink_64_route(&prefix)
+                            {
                                 info!(
                                     addr = %addr,
                                     prefix = %prefix,
@@ -844,4 +860,167 @@ async fn detect_default_ipv6_interface() -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- validate_ipv6_prefix tests ---
+
+    #[test]
+    fn test_validate_ipv6_prefix_valid() {
+        assert!(RoutedNetwork::validate_ipv6_prefix("2600:1f1c:494:201").is_ok());
+        assert!(RoutedNetwork::validate_ipv6_prefix("2803:6084:7058:46f6").is_ok());
+        assert!(RoutedNetwork::validate_ipv6_prefix("0:0:0:0").is_ok());
+        assert!(RoutedNetwork::validate_ipv6_prefix("ffff:ffff:ffff:ffff").is_ok());
+        assert!(RoutedNetwork::validate_ipv6_prefix("a:b:c:d").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ipv6_prefix_wrong_group_count() {
+        let err = RoutedNetwork::validate_ipv6_prefix("2600:1f1c:494").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("expected 4 colon-separated hex groups"));
+
+        let err = RoutedNetwork::validate_ipv6_prefix("2600:1f1c:494:201:abcd").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("expected 4 colon-separated hex groups"));
+
+        let err = RoutedNetwork::validate_ipv6_prefix("2600").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("expected 4 colon-separated hex groups"));
+
+        let err = RoutedNetwork::validate_ipv6_prefix("").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("expected 4 colon-separated hex groups"));
+    }
+
+    #[test]
+    fn test_validate_ipv6_prefix_invalid_hex() {
+        // Non-hex characters
+        let err = RoutedNetwork::validate_ipv6_prefix("zzzz:1f1c:494:201").unwrap_err();
+        assert!(err.to_string().contains("not valid hex"));
+
+        // Empty group (consecutive colons) — splits to 4 groups but one is empty
+        let err = RoutedNetwork::validate_ipv6_prefix("2600::494:201").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("each group must be 1-4 hex digits"));
+
+        // Group too long (5 digits)
+        let err = RoutedNetwork::validate_ipv6_prefix("26000:1f1c:494:201").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("each group must be 1-4 hex digits"));
+    }
+
+    #[test]
+    fn test_validate_ipv6_prefix_full_address_rejected() {
+        // Full IPv6 address (8 groups) should be rejected
+        let err = RoutedNetwork::validate_ipv6_prefix("2600:1f1c:494:201:1:2:3:4").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("expected 4 colon-separated hex groups"));
+
+        // Compressed full address
+        let err = RoutedNetwork::validate_ipv6_prefix("2600:1f1c:494:201::1").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("expected 4 colon-separated hex groups"));
+    }
+
+    // --- generate_vm_ipv6 tests ---
+
+    #[test]
+    fn test_generate_vm_ipv6_deterministic() {
+        let a1 = RoutedNetwork::generate_vm_ipv6("2600:1f1c:494:201", "vm-abc");
+        let a2 = RoutedNetwork::generate_vm_ipv6("2600:1f1c:494:201", "vm-abc");
+        assert_eq!(a1, a2, "same inputs must produce same output");
+
+        let b = RoutedNetwork::generate_vm_ipv6("2600:1f1c:494:201", "vm-xyz");
+        assert_ne!(a1, b, "different vm_ids must produce different addresses");
+
+        let c = RoutedNetwork::generate_vm_ipv6("2803:6084:7058:46f6", "vm-abc");
+        assert_ne!(a1, c, "different prefixes must produce different addresses");
+    }
+
+    #[test]
+    fn test_generate_vm_ipv6_format() {
+        let addr = RoutedNetwork::generate_vm_ipv6("2600:1f1c:494:201", "vm-test");
+        assert!(
+            addr.starts_with("2600:1f1c:494:201:"),
+            "address must start with prefix: {}",
+            addr
+        );
+        // Should have 8 colon-separated groups total (4 prefix + 4 interface ID)
+        let groups: Vec<&str> = addr.split(':').collect();
+        assert_eq!(groups.len(), 8, "IPv6 must have 8 groups: {}", addr);
+        // Each interface ID group should be valid hex
+        for group in &groups[4..] {
+            assert!(
+                u16::from_str_radix(group, 16).is_ok(),
+                "group '{}' is not valid hex in: {}",
+                group,
+                addr
+            );
+        }
+    }
+
+    // --- parse_host_ipv6 tests (deprecated address filtering) ---
+
+    #[test]
+    fn test_parse_host_ipv6_skips_deprecated() {
+        let output = "\
+2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 9001 state UP
+    inet6 2600:1f1c:494:201::1/64 scope global deprecated dynamic noprefixroute
+       valid_lft 3552sec preferred_lft 0sec
+    inet6 2803:6084:7058:46f6::1/64 scope global dynamic noprefixroute
+       valid_lft 3552sec preferred_lft 3552sec";
+
+        let result = RoutedNetwork::parse_host_ipv6(output, false);
+        assert!(result.is_some(), "should find non-deprecated address");
+        let (addr, prefix) = result.unwrap();
+        assert_eq!(addr, "2803:6084:7058:46f6::1");
+        assert_eq!(prefix, "2803:6084:7058:46f6");
+    }
+
+    #[test]
+    fn test_parse_host_ipv6_skips_link_local_and_ula() {
+        let output = "\
+    inet6 fe80::1/64 scope global
+    inet6 fd00::1/64 scope global
+    inet6 2600:1f1c:494:201::5/64 scope global dynamic";
+
+        let result = RoutedNetwork::parse_host_ipv6(output, false);
+        assert!(result.is_some());
+        let (addr, _) = result.unwrap();
+        assert_eq!(addr, "2600:1f1c:494:201::5");
+    }
+
+    #[test]
+    fn test_parse_host_ipv6_all_deprecated_returns_none() {
+        let output = "\
+    inet6 2600:1f1c:494:201::1/64 scope global deprecated dynamic
+    inet6 2803:6084:7058:46f6::1/64 scope global deprecated dynamic";
+
+        let result = RoutedNetwork::parse_host_ipv6(output, false);
+        assert!(result.is_none(), "all deprecated should return None");
+    }
+
+    #[test]
+    fn test_parse_host_ipv6_extracts_prefix() {
+        let output = "    inet6 2600:1f1c:0494:0201::abcd/64 scope global dynamic";
+
+        let result = RoutedNetwork::parse_host_ipv6(output, false);
+        assert!(result.is_some());
+        let (addr, prefix) = result.unwrap();
+        assert_eq!(addr, "2600:1f1c:0494:0201::abcd");
+        // Prefix is normalized through Ipv6Addr parsing (leading zeros stripped)
+        assert_eq!(prefix, "2600:1f1c:494:201");
+    }
 }

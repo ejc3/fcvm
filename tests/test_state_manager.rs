@@ -261,3 +261,111 @@ async fn test_load_state_by_name_duplicate_detection() {
     let found = manager.load_state_by_name("unique-name").await.unwrap();
     assert_eq!(found.pid, Some(6000));
 }
+
+/// Helper to create a minimal VmState with given vm_id and pid
+fn make_vm_state(vm_id: &str, name: &str, pid: u32) -> VmState {
+    VmState {
+        schema_version: 1,
+        vm_id: vm_id.to_string(),
+        name: Some(name.to_string()),
+        status: VmStatus::Running,
+        health_status: HealthStatus::Healthy,
+        exit_code: None,
+        pid: Some(pid),
+        holder_pid: None,
+        created_at: Utc::now(),
+        last_updated: Utc::now(),
+        config: VmConfig {
+            image: "test:latest".to_string(),
+            vcpu: 1,
+            memory_mib: 256,
+            network: NetworkConfig::default(),
+            volumes: vec![],
+            extra_disks: vec![],
+            nfs_shares: vec![],
+            health_check_url: None,
+            snapshot_name: None,
+            process_type: Some(ProcessType::Vm),
+            serve_pid: None,
+            original_vsock_vm_id: None,
+            port_mappings: vec![],
+            network_mode: Default::default(),
+            ipv6_prefix: None,
+            tty: false,
+            interactive: false,
+            labels: std::collections::HashMap::new(),
+            hugepages: false,
+            portable_volumes: false,
+            user: None,
+            username: None,
+            health_check_timeout: 5,
+        },
+    }
+}
+
+#[tokio::test]
+async fn test_load_state_by_pid_found() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = StateManager::new(temp_dir.path().to_path_buf());
+    manager.init().await.unwrap();
+
+    // Use our own PID (guaranteed to exist in /proc)
+    let my_pid = std::process::id();
+    let state = make_vm_state("vm-pid-test", "pid-test", my_pid);
+    manager.save_state(&state).await.unwrap();
+
+    let found = manager.load_state_by_pid(my_pid).await.unwrap();
+    assert_eq!(found.vm_id, "vm-pid-test");
+    assert_eq!(found.pid, Some(my_pid));
+}
+
+#[tokio::test]
+async fn test_load_state_by_pid_not_found() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = StateManager::new(temp_dir.path().to_path_buf());
+    manager.init().await.unwrap();
+
+    let my_pid = std::process::id();
+    let state = make_vm_state("vm-other", "other", my_pid);
+    manager.save_state(&state).await.unwrap();
+
+    // Search for a PID that no VM has
+    let err = manager
+        .load_state_by_pid(99999999)
+        .await
+        .expect_err("should fail for unknown PID");
+    assert!(
+        err.to_string().contains("No VM found with PID"),
+        "error should mention PID: {}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn test_load_state_by_pid_cleans_stale_on_retry() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = StateManager::new(temp_dir.path().to_path_buf());
+    manager.init().await.unwrap();
+
+    // Create a stale state file with a PID that doesn't exist.
+    // Use a very high PID that's virtually guaranteed to not exist.
+    let stale_pid = 4_000_000_000u32;
+    let stale_state = make_vm_state("vm-stale", "stale", stale_pid);
+    manager.save_state(&stale_state).await.unwrap();
+
+    // Verify the stale file exists
+    let vms = manager.list_vms().await.unwrap();
+    assert_eq!(vms.len(), 1, "stale VM state should exist before cleanup");
+
+    // load_state_by_pid for a non-existent PID triggers cleanup_stale_state
+    let _ = manager.load_state_by_pid(99999998).await;
+
+    // After the failed lookup, the stale state should have been cleaned up
+    // (PID 4000000000 doesn't exist in /proc)
+    let vms_after = manager.list_vms().await.unwrap();
+    assert_eq!(
+        vms_after.len(),
+        0,
+        "stale state file should be removed after cleanup"
+    );
+}
