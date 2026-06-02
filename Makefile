@@ -70,13 +70,6 @@ else
 IPV6_FILTER :=
 endif
 
-# Disable retries when FILTER is set (debugging specific tests)
-ifdef FILTER
-NEXTEST_RETRIES :=
-else
-NEXTEST_RETRIES := --retries 2
-endif
-
 # Default log level: fcvm debug, suppress FUSE spam
 # Override with: RUST_LOG=debug make test-root
 TEST_LOG ?= fcvm=debug,health-monitor=info,fuser=warn,fuse_backend_rs=warn,passthrough=warn
@@ -321,11 +314,11 @@ _test-unit:
 
 _test-fast:
 	RUST_LOG="$(TEST_LOG)" \
-	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_RETRIES) --no-default-features --features integration-fast $(FILTER)
+	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) --no-default-features --features integration-fast $(FILTER)
 
 _test-all:
 	RUST_LOG="$(TEST_LOG)" \
-	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_RETRIES) $(FILTER)
+	./scripts/no-sudo.sh $(NEXTEST) $(NEXTEST_CAPTURE) $(FILTER)
 
 _test-root:
 	@if find target/ -user root -print -quit 2>/dev/null | grep -q .; then \
@@ -336,7 +329,7 @@ _test-root:
 	FCVM_DATA_DIR=$(ROOT_DATA_DIR) \
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
 	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E env PATH=$(PATH)' \
-	$(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_IGNORED) $(NEXTEST_RETRIES) --features privileged-tests $(IPV6_FILTER) $(FILTER) || \
+	$(NEXTEST) $(NEXTEST_CAPTURE) $(NEXTEST_IGNORED) --features privileged-tests $(IPV6_FILTER) $(FILTER) || \
 	{ echo ""; \
 	  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
 	  echo "TEST FAILED - Check debug logs for root cause:"; \
