@@ -11,9 +11,18 @@
 //!
 //! Runs OUTSIDE the network namespace, so it has direct internet access.
 //!
-//! Backpressure: The writer channel is bounded. When the vsock is congested,
-//! send_frame().await blocks, which blocks the TCP read loop, which triggers
-//! TCP flow control back to the source. This prevents unbounded memory growth.
+//! Backpressure (both directions are bounded — no unbounded buffering):
+//! - destination → guest: the writer channel is bounded. When the vsock is
+//!   congested, send_frame().await blocks, which blocks the TCP read loop,
+//!   which triggers TCP flow control back to the destination.
+//! - guest → destination: each per-stream channel is bounded. When a stream's
+//!   destination is slower than the guest, the channel fills and the vsock read
+//!   loop blocks on send().await. The resulting vsock backpressure reaches the
+//!   guest's bounded writer channel, which stops reading the guest application's
+//!   socket (TCP flow control), so the guest is throttled to the destination's
+//!   rate instead of the upload accumulating in host memory. The trade-off is
+//!   that a stalled destination also stalls the other streams of the session
+//!   until the queue drains; memory stays bounded either way.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -38,6 +47,12 @@ const MAX_DATA_PAYLOAD: usize = 32 * 1024;
 /// Provides enough burst capacity while preventing unbounded memory growth.
 const WRITER_CHANNEL_CAPACITY: usize = 1024;
 
+/// Per-stream channel capacity (guest → destination direction).
+/// At 32KB per DATA frame, 256 slots = max 8MB buffered per stream — comparable
+/// to a kernel TCP socket buffer. When full, the mux reader stops reading the
+/// vsock, propagating backpressure to the guest instead of buffering the upload.
+const STREAM_CHANNEL_CAPACITY: usize = 256;
+
 /// Max frame payload we'll accept. Anything larger is a protocol error
 /// (prevents OOM from malformed frames claiming enormous payloads).
 const MAX_FRAME_PAYLOAD: usize = MAX_DATA_PAYLOAD + 1024;
@@ -55,8 +70,11 @@ const AF_INET: u8 = 0x04;
 const AF_INET6: u8 = 0x06;
 
 /// Per-stream channel sender for routing incoming frames.
-/// Unbounded because the vsock reader must never block (would cause HOL blocking).
-type StreamSender = mpsc::UnboundedSender<(u8, Vec<u8>)>;
+/// Bounded so a guest uploading to a slow or stalled destination cannot grow
+/// fcvm's heap without limit: when a stream's queue is full the mux reader
+/// awaits the send, and the resulting vsock backpressure throttles the guest
+/// via its bounded writer channel and TCP flow control.
+type StreamSender = mpsc::Sender<(u8, Vec<u8>)>;
 
 /// Run the host-side egress proxy.
 ///
@@ -190,8 +208,8 @@ async fn handle_mux_session(vsock_stream: UnixStream) -> Result<()> {
                     }
                 };
 
-                // Create per-stream channel
-                let (stream_tx, stream_rx) = mpsc::unbounded_channel();
+                // Create per-stream channel (bounded — see STREAM_CHANNEL_CAPACITY)
+                let (stream_tx, stream_rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
                 streams.insert(stream_id, stream_tx);
 
                 // Spawn handler for this stream
@@ -201,12 +219,17 @@ async fn handle_mux_session(vsock_stream: UnixStream) -> Result<()> {
                 });
             }
             FRAME_DATA | FRAME_CLOSE | FRAME_RST => {
-                if let Some(sender) = streams.get(&stream_id) {
-                    if sender.send((frame_type, payload)).is_err() {
-                        streams.remove(&stream_id);
-                    }
-                }
-                if frame_type == FRAME_CLOSE || frame_type == FRAME_RST {
+                // Bounded send: when this stream's queue is full (its destination is
+                // slower than the guest), awaiting here pauses the vsock read loop.
+                // The vsock backpressure propagates to the guest's bounded writer
+                // channel and from there to the guest application via TCP flow
+                // control, so guest → destination data is never buffered beyond
+                // STREAM_CHANNEL_CAPACITY frames per stream.
+                let send_failed = match streams.get(&stream_id) {
+                    Some(sender) => sender.send((frame_type, payload)).await.is_err(),
+                    None => false,
+                };
+                if send_failed || frame_type == FRAME_CLOSE || frame_type == FRAME_RST {
                     streams.remove(&stream_id);
                 }
             }
@@ -226,7 +249,7 @@ async fn handle_stream(
     stream_id: u32,
     dest_ip: IpAddr,
     dest_port: u16,
-    mut stream_rx: mpsc::UnboundedReceiver<(u8, Vec<u8>)>,
+    mut stream_rx: mpsc::Receiver<(u8, Vec<u8>)>,
     writer_tx: mpsc::Sender<Vec<u8>>,
 ) {
     // Connect to real destination (works for both IPv4 and IPv6)
