@@ -66,6 +66,24 @@ async fn snapshot_restore_runtime_config(args: &SnapshotRunArgs) -> RuntimeConfi
     config
 }
 
+/// Load the VM state targeted by `snapshot create` (selected via --name or --pid).
+///
+/// The state file is updated concurrently by the VM-owning process (health monitor,
+/// startup snapshot), so callers re-read it whenever they need a current copy instead
+/// of reusing an earlier read.
+async fn load_snapshot_create_target(
+    state_manager: &StateManager,
+    args: &SnapshotCreateArgs,
+) -> Result<VmState> {
+    if let Some(name) = &args.name {
+        state_manager.load_state_by_name(name).await
+    } else if let Some(pid) = args.pid {
+        state_manager.load_state_by_pid(pid).await
+    } else {
+        anyhow::bail!("Either --name or --pid must be specified");
+    }
+}
+
 /// Create snapshot from running VM
 async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     use super::common::VSOCK_VOLUME_PORT_BASE;
@@ -74,21 +92,14 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     // Determine which VM to snapshot
     let state_manager = StateManager::new(paths::state_dir());
 
-    let mut vm_state = if let Some(name) = &args.name {
+    if let Some(name) = &args.name {
         info!("Creating snapshot from VM: {}", name);
-        state_manager
-            .load_state_by_name(name)
-            .await
-            .context("loading VM state by name")?
     } else if let Some(pid) = args.pid {
         info!("Creating snapshot from VM with PID: {}", pid);
-        state_manager
-            .load_state_by_pid(pid)
-            .await
-            .context("loading VM state by PID")?
-    } else {
-        anyhow::bail!("Either --name or --pid must be specified");
-    };
+    }
+    let vm_state = load_snapshot_create_target(&state_manager, &args)
+        .await
+        .context("loading VM state")?;
 
     // Block snapshots when VM has read-write extra disks
     let rw_disks: Vec<_> = vm_state
@@ -105,7 +116,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         );
     }
 
-    let snapshot_name = args.tag.unwrap_or_else(|| {
+    let snapshot_name = args.tag.clone().unwrap_or_else(|| {
         vm_state
             .name
             .clone()
@@ -179,14 +190,9 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
 
     // Re-read state under lock to get the current parent snapshot key.
     // The startup snapshot may have updated snapshot_name since our initial read.
-    let fresh_state = if let Some(name) = &args.name {
-        state_manager.load_state_by_name(name).await
-    } else if let Some(pid) = args.pid {
-        state_manager.load_state_by_pid(pid).await
-    } else {
-        unreachable!()
-    }
-    .context("re-reading VM state under lock")?;
+    let fresh_state = load_snapshot_create_target(&state_manager, &args)
+        .await
+        .context("re-reading VM state under lock")?;
     let parent_dir = fresh_state
         .config
         .snapshot_name
@@ -201,10 +207,16 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     )
     .await?;
 
-    // Track this snapshot as the latest base for future diff snapshots
-    vm_state.config.snapshot_name = Some(snapshot_name.clone());
+    // Track this snapshot as the latest base for future diff snapshots.
+    // Re-read the state before saving: the snapshot can take minutes while the VM-owning
+    // process keeps updating the state file (health monitor, exit code). Mutating and saving
+    // the pre-lock copy would silently revert those concurrent updates.
+    let mut updated_state = load_snapshot_create_target(&state_manager, &args)
+        .await
+        .context("re-reading VM state after snapshot")?;
+    updated_state.config.snapshot_name = Some(snapshot_name.clone());
     state_manager
-        .save_state(&vm_state)
+        .save_state(&updated_state)
         .await
         .context("saving snapshot name to VM state")?;
 
@@ -228,6 +240,9 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
 
     Ok(())
 }
+
+/// How long serve shutdown waits for clones to exit after SIGTERM before escalating to SIGKILL.
+const CLONE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Serve snapshot memory (foreground)
 async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
@@ -309,8 +324,14 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
 
     // Wait for signal or server exit
     // First Ctrl-C warns about clones, second one shuts down
+    //
+    // Shutdown ordering matters: clones are stopped BEFORE the UFFD server is cancelled
+    // (see the cleanup below). Cancelling the server first would close the clones'
+    // userfaultfds while they are still running, and the kernel would then resolve their
+    // page faults with zero pages instead of snapshot contents — silent memory corruption.
     let mut shutdown_requested = false;
     let mut confirm_deadline: Option<tokio::time::Instant> = None;
+    let mut server_exited = false;
     loop {
         let timeout = if let Some(deadline) = confirm_deadline {
             tokio::time::sleep_until(deadline)
@@ -324,7 +345,6 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
 
             _ = sigterm.recv() => {
                 info!("received SIGTERM");
-                server_cancel.cancel();
                 break;
             }
             _ = sigint.recv() => {
@@ -333,7 +353,6 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
                     // Second Ctrl-C - force shutdown
                     info!("received second SIGINT, forcing shutdown");
                     println!("\nForcing shutdown...");
-                    server_cancel.cancel();
                     break;
                 }
 
@@ -347,7 +366,6 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
 
                 if running_clones.is_empty() {
                     println!("\nNo running clones, shutting down...");
-                    server_cancel.cancel();
                     break;
                 } else {
                     println!("\n⚠️  {} clone(s) still running!", running_clones.len());
@@ -369,6 +387,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
             }
             result = &mut server_handle => {
                 info!("server exited: {:?}", result);
+                server_exited = true;
                 break;
             }
         }
@@ -376,45 +395,117 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
 
     println!("\nShutting down memory server...");
 
-    // Cleanup: Kill all clones that connected to THIS serve
+    // Cleanup ordering: stop clones FIRST, then the UFFD server.
+    //
+    // The per-VM page-fault handlers own the clones' userfaultfds. Cancelling the server
+    // before the clones have exited closes those uffds while the clones are still running,
+    // and the kernel then resolves their outstanding/future faults with zero pages instead
+    // of snapshot contents — silent guest memory corruption that can be flushed to host
+    // volumes. So: signal the clones, wait for them to exit (SIGKILL stragglers after a
+    // bounded timeout), and only then cancel the server and remove the socket/state.
     info!("cleaning up clones connected to serve PID {}", my_pid);
-    let all_vms = state_manager.list_vms().await?;
-    let my_clones: Vec<_> = all_vms
-        .into_iter()
-        .filter(|vm| vm.config.serve_pid == Some(my_pid))
+    let my_clones: Vec<crate::state::VmState> = match state_manager.list_vms().await {
+        Ok(all_vms) => all_vms
+            .into_iter()
+            .filter(|vm| vm.config.serve_pid == Some(my_pid))
+            .collect(),
+        Err(e) => {
+            warn!("failed to list VMs during serve shutdown: {}", e);
+            Vec::new()
+        }
+    };
+
+    // Only signal PIDs that are alive AND still belong to an fcvm process. State files
+    // outlive crashed clones, so a recorded PID may have been reused by an unrelated
+    // process — never send signals to a PID we cannot identify as one of our clones.
+    let clone_pids: Vec<u32> = my_clones
+        .iter()
+        .filter_map(|clone| {
+            let pid = clone.pid?;
+            let clone_id = truncate_id(&clone.vm_id, 8);
+            if !crate::utils::is_process_alive(pid) {
+                debug!("clone {} (PID {}) already exited", clone_id, pid);
+                return None;
+            }
+            if !crate::utils::is_same_process_name(pid) {
+                warn!(
+                    "PID {} recorded for clone {} no longer belongs to an fcvm process (PID reuse), not signalling it",
+                    pid, clone_id
+                );
+                return None;
+            }
+            info!("stopping clone {} (PID {})", clone_id, pid);
+            Some(pid)
+        })
         .collect();
 
-    if !my_clones.is_empty() {
-        println!("Killing {} clone(s)...", my_clones.len());
-        for clone in my_clones {
-            if let Some(pid) = clone.pid {
-                info!(
-                    "killing clone {} (PID {})",
-                    truncate_id(&clone.vm_id, 8),
-                    pid
-                );
-                // Kill clone process
-                use std::process::Command;
-                match Command::new("kill")
-                    .arg("-TERM")
-                    .arg(pid.to_string())
-                    .status()
-                {
-                    Ok(status) if status.success() => {
-                        info!("successfully killed clone PID {}", pid);
-                    }
-                    Ok(status) => {
+    if !clone_pids.is_empty() {
+        println!("Stopping {} clone(s)...", clone_pids.len());
+
+        for &pid in &clone_pids {
+            if let Err(e) = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            ) {
+                warn!("failed to send SIGTERM to clone PID {}: {}", pid, e);
+            }
+        }
+
+        // Wait for the clones to exit; escalate to SIGKILL after the timeout.
+        let term_deadline = tokio::time::Instant::now() + CLONE_SHUTDOWN_TIMEOUT;
+        while clone_pids
+            .iter()
+            .any(|&pid| crate::utils::is_process_alive(pid))
+        {
+            if tokio::time::Instant::now() >= term_deadline {
+                for &pid in &clone_pids {
+                    if crate::utils::is_process_alive(pid) {
                         warn!(
-                            "kill command returned non-zero exit for PID {}: {:?}",
-                            pid,
-                            status.code()
+                            "clone PID {} did not exit within {:?}, sending SIGKILL",
+                            pid, CLONE_SHUTDOWN_TIMEOUT
+                        );
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(pid as i32),
+                            nix::sys::signal::Signal::SIGKILL,
                         );
                     }
-                    Err(e) => {
-                        warn!("failed to kill clone PID {}: {}", pid, e);
-                    }
                 }
+                break;
             }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Give SIGKILL'd clones a moment to be reaped so their uffds are closed before the
+        // server's handlers go away.
+        let kill_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < kill_deadline {
+            if clone_pids
+                .iter()
+                .all(|&pid| !crate::utils::is_process_alive(pid))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let stragglers: Vec<u32> = clone_pids
+            .iter()
+            .copied()
+            .filter(|&pid| crate::utils::is_process_alive(pid))
+            .collect();
+        if !stragglers.is_empty() {
+            warn!("clone PIDs {:?} still running after SIGKILL", stragglers);
+        }
+    }
+
+    // All clones are gone — now it is safe to stop the UFFD server.
+    if !server_exited {
+        server_cancel.cancel();
+        match tokio::time::timeout(Duration::from_secs(10), &mut server_handle).await {
+            Ok(Ok(Ok(()))) => info!("UFFD server stopped"),
+            Ok(Ok(Err(e))) => warn!("UFFD server exited with error: {}", e),
+            Ok(Err(e)) => warn!("UFFD server task join error: {}", e),
+            Err(_) => warn!("UFFD server did not stop within 10s, continuing cleanup"),
         }
     }
 
@@ -439,6 +530,29 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     println!("Memory server stopped");
 
     Ok(())
+}
+
+/// Rebuild `HOST:GUEST[:ro]` volume specs and the portable flag from snapshot volume metadata.
+///
+/// Clones never go through the `podman run` path that populates `config.volumes` and
+/// `config.portable_volumes`, but `snapshot create` builds a snapshot's volume metadata from
+/// exactly those fields. Reconstructing them here ensures a snapshot taken from a clone
+/// preserves the baseline's volume configuration.
+fn volume_state_from_snapshot(
+    volumes: &[crate::storage::snapshot::SnapshotVolumeConfig],
+) -> (Vec<String>, bool) {
+    let specs = volumes
+        .iter()
+        .map(|vol| {
+            if vol.read_only {
+                format!("{}:{}:ro", vol.host_path.display(), vol.guest_path)
+            } else {
+                format!("{}:{}", vol.host_path.display(), vol.guest_path)
+            }
+        })
+        .collect();
+    let portable = volumes.iter().any(|vol| vol.portable);
+    (specs, portable)
 }
 
 /// Run clone from snapshot
@@ -531,6 +645,13 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     vm_state.config.snapshot_name = Some(snapshot_name.clone());
     vm_state.config.process_type = Some(crate::state::ProcessType::Clone);
     vm_state.config.serve_pid = serve_pid; // Track which serve spawned us (None for direct mode)
+
+    // Carry the snapshot's volume metadata into the clone's state so a `snapshot create`
+    // taken from this clone records the same volumes as the baseline.
+    let (volume_specs, portable_volumes) =
+        volume_state_from_snapshot(&snapshot_config.metadata.volumes);
+    vm_state.config.volumes = volume_specs;
+    vm_state.config.portable_volumes = portable_volumes;
 
     // Setup paths
     let data_dir = paths::vm_runtime_dir(&vm_id);
@@ -1054,40 +1175,47 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     if let Some(exec_cmd) = &args.exec {
         info!("executing command in clone: {}", exec_cmd);
 
-        // Parse command using shell_words (same as --cmd in podman run)
-        let cmd_args: Vec<String> = shell_words::split(exec_cmd)
-            .with_context(|| format!("parsing --exec argument: {}", exec_cmd))?;
+        // Run the exec steps inside an inner block so any failure (parse error, vsock not
+        // ready, exec error) still reaches the cleanup below. Returning early here would
+        // leak the network namespace, state file, loopback IP, and data directory that only
+        // cleanup_vm removes.
+        let exec_result: Result<i32> = async {
+            // Parse command using shell_words (same as --cmd in podman run)
+            let cmd_args: Vec<String> = shell_words::split(exec_cmd)
+                .with_context(|| format!("parsing --exec argument: {}", exec_cmd))?;
 
-        // Wait for vsock socket to be ready (poll instead of blind sleep)
-        let vsock_socket = data_dir.join("vsock.sock");
-        let poll_start = std::time::Instant::now();
-        const MAX_VSOCK_WAIT: Duration = Duration::from_millis(5000);
-        const VSOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+            // Wait for vsock socket to be ready (poll instead of blind sleep)
+            let vsock_socket = data_dir.join("vsock.sock");
+            let poll_start = std::time::Instant::now();
+            const MAX_VSOCK_WAIT: Duration = Duration::from_millis(5000);
+            const VSOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-        loop {
-            if poll_start.elapsed() > MAX_VSOCK_WAIT {
-                bail!("vsock socket not ready after {:?}", poll_start.elapsed());
-            }
-
-            // Check if socket exists and is connectable
-            if vsock_socket.exists() {
-                if let Ok(_stream) = std::os::unix::net::UnixStream::connect(&vsock_socket) {
-                    debug!("vsock socket ready after {:?}", poll_start.elapsed());
-                    break;
+            loop {
+                if poll_start.elapsed() > MAX_VSOCK_WAIT {
+                    bail!("vsock socket not ready after {:?}", poll_start.elapsed());
                 }
-            }
 
-            tokio::time::sleep(VSOCK_POLL_INTERVAL).await;
+                // Check if socket exists and is connectable
+                if vsock_socket.exists() {
+                    if let Ok(_stream) = std::os::unix::net::UnixStream::connect(&vsock_socket) {
+                        debug!("vsock socket ready after {:?}", poll_start.elapsed());
+                        break;
+                    }
+                }
+
+                tokio::time::sleep(VSOCK_POLL_INTERVAL).await;
+            }
+            crate::commands::exec::run_exec_in_vm(
+                &vsock_socket,
+                &cmd_args,
+                true, // in_container
+            )
+            .await
         }
-        let exit_code = crate::commands::exec::run_exec_in_vm(
-            &vsock_socket,
-            &cmd_args,
-            true, // in_container
-        )
-        .await?;
+        .await;
 
         // Cleanup resources (exec path has no health monitor)
-        info!("exec completed with exit code {}, cleaning up", exit_code);
+        info!(result = ?exec_result, "exec finished, cleaning up");
 
         // Stop implicit UFFD server if running (hugepage cache restore)
         implicit_uffd_cancel.cancel();
@@ -1109,7 +1237,8 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         )
         .await;
 
-        // Return error if exec failed
+        // Propagate exec errors only after cleanup has run
+        let exit_code = exec_result?;
         if exit_code != 0 {
             bail!("exec command exited with code {}", exit_code);
         }
@@ -1177,115 +1306,123 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     // After snapshot restore, pasta may not have learned the guest's MAC yet.
     // This pings the guest to trigger ARP resolution, then probes each forwarded
     // port to confirm end-to-end forwarding works.
-    network
+    //
+    // On failure (the VM crashed during the wait above, or pasta's port probe timed out)
+    // skip the monitor/wait section and fall through to the shared cleanup below before
+    // propagating the error — returning early here would leak the network namespace,
+    // state file, loopback IP, and data directory that only cleanup_vm removes.
+    let verify_result = network
         .verify_port_forwarding()
         .await
-        .context("port forwarding verification failed after snapshot restore")?;
-
-    // Spawn health monitor task with startup snapshot trigger support
-    let health_monitor_handle = crate::health::spawn_health_monitor_full(
-        vm_id.clone(),
-        vm_state.pid,
-        paths::state_dir(),
-        Some(health_cancel_token.clone()),
-        startup_tx,
-    );
-
-    // Setup signal handlers with cancellation token
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let cancel_clone = cancel.clone();
-    tokio::spawn(async move {
-        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-        let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
-        tokio::select! {
-            _ = sigterm.recv() => { info!("received SIGTERM, shutting down VM"); }
-            _ = sigint.recv() => { info!("received SIGINT, shutting down VM"); }
-        }
-        cancel_clone.cancel();
-    });
+        .context("port forwarding verification failed after snapshot restore");
 
     // Track container exit code (from TTY mode)
-    let container_exit_code: Option<i32>;
+    let mut container_exit_code: Option<i32> = None;
+    let mut health_monitor_handle = None;
 
-    // Get disk path for startup snapshot creation
-    let disk_path = data_dir.join("disks/rootfs.raw");
+    if verify_result.is_ok() {
+        // Spawn health monitor task with startup snapshot trigger support
+        health_monitor_handle = Some(crate::health::spawn_health_monitor_full(
+            vm_id.clone(),
+            vm_state.pid,
+            paths::state_dir(),
+            Some(health_cancel_token.clone()),
+            startup_tx,
+        ));
 
-    // Wait for cancellation, VM exit, or startup snapshot trigger
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                container_exit_code = None;
-                break;
+        // Setup signal handlers with cancellation token
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+            let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
+            tokio::select! {
+                _ = sigterm.recv() => { info!("received SIGTERM, shutting down VM"); }
+                _ = sigint.recv() => { info!("received SIGINT, shutting down VM"); }
             }
-            status = vm_manager.wait() => {
-                info!(status = ?status, "VM exited");
-                // If in TTY mode, get exit code from TTY handle
-                if let Some(handle) = tty_handle {
-                    container_exit_code = handle.join().ok().and_then(|r| r.ok());
-                    info!(container_exit_code = ?container_exit_code, "TTY container exit code");
-                } else {
+            cancel_clone.cancel();
+        });
+
+        // Get disk path for startup snapshot creation
+        let disk_path = data_dir.join("disks/rootfs.raw");
+
+        // Wait for cancellation, VM exit, or startup snapshot trigger
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
                     container_exit_code = None;
+                    break;
                 }
-                break;
-            }
-            // Handle startup snapshot creation when health becomes healthy
-            Ok(()) = async {
-                match startup_rx.as_mut() {
-                    Some(rx) => rx.await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                // Oneshot channel - prevent further attempts
-                startup_rx = None;
-
-                if let Some(ref base_key) = args.startup_snapshot_base_key {
-                    let startup_key = startup_snapshot_key(base_key);
-
-                    // Skip if startup snapshot already exists
-                    if check_podman_snapshot(&startup_key).await.is_some() {
-                        info!(snapshot_key = %startup_key, "Startup snapshot already exists, skipping");
+                status = vm_manager.wait() => {
+                    info!(status = ?status, "VM exited");
+                    // If in TTY mode, get exit code from TTY handle
+                    if let Some(handle) = tty_handle {
+                        container_exit_code = handle.join().ok().and_then(|r| r.ok());
+                        info!(container_exit_code = ?container_exit_code, "TTY container exit code");
                     } else {
-                        info!(snapshot_key = %startup_key, "Creating startup snapshot (VM healthy)");
+                        container_exit_code = None;
+                    }
+                    break;
+                }
+                // Handle startup snapshot creation when health becomes healthy
+                Ok(()) = async {
+                    match startup_rx.as_mut() {
+                        Some(rx) => rx.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // Oneshot channel - prevent further attempts
+                    startup_rx = None;
 
-                        // Use select! so SIGTERM can abort startup snapshot immediately.
-                        // Startup snapshots are optional (just caching), so if the VM is
-                        // paused mid-snapshot, cleanup will kill it via vm_manager.kill().
-                        let parent_key = vm_state.config.snapshot_name.clone();
-                        let snap = CreateSnapshotParams {
-                            vm_manager: &vm_manager,
-                            snapshot_key: &startup_key,
-                            vm_state: &vm_state,
-                            disk_path: &disk_path,
-                            volume_configs: &volume_configs,
-                            parent_snapshot_key: parent_key.as_deref(),
-                            remap_refs: &volume_servers.remap_refs,
-                        };
-                        tokio::select! {
-                            outcome = create_snapshot_interruptible(&snap, &cancel) => {
-                                match outcome {
-                                    SnapshotOutcome::Interrupted => {
-                                        container_exit_code = None;
-                                        break;
-                                    }
-                                    SnapshotOutcome::Created => {
-                                        info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
-                                        vm_state.config.snapshot_name = Some(startup_key.clone());
-                                        let _ = state_manager.save_state(&vm_state).await;
-                                    }
-                                    SnapshotOutcome::Failed(e) => {
-                                        warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");
+                    if let Some(ref base_key) = args.startup_snapshot_base_key {
+                        let startup_key = startup_snapshot_key(base_key);
+
+                        // Skip if startup snapshot already exists
+                        if check_podman_snapshot(&startup_key).await.is_some() {
+                            info!(snapshot_key = %startup_key, "Startup snapshot already exists, skipping");
+                        } else {
+                            info!(snapshot_key = %startup_key, "Creating startup snapshot (VM healthy)");
+
+                            // Use select! so SIGTERM can abort startup snapshot immediately.
+                            // Startup snapshots are optional (just caching), so if the VM is
+                            // paused mid-snapshot, cleanup will kill it via vm_manager.kill().
+                            let parent_key = vm_state.config.snapshot_name.clone();
+                            let snap = CreateSnapshotParams {
+                                vm_manager: &vm_manager,
+                                snapshot_key: &startup_key,
+                                vm_state: &vm_state,
+                                disk_path: &disk_path,
+                                volume_configs: &volume_configs,
+                                parent_snapshot_key: parent_key.as_deref(),
+                                remap_refs: &volume_servers.remap_refs,
+                            };
+                            tokio::select! {
+                                outcome = create_snapshot_interruptible(&snap, &cancel) => {
+                                    match outcome {
+                                        SnapshotOutcome::Interrupted => {
+                                            container_exit_code = None;
+                                            break;
+                                        }
+                                        SnapshotOutcome::Created => {
+                                            info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
+                                            vm_state.config.snapshot_name = Some(startup_key.clone());
+                                            let _ = state_manager.save_state(&vm_state).await;
+                                        }
+                                        SnapshotOutcome::Failed(e) => {
+                                            warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");
+                                        }
                                     }
                                 }
-                            }
-                            _ = cancel.cancelled() => {
-                                info!(snapshot_key = %startup_key, "Startup snapshot aborted by shutdown signal");
-                                container_exit_code = None;
-                                break;
+                                _ = cancel.cancelled() => {
+                                    info!(snapshot_key = %startup_key, "Startup snapshot aborted by shutdown signal");
+                                    container_exit_code = None;
+                                    break;
+                                }
                             }
                         }
                     }
+                    // Continue waiting for VM exit or signals
                 }
-                // Continue waiting for VM exit or signals
             }
         }
     }
@@ -1301,7 +1438,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             remap_refs: volume_servers.remap_refs,
             data_dir: data_dir.clone(),
             health_cancel_token: Some(health_cancel_token),
-            health_monitor_handle: Some(health_monitor_handle),
+            health_monitor_handle,
             output_listener_handle: output_handle, // abort output listener task
         },
         &mut vm_manager,
@@ -1310,6 +1447,9 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         &state_manager,
     )
     .await;
+
+    // Propagate post-restore verification failure only after cleanup has run
+    verify_result?;
 
     // Return error if container exited with non-zero code
     if let Some(code) = container_exit_code {
@@ -1369,6 +1509,50 @@ async fn cmd_snapshot_ls() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::snapshot::SnapshotVolumeConfig;
+
+    #[test]
+    fn test_volume_state_from_snapshot_rebuilds_specs_and_portable_flag() {
+        let volumes = vec![
+            SnapshotVolumeConfig {
+                host_path: PathBuf::from("/data/shared"),
+                guest_path: "/mnt/shared".to_string(),
+                read_only: false,
+                vsock_port: 5000,
+                portable: true,
+            },
+            SnapshotVolumeConfig {
+                host_path: PathBuf::from("/data/config"),
+                guest_path: "/etc/app".to_string(),
+                read_only: true,
+                vsock_port: 5001,
+                portable: true,
+            },
+        ];
+
+        let (specs, portable) = volume_state_from_snapshot(&volumes);
+        // Specs must round-trip through the HOST:GUEST[:ro] parser used by `snapshot create`.
+        assert_eq!(
+            specs,
+            vec![
+                "/data/shared:/mnt/shared".to_string(),
+                "/data/config:/etc/app:ro".to_string(),
+            ]
+        );
+        assert!(portable);
+
+        let parts: Vec<&str> = specs[1].split(':').collect();
+        assert_eq!(parts[0], "/data/config");
+        assert_eq!(parts[1], "/etc/app");
+        assert_eq!(parts.get(2).map(|s| *s == "ro"), Some(true));
+    }
+
+    #[test]
+    fn test_volume_state_from_snapshot_empty() {
+        let (specs, portable) = volume_state_from_snapshot(&[]);
+        assert!(specs.is_empty());
+        assert!(!portable);
+    }
 
     #[tokio::test]
     async fn test_snapshot_restore_runtime_config_preserves_firecracker_overrides() {

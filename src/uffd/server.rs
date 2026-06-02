@@ -129,7 +129,14 @@ impl UffdServer {
                                         );
                                         match handle_vm_page_faults(vm_id.clone(), uffd, mappings, mmap).await {
                                             Ok(()) => info!(target: "uffd", vm_id = %vm_id, "VM handler exited cleanly"),
-                                            Err(e) => error!(target: "uffd", vm_id = %vm_id, error = ?e, "VM handler error"),
+                                            Err(e) => error!(
+                                                target: "uffd",
+                                                vm_id = %vm_id,
+                                                error = ?e,
+                                                "VM page-fault handler died; its userfaultfd is now closed and the \
+                                                 still-running VM will receive zero pages for unfaulted memory \
+                                                 (silent corruption) — kill the affected clone"
+                                            ),
                                         }
                                     }
                                     Ok(Err(e)) => {
@@ -168,6 +175,26 @@ impl UffdServer {
             }
         }
 
+        // Stop accepting new connections, but keep serving page faults for VMs that are
+        // already connected until each one closes its uffd (i.e. its Firecracker exits).
+        // Aborting the handlers here would close the uffds while those VMs are still
+        // running, and the kernel would then resolve their page faults with zero pages
+        // instead of snapshot contents — silent guest memory corruption.
+        drop(listener);
+        if !vm_tasks.is_empty() {
+            info!(
+                target: "uffd",
+                active_vms = vm_tasks.len(),
+                "draining VM handlers before shutdown"
+            );
+        }
+        while let Some(result) = vm_tasks.join_next().await {
+            match result {
+                Ok(vm_id) => info!(target: "uffd", vm_id = %vm_id, "VM disconnected"),
+                Err(e) => error!(target: "uffd", error = %e, "VM task panicked"),
+            }
+        }
+
         info!(target: "uffd", "UFFD server stopped");
         Ok(())
     }
@@ -178,6 +205,20 @@ impl Drop for UffdServer {
         // Clean up socket file (ignore errors - avoids TOCTOU race and handles concurrent cleanup)
         let _ = std::fs::remove_file(&self.socket_path);
     }
+}
+
+/// Whether a UFFDIO_ZEROPAGE error means the range (or part of it) is already populated.
+///
+/// Remove (balloon) events and page faults are not ordered, so a fault served with UFFDIO_COPY
+/// before the Remove event is processed leaves pages present in the removed range. The kernel
+/// then returns EEXIST (first page already present) or EAGAIN (range partially zeroed before
+/// hitting a present page) from UFFDIO_ZEROPAGE. Neither is fatal — the pages are populated.
+fn zeropage_hit_present_page(e: &userfaultfd::Error) -> bool {
+    matches!(
+        e,
+        userfaultfd::Error::ZeropageFailed(errno)
+            if (*errno as i32) == libc::EEXIST || (*errno as i32) == libc::EAGAIN
+    )
 }
 
 /// Handle page faults for a single VM
@@ -385,8 +426,65 @@ async fn handle_vm_page_faults(
                     if len == 0 {
                         continue; // Nothing to zero
                     }
-                    unsafe {
-                        guard.get_inner().zeropage(start, len, true)?;
+
+                    // Remove events and page faults for the same range arrive in either order,
+                    // so a page in this range may already have been filled by UFFDIO_COPY before
+                    // we see the Remove event. UFFDIO_ZEROPAGE then fails with EEXIST (first page
+                    // already present) or EAGAIN (range partially zeroed before hitting a present
+                    // page). Tolerate both — same as the EEXIST handling in the copy path above —
+                    // by falling back to per-page zeroing that skips already-present pages.
+                    // Killing the handler here would close the uffd and silently corrupt the
+                    // still-running VM.
+                    let bulk_result = unsafe { guard.get_inner().zeropage(start, len, true) };
+                    if let Err(e) = bulk_result {
+                        if !zeropage_hit_present_page(&e) {
+                            error!(
+                                target: "uffd",
+                                vm_id = %vm_id,
+                                start = format!("0x{:x}", start_addr),
+                                len,
+                                error = ?e,
+                                "UFFD zeropage failed for Remove event"
+                            );
+                            return Err(e.into());
+                        }
+                        debug!(
+                            target: "uffd",
+                            vm_id = %vm_id,
+                            start = format!("0x{:x}", start_addr),
+                            len,
+                            error = ?e,
+                            "bulk zeropage hit already-present pages, zeroing per page"
+                        );
+                        let mut page = start_addr;
+                        while page < end_addr {
+                            let page_result = unsafe {
+                                guard.get_inner().zeropage(
+                                    page as *mut std::ffi::c_void,
+                                    page_size,
+                                    true,
+                                )
+                            };
+                            if let Err(page_err) = page_result {
+                                if !zeropage_hit_present_page(&page_err) {
+                                    error!(
+                                        target: "uffd",
+                                        vm_id = %vm_id,
+                                        page = format!("0x{:x}", page),
+                                        error = ?page_err,
+                                        "UFFD zeropage failed for Remove event"
+                                    );
+                                    return Err(page_err.into());
+                                }
+                                debug!(
+                                    target: "uffd",
+                                    vm_id = %vm_id,
+                                    page = format!("0x{:x}", page),
+                                    "zeropage skipped - page already present"
+                                );
+                            }
+                            page += page_size;
+                        }
                     }
                 }
                 Event::Fork { .. } | Event::Remap { .. } | Event::Unmap { .. } => {
