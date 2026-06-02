@@ -7,13 +7,16 @@ REGION="${AWS_REGION:-us-west-1}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 KERNEL_DIR="$(dirname "$SCRIPT_DIR")/kernel"
 
-# Compute build hash (from kernel config + patches + boot_args)
+# Compute build hash (from kernel config + patches + boot_args + passt build inputs)
 compute_hash() {
   local repo_root="$(dirname "$KERNEL_DIR")"
   {
     cat "$KERNEL_DIR/nested.conf" "$KERNEL_DIR/patches/"*.patch 2>/dev/null
     # Include boot_args from config to invalidate cache when they change
     grep -E '^boot_args\s*=' "$repo_root/rootfs-config.toml" 2>/dev/null || true
+    # Include the passt build inputs so a pin or patch change rebuilds the AMI
+    # instead of reusing one whose baked-in pasta no longer matches CI.
+    cat "$SCRIPT_DIR/build-passt.sh" "$SCRIPT_DIR"/passt-*.patch 2>/dev/null
   } | sha256sum | cut -c1-12
 }
 
