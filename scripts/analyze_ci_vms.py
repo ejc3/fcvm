@@ -16,8 +16,15 @@ def main():
 
     artifacts_dir = Path(sys.argv[1])
     if not artifacts_dir.is_dir():
-        print(f"Error: {artifacts_dir} is not a directory")
-        sys.exit(1)
+        # No artifacts downloaded (e.g., self-hosted tests were skipped)
+        print()
+        print("=" * 50)
+        print("           FCVM CI SUMMARY")
+        print("=" * 50)
+        print()
+        print("  No test artifacts found (tests may have been skipped)")
+        print()
+        return
 
     # Count VMs from log files
     base_vms = 0
