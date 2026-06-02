@@ -15,8 +15,11 @@ mod common;
 
 use anyhow::{Context, Result};
 
-/// Build a simple test container image using podman
-async fn build_test_image() -> Result<()> {
+/// Build a simple test container image using podman with a unique tag.
+/// Each test uses its own image name to avoid races when tests run in parallel —
+/// concurrent `podman build` to the same tag causes `podman save` to see a digest
+/// change mid-export ("image changed while it was being exported").
+async fn build_test_image(image_name: &str) -> Result<()> {
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -34,7 +37,7 @@ CMD ["sh", "-c", "echo 'btrfs-rootless-test-ok' && sleep 600"]"#
         .args([
             "build",
             "-t",
-            "localhost/test-btrfs-rootless",
+            image_name,
             "-f",
             &containerfile_path.to_string_lossy(),
             temp_dir.path().to_str().unwrap(),
@@ -48,7 +51,7 @@ CMD ["sh", "-c", "echo 'btrfs-rootless-test-ok' && sleep 600"]"#
         anyhow::bail!("Failed to build test image: {}", stderr);
     }
 
-    println!("  Built localhost/test-btrfs-rootless image");
+    println!("  Built {} image", image_name);
     Ok(())
 }
 
@@ -76,16 +79,19 @@ async fn run_btrfs_storage_test(rootfs_type: Option<&str>) -> Result<()> {
     );
     println!("===================================================");
 
+    // Each test gets a unique image name to avoid parallel podman build races
+    let suffix = format!("btrfs-{}", rootfs_type.unwrap_or("native"));
+    let image_name = format!("localhost/test-btrfs-rootless-{}", suffix);
+
     // Step 1: Build test image
-    println!("\n1. Building test container image...");
-    build_test_image().await?;
+    println!("\n1. Building test container image {}...", image_name);
+    build_test_image(&image_name).await?;
 
     // Step 2: Start VM in rootless mode with btrfs kernel
     println!(
         "\n2. Starting VM (rootless, --kernel-profile btrfs, rootfs: {})...",
         label
     );
-    let suffix = format!("btrfs-{}", rootfs_type.unwrap_or("native"));
     let (vm_name, _, _, _) = common::unique_names(&suffix);
 
     let mut args = vec![
@@ -100,7 +106,7 @@ async fn run_btrfs_storage_test(rootfs_type: Option<&str>) -> Result<()> {
         args.push("--rootfs-type");
         args.push(rt);
     }
-    args.push("localhost/test-btrfs-rootless");
+    args.push(&image_name);
 
     let (mut _child, fcvm_pid) = common::spawn_fcvm(&args).await.context("spawning fcvm")?;
     println!("  fcvm PID: {}", fcvm_pid);
@@ -196,9 +202,11 @@ async fn test_localhost_rootless_btrfs_snapshot_restore() -> Result<()> {
     println!("\nBtrfs Snapshot Restore Test");
     println!("==========================");
 
-    // Step 1: Build test image
-    println!("\n1. Building test container image...");
-    build_test_image().await?;
+    let image_name = "localhost/test-btrfs-rootless-snap";
+
+    // Step 1: Build test image (unique name to avoid parallel build races)
+    println!("\n1. Building test container image {}...", image_name);
+    build_test_image(image_name).await?;
 
     // Step 2: First run (creates snapshot cache)
     println!("\n2. First run (fresh boot, creates snapshot)...");
@@ -214,7 +222,7 @@ async fn test_localhost_rootless_btrfs_snapshot_restore() -> Result<()> {
             "btrfs",
             "--user",
             "1000:1000",
-            "localhost/test-btrfs-rootless",
+            image_name,
         ])
         .await
         .context("spawning fcvm (first run)")?;
@@ -284,7 +292,7 @@ async fn test_localhost_rootless_btrfs_snapshot_restore() -> Result<()> {
             "btrfs",
             "--user",
             "1000:1000",
-            "localhost/test-btrfs-rootless",
+            image_name,
         ])
         .await
         .context("spawning fcvm (second run)")?;
@@ -466,16 +474,19 @@ async fn run_btrfs_keepid_test(rootfs_type: Option<&str>) -> Result<()> {
     );
     println!("=========================================================");
 
-    // Step 1: Build test image (same image, snapshot key includes --user)
-    println!("\n1. Building test container image...");
-    build_test_image().await?;
+    // Each test gets a unique image name to avoid parallel podman build races
+    let suffix = format!("btrfs-kid-{}", rootfs_type.unwrap_or("native"));
+    let image_name = format!("localhost/test-btrfs-rootless-{}", suffix);
+
+    // Step 1: Build test image (unique per test, snapshot key includes --user)
+    println!("\n1. Building test container image {}...", image_name);
+    build_test_image(&image_name).await?;
 
     // Step 2: Start VM with --user 1000:1000 (triggers keep-id in fc-agent)
     println!(
         "\n2. Starting VM (rootless, --kernel-profile btrfs, --user 1000:1000, rootfs: {})...",
         label
     );
-    let suffix = format!("btrfs-kid-{}", rootfs_type.unwrap_or("native"));
     let (vm_name, _, _, _) = common::unique_names(&suffix);
 
     let mut args = vec![
@@ -490,7 +501,7 @@ async fn run_btrfs_keepid_test(rootfs_type: Option<&str>) -> Result<()> {
         args.push("--rootfs-type");
         args.push(rt);
     }
-    args.extend_from_slice(&["--user", "1000:1000", "localhost/test-btrfs-rootless"]);
+    args.extend_from_slice(&["--user", "1000:1000", &image_name]);
 
     let (mut _child, fcvm_pid) = common::spawn_fcvm(&args).await.context("spawning fcvm")?;
     println!("  fcvm PID: {}", fcvm_pid);
