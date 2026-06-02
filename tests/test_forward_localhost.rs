@@ -22,10 +22,14 @@ fn spawn_host_server() -> Result<(u16, std::thread::JoinHandle<bool>)> {
     // Accept one connection in background (with timeout)
     let accept_handle = std::thread::spawn(move || -> bool {
         listener.set_nonblocking(false).expect("set_nonblocking");
-        // 45s accept timeout (must exceed nc timeout inside VM)
+        // Accept timeout must cover a full cold VM boot plus image export under
+        // parallel CI load (minutes, see the 600s nextest slow-timeout) and nc's
+        // 30s timeout — not just nc. If it expires the listener closes and the
+        // relay's later connect is refused, failing the test even though
+        // forwarding works.
         unsafe {
             let tv = libc::timeval {
-                tv_sec: 45,
+                tv_sec: 570,
                 tv_usec: 0,
             };
             libc::setsockopt(
@@ -82,7 +86,17 @@ async fn run_forward_localhost_case(extra_args: &[&str], name_prefix: &str) -> R
     let stderr = String::from_utf8_lossy(&output.stderr);
     println!("  stdout: {}", stdout.trim());
 
-    let accepted = accept_handle.join().unwrap_or(false);
+    let accepted = if accept_handle.is_finished() {
+        accept_handle.join().unwrap_or(false)
+    } else {
+        // fcvm exited without the container ever connecting (boot failure or a
+        // forwarding regression). Unblock the accept thread with a local
+        // connection so the test reports promptly instead of waiting out the
+        // accept timeout.
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+        let _ = accept_handle.join();
+        false
+    };
     println!("  server accepted: {}", accepted);
 
     assert!(

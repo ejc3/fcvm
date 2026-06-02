@@ -380,6 +380,56 @@ mod tests {
         assert_eq!(addr.port(), 8080);
     }
 
+    /// RAII network namespace for privileged tests.
+    ///
+    /// `ip netns add` is checked (a leftover same-named namespace fails the
+    /// test instead of being silently reused), and Drop deletes the namespace
+    /// even on panics and early returns, so failed tests cannot leak
+    /// namespaces on the host.
+    #[cfg(feature = "privileged-tests")]
+    struct TestNetns {
+        name: String,
+    }
+
+    #[cfg(feature = "privileged-tests")]
+    impl TestNetns {
+        async fn create(name: String) -> Result<Self> {
+            let add = tokio::process::Command::new("ip")
+                .args(["netns", "add", &name])
+                .output()
+                .await
+                .context("creating test namespace")?;
+            anyhow::ensure!(
+                add.status.success(),
+                "ip netns add {} failed: {}",
+                name,
+                String::from_utf8_lossy(&add.stderr).trim()
+            );
+            let lo = tokio::process::Command::new("ip")
+                .args(["netns", "exec", &name, "ip", "link", "set", "lo", "up"])
+                .output()
+                .await
+                .context("bringing up loopback in test namespace")?;
+            anyhow::ensure!(
+                lo.status.success(),
+                "bringing up lo in {} failed: {}",
+                name,
+                String::from_utf8_lossy(&lo.stderr).trim()
+            );
+            Ok(Self { name })
+        }
+    }
+
+    #[cfg(feature = "privileged-tests")]
+    impl Drop for TestNetns {
+        fn drop(&mut self) {
+            // Synchronous on purpose: Drop also runs on panics and `?` returns.
+            let _ = std::process::Command::new("ip")
+                .args(["netns", "del", &self.name])
+                .output();
+        }
+    }
+
     /// Test that connect_in_namespace can reach a listener inside a namespace.
     ///
     /// Creates a temp namespace, binds a listener in it, connects from outside
@@ -387,37 +437,13 @@ mod tests {
     #[cfg(feature = "privileged-tests")]
     #[tokio::test]
     async fn test_connect_in_namespace() -> Result<()> {
-        let ns_name = format!("test-proxy-{}", std::process::id());
-
-        // Create namespace
-        tokio::process::Command::new("ip")
-            .args(["netns", "add", &ns_name])
-            .output()
-            .await
-            .context("creating test namespace")?;
-
-        // Bring up loopback in namespace (required for 127.0.0.1 to work)
-        tokio::process::Command::new("ip")
-            .args(["netns", "exec", &ns_name, "ip", "link", "set", "lo", "up"])
-            .output()
-            .await?;
-
-        let cleanup = || async {
-            let _ = tokio::process::Command::new("ip")
-                .args(["netns", "del", &ns_name])
-                .output()
-                .await;
-        };
+        // Namespace is deleted by TestNetns::drop, even on failure paths.
+        let ns = TestNetns::create(format!("test-proxy-{}", std::process::id())).await?;
+        let ns_name = ns.name.clone();
 
         // Bind a listener inside the namespace
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let listener = match bind_in_namespace(&ns_name, addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                cleanup().await;
-                return Err(e);
-            }
-        };
+        let listener = bind_in_namespace(&ns_name, addr).await?;
         let listen_addr = listener.local_addr()?;
         println!("Listener bound at {} in namespace {}", listen_addr, ns_name);
 
@@ -430,14 +456,7 @@ mod tests {
         });
 
         // Connect from "outside" using setns
-        let mut stream = match connect_in_namespace(&ns_name, listen_addr).await {
-            Ok(s) => s,
-            Err(e) => {
-                echo_handle.abort();
-                cleanup().await;
-                return Err(e);
-            }
-        };
+        let mut stream = connect_in_namespace(&ns_name, listen_addr).await?;
 
         // Send data and verify we can write (connection established)
         use tokio::io::AsyncWriteExt;
@@ -445,9 +464,8 @@ mod tests {
         stream.shutdown().await?;
         println!("Successfully connected and sent data via namespace");
 
-        // Cleanup
+        // Cleanup (namespace deleted by TestNetns::drop)
         echo_handle.abort();
-        cleanup().await;
         println!("test_connect_in_namespace PASSED");
         Ok(())
     }
@@ -459,40 +477,20 @@ mod tests {
     #[cfg(feature = "privileged-tests")]
     #[tokio::test]
     async fn test_port_forward_relay() -> Result<()> {
-        let ns_name = format!("test-pf-{}", std::process::id());
-
-        // Create namespace + loopback
-        tokio::process::Command::new("ip")
-            .args(["netns", "add", &ns_name])
-            .output()
-            .await?;
-        tokio::process::Command::new("ip")
-            .args(["netns", "exec", &ns_name, "ip", "link", "set", "lo", "up"])
-            .output()
-            .await?;
-
-        let cleanup = |ns: String| async move {
-            let _ = tokio::process::Command::new("ip")
-                .args(["netns", "del", &ns])
-                .output()
-                .await;
-        };
+        // Namespace is deleted by TestNetns::drop, even on failure paths.
+        let ns = TestNetns::create(format!("test-pf-{}", std::process::id())).await?;
+        let ns_name = ns.name.clone();
 
         // Start echo server inside namespace on a known port
         let server_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
         let server_listener = bind_in_namespace(&ns_name, server_addr).await?;
 
         let echo_handle = tokio::spawn(async move {
-            loop {
-                match server_listener.accept().await {
-                    Ok((mut stream, _)) => {
-                        tokio::spawn(async move {
-                            let (mut r, mut w) = stream.split();
-                            let _ = tokio::io::copy(&mut r, &mut w).await;
-                        });
-                    }
-                    Err(_) => break,
-                }
+            while let Ok((mut stream, _)) = server_listener.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = stream.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
             }
         });
 
@@ -523,12 +521,11 @@ mod tests {
         client.read_to_end(&mut buf).await?;
         assert_eq!(buf, b"test data 12345", "echo data should match");
 
-        // Cleanup
+        // Cleanup (namespace deleted by TestNetns::drop)
         for h in handles {
             h.abort();
         }
         echo_handle.abort();
-        cleanup(ns_name).await;
         println!("test_port_forward_relay PASSED");
         Ok(())
     }
@@ -541,24 +538,9 @@ mod tests {
     #[cfg(feature = "privileged-tests")]
     #[tokio::test]
     async fn test_localhost_forward_relay() -> Result<()> {
-        let ns_name = format!("test-lf-{}", std::process::id());
-
-        // Create namespace + loopback
-        tokio::process::Command::new("ip")
-            .args(["netns", "add", &ns_name])
-            .output()
-            .await?;
-        tokio::process::Command::new("ip")
-            .args(["netns", "exec", &ns_name, "ip", "link", "set", "lo", "up"])
-            .output()
-            .await?;
-
-        let cleanup = |ns: String| async move {
-            let _ = tokio::process::Command::new("ip")
-                .args(["netns", "del", &ns])
-                .output()
-                .await;
-        };
+        // Namespace is deleted by TestNetns::drop, even if the assertion panics.
+        let ns = TestNetns::create(format!("test-lf-{}", std::process::id())).await?;
+        let ns_name = ns.name.clone();
 
         // Host service on host-namespace loopback. The relay must reach this
         // even though the listener it accepts from lives inside the namespace.
@@ -598,7 +580,6 @@ mod tests {
         .await;
 
         server_handle.abort();
-        cleanup(ns_name).await;
         result?;
         println!("test_localhost_forward_relay PASSED");
         Ok(())

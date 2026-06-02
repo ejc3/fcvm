@@ -254,7 +254,7 @@ clean-test-data: build
 	@echo "==> Killing stale VM processes from previous runs..."
 	@sudo pkill -9 firecracker 2>/dev/null; sudo pkill -9 pasta 2>/dev/null; sudo kill -9 $$(pgrep -x sleep -P 1) 2>/dev/null; sleep 1; true
 	@echo "==> Cleaning stale network namespaces..."
-	@for ns in $$(sudo ip netns list 2>/dev/null | grep '^fcvm-' | awk '{print $$1}'); do sudo ip netns del "$$ns" 2>/dev/null && echo "  deleted $$ns"; done; true
+	@for ns in $$(sudo ip netns list 2>/dev/null | grep -E '^(fcvm-|test-lf-|test-pf-|test-proxy-)' | awk '{print $$1}'); do sudo ip netns del "$$ns" 2>/dev/null && echo "  deleted $$ns"; done; true
 	@echo "==> Cleaning stale iptables rules from fcvm VMs..."
 	@sudo iptables-save -t nat 2>/dev/null | grep -E 'MASQUERADE.*(172\.30\.|10\.0\.)' | sed 's/^-A//' | while read rule; do sudo iptables -t nat -D $$rule 2>/dev/null; done; true
 	@sudo ip6tables-save -t nat 2>/dev/null | grep 'MASQUERADE' | grep -v NETAVARK | sed 's/^-A//' | while read rule; do sudo ip6tables -t nat -D $$rule 2>/dev/null; done; true
