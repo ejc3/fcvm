@@ -531,6 +531,35 @@ pub async fn import_image(
         .spawn()
         .context("spawning podman load")?;
 
+    // Drain stdout/stderr concurrently while waiting (same pattern as pull_image).
+    // podman load can emit per-layer progress lines; if neither pipe is read until
+    // after exit, the child blocks once the 64KB pipe buffer fills and wait() never
+    // returns — the import hangs forever with only heartbeats.
+    let stdout_task = load_child.stdout.take().map(|stdout| {
+        tokio::spawn(async move {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            let mut captured = Vec::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                captured.push(line);
+            }
+            captured
+        })
+    });
+
+    let stderr_task = load_child.stderr.take().map(|stderr| {
+        tokio::spawn(async move {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            let mut captured = Vec::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                eprintln!("[fc-agent] [podman] {}", line);
+                captured.push(line);
+            }
+            captured
+        })
+    });
+
     let status = loop {
         tokio::select! {
             result = load_child.wait() => {
@@ -543,25 +572,22 @@ pub async fn import_image(
         }
     };
 
+    let stdout_lines = if let Some(task) = stdout_task {
+        task.await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let stderr_lines = if let Some(task) = stderr_task {
+        task.await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     if !status.success() {
-        let stderr = if let Some(mut se) = load_child.stderr.take() {
-            let mut buf = String::new();
-            let _ = tokio::io::AsyncReadExt::read_to_string(&mut se, &mut buf).await;
-            buf
-        } else {
-            String::new()
-        };
-        anyhow::bail!("podman load failed: {}", stderr);
+        anyhow::bail!("podman load failed: {}", stderr_lines.join("\n"));
     }
 
-    let loaded_output = if let Some(mut so) = load_child.stdout.take() {
-        let mut buf = String::new();
-        let _ = tokio::io::AsyncReadExt::read_to_string(&mut so, &mut buf).await;
-        buf
-    } else {
-        String::new()
-    };
-    eprintln!("[fc-agent] podman load: {}", loaded_output.trim());
+    eprintln!("[fc-agent] podman load: {}", stdout_lines.join(" "));
     eprintln!("[fc-agent] image imported as: {}", image_name);
     Ok(image_name.to_string())
 }

@@ -56,11 +56,12 @@ pub async fn run_server(
     let _ = ready_tx.send(());
 
     loop {
-        // Check flag before polling — catches notifications lost due to select! races.
-        // When both accept() and notified() are Ready simultaneously, select! picks one
-        // and drops the other. If accept() wins, the Notified future's permit was already
-        // consumed during poll() but the re_register branch never executed. The flag
-        // persists across this race and is checked here on the next iteration.
+        // Single rebind path: the AtomicBool flag is the source of truth, the Notify
+        // below is only a wakeup. When both accept() and notified() are Ready
+        // simultaneously, select! picks one and drops the other — if accept() wins,
+        // the Notified permit may already be consumed, but the flag persists and is
+        // handled here on the next iteration. Performing the rebind only here also
+        // guarantees one rebind request produces exactly one rebind_done notification.
         if rebind_needed.swap(false, Ordering::AcqRel) {
             eprintln!(
                 "[fc-agent] exec server: vsock transport reset (flag), re-registering listener"
@@ -82,18 +83,24 @@ pub async fn run_server(
                 }
             }
             _ = rebind_signal.notified() => {
-                // Clear the flag (we're handling it now).
-                rebind_needed.store(false, Ordering::Release);
-                eprintln!("[fc-agent] exec server: vsock transport reset (notify), re-registering listener");
-                listener = do_re_register(listener).await;
-                rebind_done.store(true, Ordering::Release);
-                rebind_done_notify.notify_one();
+                // Wake-up only — the top-of-loop flag check performs the re-register.
+                // Handling the rebind here as well would double-handle a single request
+                // when accept() readiness raced the notification (the flag check wins,
+                // then the stored permit fires this arm), producing a second
+                // rebind_done notification with no waiter. That stale permit would let
+                // a LATER restore proceed before its listener re-register completed.
             }
         }
     }
 }
 
 /// Re-register or rebind the vsock listener after transport reset.
+///
+/// Does not return until a working listener exists. Failures are not fatal: this runs
+/// in a spawned task, so a panic here would only kill the exec-server task while the
+/// rest of fc-agent kept running with no exec listener at all. Instead, bind failures
+/// are logged loudly (visible on the serial console) and retried with backoff — if the
+/// vsock device recovers, the exec server recovers with it.
 async fn do_re_register(listener: vsock::VsockListener) -> vsock::VsockListener {
     match listener.re_register() {
         Ok(l) => {
@@ -109,7 +116,7 @@ async fn do_re_register(listener: vsock::VsockListener) -> vsock::VsockListener 
                 "[fc-agent] exec server: re-register failed: {}, trying full rebind",
                 e
             );
-            let mut retries = 0;
+            let mut retries: u32 = 0;
             loop {
                 match vsock::VsockListener::bind(vsock::EXEC_PORT) {
                     Ok(l) => {
@@ -121,20 +128,18 @@ async fn do_re_register(listener: vsock::VsockListener) -> vsock::VsockListener 
                     }
                     Err(e2) => {
                         retries += 1;
-                        if retries >= 50 {
+                        // Fast retries for the first ~5s (transient EADDRINUSE while
+                        // pre-snapshot connections drain), then back off to 1s and log
+                        // periodically so a broken vsock device stays visible without
+                        // flooding the console.
+                        let delay_ms = if retries < 50 { 100 } else { 1000 };
+                        if retries <= 50 || retries.is_multiple_of(30) {
                             eprintln!(
-                                "[fc-agent] exec server: re-bind failed after {} retries: {}",
-                                retries, e2
+                                "[fc-agent] ERROR: exec re-bind failed (attempt {}): {}, exec unavailable, retrying in {}ms",
+                                retries, e2, delay_ms
                             );
-                            // Fatal: exec server is unavailable. Panic to make the
-                            // failure visible rather than silently hanging.
-                            panic!("exec server: re-bind failed after 50 retries");
                         }
-                        eprintln!(
-                            "[fc-agent] exec server: re-bind failed: {}, retrying ({}/50)",
-                            e2, retries
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     }
                 }
             }
@@ -199,9 +204,14 @@ fn write_line_to_fd(fd: i32, data: &str) {
 
 /// Read the request line synchronously (blocking byte-by-byte read).
 /// Returns (ExecRequest, raw_fd) on success, or None if connection closed or parse error.
+///
+/// The request is accumulated as raw bytes and parsed as UTF-8 JSON. The host
+/// serializes ExecRequest with serde_json::to_string, which emits non-ASCII
+/// characters as raw UTF-8 — decoding byte-by-byte (Latin-1) would silently corrupt
+/// multi-byte arguments and paths.
 fn read_request_line(fd: i32) -> Option<(ExecRequest, i32)> {
     const MAX_EXEC_LINE_LENGTH: usize = 1_048_576;
-    let mut line = String::new();
+    let mut line: Vec<u8> = Vec::new();
     let mut buf = [0u8; 1];
     loop {
         let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
@@ -220,10 +230,10 @@ fn read_request_line(fd: i32) -> Option<(ExecRequest, i32)> {
             unsafe { libc::close(fd) };
             return None;
         }
-        line.push(buf[0] as char);
+        line.push(buf[0]);
     }
 
-    let request: ExecRequest = match serde_json::from_str(&line) {
+    let request: ExecRequest = match serde_json::from_slice(&line) {
         Ok(r) => r,
         Err(e) => {
             let response = ExecResponse::Error(format!("Invalid request: {}", e));
@@ -402,4 +412,55 @@ async fn handle_pipe_async(raw_fd: i32, request: &ExecRequest) {
     let conn = async_fd.lock().await;
     write_line_async(&conn, &serde_json::to_string(&response).unwrap()).await;
     // fd closed by OwnedFd drop (inside AsyncFd, inside Mutex, inside Arc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Send `data` over a socketpair and parse it with read_request_line.
+    fn parse_request(data: &[u8]) -> Option<ExecRequest> {
+        let mut fds = [0i32; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed");
+        let (server_fd, client_fd) = (fds[0], fds[1]);
+
+        let written = unsafe { libc::write(client_fd, data.as_ptr().cast(), data.len()) };
+        assert_eq!(written, data.len() as isize, "short write to socketpair");
+
+        // read_request_line closes server_fd on error; on success it returns it open.
+        let request = match read_request_line(server_fd) {
+            Some((request, fd)) => {
+                unsafe { libc::close(fd) };
+                Some(request)
+            }
+            None => None,
+        };
+        unsafe { libc::close(client_fd) };
+        request
+    }
+
+    #[test]
+    fn test_read_request_line_preserves_utf8_args() {
+        // The host serializes ExecRequest with serde_json::to_string, which emits
+        // non-ASCII characters as raw UTF-8 bytes — they must round-trip intact.
+        let json = "{\"command\":[\"touch\",\"/data/héllo wörld.txt\"]}\n";
+        let request = parse_request(json.as_bytes()).expect("request should parse");
+        assert_eq!(request.command, vec!["touch", "/data/héllo wörld.txt"]);
+        assert!(!request.in_container);
+        assert!(!request.tty);
+    }
+
+    #[test]
+    fn test_read_request_line_ascii() {
+        let json = "{\"command\":[\"echo\",\"hello\"],\"in_container\":true}\n";
+        let request = parse_request(json.as_bytes()).expect("request should parse");
+        assert_eq!(request.command, vec!["echo", "hello"]);
+        assert!(request.in_container);
+    }
+
+    #[test]
+    fn test_read_request_line_rejects_invalid_json() {
+        assert!(parse_request(b"not json\n").is_none());
+    }
 }

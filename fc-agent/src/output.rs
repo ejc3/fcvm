@@ -109,6 +109,12 @@ async fn try_reconnect() -> Option<VsockStream> {
 /// The host gates health monitoring on the output connection (snapshot.rs),
 /// so auto-reconnecting before handle_clone_restore finishes ARP/exec setup
 /// causes pasta port forwarding failures in clones.
+///
+/// Once an explicit reconnect HAS been requested, the writer keeps retrying
+/// until it succeeds (like initial startup). The request arrives at most once
+/// per restore epoch — giving up after one ~3s try_reconnect() round would
+/// leave output dead for the VM's lifetime and eventually wedge the container
+/// on a full output channel.
 async fn output_writer(
     mut rx: mpsc::Receiver<OutputMessage>,
     reconnect_signal: Arc<Notify>,
@@ -147,6 +153,14 @@ async fn output_writer(
             stream = try_reconnect().await;
             if stream.is_some() {
                 ever_connected = true;
+            } else {
+                // The explicit reconnect request failed (host listener unreachable
+                // for ~3s). Re-arm the flag and keep retrying — the request comes
+                // at most once per restore epoch, so giving up here would leave
+                // output dead for the VM's lifetime.
+                eprintln!("[fc-agent] output vsock reconnect failed, retrying");
+                reconnect_flag.store(true, std::sync::atomic::Ordering::Release);
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
             continue;
         }
@@ -217,12 +231,11 @@ async fn output_writer(
             // Don't auto-reconnect: the host gates health monitoring on the
             // output connection, so reconnecting before ARP/exec setup
             // completes causes pasta port forwarding failures in clones.
+            // The top-of-loop flag check performs the actual reconnect (and
+            // keeps retrying on failure) — this branch only waits for the wakeup.
             tokio::select! {
                 _ = reconnect_signal.notified() => {}
                 _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
-            }
-            if reconnect_flag.swap(false, std::sync::atomic::Ordering::AcqRel) {
-                stream = try_reconnect().await;
             }
         } else {
             // Never connected — initial startup. Auto-reconnect with backoff.

@@ -313,16 +313,36 @@ pub fn send_status(message: &[u8]) -> bool {
 }
 
 /// Notify host of container exit status.
+///
+/// The exit message is the host's only signal of how the container finished — if it
+/// is lost, the host treats a missing exit code as success. Retry a bounded number of
+/// times (each attempt is a fresh connection) so a transient vsock failure right
+/// before shutdown doesn't silently drop a non-zero exit code.
 pub fn notify_container_exit(exit_code: i32) {
+    const MAX_ATTEMPTS: u32 = 5;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
     let msg = format!("exit:{}\n", exit_code);
-    if send_status(msg.as_bytes()) {
-        eprintln!(
-            "[fc-agent] notified host of exit code {} via vsock",
-            exit_code
-        );
-    } else {
-        eprintln!("[fc-agent] WARNING: failed to send exit status to host");
+    for attempt in 1..=MAX_ATTEMPTS {
+        if send_status(msg.as_bytes()) {
+            eprintln!(
+                "[fc-agent] notified host of exit code {} via vsock",
+                exit_code
+            );
+            return;
+        }
+        if attempt < MAX_ATTEMPTS {
+            eprintln!(
+                "[fc-agent] WARNING: failed to send exit status to host (attempt {}/{}), retrying",
+                attempt, MAX_ATTEMPTS
+            );
+            std::thread::sleep(RETRY_DELAY);
+        }
     }
+    eprintln!(
+        "[fc-agent] WARNING: failed to send exit status to host after {} attempts",
+        MAX_ATTEMPTS
+    );
 }
 
 /// Notify host that the container has started.
