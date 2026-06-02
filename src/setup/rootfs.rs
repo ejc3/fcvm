@@ -1117,7 +1117,6 @@ pub async fn ensure_rootfs(allow_create: bool, rootfs_type: Option<&str>) -> Res
             "rootfs exists (created by another process)"
         );
         flock.unlock().map_err(|(_, err)| err).ok();
-        let _ = std::fs::remove_file(&lock_file);
         return Ok(rootfs_path);
     }
 
@@ -1155,12 +1154,14 @@ pub async fn ensure_rootfs(allow_create: bool, rootfs_type: Option<&str>) -> Res
         let _ = tokio::fs::remove_file(&temp_rootfs_path).await;
     }
 
-    // Release lock
+    // Release lock. Deliberately leave the lock file in place (matching the kernel
+    // and initrd locks): unlinking it lets a process still blocked in flock() on the
+    // old inode and a new arrival that re-creates the path both "hold" the lock at
+    // the same time, allowing two concurrent rootfs builds to clobber each other.
     flock
         .unlock()
         .map_err(|(_, err)| err)
         .context("releasing rootfs creation lock")?;
-    let _ = std::fs::remove_file(&lock_file);
 
     result?;
     Ok(rootfs_path)
@@ -1942,7 +1943,9 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
     let cache_dir = paths::cache_dir();
     let packages_dir = cache_dir.join(format!("packages-{}", script_sha_short));
 
-    // If packages directory already exists with .deb files, use it
+    // If packages directory already exists with .deb files, use it.
+    // The directory is populated under a temp name and renamed into place only
+    // after the download succeeds, so its existence implies a complete set.
     if packages_dir.exists() {
         if let Ok(mut entries) = tokio::fs::read_dir(&packages_dir).await {
             let mut has_debs = false;
@@ -1964,9 +1967,13 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
         }
     }
 
-    // Create packages directory
+    // Download into a temp directory, then atomically rename to the final cache
+    // path on success. An interrupted or failed download must never leave a
+    // partial package set at the content-addressed path.
+    let download_dir = cache_dir.join(format!("packages-{}.tmp", script_sha_short));
     let _ = tokio::fs::remove_dir_all(&packages_dir).await;
-    tokio::fs::create_dir_all(&packages_dir).await?;
+    let _ = tokio::fs::remove_dir_all(&download_dir).await;
+    tokio::fs::create_dir_all(&download_dir).await?;
 
     let codename = &plan.base.codename;
     let container_image = format!("ubuntu:{}", codename);
@@ -2007,7 +2014,7 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
 
     podman_args.extend([
         "-v".to_string(),
-        format!("{}:/packages", packages_dir.display()),
+        format!("{}:/packages", download_dir.display()),
         container_image.clone(),
         "bash".to_string(),
         "-c".to_string(),
@@ -2021,13 +2028,20 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
         .context("downloading packages with podman")?;
 
     if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!(stderr = %stderr, "podman download had errors, checking results...");
+        let _ = tokio::fs::remove_dir_all(&download_dir).await;
+        bail!(
+            "Package download failed (podman exited with {:?}). stdout={}, stderr={}",
+            output.status.code(),
+            stdout.trim(),
+            stderr.trim()
+        );
     }
 
     // Count downloaded packages
     let mut count = 0;
-    if let Ok(mut entries) = tokio::fs::read_dir(&packages_dir).await {
+    if let Ok(mut entries) = tokio::fs::read_dir(&download_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             if entry
                 .path()
@@ -2043,12 +2057,18 @@ async fn download_packages(plan: &Plan, script_sha_short: &str) -> Result<PathBu
     if count == 0 {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = tokio::fs::remove_dir_all(&download_dir).await;
         bail!(
             "No packages downloaded. stdout={}, stderr={}",
             stdout.trim(),
             stderr.trim()
         );
     }
+
+    // Atomically publish the completed download as the cache directory
+    tokio::fs::rename(&download_dir, &packages_dir)
+        .await
+        .context("renaming downloaded packages directory into place")?;
 
     info!(path = %packages_dir.display(), count = count, "packages downloaded");
     Ok(packages_dir)
@@ -2094,9 +2114,14 @@ async fn download_cloud_image(plan: &Plan) -> Result<PathBuf> {
     );
 
     let temp_path = image_path.with_extension("img.download");
+    // Clean up any leftover temp file from a previous failed attempt
+    let _ = tokio::fs::remove_file(&temp_path).await;
+
+    // -f makes curl fail on HTTP errors instead of saving the error page as the
+    // image; -S still prints the error despite --progress-bar.
     let output = Command::new("curl")
         .args([
-            "-L",
+            "-fSL",
             "-o",
             path_to_str(&temp_path)?,
             "--progress-bar",
@@ -2107,7 +2132,11 @@ async fn download_cloud_image(plan: &Plan) -> Result<PathBuf> {
         .context("downloading cloud image")?;
 
     if !output.success() {
-        bail!("curl failed to download cloud image");
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        bail!(
+            "curl failed to download cloud image from {}",
+            arch_config.url
+        );
     }
 
     // Rename to final path

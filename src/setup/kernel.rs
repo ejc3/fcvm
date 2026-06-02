@@ -108,7 +108,7 @@ pub fn get_kernel_url_hash(profile_name: &str) -> Result<String> {
     if let Some(ref url) = profile.kernel_url {
         Ok(compute_sha256_short(url.as_bytes()))
     } else {
-        Ok(compute_profile_kernel_sha(&profile))
+        compute_profile_kernel_sha(&profile)
     }
 }
 
@@ -263,9 +263,23 @@ async fn ensure_url_kernel(profile: &KernelProfile, allow_create: bool) -> Resul
         );
     }
 
-    tokio::fs::copy(&extracted_path, &kernel_path)
-        .await
-        .context("copying kernel to final location")?;
+    // Copy to a temp name in the same directory, then atomically rename onto the
+    // final content-addressed path. An interrupted or failed copy (kill, ENOSPC)
+    // must never leave a partial file that later runs treat as a valid kernel.
+    let kernel_temp = kernel_path.with_extension("downloading");
+    let _ = tokio::fs::remove_file(&kernel_temp).await;
+    if let Err(e) = tokio::fs::copy(&extracted_path, &kernel_temp).await {
+        let _ = tokio::fs::remove_file(&kernel_temp).await;
+        let _ = tokio::fs::remove_dir_all(&extract_temp).await;
+        let _ = flock.unlock();
+        return Err(e).context("copying kernel to staging location");
+    }
+    if let Err(e) = tokio::fs::rename(&kernel_temp, &kernel_path).await {
+        let _ = tokio::fs::remove_file(&kernel_temp).await;
+        let _ = tokio::fs::remove_dir_all(&extract_temp).await;
+        let _ = flock.unlock();
+        return Err(e).context("moving kernel to final location");
+    }
 
     // Clean up temp extraction dir
     let _ = tokio::fs::remove_dir_all(&extract_temp).await;
@@ -282,7 +296,7 @@ async fn ensure_url_kernel(profile: &KernelProfile, allow_create: bool) -> Resul
 // ============================================================================
 
 fn get_custom_kernel_path(profile: &KernelProfile, profile_name: &str) -> Result<PathBuf> {
-    let sha = compute_profile_kernel_sha(profile);
+    let sha = compute_profile_kernel_sha(profile)?;
     let filename = custom_kernel_filename(profile_name, &profile.kernel_version, &sha);
     Ok(paths::kernel_dir().join(filename))
 }
@@ -293,7 +307,7 @@ async fn ensure_custom_kernel(
     allow_create: bool,
     allow_build: bool,
 ) -> Result<PathBuf> {
-    let sha = compute_profile_kernel_sha(profile);
+    let sha = compute_profile_kernel_sha(profile)?;
     let filename = custom_kernel_filename(profile_name, &profile.kernel_version, &sha);
     let kernel_dir = paths::kernel_dir();
     let kernel_path = kernel_dir.join(&filename);
@@ -448,10 +462,14 @@ fn find_repo_root() -> Option<PathBuf> {
 ///
 /// Patterns are resolved relative to the repo root (directory containing Cargo.toml
 /// and rootfs-config.toml).
-pub fn compute_profile_kernel_sha(profile: &KernelProfile) -> String {
+///
+/// Errors when configured build inputs cannot be resolved (no matching files, or a
+/// matched file cannot be read). Silently degrading the cache key would make the
+/// content-addressed kernel name stop reflecting the configured patches/config.
+pub fn compute_profile_kernel_sha(profile: &KernelProfile) -> Result<String> {
     if profile.build_inputs.is_empty() {
         warn!("kernel profile has no build_inputs, using empty SHA");
-        return "000000000000".to_string();
+        return Ok("000000000000".to_string());
     }
 
     // Find repo root for relative path resolution
@@ -477,20 +495,16 @@ pub fn compute_profile_kernel_sha(profile: &KernelProfile) -> String {
         };
 
         // Expand glob pattern
-        let paths: Vec<PathBuf> = match glob(&full_pattern) {
-            Ok(entries) => {
-                let mut paths: Vec<PathBuf> = entries
-                    .filter_map(|e| e.ok())
-                    // Filter out .disabled files (allows disabling patches without changing SHA)
-                    .filter(|p| !p.to_string_lossy().ends_with(".disabled"))
-                    .collect();
-                paths.sort(); // Deterministic order
-                paths
-            }
-            Err(e) => {
-                warn!(pattern = %full_pattern, error = %e, "invalid glob pattern");
-                continue;
-            }
+        let paths: Vec<PathBuf> = {
+            let entries = glob(&full_pattern)
+                .with_context(|| format!("invalid build_inputs glob pattern: {}", full_pattern))?;
+            let mut paths: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok())
+                // Filter out .disabled files (allows disabling patches without changing SHA)
+                .filter(|p| !p.to_string_lossy().ends_with(".disabled"))
+                .collect();
+            paths.sort(); // Deterministic order
+            paths
         };
 
         if paths.is_empty() {
@@ -498,24 +512,27 @@ pub fn compute_profile_kernel_sha(profile: &KernelProfile) -> String {
         }
 
         for path in paths {
-            match std::fs::read(&path) {
-                Ok(data) => {
-                    debug!(path = %path.display(), bytes = data.len(), "hashing build input");
-                    content.extend(data);
-                }
-                Err(e) => {
-                    warn!(path = %path.display(), error = %e, "failed to read build input");
-                }
-            }
+            let data = std::fs::read(&path)
+                .with_context(|| format!("reading kernel build input {}", path.display()))?;
+            debug!(path = %path.display(), bytes = data.len(), "hashing build input");
+            content.extend(data);
         }
     }
 
     if content.is_empty() {
-        warn!("no build input files found, using empty SHA");
-        return "000000000000".to_string();
+        bail!(
+            "no kernel build input files matched build_inputs {:?} (repo root: {}). \
+             Cannot compute the kernel cache key without them - run from the fcvm \
+             repository or fix build_inputs in rootfs-config.toml",
+            profile.build_inputs,
+            repo_root
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "not found".to_string()),
+        );
     }
 
-    compute_sha256_short(&content)
+    Ok(compute_sha256_short(&content))
 }
 
 /// Get the custom kernel filename.
@@ -589,6 +606,7 @@ async fn download_kernel_binary(url: &str, dest: &Path) -> Result<()> {
 /// - Not maintain separate shell scripts in source control
 fn generate_vm_kernel_build_script(
     profile: &KernelProfile,
+    profile_name: &str,
     sha: &str,
     dest: &Path,
     repo_root: &Path,
@@ -630,7 +648,9 @@ set -euo pipefail
 
 KERNEL_VERSION="{kernel_version}"
 KERNEL_MAJOR="{kernel_major}"
-BUILD_DIR="${{BUILD_DIR:-/tmp/kernel-build}}"
+# Per-asset build dir: concurrent builds of different profiles/SHAs hold different
+# locks, so they must not share a build tree (one would rm -rf the other's source).
+BUILD_DIR="${{BUILD_DIR:-/tmp/kernel-build-{profile_name}-{sha}}}"
 NPROC="${{NPROC:-$(nproc)}}"
 SOURCE_DIR="$BUILD_DIR/linux-${{KERNEL_VERSION}}"
 SHA_MARKER="$SOURCE_DIR/.fcvm-patches-sha"
@@ -709,11 +729,14 @@ echo "Building kernel with $NPROC parallel jobs..."
 make ARCH="$KERNEL_ARCH" -j"$NPROC" "$KERNEL_IMAGE"
 
 # Copy output (Firecracker needs uncompressed ELF vmlinux, not bzImage)
+# Copy to a temp name then atomically rename so an interrupted copy never
+# leaves a partial kernel at the content-addressed path.
 echo "Copying kernel to $KERNEL_PATH..."
 case "$KERNEL_ARCH" in
-    arm64)  cp "arch/arm64/boot/Image" "$KERNEL_PATH" ;;
-    x86_64) cp "vmlinux" "$KERNEL_PATH" ;;
+    arm64)  cp "arch/arm64/boot/Image" "$KERNEL_PATH.tmp" ;;
+    x86_64) cp "vmlinux" "$KERNEL_PATH.tmp" ;;
 esac
+mv -f "$KERNEL_PATH.tmp" "$KERNEL_PATH"
 
 echo ""
 echo "=== Build Complete ==="
@@ -722,6 +745,7 @@ echo "Size: $(du -h "$KERNEL_PATH" | cut -f1)"
 "##,
         kernel_version = kernel_version,
         kernel_major = kernel_major,
+        profile_name = profile_name,
         sha = sha,
         kernel_path = dest.display(),
         patches_dir_line = patches_dir
@@ -813,10 +837,11 @@ async fn build_kernel_locally(
     })?;
 
     // Compute SHA for this build
-    let sha = compute_profile_kernel_sha(profile);
+    let sha = compute_profile_kernel_sha(profile)?;
 
     // Generate the build script
-    let script_content = generate_vm_kernel_build_script(profile, &sha, dest, &repo_root)?;
+    let script_content =
+        generate_vm_kernel_build_script(profile, profile_name, &sha, dest, &repo_root)?;
 
     // Write to temp file
     let script_path = std::env::temp_dir().join(format!("fcvm-kernel-build-{}.sh", sha));
@@ -1180,9 +1205,11 @@ pub async fn install_host_kernel(profile: &KernelProfile, boot_args: Option<&str
         );
     }
 
-    // Find the linux-image deb (exclude dbg packages)
+    // Find the linux-image deb for THIS build (exclude dbg packages). The build
+    // dir is shared across builds and may still hold debs from older SHAs, so
+    // filter by the expected package name instead of taking any linux-image-*.deb.
     let build_dir = Path::new("/tmp/kernel-build-host");
-    let pattern = format!("{}/linux-image-*.deb", build_dir.display());
+    let pattern = format!("{}/{}_*.deb", build_dir.display(), expected_pkg);
     let debs: Vec<_> = glob::glob(&pattern)
         .context("globbing for deb files")?
         .filter_map(|r| r.ok())
@@ -1190,7 +1217,11 @@ pub async fn install_host_kernel(profile: &KernelProfile, boot_args: Option<&str
         .collect();
 
     if debs.is_empty() {
-        bail!("No linux-image deb found in {}", build_dir.display());
+        bail!(
+            "No {} deb found in {} after build",
+            expected_pkg,
+            build_dir.display()
+        );
     }
 
     let deb_path = &debs[0];
@@ -1314,20 +1345,69 @@ fn libc_version_tag() -> String {
 /// Get the content-addressed path for profile firecracker binary.
 /// Uses assets_dir/firecracker/ alongside kernels and other assets.
 /// Fetches latest commit hash to ensure we detect updates.
+///
+/// Returns `Ok(None)` when the profile does not configure a custom firecracker.
+/// When the remote commit cannot be queried (offline, GitHub outage), falls back
+/// to the most recently installed cached binary for the profile instead of
+/// pretending no custom firecracker is configured; errors if none is cached.
 pub async fn get_profile_firecracker_path(
     profile: &KernelProfile,
     profile_name: &str,
-) -> Option<PathBuf> {
+) -> Result<Option<PathBuf>> {
     // Only return path if profile has a custom firecracker configured
-    let repo = profile.firecracker_repo.as_ref()?;
+    let repo = match profile.firecracker_repo.as_ref() {
+        Some(r) => r,
+        None => return Ok(None),
+    };
     let branch = profile.firecracker_branch.as_deref().unwrap_or("main");
 
     // Fetch latest commit hash to detect updates
-    let commit_hash = fetch_remote_commit_hash(repo, branch).await.ok()?;
-    let sha = compute_profile_firecracker_sha_with_commit(profile, &commit_hash);
-    let filename = format!("firecracker-{}-{}.bin", profile_name, sha);
+    match fetch_remote_commit_hash(repo, branch).await {
+        Ok(commit_hash) => {
+            let sha = compute_profile_firecracker_sha_with_commit(profile, &commit_hash);
+            let filename = format!("firecracker-{}-{}.bin", profile_name, sha);
+            Ok(Some(paths::assets_dir().join("firecracker").join(filename)))
+        }
+        Err(e) => match newest_cached_profile_firecracker(profile_name)? {
+            Some(cached) => {
+                warn!(
+                    profile = %profile_name,
+                    error = %e,
+                    path = %cached.display(),
+                    "could not query remote firecracker commit; using cached binary"
+                );
+                Ok(Some(cached))
+            }
+            None => Err(e.context(format!(
+                "could not query remote firecracker commit for profile '{}' and no cached \
+                 firecracker-{}-*.bin binary exists",
+                profile_name, profile_name
+            ))),
+        },
+    }
+}
 
-    Some(paths::assets_dir().join("firecracker").join(filename))
+/// Find the most recently modified cached firecracker binary for a profile.
+fn newest_cached_profile_firecracker(profile_name: &str) -> Result<Option<PathBuf>> {
+    let firecracker_dir = paths::assets_dir().join("firecracker");
+    let pattern = format!(
+        "{}/firecracker-{}-*.bin",
+        firecracker_dir.display(),
+        profile_name
+    );
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for path in glob(&pattern)
+        .context("globbing cached firecracker binaries")?
+        .filter_map(|e| e.ok())
+    {
+        let mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if newest.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+            newest = Some((mtime, path));
+        }
+    }
+    Ok(newest.map(|(_, path)| path))
 }
 
 /// Get the firecracker binary path for a kernel profile.
@@ -1341,7 +1421,7 @@ pub async fn get_firecracker_for_profile(
     profile_name: &str,
 ) -> Result<PathBuf> {
     // Check for custom firecracker from profile
-    if let Some(custom_fc) = get_profile_firecracker_path(profile, profile_name).await {
+    if let Some(custom_fc) = get_profile_firecracker_path(profile, profile_name).await? {
         if !custom_fc.exists() {
             bail!(
                 "Custom firecracker not found at {}. Run: fcvm setup --kernel-profile {}",
@@ -1426,8 +1506,10 @@ pub async fn ensure_profile_firecracker(
     );
     println!("    This may take 5-10 minutes...");
 
-    // Build in temp directory
-    let build_dir = PathBuf::from("/tmp/firecracker-profile-build");
+    // Build in a per-asset temp directory. The flock above is per profile+SHA, so
+    // concurrent builds of different profiles/SHAs hold different locks and must
+    // not share a build tree (one would delete the other's checkout mid-build).
+    let build_dir = PathBuf::from(format!("/tmp/firecracker-build-{}-{}", profile_name, sha));
 
     // Clean up old build
     if build_dir.exists() {
@@ -1486,10 +1568,24 @@ pub async fn ensure_profile_firecracker(
         }
     }
 
-    // Copy to content-addressed path
-    tokio::fs::copy(&binary, &bin_path)
-        .await
-        .context("installing firecracker binary")?;
+    // Copy to a temp name in the same directory, then atomically rename onto the
+    // content-addressed path. An interrupted or failed copy (kill, ENOSPC) must
+    // never leave a partial binary that later runs treat as valid.
+    let temp_path = bin_path.with_extension("tmp");
+    let _ = tokio::fs::remove_file(&temp_path).await;
+    if let Err(e) = tokio::fs::copy(&binary, &temp_path).await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = flock.unlock();
+        return Err(e).context("installing firecracker binary");
+    }
+    if let Err(e) = tokio::fs::rename(&temp_path, &bin_path).await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = flock.unlock();
+        return Err(e).context("moving firecracker binary into place");
+    }
+
+    // Clean up the build tree on success (failures keep it for debugging)
+    let _ = tokio::fs::remove_dir_all(&build_dir).await;
 
     flock.unlock().map_err(|(_, err)| err)?;
 
@@ -1563,4 +1659,56 @@ async fn update_grub_config(kernel_name: &str, boot_args: Option<&str>) -> Resul
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile_with_inputs(build_inputs: Vec<String>) -> KernelProfile {
+        KernelProfile {
+            build_inputs,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn profile_kernel_sha_hashes_resolved_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("kernel.conf");
+        std::fs::write(&input, "CONFIG_KVM=y\n").unwrap();
+
+        let profile = profile_with_inputs(vec![input.display().to_string()]);
+        let sha = compute_profile_kernel_sha(&profile).unwrap();
+        assert_eq!(sha.len(), 12);
+        assert_ne!(sha, "000000000000");
+
+        // Changing an input changes the cache key
+        std::fs::write(&input, "CONFIG_KVM=y\nCONFIG_BTRFS_FS=y\n").unwrap();
+        let sha2 = compute_profile_kernel_sha(&profile).unwrap();
+        assert_ne!(sha, sha2);
+    }
+
+    #[test]
+    fn profile_kernel_sha_errors_when_inputs_unresolvable() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist-*.patch");
+
+        let profile = profile_with_inputs(vec![missing.display().to_string()]);
+        let err = compute_profile_kernel_sha(&profile).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no kernel build input files matched"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn profile_kernel_sha_without_inputs_uses_constant() {
+        let profile = profile_with_inputs(vec![]);
+        assert_eq!(
+            compute_profile_kernel_sha(&profile).unwrap(),
+            "000000000000"
+        );
+    }
 }
