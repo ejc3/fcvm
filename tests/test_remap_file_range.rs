@@ -94,8 +94,12 @@ async fn run_remap_test_in_vm(test_name: &str, test_script: &str) -> Result<()> 
         logger.clone(),
     );
 
-    // Wait for completion (5 min timeout)
-    let timeout = std::time::Duration::from_secs(300);
+    // Wait for completion. This single budget covers the whole VM lifecycle (cold
+    // bridged boot, pre-start snapshot pause, in-guest image/container startup, the
+    // test script, and shutdown), so keep it just under the 600s nextest
+    // slow-timeout for VM tests — under heavy parallel snapshot I/O the container
+    // start alone has been observed to take several minutes.
+    let timeout = std::time::Duration::from_secs(570);
     let result = tokio::time::timeout(timeout, child.wait()).await;
 
     let exit_status = match result {
