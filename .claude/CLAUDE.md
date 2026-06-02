@@ -1065,9 +1065,23 @@ pub struct VmConfig {
 }
 
 pub struct VmState {
-    pub pid: Option<u32>,  // fcvm process PID (from std::process::id())
+    pub pid: Option<u32>,            // fcvm process PID (from std::process::id())
+    pub pid_start_time: Option<u64>, // Process start time (clock ticks since boot)
 }
 ```
+
+**Concurrency model** — state files use per-VM flock for all mutations:
+- `save_state()`: Overwrites entire file. Used for **initial creation** only (single writer).
+  Records `pid_start_time` automatically from `/proc/<pid>/stat` field 22.
+- `update_state(vm_id, |state| { ... })`: **Locked read-modify-write.** Loads current
+  on-disk state, applies the closure, writes back. Used by all post-startup writers
+  (health monitor, snapshot name recording) so concurrent updates are not clobbered.
+  Returns `Ok(None)` if the state file was deleted (no-op, cannot resurrect).
+- `delete_state()`: Acquires the per-VM flock, deletes the state file, then removes
+  the lock file. A concurrent `update_state` either completes before deletion or
+  finds no state file afterwards and becomes a no-op.
+- `update_health_status()`: Thin wrapper around `update_state` that sets
+  `health_status` and `exit_code`.
 
 ### Cleanup Architecture
 
@@ -1081,19 +1095,23 @@ On serve process exit (SIGTERM/SIGINT):
 
 **Problem**: State files persist when VMs crash (SIGKILL, test abort). When the OS reuses a PID, the old state file causes collisions when querying by PID.
 
-**Solution**: `StateManager::save_state()` automatically cleans up stale state files:
-- Before saving, checks if any OTHER state file claims the same PID
-- If found, that file is stale (the process is dead, PID was reused)
-- Deletes the stale file with a warning log
-- Then saves the new state
+**Solution — two layers of defense:**
 
-**Why it works**: If process A has PID 5000 and we're saving state for process B with PID 5000, process A must be dead (OS wouldn't reuse the PID otherwise). So A's state file is safe to delete.
+1. **PID start-time identity** (`pid_start_time` field): `save_state()` records the
+   process's start time from `/proc/<pid>/stat` (field 22, clock ticks since boot).
+   A (pid, start_time) pair uniquely identifies a process even after PID reuse.
+   `load_state_by_pid()` and `cleanup_stale_state()` verify this — if the process
+   at the recorded PID has a different start time, the state file is stale.
+
+2. **PID collision cleanup in `save_state()`**: Before saving, checks if any OTHER
+   state file claims the same PID. If found, that file is stale (process is dead,
+   PID was reused). Deletes the stale file with a warning log, then saves.
 
 **State file layout**: Individual files per VM, keyed by `vm_id` (UUID):
 ```
 /mnt/fcvm-btrfs/state/
-├── vm-abc123.json    # { vm_id: "vm-abc123", pid: 5000, ... }
-├── vm-def456.json    # { vm_id: "vm-def456", pid: 5001, ... }
+├── vm-abc123.json    # { vm_id: "vm-abc123", pid: 5000, pid_start_time: 12345, ... }
+├── vm-def456.json    # { vm_id: "vm-def456", pid: 5001, pid_start_time: 67890, ... }
 └── loopback-ip.lock  # Global lock for IP allocation
 ```
 
