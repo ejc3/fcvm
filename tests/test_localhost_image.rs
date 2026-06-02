@@ -38,6 +38,13 @@ async fn test_localhost_default_mode() -> Result<()> {
     run_localhost_test(None, "localhost-default").await
 }
 
+/// Unique image name for each test to avoid parallel podman build races.
+/// When multiple tests build the same tag concurrently, `podman save` can see
+/// a digest change mid-export, causing "image changed while it was being exported".
+fn image_name_for_suffix(suffix: &str) -> String {
+    format!("localhost/test-hello-{}", suffix)
+}
+
 async fn run_localhost_test(image_mode: Option<&str>, suffix: &str) -> Result<()> {
     run_localhost_test_with_kernel(image_mode, None, suffix).await
 }
@@ -48,6 +55,7 @@ async fn run_localhost_test_with_kernel(
     suffix: &str,
 ) -> Result<()> {
     let mode_label = image_mode.unwrap_or("default (auto-detect)");
+    let image_name = image_name_for_suffix(suffix);
 
     println!("\nLocalhost Image Test ({})", mode_label);
     println!("====================");
@@ -56,14 +64,14 @@ async fn run_localhost_test_with_kernel(
     let fcvm_path = common::find_fcvm_binary()?;
     let (vm_name, _, _, _) = common::unique_names(suffix);
 
-    // Step 1: Build a test container image on the host
-    println!("Step 1: Building test container image localhost/test-hello...");
-    build_test_image().await?;
+    // Step 1: Build a test container image on the host (unique per test to avoid parallel races)
+    println!("Step 1: Building test container image {}...", image_name);
+    build_test_image(&image_name).await?;
 
     // Step 2: Start VM with localhost image (rootless mode)
     println!(
-        "Step 2: Starting VM with localhost/test-hello image ({})...",
-        mode_label
+        "Step 2: Starting VM with {} image ({})...",
+        image_name, mode_label
     );
     let mut args = vec!["podman", "run", "--name", &vm_name];
     if let Some(mode) = image_mode {
@@ -74,7 +82,7 @@ async fn run_localhost_test_with_kernel(
         args.push("--kernel-profile");
         args.push(profile);
     }
-    args.push("localhost/test-hello");
+    args.push(&image_name);
 
     let mut child = tokio::process::Command::new(&fcvm_path)
         .args(&args)
@@ -167,8 +175,9 @@ async fn run_localhost_test_with_kernel(
     }
 }
 
-/// Build a simple test container image using podman
-async fn build_test_image() -> Result<()> {
+/// Build a simple test container image using podman with a unique tag.
+/// Each test uses its own image name to avoid races when tests run in parallel.
+async fn build_test_image(image_name: &str) -> Result<()> {
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -189,7 +198,7 @@ CMD ["echo", "Hello from localhost container!"]"#
         .args([
             "build",
             "-t",
-            "localhost/test-hello",
+            image_name,
             "-f",
             &containerfile_path.to_string_lossy(),
             temp_dir.path().to_str().unwrap(),
@@ -203,6 +212,6 @@ CMD ["echo", "Hello from localhost container!"]"#
         anyhow::bail!("Failed to build test image: {}", stderr);
     }
 
-    println!("  Built localhost/test-hello image");
+    println!("  Built {} image", image_name);
     Ok(())
 }
