@@ -14,6 +14,10 @@
 
 use std::io::{self, Read, Write};
 
+/// Maximum payload size for a single message (1MB, plenty for TTY data).
+/// This prevents DoS via large length values.
+const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
+
 /// Message types for the TTY exec protocol
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,20 +102,7 @@ impl Message {
         // Read length (4 bytes big-endian)
         let mut len_buf = [0u8; 4];
         reader.read_exact(&mut len_buf)?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-
-        // Sanity check: limit message size to 1MB (plenty for TTY data)
-        // This prevents DoS via large length values
-        const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
-        if len > MAX_MESSAGE_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "message too large: {} bytes (max {})",
-                    len, MAX_MESSAGE_SIZE
-                ),
-            ));
-        }
+        let len = validate_len(u32::from_be_bytes(len_buf))?;
 
         // Read payload progressively to avoid allocating large buffers upfront
         // This prevents memory exhaustion if sender disconnects mid-transfer
@@ -126,7 +117,46 @@ impl Message {
             remaining -= to_read;
         }
 
-        // Parse based on type
+        Self::from_parts(msg_type, payload)
+    }
+
+    /// Read a message from an async reader using the binary protocol.
+    ///
+    /// Async equivalent of [`Message::read_from`], for bridging the framed
+    /// exec stream into async contexts (e.g. WebSocket terminal sessions).
+    pub async fn read_from_async<R>(reader: &mut R) -> io::Result<Self>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+
+        // Read type byte
+        let mut type_buf = [0u8; 1];
+        reader.read_exact(&mut type_buf).await?;
+        let msg_type = MessageType::from_u8(type_buf[0])?;
+
+        // Read length (4 bytes big-endian)
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf).await?;
+        let len = validate_len(u32::from_be_bytes(len_buf))?;
+
+        // Read payload progressively to avoid allocating large buffers upfront
+        let mut payload = Vec::with_capacity(len.min(64 * 1024)); // Start with at most 64KB
+        let mut remaining = len;
+        let mut chunk = [0u8; 8192]; // Read in 8KB chunks
+
+        while remaining > 0 {
+            let to_read = remaining.min(chunk.len());
+            reader.read_exact(&mut chunk[..to_read]).await?;
+            payload.extend_from_slice(&chunk[..to_read]);
+            remaining -= to_read;
+        }
+
+        Self::from_parts(msg_type, payload)
+    }
+
+    /// Build a message from its decoded type byte and payload.
+    fn from_parts(msg_type: MessageType, payload: Vec<u8>) -> io::Result<Self> {
         match msg_type {
             MessageType::Data => Ok(Message::Data(payload)),
             MessageType::Exit => {
@@ -148,6 +178,21 @@ impl Message {
             MessageType::Stdin => Ok(Message::Stdin(payload)),
         }
     }
+}
+
+/// Validate a payload length against the maximum message size.
+fn validate_len(len: u32) -> io::Result<usize> {
+    let len = len as usize;
+    if len > MAX_MESSAGE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "message too large: {} bytes (max {})",
+                len, MAX_MESSAGE_SIZE
+            ),
+        ));
+    }
+    Ok(len)
 }
 
 /// Write a Data message directly (convenience function for high-frequency writes)
@@ -278,5 +323,56 @@ mod tests {
             Message::Data(data) => assert_eq!(data, binary),
             _ => panic!("wrong message type"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_async_read_decodes_data_then_exit() {
+        // Stream as written by the guest: terminal output frames followed by Exit
+        let mut buf = Vec::new();
+        write_data(&mut buf, b"terminal output").unwrap();
+        write_exit(&mut buf, 3).unwrap();
+
+        let mut reader = buf.as_slice();
+        match Message::read_from_async(&mut reader).await.unwrap() {
+            Message::Data(data) => assert_eq!(data, b"terminal output"),
+            other => panic!("expected Data, got {:?}", other),
+        }
+        match Message::read_from_async(&mut reader).await.unwrap() {
+            Message::Exit(code) => assert_eq!(code, 3),
+            other => panic!("expected Exit(3), got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_async_read_error_message() {
+        let mut buf = Vec::new();
+        write_error(&mut buf, "spawn failed").unwrap();
+
+        let mut reader = buf.as_slice();
+        match Message::read_from_async(&mut reader).await.unwrap() {
+            Message::Error(msg) => assert_eq!(msg, "spawn failed"),
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_async_read_eof() {
+        let mut reader: &[u8] = &[];
+        let err = Message::read_from_async(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn test_async_read_truncated_frame() {
+        // Frame header claims 16 bytes but the stream ends after 4, as if
+        // the connection dropped mid-message.
+        let mut buf = Vec::new();
+        buf.push(MessageType::Data as u8);
+        buf.extend_from_slice(&16u32.to_be_bytes());
+        buf.extend_from_slice(b"oops");
+
+        let mut reader = buf.as_slice();
+        let err = Message::read_from_async(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

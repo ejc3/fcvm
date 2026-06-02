@@ -140,6 +140,9 @@ pub fn connect_to_exec_server_with_retry(vsock_socket: &Path) -> Result<UnixStre
 /// For CLI use, see `cmd_exec`.
 ///
 /// Returns the command's exit code.
+///
+/// The blocking vsock I/O is offloaded to a blocking thread pool so this
+/// function is safe to call from async contexts without starving the runtime.
 pub async fn run_exec_in_vm(
     vsock_socket: &Path,
     command: &[String],
@@ -152,31 +155,38 @@ pub async fn run_exec_in_vm(
         "executing command in VM"
     );
 
-    // Connect to the exec server with retry logic
-    let mut stream = connect_to_exec_server_with_retry(vsock_socket)?;
+    let vsock_socket = vsock_socket.to_path_buf();
+    let command = command.to_vec();
 
-    // Long timeout — commands like phps cookie gen can take >10 min.
-    // Use 1 hour as a safety net against permanent hangs (not None/infinite).
-    stream.set_read_timeout(Some(Duration::from_secs(3600)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    tokio::task::spawn_blocking(move || {
+        // Connect to the exec server with retry logic
+        let mut stream = connect_to_exec_server_with_retry(&vsock_socket)?;
 
-    debug!("connected to guest exec server");
+        // Long timeout — commands like phps cookie gen can take >10 min.
+        // Use 1 hour as a safety net against permanent hangs (not None/infinite).
+        stream.set_read_timeout(Some(Duration::from_secs(3600)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
 
-    // Build the exec request (non-interactive, no TTY)
-    let request = ExecRequest {
-        command: command.to_vec(),
-        in_container,
-        interactive: false,
-        tty: false,
-    };
+        debug!("connected to guest exec server");
 
-    // Send request as JSON followed by newline
-    let request_json = serde_json::to_string(&request)?;
-    writeln!(stream, "{}", request_json)?;
-    stream.flush()?;
+        // Build the exec request (non-interactive, no TTY)
+        let request = ExecRequest {
+            command,
+            in_container,
+            interactive: false,
+            tty: false,
+        };
 
-    // Run in line mode and capture exit code
-    run_line_mode_with_exit_code(stream)
+        // Send request as JSON followed by newline
+        let request_json = serde_json::to_string(&request)?;
+        writeln!(stream, "{}", request_json)?;
+        stream.flush()?;
+
+        // Run in line mode and capture exit code
+        run_line_mode_with_exit_code(stream)
+    })
+    .await
+    .context("exec task panicked")?
 }
 
 pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
@@ -300,37 +310,49 @@ pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
     }
 }
 
-/// Run in line-buffered mode (non-TTY), returns exit code
-fn run_line_mode_with_exit_code(stream: UnixStream) -> Result<i32> {
-    let reader = BufReader::new(stream);
-    let mut exit_code = 0i32;
-
+/// Read JSON-line exec responses until an Exit (or Error) message arrives.
+///
+/// Stdout/stderr payloads are passed to the provided callbacks. Returns the
+/// command's exit code (Error messages map to exit code 1).
+///
+/// If the stream ends before an Exit message is received (fc-agent crash, VM
+/// reboot, vsock reset), the command's outcome is unknown, so this returns an
+/// error rather than reporting success.
+fn read_exec_responses<R: BufRead>(
+    reader: R,
+    mut on_stdout: impl FnMut(&str),
+    mut on_stderr: impl FnMut(&str),
+) -> Result<i32> {
     for line in reader.lines() {
         let line = line.context("reading from exec socket")?;
 
-        // Parse the line as JSON
-        if let Ok(response) = serde_json::from_str::<ExecResponse>(&line) {
-            match response {
-                ExecResponse::Stdout(data) => {
-                    print!("{}", data);
-                }
-                ExecResponse::Stderr(data) => {
-                    eprint!("{}", data);
-                }
-                ExecResponse::Exit(code) => {
-                    exit_code = code;
-                    break;
-                }
-                ExecResponse::Error(msg) => {
-                    eprintln!("Error: {}", msg);
-                    exit_code = 1;
-                    break;
-                }
+        // Parse the line as JSON; skip lines that aren't valid responses
+        let Ok(response) = serde_json::from_str::<ExecResponse>(&line) else {
+            continue;
+        };
+
+        match response {
+            ExecResponse::Stdout(data) => on_stdout(&data),
+            ExecResponse::Stderr(data) => on_stderr(&data),
+            ExecResponse::Exit(code) => return Ok(code),
+            ExecResponse::Error(msg) => {
+                on_stderr(&format!("Error: {}\n", msg));
+                return Ok(1);
             }
         }
     }
 
-    Ok(exit_code)
+    bail!("exec connection closed before an exit status was received")
+}
+
+/// Run in line-buffered mode (non-TTY), returns exit code
+fn run_line_mode_with_exit_code(stream: UnixStream) -> Result<i32> {
+    let reader = BufReader::new(stream);
+    read_exec_responses(
+        reader,
+        |data| print!("{}", data),
+        |data| eprint!("{}", data),
+    )
 }
 
 /// Run in line-buffered mode (non-TTY)
@@ -423,27 +445,11 @@ pub async fn run_exec_in_vm_captured(
         let reader = BufReader::new(stream);
         let mut stdout = String::new();
         let mut stderr = String::new();
-        let mut exit_code = 0i32;
-
-        for line in reader.lines() {
-            let line = line.context("reading from exec socket")?;
-
-            if let Ok(response) = serde_json::from_str::<ExecResponse>(&line) {
-                match response {
-                    ExecResponse::Stdout(data) => stdout.push_str(&data),
-                    ExecResponse::Stderr(data) => stderr.push_str(&data),
-                    ExecResponse::Exit(code) => {
-                        exit_code = code;
-                        break;
-                    }
-                    ExecResponse::Error(msg) => {
-                        stderr.push_str(&format!("Error: {}\n", msg));
-                        exit_code = 1;
-                        break;
-                    }
-                }
-            }
-        }
+        let exit_code = read_exec_responses(
+            reader,
+            |data| stdout.push_str(data),
+            |data| stderr.push_str(data),
+        )?;
 
         Ok(ExecOutput {
             stdout,
@@ -469,4 +475,71 @@ pub async fn connect_to_exec_server_async(vsock_socket: &Path) -> Result<tokio::
             .context("connect task panicked")??;
     std_stream.set_nonblocking(true)?;
     tokio::net::UnixStream::from_std(std_stream).context("converting to tokio UnixStream")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response_line(response: &ExecResponse) -> String {
+        format!("{}\n", serde_json::to_string(response).unwrap())
+    }
+
+    #[test]
+    fn read_exec_responses_returns_exit_code() {
+        let mut input = String::new();
+        input.push_str(&response_line(&ExecResponse::Stdout("hello\n".into())));
+        input.push_str(&response_line(&ExecResponse::Stderr("warning\n".into())));
+        input.push_str(&response_line(&ExecResponse::Exit(7)));
+
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let code = read_exec_responses(
+            input.as_bytes(),
+            |d| stdout.push_str(d),
+            |d| stderr.push_str(d),
+        )
+        .unwrap();
+
+        assert_eq!(code, 7);
+        assert_eq!(stdout, "hello\n");
+        assert_eq!(stderr, "warning\n");
+    }
+
+    #[test]
+    fn read_exec_responses_error_message_yields_exit_one() {
+        let input = response_line(&ExecResponse::Error("spawn failed".into()));
+
+        let mut stderr = String::new();
+        let code = read_exec_responses(input.as_bytes(), |_| {}, |d| stderr.push_str(d)).unwrap();
+
+        assert_eq!(code, 1);
+        assert_eq!(stderr, "Error: spawn failed\n");
+    }
+
+    #[test]
+    fn read_exec_responses_eof_without_exit_is_an_error() {
+        // Connection dropped after some output but before the Exit message:
+        // the command's outcome is unknown, so this must not report success.
+        let input = response_line(&ExecResponse::Stdout("partial output\n".into()));
+
+        let err = read_exec_responses(input.as_bytes(), |_| {}, |_| {}).unwrap_err();
+        assert!(
+            err.to_string().contains("before an exit status"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_exec_responses_truncated_final_line_is_an_error() {
+        // A connection drop mid-message leaves a partial JSON line and no Exit.
+        let mut input = response_line(&ExecResponse::Stdout("ok\n".into()));
+        input.push_str("{\"type\":\"exit\",\"da");
+
+        let err = read_exec_responses(input.as_bytes(), |_| {}, |_| {}).unwrap_err();
+        assert!(
+            err.to_string().contains("before an exit status"),
+            "unexpected error: {err}"
+        );
+    }
 }
