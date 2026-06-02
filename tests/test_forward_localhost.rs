@@ -22,10 +22,14 @@ fn spawn_host_server() -> Result<(u16, std::thread::JoinHandle<bool>)> {
     // Accept one connection in background (with timeout)
     let accept_handle = std::thread::spawn(move || -> bool {
         listener.set_nonblocking(false).expect("set_nonblocking");
-        // 45s accept timeout (must exceed nc timeout inside VM)
+        // Accept timeout must cover a full cold VM boot plus image export under
+        // parallel CI load (minutes, see the 600s nextest slow-timeout) and nc's
+        // 30s timeout — not just nc. If it expires the listener closes and the
+        // relay's later connect is refused, failing the test even though
+        // forwarding works.
         unsafe {
             let tv = libc::timeval {
-                tv_sec: 45,
+                tv_sec: 570,
                 tv_usec: 0,
             };
             libc::setsockopt(
