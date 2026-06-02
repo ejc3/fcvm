@@ -25,7 +25,12 @@ pub struct VmContext {
     pub health_monitor_handle: tokio::task::JoinHandle<()>,
     pub status_handle: tokio::task::JoinHandle<()>,
     pub tty_handle: Option<std::thread::JoinHandle<Result<i32>>>,
+    /// Host-side Unix socket path for the TTY vsock port (set when running with -t).
+    /// Used to unblock the TTY accept thread if the guest never connected.
+    pub tty_socket_path: Option<String>,
     pub output_handle: Option<tokio::task::JoinHandle<Vec<(String, String)>>>,
+    /// Egress proxy task (rootless mode only); aborted during cleanup.
+    pub egress_proxy_handle: Option<tokio::task::JoinHandle<()>>,
     pub cache_rx: Option<mpsc::Receiver<CacheRequest>>,
     pub startup_rx: Option<oneshot::Receiver<()>>,
     pub snapshot_key: Option<String>,

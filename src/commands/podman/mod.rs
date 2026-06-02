@@ -128,6 +128,26 @@ pub async fn cmd_podman(args: PodmanArgs) -> Result<()> {
     }
 }
 
+/// Best-effort removal of host state persisted during a failed `prepare_vm`.
+///
+/// `prepare_vm` creates the per-VM data directory and (for rootless and routed modes
+/// with published ports) persists the VM state file with an allocated loopback IP
+/// before the VM is fully set up. When setup fails partway, remove both so failed
+/// runs don't leave phantom `fcvm ls` entries, allocated loopback IPs, or per-VM
+/// disk directories behind.
+async fn cleanup_failed_prepare(
+    state_manager: &StateManager,
+    vm_id: &str,
+    data_dir: &std::path::Path,
+) {
+    if let Err(e) = state_manager.delete_state(vm_id).await {
+        warn!(vm_id = %vm_id, error = %e, "failed to delete VM state after setup error");
+    }
+    if let Err(e) = tokio::fs::remove_dir_all(data_dir).await {
+        warn!(vm_id = %vm_id, error = %e, "failed to remove VM data directory after setup error");
+    }
+}
+
 pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     info!("Starting fcvm podman run");
 
@@ -712,6 +732,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                     cleanup_err
                 );
             }
+            cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
             return Err(e);
         }
     };
@@ -733,6 +754,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                     cleanup_err
                 );
             }
+            cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
             return Err(e);
         }
         vsock_dir.join("vsock.sock")
@@ -767,6 +789,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                     cleanup_err
                 );
             }
+            cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
             return Err(e);
         }
     };
@@ -938,6 +961,9 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 cleanup_err
             );
         }
+
+        // Remove the persisted state file and per-VM data directory
+        cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
         return Err(e);
     }
 
@@ -973,7 +999,9 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         health_monitor_handle,
         status_handle,
         tty_handle,
+        tty_socket_path: tty_mode.then_some(tty_socket_path),
         output_handle,
+        egress_proxy_handle,
         cache_rx,
         startup_rx,
         snapshot_key,
@@ -996,6 +1024,50 @@ fn resolve_username(uid: u32) -> String {
     }
 }
 
+/// Join the TTY session thread after the VM has exited, with a bounded wait.
+///
+/// The TTY thread may still be blocked in `accept()` if the guest never connected
+/// (boot or fc-agent failure before the TTY attach). Connect to the listener from the
+/// host side to unblock it, then join via `spawn_blocking` with a timeout so a wedged
+/// thread can never hang shutdown.
+async fn join_tty_session(
+    handle: std::thread::JoinHandle<Result<i32>>,
+    tty_socket_path: Option<String>,
+) -> Option<i32> {
+    if let Some(socket_path) = tty_socket_path {
+        let _ = std::os::unix::net::UnixStream::connect(&socket_path);
+    }
+    let join = tokio::task::spawn_blocking(move || handle.join().ok().and_then(|r| r.ok()));
+    match tokio::time::timeout(std::time::Duration::from_secs(10), join).await {
+        Ok(Ok(code)) => code,
+        Ok(Err(e)) => {
+            warn!(error = %e, "failed to join TTY session thread");
+            None
+        }
+        Err(_) => {
+            warn!("timed out waiting for TTY session thread");
+            None
+        }
+    }
+}
+
+/// Read the container exit code recorded by the status listener after VM exit.
+///
+/// The exit notification stays buffered in the host-side unix socket even after
+/// Firecracker exits, but the listener task may not have processed it yet when the VM
+/// exit is observed — give it a bounded window to finish before reading the file.
+async fn read_container_exit_code(ctx: &mut VmContext) -> Option<i32> {
+    let drain_window = std::time::Duration::from_secs(5);
+    let drained = tokio::time::timeout(drain_window, &mut ctx.status_handle).await;
+    if drained.is_err() {
+        warn!("status listener still running 5s after VM exit");
+    }
+    let exit_file = ctx.data_dir.join("container-exit");
+    std::fs::read_to_string(&exit_file)
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+}
+
 /// Event loop: waits for VM exit, cancellation, or snapshot requests.
 /// Returns the container exit code (None if cancelled/signalled).
 pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Result<Option<i32>> {
@@ -1007,18 +1079,23 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
             }
             status = ctx.vm_manager.wait() => {
                 info!(status = ?status, "VM exited");
-                if let Some(handle) = ctx.tty_handle.take() {
-                    let exit_code = handle.join().ok().and_then(|r| r.ok());
+                let exit_code = if let Some(handle) = ctx.tty_handle.take() {
+                    let socket_path = ctx.tty_socket_path.take();
+                    let exit_code = join_tty_session(handle, socket_path).await;
                     info!(container_exit_code = ?exit_code, "TTY container exit code");
-                    return Ok(exit_code);
+                    exit_code
                 } else {
-                    let exit_file = ctx.data_dir.join("container-exit");
-                    let exit_code = std::fs::read_to_string(&exit_file)
-                        .ok()
-                        .and_then(|s| s.trim().parse::<i32>().ok());
+                    let exit_code = read_container_exit_code(ctx).await;
                     info!(container_exit_code = ?exit_code, "container exit code");
-                    return Ok(exit_code);
-                }
+                    exit_code
+                };
+                let Some(code) = exit_code else {
+                    // No exit code means the guest never reported the container's
+                    // result (boot failure, fc-agent crash, or lost vsock
+                    // notification). Fail instead of silently reporting success.
+                    bail!("VM exited without reporting a container exit code");
+                };
+                return Ok(Some(code));
             }
             // Handle cache creation requests from fc-agent
             Some(cache_request) = async {
@@ -1142,6 +1219,11 @@ pub async fn cleanup_vm_context(mut ctx: VmContext) {
     // Cancel status listener (podman-specific)
     ctx.status_handle.abort();
 
+    // Stop the egress proxy task (rootless mode only)
+    if let Some(handle) = ctx.egress_proxy_handle.take() {
+        handle.abort();
+    }
+
     // Cleanup NFS exports
     cleanup_nfs_exports(&ctx.vm_id).await;
 
@@ -1166,11 +1248,11 @@ pub async fn cleanup_vm_context(mut ctx: VmContext) {
 
 /// CLI entrypoint for `fcvm podman run`. Thin wrapper around prepare_vm/run_vm_loop/cleanup.
 async fn cmd_podman_run(args: RunArgs) -> Result<()> {
-    let Some(mut ctx) = prepare_vm(args).await? else {
-        return Ok(()); // Snapshot cache hit, already handled
-    };
-
-    // Setup signal handlers → cancellation token
+    // Setup signal handlers → cancellation token.
+    // Installed before prepare_vm so a SIGTERM/SIGINT during the (potentially long)
+    // setup phase is recorded instead of killing the process and leaving host network
+    // state, the persisted VM state file, and the data directory behind. Shutdown is
+    // deferred until setup finishes, then full cleanup runs below.
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
     tokio::spawn(async move {
@@ -1183,11 +1265,24 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         cancel_clone.cancel();
     });
 
-    let exit_code = run_vm_loop(&mut ctx, cancel).await?;
+    let Some(mut ctx) = prepare_vm(args).await? else {
+        return Ok(()); // Snapshot cache hit, already handled
+    };
+
+    // A signal may have arrived while setup was still running — clean up and exit
+    // instead of entering the run loop.
+    if cancel.is_cancelled() {
+        info!("shutdown requested during VM setup, cleaning up");
+        cleanup_vm_context(ctx).await;
+        return Ok(());
+    }
+
+    // Run the VM loop, then always clean up — even when the loop reports an error.
+    let result = run_vm_loop(&mut ctx, cancel).await;
     cleanup_vm_context(ctx).await;
 
-    // Return error if container exited with non-zero exit code
-    if let Some(code) = exit_code {
+    // Propagate a missing exit code as an error and a non-zero exit code as a failure
+    if let Some(code) = result? {
         if code != 0 {
             bail!("container exited with code {}", code);
         }
@@ -1296,5 +1391,42 @@ mod tests {
         args.image_mode = Some(CliImageMode::Btrfs);
 
         assert_eq!(resolve_image_mode(&args), ImageMode::Btrfs);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_failed_prepare_removes_state_and_data_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let data_dir = temp.path().join("vm-data");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        tokio::fs::write(data_dir.join("firecracker.log"), "log")
+            .await
+            .unwrap();
+
+        let state_manager = StateManager::new(state_dir.clone());
+        state_manager.init().await.unwrap();
+        let vm_state = VmState::new(
+            "vm-test-cleanup".to_string(),
+            "alpine:latest".to_string(),
+            1,
+            512,
+        );
+        state_manager.save_state(&vm_state).await.unwrap();
+        assert!(state_dir.join("vm-test-cleanup.json").exists());
+
+        cleanup_failed_prepare(&state_manager, "vm-test-cleanup", &data_dir).await;
+
+        assert!(
+            !state_dir.join("vm-test-cleanup.json").exists(),
+            "state file should be removed after a failed prepare"
+        );
+        assert!(
+            !data_dir.exists(),
+            "data dir should be removed after a failed prepare"
+        );
+
+        // Error paths can run before any state was persisted — calling the helper
+        // again with nothing left to remove must not panic.
+        cleanup_failed_prepare(&state_manager, "vm-test-cleanup", &data_dir).await;
     }
 }
