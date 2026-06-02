@@ -1044,7 +1044,14 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         SnapshotOutcome::Created => {
                             info!(snapshot_key = %key, "Pre-start snapshot created successfully");
                             ctx.vm_state.config.snapshot_name = Some(key.clone());
-                            let _ = ctx.state_manager.save_state(&ctx.vm_state).await;
+                            // Locked read-modify-write: only update snapshot_name so the
+                            // health monitor's concurrent writes are not clobbered.
+                            let _ = ctx
+                                .state_manager
+                                .update_state(&ctx.vm_state.vm_id, |state| {
+                                    state.config.snapshot_name = Some(key.clone());
+                                })
+                                .await;
                         }
                         SnapshotOutcome::Failed(e) => {
                             warn!(snapshot_key = %key, error = %e, "Failed to create pre-start snapshot");
@@ -1100,7 +1107,15 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                                     SnapshotOutcome::Created => {
                                         info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
                                         ctx.vm_state.config.snapshot_name = Some(startup_key.clone());
-                                        let _ = ctx.state_manager.save_state(&ctx.vm_state).await;
+                                        // Locked read-modify-write: only update snapshot_name so the
+                                        // health monitor's concurrent writes are not clobbered.
+                                        let _ = ctx
+                                            .state_manager
+                                            .update_state(&ctx.vm_state.vm_id, |state| {
+                                                state.config.snapshot_name =
+                                                    Some(startup_key.clone());
+                                            })
+                                            .await;
                                     }
                                     SnapshotOutcome::Failed(e) => {
                                         warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");

@@ -20,6 +20,33 @@ fn open_lock_file(path: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 
+/// Read the start time of a process in clock ticks since boot (field 22 of
+/// /proc/<pid>/stat). Returns None if the process doesn't exist or the field
+/// can't be parsed.
+///
+/// Used as a process identity check: a (pid, start_time) pair uniquely
+/// identifies a process even after the OS reuses the PID for something else.
+fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // The comm field (field 2) may contain spaces and parentheses; everything
+    // after the last ')' is space-separated starting at field 3 (state), so
+    // starttime (field 22) is the 20th token after the closing paren.
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Check whether the process recorded in a state file is still the same
+/// process that wrote it. Returns false when the state records a start time
+/// and the process currently at that PID has a different one (PID reuse by an
+/// unrelated process). States without a recorded start time fall back to a
+/// PID-only match.
+fn pid_identity_matches(state: &VmState) -> bool {
+    match (state.pid, state.pid_start_time) {
+        (Some(pid), Some(recorded)) => process_start_time(pid) == Some(recorded),
+        _ => true,
+    }
+}
+
 /// Manages VM state persistence
 ///
 /// PID Tracking Note:
@@ -45,6 +72,12 @@ impl StateManager {
 
     /// Save VM state atomically (write to temp file, then rename)
     /// Uses file locking to prevent concurrent writes
+    ///
+    /// This overwrites the entire state file with the caller's copy. It is
+    /// intended for initial creation and for saves where the in-memory state
+    /// is authoritative (single writer). To change individual fields after the
+    /// VM is running (when the health monitor or another process may also be
+    /// writing), use `update_state` so concurrent updates are not clobbered.
     ///
     /// If another state file claims our PID, it's stale (that process is dead
     /// and its PID was reused by the OS). We delete it to prevent collisions
@@ -97,6 +130,9 @@ impl StateManager {
             // Update last_updated timestamp before saving
             let mut state = state.clone();
             state.last_updated = chrono::Utc::now();
+            // Record the start time of the process at `pid` so later lookups
+            // can detect PID reuse by an unrelated process (see pid_identity_matches).
+            state.pid_start_time = state.pid.and_then(process_start_time);
 
             let state_json = serde_json::to_string_pretty(&state)?;
 
@@ -152,6 +188,13 @@ impl StateManager {
     }
 
     /// Delete VM state and associated lock/temp files
+    ///
+    /// Holds the same per-VM lock used by `save_state`/`update_state` while
+    /// removing the state file. A concurrent locked read-modify-write (e.g.
+    /// the health monitor's `update_health_status`) therefore either completes
+    /// before the deletion (and its result is removed), or acquires the lock
+    /// afterwards, finds no state file, and becomes a no-op — it can never
+    /// resurrect the state file of a deleted VM.
     pub async fn delete_state(&self, vm_id: &str) -> Result<()> {
         let state_file = self.state_dir.join(format!("{}.json", vm_id));
         let lock_file = self.state_dir.join(format!("{}.json.lock", vm_id));
@@ -163,32 +206,55 @@ impl StateManager {
             "delete_state: deleting state file"
         );
 
-        // Delete state file - ignore NotFound (TOCTOU race / concurrent cleanup)
-        match fs::remove_file(&state_file).await {
-            Ok(()) => {
-                tracing::debug!(
-                    vm_id = vm_id,
-                    path = %state_file.display(),
-                    "delete_state: successfully deleted state file"
-                );
+        // Acquire the per-VM lock so deletion is serialized against in-flight
+        // locked writes (save_state / update_state / update_health_status).
+        let lock_fd = open_lock_file(&lock_file).context("opening lock file for state delete")?;
+        use nix::fcntl::{Flock, FlockArg};
+        let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
+            .map_err(|(_, err)| err)
+            .context("acquiring exclusive lock for state delete")?;
+
+        let result = async {
+            // Delete state file - ignore NotFound (concurrent cleanup)
+            match fs::remove_file(&state_file).await {
+                Ok(()) => {
+                    tracing::debug!(
+                        vm_id = vm_id,
+                        path = %state_file.display(),
+                        "delete_state: successfully deleted state file"
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::debug!(
+                        vm_id = vm_id,
+                        path = %state_file.display(),
+                        "delete_state: state file already gone (NotFound)"
+                    );
+                }
+                Err(e) => return Err(e).context("deleting VM state"),
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tracing::debug!(
-                    vm_id = vm_id,
-                    path = %state_file.display(),
-                    "delete_state: state file already gone (NotFound)"
-                );
-            }
-            Err(e) => return Err(e).context("deleting VM state"),
+
+            // Clean up temp file while still holding the lock (ignore errors - may not exist)
+            let _ = fs::remove_file(&temp_file).await;
+
+            Ok(())
+        }
+        .await;
+
+        flock
+            .unlock()
+            .map_err(|(_, err)| err)
+            .context("releasing lock after state delete")?;
+
+        // Remove the lock file only after the state file is gone. A writer that
+        // creates a fresh lock file after this point finds no state file and
+        // does nothing (update_state treats a missing file as a no-op), so
+        // there is no window where two lock-file inodes guard live state.
+        if result.is_ok() {
+            let _ = fs::remove_file(&lock_file).await;
         }
 
-        // Clean up lock file (ignore errors - may not exist or be held by another process)
-        let _ = fs::remove_file(&lock_file).await;
-
-        // Clean up temp file (ignore errors - may not exist)
-        let _ = fs::remove_file(&temp_file).await;
-
-        Ok(())
+        result
     }
 
     /// Clean up stale state files from processes that no longer exist.
@@ -229,20 +295,33 @@ impl StateManager {
                             let proc_path = format!("/proc/{}", pid);
                             let proc_exists = std::path::Path::new(&proc_path).exists();
 
+                            // Even if /proc/<pid> exists, the PID may have been
+                            // reused by an unrelated process. Compare the recorded
+                            // process start time (if any) with the current one.
+                            let recorded_start_time =
+                                state.get("pid_start_time").and_then(|t| t.as_u64());
+                            let identity_matches = match recorded_start_time {
+                                Some(recorded) => process_start_time(pid as u32) == Some(recorded),
+                                None => true,
+                            };
+
                             examined += 1;
                             tracing::trace!(
                                 pid = pid,
                                 path = %path.display(),
                                 proc_exists = proc_exists,
+                                identity_matches = identity_matches,
                                 "cleanup_stale_state: examined state file"
                             );
 
-                            if !proc_exists {
-                                // Process doesn't exist - remove stale state
+                            if !proc_exists || !identity_matches {
+                                // Process doesn't exist (or PID was reused by an
+                                // unrelated process) - remove stale state
                                 tracing::warn!(
                                     pid = pid,
                                     path = %path.display(),
-                                    "cleanup_stale_state: removing state file for dead process"
+                                    proc_exists = proc_exists,
+                                    "cleanup_stale_state: removing state file for dead or replaced process"
                                 );
                                 let _ = std::fs::remove_file(&path);
                                 // Also remove lock file if exists
@@ -317,7 +396,14 @@ impl StateManager {
             );
         }
 
-        if let Some(vm) = vms.into_iter().find(|vm| vm.pid == Some(pid)) {
+        // A state file matching the PID is only trusted if the process at that
+        // PID is still the process that wrote it (start time matches). A stale
+        // file whose PID was reused by an unrelated process is skipped here and
+        // removed by cleanup_stale_state below.
+        if let Some(vm) = vms
+            .into_iter()
+            .find(|vm| vm.pid == Some(pid) && pid_identity_matches(vm))
+        {
             tracing::debug!(
                 pid = pid,
                 vm_id = %vm.vm_id,
@@ -327,14 +413,17 @@ impl StateManager {
             return Ok(vm);
         }
 
-        // PID not found. Clean stale state files (dead PIDs) and retry once.
-        // Stale files from killed VMs can shadow the target if the stale PID
-        // was reused by the OS — save_state deletes the collision, but
-        // cleanup_stale_state handles the general case.
+        // PID not found. Clean stale state files (dead or replaced PIDs) and
+        // retry once. Stale files from killed VMs can shadow the target if the
+        // stale PID was reused by the OS — save_state deletes the collision,
+        // but cleanup_stale_state handles the general case.
         self.cleanup_stale_state().await;
         let vms = self.list_vms().await?;
         let available_pids: Vec<u32> = vms.iter().filter_map(|v| v.pid).collect();
-        if let Some(vm) = vms.into_iter().find(|vm| vm.pid == Some(pid)) {
+        if let Some(vm) = vms
+            .into_iter()
+            .find(|vm| vm.pid == Some(pid) && pid_identity_matches(vm))
+        {
             tracing::debug!(
                 pid = pid,
                 vm_id = %vm.vm_id,
@@ -418,61 +507,74 @@ impl StateManager {
         Ok(vms)
     }
 
-    /// Update health status atomically by holding lock across read-modify-write.
+    /// Update VM state atomically by holding the per-VM lock across read-modify-write.
     ///
-    /// This prevents the race condition where concurrent health monitor updates
-    /// could overwrite each other's changes. The lock is held from load through save.
+    /// Loads the current on-disk state, applies `mutate`, and writes the result
+    /// back while holding the per-VM flock for the entire operation. This is the
+    /// safe way to change individual fields once a VM is running: a whole-state
+    /// `save_state` from a stale in-memory copy would silently revert fields
+    /// written by other tasks/processes (e.g. the health monitor) in the meantime.
     ///
-    /// # Arguments
-    /// * `vm_id` - VM identifier
-    /// * `health_status` - New health status to set
-    /// * `exit_code` - Optional exit code (for Stopped status)
-    ///
-    /// # Returns
-    /// The previous health status before update, or None if state didn't exist
-    pub async fn update_health_status(
-        &self,
-        vm_id: &str,
-        health_status: super::HealthStatus,
-        exit_code: Option<i32>,
-    ) -> Result<Option<super::HealthStatus>> {
+    /// Returns `Ok(None)` without writing anything if the state file does not
+    /// exist (e.g. the VM was deleted concurrently by `delete_state`), so a
+    /// late update cannot resurrect a deleted VM's state file.
+    pub async fn update_state<F>(&self, vm_id: &str, mutate: F) -> Result<Option<VmState>>
+    where
+        F: FnOnce(&mut VmState),
+    {
         let state_file = self.state_dir.join(format!("{}.json", vm_id));
         let temp_file = self.state_dir.join(format!("{}.json.tmp", vm_id));
         let lock_file = self.state_dir.join(format!("{}.json.lock", vm_id));
 
+        // Fast path: if the state file is already gone (VM deleted), don't
+        // recreate a lock file just to discover that under the lock.
+        if !state_file.exists() {
+            tracing::debug!(
+                vm_id = vm_id,
+                path = %state_file.display(),
+                "update_state: state file does not exist, skipping update"
+            );
+            return Ok(None);
+        }
+
         // Create/open lock file for exclusive locking
-        let lock_fd = open_lock_file(&lock_file).context("opening lock file for health update")?;
+        let lock_fd = open_lock_file(&lock_file).context("opening lock file for state update")?;
 
         // Acquire exclusive lock (blocks if another process has lock)
         use nix::fcntl::{Flock, FlockArg};
         let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
             .map_err(|(_, err)| err)
-            .context("acquiring exclusive lock for health update")?;
+            .context("acquiring exclusive lock for state update")?;
 
         // CRITICAL: Hold lock across entire read-modify-write
-        let result: Result<Option<super::HealthStatus>> = async {
-            // Load current state
-            let state_json = fs::read_to_string(&state_file)
-                .await
-                .context("reading VM state for health update")?;
+        let result: Result<Option<VmState>> = async {
+            // Load current state. The file may have been deleted while we
+            // waited for the lock (delete_state holds the same lock) — treat
+            // that as "nothing to update" rather than recreating it.
+            let state_json = match fs::read_to_string(&state_file).await {
+                Ok(json) => json,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::debug!(
+                        vm_id = vm_id,
+                        path = %state_file.display(),
+                        "update_state: state file deleted concurrently, skipping update"
+                    );
+                    return Ok(None);
+                }
+                Err(e) => return Err(e).context("reading VM state for update"),
+            };
             let mut state: VmState =
-                serde_json::from_str(&state_json).context("parsing VM state for health update")?;
+                serde_json::from_str(&state_json).context("parsing VM state for update")?;
 
-            // Capture previous status
-            let previous_status = state.health_status;
-
-            // Modify state
-            state.health_status = health_status;
-            if exit_code.is_some() {
-                state.exit_code = exit_code;
-            }
+            // Apply caller's modification
+            mutate(&mut state);
             state.last_updated = chrono::Utc::now();
 
             // Write to temp file
             let state_json = serde_json::to_string_pretty(&state)?;
             fs::write(&temp_file, &state_json)
                 .await
-                .context("writing temp state file for health update")?;
+                .context("writing temp state file for update")?;
 
             // Set permissions (world-readable so non-root can list VMs)
             #[cfg(unix)]
@@ -487,9 +589,9 @@ impl StateManager {
             // Atomic rename
             fs::rename(&temp_file, &state_file)
                 .await
-                .context("renaming temp state file for health update")?;
+                .context("renaming temp state file for update")?;
 
-            Ok(Some(previous_status))
+            Ok(Some(state))
         }
         .await;
 
@@ -498,9 +600,40 @@ impl StateManager {
         flock
             .unlock()
             .map_err(|(_, err)| err)
-            .context("releasing lock after health update")?;
+            .context("releasing lock after state update")?;
 
         result
+    }
+
+    /// Update health status atomically by holding lock across read-modify-write.
+    ///
+    /// This prevents the race condition where concurrent health monitor updates
+    /// could overwrite each other's changes. The lock is held from load through save.
+    ///
+    /// # Arguments
+    /// * `vm_id` - VM identifier
+    /// * `health_status` - New health status to set
+    /// * `exit_code` - Optional exit code (for Stopped status)
+    ///
+    /// # Returns
+    /// The previous health status before update, or None if the state file no
+    /// longer exists (e.g. the VM was deleted concurrently — nothing is written).
+    pub async fn update_health_status(
+        &self,
+        vm_id: &str,
+        health_status: super::HealthStatus,
+        exit_code: Option<i32>,
+    ) -> Result<Option<super::HealthStatus>> {
+        let mut previous_status = None;
+        self.update_state(vm_id, |state| {
+            previous_status = Some(state.health_status);
+            state.health_status = health_status;
+            if exit_code.is_some() {
+                state.exit_code = exit_code;
+            }
+        })
+        .await?;
+        Ok(previous_status)
     }
 
     /// Allocate a unique loopback IP for rootless networking and persist it atomically

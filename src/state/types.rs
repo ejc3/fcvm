@@ -24,6 +24,13 @@ pub struct VmState {
     #[serde(default)]
     pub exit_code: Option<i32>,
     pub pid: Option<u32>,
+    /// Start time of the process recorded in `pid`, in clock ticks since boot
+    /// (field 22 of /proc/<pid>/stat). Recorded automatically by
+    /// `StateManager::save_state` and used to detect PID reuse: if the process
+    /// currently at `pid` has a different start time, the state file is stale
+    /// even though /proc/<pid> exists.
+    #[serde(default)]
+    pub pid_start_time: Option<u64>,
     /// Namespace holder PID for rootless networking (used for nsenter health checks)
     #[serde(default)]
     pub holder_pid: Option<u32>,
@@ -182,6 +189,7 @@ impl VmState {
             health_status: HealthStatus::Unknown,
             exit_code: None,
             pid: None,
+            pid_start_time: None,
             holder_pid: None,
             created_at: now,
             last_updated: now,
