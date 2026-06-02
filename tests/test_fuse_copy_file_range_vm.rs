@@ -141,8 +141,12 @@ echo "SUCCESS: copy_file_range works through FUSE!"
     common::spawn_log_consumer_with_logger(child.stdout.take(), "fuse-cfr", logger.clone());
     common::spawn_log_consumer_stderr_with_logger(child.stderr.take(), "fuse-cfr", logger.clone());
 
-    // Wait for completion (5 min timeout)
-    let timeout = std::time::Duration::from_secs(300);
+    // Wait for completion. This single budget covers the whole VM lifecycle (boot,
+    // pre-start snapshot pause, in-guest image/container startup, the test script,
+    // and shutdown), so keep it just under the 600s nextest slow-timeout for VM
+    // tests — under heavy parallel snapshot I/O the container start alone has been
+    // observed to take several minutes.
+    let timeout = std::time::Duration::from_secs(570);
     let result = tokio::time::timeout(timeout, child.wait()).await;
 
     // Cleanup
