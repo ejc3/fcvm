@@ -902,6 +902,8 @@ pub(super) async fn run_vm_setup(
                 health_check_url: args.health_check.clone(),
                 user: args.user.clone(),
                 forward_localhost: args.forward_localhost.clone(),
+                ipv6_prefix: args.ipv6_prefix.clone(),
+                portable_volumes: args.portable_volumes,
                 image_mode: super::resolve_image_mode(args),
                 rootfs_type: super::resolve_rootfs_type(args),
                 port_mappings,

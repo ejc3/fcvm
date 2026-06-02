@@ -1374,6 +1374,50 @@ pub async fn acquire_vm_snapshot_lock(disk_path: &Path) -> Result<std::fs::File>
     Ok(lock_file)
 }
 
+/// Acquire the per-snapshot directory lock (`<snapshot_dir>.lock`).
+///
+/// Creators take it exclusively while writing or atomically replacing a snapshot
+/// directory; restore paths take it shared so an in-flight restore never observes
+/// the directory mid-swap (mixing one generation's disk.raw with another
+/// generation's memory.bin/vmstate.bin) or mid-removal.
+pub async fn acquire_snapshot_dir_lock(
+    snapshot_dir: &Path,
+    exclusive: bool,
+) -> Result<std::fs::File> {
+    let lock_path = snapshot_dir.with_extension("lock");
+    let lock_file = std::fs::File::create(&lock_path)
+        .with_context(|| format!("creating snapshot lock: {}", lock_path.display()))?;
+    loop {
+        // Fully-qualified fs2 calls: std::fs::File now has inherent try_lock_*
+        // methods with a different error type, and inherent methods win over
+        // trait methods.
+        let result = if exclusive {
+            fs2::FileExt::try_lock_exclusive(&lock_file)
+        } else {
+            fs2::FileExt::try_lock_shared(&lock_file)
+        };
+        match result {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                debug!(lock = %lock_path.display(), "waiting for per-snapshot lock");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("acquiring per-snapshot lock: {}", e));
+            }
+        }
+    }
+    debug!(lock = %lock_path.display(), exclusive, "acquired per-snapshot lock");
+    Ok(lock_file)
+}
+
+/// Extra files to write into the snapshot directory before it is atomically finalized.
+///
+/// Returns (filename, contents) pairs. Invoked after the Firecracker snapshot is taken
+/// (and the VM resumed) so contents reflect host-side state at snapshot time — e.g.
+/// portable-volume inode tables.
+pub type SnapshotExtraFiles<'a> = Option<&'a (dyn Fn() -> Vec<(String, Vec<u8>)> + Send + Sync)>;
+
 /// Create a snapshot of the running VM.
 ///
 /// # Locking
@@ -1387,6 +1431,7 @@ pub async fn create_snapshot_core(
     mut snapshot_config: crate::storage::snapshot::SnapshotConfig,
     disk_path: &Path,
     parent_snapshot_dir: Option<&Path>,
+    extra_files: SnapshotExtraFiles<'_>,
 ) -> Result<()> {
     use crate::firecracker::api::{SnapshotCreate, VmState as ApiVmState};
 
@@ -1710,6 +1755,20 @@ pub async fn create_snapshot_core(
             bytes_merged = bytes_merged,
             "diff merge complete, building atomic update"
         );
+    }
+
+    // Write caller-provided extra files (e.g. portable-volume inode tables) into the
+    // temp directory BEFORE the atomic rename. A finalized snapshot (config.json present)
+    // must never be missing these files — clones would silently restore without them —
+    // so a write failure here fails the snapshot instead of being logged and ignored.
+    if let Some(extra_files) = extra_files {
+        for (filename, contents) in extra_files() {
+            let path = temp_snapshot_dir.join(&filename);
+            if let Err(e) = tokio::fs::write(&path, &contents).await {
+                let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+                return Err(e).with_context(|| format!("writing snapshot extra file {}", filename));
+            }
+        }
     }
 
     // Record parent snapshot for the diff chain.

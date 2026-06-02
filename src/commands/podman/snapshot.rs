@@ -38,7 +38,6 @@ pub struct CreateSnapshotParams<'a> {
     pub vm_state: &'a VmState,
     pub disk_path: &'a Path,
     pub volume_configs: &'a [VolumeConfig],
-    pub parent_snapshot_key: Option<&'a str>,
     /// RemapFs references for portable volumes — used to serialize inode tables at snapshot time.
     pub remap_refs: &'a [Option<std::sync::Arc<fuse_pipe::RemapFs<fuse_pipe::PassthroughFs>>>],
 }
@@ -51,8 +50,10 @@ pub struct CreateSnapshotParams<'a> {
 /// The snapshot is stored in snapshot_dir with snapshot_key as the name,
 /// making it accessible via `fcvm snapshot run --snapshot <snapshot_key>`.
 ///
-/// If `parent_snapshot_key` is provided, the parent's memory.bin will be copied
-/// (via reflink) as a base, enabling diff snapshots for new directories.
+/// The diff parent is resolved from the VM state file while the per-VM snapshot
+/// lock is held, so a concurrent `fcvm snapshot create` (which resets the KVM
+/// dirty bitmap and updates `snapshot_name`) can never leave us merging a diff
+/// onto a stale base.
 pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<()> {
     let CreateSnapshotParams {
         vm_manager,
@@ -60,32 +61,18 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
         vm_state,
         disk_path,
         volume_configs,
-        parent_snapshot_key,
-        remap_refs: _,
+        remap_refs,
     } = snap;
     // Snapshots stored in snapshot_dir with snapshot_key as name
     let snapshot_dir = paths::snapshot_dir().join(snapshot_key);
 
-    // Lock to prevent concurrent snapshot creation
-    let lock_path = snapshot_dir.with_extension("lock");
+    // Per-snapshot lock (exclusive): prevents concurrent creation of the same key
+    // and blocks restores of this snapshot while it is being (re)created.
     tokio::fs::create_dir_all(paths::snapshot_dir())
         .await
         .context("creating snapshot directory")?;
-
-    let lock_file = std::fs::File::create(&lock_path).context("creating snapshot lock file")?;
-
-    // Use try_lock in a loop so we yield to the async runtime and can be interrupted
-    use fs2::FileExt;
-    loop {
-        match lock_file.try_lock_exclusive() {
-            Ok(()) => break,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Lock is held by another process, yield and retry
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            Err(e) => return Err(anyhow::anyhow!("acquiring snapshot lock: {}", e)),
-        }
-    }
+    let _snapshot_lock =
+        crate::commands::common::acquire_snapshot_dir_lock(&snapshot_dir, true).await?;
 
     // Double-check after lock (another process might have created it)
     if snapshot_dir.join("config.json").exists() {
@@ -97,6 +84,25 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
 
     // Per-VM lock: serialize with external `fcvm snapshot create` calls.
     let _vm_lock = crate::commands::common::acquire_vm_snapshot_lock(disk_path).await?;
+
+    // Resolve the diff parent UNDER the per-VM lock by re-reading the state file.
+    // The lock contract requires this: another process may have created a snapshot
+    // (resetting the KVM dirty bitmap) and updated snapshot_name since the caller's
+    // in-memory copy of the state was taken. Using that stale parent would merge a
+    // diff covering only post-reset writes onto an older base, silently dropping
+    // every page dirtied in between.
+    let state_manager = crate::state::StateManager::new(paths::state_dir());
+    let parent_snapshot_key = match state_manager.load_state(&vm_state.vm_id).await {
+        Ok(state) => state.config.snapshot_name,
+        Err(e) => {
+            tracing::warn!(
+                vm_id = %vm_state.vm_id,
+                error = %e,
+                "could not re-read VM state under snapshot lock; creating full snapshot"
+            );
+            None
+        }
+    };
 
     // Get Firecracker client
     let client = vm_manager.client().context("VM not started")?;
@@ -113,36 +119,43 @@ pub async fn create_podman_snapshot(snap: &CreateSnapshotParams<'_>) -> Result<(
         extra_disks,
     );
 
+    // Inode tables for portable volumes are written into the temp (.creating) directory
+    // by create_snapshot_core BEFORE the atomic rename, so a finalized snapshot can never
+    // exist without them. They are loaded by clone VolumeServers via restore_from_table()
+    // to preserve inode numbering across snapshot/restore — eliminating the TTL glitch window.
+    let extra_files = || -> Vec<(String, Vec<u8>)> {
+        let mut files = Vec::new();
+        for (idx, remap_ref) in remap_refs.iter().enumerate() {
+            if let Some(remap) = remap_ref {
+                let port = volume_configs.get(idx).map(|c| c.port).unwrap_or(0);
+                let json = remap.serialize_table();
+                tracing::info!(
+                    port,
+                    bytes = json.len(),
+                    "serialized inode table for snapshot"
+                );
+                files.push((
+                    format!("volume-{}-inode-table.json", port),
+                    json.into_bytes(),
+                ));
+            }
+        }
+        files
+    };
+
     // Use shared core function for snapshot creation
     // If parent key provided, resolve to directory path
-    let parent_dir = parent_snapshot_key.map(|key| paths::snapshot_dir().join(key));
+    let parent_dir = parent_snapshot_key
+        .as_deref()
+        .map(|key| paths::snapshot_dir().join(key));
     crate::commands::common::create_snapshot_core(
         client,
         snapshot_config,
         disk_path,
         parent_dir.as_deref(),
+        Some(&extra_files),
     )
     .await?;
-
-    // Serialize inode tables for portable volumes into the snapshot directory.
-    // These are loaded by clone VolumeServers via restore_from_table() to preserve
-    // inode numbering across snapshot/restore — eliminating the TTL glitch window.
-    for (idx, remap_ref) in snap.remap_refs.iter().enumerate() {
-        if let Some(remap) = remap_ref {
-            let port = snap.volume_configs.get(idx).map(|c| c.port).unwrap_or(0);
-            let json = remap.serialize_table();
-            let table_path = snapshot_dir.join(format!("volume-{}-inode-table.json", port));
-            if let Err(e) = tokio::fs::write(&table_path, &json).await {
-                tracing::warn!(port, error = %e, "failed to serialize inode table");
-            } else {
-                tracing::info!(
-                    port,
-                    bytes = json.len(),
-                    "serialized inode table to snapshot"
-                );
-            }
-        }
-    }
 
     Ok(())
 }
@@ -260,6 +273,8 @@ pub(super) fn build_firecracker_config(
         image_mode,
         non_blocking_output: args.non_blocking_output,
         rootfs_type: super::resolve_rootfs_type(args),
+        ipv6_prefix: args.ipv6_prefix.clone(),
+        portable_volumes: args.portable_volumes,
         firecracker_bin: firecracker_bin.map(|p| p.to_path_buf()),
     }
 }
