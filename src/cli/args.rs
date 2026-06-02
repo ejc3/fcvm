@@ -138,8 +138,8 @@ pub struct RunArgs {
     #[arg(long, default_value = "10G")]
     pub rootfs_size: String,
 
-    /// Volume mapping(s): HOST:GUEST[:ro] (repeat or comma-separated)
-    #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
+    /// Volume mapping(s): HOST:GUEST[:ro] (repeat for multiple)
+    #[arg(long, action = clap::ArgAction::Append)]
     pub map: Vec<String>,
 
     /// Use portable inode numbering for FUSE volumes.
@@ -148,35 +148,35 @@ pub struct RunArgs {
     #[arg(long)]
     pub portable_volumes: bool,
 
-    /// Extra disk(s): HOST_PATH:GUEST_MOUNT[:ro] (repeat or comma-separated)
+    /// Extra disk(s): HOST_PATH:GUEST_MOUNT[:ro] (repeat for multiple)
     /// Disks appear as /dev/vdb, /dev/vdc, etc. in order specified.
     /// Mounted at GUEST_MOUNT in both VM and container.
     /// Read-only disks (:ro) can be used with snapshots/clones.
     /// Read-write disks block snapshot/clone operations.
     /// Example: --disk /data.raw:/data --disk /scratch.raw:/scratch:ro
-    #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
+    #[arg(long, action = clap::ArgAction::Append)]
     pub disk: Vec<String>,
 
     /// Create disk image from directory: HOST_DIR:GUEST_MOUNT[:ro]
     /// Creates an ext4 image from HOST_DIR contents and mounts at GUEST_MOUNT.
     /// Image is stored in VM's data directory and cleaned up on exit.
     /// Example: --disk-dir ./mydata:/data:ro
-    #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
+    #[arg(long, action = clap::ArgAction::Append)]
     pub disk_dir: Vec<String>,
 
     /// Share directory via NFS: HOST_DIR:GUEST_MOUNT[:ro]
     /// Starts NFS server on host, VM mounts via network.
     /// Requires NFS kernel support (use --kernel-profile nested or --build-kernels).
     /// Example: --nfs /data:/mnt/data:ro
-    #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
+    #[arg(long, action = clap::ArgAction::Append)]
     pub nfs: Vec<String>,
 
-    /// Environment vars KEY=VALUE (repeat or comma-separated)
-    #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
+    /// Environment vars KEY=VALUE (repeat for multiple; values may contain commas)
+    #[arg(long, action = clap::ArgAction::Append)]
     pub env: Vec<String>,
 
-    /// Labels KEY=VALUE for tagging VMs (repeat or comma-separated)
-    #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
+    /// Labels KEY=VALUE for tagging VMs (repeat for multiple)
+    #[arg(long, action = clap::ArgAction::Append)]
     pub label: Vec<String>,
 
     /// Command to run inside container
@@ -612,5 +612,62 @@ fn parse_cpu(s: &str) -> Result<u8, String> {
                 s
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Parse a `fcvm podman run` command line and return the RunArgs.
+    fn parse_run(extra: &[&str]) -> RunArgs {
+        let mut argv = vec!["fcvm", "podman", "run", "--name", "test"];
+        argv.extend_from_slice(extra);
+        let cli = Cli::try_parse_from(argv).expect("CLI should parse");
+        match cli.cmd {
+            Commands::Podman(podman) => match podman.cmd {
+                PodmanCommands::Run(run) => run,
+            },
+            _ => panic!("expected `podman run` command"),
+        }
+    }
+
+    #[test]
+    fn env_value_with_comma_is_not_split() {
+        let run = parse_run(&["--env", "FLAGS=a,b", "nginx:alpine"]);
+        assert_eq!(run.env, vec!["FLAGS=a,b"]);
+    }
+
+    #[test]
+    fn repeated_env_flags_append() {
+        let run = parse_run(&["--env", "A=1", "--env", "B=2", "nginx:alpine"]);
+        assert_eq!(run.env, vec!["A=1", "B=2"]);
+    }
+
+    #[test]
+    fn label_and_map_values_with_commas_are_not_split() {
+        let run = parse_run(&[
+            "--label",
+            "notes=a,b",
+            "--map",
+            "/host/dir,with-comma:/guest",
+            "nginx:alpine",
+        ]);
+        assert_eq!(run.label, vec!["notes=a,b"]);
+        assert_eq!(run.map, vec!["/host/dir,with-comma:/guest"]);
+    }
+
+    #[test]
+    fn publish_and_forward_localhost_split_on_commas() {
+        let run = parse_run(&[
+            "--publish",
+            "8080:80,8443:443",
+            "--forward-localhost",
+            "1421,9099",
+            "nginx:alpine",
+        ]);
+        assert_eq!(run.publish, vec!["8080:80", "8443:443"]);
+        assert_eq!(run.forward_localhost, vec![1421u16, 9099]);
     }
 }

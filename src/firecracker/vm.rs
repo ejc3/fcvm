@@ -1,5 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -13,6 +15,12 @@ use super::FirecrackerClient;
 /// Socket/device wait timeout (total wait time = RETRY_COUNT * RETRY_DELAY)
 const SOCKET_WAIT_RETRY_COUNT: u32 = 500;
 const SOCKET_WAIT_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+/// Number of recent Firecracker stderr lines kept for error reporting.
+const STDERR_TAIL_LINES: usize = 10;
+/// How long to let the async stderr reader drain the pipe after Firecracker
+/// exits, so the failure error can include what it actually printed.
+const STDERR_DRAIN_DELAY: Duration = Duration::from_millis(200);
 
 /// Manages a Firecracker VM process
 ///
@@ -41,6 +49,7 @@ pub struct VmManager {
     net_namespace_path: Option<PathBuf>, // Net namespace path for rootless clones (enter via setns in pre_exec)
     mount_redirects: Option<(Vec<PathBuf>, PathBuf)>, // (baseline_dirs, clone_dir) for mount namespace isolation
     process: Option<Child>,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>, // last few Firecracker stderr lines, for launch failure errors
     client: Option<FirecrackerClient>,
 }
 
@@ -57,6 +66,7 @@ impl VmManager {
             net_namespace_path: None,
             mount_redirects: None,
             process: None,
+            stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
             client: None,
         }
     }
@@ -452,11 +462,21 @@ impl VmManager {
         }
 
         // Spawn process with streaming output
-        let child = spawn_streaming(cmd, |line, is_stderr| {
+        let stderr_tail = Arc::clone(&self.stderr_tail);
+        let child = spawn_streaming(cmd, move |line, is_stderr| {
             let clean = strip_firecracker_prefix(line);
             // fc-agent and container output at INFO/WARN, everything else at DEBUG
             let is_important = clean.contains("fc-agent") || clean.contains("[ctr:");
             if is_stderr {
+                // Keep the last few stderr lines so launch failures can report
+                // what Firecracker actually printed (its errors only appear at
+                // DEBUG level in the normal log stream).
+                if let Ok(mut tail) = stderr_tail.lock() {
+                    if tail.len() >= STDERR_TAIL_LINES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(clean.to_string());
+                }
                 if is_important {
                     warn!(target: "firecracker", "{}", clean);
                 } else {
@@ -482,13 +502,29 @@ impl VmManager {
     }
 
     /// Wait for Firecracker socket to be ready
-    async fn wait_for_socket(&self) -> Result<()> {
+    ///
+    /// Also polls the Firecracker child process: if it exits before the API
+    /// socket appears, fail immediately with its exit status and recent stderr
+    /// output instead of timing out with a generic socket error.
+    async fn wait_for_socket(&mut self) -> Result<()> {
         use tokio::time::sleep;
 
         for _ in 0..SOCKET_WAIT_RETRY_COUNT {
             if self.socket_path.exists() {
                 return Ok(());
             }
+
+            if let Some(status) = self.try_wait()? {
+                // Give the async stderr reader a moment to drain the pipe so
+                // the error includes what Firecracker actually printed.
+                sleep(STDERR_DRAIN_DELAY).await;
+                bail!(
+                    "Firecracker exited with {} before its API socket became ready{}",
+                    status,
+                    self.stderr_tail_message()
+                );
+            }
+
             sleep(SOCKET_WAIT_RETRY_DELAY).await;
         }
 
@@ -498,6 +534,21 @@ impl VmManager {
             "Firecracker socket not ready after {} seconds",
             timeout_secs
         )
+    }
+
+    /// Render the captured Firecracker stderr tail for error messages.
+    fn stderr_tail_message(&self) -> String {
+        let lines: Vec<String> = self
+            .stderr_tail
+            .lock()
+            .map(|tail| tail.iter().cloned().collect())
+            .unwrap_or_default();
+        if lines.is_empty() {
+            "; no stderr output captured (run with RUST_LOG=debug for full Firecracker output)"
+                .to_string()
+        } else {
+            format!("; last stderr output:\n  {}", lines.join("\n  "))
+        }
     }
 
     /// Get the API client
@@ -615,5 +666,50 @@ impl Drop for VmManager {
         if self.socket_path.exists() {
             let _ = std::fs::remove_file(&self.socket_path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A Firecracker process that exits before creating its API socket must fail
+    /// `start()` with its exit status and stderr output, not the generic
+    /// "socket not ready after 5 seconds" timeout.
+    #[tokio::test]
+    async fn start_reports_immediate_firecracker_exit() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+
+        let fake_fc = dir.path().join("fake-firecracker.sh");
+        std::fs::write(
+            &fake_fc,
+            "#!/bin/sh\necho 'boom: bad firecracker argument' >&2\nexit 2\n",
+        )
+        .expect("write fake firecracker");
+        std::fs::set_permissions(&fake_fc, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake firecracker");
+
+        let socket_path = dir.path().join("api.sock");
+        let mut vm = VmManager::new("test-vm".to_string(), socket_path, None);
+
+        let err = vm
+            .start(&fake_fc, None, None)
+            .await
+            .expect_err("start should fail when Firecracker exits immediately");
+        let msg = format!("{:#}", err);
+
+        assert!(
+            msg.contains("Firecracker exited with"),
+            "error should report the child exit status, got: {msg}"
+        );
+        assert!(
+            msg.contains("boom: bad firecracker argument"),
+            "error should include Firecracker's stderr output, got: {msg}"
+        );
+        assert!(
+            !msg.contains("socket not ready"),
+            "launch failure must not be reported as a socket timeout, got: {msg}"
+        );
     }
 }

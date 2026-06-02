@@ -211,29 +211,27 @@ pub fn spawn_health_monitor_with_state_dir(
 }
 
 /// Find the fcvm binary for exec commands.
+///
+/// The health monitor runs inside the fcvm process that manages the VM, so the
+/// running executable is the binary that wrote the state files the exec
+/// subcommand reads. Prefer it over install or build locations to avoid
+/// exec'ing a different (possibly stale) fcvm binary.
 fn find_fcvm_binary() -> Option<std::path::PathBuf> {
-    // Try several possible locations
-    // ./target/release/fcvm first for development/tests where we run from repo root
-    let candidates = [
-        std::path::PathBuf::from("./target/release/fcvm"),
-        std::path::PathBuf::from("/usr/local/bin/fcvm"),
-        std::path::PathBuf::from("/usr/bin/fcvm"),
-    ];
-
-    for path in candidates {
-        if path.exists() {
-            return Some(path);
-        }
-    }
-
-    // Fall back to current exe if it looks like fcvm
     if let Ok(exe) = std::env::current_exe() {
         if exe.file_name().map(|n| n == "fcvm").unwrap_or(false) {
             return Some(exe);
         }
     }
 
-    None
+    // Fallbacks for callers whose current_exe is not fcvm (e.g. test binaries):
+    // repo build output first, then install locations.
+    let candidates = [
+        std::path::PathBuf::from("./target/release/fcvm"),
+        std::path::PathBuf::from("/usr/local/bin/fcvm"),
+        std::path::PathBuf::from("/usr/bin/fcvm"),
+    ];
+
+    candidates.into_iter().find(|path| path.exists())
 }
 
 /// Timeout for exec-based health checks (5 seconds)
