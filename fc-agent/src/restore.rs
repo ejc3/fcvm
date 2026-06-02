@@ -101,16 +101,26 @@ pub async fn handle_clone_restore(
 
     // SECOND: Wait for exec server to confirm re-register completed.
     // This ensures accept() works before the host can reach the exec server.
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        signals.exec_rebind_done_notify.notified(),
-    )
-    .await
-    {
-        Ok(()) => {
-            eprintln!("[fc-agent] exec re-registered after restore")
+    // Wait on the AtomicBool (the source of truth) and use the Notify only as a
+    // wakeup: a stale stored permit (e.g. left over from a previous restore whose
+    // wait timed out before the rebind finished) must not let this restore proceed
+    // before its own re-register has completed. The flag was reset above, so it only
+    // reads true once the exec server has re-registered for THIS restore.
+    let rebind_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if signals.exec_rebind_done.load(Ordering::Acquire) {
+            eprintln!("[fc-agent] exec re-registered after restore");
+            break;
         }
-        Err(_) => eprintln!("[fc-agent] WARNING: exec re-register timed out (5s)"),
+        if tokio::time::Instant::now() >= rebind_deadline {
+            eprintln!("[fc-agent] WARNING: exec re-register timed out (5s)");
+            break;
+        }
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            signals.exec_rebind_done_notify.notified(),
+        )
+        .await;
     }
 
     // THIRD: Wait for egress proxy to reconnect (watch channel incremented after vsock connect).
