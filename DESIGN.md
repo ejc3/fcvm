@@ -302,6 +302,7 @@ struct RoutedNetwork {
     vm_id: String,
     tap_device: String,
     port_mappings: Vec<PortMapping>,
+    forward_localhost: Vec<u16>,       // guest 127.0.0.1:<port> -> host 127.0.0.1:<port> relays
     loopback_ip: Option<String>,
     namespace_id: Option<String>,
     host_veth: Option<String>,
@@ -312,7 +313,7 @@ struct RoutedNetwork {
 }
 
 async fn setup() -> Result<NetworkConfig> {
-    self.preflight_check()             // root, IPv6, ip6tables (ip6tables skipped if --ipv6-prefix)
+    self.preflight_check()             // root, IPv6, ip6tables (skipped if --ipv6-prefix); rejects /udp publishes
     detect_host_ipv6()                 // find /64 subnet (or /128 with on-link /64); skipped if --ipv6-prefix
     generate_vm_ipv6(prefix, vm_id)    // deterministic IPv6 from hash
     create_namespace(ns_name)
@@ -326,6 +327,7 @@ async fn setup() -> Result<NetworkConfig> {
     // Proxy NDP on default interface
     // ip6tables MASQUERADE for outbound (skipped if --ipv6-prefix is set)
     // TCP proxy port forwarding on loopback IP (setns + tokio relay)
+    // --forward-localhost: 10.0.2.2/32 alias on bridge + TCP relays to host loopback ports
 }
 ```
 

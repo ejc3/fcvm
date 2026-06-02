@@ -4,6 +4,9 @@ on:
   push:
     paths:
       - 'kernel/**'
+      # The release tag/filename are derived from rootfs-config.toml (kernel_version,
+      # build_inputs), so config-only changes must also trigger a rebuild.
+      - 'rootfs-config.toml'
     branches: [main]
   workflow_dispatch:
     inputs:
