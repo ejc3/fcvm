@@ -708,10 +708,15 @@ jobs:
       - name: Report skipped
         if: needs.skip-check.outputs.skip == 'true'
         run: echo "::notice::Skipped self-hosted tests — tree SHA already passed CI on a PR branch"
+      # When the test matrix was skipped, no artifacts exist and there is
+      # nothing to analyze; downloading would fail on the missing directory.
       - uses: actions/checkout@v6
+        if: needs.skip-check.outputs.skip != 'true'
       - name: Download all artifacts
+        if: needs.skip-check.outputs.skip != 'true'
         uses: actions/download-artifact@v7
         with:
           path: /tmp/ci-artifacts
       - name: Analyze CI run
+        if: needs.skip-check.outputs.skip != 'true'
         run: python3 scripts/analyze_ci_vms.py /tmp/ci-artifacts
