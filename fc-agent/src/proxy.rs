@@ -130,15 +130,11 @@ impl ProxyState {
 /// EPOLLERR on all vsock fds. `VsockStream::wait_for_error()` detects this via
 /// `Interest::ERROR`, which fires the select! arm and ends the session naturally.
 pub async fn run_egress_proxy(gen_tx: watch::Sender<u64>) {
-    if !setup_iptables_redirect() {
-        eprintln!(
-            "[fc-agent] WARNING: failed to set up iptables REDIRECT rules, egress proxy disabled"
-        );
-        return;
-    }
-
     // Bind on both IPv4 and IPv6 loopback so we catch redirected traffic from both stacks.
     // ip6tables REDIRECT sends IPv6 traffic to [::1]:PROXY_LISTEN_PORT.
+    //
+    // Bind BEFORE installing any REDIRECT rule: a rule pointing at a port nothing
+    // listens on turns every redirected guest connection into an immediate refusal.
     //
     // Use TcpSocket to set a large listen backlog (8192 instead of default 128).
     // With 8000+ concurrent connections, the default backlog causes accept queue
@@ -153,12 +149,19 @@ pub async fn run_egress_proxy(gen_tx: watch::Sender<u64>) {
         }
         Err(e) => {
             eprintln!(
-                "[fc-agent] WARNING: failed to bind egress proxy on 127.0.0.1:{}: {}",
+                "[fc-agent] WARNING: failed to bind egress proxy on 127.0.0.1:{}: {} (egress proxy disabled)",
                 PROXY_LISTEN_PORT, e
             );
             return;
         }
     };
+
+    if !setup_iptables_redirect_v4() {
+        eprintln!(
+            "[fc-agent] WARNING: failed to set up iptables REDIRECT rules, egress proxy disabled"
+        );
+        return;
+    }
 
     let listener_v6 = match bind_with_backlog("::1", PROXY_LISTEN_PORT, true).await {
         Ok(l) => {
@@ -166,6 +169,8 @@ pub async fn run_egress_proxy(gen_tx: watch::Sender<u64>) {
                 "[fc-agent] egress proxy listening on [::1]:{} (backlog=8192)",
                 PROXY_LISTEN_PORT
             );
+            // Only redirect IPv6 once its listener exists; failure leaves IPv6 unproxied.
+            setup_ip6tables_redirect();
             Some(l)
         }
         Err(e) => {
@@ -486,8 +491,8 @@ async fn bind_with_backlog(
     socket.listen(LISTEN_BACKLOG)
 }
 
-/// Set up iptables and ip6tables NAT OUTPUT REDIRECT rules.
-fn setup_iptables_redirect() -> bool {
+/// Set up iptables (IPv4) NAT OUTPUT REDIRECT rules.
+fn setup_iptables_redirect_v4() -> bool {
     let port_str = PROXY_LISTEN_PORT.to_string();
 
     // IPv4 rules
@@ -565,8 +570,15 @@ fn setup_iptables_redirect() -> bool {
         }
     }
     eprintln!("[fc-agent] iptables REDIRECT rules configured for egress proxy");
+    true
+}
 
-    // IPv6 rules — best-effort (ip6tables may not be available)
+/// Set up ip6tables NAT OUTPUT REDIRECT rules — best-effort (ip6tables may not be available).
+/// Only called once the IPv6 proxy listener is bound, so a failure here leaves IPv6
+/// egress unproxied rather than redirected to a dead port.
+fn setup_ip6tables_redirect() -> bool {
+    let port_str = PROXY_LISTEN_PORT.to_string();
+
     let v6_rules: &[&[&str]] = &[
         // Don't redirect localhost traffic (proxy listens on [::1])
         &[
@@ -623,14 +635,14 @@ fn setup_iptables_redirect() -> bool {
                     "[fc-agent] WARNING: ip6tables rule {:?} failed: {} (IPv6 proxy disabled)",
                     rule, stderr
                 );
-                return true; // IPv4 still works
+                return false;
             }
             Err(e) => {
                 eprintln!(
                     "[fc-agent] WARNING: ip6tables not available: {} (IPv6 proxy disabled)",
                     e
                 );
-                return true; // IPv4 still works
+                return false;
             }
         }
     }

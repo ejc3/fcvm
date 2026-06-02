@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::time::{sleep, Duration};
 
 use crate::{container, exec, lock_test, mmds, mounts, network, output, proxy, system};
@@ -134,19 +134,15 @@ pub async fn run() -> Result<()> {
         Err(_) => eprintln!("[fc-agent] WARNING: exec server did not become ready within 5s"),
     }
 
-    // Mount filesystems
+    // Mount filesystems. Mount failures are fatal: the container would otherwise
+    // start with a plain empty directory bind-mounted where the volume should be,
+    // write into the ephemeral rootfs, and the VM would still report healthy.
+    // Propagating the error makes main() report container exit 1 and shut down.
     let mounted_fuse_paths = if !plan.volumes.is_empty() {
         eprintln!("[fc-agent] mounting {} FUSE volume(s)", plan.volumes.len());
-        match mounts::mount_fuse_volumes(&plan.volumes) {
-            Ok(paths) => {
-                eprintln!("[fc-agent] FUSE volumes mounted successfully");
-                paths
-            }
-            Err(e) => {
-                eprintln!("[fc-agent] ERROR: failed to mount FUSE volumes: {:?}", e);
-                Vec::new()
-            }
-        }
+        let paths = mounts::mount_fuse_volumes(&plan.volumes).context("mounting FUSE volumes")?;
+        eprintln!("[fc-agent] FUSE volumes mounted successfully");
+        paths
     } else {
         Vec::new()
     };
@@ -162,26 +158,17 @@ pub async fn run() -> Result<()> {
             "[fc-agent] mounting {} extra disk(s)",
             plan.extra_disks.len()
         );
-        match mounts::mount_extra_disks(&plan.extra_disks) {
-            Ok(paths) => {
-                eprintln!("[fc-agent] extra disks mounted successfully");
-                paths
-            }
-            Err(e) => {
-                eprintln!("[fc-agent] ERROR: failed to mount extra disks: {:?}", e);
-                Vec::new()
-            }
-        }
+        let paths = mounts::mount_extra_disks(&plan.extra_disks).context("mounting extra disks")?;
+        eprintln!("[fc-agent] extra disks mounted successfully");
+        paths
     } else {
         Vec::new()
     };
 
     if !plan.nfs_mounts.is_empty() {
         eprintln!("[fc-agent] mounting {} NFS share(s)", plan.nfs_mounts.len());
-        match mounts::mount_nfs_shares(&plan.nfs_mounts) {
-            Ok(_) => eprintln!("[fc-agent] NFS shares mounted successfully"),
-            Err(e) => eprintln!("[fc-agent] ERROR: failed to mount NFS shares: {:?}", e),
-        }
+        mounts::mount_nfs_shares(&plan.nfs_mounts).context("mounting NFS shares")?;
+        eprintln!("[fc-agent] NFS shares mounted successfully");
     }
 
     // Start lock test watcher if shared volume exists
@@ -306,10 +293,24 @@ pub async fn run() -> Result<()> {
                 container::CacheResult::WarmStart => {
                     eprintln!("[fc-agent] cache ready: warm start (snapshot restore detected)");
                     // Vsock IS dead (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET on restore).
-                    // Reconnect output before starting the container — for fast-exit
-                    // containers (echo + exit in ~200ms), output must be live or the
-                    // container's stdout/stderr goes to the dead vsock.
-                    output.reconnect();
+                    // The restore-epoch watcher runs handle_clone_restore concurrently, and
+                    // the host treats the first output connection as the readiness signal:
+                    // it must not arrive before the exec server has re-registered and the
+                    // egress proxy has reconnected (same ordering handle_clone_restore
+                    // enforces). Wait on the exec_rebind_done flag rather than its Notify —
+                    // exec.rs uses notify_one() and the restore handler must win that
+                    // notification.
+                    let rebind_wait = std::time::Instant::now();
+                    while !exec_rebind_done.load(std::sync::atomic::Ordering::Acquire) {
+                        if rebind_wait.elapsed() > std::time::Duration::from_secs(10) {
+                            eprintln!(
+                                "[fc-agent] WARNING: exec re-register not confirmed within 10s, \
+                                 reconnecting output anyway"
+                            );
+                            break;
+                        }
+                        sleep(Duration::from_millis(25)).await;
+                    }
                     // No explicit signal to proxy needed — it detects the dead vsock fd
                     // natively via Interest::ERROR (EPOLLERR fires instantly after restore).
                     // Just wait for the watch channel to confirm reconnection.
@@ -322,6 +323,10 @@ pub async fn run() -> Result<()> {
                         )
                         .await;
                     }
+                    // Reconnect output before starting the container — for fast-exit
+                    // containers (echo + exit in ~200ms), output must be live or the
+                    // container's stdout/stderr goes to the dead vsock.
+                    output.reconnect();
                 }
                 container::CacheResult::Failed => {
                     eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing");
