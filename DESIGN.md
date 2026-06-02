@@ -1190,10 +1190,10 @@ Binary framed protocol over vsock for efficient transport of terminal data:
 ```
 
 **Message Types**:
-- `DATA (0x00)`: Output from command (stdout/stderr)
-- `STDIN (0x01)`: Input from user terminal
+- `DATA (0x01)`: Output from command (stdout/stderr)
 - `EXIT (0x02)`: Command exit code (4 bytes, big-endian i32)
 - `ERROR (0x03)`: Error message string
+- `STDIN (0x04)`: Input from user terminal
 
 **Why binary framing?**
 - Handles escape sequences (Ctrl+C = 0x03, Ctrl+D = 0x04)
