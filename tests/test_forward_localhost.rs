@@ -86,7 +86,17 @@ async fn run_forward_localhost_case(extra_args: &[&str], name_prefix: &str) -> R
     let stderr = String::from_utf8_lossy(&output.stderr);
     println!("  stdout: {}", stdout.trim());
 
-    let accepted = accept_handle.join().unwrap_or(false);
+    let accepted = if accept_handle.is_finished() {
+        accept_handle.join().unwrap_or(false)
+    } else {
+        // fcvm exited without the container ever connecting (boot failure or a
+        // forwarding regression). Unblock the accept thread with a local
+        // connection so the test reports promptly instead of waiting out the
+        // accept timeout.
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+        let _ = accept_handle.join();
+        false
+    };
     println!("  server accepted: {}", accepted);
 
     assert!(

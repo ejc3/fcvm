@@ -540,6 +540,23 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 );
             }
 
+            // podman save operates on the mutable tag, so re-check that the tag still
+            // resolves to the digest used as the cache key. If the image was rebuilt
+            // mid-export, the archive contents would no longer match the digest-keyed
+            // cache entry (and the snapshot key derived from it).
+            let digest_after = get_image_identifier(&args.image).await?;
+            if digest_after != digest {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                drop(lock_file);
+                bail!(
+                    "image '{}' changed while it was being exported (digest {} -> {}); \
+                     re-run the command",
+                    args.image,
+                    digest,
+                    digest_after
+                );
+            }
+
             // Atomic rename within the same filesystem
             tokio::fs::rename(&tmp_path, &archive_path)
                 .await
@@ -1269,12 +1286,12 @@ async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         return Ok(()); // Snapshot cache hit, already handled
     };
 
-    // A signal may have arrived while setup was still running — clean up and exit
-    // instead of entering the run loop.
+    // A signal may have arrived while setup was still running — clean up and report
+    // the interruption instead of entering the run loop (or exiting successfully).
     if cancel.is_cancelled() {
         info!("shutdown requested during VM setup, cleaning up");
         cleanup_vm_context(ctx).await;
-        return Ok(());
+        bail!("interrupted by signal during VM setup");
     }
 
     // Run the VM loop, then always clean up — even when the loop reports an error.

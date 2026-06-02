@@ -498,17 +498,28 @@ pub fn compute_profile_kernel_sha(profile: &KernelProfile) -> Result<String> {
         let paths: Vec<PathBuf> = {
             let entries = glob(&full_pattern)
                 .with_context(|| format!("invalid build_inputs glob pattern: {}", full_pattern))?;
-            let mut paths: Vec<PathBuf> = entries
-                .filter_map(|e| e.ok())
-                // Filter out .disabled files (allows disabling patches without changing SHA)
-                .filter(|p| !p.to_string_lossy().ends_with(".disabled"))
-                .collect();
-            paths.sort(); // Deterministic order
-            paths
+            let mut all_matches: Vec<PathBuf> = entries.filter_map(|e| e.ok()).collect();
+            // Every configured pattern must match at least one file on disk; otherwise a
+            // misspelled or moved pattern would be silently dropped from the cache key
+            // and the kernel name would stop reflecting the configured input set.
+            // (.disabled files count as matches so patches can be disabled without
+            // breaking the pattern check.)
+            if all_matches.is_empty() {
+                bail!(
+                    "kernel build_inputs pattern '{}' matched no files (resolved to '{}'). \
+                     Fix the pattern in rootfs-config.toml or run from the fcvm repository",
+                    pattern,
+                    full_pattern
+                );
+            }
+            // Filter out .disabled files (allows disabling patches without changing SHA)
+            all_matches.retain(|p| !p.to_string_lossy().ends_with(".disabled"));
+            all_matches.sort(); // Deterministic order
+            all_matches
         };
 
         if paths.is_empty() {
-            debug!(pattern = %full_pattern, "no files matched pattern");
+            debug!(pattern = %full_pattern, "all files matched by pattern are .disabled");
         }
 
         for path in paths {
@@ -1697,8 +1708,7 @@ mod tests {
         let profile = profile_with_inputs(vec![missing.display().to_string()]);
         let err = compute_profile_kernel_sha(&profile).unwrap_err();
         assert!(
-            err.to_string()
-                .contains("no kernel build input files matched"),
+            err.to_string().contains("matched no files"),
             "unexpected error: {err:#}"
         );
     }
