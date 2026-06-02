@@ -120,8 +120,14 @@ where
                     });
                 }
                 Err(e) => {
-                    warn!(error = %e, "{label} accept error");
-                    break;
+                    // accept() can fail transiently (ECONNABORTED, EMFILE/ENFILE
+                    // under fd pressure). The listener is owned by this loop and
+                    // never closed externally, so back off briefly and keep
+                    // accepting instead of silently killing the relay for the
+                    // VM's lifetime.
+                    warn!(error = %e, "{label} accept error, retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
                 }
             }
         }
