@@ -652,6 +652,9 @@ dependencies = [
 [[package]]
 name = "exec-proto"
 version = "0.1.0"
+dependencies = [
+ "tokio",
+]
 
 [[package]]
 name = "fastrand"

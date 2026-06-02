@@ -932,8 +932,8 @@ async fn ws_terminal(
 }
 
 async fn ws_terminal_handler(mut ws: axum::extract::ws::WebSocket, vsock_path: std::path::PathBuf) {
-    use axum::extract::ws::Message as WsMessage;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use axum::extract::ws::{CloseFrame, Message as WsMessage};
+    use tokio::io::AsyncWriteExt;
 
     // Connect to exec server
     let stream = match crate::commands::exec::connect_to_exec_server_async(&vsock_path).await {
@@ -941,7 +941,7 @@ async fn ws_terminal_handler(mut ws: axum::extract::ws::WebSocket, vsock_path: s
         Err(e) => {
             error!(error = %e, "Failed to connect to exec server for terminal");
             let _ = ws
-                .send(WsMessage::Close(Some(axum::extract::ws::CloseFrame {
+                .send(WsMessage::Close(Some(CloseFrame {
                     code: 1011,
                     reason: format!("Failed to connect: {}", e).into(),
                 })))
@@ -977,20 +977,32 @@ async fn ws_terminal_handler(mut ws: axum::extract::ws::WebSocket, vsock_path: s
 
     // Bridge WS ↔ vsock
     // Use a channel for vsock→WS since we can't hold &mut to both ws and vsock in select!
-    let (vsock_tx, mut vsock_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+    //
+    // The guest speaks the framed exec protocol (see exec-proto): terminal output
+    // arrives as Data frames and the session ends with an Exit (or Error) frame.
+    // Decode frames here and forward only payload bytes to the WebSocket client,
+    // so frame headers and control messages never reach the terminal stream.
+    let (vsock_tx, mut vsock_rx) = tokio::sync::mpsc::channel::<exec_proto::Message>(32);
 
-    // Spawn task to read from vsock and send to channel
+    // Spawn task to decode exec-proto frames from the vsock and send them to the channel
     let reader_task = tokio::spawn(async move {
-        let mut buf = vec![0u8; 8192];
         loop {
-            match vsock_read.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if vsock_tx.send(buf[..n].to_vec()).await.is_err() {
+            match exec_proto::Message::read_from_async(&mut vsock_read).await {
+                Ok(msg) => {
+                    let session_ended = matches!(
+                        msg,
+                        exec_proto::Message::Exit(_) | exec_proto::Message::Error(_)
+                    );
+                    if vsock_tx.send(msg).await.is_err() || session_ended {
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                        warn!(error = %e, "terminal vsock protocol error");
+                    }
+                    break;
+                }
             }
         }
     });
@@ -998,9 +1010,43 @@ async fn ws_terminal_handler(mut ws: axum::extract::ws::WebSocket, vsock_path: s
     // Main loop: read from WS and from vsock channel
     loop {
         tokio::select! {
-            Some(data) = vsock_rx.recv() => {
-                if ws.send(WsMessage::Binary(data.into())).await.is_err() {
-                    break;
+            msg = vsock_rx.recv() => {
+                match msg {
+                    Some(exec_proto::Message::Data(data)) => {
+                        if ws.send(WsMessage::Binary(data.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(exec_proto::Message::Exit(code)) => {
+                        let _ = ws
+                            .send(WsMessage::Close(Some(CloseFrame {
+                                code: 1000,
+                                reason: format!("exit code {}", code).into(),
+                            })))
+                            .await;
+                        break;
+                    }
+                    Some(exec_proto::Message::Error(msg)) => {
+                        let _ = ws
+                            .send(WsMessage::Close(Some(CloseFrame {
+                                code: 1011,
+                                reason: format!("terminal error: {}", msg).into(),
+                            })))
+                            .await;
+                        break;
+                    }
+                    // The guest never sends Stdin frames; ignore if one arrives
+                    Some(exec_proto::Message::Stdin(_)) => {}
+                    // vsock closed without an Exit frame
+                    None => {
+                        let _ = ws
+                            .send(WsMessage::Close(Some(CloseFrame {
+                                code: 1011,
+                                reason: "terminal closed before exit status".to_string().into(),
+                            })))
+                            .await;
+                        break;
+                    }
                 }
             }
             result = ws.recv() => {
