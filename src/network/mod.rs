@@ -13,8 +13,55 @@ pub use pasta::PastaNetwork;
 pub use routed::RoutedNetwork;
 pub use types::*;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::net::IpAddr;
+
+/// Acquire a cross-process lock serializing host-global bridged network configuration.
+///
+/// Bridged networking mutates state shared by every fcvm process on the host
+/// (veth host IPs, global MASQUERADE rules). The check-then-act sequences on that
+/// state must hold one of these locks so two fcvm processes cannot interleave.
+///
+/// Lock files live in the state directory, following the same flock pattern as
+/// `loopback-ip.lock` (world-writable so root and non-root processes can coordinate,
+/// never deleted to avoid the recreate-while-locked race).
+///
+/// Lock ordering: `bridged-subnet.lock` may be held while `bridged-nat.lock` is
+/// acquired (setup error paths that call cleanup()); the reverse never happens.
+pub(crate) async fn acquire_host_network_lock(
+    name: &str,
+) -> Result<nix::fcntl::Flock<std::fs::File>> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let dir = crate::paths::state_dir();
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .with_context(|| format!("creating state directory {}", dir.display()))?;
+    let path = dir.join(name);
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o666)
+        .open(&path)
+        .with_context(|| format!("opening lock file {}", path.display()))?;
+    // Force permissions regardless of umask (only effective if we own the file or are root)
+    let _ = file.set_permissions(std::fs::Permissions::from_mode(0o666));
+
+    // Acquire in spawn_blocking: flock blocks until the lock is free, and these
+    // critical sections span multiple subprocess invocations, so don't pin a
+    // tokio worker thread while waiting.
+    let lock_name = name.to_string();
+    tokio::task::spawn_blocking(move || {
+        use nix::fcntl::{Flock, FlockArg};
+        Flock::lock(file, FlockArg::LockExclusive)
+            .map_err(|(_, err)| anyhow::anyhow!("flock failed: {}", err))
+    })
+    .await
+    .context("joining lock acquisition task")?
+    .with_context(|| format!("acquiring host network lock {}", lock_name))
+}
 
 /// Network manager trait
 #[async_trait::async_trait]

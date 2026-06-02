@@ -144,6 +144,18 @@ impl NetworkManager for BridgedNetwork {
         id_for_subnet.hash(&mut hasher);
         let mut subnet_id = (hasher.finish() % 16384) as u16;
 
+        // Serialize subnet selection through host-IP assignment across fcvm processes.
+        // is_ip_in_use_on_veth() only sees IPs already assigned to veth interfaces, and
+        // the chosen IP is not assigned until setup_host_veth() in step 3 below. Without
+        // a cross-process lock, two concurrently starting VMs could both pass the check
+        // for the same subnet (check-then-act race) and end up with duplicate host IPs
+        // and ambiguous DNAT/return routing. Same pattern as loopback-ip.lock.
+        // Lock ordering: this lock may be held while portmap takes bridged-nat.lock
+        // (cleanup() on the error paths below); the reverse never happens.
+        let subnet_lock = super::acquire_host_network_lock("bridged-subnet.lock")
+            .await
+            .context("acquiring bridged subnet allocation lock")?;
+
         // Check for subnet collisions with live VMs and retry with incremented ID
         let subnet_id = {
             let mut attempts = 0u32;
@@ -268,6 +280,10 @@ impl NetworkManager for BridgedNetwork {
             let _ = self.cleanup().await;
             return Err(e).context("configuring host veth");
         }
+
+        // Host IP is now assigned to the veth, so other processes' collision checks
+        // can see it. The remaining steps don't touch subnet allocation state.
+        drop(subnet_lock);
 
         // Step 4: Create TAP device inside namespace
         if let Err(e) = veth::create_tap_in_ns(&namespace_id, &self.tap_device).await {
@@ -433,10 +449,13 @@ impl NetworkManager for BridgedNetwork {
             }
         }
 
-        // Step 2: Delete host route to guest IP (for clones)
+        // Step 2: Delete host route to guest IP (for clones).
+        // All clones of a snapshot share the same guest IP and the {guest_ip}/32 route
+        // points at whichever clone last set it up. Only delete the route this clone
+        // owns (via its veth_inner_ip) so a surviving clone keeps host -> guest access.
         if self.is_clone {
-            if let Some(ref guest_ip) = self.guest_ip {
-                if let Err(e) = veth::delete_host_route_to_guest(guest_ip).await {
+            if let (Some(guest_ip), Some(veth_inner_ip)) = (&self.guest_ip, &self.veth_inner_ip) {
+                if let Err(e) = veth::delete_host_route_to_guest(guest_ip, veth_inner_ip).await {
                     warn!(vm_id = %self.vm_id, error = %e, "failed to delete host route");
                     errors.push(format!("host route: {}", e));
                 }

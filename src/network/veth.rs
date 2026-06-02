@@ -71,6 +71,32 @@ pub async fn create_veth_pair(host_veth: &str, guest_veth: &str, ns_name: &str) 
     Ok(())
 }
 
+/// Check whether an `ip -o addr show` output line shows a fcvm-managed veth
+/// (`veth0-*`) carrying exactly `ip`.
+///
+/// The IP is matched as `inet <ip>/` so that 172.30.0.1 never matches a parallel
+/// VM's 172.30.0.13 (or its broadcast address) — a bare substring match here can
+/// select another VM's veth and delete it during that VM's setup window.
+fn line_has_exact_ip_on_managed_veth(line: &str, ip: &str) -> bool {
+    let inet_pattern = format!("inet {}/", ip);
+    line.contains(&inet_pattern) && line.contains("veth0-")
+}
+
+/// Extract the nexthop ("via") address from `ip route show <prefix>` output.
+///
+/// Returns None when the route has no gateway (direct/dev route) or the output
+/// is empty. Token-exact comparison avoids substring false positives
+/// (e.g. 10.0.1.2 vs 10.0.1.20).
+fn route_nexthop(route_output: &str) -> Option<&str> {
+    let mut tokens = route_output.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "via" {
+            return tokens.next();
+        }
+    }
+    None
+}
+
 /// Check if a network namespace has any running processes
 async fn namespace_has_processes(ns_name: &str) -> bool {
     // Use ip netns pids to check for processes in the namespace
@@ -121,7 +147,7 @@ async fn cleanup_stale_veth_with_ip(ip_with_cidr: &str, exclude_veth: &str) -> R
     // Parse output to find veth interfaces with matching IP
     // Format: "4: veth0-vm-abc@if3: <...> inet 10.0.1.1/30 ..."
     for line in stdout.lines() {
-        if line.contains(ip) && line.contains("veth0-") {
+        if line_has_exact_ip_on_managed_veth(line, ip) {
             // Extract interface name
             if let Some(iface) = line.split_whitespace().nth(1) {
                 // Remove trailing @... and colon
@@ -703,7 +729,8 @@ pub async fn add_host_route_to_guest(
         let existing_route = String::from_utf8_lossy(&check_output.stdout);
         if !existing_route.trim().is_empty() {
             // Route exists - check if it points to our veth or a different one
-            if !existing_route.contains(veth_inner_ip) {
+            // (token-exact via match: 10.0.1.2 must not "match" a route via 10.0.1.20)
+            if route_nexthop(&existing_route) != Some(veth_inner_ip) {
                 // Route points to a different gateway - likely stale from crashed VM
                 // Check if the device in the route still exists
                 if let Some(dev_start) = existing_route.find("dev ") {
@@ -772,23 +799,38 @@ pub async fn add_host_route_to_guest(
     Ok(())
 }
 
-/// Deletes the host route to a guest IP
+/// Deletes the host route to a guest IP, but only the route this clone owns
 ///
 /// This removes the route added by `add_host_route_to_guest`. Must be called during
 /// cleanup to prevent stale routes from interfering with future VMs using the same guest IP.
-pub async fn delete_host_route_to_guest(guest_ip: &str) -> Result<()> {
-    debug!(guest_ip = %guest_ip, "deleting host route to guest IP");
+///
+/// Bridged clones restored from the same snapshot share one guest IP, and
+/// `add_host_route_to_guest` deliberately lets the newest clone replace the
+/// {guest_ip}/32 route. Deleting unconditionally on cleanup would remove the route
+/// out from under a surviving clone, breaking host -> guest access (and HTTP health
+/// checks) for it. The delete is therefore qualified with `via {veth_inner_ip}`:
+/// it only matches the route that points at this clone's namespace veth, so a route
+/// owned by another clone is left in place. The kernel evaluates the qualifier
+/// atomically, so this stays correct even if another clone replaces the route
+/// concurrently.
+pub async fn delete_host_route_to_guest(guest_ip: &str, veth_inner_ip: &str) -> Result<()> {
+    debug!(
+        guest_ip = %guest_ip,
+        via = %veth_inner_ip,
+        "deleting host route to guest IP (if owned by this clone)"
+    );
 
     let route = format!("{}/32", guest_ip);
     let output = Command::new("ip")
-        .args(["route", "del", &route])
+        .args(["route", "del", &route, "via", veth_inner_ip])
         .output()
         .await
         .context("deleting host route to guest IP")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Ignore "No such process" - route already deleted or never existed
+        // Ignore "No such process" - route already deleted, never existed,
+        // or is owned by another clone (different nexthop)
         if !stderr.contains("No such process") {
             warn!(guest_ip = %guest_ip, error = %stderr, "failed to delete host route (non-fatal)");
         }
@@ -856,6 +898,63 @@ pub async fn delete_veth_forward_rule(veth_name: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn exact_ip_on_managed_veth_matches() {
+        let line = "4: veth0-vm-abc12345    inet 172.30.0.1/30 brd 172.30.0.3 scope global veth0-vm-abc12345";
+        assert!(line_has_exact_ip_on_managed_veth(line, "172.30.0.1"));
+    }
+
+    #[test]
+    fn prefix_ip_does_not_match_other_vm() {
+        // 172.30.0.1 must NOT match a parallel VM's veth carrying 172.30.0.13
+        // (substring match here previously deleted the other VM's veth)
+        let line = "7: veth0-vm-def67890    inet 172.30.0.13/30 brd 172.30.0.15 scope global veth0-vm-def67890";
+        assert!(!line_has_exact_ip_on_managed_veth(line, "172.30.0.1"));
+    }
+
+    #[test]
+    fn broadcast_address_does_not_match() {
+        // The brd field must not trigger a match either
+        let line = "7: veth0-vm-def67890    inet 172.30.0.13/30 brd 172.30.0.15 scope global veth0-vm-def67890";
+        assert!(!line_has_exact_ip_on_managed_veth(line, "172.30.0.15"));
+    }
+
+    #[test]
+    fn unmanaged_interface_does_not_match() {
+        let line = "2: eth0    inet 172.30.0.1/30 brd 172.30.0.3 scope global eth0";
+        assert!(!line_has_exact_ip_on_managed_veth(line, "172.30.0.1"));
+    }
+
+    #[test]
+    fn route_nexthop_extracts_via() {
+        let output = "172.30.90.2 via 10.0.1.2 dev veth0-vm-abc12345 \n";
+        assert_eq!(route_nexthop(output), Some("10.0.1.2"));
+    }
+
+    #[test]
+    fn route_nexthop_none_for_dev_route() {
+        let output = "172.30.90.2 dev veth0-vm-abc12345 scope link \n";
+        assert_eq!(route_nexthop(output), None);
+    }
+
+    #[test]
+    fn route_nexthop_none_for_empty_output() {
+        assert_eq!(route_nexthop(""), None);
+    }
+
+    #[test]
+    fn route_nexthop_is_token_exact() {
+        // 10.0.1.2 must not be considered the nexthop of a route via 10.0.1.20
+        let output = "172.30.90.2 via 10.0.1.20 dev veth0-vm-def67890 \n";
+        assert_ne!(route_nexthop(output), Some("10.0.1.2"));
+        assert_eq!(route_nexthop(output), Some("10.0.1.20"));
+    }
 }
 
 #[cfg(test)]

@@ -229,12 +229,25 @@ pub async fn cleanup_port_mappings(rules: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Comment used to tag iptables rules that fcvm added.
+///
+/// `cleanup_global_nat_if_unused()` only deletes rules carrying this comment, so
+/// fcvm never removes NAT configuration an admin or another tool put in place.
+const FCVM_RULE_COMMENT: &str = "fcvm-bridged";
+
 /// Ensures global NAT is enabled for VM traffic
 ///
 /// Sets up:
 /// 1. Verifies IP forwarding is enabled (errors if not — admin must configure)
 /// 2. Enables per-interface forwarding on the outbound interface
-/// 3. MASQUERADE rule for outbound traffic from VM subnet
+/// 3. MASQUERADE rule for outbound traffic from VM subnet (tagged with an
+///    fcvm comment so cleanup only ever removes rules fcvm created)
+///
+/// The check-then-add of the MASQUERADE rule runs under the host-level
+/// `bridged-nat.lock`, serializing it against `cleanup_global_nat_if_unused()`
+/// in other fcvm processes. Without the lock, a stopping VM that has already
+/// listed interfaces (and saw no veths) could delete the rule right after this
+/// check sees it, leaving this VM without outbound NAT.
 ///
 /// This should be called once during fcvm initialization, not per-VM.
 pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<()> {
@@ -277,7 +290,13 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
         );
     }
 
-    // Check if MASQUERADE rule already exists
+    // Serialize the check-then-add against cleanup_global_nat_if_unused() running
+    // in a concurrently stopping fcvm process.
+    let _nat_lock = super::acquire_host_network_lock("bridged-nat.lock")
+        .await
+        .context("acquiring bridged NAT lock")?;
+
+    // Check if the fcvm-tagged MASQUERADE rule already exists
     let output = Command::new("iptables")
         .args([
             "-t",
@@ -288,6 +307,10 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
             vm_subnet,
             "-o",
             outbound_iface,
+            "-m",
+            "comment",
+            "--comment",
+            FCVM_RULE_COMMENT,
             "-j",
             "MASQUERADE",
         ])
@@ -311,6 +334,10 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
             vm_subnet,
             "-o",
             outbound_iface,
+            "-m",
+            "comment",
+            "--comment",
+            FCVM_RULE_COMMENT,
             "-j",
             "MASQUERADE",
         ])
@@ -330,10 +357,24 @@ pub async fn ensure_global_nat(vm_subnet: &str, outbound_iface: &str) -> Result<
 /// Removes global NAT rules if no bridged VMs are running
 ///
 /// Checks for veth0-* interfaces (indicates active bridged VMs).
-/// If none exist, removes the MASQUERADE rules for both subnets.
+/// If none exist, removes the fcvm-tagged MASQUERADE rules for both subnets
+/// (rules without the fcvm comment were added by someone else and are left alone).
 /// IP forwarding is intentionally left enabled (other services may depend on it).
 /// Best-effort — logs warnings but doesn't fail.
+///
+/// The list-then-delete sequence runs under the host-level `bridged-nat.lock`,
+/// serializing it against `ensure_global_nat()` in concurrently starting fcvm
+/// processes so this never deletes a MASQUERADE rule another VM just confirmed.
 pub async fn cleanup_global_nat_if_unused() {
+    // Serialize against ensure_global_nat() in other fcvm processes.
+    let _nat_lock = match super::acquire_host_network_lock("bridged-nat.lock").await {
+        Ok(lock) => lock,
+        Err(e) => {
+            warn!(error = %e, "failed to acquire bridged NAT lock, leaving global NAT rules in place");
+            return;
+        }
+    };
+
     // Check if any veth0- interfaces exist (active bridged VMs)
     let output = match Command::new("ip")
         .args(["-o", "link", "show"])
@@ -361,7 +402,7 @@ pub async fn cleanup_global_nat_if_unused() {
         }
     };
 
-    // Remove MASQUERADE rules for both subnets
+    // Remove the fcvm-tagged MASQUERADE rules for both subnets
     for subnet in &["172.30.0.0/16", "10.0.0.0/8"] {
         let output = Command::new("iptables")
             .args([
@@ -373,6 +414,10 @@ pub async fn cleanup_global_nat_if_unused() {
                 subnet,
                 "-o",
                 &outbound_iface,
+                "-m",
+                "comment",
+                "--comment",
+                FCVM_RULE_COMMENT,
                 "-j",
                 "MASQUERADE",
             ])
@@ -385,8 +430,11 @@ pub async fn cleanup_global_nat_if_unused() {
             }
             Ok(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr);
-                // Rule may already be gone
-                if !stderr.contains("does not exist") && !stderr.contains("No chain") {
+                // Rule may already be gone (or was never added by fcvm)
+                if !stderr.contains("does not exist")
+                    && !stderr.contains("No chain")
+                    && !stderr.contains("Bad rule")
+                {
                     warn!(subnet = %subnet, error = %stderr, "failed to remove MASQUERADE rule");
                 }
             }
