@@ -698,7 +698,21 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         }
     };
 
-    let network_config = network.setup().await.context("setting up network")?;
+    // network.setup() may fail partway through (it tears nothing down itself),
+    // so any error from here until the run_vm_setup error handler below must
+    // run network.cleanup() to remove partially-created host network state.
+    let network_config = match network.setup().await.context("setting up network") {
+        Ok(config) => config,
+        Err(e) => {
+            if let Err(cleanup_err) = network.cleanup().await {
+                warn!(
+                    "failed to cleanup network after setup error: {}",
+                    cleanup_err
+                );
+            }
+            return Err(e);
+        }
+    };
 
     info!(tap = %network_config.tap_device, mac = %network_config.guest_mac, "network configured");
 
@@ -707,9 +721,18 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     // Use custom vsock_dir if provided (for predictable socket paths)
     let vsock_socket_path = if let Some(ref vsock_dir) = args.vsock_dir {
         let vsock_dir = std::path::PathBuf::from(vsock_dir);
-        tokio::fs::create_dir_all(&vsock_dir)
+        if let Err(e) = tokio::fs::create_dir_all(&vsock_dir)
             .await
-            .with_context(|| format!("creating vsock dir: {:?}", vsock_dir))?;
+            .with_context(|| format!("creating vsock dir: {:?}", vsock_dir))
+        {
+            if let Err(cleanup_err) = network.cleanup().await {
+                warn!(
+                    "failed to cleanup network after setup error: {}",
+                    cleanup_err
+                );
+            }
+            return Err(e);
+        }
         vsock_dir.join("vsock.sock")
     } else {
         data_dir.join("vsock.sock")
@@ -730,9 +753,21 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         })
         .collect();
 
-    let volume_servers = spawn_volume_servers(&volume_configs, &vsock_socket_path)
+    let volume_servers = match spawn_volume_servers(&volume_configs, &vsock_socket_path)
         .await
-        .context("spawning VolumeServers")?;
+        .context("spawning VolumeServers")
+    {
+        Ok(servers) => servers,
+        Err(e) => {
+            if let Err(cleanup_err) = network.cleanup().await {
+                warn!(
+                    "failed to cleanup network after setup error: {}",
+                    cleanup_err
+                );
+            }
+            return Err(e);
+        }
+    };
 
     // Create snapshot channel for snapshot-ready notifications
     // Skip snapshot creation when:

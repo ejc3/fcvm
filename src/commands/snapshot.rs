@@ -763,7 +763,21 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
         }
     };
 
-    let network_config = network.setup().await.context("setting up network")?;
+    // network.setup() may fail partway through (it tears nothing down itself),
+    // so any error from here until the restore_from_snapshot error handler below
+    // must run network.cleanup() to remove partially-created host network state.
+    let network_config = match network.setup().await.context("setting up network") {
+        Ok(config) => config,
+        Err(e) => {
+            if let Err(cleanup_err) = network.cleanup().await {
+                warn!(
+                    "failed to cleanup network after setup error: {}",
+                    cleanup_err
+                );
+            }
+            return Err(e);
+        }
+    };
 
     // For routed mode clones: the snapshot's guest IPv6 (baked into boot params) is shared
     // across all clones. After restore, fc-agent will be told to swap it to the unique
@@ -859,13 +873,25 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                 "starting implicit UFFD server for snapshot restore"
             );
 
-            let server = UffdServer::new_with_path(
+            let server = match UffdServer::new_with_path(
                 format!("implicit-{}", truncate_id(&vm_id, 8)),
                 &snapshot_config.memory_path,
                 &implicit_socket_path,
             )
             .await
-            .context("creating implicit UFFD server")?;
+            .context("creating implicit UFFD server")
+            {
+                Ok(server) => server,
+                Err(e) => {
+                    if let Err(cleanup_err) = network.cleanup().await {
+                        warn!(
+                            "failed to cleanup network after setup error: {}",
+                            cleanup_err
+                        );
+                    }
+                    return Err(e);
+                }
+            };
 
             let cancel = implicit_uffd_cancel.clone();
             tokio::spawn(async move {
@@ -879,6 +905,12 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                     break;
                 }
                 if i == 99 {
+                    if let Err(cleanup_err) = network.cleanup().await {
+                        warn!(
+                            "failed to cleanup network after setup error: {}",
+                            cleanup_err
+                        );
+                    }
                     bail!("implicit UFFD server did not bind socket within 5s");
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;

@@ -82,6 +82,26 @@ pub async fn exec_in_namespace(ns_name: &str, command: &[&str]) -> Result<std::p
     Ok(output)
 }
 
+/// Executes a command inside a network namespace and fails on non-zero exit.
+///
+/// Like [`exec_in_namespace`], but bails with the command, exit status, and
+/// stderr when the inner command exits non-zero. Use for configuration
+/// commands whose failure must not be silently ignored. Callers that need to
+/// inspect the output themselves should use [`exec_in_namespace`] directly.
+pub async fn exec_in_namespace_checked(ns_name: &str, command: &[&str]) -> Result<()> {
+    let output = exec_in_namespace(ns_name, command).await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "command {:?} in namespace {} failed ({}): {}",
+            command,
+            ns_name,
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Lists all network namespaces
 #[allow(dead_code)]
 pub async fn list_namespaces() -> Result<Vec<String>> {

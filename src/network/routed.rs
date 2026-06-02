@@ -5,7 +5,7 @@ use super::namespace;
 use super::tcp_proxy;
 use super::types::generate_mac;
 use super::veth;
-use super::{NetworkConfig, NetworkManager, PortMapping};
+use super::{NetworkConfig, NetworkManager, PortMapping, Protocol};
 use crate::state::truncate_id;
 
 /// Guest network addressing (same as pasta/bridged for Firecracker compatibility)
@@ -144,6 +144,15 @@ impl RoutedNetwork {
             anyhow::bail!(
                 "routed networking requires root (creates network namespaces and veth pairs). \
                  Run with sudo or use --network rootless instead."
+            );
+        }
+
+        // Routed-mode port forwarding is a TCP relay (tcp_proxy::start_port_forwards),
+        // so UDP mappings would be silently set up as useless TCP listeners.
+        if self.port_mappings.iter().any(|m| m.proto == Protocol::Udp) {
+            anyhow::bail!(
+                "routed networking does not support UDP port mappings (--publish .../udp); \
+                 use bridged or rootless networking for UDP"
             );
         }
 
@@ -370,6 +379,9 @@ impl NetworkManager for RoutedNetwork {
             }
             candidate
         };
+        // Record state as soon as it's known so cleanup() can tear down a
+        // partially-completed setup if a later step fails.
+        self.vm_ipv6 = Some(vm_ipv6.clone());
         info!(
             host_ipv6 = %host_ipv6,
             vm_ipv6 = %vm_ipv6,
@@ -379,9 +391,11 @@ impl NetworkManager for RoutedNetwork {
 
         // 1. Create network namespace
         namespace::create_namespace(&ns_name).await?;
+        self.namespace_id = Some(ns_name.clone());
 
         // 2. Create veth pair and move guest side to namespace
         veth::create_veth_pair(&host_veth, &guest_veth, &ns_name).await?;
+        self.host_veth = Some(host_veth.clone());
 
         // 3. Create TAP in namespace
         veth::create_tap_in_ns(&ns_name, &self.tap_device).await?;
@@ -392,14 +406,18 @@ impl NetworkManager for RoutedNetwork {
         //    IPv6 for external destinations traverses the bridge to the veth peer on the host.
         veth::connect_tap_to_veth(&ns_name, &self.tap_device, &guest_veth).await?;
         // Bring up all interfaces (connect_tap_to_veth only brings up the bridge)
-        namespace::exec_in_namespace(&ns_name, &["ip", "link", "set", "lo", "up"]).await?;
-        namespace::exec_in_namespace(&ns_name, &["ip", "link", "set", &self.tap_device, "up"])
+        namespace::exec_in_namespace_checked(&ns_name, &["ip", "link", "set", "lo", "up"]).await?;
+        namespace::exec_in_namespace_checked(
+            &ns_name,
+            &["ip", "link", "set", &self.tap_device, "up"],
+        )
+        .await?;
+        namespace::exec_in_namespace_checked(&ns_name, &["ip", "link", "set", &guest_veth, "up"])
             .await?;
-        namespace::exec_in_namespace(&ns_name, &["ip", "link", "set", &guest_veth, "up"]).await?;
 
         // 5. Assign gateway IPs to bridge (VM connects here via TAP)
         let gw_cidr = format!("{}/24", GUEST_GATEWAY);
-        namespace::exec_in_namespace(
+        namespace::exec_in_namespace_checked(
             &ns_name,
             &["ip", "addr", "add", &gw_cidr, "dev", BRIDGE_DEVICE],
         )
@@ -407,7 +425,7 @@ impl NetworkManager for RoutedNetwork {
         // nodad: skip Duplicate Address Detection so the address is usable immediately.
         // Without nodad, the address stays "tentative" for ~1-3s and the kernel silently
         // drops all IPv6 packets to it — breaking the VM's default route via fd00::1.
-        namespace::exec_in_namespace(
+        namespace::exec_in_namespace_checked(
             &ns_name,
             &[
                 "ip",
@@ -434,15 +452,18 @@ impl NetworkManager for RoutedNetwork {
         }
         // 7. Enable IPv6 forwarding on the host veth only (not all.forwarding —
         //    that prevents link-local auto-assignment on future interfaces).
-        let _ = tokio::process::Command::new("sysctl")
-            .args(["-w", &format!("net.ipv6.conf.{}.forwarding=1", host_veth)])
-            .output()
-            .await;
+        run_host_command(
+            "enabling IPv6 forwarding on host veth",
+            "sysctl",
+            &["-w", &format!("net.ipv6.conf.{}.forwarding=1", host_veth)],
+        )
+        .await;
 
         // Detect default interface early — used for sysctl checks AND proxy NDP below.
         let default_iface = detect_default_ipv6_interface()
             .await
             .unwrap_or_else(|| "eth0".to_string());
+        self.default_iface = Some(default_iface.clone());
 
         // Verify host routing is set up correctly. These sysctls are the user's
         // responsibility (host sysctl configuration), not fcvm's — but warn
@@ -489,8 +510,10 @@ impl NetworkManager for RoutedNetwork {
             .await
             .context("failed to generate link-local for host veth")?;
         let host_ll_cidr = format!("{}/64", host_ll);
-        let _ = tokio::process::Command::new("ip")
-            .args([
+        if run_host_command(
+            "assigning link-local to host veth",
+            "ip",
+            &[
                 "-6",
                 "addr",
                 "add",
@@ -500,16 +523,18 @@ impl NetworkManager for RoutedNetwork {
                 "scope",
                 "link",
                 "nodad",
-            ])
-            .output()
-            .await;
-        info!(host_ll = %host_ll, "assigned link-local to host veth");
+            ],
+        )
+        .await
+        {
+            info!(host_ll = %host_ll, "assigned link-local to host veth");
+        }
 
         // 9. In namespace: default IPv6 route goes through bridge → veth → host.
         //     The bridge forwards L2 frames from br0 to veth (bridge member).
         //     The host veth receives them and the host kernel routes to eth0.
         //     Use the host veth's link-local as nexthop (reachable via NDP on bridge).
-        namespace::exec_in_namespace(
+        namespace::exec_in_namespace_checked(
             &ns_name,
             &[
                 "ip",
@@ -526,7 +551,7 @@ impl NetworkManager for RoutedNetwork {
         .await?;
 
         // 10. Enable IPv6 forwarding in namespace (for VM traffic forwarding)
-        namespace::exec_in_namespace(
+        namespace::exec_in_namespace_checked(
             &ns_name,
             &["sysctl", "-w", "net.ipv6.conf.all.forwarding=1"],
         )
@@ -538,24 +563,30 @@ impl NetworkManager for RoutedNetwork {
 
         // 11. On host: route VM's IPv6 back through veth to the namespace (per-VM, no collision)
         let vm_route = format!("{}/128", vm_ipv6);
-        let _ = tokio::process::Command::new("ip")
-            .args(["-6", "route", "replace", &vm_route, "dev", &host_veth])
-            .output()
-            .await;
+        run_host_command(
+            "adding host return route for VM IPv6",
+            "ip",
+            &["-6", "route", "replace", &vm_route, "dev", &host_veth],
+        )
+        .await;
 
         // 12. Add proxy NDP so the network fabric routes VM's IPv6 to this host
         // (default_iface already detected above)
         // Enable proxy NDP on the interface so the kernel actually responds
         // to neighbor solicitations for our proxy entries.
-        let _ = tokio::process::Command::new("sysctl")
-            .args([
+        run_host_command(
+            "enabling proxy NDP on default interface",
+            "sysctl",
+            &[
                 "-w",
                 &format!("net.ipv6.conf.{}.proxy_ndp=1", default_iface),
-            ])
-            .output()
-            .await;
-        let _ = tokio::process::Command::new("ip")
-            .args([
+            ],
+        )
+        .await;
+        if run_host_command(
+            "adding proxy NDP entry",
+            "ip",
+            &[
                 "-6",
                 "neigh",
                 "add",
@@ -563,10 +594,12 @@ impl NetworkManager for RoutedNetwork {
                 &vm_ipv6,
                 "dev",
                 &default_iface,
-            ])
-            .output()
-            .await;
-        info!(vm_ipv6 = %vm_ipv6, iface = %default_iface, "added proxy NDP");
+            ],
+        )
+        .await
+        {
+            info!(vm_ipv6 = %vm_ipv6, iface = %default_iface, "added proxy NDP");
+        }
 
         // 13. MASQUERADE outbound IPv6 traffic from the namespace.
         //     On AWS, source/dest check drops packets with unassigned source IPs.
@@ -576,22 +609,24 @@ impl NetworkManager for RoutedNetwork {
         //     and the VM's source IP matches the cert's IP SANs.
         if self.ipv6_prefix.is_some() {
             info!(iface = %default_iface, "skipping MASQUERADE (--ipv6-prefix is routable)");
-        } else {
-            let _ = tokio::process::Command::new("ip6tables")
-                .args([
-                    "-t",
-                    "nat",
-                    "-A",
-                    "POSTROUTING",
-                    "-o",
-                    &default_iface,
-                    "-s",
-                    &format!("{}/128", vm_ipv6),
-                    "-j",
-                    "MASQUERADE",
-                ])
-                .output()
-                .await;
+        } else if run_host_command(
+            "adding IPv6 MASQUERADE rule",
+            "ip6tables",
+            &[
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-o",
+                &default_iface,
+                "-s",
+                &format!("{}/128", vm_ipv6),
+                "-j",
+                "MASQUERADE",
+            ],
+        )
+        .await
+        {
             info!(iface = %default_iface, "added IPv6 MASQUERADE for outbound traffic");
         }
 
@@ -623,19 +658,12 @@ impl NetworkManager for RoutedNetwork {
         //     127.0.0.1:<port> from the host namespace.
         if !self.forward_localhost.is_empty() {
             let alias_cidr = format!("{}/32", HOST_LOOPBACK_ALIAS);
-            let output = namespace::exec_in_namespace(
+            namespace::exec_in_namespace_checked(
                 &ns_name,
                 &["ip", "addr", "add", &alias_cidr, "dev", BRIDGE_DEVICE],
             )
-            .await?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "failed to assign host loopback alias {} to {}: {}",
-                    alias_cidr,
-                    BRIDGE_DEVICE,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-            }
+            .await
+            .context("assigning host loopback alias for --forward-localhost")?;
 
             let handles = tcp_proxy::start_localhost_forwards(
                 &ns_name,
@@ -676,12 +704,6 @@ impl NetworkManager for RoutedNetwork {
 
         let guest_mac = generate_mac();
         let guest_ip = format!("{}/{}", GUEST_IP, "24");
-
-        // Store state for cleanup
-        self.namespace_id = Some(ns_name);
-        self.host_veth = Some(host_veth);
-        self.vm_ipv6 = Some(vm_ipv6.clone());
-        self.default_iface = Some(default_iface);
 
         Ok(NetworkConfig {
             tap_device: self.tap_device.clone(),
@@ -820,6 +842,34 @@ impl NetworkManager for RoutedNetwork {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+/// Run a host-namespace command, returning whether it succeeded.
+///
+/// Failures are logged with the command's stderr instead of bailing — some of
+/// these commands legitimately fail on re-runs (e.g. a stale proxy-NDP entry
+/// left by a previous VM). Callers should only log success messages when this
+/// returns true.
+async fn run_host_command(what: &str, program: &str, args: &[&str]) -> bool {
+    match tokio::process::Command::new(program)
+        .args(args)
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            warn!(
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "{} failed",
+                what
+            );
+            false
+        }
+        Err(e) => {
+            warn!(error = %e, "{} failed to run", what);
+            false
+        }
     }
 }
 
