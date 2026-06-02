@@ -289,6 +289,12 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         None
     };
 
+    // Resolve the image identifier ONCE: digest for localhost/ images (single podman
+    // inspect), name for remote images. The same value feeds both the snapshot cache key
+    // and the image export cache below, so the two can never disagree when a localhost
+    // tag is rebuilt between two separate inspects.
+    let image_identifier = get_image_identifier(&args.image).await?;
+
     // Check for snapshot cache (unless --no-snapshot is set or FCVM_NO_SNAPSHOT env var)
     // Keep fc_config and snapshot_key available for later snapshot creation on miss
     let no_snapshot = args.no_snapshot
@@ -299,8 +305,6 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         Option<crate::firecracker::FirecrackerConfig>,
         Option<String>,
     ) = if !no_snapshot {
-        // Get image identifier for cache key computation
-        let image_identifier = get_image_identifier(&args.image).await?;
         let resolved_mode = resolve_image_mode(&args);
         let config = build_firecracker_config(
             &args,
@@ -419,27 +423,11 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     // For localhost/ images, export as OCI archive for direct podman run
     // Uses content-addressable cache to avoid re-exporting the same image
     let image_disk_path = if args.image.starts_with("localhost/") {
-        // Get image digest for content-addressable storage
-        let inspect_output = tokio::process::Command::new("podman")
-            .args(["image", "inspect", &args.image, "--format", "{{.Digest}}"])
-            .output()
-            .await
-            .context("inspecting image digest")?;
-
-        if !inspect_output.status.success() {
-            let stderr = String::from_utf8_lossy(&inspect_output.stderr);
-            bail!(
-                "Failed to get digest for image '{}': {}",
-                args.image,
-                stderr
-            );
-        }
-
-        let digest = String::from_utf8_lossy(&inspect_output.stdout)
-            .trim()
-            // Strip "sha256:" prefix for use in filenames (colons invalid in paths)
-            .trim_start_matches("sha256:")
-            .to_string();
+        // Reuse the digest resolved by get_image_identifier above (already stripped of
+        // the "sha256:" prefix). Using the same inspect result for the snapshot key and
+        // the export cache prevents a tag rebuilt in between from being exported under
+        // a digest that no longer matches the snapshot key.
+        let digest = image_identifier.clone();
 
         // Use content-addressable cache: /mnt/fcvm-btrfs/image-cache/{digest}/
         let image_cache_dir = paths::image_cache_dir();
@@ -462,13 +450,27 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         let archive_path = cache_dir.with_extension("docker.tar");
         let needs_export = if !archive_path.exists() {
             true
-        } else if !validate_docker_archive(&archive_path)? {
-            warn!(path = %archive_path.display(), "Cached archive is invalid, re-exporting");
-            let _ = tokio::fs::remove_file(&archive_path).await;
-            true
         } else {
-            info!(image = %args.image, digest = %digest, "Using cached Docker archive");
-            false
+            // A cached archive that fails validation — whether it parses cleanly but is
+            // missing manifest.json (Ok(false)) or is structurally corrupt and can't be
+            // parsed at all (Err) — is removed and re-exported. Only the freshly exported
+            // archive below treats a validation error as fatal.
+            match validate_docker_archive(&archive_path) {
+                Ok(true) => {
+                    info!(image = %args.image, digest = %digest, "Using cached Docker archive");
+                    false
+                }
+                Ok(false) => {
+                    warn!(path = %archive_path.display(), "Cached archive is invalid, re-exporting");
+                    let _ = tokio::fs::remove_file(&archive_path).await;
+                    true
+                }
+                Err(e) => {
+                    warn!(path = %archive_path.display(), error = %e, "Cached archive is unreadable, re-exporting");
+                    let _ = tokio::fs::remove_file(&archive_path).await;
+                    true
+                }
+            }
         };
 
         if needs_export {
@@ -1034,7 +1036,6 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         vm_state: &ctx.vm_state,
                         disk_path: &ctx.disk_path,
                         volume_configs: &ctx.volume_configs,
-                        parent_snapshot_key: None, // Pre-start is the first snapshot, no parent
                         remap_refs: &ctx.volume_servers.remap_refs,
                     };
                     match create_snapshot_interruptible(&snap, &cancel).await {
@@ -1088,14 +1089,15 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         // This is safe: startup snapshots are optional (just caching), so
                         // if the VM is paused mid-snapshot when we cancel, cleanup will
                         // kill the VM anyway via vm_manager.kill().
-                        let parent_key = ctx.vm_state.config.snapshot_name.clone();
+                        // The diff parent is resolved inside create_podman_snapshot under
+                        // the per-VM snapshot lock (re-read from the state file), so a
+                        // concurrent `fcvm snapshot create` cannot leave us with a stale base.
                         let snap = CreateSnapshotParams {
                             vm_manager: &ctx.vm_manager,
                             snapshot_key: &startup_key,
                             vm_state: &ctx.vm_state,
                             disk_path: &ctx.disk_path,
                             volume_configs: &ctx.volume_configs,
-                            parent_snapshot_key: parent_key.as_deref(),
                             remap_refs: &ctx.volume_servers.remap_refs,
                         };
                         tokio::select! {

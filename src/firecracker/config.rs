@@ -98,6 +98,18 @@ pub struct FirecrackerConfig {
     /// Different rootfs types produce different VM states and must not share snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rootfs_type: Option<String>,
+    /// IPv6 prefix for routed mode (--ipv6-prefix).
+    /// Part of cache key so a run requesting a different prefix never silently
+    /// reuses a snapshot recorded with another prefix (the restore path applies
+    /// the prefix stored in snapshot metadata, not the CLI flag).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6_prefix: Option<String>,
+    /// Portable FUSE volumes (--portable-volumes).
+    /// Part of cache key because per-volume inode tables are baked into the
+    /// snapshot at create time — a portable run must not reuse a non-portable
+    /// snapshot (and vice versa).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub portable_volumes: bool,
     /// Firecracker binary path used to create this snapshot.
     /// Content-addressed (e.g., firecracker-default-76c9e1236dab.bin), so changing
     /// the binary automatically invalidates the cache. Required because snapshots
@@ -131,6 +143,8 @@ impl Default for FirecrackerConfig {
             forward_localhost: Vec::new(),
             image_mode: ImageMode::Overlay,
             rootfs_type: None,
+            ipv6_prefix: None,
+            portable_volumes: false,
             firecracker_bin: None,
         }
     }
@@ -568,6 +582,22 @@ mod tests {
         let config1 = test_config();
         let mut config2 = test_config();
         config2.rootfs_type = Some("btrfs".to_string());
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    #[test]
+    fn test_snapshot_key_changes_with_ipv6_prefix() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.ipv6_prefix = Some("2001:db8::/64".to_string());
+        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    #[test]
+    fn test_snapshot_key_changes_with_portable_volumes() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.portable_volumes = true;
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 

@@ -181,6 +181,16 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         extra_disk_configs,
     );
 
+    // Acquire the per-snapshot lock (exclusive) BEFORE the per-VM lock — same order as
+    // create_podman_snapshot. Re-creating an existing tag atomically swaps the snapshot
+    // directory; restores of this snapshot hold the same lock shared, so a concurrent
+    // `fcvm snapshot run --snapshot <tag>` can never pair one generation's disk.raw with
+    // another generation's memory.bin.
+    tokio::fs::create_dir_all(paths::snapshot_dir())
+        .await
+        .context("creating snapshot directory")?;
+    let _snapshot_lock = super::common::acquire_snapshot_dir_lock(&snapshot_dir, true).await?;
+
     // Acquire per-VM lock BEFORE reading the parent snapshot key.
     // Without this, a concurrent startup snapshot can complete between our state read
     // and the actual Firecracker snapshot — resetting the KVM dirty bitmap while we
@@ -204,6 +214,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         snapshot_config.clone(),
         &vm_disk_path,
         parent_dir.as_deref(),
+        None,
     )
     .await?;
 
@@ -610,6 +621,21 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     };
 
     let state_manager = StateManager::new(paths::state_dir());
+
+    // Hold the per-snapshot lock SHARED from reading config.json until the restore has
+    // opened memory.bin/vmstate.bin and reflinked disk.raw (released after
+    // restore_from_snapshot below). Snapshot creators take the same lock exclusively
+    // while atomically replacing the directory, so a concurrent re-create of this tag
+    // can never swap generations under us mid-restore (mixed disk/memory) or remove
+    // the directory between our reads.
+    tokio::fs::create_dir_all(paths::snapshot_dir())
+        .await
+        .context("creating snapshot directory")?;
+    let snapshot_shared_lock = super::common::acquire_snapshot_dir_lock(
+        &paths::snapshot_dir().join(&snapshot_name),
+        false,
+    )
+    .await?;
 
     // Load snapshot configuration
     let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
@@ -1100,6 +1126,11 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     )
     .await;
 
+    // The restore has opened/reflinked everything it needs from the snapshot directory;
+    // release the shared per-snapshot lock so creators are not blocked for the lifetime
+    // of this clone.
+    drop(snapshot_shared_lock);
+
     // If setup failed, cleanup all resources before propagating error
     if let Err(e) = setup_result {
         warn!("Clone setup failed, cleaning up resources");
@@ -1392,14 +1423,15 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                             // Use select! so SIGTERM can abort startup snapshot immediately.
                             // Startup snapshots are optional (just caching), so if the VM is
                             // paused mid-snapshot, cleanup will kill it via vm_manager.kill().
-                            let parent_key = vm_state.config.snapshot_name.clone();
+                            // The diff parent is resolved inside create_podman_snapshot under
+                            // the per-VM snapshot lock (re-read from the state file), so a
+                            // concurrent `fcvm snapshot create` cannot leave us with a stale base.
                             let snap = CreateSnapshotParams {
                                 vm_manager: &vm_manager,
                                 snapshot_key: &startup_key,
                                 vm_state: &vm_state,
                                 disk_path: &disk_path,
                                 volume_configs: &volume_configs,
-                                parent_snapshot_key: parent_key.as_deref(),
                                 remap_refs: &volume_servers.remap_refs,
                             };
                             tokio::select! {
