@@ -12,6 +12,12 @@ use crate::state::truncate_id;
 const GUEST_IP: &str = "10.0.2.100";
 const GUEST_GATEWAY: &str = "10.0.2.1";
 
+/// Host loopback alias for `--forward-localhost`. fc-agent's guest-side relay
+/// connects to this address (pasta maps it to host loopback in rootless mode).
+/// In routed mode nothing owns it by default, so setup assigns it to the bridge
+/// and listens there, relaying to the host's 127.0.0.1.
+const HOST_LOOPBACK_ALIAS: &str = "10.0.2.2";
+
 /// Bridge device name
 const BRIDGE_DEVICE: &str = "br0";
 
@@ -42,6 +48,8 @@ pub struct RoutedNetwork {
     loopback_ip: Option<String>,
     /// Explicit routable /64 prefix. Skips auto-detect and MASQUERADE.
     ipv6_prefix: Option<String>,
+    /// Guest localhost ports forwarded to the host's 127.0.0.1 (--forward-localhost).
+    forward_localhost: Vec<u16>,
 
     // Network state (populated during setup)
     namespace_id: Option<String>,
@@ -59,6 +67,7 @@ impl RoutedNetwork {
             port_mappings,
             loopback_ip: None,
             ipv6_prefix: None,
+            forward_localhost: Vec::new(),
             namespace_id: None,
             host_veth: None,
             vm_ipv6: None,
@@ -69,6 +78,15 @@ impl RoutedNetwork {
 
     pub fn with_ipv6_prefix(mut self, prefix: String) -> Self {
         self.ipv6_prefix = Some(prefix);
+        self
+    }
+
+    /// Set guest localhost ports to forward to the host's 127.0.0.1 (--forward-localhost).
+    ///
+    /// fc-agent relays guest 127.0.0.1:<port> to 10.0.2.2:<port>; setup() makes the
+    /// namespace own 10.0.2.2 and relays each connection to the host's loopback.
+    pub fn with_forward_localhost(mut self, ports: Vec<u16>) -> Self {
+        self.forward_localhost = ports;
         self
     }
 
@@ -598,7 +616,43 @@ impl NetworkManager for RoutedNetwork {
             self.proxy_handles.extend(handles);
         }
 
-        // 15. Reverse proxy relay: TCP proxy listens inside the namespace on the
+        // 15. Localhost forwarding (--forward-localhost): fc-agent's guest relay
+        //     connects to 10.0.2.2:<port> (the pasta-style host gateway). Nothing
+        //     owns 10.0.2.2 in routed mode, so assign it to the bridge and listen
+        //     there inside the namespace, relaying each connection to the host's
+        //     127.0.0.1:<port> from the host namespace.
+        if !self.forward_localhost.is_empty() {
+            let alias_cidr = format!("{}/32", HOST_LOOPBACK_ALIAS);
+            let output = namespace::exec_in_namespace(
+                &ns_name,
+                &["ip", "addr", "add", &alias_cidr, "dev", BRIDGE_DEVICE],
+            )
+            .await?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "failed to assign host loopback alias {} to {}: {}",
+                    alias_cidr,
+                    BRIDGE_DEVICE,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+
+            let handles = tcp_proxy::start_localhost_forwards(
+                &ns_name,
+                HOST_LOOPBACK_ALIAS,
+                &self.forward_localhost,
+            )
+            .await
+            .context("starting localhost forward proxies")?;
+            self.proxy_handles.extend(handles);
+            info!(
+                ports = ?self.forward_localhost,
+                alias = %HOST_LOOPBACK_ALIAS,
+                "forwarding guest localhost ports to host loopback"
+            );
+        }
+
+        // 16. Reverse proxy relay: TCP proxy listens inside the namespace on the
         //     gateway and connects to the actual proxy from the HOST namespace.
         //     Host-side BPF programs intercept connect() syscalls and inject
         //     client certs for proxy auth. Without this relay, the VM's direct
