@@ -718,12 +718,72 @@ pub(super) struct VmSetupParams<'a> {
 /// Helper function that runs VM setup and returns VmManager on success.
 /// This allows the caller to cleanup network resources on error.
 /// For rootless mode, also returns the holder process that keeps the namespace alive.
+///
+/// On error, any Firecracker or namespace-holder process started by the failed setup
+/// is killed and any NFS exports written for the VM are removed, so a partial setup
+/// failure never leaks running processes or host export entries.
 pub(super) async fn run_vm_setup(
     params: VmSetupParams<'_>,
     network: &mut dyn NetworkManager,
     state_manager: &StateManager,
     vm_state: &mut VmState,
 ) -> Result<(VmManager, Option<tokio::process::Child>)> {
+    let vm_id = params.vm_id.to_string();
+
+    // The inner setup publishes the Firecracker manager and holder process into these
+    // slots as soon as they are created, so the error path below can kill them even
+    // when the failure happens partway through configuration.
+    let mut vm_manager_slot: Option<VmManager> = None;
+    let mut holder_slot: Option<tokio::process::Child> = None;
+
+    let result = run_vm_setup_inner(
+        params,
+        network,
+        state_manager,
+        vm_state,
+        &mut vm_manager_slot,
+        &mut holder_slot,
+    )
+    .await;
+
+    if let Err(e) = result {
+        // Firecracker and/or the namespace holder may already be running — kill them
+        // so the failed setup doesn't leak processes (and the guest memory, TAP
+        // device, and CoW disk they hold).
+        if let Some(ref mut vm_manager) = vm_manager_slot {
+            if let Err(kill_err) = vm_manager.kill().await {
+                warn!("failed to kill VM process: {}", kill_err);
+            }
+        }
+        if let Some(ref mut holder) = holder_slot {
+            if let Err(kill_err) = holder.kill().await {
+                warn!("failed to kill holder process: {}", kill_err);
+            }
+            let _ = holder.wait().await; // Clean up zombie
+        }
+        // NFS exports may have been written before the failing step; remove them
+        // (no-op when the exports file was never created).
+        cleanup_nfs_exports(&vm_id).await;
+        return Err(e);
+    }
+
+    let vm_manager = vm_manager_slot.expect("run_vm_setup_inner sets vm_manager on success");
+    Ok((vm_manager, holder_slot))
+}
+
+/// Inner VM setup: creates the CoW disk, starts Firecracker, and configures the VM.
+///
+/// The Firecracker manager and (for rootless mode) the namespace-holder child are
+/// stored into the provided slots as soon as they exist so that `run_vm_setup` can
+/// kill them if a later step fails.
+async fn run_vm_setup_inner(
+    params: VmSetupParams<'_>,
+    network: &mut dyn NetworkManager,
+    state_manager: &StateManager,
+    vm_state: &mut VmState,
+    vm_manager_slot: &mut Option<VmManager>,
+    holder_slot: &mut Option<tokio::process::Child>,
+) -> Result<()> {
     let VmSetupParams {
         args,
         vm_id,
@@ -784,21 +844,18 @@ pub(super) async fn run_vm_setup(
     // Enable Firecracker debug logging
     let fc_log_path = data_dir.join("firecracker.log");
     let _ = std::fs::File::create(&fc_log_path);
-    let mut vm_manager = VmManager::new(
+    let vm_manager = vm_manager_slot.insert(VmManager::new(
         vm_id.to_string(),
         socket_path.to_path_buf(),
         Some(fc_log_path),
-    );
+    ));
 
     // Set VM name for logging
     vm_manager.set_vm_name(vm_name);
 
     // Configure namespace isolation based on network type
-    let holder_child: Option<tokio::process::Child>;
-
     if let Some(bridged_net) = network.as_any().downcast_ref::<BridgedNetwork>() {
         // Bridged mode: use pre-created network namespace
-        holder_child = None;
         if let Some(ns_id) = bridged_net.namespace_id() {
             info!(namespace = %ns_id, "configuring VM to run in network namespace");
             vm_manager.set_namespace(ns_id.to_string());
@@ -808,17 +865,13 @@ pub(super) async fn run_vm_setup(
         .downcast_ref::<crate::network::RoutedNetwork>()
     {
         // Routed mode: use pre-created network namespace (like bridged)
-        holder_child = None;
         if let Some(ns_id) = routed_net.namespace_id() {
             info!(namespace = %ns_id, "configuring VM to run in routed network namespace");
             vm_manager.set_namespace(ns_id.to_string());
         }
     } else if let Some(pasta_net) = network.as_any().downcast_ref::<PastaNetwork>() {
-        holder_child = Some(
-            setup_rootless_namespace(pasta_net, network_config, &mut vm_manager, vm_state).await?,
-        );
-    } else {
-        holder_child = None;
+        *holder_slot =
+            Some(setup_rootless_namespace(pasta_net, network_config, vm_manager, vm_state).await?);
     }
 
     let firecracker_bin = crate::commands::common::find_firecracker(runtime_config)?;
@@ -1077,7 +1130,7 @@ pub(super) async fn run_vm_setup(
     crate::commands::common::save_vm_state_with_network(state_manager, vm_state, network_config)
         .await?;
 
-    Ok((vm_manager, holder_child))
+    Ok(())
 }
 
 #[cfg(test)]
