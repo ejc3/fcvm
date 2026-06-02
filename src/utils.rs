@@ -21,6 +21,22 @@ pub fn is_process_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{}", pid)).exists()
 }
 
+/// Check whether `pid` runs the same executable name (`/proc/<pid>/comm`) as the current process.
+///
+/// State files can outlive a crashed/SIGKILL'd fcvm process, so a PID recorded in a state file
+/// may have been reused by an unrelated process. Callers use this as an identity check before
+/// signalling such PIDs: an fcvm process must never SIGTERM a stranger's PID.
+///
+/// Returns `false` if the process does not exist or its comm cannot be read.
+pub fn is_same_process_name(pid: u32) -> bool {
+    let other = std::fs::read_to_string(format!("/proc/{}/comm", pid));
+    let me = std::fs::read_to_string("/proc/self/comm");
+    match (other, me) {
+        (Ok(other), Ok(me)) => other.trim() == me.trim(),
+        _ => false,
+    }
+}
+
 /// Gracefully kill a process by sending SIGTERM first, then SIGKILL if needed.
 ///
 /// This allows the process to run cleanup handlers (network teardown, file cleanup, etc.)
@@ -338,6 +354,23 @@ mod tests {
     fn test_is_process_alive_init() {
         // PID 1 (init/systemd) should always exist on Linux
         assert!(is_process_alive(1));
+    }
+
+    #[test]
+    fn test_is_same_process_name_current_process() {
+        // The current process trivially runs the same executable as itself
+        assert!(is_same_process_name(std::process::id()));
+    }
+
+    #[test]
+    fn test_is_same_process_name_other_process() {
+        // PID 1 (init/systemd) is never the test binary
+        assert!(!is_same_process_name(1));
+    }
+
+    #[test]
+    fn test_is_same_process_name_nonexistent() {
+        assert!(!is_same_process_name(u32::MAX));
     }
 
     #[test]
