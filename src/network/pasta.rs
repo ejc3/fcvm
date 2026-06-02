@@ -668,8 +668,16 @@ impl NetworkManager for PastaNetwork {
     /// existing ones. The active ping forces the namespace kernel to send an
     /// ARP request that the guest replies to, creating a REACHABLE entry.
     ///
-    /// Once ARP is resolved, we probe each forwarded port to confirm pasta's
-    /// loopback port forwarding is end-to-end functional.
+    /// Once ARP is resolved, the L2 forwarding path through pasta's bridge is
+    /// confirmed working. We do NOT probe individual forwarded ports with
+    /// TcpStream::connect() here — even though the guest is alive, a bare
+    /// connect-then-drop creates a half-open connection in pasta's
+    /// connection tracking that poisons subsequent data connections on the
+    /// same port (manifesting as 0-byte HTTP responses).
+    ///
+    /// The ping proves: namespace → pasta bridge → guest L2/L3 path works.
+    /// Pasta is already listening on the loopback ports (confirmed at startup).
+    /// Together these guarantee the forwarding chain is functional.
     async fn verify_port_forwarding(&self) -> Result<()> {
         if self.port_mappings.is_empty() {
             return Ok(());
@@ -699,9 +707,14 @@ impl NetworkManager for PastaNetwork {
             if output.status.success() {
                 info!(
                     guest_ip = GUEST_IP,
-                    "guest reachable via ping, ARP resolved"
+                    "guest reachable via ping, ARP resolved — port forwarding path ready"
                 );
-                self.wait_for_port_forwarding().await?;
+                // Do NOT call wait_for_port_forwarding() here.
+                // A bare TcpStream::connect() + immediate drop through pasta's
+                // L2 translation creates a half-open entry in pasta's connection
+                // tracking table that poisons subsequent connections on the same
+                // port (0-byte responses). The ping already confirms L2
+                // reachability and pasta is listening on the loopback ports.
                 return Ok(());
             }
 
