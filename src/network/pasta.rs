@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tracing::{debug, info, warn};
 
@@ -26,6 +29,16 @@ const PASTA_DEVICE_NAME: &str = "pasta0";
 
 /// Timeout for waiting for pasta PID file (readiness signal)
 const PASTA_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Timeout for waiting for pasta's TAP device to appear in the namespace
+const PASTA_DEVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Number of recent pasta stderr lines kept for error reporting
+const PASTA_STDERR_TAIL_LINES: usize = 20;
+
+/// How long to let the async stderr reader drain the pipe after pasta exits,
+/// so the failure error can include what it actually printed.
+const PASTA_STDERR_DRAIN_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Rootless networking using pasta with bridge architecture
 ///
@@ -72,6 +85,7 @@ pub struct PastaNetwork {
 
     // State (populated during setup)
     pasta_process: Option<Child>,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>, // last few pasta stderr lines, for failure attribution
     pid_file: Option<PathBuf>,
     loopback_ip: Option<String>, // Unique loopback IP for port forwarding (127.x.y.z)
     holder_pid: Option<u32>,     // Namespace PID (set in post_start)
@@ -88,6 +102,7 @@ impl PastaNetwork {
             guest_ip: GUEST_IP.to_string(),
             guest_ipv6: GUEST_IPV6.to_string(),
             pasta_process: None,
+            stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
             pid_file: None,
             loopback_ip: None,
             holder_pid: None,
@@ -172,17 +187,13 @@ ip link set lo up
     /// Port forwarding: pasta splices inbound loopback connections directly into the
     /// namespace, where they route via br0 → tap-fc → VM. Outbound traffic goes
     /// through pasta's L2 translation: tap-fc → br0 → pasta0 → pasta → host.
+    ///
+    /// The caller (post_start) waits for pasta's TAP device to exist via
+    /// wait_for_pasta_device() before running this script.
     pub fn build_bridge_script(&self) -> String {
         let script = format!(
             r#"
 set -e
-
-# Wait for pasta0 to appear (under load, PID file may be written before device is visible)
-for i in $(seq 1 50); do
-    ip link show {pasta_dev} >/dev/null 2>&1 && break
-    sleep 0.1
-done
-ip link show {pasta_dev} >/dev/null 2>&1 || {{ echo "Cannot find device \"{pasta_dev}\"" >&2; exit 1; }}
 
 # Bring pasta0 up (pasta creates it but doesn't bring it up without --config-net)
 ip link set {pasta_dev} up
@@ -432,31 +443,45 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
         debug!(cmd = ?cmd, "pasta command");
         let mut child = cmd.spawn().context("failed to spawn pasta")?;
 
+        // Stream pasta's stderr: log every line and keep a tail so error paths
+        // can show what pasta actually printed. Without this, pasta's output is
+        // silently discarded and a dead pasta only surfaces later as an
+        // unrelated bridge setup failure.
+        if let Some(stderr) = child.stderr.take() {
+            let stderr_tail = Arc::clone(&self.stderr_tail);
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    warn!(target: "pasta", "{}", line);
+                    if let Ok(mut tail) = stderr_tail.lock() {
+                        if tail.len() >= PASTA_STDERR_TAIL_LINES {
+                            tail.pop_front();
+                        }
+                        tail.push_back(line);
+                    }
+                }
+            });
+        }
+
         // Wait for PID file to appear (signals pasta is ready)
         let deadline = std::time::Instant::now() + PASTA_READY_TIMEOUT;
         loop {
             if pid_file.exists() {
                 info!("pasta ready (PID file created)");
-                // Drop stderr to prevent pipe buffer deadlock
-                drop(child.stderr.take());
                 break;
             }
 
             // Check if pasta died during startup
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    let output = child.wait_with_output().await?;
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let stderr = stderr.trim();
-                    if stderr.is_empty() {
-                        anyhow::bail!("pasta exited before becoming ready (status: {})", status);
-                    } else {
-                        anyhow::bail!(
-                            "pasta exited before becoming ready (status: {}): {}",
-                            status,
-                            stderr
-                        );
-                    }
+                    // Give the stderr reader a moment to drain the pipe so the
+                    // error includes what pasta actually printed.
+                    tokio::time::sleep(PASTA_STDERR_DRAIN_DELAY).await;
+                    anyhow::bail!(
+                        "pasta exited before becoming ready (status: {}){}",
+                        status,
+                        self.stderr_tail_message()
+                    );
                 }
                 Ok(None) => {} // Still running
                 Err(e) => anyhow::bail!("failed to check pasta status: {}", e),
@@ -465,8 +490,9 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
             if std::time::Instant::now() > deadline {
                 let _ = child.kill().await;
                 anyhow::bail!(
-                    "pasta did not become ready within {:?}",
-                    PASTA_READY_TIMEOUT
+                    "pasta did not become ready within {:?}{}",
+                    PASTA_READY_TIMEOUT,
+                    self.stderr_tail_message()
                 );
             }
 
@@ -477,6 +503,81 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
         self.pid_file = Some(pid_file);
 
         Ok(())
+    }
+
+    /// Render the captured pasta stderr tail for error messages.
+    fn stderr_tail_message(&self) -> String {
+        let lines: Vec<String> = self
+            .stderr_tail
+            .lock()
+            .map(|tail| tail.iter().cloned().collect())
+            .unwrap_or_default();
+        if lines.is_empty() {
+            "; no stderr output captured from pasta".to_string()
+        } else {
+            format!("; last pasta stderr output:\n  {}", lines.join("\n  "))
+        }
+    }
+
+    /// Wait for pasta's TAP device to appear in the namespace, supervising pasta itself.
+    ///
+    /// pasta writes its PID file before the device is visible in the namespace,
+    /// and under load that window can stretch out — or pasta can die right after
+    /// startup, in which case the device never appears at all. Polling here
+    /// (instead of inside the bridge script) lets every iteration also check the
+    /// pasta child, so a dead pasta fails fast with its own exit status and
+    /// stderr instead of a generic "Cannot find device" from the bridge setup.
+    async fn wait_for_pasta_device(&mut self, holder_pid: u32) -> Result<()> {
+        let deadline = std::time::Instant::now() + PASTA_DEVICE_TIMEOUT;
+        let nsenter_prefix = self.build_nsenter_prefix(holder_pid);
+
+        loop {
+            let output = Command::new(&nsenter_prefix[0])
+                .args(&nsenter_prefix[1..])
+                .args(["ip", "link", "show", &self.pasta_device])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .await
+                .context("checking for pasta TAP device via nsenter")?;
+
+            if output.status.success() {
+                debug!(device = %self.pasta_device, "pasta TAP device present in namespace");
+                return Ok(());
+            }
+
+            // Device not visible yet — if pasta has exited, attribute the failure
+            // to pasta instead of letting the bridge setup fail later.
+            let pasta_exit = match self.pasta_process.as_mut() {
+                Some(process) => process
+                    .try_wait()
+                    .context("checking pasta process status")?,
+                None => None,
+            };
+            if let Some(status) = pasta_exit {
+                self.pasta_process = None;
+                // Give the stderr reader a moment to drain the pipe so the
+                // error includes what pasta actually printed.
+                tokio::time::sleep(PASTA_STDERR_DRAIN_DELAY).await;
+                anyhow::bail!(
+                    "pasta exited (status: {}) before its TAP device {} appeared in the namespace{}",
+                    status,
+                    self.pasta_device,
+                    self.stderr_tail_message()
+                );
+            }
+
+            if std::time::Instant::now() > deadline {
+                anyhow::bail!(
+                    "pasta is still running but its TAP device {} did not appear in the namespace within {:?}{}",
+                    self.pasta_device,
+                    PASTA_DEVICE_TIMEOUT,
+                    self.stderr_tail_message()
+                );
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     /// Get guest IP address for kernel boot args
@@ -591,7 +692,12 @@ impl NetworkManager for PastaNetwork {
         // Phase 1: Start pasta (creates pasta0 TAP in namespace)
         self.start_pasta(holder_pid).await?;
 
-        // Phase 2: Create bridge connecting pasta0 and Firecracker's TAP
+        // Phase 2: Wait for pasta's TAP device to be visible in the namespace,
+        // failing fast (with pasta's exit status and stderr) if pasta dies right
+        // after startup.
+        self.wait_for_pasta_device(holder_pid).await?;
+
+        // Phase 3: Create bridge connecting pasta0 and Firecracker's TAP
         let bridge_script = self.build_bridge_script();
         let nsenter_prefix = self.build_nsenter_prefix(holder_pid);
 
@@ -615,7 +721,7 @@ impl NetworkManager for PastaNetwork {
             anyhow::bail!("bridge setup failed: {}", stderr.trim());
         }
 
-        // Phase 3: Verify port forwarding is actually working
+        // Phase 4: Verify port forwarding is actually working
         // The PID file only means pasta spawned, not that ports are bound.
         // Health checks use nsenter (bridge path), so without this check
         // "healthy" doesn't mean port forwarding works.

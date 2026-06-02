@@ -501,17 +501,37 @@ impl VmManager {
         Ok(())
     }
 
-    /// Wait for Firecracker socket to be ready
+    /// Wait for the Firecracker API server to accept connections
+    ///
+    /// The socket file becoming visible is not enough: there is a window between
+    /// Firecracker's bind() (file exists) and listen() where connect() fails with
+    /// ECONNREFUSED. Poll by actually connecting so the first real API request
+    /// never races that window.
     ///
     /// Also polls the Firecracker child process: if it exits before the API
-    /// socket appears, fail immediately with its exit status and recent stderr
-    /// output instead of timing out with a generic socket error.
+    /// server accepts connections, fail immediately with its exit status and
+    /// recent stderr output instead of timing out with a generic socket error.
     async fn wait_for_socket(&mut self) -> Result<()> {
         use tokio::time::sleep;
 
         for _ in 0..SOCKET_WAIT_RETRY_COUNT {
-            if self.socket_path.exists() {
-                return Ok(());
+            match tokio::net::UnixStream::connect(&self.socket_path).await {
+                Ok(stream) => {
+                    // Only probing readiness — drop the connection immediately.
+                    drop(stream);
+                    return Ok(());
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        || e.kind() == std::io::ErrorKind::ConnectionRefused =>
+                {
+                    // Socket file not created yet, or created but not listening yet.
+                }
+                Err(e) => bail!(
+                    "unexpected error connecting to Firecracker API socket {}: {}",
+                    self.socket_path.display(),
+                    e
+                ),
             }
 
             if let Some(status) = self.try_wait()? {
