@@ -208,17 +208,23 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     .await?;
 
     // Track this snapshot as the latest base for future diff snapshots.
-    // Re-read the state before saving: the snapshot can take minutes while the VM-owning
-    // process keeps updating the state file (health monitor, exit code). Mutating and saving
-    // the pre-lock copy would silently revert those concurrent updates.
-    let mut updated_state = load_snapshot_create_target(&state_manager, &args)
-        .await
-        .context("re-reading VM state after snapshot")?;
-    updated_state.config.snapshot_name = Some(snapshot_name.clone());
-    state_manager
-        .save_state(&updated_state)
+    // Use a locked read-modify-write so we only change snapshot_name — this
+    // process's copy of the state is minutes old by now, and a whole-state save
+    // would clobber fields the VM owner wrote in the meantime (health status,
+    // exit code, its own startup-snapshot key).
+    let recorded_snapshot_name = snapshot_name.clone();
+    let recorded = state_manager
+        .update_state(&vm_state.vm_id, |state| {
+            state.config.snapshot_name = Some(recorded_snapshot_name);
+        })
         .await
         .context("saving snapshot name to VM state")?;
+    if recorded.is_none() {
+        warn!(
+            vm_id = %vm_state.vm_id,
+            "VM state file no longer exists; snapshot base not recorded"
+        );
+    }
 
     // Print user-friendly output
     let vm_name = vm_state
@@ -1406,7 +1412,13 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
                                         SnapshotOutcome::Created => {
                                             info!(snapshot_key = %startup_key, "Startup snapshot created successfully");
                                             vm_state.config.snapshot_name = Some(startup_key.clone());
-                                            let _ = state_manager.save_state(&vm_state).await;
+                                            // Locked read-modify-write: only update snapshot_name so the
+                                            // health monitor's concurrent writes are not clobbered.
+                                            let _ = state_manager
+                                                .update_state(&vm_state.vm_id, |state| {
+                                                    state.config.snapshot_name = Some(startup_key.clone());
+                                                })
+                                                .await;
                                         }
                                         SnapshotOutcome::Failed(e) => {
                                             warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");

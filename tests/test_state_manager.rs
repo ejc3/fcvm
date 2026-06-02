@@ -22,6 +22,7 @@ async fn test_state_persistence() {
         health_status: HealthStatus::Healthy,
         exit_code: None,
         pid: Some(12345),
+        pid_start_time: None,
         holder_pid: None,
         created_at: now,
         last_updated: now,
@@ -113,6 +114,7 @@ async fn test_list_vms() {
             health_status: HealthStatus::Healthy,
             exit_code: None,
             pid: Some(10000 + i),
+            pid_start_time: None,
             holder_pid: None,
             created_at: now,
             last_updated: now,
@@ -175,6 +177,7 @@ async fn test_load_state_by_name_duplicate_detection() {
             health_status: HealthStatus::Healthy,
             exit_code: None,
             pid: Some(pid),
+            pid_start_time: None,
             holder_pid: None,
             created_at: now,
             last_updated: now,
@@ -231,6 +234,7 @@ async fn test_load_state_by_name_duplicate_detection() {
         health_status: HealthStatus::Healthy,
         exit_code: None,
         pid: Some(6000),
+        pid_start_time: None,
         holder_pid: None,
         created_at: now,
         last_updated: now,
@@ -276,6 +280,7 @@ fn make_vm_state(vm_id: &str, name: &str, pid: u32) -> VmState {
         health_status: HealthStatus::Healthy,
         exit_code: None,
         pid: Some(pid),
+        pid_start_time: None,
         holder_pid: None,
         created_at: Utc::now(),
         last_updated: Utc::now(),
@@ -372,5 +377,126 @@ async fn test_load_state_by_pid_cleans_stale_on_retry() {
         vms_after.len(),
         0,
         "stale state file should be removed after cleanup"
+    );
+}
+
+#[tokio::test]
+async fn test_update_state_preserves_concurrent_updates() {
+    let temp_dir = TempDir::new().unwrap();
+    // Two manager instances over the same directory simulate two processes
+    // (the VM owner's health monitor and an external `fcvm snapshot create`).
+    let owner = StateManager::new(temp_dir.path().to_path_buf());
+    let external = StateManager::new(temp_dir.path().to_path_buf());
+    owner.init().await.unwrap();
+
+    let my_pid = std::process::id();
+    let state = make_vm_state("vm-update", "update-test", my_pid);
+    owner.save_state(&state).await.unwrap();
+
+    // The owner's health monitor records a stop with an exit code...
+    owner
+        .update_health_status("vm-update", HealthStatus::Stopped, Some(7))
+        .await
+        .unwrap();
+
+    // ...then the external process records a snapshot name via a locked
+    // read-modify-write. The health monitor's write must survive even though
+    // the external process never saw it in memory.
+    let updated = external
+        .update_state("vm-update", |s| {
+            s.config.snapshot_name = Some("snap-1".to_string());
+        })
+        .await
+        .unwrap()
+        .expect("state file should exist");
+    assert_eq!(updated.config.snapshot_name.as_deref(), Some("snap-1"));
+
+    let on_disk = owner.load_state("vm-update").await.unwrap();
+    assert_eq!(on_disk.config.snapshot_name.as_deref(), Some("snap-1"));
+    assert_eq!(on_disk.health_status, HealthStatus::Stopped);
+    assert_eq!(on_disk.exit_code, Some(7));
+}
+
+#[tokio::test]
+async fn test_delete_state_then_update_does_not_resurrect() {
+    let temp_dir = TempDir::new().unwrap();
+    // Two manager instances over the same directory simulate the cleanup path
+    // and a health monitor task that hasn't stopped yet.
+    let cleanup = StateManager::new(temp_dir.path().to_path_buf());
+    let monitor = StateManager::new(temp_dir.path().to_path_buf());
+    cleanup.init().await.unwrap();
+
+    let my_pid = std::process::id();
+    let state = make_vm_state("vm-deleted", "deleted", my_pid);
+    cleanup.save_state(&state).await.unwrap();
+
+    cleanup.delete_state("vm-deleted").await.unwrap();
+
+    // A late health-monitor write after deletion must be a no-op, not a
+    // recreation of the state file.
+    let previous = monitor
+        .update_health_status("vm-deleted", HealthStatus::Stopped, Some(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        previous, None,
+        "update on deleted VM should report no state"
+    );
+
+    assert!(
+        !temp_dir.path().join("vm-deleted.json").exists(),
+        "state file must not be resurrected after delete_state"
+    );
+    assert!(cleanup.list_vms().await.unwrap().is_empty());
+
+    // delete_state also removes its lock and temp files, and the no-op update
+    // must not recreate them.
+    assert!(!temp_dir.path().join("vm-deleted.json.lock").exists());
+    assert!(!temp_dir.path().join("vm-deleted.json.tmp").exists());
+}
+
+#[tokio::test]
+async fn test_load_state_by_pid_rejects_pid_reuse() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = StateManager::new(temp_dir.path().to_path_buf());
+    manager.init().await.unwrap();
+
+    // Simulate a VM that crashed without cleanup and whose PID was later
+    // reused by an unrelated process: the state file claims a live PID (ours)
+    // but records a start time that does not match that process.
+    let my_pid = std::process::id();
+    let mut stale = make_vm_state("vm-reused-pid", "reused-pid", my_pid);
+    stale.pid_start_time = Some(1); // bogus: a real start time is far larger
+    let json = serde_json::to_string_pretty(&stale).unwrap();
+    // Write the file directly — save_state would overwrite pid_start_time with
+    // the real value for the live process.
+    std::fs::write(temp_dir.path().join("vm-reused-pid.json"), json).unwrap();
+
+    // The lookup must not trust the stale file even though /proc/<pid> exists.
+    let err = manager
+        .load_state_by_pid(my_pid)
+        .await
+        .expect_err("stale state with reused PID must not match");
+    assert!(
+        err.to_string().contains("No VM found with PID"),
+        "unexpected error: {}",
+        err
+    );
+
+    // The stale file is removed by the cleanup pass that runs on lookup miss.
+    assert!(
+        manager.list_vms().await.unwrap().is_empty(),
+        "stale state file with reused PID should be cleaned up"
+    );
+
+    // A state saved by the live process (start time recorded by save_state)
+    // is still found.
+    let live = make_vm_state("vm-live-pid", "live-pid", my_pid);
+    manager.save_state(&live).await.unwrap();
+    let found = manager.load_state_by_pid(my_pid).await.unwrap();
+    assert_eq!(found.vm_id, "vm-live-pid");
+    assert!(
+        found.pid_start_time.is_some(),
+        "save_state should record the process start time"
     );
 }
