@@ -413,6 +413,16 @@ fn find_repo_root() -> Option<PathBuf> {
         }
     }
 
+    // Try the repo path baked in at build time. This keeps locally-built
+    // binaries working when invoked from another directory while target/ is a
+    // symlink outside the repo (then /proc/self/exe resolves outside the repo
+    // and the executable-path fallback below cannot find Cargo.toml).
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if manifest_dir.join("Cargo.toml").exists() && manifest_dir.join("rootfs-config.toml").exists()
+    {
+        return Some(manifest_dir);
+    }
+
     // Try relative to executable
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
