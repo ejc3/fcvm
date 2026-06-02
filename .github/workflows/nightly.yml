@@ -57,7 +57,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y fuse3 libfuse3-dev libclang-dev clang musl-tools \
-            iproute2 iptables passt dnsmasq qemu-utils e2fsprogs parted \
+            iproute2 iptables passt dnsmasq qemu-utils e2fsprogs parted patch \
             podman skopeo busybox-static cpio zstd autoconf automake libtool cmake \
             libseccomp-dev
       - name: Build passt from source

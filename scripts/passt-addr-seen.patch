@@ -1,0 +1,47 @@
+Restrict addr_seen updates to the configured guest address.
+
+pasta tracks the latest source address seen on the tap interface
+(addr_seen) and uses it as the target for inbound port forwarding. The
+update accepts any IPv4/IPv6 frame, so when the tap interface sits on a
+shared L2 segment (fcvm enslaves pasta's tap to a bridge that also
+carries the namespace gateway), an overheard frame from another host
+silently retargets all forwarded connections away from the guest. A
+restored clone sends almost no traffic of its own through pasta, so the
+bad target sticks and every forwarded connection is reset.
+
+With this guard, only frames sourced from the configured guest address
+(fcvm always passes -a/--no-dhcp) update addr_seen. Intended for static
+address deployments; to be discussed upstream.
+
+diff -ru a/tap.c b/tap.c
+--- a/tap.c	2026-01-20 10:37:53.000000000 -0800
++++ b/tap.c	2026-06-02 00:11:11.454185065 -0700
+@@ -771,7 +771,13 @@
+ 			continue;
+ 		}
+ 
+-		if (iph->saddr && c->ip4.addr_seen.s_addr != iph->saddr)
++		/* Only frames sourced from the guest's configured address may
++		 * move addr_seen: the tap interface can sit on a shared L2
++		 * segment (e.g. a bridge port), and frames overheard from other
++		 * hosts there must not retarget inbound forwarding.
++		 */
++		if (iph->saddr && iph->saddr == c->ip4.addr.s_addr &&
++		    c->ip4.addr_seen.s_addr != iph->saddr)
+ 			c->ip4.addr_seen.s_addr = iph->saddr;
+ 
+ 		if (!iov_drop_header(&data, hlen))
+@@ -953,7 +959,12 @@
+ 
+ 			if (IN6_IS_ADDR_UNSPECIFIED(&c->ip6.addr))
+ 				c->ip6.addr = *saddr;
+-		} else if (!IN6_IS_ADDR_UNSPECIFIED(saddr)){
++		} else if (!IN6_IS_ADDR_UNSPECIFIED(saddr) &&
++			   (IN6_IS_ADDR_UNSPECIFIED(&c->ip6.addr) ||
++			    IN6_ARE_ADDR_EQUAL(saddr, &c->ip6.addr))) {
++			/* As for IPv4: only the guest's configured address may
++			 * move addr_seen on a shared L2 segment.
++			 */
+ 			c->ip6.addr_seen = *saddr;
+ 		}
+ 
