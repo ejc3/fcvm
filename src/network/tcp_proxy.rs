@@ -199,6 +199,74 @@ pub async fn start_port_forwards(
     Ok(handles)
 }
 
+/// Start localhost forwarding: listen inside the namespace, relay to host loopback.
+///
+/// Used for `--forward-localhost` in routed mode. fc-agent's guest-side relay
+/// connects to `<listen_ip>:<port>` (the pasta-style host gateway 10.0.2.2) for
+/// traffic destined to the host's loopback. The listener runs inside the VM's
+/// network namespace; the upstream connect happens in the host namespace,
+/// reaching services bound to 127.0.0.1:<port> on the host.
+///
+/// Returns a `JoinHandle` per port. Abort all handles on cleanup.
+pub async fn start_localhost_forwards(
+    ns_name: &str,
+    listen_ip: &str,
+    ports: &[u16],
+) -> Result<Vec<JoinHandle<()>>> {
+    let mut handles: Vec<JoinHandle<()>> = Vec::new();
+
+    // Helper: abort all started handles on error.
+    let abort_all = |handles: &[JoinHandle<()>]| {
+        for h in handles {
+            h.abort();
+        }
+    };
+
+    for &port in ports {
+        let bind_addr: SocketAddr = match format!("{}:{}", listen_ip, port).parse() {
+            Ok(addr) => addr,
+            Err(e) => {
+                abort_all(&handles);
+                return Err(anyhow::anyhow!(e)).with_context(|| {
+                    format!(
+                        "invalid localhost forward bind address {}:{}",
+                        listen_ip, port
+                    )
+                });
+            }
+        };
+
+        let listener = match bind_in_namespace(ns_name, bind_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                abort_all(&handles);
+                return Err(e).with_context(|| format!("binding localhost forward on {bind_addr}"));
+            }
+        };
+
+        info!(
+            port,
+            bind = %bind_addr,
+            "localhost forwarding via TCP proxy"
+        );
+
+        let host_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let handle = spawn_relay_loop(
+            listener,
+            move || async move {
+                tokio::net::TcpStream::connect(host_addr)
+                    .await
+                    .context("connecting to host loopback")
+            },
+            "localhost forward",
+        );
+
+        handles.push(handle);
+    }
+
+    Ok(handles)
+}
+
 /// Start a reverse proxy relay: listen inside namespace, connect to host proxy.
 ///
 /// Used when host-side BPF programs intercept connect() for proxy auth.
@@ -456,6 +524,77 @@ mod tests {
         echo_handle.abort();
         cleanup(ns_name).await;
         println!("test_port_forward_relay PASSED");
+        Ok(())
+    }
+
+    /// Test the localhost-forward relay path without a VM.
+    ///
+    /// Creates a namespace with the forward listener inside it (the guest side),
+    /// a server on host loopback (the host side), and verifies that connections
+    /// made from inside the namespace reach the host loopback service.
+    #[cfg(feature = "privileged-tests")]
+    #[tokio::test]
+    async fn test_localhost_forward_relay() -> Result<()> {
+        let ns_name = format!("test-lf-{}", std::process::id());
+
+        // Create namespace + loopback
+        tokio::process::Command::new("ip")
+            .args(["netns", "add", &ns_name])
+            .output()
+            .await?;
+        tokio::process::Command::new("ip")
+            .args(["netns", "exec", &ns_name, "ip", "link", "set", "lo", "up"])
+            .output()
+            .await?;
+
+        let cleanup = |ns: String| async move {
+            let _ = tokio::process::Command::new("ip")
+                .args(["netns", "del", &ns])
+                .output()
+                .await;
+        };
+
+        // Host service on host-namespace loopback. The relay must reach this
+        // even though the listener it accepts from lives inside the namespace.
+        let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let host_port = host_listener.local_addr()?.port();
+        let server_handle = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = host_listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let _ = stream.write_all(b"HELLO_FROM_HOST").await;
+            }
+        });
+
+        // Forward listener inside the namespace on the same port number.
+        // Production binds on the bridge's 10.0.2.2 alias; the namespace
+        // loopback exercises the same bind-in-namespace + relay path.
+        let result: Result<()> = async {
+            let handles = start_localhost_forwards(&ns_name, "127.0.0.1", &[host_port]).await?;
+
+            // Give the listener a moment to start accepting
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            // Connect from inside the namespace (the guest contract: connect to
+            // <listen_ip>:<port>) and verify data from the host service arrives.
+            let listen_addr: SocketAddr = format!("127.0.0.1:{}", host_port).parse().unwrap();
+            let mut client = connect_in_namespace(&ns_name, listen_addr).await?;
+
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            client.read_to_end(&mut buf).await?;
+            assert_eq!(buf, b"HELLO_FROM_HOST", "relay should reach host loopback");
+
+            for h in handles {
+                h.abort();
+            }
+            Ok(())
+        }
+        .await;
+
+        server_handle.abort();
+        cleanup(ns_name).await;
+        result?;
+        println!("test_localhost_forward_relay PASSED");
         Ok(())
     }
 }

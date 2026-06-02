@@ -731,6 +731,10 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
             if let Some(ref prefix) = snapshot_config.metadata.ipv6_prefix {
                 net = net.with_ipv6_prefix(prefix.clone());
             }
+            if !snapshot_config.metadata.forward_localhost.is_empty() {
+                net =
+                    net.with_forward_localhost(snapshot_config.metadata.forward_localhost.clone());
+            }
             net.preflight_check()
                 .context("routed mode preflight check failed")?;
             if !port_mappings.is_empty() {
@@ -793,6 +797,7 @@ pub async fn cmd_snapshot_run(args: SnapshotRunArgs) -> Result<()> {
     vm_state.config.username = snapshot_config.metadata.username.clone();
     vm_state.config.user = snapshot_config.metadata.user.clone();
     vm_state.config.port_mappings = port_mappings;
+    vm_state.config.forward_localhost = snapshot_config.metadata.forward_localhost.clone();
     vm_state.config.network_mode = network_mode;
     vm_state.config.ipv6_prefix = snapshot_config.metadata.ipv6_prefix.clone();
     vm_state.config.tty = tty_mode;

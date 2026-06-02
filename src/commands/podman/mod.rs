@@ -142,6 +142,18 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
         );
     }
 
+    // Normalize --forward-localhost: a repeated port would otherwise fail the
+    // host-side bind in routed mode. Bridged mode has no host-side relay for the
+    // guest's 10.0.2.2 gateway target, so reject it instead of silently ignoring it.
+    args.forward_localhost.sort_unstable();
+    args.forward_localhost.dedup();
+    if !args.forward_localhost.is_empty() && matches!(args.network, NetworkMode::Bridged) {
+        bail!(
+            "--forward-localhost is not supported with --network bridged \
+             (supported modes: rootless, routed)"
+        );
+    }
+
     // Disallow --setup when running as root
     // Root users should run `fcvm setup` explicitly
     if args.setup && nix::unistd::geteuid().is_root() {
@@ -599,6 +611,7 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
     vm_state.config.hugepages = args.hugepages;
     vm_state.config.portable_volumes = args.portable_volumes;
     vm_state.config.port_mappings = port_mappings.clone();
+    vm_state.config.forward_localhost = args.forward_localhost.clone();
     vm_state.config.network_mode = args.network.into();
     vm_state.config.ipv6_prefix = args.ipv6_prefix.clone();
     vm_state.config.tty = args.tty;
@@ -655,6 +668,9 @@ pub async fn prepare_vm(mut args: RunArgs) -> Result<Option<VmContext>> {
                 RoutedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
             if let Some(ref prefix) = args.ipv6_prefix {
                 net = net.with_ipv6_prefix(prefix.clone());
+            }
+            if !args.forward_localhost.is_empty() {
+                net = net.with_forward_localhost(args.forward_localhost.clone());
             }
             net.preflight_check()
                 .context("routed mode preflight check failed")?;

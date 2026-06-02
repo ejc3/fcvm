@@ -11,12 +11,9 @@ use anyhow::{Context, Result};
 use std::io::Write;
 use std::net::TcpListener;
 
-/// Test that --forward-localhost makes container's 127.0.0.1 reach host services.
-#[tokio::test]
-async fn test_forward_localhost() -> Result<()> {
-    println!("\nTest --forward-localhost");
-    println!("========================");
-
+/// Start a TCP server on host 127.0.0.1 that accepts one connection and replies
+/// with a greeting. Returns the bound port and the accept thread handle.
+fn spawn_host_server() -> Result<(u16, std::thread::JoinHandle<bool>)> {
     // Start a TCP server on host 127.0.0.1 (only reachable via loopback)
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
@@ -48,27 +45,35 @@ async fn test_forward_localhost() -> Result<()> {
         }
     });
 
+    Ok((port, accept_handle))
+}
+
+/// Run a VM with --forward-localhost that connects to localhost:port from the
+/// container, and assert the host server's greeting reaches the container.
+async fn run_forward_localhost_case(extra_args: &[&str], name_prefix: &str) -> Result<()> {
+    let (port, accept_handle) = spawn_host_server()?;
+
     let port_str = port.to_string();
-    let (vm_name, _, _, _) = common::unique_names("fwd-localhost");
+    let (vm_name, _, _, _) = common::unique_names(name_prefix);
 
     // Run container command that connects to localhost:port
     // This matches the exact manual test that works
     let fcvm_path = common::find_fcvm_binary()?;
+    let mut args = vec![
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--forward-localhost",
+        &port_str,
+        "--no-snapshot",
+    ];
+    args.extend_from_slice(extra_args);
+    let cmd = format!("nc -w30 127.0.0.1 {} 2>&1 || echo FAILED", port);
+    args.extend_from_slice(&[common::TEST_IMAGE, "--", "sh", "-c", &cmd]);
+
     let output = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "podman",
-            "run",
-            "--name",
-            &vm_name,
-            "--forward-localhost",
-            &port_str,
-            "--no-snapshot",
-            common::TEST_IMAGE,
-            "--",
-            "sh",
-            "-c",
-            &format!("nc -w30 127.0.0.1 {} 2>&1 || echo FAILED", port),
-        ])
+        .args(&args)
         .output()
         .await
         .context("running fcvm")?;
@@ -87,6 +92,34 @@ async fn test_forward_localhost() -> Result<()> {
         &stderr[..std::cmp::min(200, stderr.len())]
     );
 
+    Ok(())
+}
+
+/// Test that --forward-localhost makes container's 127.0.0.1 reach host services.
+#[tokio::test]
+async fn test_forward_localhost() -> Result<()> {
+    println!("\nTest --forward-localhost");
+    println!("========================");
+
+    run_forward_localhost_case(&[], "fwd-localhost").await?;
+
     println!("✅ FORWARD LOCALHOST TEST PASSED!");
+    Ok(())
+}
+
+/// Test --forward-localhost with routed networking.
+///
+/// Routed mode has no pasta gateway mapping: fcvm assigns 10.0.2.2 to the
+/// namespace bridge and relays connections to the host's 127.0.0.1 via the
+/// built-in TCP proxy. Requires root (network namespaces, veth pairs).
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_forward_localhost_routed() -> Result<()> {
+    println!("\nTest --forward-localhost (routed)");
+    println!("=================================");
+
+    run_forward_localhost_case(&["--network", "routed"], "fwd-localhost-routed").await?;
+
+    println!("✅ FORWARD LOCALHOST ROUTED TEST PASSED!");
     Ok(())
 }

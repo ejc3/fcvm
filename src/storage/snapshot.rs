@@ -93,6 +93,10 @@ pub struct SnapshotMetadata {
     /// Published port mappings inherited by clones
     #[serde(default)]
     pub port_mappings: Vec<crate::network::PortMapping>,
+    /// Guest localhost ports forwarded to the host's 127.0.0.1 (--forward-localhost),
+    /// inherited by clones so routed mode re-establishes the host-side relay on restore
+    #[serde(default)]
+    pub forward_localhost: Vec<u16>,
     /// Network mode (bridged, rootless, routed) inherited by clones
     #[serde(default)]
     pub network_mode: crate::firecracker::FcNetworkMode,
@@ -285,6 +289,7 @@ mod tests {
                 username: None,
                 user: None,
                 port_mappings: vec![],
+                forward_localhost: vec![],
                 network_mode: Default::default(),
                 ipv6_prefix: None,
                 tty: false,
@@ -410,6 +415,7 @@ mod tests {
                 username: None,
                 user: None,
                 port_mappings: vec![],
+                forward_localhost: vec![],
                 network_mode: Default::default(),
                 ipv6_prefix: None,
                 tty: false,
@@ -479,6 +485,7 @@ mod tests {
                     username: None,
                     user: None,
                     port_mappings: vec![],
+                    forward_localhost: vec![],
                     network_mode: Default::default(),
                     ipv6_prefix: None,
                     tty: false,
@@ -535,6 +542,7 @@ mod tests {
                 username: None,
                 user: None,
                 port_mappings: vec![],
+                forward_localhost: vec![],
                 network_mode: Default::default(),
                 ipv6_prefix: None,
                 tty: false,
@@ -642,6 +650,7 @@ mod tests {
                 username: None,
                 user: None,
                 port_mappings: vec![],
+                forward_localhost: vec![],
                 network_mode: Default::default(),
                 ipv6_prefix: None,
                 tty: false,
@@ -679,6 +688,7 @@ mod tests {
             username: None,
             user: None,
             port_mappings: vec![],
+            forward_localhost: vec![],
             network_mode: Default::default(),
             ipv6_prefix: Some("2600:1f1c:494:201".to_string()),
             tty: false,

@@ -223,6 +223,7 @@ pub struct RunArgs {
 
     /// Forward specific localhost ports to the host gateway via TCP proxy.
     /// Enables containers to reach host-only services via localhost.
+    /// Supported with rootless and routed networking (not bridged).
     /// Comma-separated port list, e.g., --forward-localhost 1421,9099
     #[arg(long, value_delimiter = ',')]
     pub forward_localhost: Vec<u16>,

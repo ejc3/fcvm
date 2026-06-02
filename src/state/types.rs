@@ -127,6 +127,11 @@ pub struct VmConfig {
     /// Published port mappings (host:guest)
     #[serde(default)]
     pub port_mappings: Vec<PortMapping>,
+    /// Guest localhost ports forwarded to the host's 127.0.0.1 (--forward-localhost).
+    /// Routed mode needs these to set up the host-side relay; clones inherit them
+    /// from snapshots so forwarding is re-established after restore.
+    #[serde(default)]
+    pub forward_localhost: Vec<u16>,
     /// User-defined labels for tagging/filtering VMs
     #[serde(default)]
     pub labels: HashMap<String, String>,
@@ -195,6 +200,7 @@ impl VmState {
                 serve_pid: None,
                 original_vsock_vm_id: None,
                 port_mappings: Vec::new(),
+                forward_localhost: Vec::new(),
                 network_mode: crate::firecracker::FcNetworkMode::default(),
                 tty: false,
                 interactive: false,
