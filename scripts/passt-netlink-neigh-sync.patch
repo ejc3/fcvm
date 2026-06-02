@@ -1,0 +1,128 @@
+From d00255bd3ccc3b19099fb34ab278b06d6be2ca59 Mon Sep 17 00:00:00 2001
+From: Stefano Brivio <sbrivio@redhat.com>
+Date: Thu, 21 May 2026 19:00:51 +0200
+Subject: [PATCH] netlink: Use regular request/response netlink socket for
+ initial neighbour sync
+
+...instead of the one dedicated to the neighbour monitor, because, if
+neighbour notifications start coming in before or while we send the
+initial request to read out the neighbour tables, messages and
+sequence numbers will collide.
+
+For example, if nl_neigh_sync() sends a RTM_GETNEIGH request with
+sequence 20, we expect a corresponding reply with sequence 20. But
+given that we already used the same socket to subscribe to
+notifications, and notifications don't correspond to any specific
+request we sent, we might now get a message with sequence 0.
+
+The collision between messages wouldn't actually matter, as we'll
+handle anyway any RTM_NEWNEIGH message in the same fashion, but we
+need to validate sequence numbers for robustness, and that will fail.
+
+At the same time, we have to subscribe to neighbour notifications
+before calling nl_neigh_sync(), because we'll have a race condition
+otherwise, as we might miss neighbours that were added before the
+notifier is registered.
+
+Use the regular nl_sock for nl_neigh_sync().
+
+Drop the interface index from the request: we won't get any entry
+otherwise, because the Linux kernel (as of version 7.0) is unable to
+filter on it. Results are now filtered by interface index as we read
+them.
+
+Passing along an interface index used to work when nl_neigh_sync()
+used the notifier socket, because NETLINK_GET_STRICT_CHK is not set
+on it, meaning that results weren't filtered at all (interface and
+IP version passed in the request were ignored altogether).
+
+To reproduce the issue fixed here:
+
+* detach a network and user namespace:
+
+  [terminal 0]
+  $ unshare -rUn
+  # echo $$
+  1543307
+
+* attach pasta to it:
+
+  [terminal 1]
+  $ ./pasta -f --config-net 1543307 -I enp9s0
+
+* enter that namespace from yet another terminal:
+
+  [terminal 2]
+  $ nsenter --preserve-credentials -U -n -t 1543307
+
+* start flooding the MAC address table of this namespace:
+
+  [terminal 1]
+  # for i in $(seq 10 99); do for j in $(seq 10 99); do for k in $(seq 10 99); do ip ne add dev enp9s0 10.$i.$j.$k lladdr 00:11:22:$i:$j:$k; done; done; done
+
+* and now start another instance of pasta in this namespace:
+
+  [terminal 2]
+  # ./pasta -d --config-net
+
+which will eventually result in pasta exiting with a message like:
+
+  0.0253: netlink: Unexpected sequence number (0 != 34)
+
+Reported-by: Paul Holzinger <pholzing@redhat.com>
+Link: https://bugs.passt.top/show_bug.cgi?id=203
+Fixes: 3c469013cfaa ("netlink: add subscription on changes in NDP/ARP table")
+Signed-off-by: Stefano Brivio <sbrivio@redhat.com>
+Reviewed-by: David Gibson <david@gibson.dropbear.id.au>
+---
+ netlink.c | 15 +++++++--------
+ 1 file changed, 7 insertions(+), 8 deletions(-)
+
+diff --git a/netlink.c b/netlink.c
+index c3c830e..0863734 100644
+--- a/netlink.c
++++ b/netlink.c
+@@ -1206,24 +1206,23 @@ static void nl_neigh_msg_read(const struct ctx *c, struct nlmsghdr *nh)
+  * @proto:	Protocol, AF_INET or AF_INET6
+  * @ifi:	Interface index
+  */
+-static void nl_neigh_sync(const struct ctx *c, int proto, int ifi)
++static void nl_neigh_sync(const struct ctx *c, int proto)
+ {
+ 	struct {
+ 		struct nlmsghdr nlh;
+ 		struct ndmsg    ndm;
+ 	} req = {
+-		.ndm.ndm_family  = proto,
+-		.ndm.ndm_ifindex = ifi,
++		.ndm.ndm_family = proto,
+ 	};
+ 	struct nlmsghdr *nh;
+ 	char buf[NLBUFSIZ];
+ 	ssize_t status;
+ 	uint32_t seq;
+ 
+-	seq = nl_send(nl_sock_neigh, &req, RTM_GETNEIGH,
+-		      NLM_F_DUMP, sizeof(req));
+-	nl_foreach_oftype(nh, status, nl_sock_neigh, buf, seq, RTM_NEWNEIGH)
++	seq = nl_send(nl_sock, &req, RTM_GETNEIGH, NLM_F_DUMP, sizeof(req));
++	nl_foreach_oftype(nh, status, nl_sock, buf, seq, RTM_NEWNEIGH)
+ 		nl_neigh_msg_read(c, nh);
++
+ 	if (status < 0)
+ 		warn("netlink: RTM_GETNEIGH failed: %s", strerror_(-status));
+ }
+@@ -1298,8 +1297,8 @@ int nl_neigh_notify_init(const struct ctx *c)
+ 		return -1;
+ 	}
+ 
+-	nl_neigh_sync(c, AF_INET, c->ifi4);
+-	nl_neigh_sync(c, AF_INET6, c->ifi6);
++	nl_neigh_sync(c, AF_INET);
++	nl_neigh_sync(c, AF_INET6);
+ 
+ 	return 0;
+ }
+-- 
+2.53.0-Meta
+
