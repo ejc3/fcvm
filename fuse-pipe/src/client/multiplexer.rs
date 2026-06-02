@@ -441,6 +441,12 @@ fn writer_loop(
 /// 3. Re-sends all pending requests on the new socket
 /// 4. Resumes normal operation
 ///
+/// Each reader is tagged with a generation number that it reports when its
+/// socket dies. The writer only reconnects for the current generation, so a
+/// stale notification from a reader whose socket was already replaced (e.g.
+/// after a write-failure-triggered reconnect) does not discard the healthy
+/// new socket or re-send pending requests a second time.
+///
 /// This keeps the FUSE session alive — callers waiting on responses
 /// simply experience a delay, not an error.
 fn writer_loop_reconnectable(
@@ -454,17 +460,26 @@ fn writer_loop_reconnectable(
     let mut count = 0u64;
     let mut total_bytes_written: u64 = 0;
 
-    // Channel for reader-death notifications. When the reader thread exits
-    // (socket EOF/error), it sends () to wake the writer for reconnection.
-    let (reader_died_tx, reader_died_rx) = bounded::<()>(1);
+    // Channel for reader-death notifications. When a reader thread exits
+    // (socket EOF/error), it sends its generation to wake the writer for
+    // reconnection. The generation lets the writer ignore notifications from
+    // readers whose socket has already been replaced.
+    let (reader_died_tx, reader_died_rx) = bounded::<u64>(1);
+    let mut reader_generation: u64 = 0;
 
     // Spawn initial reader thread
     let initial_died_tx = reader_died_tx.clone();
+    let initial_generation = reader_generation;
     std::thread::Builder::new()
         .name("fuse-mux-reader".to_string())
         .stack_size(512 * 1024)
         .spawn(move || {
-            reader_loop_reconnectable(reader_socket, pending_for_initial_reader, initial_died_tx);
+            reader_loop_reconnectable(
+                reader_socket,
+                pending_for_initial_reader,
+                initial_died_tx,
+                initial_generation,
+            );
         })
         .expect("failed to spawn fuse mux reader thread");
 
@@ -502,6 +517,7 @@ fn writer_loop_reconnectable(
                 }
 
                 // Register in pending BEFORE writing (stores data for re-send)
+                let is_no_reply = req.response_tx.is_none();
                 if let Some(tx) = req.response_tx {
                     pending.insert(
                         req.unique,
@@ -538,9 +554,54 @@ fn writer_loop_reconnectable(
                     &pending,
                     &reconnect_fn,
                     &reader_died_tx,
+                    &mut reader_generation,
                 );
+
+                // Requests with a response channel are stored in `pending` and were
+                // re-sent by do_reconnect. Fire-and-forget requests (forget/
+                // batch_forget) are not tracked there, so retry the failed write
+                // once on the new socket — dropping a forget permanently leaks the
+                // server-side inode reference (and its O_PATH fd). The failed
+                // write_all means the server never received a complete frame, so
+                // the retry cannot double-apply the forget.
+                if is_no_reply {
+                    if writer_socket
+                        .write_all(&req.data)
+                        .and_then(|_| writer_socket.flush())
+                        .is_ok()
+                    {
+                        total_bytes_written += msg_len as u64;
+                    } else {
+                        tracing::warn!(
+                            target: "fuse-pipe::mux",
+                            unique = req.unique,
+                            "writer[reconnectable]: dropping fire-and-forget request, retry after reconnect failed"
+                        );
+                    }
+                }
             },
-            recv(reader_died_rx) -> _ => {
+            recv(reader_died_rx) -> msg => {
+                // The writer holds its own clone of reader_died_tx, so this only
+                // fails if something is catastrophically wrong; treat as shutdown.
+                let died_generation = match msg {
+                    Ok(generation) => generation,
+                    Err(_) => break,
+                };
+
+                // Ignore notifications from readers of sockets we already replaced
+                // (e.g. the old reader noticing the same death that triggered a
+                // write-failure reconnect). Reconnecting again would discard a
+                // healthy socket and re-send pending requests another time.
+                if died_generation != reader_generation {
+                    tracing::debug!(
+                        target: "fuse-pipe::mux",
+                        died_generation,
+                        current_generation = reader_generation,
+                        "writer[reconnectable]: ignoring stale reader-death notification"
+                    );
+                    continue;
+                }
+
                 // Reader detected socket death while writer was idle.
                 // If there are pending requests, reconnect now so they get responses.
                 if pending.is_empty() {
@@ -566,6 +627,7 @@ fn writer_loop_reconnectable(
                     &pending,
                     &reconnect_fn,
                     &reader_died_tx,
+                    &mut reader_generation,
                 );
             },
         }
@@ -574,12 +636,16 @@ fn writer_loop_reconnectable(
 }
 
 /// Perform reconnection: get new socket, spawn new reader, re-send pending.
+///
+/// On success, increments `reader_generation` so death notifications from
+/// readers of older (already replaced) sockets can be recognized and ignored.
 fn do_reconnect(
     writer_socket: &mut UnixStream,
     total_bytes_written: &mut u64,
     pending: &Arc<DashMap<u64, PendingEntry>>,
     reconnect_fn: &dyn Fn() -> std::io::Result<UnixStream>,
-    reader_died_tx: &Sender<()>,
+    reader_died_tx: &Sender<u64>,
+    reader_generation: &mut u64,
 ) {
     // Retry reconnect_fn with exponential backoff, capped at ~3 minutes total
     let mut backoff_ms = 500u64;
@@ -635,6 +701,12 @@ fn do_reconnect(
     writer_socket.set_write_timeout(None).ok();
     new_reader_socket.set_read_timeout(None).ok();
 
+    // The old socket is gone; any death notification still owed by its reader
+    // is now stale. Bump the generation so the writer can tell them apart from
+    // a death of the reader spawned below.
+    *reader_generation += 1;
+    let new_generation = *reader_generation;
+
     // Spawn new reader thread for the new socket
     let pending_for_reader = Arc::clone(pending);
     let died_tx = reader_died_tx.clone();
@@ -642,7 +714,12 @@ fn do_reconnect(
         .name("fuse-mux-reader".to_string())
         .stack_size(512 * 1024)
         .spawn(move || {
-            reader_loop_reconnectable(new_reader_socket, pending_for_reader, died_tx);
+            reader_loop_reconnectable(
+                new_reader_socket,
+                pending_for_reader,
+                died_tx,
+                new_generation,
+            );
         })
         .expect("failed to spawn fuse mux reader thread");
 
@@ -695,34 +772,36 @@ fn do_reconnect(
 
 /// Reader thread for reconnectable mode.
 ///
-/// When the socket dies, notifies the writer via `died_tx` so it can
-/// proactively reconnect (even if no new write is pending).
+/// When the socket dies, notifies the writer via `died_tx` (tagged with this
+/// reader's generation) so it can proactively reconnect (even if no new write
+/// is pending). The writer ignores notifications from superseded generations.
 fn reader_loop_reconnectable(
     mut socket: UnixStream,
     pending: Arc<DashMap<u64, PendingEntry>>,
-    died_tx: Sender<()>,
+    died_tx: Sender<u64>,
+    generation: u64,
 ) {
     let mut len_buf = [0u8; 4];
     let mut count = 0u64;
 
     loop {
         if socket.read_exact(&mut len_buf).is_err() {
-            tracing::warn!(target: "fuse-pipe::mux", count, pending_count = pending.len(), "reader[reconnectable]: socket read failed, notifying writer");
-            let _ = died_tx.send(());
+            tracing::warn!(target: "fuse-pipe::mux", count, generation, pending_count = pending.len(), "reader[reconnectable]: socket read failed, notifying writer");
+            let _ = died_tx.send(generation);
             break;
         }
 
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > MAX_MESSAGE_SIZE {
-            tracing::error!(target: "fuse-pipe::mux", len, "reader[reconnectable]: oversized message");
-            let _ = died_tx.send(());
+            tracing::error!(target: "fuse-pipe::mux", len, generation, "reader[reconnectable]: oversized message");
+            let _ = died_tx.send(generation);
             break;
         }
 
         let mut resp_buf = vec![0u8; len];
         if socket.read_exact(&mut resp_buf).is_err() {
-            tracing::warn!(target: "fuse-pipe::mux", count, "reader[reconnectable]: failed to read response body");
-            let _ = died_tx.send(());
+            tracing::warn!(target: "fuse-pipe::mux", count, generation, "reader[reconnectable]: failed to read response body");
+            let _ = died_tx.send(generation);
             break;
         }
 
@@ -742,13 +821,13 @@ fn reader_loop_reconnectable(
                 }
             }
             Err(e) => {
-                tracing::error!(target: "fuse-pipe::mux", count, len, error = %e, "reader[reconnectable]: deserialization failed");
-                let _ = died_tx.send(());
+                tracing::error!(target: "fuse-pipe::mux", count, len, generation, error = %e, "reader[reconnectable]: deserialization failed");
+                let _ = died_tx.send(generation);
                 break;
             }
         }
     }
-    tracing::info!(target: "fuse-pipe::mux", count, "reader[reconnectable]: exiting");
+    tracing::info!(target: "fuse-pipe::mux", count, generation, "reader[reconnectable]: exiting");
 }
 
 /// Reader thread: reads responses from socket, routes to waiting readers.

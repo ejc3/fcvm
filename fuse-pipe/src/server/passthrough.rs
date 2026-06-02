@@ -450,7 +450,18 @@ impl FilesystemHandler for PassthroughFs {
             tracing::debug!(target: "passthrough", ino, "readdir looking up parent");
             let dotdot = CString::new("..").unwrap();
             match self.inner.lookup(&ctx, ino, &dotdot) {
-                Ok(entry) => entry.inode,
+                Ok(entry) => {
+                    // do_lookup() takes an inode reference, but the kernel never
+                    // learns about this internal lookup (the value is only used as
+                    // the d_ino of the synthetic ".." dirent, not returned as a FUSE
+                    // entry), so no FORGET will ever balance it. Release it here so
+                    // repeated readdirs don't pin the parent's InodeData (and its
+                    // O_PATH fd) for the lifetime of the server.
+                    if entry.inode != 0 {
+                        self.inner.forget(&ctx, entry.inode, 1);
+                    }
+                    entry.inode
+                }
                 Err(_) => ino, // Fallback to self if can't find parent
             }
         };
@@ -1614,6 +1625,70 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// Regression test: readdir of a non-root directory resolves ".." via an
+    /// internal lookup. That lookup used to take an inode reference on the
+    /// parent that the kernel never learns about, so no FORGET could ever
+    /// release the parent's InodeData (and its O_PATH fd) in a long-running
+    /// server. Verify that after balanced kernel-style forgets the parent
+    /// inode is fully released, no matter how many readdirs ran in between.
+    #[test]
+    fn test_readdir_does_not_leak_parent_inode_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("parent")).unwrap();
+        std::fs::create_dir(dir.path().join("parent").join("child")).unwrap();
+
+        let fs = PassthroughFs::new(dir.path());
+
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+
+        // Kernel-style lookups: exactly one reference each on parent and child.
+        let parent_ino = match fs.lookup(1, b"parent", uid, gid, 0) {
+            VolumeResponse::Entry { attr, .. } => attr.ino,
+            other => panic!("lookup parent failed: {:?}", other),
+        };
+        let child_ino = match fs.lookup(parent_ino, b"child", uid, gid, 0) {
+            VolumeResponse::Entry { attr, .. } => attr.ino,
+            other => panic!("lookup child failed: {:?}", other),
+        };
+
+        // Each readdir of the child resolves ".." (the parent) internally.
+        // Those internal lookups must not leave extra references behind.
+        for _ in 0..10 {
+            let resp = fs.readdir(child_ino, 0, uid, gid, 0);
+            let entries = match resp {
+                VolumeResponse::DirEntries { entries } => entries,
+                other => panic!("readdir failed: {:?}", other),
+            };
+            assert_eq!(entries[1].name, b"..");
+            assert_eq!(
+                entries[1].ino, parent_ino,
+                "\"..\" entry should report the parent's inode"
+            );
+        }
+
+        // The parent is still pinned by the kernel's single reference.
+        let resp = fs.getattr(parent_ino);
+        assert!(
+            matches!(resp, VolumeResponse::Attr { .. }),
+            "parent inode should still be valid before forget, got {:?}",
+            resp
+        );
+
+        // Release exactly the references the kernel took. If readdir leaked
+        // references on the parent, this cannot drop its refcount to zero and
+        // the parent's InodeData (with its O_PATH fd) stays pinned forever.
+        fs.forget(child_ino, 1);
+        fs.forget(parent_ino, 1);
+
+        let resp = fs.getattr(parent_ino);
+        assert!(
+            matches!(resp, VolumeResponse::Error { .. }),
+            "parent inode should be fully released after balanced forgets, got {:?}",
+            resp
+        );
     }
 
     /// Test remap_file_range (FICLONE) functionality.
