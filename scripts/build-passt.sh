@@ -1,31 +1,30 @@
 #!/bin/bash
 # Build passt/pasta from source using a pinned Debian source tarball.
-# Pinned to commit 386b5f5 (2026-01-20) from https://passt.top/passt
+# Pinned to commit 038c51e (2026-05-26, upstream release 2026_05_26.038c51e)
+# from https://passt.top/passt. This pin includes the upstream fix for the
+# netlink neighbour-sync race that made pasta exit right after startup
+# ("netlink: Unexpected sequence number"), previously carried here as a patch.
 # Served from snapshot.debian.org: deb.debian.org drops superseded versions
-# from its pool (which 404'd the previous pin), while snapshot.debian.org
+# from its pool (which 404'd a previous pin), while snapshot.debian.org
 # archives every version permanently. The checksum guards the pin.
 #
 # Local patches (passt-*.patch, kept next to this script) are applied on top:
 #   - passt-addr-seen.patch: stops overheard bridge traffic from retargeting
 #     pasta's inbound port forwarding away from the guest.
-#   - passt-netlink-neigh-sync.patch: upstream fix (post-pin) for a netlink
-#     sequence-number race during the initial neighbour sync that makes pasta
-#     exit right after startup.
 set -euo pipefail
 
-PASST_TARBALL_URL="https://snapshot.debian.org/archive/debian/20260301T000000Z/pool/main/p/passt/passt_0.0~git20260120.386b5f5.orig.tar.xz"
-PASST_TARBALL_SHA256="cc0a86b0ac28e1e5b2a4243bcf7fa84b14dd91c7dc883a78896060111e12d105"
+PASST_TARBALL_URL="https://snapshot.debian.org/archive/debian/20260527T083727Z/pool/main/p/passt/passt_0.0~git20260526.038c51e.orig.tar.xz"
+PASST_TARBALL_SHA256="78d9a5c11592a30ebbb35e39614d4ae5059c443f7f4f96ddce195ba3e9129172"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PASST_PATCHES=(
     "$SCRIPT_DIR/passt-addr-seen.patch"
-    "$SCRIPT_DIR/passt-netlink-neigh-sync.patch"
 )
-# Key the build dir on the patch contents so a cached build tree from an older
-# patch set (or no patches) is rebuilt instead of silently reused.
-PATCH_FINGERPRINT="$(cat "${PASST_PATCHES[@]}" | sha256sum | cut -c1-12)"
-BUILD_DIR="${BUILD_DIR:-/tmp/passt-build-${PATCH_FINGERPRINT}}"
+# Key the build dir on the tarball and patch contents so a cached build tree
+# from an older pin or patch set is rebuilt instead of silently reused.
+BUILD_FINGERPRINT="$({ echo "$PASST_TARBALL_SHA256"; cat "${PASST_PATCHES[@]}"; } | sha256sum | cut -c1-12)"
+BUILD_DIR="${BUILD_DIR:-/tmp/passt-build-${BUILD_FINGERPRINT}}"
 
-echo "==> Building passt from Debian source tarball (commit 386b5f5)..."
+echo "==> Building passt from Debian source tarball (commit 038c51e)..."
 
 if [ ! -f "$BUILD_DIR/Makefile" ]; then
     rm -rf "$BUILD_DIR"
