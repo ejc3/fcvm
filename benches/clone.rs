@@ -263,34 +263,22 @@ impl CloneFixture {
             std::thread::sleep(Duration::from_millis(50));
         };
 
-        // Make HTTP request to nginx via loopback port forward (pasta).
-        // verify_port_forwarding() already confirmed the port works, but under
-        // heavy CI load the first request can get an empty response if pasta's
-        // internal forwarding state is briefly inconsistent. Retry up to 3 times.
+        // Make one HTTP request to nginx via the loopback port forward (pasta).
+        // verify_port_forwarding() already confirmed the L2 path, and pasta no
+        // longer retargets forwarding from overheard bridge traffic
+        // (scripts/passt-addr-seen.patch), so the first request must succeed.
         let addr = format!("{}:{}", loopback_ip, health_port);
         let request = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
 
         let mut last_response = String::new();
-        for attempt in 0..3 {
-            if attempt > 0 {
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            let Ok(mut stream) = TcpStream::connect(&addr) else {
-                continue;
-            };
+        if let Ok(mut stream) = TcpStream::connect(&addr) {
             let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
             let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
-            if stream.write_all(request.as_bytes()).is_err() {
-                continue;
-            }
-
-            let mut response = Vec::new();
-            let _ = stream.read_to_end(&mut response);
-            last_response = String::from_utf8_lossy(&response).to_string();
-
-            if last_response.contains("200 OK") {
-                break;
+            if stream.write_all(request.as_bytes()).is_ok() {
+                let mut response = Vec::new();
+                let _ = stream.read_to_end(&mut response);
+                last_response = String::from_utf8_lossy(&response).to_string();
             }
         }
 
@@ -322,7 +310,7 @@ impl CloneFixture {
                 .join("\n");
 
             panic!(
-                "clone HTTP failed after 3 attempts\n\
+                "clone HTTP request failed\n\
                  addr: {}:{}\n\
                  last_response: {} bytes\n\
                  clone_pid: {}\n\

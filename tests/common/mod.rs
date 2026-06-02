@@ -1625,50 +1625,28 @@ pub async fn curl_check(ip: &str, port: u16, timeout_secs: u32) -> CurlResult {
     }
 }
 
-/// Make HTTP requests via curl with retries until success or deadline.
+/// Make a single HTTP request via curl and dump network diagnostics on failure.
 ///
-/// After snapshot restore, the network channel (L2 + pasta) is ready but the
-/// guest application may need a moment. This retries with 500ms backoff
-/// and prints extensive diagnostics on failure.
-pub async fn curl_check_retry(
+/// Used for the first request through a clone's port forward after restore.
+/// The request must succeed on the first attempt (pasta's forwarding target is
+/// no longer retargeted by overheard bridge traffic, see
+/// scripts/passt-addr-seen.patch); a failure dumps the pasta and namespace
+/// state needed to debug it.
+pub async fn curl_check_with_diag(
     ip: &str,
     port: u16,
     timeout_secs: u32,
     clone_pid: Option<u32>,
 ) -> CurlResult {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
-    let mut attempt = 0u32;
-    let mut last_result = CurlResult {
-        success: false,
-        body_len: 0,
-        error: "no attempt made".to_string(),
-    };
-
-    while std::time::Instant::now() < deadline {
-        attempt += 1;
-        last_result = curl_check(ip, port, 1).await;
-        if last_result.success && last_result.body_len > 0 {
-            if attempt > 1 {
-                println!(
-                    "    curl_check_retry: succeeded on attempt {} after retries",
-                    attempt
-                );
-            }
-            return last_result;
-        }
-        println!(
-            "    curl_check_retry attempt {}: {}:{} -> success={} body={} err={}",
-            attempt, ip, port, last_result.success, last_result.body_len, last_result.error
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let result = curl_check(ip, port, timeout_secs).await;
+    if result.success && result.body_len > 0 {
+        return result;
     }
 
-    // All retries exhausted — dump diagnostics
     println!(
-        "\n    curl_check_retry FAILED after {} attempts to {}:{}",
-        attempt, ip, port
+        "\n    curl_check_with_diag FAILED for {}:{} (success={} body={} err={})",
+        ip, port, result.success, result.body_len, result.error
     );
-    println!("    last error: {}", last_result.error);
 
     // Verbose curl to see exactly what happens at TCP level
     let url = format!("http://{}:{}", ip, port);
@@ -1688,7 +1666,7 @@ pub async fn curl_check_retry(
         dump_clone_network_diagnostics(pid).await;
     }
 
-    last_result
+    result
 }
 
 /// Dump network diagnostics for a clone VM: pasta processes, ARP cache,

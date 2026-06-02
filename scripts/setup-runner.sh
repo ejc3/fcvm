@@ -83,15 +83,11 @@ ln -sf /home/ubuntu/.cargo/bin/cargo /usr/local/bin/cargo
 ln -sf /home/ubuntu/.cargo/bin/rustc /usr/local/bin/rustc
 ln -sf /home/ubuntu/.cargo/bin/rustup /usr/local/bin/rustup
 
-# Build passt from source for consistent version across environments
-PASST_TAG="2025_01_20.386b5f5"
-cd /tmp
-git clone https://passt.top/passt /tmp/passt-build
-cd /tmp/passt-build
-git checkout "$PASST_TAG"
-make -j"$(nproc)"
-for bin in pasta passt; do cp "$bin" "/usr/local/bin/${bin}.tmp.$$" && mv -f "/usr/local/bin/${bin}.tmp.$$" "/usr/local/bin/${bin}"; done
-rm -rf /tmp/passt-build
+# Build pasta/passt from the repo's pinned source so runners match CI
+# (scripts/build-passt.sh owns the pin and the local patches).
+git clone --depth 1 https://github.com/ejc3/fcvm.git /tmp/fcvm-passt
+/tmp/fcvm-passt/scripts/build-passt.sh
+rm -rf /tmp/fcvm-passt /tmp/passt-build-*
 cd /
 
 # Firecracker (upstream baseline - CI overrides with custom fork from rootfs-config.toml)
