@@ -110,8 +110,9 @@ for i in $(seq 1 $TIMEOUT); do
     # Check if VM is healthy via ls command (use jq to parse JSON properly)
     LS_OUTPUT=$(sudo "$FCVM" ls --json 2>/dev/null || echo "[]")
 
-    # Find healthy VM using jq
-    HEALTHY_VM=$(echo "$LS_OUTPUT" | jq -r '.[] | select(.health_status == "healthy") | .pid' 2>/dev/null | head -1)
+    # Find the VM we started (by name) and check it is healthy
+    HEALTHY_VM=$(echo "$LS_OUTPUT" | jq -r --arg name "$VM_NAME" \
+        '.[] | select(.name == $name and .health_status == "healthy") | .pid' | head -1)
 
     if [[ -n "$HEALTHY_VM" ]]; then
         HEALTHY=true
@@ -121,8 +122,9 @@ for i in $(seq 1 $TIMEOUT); do
 
     # Debug: show status every 10 seconds
     if [[ $((i % 10)) -eq 0 ]]; then
-        STATUS=$(echo "$LS_OUTPUT" | jq -r '.[0] | "\(.name): \(.health_status)"' 2>/dev/null || echo "no VMs yet")
-        echo "  [$i s] $STATUS"
+        STATUS=$(echo "$LS_OUTPUT" | jq -r --arg name "$VM_NAME" \
+            '.[] | select(.name == $name) | "\(.name): \(.health_status)"' | head -1)
+        echo "  [$i s] ${STATUS:-$VM_NAME not registered yet}"
     fi
 
     # Check if background process exited (VM failed)
@@ -148,11 +150,15 @@ echo "PASS: VM is healthy (PID: $FCVM_PID)"
 echo ""
 echo "Step 3: Execute command in VM"
 # Run a simple command to verify exec works (use sh -c for portability)
-OUTPUT=$(sudo "$FCVM" exec --pid "$FCVM_PID" -- sh -c "echo hello" 2>/dev/null || true)
+if ! OUTPUT=$(sudo "$FCVM" exec --pid "$FCVM_PID" -- sh -c "echo hello"); then
+    echo "FAIL: Exec command failed"
+    exit 1
+fi
 if [[ "$OUTPUT" == *"hello"* ]]; then
     echo "PASS: Exec works"
 else
-    echo "WARN: Exec output unexpected: $OUTPUT"
+    echo "FAIL: Exec output unexpected: $OUTPUT"
+    exit 1
 fi
 
 echo ""

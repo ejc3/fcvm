@@ -14,7 +14,6 @@ on:
   pull_request:
     branches: [main]
     paths-ignore:
-      - 'kernel/**'
       - 'scripts/claude-assistant/**'
       - '.github/workflows/claude*.yml'
       - '.claude/**'
@@ -58,8 +57,6 @@ jobs:
       skip: ${{ steps.check.outputs.skip }}
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 20
       - name: Check if tree SHA already passed CI
         id: check
         env:
@@ -74,20 +71,24 @@ jobs:
           TREE_SHA=$(git rev-parse HEAD^{tree})
           echo "Current tree SHA: $TREE_SHA"
 
-          # Check recent successful CI runs on PRs for the same tree SHA
-          # Look at the last 20 commits on main to find PR branch tips
+          # GitHub Actions results are check runs, not commit statuses, so the
+          # legacy status API never reports them. Look for a successful run of
+          # this CI workflow on a PR whose head commit has the same tree SHA.
           SKIP=false
-          for sha in $(git log --format=%H -20 HEAD^ 2>/dev/null || true); do
-            COMMIT_TREE=$(git rev-parse "$sha^{tree}" 2>/dev/null || true)
-            if [ "$COMMIT_TREE" = "$TREE_SHA" ] && [ "$sha" != "$(git rev-parse HEAD)" ]; then
-              # Found a commit with the same tree — check if it passed CI
-              STATUS=$(gh api "repos/${{ github.repository }}/commits/$sha/status" --jq '.state' 2>/dev/null || echo "unknown")
-              echo "Commit $sha has same tree SHA, CI status: $STATUS"
-              if [ "$STATUS" = "success" ]; then
-                SKIP=true
-                echo "Tree SHA $TREE_SHA already passed CI on commit $sha"
-                break
-              fi
+          if ! HEAD_SHAS=$(gh run list --repo "${{ github.repository }}" --workflow ci.yml \
+              --event pull_request --status success --limit 30 --json headSha --jq '.[].headSha'); then
+            echo "Could not list workflow runs, running CI"
+            HEAD_SHAS=""
+          fi
+          for sha in $HEAD_SHAS; do
+            if ! COMMIT_TREE=$(gh api "repos/${{ github.repository }}/git/commits/$sha" --jq '.tree.sha'); then
+              echo "Could not look up commit $sha, ignoring it"
+              continue
+            fi
+            if [ "$COMMIT_TREE" = "$TREE_SHA" ]; then
+              SKIP=true
+              echo "Tree SHA $TREE_SHA already passed CI on PR commit $sha"
+              break
             fi
           done
 
@@ -385,21 +386,6 @@ jobs:
       - name: test-fast
         working-directory: fcvm
         run: make test-fast
-      - name: test-serve-sdk
-        working-directory: fcvm
-        run: |
-          # SDK test requires computesdk package (sibling repo)
-          # On CI, check if it's available; on dev machines, always available
-          COMPUTESDK_DIR="${{ github.workspace }}/computesdk"
-          if [ ! -d "$COMPUTESDK_DIR/packages/computesdk" ]; then
-            echo "⚠ Skipping SDK E2E test (computesdk not checked out)"
-            echo "  To run locally: cd tests && npm install && cd .. && npx tsx tests/test_serve_sdk.ts"
-            exit 0
-          fi
-          # Install Node.js if not available
-          which node || { echo "⚠ Skipping SDK test (Node.js not available)"; exit 0; }
-          cd tests && npm install && cd ..
-          npx tsx tests/test_serve_sdk.ts
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v6
@@ -676,8 +662,8 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/cargo-cache
-          key: container-cargo-${{ hashFiles('fcvm/Cargo.lock') }}
-          restore-keys: container-cargo-
+          key: container-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('fcvm/Cargo.lock') }}
+          restore-keys: container-cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: Create test log directory
         run: sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
       - name: Clean test data

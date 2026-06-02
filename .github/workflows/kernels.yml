@@ -47,18 +47,26 @@ jobs:
 
       - name: Build fcvm and fc-agent
         working-directory: fcvm
-        run: cargo build --release -p fcvm -p fc-agent
+        run: |
+          cargo build --release -p fcvm -p fc-agent
+          # Sync the checkout's embedded config to the runner user's config dir so the
+          # kernel build below uses this checkout, not stale per-runner state.
+          ./target/release/fcvm setup --generate-config --force
 
       - name: Compute kernel version and SHA
         id: kernel
         working-directory: fcvm
         run: |
-          # Get kernel info from fcvm (reads from rootfs-config.toml)
-          # SHA is computed from build_inputs: kernel/nested.conf + kernel/patches/*.patch
-          SHA=$(cat kernel/nested.conf kernel/patches/*.patch 2>/dev/null | sha256sum | cut -c1-12)
+          # SHA must match fcvm's content-addressed kernel naming:
+          # build_inputs for kernel_profiles.nested.arm64 in rootfs-config.toml
+          SHA=$(cat kernel/nested.conf kernel/patches-arm64/*.patch | sha256sum | cut -c1-12)
 
-          # Version from config
-          VERSION=$(grep 'kernel_version' ~/.config/fcvm/rootfs-config.toml | grep -oE '"[0-9]+\.[0-9]+\.[0-9]+"' | head -1 | tr -d '"' || echo "6.18.3")
+          # Version from the checked-out repo config (the source of truth)
+          VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('rootfs-config.toml','rb'))['kernel_profiles']['nested']['arm64']['kernel_version'])")
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: kernel_version not found for kernel_profiles.nested.arm64 in rootfs-config.toml"
+            exit 1
+          fi
 
           ARCH=$(uname -m)
 
@@ -115,16 +123,12 @@ jobs:
           # Build the nested kernel using fcvm
           sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels
 
-          # Find the built kernel and copy to expected location
+          # The built kernel must match the exact version/arch/SHA we publish under
           KERNEL_PATH="/tmp/${{ steps.kernel.outputs.filename }}"
-          SHA="${{ steps.kernel.outputs.sha }}"
-          VERSION="${{ steps.kernel.outputs.version }}"
+          BUILT_KERNEL="/mnt/fcvm-btrfs/kernels/${{ steps.kernel.outputs.filename }}"
 
-          # The kernel is at /mnt/fcvm-btrfs/kernels/vmlinux-nested-{version}-{arch}-{sha}.bin
-          BUILT_KERNEL=$(find /mnt/fcvm-btrfs/kernels -name "vmlinux-nested-*-${SHA}.bin" | head -1)
-
-          if [ -z "$BUILT_KERNEL" ] || [ ! -f "$BUILT_KERNEL" ]; then
-            echo "ERROR: Built kernel not found"
+          if [ ! -f "$BUILT_KERNEL" ]; then
+            echo "ERROR: Built kernel not found at $BUILT_KERNEL"
             ls -la /mnt/fcvm-btrfs/kernels/ || true
             exit 1
           fi
@@ -231,16 +235,27 @@ jobs:
 
       - name: Build fcvm and fc-agent
         working-directory: fcvm
-        run: cargo build --release -p fcvm -p fc-agent
+        run: |
+          cargo build --release -p fcvm -p fc-agent
+          # Sync the checkout's embedded config to the runner user's config dir so the
+          # kernel build below uses this checkout, not stale per-runner state.
+          ./target/release/fcvm setup --generate-config --force
 
       - name: Compute kernel version and SHA
         id: kernel
         working-directory: fcvm
         run: |
-          # SHA is computed from build_inputs: kernel/btrfs.conf only (no patches)
+          # SHA must match fcvm's content-addressed kernel naming:
+          # build_inputs for kernel_profiles.btrfs.arm64 in rootfs-config.toml (no patches)
           SHA=$(cat kernel/btrfs.conf | sha256sum | cut -c1-12)
 
-          VERSION="6.18.3"
+          # Version from the checked-out repo config (the source of truth)
+          VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('rootfs-config.toml','rb'))['kernel_profiles']['btrfs']['arm64']['kernel_version'])")
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: kernel_version not found for kernel_profiles.btrfs.arm64 in rootfs-config.toml"
+            exit 1
+          fi
+
           ARCH=$(uname -m)
 
           echo "version=$VERSION" >> $GITHUB_OUTPUT
@@ -296,15 +311,12 @@ jobs:
           # Build the btrfs kernel using fcvm
           sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels
 
-          # Find the built kernel and copy to expected location
+          # The built kernel must match the exact version/arch/SHA we publish under
           KERNEL_PATH="/tmp/${{ steps.kernel.outputs.filename }}"
-          SHA="${{ steps.kernel.outputs.sha }}"
+          BUILT_KERNEL="/mnt/fcvm-btrfs/kernels/${{ steps.kernel.outputs.filename }}"
 
-          # The kernel is at /mnt/fcvm-btrfs/kernels/vmlinux-btrfs-{version}-{arch}-{sha}.bin
-          BUILT_KERNEL=$(find /mnt/fcvm-btrfs/kernels -name "vmlinux-btrfs-*-${SHA}.bin" | head -1)
-
-          if [ -z "$BUILT_KERNEL" ] || [ ! -f "$BUILT_KERNEL" ]; then
-            echo "ERROR: Built kernel not found"
+          if [ ! -f "$BUILT_KERNEL" ]; then
+            echo "ERROR: Built kernel not found at $BUILT_KERNEL"
             ls -la /mnt/fcvm-btrfs/kernels/ || true
             exit 1
           fi
