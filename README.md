@@ -1,15 +1,16 @@
 # fcvm
 
-VM-level isolation with a container workflow. fcvm runs Podman containers inside Firecracker microVMs — same images, same registries, but each container gets its own kernel.
+fcvm runs Podman containers inside Firecracker microVMs. You use the same images and registries as plain Podman, and each container gets its own kernel, so isolation comes from a VM boundary rather than from namespaces sharing the host kernel.
 
-- ~540ms cached startup via snapshot restore, vs ~3s cold (see [Container Image Cache](#container-image-cache))
-- ~10ms VM cloning via UFFD memory sharing + btrfs reflinks
-- 50 clones share physical pages through kernel page cache (~512MB total, not 25GB)
-- Rootless, bridged, and routed networking
-- Full `-it` support (vim, colors, Ctrl+C)
-- HTTP API (`fcvm serve`) for programmatic sandbox management
+fcvm avoids paying the VM boot cost on every run: the first run of an image boots cold and saves a snapshot once the image is loaded, later runs restore from that snapshot, and a running VM can be cloned in milliseconds with copy-on-write memory and disk. `fcvm serve` exposes the same workflow over an HTTP API for programs that create sandboxes on demand.
 
-All benchmarks on c7g.metal ARM64. See [PERFORMANCE.md](PERFORMANCE.md) for methodology and results.
+- Cached startup takes ~540ms via snapshot restore, compared to ~3s for a cold boot (see [Container Image Cache](#container-image-cache))
+- Cloning a running VM takes ~10ms using UFFD memory sharing and btrfs reflinks
+- 50 clones of a 512MB VM share physical pages through the kernel page cache, using ~512MB total rather than 25GB
+- Three network modes: rootless (no root required), bridged, and routed (native IPv6 at kernel line rate)
+- Interactive containers behave like local ones: `-it`, colors, Ctrl+C, vim
+
+Benchmarks were measured on c7g.metal ARM64. See [PERFORMANCE.md](PERFORMANCE.md) for methodology and results.
 
 ---
 
