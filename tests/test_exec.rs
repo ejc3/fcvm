@@ -679,6 +679,8 @@ async fn run_exec(
     // leave an orphan process (matches the pattern in src/health.rs).
     let child = tokio::process::Command::new(fcvm_path)
         .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .context("spawning fcvm exec")?;
