@@ -323,10 +323,18 @@ pub async fn run() -> Result<()> {
                         )
                         .await;
                     }
-                    // Reconnect output before starting the container — for fast-exit
-                    // containers (echo + exit in ~200ms), output must be live or the
-                    // container's stdout/stderr goes to the dead vsock.
-                    output.reconnect();
+                    // Output reconnect is handled by handle_clone_restore() which runs
+                    // concurrently in the MMDS watcher task. It reconnects output as the
+                    // FOURTH step (after exec rebind + egress reconnect). Since we already
+                    // waited for exec_rebind_done above — which handle_clone_restore sets
+                    // BEFORE reconnecting output — the output is guaranteed to be reconnected
+                    // (or in the process of reconnecting) by this point.
+                    //
+                    // DO NOT call output.reconnect() here. A second reconnect() races with
+                    // the first: the writer successfully connects, then the second call drops
+                    // that connection and tries again, causing a connection storm that leaves
+                    // the host listener stuck on a dead connection. This results in zero
+                    // output lines being delivered to the host.
                 }
                 container::CacheResult::Failed => {
                     eprintln!("[fc-agent] WARNING: cache-ready handshake failed, continuing");
