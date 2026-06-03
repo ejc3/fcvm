@@ -16,8 +16,11 @@ def main():
 
     artifacts_dir = Path(sys.argv[1])
     if not artifacts_dir.is_dir():
-        print(f"Error: {artifacts_dir} is not a directory")
-        sys.exit(1)
+        # No artifacts to analyze. The Summary job already gates this step on the
+        # test matrix having run, so reaching here means the matrix produced no
+        # artifacts (e.g. it was skipped). Report it without failing the job.
+        print("No CI artifacts to analyze (test matrix skipped or uploaded nothing)")
+        return
 
     # Count VMs from log files
     base_vms = 0
