@@ -510,6 +510,28 @@ pub async fn spawn_fcvm_with_log_path(
     args: &[&str],
     name: &str,
 ) -> anyhow::Result<(tokio::process::Child, u32, PathBuf)> {
+    spawn_fcvm_with_log_path_inner(args, name, true).await
+}
+
+/// Like `spawn_fcvm_with_log_path` but never echoes the child's output to the
+/// console — it only goes to the debug log file.
+///
+/// Use this for tests whose container deliberately emits a large volume of output
+/// (verified by polling the log file): echoing megabytes of container output into
+/// the CI job log can overwhelm the self-hosted runner's log uploader and drop the
+/// runner. The file still captures everything for assertions and debugging.
+pub async fn spawn_fcvm_with_log_path_quiet(
+    args: &[&str],
+    name: &str,
+) -> anyhow::Result<(tokio::process::Child, u32, PathBuf)> {
+    spawn_fcvm_with_log_path_inner(args, name, false).await
+}
+
+async fn spawn_fcvm_with_log_path_inner(
+    args: &[&str],
+    name: &str,
+    console: bool,
+) -> anyhow::Result<(tokio::process::Child, u32, PathBuf)> {
     // Ensure config exists (runs once per test process)
     ensure_config_exists();
 
@@ -537,8 +559,14 @@ pub async fn spawn_fcvm_with_log_path(
     logger.info(&format!("Spawned fcvm PID={} args={:?}", pid, args));
 
     // Spawn log consumers immediately to prevent pipe buffer deadlock
-    spawn_log_consumer_to_file(child.stdout.take(), name, Some(logger.clone()), false);
-    spawn_log_consumer_to_file(child.stderr.take(), name, Some(logger), true);
+    spawn_log_consumer_opts(
+        child.stdout.take(),
+        name,
+        Some(logger.clone()),
+        false,
+        console,
+    );
+    spawn_log_consumer_opts(child.stderr.take(), name, Some(logger), true, console);
 
     Ok((child, pid, log_path))
 }
@@ -582,6 +610,22 @@ fn spawn_log_consumer_to_file<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     logger: Option<TestLogger>,
     is_stderr: bool,
 ) {
+    spawn_log_consumer_opts(reader, name, logger, is_stderr, true);
+}
+
+/// Internal: spawn log consumer with explicit control over console echoing.
+///
+/// When `console` is false, lines are written only to the log file (if a logger
+/// is provided), never to the test's stdout/stderr. This keeps a high-volume
+/// container from flooding the CI job log while still capturing everything in the
+/// debug log file for assertions.
+fn spawn_log_consumer_opts<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+    reader: Option<R>,
+    name: &str,
+    logger: Option<TestLogger>,
+    is_stderr: bool,
+    console: bool,
+) {
     use tokio::io::{AsyncBufReadExt, BufReader};
     if let Some(reader) = reader {
         let name = name.to_string();
@@ -605,7 +649,7 @@ fn spawn_log_consumer_to_file<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
                 // Only print non-debug lines to console when logging to file
                 // This keeps console clean while file has full debug output
                 let is_debug = line.contains(" DEBUG ") || line.contains(" TRACE ");
-                if !has_logger || !is_debug {
+                if console && (!has_logger || !is_debug) {
                     eprintln!("{}", formatted);
                 }
             }

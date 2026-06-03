@@ -122,36 +122,28 @@ async fn exec_test_impl(network: &str) -> Result<()> {
     );
 
     // Test 6: Container internet connectivity
+    // Use busybox wget (already in nginx:alpine) instead of `apk add curl`: the
+    // package fetch from the Alpine CDN has no time bound and could hang past the
+    // nextest budget. wget's -T bounds the request itself.
     println!(
         "\nTest 6: Container internet ({})",
         if network == "routed" { "IPv6" } else { "IPv4" }
     );
-    let _ = run_exec(
-        &fcvm_path,
-        fcvm_pid,
-        false,
-        &["apk", "add", "--no-cache", "curl"],
-    )
-    .await?;
-    let mut args = vec![
-        "curl",
-        "-s",
-        "-o",
-        "/dev/null",
-        "-w",
-        "%{http_code}",
-        "--max-time",
-        "15",
-    ];
-    args.extend_from_slice(ipv6_flag);
+    let wget_ipv6: &[&str] = if network == "routed" { &["-6"] } else { &[] };
+    let mut args = vec!["wget", "-q", "-O", "/dev/null", "-T", "15", "-S"];
+    args.extend_from_slice(wget_ipv6);
     args.push("https://ecr-public.aws.com/");
+    // busybox wget prints the server response headers (incl. the status line) to
+    // stderr with -S; run_exec merges stderr, so the HTTP status is captured.
     let output = run_exec(&fcvm_path, fcvm_pid, false, &args).await?;
-    let http_code = output.trim();
-    println!("  curl HTTP status: {}", http_code);
+    println!(
+        "  container egress headers: {}",
+        output.replace('\n', " | ")
+    );
     assert!(
-        http_code.starts_with('2') || http_code.starts_with('3'),
-        "curl should get 2xx/3xx, got: {}",
-        http_code
+        output.contains("HTTP/") && (output.contains(" 2") || output.contains(" 3")),
+        "container egress should get an HTTP 2xx/3xx response, got: {}",
+        output
     );
 
     // Test 7: TTY NOT allocated without -t flag (VM exec)
@@ -661,11 +653,16 @@ async fn run_exec(
     args.push("--");
     args.extend(cmd.iter().copied());
 
-    let output = tokio::process::Command::new(fcvm_path)
-        .args(&args)
-        .output()
-        .await
-        .context("running fcvm exec")?;
+    // Bound the exec on the host side: a guest command that hangs (e.g. a network
+    // fetch with no internal timeout) must not consume the whole nextest budget.
+    // 120s is well above any legitimate exec here and well under the 600s ceiling.
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        tokio::process::Command::new(fcvm_path).args(&args).output(),
+    )
+    .await
+    .with_context(|| format!("fcvm exec timed out after 120s: {}", cmd.join(" ")))?
+    .context("running fcvm exec")?;
 
     // Combine stdout and stderr (exec streams both)
     let stdout = String::from_utf8_lossy(&output.stdout);
