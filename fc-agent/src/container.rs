@@ -869,44 +869,71 @@ pub fn notify_cache_ready_and_wait(
             Ok(_) => {}
         }
 
-        if let Some(revents) = poll_fds[0].revents() {
-            if revents.contains(PollFlags::POLLHUP) || revents.contains(PollFlags::POLLERR) {
-                // vsock reset from snapshot RESTORE. This happens on warm start:
-                // the host restored this VM from a cached pre-start snapshot, and
-                // VIRTIO_VSOCK_EVENT_TRANSPORT_RESET killed all connections.
-                eprintln!("[fc-agent] cache-ack connection reset (snapshot restore detected)");
-                return CacheResult::WarmStart;
-            }
-        }
+        // Drain readable data BEFORE acting on POLLHUP/POLLERR. Linux can report
+        // POLLIN|POLLHUP together when the host writes "cache-ack" and then
+        // immediately closes the connection — which the host status listener does
+        // after a cold-start cache handshake. Treating POLLHUP as EOF before
+        // reading would discard a buffered cache-ack and misclassify the cold
+        // start as a warm restore, sending it through the restore-wait path.
+        let hung_up = poll_fds[0]
+            .revents()
+            .is_some_and(|r| r.contains(PollFlags::POLLHUP) || r.contains(PollFlags::POLLERR));
 
         match read(sock.as_raw_fd(), &mut buf[total_read..]) as Result<usize, nix::errno::Errno> {
+            Ok(n) if n > 0 => {
+                total_read += n;
+                let received = std::str::from_utf8(&buf[..total_read]).unwrap_or("");
+                if received.contains("cache-ack") {
+                    eprintln!("[fc-agent] received cache-ack from host");
+                    return CacheResult::ColdStart;
+                }
+                if total_read >= buf.len() {
+                    eprintln!("[fc-agent] cache-ack buffer overflow, giving up");
+                    return CacheResult::Failed;
+                }
+                // Partial data and the peer has hung up: no cache-ack is coming.
+                if hung_up {
+                    eprintln!(
+                        "[fc-agent] cache-ack connection reset after partial read (warm start)"
+                    );
+                    return CacheResult::WarmStart;
+                }
+                // Otherwise keep reading for the rest of the message.
+            }
+            Ok(_) => {
+                // Orderly EOF with no buffered cache-ack — vsock reset from a
+                // snapshot RESTORE (warm start).
+                eprintln!("[fc-agent] cache-ack connection closed (snapshot taken)");
+                return CacheResult::WarmStart;
+            }
             Err(nix::errno::Errno::EAGAIN) => {
-                // Spurious wakeup, continue polling
+                // No data pending. If the peer hung up, it's a genuine reset.
+                if hung_up {
+                    eprintln!("[fc-agent] cache-ack connection reset (snapshot restore detected)");
+                    return CacheResult::WarmStart;
+                }
+                // Spurious wakeup, continue polling.
                 continue;
+            }
+            // A reset/torn-down connection (no buffered cache-ack recovered above)
+            // means the vsock transport went away — either a genuine snapshot
+            // RESTORE, or a cold-start handshake where the host closed the
+            // connection with our write-probe bytes still unread, turning its
+            // close into a RST that flushes our receive buffer. Either way the
+            // correct fallback is a warm start, matching the write-probe
+            // classification above; returning Failed here would abort container
+            // launch on every reset. Only genuinely unexpected errors are fatal.
+            Err(nix::errno::Errno::ECONNRESET)
+            | Err(nix::errno::Errno::EPIPE)
+            | Err(nix::errno::Errno::ENOTCONN)
+            | Err(nix::errno::Errno::ECONNREFUSED) => {
+                eprintln!("[fc-agent] cache-ack connection reset on read (warm start)");
+                return CacheResult::WarmStart;
             }
             Err(e) => {
                 eprintln!("[fc-agent] cache-ack read error: {}", e);
                 return CacheResult::Failed;
             }
-            Ok(0) => {
-                // Connection closed — snapshot vsock reset
-                eprintln!("[fc-agent] cache-ack connection closed (snapshot taken)");
-                return CacheResult::WarmStart;
-            }
-            Ok(n) => {
-                total_read += n;
-            }
-        }
-
-        let received = std::str::from_utf8(&buf[..total_read]).unwrap_or("");
-        if received.contains("cache-ack") {
-            eprintln!("[fc-agent] received cache-ack from host");
-            return CacheResult::ColdStart;
-        }
-
-        if total_read >= buf.len() {
-            eprintln!("[fc-agent] cache-ack buffer overflow, giving up");
-            return CacheResult::Failed;
         }
     }
 }
