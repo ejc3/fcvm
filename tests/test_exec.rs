@@ -122,27 +122,45 @@ async fn exec_test_impl(network: &str) -> Result<()> {
     );
 
     // Test 6: Container internet connectivity
-    // Use busybox wget (already in nginx:alpine) instead of `apk add curl`: the
+    // Use the busybox wget already in nginx:alpine instead of `apk add curl`: the
     // package fetch from the Alpine CDN has no time bound and could hang past the
-    // nextest budget. wget's -T bounds the request itself.
+    // nextest budget. wget's -T bounds the request. In routed mode the container's
+    // only external route is IPv6, so plain wget already exercises IPv6 egress
+    // (no -6 flag, which busybox wget doesn't support).
     println!(
         "\nTest 6: Container internet ({})",
         if network == "routed" { "IPv6" } else { "IPv4" }
     );
-    let wget_ipv6: &[&str] = if network == "routed" { &["-6"] } else { &[] };
-    let mut args = vec!["wget", "-q", "-O", "/dev/null", "-T", "15", "-S"];
-    args.extend_from_slice(wget_ipv6);
-    args.push("https://ecr-public.aws.com/");
-    // busybox wget prints the server response headers (incl. the status line) to
-    // stderr with -S; run_exec merges stderr, so the HTTP status is captured.
-    let output = run_exec(&fcvm_path, fcvm_pid, false, &args).await?;
-    println!(
-        "  container egress headers: {}",
-        output.replace('\n', " | ")
-    );
+    // busybox wget -S prints the response status line + headers to stderr; -q
+    // would suppress them, so it is intentionally omitted. run_exec merges stderr,
+    // so the "HTTP/1.1 NNN" status line is captured.
+    let output = run_exec(
+        &fcvm_path,
+        fcvm_pid,
+        false,
+        &[
+            "wget",
+            "-S",
+            "-O",
+            "/dev/null",
+            "-T",
+            "15",
+            "https://ecr-public.aws.com/",
+        ],
+    )
+    .await?;
+    println!("  container egress: {}", output.replace('\n', " | "));
+    let status_ok = output.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("HTTP/")
+            && line
+                .split_whitespace()
+                .nth(1)
+                .is_some_and(|code| code.starts_with('2') || code.starts_with('3'))
+    });
     assert!(
-        output.contains("HTTP/") && (output.contains(" 2") || output.contains(" 3")),
-        "container egress should get an HTTP 2xx/3xx response, got: {}",
+        status_ok,
+        "container egress should report an HTTP 2xx/3xx status line, got: {}",
         output
     );
 
