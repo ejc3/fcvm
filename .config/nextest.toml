@@ -46,13 +46,20 @@ max-threads = 1
 [test-groups.hugepage-tests]
 max-threads = 1
 
-# Snapshot tests limited to 3 concurrent (each snapshot is ~5.6GB on disk)
+# Snapshot tests limited to 2 concurrent (each snapshot is ~5.6GB on disk).
+# Snapshot creation is disk-I/O heavy; on the SnapshotEnabled CI jobs three
+# concurrent 5.6GB writes plus full-parallelism VM tests saturated the runner
+# and starved whole-lifecycle tests (test_ficlone, test_custom_command) past
+# their timeouts. Capped to 2 to cut the peak snapshot I/O.
 [test-groups.snapshot-tests]
-max-threads = 3
+max-threads = 2
 
-# VM tests run at full parallelism (num-cpus)
+# VM tests are capped well below num-cpus: each test boots a full microVM
+# (real vCPU + RAM + disk), so on the metal runners (num-cpus up to 64) running
+# that many VMs at once oversubscribes the box and the lifecycle tests time out.
+# 8 concurrent VM boots keeps the runner from saturating while staying parallel.
 [test-groups.vm-tests]
-max-threads = "num-cpus"
+max-threads = 8
 
 [[profile.default.overrides]]
 filter = "package(fcvm) & (test(/stress_100/) | test(/8000_concurrent/))"
