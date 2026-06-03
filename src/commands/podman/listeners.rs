@@ -142,6 +142,20 @@ pub(super) async fn run_status_listener(
                 if let Err(e) = write_half.write_all(b"cache-ack\n").await {
                     warn!(vm_id = %vm_id, error = %e, "Failed to send cache-ack to fc-agent");
                 }
+                let _ = write_half.flush().await;
+
+                // Stop reading this connection and go back to accept(). fc-agent
+                // sends each status message ("cache-ready", then "ready", then
+                // "exit") on a SEPARATE vsock connection, so nothing more arrives
+                // here. Critically, this connection is the one held open across
+                // the pre-start snapshot's pause/resume: after resume the vsock
+                // transport can fail to propagate its close, so a second read_line
+                // here would block for the full 300s timeout before the accept
+                // loop could take the new connection carrying "ready" — stalling
+                // container startup by ~5 minutes (intermittently, worse on the
+                // NV2 nested kernel). Breaking to re-accept delivers "ready"
+                // immediately regardless of when this connection's EOF arrives.
+                break;
             } else {
                 warn!(vm_id = %vm_id, msg = %msg, "Unexpected status message");
             }
