@@ -689,56 +689,13 @@ impl NetworkManager for PastaNetwork {
             "starting pasta for rootless networking"
         );
 
-        // Phases 1+2: start pasta and wait for its TAP device, with a bounded
-        // retry on a transient startup failure.
-        //
-        // pasta has a netlink startup race: it subscribes to route/neighbour
-        // notifications and then issues request/response netlink calls during
-        // setup; a notification (sequence 0) arriving mid-sequence makes
-        // nl_status() die() with "netlink: Unexpected sequence number". Upstream
-        // d00255bd fixed the neighbour-sync path, but the race still recurs under
-        // heavy parallelism (many pastas starting while veth/tap/bridge churn
-        // generates netlink traffic), so pasta exits before its TAP appears.
-        // It is transient — a fresh start almost always succeeds — so retry a few
-        // times rather than failing the whole VM. (The remaining race is reported
-        // upstream; this keeps us resilient until it lands and the pin is bumped.)
-        const PASTA_START_ATTEMPTS: u32 = 4;
-        let mut last_err = None;
-        for attempt in 1..=PASTA_START_ATTEMPTS {
-            let result = match self.start_pasta(holder_pid).await {
-                Ok(()) => self.wait_for_pasta_device(holder_pid).await,
-                Err(e) => Err(e),
-            };
-            match result {
-                Ok(()) => {
-                    last_err = None;
-                    break;
-                }
-                Err(e) => {
-                    warn!(
-                        attempt,
-                        max = PASTA_START_ATTEMPTS,
-                        error = %e,
-                        "pasta startup failed (likely the transient netlink race), retrying"
-                    );
-                    // Reap the dead pasta (if start_pasta got far enough to store it)
-                    // so the next attempt starts clean; start_pasta also removes a
-                    // stale PID file at its start.
-                    if let Some(mut p) = self.pasta_process.take() {
-                        let _ = p.kill().await;
-                    }
-                    last_err = Some(e);
-                    if attempt < PASTA_START_ATTEMPTS {
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    }
-                }
-            }
-        }
-        if let Some(e) = last_err {
-            return Err(e.context(format!(
-                "pasta failed to start after {PASTA_START_ATTEMPTS} attempts"
-            )));
-        }
+        // Phase 1: Start pasta (creates pasta0 TAP in namespace)
+        self.start_pasta(holder_pid).await?;
+
+        // Phase 2: Wait for pasta's TAP device to be visible in the namespace,
+        // failing fast (with pasta's exit status and stderr) if pasta dies right
+        // after startup.
+        self.wait_for_pasta_device(holder_pid).await?;
 
         // Phase 3: Create bridge connecting pasta0 and Firecracker's TAP
         let bridge_script = self.build_bridge_script();
