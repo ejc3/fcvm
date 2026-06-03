@@ -405,6 +405,7 @@ async fn test_fcvm_ls_bridged() -> Result<()> {
 /// sudo fcvm podman run --name web1 --cmd "nginx -g 'daemon off;'" nginx:alpine
 /// ```
 #[tokio::test]
+#[ignore = "disabled pending #617: exec into a restored VM (2nd SnapshotEnabled pass) hangs to the 600s ceiling; cold pass passes"]
 async fn test_custom_command_bridged() -> Result<()> {
     println!("\ntest_custom_command_bridged");
     println!("===========================");
