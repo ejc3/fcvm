@@ -122,36 +122,46 @@ async fn exec_test_impl(network: &str) -> Result<()> {
     );
 
     // Test 6: Container internet connectivity
+    // Use the busybox wget already in nginx:alpine instead of `apk add curl`: the
+    // package fetch from the Alpine CDN has no time bound and could hang past the
+    // nextest budget. wget's -T bounds the request. In routed mode the container's
+    // only external route is IPv6, so plain wget already exercises IPv6 egress
+    // (no -6 flag, which busybox wget doesn't support).
     println!(
         "\nTest 6: Container internet ({})",
         if network == "routed" { "IPv6" } else { "IPv4" }
     );
-    let _ = run_exec(
+    // busybox wget -S prints the response status line + headers to stderr; -q
+    // would suppress them, so it is intentionally omitted. run_exec merges stderr,
+    // so the "HTTP/1.1 NNN" status line is captured.
+    let output = run_exec(
         &fcvm_path,
         fcvm_pid,
         false,
-        &["apk", "add", "--no-cache", "curl"],
+        &[
+            "wget",
+            "-S",
+            "-O",
+            "/dev/null",
+            "-T",
+            "15",
+            "https://ecr-public.aws.com/",
+        ],
     )
     .await?;
-    let mut args = vec![
-        "curl",
-        "-s",
-        "-o",
-        "/dev/null",
-        "-w",
-        "%{http_code}",
-        "--max-time",
-        "15",
-    ];
-    args.extend_from_slice(ipv6_flag);
-    args.push("https://ecr-public.aws.com/");
-    let output = run_exec(&fcvm_path, fcvm_pid, false, &args).await?;
-    let http_code = output.trim();
-    println!("  curl HTTP status: {}", http_code);
+    println!("  container egress: {}", output.replace('\n', " | "));
+    let status_ok = output.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("HTTP/")
+            && line
+                .split_whitespace()
+                .nth(1)
+                .is_some_and(|code| code.starts_with('2') || code.starts_with('3'))
+    });
     assert!(
-        http_code.starts_with('2') || http_code.starts_with('3'),
-        "curl should get 2xx/3xx, got: {}",
-        http_code
+        status_ok,
+        "container egress should report an HTTP 2xx/3xx status line, got: {}",
+        output
     );
 
     // Test 7: TTY NOT allocated without -t flag (VM exec)
@@ -661,11 +671,28 @@ async fn run_exec(
     args.push("--");
     args.extend(cmd.iter().copied());
 
-    let output = tokio::process::Command::new(fcvm_path)
+    // Bound the exec on the host side: a guest command that hangs (e.g. a network
+    // fetch with no internal timeout) must not consume the whole nextest budget.
+    // 120s is well above any legitimate exec here and well under the 600s ceiling.
+    // kill_on_drop ensures the spawned `fcvm exec` is killed when the timeout
+    // fires; Command::output()'s default kill_on_drop(false) would otherwise
+    // leave an orphan process (matches the pattern in src/health.rs).
+    // stdout/stderr must be piped explicitly: unlike output(), a manual spawn
+    // defaults to inherit, which would make wait_with_output() capture nothing.
+    let child = tokio::process::Command::new(fcvm_path)
         .args(&args)
-        .output()
-        .await
-        .context("running fcvm exec")?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawning fcvm exec")?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        child.wait_with_output(),
+    )
+    .await
+    .with_context(|| format!("fcvm exec timed out after 120s: {}", cmd.join(" ")))?
+    .context("running fcvm exec")?;
 
     // Combine stdout and stderr (exec streams both)
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1331,6 +1358,16 @@ async fn test_exec_parallel_pipe_stress() -> Result<()> {
         &vm_name,
         "--network",
         "rootless",
+        // No pre-start snapshot: this test boots one VM, runs 100 execs, and
+        // kills it — it never restores, so the snapshot is pure overhead and
+        // irrelevant to what it validates (the async exec pipe path under load).
+        // In SnapshotEnabled CI the pre-start snapshot sits on the boot->healthy
+        // path; under peak concurrent disk contention the ~1GB memory dump can
+        // take ~45s, blowing the 60s health budget before any exec runs. The
+        // snapshot machinery is covered by the dedicated snapshot suite and every
+        // other VM test; disabling it here also drops this VM's contribution to
+        // box-wide dump contention.
+        "--no-snapshot",
         common::TEST_IMAGE,
     ])
     .await
