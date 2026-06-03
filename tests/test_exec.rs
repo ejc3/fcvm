@@ -125,14 +125,20 @@ async fn exec_test_impl(network: &str) -> Result<()> {
     // Use busybox wget (already in nginx:alpine) instead of `apk add curl`: the
     // package fetch from the Alpine CDN has no time bound and could hang past the
     // nextest budget. wget's -T bounds the request itself.
-    println!(
-        "\nTest 6: Container internet ({})",
-        if network == "routed" { "IPv6" } else { "IPv4" }
-    );
-    let wget_ipv6: &[&str] = if network == "routed" { &["-6"] } else { &[] };
-    let mut args = vec!["wget", "-q", "-O", "/dev/null", "-T", "15", "-S"];
-    args.extend_from_slice(wget_ipv6);
-    args.push("https://ecr-public.aws.com/");
+    // Note: busybox wget does not support -6 (IPv6-only), so we don't force the
+    // address family here. IPv6 connectivity in routed mode is already validated
+    // by Test 5's `curl -6` in the VM; this test verifies *container* egress works.
+    println!("\nTest 6: Container internet connectivity");
+    let args = vec![
+        "wget",
+        "-q",
+        "-O",
+        "/dev/null",
+        "-T",
+        "15",
+        "-S",
+        "https://ecr-public.aws.com/",
+    ];
     // busybox wget prints the server response headers (incl. the status line) to
     // stderr with -S; run_exec merges stderr, so the HTTP status is captured.
     let output = run_exec(&fcvm_path, fcvm_pid, false, &args).await?;
