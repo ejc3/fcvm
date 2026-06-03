@@ -674,9 +674,17 @@ async fn run_exec(
     // Bound the exec on the host side: a guest command that hangs (e.g. a network
     // fetch with no internal timeout) must not consume the whole nextest budget.
     // 120s is well above any legitimate exec here and well under the 600s ceiling.
+    // kill_on_drop ensures the spawned `fcvm exec` is killed when the timeout
+    // fires; Command::output()'s default kill_on_drop(false) would otherwise
+    // leave an orphan process (matches the pattern in src/health.rs).
+    let child = tokio::process::Command::new(fcvm_path)
+        .args(&args)
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawning fcvm exec")?;
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(120),
-        tokio::process::Command::new(fcvm_path).args(&args).output(),
+        child.wait_with_output(),
     )
     .await
     .with_context(|| format!("fcvm exec timed out after 120s: {}", cmd.join(" ")))?
