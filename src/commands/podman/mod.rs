@@ -1154,6 +1154,18 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                     }
                     // Send ack back regardless of success (fc-agent should continue)
                     let _ = cache_request.ack_tx.send(());
+
+                    // Signal the output listener to drop its current connection and
+                    // re-accept. The snapshot's pause/resume can leave the output
+                    // vsock in a zombie state: writes from fc-agent succeed locally
+                    // but data never reaches the host. fc-agent reconnects output
+                    // after receiving cache-ack, but the host-side listener may still
+                    // be blocked in read_line() on the dead connection. Notifying
+                    // here makes the listener's tokio::select! take the reconnect
+                    // branch, dropping the stale reader and accepting fc-agent's new
+                    // connection immediately — before the container starts and
+                    // potentially exits in <200ms.
+                    ctx.output_reconnect.notify_one();
                 } else {
                     // Should not happen if channel exists, but send ack anyway
                     let _ = cache_request.ack_tx.send(());
