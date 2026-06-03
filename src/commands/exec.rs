@@ -342,8 +342,29 @@ fn read_exec_responses<R: BufRead>(
         }
     }
 
-    bail!("exec connection closed before an exit status was received")
+    Err(ExecConnectionClosed.into())
 }
+
+/// The exec stream ended before an Exit message arrived.
+///
+/// This is a real failure — the command's outcome is unknown, so the caller
+/// still exits non-zero. But it is also the expected, benign terminal
+/// condition when an exec races VM or container shutdown (for example the
+/// health monitor's `podman inspect` healthcheck during teardown), so `main`
+/// logs it at debug rather than alarming at ERROR.
+#[derive(Debug)]
+pub struct ExecConnectionClosed;
+
+impl std::fmt::Display for ExecConnectionClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "exec connection closed before an exit status was received"
+        )
+    }
+}
+
+impl std::error::Error for ExecConnectionClosed {}
 
 /// Run in line-buffered mode (non-TTY), returns exit code
 fn run_line_mode_with_exit_code(stream: UnixStream) -> Result<i32> {
